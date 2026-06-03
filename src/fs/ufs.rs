@@ -1075,11 +1075,6 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
 // effect (allocated vs free) so callers don't have to remember which
 // polarity applies to which bitmap.
 
-// `#[allow(dead_code)]` because the public consumer (`impl
-// EditableFilesystem for UfsFilesystem`) ships in the next slice; tests in
-// this module exercise every method but clippy `--all-targets` lints the
-// lib pass in isolation and flags methods that only the test target uses.
-#[allow(dead_code)]
 impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     /// Write raw bytes at the start of fragment `start_frag`. The caller
     /// is responsible for sizing `data` to a multiple of `fsize` when
@@ -1475,6 +1470,684 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
     }
 }
 
+// ---- U.4 directory + file-data helpers + EditableFilesystem ----
+//
+// The trait surface mirrors `efs.rs` (create_file / create_directory /
+// delete_entry / sync_metadata / free_space). v1 scope is intentionally
+// conservative:
+//   - File data fork: direct extents only (≤ 12 × bsize). Indirect
+//     blocks (> 96 KiB at the typical 8 KiB block size) are rejected
+//     with `Unsupported` rather than corrupting the allocator with
+//     a half-implemented multi-level walker. A follow-up slice can
+//     lift this when needed.
+//   - Directories: laid out in DIRBLKSIZ (512-byte) chunks within
+//     direct slots. Each chunk has self-contained DIRENT2 records; no
+//     entry crosses a chunk boundary. Growing past 12 × bsize hits
+//     the same `Unsupported` gate.
+//   - sync_metadata is a no-op: every primitive write is immediate
+//     (CG bitmaps + cs counters + inode + frag data flush as they
+//     happen). The trait still requires the method so callers don't
+//     need to special-case UFS.
+
+/// UFS directory record d_type values (`sys/ufs/ufs/dirent.h`).
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+
+/// Directory record alignment + minimum-record gate. Matches
+/// FreeBSD `DIRSIZ(fmt, dp)` rounding (`(8 + namlen + 1 + 3) & ~3`).
+const DIRENT_ALIGN: usize = 4;
+
+/// On-disk directory chunk size (`DIRBLKSIZ` = `DEV_BSIZE` in UFS).
+/// Directory entries never cross a 512-byte boundary.
+const DIRBLKSIZ: usize = 512;
+
+/// Compute the minimum d_reclen needed to hold a directory entry with
+/// the given name length. Header (8) + name + NUL pad up to 4-byte
+/// alignment.
+fn dirent_record_size(namlen: usize) -> usize {
+    (DIRENT_HDR_LEN + namlen + 1 + (DIRENT_ALIGN - 1)) & !(DIRENT_ALIGN - 1)
+}
+
+/// Filename validation: non-empty, no embedded NUL, no `/`, length
+/// within MAXNAMLEN (255 per FreeBSD `sys/ufs/ufs/dir.h`).
+fn validate_name(name: &[u8]) -> Result<(), FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData("empty filename".into()));
+    }
+    if name.len() > 255 {
+        return Err(FilesystemError::InvalidData(format!(
+            "filename too long: {} bytes (max 255)",
+            name.len()
+        )));
+    }
+    if name.iter().any(|&b| b == 0 || b == b'/') {
+        return Err(FilesystemError::InvalidData(
+            "filename contains NUL or '/' byte".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// d_type for a file mode (used when stamping the directory entry).
+fn mode_to_dirent_type(mode: u32) -> u8 {
+    match unix_file_type(mode) {
+        UnixFileType::Directory => DT_DIR,
+        UnixFileType::Symlink => DT_LNK,
+        _ => DT_REG,
+    }
+}
+
+impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
+    /// Look up `name` in `parent`'s directory data fork. Returns the
+    /// (logical-byte-offset, d_reclen) of the matching DIRENT2 record,
+    /// or `None`.
+    fn dir_find(
+        &mut self,
+        parent: &UfsInode,
+        name: &[u8],
+    ) -> Result<Option<(usize, usize)>, FilesystemError> {
+        let bytes = self.read_dir_bytes_raw(parent)?;
+        let endian = self.endian;
+        let mut off = 0;
+        while off + DIRENT_HDR_LEN <= bytes.len() {
+            let d_ino = read_u32(&bytes, off, endian);
+            let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
+            let d_namlen = bytes[off + 7] as usize;
+            if d_reclen == 0 || !d_reclen.is_multiple_of(DIRENT_ALIGN) {
+                return Err(FilesystemError::Parse(format!(
+                    "ufs dir_find: corrupt d_reclen {d_reclen} at off {off}"
+                )));
+            }
+            if d_ino != 0
+                && d_namlen == name.len()
+                && &bytes[off + DIRENT_HDR_LEN..off + DIRENT_HDR_LEN + d_namlen] == name
+            {
+                return Ok(Some((off, d_reclen)));
+            }
+            off += d_reclen;
+        }
+        Ok(None)
+    }
+
+    /// Insert `name -> inum` into `parent`'s directory data fork. Splits
+    /// the trailing-slack record in an existing 512-byte chunk when one
+    /// can be found; otherwise appends a new 512-byte chunk to the next
+    /// direct slot (allocating fragments as needed). Caller is
+    /// responsible for writing the (possibly mutated) parent inode back.
+    /// Refuses with `Unsupported` if growing past 12 × bsize.
+    fn dir_insert(
+        &mut self,
+        parent: &mut UfsInode,
+        name: &[u8],
+        child_inum: u32,
+        child_d_type: u8,
+    ) -> Result<(), FilesystemError> {
+        let bsize = self.bsize as usize;
+        let frags_per_block = self.frag as u64;
+        let dir_bytes = self.read_dir_bytes_raw(parent)?;
+        let need = dirent_record_size(name.len());
+
+        // Try to fit into an existing chunk by splitting the slack of
+        // any record whose actual size (8 + namlen + alignment) plus
+        // `need` fits within its d_reclen. We scan chunks in order so
+        // an insert lands as close to the front as possible — matches
+        // the kernel's `ufs_direnter` behavior.
+        let endian = self.endian;
+        for chunk_start in (0..dir_bytes.len()).step_by(DIRBLKSIZ) {
+            let chunk_end = (chunk_start + DIRBLKSIZ).min(dir_bytes.len());
+            let mut last_off: Option<usize> = None;
+            let mut off = chunk_start;
+            while off + DIRENT_HDR_LEN <= chunk_end {
+                let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
+                let d_namlen = dir_bytes[off + 7] as usize;
+                if d_reclen == 0 || off + d_reclen > chunk_end {
+                    break;
+                }
+                let actual = dirent_record_size(d_namlen);
+                let slack = d_reclen.saturating_sub(actual);
+                if slack >= need {
+                    // Split: shrink this record to its actual size,
+                    // place the new entry in the trailing slack.
+                    let mut updated = dir_bytes.clone();
+                    write_u16(&mut updated, off + 4, actual as u16, endian);
+                    let new_off = off + actual;
+                    write_u32(&mut updated, new_off, child_inum, endian);
+                    write_u16(&mut updated, new_off + 4, slack as u16, endian);
+                    updated[new_off + 6] = child_d_type;
+                    updated[new_off + 7] = name.len() as u8;
+                    let name_end = new_off + DIRENT_HDR_LEN + name.len();
+                    updated[new_off + DIRENT_HDR_LEN..name_end].copy_from_slice(name);
+                    // Pad to record length with zeros.
+                    for b in &mut updated[name_end..new_off + slack] {
+                        *b = 0;
+                    }
+                    self.write_dir_bytes(parent, &updated)?;
+                    return Ok(());
+                }
+                last_off = Some(off);
+                off += d_reclen;
+            }
+            let _ = last_off;
+        }
+
+        // No fit in any existing chunk — append a new DIRBLKSIZ chunk
+        // at the current end of the dir. Grow within the current dir
+        // block if there's still room; else allocate a new direct block.
+        let cur_size = dir_bytes.len();
+        if cur_size + DIRBLKSIZ > 12 * bsize {
+            return Err(FilesystemError::Unsupported(format!(
+                "ufs dir_insert: directory would exceed v1 cap of {} bytes (12 × bsize); \
+                 indirect-block dir growth not yet implemented",
+                12 * bsize
+            )));
+        }
+        let new_size = cur_size + DIRBLKSIZ;
+
+        // Build the new chunk holding just the new entry, padded out to
+        // DIRBLKSIZ via a single trailing-slack record.
+        let mut new_chunk = vec![0u8; DIRBLKSIZ];
+        write_u32(&mut new_chunk, 0, child_inum, endian);
+        write_u16(&mut new_chunk, 4, DIRBLKSIZ as u16, endian);
+        new_chunk[6] = child_d_type;
+        new_chunk[7] = name.len() as u8;
+        new_chunk[DIRENT_HDR_LEN..DIRENT_HDR_LEN + name.len()].copy_from_slice(name);
+
+        // Does cur_size already end on a bsize boundary? If yes, we need
+        // a fresh direct block. If no, we extend the current block (the
+        // bsize block at direct[cur_size / bsize - 1]).
+        if cur_size % bsize == 0 {
+            // Need a new direct slot.
+            let slot = cur_size / bsize;
+            if slot >= UFS_NDADDR {
+                return Err(FilesystemError::Unsupported(format!(
+                    "ufs dir_insert: directory exhausted all {UFS_NDADDR} direct slots"
+                )));
+            }
+            // Allocate one full block (`frag` fragments).
+            let cg_hint = (parent.inum / self.ipg) % self.ncg;
+            let start_frag = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            parent.direct[slot] = start_frag;
+            // Write the new chunk at the new block start, zero-pad the
+            // rest of the bsize block.
+            let mut full_block = vec![0u8; bsize];
+            full_block[..DIRBLKSIZ].copy_from_slice(&new_chunk);
+            self.write_frag_run(start_frag, &full_block)?;
+        } else {
+            // Append to the current trailing partial block. Read it,
+            // splice the new chunk in, write back. The block's
+            // remaining region (cur_size % bsize .. cur_size % bsize +
+            // DIRBLKSIZ) gets the new chunk.
+            let last_block_lbn = (cur_size - 1) / bsize;
+            let last_frag = parent.direct[last_block_lbn];
+            // Read the existing block.
+            let byte = self.partition_offset + last_frag * self.fsize;
+            self.reader.seek(SeekFrom::Start(byte))?;
+            let mut block = vec![0u8; bsize];
+            self.reader.read_exact(&mut block)?;
+            let in_block = cur_size % bsize;
+            block[in_block..in_block + DIRBLKSIZ].copy_from_slice(&new_chunk);
+            self.write_frag_run(last_frag, &block)?;
+        }
+        parent.size = new_size as u64;
+        Ok(())
+    }
+
+    /// Remove the dirent for `name` from `parent`. Returns the inum it
+    /// referenced. The slot is merged into the previous record (i.e. the
+    /// previous record's d_reclen grows to absorb it); if the removed
+    /// entry is the first in its chunk, its `d_ino` is set to 0 to mark
+    /// the slot vacant while preserving the chunk-traversal invariant.
+    fn dir_remove(&mut self, parent: &UfsInode, name: &[u8]) -> Result<u32, FilesystemError> {
+        let mut dir_bytes = self.read_dir_bytes_raw(parent)?;
+        let endian = self.endian;
+        // Find the target and the previous record within its chunk.
+        let mut found_off: Option<usize> = None;
+        let mut found_reclen: usize = 0;
+        let mut prev_off: Option<usize> = None;
+        for chunk_start in (0..dir_bytes.len()).step_by(DIRBLKSIZ) {
+            let chunk_end = (chunk_start + DIRBLKSIZ).min(dir_bytes.len());
+            let mut off = chunk_start;
+            let mut prev_in_chunk: Option<usize> = None;
+            while off + DIRENT_HDR_LEN <= chunk_end {
+                let d_ino = read_u32(&dir_bytes, off, endian);
+                let d_reclen = read_u16(&dir_bytes, off + 4, endian) as usize;
+                let d_namlen = dir_bytes[off + 7] as usize;
+                if d_reclen == 0 || off + d_reclen > chunk_end {
+                    break;
+                }
+                if d_ino != 0
+                    && d_namlen == name.len()
+                    && &dir_bytes[off + DIRENT_HDR_LEN..off + DIRENT_HDR_LEN + d_namlen] == name
+                {
+                    found_off = Some(off);
+                    found_reclen = d_reclen;
+                    prev_off = prev_in_chunk;
+                    break;
+                }
+                prev_in_chunk = Some(off);
+                off += d_reclen;
+            }
+            if found_off.is_some() {
+                break;
+            }
+        }
+        let off = found_off
+            .ok_or_else(|| FilesystemError::NotFound(String::from_utf8_lossy(name).into_owned()))?;
+        let removed_inum = read_u32(&dir_bytes, off, endian);
+
+        match prev_off {
+            Some(prev) => {
+                // Merge into previous record's d_reclen.
+                let prev_reclen = read_u16(&dir_bytes, prev + 4, endian) as usize;
+                write_u16(
+                    &mut dir_bytes,
+                    prev + 4,
+                    (prev_reclen + found_reclen) as u16,
+                    endian,
+                );
+            }
+            None => {
+                // First entry in its chunk — zero the d_ino slot. The
+                // chunk's structural invariant (sum of d_reclen ==
+                // DIRBLKSIZ) is preserved.
+                write_u32(&mut dir_bytes, off, 0, endian);
+            }
+        }
+        self.write_dir_bytes(parent, &dir_bytes)?;
+        Ok(removed_inum)
+    }
+
+    /// Re-write the parent's directory data fork in place. The data fork
+    /// length stays at `parent.size`; only contents change.
+    fn write_dir_bytes(&mut self, parent: &UfsInode, bytes: &[u8]) -> Result<(), FilesystemError> {
+        if bytes.len() as u64 != parent.size {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs write_dir_bytes: caller passed {} bytes, parent.size = {}",
+                bytes.len(),
+                parent.size
+            )));
+        }
+        let bs = self.bsize as usize;
+        let mut written = 0usize;
+        for slot in 0..UFS_NDADDR {
+            if written >= bytes.len() {
+                break;
+            }
+            let frag = parent.direct[slot];
+            if frag == 0 {
+                return Err(FilesystemError::Parse(format!(
+                    "ufs write_dir_bytes: parent inode {} has zero direct[{slot}] mid-dir",
+                    parent.inum
+                )));
+            }
+            let take = (bytes.len() - written).min(bs);
+            // Whole-block writes round up to bsize; the last partial
+            // write only updates `take` bytes (preserves anything past
+            // the file's logical end).
+            let byte = self.partition_offset + frag * self.fsize;
+            self.reader.seek(SeekFrom::Start(byte))?;
+            self.reader.write_all(&bytes[written..written + take])?;
+            written += take;
+        }
+        if written < bytes.len() {
+            return Err(FilesystemError::Unsupported(
+                "ufs write_dir_bytes: parent dir spills past direct[] (indirect not yet supported)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write a regular file's data fork. Allocates one full block per
+    /// occupied direct slot (`alloc_frag_run(frag, ...)`). Refuses with
+    /// `Unsupported` if the file needs more than 12 direct blocks
+    /// (indirect-block writes not yet implemented).
+    fn write_file_data(
+        &mut self,
+        inode: &mut UfsInode,
+        data: &mut dyn Read,
+        data_len: u64,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.bsize;
+        let frags_per_block = self.frag as u64;
+        let max_direct_bytes = bs * UFS_NDADDR as u64;
+        if data_len > max_direct_bytes {
+            return Err(FilesystemError::Unsupported(format!(
+                "ufs write_file_data: file size {data_len} > direct cap {max_direct_bytes} \
+                 (indirect-block writes not yet implemented)"
+            )));
+        }
+        let cg_hint = (inode.inum / self.ipg) % self.ncg;
+        let mut written: u64 = 0;
+        let mut block_buf = vec![0u8; bs as usize];
+        let mut slot = 0;
+        while written < data_len {
+            let remaining = data_len - written;
+            let chunk = (bs).min(remaining);
+            // Allocate one block (frag fragments) for this slot.
+            let start = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            inode.direct[slot] = start;
+            // Read the chunk from the source into the block buffer.
+            let mut filled = 0usize;
+            while filled < chunk as usize {
+                let n = data.read(&mut block_buf[filled..chunk as usize])?;
+                if n == 0 {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "ufs write_file_data: source ran out at {} bytes, expected {data_len}",
+                        written + filled as u64
+                    )));
+                }
+                filled += n;
+            }
+            // Zero the trailing bytes (when chunk < bs) so the on-disk
+            // block doesn't carry stale tail content.
+            for b in &mut block_buf[chunk as usize..] {
+                *b = 0;
+            }
+            self.write_frag_run(start, &block_buf)?;
+            written += chunk;
+            slot += 1;
+        }
+        inode.size = data_len;
+        Ok(())
+    }
+
+    /// Free every disk fragment an inode owns (data + indirect blocks).
+    /// Re-uses the `walk_inode_blocks` traversal so the indirect-block
+    /// fragments are caught alongside the leaves.
+    fn free_inode_blocks(&mut self, inode: &UfsInode) -> Result<(), FilesystemError> {
+        let (data_frags, indirect_frags) = self.walk_inode_blocks(inode)?;
+        // Group consecutive frags per CG so each free_frag_run call sees
+        // a contiguous in-CG slice. Simplest: one frag at a time. With
+        // v1's direct-only file layout each direct[i] is a `frag`-long
+        // block, so we can collapse into runs trivially when neighbors
+        // line up; the dumb path is correct and slow.
+        for f in data_frags.into_iter().chain(indirect_frags.into_iter()) {
+            if f == 0 {
+                continue;
+            }
+            // For now, free one block (frag fragments) at a time — every
+            // direct slot is exactly one block by construction in
+            // write_file_data.
+            let frags_per_block = self.frag as u64;
+            // Guard against runs that cross CG boundaries (won't happen
+            // for direct allocations from alloc_frag_run, which refuses
+            // them, but defensive coding for future indirect support).
+            let cg = f / self.fpg as u64;
+            let in_cg = f % self.fpg as u64;
+            let span = frags_per_block.min(self.fpg as u64 - in_cg);
+            self.free_frag_run(f, span)?;
+            let _ = cg;
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for UfsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        let parent_inum = parent.location as u32;
+
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        // Allocate the new inode first; if anything below fails we free
+        // it back. Inum allocation is sticky across the create.
+        let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
+        let mode = options.mode.unwrap_or(0o100644);
+        let mut new_inode = UfsInode {
+            inum: new_inum,
+            mode,
+            nlink: 1,
+            uid: options.uid.unwrap_or(0),
+            gid: options.gid.unwrap_or(0),
+            size: 0,
+            mtime: 0,
+            direct: [0; UFS_NDADDR],
+            indirect: [0; UFS_NIADDR],
+            inline_payload: Vec::new(),
+        };
+        let create_result = (|| -> Result<FileEntry, FilesystemError> {
+            self.write_file_data(&mut new_inode, data, data_len)?;
+            self.write_inode(new_inum, &new_inode)?;
+
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(
+                &mut parent_inode,
+                name_bytes,
+                new_inum,
+                mode_to_dirent_type(mode),
+            )?;
+            self.write_inode(parent_inum, &parent_inode)?;
+            // Build the resulting FileEntry.
+            let parent_path = if parent.path == "/" {
+                String::new()
+            } else {
+                parent.path.clone()
+            };
+            let mut entry = FileEntry::new_file(
+                name.to_string(),
+                format!("{parent_path}/{name}"),
+                new_inode.size,
+                new_inum as u64,
+            );
+            entry.mode = Some(new_inode.mode);
+            entry.uid = Some(new_inode.uid);
+            entry.gid = Some(new_inode.gid);
+            Ok(entry)
+        })();
+
+        if create_result.is_err() {
+            // Roll back: free any allocated data blocks, free the inode.
+            let _ = self.free_inode_blocks(&new_inode);
+            let _ = self.free_inode(new_inum);
+        }
+        create_result
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &super::filesystem::CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        let parent_inum = parent.location as u32;
+
+        let parent_inode_check = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode_check, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let bsize = self.bsize as usize;
+        let frags_per_block = self.frag as u64;
+        let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
+
+        let create_result = (|| -> Result<FileEntry, FilesystemError> {
+            // Allocate one block for the new dir's initial DIRBLKSIZ
+            // chunk holding `.` and `..`. The remaining bsize - DIRBLKSIZ
+            // bytes are zero-padded — they'll be reused when files are
+            // added via the same chunk-append logic in dir_insert.
+            let cg_hint = parent_inum / self.ipg;
+            let start_frag = self.alloc_frag_run(frags_per_block, cg_hint)?;
+            let endian = self.endian;
+            let mut block = vec![0u8; bsize];
+
+            // `.` record: 12 bytes (8 hdr + 1 name + 3 pad).
+            let dot_reclen = dirent_record_size(1);
+            write_u32(&mut block, 0, new_inum, endian);
+            write_u16(&mut block, 4, dot_reclen as u16, endian);
+            block[6] = DT_DIR;
+            block[7] = 1;
+            block[DIRENT_HDR_LEN] = b'.';
+
+            // `..` record: takes the rest of the first DIRBLKSIZ chunk.
+            let dotdot_off = dot_reclen;
+            let dotdot_reclen = DIRBLKSIZ - dot_reclen;
+            write_u32(&mut block, dotdot_off, parent_inum, endian);
+            write_u16(&mut block, dotdot_off + 4, dotdot_reclen as u16, endian);
+            block[dotdot_off + 6] = DT_DIR;
+            block[dotdot_off + 7] = 2;
+            block[dotdot_off + DIRENT_HDR_LEN] = b'.';
+            block[dotdot_off + DIRENT_HDR_LEN + 1] = b'.';
+
+            self.write_frag_run(start_frag, &block)?;
+
+            let mode = options.mode.unwrap_or(0o040755);
+            let mut new_dir = UfsInode {
+                inum: new_inum,
+                mode,
+                nlink: 2, // `.` is the second link
+                uid: options.uid.unwrap_or(0),
+                gid: options.gid.unwrap_or(0),
+                size: DIRBLKSIZ as u64,
+                mtime: 0,
+                direct: [0; UFS_NDADDR],
+                indirect: [0; UFS_NIADDR],
+                inline_payload: Vec::new(),
+            };
+            new_dir.direct[0] = start_frag;
+            self.write_inode(new_inum, &new_dir)?;
+            // Tracking: the new directory bumps the per-CG ndir counter.
+            self.update_cg_cs(new_inum / self.ipg, 1, 0, 0, 0)?;
+
+            // Link into parent + bump parent's nlink for the back-link.
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_inode, name_bytes, new_inum, DT_DIR)?;
+            parent_inode.nlink = parent_inode.nlink.saturating_add(1);
+            self.write_inode(parent_inum, &parent_inode)?;
+
+            let parent_path = if parent.path == "/" {
+                String::new()
+            } else {
+                parent.path.clone()
+            };
+            let mut entry = FileEntry::new_directory(
+                name.to_string(),
+                format!("{parent_path}/{name}"),
+                new_inum as u64,
+            );
+            entry.mode = Some(new_dir.mode);
+            entry.uid = Some(new_dir.uid);
+            entry.gid = Some(new_dir.gid);
+            Ok(entry)
+        })();
+
+        if create_result.is_err() {
+            let _ = self.free_inode(new_inum);
+        }
+        create_result
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let parent_inum = parent.location as u32;
+        let entry_inum = entry.location as u32;
+        if entry_inum < ROOT_INODE {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs delete_entry: refusing to delete reserved inum {entry_inum}"
+            )));
+        }
+        let target = self.read_inode(entry_inum)?;
+        let is_dir = matches!(unix_file_type(target.mode), UnixFileType::Directory);
+        if is_dir {
+            // Empty-check: scan every chunk and reject if any DIRENT2
+            // outside `.` / `..` references a non-zero inum.
+            let bytes = self.read_dir_bytes_raw(&target)?;
+            let endian = self.endian;
+            let mut off = 0;
+            while off + DIRENT_HDR_LEN <= bytes.len() {
+                let d_ino = read_u32(&bytes, off, endian);
+                let d_reclen = read_u16(&bytes, off + 4, endian) as usize;
+                let d_namlen = bytes[off + 7] as usize;
+                if d_reclen == 0 || off + d_reclen > bytes.len() {
+                    break;
+                }
+                if d_ino != 0 && d_namlen > 0 {
+                    let name = &bytes[off + DIRENT_HDR_LEN..off + DIRENT_HDR_LEN + d_namlen];
+                    if name != b"." && name != b".." {
+                        return Err(FilesystemError::InvalidData(format!(
+                            "ufs delete_entry: directory '{}' not empty",
+                            entry.path
+                        )));
+                    }
+                }
+                off += d_reclen;
+            }
+        }
+
+        // Unlink from parent first (a crash after this point leaves an
+        // orphan inode, recoverable; a crash before leaves a dangling
+        // dirent, NOT recoverable cleanly).
+        let parent_inode = self.read_inode(parent_inum)?;
+        let removed = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        if removed != entry_inum {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs delete_entry: dirent inum {removed} differs from entry inum {entry_inum}"
+            )));
+        }
+
+        // Free the inode's data blocks, then the inode itself.
+        self.free_inode_blocks(&target)?;
+        self.free_inode(entry_inum)?;
+        if is_dir {
+            // Account for the directory-count drop on the CG.
+            self.update_cg_cs(entry_inum / self.ipg, -1, 0, 0, 0)?;
+            // Parent loses its "back-link" from the deleted dir's `..`.
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+            self.write_inode(parent_inum, &parent_inode)?;
+        }
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        // Every primitive write flushes synchronously — bitmaps, cs
+        // counters, inodes, and frag data all land at the moment they're
+        // mutated. sync_metadata is a no-op for callers that want to
+        // batch (the trait contract allows it). When buffered SB-level
+        // summary (`fs_old_cstotal` / `fs_cstotal`) propagation lands in
+        // a follow-up, it'll flush here.
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        // Sum nffree across every CG and multiply by fsize. Modest cost
+        // (one CG header read per CG) and correct under arbitrary edits
+        // because each primitive keeps `cg_cs` in sync.
+        let mut total: u64 = 0;
+        for cg in 0..self.ncg {
+            let (_, _, _, nffree) = self.read_cg_cs(cg)?;
+            total = total.saturating_add(nffree.max(0) as u64);
+        }
+        Ok(total * self.fsize)
+    }
+}
+
 // ---- `fs_flags2` bits we care about ----
 
 /// `FS_SUJ` (softupdate journaling enabled). Defined as `1 << 3` in
@@ -1529,7 +2202,6 @@ pub(crate) fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
     }
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
@@ -1538,12 +2210,10 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
     buf[off..off + 2].copy_from_slice(&bytes);
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
     write_u16(buf, off, v as u16, endian);
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
@@ -1552,12 +2222,10 @@ fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
     buf[off..off + 4].copy_from_slice(&bytes);
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
     write_u32(buf, off, v as u32, endian);
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_u64(buf: &mut [u8], off: usize, v: u64, endian: UfsEndian) {
     let bytes = match endian {
         UfsEndian::Little => v.to_le_bytes(),
@@ -1566,7 +2234,6 @@ fn write_u64(buf: &mut [u8], off: usize, v: u64, endian: UfsEndian) {
     buf[off..off + 8].copy_from_slice(&bytes);
 }
 
-#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
 fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
     write_u64(buf, off, v as u64, endian);
 }
@@ -2952,6 +3619,295 @@ mod tests {
             matches!(err, FilesystemError::DiskFull(_)),
             "expected DiskFull, got {err:?}"
         );
+    }
+
+    // ---- EditableFilesystem (U.4 edit) ----
+
+    /// Round-trip create_file + read_file against the real UFS1 makefs
+    /// fixture. The fixture is already fsck-clean; we mutate it in
+    /// memory, re-run fsck, and confirm the new file shows up via
+    /// list_directory.
+    #[test]
+    fn create_file_round_trips_against_ufs1_fixture() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"hello from ufs editable surface".to_vec();
+        let mut src = payload.as_slice();
+        let new_entry = fs
+            .create_file(
+                &root,
+                "newfile.txt",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        assert_eq!(new_entry.size, payload.len() as u64);
+
+        // Re-open to confirm everything is on disk.
+        let mut fs2 = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root2 = fs2.root().expect("root2");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let found = kids
+            .iter()
+            .find(|e| e.name == "newfile.txt")
+            .expect("newfile.txt present");
+        let bytes = fs2.read_file(found, 1024).expect("read");
+        assert_eq!(bytes, payload);
+
+        // fsck must stay clean after the mutation.
+        let result = fs2.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors after create_file: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// `create_directory` writes `.` and `..` and bumps the parent's
+    /// nlink. Listing the new dir returns no children (the trait
+    /// hides `.` / `..`).
+    #[test]
+    fn create_directory_round_trips_against_ufs2_fixture() {
+        use super::super::filesystem::{CreateDirectoryOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let parent_nlink_before = fs
+            .read_inode(root.location as u32)
+            .expect("root inode")
+            .nlink;
+
+        let new_dir = fs
+            .create_directory(&root, "newdir", &CreateDirectoryOptions::default())
+            .expect("create_directory");
+        assert!(new_dir.is_directory());
+
+        // Re-open.
+        let mut fs2 = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root2 = fs2.root().expect("root2");
+        let kids = fs2.list_directory(&root2).expect("list");
+        let found = kids
+            .iter()
+            .find(|e| e.name == "newdir")
+            .expect("newdir present");
+        assert!(found.is_directory());
+
+        // Listing the new dir filters `.` / `..`, so it should be empty.
+        let sub_kids = fs2.list_directory(found).expect("list sub");
+        assert!(
+            sub_kids.is_empty(),
+            "fresh dir should list empty: {sub_kids:?}"
+        );
+
+        // Parent's nlink must have bumped (back-link from new dir's `..`).
+        let parent_nlink_after = fs2.read_inode(root2.location as u32).expect("inode").nlink;
+        assert_eq!(parent_nlink_after, parent_nlink_before + 1);
+
+        let result = fs2.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors after create_directory: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// delete_entry frees the inode + data blocks; counters bump back.
+    #[test]
+    fn delete_entry_frees_inode_and_blocks() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+
+        // Snapshot CG 0's counters BEFORE.
+        let (nffree_before, nifree_before) = {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            let (_, _, nifree, nffree) = fs.read_cg_cs(0).expect("cs");
+            (nffree, nifree)
+        };
+
+        let new_inum: u32;
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            let root = fs.root().expect("root");
+            let payload = vec![0xABu8; 4096];
+            let mut src = payload.as_slice();
+            let new_entry = fs
+                .create_file(
+                    &root,
+                    "tempfile.bin",
+                    &mut src,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create");
+            new_inum = new_entry.location as u32;
+
+            // Delete it.
+            fs.delete_entry(&root, &new_entry).expect("delete");
+        }
+
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "tempfile.bin"),
+            "tempfile.bin must be gone"
+        );
+        // Inode slot must be zeroed (mode == 0).
+        let zeroed = fs.read_inode(new_inum).expect("re-read inode");
+        assert_eq!(zeroed.mode, 0);
+
+        // Counters restored (modulo intermediate ops on counters from
+        // create_directory's ndir bump — we don't make any here, so the
+        // create+delete sequence should net to zero).
+        let (_, _, nifree_after, nffree_after) = fs.read_cg_cs(0).expect("cs");
+        assert_eq!(nifree_after, nifree_before);
+        assert_eq!(nffree_after, nffree_before);
+
+        let result = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors after delete: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// delete_entry on a non-empty directory must error.
+    #[test]
+    fn delete_non_empty_dir_refuses() {
+        use super::super::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+        };
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let dir = fs
+            .create_directory(&root, "notempty", &CreateDirectoryOptions::default())
+            .expect("create dir");
+        let payload = b"x".to_vec();
+        let mut src = payload.as_slice();
+        let _file = fs
+            .create_file(
+                &dir,
+                "child",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create child");
+
+        let err = fs.delete_entry(&root, &dir).expect_err("must refuse");
+        assert!(
+            matches!(err, FilesystemError::InvalidData(_)),
+            "expected InvalidData, got {err:?}"
+        );
+    }
+
+    /// Files larger than 12 × bsize hit the indirect-block gate and
+    /// return Unsupported. Confirms we don't silently accept oversized
+    /// writes that would corrupt the volume.
+    #[test]
+    fn create_file_oversize_returns_unsupported() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let bsize = fs.bsize as usize;
+        let oversize = vec![0u8; bsize * UFS_NDADDR + 1];
+        let mut src = oversize.as_slice();
+        let err = fs
+            .create_file(
+                &root,
+                "toobig.bin",
+                &mut src,
+                oversize.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, FilesystemError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+
+        // The failed create rolls back: no `toobig.bin` in the listing,
+        // and fsck stays clean (no orphan inode, no leaked frags).
+        let kids = fs.list_directory(&root).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "toobig.bin"),
+            "failed create must roll back"
+        );
+        let result = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck after failed create: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two files in the same dir exercise dir_insert's slack-split path
+    /// (the new entry should fit into the trailing slack of the existing
+    /// `..` record without growing the dir).
+    #[test]
+    fn dir_insert_splits_trailing_slack_for_second_file() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let root_size_before = fs.read_inode(root.location as u32).expect("inode").size;
+
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            let payload = name.as_bytes().to_vec();
+            let mut src = payload.as_slice();
+            fs.create_file(
+                &root,
+                name,
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create");
+        }
+
+        let kids = fs.list_directory(&root).expect("list");
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            assert!(kids.iter().any(|e| e.name == *name), "{name} missing");
+        }
+
+        // Root size shouldn't grow: three short filenames fit easily in
+        // the existing trailing slack of the first chunk.
+        let root_size_after = fs.read_inode(root.location as u32).expect("inode").size;
+        assert_eq!(
+            root_size_after, root_size_before,
+            "root dir grew unnecessarily"
+        );
+
+        let result = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// free_space sums per-CG nffree counts × fsize.
+    #[test]
+    fn free_space_aggregates_per_cg_nffree() {
+        use super::super::filesystem::EditableFilesystem;
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let space = fs.free_space().expect("free_space");
+        // Sanity bound — must be > 0 and ≤ total_size.
+        assert!(space > 0);
+        assert!(space <= fs.total_size());
     }
 
     // ---- fsck (U.4) ----
