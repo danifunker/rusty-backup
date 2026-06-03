@@ -63,18 +63,44 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
   gate is also relaxed: R2/R5 now account bmbt blocks via
   `collect_bmbt_blocks`.
 
-- **(E) v5/CRC editing** — largest item. Every write path is v4-only
-  today (`is_v5() → Unsupported/skip`) because v5 blocks carry crc32c +
-  uuid + owner + blkno/lsn. Add a crc32c (Castagnoli) routine and at every
-  write site set CRC (computed over the block with the crc field zeroed) +
-  uuid (=sb_uuid) + owner + blkno on: v3 inode core (176-byte core,
-  `di_crc`), dir3 data/leaf/node blocks (64-byte hdr), short-form-block
-  btrees (`XFS_BTREE_SBLOCK_CRC_LEN=56`), bmbt crc blocks, AGF/AGI, the
-  superblock. Thread `is_v5` through `edit.rs` / `repair` (header
-  lengths, `fork_offset(true)=176`) instead of hardcoding v4. Open up the
-  v5 open-time rejection for editing. Ref `libxfs/xfs_cksum.h` and the
-  per-structure crc offsets. Multi-slice; land v5 reads/writes
-  structure-by-structure, oracle-checking each.
+- **(E) v5/CRC editing** — largest item, multi-slice. **E.1 through E.4
+  shipped 2026-06-03** (see §10):
+  - E.1: `v5_crc.rs` module — CRC-32C primitive + per-block stampers +
+    on-disk fixture cross-check that proves the crc32c crate's params
+    match `mkfs.xfs`.
+  - E.2: `write_inode_region` + `init_free_inode_chunk` stamp v3 inode
+    cores on v5 writes.
+  - E.3: dir3 single-block / data-block / leaf1 builders parameterized
+    on `is_v5`; call sites stamp `xfs_dir3_blk_hdr` / `xfs_da3_blkinfo`
+    once the destination fsblock is known.
+  - E.4: `btree_build` capacities + builders thread `is_v5`; v5
+    `build_alloc_btree` / `build_sblock_btree` emit the 56-byte
+    `xfs_btree_block_shdr` with stamped uuid/blkno/lsn/owner/crc.
+    freespace_rebuild picks the v5 magic + passes `Some(sb)`.
+
+  **E.5 still open** — lift the gates:
+  - AGF / AGI / AGFL sector writes stamp v5 CRC (uuid/lsn/crc).
+  - Superblock writes (counter bumps) stamp `sb_crc`.
+  - `splice_inobt_single_leaf_record` stamps the rewritten leaf's
+    sblock-crc header.
+  - `grow_inobt_with_new_record` passes `Some(sb)` through
+    `build_sblock_btree(XFS_IBT_CRC_MAGIC)`.
+  - Top-level v5 gates in `alloc_inode_slot` /
+    `alloc_new_inode_chunk` come down; same for the R3/R5/R6/R7 repair
+    passes once their write paths are CRC-aware.
+  - **bmbt v5** (long-form, 72-byte hdr with owner = inode) — touch
+    `init_file_inode`'s `write_bmbt_root_to_leaf` and the
+    `build_bmbt_leaf_v4` helper. `XFS_BMAP_CRC_MAGIC` + the
+    `LBLOCK_CRC_*` field offsets are already wired in `v5_crc`.
+  - `fork_offset(false)` hardcodes at ~13 sites in `edit.rs` switch
+    to `fork_offset(sb.is_v5())` so the v3 inode literal area starts at
+    176 instead of 100.
+  - Stale `"v5 not supported"` comment in `src/fs/mod.rs:162` deleted.
+  - Integration test: drive `alloc_new_inode_chunk` end-to-end on the
+    v5 fixture, assert every block's CRC validates and our verifier
+    stays clean.
+
+  Ref `libxfs/xfs_cksum.h` and the per-structure crc offsets.
 
 ### 2.2 XFS shrink via clone-into-fresh
 
@@ -387,6 +413,62 @@ Out, not parked. Listed so the question doesn't get re-litigated.
 Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
+
+- **XFS hole (E.1) — v5/CRC primitives** — new `src/fs/xfs/v5_crc.rs`
+  with `crc32c` (Castagnoli, init=0xFFFFFFFF, xorout=0xFFFFFFFF, matched
+  to `xfs_start_cksum_safe`), `stamp_crc(buf, crc_off)` that zeroes
+  the field before computing, per-block-type stampers (`stamp_inode_v3`
+  / `stamp_dir3_blk_hdr` / `stamp_da3_blkinfo` /
+  `stamp_sblock_crc_header` / `stamp_lblock_crc_header` /
+  `stamp_agf` / `stamp_agi` / `stamp_agfl` / `stamp_superblock`), and
+  the field-offset constants every later slice keys off. New `sb_uuid`
+  / `sb_meta_uuid` fields on `XfsSuperblock` plus a `meta_uuid()`
+  accessor that routes through the META_UUID incompat bit. A fixture
+  cross-check (`v5_crc_primitive_matches_on_disk_root_inode_and_ag_headers`)
+  verifies our CRC of mkfs.xfs's root inode + AGF + AGI + SB matches
+  the on-disk values — if the crc32c crate's params ever drifted from
+  what `xfs_repair` expects, that test fires.
+- **XFS hole (E.2) — v3 inode core stamping** — `write_inode_region`
+  (the read-modify-write helper that every edit / repair path funnels
+  through) calls `stamp_inode_v3` over the freshly-copied inode bytes
+  on v5, just before the sector span commits. `init_free_inode_chunk`
+  stamps each of the 64 fresh slots in a new chunk with its own
+  `di_ino`. Upstream alloc/repair gates still reject v5 because the
+  AGI / SB / sblock write paths haven't landed yet — when E.5 lifts
+  them, inode writes Just Work. Verified by a v5-fixture round-trip
+  test that mutates `di_atime`, writes back through `write_inode_region`,
+  and re-validates `di_crc`.
+- **XFS hole (E.3) — dir3 block / data / leaf1 builders** — three dir
+  builders parameterized on `is_v5`: `build_block_dir` emits XDB3 with
+  64-byte hdr + bestfree at offset 48; `build_leaf_data_block` emits
+  XDD3 (same layout); `build_leaf1_block_v4` → `build_leaf1_block`
+  emits XD3F with 56-byte `xfs_da3_blkinfo` + magic 0x3DF1 at byte 8.
+  CRC tuple is left zero in the builder; call sites
+  (`create_block_dir_from_shortform`, `block_insert_entry`,
+  `convert_block_dir_to_leaf_form` over 3 blocks,
+  `dir_remove_entry`) stamp via `stamp_dir3_blk_hdr` /
+  `stamp_da3_blkinfo` once the destination fsblock is known. The
+  bests-extraction in the conversion path adapts (v4: bytes 6..8, v5:
+  bytes 50..52). New `v5_crc::fsblock_to_daddr` helper translates a
+  filesystem block to the 512-byte-basic-block disk address
+  (`fsbno << (blocklog - 9)`) every `blkno` stamp needs. Three unit
+  tests in `edit.rs::tests` round-trip each builder through the
+  existing dir3-aware reader.
+- **XFS hole (E.4) — sblock-crc btree builder** — `btree_build`'s
+  `capacities` / `blocks_needed[_for]` thread an `is_v5` flag (v5
+  shrinks `max_leaf` / `max_intern` by the 40-byte CRC overhead),
+  and `build_sblock_btree` / `build_alloc_btree` take
+  `Option<&XfsSuperblock>`. When `Some(sb)`, every produced block
+  (leaf + internal node) carries the standard 16-byte v4 short header
+  followed by the CRC-header tuple at bytes 16..56
+  (`bb_blkno`/`bb_lsn`/`bb_uuid`/`bb_owner`/`bb_crc`) via the new
+  `stamp_v5_sblock` helper. `freespace_rebuild` picks v5 magics
+  (`XFS_ABTB_CRC_MAGIC` / `XFS_ABTC_CRC_MAGIC`) and passes
+  `Some(sb)` through `build_alloc_btree` on v5 volumes; inobt
+  rebuild (R3) and `swap_inobt_blocks_in_ag` stay v4-only because
+  their upstream gates still reject v5. Two builder-level tests verify
+  the round-trip and assert every emitted block's CRC validates via
+  `crc_valid`.
 
 - **Windows install + self-update** — Phases 1-9 + elevation A-H all
   done (Setup.exe via Inno, in-app `self_update` + `self_replace`,
