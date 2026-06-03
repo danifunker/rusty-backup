@@ -45,11 +45,13 @@
 //! * NetBSD `usr.sbin/makefs/ffs/ffs.c` for the writer that produces our
 //!   test fixtures (`tests/fixtures/test_ufs{1,2}.img.zst`).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
-use super::unix_common::bitmap::BitmapReader;
+use super::unix_common::bitmap::{
+    bitmap_clear_bit, bitmap_find_clear_bit, bitmap_set_bit, BitmapReader,
+};
 use super::unix_common::compact::{CompactLayout, CompactSection, CompactStreamReader};
 use super::unix_common::inode::{format_unix_timestamp, unix_file_type, UnixFileType};
 use crate::fs::CompactResult;
@@ -1047,6 +1049,430 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
     pub fn sb_frag(&self) -> u64 {
         self.sb_offset / self.fsize
     }
+
+    /// Endian-aware accessor used by `ufs.rs`-internal tests.
+    #[cfg(test)]
+    fn endian_for_test(&self) -> UfsEndian {
+        self.endian
+    }
+}
+
+// ---- U.4 write primitives ----
+//
+// Everything in this impl block requires `R: Read + Write + Seek + Send` and
+// is consumed exclusively by the editable surface (`impl
+// EditableFilesystem`, plus the `repair_ufs` companion). Mirrors the
+// `efs.rs` split — read-only handles can't accidentally call write methods
+// because the trait bounds don't include `Write`.
+//
+// **Bitmap polarity, again** — UFS keeps two bitmaps per cylinder group:
+//   * **`cg_freeoff`** (free-fragment bitmap): **set bit = FREE**, clear =
+//     in use. Opposite of every Linux FS we touch.
+//   * **`cg_iusedoff`** (inode-used bitmap): **set bit = USED**, clear =
+//     free. Standard convention, same as ext / xfs / etc.
+//
+// The `mark_frag_*` / `mark_inode_*` helpers below name the operation by
+// effect (allocated vs free) so callers don't have to remember which
+// polarity applies to which bitmap.
+
+// `#[allow(dead_code)]` because the public consumer (`impl
+// EditableFilesystem for UfsFilesystem`) ships in the next slice; tests in
+// this module exercise every method but clippy `--all-targets` lints the
+// lib pass in isolation and flags methods that only the test target uses.
+#[allow(dead_code)]
+impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
+    /// Write raw bytes at the start of fragment `start_frag`. The caller
+    /// is responsible for sizing `data` to a multiple of `fsize` when
+    /// aligning with the on-disk fragment grid is required (which is
+    /// almost always — every block-level mutation lands here).
+    pub(crate) fn write_frag_run(
+        &mut self,
+        start_frag: u64,
+        data: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let byte_len = data.len() as u64;
+        let end_byte = start_frag * self.fsize + byte_len;
+        let max_byte = self.total_frags * self.fsize;
+        if end_byte > max_byte {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs write_frag_run: fragment {start_frag} + {byte_len} bytes \
+                 exceeds total volume bytes {max_byte}"
+            )));
+        }
+        let byte = self.partition_offset + start_frag * self.fsize;
+        self.reader.seek(SeekFrom::Start(byte))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Encode `inode` into its on-disk dinode shape (UFS1: 128 B, UFS2:
+    /// 256 B) and write it at `inum`'s slot. Fields the read path captures
+    /// round-trip; fields the read path ignores (atime / ctime / generation
+    /// / flags / blocks count / spare slots) are left zero — the kernel
+    /// updates them on mount, and our oracle (`fsck.ufs -n`) doesn't fault
+    /// on a zero-stamped generation.
+    pub(crate) fn write_inode(
+        &mut self,
+        inum: u32,
+        inode: &UfsInode,
+    ) -> Result<(), FilesystemError> {
+        if inum < ROOT_INODE {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs write_inode: invalid inum {inum} (must be >= {ROOT_INODE})"
+            )));
+        }
+        if inum as u64 >= self.total_inodes() {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs write_inode: inum {inum} out of range (total inodes = {})",
+                self.total_inodes()
+            )));
+        }
+        let dsize = self.dinode_size() as usize;
+        let mut buf = vec![0u8; dsize];
+        let endian = self.endian;
+
+        // di_mode + di_nlink share offsets across versions.
+        write_u16(&mut buf, D1_OFF_MODE, inode.mode as u16, endian);
+        write_i16(&mut buf, D1_OFF_NLINK, inode.nlink as i16, endian);
+
+        match self.version {
+            UfsVersion::Ufs1 => {
+                write_u64(&mut buf, D1_OFF_SIZE, inode.size, endian);
+                write_i32(&mut buf, D1_OFF_MTIME, inode.mtime as i32, endian);
+                write_u32(&mut buf, D1_OFF_UID, inode.uid, endian);
+                write_u32(&mut buf, D1_OFF_GID, inode.gid, endian);
+                for (i, &slot) in inode.direct.iter().enumerate() {
+                    write_i32(&mut buf, D1_OFF_DB + i * 4, slot as i32, endian);
+                }
+                for (i, &slot) in inode.indirect.iter().enumerate() {
+                    write_i32(&mut buf, D1_OFF_IB + i * 4, slot as i32, endian);
+                }
+                // Inline payload (fast symlink target, etc.) overlays the
+                // direct/indirect pointer area. Callers that want to write
+                // an inline symlink should populate `inline_payload` AND
+                // leave direct/indirect zero; the inline bytes win.
+                if !inode.inline_payload.is_empty() {
+                    let len = inode.inline_payload.len().min(60);
+                    buf[D1_OFF_DB..D1_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
+                }
+            }
+            UfsVersion::Ufs2 => {
+                write_u32(&mut buf, D2_OFF_UID, inode.uid, endian);
+                write_u32(&mut buf, D2_OFF_GID, inode.gid, endian);
+                write_u64(&mut buf, D2_OFF_SIZE, inode.size, endian);
+                write_i64(&mut buf, D2_OFF_MTIME, inode.mtime, endian);
+                for (i, &slot) in inode.direct.iter().enumerate() {
+                    write_i64(&mut buf, D2_OFF_DB + i * 8, slot as i64, endian);
+                }
+                for (i, &slot) in inode.indirect.iter().enumerate() {
+                    write_i64(&mut buf, D2_OFF_IB + i * 8, slot as i64, endian);
+                }
+                if !inode.inline_payload.is_empty() {
+                    let len = inode.inline_payload.len().min(120);
+                    buf[D2_OFF_DB..D2_OFF_DB + len].copy_from_slice(&inode.inline_payload[..len]);
+                }
+            }
+        }
+
+        let byte = self.partition_offset + self.inode_byte_offset(inum);
+        self.reader.seek(SeekFrom::Start(byte))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Read CG `cg`'s inode-used bitmap. Sibling to `read_cg_free_bitmap`;
+    /// covers `ipg` bits (`SET = used`, opposite polarity to the free-frag
+    /// bitmap which is `SET = free`).
+    pub(crate) fn read_cg_iused_bitmap(&mut self, cg: u32) -> Result<Vec<u8>, FilesystemError> {
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        self.reader.read_exact(&mut hdr)?;
+        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        if magic != CG_MAGIC {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {cg}: bad magic 0x{magic:08X} (expected 0x{CG_MAGIC:08X})"
+            )));
+        }
+        let iusedoff = read_u32(&hdr, CG_OFF_IUSEDOFF, self.endian) as u64;
+        let freeoff = read_u32(&hdr, CG_OFF_FREEOFF, self.endian) as u64;
+        if iusedoff == 0 || iusedoff >= freeoff {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {cg}: implausible iusedoff={iusedoff} freeoff={freeoff}"
+            )));
+        }
+        let bytes = (self.ipg as u64).div_ceil(8);
+        if iusedoff + bytes > freeoff {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {cg}: iused bitmap [{iusedoff}, {}) overlaps freeoff {freeoff}",
+                iusedoff + bytes
+            )));
+        }
+        self.reader.seek(SeekFrom::Start(cg_byte + iusedoff))?;
+        let mut bm = vec![0u8; bytes as usize];
+        self.reader.read_exact(&mut bm)?;
+        Ok(bm)
+    }
+
+    /// Write CG `cg`'s free-fragment bitmap back to disk. Caller-supplied
+    /// `bm` must match the bitmap's on-disk length (`cg_ndblk` bits, padded
+    /// to a byte boundary).
+    pub(crate) fn write_cg_free_bitmap(
+        &mut self,
+        cg: u32,
+        bm: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let (cg_byte, freeoff) = self.cg_freeoff_byte(cg)?;
+        self.reader.seek(SeekFrom::Start(cg_byte + freeoff))?;
+        self.reader.write_all(bm)?;
+        Ok(())
+    }
+
+    /// Write CG `cg`'s inode-used bitmap back to disk. Caller-supplied `bm`
+    /// must hold `ipg` bits worth of bytes.
+    pub(crate) fn write_cg_iused_bitmap(
+        &mut self,
+        cg: u32,
+        bm: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let (cg_byte, iusedoff) = self.cg_iusedoff_byte(cg)?;
+        self.reader.seek(SeekFrom::Start(cg_byte + iusedoff))?;
+        self.reader.write_all(bm)?;
+        Ok(())
+    }
+
+    /// Read CG `cg`'s `cg_cs` summary (`ndir`, `nbfree`, `nifree`,
+    /// `nffree` — each i32). Used by sync_metadata to propagate the +/-1
+    /// delta from an inode allocation up to the per-CG counter.
+    pub(crate) fn read_cg_cs(&mut self, cg: u32) -> Result<(i32, i32, i32, i32), FilesystemError> {
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = vec![0u8; CG_HEADER_FIXED_BYTES];
+        self.reader.read_exact(&mut hdr)?;
+        let endian = self.endian;
+        Ok((
+            read_i32(&hdr, 24, endian),
+            read_i32(&hdr, 28, endian),
+            read_i32(&hdr, 32, endian),
+            read_i32(&hdr, 36, endian),
+        ))
+    }
+
+    /// Update CG `cg`'s `cg_cs` summary by the given deltas.
+    pub(crate) fn update_cg_cs(
+        &mut self,
+        cg: u32,
+        d_ndir: i32,
+        d_nbfree: i32,
+        d_nifree: i32,
+        d_nffree: i32,
+    ) -> Result<(), FilesystemError> {
+        let (ndir, nbfree, nifree, nffree) = self.read_cg_cs(cg)?;
+        let new = [
+            ndir.wrapping_add(d_ndir),
+            nbfree.wrapping_add(d_nbfree),
+            nifree.wrapping_add(d_nifree),
+            nffree.wrapping_add(d_nffree),
+        ];
+        let mut buf = [0u8; 16];
+        let endian = self.endian;
+        write_i32(&mut buf, 0, new[0], endian);
+        write_i32(&mut buf, 4, new[1], endian);
+        write_i32(&mut buf, 8, new[2], endian);
+        write_i32(&mut buf, 12, new[3], endian);
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        self.reader.seek(SeekFrom::Start(cg_byte + 24))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Allocate a free inode. Walks CGs starting from `cg_hint` (typically
+    /// the parent directory's CG so children land near their parent), sets
+    /// the inum's bit in `cg_iusedoff`, and decrements `cs_nifree`. Returns
+    /// the new inum (always ≥ `ROOT_INODE`).
+    pub(crate) fn alloc_inode(&mut self, cg_hint: u32) -> Result<u32, FilesystemError> {
+        let start = cg_hint % self.ncg;
+        let inodes_per_cg = self.ipg as u64;
+        for offset in 0..self.ncg {
+            let cg = (start + offset) % self.ncg;
+            let mut bm = self.read_cg_iused_bitmap(cg)?;
+            // Inode bitmap is SET = USED — find a CLEAR bit.
+            if let Some(in_cg) = bitmap_find_clear_bit(&bm, inodes_per_cg) {
+                // CG 0 reserves the first 2 inums (0 = unused, 1 = legacy
+                // bad-blocks); never hand out below ROOT_INODE.
+                let global = cg as u64 * inodes_per_cg + in_cg;
+                if global < ROOT_INODE as u64 {
+                    continue;
+                }
+                bitmap_set_bit(&mut bm, in_cg);
+                self.write_cg_iused_bitmap(cg, &bm)?;
+                self.update_cg_cs(cg, 0, 0, -1, 0)?;
+                return Ok(global as u32);
+            }
+        }
+        Err(FilesystemError::DiskFull(
+            "ufs alloc_inode: no free inode in any cylinder group".into(),
+        ))
+    }
+
+    /// Free `inum`'s bit in its CG's `cg_iusedoff` bitmap and zero out the
+    /// on-disk dinode. Caller is responsible for first freeing any
+    /// fragments the inode owns.
+    pub(crate) fn free_inode(&mut self, inum: u32) -> Result<(), FilesystemError> {
+        if inum < ROOT_INODE || inum as u64 >= self.total_inodes() {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs free_inode: invalid inum {inum}"
+            )));
+        }
+        let cg = inum / self.ipg;
+        let in_cg = (inum % self.ipg) as u64;
+        let mut bm = self.read_cg_iused_bitmap(cg)?;
+        bitmap_clear_bit(&mut bm, in_cg);
+        self.write_cg_iused_bitmap(cg, &bm)?;
+        self.update_cg_cs(cg, 0, 0, 1, 0)?;
+
+        // Zero the dinode so a future scan doesn't see stale metadata.
+        let zero = vec![0u8; self.dinode_size() as usize];
+        let byte = self.partition_offset + self.inode_byte_offset(inum);
+        self.reader.seek(SeekFrom::Start(byte))?;
+        self.reader.write_all(&zero)?;
+        Ok(())
+    }
+
+    /// Allocate a contiguous run of `count` fragments somewhere on disk.
+    /// Walks CGs starting from `cg_hint`, picks the first CG with a clear
+    /// `count`-bit window in its free-fragment bitmap, marks the bits
+    /// allocated (CLEAR), and returns the absolute starting fragment.
+    ///
+    /// `count` of 0 is rejected; `count > fpg` is rejected (we don't span
+    /// CG boundaries).
+    pub(crate) fn alloc_frag_run(
+        &mut self,
+        count: u64,
+        cg_hint: u32,
+    ) -> Result<u64, FilesystemError> {
+        if count == 0 {
+            return Err(FilesystemError::InvalidData(
+                "ufs alloc_frag_run: count == 0".into(),
+            ));
+        }
+        if count > self.fpg as u64 {
+            return Err(FilesystemError::Unsupported(format!(
+                "ufs alloc_frag_run: cross-CG run of {count} fragments not supported \
+                 (fpg = {})",
+                self.fpg
+            )));
+        }
+        let start = cg_hint % self.ncg;
+        for offset in 0..self.ncg {
+            let cg = (start + offset) % self.ncg;
+            let (mut bm, ndblk) = self.read_cg_free_bitmap(cg)?;
+            // Find first clear-bit window. Bitmap polarity: SET = FREE,
+            // so a "clear-bit window" in our search semantics means
+            // "consecutive SET bits in the bitmap". Walk linearly.
+            let cap = ndblk.min(self.fpg as u64);
+            let mut run_start: Option<u64> = None;
+            let mut run_len: u64 = 0;
+            let mut found: Option<u64> = None;
+            for bit in 0..cap {
+                let byte = (bit / 8) as usize;
+                let bit_idx = (bit % 8) as u8;
+                let is_free = bm[byte] & (1u8 << bit_idx) != 0;
+                if is_free {
+                    if run_start.is_none() {
+                        run_start = Some(bit);
+                    }
+                    run_len += 1;
+                    if run_len >= count {
+                        found = run_start;
+                        break;
+                    }
+                } else {
+                    run_start = None;
+                    run_len = 0;
+                }
+            }
+            if let Some(in_cg) = found {
+                for i in 0..count {
+                    bitmap_clear_bit(&mut bm, in_cg + i);
+                }
+                self.write_cg_free_bitmap(cg, &bm)?;
+                // `nffree` tracks free fragments — drop by `count`. `nbfree`
+                // (free *blocks*) would only change when a whole-block worth
+                // of frags transitions; we leave it alone for sub-block
+                // allocations (matches FreeBSD's `ffs_clusteracct` behavior
+                // for the common case our edit path hits).
+                self.update_cg_cs(cg, 0, 0, 0, -(count as i32))?;
+                return Ok(cg as u64 * self.fpg as u64 + in_cg);
+            }
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "ufs alloc_frag_run: no {count}-fragment free run in any cylinder group"
+        )))
+    }
+
+    /// Free a previously-allocated run of `count` fragments starting at
+    /// absolute fragment `start`. The run must lie inside a single CG.
+    pub(crate) fn free_frag_run(&mut self, start: u64, count: u64) -> Result<(), FilesystemError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let cg = start / self.fpg as u64;
+        let in_cg = start % self.fpg as u64;
+        if cg >= self.ncg as u64 {
+            return Err(FilesystemError::InvalidData(format!(
+                "ufs free_frag_run: start fragment {start} past total volume"
+            )));
+        }
+        if in_cg + count > self.fpg as u64 {
+            return Err(FilesystemError::Unsupported(format!(
+                "ufs free_frag_run: run [{start}..{}) crosses a CG boundary",
+                start + count
+            )));
+        }
+        let (mut bm, _ndblk) = self.read_cg_free_bitmap(cg as u32)?;
+        for i in 0..count {
+            bitmap_set_bit(&mut bm, in_cg + i);
+        }
+        self.write_cg_free_bitmap(cg as u32, &bm)?;
+        self.update_cg_cs(cg as u32, 0, 0, 0, count as i32)?;
+        Ok(())
+    }
+
+    // ---- Internal byte-offset helpers ----
+
+    /// Return `(cg_header_byte, freeoff)` where the free-frag bitmap of
+    /// `cg` lives — header byte + freeoff = bitmap start byte.
+    fn cg_freeoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        self.reader.seek(SeekFrom::Start(cg_byte))?;
+        let mut hdr = [0u8; 8];
+        self.reader.read_exact(&mut hdr)?;
+        let magic = read_u32(&hdr, CG_OFF_MAGIC, self.endian);
+        if magic != CG_MAGIC {
+            return Err(FilesystemError::Parse(format!(
+                "ufs CG {cg}: bad magic on write path"
+            )));
+        }
+        self.reader
+            .seek(SeekFrom::Start(cg_byte + CG_OFF_FREEOFF as u64))?;
+        let mut buf = [0u8; 4];
+        self.reader.read_exact(&mut buf)?;
+        let freeoff = read_u32(&buf, 0, self.endian) as u64;
+        Ok((cg_byte, freeoff))
+    }
+
+    /// Return `(cg_header_byte, iusedoff)` where the inode-used bitmap of
+    /// `cg` lives.
+    fn cg_iusedoff_byte(&mut self, cg: u32) -> Result<(u64, u64), FilesystemError> {
+        let cg_byte = self.partition_offset + self.cg_header_offset(cg);
+        self.reader
+            .seek(SeekFrom::Start(cg_byte + CG_OFF_IUSEDOFF as u64))?;
+        let mut buf = [0u8; 4];
+        self.reader.read_exact(&mut buf)?;
+        let iusedoff = read_u32(&buf, 0, self.endian) as u64;
+        Ok((cg_byte, iusedoff))
+    }
 }
 
 // ---- `fs_flags2` bits we care about ----
@@ -1101,6 +1527,48 @@ pub(crate) fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
         UfsEndian::Little => u64::from_le_bytes(bytes),
         UfsEndian::Big => u64::from_be_bytes(bytes),
     }
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_u16(buf: &mut [u8], off: usize, v: u16, endian: UfsEndian) {
+    let bytes = match endian {
+        UfsEndian::Little => v.to_le_bytes(),
+        UfsEndian::Big => v.to_be_bytes(),
+    };
+    buf[off..off + 2].copy_from_slice(&bytes);
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_i16(buf: &mut [u8], off: usize, v: i16, endian: UfsEndian) {
+    write_u16(buf, off, v as u16, endian);
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_u32(buf: &mut [u8], off: usize, v: u32, endian: UfsEndian) {
+    let bytes = match endian {
+        UfsEndian::Little => v.to_le_bytes(),
+        UfsEndian::Big => v.to_be_bytes(),
+    };
+    buf[off..off + 4].copy_from_slice(&bytes);
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_i32(buf: &mut [u8], off: usize, v: i32, endian: UfsEndian) {
+    write_u32(buf, off, v as u32, endian);
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_u64(buf: &mut [u8], off: usize, v: u64, endian: UfsEndian) {
+    let bytes = match endian {
+        UfsEndian::Little => v.to_le_bytes(),
+        UfsEndian::Big => v.to_be_bytes(),
+    };
+    buf[off..off + 8].copy_from_slice(&bytes);
+}
+
+#[allow(dead_code)] // consumed by the EditableFilesystem impl (next slice)
+fn write_i64(buf: &mut [u8], off: usize, v: i64, endian: UfsEndian) {
+    write_u64(buf, off, v as u64, endian);
 }
 
 pub(crate) fn read_i64(buf: &[u8], off: usize, endian: UfsEndian) -> i64 {
@@ -2274,6 +2742,216 @@ mod tests {
         for i in 0..8192usize {
             assert_eq!(bytes[12 * 8192 + i], (i & 0xFF) as u8);
         }
+    }
+
+    // ---- U.4 write primitives ----
+
+    /// Build a tiny synthetic UFS2 volume with one CG, valid CG header,
+    /// inode-used bitmap, and free-fragment bitmap, all sized so the write
+    /// primitives can round-trip without tripping the CG validators.
+    fn build_writable_fixture() -> Vec<u8> {
+        let bsize = 8192u32;
+        let fsize = 1024u32;
+        let fpg = 256u32; // small CG for fast iteration
+        let ipg = 64u32;
+        let ncg = 1u32;
+        let total_frags = fpg as u64;
+        let mut img = build_sb(
+            UfsVersion::Ufs2,
+            UfsEndian::Little,
+            SB_OFFSET_UFS1,
+            bsize,
+            fsize,
+            ncg,
+            fpg,
+            ipg,
+            total_frags,
+            b"",
+            1,
+            0,
+        );
+        // Grow to volume size.
+        let needed = (total_frags as usize) * (fsize as usize);
+        if img.len() < needed {
+            img.resize(needed, 0);
+        }
+        // Stamp CG 0 header at fragment 24 (build_sb's default cblkno).
+        let cg_byte = 24usize * fsize as usize;
+        img[cg_byte + CG_OFF_MAGIC..cg_byte + CG_OFF_MAGIC + 4]
+            .copy_from_slice(&CG_MAGIC.to_le_bytes());
+        // cg_cgx = 0
+        // cg_ndblk = fpg
+        img[cg_byte + CG_OFF_NDBLK..cg_byte + CG_OFF_NDBLK + 4].copy_from_slice(&fpg.to_le_bytes());
+        // cs counters: ndir=0, nbfree=0, nifree=ipg-2 (root + bad-blocks
+        // marked used by the fixture), nffree=fpg
+        let cs_off = cg_byte + 24;
+        (img[cs_off..cs_off + 4]).copy_from_slice(&0i32.to_le_bytes());
+        (img[cs_off + 4..cs_off + 8]).copy_from_slice(&0i32.to_le_bytes());
+        (img[cs_off + 8..cs_off + 12]).copy_from_slice(&((ipg as i32) - 2).to_le_bytes());
+        (img[cs_off + 12..cs_off + 16]).copy_from_slice(&(fpg as i32).to_le_bytes());
+        // iusedoff = 256, freeoff = 264, nextfreeoff = freeoff + ndblk/8
+        let iusedoff = 256u32;
+        let freeoff = 264u32;
+        let nextfreeoff = freeoff + fpg.div_ceil(8);
+        img[cg_byte + CG_OFF_IUSEDOFF..cg_byte + CG_OFF_IUSEDOFF + 4]
+            .copy_from_slice(&iusedoff.to_le_bytes());
+        img[cg_byte + CG_OFF_FREEOFF..cg_byte + CG_OFF_FREEOFF + 4]
+            .copy_from_slice(&freeoff.to_le_bytes());
+        img[cg_byte + CG_OFF_NEXTFREEOFF..cg_byte + CG_OFF_NEXTFREEOFF + 4]
+            .copy_from_slice(&nextfreeoff.to_le_bytes());
+        // iused bitmap: first 2 bits set (inums 0 + 1 reserved, inum 2 root).
+        // Actually mark inums 0, 1, 2 used so the next alloc returns 3.
+        img[cg_byte + iusedoff as usize] = 0b0000_0111;
+        // Free bitmap: all fragments free (0xFF, set=free).
+        let free_bytes = fpg.div_ceil(8) as usize;
+        for i in 0..free_bytes {
+            img[cg_byte + freeoff as usize + i] = 0xFF;
+        }
+        img
+    }
+
+    #[test]
+    fn write_inode_round_trips_through_read_inode() {
+        let img = build_writable_fixture();
+        let mut backing = img.clone();
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        // Build a synthetic regular-file inode at inum 5.
+        let mut inode = UfsInode {
+            inum: 5,
+            mode: 0o100644,
+            nlink: 1,
+            uid: 1000,
+            gid: 100,
+            size: 4096,
+            mtime: 0x12345678,
+            direct: [0; UFS_NDADDR],
+            indirect: [0; UFS_NIADDR],
+            inline_payload: Vec::new(),
+        };
+        inode.direct[0] = 64;
+        inode.direct[1] = 72;
+        inode.indirect[0] = 128;
+
+        fs.write_inode(5, &inode).expect("write inode");
+        let read_back = fs.read_inode(5).expect("read inode");
+        assert_eq!(read_back.mode, inode.mode);
+        assert_eq!(read_back.nlink, inode.nlink);
+        assert_eq!(read_back.uid, inode.uid);
+        assert_eq!(read_back.gid, inode.gid);
+        assert_eq!(read_back.size, inode.size);
+        assert_eq!(read_back.mtime, inode.mtime);
+        assert_eq!(read_back.direct[0], 64);
+        assert_eq!(read_back.direct[1], 72);
+        assert_eq!(read_back.indirect[0], 128);
+    }
+
+    #[test]
+    fn alloc_inode_marks_iused_and_decrements_nifree() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let (_ndir, _nbfree, nifree_before, _nffree) = fs.read_cg_cs(0).expect("cs before");
+        let inum = fs.alloc_inode(0).expect("alloc inode");
+        assert_eq!(inum, 3, "first free inum after reserved [0..3) is 3");
+        // iused bit for inum 3 must now be set.
+        let bm = fs.read_cg_iused_bitmap(0).expect("iused");
+        assert_eq!(bm[0] & 0b0000_1000, 0b0000_1000);
+        // nifree must drop by 1.
+        let (_, _, nifree_after, _) = fs.read_cg_cs(0).expect("cs after");
+        assert_eq!(nifree_after, nifree_before - 1);
+    }
+
+    #[test]
+    fn free_inode_clears_iused_and_increments_nifree() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        // Inum 2 is the root, marked used in the fixture. Free it.
+        let (_, _, nifree_before, _) = fs.read_cg_cs(0).expect("cs before");
+        fs.free_inode(2).expect("free inode");
+        let bm = fs.read_cg_iused_bitmap(0).expect("iused");
+        assert_eq!(bm[0] & 0b0000_0100, 0, "inum 2 bit must clear");
+        let (_, _, nifree_after, _) = fs.read_cg_cs(0).expect("cs after");
+        assert_eq!(nifree_after, nifree_before + 1);
+    }
+
+    #[test]
+    fn alloc_frag_run_finds_contig_window_and_marks_allocated() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let (_, _, _, nffree_before) = fs.read_cg_cs(0).expect("cs before");
+        let start = fs.alloc_frag_run(8, 0).expect("alloc 8 frags");
+        // First clear-bit run starts at bit 0 (all 256 frags are free).
+        assert_eq!(start, 0);
+        let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read free bitmap");
+        // Frags 0..8 must now be CLEAR (= allocated). Byte 0 should be 0.
+        assert_eq!(bm[0], 0);
+        let (_, _, _, nffree_after) = fs.read_cg_cs(0).expect("cs after");
+        assert_eq!(nffree_after, nffree_before - 8);
+    }
+
+    #[test]
+    fn free_frag_run_restores_bits() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let start = fs.alloc_frag_run(8, 0).expect("alloc");
+        let (_, _, _, nffree_after_alloc) = fs.read_cg_cs(0).expect("cs alloc");
+        fs.free_frag_run(start, 8).expect("free");
+        let (bm, _) = fs.read_cg_free_bitmap(0).expect("re-read");
+        // First 8 bits must be SET again (all free).
+        assert_eq!(bm[0], 0xFF);
+        let (_, _, _, nffree_after_free) = fs.read_cg_cs(0).expect("cs free");
+        assert_eq!(nffree_after_free, nffree_after_alloc + 8);
+    }
+
+    #[test]
+    fn write_frag_run_round_trips_through_read() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let payload: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        // Write 1 fragment's worth at frag 100 (within bounds).
+        fs.write_frag_run(100, &payload).expect("write frag");
+        // Read back by seeking directly to the same byte offset.
+        let byte = 100 * fs.fsize;
+        fs.reader.seek(SeekFrom::Start(byte)).expect("seek");
+        let mut buf = vec![0u8; 1024];
+        fs.reader.read_exact(&mut buf).expect("read");
+        assert_eq!(buf, payload);
+        let _ = fs.endian_for_test(); // exercise the test-only accessor
+    }
+
+    #[test]
+    fn alloc_frag_run_rejects_oversize_request() {
+        let img = build_writable_fixture();
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        // fpg = 256; ask for fpg + 1 — must refuse with Unsupported.
+        let err = fs.alloc_frag_run(257, 0).expect_err("oversize must fail");
+        assert!(
+            matches!(err, FilesystemError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn alloc_inode_returns_disk_full_when_all_used() {
+        let mut img = build_writable_fixture();
+        // Saturate the iused bitmap so every inum is "used".
+        // iused bitmap lives at CG 0 byte (cblkno=24, fsize=1024) + iusedoff (256).
+        let iused_byte = 24 * 1024usize + 256usize;
+        for i in 0..(64u32.div_ceil(8) as usize) {
+            img[iused_byte + i] = 0xFF;
+        }
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let err = fs.alloc_inode(0).expect_err("alloc when full must fail");
+        assert!(
+            matches!(err, FilesystemError::DiskFull(_)),
+            "expected DiskFull, got {err:?}"
+        );
     }
 
     // ---- fsck (U.4) ----
