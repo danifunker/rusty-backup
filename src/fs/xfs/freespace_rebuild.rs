@@ -641,9 +641,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             btreeblks,
         );
 
-        self.reader.seek(SeekFrom::Start(agf_byte))?;
-        self.reader.write_all(&agf)?;
-        Ok(())
+        self.write_agf_sector(sb, agf_byte, &mut agf)
     }
 
     /// Write one filesystem block at `fsblock`.
@@ -687,9 +685,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             &mut primary,
         )?;
         BigEndian::write_u64(&mut primary[SB_FDBLOCKS_OFF..SB_FDBLOCKS_OFF + 8], total);
-        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
-        self.reader.write_all(&primary)?;
-        Ok(())
+        self.write_sb_primary(sb, &mut primary)
     }
 }
 

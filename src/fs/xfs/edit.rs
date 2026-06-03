@@ -199,7 +199,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                         &mut agi_sec[AGI_FREECOUNT_OFF..AGI_FREECOUNT_OFF + 4],
                         agi.freecount - 1,
                     );
-                    self.write_at(agi_byte, &agi_sec)?;
+                    self.write_agi_sector(sb, agi_byte, &mut agi_sec)?;
                     self.bump_sb_ifree(sb, -1)?;
                     return Ok(Some(ino));
                 }
@@ -324,7 +324,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             &mut agi_sec[AGI_FREECOUNT_OFF..AGI_FREECOUNT_OFF + 4],
             new_freecount,
         );
-        self.write_at(agi_byte, &agi_sec)?;
+        self.write_agi_sector(sb, agi_byte, &mut agi_sec)?;
 
         // sb_icount += 64, sb_ifree += 64.
         self.bump_sb_inode_counters(sb, XFS_INODES_PER_CHUNK as i64, XFS_INODES_PER_CHUNK as i64)
@@ -492,7 +492,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             tree.root_agbno,
         );
         BigEndian::write_u32(&mut agi_sec[AGI_LEVEL_OFF..AGI_LEVEL_OFF + 4], tree.levels);
-        self.write_at(agi_byte, &agi_sec)?;
+        self.write_agi_sector(sb, agi_byte, &mut agi_sec)?;
         Ok(())
     }
 
@@ -666,7 +666,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             let new = (cur as i64 + ifree_delta).max(0) as u64;
             BigEndian::write_u64(&mut primary[SB_IFREE_OFF..SB_IFREE_OFF + 8], new);
         }
-        self.write_at(self.partition_offset, &primary)
+        self.write_sb_primary(sb, &mut primary)
     }
 
     /// Initialize a freshly-allocated inode as an empty short-form directory
@@ -870,6 +870,67 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(())
     }
 
+    /// Stamp v5 AGI CRC tuple (uuid/lsn/crc) and write the sector. v4 just
+    /// writes through. Every AGI mutation funnels through here so the CRC
+    /// stays valid on v5 volumes.
+    pub(crate) fn write_agi_sector(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        byte_off: u64,
+        sec: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if sb.is_v5() {
+            super::v5_crc::stamp_agi(sec, sb);
+        }
+        self.write_at(byte_off, sec)
+    }
+
+    /// Stamp v5 AGF CRC tuple (uuid/lsn/crc) and write the sector. v4 just
+    /// writes through.
+    pub(crate) fn write_agf_sector(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        byte_off: u64,
+        sec: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if sb.is_v5() {
+            super::v5_crc::stamp_agf(sec, sb);
+        }
+        self.write_at(byte_off, sec)
+    }
+
+    /// Stamp v5 AGFL CRC tuple (uuid/lsn/crc) and write the sector. v4 just
+    /// writes through. No current edit path mutates the AGFL contents, so
+    /// this helper isn't called yet — kept here so when E.5b's
+    /// `alloc_blocks_aligned` path needs to touch the AGFL (e.g. when an
+    /// allocation drains the AGFL reserve and a refill becomes necessary)
+    /// the stamping site is already wired.
+    #[allow(dead_code)]
+    pub(crate) fn write_agfl_sector(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        byte_off: u64,
+        sec: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if sb.is_v5() {
+            super::v5_crc::stamp_agfl(sec, sb);
+        }
+        self.write_at(byte_off, sec)
+    }
+
+    /// Stamp v5 SB CRC and write the primary superblock sector. v4 just
+    /// writes through.
+    pub(crate) fn write_sb_primary(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        sec: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if sb.is_v5() {
+            super::v5_crc::stamp_superblock(sec);
+        }
+        self.write_at(self.partition_offset, sec)
+    }
+
     /// Adjust `sb_ifree` by `delta` in the primary superblock.
     fn bump_sb_ifree(
         &mut self,
@@ -887,7 +948,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let cur = BigEndian::read_u64(&primary[SB_IFREE_OFF..SB_IFREE_OFF + 8]);
         let new = (cur as i64 + delta).max(0) as u64;
         BigEndian::write_u64(&mut primary[SB_IFREE_OFF..SB_IFREE_OFF + 8], new);
-        self.write_at(self.partition_offset, &primary)
+        self.write_sb_primary(sb, &mut primary)
     }
 
     /// Internal entry point for `create_directory`: allocate an inode, init it
@@ -1436,7 +1497,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     &mut agi_sec[AGI_FREECOUNT_OFF..AGI_FREECOUNT_OFF + 4],
                     agi.freecount + 1,
                 );
-                self.write_at(agi_byte, &agi_sec)?;
+                self.write_agi_sector(sb, agi_byte, &mut agi_sec)?;
                 self.bump_sb_ifree(sb, 1)?;
 
                 // Zero the dinode's mode so it reads as free.

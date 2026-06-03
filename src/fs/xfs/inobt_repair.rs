@@ -236,8 +236,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     BigEndian::write_u32(&mut agi_sec[AGI_ROOT_OFF..AGI_ROOT_OFF + 4], root);
                     BigEndian::write_u32(&mut agi_sec[AGI_LEVEL_OFF..AGI_LEVEL_OFF + 4], level);
                 }
-                self.reader.seek(SeekFrom::Start(agi_byte))?;
-                self.reader.write_all(&agi_sec)?;
+                self.write_agi_sector(&sb, agi_byte, &mut agi_sec)?;
                 any_change = true;
                 let what = if new_root_level.is_some() {
                     "AGI root/level/count/freecount"
@@ -295,8 +294,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         BigEndian::write_u64(&mut primary[SB_ICOUNT_OFF..SB_ICOUNT_OFF + 8], icount);
         BigEndian::write_u64(&mut primary[SB_IFREE_OFF..SB_IFREE_OFF + 8], ifree);
-        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
-        self.reader.write_all(&primary)?;
+        self.write_sb_primary(sb, &mut primary)?;
         Ok(true)
     }
 

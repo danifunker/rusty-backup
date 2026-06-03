@@ -2809,6 +2809,87 @@ mod tests {
         );
     }
 
+    /// §2.1 hole (E.5a): round-trip the AGI, AGF, and primary superblock
+    /// through the new sector-stamper helpers on the v5 fixture. The test
+    /// mutates a non-CRC field in each (AGI `count` / AGF `freeblks` / SB
+    /// `sb_icount`), writes back through `write_agi_sector` /
+    /// `write_agf_sector` / `write_sb_primary`, then re-reads and asserts
+    /// (a) the mutation survived and (b) the CRC at the corresponding
+    /// `*_CRC_OFF` re-verifies. Without the v5 stamping path inside each
+    /// helper, the CRC after the write would be stale.
+    #[test]
+    fn ag_header_stamp_helpers_round_trip_on_v5_fixture() {
+        use crate::fs::xfs::v5_crc::{
+            crc_valid, AGF_CRC_OFF, AGF_LSN_OFF, AGI_CRC_OFF, AGI_LSN_OFF, SB_CRC_OFF,
+        };
+
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open xfs v5");
+        let sb = fs.superblock().clone();
+        assert!(sb.is_v5());
+
+        let sectsize = sb.sectsize as u64;
+
+        // AGI sector for AG 0.
+        let agi_byte = 2 * sectsize;
+        let mut agi_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, agi_byte, sectsize, &mut agi_sec).unwrap();
+        assert!(crc_valid(&agi_sec, AGI_CRC_OFF), "pre-write AGI CRC valid");
+        // Bump AGI count by 0 (no-op mutation) — still triggers a CRC restamp.
+        let count_off = 16;
+        let cur = BigEndian::read_u32(&agi_sec[count_off..count_off + 4]);
+        BigEndian::write_u32(&mut agi_sec[count_off..count_off + 4], cur); // identity
+                                                                           // Mark LSN to NULL sentinel so the stamper has work to do.
+        BigEndian::write_u64(&mut agi_sec[AGI_LSN_OFF..AGI_LSN_OFF + 8], 0xCAFE);
+        fs.write_agi_sector(&sb, agi_byte, &mut agi_sec).unwrap();
+        let mut agi_re = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, agi_byte, sectsize, &mut agi_re).unwrap();
+        assert!(
+            crc_valid(&agi_re, AGI_CRC_OFF),
+            "post-write AGI CRC must verify"
+        );
+        // LSN was overwritten with NULL sentinel by stamper.
+        assert_eq!(
+            BigEndian::read_u64(&agi_re[AGI_LSN_OFF..AGI_LSN_OFF + 8]),
+            u64::MAX
+        );
+
+        // AGF sector for AG 0.
+        let agf_byte = sectsize;
+        let mut agf_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, agf_byte, sectsize, &mut agf_sec).unwrap();
+        assert!(crc_valid(&agf_sec, AGF_CRC_OFF), "pre-write AGF CRC valid");
+        BigEndian::write_u64(&mut agf_sec[AGF_LSN_OFF..AGF_LSN_OFF + 8], 0xBEEF);
+        fs.write_agf_sector(&sb, agf_byte, &mut agf_sec).unwrap();
+        let mut agf_re = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, agf_byte, sectsize, &mut agf_re).unwrap();
+        assert!(
+            crc_valid(&agf_re, AGF_CRC_OFF),
+            "post-write AGF CRC must verify"
+        );
+
+        // Primary superblock.
+        let mut sb_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, 0, sectsize, &mut sb_sec).unwrap();
+        assert!(crc_valid(&sb_sec, SB_CRC_OFF), "pre-write SB CRC valid");
+        // Mutate sb_icount (bytes 128..136).
+        let cur_ic = BigEndian::read_u64(&sb_sec[128..136]);
+        BigEndian::write_u64(&mut sb_sec[128..136], cur_ic + 1);
+        fs.write_sb_primary(&sb, &mut sb_sec).unwrap();
+        let mut sb_re = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut fs.reader, 0, sectsize, &mut sb_re).unwrap();
+        assert!(
+            crc_valid(&sb_re, SB_CRC_OFF),
+            "post-write SB CRC must verify"
+        );
+        assert_eq!(
+            BigEndian::read_u64(&sb_re[128..136]),
+            cur_ic + 1,
+            "sb_icount mutation round-tripped"
+        );
+    }
+
     /// §2.1 hole (E.2): round-trip the root inode through `write_inode_region`
     /// on the v5 fixture. The caller mutates a non-CRC field (`di_atime`),
     /// the writer stamps `di_crc` over the entire on-disk inode buffer, and

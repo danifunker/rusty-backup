@@ -107,6 +107,13 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 continue;
             }
 
+            // v5 secondary SBs have an `sb_crc` at byte 224 — re-stamp before
+            // the write so a geometry-only patch doesn't invalidate the
+            // checksum.
+            if sb.is_v5() {
+                super::v5_crc::stamp_superblock(&mut sec);
+            }
+
             self.reader.seek(SeekFrom::Start(ag_byte))?;
             match self.reader.write_all(&sec) {
                 Ok(()) => report.fixes_applied.push(format!(
@@ -160,6 +167,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     match self.freesp_block_total(&sb, agno, parsed.bno_root, expected_len) {
                         Ok(correct) if correct != parsed.freeblks as u64 => {
                             BigEndian::write_u32(&mut agf[52..56], correct as u32);
+                            if sb.is_v5() {
+                                super::v5_crc::stamp_agf(&mut agf, &sb);
+                            }
                             self.write_sector(agf_byte, &agf, &mut report, agno, "AGF freeblks");
                         }
                         Ok(_) => {}
@@ -182,6 +192,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                         {
                             BigEndian::write_u32(&mut agi[16..20], count);
                             BigEndian::write_u32(&mut agi[28..32], freecount);
+                            if sb.is_v5() {
+                                super::v5_crc::stamp_agi(&mut agi, &sb);
+                            }
                             self.write_sector(agi_byte, &agi, &mut report, agno, "AGI count");
                         }
                         Ok(_) => {}
