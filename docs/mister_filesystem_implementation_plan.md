@@ -20,14 +20,34 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** AtariST stage 4 complete — committed fixtures
-(MSA + raw .st pair + AHDI HDD) generated against Hatari's `hmsa` and
-mtools as reference oracles, with 7 e2e integration tests in
-`tests/atarist_e2e.rs` proving the full pipeline. Our MSA decoder is
-byte-for-byte equivalent to Hatari's reference encoder. Next action:
-MacPlus MFS 400K (Wave 1) or Apple-II DOS 3.3 (Wave 1).
+**Current position:** Wave 1 closeout complete — AtariST + MacPlus MFS
++ Apple-II DOS 3.3 all shipped to extract-floor (or above). Next
+action: Wave 2 (X68000 / Archie / QL / Altair8800 / BK0011M) or come
+back for the Add/Delete write paths on MFS + DOS 3.3.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 (later still) — Wave 1 closeout: shipped MacPlus MFS
+  (extract-floor) and Apple-II DOS 3.3 (extract-floor) in 5 commits.
+  **MFS**: `src/fs/mfs.rs` (~720 LOC) implements Inside Macintosh:
+  Files vol.II ch.2 for the pre-HFS 400 KB filesystem (signature
+  0xD2D7 at byte 1024, 12-bit volume map, flat directory, allocation-
+  chain reader); `partition::detect_superfloppy` + `fs::detect_
+  filesystem_type` recognize the signature and dispatch to
+  `MfsFilesystem`. **Apple DOS 3.3**: `src/rbformats/containers/
+  sector_order.rs` (~420 LOC) handles the .do/.po byte interleave with
+  the canonical Apple sector-skew table DOS_TO_PO = [0, 14, 13, ...
+  1, 15], using a 15-hop catalog-chain walk to disambiguate the two
+  orderings (sectors 0 and 15 are fixed points so VTOC sniffing alone
+  is ambiguous). `src/fs/apple_dos.rs` (~720 LOC) implements the FS
+  per Beneath Apple DOS (VTOC + catalog chain + T/S list + binary-
+  header strip). Wired into `detect_superfloppy` + auto-dispatch +
+  `source_reader::open_read` (which converts .po to .do at file-open
+  time when detect_sector_order finds DOS 3.3 in PO order; pure
+  ProDOS .po files pass through unchanged). 7 + 11 + 10 + 2 + 5 = 35
+  new tests, all green; full lib suite at 1549 pass (+28 from session
+  start). Next: Wave 2 OR come back for MFS / DOS 3.3 Add/Delete
+  write paths.
+- 2026-06-03 (later) — AtariST stage 4 (verify + fixtures): committed
 - 2026-06-03 (later) — AtariST stage 4 (verify + fixtures): committed
   `tests/fixtures/test_atarist_floppy.{msa,st}.zst` (720K FAT12 floppy
   hmsa-encoded; SHA aacc6943... cross-checked) and
@@ -81,8 +101,8 @@ A core is **done** only when every applicable stage is `[x]`.
 ### Wave 1 — near-complete dual-media cores
 
 - [~] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect (FAT via existing dispatch) · [x] extract (FAT) · [x] ref (hmsa byte-identical; mtools per-partition mdir) · [x] add/del (FAT) · [ ] write-verified · [x] resize (FAT/HDD via existing FAT resize) · [~] gui (MSA materialize wired; AHDI surfaces in inspect) · [ ] cli · [x] tests (AHDI + MSA + end-to-end source_reader + 7 e2e fixture tests)
-- [ ] **MacPlus** (MFS 400K) · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
-- [ ] **Apple-II** (DOS 3.3) — prereq [ ] sector-order container · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
+- [~] **MacPlus** (MFS 400K) · [x] inspect (via detect_superfloppy / autodispatch) · [x] extract (data fork + resource fork side channel) · [ ] ref (no apt tool exists; BasiliskII needs Mac ROM, deferred) · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [x] tests (7 unit + 2 e2e)
+- [~] **Apple-II** (DOS 3.3) — prereq [x] sector-order container (.do/.po with catalog-chain disambiguator) · [x] inspect (via detect_superfloppy / autodispatch) · [x] extract (data with binary-header strip) · [ ] ref (a2kit / CiderPress2 Rust port reference; not run as oracle yet) · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [x] tests (11 sector-order + 10 fs unit + 5 e2e)
 
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 

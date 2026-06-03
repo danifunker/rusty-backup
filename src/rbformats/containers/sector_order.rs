@@ -262,12 +262,18 @@ pub fn sector_order_from_extension(ext: Option<&str>, default_order: SectorOrder
     }
 }
 
-/// Decode a `.do` / `.po` / `.dsk` file into a flat DOS-order byte stream.
-/// Magic-first: content sniffing decides between DOS- and ProDOS-order.
-/// If neither interpretation has a valid DOS 3.3 VTOC, the function falls
-/// back to the extension hint, and if that's `.dsk` / unknown, passes the
-/// bytes through as DOS-order (the historical default).
-pub fn open_apple_ii_dsk(bytes: Vec<u8>, ext_hint: Option<&str>) -> Result<Vec<u8>> {
+/// Open a `.do` / `.po` / `.dsk` file as a DOS-order byte stream **iff**
+/// content sniffing finds a DOS 3.3 disk in ProDOS-order layout. All
+/// other cases pass through unchanged: a DOS-order DOS 3.3 disk is
+/// already in the right format; a ProDOS-formatted disk (in either
+/// `.po` or `.do`) must NOT be re-interleaved because the ProDOS driver
+/// expects ProDOS-order bytes on floppies.
+///
+/// The `_ext_hint` parameter is accepted for symmetry with sibling
+/// container openers but is intentionally unused — relying on the
+/// extension alone would corrupt a ProDOS-formatted `.po` (the natural
+/// case for ProDOS floppies) by re-interleaving it as if it were DOS 3.3.
+pub fn open_apple_ii_dsk(bytes: Vec<u8>, _ext_hint: Option<&str>) -> Result<Vec<u8>> {
     if bytes.len() != APPLE_II_DISK_BYTES {
         return Err(anyhow!(
             "Apple-II disk image must be exactly {} bytes (got {}); \
@@ -276,11 +282,9 @@ pub fn open_apple_ii_dsk(bytes: Vec<u8>, ext_hint: Option<&str>) -> Result<Vec<u
             bytes.len()
         ));
     }
-    let order = detect_sector_order(&bytes)
-        .unwrap_or_else(|| sector_order_from_extension(ext_hint, SectorOrder::Dos));
-    match order {
-        SectorOrder::Dos => Ok(bytes),
-        SectorOrder::ProDos => convert_po_to_do_bytes(&bytes),
+    match detect_sector_order(&bytes) {
+        Some(SectorOrder::ProDos) => convert_po_to_do_bytes(&bytes),
+        _ => Ok(bytes),
     }
 }
 

@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
+use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::ReadSeek;
@@ -51,6 +52,29 @@ pub fn is_imz_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 4];
     matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == IMZ_MAGIC
+}
+
+/// True when `path` is a 140 KB Apple-II disk image (`.do`, `.po`, or
+/// `.dsk`). Used by [`open_read`] to decide whether to run
+/// [`open_apple_ii_dsk`], which converts a ProDOS-order DOS 3.3 disk
+/// to DOS-order at file-open time so the downstream `apple_dos` driver
+/// reads bytes at the right offsets. Pure-ProDOS disks (any order) and
+/// DOS-order DOS 3.3 disks pass through unchanged.
+pub fn is_apple_ii_dsk_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| {
+            let s = s.to_ascii_lowercase();
+            s == "do" || s == "po" || s == "dsk"
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    std::fs::metadata(path)
+        .map(|m| m.len() as usize == APPLE_II_DISK_BYTES)
+        .unwrap_or(false)
 }
 
 /// Cheap sniff: returns true when `path` looks like an Atari MSA floppy
@@ -125,6 +149,19 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let bytes = std::fs::read(path).with_context(|| format!("read MSA {}", path.display()))?;
         let flat =
             decode_msa_bytes(&bytes).with_context(|| format!("decode MSA {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_apple_ii_dsk_path(path) {
+        // 140 KB Apple-II floppy. `open_apple_ii_dsk` converts a
+        // ProDOS-order DOS 3.3 disk to DOS-order; pure-ProDOS and
+        // already-DOS-order disks pass through unchanged.
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read Apple-II disk {}", path.display()))?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_string());
+        let flat = open_apple_ii_dsk(bytes, ext.as_deref())
+            .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;

@@ -220,6 +220,31 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // Apple DOS 3.3 VTOC at byte 0x11000 (track 17, sector 0). The same
+    // byte offset is a fixed point of the .do/.po sector interleave, so a
+    // PO-ordered .dsk would also surface here — by the time bytes reach
+    // this function the source_reader has already converted PO to DO.
+    // Skip the lookup unless the disk is exactly 140 KB (the only Apple-II
+    // floppy geometry); otherwise the offset might be inside a different
+    // filesystem and false-positive.
+    if let Ok(size) = reader.seek(SeekFrom::End(0)) {
+        if size == 143_360 && reader.seek(SeekFrom::Start(0x11000)).is_ok() {
+            let mut vtoc = [0u8; 256];
+            if reader.read_exact(&mut vtoc).is_ok()
+                && vtoc[0x01] == 17
+                && vtoc[0x02] == 15
+                && (1..=4).contains(&vtoc[0x03])
+                && vtoc[0x27] == 122
+                && vtoc[0x34] == 35
+                && vtoc[0x35] == 16
+                && vtoc[0x36] == 0x00
+                && vtoc[0x37] == 0x01
+            {
+                return Some("DOS 3.3".to_string());
+            }
+        }
+    }
+
     None
 }
 

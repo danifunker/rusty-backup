@@ -298,6 +298,35 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // Apple DOS 3.3 VTOC at byte 0x11000 (track 17, sector 0). Same gate
+    // as `partition::detect_superfloppy`: only fire on the exact 140 KB
+    // Apple-II floppy geometry, since the VTOC offset would otherwise be
+    // mid-stream on a different filesystem.
+    let partition_size = reader
+        .seek(SeekFrom::End(0))
+        .ok()
+        .and_then(|end| end.checked_sub(partition_offset))
+        .unwrap_or(0);
+    if partition_size == 143_360
+        && reader
+            .seek(SeekFrom::Start(partition_offset + 0x11000))
+            .is_ok()
+    {
+        let mut vtoc = [0u8; 256];
+        if reader.read_exact(&mut vtoc).is_ok()
+            && vtoc[0x01] == 17
+            && vtoc[0x02] == 15
+            && (1..=4).contains(&vtoc[0x03])
+            && vtoc[0x27] == 122
+            && vtoc[0x34] == 35
+            && vtoc[0x35] == 16
+            && vtoc[0x36] == 0x00
+            && vtoc[0x37] == 0x01
+        {
+            return "applesdos33";
+        }
+    }
+
     "unknown"
 }
 
@@ -1112,6 +1141,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "applesdos33" => Ok(Box::new(apple_dos::AppleDosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
