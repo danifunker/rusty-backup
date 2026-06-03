@@ -64,16 +64,10 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
   Oracle: add 100s of entries to one directory → list all back, read a
   sample, clean.
 
-- **(D) bmap-btree file forks** — `create_file` caps at one 2²¹-block
-  extent and ~9 inline extents (`alloc_extents`). When a file needs more
-  extents or >2²¹ blocks, convert the data fork to btree format
-  (`di_format=3`): allocate bmbt block(s), write extent records into the
-  leaf chain, put a bmbt root in the inode fork, include the bmbt blocks
-  in `di_nblocks`. Reader already supports bmbt READ (`walk_bmbt`). Ref
-  `libxfs/xfs_bmap_btree.c`. Bonus: once we can enumerate bmbt blocks for
-  ownership, relax the R2/R3 "abort on `di_format==3`" gate so repair
-  handles fragmented files. Oracle: write a file with >9 extents (heavily
-  fragment free space first) → clean, data byte-matches.
+- **(D) bmap-btree file forks** — **shipped 2026-06-02** (single-leaf
+  bmbt — multi-leaf parked for follow-up; see §10). The R2 abort-on-btree
+  gate is also relaxed: R2/R5 now account bmbt blocks via
+  `collect_bmbt_blocks`.
 
 - **(E) v5/CRC editing** — largest item. Every write path is v4-only
   today (`is_v5() → Unsupported/skip`) because v5 blocks carry crc32c +
@@ -528,6 +522,34 @@ docs-consolidation pass.
   longest non-glob prefix of the pattern. Symlinks ride out as plain
   text files containing the target (lossy but cross-platform safe);
   specials skip with a one-line note.
+- **XFS hole (D) — bmap-btree file forks (single-leaf)** —
+  `do_create_file` no longer caps at `MAX_SINGLE_EXTENT_BLOCKS` blocks or
+  `max_inline` extents: `alloc_extents` returns arbitrary runs (capped at
+  `bmbt_leaf_max = (bs - hdr) / 16`), `runs_to_extent_records` splits any
+  run whose count exceeds the 21-bit on-disk `blockcount` field into
+  multiple consecutive records, and `init_file_inode` dispatches between
+  inline-extents and btree formats. When the record count exceeds
+  `max_inline`, do_create_file allocates one block for the bmbt leaf,
+  writes the leaf via `build_bmbt_leaf_v4` (XFS_BMAP_MAGIC, level 0, sibling
+  pointers NULLFSBLOCK, extents packed after the long-form header), and
+  `init_file_inode` writes the in-inode root via `write_bmbt_root_to_leaf`
+  (level 1, numrecs 1, key = first extent's startoff, ptr = leaf fsblock,
+  remaining (key, ptr) slots zeroed). `di_format = 3`, `di_nblocks`
+  includes the leaf block. Multi-leaf bmbt (>= bmbt_leaf_max records) is
+  refused with a clear error after rolling back the data allocation. R2
+  freespace rebuild's `mark_inode_blocks` now walks bmbt-format inodes via
+  the new `collect_bmbt_blocks` helper (mirrors `walk_bmbt`'s descent +
+  rightsib chain, returns block numbers) and marks the bmbt blocks as
+  owned alongside the extent blocks — the previous abort on `di_format==3`
+  is gone. R5 inode-nblocks repair also picks up bmbt blocks. Reader path
+  unchanged (still `walk_bmbt`). Test
+  `create_file_writes_bmbt_format_when_extents_exceed_inline_cap` forges
+  both AGs' bnobt/cntbt into 12 free fragments of 100 blocks (gaps of 100)
+  so the fast-path single-extent alloc fails, then creates a 1100-block
+  file whose 11 carved runs blow past the 9-extent inline cap and force
+  btree format. Assertions: `DiFormat::Btree`, `nextents > 9`,
+  `nblocks = data + 1` (one leaf), byte-for-byte data round-trip via the
+  standard `read_file`. v4 only.
 - **XFS hole (B) — block → short-form dir re-compaction** —
   `dir_remove_entry` calls `try_recompact_block_dir_to_shortform` after
   `block_remove_entry` rewrites the data block. The helper bails (no-op,

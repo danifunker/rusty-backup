@@ -307,6 +307,72 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         Ok(out)
     }
 
+    /// Collect every block a bmap btree physically occupies — every internal
+    /// node from the descent plus every leaf reached via `rightsib`. Mirrors
+    /// `walk_bmbt`'s structural traversal but returns block numbers instead of
+    /// extents. Used by R2 freespace rebuild (`mark_inode_blocks`) to account
+    /// the bmbt's own blocks when an inode is `DiFormat::Btree`.
+    pub(crate) fn collect_bmbt_blocks(
+        &mut self,
+        root_level: u16,
+        first_child: u64,
+    ) -> Result<Vec<u64>, FilesystemError> {
+        if root_level == 0 {
+            return Err(FilesystemError::Parse(
+                "XFS bmap btree root claims level 0 — should be inline extents".into(),
+            ));
+        }
+        let bs = self.sb.blocksize as u64;
+        let hdr_len = if self.sb.is_v5() {
+            XFS_BTREE_LBLOCK_CRC_LEN
+        } else {
+            XFS_BTREE_LBLOCK_LEN
+        };
+        if (bs as usize) < hdr_len + 16 {
+            return Err(FilesystemError::Parse(format!(
+                "XFS blocksize {bs} too small for bmap btree block (hdr {hdr_len})"
+            )));
+        }
+        let max_intermediate_recs = ((bs as usize) - hdr_len) / 16;
+
+        let mut out = Vec::new();
+        let mut block = vec![0u8; bs as usize];
+        let mut current = first_child;
+        let mut expected_level = root_level - 1;
+        loop {
+            if current == NULLFSBLOCK {
+                return Err(FilesystemError::Parse(
+                    "XFS bmap btree: NULL child pointer during descent".into(),
+                ));
+            }
+            out.push(current);
+            self.read_fsblock(current, &mut block)?;
+            check_bmbt_header(&block, Some(expected_level), self.sb.is_v5())?;
+            if expected_level == 0 {
+                break;
+            }
+            let ptrs_off = hdr_len + max_intermediate_recs * 8;
+            if ptrs_off + 8 > block.len() {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS bmap btree intermediate block truncated (ptrs_off={ptrs_off}, bs={bs})"
+                )));
+            }
+            current = BigEndian::read_u64(&block[ptrs_off..ptrs_off + 8]);
+            expected_level -= 1;
+        }
+        // Walk the leaf sibling chain, collecting every leaf block.
+        loop {
+            let rightsib = BigEndian::read_u64(&block[16..24]);
+            if rightsib == NULLFSBLOCK {
+                break;
+            }
+            out.push(rightsib);
+            self.read_fsblock(rightsib, &mut block)?;
+            check_bmbt_header(&block, Some(0), self.sb.is_v5())?;
+        }
+        Ok(out)
+    }
+
     /// Read the bytes of one filesystem block at `fsblock` into `out`.
     pub(crate) fn read_fsblock(
         &mut self,
@@ -1693,6 +1759,174 @@ mod tests {
             "expected clean after re-compaction, got: {:?}",
             res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn create_file_writes_bmbt_format_when_extents_exceed_inline_cap() {
+        // §2.1 hole (D): when an allocation produces more extent records than
+        // fit the inline data fork (`max_inline = (inodesize - fork_offset) /
+        // 16 = 9` for our 256-byte v4 inode), do_create_file must lay out the
+        // data fork as a single-leaf bmap btree rather than failing. The
+        // fixture's AG 0 is one big contiguous free extent (~64k blocks) — to
+        // force 11 runs of 100 blocks each, this test forges AG 0's bnobt/cntbt
+        // to a 12-extent fragmented free set via rebuild_ag_freespace. After
+        // creation: di_format = Btree (3), reading the file produces the
+        // original payload byte-for-byte, and walk_bmbt enumerates the same
+        // extents the writer laid down.
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+        use crate::fs::xfs::btree_build::FreeExtent;
+        use std::io::Cursor as IoCursor;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let sb_clone;
+        let original_sb_fdblocks: u64;
+        {
+            let fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            sb_clone = fs.superblock().clone();
+        }
+        let sectsize = sb_clone.sectsize as u64;
+        let blocksize = sb_clone.blocksize as u64;
+        let agblocks = sb_clone.agblocks as u64;
+
+        // Capture each AG's pre-forge freeblks + sb_fdblocks so we can adjust
+        // sb_fdblocks for the blocks our forge "leaks". Both AGs must be
+        // fragmented or the fast-path alloc_blocks would find a contiguous
+        // 1100-block extent in the un-forged AG and inline format would win.
+        let mut original_ag_free: Vec<u64> = Vec::with_capacity(sb_clone.agcount as usize);
+        for agno in 0..sb_clone.agcount as u64 {
+            let agf_byte = agno * agblocks * blocksize + sectsize;
+            let mut agf_sec = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                agf_byte,
+                sectsize,
+                &mut agf_sec,
+            )
+            .expect("read AGF");
+            original_ag_free.push(BigEndian::read_u32(&agf_sec[52..56]) as u64);
+        }
+        {
+            let mut sb_primary = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                0,
+                sectsize,
+                &mut sb_primary,
+            )
+            .expect("read primary sb");
+            original_sb_fdblocks = BigEndian::read_u64(&sb_primary[144..152]);
+        }
+        // Forge EVERY AG's freespace into 12 fragments of 100 blocks each, with
+        // 100-block gaps — placed in the lower portion (above metadata + the
+        // initial inode chunk). Both bnobt and cntbt get rebuilt by
+        // rebuild_ag_freespace; sb_fdblocks is patched to absorb the leak.
+        let frag_count = 12u32;
+        let frag_blocksize = 100u32;
+        let frag_stride = 200u32;
+        let frag_base = 4_000u32; // safely above all metadata + initial chunks
+        let frag_extents: Vec<FreeExtent> = (0..frag_count)
+            .map(|i| FreeExtent {
+                startblock: frag_base + i * frag_stride,
+                blockcount: frag_blocksize,
+            })
+            .collect();
+        let forged_ag_free: u64 = (frag_count as u64) * (frag_blocksize as u64);
+
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            for agno in 0..sb_clone.agcount as u64 {
+                let expected_len = if agno == sb_clone.agcount as u64 - 1 {
+                    sb_clone.dblocks - agno * agblocks
+                } else {
+                    agblocks
+                };
+                fs.rebuild_ag_freespace(&sb_clone, agno, expected_len, &frag_extents)
+                    .unwrap_or_else(|e| panic!("rebuild AG {agno} freespace: {e}"));
+            }
+        }
+
+        // sb_fdblocks: subtract the sum of (original - forged) deltas across AGs.
+        let delta: u64 = original_ag_free
+            .iter()
+            .map(|&orig| orig - forged_ag_free)
+            .sum();
+        let mut sb_primary = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            0,
+            sectsize,
+            &mut sb_primary,
+        )
+        .expect("read primary sb again");
+        BigEndian::write_u64(&mut sb_primary[144..152], original_sb_fdblocks - delta);
+        {
+            let writer = cursor.get_mut();
+            writer[0..sectsize as usize].copy_from_slice(&sb_primary);
+        }
+
+        // Create a file that needs 1100 blocks. The fast path (single
+        // contiguous extent of 1100 blocks) fails because no free extent that
+        // big exists; the multi-run path lights up and lays out 11 runs of
+        // 100 blocks each from extents 0..10, exceeding the 9-extent inline
+        // cap and forcing btree format.
+        let nblocks = 1100u64;
+        let payload_len = nblocks * blocksize - blocksize / 2; // slightly less than full
+        let payload: Vec<u8> = (0..payload_len as usize)
+            .map(|i| ((i * 7 + 13) % 251) as u8)
+            .collect();
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen for create");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "big.bin",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file in btree mode");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Reopen, verify the inode is in btree format and the file reads back.
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let big = entries
+            .iter()
+            .find(|e| e.name == "big.bin")
+            .expect("big.bin present");
+        let core = fs.read_inode(big.location).expect("core");
+        assert_eq!(
+            core.format,
+            DiFormat::Btree,
+            "expected btree format, got {:?}",
+            core.format
+        );
+        assert!(
+            core.nextents > 9,
+            "expected > 9 extents (inline cap), got {}",
+            core.nextents
+        );
+        // nblocks should include data + 1 bmbt leaf block.
+        assert_eq!(
+            core.nblocks,
+            nblocks + 1,
+            "expected nblocks = data ({nblocks}) + 1 bmbt leaf"
+        );
+
+        let got = fs
+            .read_file(big, payload.len() + (blocksize as usize))
+            .expect("read big.bin");
+        assert_eq!(
+            got.len(),
+            payload.len(),
+            "file size differs from payload size"
+        );
+        assert_eq!(&got[..], &payload[..], "data round-trip mismatch");
     }
 
     #[test]

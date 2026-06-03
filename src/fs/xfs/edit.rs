@@ -39,7 +39,9 @@ use std::io::{Read, Seek, Write};
 use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
-use super::bmap::{encode_extent, fsblock_to_partition_byte};
+use super::bmap::{
+    encode_extent, fsblock_to_partition_byte, NULLFSBLOCK, XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_LEN,
+};
 use super::btree_build::{blocks_needed, blocks_needed_for, build_sblock_btree, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
@@ -53,6 +55,9 @@ use crate::fs::fsck::RepairReport;
 
 /// Largest single-extent file we write: the on-disk blockcount field is 21 bits.
 const MAX_SINGLE_EXTENT_BLOCKS: u64 = (1 << 21) - 1;
+
+/// One bmap extent record (`xfs_bmbt_rec`) on disk.
+const BMBT_REC_SIZE: usize = 16;
 
 /// A directory's child entries as `(name, inode, ftype)`, excluding `.`/`..`.
 type DirEntries = Vec<(String, u64, u8)>;
@@ -980,11 +985,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(())
     }
 
-    /// Initialize a freshly-allocated inode as a regular file. `extent` is the
-    /// single data-fork extent `(fsblock, count)` (`None` for an empty file).
-    /// Initialize a freshly-allocated inode as a regular file. `extents` is the
-    /// data fork as `(startoff, fsblock, count)` records (already in file-offset
-    /// order); empty for a zero-length file.
+    /// Initialize a freshly-allocated inode as a regular file. `extents` is
+    /// the data fork as `(startoff, fsblock, count)` records (already in
+    /// file-offset order); empty for a zero-length file. When
+    /// `bmbt_leaf_fsblock` is `Some`, the inode is written in btree format
+    /// (§2.1 hole (D)): the inline fork carries an `xfs_bmdr_block` root that
+    /// points at the single leaf block, `di_format = 3`, and `di_nblocks`
+    /// includes the leaf block. Otherwise the extents are written inline
+    /// (`di_format = 2`), and the caller must have bounded the count to the
+    /// inline literal area.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn init_file_inode(
         &mut self,
@@ -995,16 +1004,18 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         gid: u32,
         size: u64,
         extents: &[(u64, u64, u32)],
+        bmbt_leaf_fsblock: Option<u64>,
     ) -> Result<(), FilesystemError> {
         let (_core, mut buf) = self.read_inode_buf(ino)?;
         let version = buf[4];
         let gen = BigEndian::read_u32(&buf[92..96]).wrapping_add(1);
         let isz = buf.len();
+        let use_btree = bmbt_leaf_fsblock.is_some();
 
         BigEndian::write_u16(&mut buf[0..2], super::types::XFS_DINODE_MAGIC);
         BigEndian::write_u16(&mut buf[2..4], mode);
         buf[4] = version;
-        buf[5] = 2; // di_format = extents
+        buf[5] = if use_btree { 3 } else { 2 }; // di_format: btree or extents
         if version == 1 {
             BigEndian::write_u16(&mut buf[6..8], 1);
             BigEndian::write_u32(&mut buf[16..20], 0);
@@ -1018,11 +1029,14 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             *b = 0;
         }
         BigEndian::write_u64(&mut buf[56..64], size);
-        let nblocks: u64 = extents.iter().map(|&(_, _, c)| c as u64).sum();
-        BigEndian::write_u64(&mut buf[64..72], nblocks);
+        // di_nblocks = data extent blocks + (bmbt leaf block, if any).
+        let data_nblocks: u64 = extents.iter().map(|&(_, _, c)| c as u64).sum();
+        let bmbt_nblocks: u64 = if use_btree { 1 } else { 0 };
+        BigEndian::write_u64(&mut buf[64..72], data_nblocks + bmbt_nblocks);
         for b in buf.iter_mut().take(76).skip(72) {
             *b = 0; // extsize
         }
+        // di_nextents: total file-offset extents (same value in both formats).
         BigEndian::write_u32(&mut buf[76..80], extents.len() as u32);
         for b in buf.iter_mut().take(92).skip(80) {
             *b = 0; // anextents, forkoff, aformat(set below), dm*, flags
@@ -1035,24 +1049,35 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         for b in buf.iter_mut().take(isz).skip(fs) {
             *b = 0;
         }
-        // Inline extent records must fit the literal area; the caller bounds the
-        // extent count, but guard anyway.
-        if fs + extents.len() * 16 > isz {
-            return Err(FilesystemError::Unsupported(
-                "too many extents for an inline data fork (bmap-btree not implemented)".into(),
-            ));
-        }
-        for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
-            let rec = encode_extent(false, startoff, fsblock, count as u64);
-            buf[fs + i * 16..fs + i * 16 + 16].copy_from_slice(&rec);
+        if let Some(leaf_fsblock) = bmbt_leaf_fsblock {
+            // Btree format: write an in-inode root pointing at the leaf.
+            let first_startoff = extents.first().map(|&(off, _, _)| off).ok_or_else(|| {
+                FilesystemError::Parse("bmbt root requires at least one extent".into())
+            })?;
+            write_bmbt_root_to_leaf(&mut buf[fs..isz], first_startoff, leaf_fsblock);
+        } else {
+            // Inline extents: each record must fit the literal area.
+            if fs + extents.len() * BMBT_REC_SIZE > isz {
+                return Err(FilesystemError::Unsupported(
+                    "too many extents for an inline data fork (bmap-btree not threaded here)"
+                        .into(),
+                ));
+            }
+            for (i, &(startoff, fsblock, count)) in extents.iter().enumerate() {
+                let rec = encode_extent(false, startoff, fsblock, count as u64);
+                buf[fs + i * BMBT_REC_SIZE..fs + (i + 1) * BMBT_REC_SIZE].copy_from_slice(&rec);
+            }
         }
         self.write_inode_region(sb, ino, &buf)
     }
 
     /// Internal entry point for `create_file`: pre-flight the parent insert,
-    /// allocate the data blocks (one contiguous extent) and write the data,
-    /// allocate + initialize the file inode, then insert it into the parent.
-    /// Returns the new file's inode number.
+    /// allocate the data blocks (single contiguous extent OR multiple runs,
+    /// possibly larger than one extent record), write the data, allocate +
+    /// initialize the file inode, then insert it into the parent. When the
+    /// resulting extent records overflow the inline literal area, the data
+    /// fork is laid out as a single-leaf bmap btree (§2.1 hole (D)). Returns
+    /// the new file's inode number.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn do_create_file(
         &mut self,
@@ -1069,57 +1094,98 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         let bs = sb.blocksize as u64;
         let nblocks = data_len.div_ceil(bs);
-        // Each extent's blockcount is 21 bits; the data fork holds it inline as
-        // up to `max_inline` records before it would need a bmap btree.
-        if nblocks > MAX_SINGLE_EXTENT_BLOCKS {
-            return Err(FilesystemError::Unsupported(format!(
-                "file needs {nblocks} blocks; files larger than one 2^21-block extent are not supported"
-            )));
-        }
 
-        // Allocate data first (so a DiskFull leaves no half-built inode): one
-        // contiguous run when possible, else several (capped at the inline-fork
-        // extent limit). Then the inode, then write data + init + link.
+        // Allocate data first (so a DiskFull leaves no half-built inode). The
+        // allocator returns AG-local runs; runs_to_extent_records splits any
+        // run larger than `MAX_SINGLE_EXTENT_BLOCKS` into multiple consecutive
+        // extent records (the on-disk blockcount field is only 21 bits).
         let runs = if nblocks > 0 {
-            self.alloc_extents(&sb, nblocks as u32)?
+            self.alloc_extents(&sb, nblocks)?
         } else {
             Vec::new()
         };
-        // Assign sequential file offsets to the runs.
-        let mut extents: Vec<(u64, u64, u32)> = Vec::with_capacity(runs.len());
-        let mut off = 0u64;
-        for (fsblock, count) in runs {
-            extents.push((off, fsblock, count));
-            off += count as u64;
-        }
+        let extents = runs_to_extent_records(&runs);
 
+        // Pick between inline and btree data-fork format. v1 supports single-
+        // leaf bmbt only: leaves beyond the leaf cap force a clear error so
+        // the partial allocation is reclaimed before the operation aborts.
+        let max_inline = (sb.inodesize as usize - fork_offset(false)) / BMBT_REC_SIZE;
+        let leaf_max = bmbt_leaf_max(&sb);
+        if extents.len() > leaf_max {
+            // Roll back the data allocation.
+            self.free_blocks(&sb, &runs)?;
+            return Err(FilesystemError::Unsupported(format!(
+                "file needs {} extents; multi-leaf bmap btree not yet implemented (max {})",
+                extents.len(),
+                leaf_max
+            )));
+        }
+        let bmbt_leaf_fsblock = if extents.len() > max_inline {
+            // Allocate one block for the leaf; on failure, roll back the data.
+            match self.alloc_blocks(&sb, 1) {
+                Ok(fb) => Some(fb),
+                Err(e) => {
+                    self.free_blocks(&sb, &runs)?;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        // From here on, every failure leaves an inode-shaped on-disk
+        // commitment — that's the existing contract, so don't bend the
+        // ordering to try to rescue it.
         let ino = self.alloc_inode_slot(&sb)?;
         self.write_file_data_extents(&sb, &extents, data, data_len)?;
-        self.init_file_inode(&sb, ino, mode, uid, gid, data_len, &extents)?;
+        if let Some(leaf_fsblock) = bmbt_leaf_fsblock {
+            let leaf_bytes = build_bmbt_leaf_v4(&extents, sb.blocksize as usize);
+            self.write_fsblock(&sb, leaf_fsblock, &leaf_bytes)?;
+        }
+        self.init_file_inode(
+            &sb,
+            ino,
+            mode,
+            uid,
+            gid,
+            data_len,
+            &extents,
+            bmbt_leaf_fsblock,
+        )?;
         self.dir_insert_entry(&sb, parent_ino, name, ino, false)?;
         self.reader.flush()?;
         Ok(ino)
     }
 
-    /// Allocate `n` blocks as up to `max_inline` contiguous runs. Tries a single
-    /// run first (the common case); otherwise carves several runs largest-first
-    /// from one allocation group's free extents and rebuilds that AG's
-    /// free-space btrees over the remainder. Errors `DiskFull` when no AG can
-    /// satisfy `n` within the inline-extent budget.
+    /// Allocate `n` total blocks as one or more contiguous runs (returns
+    /// `(fsblock, count)` per run, file-offset assignment is the caller's
+    /// job). Tries a single contiguous extent first via [`alloc_blocks`]; if
+    /// that fails (`DiskFull`), walks AGs largest-first and carves multiple
+    /// runs from one AG's free set. The run count is capped at
+    /// [`bmbt_leaf_max`] — the on-disk ceiling for a single-leaf bmap btree
+    /// (§2.1 hole (D)). Errors `DiskFull` when no AG can satisfy `n` within
+    /// that cap. The largest individual run is left uncapped here; oversize
+    /// runs are split into per-record-sized extents downstream by
+    /// [`runs_to_extent_records`].
     fn alloc_extents(
         &mut self,
         sb: &super::sb::XfsSuperblock,
-        n: u32,
+        n: u64,
     ) -> Result<Vec<(u64, u32)>, FilesystemError> {
-        // Fast path: one contiguous run.
-        match self.alloc_blocks(sb, n) {
-            Ok(fsblock) => return Ok(vec![(fsblock, n)]),
-            Err(FilesystemError::DiskFull(_)) => {}
-            Err(e) => return Err(e),
+        // Fast path: one contiguous run when n fits a u32 (alloc_blocks's
+        // interface). Single-extent allocations larger than 2^32 blocks are
+        // theoretically possible but absurd for our target volumes, so this
+        // is a reasonable cap on the fast-path attempt.
+        if n <= u64::from(u32::MAX) {
+            match self.alloc_blocks(sb, n as u32) {
+                Ok(fsblock) => return Ok(vec![(fsblock, n as u32)]),
+                Err(FilesystemError::DiskFull(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         let bs = sb.blocksize as usize;
-        let max_inline = (sb.inodesize as usize - fork_offset(false)) / 16;
+        let leaf_max = bmbt_leaf_max(sb);
         let agblocks = sb.agblocks as u64;
         for agno in 0..sb.agcount as u64 {
             let expected_len = if agno == sb.agcount as u64 - 1 {
@@ -1132,7 +1198,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 Err(_) => continue,
             };
             let total: u64 = full.iter().map(|e| e.blockcount as u64).sum();
-            if total < n as u64 {
+            if total < n {
                 continue;
             }
             // Allocate largest-first to minimise the run count; take from the
@@ -1146,9 +1212,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     post.push(*ext);
                     continue;
                 }
-                let take = remaining.min(ext.blockcount);
+                let take = remaining.min(ext.blockcount as u64) as u32;
                 runs.push((ext.startblock, take));
-                remaining -= take;
+                remaining -= take as u64;
                 if take < ext.blockcount {
                     post.push(FreeExtent {
                         startblock: ext.startblock + take,
@@ -1156,8 +1222,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     });
                 }
             }
-            if remaining > 0 || runs.len() > max_inline {
-                continue; // (shouldn't underflow; too fragmented for inline)
+            if remaining > 0 || runs.len() > leaf_max {
+                continue;
             }
             // The rebuild carves its btree blocks from the largest remaining
             // free extent, so make sure one is big enough.
@@ -1174,7 +1240,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 .collect());
         }
         Err(FilesystemError::DiskFull(format!(
-            "could not allocate {n} blocks as <= {max_inline} contiguous runs"
+            "could not allocate {n} blocks as <= {leaf_max} contiguous runs"
         )))
     }
 
@@ -2248,6 +2314,66 @@ fn dir_hashname(name: &[u8]) -> u32 {
 fn dir2_data_entsize(namelen: usize, has_ftype: bool) -> usize {
     let raw = 8 + 1 + namelen + usize::from(has_ftype) + 2;
     raw.div_ceil(8) * 8
+}
+
+/// Maximum extent records in one v4 bmap btree leaf block — what fits after
+/// the long-form `xfs_btree_block` header.
+fn bmbt_leaf_max(sb: &super::sb::XfsSuperblock) -> usize {
+    (sb.blocksize as usize - XFS_BTREE_LBLOCK_LEN) / BMBT_REC_SIZE
+}
+
+/// Convert raw `(fsblock, count)` allocation runs into bmap extent records
+/// `(startoff, fsblock, count)`, splitting any run whose `count` exceeds the
+/// 21-bit on-disk `blockcount` field into multiple consecutive records that
+/// describe the same physical blocks. File offsets advance sequentially over
+/// the runs (the data-fork layout assumed by every other write path here).
+fn runs_to_extent_records(runs: &[(u64, u32)]) -> Vec<(u64, u64, u32)> {
+    let mut out: Vec<(u64, u64, u32)> = Vec::with_capacity(runs.len());
+    let mut file_off = 0u64;
+    for &(fsblock, count) in runs {
+        let mut remaining = count as u64;
+        let mut start_fsblock = fsblock;
+        while remaining > 0 {
+            let chunk = remaining.min(MAX_SINGLE_EXTENT_BLOCKS);
+            out.push((file_off, start_fsblock, chunk as u32));
+            file_off += chunk;
+            start_fsblock += chunk;
+            remaining -= chunk;
+        }
+    }
+    out
+}
+
+/// Build a v4 bmap btree leaf block (`XFS_BMAP_MAGIC`) holding every extent
+/// record; sibling pointers are `NULLFSBLOCK` since hole (D) only supports a
+/// single leaf. The caller has guaranteed `extents.len() <= bmbt_leaf_max(sb)`.
+fn build_bmbt_leaf_v4(extents: &[(u64, u64, u32)], bs: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; bs];
+    BigEndian::write_u32(&mut buf[0..4], XFS_BMAP_MAGIC);
+    BigEndian::write_u16(&mut buf[4..6], 0); // level 0 = leaf
+    BigEndian::write_u16(&mut buf[6..8], extents.len() as u16);
+    BigEndian::write_u64(&mut buf[8..16], NULLFSBLOCK); // leftsib
+    BigEndian::write_u64(&mut buf[16..24], NULLFSBLOCK); // rightsib
+    for (i, &(off, fsblock, count)) in extents.iter().enumerate() {
+        let rec = encode_extent(false, off, fsblock, count as u64);
+        let pos = XFS_BTREE_LBLOCK_LEN + i * BMBT_REC_SIZE;
+        buf[pos..pos + BMBT_REC_SIZE].copy_from_slice(&rec);
+    }
+    buf
+}
+
+/// Write the in-inode `xfs_bmdr_block` root pointing at a single leaf. Layout:
+/// `level(2) + numrecs(2)` then `maxrecs` keys (each 8 bytes — `startoff`) then
+/// `maxrecs` pointers (each 8 bytes — leaf fsblock). Only the level-1 root
+/// case with `numrecs=1` is in scope. `maxrecs = (fork_len - 4) / 16` matches
+/// the read-side `parse_bmbt_root`.
+fn write_bmbt_root_to_leaf(fork: &mut [u8], first_startoff: u64, leaf_fsblock: u64) {
+    BigEndian::write_u16(&mut fork[0..2], 1); // level 1 (above leaves)
+    BigEndian::write_u16(&mut fork[2..4], 1); // numrecs
+    let maxrecs = (fork.len().saturating_sub(4)) / 16;
+    BigEndian::write_u64(&mut fork[4..12], first_startoff);
+    let ptrs_off = 4 + maxrecs * 8;
+    BigEndian::write_u64(&mut fork[ptrs_off..ptrs_off + 8], leaf_fsblock);
 }
 
 /// Build a v4 single-block (`XD2B`) directory holding `.`, `..`, and `entries`.

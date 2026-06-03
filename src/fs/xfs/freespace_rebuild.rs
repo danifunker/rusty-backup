@@ -323,9 +323,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(map)
     }
 
-    /// Mark one allocated inode's data-fork blocks in use. Returns a skip
-    /// reason if the inode is btree-format (unmappable bmap blocks), if a
-    /// block is cross-linked, or on any read/decode failure.
+    /// Mark one allocated inode's data-fork blocks in use. For inline-extents
+    /// format, mark the extents directly; for btree format, walk the bmbt to
+    /// collect every block the tree physically occupies (intermediate nodes
+    /// plus leaves — the root sits in the inode literal area), mark them,
+    /// then mark every extent record's blocks. Returns a skip reason on any
+    /// read/decode failure or block cross-link.
     pub(crate) fn mark_inode_blocks(
         &mut self,
         sb: &XfsSuperblock,
@@ -341,10 +344,33 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         match core.format {
             DiFormat::Local | DiFormat::Other(_) => return Ok(()), // owns no blocks
             DiFormat::Btree => {
-                return Err(format!(
-                    "inode {ino} is bmap-btree format (di_format 3) — \
-                     intermediate map blocks not yet accounted; skipping rebuild"
-                ));
+                // Account every block the bmap btree physically occupies
+                // (root sits in the inode literal area, so only intermediate
+                // nodes + leaves consume separate blocks). The decoded extents
+                // come from the same walk path the reader uses.
+                let fork_len = self.data_fork(&core, &inode_buf).len();
+                let (root_level, first_child) = {
+                    let fork = self.data_fork(&core, &inode_buf);
+                    super::parse_bmbt_root(fork, fork_len)
+                        .map_err(|e| format!("inode {ino}: bmbt root parse: {e}"))?
+                };
+                let bmbt_blocks = self
+                    .collect_bmbt_blocks(root_level, first_child)
+                    .map_err(|e| format!("inode {ino}: bmbt walk: {e}"))?;
+                let agblocks = sb.agblocks as u64;
+                let agmask = (1u64 << sb.agblklog) - 1;
+                for fsb in &bmbt_blocks {
+                    let agno = fsb >> sb.agblklog;
+                    let agbno = fsb & agmask;
+                    if agno >= sb.agcount as u64 || agbno >= agblocks {
+                        return Err(format!("inode {ino}: bmbt block {fsb} outside volume"));
+                    }
+                    if map.mark(agno * agblocks + agbno) {
+                        return Err(format!("inode {ino}: bmbt block {fsb} double-allocated"));
+                    }
+                }
+                // Fall through to extent-marking below; decode_data_extents
+                // handles Btree format identically to Extents.
             }
             DiFormat::Extents => {}
         }

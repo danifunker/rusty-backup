@@ -194,9 +194,26 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 if !self.extents_in_bounds(sb, &extents) {
                     return Ok(false);
                 }
-                // Btree data fork also owns its bmbt blocks; we can't count
-                // those here, so recompute nextents only and leave nblocks.
-                (Some(extents.len() as u32), None)
+                // Btree data fork owns its bmbt blocks too. Walk the tree once
+                // more and sum (extent blocks + bmbt blocks); a parse failure
+                // means the fork is damaged and any nblocks recompute would
+                // ratify a bad layout, so leave both counters alone.
+                let fork_len = self.data_fork(&core, &inode_buf).len();
+                let root_parse = {
+                    let fork = self.data_fork(&core, &inode_buf);
+                    super::parse_bmbt_root(fork, fork_len)
+                };
+                let (root_level, first_child) = match root_parse {
+                    Ok(v) => v,
+                    Err(_) => return Ok(false),
+                };
+                let bmbt_blocks = match self.collect_bmbt_blocks(root_level, first_child) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(false),
+                };
+                let blocks: u64 =
+                    extents.iter().map(|e| e.blockcount).sum::<u64>() + bmbt_blocks.len() as u64;
+                (Some(extents.len() as u32), Some(blocks))
             }
             DiFormat::Other(_) => return Ok(false),
         };
