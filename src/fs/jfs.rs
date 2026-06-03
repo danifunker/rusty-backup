@@ -225,6 +225,9 @@ const S_IFSOCK: u32 = 0o140000;
 const XAD_SIZE: usize = 16;
 const XTHEADER_SIZE: usize = 32;
 const XTROOT_SIZE: usize = 288;
+#[allow(dead_code)] // historical XTROOT-only XAD cap; parse_xtpage_buf
+                    // now validates against the actual buffer size, so the
+                    // inline-specific cap isn't checked separately.
 const XTROOT_MAX_XAD: usize = (XTROOT_SIZE - XTHEADER_SIZE) / XAD_SIZE; // 16
 #[allow(dead_code)]
 const XTPAGE_SIZE: usize = 4096;
@@ -513,12 +516,19 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     pub(crate) fn read_fileset_iag(&mut self) -> Result<FilesetIag, FilesystemError> {
         let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
         let xtroot = self.parse_inline_xtree_root(&fs_ino.raw)?;
-        if xtroot.flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
-            return Err(FilesystemError::Unsupported(
-                "JFS: FILESYSTEM_I xtree has internal nodes — multi-IAG layouts \
-                 (filesets with > 4096 inodes) not yet supported"
-                    .into(),
-            ));
+        // Multi-IAG filesets (> 4096 inodes) are still parked — only IAG 0
+        // is read for now, and read_fileset_inode caps `fino` at
+        // INOSPEREXT * EXTSPERIAG = 4096. FILESYSTEM_I's logical layout
+        // is `page 0 = dinomap_disk header, page 1 = IAG 0, page 2 =
+        // IAG 1, ...`; we refuse here when `di_size` claims more than
+        // 2 pages (≤ 8 KiB ⇒ single IAG).
+        if fs_ino.size > 2 * PSIZE {
+            return Err(FilesystemError::Unsupported(format!(
+                "JFS: FILESYSTEM_I di_size {} bytes implies multi-IAG fileset \
+                 (> {} inodes) — multi-IAG dispatch not yet implemented",
+                fs_ino.size,
+                INOSPEREXT * EXTSPERIAG as u32
+            )));
         }
         if xtroot.xads.is_empty() {
             return Err(FilesystemError::Parse(
@@ -526,7 +536,8 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             ));
         }
         // FILESYSTEM_I data: page 0 = dinomap_disk header (we skip
-        // it), page 1 = first IAG. The first XAD must cover both.
+        // it), page 1 = first IAG. Descends internal xtpages when the
+        // xtroot is INTERNAL — the walker handles the depth.
         let iag_page = self.read_inode_logical_page(&xtroot, 1)?;
         let agstart = u64::from_le_bytes(iag_page[0..8].try_into().unwrap());
         let iagnum = u32::from_le_bytes(iag_page[8..12].try_into().unwrap());
@@ -556,14 +567,14 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     }
 
     /// Read logical page `logical_page` from an inode's data area via
-    /// the inline xtree root. Used by both BMAP and FILESYSTEM_I walks.
-    /// Returns a 4 KiB page buffer.
+    /// the xtree root. Descends through any internal xtpages. Used by
+    /// both BMAP and FILESYSTEM_I walks.
     fn read_inode_logical_page(
         &mut self,
         xtroot: &XtreeRoot,
         logical_page: u64,
     ) -> Result<Vec<u8>, FilesystemError> {
-        self.read_bmap_logical_page(xtroot, logical_page)
+        self.read_xtree_logical_page(xtroot, logical_page)
     }
 
     /// Read fileset inode `fino` (a user-fileset inode number) via the
@@ -699,31 +710,30 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         Ok(entries)
     }
 
-    /// Read a user file's data fork. Walks the inline xtree root only
-    /// (no xtpage chase yet) — refuses files larger than ~64 KiB of
-    /// data spread across more than 16 XADs with a clear error.
+    /// Read a user file's data fork. Walks the (possibly multi-level)
+    /// xtree via [`Self::walk_xtree_leaves`], collects every leaf XAD,
+    /// sorts them by logical offset, then emits bytes: sparse gaps are
+    /// zero-filled, allocated extents are read from disk verbatim.
     pub(crate) fn read_file_data(
         &mut self,
         file_inode: &JfsDinode,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
         let xtroot = self.parse_inline_xtree_root(&file_inode.raw)?;
-        if xtroot.flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
-            return Err(FilesystemError::Unsupported(format!(
-                "JFS: file inode {} has internal-node xtree (multi-level xtpage \
-                 walker not yet implemented)",
-                file_inode.di_number
-            )));
-        }
+        // Collect every leaf XAD. For an inline-only file (LEAF
+        // xtroot), this is just the inline XADs; for an internal-xtree
+        // file the walker descends through every xtpage.
+        let mut leaves: Vec<Xad> = Vec::new();
+        self.walk_xtree_leaves(&xtroot, &mut |xad| leaves.push(*xad))?;
+        leaves.sort_by_key(|xad| xad.logical_offset);
+
         let total = (file_inode.size as usize).min(max_bytes);
         let mut out: Vec<u8> = Vec::with_capacity(total);
-        for xad in &xtroot.xads {
+        for xad in &leaves {
             if out.len() >= total {
                 break;
             }
             let logical_start_byte = xad.logical_offset * self.bsize;
-            // If the XAD's logical start is past where we are, the
-            // gap is sparse — emit zeros up to it.
             if logical_start_byte as usize > out.len() {
                 let gap = (logical_start_byte as usize - out.len()).min(total - out.len());
                 out.resize(out.len() + gap, 0);
@@ -739,7 +749,6 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             out.resize(start + take, 0);
             self.reader.read_exact(&mut out[start..start + take])?;
         }
-        // Pad with zeros to file_size if there's a sparse tail.
         if out.len() < total {
             out.resize(total, 0);
         }
@@ -876,27 +885,153 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             )));
         }
         let root = &dinode_buf[DI_OFF_TYPE_AREA..DI_OFF_TYPE_AREA + XTROOT_SIZE];
-        let flag = root[XTH_OFF_FLAG];
-        let nextindex = u16::from_le_bytes([root[XTH_OFF_NEXTINDEX], root[XTH_OFF_NEXTINDEX + 1]]);
-        // nextindex is in slot units (16 bytes/slot). Header takes 2
-        // slots; real XADs start at slot 2.
+        Self::parse_xtpage_buf(root, "xtree root")
+    }
+
+    /// Parse a single xtpage from `buf` — either the inline 288-byte
+    /// xtroot region of a dinode, or a full 4 KiB external xtpage. The
+    /// on-disk header layout is the same in both forms: 16-byte
+    /// next/prev/sibling area, then `flag` (u8), `rsrvd1` (u8),
+    /// `nextindex` (u16), `maxentry` (u16), `rsrvd2` (u16), `self_pxd`
+    /// (8 B). XADs start at byte 32.
+    ///
+    /// `nextindex` is in slot units (16 bytes/slot); the header takes 2
+    /// slots, so real XAD count = `nextindex - 2`. We validate the
+    /// count against the buffer's capacity to catch corruption that
+    /// would otherwise read past the end of the slice.
+    pub(crate) fn parse_xtpage_buf(
+        buf: &[u8],
+        context: &str,
+    ) -> Result<XtreeRoot, FilesystemError> {
+        if buf.len() < XTHEADER_SIZE {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: xtpage buffer too small ({} < {XTHEADER_SIZE}) — {context}",
+                buf.len()
+            )));
+        }
+        let flag = buf[XTH_OFF_FLAG];
+        let nextindex = u16::from_le_bytes([buf[XTH_OFF_NEXTINDEX], buf[XTH_OFF_NEXTINDEX + 1]]);
         if nextindex < 2 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtree root nextindex {nextindex} < 2 (header takes 2 slots)"
+                "jfs: xtpage nextindex {nextindex} < 2 (header takes 2 slots) — {context}"
             )));
         }
         let xad_count = (nextindex as usize) - 2;
-        if xad_count > XTROOT_MAX_XAD {
+        let max_xad_slots = (buf.len() - XTHEADER_SIZE) / XAD_SIZE;
+        if xad_count > max_xad_slots {
             return Err(FilesystemError::Parse(format!(
-                "jfs: xtree root has {xad_count} XADs (max {XTROOT_MAX_XAD})"
+                "jfs: xtpage has {xad_count} XADs but the buffer only holds {max_xad_slots} slots \
+                 — {context}"
             )));
         }
         let mut xads = Vec::with_capacity(xad_count);
         for i in 0..xad_count {
-            let xad_off = XTHEADER_SIZE + i * XAD_SIZE;
-            xads.push(Xad::parse(&root[xad_off..xad_off + XAD_SIZE]));
+            let off = XTHEADER_SIZE + i * XAD_SIZE;
+            xads.push(Xad::parse(&buf[off..off + XAD_SIZE]));
         }
         Ok(XtreeRoot { flag, xads })
+    }
+
+    /// Read a single external xtpage from disk at the given aggregate
+    /// block address. Pages are always 4 KiB (`PSIZE`), regardless of
+    /// the aggregate block size — JFS metadata always uses a fixed page
+    /// granularity.
+    pub(crate) fn read_xtpage_at(
+        &mut self,
+        addr_in_blocks: u64,
+    ) -> Result<XtreeRoot, FilesystemError> {
+        let byte = self.partition_offset + addr_in_blocks * self.bsize;
+        self.reader.seek(SeekFrom::Start(byte))?;
+        let mut buf = vec![0u8; PSIZE as usize];
+        self.reader.read_exact(&mut buf)?;
+        Self::parse_xtpage_buf(&buf, &format!("xtpage at agg block {addr_in_blocks}"))
+    }
+
+    /// Descend a (possibly multi-level) xtree to find the leaf XAD
+    /// covering `logical_page`, then read and return that 4 KiB page.
+    /// `root` may be either an inline xtroot or an external xtpage —
+    /// both share the same descent contract.
+    ///
+    /// Returns an error if the logical page is past the xtree's end or
+    /// not covered by any leaf XAD (sparse hole).
+    pub(crate) fn read_xtree_logical_page(
+        &mut self,
+        root: &XtreeRoot,
+        logical_page: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let mut cur = root.clone();
+        // Guard against pathological cycles in corrupted xtrees. Real
+        // JFS xtrees never exceed a handful of levels (each level
+        // fan-out is ~254 for external pages, so 16 levels covers 2^120
+        // logical pages — wildly past any real volume).
+        for _depth in 0..16 {
+            let xad = cur
+                .xads
+                .iter()
+                .find(|xad| {
+                    logical_page >= xad.logical_offset
+                        && logical_page < xad.logical_offset + xad.physical_length as u64
+                })
+                .ok_or_else(|| {
+                    FilesystemError::Parse(format!(
+                        "jfs: logical page {logical_page} not covered by xtree"
+                    ))
+                })?;
+            if cur.flag & BT_LEAF_FLAG != 0 {
+                let within = logical_page - xad.logical_offset;
+                let phys_block = xad.physical_address + within;
+                let byte = self.partition_offset + phys_block * self.bsize;
+                self.reader.seek(SeekFrom::Start(byte))?;
+                let mut buf = vec![0u8; PSIZE as usize];
+                self.reader.read_exact(&mut buf)?;
+                return Ok(buf);
+            }
+            // INTERNAL — descend into the next xtpage. Internal XAD's
+            // `physical_address` points to a child xtpage; its
+            // `logical_offset` + `physical_length` describe the
+            // logical range that subtree covers (sum of leaves).
+            cur = self.read_xtpage_at(xad.physical_address)?;
+        }
+        Err(FilesystemError::Parse(format!(
+            "jfs: xtree descent exceeded 16 levels at logical page {logical_page}"
+        )))
+    }
+
+    /// Walk every leaf XAD reachable from `root`, calling `visit` once
+    /// per XAD. Internal-node xtrees are descended iteratively (DFS)
+    /// without recursion so deep trees don't blow the stack.
+    ///
+    /// Visitation order is leaf-XADs in xtree order (left to right,
+    /// depth-first); callers that need ascending logical-offset can
+    /// sort the collected XADs themselves.
+    pub(crate) fn walk_xtree_leaves<F: FnMut(&Xad)>(
+        &mut self,
+        root: &XtreeRoot,
+        visit: &mut F,
+    ) -> Result<(), FilesystemError> {
+        let mut stack: Vec<XtreeRoot> = vec![root.clone()];
+        let mut iter_budget: u32 = 0;
+        while let Some(node) = stack.pop() {
+            iter_budget += 1;
+            if iter_budget > 1_000_000 {
+                return Err(FilesystemError::Parse(
+                    "jfs: walk_xtree_leaves exceeded 1M node visits — likely cyclic xtree".into(),
+                ));
+            }
+            if node.flag & BT_LEAF_FLAG != 0 {
+                for xad in &node.xads {
+                    visit(xad);
+                }
+            } else {
+                // Push children in reverse so the leftmost subtree is
+                // popped next (DFS, ascending logical offsets first).
+                for xad in node.xads.iter().rev() {
+                    let child = self.read_xtpage_at(xad.physical_address)?;
+                    stack.push(child);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Walk the BMAP control inode (#2) and return per-page pmap data
@@ -906,20 +1041,15 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     fn walk_bmap(&mut self) -> Result<Option<BmapWalk>, FilesystemError> {
         let bmap_ino = self.read_ait_inode(BMAP_I)?;
         let xtroot = self.parse_inline_xtree_root(&bmap_ino.raw)?;
-        // The xtroot must be a leaf with at least one XAD pointing at
-        // the BMAP file's data. Internal-node xtrees would need a
-        // multi-level xtree walker (xtpage chase) that hasn't shipped.
+        // Both inline-LEAF and inline-INTERNAL xtroots are accepted —
+        // the descent helper (`read_bmap_logical_page` →
+        // `read_xtree_logical_page`) walks through internal xtpages
+        // when necessary. The flag still needs the ROOT bit to indicate
+        // an xtree at all.
         let node_type = xtroot.flag & BT_TYPE_MASK;
-        if node_type & BT_INTERNAL_FLAG != 0 {
-            return Err(FilesystemError::Unsupported(
-                "JFS: BMAP control inode's xtree has internal nodes (BMAP > 256 MiB \
-                 not yet supported)"
-                    .into(),
-            ));
-        }
-        if node_type & BT_LEAF_FLAG == 0 {
+        if node_type & (BT_LEAF_FLAG | BT_INTERNAL_FLAG) == 0 {
             return Err(FilesystemError::Parse(format!(
-                "jfs: BMAP xtree root flag 0x{:02X} has no LEAF bit",
+                "jfs: BMAP xtree root flag 0x{:02X} has neither LEAF nor INTERNAL bit",
                 xtroot.flag
             )));
         }
@@ -1070,31 +1200,16 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     }
 
     /// Read logical page `logical_page` from the BMAP control file's
-    /// data area, resolving it through `xtroot` (a single-leaf xtree
-    /// is the only shape we accept for BMAP — the file is always
-    /// contiguous on disk by construction).
+    /// data area, descending `xtroot` through any internal xtpages
+    /// along the way. Thin shim around the generic
+    /// [`Self::read_xtree_logical_page`] kept for naming continuity at
+    /// the call sites in [`Self::walk_bmap`].
     fn read_bmap_logical_page(
         &mut self,
         xtroot: &XtreeRoot,
         logical_page: u64,
     ) -> Result<Vec<u8>, FilesystemError> {
-        // Find which XAD covers this logical page, then read.
-        for xad in &xtroot.xads {
-            if logical_page >= xad.logical_offset
-                && logical_page < xad.logical_offset + xad.physical_length as u64
-            {
-                let within = logical_page - xad.logical_offset;
-                let phys_block = xad.physical_address + within;
-                let byte = self.partition_offset + phys_block * self.bsize;
-                self.reader.seek(SeekFrom::Start(byte))?;
-                let mut buf = vec![0u8; PSIZE as usize];
-                self.reader.read_exact(&mut buf)?;
-                return Ok(buf);
-            }
-        }
-        Err(FilesystemError::Parse(format!(
-            "jfs: BMAP logical page {logical_page} not covered by any inline-xtree XAD"
-        )))
+        self.read_xtree_logical_page(xtroot, logical_page)
     }
 }
 
@@ -2446,5 +2561,227 @@ mod tests {
             ms.starts_with('-'),
             "expected mode_string to begin with '-', got {ms}"
         );
+    }
+
+    // ---- J.3 xtpage walker (multi-level xtree) ----
+
+    /// Pack an xtpage buffer with `flag`, `nextindex` matching `xads.len()
+    /// + 2` (the 2-slot header), and the XADs starting at byte 32. Buffer
+    /// is sized to `PSIZE` (external xtpage shape).
+    fn pack_xtpage(flag: u8, xads: &[(u64, u32, u64)]) -> Vec<u8> {
+        let mut buf = vec![0u8; PSIZE as usize];
+        buf[XTH_OFF_FLAG] = flag;
+        let nextindex = (xads.len() + 2) as u16;
+        buf[XTH_OFF_NEXTINDEX..XTH_OFF_NEXTINDEX + 2].copy_from_slice(&nextindex.to_le_bytes());
+        for (i, &(logical, length, addr)) in xads.iter().enumerate() {
+            let off = XTHEADER_SIZE + i * XAD_SIZE;
+            // XAD layout: flag(1), rsrvd(2), off1(1), off2(4), pxd(8).
+            // off1 = high 8 bits of 40-bit logical_offset; off2 = low 32.
+            buf[off + XAD_OFF_OFF1] = ((logical >> 32) & 0xFF) as u8;
+            buf[off + XAD_OFF_OFF2..off + XAD_OFF_OFF2 + 4]
+                .copy_from_slice(&((logical & 0xFFFF_FFFF) as u32).to_le_bytes());
+            // pxd_t: word0 has length in low 24 bits + addr-high in high 8;
+            // word1 has low 32 bits of address.
+            let addr_hi = ((addr >> 32) & 0xFF) as u32;
+            let word0 = (length & 0x00FF_FFFF) | (addr_hi << 24);
+            let word1 = (addr & 0xFFFF_FFFF) as u32;
+            buf[off + XAD_OFF_LOC..off + XAD_OFF_LOC + 4].copy_from_slice(&word0.to_le_bytes());
+            buf[off + XAD_OFF_LOC + 4..off + XAD_OFF_LOC + 8].copy_from_slice(&word1.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Build a synthetic 2-level xtree disk:
+    ///   root = INTERNAL with two index XADs pointing at xtpages at agg
+    ///         blocks 10 and 11 (PSIZE = 4 KiB each).
+    ///   page@10 = LEAF with two data XADs (logical 0/length 2 and
+    ///         logical 2/length 2; addresses at agg blocks 50 and 52).
+    ///   page@11 = LEAF with one data XAD (logical 4/length 3; address
+    ///         at agg block 60).
+    /// Aggregate block size = 4 KiB so logical_offset == logical_page.
+    /// Returns (disk_bytes, root_xtreeroot).
+    fn build_2level_xtree() -> (Vec<u8>, XtreeRoot) {
+        let bsize = 4096u64;
+        let total_blocks = 100u64;
+        let mut disk = vec![0u8; (total_blocks * bsize) as usize];
+
+        // Leaf page @ block 10 — covers logical pages 0..4.
+        let leaf_a = pack_xtpage(BT_LEAF_FLAG, &[(0, 2, 50), (2, 2, 52)]);
+        let leaf_a_byte = 10 * bsize as usize;
+        disk[leaf_a_byte..leaf_a_byte + leaf_a.len()].copy_from_slice(&leaf_a);
+
+        // Leaf page @ block 11 — covers logical pages 4..7.
+        let leaf_b = pack_xtpage(BT_LEAF_FLAG, &[(4, 3, 60)]);
+        let leaf_b_byte = 11 * bsize as usize;
+        disk[leaf_b_byte..leaf_b_byte + leaf_b.len()].copy_from_slice(&leaf_b);
+
+        // Stamp recognizable sentinels into the four data pages so the
+        // reader can verify it picked the right physical address.
+        for (logical_page, phys_block) in [
+            (0u64, 50u64),
+            (1, 51),
+            (2, 52),
+            (3, 53),
+            (4, 60),
+            (5, 61),
+            (6, 62),
+        ] {
+            let byte = phys_block as usize * bsize as usize;
+            for i in 0..bsize as usize {
+                disk[byte + i] = ((logical_page * 17) as u8).wrapping_add(i as u8);
+            }
+        }
+
+        // Root: INTERNAL with two index XADs. Each index XAD's logical
+        // range covers the subtree below it.
+        // Index 0 → leaf_a (logical 0..4, addr 10).
+        // Index 1 → leaf_b (logical 4..7, addr 11).
+        let root = XtreeRoot {
+            flag: BT_ROOT_FLAG | BT_INTERNAL_FLAG,
+            xads: vec![
+                Xad {
+                    flag: 0,
+                    logical_offset: 0,
+                    physical_address: 10,
+                    physical_length: 4,
+                },
+                Xad {
+                    flag: 0,
+                    logical_offset: 4,
+                    physical_address: 11,
+                    physical_length: 3,
+                },
+            ],
+        };
+        (disk, root)
+    }
+
+    #[test]
+    fn parse_xtpage_buf_round_trips() {
+        let buf = pack_xtpage(BT_LEAF_FLAG, &[(0, 2, 50), (2, 1, 53)]);
+        let parsed =
+            JfsFilesystem::<Cursor<Vec<u8>>>::parse_xtpage_buf(&buf, "test").expect("parse");
+        assert_eq!(parsed.flag, BT_LEAF_FLAG);
+        assert_eq!(parsed.xads.len(), 2);
+        assert_eq!(parsed.xads[0].logical_offset, 0);
+        assert_eq!(parsed.xads[0].physical_length, 2);
+        assert_eq!(parsed.xads[0].physical_address, 50);
+        assert_eq!(parsed.xads[1].logical_offset, 2);
+        assert_eq!(parsed.xads[1].physical_length, 1);
+        assert_eq!(parsed.xads[1].physical_address, 53);
+    }
+
+    #[test]
+    fn walk_xtree_leaves_descends_internal_nodes() {
+        let (disk, root) = build_2level_xtree();
+        // The reader needs to look like an open JFS filesystem so we
+        // can call the walker. The simplest path: hand-construct a
+        // JfsFilesystem with just the fields walk_xtree_leaves
+        // touches (reader, partition_offset, bsize).
+        let mut fs = JfsFilesystem {
+            reader: Cursor::new(disk),
+            partition_offset: 0,
+            version: 2,
+            size_in_pblocks: 0,
+            bsize: 4096,
+            pbsize: 4096,
+            agsize: 0,
+            state: FM_CLEAN,
+            flag: 0,
+            logpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            fsckpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            total_byte_extent: 0,
+            label: None,
+            bmap_walk_cache: None,
+        };
+        let mut leaves: Vec<Xad> = Vec::new();
+        fs.walk_xtree_leaves(&root, &mut |xad| leaves.push(*xad))
+            .expect("walk");
+        // Three leaf XADs total: two from the first leaf page, one from
+        // the second. Visitation order (DFS, left-to-right) matches
+        // logical offset.
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(leaves[0].logical_offset, 0);
+        assert_eq!(leaves[0].physical_address, 50);
+        assert_eq!(leaves[1].logical_offset, 2);
+        assert_eq!(leaves[1].physical_address, 52);
+        assert_eq!(leaves[2].logical_offset, 4);
+        assert_eq!(leaves[2].physical_address, 60);
+    }
+
+    #[test]
+    fn read_xtree_logical_page_descends_to_correct_leaf() {
+        let (disk, root) = build_2level_xtree();
+        let mut fs = JfsFilesystem {
+            reader: Cursor::new(disk),
+            partition_offset: 0,
+            version: 2,
+            size_in_pblocks: 0,
+            bsize: 4096,
+            pbsize: 4096,
+            agsize: 0,
+            state: FM_CLEAN,
+            flag: 0,
+            logpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            fsckpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            total_byte_extent: 0,
+            label: None,
+            bmap_walk_cache: None,
+        };
+        // Logical page 3 is covered by leaf_a's second XAD (logical 2,
+        // length 2, addr 52). Within the extent, the page maps to
+        // physical block 53.
+        let page = fs.read_xtree_logical_page(&root, 3).expect("read");
+        assert_eq!(page.len(), PSIZE as usize);
+        // Sentinel: byte 0 = (3 * 17) as u8 = 51.
+        assert_eq!(page[0], (3u64 * 17) as u8);
+        // Logical page 5 lives in leaf_b (logical 4, length 3, addr 60)
+        // → physical block 61. Sentinel: (5 * 17) as u8 = 85.
+        let page5 = fs.read_xtree_logical_page(&root, 5).expect("read 5");
+        assert_eq!(page5[0], (5u64 * 17) as u8);
+    }
+
+    #[test]
+    fn read_xtree_logical_page_uncovered_errors() {
+        let (disk, root) = build_2level_xtree();
+        let mut fs = JfsFilesystem {
+            reader: Cursor::new(disk),
+            partition_offset: 0,
+            version: 2,
+            size_in_pblocks: 0,
+            bsize: 4096,
+            pbsize: 4096,
+            agsize: 0,
+            state: FM_CLEAN,
+            flag: 0,
+            logpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            fsckpxd: Pxd {
+                length: 0,
+                address: 0,
+            },
+            total_byte_extent: 0,
+            label: None,
+            bmap_walk_cache: None,
+        };
+        // Logical page 7 is past leaf_b's end (covers 4..7) — error.
+        let err = fs
+            .read_xtree_logical_page(&root, 7)
+            .expect_err("must error");
+        assert!(matches!(err, FilesystemError::Parse(_)));
     }
 }
