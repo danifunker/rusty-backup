@@ -1405,6 +1405,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "applesdos33" => Ok(Box::new(apple_dos::AppleDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "efs" => Ok(Box::new(efs::EfsFilesystem::open(
                     reader,
                     partition_offset,
