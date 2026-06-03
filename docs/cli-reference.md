@@ -404,7 +404,7 @@ Usage: convert [OPTIONS] <IN> <OUT>
 
 ### `expand`
 
-Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image
+Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single-partition HFS images.
 
 ```
 Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>

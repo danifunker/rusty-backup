@@ -16,7 +16,7 @@ use super::filesystem::{
 };
 use super::hfs::{HfsExtDescriptor, HfsFilesystem};
 use crate::fs::FilesystemError;
-use crate::partition::apm::{Apm, ApmPartitionEntry};
+use crate::partition::apm::{Apm, ApmPartitionEntry, DriverDescriptorRecord};
 
 /// Classic-HFS catalog record type byte.
 const CATALOG_DIR: i8 = 1;
@@ -548,6 +548,11 @@ fn is_driver_type(t: &str) -> bool {
 /// `Apple_HFS` partition when one exists; otherwise it starts immediately
 /// after the last driver partition (or at block 64 if there are none),
 /// matching the layout Apple's tools produce.
+///
+/// A non-APM source (a raw single-partition HFS image with no DDR at sector
+/// 0) is accepted: drivers come up empty, no `Apple_HFS` self-entry is
+/// mimicked, and the output is a fresh APM-wrapped disk with just one
+/// `Apple_HFS` partition at block 64.
 pub fn emit_apm_disk_with_hfs<R, W>(
     source_disk: &mut R,
     source_data_size: u64,
@@ -571,22 +576,32 @@ where
         ));
     }
 
-    let source_apm = Apm::parse(source_disk)
-        .map_err(|e| FilesystemError::InvalidData(format!("failed to parse source APM: {e}")))?;
-    let block_size = source_apm.ddr.block_size as u64;
-    if block_size != 512 {
-        return Err(FilesystemError::InvalidData(format!(
-            "unsupported APM block size {block_size}; only 512 is handled"
-        )));
+    // Source APM is optional: a raw single-partition HFS image (no DDR at
+    // sector 0) is a valid input too. When parsing fails we treat the source
+    // as having no APM — no drivers to carry over, no source HFS partition
+    // to mimic, no self-entry to clone. The result is a fresh APM with one
+    // Apple_HFS partition at block 64.
+    let source_apm = Apm::parse(source_disk).ok();
+    if let Some(apm) = &source_apm {
+        let block_size = apm.ddr.block_size as u64;
+        if block_size != 512 {
+            return Err(FilesystemError::InvalidData(format!(
+                "unsupported APM block size {block_size}; only 512 is handled"
+            )));
+        }
     }
 
     // Collect driver partitions from the source, in start-block order.
     let mut drivers: Vec<ApmPartitionEntry> = source_apm
-        .entries
-        .iter()
-        .filter(|e| is_driver_type(&e.partition_type))
-        .cloned()
-        .collect();
+        .as_ref()
+        .map(|apm| {
+            apm.entries
+                .iter()
+                .filter(|e| is_driver_type(&e.partition_type))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     drivers.sort_by_key(|d| d.start_block);
 
     // HFS start block: prefer the source's first Apple_HFS start so emulators
@@ -598,9 +613,8 @@ where
         .max()
         .unwrap_or(0);
     let source_hfs_start: Option<u32> = source_apm
-        .entries
-        .iter()
-        .find(|e| e.partition_type == "Apple_HFS")
+        .as_ref()
+        .and_then(|apm| apm.entries.iter().find(|e| e.partition_type == "Apple_HFS"))
         .map(|e| e.start_block);
 
     // The APM map itself is `1 + map_entries` blocks (DDR + entries) starting
@@ -630,10 +644,11 @@ where
     // reserved block_count (typically 63 on classic Mac disks) and status
     // flags (0x37 on bootable Quadra disks). Some Mac ROMs reject the disk
     // if the self-entry's status is zero.
-    let source_self = source_apm
-        .entries
-        .iter()
-        .find(|e| e.partition_type == "Apple_partition_map");
+    let source_self = source_apm.as_ref().and_then(|apm| {
+        apm.entries
+            .iter()
+            .find(|e| e.partition_type == "Apple_partition_map")
+    });
     let map_block_count = source_self.map(|e| e.block_count).unwrap_or(map_entries);
     entries.push(ApmPartitionEntry {
         signature: 0x504D,
@@ -666,9 +681,8 @@ where
     // through to the expanded copy. Fall back to 0x33 / "MacOS" only when
     // the source has no Apple_HFS entry.
     let source_hfs = source_apm
-        .entries
-        .iter()
-        .find(|e| e.partition_type == "Apple_HFS");
+        .as_ref()
+        .and_then(|apm| apm.entries.iter().find(|e| e.partition_type == "Apple_HFS"));
     entries.push(ApmPartitionEntry {
         signature: 0x504D,
         map_entries,
@@ -690,7 +704,24 @@ where
         pad: source_hfs.map(|e| e.pad.clone()).unwrap_or_default(),
     });
 
-    let mut new_apm = source_apm.clone();
+    // Reuse the source's DDR when present (preserves SCSI driver descriptor
+    // entries the Mac ROM needs to load drivers at boot). For a non-APM
+    // source there's nothing to preserve — build a minimal DDR that matches
+    // what `build_minimal_apm` produces for a fresh disk.
+    let mut new_apm = source_apm.unwrap_or_else(|| Apm {
+        ddr: DriverDescriptorRecord {
+            signature: 0x4552,
+            block_size: 512,
+            block_count: target_block_count,
+            dev_type: 0,
+            dev_id: 0,
+            sb_data: 0,
+            driver_count: 0,
+            driver_info: Vec::new(),
+        },
+        entries: Vec::new(),
+        map_entry_count: 0,
+    });
     new_apm.entries = entries;
     new_apm.map_entry_count = map_entries;
     new_apm.ddr.block_count = target_block_count;
@@ -1334,5 +1365,59 @@ mod tests {
         let err = emit_apm_disk_with_hfs(&mut src, source_len, &bad_image, &mut out_cursor)
             .expect_err("non-512-aligned image must be rejected");
         assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    /// A raw single-partition HFS image (a `partition-0.img` with no APM
+    /// wrapper) is a valid source for `emit_apm_disk_with_hfs`: it produces
+    /// a fresh APM-wrapped disk with one `Apple_HFS` partition at block 64
+    /// and zero drivers carried over.
+    #[test]
+    fn emit_apm_from_non_apm_source() {
+        // Source: bare HFS bytes, no DDR at sector 0.
+        let source_disk = crate::fs::hfs::create_blank_hfs(1024 * 1024, 4096, "Source").unwrap();
+        let source_len = source_disk.len() as u64;
+        // Sanity check: Apm::parse must refuse this — otherwise the test
+        // isn't exercising the non-APM fallback.
+        assert!(Apm::parse(&mut Cursor::new(&source_disk)).is_err());
+
+        // Cloned HFS payload (the "expanded" volume).
+        let hfs_image =
+            crate::fs::hfs::create_blank_hfs(2 * 1024 * 1024, 4096, "Expanded").unwrap();
+
+        let mut src_cursor = Cursor::new(source_disk);
+        let mut output: Vec<u8> = Vec::new();
+        let mut out_cursor = Cursor::new(&mut output);
+        let report =
+            emit_apm_disk_with_hfs(&mut src_cursor, source_len, &hfs_image, &mut out_cursor)
+                .expect("emit succeeds against a non-APM source");
+
+        assert_eq!(report.drivers_copied, 0);
+        // min_after_map = 1 + (1 + 0 + 1) = 3; drivers_end = 0; falls back
+        // to the block-64 floor.
+        assert_eq!(report.hfs_start_block, 64);
+        assert_eq!(report.hfs_block_count, hfs_image.len() as u32 / 512);
+
+        // Re-parse the emitted disk: DDR + self-entry + Apple_HFS only.
+        let mut cursor = Cursor::new(&output);
+        let parsed = Apm::parse(&mut cursor).expect("emitted APM parses");
+        assert_eq!(parsed.ddr.block_size, 512);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].partition_type, "Apple_partition_map");
+        assert_eq!(parsed.entries[1].partition_type, "Apple_HFS");
+        assert_eq!(parsed.entries[1].start_block, 64);
+        assert_eq!(parsed.entries[1].name, "MacOS");
+
+        // HFS partition is fsck-clean inside the wrapper.
+        let mut fs =
+            HfsFilesystem::open(Cursor::new(&output), report.hfs_start_block as u64 * 512).unwrap();
+        let fsck = fs.fsck().expect("HFS supports fsck");
+        assert!(
+            fsck.is_clean(),
+            "fsck errors on emitted HFS partition: {:?}",
+            fsck.errors
+                .iter()
+                .map(|e| e.code.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

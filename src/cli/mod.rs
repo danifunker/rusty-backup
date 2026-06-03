@@ -120,7 +120,9 @@ pub enum Command {
     Resize(verbs::resize::ResizeArgs),
 
     /// Expand a classic-HFS volume to a new size + allocation block size
-    /// by cloning into a fresh APM disk image.
+    /// by cloning into a fresh APM disk image (default) or a bare HFS
+    /// image (`--to-hfv`). Accepts APM-wrapped sources or raw single-
+    /// partition HFS images.
     Expand(verbs::expand::ExpandArgs),
 
     /// Grow a disk image by `--add SIZE` of trailing zero-padding so a

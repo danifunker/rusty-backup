@@ -7,7 +7,7 @@ references. The MiSTer plan
 is the one other living plan and is treated as a single line item here;
 everything else has been consolidated into this file.
 
-Last reconciled against the code: 2026-06-02.
+Last reconciled against the code: 2026-06-03.
 
 When an item lands, remove its block. When new work surfaces, add a block
 here.
@@ -203,20 +203,8 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-### 3.1 HFS — extending a raw partition image
-
-Investigate how to extend `~/Documents/partition-0.img` (a raw single-
-partition HFS image with no APM wrapper). The current expand-HFS path
-runs through `emit_apm_disk_with_hfs` in `src/fs/hfs_clone.rs`, which
-assumes an APM source.
-
-Step 1: reproduce, confirm whether raw-image expand ever worked or has
-always been APM-only. Step 2: either add a non-APM emit path (just
-write the cloned HFS image to the output) or document the APM-only
-constraint and offer to wrap the source first. The HFV path
-(`src/fs/hfv.rs::clone_into_hfv`) is the analogous "bare HFS, no
-wrapper" pattern and likely the cleanest reference for what a non-APM
-extend would look like.
+(Section currently empty — §3.1 HFS raw-image expand closed 2026-06-03,
+see §10. Reopen when new small-to-medium filesystem work surfaces.)
 
 ---
 
@@ -398,6 +386,23 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **HFS — extending a raw partition image (§3.1)** — `emit_apm_disk_with_hfs`
+  in `src/fs/hfs_clone.rs` now takes `Apm::parse` as optional: a non-APM
+  source (a raw single-partition HFS image like `partition-0.img`, no DDR at
+  sector 0) is a valid input. Drivers come up empty, no Apple_HFS self-entry
+  is mimicked, and the output is a fresh APM-wrapped disk with one
+  `Apple_HFS` partition at block 64. The fallback DDR mirrors what
+  `build_minimal_apm` produces. GUI default `output_hfv` now keys on
+  `partition_offset == 0` (covers both `.hfv` superfloppies and any raw
+  single-partition HFS image), and the "Flat HFV" radio + Save As dialog
+  broaden to "Bare HFS image (.hfv / .img)" so the cap-at-2047-MB framing
+  reads as a classic-HFS limit rather than BasiliskII-specific. CLI `expand`
+  about-string updated to advertise raw-source support. Tests: unit
+  `emit_apm_from_non_apm_source` in `src/fs/hfs_clone.rs` (asserts 0 drivers
+  copied, HFS at block 64, output parses + fsck-clean) and integration
+  `test_expand_runner_wraps_non_apm_source_in_apm` in
+  `tests/filesystem_e2e.rs` (end-to-end runner from `partition-0.img`-style
+  source to APM-wrapped output with file round-trip).
 - **XFS hole (E.1) — v5/CRC primitives** — new `src/fs/xfs/v5_crc.rs`
   with `crc32c` (Castagnoli, init=0xFFFFFFFF, xorout=0xFFFFFFFF, matched
   to `xfs_start_cksum_safe`), `stamp_crc(buf, crc_off)` that zeroes
