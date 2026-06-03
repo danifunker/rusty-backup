@@ -6,6 +6,7 @@ pub mod chd;
 pub mod chd_edit;
 pub mod chd_options;
 pub mod compress;
+pub mod containers;
 pub mod dc42;
 pub mod dmg;
 pub mod export;
