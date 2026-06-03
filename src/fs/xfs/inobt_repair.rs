@@ -521,7 +521,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // (2) free extents of this AG, carve the tree's blocks off the largest.
         let derived = derive_free_extents(&map, agno, agblocks, expected_len);
-        let need = blocks_needed_for(chunks.len(), bs, INOBT_REC_SIZE, INOBT_KEY_SIZE);
+        // R3 currently rejects v5 at the entry point above, so this AG-rebuild
+        // is always v4 today; passing `false` preserves that.
+        let need = blocks_needed_for(chunks.len(), bs, INOBT_REC_SIZE, INOBT_KEY_SIZE, false);
         let (carved, _reduced) = carve_from_largest(&derived, need as u32).ok_or_else(|| {
             FilesystemError::Unsupported(format!(
                 "AG {agno}: largest free extent too small for a {need}-block inobt"
@@ -547,6 +549,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             bs,
             agno as u32,
             &carved,
+            None,
         );
         for blk in &tree.blocks {
             let fsblock = (agno << sb.agblklog) | blk.agbno as u64;

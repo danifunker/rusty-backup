@@ -529,8 +529,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         derived: &[FreeExtent],
     ) -> Result<u64, FilesystemError> {
         let bs = sb.blocksize as usize;
+        let is_v5 = sb.is_v5();
         // Per-tree block count is the same for bno and cnt (same record set).
-        let per_tree = blocks_needed(derived.len(), bs);
+        let per_tree = blocks_needed(derived.len(), bs, is_v5);
         let total_needed = 2 * per_tree;
 
         // Carve the btree blocks off the end of the largest free extent so the
@@ -546,7 +547,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         debug_assert_eq!(carved.len(), total_needed);
         // The shortened largest extent might change which tree is bigger? No —
         // count is unchanged, so blocks_needed is unchanged.
-        debug_assert_eq!(blocks_needed(reduced.len(), bs), per_tree);
+        debug_assert_eq!(blocks_needed(reduced.len(), bs, is_v5), per_tree);
 
         let bno_blocks = &carved[0..per_tree];
         let cnt_blocks = &carved[per_tree..total_needed];
@@ -561,8 +562,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 .then(a.startblock.cmp(&b.startblock))
         });
 
-        let bno = build_alloc_btree(&bno_recs, XFS_ABTB_MAGIC, bs, agno as u32, bno_blocks);
-        let cnt = build_alloc_btree(&cnt_recs, XFS_ABTC_MAGIC, bs, agno as u32, cnt_blocks);
+        // v4 + v5: build_alloc_btree branches on `Some(sb)` to emit the CRC
+        // sblock header tuple. The v5 magic is the `_CRC_` variant.
+        let (bno_magic, cnt_magic) = if is_v5 {
+            (
+                super::types::XFS_ABTB_CRC_MAGIC,
+                super::types::XFS_ABTC_CRC_MAGIC,
+            )
+        } else {
+            (XFS_ABTB_MAGIC, XFS_ABTC_MAGIC)
+        };
+        let sb_for_v5: Option<&XfsSuperblock> = if is_v5 { Some(sb) } else { None };
+        let bno = build_alloc_btree(&bno_recs, bno_magic, bs, agno as u32, bno_blocks, sb_for_v5);
+        let cnt = build_alloc_btree(&cnt_recs, cnt_magic, bs, agno as u32, cnt_blocks, sb_for_v5);
 
         // Write every built block at its fsblock location.
         for blk in bno.blocks.iter().chain(cnt.blocks.iter()) {

@@ -446,11 +446,20 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // (4) Reserve `need` contiguous AG-local blocks for the new tree AND
         // free the old tree blocks in one freespace rebuild — the only way to
         // avoid stranding either side when the AG's freespace is tight.
-        let need = blocks_needed_for(records.len(), bs_usize, INOBT_REC_SIZE, INOBT_KEY_SIZE);
+        let is_v5 = sb.is_v5();
+        let need = blocks_needed_for(
+            records.len(),
+            bs_usize,
+            INOBT_REC_SIZE,
+            INOBT_KEY_SIZE,
+            is_v5,
+        );
         let new_tree_start_agbno =
             self.swap_inobt_blocks_in_ag(sb, agno, &old_blocks, need as u32)?;
 
-        // (5) Build the new tree on the carved block run.
+        // (5) Build the new tree on the carved block run. v4 always; v5
+        // (`XFS_IBT_CRC_MAGIC`) lights up once the upstream alloc gate lifts
+        // (E.4 follow-up + E.5).
         let carved_agbnos: Vec<u32> = (0..need as u32).map(|i| new_tree_start_agbno + i).collect();
         let tree = build_sblock_btree(
             &packed,
@@ -460,6 +469,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             bs_usize,
             agno as u32,
             &carved_agbnos,
+            None, // v4-only until the v5 path activates
         );
 
         // (6) Write every new tree block. Until the AGI root/level update at
@@ -1258,7 +1268,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             // The rebuild carves its btree blocks from the largest remaining
             // free extent, so make sure one is big enough.
             let post_largest = post.iter().map(|e| e.blockcount).max().unwrap_or(0) as usize;
-            let need_bt = 2 * blocks_needed(post.len(), bs);
+            let need_bt = 2 * blocks_needed(post.len(), bs, sb.is_v5());
             if post_largest <= need_bt {
                 continue;
             }
