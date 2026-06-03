@@ -64,35 +64,33 @@ const SB_OFFSET_UFS2: u64 = 65536;
 const SB_OFFSET_UFS1: u64 = 8192;
 
 /// UFS1 magic — `0x00011954`, encoded little-endian as `54 19 01 00`.
-const MAGIC_UFS1: u32 = 0x0001_1954;
+pub(crate) const MAGIC_UFS1: u32 = 0x0001_1954;
 /// UFS2 magic — `0x19540119`, encoded little-endian as `19 01 54 19`.
-const MAGIC_UFS2: u32 = 0x1954_0119;
+pub(crate) const MAGIC_UFS2: u32 = 0x1954_0119;
 
 /// Offset of `fs_magic` within `struct fs` (FreeBSD `sys/ufs/ffs/fs.h`).
-const MAGIC_OFF: usize = 1372;
+pub(crate) const MAGIC_OFF: usize = 1372;
 
 /// How many bytes of the superblock we read in a single call. 2 KiB covers
 /// every Tier-A field including the 64-bit UFS2 size at offset 1080 and
 /// the magic at offset 1372.
-const SB_READ_SIZE: usize = 2048;
+pub(crate) const SB_READ_SIZE: usize = 2048;
 
 // On-disk field offsets, validated against the FreeBSD struct definition
 // and cross-checked against our makefs-built fixtures (see scripts/
 // generate-ufs-fixtures.sh + scripts/probe-ufs-sb.py).
-#[allow(dead_code)] // surfaced for completeness; the SB block address isn't
-                    // needed by U.1/U.2/U.3
-const OFF_SBLKNO: usize = 0x008; // fs_sblkno      i32 — SB address in frags
-const OFF_CBLKNO: usize = 0x00C; // fs_cblkno      i32 — CG block addr in frags
-const OFF_IBLKNO: usize = 0x010; // fs_iblkno      i32 — inode-block addr in frags
-const OFF_OLD_SIZE: usize = 0x024; // fs_old_size    i32 — UFS1 total fragments
-const OFF_NCG: usize = 0x02C; // fs_ncg         u32 — # cylinder groups
-const OFF_BSIZE: usize = 0x030; // fs_bsize       i32 — block size in bytes
-const OFF_FSIZE: usize = 0x034; // fs_fsize       i32 — fragment size in bytes
-const OFF_FRAG: usize = 0x038; // fs_frag        i32 — frags per block
-const OFF_IPG: usize = 0x0B8; // fs_ipg         u32 — inodes per CG
-const OFF_FPG: usize = 0x0BC; // fs_fpg         i32 — fragments per CG
+pub(crate) const OFF_SBLKNO: usize = 0x008; // fs_sblkno      i32 — SB address in frags
+pub(crate) const OFF_CBLKNO: usize = 0x00C; // fs_cblkno      i32 — CG block addr in frags
+pub(crate) const OFF_IBLKNO: usize = 0x010; // fs_iblkno      i32 — inode-block addr in frags
+pub(crate) const OFF_OLD_SIZE: usize = 0x024; // fs_old_size    i32 — UFS1 total fragments
+pub(crate) const OFF_NCG: usize = 0x02C; // fs_ncg         u32 — # cylinder groups
+pub(crate) const OFF_BSIZE: usize = 0x030; // fs_bsize       i32 — block size in bytes
+pub(crate) const OFF_FSIZE: usize = 0x034; // fs_fsize       i32 — fragment size in bytes
+pub(crate) const OFF_FRAG: usize = 0x038; // fs_frag        i32 — frags per block
+pub(crate) const OFF_IPG: usize = 0x0B8; // fs_ipg         u32 — inodes per CG
+pub(crate) const OFF_FPG: usize = 0x0BC; // fs_fpg         i32 — fragments per CG
 const OFF_VOLNAME: usize = 680; // fs_volname[32] — `u_char[MAXVOLLEN]`
-const OFF_SIZE_UFS2: usize = 1080; // fs_size        i64 — UFS2 64-bit fragments
+pub(crate) const OFF_SIZE_UFS2: usize = 1080; // fs_size        i64 — UFS2 64-bit fragments
 const OFF_MAXSYMLINKLEN: usize = 0x528; // fs_maxsymlinklen i32 — inline-symlink cutoff (60 for UFS1, 120 for UFS2)
 const OFF_FLAGS2: usize = 0x35E; // fs_flags2      i32 (relevant journal bits live elsewhere too, but this is the canonical "ENABLED" word in modern UFS2)
 
@@ -102,7 +100,7 @@ const VOLNAME_LEN: usize = 32;
 
 /// Reserved as "not an inode". Inode 1 is the historical bad-blocks file
 /// (unused since BSD 4.2); inode 2 is the root directory.
-const ROOT_INODE: u32 = 2;
+pub(crate) const ROOT_INODE: u32 = 2;
 
 const UFS_NDADDR: usize = 12; // direct disk-block pointers per inode
 const UFS_NIADDR: usize = 3; // indirect disk-block pointers per inode
@@ -144,19 +142,19 @@ const MAX_DIR_BYTES: usize = 16 * 1024 * 1024;
 //   d_type     u8   (offset 6)
 //   d_namlen   u8   (offset 7)
 // Followed by `d_namlen` name bytes + NUL pad to a 4-byte boundary.
-const DIRENT_HDR_LEN: usize = 8;
+pub(crate) const DIRENT_HDR_LEN: usize = 8;
 
 // ---- Cylinder-group on-disk header (`struct cg` in fs.h) ----
 
 /// Magic number at offset 4 of every cylinder-group header. Matches
 /// `CG_MAGIC` from FreeBSD `sys/ufs/ffs/fs.h`.
-const CG_MAGIC: u32 = 0x0009_0255;
-const CG_OFF_MAGIC: usize = 0x004;
-const CG_OFF_CGX: usize = 0x00C; // cg_cgx          u32 — CG index
-const CG_OFF_NDBLK: usize = 0x014; // cg_ndblk        u32 — # data frags in CG
-const CG_OFF_IUSEDOFF: usize = 0x05C; // cg_iusedoff     u32 — inode-used bitmap offset
-const CG_OFF_FREEOFF: usize = 0x060; // cg_freeoff      u32 — free-frag bitmap offset
-const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — used to bound the bitmap
+pub(crate) const CG_MAGIC: u32 = 0x0009_0255;
+pub(crate) const CG_OFF_MAGIC: usize = 0x004;
+pub(crate) const CG_OFF_CGX: usize = 0x00C; // cg_cgx          u32 — CG index
+pub(crate) const CG_OFF_NDBLK: usize = 0x014; // cg_ndblk        u32 — # data frags in CG
+pub(crate) const CG_OFF_IUSEDOFF: usize = 0x05C; // cg_iusedoff     u32 — inode-used bitmap offset
+pub(crate) const CG_OFF_FREEOFF: usize = 0x060; // cg_freeoff      u32 — free-frag bitmap offset
+pub(crate) const CG_OFF_NEXTFREEOFF: usize = 0x064; // cg_nextfreeoff  u32 — used to bound the bitmap
 
 /// How many bytes of the CG header we read in a single sweep. The fixed
 /// portion ends around byte 168, and the trailing free-frag bitmap can
@@ -249,6 +247,10 @@ pub struct UfsFilesystem<R> {
     /// CG. Inode `inum`'s dinode lives at `(cg * fpg + iblkno) * fsize +
     /// in_cg * dinode_size` for CG `cg = inum / ipg`.
     pub(crate) iblkno: u32,
+    /// `fs_sblkno`: fragment offset of the SB replica region inside each
+    /// CG. CG `i`'s replica SB lives at `(cg * fpg + sblkno) * fsize`. Used
+    /// by `ufs_fsck` to check that every replica matches the primary.
+    pub(crate) sblkno: u32,
     pub(crate) total_frags: u64,
     /// `fs_maxsymlinklen`: byte cutoff for inline (fast) symlinks. A
     /// symlink whose `di_size <= maxsymlinklen` stores its target
@@ -328,6 +330,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let ipg = read_u32(&sb, OFF_IPG, endian);
         let cblkno = read_i32(&sb, OFF_CBLKNO, endian);
         let iblkno = read_i32(&sb, OFF_IBLKNO, endian);
+        let sblkno = read_i32(&sb, OFF_SBLKNO, endian);
         // `fs_maxsymlinklen` may be negative on corrupt images; clamp to
         // zero and a generous upper bound (the dinode pointer area). The
         // upper clamp matches the kernel — a value larger than the inline
@@ -378,6 +381,11 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         if iblkno <= 0 || (iblkno as i64) <= (cblkno as i64) {
             return Err(FilesystemError::Parse(format!(
                 "ufs: implausible inode-table offset iblkno={iblkno} (cblkno={cblkno})"
+            )));
+        }
+        if sblkno < 0 {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: implausible SB replica offset sblkno={sblkno}"
             )));
         }
 
@@ -441,6 +449,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             ipg,
             cblkno: cblkno as u32,
             iblkno: iblkno as u32,
+            sblkno: sblkno as u32,
             total_frags,
             maxsymlinklen,
             label,
@@ -527,6 +536,195 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
         let mut bitmap = vec![0u8; expected_len as usize];
         self.reader.read_exact(&mut bitmap)?;
         Ok((bitmap, cg_ndblk as u64))
+    }
+
+    // ---- U.4 (fsck) helpers ----
+
+    /// Total addressable inode count across every CG (`ipg * ncg`). Inode 0
+    /// and 1 are reserved; root lives at inum 2.
+    pub(crate) fn total_inodes(&self) -> u64 {
+        self.ipg as u64 * self.ncg as u64
+    }
+
+    /// Byte offset (relative to the partition start) of the replica
+    /// superblock inside CG `cg`. Mirrors the kernel's `cgsblock(fs, c)`
+    /// macro for layouts where `cgstart == cgbase` (UFS2 always; UFS1
+    /// post-rotational-table-removal). Returns `None` if `cg >= ncg`.
+    pub(crate) fn replica_sb_byte_offset(&self, cg: u32) -> Option<u64> {
+        if cg >= self.ncg {
+            return None;
+        }
+        Some((cg as u64 * self.fpg as u64 + self.sblkno as u64) * self.fsize)
+    }
+
+    /// Read the SB-sized prefix (`SB_READ_SIZE` bytes) at CG `cg`'s replica
+    /// slot. Failures bubble up — callers (fsck) turn them into warnings.
+    pub(crate) fn read_replica_sb_bytes(&mut self, cg: u32) -> Result<Vec<u8>, FilesystemError> {
+        let off = self
+            .replica_sb_byte_offset(cg)
+            .ok_or_else(|| FilesystemError::Parse(format!("ufs: cg {cg} out of range")))?;
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + off))?;
+        let mut buf = vec![0u8; SB_READ_SIZE];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Walk every disk fragment a regular-file / directory / symlink-with-
+    /// out-of-line-target inode owns. Returns `(data_frags, indirect_frags)`
+    /// — sparse-hole blocks (pointer = 0) are skipped. `indirect_frags`
+    /// covers the indirect blocks themselves (which occupy disk space too)
+    /// so a thorough bitmap consistency check can account for them.
+    ///
+    /// Special files (device / fifo / socket) and inline symlinks own no
+    /// disk blocks; this returns `(vec![], vec![])` for those.
+    pub(crate) fn walk_inode_blocks(
+        &mut self,
+        inode: &UfsInode,
+    ) -> Result<(Vec<u64>, Vec<u64>), FilesystemError> {
+        let mut data: Vec<u64> = Vec::new();
+        let mut indirect: Vec<u64> = Vec::new();
+
+        match unix_file_type(inode.mode) {
+            UnixFileType::Regular
+            | UnixFileType::Directory
+            | UnixFileType::Unknown
+            | UnixFileType::Symlink => {}
+            _ => return Ok((data, indirect)),
+        }
+
+        // Inline symlinks live in the dinode payload area — no disk blocks
+        // beyond the dinode itself, which the bitmap already accounts for.
+        if matches!(unix_file_type(inode.mode), UnixFileType::Symlink)
+            && self.maxsymlinklen > 0
+            && (inode.size as u32) <= self.maxsymlinklen
+        {
+            return Ok((data, indirect));
+        }
+
+        // How many logical blocks does the file span? `bsize` is the block
+        // size; the last block may be partial (smaller than `bsize`) which
+        // is fine because we walk by logical-block index, not by byte.
+        let total_bytes = inode.size;
+        if total_bytes == 0 {
+            return Ok((data, indirect));
+        }
+        let bs = self.bsize;
+        let last_lbn = total_bytes.div_ceil(bs);
+
+        // First 12 logical blocks live in `direct[]`; no indirect blocks
+        // are touched until the file spans more than that.
+        let ndaddr = UFS_NDADDR as u64;
+        for lbn in 0..last_lbn.min(ndaddr) {
+            let frag = inode.direct[lbn as usize];
+            if frag != 0 {
+                data.push(frag);
+            }
+        }
+        if last_lbn <= ndaddr {
+            return Ok((data, indirect));
+        }
+
+        let nindir = self.nindir();
+
+        // Single indirect — one indirect block, `nindir` pointers.
+        if inode.indirect[0] != 0 {
+            indirect.push(inode.indirect[0]);
+            let span = (last_lbn - ndaddr).min(nindir);
+            for i in 0..span {
+                let frag = self.read_indirect_pointer(inode.indirect[0], i)?;
+                if frag != 0 {
+                    data.push(frag);
+                }
+            }
+        }
+        if last_lbn <= ndaddr + nindir {
+            return Ok((data, indirect));
+        }
+
+        // Double indirect — one top + nindir middle + nindir² leaves.
+        let n2 = nindir.saturating_mul(nindir);
+        if inode.indirect[1] != 0 {
+            indirect.push(inode.indirect[1]);
+            let span = (last_lbn - ndaddr - nindir).min(n2);
+            let mid_count = span.div_ceil(nindir);
+            for m in 0..mid_count {
+                let mid = self.read_indirect_pointer(inode.indirect[1], m)?;
+                if mid == 0 {
+                    continue;
+                }
+                indirect.push(mid);
+                let lo = m * nindir;
+                let hi = ((m + 1) * nindir).min(span);
+                for inner in lo..hi {
+                    let frag = self.read_indirect_pointer(mid, inner - lo)?;
+                    if frag != 0 {
+                        data.push(frag);
+                    }
+                }
+            }
+        }
+        if last_lbn <= ndaddr + nindir + n2 {
+            return Ok((data, indirect));
+        }
+
+        // Triple indirect — one top + nindir mid + nindir² inner.
+        let n3 = n2.saturating_mul(nindir);
+        if inode.indirect[2] != 0 {
+            indirect.push(inode.indirect[2]);
+            let span = (last_lbn - ndaddr - nindir - n2).min(n3);
+            let outer_count = span.div_ceil(n2);
+            for o in 0..outer_count {
+                let mid_top = self.read_indirect_pointer(inode.indirect[2], o)?;
+                if mid_top == 0 {
+                    continue;
+                }
+                indirect.push(mid_top);
+                let outer_lo = o * n2;
+                let outer_hi = ((o + 1) * n2).min(span);
+                let outer_span = outer_hi - outer_lo;
+                let inner_count = outer_span.div_ceil(nindir);
+                for m in 0..inner_count {
+                    let inner_idx = self.read_indirect_pointer(mid_top, m)?;
+                    if inner_idx == 0 {
+                        continue;
+                    }
+                    indirect.push(inner_idx);
+                    let lo = m * nindir;
+                    let hi = ((m + 1) * nindir).min(outer_span);
+                    for leaf in lo..hi {
+                        let frag = self.read_indirect_pointer(inner_idx, leaf - lo)?;
+                        if frag != 0 {
+                            data.push(frag);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((data, indirect))
+    }
+
+    /// Read raw bytes from `inode`'s data fork into `buf`, used by fsck's
+    /// directory walk so it can iterate DIRENT2 records without going
+    /// through the `Filesystem::list_directory` path (which is recursive
+    /// and would re-enter the trait).
+    pub(crate) fn read_dir_bytes_raw(
+        &mut self,
+        inode: &UfsInode,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        if inode.size as usize > MAX_DIR_BYTES {
+            return Err(FilesystemError::Parse(format!(
+                "ufs: directory inode {} claims size {} bytes (cap {MAX_DIR_BYTES})",
+                inode.inum, inode.size
+            )));
+        }
+        self.read_inode_data(inode, inode.size, inode.size as usize)
+    }
+
+    /// Endian-aware accessor for `ufs_fsck` so the helper can decode
+    /// replica SB byte slices without re-exporting every per-field reader.
+    pub(crate) fn endian_value(&self) -> UfsEndian {
+        self.endian
     }
 
     // ---- U.3: dinode + directory + file walk ----
@@ -864,7 +1062,7 @@ const FS_DIRTY: u8 = 0;
 
 // ---- Byte-order-aware field readers ----
 
-fn read_u16(buf: &[u8], off: usize, endian: UfsEndian) -> u16 {
+pub(crate) fn read_u16(buf: &[u8], off: usize, endian: UfsEndian) -> u16 {
     let bytes = [buf[off], buf[off + 1]];
     match endian {
         UfsEndian::Little => u16::from_le_bytes(bytes),
@@ -872,11 +1070,11 @@ fn read_u16(buf: &[u8], off: usize, endian: UfsEndian) -> u16 {
     }
 }
 
-fn read_i16(buf: &[u8], off: usize, endian: UfsEndian) -> i16 {
+pub(crate) fn read_i16(buf: &[u8], off: usize, endian: UfsEndian) -> i16 {
     read_u16(buf, off, endian) as i16
 }
 
-fn read_u32(buf: &[u8], off: usize, endian: UfsEndian) -> u32 {
+pub(crate) fn read_u32(buf: &[u8], off: usize, endian: UfsEndian) -> u32 {
     let bytes = [buf[off], buf[off + 1], buf[off + 2], buf[off + 3]];
     match endian {
         UfsEndian::Little => u32::from_le_bytes(bytes),
@@ -884,11 +1082,11 @@ fn read_u32(buf: &[u8], off: usize, endian: UfsEndian) -> u32 {
     }
 }
 
-fn read_i32(buf: &[u8], off: usize, endian: UfsEndian) -> i32 {
+pub(crate) fn read_i32(buf: &[u8], off: usize, endian: UfsEndian) -> i32 {
     read_u32(buf, off, endian) as i32
 }
 
-fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
+pub(crate) fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
     let bytes = [
         buf[off],
         buf[off + 1],
@@ -905,7 +1103,7 @@ fn read_u64(buf: &[u8], off: usize, endian: UfsEndian) -> u64 {
     }
 }
 
-fn read_i64(buf: &[u8], off: usize, endian: UfsEndian) -> i64 {
+pub(crate) fn read_i64(buf: &[u8], off: usize, endian: UfsEndian) -> i64 {
     let bytes = [
         buf[off],
         buf[off + 1],
@@ -1068,6 +1266,10 @@ impl<R: Read + Seek + Send> Filesystem for UfsFilesystem<R> {
         // is a follow-up under U.2 (alongside the bitmap walk that
         // drives `last_data_byte`).
         self.total_size()
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::ufs_fsck::fsck_ufs(self))
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
@@ -2072,6 +2274,217 @@ mod tests {
         for i in 0..8192usize {
             assert_eq!(bytes[12 * 8192 + i], (i & 0xFF) as u8);
         }
+    }
+
+    // ---- fsck (U.4) ----
+
+    #[test]
+    fn fixture_ufs1_fsck_clean() {
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open ufs1");
+        let result = fs.fsck().expect("UFS implements fsck").expect("fsck runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors on a known-clean fixture: {:?}",
+            result
+                .errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+        // Fixture has the standard makefs root structure (./../a.txt/...);
+        // confirm the stats counters fired.
+        assert!(result.stats.files_checked > 0 || result.stats.directories_checked > 0);
+    }
+
+    #[test]
+    fn fixture_ufs2_fsck_clean() {
+        let img = load_fixture("test_ufs2.img.zst");
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open ufs2");
+        let result = fs.fsck().expect("UFS implements fsck").expect("fsck runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors on a known-clean UFS2 fixture: {:?}",
+            result
+                .errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Corrupt CG 0's bitmap so a known-allocated fragment looks free.
+    /// The fsck's inode-allocated cross-check must surface
+    /// `BitmapMissingAllocation`.
+    #[test]
+    fn fsck_flags_bitmap_missing_allocation() {
+        let mut img = load_fixture("test_ufs1.img.zst");
+
+        // Find the root dir's first allocated data fragment by walking
+        // it through the clean view, then flip its bitmap bit to "free".
+        let frag = {
+            let mut fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("open");
+            let root = fs.read_inode(ROOT_INODE).expect("read root inode");
+            let (data, _) = fs.walk_inode_blocks(&root).expect("walk root");
+            *data
+                .iter()
+                .find(|&&f| f != 0)
+                .expect("root has at least one data fragment")
+        };
+
+        // Re-open to learn CG 0's bitmap byte offset.
+        let (bitmap_byte, in_cg) = {
+            let fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("open");
+            let cg = frag / fs.fpg as u64;
+            assert_eq!(cg, 0, "test assumes root is in CG 0");
+            let in_cg = frag % fs.fpg as u64;
+            // The bitmap lives at `cg_freeoff` from the CG header start;
+            // the simplest way to get the byte offset is to ask read_cg_*
+            // for it. Use the canonical formula: cg_header_offset + freeoff,
+            // but we only need the resulting bitmap-byte position. Walking
+            // the same path as `read_cg_free_bitmap` would re-validate the
+            // header; we don't need to repeat that. Read freeoff directly.
+            let cg_byte = fs.cg_header_offset(cg as u32);
+            // freeoff lives at offset CG_OFF_FREEOFF in the header.
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(
+                &img[cg_byte as usize + CG_OFF_FREEOFF..cg_byte as usize + CG_OFF_FREEOFF + 4],
+            );
+            let freeoff = u32::from_le_bytes(buf) as u64;
+            (cg_byte + freeoff + in_cg / 8, in_cg % 8)
+        };
+
+        // Flip the bit ON (= free in UFS convention) while the inode
+        // still claims it.
+        img[bitmap_byte as usize] |= 1u8 << in_cg as u8;
+
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("re-open");
+        let result = fs.fsck().expect("UFS implements fsck").expect("fsck runs");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.code == "BitmapMissingAllocation"),
+            "expected BitmapMissingAllocation, got: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(result.repairable);
+    }
+
+    /// Corrupt CG 0's replica SB magic so the fsck flags
+    /// `ReplicaSbMagicMismatch`. UFS1 fixture has 1 CG → no replica
+    /// distinct from primary, so this test uses a multi-CG fixture path
+    /// by hand-rolling a 2-CG image instead. (Real makefs fixtures we
+    /// have are 1-CG; the synthetic SB builder + a tiny replica suffices.)
+    #[test]
+    fn fsck_flags_replica_sb_magic_mismatch() {
+        // Build a 2-CG synthetic UFS2 image. fpg=64, ipg=64. Total frags
+        // = 128. bsize=8192, fsize=1024. sblkno=8 (placed inside the CG
+        // header region for simplicity).
+        let bsize = 8192u32;
+        let fsize = 1024u32;
+        let fpg = 64u32;
+        let ipg = 64u32;
+        let ncg = 2u32;
+        let total_frags = (fpg as u64) * (ncg as u64);
+        let sblkno = 8i32;
+        let mut img = build_sb(
+            UfsVersion::Ufs2,
+            UfsEndian::Little,
+            SB_OFFSET_UFS1,
+            bsize,
+            fsize,
+            ncg,
+            fpg,
+            ipg,
+            total_frags,
+            b"",
+            1,
+            0,
+        );
+        // Patch sblkno into the SB so the parser captures it.
+        img[SB_OFFSET_UFS1 as usize + OFF_SBLKNO..SB_OFFSET_UFS1 as usize + OFF_SBLKNO + 4]
+            .copy_from_slice(&sblkno.to_le_bytes());
+
+        // Grow the buffer to the size the SB claims.
+        let needed = (total_frags as usize) * (fsize as usize);
+        if img.len() < needed {
+            img.resize(needed, 0);
+        }
+
+        // Stamp a CG header at the start of each CG. The cg layout the
+        // bitmap reader inspects requires CG_MAGIC + cg_cgx + cg_ndblk +
+        // valid freeoff/nextfreeoff. We carve a tiny header: magic at
+        // byte 4, cg_cgx at byte 12, cg_ndblk at byte 20, iusedoff at
+        // byte 92, freeoff at byte 96, nextfreeoff at byte 100.
+        for cg in 0..ncg {
+            let cg_byte = (cg as u64 * fpg as u64 + 24/*cblkno default from build_sb*/) as usize
+                * fsize as usize;
+            // Magic at byte 4.
+            img[cg_byte + CG_OFF_MAGIC..cg_byte + CG_OFF_MAGIC + 4]
+                .copy_from_slice(&CG_MAGIC.to_le_bytes());
+            // cg_cgx at byte 12.
+            img[cg_byte + CG_OFF_CGX..cg_byte + CG_OFF_CGX + 4].copy_from_slice(&cg.to_le_bytes());
+            // cg_ndblk at byte 20 = fpg.
+            img[cg_byte + CG_OFF_NDBLK..cg_byte + CG_OFF_NDBLK + 4]
+                .copy_from_slice(&fpg.to_le_bytes());
+            // iusedoff = 256 (somewhere past the fixed header), freeoff = 264,
+            // nextfreeoff = 264 + ndblk/8.
+            let iusedoff = 256u32;
+            let freeoff = 264u32;
+            let nextfreeoff = freeoff + fpg.div_ceil(8);
+            img[cg_byte + CG_OFF_IUSEDOFF..cg_byte + CG_OFF_IUSEDOFF + 4]
+                .copy_from_slice(&iusedoff.to_le_bytes());
+            img[cg_byte + CG_OFF_FREEOFF..cg_byte + CG_OFF_FREEOFF + 4]
+                .copy_from_slice(&freeoff.to_le_bytes());
+            img[cg_byte + CG_OFF_NEXTFREEOFF..cg_byte + CG_OFF_NEXTFREEOFF + 4]
+                .copy_from_slice(&nextfreeoff.to_le_bytes());
+            // Bitmap: mark all free except a few overhead frags at start.
+            for i in (freeoff as usize)..(nextfreeoff as usize) {
+                img[cg_byte + i] = 0xFF;
+            }
+        }
+
+        // Write a valid replica SB at CG 1's sblkno (mirror primary).
+        let cg1_sb_byte = (fpg as u64 + sblkno as u64) as usize * fsize as usize;
+        let primary_sb_bytes: Vec<u8> =
+            img[SB_OFFSET_UFS1 as usize..SB_OFFSET_UFS1 as usize + SB_READ_SIZE].to_vec();
+        if cg1_sb_byte + SB_READ_SIZE > img.len() {
+            img.resize(cg1_sb_byte + SB_READ_SIZE, 0);
+        }
+        img[cg1_sb_byte..cg1_sb_byte + SB_READ_SIZE].copy_from_slice(&primary_sb_bytes);
+
+        // Sanity: clean fsck before corruption.
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&img), 0).expect("open clean");
+            let result = fs.fsck().expect("supports fsck").expect("runs");
+            // Geometry warnings are OK (this is a hand-rolled tiny image);
+            // we only assert no ReplicaSbMagicMismatch fires on a clean replica.
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|e| e.code == "ReplicaSbMagicMismatch"),
+                "expected no ReplicaSbMagicMismatch on clean replica, got: {:?}",
+                result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+            );
+        }
+
+        // Corrupt the replica SB's magic.
+        img[cg1_sb_byte + MAGIC_OFF..cg1_sb_byte + MAGIC_OFF + 4]
+            .copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut fs = UfsFilesystem::open(Cursor::new(img), 0).expect("open corrupted");
+        let result = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.code == "ReplicaSbMagicMismatch"),
+            "expected ReplicaSbMagicMismatch, got: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(result.repairable);
     }
 
     #[test]

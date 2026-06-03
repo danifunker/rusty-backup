@@ -37,6 +37,7 @@ pub mod resource_fork;
 pub mod sfs;
 pub mod tree;
 pub mod ufs;
+pub mod ufs_fsck;
 pub mod unix_common;
 pub mod xfs;
 pub mod zstd_stream;
