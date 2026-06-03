@@ -378,10 +378,16 @@ now-contiguous free tail → **defrag**.
 EtherDFS was considered and **dropped**: its server side is Linux-centric, so
 "support macOS/Windows/Linux hosts" would mean owning a cross-platform
 raw-Ethernet listener anyway — not easy. For v1 there is **no network code**;
-removable media is the path. If we ever add networking, we build **both ends
-ourselves** (a small cross-platform host listener — likely libpcap/npcap or even
-just serial — plus a DOS-side client) so the UX stays simple. Revisit only after
-the local round-trip ships.
+removable media is the path. Revisit only after the local round-trip ships.
+
+When we do, the design is scoped in detail in
+**[`cb_dos_network_and_state.md`](cb_dos_network_and_state.md)**: **TCP/IP over a
+Crynwr packet driver** (mTCP as reference/borrow candidate) with the host as an
+`rb-cli net-serve` subcommand on a **plain unprivileged socket** — chosen over raw
+L2 because TCP gives reliability for free and keeps the host pcap/root-free. That
+doc also covers the coupled **disk-state model** the transport needs (chunked
+`.cbk` resume container, the "same source?" fingerprint, the file manifest +
+attribute round-trip, boot protection, and swap-file exclusion).
 
 ---
 
@@ -436,7 +442,11 @@ the local round-trip ships.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
 - [ ] **Phase 7 (deferred)** — built-in network transport (host + DOS client,
-      both ours), only if removable media proves insufficient.
+      both ours), only if removable media proves insufficient. Full design +
+      sub-phases (7a–7i) in
+      [`cb_dos_network_and_state.md`](cb_dos_network_and_state.md): TCP/IP over a
+      packet driver, chunked `.cbk` resume container, disk-state fingerprint, file
+      manifest + idempotency, boot protection, swap exclusion.
 
 ---
 
