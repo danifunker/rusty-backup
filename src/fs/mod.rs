@@ -24,6 +24,7 @@ pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
 pub mod jfs;
+pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod ntfs;

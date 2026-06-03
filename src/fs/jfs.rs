@@ -113,7 +113,7 @@ const FM_CLEAN: u32 = 0;
 /// Page size. JFS uses 4 KiB pages for all metadata structures
 /// regardless of the aggregate block size — even on a 512-byte-block
 /// volume, the inode/xtree/dmap pages are 4 KiB.
-const PSIZE: u64 = 4096;
+pub(crate) const PSIZE: u64 = 4096;
 /// `AIMAP_OFF = SUPER1_OFF + SIZE_OF_SUPER` — primary aggregate inode
 /// allocation map. Right after the primary superblock.
 const AIMAP_OFF: u64 = SB_OFFSET + PSIZE;
@@ -125,22 +125,19 @@ const AITBL_OFF: u64 = AIMAP_OFF + 2 * PSIZE;
 /// `DISIZE` — bytes per on-disk inode.
 const DISIZE: u64 = 512;
 /// Aggregate's reserved system-inode numbers.
-#[allow(dead_code)] // J.3 consumes AGGREGATE_I for the AIT-self xtree walk
-const AGGREGATE_I: u32 = 1; // self-describes the AIT
-const BMAP_I: u32 = 2; // block allocation map control inode
-#[allow(dead_code)] // surfaced for completeness; J.2/J.3 don't consult LOG_I
-const LOG_I: u32 = 3;
-#[allow(dead_code)]
-const BADBLOCK_I: u32 = 4;
-const FILESYSTEM_I: u32 = 16; // first fileset (user data)
+pub(crate) const AGGREGATE_I: u32 = 1; // self-describes the AIT
+pub(crate) const BMAP_I: u32 = 2; // block allocation map control inode
+pub(crate) const LOG_I: u32 = 3;
+pub(crate) const BADBLOCK_I: u32 = 4;
+pub(crate) const FILESYSTEM_I: u32 = 16; // first fileset (user data)
 /// Fileset-internal root directory inode number. Reserved like UFS's
 /// inode 2: the first fileset inode (`fino=0`/`fino=1`) is reserved
 /// and the root dir always lives at `fino=2`.
-const FILESET_ROOT_INO: u32 = 2;
+pub(crate) const FILESET_ROOT_INO: u32 = 2;
 /// Maximum aggregate inode number we read via the first AIT extent.
 /// FILESYSTEM_I = 16 is the highest one we care about; the kernel
 /// reserves slots up to 31.
-const AIT_INODES: u32 = 32;
+pub(crate) const AIT_INODES: u32 = 32;
 
 // Dinode field byte offsets (`struct dinode` in `jfs_dinode.h`).
 const DI_OFF_INOSTAMP: usize = 0; // u32
@@ -169,10 +166,10 @@ const DI_FASTSYMLINK_LEN: usize = 128;
 
 /// `INOSPEREXT` — dinodes per inode extent (32 × 512 B = 16 KiB =
 /// 4 aggregate blocks at bsize=4096).
-const INOSPEREXT: u32 = 32;
+pub(crate) const INOSPEREXT: u32 = 32;
 /// `EXTSPERIAG` — inode-extent slots per IAG (each iag describes 128
 /// possible inode extents = 4096 fileset inodes).
-const EXTSPERIAG: usize = 128;
+pub(crate) const EXTSPERIAG: usize = 128;
 /// Byte offset of `inoext[]` (pxd_t[EXTSPERIAG]) within a 4096-byte
 /// iag. Layout per `jfs_imap.h`:
 ///   header (72) + pad (1976) + wmap (512) + pmap (512) + inoext (1024) = 4096
@@ -205,7 +202,7 @@ const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
 /// slice. Empirically the kernel keeps a directory inline while its
 /// total entry count fits in the 8 free slots (~7 short-name entries),
 /// so the cap below is generous.
-const DT_INLINE_CAP: u64 = 4096;
+pub(crate) const DT_INLINE_CAP: u64 = 4096;
 
 // Mode bits. The low 16 bits hold POSIX mode (S_IFMT + perms); high bits
 // hold JFS attribute flags (IFJOURNAL, IDIRECTORY, etc.).
@@ -1602,6 +1599,10 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
         }
     }
 
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::jfs_fsck::fsck_jfs(self))
+    }
+
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         // Lazy-walk the BMAP on first call so the inspect tab + the
         // backup pipeline both get the tighter (highest-allocated)
@@ -2538,6 +2539,150 @@ mod tests {
             }
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    // ---- J.4a fsck (read-only verifier) ----
+
+    /// The clean fixture must fsck clean — no errors. We tolerate
+    /// warnings because the fixture's BMAP walk may surface BMAP-walk
+    /// warnings the same way `last_data_byte` does.
+    #[test]
+    fn fixture_fsck_clean() {
+        use crate::fs::filesystem::Filesystem;
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let result = fs.fsck().expect("JFS implements fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors on a known-clean fixture: {:?}",
+            result
+                .errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+        // The fixture has /hello.txt /large.bin /link.txt /subdir /tiny.txt
+        // — connectivity pass should walk root + subdir.
+        assert!(
+            result.stats.directories_checked >= 2,
+            "expected ≥2 dirs walked (/ + /subdir), got {}",
+            result.stats.directories_checked
+        );
+        // Should report at least the BMAP stats + IAG count + allocated
+        // fileset inodes — pin one of those to lock the extras format.
+        assert!(
+            result
+                .stats
+                .extra
+                .iter()
+                .any(|(k, _)| k == "allocated_fileset_inodes"),
+            "missing allocated_fileset_inodes extra: {:?}",
+            result.stats.extra
+        );
+    }
+
+    /// fsck must surface an `IagPmapInoextSkew` when a pmap word is
+    /// non-zero for an extent slot whose `inoext[i].length` is zero
+    /// (kernel writes both ways simultaneously; non-zero pmap on a
+    /// length=0 extent is structural skew). We forge this by writing a
+    /// stray bit into the pmap word of an unallocated extent slot
+    /// (`pmap[10]`, which is normally zero on the small fixture).
+    #[test]
+    fn fsck_flags_pmap_inoext_skew() {
+        use crate::fs::filesystem::Filesystem;
+        let mut img = load_fixture("test_jfs.img.zst");
+
+        // Locate IAG 0's pmap[]. FILESYSTEM_I's xtree root has a single
+        // XAD covering logical pages 0..N; page 0 is the dinomap header,
+        // page 1 is IAG 0. So IAG 0's byte = (xad.physical_address + 1)
+        // * bsize.
+        let iag0_byte = {
+            let mut fs = JfsFilesystem::open(Cursor::new(&img), 0).expect("open");
+            let fs_ino = fs.read_ait_inode(FILESYSTEM_I).expect("read FS_I");
+            let xtroot = fs
+                .parse_inline_xtree_root(&fs_ino.raw)
+                .expect("parse xtree");
+            let xad = xtroot.xads[0];
+            (xad.physical_address + 1) * fs.aggregate_block_size()
+        };
+        // pmap is `u32[EXTSPERIAG]` at offset 2560. Target pmap[10] —
+        // way past the fixture's actually-allocated extents.
+        let pmap10_byte = iag0_byte as usize + 2560 + 10 * 4;
+        // Sanity: it must be zero pre-corruption.
+        let pre = u32::from_le_bytes(img[pmap10_byte..pmap10_byte + 4].try_into().unwrap());
+        assert_eq!(pre, 0, "test assumes pmap[10] is currently zero");
+        // Set the MSB → claims inode 0 in extent 10 is allocated.
+        img[pmap10_byte..pmap10_byte + 4].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("re-open");
+        let result = fs.fsck().expect("JFS implements fsck").expect("runs");
+        assert!(
+            result.errors.iter().any(|e| e.code == "IagPmapInoextSkew"),
+            "expected IagPmapInoextSkew, got: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// fsck must flag an orphan inode: forge an unreachable inode by
+    /// (a) setting its pmap bit in IAG 0's `pmap[0]` (the word for
+    /// extent 0, which is already allocated on the fixture); and
+    /// (b) stamping a valid `mode + di_number` in the dinode slot at
+    /// fino 8's byte offset. The fixture's root dir doesn't reference
+    /// fino 8 → orphan.
+    #[test]
+    fn fsck_flags_orphan_inode() {
+        use crate::fs::filesystem::Filesystem;
+        let mut img = load_fixture("test_jfs.img.zst");
+        let orphan_inum = 8u32;
+
+        // Locate IAG 0's byte + extent 0's dinode-extent byte.
+        let (iag0_byte, extent0_addr_byte, bsize) = {
+            let mut fs = JfsFilesystem::open(Cursor::new(&img), 0).expect("open");
+            let fs_ino = fs.read_ait_inode(FILESYSTEM_I).expect("read FS_I");
+            let xtroot = fs
+                .parse_inline_xtree_root(&fs_ino.raw)
+                .expect("parse xtree");
+            let xad = xtroot.xads[0];
+            let iag0 = fs.read_fileset_iag_at(0).expect("IAG 0");
+            assert!(iag0.inoext[0].length > 0, "extent 0 must be allocated");
+            let bs = fs.aggregate_block_size();
+            (
+                (xad.physical_address + 1) * bs,
+                iag0.inoext[0].address * bs,
+                bs,
+            )
+        };
+
+        // (a) Set pmap[0] bit 23 (= 31 - 8) → claims fino 8 allocated.
+        let pmap0_byte = iag0_byte as usize + 2560;
+        let pre = u32::from_le_bytes(img[pmap0_byte..pmap0_byte + 4].try_into().unwrap());
+        let post = pre | (1u32 << (31 - 8));
+        img[pmap0_byte..pmap0_byte + 4].copy_from_slice(&post.to_le_bytes());
+
+        // (b) Stamp dinode at fino 8's byte offset: extent base + 8 * DISIZE.
+        let dinode_byte = (extent0_addr_byte + orphan_inum as u64 * 512) as usize;
+        // di_number at offset 8.
+        img[dinode_byte + 8..dinode_byte + 12].copy_from_slice(&orphan_inum.to_le_bytes());
+        // mode at offset 52 — 0o100644 (regular file).
+        img[dinode_byte + 52..dinode_byte + 56].copy_from_slice(&0o100644u32.to_le_bytes());
+
+        let _ = bsize; // silence unused warning when bsize stays here
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("re-open");
+        let result = fs.fsck().expect("JFS implements fsck").expect("runs");
+        assert!(
+            result.errors.iter().any(|e| e.code == "OrphanInode"),
+            "expected OrphanInode, got: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(
+            result
+                .orphaned_entries
+                .iter()
+                .any(|o| o.id == orphan_inum as u64),
+            "orphaned_entries did not include forged inum {orphan_inum}: {:?}",
+            result.orphaned_entries
+        );
+        assert!(result.repairable, "OrphanInode is repairable");
     }
 
     #[test]
