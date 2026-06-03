@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::ReadSeek;
@@ -50,6 +51,26 @@ pub fn is_imz_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 4];
     matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == IMZ_MAGIC
+}
+
+/// Cheap sniff: returns true when `path` looks like an Atari MSA floppy
+/// image. MSA's `$0E 0F` magic is short; we additionally require the
+/// extension to be `.msa` (case-insensitive) to keep the detector from
+/// guessing on arbitrary files whose first two bytes coincide.
+pub fn is_msa_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("msa"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == MSA_MAGIC
 }
 
 /// Cheap magic sniff: returns true when `path` starts with the Norton
@@ -97,6 +118,14 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let imz = ImzReader::open_with_password(path, password)
             .with_context(|| format!("open IMZ {}", path.display()))?;
         Ok(Box::new(imz))
+    } else if is_msa_path(path) {
+        // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into
+        // memory and wrapping in a Cursor is simpler than a streaming reader
+        // and matches how the container framework hands out flat sectors.
+        let bytes = std::fs::read(path).with_context(|| format!("read MSA {}", path.display()))?;
+        let flat =
+            decode_msa_bytes(&bytes).with_context(|| format!("decode MSA {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
@@ -167,6 +196,84 @@ mod tests {
         let mut f = File::create(&path).unwrap();
         f.write_all(&[0xFE, 0xEF, 0x01]).unwrap();
         assert!(is_gho_path(&path));
+    }
+
+    #[test]
+    fn is_msa_path_requires_both_extension_and_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Right magic, wrong extension.
+        let no_ext = dir.path().join("disk.bin");
+        std::fs::write(&no_ext, b"\x0E\x0Frest").unwrap();
+        assert!(!is_msa_path(&no_ext), "magic without .msa extension");
+
+        // Right extension, wrong magic.
+        let wrong_magic = dir.path().join("fake.msa");
+        std::fs::write(&wrong_magic, b"NOPE").unwrap();
+        assert!(
+            !is_msa_path(&wrong_magic),
+            ".msa extension without 0E 0F magic"
+        );
+
+        // Both.
+        let real = dir.path().join("real.msa");
+        std::fs::write(&real, b"\x0E\x0F\0\0").unwrap();
+        assert!(is_msa_path(&real));
+    }
+
+    #[test]
+    fn open_read_routes_msa_through_decoder_and_partition_detect_finds_fat() {
+        use crate::partition::PartitionTable;
+        use crate::rbformats::containers::msa::{encode_msa_bytes, MsaHeader};
+
+        // Build a 720K raw FAT12 floppy in memory: BPB at byte 0, 0xAA55 at
+        // 510-511. No partition table — `detect` should report
+        // `PartitionTable::None { fs_hint: "FAT" }`.
+        let header = MsaHeader {
+            sectors_per_track: 9,
+            sides: 1,
+            start_track: 0,
+            end_track: 79,
+        };
+        let total = 720 * 1024;
+        let mut raw = vec![0u8; total];
+        // Minimal valid BPB.
+        raw[0] = 0xEB; // JMP short
+        raw[1] = 0x3C;
+        raw[2] = 0x90;
+        raw[3..11].copy_from_slice(b"MSDOS5.0");
+        raw[11] = 0x00; // 512 bps
+        raw[12] = 0x02;
+        raw[13] = 0x01; // 1 spc
+        raw[14] = 0x01; // 1 reserved
+        raw[15] = 0x00;
+        raw[16] = 0x02; // 2 FATs
+        raw[21] = 0xF9; // media descriptor for 720K
+        raw[510] = 0x55;
+        raw[511] = 0xAA;
+
+        let msa = encode_msa_bytes(header, &raw);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atari.msa");
+        std::fs::write(&path, &msa).unwrap();
+        assert!(is_msa_path(&path));
+
+        let mut reader = open_read(&path).unwrap();
+        // First 512 bytes should be the BPB-bearing boot sector.
+        let mut sector = [0u8; 512];
+        reader.read_exact(&mut sector).unwrap();
+        assert_eq!(&sector[3..11], b"MSDOS5.0");
+        assert_eq!(sector[510], 0x55);
+        assert_eq!(sector[511], 0xAA);
+
+        // And the partition detector should treat it as a FAT superfloppy.
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "FAT");
+        assert_eq!(parts[0].size_bytes, total as u64);
     }
 
     /// SECTOR-mode uncompressed GHO opens as a GhoReader via the

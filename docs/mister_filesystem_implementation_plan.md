@@ -20,10 +20,22 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Planning complete and technically verified. No
-implementation started. Next action: Wave-1 shared infra + AtariST.
+**Current position:** AtariST prereqs landed — AHDI partition table + the
+container framework with MSA decoder are in tree and dispatch end-to-end
+through the existing FAT12 driver. Next action: MacPlus MFS 400K (Wave 1)
+or step into AtariST stage 4 (reference cross-check against Hatari / real
+`.st` images).
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 — Shipped AtariST prereqs: `src/partition/atari.rs` (AHDI
+  primary + XGM extended chain, big-endian, no magic, checksum round-trip)
+  wired into `PartitionTable::Ahdi` with synthetic MBR type bytes routing
+  GEM/BGM straight into FAT; `src/rbformats/containers/{mod,msa}.rs`
+  (container dispatch + MSA `$0E0F` decoder w/ `$E5` RLE) wired through
+  both `model::source_reader::open_read` (in-memory `Cursor`) and GUI
+  `prepare_disk_image_path` (`.msa` → `.st` tempfile). End-to-end test:
+  MSA bytes → `open_read` → `PartitionTable::detect` → FAT12 superfloppy.
+  Next: pick up MacPlus MFS 400K or AtariST stage 4 (reference cross-check).
 - 2026-05-31 — Plan authored; tech assumptions verified (AHDI ✓, MSA ✓, a2kit
   CP/M DPB ✓ flexible; fluxfox import ✗ → port decoders from source). Net-new
   deps = 0. No code yet. Next: §3.1 + container framework, then AtariST.
@@ -47,14 +59,14 @@ A core is **done** only when every applicable stage is `[x]`.
 ### Shared infrastructure (built lazily; first wave that needs it)
 
 - [ ] §3.1 non-512 logical-sector accessor + `src/fs/README.md` note
-- [ ] §3.2 container framework `src/rbformats/containers/` (`open_container` dispatch)
-- [ ] §3.2 decoders: [ ] MSA · [ ] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [ ] `.d88`
+- [x] §3.2 container framework `src/rbformats/containers/` (`open_container` dispatch)
+- [ ] §3.2 decoders: [x] MSA · [ ] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [ ] `.d88`
 - [ ] §3.3 partitionless / extension-dispatch framework
 - [ ] §3.4 convention docs (endianness, bitmap polarity, write-safety)
 
 ### Wave 1 — near-complete dual-media cores
 
-- [ ] **AtariST** — prereqs [ ] MSA [ ] AHDI table · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize (FAT/HDD) · [ ] gui · [ ] cli · [ ] tests
+- [~] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect (FAT via existing dispatch) · [x] extract (FAT) · [ ] ref · [x] add/del (FAT) · [ ] write-verified · [x] resize (FAT/HDD via existing FAT resize) · [~] gui (MSA materialize wired; AHDI surfaces in inspect) · [ ] cli · [x] tests (AHDI + MSA + end-to-end source_reader)
 - [ ] **MacPlus** (MFS 400K) · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
 - [ ] **Apple-II** (DOS 3.3) — prereq [ ] sector-order container · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
 

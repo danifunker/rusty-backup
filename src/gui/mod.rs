@@ -105,11 +105,16 @@ fn file_dialog() -> rfd::FileDialog {
 /// worker code. Returns a path to a raw, seekable image — possibly the
 /// original (no work needed) or a tempfile.
 ///
-/// Only handles `.adz` / `.hdz` (gzip-decompressed to a tempfile —
-/// gzip isn't seekable). Everything else — including `.gho`/`.ghs`,
-/// `.imz`, `.chd` — passes through unchanged, since the inspect worker
-/// opens those via [`open_disk_image_for_reading`] (streaming
-/// `Read + Seek` readers, no tempfile).
+/// Handles two wrapper formats whose raw stream isn't seekable / flat:
+/// - `.adz` / `.hdz` — gzip-decompressed to a tempfile (gzip isn't
+///   seekable).
+/// - `.msa` — Atari ST Magic Shadow Archiver, decoded to a flat `.st`
+///   tempfile.
+///
+/// Everything else — including `.gho`/`.ghs`, `.imz`, `.chd` — passes
+/// through unchanged, since the inspect worker opens those via
+/// [`open_disk_image_for_reading`] (streaming `Read + Seek` readers,
+/// no tempfile).
 ///
 /// The output file lives inside a fresh `tempfile::tempdir`; callers
 /// must hold the returned `TempDir` (second tuple element) for the
@@ -129,8 +134,31 @@ pub fn prepare_disk_image_path(
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
         Some("hdz") => "hdf",
+        Some("msa") => "st",
         _ => return Ok((path.to_path_buf(), None)),
     };
+    let tmp = tempfile::tempdir()?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
+
+    if target_ext == "st" {
+        // MSA → flat raw sectors, written to a tempfile so the rest of the
+        // GUI pipeline (which addresses partitions by byte offset on a
+        // path) sees a plain `.st` image.
+        let bytes = std::fs::read(path)?;
+        let flat = rusty_backup::rbformats::containers::msa::decode_msa_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, MSA decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len()
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+
+    // Gzip-wrapped Amiga images (.adz / .hdz).
     let mut input = std::fs::File::open(path)?;
     // Spot-check the gzip magic so we surface a clear error if the
     // user renamed something to .adz that isn't actually gzipped.
@@ -145,9 +173,6 @@ pub fn prepare_disk_image_path(
     }
     use std::io::Seek;
     input.seek(std::io::SeekFrom::Start(0))?;
-    let tmp = tempfile::tempdir()?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("amiga");
-    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
     let mut decoder = flate2::read::GzDecoder::new(input);
     let mut out = std::fs::File::create(&out_path)?;
     std::io::copy(&mut decoder, &mut out)?;

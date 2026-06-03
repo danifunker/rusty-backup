@@ -7,7 +7,7 @@ references. The MiSTer plan
 is the one other living plan and is treated as a single line item here;
 everything else has been consolidated into this file.
 
-Last reconciled against the code: 2026-06-03 (late).
+Last reconciled against the code: 2026-06-03 (later — AtariST MiSTer prereqs).
 
 When an item lands, remove its block. When new work surfaces, add a block
 here.
@@ -414,6 +414,40 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **AtariST MiSTer-core prereqs (§5 MiSTer plan → §10)** — first slice
+  of the MiSTer-core spine. `src/partition/atari.rs` parses AHDI root
+  sectors (4 big-endian 12-byte slots at 0x1C6, GEM / BGM / XGM / RAW
+  IDs, optional disk-size + bad-sector + 0x1234 word-sum checksum) and
+  walks XGM extended chains MBR-EBR-style — slot 0 (logical) is
+  relative to the current extended root sector, slot 1 (XGM link)
+  relative to the outermost container; cycle + hop + total-partition
+  guards. Wires through a new `PartitionTable::Ahdi` variant gated by
+  the magic-less `looks_like_ahdi_root` probe (rejects MBR signatures,
+  requires at least one in-bounds entry with a recognized ID), inserted
+  between RDB and superfloppy probes. `partitions()` emits synthetic
+  MBR type bytes (GEM→0x01, BGM→0x06, XGM→0x05) so existing FAT12/16
+  dispatch routes the partitions directly; backup emits `ahdi.json`
+  sidecar; editor / single-file CHD assemble bail with clear "not yet
+  implemented" messages. `src/rbformats/containers/{mod,msa}.rs` adds
+  the container-decode layer (per §3.2 of the MiSTer plan): pure-Rust
+  `ContainerKind` enum + `detect_container_kind` magic-first sniffer +
+  `open_container_bytes` / `open_container_reader` returning a
+  `Box<dyn ReadSeek>` view; MSA decoder handles the 10-byte `$0E0F`
+  header + per-track payloads (uncompressed or `$E5`-RLE-compressed,
+  including the `$E5 $E5 $00 $01` literal-marker encoding); strict
+  spt/sides/track-range bounds + 4 MiB decoded-size cap. Wired into
+  `model::source_reader::open_read` (in-memory Cursor) and GUI
+  `prepare_disk_image_path` (`.msa` → `.st` tempfile) so both the
+  streaming + path-based open paths see flat sectors. End-to-end test
+  in `model/source_reader.rs` round-trips a FAT12-shaped 720K MSA
+  through `open_read` → `PartitionTable::detect` and asserts the
+  detector lands on `PartitionTable::None { fs_hint: "FAT" }`. Tests:
+  11 AHDI unit + 2 partition::tests integration + 10 container/MSA +
+  2 source_reader (is_msa_path + end-to-end MSA → FAT). Closes the
+  AtariST prereqs row in `docs/mister_filesystem_implementation_plan.md`
+  Wave 1; AtariST is now `[~]` in progress (every applicable stage
+  except reference cross-check + CLI parity flips on the FAT
+  inheritance). v4 only.
 - **XFS R3 finobt resync (slice 5) (§8 parked → §10)** — `repair_inobt_
   leaf` now uses `sb.sblock_hdr_len()` (was hardcoded 16-byte v4
   header) and re-stamps sblock-CRC on v5, returns per-record
