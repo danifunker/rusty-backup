@@ -63,44 +63,17 @@ Open holes in v4 edit (suggested order — easiest/most reusable first):
   gate is also relaxed: R2/R5 now account bmbt blocks via
   `collect_bmbt_blocks`.
 
-- **(E) v5/CRC editing** — largest item, multi-slice. **E.1 through E.4
-  shipped 2026-06-03** (see §10):
-  - E.1: `v5_crc.rs` module — CRC-32C primitive + per-block stampers +
-    on-disk fixture cross-check that proves the crc32c crate's params
-    match `mkfs.xfs`.
-  - E.2: `write_inode_region` + `init_free_inode_chunk` stamp v3 inode
-    cores on v5 writes.
-  - E.3: dir3 single-block / data-block / leaf1 builders parameterized
-    on `is_v5`; call sites stamp `xfs_dir3_blk_hdr` / `xfs_da3_blkinfo`
-    once the destination fsblock is known.
-  - E.4: `btree_build` capacities + builders thread `is_v5`; v5
-    `build_alloc_btree` / `build_sblock_btree` emit the 56-byte
-    `xfs_btree_block_shdr` with stamped uuid/blkno/lsn/owner/crc.
-    freespace_rebuild picks the v5 magic + passes `Some(sb)`.
-
-  **E.5 still open** — lift the gates:
-  - AGF / AGI / AGFL sector writes stamp v5 CRC (uuid/lsn/crc).
-  - Superblock writes (counter bumps) stamp `sb_crc`.
-  - `splice_inobt_single_leaf_record` stamps the rewritten leaf's
-    sblock-crc header.
-  - `grow_inobt_with_new_record` passes `Some(sb)` through
-    `build_sblock_btree(XFS_IBT_CRC_MAGIC)`.
-  - Top-level v5 gates in `alloc_inode_slot` /
-    `alloc_new_inode_chunk` come down; same for the R3/R5/R6/R7 repair
-    passes once their write paths are CRC-aware.
-  - **bmbt v5** (long-form, 72-byte hdr with owner = inode) — touch
-    `init_file_inode`'s `write_bmbt_root_to_leaf` and the
-    `build_bmbt_leaf_v4` helper. `XFS_BMAP_CRC_MAGIC` + the
-    `LBLOCK_CRC_*` field offsets are already wired in `v5_crc`.
-  - `fork_offset(false)` hardcodes at ~13 sites in `edit.rs` switch
-    to `fork_offset(sb.is_v5())` so the v3 inode literal area starts at
-    176 instead of 100.
-  - Stale `"v5 not supported"` comment in `src/fs/mod.rs:162` deleted.
-  - Integration test: drive `alloc_new_inode_chunk` end-to-end on the
-    v5 fixture, assert every block's CRC validates and our verifier
-    stays clean.
-
-  Ref `libxfs/xfs_cksum.h` and the per-structure crc offsets.
+- **(E) v5/CRC editing** — **shipped 2026-06-03** across nine slices
+  (E.1 / E.2 / E.3 / E.4 / E.5a / E.5b / E.5c / E.5d). End-to-end v5
+  file creation works on the modern `mkfs.xfs` fixture, `run_fsck`
+  stays clean across alloc + dir-grow + bmbt + repair paths. See §10
+  for per-slice audit. **R2 (freespace rebuild) + R3 (inobt rebuild)
+  remain v4-only** — both can write a structurally correct CRC tree,
+  but v5 layouts may carry `finobt` / `rmapbt` / `refcountbt`
+  ro-compat metadata that R2's block-completeness map and R3's
+  AGI-summary recompute don't model. Parked in §8 behind those
+  side-trees actually being needed; the existing read path is
+  already finobt-tolerant.
 
 ### 2.2 XFS shrink via clone-into-fresh
 
@@ -376,6 +349,17 @@ aren't lost.
   nodes. All four are out of scope for vintage hardware (the actual
   motivating workload) but would block any larger-than-vintage JFS
   read.
+- **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
+  helpers can now emit CRC-correct sblock-crc trees (E.4 wired
+  `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
+  safe lift is that v5 layouts may carry `finobt` (free inode btree)
+  / `rmapbt` (reverse-map btree) / `refcountbt` (reflink refcount
+  btree) ro-compat metadata that our in-memory block-completeness map
+  and AGI-summary recompute don't model — rebuilding the bnobt / cntbt
+  / inobt without resyncing the finobt would leave those side-trees
+  with stale records. Revisit when a v5 image with one of these
+  features actually needs `--repair`; the existing read path is
+  already finobt-tolerant.
 
 ---
 
@@ -469,6 +453,63 @@ docs-consolidation pass.
   their upstream gates still reject v5. Two builder-level tests verify
   the round-trip and assert every emitted block's CRC validates via
   `crc_valid`.
+- **XFS hole (E.5a) — AGF/AGI/AGFL/SB stampers** — new per-sector
+  stamp+write helpers (`write_agi_sector` / `write_agf_sector` /
+  `write_agfl_sector` / `write_sb_primary`) on `XfsFilesystem`. Each
+  branches on `sb.is_v5()`, stamps the v5 CRC tuple (uuid/lsn/crc),
+  and writes through. Every existing AGI / AGF / SB write site funnels
+  through these — `alloc_inode_slot`, `alloc_new_inode_chunk`,
+  `grow_inobt_with_new_record`, `free_inode`, R3
+  `resync_sb_inode_counts`, R4 secondary-SB fixup, R4b summary
+  rewrites, R2 `write_agf_fields` + `resync_sb_fdblocks`,
+  `bump_sb_ifree` / `bump_sb_inode_counters`. AGFL helper stays in
+  tree (`#[allow(dead_code)]`) for future allocation refills.
+- **XFS hole (E.5b) — splice / grow inobt v5 + lift inode alloc** —
+  `walk_inobt` reader accepts both v4 (`IABT`) and v5 (`IAB3`)
+  magics + the 56-byte CRC header. `splice_inobt_single_leaf_record`
+  and the single-leaf splice path in `try_claim_slot_from_existing_
+  chunks` use `sblock_hdr_len(sb.is_v5())` to pack records and
+  re-stamp the leaf's sblock-crc before write. `grow_inobt_with_new_
+  record` selects `XFS_IBT_CRC_MAGIC` + `Some(sb)` on v5 so every
+  emitted node carries a stamped CRC. `free_inode` mirrors the
+  splice-write stamp. Top-level v5 gates on `alloc_inode_slot` /
+  `alloc_new_inode_chunk` come down. Integration test
+  `alloc_new_inode_chunk_on_v5_stamps_every_block_and_stays_clean`
+  drives a fresh-chunk allocation on the modern fixture and asserts:
+  AGI/AGF/SB CRCs re-verify, the inobt leaf's sblock-crc re-verifies,
+  AGI/SB counters bump by +64, every fresh dinode carries di_version=3
+  + di_ino + di_uuid + valid di_crc, and `run_fsck` stays clean.
+- **XFS hole (E.5c) — bmbt v5 + fork_offset sweep + create_file** —
+  `build_bmbt_leaf_v4` → `build_bmbt_leaf` parameterized on `is_v5`
+  (72-byte CRC header, `XFS_BMAP_CRC_MAGIC`). `do_create_file` stamps
+  the leaf's `xfs_btree_block_lhdr` CRC via
+  `v5_crc::stamp_lblock_crc_header` (owner = new file inode) before
+  the write. `fork_offset(false)` hardcoded at 10 sites in `edit.rs`
+  is swept to `fork_offset(sb.is_v5())` so the literal area starts at
+  byte 176 on v5. `init_file_inode` zeroes bytes 100..176 on v5 so a
+  recycled slot doesn't inherit stale v3 fields. Integration test
+  `create_file_on_v5_fixture_round_trips_through_fsck` creates a new
+  file on the modern fixture, re-opens read-only, lists / reads the
+  file back, and asserts `run_fsck` stays clean — the verifier walks
+  every metadata block, so a stale CRC anywhere along the alloc /
+  init / insert path would surface as a failure.
+- **XFS hole (E.5d) — repair gates + verify** — R5 (`run_inode_core_
+  repair`), R6 (`run_dir_repair`), R7 nlink (`run_nlink_repair`), and
+  R7 orphan reconnect (`run_orphan_reconnect`) all lift their v5
+  early-returns now that `write_inode_region`, `dir_insert_entry`,
+  `init_empty_shortform_dir`, and the inobt-walk traversal are v5-
+  aware. R5/R6 inobt-leaf iteration in their own helpers picks up
+  `XFS_BTREE_SBLOCK_CRC_LEN` (56 B) when v5. **R2 (freespace rebuild)
+  and R3 (inobt repair) stay v4-only**: both could write a CRC-
+  correct tree, but v5 layouts may carry `finobt` / `rmapbt` /
+  `refcountbt` ro-compat metadata that R2's block-completeness map
+  and R3's AGI-summary recompute don't model — parked in §8. Stale
+  `"v5 not supported"` comment in `src/fs/mod.rs` updated to reflect
+  full v5 read+edit+fsck support. Integration test
+  `repair_on_clean_v5_fixture_runs_passes_and_stays_clean` runs the
+  full repair pass on a clean v5 volume: no fixes applied, no
+  failures, and `run_fsck` stays clean post-repair. 114 xfs tests
+  pass.
 
 - **Windows install + self-update** — Phases 1-9 + elevation A-H all
   done (Setup.exe via Inno, in-app `self_update` + `self_replace`,

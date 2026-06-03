@@ -55,17 +55,19 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            // v5 inode cores are CRC-protected; rewriting would invalidate
-            // them. R6 is v4-only (silent, not a failure).
-            return Ok(report);
-        }
-
+        // §2.1 (E.5d): v5 lifted. `repair_shortform_dir` rewrites the
+        // inode via `write_inode_region` (E.2), which re-stamps the v3
+        // inode core. Tree-walk offsets pick up the v5 sblock-crc header.
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
         let bs = sb.blocksize as usize;
         let ino_shift = sb.agblklog + sb.inopblog;
+        let hdr_len = if sb.is_v5() {
+            super::types::XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            INOBT_HDR_LEN
+        };
         let mut any_change = false;
 
         for agno in 0..sb.agcount as u64 {
@@ -90,12 +92,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     continue;
                 }
                 let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-                let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+                let max_leaf = (bs - hdr_len) / INOBT_REC_SIZE;
                 if numrecs > max_leaf {
                     continue;
                 }
                 for r in 0..numrecs {
-                    let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+                    let off = hdr_len + r * INOBT_REC_SIZE;
                     let start_agino = BigEndian::read_u32(&block[off..off + 4]) as u64;
                     let free = BigEndian::read_u64(&block[off + 8..off + 16]);
                     for slot in 0..XFS_INODES_PER_CHUNK as u64 {
@@ -143,9 +145,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            return Ok(report);
-        }
+        // §2.1 (E.5d): v5 lifted. `fix_inode_nlink` writes via
+        // `write_inode_region` (E.2), which re-stamps the v3 inode core.
 
         let root = match self.root() {
             Ok(r) => r,

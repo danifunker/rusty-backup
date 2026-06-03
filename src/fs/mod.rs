@@ -158,9 +158,8 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return "fat";
     }
     // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
-    // (IRIX-compatible) and v5/CRC superblocks share this magic; the
-    // XfsFilesystem parser will return a clear "v5 not supported" error
-    // on v5 disks until that work lands.
+    // (IRIX-compatible) and v5/CRC superblocks share this magic and are
+    // fully supported for read + edit + fsck (§2.1 hole (E)).
     if &sector0[0..4] == b"XFSB" {
         return "xfs";
     }

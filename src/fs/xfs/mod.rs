@@ -3382,6 +3382,48 @@ mod tests {
         );
     }
 
+    /// §2.1 hole (E.5d): drive `EditableFilesystem::repair` on a healthy v5
+    /// modern fixture. R5 / R6 / R7 / orphan-reconnect now run on v5 (they
+    /// previously short-circuited). On a clean volume they should be no-ops
+    /// — no fixes applied, no failures — and the post-repair volume must
+    /// still pass `run_fsck` clean.
+    #[test]
+    fn repair_on_clean_v5_fixture_runs_passes_and_stays_clean() {
+        use crate::fs::filesystem::EditableFilesystem;
+
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+            assert!(fs.superblock().is_v5(), "expected v5 fixture");
+            let report = fs.repair().expect("repair on clean v5 fixture");
+            assert!(
+                report.fixes_failed.is_empty(),
+                "no repair pass should fail on a clean v5 volume; got {:?}",
+                report.fixes_failed
+            );
+            // A clean volume legitimately has nothing for R5/R6/R7 to
+            // change; the repair surface promises "no-op on healthy".
+            assert!(
+                report.fixes_applied.is_empty(),
+                "no fixes should be needed on a clean v5 volume; got {:?}",
+                report.fixes_applied
+            );
+            fs.sync_metadata().expect("sync");
+        }
+
+        // After a no-op repair, the verifier must still be clean.
+        let bytes = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen v5");
+        let res = fs.run_fsck().expect("fsck after v5 repair");
+        assert!(
+            res.errors.is_empty(),
+            "v5 volume should be clean after repair pass, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
     /// §2.1 hole (E.5c): end-to-end create + read on the v5 modern fixture.
     /// Drives `EditableFilesystem::create_file` (which threads through
     /// `do_create_file` → `alloc_inode_slot` → `alloc_blocks` →

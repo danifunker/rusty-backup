@@ -2464,9 +2464,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            return Ok(report);
-        }
+        // §2.1 (E.5d): v5 lifted. Reconnection creates a `/lost+found`
+        // directory entry via the same `dir_insert_entry` /
+        // `init_empty_shortform_dir` pipeline `do_create_directory` uses;
+        // both now stamp dir3 / v3 inode core on v5.
         let root = match self.root() {
             Ok(r) => r,
             Err(_) => return Ok(report),
