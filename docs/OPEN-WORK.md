@@ -19,11 +19,13 @@ here.
 **Closed 2026-06-02.** ReiserFS (v3.5 + v3.6), UFS (UFS1 + UFS2), and JFS
 (JFS2) all read end-to-end through the trait: inspect, layout-preserving
 backup compactor, browse, file read, symlinks, recursive directory
-descent. UFS U.4 (fsck + edit + repair) all shipped 2026-06-03; see §10
-for the per-FS one-liners. JFS Tier B+ (J.4 fsck + edit, plus the J.3
-multi-page B+tree walkers for >32 GiB / non-inline-dtree JFS volumes)
-remains parked in §8 behind real demand — multi-IAG dispatch covering
->4k inodes already lifted 2026-06-03. ReiserFS is intentionally
+descent. UFS U.4 (fsck + edit + repair) shipped 2026-06-03; see §10
+for the per-FS one-liners. JFS J.4a (fsck read-only verifier) and
+multi-IAG dispatch covering >4k inodes both shipped 2026-06-03 late;
+J.4b (edit-side write primitives) and the multi-page external-dtree
+walker remain parked in §8 behind real demand. The multi-level dmapctl
+walker (>32 GiB JFS aggregates) is in §9 explicitly excluded — vintage
+hardware doesn't address that scale. ReiserFS is intentionally
 read-only forever (filesystem leaving the kernel; investment caps at
 "read what exists").
 
@@ -320,14 +322,19 @@ see §10. Reopen when new CLI / GUI work surfaces.)
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
 
-- **JFS Tier B+ (J.4) — fsck + edit.** Read shipped (see §10), but
-  every edit path runs through xtree / dtree / dmapctl B+tree writes
-  that J.1–J.3 deliberately walked only at the inline-root level.
-  Picking up edit means the multi-page B+tree walkers + reverse-
-  direction writers for all three trees. (Read-side xtpage walker
-  landed 2026-06-03, see §10 — file + BMAP xtree-internal refusals
-  lifted; multi-IAG dispatch / dtree walker / dmapctl walker still
-  open below.)
+- **JFS J.4b — edit-side write primitives.** J.4a fsck (read-only
+  verifier) shipped 2026-06-03 late (see §10). J.4b is the
+  EditableFilesystem trait surface: dir-insert into external dtrees,
+  inode alloc + free across IAGs, block alloc + free via BMAP pmap
+  flip + write, xtree leaf/internal split + collapse, dtree leaf/
+  internal split + collapse. The combined write surface drives a
+  `repair()` driver that can adopt the OrphanInode findings the
+  J.4a verifier already produces. Each sub-primitive (xtree-write /
+  dtree-write / dmap-write) is itself a non-trivial slice — multi-
+  month combined. Park reason: J.4a alone is useful (fsck-clean
+  gating in CLI + GUI, structured-output via `rb-cli fsck --format
+  json`); J.4b's value depends on the volume of OrphanInode findings
+  in the wild, which is empirically rare.
 - **JFS multi-page dtree walker (read-side).** `parse_inline_dtree`
   still refuses `di_size > DT_INLINE_CAP` (4096 bytes) and
   internal-node dtrees. Unblocks any directory whose entries spill
@@ -344,24 +351,23 @@ aren't lost.
   contents are dtree records rather than XADs so it's a separate
   parser. Park reason: shipping an unverified B+tree walker is
   higher-risk than the value of speculative support; refused on
-  demand with a clear error today.
-- **JFS multi-level dmapctl walker (read-side).** `walk_bmap` still
-  refuses aggregates ≥ 2²³ blocks (32 GiB at bsize=4096) via the
-  `MAX_BMAP_DEPTH_1_BLOCKS` cap. The new xtree walker (2026-06-03,
-  see §10) covers BMAP's internal xtree but the dmapctl L0/L1/L2
-  hierarchy past one level is a separate structure. Out of scope for
-  vintage hardware; revisit if someone hits a multi-TiB JFS volume.
+  demand with a clear error today. J.4a fsck also emits an
+  `ExternalDtreeNotWalked` warning on encounter so the verifier's
+  silence on subtrees-not-walked is loud and audited.
 - **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
   helpers can now emit CRC-correct sblock-crc trees (E.4 wired
   `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
-  safe lift is that v5 layouts may carry `finobt` (free inode btree)
-  / `rmapbt` (reverse-map btree) / `refcountbt` (reflink refcount
-  btree) ro-compat metadata that our in-memory block-completeness map
-  and AGI-summary recompute don't model — rebuilding the bnobt / cntbt
-  / inobt without resyncing the finobt would leave those side-trees
-  with stale records. Revisit when a v5 image with one of these
-  features actually needs `--repair`; the existing read path is
-  already finobt-tolerant.
+  safe lift is structural, not a TODO: v5 layouts may carry `finobt`
+  (free inode btree) / `rmapbt` (reverse-map btree) / `refcountbt`
+  (reflink refcount btree) ro-compat metadata that our in-memory
+  block-completeness map and AGI-summary recompute don't model.
+  Rebuilding the bnobt / cntbt / inobt without resyncing the finobt
+  would leave those side-trees with stale records — the rebuild
+  succeeds but `xfs_repair -n` post-repair re-flags. Lift requires
+  modeling each side-tree we encounter (read-side already finobt-
+  tolerant; rmapbt and refcountbt have no read-side path yet
+  either). Revisit when a v5 image actually carrying one of these
+  features needs `--repair` AND we have an oracle to verify against.
 
 ---
 
@@ -388,6 +394,16 @@ Out, not parked. Listed so the question doesn't get re-litigated.
   §2 for the per-crate rationale; all are reference ports, not crates.
 - **In-place btrfs balance / shrink** — replaced by §2.4
   scratch-recreate (gated on B.0 decision).
+- **JFS multi-level dmapctl walker** (read-side, BMAP at
+  `MAX_BMAP_DEPTH_1_BLOCKS` = 32 GiB cap). Vintage hardware doesn't
+  address a multi-TiB JFS aggregate; the rusty-backup target is
+  CF / SD card / single-disk retro-restore workflows where 32 GiB
+  is already an outlier. `walk_bmap` returns `Ok(None)` past the
+  cap and falls back to the conservative full-partition extent —
+  backups are still correct, only compaction efficiency is hurt.
+  Lift would require implementing the L0/L1/L2 dmapctl hierarchy
+  walk (separate from the xtree walker that already covers BMAP's
+  internal-xtree pointers). Closed-by-design rather than parked.
 - **External `chdman`** — replaced by the in-tree MAME CHD core via
   `libchdman-rs`. The Windows-host elevation rework removed the
   separate `chdman.exe` dependency.
@@ -400,6 +416,39 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **JFS J.4a — fsck (read-only verifier) (§8 parked → §10)** — new
+  `src/fs/jfs_fsck.rs` (~370 LOC) closes the read-side half of the §8
+  J.4 entry. Mirrors `ufs_fsck.rs` / `efs_fsck.rs` in shape (Builder
+  + ordered passes) but adapts to JFS's AIT + IAG + BMAP layout.
+  Passes: (1) geometry re-validation (version / bsize / pbsize); (2)
+  AIT walk via `read_ait_inode` for AGGREGATE_I / BMAP_I / LOG_I /
+  BADBLOCK_I / FILESYSTEM_I — `dinode.di_number == inum` plus
+  size-non-zero on BMAP_I + FILESYSTEM_I (LOG_I points to SB
+  logpxd, BADBLOCK_I empty on clean volume); (3) IAG walk via
+  `read_fileset_iag_at` over `(FILESYSTEM_I.di_size / PSIZE) - 1`
+  IAGs, with the CORRECTED pmap interpretation (`pmap[i]` is the u32
+  word covering 32 inodes inside extent `i`, MSB-first → bit
+  `31 - in_extent`) — an extent with length=0 + non-zero pmap word
+  fires `IagPmapInoextSkew`; per-bit walk builds the
+  allocated-fileset-inum set with `FIRST_USER_FILESET_INO = 4` skip
+  (fino 0 dummy / 1 badblock / 2 root / 3 root-ACL kernel-reserved);
+  (4) BMAP walk via `require_bmap_walk` surfaces stats + cross-checks
+  dbmap.nfree against pmap-walk-derived nfree; (5) connectivity BFS
+  from FILESET_ROOT_INO through inline dtrees, external dtrees emit
+  `ExternalDtreeNotWalked` warning + skip. Orphans = pmap-allocated
+  ∖ reachable; `PmapAllocatedInodeIsZero` fires for the pmap/dinode
+  skew variant. Wired into `Filesystem::fsck` so the trait method
+  returns `Some(Ok(result))` for JFS volumes.
+  `OrphanInode` is the only repairable code today — a repair driver
+  needs the J.4b edit-side write primitives. Constants promoted to
+  pub(crate) for the sibling module. Tests (3 added; JFS suite 57
+  → 60): `fixture_fsck_clean` is_clean() round-trip on the real
+  fixture, `fsck_flags_pmap_inoext_skew` sets the MSB of `pmap[10]`
+  (an unallocated-extent slot) and asserts the code surfaces,
+  `fsck_flags_orphan_inode` forges an orphan at fino 8 by setting
+  pmap bit 23 of `pmap[0]` + stamping mode=0o100644 + di_number=8 at
+  fino 8's dinode byte offset, asserts OrphanInode + orphaned_entries
+  + `repairable` flag.
 - **UFS U.4 — `repair()` (§8 parked → §10)** — closes the §8 parked
   driver. `repair()` lives on the `EditableFilesystem` impl at
   `src/fs/ufs.rs` and delegates to `repair_ufs`, mirroring `repair_efs`
