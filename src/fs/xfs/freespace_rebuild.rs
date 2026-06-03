@@ -563,18 +563,25 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         });
 
         // v4 + v5: build_alloc_btree branches on `Some(sb)` to emit the CRC
-        // sblock header tuple. The v5 magic is the `_CRC_` variant.
-        let (bno_magic, cnt_magic) = if is_v5 {
-            (
-                super::types::XFS_ABTB_CRC_MAGIC,
-                super::types::XFS_ABTC_CRC_MAGIC,
-            )
-        } else {
-            (XFS_ABTB_MAGIC, XFS_ABTC_MAGIC)
-        };
+        // sblock header tuple. Magics dispatch on is_v5 via the canonical
+        // `XfsSuperblock` accessors.
         let sb_for_v5: Option<&XfsSuperblock> = if is_v5 { Some(sb) } else { None };
-        let bno = build_alloc_btree(&bno_recs, bno_magic, bs, agno as u32, bno_blocks, sb_for_v5);
-        let cnt = build_alloc_btree(&cnt_recs, cnt_magic, bs, agno as u32, cnt_blocks, sb_for_v5);
+        let bno = build_alloc_btree(
+            &bno_recs,
+            sb.bnobt_magic(),
+            bs,
+            agno as u32,
+            bno_blocks,
+            sb_for_v5,
+        );
+        let cnt = build_alloc_btree(
+            &cnt_recs,
+            sb.cntbt_magic(),
+            bs,
+            agno as u32,
+            cnt_blocks,
+            sb_for_v5,
+        );
 
         // Write every built block at its fsblock location.
         for blk in bno.blocks.iter().chain(cnt.blocks.iter()) {

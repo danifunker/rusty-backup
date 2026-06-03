@@ -268,6 +268,43 @@ impl XfsSuperblock {
         }
     }
 
+    /// Inode-allocation btree magic (`bb_magic`). `IAB3` on v5, `IABT` on
+    /// v4 — both are accepted by readers; writers pick the matching one.
+    pub fn inobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_IBT_CRC_MAGIC
+        } else {
+            super::types::XFS_IBT_MAGIC
+        }
+    }
+
+    /// Free-space-by-block btree magic. `AB3B` on v5, `ABTB` on v4.
+    pub fn bnobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_ABTB_CRC_MAGIC
+        } else {
+            super::types::XFS_ABTB_MAGIC
+        }
+    }
+
+    /// Free-space-by-count btree magic. `AB3C` on v5, `ABTC` on v4.
+    pub fn cntbt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_ABTC_CRC_MAGIC
+        } else {
+            super::types::XFS_ABTC_MAGIC
+        }
+    }
+
+    /// Bmap-btree (long-form) block magic. `BMA3` on v5, `BMAP` on v4.
+    pub fn bmbt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::bmap::XFS_BMAP_CRC_MAGIC
+        } else {
+            super::bmap::XFS_BMAP_MAGIC
+        }
+    }
+
     /// True iff the DIRV2 bit is set (dir2 layout). v5 implies dir3 which is
     /// dir2-derived, so this also returns true on v5.
     pub fn is_dir2(&self) -> bool {

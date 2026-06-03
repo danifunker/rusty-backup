@@ -24,7 +24,6 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::sb::XfsSuperblock;
 use super::types::{NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN};
-use super::v5_crc::{fsblock_to_daddr, stamp_sblock_crc_header};
 
 /// Short-form btree pointers are always 4 bytes (AG-relative block numbers).
 const PTR_SIZE: usize = 4;
@@ -170,7 +169,7 @@ pub fn build_sblock_btree(
         write_header(&mut buf, magic, 0, chunk_recs as u16, left, right, seqno);
         buf[hdr..hdr + chunk.len()].copy_from_slice(chunk);
         if let Some(sb) = sb_v5 {
-            stamp_v5_sblock(&mut buf, sb, seqno as u64, agbno);
+            super::v5_crc::stamp_sblock_hdr_for_ag(&mut buf, sb, seqno as u64, agbno);
         }
         // The leaf's first record's key is its key in the parent.
         let mut key = vec![0u8; key_size];
@@ -212,7 +211,7 @@ pub fn build_sblock_btree(
                 BigEndian::write_u32(&mut buf[poff..poff + PTR_SIZE], *child_agbno);
             }
             if let Some(sb) = sb_v5 {
-                stamp_v5_sblock(&mut buf, sb, seqno as u64, agbno);
+                super::v5_crc::stamp_sblock_hdr_for_ag(&mut buf, sb, seqno as u64, agbno);
             }
             // This node's key in its parent is its first child's key.
             let key = chunk[0].1.clone();
@@ -230,17 +229,6 @@ pub fn build_sblock_btree(
         root_agbno,
         levels,
     }
-}
-
-/// Translate a v5 sblock-crc header onto an in-memory btree block (the
-/// caller has already written `bb_magic` / `bb_level` / `bb_numrecs` /
-/// `bb_leftsib` / `bb_rightsib`). `agno` is the host AG, `agbno` is the
-/// block's AG-relative number — together they map to the v5 `bb_blkno`
-/// disk address. Owner is the AG seqno.
-fn stamp_v5_sblock(buf: &mut [u8], sb: &XfsSuperblock, agno: u64, agbno: u32) {
-    let fsblock = (agno << sb.agblklog) | agbno as u64;
-    let blkno = fsblock_to_daddr(fsblock, sb);
-    stamp_sblock_crc_header(buf, blkno, agno as u32, sb);
 }
 
 /// Build an alloc btree from `extents` (already sorted by the caller in the

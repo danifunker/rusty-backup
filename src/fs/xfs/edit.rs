@@ -50,14 +50,11 @@ use std::io::{Read, Seek, Write};
 use byteorder::{BigEndian, ByteOrder};
 
 use super::ag::{XfsAgf, XfsAgi};
-use super::bmap::{encode_extent, fsblock_to_partition_byte, NULLFSBLOCK, XFS_BMAP_MAGIC};
+use super::bmap::{encode_extent, fsblock_to_partition_byte, NULLFSBLOCK};
 use super::btree_build::{blocks_needed, blocks_needed_for, build_sblock_btree, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
 use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
-use super::types::{
-    XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_DINODE_MAGIC, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC,
-    XFS_INODES_PER_CHUNK,
-};
+use super::types::{XFS_DINODE_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
@@ -84,18 +81,6 @@ const INOBT_REC_SIZE: usize = 16;
 /// inobt key is the leading 4-byte `startino` field; same width as a btree
 /// pointer.
 const INOBT_KEY_SIZE: usize = 4;
-
-/// Stamp the v5 sblock-crc header tuple (`bb_blkno` / `bb_lsn` / `bb_uuid` /
-/// `bb_owner` / `bb_crc`) on an inobt / bnobt / cntbt block buffer, given
-/// the host AG, the block's AG-relative number, and the superblock. v4
-/// callers must guard with `sb.is_v5()` — this helper unconditionally
-/// stamps. Mirrors `stamp_v5_sblock` in `btree_build` but exposed for the
-/// edit-path leaf rewrites (splice / grow callers reach for it directly).
-fn stamp_v5_sblock_for_ag(buf: &mut [u8], sb: &super::sb::XfsSuperblock, agno: u64, agbno: u32) {
-    let fsblock = (agno << sb.agblklog) | agbno as u64;
-    let blkno = super::v5_crc::fsblock_to_daddr(fsblock, sb);
-    super::v5_crc::stamp_sblock_crc_header(buf, blkno, agno as u32, sb);
-}
 
 /// AGI / superblock counter offsets.
 const AGI_COUNT_OFF: usize = 16;
@@ -204,7 +189,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     BigEndian::write_u64(&mut block[off + 8..off + 16], new_free);
                     // v5: re-stamp the leaf's sblock-crc tuple before writing.
                     if sb.is_v5() {
-                        stamp_v5_sblock_for_ag(&mut block, sb, agno, leaf_agbno);
+                        super::v5_crc::stamp_sblock_hdr_for_ag(&mut block, sb, agno, leaf_agbno);
                     }
                     self.write_fsblock(sb, fsblock, &block)?;
 
@@ -396,7 +381,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // v5 leaf carries an sblock-crc tuple — restamp after the record
         // mutation so the on-disk CRC matches the rewritten payload.
         if sb.is_v5() {
-            stamp_v5_sblock_for_ag(&mut leaf, sb, agno, root_agbno);
+            super::v5_crc::stamp_sblock_hdr_for_ag(&mut leaf, sb, agno, root_agbno);
         }
         self.write_fsblock(sb, leaf_fsblock, &leaf)?;
         Ok(())
@@ -482,17 +467,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         // emits `XFS_IBT_CRC_MAGIC` + the standard CRC tuple via
         // `build_sblock_btree`'s `Some(sb)` path.
         let carved_agbnos: Vec<u32> = (0..need as u32).map(|i| new_tree_start_agbno + i).collect();
-        let inobt_magic = if is_v5 {
-            XFS_IBT_CRC_MAGIC
-        } else {
-            XFS_IBT_MAGIC
-        };
         let sb_for_v5: Option<&super::sb::XfsSuperblock> = if is_v5 { Some(sb) } else { None };
         let tree = build_sblock_btree(
             &packed,
             INOBT_REC_SIZE,
             INOBT_KEY_SIZE,
-            inobt_magic,
+            sb.inobt_magic(),
             bs_usize,
             agno as u32,
             &carved_agbnos,
@@ -1070,9 +1050,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         read_at_aligned(&mut self.reader, agf_byte, sectsize, &mut agf_sec)?;
         let agf = XfsAgf::parse(&agf_sec)?;
         let (recs, bno_blocks) =
-            self.walk_alloc_tree(sb, agno, agf.bno_root, expected_len, XFS_ABTB_MAGIC)?;
+            self.walk_alloc_tree(sb, agno, agf.bno_root, expected_len, sb.bnobt_magic())?;
         let (_cnt_recs, cnt_blocks) =
-            self.walk_alloc_tree(sb, agno, agf.cnt_root, expected_len, XFS_ABTC_MAGIC)?;
+            self.walk_alloc_tree(sb, agno, agf.cnt_root, expected_len, sb.cntbt_magic())?;
         let mut all = recs;
         for agbno in bno_blocks.into_iter().chain(cnt_blocks) {
             all.push(FreeExtent {
@@ -1538,7 +1518,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 BigEndian::write_u32(&mut block[off + 4..off + 8], freecount + 1);
                 BigEndian::write_u64(&mut block[off + 8..off + 16], free | (1u64 << slot));
                 if sb.is_v5() {
-                    stamp_v5_sblock_for_ag(&mut block, sb, agno, leaf_agbno);
+                    super::v5_crc::stamp_sblock_hdr_for_ag(&mut block, sb, agno, leaf_agbno);
                 }
                 self.write_fsblock(sb, fsblock, &block)?;
 
@@ -2798,12 +2778,7 @@ fn runs_to_extent_records(runs: &[(u64, u32)]) -> Vec<(u64, u64, u32)> {
 fn build_bmbt_leaf(extents: &[(u64, u64, u32)], sb: &super::sb::XfsSuperblock) -> Vec<u8> {
     let bs = sb.blocksize as usize;
     let mut buf = vec![0u8; bs];
-    let magic = if sb.is_v5() {
-        super::bmap::XFS_BMAP_CRC_MAGIC
-    } else {
-        XFS_BMAP_MAGIC
-    };
-    BigEndian::write_u32(&mut buf[0..4], magic);
+    BigEndian::write_u32(&mut buf[0..4], sb.bmbt_magic());
     BigEndian::write_u16(&mut buf[4..6], 0); // level 0 = leaf
     BigEndian::write_u16(&mut buf[6..8], extents.len() as u16);
     BigEndian::write_u64(&mut buf[8..16], NULLFSBLOCK); // leftsib

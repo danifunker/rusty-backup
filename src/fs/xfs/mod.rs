@@ -40,9 +40,11 @@ use byteorder::{BigEndian, ByteOrder};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
+#[cfg(test)]
+use bmap::XFS_BTREE_LBLOCK_CRC_LEN;
 use bmap::{
     decode_extent, fsblock_to_partition_byte, XfsBmbtIrec, NULLFSBLOCK, XFS_BMAP_CRC_MAGIC,
-    XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_CRC_LEN, XFS_BTREE_LBLOCK_LEN,
+    XFS_BMAP_MAGIC, XFS_BTREE_LBLOCK_LEN,
 };
 use inode::{inode_byte_offset, XfsDinodeCore};
 use sb::XfsSuperblock;
@@ -238,11 +240,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             ));
         }
         let bs = self.sb.blocksize as u64;
-        let hdr_len = if self.sb.is_v5() {
-            XFS_BTREE_LBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_LBLOCK_LEN
-        };
+        let hdr_len = self.sb.lblock_hdr_len();
         if (bs as usize) < hdr_len + 16 {
             return Err(FilesystemError::Parse(format!(
                 "XFS blocksize {bs} too small for bmap btree block (hdr {hdr_len})"
@@ -324,11 +322,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             ));
         }
         let bs = self.sb.blocksize as u64;
-        let hdr_len = if self.sb.is_v5() {
-            XFS_BTREE_LBLOCK_CRC_LEN
-        } else {
-            XFS_BTREE_LBLOCK_LEN
-        };
+        let hdr_len = self.sb.lblock_hdr_len();
         if (bs as usize) < hdr_len + 16 {
             return Err(FilesystemError::Parse(format!(
                 "XFS blocksize {bs} too small for bmap btree block (hdr {hdr_len})"
