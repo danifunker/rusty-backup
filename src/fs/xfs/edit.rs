@@ -9,7 +9,13 @@
 //!   * **Inode-slot allocation** ([`alloc_inode_slot`]) / freeing
 //!     ([`free_inode`]): claim/release an inode in an existing inode-btree
 //!     chunk (flip `ir_free`, adjust the record freecount + AGI freecount +
-//!     `sb_ifree`). New-chunk allocation when every chunk is full is deferred.
+//!     `sb_ifree`). When every existing chunk is full, `alloc_new_inode_chunk`
+//!     carves a fresh 64-inode chunk via [`alloc_blocks_aligned`], writes 64
+//!     free dinodes, splices a new record into the AG's single-leaf inobt, and
+//!     bumps the AGI + superblock inode counters; the slot search then runs
+//!     again and claims slot 0 of the new chunk. v1 only handles single-leaf
+//!     inobt growth — multi-level growth (when the existing root leaf is full)
+//!     stays `Unsupported` pending the multi-level rebuild follow-up.
 //!   * **Block allocation** ([`alloc_blocks`]) / freeing ([`free_blocks`]):
 //!     carve/return contiguous blocks by rebuilding the AG free-space btrees
 //!     (reusing the R2 rebuild) + resyncing `sb_fdblocks`.
@@ -33,9 +39,9 @@ use super::ag::{XfsAgf, XfsAgi};
 use super::bmap::{encode_extent, fsblock_to_partition_byte};
 use super::btree_build::{blocks_needed, FreeExtent};
 use super::dir2::XFS_DIR2_DATA_HDR_LEN;
-use super::freespace_rebuild::{carve_from_largest, coalesce};
+use super::freespace_rebuild::{carve_aligned_from_largest, carve_from_largest, coalesce};
 use super::inode::fork_offset;
-use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_INODES_PER_CHUNK};
+use super::types::{XFS_ABTB_MAGIC, XFS_ABTC_MAGIC, XFS_DINODE_MAGIC, XFS_INODES_PER_CHUNK};
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
@@ -58,8 +64,13 @@ const INOBT_REC_SIZE: usize = 16;
 const INOBT_HDR_LEN: usize = 16;
 
 /// AGI / superblock counter offsets.
+const AGI_COUNT_OFF: usize = 16;
 const AGI_FREECOUNT_OFF: usize = 28;
+const SB_ICOUNT_OFF: usize = 128;
 const SB_IFREE_OFF: usize = 136;
+
+/// `di_next_unlinked` lives 96 bytes into every dinode.
+const DI_NEXT_UNLINKED_OFF: usize = 96;
 
 /// `xfs_dir2_data_entsize`: the space one entry occupies in the notional data
 /// block — `inumber(8) + namelen(1) + name + [ftype] + tag(2)`, rounded up to 8.
@@ -71,14 +82,10 @@ fn data_entsize(namelen: usize, has_ftype: bool) -> usize {
 }
 
 impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
-    /// Allocate one inode from a free slot in an existing inode-btree chunk.
-    /// Returns its inode number. Errors with `DiskFull` when every chunk is
-    /// full (allocating a new chunk is not implemented). v4 only.
-    ///
-    /// Flips the chunk record's `ir_free` bit for the chosen slot, decrements
-    /// the record's freecount, the AGI freecount, and `sb_ifree`. The caller is
-    /// responsible for initializing the dinode (it is left in its on-disk free
-    /// state until then).
+    /// Allocate one inode. Tries existing chunks first; when every chunk in
+    /// every AG is full, allocates a fresh 64-inode chunk via
+    /// [`alloc_new_inode_chunk`] and re-runs the slot search against it.
+    /// Returns the new inode number. v4 only.
     pub(crate) fn alloc_inode_slot(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -88,6 +95,28 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 "XFS v5 inode allocation not supported (CRC)".into(),
             ));
         }
+        if let Some(ino) = self.try_claim_slot_from_existing_chunks(sb)? {
+            return Ok(ino);
+        }
+        // No free slots anywhere: extend an AG's inobt with a brand-new chunk,
+        // then claim slot 0 of it.
+        self.alloc_new_inode_chunk(sb)?;
+        self.try_claim_slot_from_existing_chunks(sb)?
+            .ok_or_else(|| {
+                FilesystemError::DiskFull(
+                    "alloc_new_inode_chunk left no claimable slot (internal inconsistency)".into(),
+                )
+            })
+    }
+
+    /// First-pass slot search: walk every AG's existing inobt, claim the
+    /// lowest free slot in the first record that has one. Returns `Ok(None)`
+    /// when every chunk is full (the trigger for `alloc_new_inode_chunk`).
+    /// Lifted from the old `alloc_inode_slot` body.
+    fn try_claim_slot_from_existing_chunks(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+    ) -> Result<Option<u64>, FilesystemError> {
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
@@ -146,13 +175,277 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     );
                     self.write_at(agi_byte, &agi_sec)?;
                     self.bump_sb_ifree(sb, -1)?;
-                    return Ok(ino);
+                    return Ok(Some(ino));
                 }
             }
         }
-        Err(FilesystemError::DiskFull(
-            "no free inode slots; new-chunk allocation not implemented".into(),
-        ))
+        Ok(None)
+    }
+
+    /// Extend an AG's inobt with a brand-new 64-inode chunk. Carves
+    /// `blocks_per_chunk` aligned contiguous blocks via
+    /// [`alloc_blocks_aligned`], writes 64 free dinodes there, then splices a
+    /// fresh inobt record (all 64 bits set ⇒ all free) into the AG's existing
+    /// root leaf. Updates AGI `count`/`freecount` and superblock
+    /// `sb_icount`/`sb_ifree` by `+64` each — the caller's slot claim later
+    /// rebalances `freecount`/`sb_ifree` by `-1`.
+    ///
+    /// **v1 scope** (matches `OPEN-WORK.md` §2.1 hole A first cut): single-leaf
+    /// inobt growth only. An AG whose inobt is already multi-level, or whose
+    /// root leaf is already full, is reported with a clear `Unsupported`
+    /// instead of being grown — the multi-level rebuild path that handles that
+    /// case (R3's [`build_sblock_btree`] reuse) is the natural follow-up.
+    /// v4 only.
+    pub(crate) fn alloc_new_inode_chunk(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+    ) -> Result<(), FilesystemError> {
+        // alloc_inode_slot already gates v5, but defense in depth.
+        if sb.is_v5() {
+            return Err(FilesystemError::Unsupported(
+                "XFS v5 inode-chunk allocation not supported (CRC)".into(),
+            ));
+        }
+        let bs = sb.blocksize as u64;
+        let bs_usize = bs as usize;
+        let inodesize = sb.inodesize as u64;
+        let blocks_per_chunk = ((XFS_INODES_PER_CHUNK as u64) * inodesize).div_ceil(bs) as u32;
+        // sb_inoalignmt is the on-disk chunk alignment; fall back to the
+        // chunk's own block count when it's unset (older v4 images without
+        // the ALIGN feature). The fallback gives natural chunk-stride
+        // alignment, which is the minimum every walker assumes.
+        let alignment = if sb.inoalignmt > 0 {
+            sb.inoalignmt
+        } else {
+            blocks_per_chunk
+        };
+        let max_leaf = (bs_usize - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+
+        // di_version: every inode in a v4 volume shares the version byte the
+        // root inode carries. Reading it once gives the right value for both
+        // v1 (16-bit nlink, di_onlink) and v2 (32-bit nlink, di_nlink) inode
+        // formats without having to read sb_features2 directly.
+        let (_root_core, root_buf) = self.read_inode_buf(sb.rootino)?;
+        let di_version = root_buf[4];
+
+        // Carve the chunk's contiguous aligned blocks. alloc_blocks_aligned
+        // also rebuilds the host AG's freespace btrees + resyncs sb_fdblocks,
+        // so on success the volume's free-space accounting is already correct
+        // for the consumed run.
+        let chunk_fsblock = self.alloc_blocks_aligned(sb, blocks_per_chunk, alignment)?;
+        let agno = chunk_fsblock >> sb.agblklog;
+        let chunk_agbno = (chunk_fsblock & ((1u64 << sb.agblklog) - 1)) as u32;
+        let start_agino = ((chunk_agbno as u64) << sb.inopblog) as u32;
+
+        // Initialize the chunk: 64 free dinodes (magic + version +
+        // di_next_unlinked = NULLAGINO, mode 0 == free).
+        self.init_free_inode_chunk(sb, chunk_fsblock, di_version, blocks_per_chunk as usize)?;
+
+        // Re-read the AGI of the chosen AG so we can splice the new record
+        // into the inobt's root leaf.
+        let sectsize = sb.sectsize as u64;
+        let agblocks = sb.agblocks as u64;
+        let agi_byte = self.partition_offset + agno * agblocks * bs + 2 * sectsize;
+        let mut agi_sec = vec![0u8; sectsize as usize];
+        read_at_aligned(&mut self.reader, agi_byte, sectsize, &mut agi_sec)?;
+        let agi = XfsAgi::parse(&agi_sec)?;
+
+        // v1 single-leaf gate. The multi-level path (existing tree relocates
+        // to a fresh build via build_sblock_btree) is the documented follow-up.
+        if agi.level != 1 {
+            return Err(FilesystemError::Unsupported(format!(
+                "XFS new-chunk allocation: AG {agno} inobt has {} levels; \
+                 only single-leaf growth supported in v1",
+                agi.level
+            )));
+        }
+        let leaves = self.collect_inobt_leaf_blocks(sb, agno, agi.root)?;
+        if leaves.as_slice() != [agi.root] {
+            return Err(FilesystemError::Unsupported(format!(
+                "XFS new-chunk allocation: AG {agno} inobt structure does not match \
+                 single-root-leaf assumption (got leaves {leaves:?}, AGI root {})",
+                agi.root
+            )));
+        }
+        let leaf_fsblock = (agno << sb.agblklog) | agi.root as u64;
+        let mut leaf = vec![0u8; bs_usize];
+        self.read_fsblock(leaf_fsblock, &mut leaf)?;
+        let numrecs = BigEndian::read_u16(&leaf[6..8]) as usize;
+        if numrecs >= max_leaf {
+            return Err(FilesystemError::Unsupported(format!(
+                "XFS new-chunk allocation: AG {agno} inobt root leaf full \
+                 ({numrecs}/{max_leaf} records); multi-level growth not yet \
+                 implemented"
+            )));
+        }
+
+        // Read existing records, append the new one, sort by start_agino, and
+        // rewrite the leaf. The leaf header (level/sibling pointers) is left
+        // untouched; we only bump numrecs and the per-record body.
+        let mut records: Vec<(u32, u32, u64)> = Vec::with_capacity(numrecs + 1);
+        for r in 0..numrecs {
+            let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+            let s = BigEndian::read_u32(&leaf[off..off + 4]);
+            let fc = BigEndian::read_u32(&leaf[off + 4..off + 8]);
+            let free = BigEndian::read_u64(&leaf[off + 8..off + 16]);
+            // Defense: refuse a duplicate start_agino (would mean the new
+            // chunk's blocks collided with an existing chunk — alloc_blocks
+            // should have prevented this, but check anyway).
+            if s == start_agino {
+                return Err(FilesystemError::Parse(format!(
+                    "XFS new-chunk allocation: AG {agno} already has chunk at \
+                     start_agino {start_agino}"
+                )));
+            }
+            records.push((s, fc, free));
+        }
+        records.push((start_agino, XFS_INODES_PER_CHUNK as u32, u64::MAX));
+        records.sort_by_key(|&(s, _, _)| s);
+
+        BigEndian::write_u16(&mut leaf[6..8], (numrecs + 1) as u16);
+        for (i, &(s, fc, free)) in records.iter().enumerate() {
+            let off = INOBT_HDR_LEN + i * INOBT_REC_SIZE;
+            BigEndian::write_u32(&mut leaf[off..off + 4], s);
+            BigEndian::write_u32(&mut leaf[off + 4..off + 8], fc);
+            BigEndian::write_u64(&mut leaf[off + 8..off + 16], free);
+        }
+        // Zero the bytes that the dropped trailing record used to occupy, so a
+        // future numrecs bump doesn't read stale data.
+        let used = INOBT_HDR_LEN + records.len() * INOBT_REC_SIZE;
+        let stale_end = INOBT_HDR_LEN + (numrecs + 1).min(max_leaf) * INOBT_REC_SIZE;
+        for b in &mut leaf[used..stale_end.max(used)] {
+            *b = 0;
+        }
+        self.write_fsblock(sb, leaf_fsblock, &leaf)?;
+
+        // AGI count += 64, freecount += 64.
+        let new_count = agi
+            .count
+            .checked_add(XFS_INODES_PER_CHUNK as u32)
+            .ok_or_else(|| FilesystemError::Parse("AGI count overflow".into()))?;
+        let new_freecount = agi
+            .freecount
+            .checked_add(XFS_INODES_PER_CHUNK as u32)
+            .ok_or_else(|| FilesystemError::Parse("AGI freecount overflow".into()))?;
+        BigEndian::write_u32(&mut agi_sec[AGI_COUNT_OFF..AGI_COUNT_OFF + 4], new_count);
+        BigEndian::write_u32(
+            &mut agi_sec[AGI_FREECOUNT_OFF..AGI_FREECOUNT_OFF + 4],
+            new_freecount,
+        );
+        self.write_at(agi_byte, &agi_sec)?;
+
+        // sb_icount += 64, sb_ifree += 64.
+        self.bump_sb_inode_counters(sb, XFS_INODES_PER_CHUNK as i64, XFS_INODES_PER_CHUNK as i64)
+    }
+
+    /// Carve `n` contiguous blocks whose start agbno is a multiple of
+    /// `alignment`, returning the starting fsblock. Walks every AG, picks the
+    /// first whose largest free extent admits an aligned `n`-block run, then
+    /// rebuilds that AG's bno/cnt over the remainder and resyncs
+    /// `sb_fdblocks` — same shape as [`alloc_blocks`].
+    fn alloc_blocks_aligned(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        n: u32,
+        alignment: u32,
+    ) -> Result<u64, FilesystemError> {
+        if n == 0 || alignment == 0 {
+            return Err(FilesystemError::InvalidData(
+                "alloc_blocks_aligned: zero n or alignment".into(),
+            ));
+        }
+        let agblocks = sb.agblocks as u64;
+        for agno in 0..sb.agcount as u64 {
+            let expected_len = if agno == sb.agcount as u64 - 1 {
+                sb.dblocks - agno * agblocks
+            } else {
+                agblocks
+            };
+            let full_free = match self.current_full_free(sb, agno, expected_len) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let Some((carved_start, free_after)) =
+                carve_aligned_from_largest(&full_free, n, alignment)
+            else {
+                continue;
+            };
+            if self
+                .rebuild_ag_freespace(sb, agno, expected_len, &free_after)
+                .is_err()
+            {
+                continue;
+            }
+            self.resync_sb_fdblocks(sb)?;
+            return Ok((agno << sb.agblklog) | carved_start as u64);
+        }
+        Err(FilesystemError::DiskFull(format!(
+            "no allocation group has a free extent admitting a {n}-block run \
+             aligned to {alignment}"
+        )))
+    }
+
+    /// Initialize a fresh inode chunk: write 64 free dinodes at the chunk's
+    /// starting fsblock. Each dinode carries `XFS_DINODE_MAGIC`, the volume's
+    /// `di_version` (matching every other inode), `di_mode = 0` (the on-disk
+    /// "free slot" marker), and `di_next_unlinked = NULLAGINO`. All other
+    /// fields are zero — matching what `xfs_ialloc_inode_init` writes.
+    fn init_free_inode_chunk(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        chunk_fsblock: u64,
+        di_version: u8,
+        blocks_per_chunk: usize,
+    ) -> Result<(), FilesystemError> {
+        let inodesize = sb.inodesize as usize;
+        let bs = sb.blocksize as usize;
+        let span = blocks_per_chunk * bs;
+        let mut buf = vec![0u8; span];
+        for slot in 0..XFS_INODES_PER_CHUNK {
+            let base = slot * inodesize;
+            BigEndian::write_u16(&mut buf[base..base + 2], XFS_DINODE_MAGIC);
+            // di_mode (offset 2..4) and everything else stays zero.
+            buf[base + 4] = di_version;
+            BigEndian::write_u32(
+                &mut buf[base + DI_NEXT_UNLINKED_OFF..base + DI_NEXT_UNLINKED_OFF + 4],
+                NULLAGINO,
+            );
+        }
+        let part_byte =
+            fsblock_to_partition_byte(chunk_fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
+        self.write_at(self.partition_offset + part_byte, &buf)
+    }
+
+    /// Bump `sb_icount` and `sb_ifree` by the given deltas in the primary
+    /// superblock (a single read+write). Either delta of 0 is a skip.
+    fn bump_sb_inode_counters(
+        &mut self,
+        sb: &super::sb::XfsSuperblock,
+        icount_delta: i64,
+        ifree_delta: i64,
+    ) -> Result<(), FilesystemError> {
+        if icount_delta == 0 && ifree_delta == 0 {
+            return Ok(());
+        }
+        let sectsize = sb.sectsize as u64;
+        let mut primary = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut self.reader,
+            self.partition_offset,
+            sectsize,
+            &mut primary,
+        )?;
+        if icount_delta != 0 {
+            let cur = BigEndian::read_u64(&primary[SB_ICOUNT_OFF..SB_ICOUNT_OFF + 8]);
+            let new = (cur as i64 + icount_delta).max(0) as u64;
+            BigEndian::write_u64(&mut primary[SB_ICOUNT_OFF..SB_ICOUNT_OFF + 8], new);
+        }
+        if ifree_delta != 0 {
+            let cur = BigEndian::read_u64(&primary[SB_IFREE_OFF..SB_IFREE_OFF + 8]);
+            let new = (cur as i64 + ifree_delta).max(0) as u64;
+            BigEndian::write_u64(&mut primary[SB_IFREE_OFF..SB_IFREE_OFF + 8], new);
+        }
+        self.write_at(self.partition_offset, &primary)
     }
 
     /// Initialize a freshly-allocated inode as an empty short-form directory

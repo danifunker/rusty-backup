@@ -722,6 +722,60 @@ pub(crate) fn carve_from_largest(
     Some((carved, reduced))
 }
 
+/// Like `carve_from_largest(n)` but requires the carved run to start on a
+/// multiple of `alignment` (AG-relative blocks). Returns `(start_agbno,
+/// reduced)` where `start_agbno % alignment == 0` and `reduced` is the input
+/// extents with `[start_agbno, start_agbno + n)` removed (the host extent
+/// splits in two if both sides are non-empty, otherwise shrinks or vanishes).
+///
+/// Scans extents largest-first and uses the highest aligned position that
+/// fits within the chosen extent — tail-anchoring matches the alignment
+/// behaviour of `xfs_repair`'s allocator and keeps the alignment gap on the
+/// low side, where it tends to coalesce with neighbouring free runs on later
+/// allocations. Unlike `carve_from_largest` this may produce *one extra* free
+/// extent (a tail carve that doesn't reach the start splits the host in two);
+/// the caller's freespace rebuild handles the new shape without further
+/// constraint.
+pub(crate) fn carve_aligned_from_largest(
+    extents: &[FreeExtent],
+    n: u32,
+    alignment: u32,
+) -> Option<(u32, Vec<FreeExtent>)> {
+    if n == 0 || alignment == 0 {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..extents.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(extents[i].blockcount));
+    for i in order {
+        let e = extents[i];
+        let end = e.startblock.checked_add(e.blockcount)?;
+        if e.blockcount < n {
+            continue;
+        }
+        let highest_fit = (end - n) / alignment * alignment;
+        if highest_fit < e.startblock {
+            continue;
+        }
+        let mut out = extents.to_vec();
+        out.remove(i);
+        if highest_fit > e.startblock {
+            out.push(FreeExtent {
+                startblock: e.startblock,
+                blockcount: highest_fit - e.startblock,
+            });
+        }
+        let after = highest_fit + n;
+        if after < end {
+            out.push(FreeExtent {
+                startblock: after,
+                blockcount: end - after,
+            });
+        }
+        return Some((highest_fit, out));
+    }
+    None
+}
+
 /// Sort by startblock and merge adjacent/touching extents into maximal runs.
 /// Input extents must be non-overlapping (they come from disjoint sources:
 /// free records plus the trees' own distinct blocks).
@@ -773,6 +827,62 @@ mod tests {
     fn carve_refuses_when_largest_too_small() {
         let exts = vec![fe(1, 2), fe(4, 3)];
         assert!(carve_from_largest(&exts, 4).is_none());
+    }
+
+    #[test]
+    fn aligned_carve_tail_anchors_at_largest_extent() {
+        // Largest is the 100-block extent at start=12. End=112. n=8, align=8.
+        // Highest aligned fit = ((112 - 8) / 8) * 8 = 104. Tail carve leaves
+        // [12, 104) (92 blocks) intact and [112, 112) empty.
+        let exts = vec![fe(1, 2), fe(4, 4), fe(12, 100)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 8).unwrap();
+        assert_eq!(start, 104);
+        let mut got = reduced;
+        got.sort_by_key(|e| e.startblock);
+        assert_eq!(got, vec![fe(1, 2), fe(4, 4), fe(12, 92)]);
+    }
+
+    #[test]
+    fn aligned_carve_splits_host_when_both_sides_left() {
+        // One extent [16, 80), n=8, alignment=16. End=80; highest aligned fit
+        // = (80 - 8) / 16 * 16 = 64. Carve [64, 72) splits host into [16, 64)
+        // and [72, 80).
+        let exts = vec![fe(16, 64)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 16).unwrap();
+        assert_eq!(start, 64);
+        let mut got = reduced;
+        got.sort_by_key(|e| e.startblock);
+        assert_eq!(got, vec![fe(16, 48), fe(72, 8)]);
+    }
+
+    #[test]
+    fn aligned_carve_consumes_extent_when_perfect_fit() {
+        // One extent [32, 40), n=8, alignment=8. Highest aligned fit = 32.
+        // Both sides empty → extent vanishes.
+        let exts = vec![fe(8, 4), fe(32, 8)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 8).unwrap();
+        assert_eq!(start, 32);
+        assert_eq!(reduced, vec![fe(8, 4)]);
+    }
+
+    #[test]
+    fn aligned_carve_skips_extent_whose_aligned_run_overflows_start() {
+        // [5, 8): 3 blocks, but alignment=8 wants the start at 0 or 8 — both
+        // outside the extent. Skip; fall through to a smaller extent that
+        // happens to fit (none in this set), so return None.
+        let exts = vec![fe(5, 3)];
+        assert!(carve_aligned_from_largest(&exts, 1, 8).is_none());
+    }
+
+    #[test]
+    fn aligned_carve_picks_smaller_extent_when_largest_misaligned() {
+        // The "biggest" extent [9, 14) (5 blocks) can't host an 8-aligned
+        // 1-block run (no multiple of 8 in [9, 14)); the smaller [16, 20)
+        // can (16). Largest-first ordering tries [9,14) first, falls
+        // through, then takes [16, 20).
+        let exts = vec![fe(9, 5), fe(16, 4)];
+        let (start, _reduced) = carve_aligned_from_largest(&exts, 1, 8).unwrap();
+        assert_eq!(start, 16);
     }
 
     #[test]

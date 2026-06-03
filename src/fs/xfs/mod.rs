@@ -2321,6 +2321,230 @@ mod tests {
     }
 
     #[test]
+    fn alloc_new_inode_chunk_extends_inobt_and_keeps_volume_clean() {
+        // §2.1 hole (A): when every existing inobt chunk is full,
+        // alloc_new_inode_chunk should carve fresh aligned blocks, write 64
+        // free dinodes, splice a new record into AG 0's single-leaf inobt,
+        // and bump AGI count/freecount + sb_icount/sb_ifree by 64 — with the
+        // verifier remaining clean afterward.
+        //
+        // Driving it through alloc_inode_slot would require exhausting every
+        // existing chunk first (~16k file creations on this 512 MiB fixture);
+        // instead we call alloc_new_inode_chunk directly to exercise the
+        // pipeline once, then check both the AGI/superblock counter deltas
+        // and the on-disk shape of the new chunk.
+        use crate::fs::filesystem::EditableFilesystem;
+        use crate::fs::xfs::ag::XfsAgi;
+        use crate::fs::xfs::types::XFS_INODES_PER_CHUNK;
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        // Snapshot pre-state: AGI 0 count/freecount/root, sb_icount/sb_ifree.
+        let (
+            sb_clone,
+            agi_byte0,
+            sectsize,
+            blocksize,
+            agi_before,
+            agbno_root,
+            sb_icount_before,
+            sb_ifree_before,
+        ) = {
+            let fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let sb = fs.superblock().clone();
+            let sectsize = sb.sectsize as u64;
+            let agblocks = sb.agblocks as u64;
+            let blocksize = sb.blocksize as u64;
+            let agi_byte0 = 2 * sectsize; // AG 0, AGI is the third sector.
+            let mut agi_sec = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                agi_byte0,
+                sectsize,
+                &mut agi_sec,
+            )
+            .expect("read AGI 0");
+            let agi = XfsAgi::parse(&agi_sec).expect("parse AGI 0");
+            let agbno_root = agi.root;
+            let _ = agblocks;
+            // Read sb_icount / sb_ifree from the primary superblock.
+            let mut primary = vec![0u8; sectsize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                0,
+                sectsize,
+                &mut primary,
+            )
+            .expect("read primary");
+            let sb_icount = BigEndian::read_u64(&primary[128..136]);
+            let sb_ifree = BigEndian::read_u64(&primary[136..144]);
+            (
+                sb, agi_byte0, sectsize, blocksize, agi, agbno_root, sb_icount, sb_ifree,
+            )
+        };
+
+        let leaf_fsblock = agbno_root as u64; // AG 0 → fsblock == agbno
+        let leaf_byte = leaf_fsblock * blocksize;
+        let leaf_before = {
+            let mut buf = vec![0u8; blocksize as usize];
+            read_at_aligned(
+                &mut Cursor::new(cursor.get_ref().as_slice()),
+                leaf_byte,
+                blocksize,
+                &mut buf,
+            )
+            .expect("read inobt leaf");
+            buf
+        };
+        let numrecs_before = BigEndian::read_u16(&leaf_before[6..8]) as usize;
+
+        // Drive the new-chunk path once.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            fs.alloc_new_inode_chunk(&sb_clone)
+                .expect("alloc_new_inode_chunk");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Snapshot post-state and verify the deltas.
+        let mut agi_sec_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            agi_byte0,
+            sectsize,
+            &mut agi_sec_after,
+        )
+        .expect("read AGI 0 after");
+        let agi_after = XfsAgi::parse(&agi_sec_after).expect("parse AGI 0 after");
+        assert_eq!(
+            agi_after.count,
+            agi_before.count + XFS_INODES_PER_CHUNK as u32,
+            "AGI count should bump by 64",
+        );
+        assert_eq!(
+            agi_after.freecount,
+            agi_before.freecount + XFS_INODES_PER_CHUNK as u32,
+            "AGI freecount should bump by 64",
+        );
+
+        let mut primary_after = vec![0u8; sectsize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            0,
+            sectsize,
+            &mut primary_after,
+        )
+        .expect("read primary after");
+        assert_eq!(
+            BigEndian::read_u64(&primary_after[128..136]),
+            sb_icount_before + XFS_INODES_PER_CHUNK as u64,
+            "sb_icount should bump by 64",
+        );
+        assert_eq!(
+            BigEndian::read_u64(&primary_after[136..144]),
+            sb_ifree_before + XFS_INODES_PER_CHUNK as u64,
+            "sb_ifree should bump by 64",
+        );
+
+        // Inobt root leaf: one extra record, sorted by start_agino.
+        let mut leaf_after = vec![0u8; blocksize as usize];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            leaf_byte,
+            blocksize,
+            &mut leaf_after,
+        )
+        .expect("read inobt leaf after");
+        let numrecs_after = BigEndian::read_u16(&leaf_after[6..8]) as usize;
+        assert_eq!(
+            numrecs_after,
+            numrecs_before + 1,
+            "inobt grew by one record"
+        );
+        let mut prev_start: i64 = -1;
+        let mut new_record_start: Option<u32> = None;
+        for r in 0..numrecs_after {
+            let off = 16 + r * 16; // INOBT_HDR_LEN + r * INOBT_REC_SIZE
+            let s = BigEndian::read_u32(&leaf_after[off..off + 4]);
+            let fc = BigEndian::read_u32(&leaf_after[off + 4..off + 8]);
+            let free = BigEndian::read_u64(&leaf_after[off + 8..off + 16]);
+            assert!(
+                (s as i64) > prev_start,
+                "records must be sorted by start_agino"
+            );
+            prev_start = s as i64;
+            if fc == XFS_INODES_PER_CHUNK as u32 && free == u64::MAX {
+                assert!(
+                    new_record_start.is_none(),
+                    "more than one all-free chunk record after extend"
+                );
+                new_record_start = Some(s);
+            }
+        }
+        let start_agino = new_record_start.expect("new all-free chunk record present");
+
+        // Every dinode in the new chunk should carry XFS_DINODE_MAGIC, the
+        // volume's di_version, and di_next_unlinked = NULLAGINO (the on-disk
+        // "free slot" initialization).
+        let inodesize = sb_clone.inodesize as u64;
+        let blocks_per_chunk =
+            ((XFS_INODES_PER_CHUNK as u64) * inodesize).div_ceil(blocksize) as usize;
+        let chunk_agbno = (start_agino as u64) >> sb_clone.inopblog;
+        let chunk_byte = chunk_agbno * blocksize;
+        let span = blocks_per_chunk * blocksize as usize;
+        let mut chunk_bytes = vec![0u8; span];
+        read_at_aligned(
+            &mut Cursor::new(cursor.get_ref().as_slice()),
+            chunk_byte,
+            span as u64,
+            &mut chunk_bytes,
+        )
+        .expect("read new chunk blocks");
+        // Sample the root inode for di_version so we know what to expect.
+        let mut root_inode_buf = vec![0u8; inodesize as usize];
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open for root version");
+            let (_core, buf) = fs.read_inode_buf(sb_clone.rootino).expect("root inode");
+            root_inode_buf[..buf.len()].copy_from_slice(&buf);
+        }
+        let expected_version = root_inode_buf[4];
+        for slot in 0..XFS_INODES_PER_CHUNK {
+            let base = slot * inodesize as usize;
+            assert_eq!(
+                BigEndian::read_u16(&chunk_bytes[base..base + 2]),
+                super::types::XFS_DINODE_MAGIC,
+                "slot {slot} missing dinode magic",
+            );
+            assert_eq!(
+                chunk_bytes[base + 4],
+                expected_version,
+                "slot {slot} wrong di_version",
+            );
+            assert_eq!(
+                BigEndian::read_u32(&chunk_bytes[base + 96..base + 100]),
+                0xFFFF_FFFF,
+                "slot {slot} di_next_unlinked != NULLAGINO",
+            );
+            assert_eq!(
+                BigEndian::read_u16(&chunk_bytes[base + 2..base + 4]),
+                0,
+                "slot {slot} di_mode should be 0 (free)",
+            );
+        }
+
+        // End-to-end: the verifier stays clean over the extended inobt.
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let res = fs.run_fsck().expect("fsck after new-chunk allocation");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean after new-chunk allocation, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn dir1_dispatch_uses_dir1_shortform_parser() {
         // Patch the fixture's versionnum to clear the DIRV2 bit, then assert
         // the dir1 dispatch path is taken. The fixture's root inode is dir2
