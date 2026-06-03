@@ -87,9 +87,16 @@ pub fn resolve_partition_streaming_with_password(
     selector: Option<u32>,
     password: Option<&[u8]>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
+    // Anything `source_reader::open_read_with_password` would unwrap
+    // (CHD / GHO / IMZ streaming readers, MSA decoded floppies, 140 KB
+    // Apple-II .do/.po/.dsk floppies) must NOT skip source_reader and go
+    // straight to `open_image_ro`, or the consumer would see the wrapped
+    // bytes instead of the decoded flat-sector stream.
     let is_streaming = source_reader::is_gho_path(path)
         || source_reader::is_imz_path(path)
-        || source_reader::is_chd_path(path);
+        || source_reader::is_chd_path(path)
+        || source_reader::is_msa_path(path)
+        || source_reader::is_apple_ii_dsk_path(path);
     if is_streaming {
         let mut reader = source_reader::open_read_with_password(path, password)?;
         let ctx = resolve(&mut reader, selector)?;
