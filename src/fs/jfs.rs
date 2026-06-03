@@ -204,6 +204,53 @@ const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
 /// so the cap below is generous.
 pub(crate) const DT_INLINE_CAP: u64 = 4096;
 
+// ---- External dtpage layout (4 KiB) ----
+//
+// Confirmed via on-disk probe of `/bigdir` in `test_jfs.img.zst`
+// (200 files force one internal dtroot + two leaf dtpages):
+//   - header is exactly 32 bytes = one slot (slot 0).
+//   - dtpage's u8 fields match dtroot's layout (NOT __le16 as the
+//     kernel header suggests — the on-disk truth is u8 here).
+//   - self_pxd at offset 24 (length=1, addr=block-of-this-page).
+//
+// Layout of bytes 0..32:
+//   0..8   next  (le64) — sibling-next dtpage in agg blocks
+//   8..16  prev  (le64) — sibling-prev dtpage
+//   16     flag  (u8)   — BT_LEAF / BT_INTERNAL / BT_ROOT / first_written
+//   17     nextindex (u8) — count of active stbl entries
+//   18     freecnt   (s8) — count of slots in free chain
+//   19     freelist  (s8) — head of free slot chain (-1 sentinel)
+//   20     maxslot   (u8) — total slots (128 for 4 KiB / 32 B)
+//   21     stblindex (u8) — slot index where stbl[] array starts
+//   22..24 rsrvd2
+//   24..32 self_pxd  (pxd_t)
+const DTPAGE_SIZE: u64 = PSIZE;
+/// Maximum total slots per 4 KiB dtpage (4096 / 32).
+const DTPAGE_MAX_SLOT: u8 = 128;
+#[allow(dead_code)]
+const DTPH_OFF_NEXT: usize = 0;
+const DTPH_OFF_FLAG: usize = 16;
+const DTPH_OFF_NEXTINDEX: usize = 17;
+#[allow(dead_code)]
+const DTPH_OFF_FREECNT: usize = 18;
+#[allow(dead_code)]
+const DTPH_OFF_FREELIST: usize = 19;
+const DTPH_OFF_MAXSLOT: usize = 20;
+const DTPH_OFF_STBLINDEX: usize = 21;
+#[allow(dead_code)]
+const DTPH_OFF_SELF_PXD: usize = 24;
+
+/// Cycle / depth limit for the external-dtree descent. With max-depth-5
+/// dtree (kernel: `DTREEHEIGHT = 8`), 16 levels is generous. Cycles in
+/// sibling-chain traversal are also capped at this depth via the
+/// chain-length counter.
+const DTREE_MAX_DEPTH: u32 = 16;
+/// Cap on total dtpages visited per directory walk. 200-entry dir uses
+/// 2 leaves; 4 K-entry dir would use ~33 leaves; 1M entries would need
+/// ~8 K leaves. We cap at 65 K which is enough for any directory short
+/// of pathological corruption that loops indefinitely.
+const DTREE_MAX_PAGES_VISITED: u32 = 1 << 16;
+
 // Mode bits. The low 16 bits hold POSIX mode (S_IFMT + perms); high bits
 // hold JFS attribute flags (IFJOURNAL, IDIRECTORY, etc.).
 const S_IFMT: u32 = 0o170000;
@@ -675,36 +722,32 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         JfsDinode::parse(&buf, fino)
     }
 
-    /// Walk an inline dtroot and return one decoded entry per active
-    /// stbl slot. Refuses non-inline dtrees (di_size > DT_INLINE_CAP)
-    /// with a clear error — multi-page dtree walkers are a J.3
-    /// follow-up.
+    /// Walk a directory's dtree (inline dtroot OR external multi-page
+    /// dtree) and return one decoded entry per active stbl slot at
+    /// every reachable leaf. Cycle / depth / page-budget guarded.
     pub(crate) fn parse_inline_dtree(
-        &self,
+        &mut self,
         dir_inode: &JfsDinode,
     ) -> Result<Vec<DtreeEntry>, FilesystemError> {
-        if dir_inode.size > DT_INLINE_CAP {
-            return Err(FilesystemError::Unsupported(format!(
-                "JFS: directory inode {} has size {} > {} (multi-page \
-                 dtree walker not yet implemented)",
-                dir_inode.di_number, dir_inode.size, DT_INLINE_CAP
-            )));
-        }
         if dir_inode.raw.len() < DI_OFF_TYPE_AREA + DTROOT_SIZE {
             return Err(FilesystemError::Parse(format!(
                 "jfs: directory inode {} buffer too small for dtroot",
                 dir_inode.di_number
             )));
         }
-        let dtroot = &dir_inode.raw[DI_OFF_TYPE_AREA..DI_OFF_TYPE_AREA + DTROOT_SIZE];
+        let dtroot = dir_inode.raw[DI_OFF_TYPE_AREA..DI_OFF_TYPE_AREA + DTROOT_SIZE].to_vec();
         let flag = dtroot[DTROOT_OFF_FLAG];
-        if flag & BT_TYPE_MASK & BT_INTERNAL_FLAG != 0 {
-            return Err(FilesystemError::Unsupported(format!(
-                "JFS: directory inode {} dtree has internal nodes — multi-page \
-                 dtree walker not yet implemented",
-                dir_inode.di_number
-            )));
+        let kind = flag & BT_TYPE_MASK;
+
+        if kind & BT_INTERNAL_FLAG != 0 {
+            // dtroot is an internal node — its 8 active slots hold
+            // `idtentry` records each pointing to an off-disk dtpage.
+            // Walk every reachable leaf and concatenate their entries.
+            return self.walk_external_dtree_from_dtroot(dir_inode, &dtroot);
         }
+        // Inline leaf dtroot. Same parsing code path as before — but now
+        // with the dtroot bytes copied into a local buffer so the
+        // signature matches the external path's helpers.
         let nextindex = dtroot[DTROOT_OFF_NEXTINDEX] as usize;
         if nextindex > 8 {
             return Err(FilesystemError::Parse(format!(
@@ -713,7 +756,6 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             )));
         }
         let stbl = &dtroot[DTROOT_OFF_STBL..DTROOT_OFF_STBL + 8];
-
         let mut entries = Vec::with_capacity(nextindex);
         for (i, raw_slot) in stbl.iter().enumerate().take(nextindex) {
             let slot_idx = *raw_slot as i8 as i32;
@@ -725,46 +767,263 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             }
             let slot_off = slot_idx as usize * DT_SLOT_SIZE;
             let slot = &dtroot[slot_off..slot_off + DT_SLOT_SIZE];
-            // ldtentry: inumber u32 + next s8 + namlen u8 + name[11] u16 + index u32
-            let inumber = u32::from_le_bytes(slot[0..4].try_into().unwrap());
-            let mut next = slot[4] as i8 as i32;
-            let namlen = slot[5] as usize;
-            // First 11 UCS-2 chars live in the entry slot.
-            let mut name_buf: Vec<u16> = Vec::with_capacity(namlen);
-            let take_first = namlen.min(11);
-            for c in 0..take_first {
-                let cp_off = 6 + c * 2;
-                let cp = u16::from_le_bytes(slot[cp_off..cp_off + 2].try_into().unwrap());
-                name_buf.push(cp);
-            }
-            // Walk the continuation chain for remaining chars.
-            let mut remaining = namlen.saturating_sub(11);
-            while remaining > 0 {
-                if !(0..=8).contains(&next) {
-                    return Err(FilesystemError::Parse(format!(
-                        "jfs: directory inode {} name-continuation next slot {next} \
-                         out of range (remaining={remaining})",
-                        dir_inode.di_number
-                    )));
-                }
-                let cont_off = next as usize * DT_SLOT_SIZE;
-                let cont_slot = &dtroot[cont_off..cont_off + DT_SLOT_SIZE];
-                // dtslot: next s8 + cnt s8 + name[15] u16
-                let cont_next = cont_slot[0] as i8 as i32;
-                let cont_cnt = cont_slot[1] as usize;
-                let take = cont_cnt.min(15).min(remaining);
-                for c in 0..take {
-                    let cp_off = 2 + c * 2;
-                    let cp = u16::from_le_bytes(cont_slot[cp_off..cp_off + 2].try_into().unwrap());
-                    name_buf.push(cp);
-                }
-                remaining = remaining.saturating_sub(take);
-                next = cont_next;
-            }
-            let name = String::from_utf16_lossy(&name_buf);
-            entries.push(DtreeEntry { inumber, name });
+            let entry = Self::parse_dtree_ldtentry(
+                slot,
+                |cont_idx| {
+                    if !(0..=8).contains(&cont_idx) {
+                        return None;
+                    }
+                    let off = cont_idx as usize * DT_SLOT_SIZE;
+                    Some(&dtroot[off..off + DT_SLOT_SIZE])
+                },
+                dir_inode.di_number,
+            )?;
+            entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// Walk an external dtree rooted at `dtroot` (which has
+    /// `BT_INTERNAL` set). Descends through every internal dtpage to
+    /// the leaves, then emits each leaf's ldtentry records in stbl
+    /// order. Cycle-guarded via `DTREE_MAX_DEPTH` (descent depth) and
+    /// `DTREE_MAX_PAGES_VISITED` (total pages touched per directory).
+    fn walk_external_dtree_from_dtroot(
+        &mut self,
+        dir_inode: &JfsDinode,
+        dtroot: &[u8],
+    ) -> Result<Vec<DtreeEntry>, FilesystemError> {
+        // dtroot internal: 8 slots hold idtentries (sorted via stbl[]).
+        // Each idtentry's pxd points to a child dtpage.
+        let nextindex = dtroot[DTROOT_OFF_NEXTINDEX] as usize;
+        if nextindex > 8 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} dtroot-internal nextindex {nextindex} > 8",
+                dir_inode.di_number
+            )));
+        }
+        let stbl = &dtroot[DTROOT_OFF_STBL..DTROOT_OFF_STBL + 8];
+        let mut child_pxds: Vec<Pxd> = Vec::with_capacity(nextindex);
+        for (i, raw_slot) in stbl.iter().enumerate().take(nextindex) {
+            let slot_idx = *raw_slot as i8 as i32;
+            if !(0..=8).contains(&slot_idx) {
+                return Err(FilesystemError::Parse(format!(
+                    "jfs: directory inode {} dtroot stbl[{i}] = {slot_idx} out of range",
+                    dir_inode.di_number
+                )));
+            }
+            let slot_off = slot_idx as usize * DT_SLOT_SIZE;
+            let slot = &dtroot[slot_off..slot_off + DT_SLOT_SIZE];
+            // idtentry: pxd_t (8B) + next s8 + namlen u8 + name[11] u16
+            let pxd = Pxd::parse(&slot[0..PXD_LEN]);
+            if pxd.length == 0 {
+                return Err(FilesystemError::Parse(format!(
+                    "jfs: directory inode {} dtroot idtentry {i} has length=0 pxd",
+                    dir_inode.di_number
+                )));
+            }
+            child_pxds.push(pxd);
+        }
+        let mut entries = Vec::new();
+        let mut pages_visited = 0u32;
+        for pxd in child_pxds {
+            self.walk_dtpage_subtree(dir_inode, pxd, 0, &mut pages_visited, &mut entries)?;
+        }
+        Ok(entries)
+    }
+
+    /// Recursive descent into a dtpage subtree rooted at `page_pxd`.
+    /// `depth` and `pages_visited` are cycle/budget guards.
+    fn walk_dtpage_subtree(
+        &mut self,
+        dir_inode: &JfsDinode,
+        page_pxd: Pxd,
+        depth: u32,
+        pages_visited: &mut u32,
+        out: &mut Vec<DtreeEntry>,
+    ) -> Result<(), FilesystemError> {
+        if depth > DTREE_MAX_DEPTH {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} dtree depth exceeds {DTREE_MAX_DEPTH} \
+                 (cycle or corruption)",
+                dir_inode.di_number
+            )));
+        }
+        *pages_visited += 1;
+        if *pages_visited > DTREE_MAX_PAGES_VISITED {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} dtree visited > {DTREE_MAX_PAGES_VISITED} pages",
+                dir_inode.di_number
+            )));
+        }
+        // Read 4 KiB dtpage from the pxd's first block. Multi-block
+        // dtpages (pxd.length > 1) aren't a thing in the current
+        // kernel — a dtpage is always exactly one PSIZE block — so we
+        // refuse if length != 1.
+        if page_pxd.length != 1 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {} dtpage pxd length = {} (expected 1)",
+                dir_inode.di_number, page_pxd.length
+            )));
+        }
+        let page_byte = self.partition_offset + page_pxd.address * self.bsize;
+        self.reader.seek(SeekFrom::Start(page_byte))?;
+        let mut page = vec![0u8; DTPAGE_SIZE as usize];
+        self.reader.read_exact(&mut page)?;
+        // Parse header.
+        let flag = page[DTPH_OFF_FLAG];
+        let nextindex = page[DTPH_OFF_NEXTINDEX] as usize;
+        let maxslot = page[DTPH_OFF_MAXSLOT];
+        let stblindex = page[DTPH_OFF_STBLINDEX] as usize;
+        // Sanity-check fields. maxslot should equal DTPAGE_MAX_SLOT;
+        // first-time-written pages may report 0 — accept that.
+        if maxslot != 0 && maxslot != DTPAGE_MAX_SLOT {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: dtpage @ block {} bad maxslot {maxslot} (expected {DTPAGE_MAX_SLOT})",
+                page_pxd.address
+            )));
+        }
+        if nextindex == 0 {
+            // Empty page — nothing to emit. Continue (sibling chain
+            // may still carry entries).
+            return Ok(());
+        }
+        // stbl array starts at slot `stblindex`. Each entry is 1 byte
+        // (s8 slot index). The array spans ceil(nextindex / 32) slots
+        // (32 bytes per slot), but we just read `nextindex` consecutive
+        // bytes from the stbl start.
+        let stbl_byte = stblindex * (DT_SLOT_SIZE);
+        if stbl_byte + nextindex > page.len() {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: dtpage @ block {} stbl[{nextindex}] @ slot {stblindex} \
+                 exceeds page",
+                page_pxd.address
+            )));
+        }
+        let stbl_bytes = page[stbl_byte..stbl_byte + nextindex].to_vec();
+        let is_leaf = (flag & BT_LEAF_FLAG) != 0;
+        let is_internal = (flag & BT_INTERNAL_FLAG) != 0;
+        if !is_leaf && !is_internal {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: dtpage @ block {} flag 0x{:02X} has neither LEAF nor INTERNAL bit",
+                page_pxd.address, flag
+            )));
+        }
+        if is_leaf {
+            for (i, &raw_idx) in stbl_bytes.iter().enumerate() {
+                let slot_idx = raw_idx as i8 as i32;
+                if slot_idx < 0 || slot_idx as u8 >= DTPAGE_MAX_SLOT {
+                    return Err(FilesystemError::Parse(format!(
+                        "jfs: dtpage @ block {} stbl[{i}] = {slot_idx} out of range",
+                        page_pxd.address
+                    )));
+                }
+                let slot_off = slot_idx as usize * DT_SLOT_SIZE;
+                let slot = &page[slot_off..slot_off + DT_SLOT_SIZE];
+                let entry = Self::parse_dtree_ldtentry(
+                    slot,
+                    |cont_idx| {
+                        if cont_idx < 0 || cont_idx as u8 >= DTPAGE_MAX_SLOT {
+                            return None;
+                        }
+                        let off = cont_idx as usize * DT_SLOT_SIZE;
+                        if off + DT_SLOT_SIZE > page.len() {
+                            return None;
+                        }
+                        Some(&page[off..off + DT_SLOT_SIZE])
+                    },
+                    dir_inode.di_number,
+                )?;
+                out.push(entry);
+            }
+        } else {
+            // Internal page — recurse into each child pxd.
+            for (i, &raw_idx) in stbl_bytes.iter().enumerate() {
+                let slot_idx = raw_idx as i8 as i32;
+                if slot_idx < 0 || slot_idx as u8 >= DTPAGE_MAX_SLOT {
+                    return Err(FilesystemError::Parse(format!(
+                        "jfs: dtpage @ block {} (internal) stbl[{i}] = {slot_idx} out of range",
+                        page_pxd.address
+                    )));
+                }
+                let slot_off = slot_idx as usize * DT_SLOT_SIZE;
+                let slot = &page[slot_off..slot_off + DT_SLOT_SIZE];
+                let child_pxd = Pxd::parse(&slot[0..PXD_LEN]);
+                if child_pxd.length == 0 {
+                    return Err(FilesystemError::Parse(format!(
+                        "jfs: dtpage @ block {} idtentry {i} has length=0 pxd",
+                        page_pxd.address
+                    )));
+                }
+                self.walk_dtpage_subtree(dir_inode, child_pxd, depth + 1, pages_visited, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse one `ldtentry` from a 32-byte slot and stitch its
+    /// (possibly multi-slot) name through the `continuation` callback.
+    /// Works for both inline-dtroot slots and external-dtpage slots —
+    /// the difference is the slot pool the continuation callback walks.
+    ///
+    /// Layout (8/8/8/8 = 32 bytes):
+    ///   - 0..4   inumber (le32)
+    ///   - 4      next slot index for continuation (s8; 0xFF or -1 = end)
+    ///   - 5      namlen (u8)
+    ///   - 6..28  name[11] (UCS-2 LE)
+    ///   - 28..32 index (le32) — hash bucket index, unused for read
+    ///
+    /// Continuation slots (`dtslot_t`):
+    ///   - 0      next slot index (s8)
+    ///   - 1      cnt (u8) — chars in this slot
+    ///   - 2..32  name[15] (UCS-2 LE)
+    fn parse_dtree_ldtentry<'a, F>(
+        slot: &[u8],
+        mut continuation: F,
+        di_number: u32,
+    ) -> Result<DtreeEntry, FilesystemError>
+    where
+        F: FnMut(i32) -> Option<&'a [u8]>,
+    {
+        let inumber = u32::from_le_bytes(slot[0..4].try_into().unwrap());
+        let mut next = slot[4] as i8 as i32;
+        let namlen = slot[5] as usize;
+        let mut name_buf: Vec<u16> = Vec::with_capacity(namlen);
+        let take_first = namlen.min(11);
+        for c in 0..take_first {
+            let cp_off = 6 + c * 2;
+            let cp = u16::from_le_bytes(slot[cp_off..cp_off + 2].try_into().unwrap());
+            name_buf.push(cp);
+        }
+        let mut remaining = namlen.saturating_sub(11);
+        let mut hops = 0u32;
+        while remaining > 0 {
+            // Cycle guard for continuation chain.
+            hops += 1;
+            if hops > DTREE_MAX_PAGES_VISITED {
+                return Err(FilesystemError::Parse(format!(
+                    "jfs: directory inode {di_number} name-continuation hops > limit"
+                )));
+            }
+            let cont_slot = continuation(next).ok_or_else(|| {
+                FilesystemError::Parse(format!(
+                    "jfs: directory inode {di_number} name-continuation next slot \
+                     {next} out of range (remaining={remaining})"
+                ))
+            })?;
+            let cont_next = cont_slot[0] as i8 as i32;
+            let cont_cnt = cont_slot[1] as usize;
+            let take = cont_cnt.min(15).min(remaining);
+            for c in 0..take {
+                let cp_off = 2 + c * 2;
+                let cp = u16::from_le_bytes(cont_slot[cp_off..cp_off + 2].try_into().unwrap());
+                name_buf.push(cp);
+            }
+            remaining = remaining.saturating_sub(take);
+            next = cont_next;
+        }
+        let name = String::from_utf16_lossy(&name_buf);
+        Ok(DtreeEntry { inumber, name })
     }
 
     /// Read a user file's data fork. Walks the (possibly multi-level)
@@ -2248,24 +2507,26 @@ mod tests {
 
     #[test]
     fn fixture_bmap_walk_matches_probe() {
-        // From probe-jfs-bmap.py: mapsize=3788, nfree=3741, so
-        // allocated_blocks should be 47. Highest pmap-allocated block
-        // = 46 (= 47 - 1).
+        // Regenerated fixture (with /bigdir's 200 8-byte files plus the
+        // FILESYSTEM_I extents to back 256 fileset inodes plus the
+        // external dtpage(s) for bigdir): mapsize=3788 (unchanged from
+        // the 16 MiB image geometry), nfree=3514. allocated_blocks =
+        // mapsize - nfree = 274. highest pmap-allocated block = 273.
         let img = load_fixture("test_jfs.img.zst");
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let walk = fs.require_bmap_walk().expect("walk BMAP").clone();
         assert_eq!(walk.mapsize, 3788);
-        assert_eq!(walk.nfree, 3741);
-        assert_eq!(walk.allocated_blocks, 47);
-        assert_eq!(walk.highest_alloc, Some(46));
-        // First run is allocated (blocks 0..47), then a single
-        // free run to mapsize.
+        assert_eq!(walk.nfree, 3514);
+        assert_eq!(walk.allocated_blocks, 274);
+        assert_eq!(walk.highest_alloc, Some(273));
+        // The fixture currently lays out as one contiguous allocated
+        // run followed by one free run to mapsize.
         assert_eq!(walk.runs.len(), 2);
         assert!(walk.runs[0].allocated);
         assert_eq!(walk.runs[0].start_block, 0);
-        assert_eq!(walk.runs[0].length, 47);
+        assert_eq!(walk.runs[0].length, 274);
         assert!(!walk.runs[1].allocated);
-        assert_eq!(walk.runs[1].length, 3788 - 47);
+        assert_eq!(walk.runs[1].length, 3788 - 274);
     }
 
     #[test]
@@ -2274,8 +2535,8 @@ mod tests {
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
         // Trigger walk via last_data_byte.
         let _ = fs.last_data_byte().expect("last_data_byte");
-        // 47 blocks × 4096 = 192512 bytes
-        assert_eq!(fs.used_size(), 47 * 4096);
+        // 274 blocks × 4096 = 1_122_304 bytes (regenerated fixture).
+        assert_eq!(fs.used_size(), 274 * 4096);
         // total_size unchanged (FS-claimed aggregate bytes).
         assert_eq!(fs.total_size(), 30304 * 512);
     }
@@ -2302,10 +2563,10 @@ mod tests {
         // total_byte_extent = 16 MiB.
         assert_eq!(info.original_size, 16 * 1024 * 1024);
         assert_eq!(info.compacted_size, 16 * 1024 * 1024);
-        // data_size = 47 * 4096 = 192512 (aggregate allocated bytes)
+        // data_size = 274 * 4096 = 1_122_304 (aggregate allocated bytes)
         // — NOT counting the inline log + fsckpxd which are emitted
         // verbatim but not tracked as "user data."
-        assert_eq!(info.data_size, 47 * 4096);
+        assert_eq!(info.data_size, 274 * 4096);
 
         let mut sink = Vec::new();
         std::io::copy(&mut reader, &mut sink).expect("drain");
@@ -2316,14 +2577,15 @@ mod tests {
     fn fixture_compact_reader_preserves_allocated_blocks() {
         // The compactor must emit the original bytes of allocated
         // aggregate blocks at their original byte offsets. Compare
-        // against the raw fixture bytes for blocks 0..47.
+        // against the raw fixture bytes for blocks 0..274 (regenerated
+        // fixture's allocated block range).
         let img = load_fixture("test_jfs.img.zst");
         let raw = img.clone();
         let (mut reader, _info) = CompactJfsReader::new(Cursor::new(img), 0).expect("compactor");
         let mut out = Vec::new();
         std::io::copy(&mut reader, &mut out).expect("drain");
         let bsize = 4096usize;
-        for blk in 0..47 {
+        for blk in 0..274 {
             let start = blk * bsize;
             assert_eq!(
                 &out[start..start + bsize],
@@ -2331,8 +2593,8 @@ mod tests {
                 "allocated block {blk} should round-trip byte-for-byte"
             );
         }
-        // Free blocks 47..3788 → compactor emits zeros.
-        for blk in 47..3788 {
+        // Free blocks 274..3788 → compactor emits zeros.
+        for blk in 274..3788 {
             let start = blk * bsize;
             assert!(
                 out[start..start + bsize].iter().all(|&b| b == 0),
@@ -2435,18 +2697,22 @@ mod tests {
 
     #[test]
     fn fixture_reads_fileset_iag() {
-        // Per probe-jfs-fileset.py: pmap[0] = 0xFF000000 (extents 0..7
-        // allocated), inoext[0] = (len=4, addr=28).
+        // After regenerating the fixture with /bigdir (200 files), 8
+        // inode extents are allocated (extent 0 fills with the first
+        // 32 inodes, then extents 1..7 hold the rest). Probe values:
+        //   inoext[0] = (len=4, addr=28)
+        //   pmap[0]   = 0xFFFFFFFF — all 32 inodes in extent 0 used
+        //   pmap[1]   = 0xC0000000 — first 2 of extent 1 used
         let img = load_fixture("test_jfs.img.zst");
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let iag = fs.read_fileset_iag_at(0).expect("read IAG 0");
         assert_eq!(iag.iagnum, 0);
         assert_eq!(iag.inoext[0].length, 4);
         assert_eq!(iag.inoext[0].address, 28);
-        assert_eq!(iag.inoext[1].length, 4);
-        assert_eq!(iag.inoext[1].address, 36);
-        // pmap[0] = 0xFF000000 → top 8 bits set → extents 0..7 allocated.
-        assert_eq!(iag.pmap[0], 0xFF00_0000);
+        // pmap[0] = 0xFFFFFFFF → all 32 inodes in extent 0 allocated.
+        assert_eq!(iag.pmap[0], 0xFFFF_FFFF);
+        // Extents 1..7 also have at least some inodes allocated.
+        assert!(iag.inoext[7].length > 0);
     }
 
     #[test]
@@ -2458,9 +2724,11 @@ mod tests {
             .read_fileset_inode(FILESET_ROOT_INO, &iag)
             .expect("read root");
         assert_eq!(root.di_number, FILESET_ROOT_INO);
-        // From probe: di_size=40, di_nlink=3, mode=0o240755 (S_IFDIR + 0o755).
-        assert_eq!(root.size, 40);
-        assert_eq!(root.nlink, 3);
+        // With 6 root entries (bigdir, hello.txt, large.bin, link.txt,
+        // subdir, tiny.txt), root nlink=4 (self + bigdir + subdir + .)
+        // and dtree fits inline (size=48 = 6 active inline entries).
+        assert_eq!(root.size, 48);
+        assert_eq!(root.nlink, 4);
         assert_eq!(root.mode & 0xFFFF, 0o40755);
         assert!(root.is_directory());
     }
@@ -2624,19 +2892,20 @@ mod tests {
     }
 
     /// fsck must flag an orphan inode: forge an unreachable inode by
-    /// (a) setting its pmap bit in IAG 0's `pmap[0]` (the word for
-    /// extent 0, which is already allocated on the fixture); and
-    /// (b) stamping a valid `mode + di_number` in the dinode slot at
-    /// fino 8's byte offset. The fixture's root dir doesn't reference
-    /// fino 8 → orphan.
+    /// (a) setting its pmap bit in IAG 0's `pmap[1]` (the word for
+    /// extent 1, which is allocated but has unused slots at fino
+    /// 34..63 on the regenerated fixture); and (b) stamping a valid
+    /// `mode + di_number` in the dinode slot at fino 34's byte offset.
+    /// The fixture's dtree doesn't reference fino 34 → orphan.
     #[test]
     fn fsck_flags_orphan_inode() {
         use crate::fs::filesystem::Filesystem;
         let mut img = load_fixture("test_jfs.img.zst");
-        let orphan_inum = 8u32;
+        let orphan_inum = 34u32;
+        let in_extent = (orphan_inum - 32) as usize; // = 2
 
-        // Locate IAG 0's byte + extent 0's dinode-extent byte.
-        let (iag0_byte, extent0_addr_byte, bsize) = {
+        // Locate IAG 0's byte + extent 1's dinode-extent byte.
+        let (iag0_byte, extent1_addr_byte) = {
             let mut fs = JfsFilesystem::open(Cursor::new(&img), 0).expect("open");
             let fs_ino = fs.read_ait_inode(FILESYSTEM_I).expect("read FS_I");
             let xtroot = fs
@@ -2644,29 +2913,26 @@ mod tests {
                 .expect("parse xtree");
             let xad = xtroot.xads[0];
             let iag0 = fs.read_fileset_iag_at(0).expect("IAG 0");
-            assert!(iag0.inoext[0].length > 0, "extent 0 must be allocated");
+            assert!(iag0.inoext[1].length > 0, "extent 1 must be allocated");
             let bs = fs.aggregate_block_size();
-            (
-                (xad.physical_address + 1) * bs,
-                iag0.inoext[0].address * bs,
-                bs,
-            )
+            ((xad.physical_address + 1) * bs, iag0.inoext[1].address * bs)
         };
 
-        // (a) Set pmap[0] bit 23 (= 31 - 8) → claims fino 8 allocated.
-        let pmap0_byte = iag0_byte as usize + 2560;
-        let pre = u32::from_le_bytes(img[pmap0_byte..pmap0_byte + 4].try_into().unwrap());
-        let post = pre | (1u32 << (31 - 8));
-        img[pmap0_byte..pmap0_byte + 4].copy_from_slice(&post.to_le_bytes());
+        // (a) Set pmap[1] bit (31 - in_extent) → claims fino 34 allocated.
+        let pmap1_byte = iag0_byte as usize + 2560 + 4; // pmap[1]
+        let pre = u32::from_le_bytes(img[pmap1_byte..pmap1_byte + 4].try_into().unwrap());
+        assert!(
+            pre & (1u32 << (31 - in_extent as u32)) == 0,
+            "test assumes fino {orphan_inum} starts free in pmap[1] (got 0x{pre:08X})"
+        );
+        let post = pre | (1u32 << (31 - in_extent as u32));
+        img[pmap1_byte..pmap1_byte + 4].copy_from_slice(&post.to_le_bytes());
 
-        // (b) Stamp dinode at fino 8's byte offset: extent base + 8 * DISIZE.
-        let dinode_byte = (extent0_addr_byte + orphan_inum as u64 * 512) as usize;
-        // di_number at offset 8.
+        // (b) Stamp dinode at fino 34's byte offset: extent 1 base + in_extent * DISIZE.
+        let dinode_byte = (extent1_addr_byte + in_extent as u64 * 512) as usize;
         img[dinode_byte + 8..dinode_byte + 12].copy_from_slice(&orphan_inum.to_le_bytes());
-        // mode at offset 52 — 0o100644 (regular file).
         img[dinode_byte + 52..dinode_byte + 56].copy_from_slice(&0o100644u32.to_le_bytes());
 
-        let _ = bsize; // silence unused warning when bsize stays here
         let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("re-open");
         let result = fs.fsck().expect("JFS implements fsck").expect("runs");
         assert!(
@@ -2695,10 +2961,17 @@ mod tests {
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            5,
-            "expected 5 entries (hello.txt, large.bin, link.txt, subdir, tiny.txt); got {names:?}"
+            6,
+            "expected 6 entries (bigdir, hello.txt, large.bin, link.txt, subdir, tiny.txt); got {names:?}"
         );
-        for expected in ["hello.txt", "large.bin", "link.txt", "subdir", "tiny.txt"] {
+        for expected in [
+            "bigdir",
+            "hello.txt",
+            "large.bin",
+            "link.txt",
+            "subdir",
+            "tiny.txt",
+        ] {
             assert!(
                 names.contains(&expected),
                 "missing {expected}; got {names:?}"
@@ -2713,6 +2986,72 @@ mod tests {
         let subdir = find_entry(&entries, "subdir");
         assert_eq!(subdir.entry_type, EntryType::Directory);
         assert_eq!(subdir.path, "/subdir");
+    }
+
+    /// Multi-page dtree walker — `/bigdir` on the regenerated fixture
+    /// contains `file_001`..`file_200` which overflow the inline
+    /// 8-slot dtroot, forcing JFS to convert to an external dtree
+    /// (1 internal dtroot + 2 leaf dtpages chained via sibling next
+    /// pointers). The walker descends from dtroot's BT_INTERNAL flag
+    /// through the leaf dtpages and emits all 200 entries.
+    #[test]
+    fn fixture_external_dtree_lists_all_200_bigdir_entries() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let root_entries = fs.list_directory(&root).expect("list root");
+        let bigdir = root_entries
+            .iter()
+            .find(|e| e.name == "bigdir")
+            .expect("bigdir entry");
+        assert_eq!(bigdir.entry_type, EntryType::Directory);
+        let bigdir_entries = fs
+            .list_directory(bigdir)
+            .expect("walk bigdir external dtree");
+        assert_eq!(
+            bigdir_entries.len(),
+            200,
+            "expected 200 entries in /bigdir, got {}",
+            bigdir_entries.len()
+        );
+        // Spot-check that file_001, file_100, file_200 are all present
+        // with their expected inumbers (8-byte files "line NNN").
+        let names: std::collections::HashSet<_> =
+            bigdir_entries.iter().map(|e| e.name.as_str()).collect();
+        for n in ["file_001", "file_100", "file_200"] {
+            assert!(names.contains(n), "missing {n} in bigdir listing");
+        }
+        // No duplicates.
+        assert_eq!(
+            names.len(),
+            200,
+            "duplicate names in bigdir listing: {}",
+            bigdir_entries.len() - names.len()
+        );
+    }
+
+    /// Reading a small bigdir file's bytes still works through the
+    /// regular file-read path after the walker enumerated it via the
+    /// external dtree.
+    #[test]
+    fn fixture_external_dtree_reads_individual_bigdir_file() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let bigdir = fs
+            .list_directory(&root)
+            .expect("list root")
+            .into_iter()
+            .find(|e| e.name == "bigdir")
+            .expect("bigdir");
+        let bigdir_entries = fs.list_directory(&bigdir).expect("list bigdir");
+        let one = bigdir_entries
+            .iter()
+            .find(|e| e.name == "file_001")
+            .expect("file_001");
+        let body = fs.read_file(one, 64).expect("read file_001");
+        // Script writes `"line 001"` literally (no trailing newline).
+        assert_eq!(body, b"line 001");
     }
 
     #[test]
