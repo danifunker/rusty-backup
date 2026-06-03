@@ -365,11 +365,13 @@ aren't lost.
   `build_alloc_btree` / `build_sblock_btree` for v5). What stops the
   v5 lift is unwritten side-tree code, not fundamental:
 
-  The bundled `xfs_v5_modern_small.img.zst` fixture is sufficient
-  (modern mkfs.xfs defaults to `crc=1 finobt=1 reflink=1`), the
-  WSL oracle works (`xfs_repair -n` available in xfsprogs 5.x), and
+  The bundled `tests/fixtures/sgi/xfs_v5_modern_small.img.zst` carries
+  `features_ro_compat = 0xf` per `xfs_db` probe — **all four**
+  ro-compat features on: FINOBT, RMAPBT, REFLINK, INOBTCNT (modern
+  xfsprogs 6.6.0 defaults rmapbt=1, no longer opt-in). The WSL
+  oracle works (`xfs_repair -n` from xfsprogs 6.6.0), and
   `features_ro_compat` is already parsed in `sb.rs:129`. The actual
-  gaps are:
+  gaps to unlock R2 on the bundled fixture are:
 
   1. **finobt parser** — `agi_free_root` + `agi_free_level` are read
      into `XfsSuperblock` but never walked. Adding a `walk_finobt`
@@ -382,9 +384,10 @@ aren't lost.
      not in tree. With reflink=1 (modern default) refcountbt is
      allocated even if empty. ~200 LOC parser + walker that marks
      refcountbt blocks. `XFS_REFC_CRC_MAGIC = 0x52334320`.
-  3. **rmapbt parser** — `agf_rmap_root` + `agf_rmap_level`. Only
-     present when rmap=1 (opt-in; modern default OFF). Same shape as
-     above. `XFS_RMAP_CRC_MAGIC = 0x524d4233`. ~200 LOC.
+  3. **rmapbt parser** — `agf_rmap_root` + `agf_rmap_level`. Modern
+     mkfs.xfs default (rmapbt=1 in xfsprogs 6.6.0; the bundled
+     fixture has it on). Same shape as above.
+     `XFS_RMAP_CRC_MAGIC = 0x524d4233`. ~200 LOC.
   4. **R2 v5 gate lift** — `freespace_rebuild.rs:119-124` early-
      returns on `sb.is_v5()`. With (1)-(3) accounted, lift the gate
      and let the v4 rebuild logic run on v5. Plus the
@@ -398,12 +401,14 @@ aren't lost.
      refcountbt with a clear "feature X enabled — not yet supported"
      error rather than silent v5-gate dropthrough.
 
-  Park reason: the modern-default v5 image has finobt + (empty)
-  refcountbt, so (1) + (2) + (4) + (6) is a ~750 LOC slice to unlock
-  R2 on default modern v5 images. R3 inobt-rebuild requires (5) on
-  top. Substantial but not blocked on external dependencies. Track
-  here under "scoped, not started"; pick up alongside the next time
-  XFS work gets opened.
+  Park reason: the bundled v5 fixture has all four ro-compat
+  features on, so the safe-on-bundled-fixture slice is
+  (1)+(2)+(3)+(4)+(6) ≈ ~950 LOC to unlock R2. R3 inobt-rebuild
+  needs (5) on top (~300 LOC more — finobt resync builder).
+  Substantial but not blocked on external dependencies; the WSL
+  oracle (xfsprogs 6.6.0) and the bundled fixture together cover
+  the verification surface. Track here under "scoped, not started";
+  pick up alongside the next XFS-work window.
 
 ---
 
