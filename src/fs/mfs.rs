@@ -65,12 +65,14 @@
 //!
 //! All multi-byte fields are **big-endian** (m68k native).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::entry::{EntryType, FileEntry};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 /// MFS magic — big-endian u16 at byte 1024.
 pub const MFS_SIGNATURE: u16 = 0xD2D7;
@@ -440,6 +442,298 @@ fn parse_dir_sector(sec: &[u8; 512], out: &mut Vec<MfsDirEntry>) {
     }
 }
 
+/// Maximum length of an MFS filename in bytes (Mac Roman). The on-disk
+/// field is a 28-byte Pascal string, so 1 length byte + up to 27 chars.
+pub const MFS_MAX_NAME_LEN: usize = 27;
+
+/// Validate a candidate filename for `create_file` / `set_type_creator`.
+/// MFS uses Mac Roman encoding and disallows the path-separator ':' (a
+/// Classic Mac OS convention also enforced by HFS).
+fn validate_mfs_name(name: &str) -> Result<Vec<u8>, FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData("MFS filename is empty".into()));
+    }
+    if name.contains(':') {
+        return Err(FilesystemError::InvalidData(
+            "MFS filename contains ':' (Mac path separator) — use '-' or '_'".into(),
+        ));
+    }
+    let bytes = super::hfs::utf8_to_mac_roman(name).map_err(|_| {
+        FilesystemError::InvalidData(
+            "MFS filename contains characters not representable in Mac Roman".into(),
+        )
+    })?;
+    if bytes.len() > MFS_MAX_NAME_LEN {
+        return Err(FilesystemError::InvalidData(format!(
+            "MFS filename is {} bytes; max is {MFS_MAX_NAME_LEN}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+impl MfsDirEntry {
+    /// Serialize a single directory entry into a fresh `Vec<u8>` padded to
+    /// even length (the on-disk constraint — entries align to even byte
+    /// offsets within a directory sector). Caller stamps the result into
+    /// the sector buffer.
+    fn encode(&self) -> Vec<u8> {
+        let name_bytes = super::hfs::utf8_to_mac_roman(&self.name).unwrap_or_default();
+        let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN) as u8;
+        let total = 51 + name_len as usize;
+        let padded = total + (total & 1);
+        let mut buf = vec![0u8; padded];
+        buf[0] = self.flags;
+        // byte 1 = version (=0); already zeroed
+        buf[2..18].copy_from_slice(&self.finder_info);
+        BigEndian::write_u32(&mut buf[18..22], self.file_number);
+        BigEndian::write_u16(&mut buf[22..24], self.data_first_block);
+        BigEndian::write_u32(&mut buf[24..28], self.data_logical_length);
+        // physical length: round logical up to allocation-block boundary.
+        // Caller will overwrite if a more accurate value is known.
+        BigEndian::write_u32(&mut buf[28..32], self.data_logical_length);
+        BigEndian::write_u16(&mut buf[32..34], self.rsrc_first_block);
+        BigEndian::write_u32(&mut buf[34..38], self.rsrc_logical_length);
+        BigEndian::write_u32(&mut buf[38..42], self.rsrc_logical_length);
+        BigEndian::write_u32(&mut buf[42..46], self.create_date);
+        BigEndian::write_u32(&mut buf[46..50], self.modify_date);
+        buf[50] = name_len;
+        buf[51..51 + name_len as usize].copy_from_slice(&name_bytes[..name_len as usize]);
+        buf
+    }
+}
+
+impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
+    // --- low-level block-map editing ---------------------------------------
+
+    /// Set a 12-bit volume-map entry to `value`. Mirrors `map_get`'s
+    /// high-nibble-first packing. Panics on out-of-range `block`.
+    fn map_set(&mut self, block: u16, value: u16) {
+        debug_assert!(
+            block as u32 >= 2 && (block as u32) < self.mdb.num_alloc_blocks as u32 + 2,
+            "map_set out-of-range block {block}"
+        );
+        let value = value & 0x0FFF;
+        let bit_off = block as usize * 12;
+        let byte_off = bit_off / 8;
+        if block.is_multiple_of(2) {
+            self.map_bytes[byte_off] = (value >> 4) as u8;
+            self.map_bytes[byte_off + 1] =
+                (self.map_bytes[byte_off + 1] & 0x0F) | (((value & 0x0F) as u8) << 4);
+        } else {
+            self.map_bytes[byte_off] =
+                (self.map_bytes[byte_off] & 0xF0) | ((value >> 8) as u8 & 0x0F);
+            self.map_bytes[byte_off + 1] = (value & 0xFF) as u8;
+        }
+    }
+
+    /// Find `count` free allocation blocks, link them into a chain
+    /// (block_i -> block_{i+1}, last block -> 1 = end-of-chain), and
+    /// return the first block number. Bumps `mdb.free_blocks` down.
+    fn alloc_chain(&mut self, count: u32) -> Result<u16, FilesystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        if (count as u16) > self.mdb.free_blocks {
+            return Err(FilesystemError::InvalidData(format!(
+                "out of space: need {count} alloc blocks, have {} free",
+                self.mdb.free_blocks
+            )));
+        }
+        // First pass: gather the indices of `count` free blocks.
+        let mut picked = Vec::with_capacity(count as usize);
+        // Allocation blocks are numbered starting at 2 (blocks 0 and 1
+        // reserved by the spec). num_alloc_blocks counts the
+        // user-addressable blocks, so valid range is 2 ..= num_alloc_blocks + 1.
+        for b in 2..(self.mdb.num_alloc_blocks as u32 + 2) {
+            if self.map_get(b as u16) == 0 {
+                picked.push(b as u16);
+                if picked.len() == count as usize {
+                    break;
+                }
+            }
+        }
+        if picked.len() < count as usize {
+            return Err(FilesystemError::InvalidData(format!(
+                "fragmentation: {} free per MDB but only {} blocks found in map",
+                self.mdb.free_blocks,
+                picked.len()
+            )));
+        }
+        // Second pass: link them.
+        for w in picked.windows(2) {
+            let cur = w[0];
+            let nxt = w[1];
+            self.map_set(cur, nxt);
+        }
+        // Last block: end-of-chain marker (1).
+        let last = *picked.last().expect("picked non-empty");
+        self.map_set(last, 1);
+        self.mdb.free_blocks -= count as u16;
+        Ok(picked[0])
+    }
+
+    /// Walk an allocation-block chain starting at `first` and mark every
+    /// block free (map entry = 0). Bumps `mdb.free_blocks` up by the
+    /// number of blocks released.
+    fn free_chain(&mut self, first: u16) -> Result<(), FilesystemError> {
+        if first == 0 {
+            return Ok(());
+        }
+        let mut block = first;
+        let mut visited = std::collections::HashSet::new();
+        for _hop in 0..MAX_ALLOC_CHAIN {
+            if block < 2 || block as u32 - 2 >= self.mdb.num_alloc_blocks as u32 {
+                return Err(FilesystemError::InvalidData(format!(
+                    "free_chain hit out-of-range block {block}"
+                )));
+            }
+            if !visited.insert(block) {
+                return Err(FilesystemError::InvalidData(format!(
+                    "free_chain cycle at block {block}"
+                )));
+            }
+            let next = self.map_get(block);
+            self.map_set(block, 0);
+            self.mdb.free_blocks += 1;
+            if next == 1 || next == 0 {
+                return Ok(());
+            }
+            block = next;
+        }
+        Err(FilesystemError::InvalidData(
+            "free_chain ran past MAX_ALLOC_CHAIN".into(),
+        ))
+    }
+
+    /// Write `data` across the allocation-block chain starting at `first`.
+    /// The chain must have been pre-allocated by `alloc_chain`. Each block
+    /// holds `mdb.alloc_block_size` bytes; the last block is zero-padded
+    /// to its full size.
+    fn write_data_chain(&mut self, first: u16, data: &[u8]) -> Result<(), FilesystemError> {
+        if first == 0 || data.is_empty() {
+            return Ok(());
+        }
+        let bs = self.mdb.alloc_block_size as usize;
+        let mut written = 0usize;
+        let mut block = first;
+        for _hop in 0..MAX_ALLOC_CHAIN {
+            let chunk_off = written;
+            let chunk_end = (written + bs).min(data.len());
+            let abs = self.partition_offset + self.alloc_block_offset(block);
+            self.reader.seek(SeekFrom::Start(abs))?;
+            let chunk = &data[chunk_off..chunk_end];
+            self.reader.write_all(chunk)?;
+            // Zero-pad the rest of the block.
+            if chunk.len() < bs {
+                let pad = vec![0u8; bs - chunk.len()];
+                self.reader.write_all(&pad)?;
+            }
+            written = chunk_end;
+            if written >= data.len() {
+                return Ok(());
+            }
+            let next = self.map_get(block);
+            if next == 1 || next == 0 {
+                if written < data.len() {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "write_data_chain short-chained: {} bytes unwritten",
+                        data.len() - written
+                    )));
+                }
+                return Ok(());
+            }
+            block = next;
+        }
+        Err(FilesystemError::InvalidData(
+            "write_data_chain ran past MAX_ALLOC_CHAIN".into(),
+        ))
+    }
+
+    // --- on-disk write-back -----------------------------------------------
+
+    /// Re-encode the in-memory `entries` Vec into the directory sectors
+    /// and write them out. Used by `sync_metadata`.
+    fn dir_write_back(&mut self) -> Result<(), FilesystemError> {
+        let sector_count = self.mdb.dir_length_sectors as usize;
+        let mut packed = vec![vec![0u8; 512]; sector_count];
+        let mut sector_idx = 0usize;
+        let mut byte_off = 0usize;
+        for e in self.entries.iter().filter(|e| e.is_in_use()) {
+            let bytes = e.encode();
+            // If this entry doesn't fit in the remainder of the current
+            // sector (after leaving 1 byte for the terminator), advance.
+            if byte_off + bytes.len() + 1 > 512 {
+                sector_idx += 1;
+                byte_off = 0;
+                if sector_idx >= sector_count {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "directory full: {} sectors of {sector_count} can't hold {} entries",
+                        sector_count,
+                        self.entries.iter().filter(|e| e.is_in_use()).count()
+                    )));
+                }
+            }
+            packed[sector_idx][byte_off..byte_off + bytes.len()].copy_from_slice(&bytes);
+            byte_off += bytes.len();
+        }
+        for (i, sec) in packed.into_iter().enumerate() {
+            let sector_no = self.mdb.dir_start_sector as u64 + i as u64;
+            let off = self.partition_offset + sector_no * 512;
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.write_all(&sec)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize MDB fields back into a 512-byte buffer and write.
+    fn mdb_write_back(&mut self) -> Result<(), FilesystemError> {
+        // Re-read the original MDB sector to preserve any spare bytes we
+        // don't model (e.g. the post-volume-name volume-map area, which
+        // we write separately via `map_write_back`).
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + MDB_OFFSET))?;
+        let mut buf = [0u8; 512];
+        self.reader.read_exact(&mut buf)?;
+        // Re-stamp the fields we own.
+        BigEndian::write_u16(&mut buf[0..2], MFS_SIGNATURE);
+        BigEndian::write_u32(&mut buf[2..6], self.mdb.create_date);
+        BigEndian::write_u32(&mut buf[6..10], self.mdb.last_backup_date);
+        BigEndian::write_u16(&mut buf[10..12], self.mdb.volume_attributes);
+        BigEndian::write_u16(&mut buf[12..14], self.mdb.num_files);
+        BigEndian::write_u16(&mut buf[14..16], self.mdb.dir_start_sector);
+        BigEndian::write_u16(&mut buf[16..18], self.mdb.dir_length_sectors);
+        BigEndian::write_u16(&mut buf[18..20], self.mdb.num_alloc_blocks);
+        BigEndian::write_u32(&mut buf[20..24], self.mdb.alloc_block_size);
+        BigEndian::write_u32(&mut buf[24..28], self.mdb.clump_size);
+        BigEndian::write_u16(&mut buf[28..30], self.mdb.first_alloc_block_sector);
+        BigEndian::write_u32(&mut buf[30..34], self.mdb.next_file_number);
+        BigEndian::write_u16(&mut buf[34..36], self.mdb.free_blocks);
+        let name_bytes = super::hfs::utf8_to_mac_roman(&self.mdb.volume_name).unwrap_or_default();
+        let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN);
+        buf[36] = name_len as u8;
+        // Zero the old name area before stamping the new one.
+        for b in buf[37..37 + MFS_MAX_NAME_LEN].iter_mut() {
+            *b = 0;
+        }
+        buf[37..37 + name_len].copy_from_slice(&name_bytes[..name_len]);
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + MDB_OFFSET))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Write the in-memory `map_bytes` back to its on-disk position
+    /// (right after the volume name Pascal string within the MDB sector,
+    /// possibly straddling subsequent sectors).
+    fn map_write_back(&mut self) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + self.mdb.map_offset))?;
+        let bytes = self.map_bytes.clone();
+        self.reader.write_all(&bytes)?;
+        Ok(())
+    }
+}
 impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
@@ -506,6 +800,167 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
 
     fn used_size(&self) -> u64 {
         (self.mdb.num_alloc_blocks - self.mdb.free_blocks) as u64 * self.mdb.alloc_block_size as u64
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "MFS is flat; only the root directory accepts new files".into(),
+            ));
+        }
+        let _ = validate_mfs_name(name)?;
+        // Reject duplicates.
+        if self.entries.iter().any(|e| e.is_in_use() && e.name == name) {
+            return Err(FilesystemError::InvalidData(format!(
+                "MFS file '{name}' already exists"
+            )));
+        }
+        if data_len > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(
+                "MFS file size capped at u32::MAX bytes".into(),
+            ));
+        }
+        // Read all data into memory. MFS volumes top out at 800 KB so
+        // this is fine.
+        let mut bytes = Vec::with_capacity(data_len as usize);
+        data.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != data_len {
+            return Err(FilesystemError::InvalidData(format!(
+                "data_len {data_len} != actual {} bytes",
+                bytes.len()
+            )));
+        }
+        let bs = self.mdb.alloc_block_size;
+        let block_count = if bytes.is_empty() {
+            0u32
+        } else {
+            bytes.len().div_ceil(bs as usize) as u32
+        };
+        let first_block = self.alloc_chain(block_count)?;
+        // Commit data + map.
+        if first_block != 0 {
+            self.write_data_chain(first_block, &bytes)?;
+        }
+
+        let file_number = self.mdb.next_file_number;
+        self.mdb.next_file_number += 1;
+        self.mdb.num_files += 1;
+
+        let entry = MfsDirEntry {
+            flags: 0x80, // in use, not locked
+            finder_info: [0u8; 16],
+            file_number,
+            data_first_block: first_block,
+            data_logical_length: bytes.len() as u32,
+            rsrc_first_block: 0,
+            rsrc_logical_length: 0,
+            create_date: 0,
+            modify_date: 0,
+            name: name.to_string(),
+        };
+        self.entries.push(entry);
+        // Surface a freshly-built FileEntry for the caller.
+        let mut fe = FileEntry::new_file(
+            name.to_string(),
+            format!("/{name}"),
+            bytes.len() as u64,
+            file_number as u64,
+        );
+        fe.type_code = Some("    ".to_string());
+        fe.creator_code = Some("    ".to_string());
+        Ok(fe)
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "MFS has no directory hierarchy — all files live in the volume root".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "MFS is flat; only files in the root are deletable".into(),
+            ));
+        }
+        if entry.entry_type != EntryType::File {
+            return Err(FilesystemError::InvalidData(
+                "MFS only stores files; cannot delete a directory".into(),
+            ));
+        }
+        let fnum = entry.location as u32;
+        // Snapshot the chain heads before we touch the entries vec.
+        let (data_head, rsrc_head) = {
+            let de = self
+                .entries
+                .iter()
+                .find(|e| e.is_in_use() && e.file_number == fnum)
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!("file number {fnum} not in directory"))
+                })?;
+            (de.data_first_block, de.rsrc_first_block)
+        };
+        self.free_chain(data_head)?;
+        self.free_chain(rsrc_head)?;
+        // Remove the entry from the in-memory directory.
+        self.entries
+            .retain(|e| !(e.is_in_use() && e.file_number == fnum));
+        self.mdb.num_files = self.mdb.num_files.saturating_sub(1);
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.dir_write_back()?;
+        self.map_write_back()?;
+        self.mdb_write_back()?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.mdb.free_blocks as u64 * self.mdb.alloc_block_size as u64)
+    }
+
+    fn set_type_creator(
+        &mut self,
+        entry: &FileEntry,
+        type_code: &str,
+        creator_code: &str,
+    ) -> Result<(), FilesystemError> {
+        if type_code.len() != 4 || creator_code.len() != 4 {
+            return Err(FilesystemError::InvalidData(
+                "Mac OSType / creator must be exactly 4 chars".into(),
+            ));
+        }
+        let fnum = entry.location as u32;
+        let de = self
+            .entries
+            .iter_mut()
+            .find(|e| e.is_in_use() && e.file_number == fnum)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("file number {fnum} not in directory"))
+            })?;
+        de.finder_info[0..4].copy_from_slice(type_code.as_bytes());
+        de.finder_info[4..8].copy_from_slice(creator_code.as_bytes());
+        Ok(())
     }
 }
 
@@ -772,5 +1227,147 @@ mod tests {
         assert_eq!(fs.total_size(), 8 * 1024);
         // 3 allocation blocks used (Hello data, Doc data, Doc rsrc).
         assert_eq!(fs.used_size(), 3 * 1024);
+    }
+
+    // ------------------------------------------------------------------
+    // EditableFilesystem — create / delete / round-trip
+    // ------------------------------------------------------------------
+
+    /// Build a fresh test volume already inside a `Cursor<Vec<u8>>`. The
+    /// cursor is the in-memory backing store the edit tests mutate
+    /// through `EditableFilesystem`, then reopen for read-side
+    /// verification.
+    fn edit_fixture() -> Cursor<Vec<u8>> {
+        Cursor::new(build_test_mfs())
+    }
+
+    #[test]
+    fn create_file_writes_data_and_round_trips_through_sync() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+        let payload = b"freshly-created via EditableFilesystem".to_vec();
+        let mut src = Cursor::new(payload.clone());
+        let opts = CreateFileOptions::default();
+        let fe = fs
+            .create_file(&root, "NewFile", &mut src, payload.len() as u64, &opts)
+            .unwrap();
+        assert_eq!(fe.name, "NewFile");
+        assert_eq!(fe.size, payload.len() as u64);
+
+        fs.sync_metadata().unwrap();
+        // Reopen and prove the file persisted across a fresh parse.
+        let inner = fs.reader.clone();
+        let mut fs2 = MfsFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        let new = entries.iter().find(|e| e.name == "NewFile").unwrap();
+        let read_back = fs2.read_file(new, 4096).unwrap();
+        assert_eq!(read_back, payload);
+
+        // Free-space accounting: one alloc-block consumed (payload < 1024 B).
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        assert_eq!(after_free, before_free - 1024);
+    }
+
+    #[test]
+    fn delete_entry_releases_blocks_and_clears_directory() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+
+        fs.delete_entry(&root, &doc).unwrap();
+        fs.sync_metadata().unwrap();
+
+        let inner = fs.reader.clone();
+        let mut fs2 = MfsFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert!(
+            entries.iter().all(|e| e.name != "Doc"),
+            "Doc should be gone after delete"
+        );
+
+        // "Doc" used 2 blocks (data fork + resource fork) at 1024 B each.
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        assert_eq!(after_free, before_free + 2 * 1024);
+    }
+
+    #[test]
+    fn create_file_rejects_duplicate_names() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut src = Cursor::new(b"x".to_vec());
+        let err = fs
+            .create_file(&root, "Hello", &mut src, 1, &CreateFileOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn create_file_rejects_oversize_data() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        // The fixture has 5 free blocks of 1024 B each = 5 KiB free.
+        // Try to write 8 KiB — must fail with InvalidData.
+        let huge = vec![0u8; 8 * 1024];
+        let mut src = Cursor::new(huge);
+        let err = fs
+            .create_file(
+                &root,
+                "TooBig",
+                &mut src,
+                8 * 1024,
+                &CreateFileOptions::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn create_then_delete_returns_to_original_free_count() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let before = EditableFilesystem::free_space(&mut fs).unwrap();
+        let mut src = Cursor::new(b"abc".to_vec());
+        let fe = fs
+            .create_file(&root, "Tmp", &mut src, 3, &CreateFileOptions::default())
+            .unwrap();
+        let mid = EditableFilesystem::free_space(&mut fs).unwrap();
+        assert_eq!(mid, before - 1024);
+        // delete_entry needs a parent + the synthesized FileEntry from create.
+        fs.delete_entry(&root, &fe).unwrap();
+        let after = EditableFilesystem::free_space(&mut fs).unwrap();
+        assert_eq!(after, before, "free count must return after create+delete");
+    }
+
+    #[test]
+    fn create_directory_is_unsupported() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let err = fs
+            .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::Unsupported(_)));
+    }
+
+    #[test]
+    fn set_type_creator_updates_finder_info_and_persists() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let hello = entries.iter().find(|e| e.name == "Hello").unwrap().clone();
+        fs.set_type_creator(&hello, "PICT", "8BIM").unwrap();
+        fs.sync_metadata().unwrap();
+
+        let inner = fs.reader.clone();
+        let mut fs2 = MfsFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        let hello2 = entries.iter().find(|e| e.name == "Hello").unwrap();
+        assert_eq!(hello2.type_code.as_deref(), Some("PICT"));
+        assert_eq!(hello2.creator_code.as_deref(), Some("8BIM"));
     }
 }

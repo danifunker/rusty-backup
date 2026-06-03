@@ -1397,6 +1397,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
+                "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
                     reader,
                     partition_offset,
