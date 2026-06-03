@@ -7,7 +7,7 @@ references. The MiSTer plan
 is the one other living plan and is treated as a single line item here;
 everything else has been consolidated into this file.
 
-Last reconciled against the code: 2026-06-03.
+Last reconciled against the code: 2026-06-03 (late).
 
 When an item lands, remove its block. When new work surfaces, add a block
 here.
@@ -19,12 +19,13 @@ here.
 **Closed 2026-06-02.** ReiserFS (v3.5 + v3.6), UFS (UFS1 + UFS2), and JFS
 (JFS2) all read end-to-end through the trait: inspect, layout-preserving
 backup compactor, browse, file read, symlinks, recursive directory
-descent. See §10 for the per-FS one-liners. Optional Tier B+ follow-ups
-(UFS U.4 fsck + edit; JFS J.4 fsck + edit, plus the J.3 multi-page B+tree
-walkers for >32 GiB / >4k-inode / non-inline-dtree JFS volumes) are
-parked in §8 behind real demand. ReiserFS is intentionally read-only
-forever (filesystem leaving the kernel; investment caps at "read what
-exists").
+descent. UFS U.4 (fsck + edit + repair) all shipped 2026-06-03; see §10
+for the per-FS one-liners. JFS Tier B+ (J.4 fsck + edit, plus the J.3
+multi-page B+tree walkers for >32 GiB / non-inline-dtree JFS volumes)
+remains parked in §8 behind real demand — multi-IAG dispatch covering
+>4k inodes already lifted 2026-06-03. ReiserFS is intentionally
+read-only forever (filesystem leaving the kernel; investment caps at
+"read what exists").
 
 ---
 
@@ -319,15 +320,6 @@ see §10. Reopen when new CLI / GUI work surfaces.)
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
 
-- **UFS U.4 — `repair()`.** Detection shipped 2026-06-03 (see §10):
-  `fsck_ufs` runs 5 passes and flags `ReplicaSb*Mismatch`,
-  `BitmapMissingAllocation`, and `OrphanInode` as repairable. The
-  `EditableFilesystem::repair()` driver that actually applies the
-  fixes (rewrite replica SB from primary; clear stray bitmap bits;
-  adopt orphan inodes into `/lost+found/`) is the remaining half —
-  the write primitives + edit surface needed to drive it shipped
-  in the same sweep, so the implementation is small (~200-300 LOC
-  mirroring `repair_efs`).
 - **JFS Tier B+ (J.4) — fsck + edit.** Read shipped (see §10), but
   every edit path runs through xtree / dtree / dmapctl B+tree writes
   that J.1–J.3 deliberately walked only at the inline-root level.
@@ -336,36 +328,29 @@ aren't lost.
   landed 2026-06-03, see §10 — file + BMAP xtree-internal refusals
   lifted; multi-IAG dispatch / dtree walker / dmapctl walker still
   open below.)
-- **JFS multi-IAG dispatch.** `read_fileset_iag` now accepts internal-
-  node FILESYSTEM_I xtree (lifted 2026-06-03; see §10) but still
-  reads only page 1 (IAG 0) and gates on `di_size > 2 * PSIZE`. Full
-  multi-IAG support needs `read_fileset_inode` to route by `fino /
-  4096` to the right IAG and either lazy-load or cache them. ~200 LOC
-  follow-up.
 - **JFS multi-page dtree walker (read-side).** `parse_inline_dtree`
   still refuses `di_size > DT_INLINE_CAP` (4096 bytes) and
   internal-node dtrees. Unblocks any directory whose entries spill
-  past the 8-slot inline stbl into off-disk pages — uses the new
-  xtpage walker pattern but the leaf-page contents are dtree records
-  rather than data, so it's a separate slice (the xtpage walker
-  shipped 2026-06-03 doesn't help directly).
+  past the 8-slot inline stbl into off-disk pages. Layout notes from
+  the parked-item exploration: external dtpages are 4 KiB with a
+  40-byte header at the page start: `next i64 / prev i64 / flag u8
+  / rsrvd[3] / nextindex i16 / freecnt i16 / freelist i16 / maxslot
+  u8 / stblindex u8 / rsrvd[2] / self pxd`, then dtslots (32 B each)
+  up to DTPAGEMAXSLOT=128. Internal entry layout is `idtentry { xd
+  pxd 8B + next i8 + namlen u8 + name[11] u16 }` — same 32 B as
+  ldtentry. The slice needs a fixture with a directory > 127 entries
+  to verify the recursive descent (we don't have one in tree); the
+  xtpage walker pattern from 2026-06-03 carries over, but leaf-page
+  contents are dtree records rather than XADs so it's a separate
+  parser. Park reason: shipping an unverified B+tree walker is
+  higher-risk than the value of speculative support; refused on
+  demand with a clear error today.
 - **JFS multi-level dmapctl walker (read-side).** `walk_bmap` still
   refuses aggregates ≥ 2²³ blocks (32 GiB at bsize=4096) via the
   `MAX_BMAP_DEPTH_1_BLOCKS` cap. The new xtree walker (2026-06-03,
   see §10) covers BMAP's internal xtree but the dmapctl L0/L1/L2
   hierarchy past one level is a separate structure. Out of scope for
   vintage hardware; revisit if someone hits a multi-TiB JFS volume.
-- **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
-  helpers can now emit CRC-correct sblock-crc trees (E.4 wired
-  `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
-  safe lift is that v5 layouts may carry `finobt` (free inode btree)
-  / `rmapbt` (reverse-map btree) / `refcountbt` (reflink refcount
-  btree) ro-compat metadata that our in-memory block-completeness map
-  and AGI-summary recompute don't model — rebuilding the bnobt / cntbt
-  / inobt without resyncing the finobt would leave those side-trees
-  with stale records. Revisit when a v5 image with one of these
-  features actually needs `--repair`; the existing read path is
-  already finobt-tolerant.
 - **XFS R2 (freespace rebuild) + R3 (inobt rebuild) on v5.** Both
   helpers can now emit CRC-correct sblock-crc trees (E.4 wired
   `build_alloc_btree` / `build_sblock_btree` for v5). What stops a
@@ -415,6 +400,71 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **UFS U.4 — `repair()` (§8 parked → §10)** — closes the §8 parked
+  driver. `repair()` lives on the `EditableFilesystem` impl at
+  `src/fs/ufs.rs` and delegates to `repair_ufs`, mirroring `repair_efs`
+  in shape: re-runs `fsck_ufs`, switches on the repairable issue codes,
+  returns a `RepairReport`. Three branches: (1) `ReplicaSb*Mismatch` —
+  reads the primary SB byte image once via the new
+  `read_primary_sb_bytes`, parses the CG out of every replica issue's
+  message, then rewrites each affected CG's replica slot via the new
+  `write_replica_sb_bytes(cg, &bytes)` (refuses cg=0 and length !=
+  SB_READ_SIZE); (2) `BitmapMissingAllocation` — groups fragments by
+  CG so each CG's free-bitmap reads + writes once, parses fragment
+  number from each issue's message, clears the stray free bit (UFS
+  polarity: set=FREE so clearing = mark allocated), bumps cg_cs.nffree
+  down by the cleared count via `update_cg_cs`; (3) `OrphanInode` —
+  via the new `adopt_orphans_into_lost_found_ufs` helper: looks up or
+  creates `/lost+found` under root inum 2 through the trait
+  `create_directory`, then for each orphan re-reads the inode (to source
+  the actual d_type via `mode_to_dirent_type`, not assume), generates
+  `ino_<inum>` with `_<n>` suffix retry on collision (capped at 1000
+  retries before failed-fix bookkeeping), calls `dir_insert` + writes
+  the lost+found inode back. Unrepairable codes (geometry damage,
+  double-allocation, out-of-range pointers, indirect-read failures)
+  flow into `unrepairable_count`. Tests (`src/fs/ufs.rs::tests`, 3
+  added; UFS suite 62 → 65): `repair_clears_bitmap_missing_allocation
+  _and_refscks_clean` flips a root-claimed fragment's bitmap bit on
+  the real UFS1 fixture and asserts `is_clean()` post-repair;
+  `repair_adopts_orphan_inode_into_lost_found_and_refscks_clean`
+  forges an orphan via `alloc_inode` + `write_inode` with no parent
+  link, repairs, asserts `/lost+found/ino_<inum>` exists with matching
+  inum and the volume re-fscks clean;
+  `repair_rewrites_replica_sb_from_primary` corrupts CG 1's replica SB
+  magic + bsize on a synthetic 2-CG UFS2 image and asserts every
+  `ReplicaSb*Mismatch` is gone post-repair (geometry warnings from the
+  hand-rolled image tolerated).
+- **JFS multi-IAG dispatch (§8 parked → §10)** — lifts the §8
+  refusal in `read_fileset_iag` for FILESYSTEM_I sized past 2 × PSIZE.
+  The old cap topped out at EXTSPERIAG * INOSPEREXT = 4096 fileset
+  inodes; the new dispatch routes lookups to whichever IAG holds the
+  requested fino via a cached HashMap. Surface (`src/fs/jfs.rs`):
+  `read_fileset_iag_at(iag_no)` is the new primitive (logical page
+  `1 + iag_no` of FILESYSTEM_I — page 0 is the dinomap header),
+  `iag_for_fino(fino)` is the cached lookup (returns `Clone`d
+  FilesetIag so callers don't carry a `&mut self` borrow across the
+  next reader seek), `read_fileset_inode_global(fino)` is the trait-
+  layer entry point. The old `read_fileset_inode(fino, &iag)`
+  validates that the supplied iag's iagnum matches
+  `iag_no_for_fino(fino)` — silent mismatches now surface as a clear
+  `Parse` error instead of garbage. The `di_size > 2 * PSIZE` gate is
+  replaced by `iag_no >= (di_size / PSIZE) - 1` so any IAG covered by
+  the on-disk fileset inode is now reachable. JfsFilesystem gains an
+  `iag_cache: HashMap<u32, FilesetIag>` field (lazy, never cleared —
+  read-only mode, xtree stable). All three trait callers (root /
+  list_directory / read_file) moved to `read_fileset_inode_global`;
+  the list_directory per-child loop benefits most because a directory
+  whose children straddle IAGs now pays one logical-page read per
+  IAG, not per inum. Tests (`src/fs/jfs.rs::tests`, 4 added; JFS
+  suite 53 → 57): `iag_no_for_fino_splits_every_4096_inodes` —
+  pure arithmetic; `iag_cache_short_circuits_second_lookup_for_same_
+  iag` — first hit populates, second hit reuses, third hit on a
+  different inum in the same IAG stays at len=1;
+  `read_fileset_inode_global_matches_iag_supplied_form` — dispatch
+  result is byte-identical to the explicit `(fino, &iag)` form on
+  the single-IAG fixture; `read_fileset_inode_rejects_iag_mismatch`
+  — passing IAG 0 for inum 4096 returns the new "belongs in IAG 1"
+  Parse error.
 - **UFS U.4 — fsck + write + EditableFilesystem (§8)** — shipped
   across three slices on 2026-06-03. **fsck** (`src/fs/ufs_fsck.rs`,
   ~500 LOC) mirrors `efs_fsck.rs`: 5 ordered passes covering geometry
