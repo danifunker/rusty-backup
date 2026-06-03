@@ -16,102 +16,15 @@ here.
 
 ## 1. Filesystem engine — Unix priority track
 
-The three Unix filesystems we want soon. ReiserFS is on the kernel removal
-track and should land before it disappears from upstream distros; UFS and
-JFS unblock BSD/Solaris/OS-2 workflows. **Sequence: ReiserFS → UFS → JFS**.
-Within each, **Tier A** (detect + size + compact, the bitmap-only floor) is
-the high-value slice that lights up backup + restore + inspect even without
-browse; **Tier B** (inode + dir + file walk) follows for `rb-cli ls` / `get`
-and the GUI browse tab.
-
-Magic dispatch order (`probe_0x83_fs_type` in `src/fs/mod.rs`) should remain
-**content-magic first, partition-type-byte second**; all four (ext, btrfs,
-xfs, reiserfs/ufs/jfs) share MBR type `0x83` on Linux.
-
-### 1.1 ReiserFS — **Read-track shipped 2026-06-02.** Tier A (R.1–R.2) +
-Tier B (R.3a–R.3d) all landed; inspect / browse / read all work on v3.6.
-
-- **Scope**: v3.5 (`ReIsErFs` magic) + v3.6 (`ReIsEr2Fs` magic). Reject
-  reiser4 with a clear error — wholly different on-disk format, extinct,
-  partimage never handled it either. **Read-only** — no edit, no fsck, no
-  resize (the filesystem is leaving the kernel; investment caps at "read
-  what exists").
-- **References**: `partimage-0.6.9/src/client/fs/fs_reiser.{cpp,h}` for Tier
-  A (port directly); `reiserfsprogs` (`debugreiserfs`, `reiserfsck`) for
-  Tier B's S+tree walker; Linux kernel `fs/reiserfs/reiserfs_fs.h` for
-  authoritative on-disk structs.
-- **Bitmap polarity**: confirm against a real image before committing — most
-  Linux FS use set = allocated, but CLAUDE.md notes the Amiga / EFS "set =
-  free" trap; ReiserFS is presumed Linux-standard but verify.
-
-| # | Tier | Deliverable |
-|---|---|---|
-| ~~R.1~~ | A | **Shipped.** `src/fs/reiserfs.rs` parses the superblock at byte 65536 with magic dispatch (v3.5 / v3.6 / reject-reiser4), reads `s_block_count` / `s_free_blocks` / `s_blocksize` / `s_bmap_nr` / `s_label`, and is wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("ReiserFS"), and both `open_filesystem` dispatch arms (type 0x83 + auto-detect). Inspect tab shows the right type + sizes. 9 unit tests cover both magics, the reiser4 reject path, block-size validation, label parsing, partition-offset threading, and `probe_0x83_fs_type` routing. Gated test against a real `mkfs.reiserfs` fixture still pending. |
-| ~~R.2~~ | A | **Shipped.** `src/fs/reiserfs.rs` adds `read_bitmap_block` + `bitmap_valid_bits` helpers (bitmap 0 at sb_block+1, bitmap i≥1 at i*blocks_per_bitmap), `Filesystem::last_data_byte` override (scans bitmaps from end via `highest_set_bit`), and a layout-preserving `CompactReiserFsReader` that coalesces same-state bitmap runs into `MappedBlocks` / `Zeros` sections. Bitmap polarity is **set = allocated** (standard Linux). Wired into `compact_partition_reader` for both auto-detect and 0x83 dispatch arms; re-exported as `crate::fs::CompactReiserFsReader`. 6 new tests: `last_data_byte` with extras / reserved-only / empty-bitmap / multi-bitmap-block, plus a layout-preserving stream check and a round-trip-through-parser test. Gated test against a real `mkfs.reiserfs` fixture still pending. |
-| R.3a | B | **Shipped.** On-disk S+tree node parsers in `src/fs/reiserfs.rs`: `BlockHead` (level + nr_item + free_space + right_delim_key, 24 bytes); `Key` (16-byte raw + `KeyFormat`-aware `dir_id` / `objectid` / `offset` / `item_type` accessors handling both v1 sentinel-u32 and v2 packed-u64 layouts); `ItemHead` (24-byte leaf header with `version` → `key_format`); `DiskChild` (8-byte internal-node child pointer). `parse_leaf_item_heads` / `parse_internal_keys_and_children` walk a whole block and assert the B-tree N+1 invariant. Superblock `root_block` is now parsed and stored. 13 new tests cover both key formats, both item-type decode tables, BlockHead leaf/internal, ItemHead, DiskChild, leaf-of-3 + internal-with-2-keys round trips, and the leaf/internal mismatch rejections. |
-| R.3b | B | **In progress.** Tree walker (descend root → find leaves). Fixture `tests/fixtures/test_reiserfs_v3_6.img.zst` shipped 2026-06-02 via `scripts/generate-reiserfs-fixtures.sh` (libguestfs appliance, kernel modules from `linux-modules-extra-$(uname -r)`). |
-| ~~R.3c~~ | B | **Shipped.** `Filesystem::list_directory` decodes DIR_ENTRY items: 16-byte `reiserfs_de_head` headers sorted by hash, names packed in reverse at item tail, NUL-padded to 8-byte slots. `.`, `..`, and `.reiserfs_priv` are filtered. Per-entry SD lookup populates mode/uid/gid/mtime + size; symlink targets fetched from the Direct item and truncated to SD-recorded size. `FileEntry::location` packs `(dir_id << 32) \| objectid` so subdir entries round-trip through subsequent `list_directory` calls. Tests: 9 synth (StatData new/old + reject-wrong-size, DIR_ENTRY empty/single/multi + overlap/past-body refusals, pack/unpack round-trip) and 5 fixture-driven (root entry, hidden-filter, file metadata, symlink target, recursive subdir descent). |
-| ~~R.3d~~ | B | **Shipped.** `Filesystem::read_file` walks the file's items in key-order: SD fixes the logical size, IND items expand to `block_size` chunks per u32 pointer (sparse pointers = 0 emit zeros), DRCT items append raw bytes. Final truncation to SD.size drops the NUL-padding inside the tail-packed DRCT's 8-byte slot. `max_bytes` is honoured eagerly so over-cap reads short-circuit without loading entire IND chains. Tests: 5 fixture-driven (`hello.txt` DRCT, `tiny.txt` tail-packed-with-padding, `large.bin` 6-pointer IND with byte-formula spot-checks at 0/1/100/4095/4096/12345/24575, `subdir/nested.txt` recursive read, `max_bytes` cap). |
-
-### 1.2 UFS — **Read-track shipped 2026-06-02.** U.1 + U.2 (Tier A) +
-U.3 (Tier B) all landed; inspect / backup compactor / browse / read all
-work on UFS1 + UFS2 (both 8192- and 65536-byte SB locations, both LE
-and BE endians). Tier B+ (U.4 fsck + edit) is parked behind real
-demand.
-
-- **Scope**: UFS1 (4.2BSD/FFS — SunOS 4, Solaris 2, NetBSD, OpenBSD, FreeBSD
-  ≤4) and UFS2 (FreeBSD 5+). Read + size on first pass; edit + fsck gated
-  on real demand. Softupdate-journaled (SU+J) **dirty** volumes are
-  refused at open with a clear message — the safe path is "let
-  `fsck_ffs -y` replay the journal first."
-- **References**: `partimage-0.6.9/src/client/fs/fs_ufs.cpp` for Tier A;
-  FreeBSD `sys/ufs/ffs/fs.h` + `sys/ufs/ufs/dinode.h` for on-disk structs;
-  `ufstools` (`ufstool`, `fsck_ffs`) as oracle.
-- **Internal precedent**: `src/fs/efs.rs` + `src/fs/unix_common/` — EFS is
-  the same cylinder-group + inode-bitmap + classic-Unix-inode shape, and
-  the unix_common scaffolding lifts to UFS with little change.
-- **Bitmap polarity**: confirmed **set = FREE** (BSD convention, opposite
-  of ReiserFS / ext). `BitmapReader::highest_clear_bit` (added under U.2)
-  is the matching primitive; JFS can reuse it.
-
-| # | Tier | Deliverable |
-|---|---|---|
-| ~~U.1~~ | A | **Shipped.** `src/fs/ufs.rs` parses the FreeBSD UFS superblock for both UFS1 (`0x00011954`) and UFS2 (`0x19540119`), probing the kernel `SBLOCKSEARCH` order — UFS2's modern byte 65536 first, then UFS1's byte 8192 — and accepting whichever magic matches in either endian. Geometry (bsize / fsize / frag / ncg / fpg / ipg / cblkno) is read with byte-order-aware accessors and gated on power-of-two block sizes, frag×fsize == bsize, and plausible ncg. UFS1 total comes from `fs_old_size`; UFS2 from the 64-bit `fs_size` at offset 1080. Refuses SU+J dirty volumes. Wired through `detect_filesystem_type`, `probe_0x83_fs_type` ("UFS"), and `open_filesystem`'s superfloppy + 0x83 dispatch arms. 15 synth unit tests + 2 fixture-driven tests cover both magics, both endians, both SB offsets, SB-ambiguous "prefer-UFS2" disambiguation, SU+J reject/accept, bsize/frag sanity, label parsing, partition-offset threading, UFS1 / UFS2 size formulas. |
-| ~~U.2~~ | A | **Shipped.** Cylinder-group walker: `cg_header_offset(i)` / `cgbase_frag(i)` math, `read_cg_free_bitmap(i)` (validates cg_magic `0x00090255` + cg_cgx; bounds the bitmap to `[freeoff, nextfreeoff)`), `Filesystem::last_data_byte` override (scans CGs from end, returns highest CLEAR-bit position translated to bytes), and `CompactUfsReader` (layout-preserving stream coalescing same-state bitmap runs into MappedBlocks / Zeros sections, with trailing zero-pad to `total_frags * fsize`). Re-exported as `crate::fs::CompactUfsReader` and wired through `compact_partition_reader` (both 0x83 + superfloppy arms). `BitmapReader::highest_clear_bit` added to `unix_common::bitmap` with 6 dedicated tests. 7 new fixture-driven tests verify last_data_byte (= 73728 on both UFS1/UFS2 fixtures, independently confirmed via `scripts/probe-ufs-cg.py`), CG-magic corruption rejection, stream length == original_size, byte-for-byte allocated-region preservation, zero-fill in free regions, and round-trip through the parser for both fixtures. |
-| ~~U.3~~ | B | **Shipped.** `src/fs/ufs.rs` adds the `UfsInode` struct (version-agnostic in-memory dinode), `read_inode` (UFS1 128 B + UFS2 256 B layouts at `(cg * fpg + iblkno) * fsize + in_cg * dinode_size`), `resolve_logical_block` (direct[0..12] → single → double → triple indirect with sparse-pointer zero handling), `read_inode_data` (logical-block-by-logical-block walk with eager `max_bytes` clamp), `read_symlink_target` (inline payload when `di_size <= fs_maxsymlinklen`, otherwise data-block fallback), `build_file_entry` (mode-driven dispatch into File / Directory / Symlink / Special), and the `Filesystem::list_directory` + `Filesystem::read_file` implementations. `list_directory` decodes DIRENT2 records (8-byte fixed header + name + 4-byte-aligned pad), filters `.` / `..`, and validates `d_reclen` alignment + bounds + `d_namlen` slot fit. Wired through the existing dispatch — inspect → root → list → read works end-to-end on UFS1 and UFS2 fixtures. 19 new tests: inode_byte_offset against probe-derived absolute offsets, root-inode parse on both versions, dot/dotdot filtering, recursive subdir descent, inline symlink decode on both UFS1 (60 B cutoff) and UFS2 (120 B cutoff), 11 B file read (hello.txt), 10 B file read (tiny.txt), 24 KiB direct-block walk (large.bin = 3 blocks via direct[0..3]) with deterministic byte-formula spot checks, max_bytes early-exit clamp, regular/symlink/directory dispatch in read_file, two synthetic indirect-walk tests (single-indirect resolution to fragment 800 + sparse-block zero emission), and two inode-OOB rejection tests. |
-| U.4 | B+ | **Optional follow-up** — fsck + edit. Defer until there's real demand. |
-
-### 1.3 JFS — **Read-track shipped 2026-06-02.** Tier A (J.1 + J.2) + Tier B (J.3) all landed; detect + size + inline-log-aware backup + BMAP-driven compaction + browse + read all work on the JFS2 read path.
-
-- **Scope**: JFS2 only (the only on-disk format Linux ever shipped; AIX
-  JFS1 is a different format with different magic and is rejected
-  implicitly by the `"JFS1"` ASCII-magic gate). Linux's `s_version` field
-  carries `1` (mkfs.jfs default); the kernel constant is `2`. The parser
-  accepts `1..=2` for forward compatibility.
-- **References**: `jfsutils/include/jfs_superblock.h` for the on-disk
-  struct; Linux `fs/jfs/{jfs_superblock,jfs_dinode,jfs_dtree,jfs_xtree,
-  jfs_dmap}.h` for AIT + xtree + BMAP walkers (J.2+).
-- **Note**: Tier A's "compact" piece needs a BMAP B+tree walker because
-  the Block Allocation Map is itself a B+tree of allocation control
-  pages (not a flat bitmap). J.1's `last_data_byte` returned
-  `max(aggregate_end, logpxd_end, fsckpxd_end)` (correct but pessimistic);
-  J.2 now walks dmap leaves and tightens `last_data_byte` to the
-  pmap-derived highest-allocated block (still maxed against logpxd /
-  fsckpxd so the inline log keeps riding out verbatim).
-
-| # | Tier | Deliverable |
-|---|---|---|
-| ~~J.1~~ | A | **Shipped.** `src/fs/jfs.rs` parses the Aggregate Superblock at byte 32768 (`"JFS1"` ASCII magic + version `1..=2`), reads `s_size` (hardware-block count) / `s_bsize` (aggregate block size) / `s_pbsize` (hardware/LVM block size) / `s_agsize` / `s_state` / `s_label`, and decodes the inline-log + fsck-workspace `pxd_t`s (24-bit length + 40-bit address split across two LE words). Refuses dirty aggregates (`s_state != 0`) and asks the user to run `fsck.jfs -p`. `last_data_byte` returns `max(aggregate_end, logpxd_end, fsckpxd_end)` so backups capture the inline log even when it lives at the partition tail past the aggregate end (true on the makefs-equivalent layout `mkfs.jfs` produces — the log sits at agg block 3840 of a 3788-agg-block volume). Wired through `detect_filesystem_type` (4-byte ASCII probe at byte 32768), `probe_0x83_fs_type` ("JFS2"), and `open_filesystem`'s superfloppy + 0x83 dispatch arms. Fixture `tests/fixtures/test_jfs.img.zst` ships via `scripts/generate-jfs-fixtures.sh` (16 MiB, mkfs.jfs + libguestfs to populate the standard test tree). 21 tests: 14 synth (magic / version-1 / version-2 / future-version reject / dirty-aggregate reject / bad-bsize / l2bsize-mismatch / pbsize > bsize / zero-size / Pxd encode + decode round-trip / label / no-label / last_data_byte when log past aggregate vs inside / partition-offset threading) + 4 fixture-driven (geometry, logpxd / fsckpxd addresses, last_data_byte == 16 MiB > total_size). |
-| ~~J.2~~ | A | **Shipped.** AIT bootstrap at `AITBL_OFF = AIMAP_OFF + (SIZE_OF_MAP_PAGE << 1) = 0xB000` reads the 32-dinode first extent; `JfsDinode` decodes the 512-byte struct (field offsets all verbatim from `jfs_dinode.h`); `Xad` decodes the 16-byte xad_t with the split 40-bit logical offset (off1 high byte + off2 low u32). `walk_bmap` reads BMAP control inode (#2) → inline xtree → dmap pages laid out at `(agg_block >> 13) + 4` per `BLKTODMAP`. Each dmap leaf is 4 KiB with a 16-byte header + binary buddy tree + wmap + pmap (MSB-first, bit `31 - (block & 31)` of word `block / 32`); bits past mapsize are kernel-forced to 1 and masked out. `CompactJfsReader` emits one section per BMAP run + the logpxd + fsckpxd verbatim. Cached lazily; `used_size` returns `allocated_blocks * bsize` once the cache is warm. Refuses aggregates ≥ 2^23 blocks (32 GiB at bsize=4096) — multi-level `dmapctl` walker is a follow-up; vintage hardware never hits this. 16 tests cover the AIT byte-offset arithmetic, dinode metadata, xtree XAD decoding, BMAP walk (47 allocated, highest=46), used_size + last_data_byte interaction with the log, and CompactJfsReader byte-for-byte preservation. |
-| ~~J.3~~ | B | **Shipped.** `read_fileset_iag` parses the IAG at page 1 of FILESYSTEM_I's data — header (72 B) + pad (1976 B) + wmap (512 B) + pmap (512 B) + `inoext[128]` (1024 B). `read_fileset_inode(fino, &iag)` locates user dinodes via `inoext[fino/32].address * bsize + (fino % 32) * 512`, with a pmap sanity check. `parse_inline_dtree` walks the 288-byte dtroot — slot[0] overlaps the header per the kernel's union type, so leaf entries live at slots 1..8; iteration goes through `stbl[0..nextindex]`. ldtentry holds inumber+next+namlen+name[11]UCS-2+index; long names (> 11 chars) chase the `next` chain through dtslot continuation slots. `read_file_data` walks the inline xtree XADs with sparse-aware gap-fill. `read_symlink_target` reads inline (≤ 128 bytes) from `di_fastsymlink` at dinode +256, else falls back to xtree. Wires `root` / `list_directory` / `read_file` through the FileEntry pipeline with mode/uid/gid/mtime metadata. Refuses non-inline dtrees (`di_size > 4096`), multi-IAG filesets (> 4096 inodes), and xtrees with internal nodes — all multi-page B+tree walkers parked as J.3 follow-ups. 12 tests cover the IAG parse, root inode + listing (5 user entries), inline symlink decode, three file reads (hello.txt 11 B, tiny.txt 10 B, large.bin 24 KiB via xtree XADs), recursive subdir descent, regular/symlink/directory dispatch, max_bytes clamp, and metadata carry-through. |
-| J.4 | B+ | **Parked — design dependency on J.3.** fsck + edit. Defer until there's real demand. |
-
-### Estimated total
-
-~~8 ReiserFS Tier A+B sessions~~ + ~~6 UFS Tier A+B sessions~~ +
-~~3 JFS J.1 + J.2 + J.3 sessions~~ done. The whole Unix-FS read
-track for §1 is closed. Only fsck + edit (per-FS B+) remains as
-optional follow-up work, parked on real demand.
+**Closed 2026-06-02.** ReiserFS (v3.5 + v3.6), UFS (UFS1 + UFS2), and JFS
+(JFS2) all read end-to-end through the trait: inspect, layout-preserving
+backup compactor, browse, file read, symlinks, recursive directory
+descent. See §10 for the per-FS one-liners. Optional Tier B+ follow-ups
+(UFS U.4 fsck + edit; JFS J.4 fsck + edit, plus the J.3 multi-page B+tree
+walkers for >32 GiB / >4k-inode / non-inline-dtree JFS volumes) are
+parked in §8 behind real demand. ReiserFS is intentionally read-only
+forever (filesystem leaving the kernel; investment caps at "read what
+exists").
 
 ---
 
@@ -132,16 +45,15 @@ byte 2097152 / `@1`, partition slot 7). Always operate on a copy.
 
 Open holes in v4 edit (suggested order — easiest/most reusable first):
 
-- **(A) new-chunk inode allocation** — `alloc_inode_slot` currently returns
-  `DiskFull` when every inobt chunk is full. Allocate `blocks_per_chunk`
-  contiguous blocks (alloc_blocks, respecting `sb_inoalignmt`), initialize
-  all 64 dinodes (magic `0x494e`, version from a sibling, `di_mode=0`,
-  `di_next_unlinked=NULLAGINO`), add the chunk to the inobt (startino,
-  freecount 64, free=all-ones). Reuse the R3 multi-level REBUILD
-  (`build_sblock_btree`): gather all chunks + the new one, rebuild the
-  inobt, update AGI root/level/count/freecount and `sb_icount`/`sb_ifree`.
-  Ref `libxfs/xfs_ialloc.c (xfs_ialloc_ag_alloc)`. Oracle: fill every free
-  inode slot, then create one more file/dir → clean.
+- **(A) new-chunk inode allocation** — **single-leaf path shipped
+  2026-06-02** (see §10). Follow-up still open: **multi-level inobt
+  growth.** When an AG outgrows its single-leaf inobt (≈16k inodes per AG
+  at 4 KiB blocksize + 16-byte records), `alloc_new_inode_chunk` currently
+  returns `Unsupported`. Reuse R3's `rebuild_multilevel_inobt` shape via
+  `build_sblock_btree`, but free the old tree blocks alongside allocating
+  the new ones (R3 relies on a follow-up R2 pass that hole (A) doesn't
+  have). Oracle: a deliberately-overgrown AG with the leaf full → create
+  one more file → `xfs_repair -n` clean.
 
 - **(B) block → short-form dir re-compaction** — cosmetic. After
   `block_remove_entry`, if surviving entries fit the inode literal area,
@@ -315,58 +227,7 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-### 3.1 ProDOS access-bit setter — **Shipped**
-
-`EditableFilesystem::set_prodos_access(entry, access)` added to the
-trait (default returns `Unsupported`) and overridden on
-`ProDosFilesystem`. The access byte at offset 30 of each directory
-entry is patched in place; other fields (file_type at 16, aux_type at
-31-32, key_pointer, blocks_used, etc.) round-trip unchanged. The
-volume root has no settable access byte and is refused with a clear
-`Unsupported`.
-
-`StagedEdit::SetProdosAccess { entry, access }` added to the staged-
-edit pipeline with the usual replace-prior + pending-query helpers
-(`EditQueue::replace_set_prodos_access`,
-`EditQueue::pending_prodos_access_for`). Browse-view edit toolbar gets
-a **Lock** ($21 = read + backup) and **Unlock** ($C3 = read + write +
-destroy + rename + backup) button pair, gated on a ProDOS partition
-being open and an entry being selected. Advanced bit-level access
-overrides ship via the trait method for CLI use.
-
-Tests: 4 new unit tests in `src/fs/prodos.rs` cover the file lock/
-unlock cycle, the directory case, the volume-root refusal, and the
-preservation of file_type / aux_type when the access byte changes.
-
-### 3.2 NTFS file-aware GHO — compressed path
-
-Uncompressed NTFS file-aware Ghost backups work end-to-end via
-`src/rbformats/gho.rs` (the `NtfsFileAware` `GhoReaderMode` variant
-threads a cluster-run index + inline-MFT fallback through `GhoReader`).
-Originally landed in commits `63a57af`, `84e3d26`, `7e29fda`, `b9f8924`
-plus visibility changes to `src/fs/ntfs.rs`.
-
-The compressed path bails with `"compressed NTFS not yet supported"`
-in `GhoReader::open` (around line 1102, the branch where
-`find_inner_stream_start` fails AND `compression != None`). Picking it
-up needs:
-
-1. A real compressed NTFS file-aware `.GHO` fixture from a Ghost dump
-   (the format is reverse-engineered from uncompressed samples; the
-   compressed wrapper format isn't observed yet — likely the same
-   Fast-LZ chunking as compressed FAT GHO, but verify).
-2. Plumb the compressed-block reader (already shipped for FAT
-   file-aware) into the NTFS index builder. The on-disk cluster-run
-   format documented in the original NTFS file-aware work is the same;
-   only the surrounding container framing changes when compression is
-   on.
-3. Round-trip test against a known-good Ghost-produced compressed
-   image.
-
-The `docs/gho_file_aware.md` reference doc covers the binary format
-(kept).
-
-### 3.3 HFS — extending a raw partition image
+### 3.1 HFS — extending a raw partition image
 
 Investigate how to extend `~/Documents/partition-0.img` (a raw single-
 partition HFS image with no APM wrapper). The current expand-HFS path
@@ -465,246 +326,9 @@ Gaps to reconcile back into the plan when it gets picked up:
 
 ## 6. CLI / GUI
 
-### 6.1 `rb-cli fsck --format json|yaml` — **Shipped**
+(Section currently empty — Mac archives GUI polish closed 2026-06-02,
+see §10. Reopen when new CLI / GUI work surfaces.)
 
-`FsckResult` / `FsckIssue` / `FsckStats` / `OrphanedEntry` /
-`RepairReport` all gained `#[derive(Serialize)]`. The `fsck` verb
-accepts the same `--format text|json|yaml` flag as every other
-read-only verb (`csv`/`tsv` rejected — the report is nested). The
-JSON/YAML payload wraps the `FsckResult` plus a top-level
-`clean: bool` so scripts can branch without re-deriving it; in
-`--repair` mode the envelope additionally carries a `repair`
-sub-object with the applied/failed/unrepairable counts. Unsupported
-filesystems emit a structured error envelope with
-`status.error: true`, `status.code: GENERIC_FAILURE`, and
-`result: null`. The process exit code stays non-zero on issues even
-in structured mode, so shell `$?` branching keeps working. 5 new
-unit tests cover the OK / clean / error / unsupported envelopes plus
-the CSV/TSV rejection.
-
-### 6.2 `rb-cli get` globbing — **Shipped**
-
-`get` now accepts the same glob / `--exclude` / `--ignore-case` /
-`--case-sensitive` syntax as `ls` and `rm`. Plus three new flags:
-
-  * `-r` / `--recursive` — descend into directories. A literal
-    directory source without `-r` is a clear error pointing at the
-    flag; matched directory entries in a glob with no `-r` are
-    skipped with a one-line warning.
-  * `--force` — overwrite existing host files.
-  * `--skip-existing` — skip with a one-line note. Mutually exclusive
-    with `--force`. Default is a hard error on conflict.
-
-Destination semantics:
-
-  * Single literal file → DST is the literal target path. If DST
-    exists as a directory **or** the user wrote a trailing
-    separator, the file lands under `DST/<basename>`.
-  * Literal directory + `-r` → DST is the parent under which
-    `DST/<source-basename>/...` mirrors the source tree (cp/rsync
-    convention).
-  * Glob → DST is a directory; matches lay out relative to the
-    longest non-glob prefix of the pattern (so `/foo/*.txt` matched
-    by `/foo/a.txt` and `/foo/sub/a.txt` under
-    `**/*.txt` land at `DST/a.txt` and `DST/sub/a.txt`
-    respectively).
-
-Symlinks ride out as plain text files containing the target path —
-lossy but cross-platform safe (Windows symlinks need developer mode
-or admin). Special files (devices / fifos / sockets) are skipped
-with a one-line note. The original `get-binhex` / `get-applesingle`
-paths still handle Mac resource forks for the cases where they
-matter.
-
-Tests: 12 unit (`src/cli/verbs/get.rs`) for the path / glob-root /
-conflict-mode primitives + 6 end-to-end (`tests/cli_flat.rs`) for
-single-file extract, glob extract, recursive directory dump, literal
-directory refusal without `-r`, `--force` overwrite, `--skip-existing`
-preservation, and `--exclude` filtering against an HFS scratch
-image.
-
-### 6.3 Native Mac archives — GUI workflow polish
-
-Reader / writer for BinHex 4.0 (.hqx), StuffIt classic (SIT! and SIT5),
-and .sea are in tree (Phase 1-2-3 of the original plan plus SEA
-detection via `find_sea_archive`). CLI verbs `put-binhex`, `get-binhex`,
-`sit list`, `sit extract`, `sit create`, `sit create OUT.sit.hqx`
-shipped. `src/macarchive/stuffit.rs` exposes a tree-shaped writer
-(`StuffItInputNode { File | Folder }` + `build_archive_tree`) that
-emits START_FOLDER / END_FOLDER markers; the flat `build_archive` API
-delegates to it. ASCII-only audit on every user-visible string in
-`src/macarchive/`, `src/gui/archives_tab.rs`, and the SIT / MacBinary
-CLI verbs is clean (verified 2026-06-02; non-ASCII only in dev-facing
-doc comments).
-
-#### Why these workflows matter
-
-Classic Mac files carry a **resource fork** + 4-byte **type code** +
-4-byte **creator code** that vanish the moment the file touches a
-non-HFS filesystem. BinHex 4.0 (`.hqx`) encodes the whole
-data+resource+Finder-info bundle into printable 7-bit ASCII, so it's
-the only format that round-trips a classic Mac file through email,
-modern web uploads, Windows/Linux disks, macOS HFS+, or anywhere else
-the resource fork would otherwise be silently dropped. StuffIt
-(`.sit`) bundles many files but only preserves forks intact if the
-archive itself lives on HFS or rides inside `.hqx`. Hence the
-recurring `.sit.hqx` combo for emailing a collection: SIT bundles,
-HQX makes the bundle transport-safe.
-
-The four GUI workflows below cover both directions across the
-disk-image boundary, plus a standalone "just open an archive"
-mode. Each modal includes a short explanatory paragraph so users
-who don't already know the SIT/HQX history can choose correctly.
-
-#### Workflow A — Importing a `.hqx` / `.sit` / `.sea` into a disk image
-
-Trigger: user clicks **Add File…** (or drags onto the browse pane) in
-the edit-mode browse view of an HFS / HFS+ partition, and the picked
-file matches one of the archive extensions.
-
-Modal: "This is a `<format>` archive. What would you like to add to
-the disk image?"
-
-  * **Extract and add the archive contents.** *Decode the archive on
-    the host, then create each file/folder inside the open directory
-    of the disk image. Use this when you're trying to land the
-    enclosed files on the target Mac (e.g. you downloaded
-    `MacApp.sit.hqx` and want to install MacApp).*
-  * **Add the archive file as-is.** *The `.hqx` / `.sit` lands as a
-    single flat file on the disk image. Use this when you want to
-    move the archive through the disk image as cargo (e.g. shipping
-    a `.sit.hqx` to an emulator user who will unstuff it themselves
-    with StuffIt Expander on the target Mac).*
-  * **Cancel.**
-
-For `.sit.hqx` (double-wrapped), surface a third option: **Decode HQX
-only (the `.sit` lands on the disk image).** Useful when the target
-Mac has StuffIt Expander but no BinHex tool.
-
-Auto-unwrap hook (same modal flow): when the decoded HQX payload
-sniffs as a DiskCopy 4.2 (`dc42::detect_dc42`) or raw HFS volume, the
-"Extract and add" choice routes to the disk-image pipeline instead of
-loose-file creation, with a fourth option "Mount this image" surfaced
-when a disk-image-aware modal already handles selection of target
-partition / source view.
-
-Code placement: file-type membership in `src/model/file_types.rs`
-(single source of truth for picker filters across inspect / restore /
-backup tabs); decode path reuses the CLI `put-binhex` /
-`sit extract` core functions; modal lives in the browse-tab edit
-toolbar alongside the existing Add File flow.
-
-#### Workflow B — Exporting selected file(s) from a disk image as a SIT / HQX archive
-
-Trigger: user selects one or more entries in the browse view of an
-HFS / HFS+ partition (or an Amiga / classic-Unix partition where
-resource forks aren't relevant but multi-file bundling still is) and
-opens the **Save As…** dropdown.
-
-New dropdown entries (alongside the existing "Raw bytes" /
-"MacBinary" / "AppleDouble" options):
-
-  * **Save as BinHex 4.0 (`.hqx`).** Enabled only for single-file
-    selections. Tooltip: *Encodes both forks + Finder info (type +
-    creator codes) in printable ASCII. The only format that
-    preserves a classic Mac file's resource fork through email,
-    web uploads, modern Windows / Linux / macOS filesystems, or
-    anything else that isn't HFS — every other "flat" export
-    silently drops the resource fork.*
-  * **Save as StuffIt classic (`.sit`).** Enabled for any selection
-    including folders. Tooltip: *Multi-file compressed archive in
-    StuffIt 1.x–3.x format. Works on System 6+. Preserves forks
-    intact only if the resulting `.sit` then sits on HFS or rides
-    inside a `.hqx` — see the `.sit.hqx` option below for
-    transport-safe distribution.*
-  * **Save as StuffIt-over-BinHex (`.sit.hqx`).** Enabled for any
-    selection. Tooltip: *Use this when emailing or web-uploading a
-    bundle of Mac files: SIT bundles them, HQX wraps the bundle in
-    transport-safe ASCII. The classic "I emailed you a Mac app"
-    format.*
-
-Implementation reuses `build_archive_tree(StuffItInputNode::Folder,
-…)` for SIT, the existing `binhex::encode` for HQX, and chains them
-for the combined variant. Each selected entry becomes a
-`StuffItInputNode::File` carrying data fork + resource fork +
-`FinderInfo`; selected folders walk recursively into nested
-`StuffItInputNode::Folder` nodes.
-
-#### Workflow C — Extracting an already-archived file *out of* a disk image
-
-Trigger: user selects a `.hqx` / `.sit` / `.sea` / `.sit.hqx` file
-**inside** the disk image (browse view) and clicks **Save As…**.
-
-Modal: "This file inside the disk image is a `<format>` archive. How
-would you like to extract it?"
-
-  * **Save the archive as-is (`<format>` file).** *The raw bytes from
-    the disk image land on the host. Useful when the host is just a
-    way station — you want to email the `.sit.hqx` along to someone
-    else without disturbing the encoding.*
-  * **Decode and extract the contents to a folder.** *Decompress the
-    archive on the host. The enclosed files lose their resource
-    forks the moment they touch a non-HFS host filesystem; pick a
-    fork-preserving container (BinHex / MacBinary / AppleDouble) in
-    the follow-up dialog if you need them preserved.*
-  * **Cancel.**
-
-The decoded-extract path reuses the standalone Archives tab's
-extract pipeline (which already offers the BinHex / MacBinary /
-AppleDouble / raw container choice in a follow-up dialog), so
-selecting "Decode and extract" effectively pipes the archive bytes
-into the same code path as Workflow D's extract action — but rooted
-at a host directory chosen here instead of the Archives tab's
-dropdown target.
-
-#### Workflow D — Browsing / extracting a `.hqx` / `.sit` / `.sea` standalone
-
-Trigger: user opens the **Archives** tab (already in tree, 316 lines
-of egui surface in `src/gui/archives_tab.rs`) and picks a file via
-the file-type picker.
-
-Today: `.sit`, `.sea`, and `.sit.hqx` browse + extract work. Still
-open:
-
-  * **Accept loose `.hqx`** in the file picker. A `.hqx` whose
-    payload is not a SIT archive still has one file's worth of
-    content (data fork + resource fork + Finder info). The browse
-    view shows the single decoded entry; extract emits the
-    container of the user's choice.
-  * **Show the auto-unwrap hint** when the decoded `.hqx` payload
-    sniffs as DiskCopy 4.2 or raw HFS: surface a "Mount this image
-    in a new Inspect tab" affordance alongside the regular extract
-    options. This is the standalone version of Workflow A's
-    auto-unwrap; same `dc42::detect_dc42` probe.
-  * **Mixed selection extract**: today the tab extracts everything
-    in the archive. Add per-entry checkboxes so users can pull just
-    one file out without unpacking the whole bundle. Same fork-
-    preserving container choice applies per entry.
-  * **File-picker extensions** for `.hqx` / `.sit` / `.sea` /
-    `.sit.hqx` in the inspect-tab / restore-tab / backup-tab
-    pickers — single source of truth in
-    `src/model/file_types.rs`. Today only the Archives tab knows
-    about these extensions, so a user trying to inspect a
-    `.sit.hqx` from those other tabs has to type the path manually.
-
-#### Design checkpoint expected before any code work
-
-The modal text above is illustrative. Before implementation, the user
-will want to see:
-
-  * Final wording for each modal (especially the educational
-    paragraphs — they shouldn't lecture, just inform).
-  * Auto-detect vs. always-prompt policy: does Workflow A pop the
-    modal whenever the picked file's extension matches, or only
-    when the magic also sniffs? (Recommended: always pop on
-    extension match, since the user explicitly picked the file —
-    surprise auto-extraction is worse than one extra click.)
-  * Whether Workflow B's per-format tooltips live inline in the
-    dropdown (cleaner) or as a "?" affordance opening the same
-    educational paragraph (denser dropdown).
-  * Settings affordance to remember "always extract" / "always
-    add as-is" per format for power users, so the modal doesn't
-    nag on every import.
 
 ---
 
@@ -731,7 +355,24 @@ will want to see:
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
 
-- (None right now.)
+- **UFS Tier B+ (U.4) — fsck + edit.** Read shipped (see §10); on-disk
+  ground knowledge is already in tree via `src/fs/ufs.rs` + EFS precedent
+  (`src/fs/efs.rs` shares the cylinder-group + classic-Unix-inode shape).
+  Real-world demand has been zero so far; revisit if someone needs to
+  edit / repair a UFS image.
+- **JFS Tier B+ (J.4) — fsck + edit.** Read shipped (see §10), but every
+  edit path runs through xtree / dtree / dmapctl B+tree writes that
+  J.1–J.3 deliberately walked only at the inline-root level. Picking up
+  edit means the multi-page B+tree walkers + reverse-direction writers
+  for all three trees.
+- **JFS multi-page B+tree walkers (read-side).** `walk_bmap` refuses
+  aggregates ≥ 2²³ blocks (32 GiB at bsize=4096) — a multi-level `dmapctl`
+  walker is the unblocker. `read_fileset_iag` refuses multi-IAG filesets
+  (> 4096 inodes). `parse_inline_dtree` refuses non-inline dtrees
+  (`di_size > 4096`); `read_file_data` refuses xtrees with internal
+  nodes. All four are out of scope for vintage hardware (the actual
+  motivating workload) but would block any larger-than-vintage JFS
+  read.
 
 ---
 
@@ -819,7 +460,7 @@ docs-consolidation pass.
 - **SEA detection** — `find_sea_archive` + extract.rs routing classifies
   `.sea` as SIT-over-Mac-app data fork.
 - **Native Mac archives reader/writer** — BinHex 4.0 + StuffIt classic
-  + SIT5 + SEA, CLI verbs, Archives tab in GUI, all shipped. §6.3
+  + SIT5 + SEA, CLI verbs, Archives tab in GUI, all shipped. §6.1
   covers the GUI import / auto-unwrap / folder-emit / file-picker
   remainder.
 - **`docs/codecleanup.md`** — every actionable item closed; survey
@@ -833,3 +474,135 @@ docs-consolidation pass.
 - **`docs/chdman_replacement.md`** — Stages 1-10 shipped; no external
   `chdman` binary required. The user-side CD CHD browse verify in §7
   is the only loose end.
+- **Unix-FS read track (§1 ReiserFS / UFS / JFS)** — three filesystems
+  shipped end-to-end. **ReiserFS** (v3.5 `ReIsErFs` + v3.6 `ReIsEr2Fs`,
+  reiser4 rejected): superblock at byte 65536 + bitmap-driven
+  layout-preserving `CompactReiserFsReader` (set bit = allocated) + S+tree
+  walker (`collect_leaf_block_numbers` DFS with cycle / level / child=0
+  guards) + `read_statdata` / `read_symlink_target` / `list_directory`
+  (DIR_ENTRY decode, hidden-filter) / `read_file` (SD/IND/DRCT
+  stitching with sparse + tail-pad handling). Fixture
+  `tests/fixtures/test_reiserfs_v3_6.img.zst`. **UFS** (UFS1 4.2BSD/FFS +
+  UFS2 — SunOS / Solaris / *BSD): superblock probe at 65536 then 8192
+  with both endians, SU+J dirty refused, cylinder-group bitmap walker
+  (set = FREE — opposite polarity of every other Linux FS, matching
+  primitive `BitmapReader::highest_clear_bit`), `CompactUfsReader`,
+  `UfsInode` (UFS1 128 B / UFS2 256 B), `resolve_logical_block` (direct
+  → single → double → triple indirect with sparse handling), DIRENT2
+  decode with `d_reclen` alignment validation, inline-symlink decode at
+  the version-specific cutoffs. **JFS** (JFS2 only — AIX JFS1 rejected
+  via the `"JFS1"` ASCII magic gate paired with version `1..=2`):
+  Aggregate Superblock at byte 32768, AIT bootstrap at
+  `AIMAP_OFF + 2 * SIZE_OF_MAP_PAGE = 0xB000`, BMAP B+tree walker that
+  tightens `last_data_byte` to the pmap-derived highest allocated block
+  (still maxed against `logpxd`/`fsckpxd` so the inline log rides out
+  verbatim), `CompactJfsReader`, IAG-based dinode locator with pmap
+  sanity check, inline-dtree walker (stbl iteration through slots 1..8 +
+  dtslot continuation chain for names > 11 chars), inline-xtree XAD walker
+  with sparse gap-fill. Parked Tier B+ follow-ups (UFS U.4 / JFS J.4
+  fsck+edit, JFS J.3 multi-page B+tree walkers) live in §8.
+- **ProDOS access-bit setter** —
+  `EditableFilesystem::set_prodos_access(entry, access)` patches the
+  access byte at directory-entry offset 30 in place. **Lock** ($21 = read
+  + backup) / **Unlock** ($C3 = read + write + destroy + rename +
+  backup) buttons on the browse-view edit toolbar; `StagedEdit::
+  SetProdosAccess { entry, access }` queues through the same
+  replace-prior + pending-query helpers as the rest of the staged-edit
+  pipeline.
+- **NTFS file-aware GHO — compressed path** — `NtfsCompressedState`
+  in `src/rbformats/gho.rs` carries per-block zlib metadata + a lazy
+  scan cursor; `open_ntfs_compressed_mft_only` decompresses just the
+  $MFT run to bootstrap the index, then `extend_ntfs_compressed_index`
+  decompresses the rest on demand as `GhoReader` reads progress. The
+  scan result rides through `ntfs_scan_cache_store` so re-opening the
+  same `.GHO` skips the multi-second decompress pass. Compressed +
+  uncompressed file-aware NTFS GHO backups now round-trip identically.
+- **`rb-cli fsck --format json|yaml`** — `FsckResult` / `FsckIssue`
+  / `FsckStats` / `OrphanedEntry` / `RepairReport` all carry
+  `#[derive(Serialize)]`. The verb mirrors the structured-output flag
+  every other read-only verb already has, with a `clean: bool` top-level
+  envelope for scripted branching and a `repair: { applied / failed /
+  unrepairable }` sub-object when `--repair` runs. Unsupported
+  filesystems emit `status.error: true, status.code: GENERIC_FAILURE,
+  result: null`. Process exit code stays issue-driven so `$?` branching
+  works in either text or structured mode.
+- **`rb-cli get` globbing** — accepts the same glob /
+  `--exclude` / `--ignore-case` / `--case-sensitive` syntax as `ls` /
+  `rm`. Adds `-r` / `--recursive` (literal-directory source without it
+  errors with a clear pointer to the flag; glob-matched directories
+  without it skip with a warning), `--force` (overwrite existing host
+  files), `--skip-existing` (skip silently). Destination semantics
+  follow cp/rsync: literal-file source treats DST as the target path
+  (or `DST/<basename>` when DST exists as a directory or has a trailing
+  separator); literal-directory + `-r` mirrors the tree under
+  `DST/<source-basename>/`; glob lays matches out relative to the
+  longest non-glob prefix of the pattern. Symlinks ride out as plain
+  text files containing the target (lossy but cross-platform safe);
+  specials skip with a one-line note.
+- **XFS hole (A) — single-leaf inobt growth** — `alloc_inode_slot`
+  lifted into `try_claim_slot_from_existing_chunks`; the new
+  `alloc_new_inode_chunk` reads `di_version` from the root inode, carves
+  `blocks_per_chunk` contiguous fsblocks aligned to `sb_inoalignmt`
+  (or `blocks_per_chunk` when ALIGN is off) via the new
+  `alloc_blocks_aligned` + `carve_aligned_from_largest` primitives,
+  writes 64 free dinodes (magic + version + `di_mode = 0` +
+  `di_next_unlinked = NULLAGINO`), splices an all-free record (freecount
+  64, free `u64::MAX`) into the AG's single-leaf inobt, and bumps AGI
+  `count`/`freecount` + sb `sb_icount`/`sb_ifree` by 64. Slot search
+  re-runs and claims slot 0 of the new chunk via the existing -1
+  accounting. v1 single-leaf scope only — multi-level growth is the
+  remaining §2.1 (A) follow-up. Tests: 5 alignment-carve unit tests +
+  `alloc_new_inode_chunk_extends_inobt_and_keeps_volume_clean` end-to-end
+  against the v4 fixture (counter deltas, sorted record + all-free
+  shape, every dinode initialized, our verifier stays clean). Oracle
+  helper: `examples/xfs_fill_chunks.rs`.
+- **Native Mac archives GUI polish (Workflows A / B / C / D / E)** —
+  full sweep. Detection is now magic-driven via
+  `macarchive::detect::detect_mac_archive` (six `MacArchiveKind`
+  variants — BinHexSingleFile, BinHexOverSit, BinHexOverSea, Sit, Sit5,
+  Sea); filename extension is hint-only. `MacArchiveKind::label()` keeps
+  user-visible strings ASCII-only (CLAUDE.md egui-font rule).
+  `detect_mountable_image` sniffs DiskCopy 4.2 / raw HFS / raw HFS+ for
+  the auto-unwrap "Mount in new Inspect tab" affordance.
+  **D.4**: inspect / restore / backup tab pickers gained a "Mac
+  archives" filter group alongside Disk Images. **D.1**:
+  `extract::open_bytes` routes through `detect_mac_archive` and
+  synthesizes a one-entry archive (with proper `crc16_arc` stamping) for
+  loose BinHex single-file inputs, so the Archives tab and every
+  downstream extract path handle `.hqx` end-to-end without any special
+  case. **D.2**: Archives tab caches a `MountablePayload` on load when
+  the archive has exactly one entry whose data fork sniffs as a disk
+  image; "Mount in new Inspect tab (<kind>)" button writes the bytes to
+  a tempfile, hands path + tempdir guard to the Inspect tab via the new
+  `InspectTab::load_image_with_tempdir`, and the RustyBackupApp update
+  loop drains `take_pending_inspect_open` + switches `active_tab`.
+  **D.3**: per-entry checkbox column on the Archives tab grid; new
+  `extract::extract_filtered(keep: impl FnMut(usize) -> bool)`
+  (folder markers always extract); "Extract Selected... (N)" button
+  alongside Extract All. **A**: browse-view `stage_host_file` intercepts
+  any picked file that sniffs as a Mac archive when the target is HFS /
+  HFS+; queues a `PendingArchiveImport`; modal pops with the per-kind
+  three-action set ("Convert" / "Expand" / "Convert and expand" +
+  "Convert only" for HQX-over / "Add as-is" + Cancel). Extract path
+  dumps to an AppleDouble tree under a BrowseView-owned
+  `archive_import_tempdir`, then re-stages the resulting children
+  through the existing `stage_host_directory` / `stage_host_file` flow
+  so resource forks come back through `detect_resource_fork`. Tempdir
+  cleaned up on Apply / Discard / close. **B**: three new "Export Mac
+  archive" buttons under the existing Extract row — BinHex (single file
+  only), StuffIt (any selection — folders walk recursively), and
+  StuffIt-over-BinHex (any selection). `walk_fs_to_input_nodes` reads
+  data + resource fork + type/creator from the FileEntry / Filesystem
+  trait; `build_archive_tree` + optional `binhex::build_binhex` wrap
+  produces the output bytes. **C**: a "Save as Mac archive..." button on
+  selected files inside the disk image sniffs the bytes and pops a
+  Save-as-is / Decode-and-save modal with an inline ForkFormat dropdown
+  (BinHex / MacBinary / AppleDouble / Raw) for the decode path. **E**:
+  a "Browse archive..." button opens a floating read-only viewer window
+  with the same shape as the standalone Archives tab — entry list with
+  per-entry checkboxes, fork-format dropdown, Extract All / Extract
+  Selected. Edit operations inside the archive (would need repacking)
+  are deferred. Modal wording lives in
+  `docs/mac-archives-gui-wording.md` (kept as the spec source of truth).
+  Tests: 17 detect-tests (6 kinds + 3 mountable + edge cases) + 4
+  extract-tests (open_bytes synth, extract_filtered subset).
