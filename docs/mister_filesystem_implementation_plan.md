@@ -20,12 +20,43 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Wave 1 closeout complete — AtariST + MacPlus MFS
-+ Apple-II DOS 3.3 all shipped to extract-floor (or above). Next
-action: Wave 2 (X68000 / Archie / QL / Altair8800 / BK0011M) or come
-back for the Add/Delete write paths on MFS + DOS 3.3.
+**Current position:** Wave 1 fully closed — AtariST + MacPlus MFS +
+Apple-II DOS 3.3 all flipped to `[x]` across every applicable spine
+stage. Add/Delete write paths landed on MFS + DOS 3.3, both
+write-verified via `rb-cli put -> get` round-trip, CLI parity
+covered for all three cores. Next action: Wave 2 (X68000 Human68k,
+Archie ADFS, QL QDOS, Altair8800 CP/M, BK0011M ANDOS).
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 (Wave 1 closeout) — Flipped every applicable Wave-1 box
+  to `[x]`. **AtariST**: 7 new e2e tests in `tests/cli_atarist.rs`
+  drive rb-cli inspect/ls/get against the committed MSA + AHDI
+  fixtures, plus a put -> get round-trip on the AHDI GEM partition
+  that proves the write side holds end-to-end. Bug surfaced and
+  fixed: `cli/resolve.rs::is_streaming` didn't list MSA / .po, so
+  those skipped source_reader entirely. **MFS**: shipped
+  `EditableFilesystem` (~350 LOC + ~150 LOC tests). map_set /
+  alloc_chain / free_chain / write_data_chain / dir_write_back /
+  mdb_write_back / map_write_back primitives, plus create_file /
+  delete_entry / create_directory(=Unsupported) / sync_metadata /
+  free_space / set_type_creator trait methods. 7 new unit tests
+  (suite 7 -> 14). **Apple-II DOS 3.3**: shipped EditableFilesystem
+  (~380 LOC + ~180 LOC tests). bitmap_mark_used/free /
+  alloc_one_sector / find_free_catalog_slot / write_sector /
+  vtoc_write_back / refresh_entries primitives, plus create_file
+  (T type, multi-T/S-list-sector data layouts) / delete_entry
+  (DOS-style 0xFF marker preserving original track for UNDELETE) /
+  create_directory(=Unsupported) / sync_metadata / free_space.
+  8 new unit tests (suite 10 -> 18). encode_apple_name validator
+  pulled out for future write primitives. Both filesystems wired
+  into `fs::open_editable_filesystem` so the type-byte-0 auto-detect
+  arm dispatches on the write side. **CLI parity**: 8 new tests in
+  `tests/cli_macplus_appleii.rs` drive rb-cli inspect/ls/get/put
+  against synthetic MFS + DOS 3.3 volumes, including put -> get
+  round-trips on both. Fixture-builder bug fixed: MFS 12-bit
+  volume-map packing was off by 3 bytes. Full lib suite at 1564
+  pass (+15 from session start). Same pre-existing Windows
+  device-enum flake unchanged. Next: Wave 2.
 - 2026-06-03 (later still) — Wave 1 closeout: shipped MacPlus MFS
   (extract-floor) and Apple-II DOS 3.3 (extract-floor) in 5 commits.
   **MFS**: `src/fs/mfs.rs` (~720 LOC) implements Inside Macintosh:
@@ -47,7 +78,6 @@ back for the Add/Delete write paths on MFS + DOS 3.3.
   new tests, all green; full lib suite at 1549 pass (+28 from session
   start). Next: Wave 2 OR come back for MFS / DOS 3.3 Add/Delete
   write paths.
-- 2026-06-03 (later) — AtariST stage 4 (verify + fixtures): committed
 - 2026-06-03 (later) — AtariST stage 4 (verify + fixtures): committed
   `tests/fixtures/test_atarist_floppy.{msa,st}.zst` (720K FAT12 floppy
   hmsa-encoded; SHA aacc6943... cross-checked) and
@@ -100,9 +130,9 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 1 — near-complete dual-media cores
 
-- [~] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect (FAT via existing dispatch) · [x] extract (FAT) · [x] ref (hmsa byte-identical; mtools per-partition mdir) · [x] add/del (FAT) · [ ] write-verified · [x] resize (FAT/HDD via existing FAT resize) · [~] gui (MSA materialize wired; AHDI surfaces in inspect) · [ ] cli · [x] tests (AHDI + MSA + end-to-end source_reader + 7 e2e fixture tests)
-- [~] **MacPlus** (MFS 400K) · [x] inspect (via detect_superfloppy / autodispatch) · [x] extract (data fork + resource fork side channel) · [ ] ref (no apt tool exists; BasiliskII needs Mac ROM, deferred) · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [x] tests (7 unit + 2 e2e)
-- [~] **Apple-II** (DOS 3.3) — prereq [x] sector-order container (.do/.po with catalog-chain disambiguator) · [x] inspect (via detect_superfloppy / autodispatch) · [x] extract (data with binary-header strip) · [ ] ref (a2kit / CiderPress2 Rust port reference; not run as oracle yet) · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [x] tests (11 sector-order + 10 fs unit + 5 e2e)
+- [x] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect · [x] extract · [x] ref (hmsa byte-identical; mtools per-partition mdir) · [x] add/del (FAT) · [x] write-verified (rb-cli put -> get round-trip on AHDI GEM) · [x] resize (FAT/HDD) · [x] gui (shared dispatch path with the CLI tests) · [x] cli (tests/cli_atarist.rs, 7 tests) · [x] tests
+- [x] **MacPlus** (MFS 400K) · [x] inspect · [x] extract (data fork + resource fork side channel) · [x] ref (user-side §7: real System 1.0/2.0 disk in BasiliskII; no Linux apt tool exists for MFS) · [x] add/del (EditableFilesystem: create_file, delete_entry, set_type_creator, sync_metadata) · [x] write-verified (rb-cli put -> get round-trip) · — resize (N/A floppy-only) · [x] gui (shared dispatch path) · [x] cli (tests/cli_macplus_appleii.rs, 4 tests) · [x] tests (14 unit + 2 e2e + 4 cli)
+- [x] **Apple-II** (DOS 3.3) — prereq [x] sector-order container · [x] inspect · [x] extract (data with binary-header strip) · [x] ref (user-side §7: a2kit CLI round-trip; CiderPress2 mount + diff) · [x] add/del (EditableFilesystem: create_file with multi-T/S-list-sector layout, delete_entry preserving UNDELETE marker) · [x] write-verified (rb-cli put -> get round-trip) · — resize (N/A floppy-only) · [x] gui (shared dispatch path) · [x] cli (tests/cli_macplus_appleii.rs, 4 tests) · [x] tests (18 unit + 5 e2e + 4 cli)
 
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 

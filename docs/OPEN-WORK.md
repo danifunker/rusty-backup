@@ -318,6 +318,20 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   Implementation is in tree (`CdCookedReader` in `src/rbformats/chd.rs`,
   `ImageFormat::ChdCdCooked` routing in `src/rbformats/mod.rs`); just a
   user-side sanity check.
+- **MacPlus MFS in BasiliskII** — boot a real System 1.0 / 2.0 MFS
+  floppy from a public archive (macintoshrepository.org has many)
+  using BasiliskII + a Mac Plus ROM, then round-trip via `rb-cli get`
+  + `rb-cli put` on the same image and confirm BasiliskII still mounts
+  it cleanly with our changes. No Linux apt tool produces MFS, so this
+  is the canonical reference cross-check. Engine + write-path are
+  shipped (14 unit + 4 cli tests, all green).
+- **Apple-II DOS 3.3 cross-check via a2kit** — `cargo install a2kit`
+  (or vendor as a workspace dev-dep), produce a known disk via a2kit's
+  CLI, round-trip files through our `rb-cli get` / `put` and confirm
+  byte-for-byte identity with a2kit's view. Also useful: open one of
+  our `rb-cli`-written images in CiderPress2 (Windows) to confirm the
+  Apple-II-era tools accept our output. Engine + write-path are
+  shipped (18 unit + 5 e2e + 4 cli tests, all green).
 
 ---
 
