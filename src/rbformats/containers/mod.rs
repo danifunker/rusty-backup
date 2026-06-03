@@ -22,6 +22,7 @@
 //! crate dependency.
 
 pub mod msa;
+pub mod sector_order;
 
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
