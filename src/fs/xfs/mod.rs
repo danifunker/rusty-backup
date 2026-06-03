@@ -3382,6 +3382,68 @@ mod tests {
         );
     }
 
+    /// §2.1 hole (E.5c): end-to-end create + read on the v5 modern fixture.
+    /// Drives `EditableFilesystem::create_file` (which threads through
+    /// `do_create_file` → `alloc_inode_slot` → `alloc_blocks` →
+    /// `write_file_data_extents` → `init_file_inode` → `dir_insert_entry`),
+    /// then re-opens read-only and reads the new file back. The on-disk
+    /// stamps are validated indirectly: `run_fsck` walks every metadata
+    /// block and would refuse a v5 inode / dir3 / sblock with a stale CRC.
+    #[test]
+    fn create_file_on_v5_fixture_round_trips_through_fsck() {
+        use crate::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+
+        let img = load_modern_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+
+        let payload: &[u8] = b"hello, v5/CRC XFS world\n";
+        let new_name = "v5_newfile.bin";
+
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+            assert!(fs.superblock().is_v5(), "expected v5 fixture");
+            let root = fs.root().expect("root");
+            let mut reader = std::io::Cursor::new(payload);
+            fs.create_file(
+                &root,
+                new_name,
+                &mut reader,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file on v5");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // Re-open and read the file back.
+        let bytes = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen v5");
+        let root = fs.root().expect("root post-create");
+        let entries = fs.list_directory(&root).expect("list root post-create");
+        let child = entries
+            .iter()
+            .find(|e| e.name == new_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "new file {new_name} missing; got names {:?}",
+                    entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(child.size, payload.len() as u64);
+        let read_back = fs.read_file(child, 4096).expect("read newly-created file");
+        assert_eq!(read_back, payload, "v5 round-trip preserved file bytes");
+
+        // run_fsck walks every metadata block (inode CRCs, dir3 CRCs,
+        // sblock-crc btrees, AGF/AGI/SB) and would surface any stale CRC
+        // from the create path.
+        let res = fs.run_fsck().expect("fsck after v5 create_file");
+        assert!(
+            res.errors.is_empty(),
+            "expected clean v5 volume after create_file, got: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn alloc_new_inode_chunk_promotes_full_leaf_to_multi_level() {
         // §2.1 hole (A) follow-up: when the AG's only inobt leaf is full
