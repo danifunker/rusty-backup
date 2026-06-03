@@ -20,13 +20,27 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** AtariST prereqs landed — AHDI partition table + the
-container framework with MSA decoder are in tree and dispatch end-to-end
-through the existing FAT12 driver. Next action: MacPlus MFS 400K (Wave 1)
-or step into AtariST stage 4 (reference cross-check against Hatari / real
-`.st` images).
+**Current position:** AtariST stage 4 complete — committed fixtures
+(MSA + raw .st pair + AHDI HDD) generated against Hatari's `hmsa` and
+mtools as reference oracles, with 7 e2e integration tests in
+`tests/atarist_e2e.rs` proving the full pipeline. Our MSA decoder is
+byte-for-byte equivalent to Hatari's reference encoder. Next action:
+MacPlus MFS 400K (Wave 1) or Apple-II DOS 3.3 (Wave 1).
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 (later) — AtariST stage 4 (verify + fixtures): committed
+  `tests/fixtures/test_atarist_floppy.{msa,st}.zst` (720K FAT12 floppy
+  hmsa-encoded; SHA aacc6943... cross-checked) and
+  `test_atarist_ahdi.img.zst` (32 MiB GEM 8 MiB FAT12 + BGM 16 MiB
+  FAT16). New `scripts/generate-atarist-fixtures.sh` and
+  `scripts/generate-ahdi-fixture.sh` regenerate them reproducibly.
+  7 integration tests in `tests/atarist_e2e.rs` exercise:
+  decode-byte-identity vs `.st` reference, AHDI 0x1234 word-sum
+  checksum validation, end-to-end MSA → FAT12 dispatch w/ content
+  read, AHDI two-partition detect w/ correct synthesized type bytes,
+  GEM→FAT12 and BGM→FAT16 dispatch w/ content read. Quirk worked
+  around: Ubuntu hatari pkg's `hmsa` exits 1 even on success.
+  Next: MacPlus MFS 400K (Wave 1, last) or Apple-II DOS 3.3 (Wave 1).
 - 2026-06-03 — Shipped AtariST prereqs: `src/partition/atari.rs` (AHDI
   primary + XGM extended chain, big-endian, no magic, checksum round-trip)
   wired into `PartitionTable::Ahdi` with synthetic MBR type bytes routing
@@ -66,7 +80,7 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 1 — near-complete dual-media cores
 
-- [~] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect (FAT via existing dispatch) · [x] extract (FAT) · [ ] ref · [x] add/del (FAT) · [ ] write-verified · [x] resize (FAT/HDD via existing FAT resize) · [~] gui (MSA materialize wired; AHDI surfaces in inspect) · [ ] cli · [x] tests (AHDI + MSA + end-to-end source_reader)
+- [~] **AtariST** — prereqs [x] MSA [x] AHDI table · [x] inspect (FAT via existing dispatch) · [x] extract (FAT) · [x] ref (hmsa byte-identical; mtools per-partition mdir) · [x] add/del (FAT) · [ ] write-verified · [x] resize (FAT/HDD via existing FAT resize) · [~] gui (MSA materialize wired; AHDI surfaces in inspect) · [ ] cli · [x] tests (AHDI + MSA + end-to-end source_reader + 7 e2e fixture tests)
 - [ ] **MacPlus** (MFS 400K) · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
 - [ ] **Apple-II** (DOS 3.3) — prereq [ ] sector-order container · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
 
