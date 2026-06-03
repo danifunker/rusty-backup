@@ -116,10 +116,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         };
         let sb = self.superblock().clone();
 
-        if sb.is_v5() {
-            // v5 adds finobt/rmapbt/refcountbt metadata we don't model, so a
-            // block-completeness map would be wrong. R2 simply doesn't apply to
-            // v5 — return silently (not a failure) and leave it to R4/R4b.
+        // v5 with rmapbt or reflink enabled: silently skip. Rebuilding
+        // bnobt/cntbt without resyncing rmapbt would leave reverse-
+        // mapping records pointing at the OLD tree blocks; same risk
+        // for refcountbt under reflink. Until the rmapbt-rebuild and
+        // refcountbt-rebuild slices land, R2 is a no-op on those
+        // volumes. Silent (not surfaced via `fixes_failed`) to
+        // preserve the "no-op on clean volume" promise the repair()
+        // driver relies on.
+        if sb.has_rmapbt() || sb.has_reflink() {
             return Ok(report);
         }
 

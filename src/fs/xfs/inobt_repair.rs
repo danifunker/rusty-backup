@@ -80,9 +80,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            // v5 inobt blocks are CRC-protected; rewriting would invalidate
-            // them. R3 is v4-only (silent, not a failure).
+        // The v5 sblock-CRC writers (E.4) can stamp inobt blocks
+        // correctly, so the original "v5 CRCs prevent rewrite" reason
+        // no longer holds. What still blocks safe R3 on v5 is the
+        // finobt: every inobt record with at least one free inode also
+        // gets a finobt record, and rebuilding inobt without resyncing
+        // finobt leaves the finobt pointing at the old tree blocks.
+        // Silent skip on v5+FINOBT/RMAPBT until the resync slices land
+        // — preserves the "no-op on clean volume" promise.
+        if sb.has_finobt() || sb.has_rmapbt() {
             return Ok(report);
         }
 
@@ -335,9 +341,25 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         agno: u64,
         root: u32,
     ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
+        self.walk_short_btree_blocks(sb, agno, root, sb.inobt_magic(), "inobt")
+    }
+
+    /// Generalised AG-relative B+tree traversal. Reuses the same descent
+    /// shape as `walk_inobt` but parameterises the magic + the
+    /// debug-context label so it can drive finobt / rmapbt / refcountbt
+    /// walks the same way. Caller supplies the expected magic via
+    /// `sb.inobt_magic()` / `sb.finobt_magic()` / etc. (or, for the
+    /// other side-tree magics, hard-coded constants for now).
+    pub(crate) fn walk_short_btree_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+        want_magic: u32,
+        ctx: &'static str,
+    ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
         let bs = sb.blocksize as usize;
         let hdr = sb.sblock_hdr_len();
-        let want_magic = sb.inobt_magic();
         let max_intern = (bs - hdr) / (4 + 4); // 4-byte key + 4-byte ptr
         let mut block = vec![0u8; bs];
         let mut leaves = Vec::new();
@@ -351,7 +373,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             }
             if !visited.insert(agbno) {
                 return Err(FilesystemError::Parse(format!(
-                    "AG {agno} inobt block {agbno} visited twice (cycle)"
+                    "AG {agno} {ctx} block {agbno} visited twice (cycle)"
                 )));
             }
             all.push(agbno);
@@ -360,7 +382,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             let magic = BigEndian::read_u32(&block[0..4]);
             if magic != want_magic {
                 return Err(FilesystemError::Parse(format!(
-                    "bad inobt magic 0x{magic:08X} at AG {agno} block {agbno}"
+                    "bad {ctx} magic 0x{magic:08X} at AG {agno} block {agbno} \
+                     (expected 0x{want_magic:08X})"
                 )));
             }
             let level = BigEndian::read_u16(&block[4..6]);
@@ -370,7 +393,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             } else {
                 if numrecs > max_intern {
                     return Err(FilesystemError::Parse(format!(
-                        "AG {agno} inobt node numrecs {numrecs} > max {max_intern}"
+                        "AG {agno} {ctx} node numrecs {numrecs} > max {max_intern}"
                     )));
                 }
                 let ptr_base = hdr + max_intern * 4;

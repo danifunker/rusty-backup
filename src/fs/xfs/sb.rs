@@ -278,6 +278,40 @@ impl XfsSuperblock {
         }
     }
 
+    /// Free-inode btree magic. v5-only (`FIB3`); the FINOBT feature is
+    /// itself ro_compat → exclusive to v5 superblocks. Calling this on
+    /// a v4 SB returns 0 (the caller should gate on FEAT_RO_FINOBT
+    /// before touching the finobt).
+    pub fn finobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_FIBT_CRC_MAGIC
+        } else {
+            0
+        }
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// FINOBT (free-inode btree) feature. Modern mkfs.xfs defaults on.
+    pub fn has_finobt(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_FINOBT) != 0
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// RMAPBT (reverse-mapping btree) feature. Modern xfsprogs 6.6.0
+    /// defaults on; the rmapbt is allocated whether or not records are
+    /// populated.
+    pub fn has_rmapbt(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_RMAPBT) != 0
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// REFLINK (refcountbt) feature. Modern mkfs.xfs defaults on; the
+    /// refcountbt is allocated whether or not reflinks have ever been
+    /// created.
+    pub fn has_reflink(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_REFLINK) != 0
+    }
+
     /// Free-space-by-block btree magic. `AB3B` on v5, `ABTB` on v4.
     pub fn bnobt_magic(&self) -> u32 {
         if self.is_v5() {

@@ -27,7 +27,8 @@ use super::ag::{XfsAgf, XfsAgi};
 use super::sb::XfsSuperblock;
 use super::types::{
     NULLAGBLOCK, XFS_ABTB_CRC_MAGIC, XFS_ABTB_MAGIC, XFS_ABTC_CRC_MAGIC, XFS_ABTC_MAGIC,
-    XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK,
+    XFS_FIBT_CRC_MAGIC, XFS_IBT_CRC_MAGIC, XFS_IBT_MAGIC, XFS_INODES_PER_CHUNK, XFS_REFC_CRC_MAGIC,
+    XFS_RMAP_CRC_MAGIC,
 };
 use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
@@ -111,6 +112,10 @@ struct AgHeaders {
     /// AG-relative root block of the inode-allocation btree, if the AGI
     /// parsed. `None` means we can't enumerate this AG's inodes.
     agi_root: Option<u32>,
+    /// AG-relative root block of the FREE-INODE btree (finobt). v5 +
+    /// `XFS_SB_FEAT_RO_FINOBT`. `None` on v4 / feature off / parse failure.
+    /// Each block is metadata that must be marked in the completeness map.
+    agi_free_root: Option<u32>,
     /// AG-relative root block of the free-space-by-block (bnobt) btree and
     /// the AGF's cached free-block count, if the AGF parsed.
     agf_bno_root: Option<u32>,
@@ -120,6 +125,12 @@ struct AgHeaders {
     /// metadata block in the ownership scan.
     agf_cnt_root: Option<u32>,
     agf_fl: Option<(u32, u32, u32)>,
+    /// AG-relative root block of the reverse-mapping btree (rmapbt).
+    /// v5 + `XFS_SB_FEAT_RO_RMAPBT`.
+    agf_rmap_root: Option<u32>,
+    /// AG-relative root block of the refcount btree (refcountbt).
+    /// v5 + `XFS_SB_FEAT_RO_REFLINK`.
+    agf_refcount_root: Option<u32>,
 }
 
 impl<R: Read + Seek + Send> XfsFilesystem<R> {
@@ -182,10 +193,13 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 out.push(AgHeaders {
                     expected_len,
                     agi_root: None,
+                    agi_free_root: None,
                     agf_bno_root: None,
                     agf_freeblks: None,
                     agf_cnt_root: None,
                     agf_fl: None,
+                    agf_rmap_root: None,
+                    agf_refcount_root: None,
                 });
                 continue;
             }
@@ -202,50 +216,90 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             // --- AGF (sector 1) ---
             let agf_off = sectsize as usize;
             #[allow(clippy::type_complexity)]
-            let (agf_bno_root, agf_freeblks, agf_cnt_root, agf_fl): (
+            let (
+                agf_bno_root,
+                agf_freeblks,
+                agf_cnt_root,
+                agf_fl,
+                agf_rmap_root,
+                agf_refcount_root,
+            ): (
                 Option<u32>,
                 Option<u32>,
                 Option<u32>,
                 Option<(u32, u32, u32)>,
+                Option<u32>,
+                Option<u32>,
             ) = match XfsAgf::parse(&buf[agf_off..agf_off + sectsize as usize]) {
                 Ok(agf) => {
                     check_agf(&agf, agno, expected_len, b);
                     total_free_blocks += agf.freeblks as u64;
+                    // Side-tree roots: only meaningful when the
+                    // corresponding ro_compat bit is on and the root
+                    // != NULLAGBLOCK / != 0.
+                    let rmap_root =
+                        if sb.has_rmapbt() && agf.rmap_root != NULLAGBLOCK && agf.rmap_root != 0 {
+                            Some(agf.rmap_root)
+                        } else {
+                            None
+                        };
+                    let refc_root = if sb.has_reflink()
+                        && agf.refcount_root != NULLAGBLOCK
+                        && agf.refcount_root != 0
+                    {
+                        Some(agf.refcount_root)
+                    } else {
+                        None
+                    };
                     (
                         Some(agf.bno_root),
                         Some(agf.freeblks),
                         Some(agf.cnt_root),
                         Some((agf.flfirst, agf.fllast, agf.flcount)),
+                        rmap_root,
+                        refc_root,
                     )
                 }
                 Err(e) => {
                     b.err("AgfBadMagic", format!("AG {agno} AGF: {e}"));
-                    (None, None, None, None)
+                    (None, None, None, None, None, None)
                 }
             };
 
             // --- AGI (sector 2) ---
             let agi_off = 2 * sectsize as usize;
-            let agi_root = match XfsAgi::parse(&buf[agi_off..agi_off + sectsize as usize]) {
-                Ok(agi) => {
-                    check_agi(&agi, agno, expected_len, b);
-                    total_inodes += agi.count as u64;
-                    total_free_inodes += agi.freecount as u64;
-                    Some(agi.root)
-                }
-                Err(e) => {
-                    b.err("AgiBadMagic", format!("AG {agno} AGI: {e}"));
-                    None
-                }
-            };
+            let (agi_root, agi_free_root) =
+                match XfsAgi::parse(&buf[agi_off..agi_off + sectsize as usize]) {
+                    Ok(agi) => {
+                        check_agi(&agi, agno, expected_len, b);
+                        total_inodes += agi.count as u64;
+                        total_free_inodes += agi.freecount as u64;
+                        let fino = if sb.has_finobt()
+                            && agi.free_root != NULLAGBLOCK
+                            && agi.free_root != 0
+                        {
+                            Some(agi.free_root)
+                        } else {
+                            None
+                        };
+                        (Some(agi.root), fino)
+                    }
+                    Err(e) => {
+                        b.err("AgiBadMagic", format!("AG {agno} AGI: {e}"));
+                        (None, None)
+                    }
+                };
 
             out.push(AgHeaders {
                 expected_len,
                 agi_root,
+                agi_free_root,
                 agf_bno_root,
                 agf_freeblks,
                 agf_cnt_root,
                 agf_fl,
+                agf_rmap_root,
+                agf_refcount_root,
             });
         }
 
@@ -338,6 +392,46 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
                 self.mark_agfl_blocks(sb, agno, flfirst, flcount, &mut map, b);
             }
 
+            // v5 side-tree blocks. These are metadata that the v4
+            // completeness check ignored (and previously the v5 gate
+            // suppressed the check entirely to avoid false-positive
+            // leaks). Walk each tree gated on its ro_compat feature bit
+            // and mark every visited block as allocated metadata.
+
+            // FINOBT — free-inode btree (v5 + FEAT_RO_FINOBT).
+            if let Some(finobt_root) = ag.agi_free_root {
+                if let Err(e) =
+                    self.mark_finobt_blocks(sb, agno, finobt_root, ag.expected_len, &mut map)
+                {
+                    b.err(
+                        "FinobtWalkFailed",
+                        format!("AG {agno} free-inode btree: {e}"),
+                    );
+                }
+            }
+            // RMAPBT — reverse-mapping btree (v5 + FEAT_RO_RMAPBT).
+            if let Some(rmap_root) = ag.agf_rmap_root {
+                if let Err(e) =
+                    self.mark_rmapbt_blocks(sb, agno, rmap_root, ag.expected_len, &mut map)
+                {
+                    b.err(
+                        "RmapBtreeWalkFailed",
+                        format!("AG {agno} reverse-mapping btree: {e}"),
+                    );
+                }
+            }
+            // REFCOUNTBT — reflink refcount btree (v5 + FEAT_RO_REFLINK).
+            if let Some(refc_root) = ag.agf_refcount_root {
+                if let Err(e) =
+                    self.mark_refcountbt_blocks(sb, agno, refc_root, ag.expected_len, &mut map)
+                {
+                    b.err(
+                        "RefcountBtreeWalkFailed",
+                        format!("AG {agno} refcount btree: {e}"),
+                    );
+                }
+            }
+
             let Some(root) = ag.agi_root else { continue };
             let recs = match self.collect_inobt_records(sb, agno, root, ag.expected_len, &mut map) {
                 Ok(r) => r,
@@ -417,26 +511,24 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
         // neither allocated metadata/inode-data nor free — a leak. On a
         // healthy volume the map is exhaustive, so this is 0.
         //
-        // Only meaningful on v4: v5 adds metadata structures we don't model
-        // here (finobt, rmapbt, refcountbt), so their blocks would look
-        // "leaked". The completeness check is v4-only; v5 is read-only-best-
-        // effort for us anyway.
+        // Now safe on v5 too: the finobt / rmapbt / refcountbt walks
+        // above mark their tree blocks the same way bnobt / cntbt /
+        // inobt do, so an UNKNOWN block on a clean v5 volume is a real
+        // leak, not a side-tree we forgot about.
         for &(start, len) in &all_free {
             for blk in start..start + len {
                 map.mark_free(blk);
             }
         }
-        if !sb.is_v5() {
-            let unaccounted = map.count_unknown();
-            if unaccounted > 0 {
-                b.err(
-                    "UnaccountedBlocks",
-                    format!(
-                        "{unaccounted} block(s) are neither allocated nor in the free-space btree \
-                         (lost/leaked space)"
-                    ),
-                );
-            }
+        let unaccounted = map.count_unknown();
+        if unaccounted > 0 {
+            b.err(
+                "UnaccountedBlocks",
+                format!(
+                    "{unaccounted} block(s) are neither allocated nor in the free-space btree \
+                     (lost/leaked space)"
+                ),
+            );
         }
 
         let mult = map.count_mult();
@@ -465,6 +557,93 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             [XFS_ABTC_MAGIC, XFS_ABTC_CRC_MAGIC],
             8,
             8,
+            |_| {},
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )
+    }
+
+    /// Walk the free-inode btree (finobt) and mark its tree blocks. The
+    /// record + key shapes are identical to the inobt's
+    /// `xfs_inobt_rec` (rec_size=16, key_size=4), so the generic
+    /// `walk_sblock_btree` handles it with just the magic swapped to
+    /// `XFS_FIBT_CRC_MAGIC`. finobt is v5-only; the v4 entry of the
+    /// magic-list array uses the v5 magic again (no v4 finobt exists)
+    /// so the leaf-magic check still functions.
+    fn mark_finobt_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+    ) -> Result<(), FilesystemError> {
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_FIBT_CRC_MAGIC, XFS_FIBT_CRC_MAGIC],
+            16,
+            4,
+            |_| {},
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )
+    }
+
+    /// Walk the reverse-mapping btree (rmapbt) and mark its tree blocks.
+    /// rmapbt records are 24 bytes (startblock 4 + blockcount 4 +
+    /// owner 8 + offset/flags 8) with 20-byte keys (startblock 4 +
+    /// owner 8 + offset 8). The records themselves are skipped — we
+    /// only care about marking the tree's own blocks for the
+    /// completeness map.
+    fn mark_rmapbt_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+    ) -> Result<(), FilesystemError> {
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_RMAP_CRC_MAGIC, XFS_RMAP_CRC_MAGIC],
+            24,
+            20,
+            |_| {},
+            |linear| {
+                map.mark(linear, S_INUSE_FS);
+            },
+        )
+    }
+
+    /// Walk the reflink refcount btree (refcountbt) and mark its tree
+    /// blocks. Records are 12 bytes (startblock 4 + blockcount 4 +
+    /// refcount 4) with 4-byte keys (startblock only). Records
+    /// themselves are skipped — only the blocks matter for the
+    /// completeness map.
+    fn mark_refcountbt_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root_agbno: u32,
+        expected_len: u64,
+        map: &mut OwnerMap,
+    ) -> Result<(), FilesystemError> {
+        self.walk_sblock_btree(
+            sb,
+            agno,
+            root_agbno,
+            expected_len,
+            [XFS_REFC_CRC_MAGIC, XFS_REFC_CRC_MAGIC],
+            12,
+            4,
             |_| {},
             |linear| {
                 map.mark(linear, S_INUSE_FS);
