@@ -33,6 +33,30 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (CLI parity for Wave-2 cores) — shipped the five
+  `tests/cli_{x68000,archie,ql,altair,bk0011m}.rs` end-to-end tests
+  called out in the open-work list. Drives `rb-cli` against synthetic
+  (Archie/QL/BK0011M/Altair) and committed (X68000 .d88) fixtures,
+  same shape as `cli_atarist.rs`. Surfaced and fixed three latent
+  bugs the new tests caught: (1) **FAT12/16 dir parser was reading
+  bytes 20..21 as the high half of the first-cluster pointer** —
+  those bytes are FAT32-only; the X68000 mkfs.fat fixture leaks
+  `0x2020` ASCII spaces there, which inflated cluster numbers into
+  the hundred-millions range and made `rb-cli get` fail with
+  "failed to fill whole buffer". (2) **detect_superfloppy didn't
+  recognise the BK0011M `ANDOS` signature** — raw 1 MB ANDOS disks
+  hit the MBR parser and bailed before reaching the superfloppy
+  fallback. Added the four canonical sector-0 candidate offsets.
+  (3) **is_floppy_size whitelist missed Altair 8" SSSD CP/M**
+  (255,488 B + 256,256 B); now both round-trip the superfloppy
+  fallback. Test scope is honest about engine vs CLI surface —
+  Altair limited to `inspect` (no CLI DPB flag yet), Archie limited
+  to read (FSM walker pending), BK0011M limited to detect-only
+  (matches the engine scaffold). 1634 lib + all integration tests
+  green (+4 vs prior commit; Windows enumerate-devices flake is the
+  only failure as expected). **Next**: HDD resize for X68000 /
+  Archie / QL, or ADFS FSM walker pickup when a non-blank reference
+  disc is in hand.
 - 2026-06-04 (ADFS non-blank reference scout via 8bs.com Acorn
   archive) — downloaded the 8bs.com Acorn floppy archive samples
   (`arc-01..arc-05` from <https://8bs.com/pool/arc/>). The 640K
