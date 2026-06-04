@@ -33,6 +33,35 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (ADFS FSM scout → QDOS write path pivot) — Scouted the
+  kilgus blank256E.hdf to plan the FSM walker. Surfaced THREE
+  unexpected layout findings that put the FSM work out of "well-
+  scoped" range until we have a non-blank reference: (1) **Hugo
+  magic is at byte 0x07E10601, not 0x7E11800** as the prior log
+  guessed — the dir block sits at 0x07E10600..0x07E10DFF (2 KB,
+  4 sectors, with tail-Hugo at 0x07E10DFB). (2) **Zone 0 (with
+  embedded DR) is at byte 0x07E08400** (sector 258114); the DR copy
+  inside zone 0 (at 0x07E08404) carries the disc name "HardDisc4 "
+  and disc_id 0x59CD — the boot-block DR at 0xFC0 has those zeroed.
+  (3) **The Linux ADFS map_addr formula gives sector 258048**, off
+  by 66 sectors (= 33,792 bytes = 33 map_bits) from the actual map
+  location at sector 258114. There are ~129 zone-header-shaped
+  patterns in the range 0x07E00400..0x07E10400 (one map's worth =
+  65 zones expected, but 2× count observed — possibly a backup map
+  copy + primary map). Also: `dr.root = 643` doesn't trivially walk
+  to byte 0x07E10600 because that byte position lands at map_bit
+  129089.5 (non-integer) — the dir doesn't sit on a map_bit
+  boundary, contradicting the standard FSM model. **Conclusion**:
+  FSM walker is blocked until we get (a) a non-blank ADFS reference
+  disc and (b) deeper RE of the RPCEmu format vs Linux's
+  understanding (the formula off-by-66 + 129-zone count are the
+  next mysteries to solve). **Pivoting** to QDOS write path which
+  is fully unblocked (sQLux harness proven; QDOS read byte-correct
+  vs kilgus QXL.WIN). Next: implement `QdosFilesystem::
+  EditableFilesystem` per sQLux QDisk.c conventions
+  (`QLWA_GetFreeBlock` / `QLWA_KillFile` / `QLWA_CreateNewFile` —
+  free-cluster linked list with `ffc` at 0x32 + `fc` at 0x2C, dir
+  entry append with `rlen` growth at 0x36).
 - 2026-06-04 (ADFS Disc Record scan + total_size repair) — user
   downloaded the RPCEmu bundle (`C:\Temp\rpcemu-win32-0.9.5-bundle-
   371-issue-1\RPCEmu - 371\`) and we grabbed two pre-formatted blank
