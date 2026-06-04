@@ -1129,9 +1129,20 @@ pub fn resize_btrfs_in_place(
     log_cb: &mut impl FnMut(&str),
 ) -> anyhow::Result<()> {
     let sb_pos = partition_offset + SUPERBLOCK_OFFSET;
-    file.seek(SeekFrom::Start(sb_pos))?;
+    if file.seek(SeekFrom::Start(sb_pos)).is_err() {
+        // Volume too small to host a btrfs superblock — silent no-op so
+        // the blind `resize_filesystem_for` dispatcher can call us
+        // against any image without bailing on small partitions
+        // (e.g. QDOS QXL.WIN, ProDOS, sub-64-KiB FAT floppies).
+        return Ok(());
+    }
     let mut sb = [0u8; 4096];
-    file.read_exact(&mut sb)?;
+    if file.read_exact(&mut sb).is_err() {
+        // Same justification — partition is smaller than the btrfs
+        // primary-superblock offset + size, so it's definitely not
+        // btrfs. Skip silently.
+        return Ok(());
+    }
 
     // Validate magic — skip silently if not btrfs (matches ext/fat pattern)
     if &sb[0x40..0x48] != BTRFS_MAGIC {
