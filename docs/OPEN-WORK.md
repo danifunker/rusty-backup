@@ -380,6 +380,20 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   `src/fs/qdos.rs` currently implements. Lives in *QDOS Reference
   Manual* ch. 12; ~300 LOC engine + tests against the two anchored
   fixtures.
+- **AcornAtom — already MiSTer-ready via existing FAT**
+  (reconciles the §5 plan gap noted as "Atom DOS niche / omitted").
+  The MiSTer AcornAtom core uses a 100 MB FAT-formatted .vhd as the
+  SD-card backing, not native Atom DOS. We **already fully support
+  that**: `scripts/build_atom_vhd.sh` packs the full
+  `hoglet67/AtomSoftwareArchive` V13.00 (5311 `.atm` files, 16 MB
+  raw) into a fresh FAT16 VHD via `mkfs.fat` + `mtools`, and our
+  existing FAT engine reads any `.atm` from it byte-for-byte
+  identical to the source. The packed VHD is on the user's MiSTer at
+  `/media/fat/games/AcornAtom/AtomSoftwareArchive_V13.vhd`. **No
+  Atom DOS engine work is required for MiSTer scope.** A future
+  `src/fs/atom_file.rs` for `.atm` metadata decoding (load/exec
+  addresses, AGD detection) would be a content-aware nicety but is
+  not on the spine.
 
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.

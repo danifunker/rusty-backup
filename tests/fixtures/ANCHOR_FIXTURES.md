@@ -23,6 +23,30 @@ Human68k volume.
 ships, `src/fs/human68k.rs` (already implemented + write-path-ready)
 can validate against this disk byte-for-byte.
 
+### `anchor_atom_FROGGER.atm.zst` (2.5 KB) + `anchor_atom_INVADER.atm.zst` (2.9 KB)
+
+Two sample Acorn Atom files in the canonical `.atm` cassette/tape
+format from `hoglet67/AtomSoftwareArchive` V13.00 (2024-05-05).
+Each `.atm` file has a 22-byte header (16-byte name + 2-byte load
++ 2-byte exec + 2-byte length) followed by raw program bytes.
+
+**Status:** the MiSTer AcornAtom core uses a FAT-formatted .vhd as
+its SD-card backing (per the MiSTer-devel/AcornAtom_MiSTer README),
+so the FAT side is already covered by our existing FAT engine. These
+`.atm` anchors are for **any future Atom file-format-aware tooling**
+(metadata extraction, type/load/exec surfacing, AGD/.atm conversion).
+A real-world FAT VHD with the full 5311-file archive is on the user's
+MiSTer at `/media/fat/games/AcornAtom/AtomSoftwareArchive_V13.vhd`
+(built by `scripts/build_atom_vhd.sh` and uploaded via scp). Our
+FAT engine extracts files from that VHD **byte-for-byte identical**
+to the original `.atm` sources (verified by host-side cmp against
+the two committed anchors).
+
+**Blocked by:** nothing required for MiSTer use today (FAT is
+shipped). Optional follow-up: `src/fs/atom_file.rs` for `.atm`
+metadata decoding, which would surface load/exec addresses in
+inspect rows for tools that scan .atm collections.
+
 ### `anchor_mister_GamesCart.mdv.zst` (36 KB) + `anchor_mister_crazy.mdv.zst` (54 KB)
 
 Two QL Microdrive cartridges shipping with the MiSTer QL core
