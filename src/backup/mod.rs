@@ -536,19 +536,17 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .context("failed to write ahdi.json")?;
             log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
         }
-        PartitionTable::X68k { .. } => {
-            // X68000 Human68k partition layout: per-partition Human68k
-            // (FAT-derived) backup rides the existing FAT pipeline; the
-            // partition-table sidecar is not yet emitted because the
-            // X68kPartitionTable struct doesn't implement Serialize.
-            // Restore-side support for X68k tables is future work
-            // tracked in OPEN-WORK.
-            log(
-                &progress,
-                LogLevel::Info,
-                "X68k partition table detected; per-partition data backup only \
-                 (sidecar serialisation pending)",
-            );
+        PartitionTable::X68k { table, .. } => {
+            // Mirror the AHDI sidecar shape: emit x68k.json so restore
+            // knows the X68k SASI slots, disk-size field, and partition
+            // start/length. Per-partition Human68k (FAT-derived) backup
+            // rides the standard layout-preserving path through the
+            // existing FAT pipeline.
+            let json = serde_json::to_string_pretty(table)
+                .context("failed to serialize X68k table to JSON")?;
+            std::fs::write(backup_folder.join("x68k.json"), json)
+                .context("failed to write x68k.json")?;
+            log(&progress, LogLevel::Info, "Exported X68k (x68k.json)");
         }
         PartitionTable::None { fs_hint, .. } => {
             log(

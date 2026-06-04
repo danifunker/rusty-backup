@@ -41,9 +41,12 @@
 //! byte fields are big-endian (M68k native).
 
 use byteorder::{BigEndian, ByteOrder};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
+
+use super::PartitionSizeOverride;
 
 /// `"X68K"` in big-endian u32.
 pub const X68K_MAGIC: u32 = 0x5836_384B;
@@ -71,11 +74,12 @@ pub const X68K_FIRST_PARTITION_SECTOR: u32 = 64;
 pub const X68K_DEFAULT_SECTOR_SIZE: u64 = 512;
 
 /// One decoded partition entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X68kEntry {
     /// 8-byte name field (Shift-JIS, space-padded). Held as raw bytes
     /// so the dispatch layer can route on the un-decoded name (most
     /// real disks have ASCII "Human   ").
+    #[serde(with = "serde_bytes_array")]
     pub name_raw: [u8; 8],
     /// Lossy ASCII rendering of the name for display (Shift-JIS
     /// double-byte sequences surface as `?`). Trimmed of trailing
@@ -86,6 +90,27 @@ pub struct X68kEntry {
     pub start_sector: u32,
     /// Length in sectors. 0 indicates an unused slot.
     pub length_sectors: u32,
+}
+
+mod serde_bytes_array {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 8], D::Error> {
+        let v: Vec<u8> = Deserialize::deserialize(d)?;
+        if v.len() != 8 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 8 bytes for X68k name_raw, got {}",
+                v.len()
+            )));
+        }
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&v);
+        Ok(out)
+    }
 }
 
 impl X68kEntry {
@@ -120,7 +145,7 @@ impl X68kEntry {
 }
 
 /// Parsed X68k partition table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X68kPartitionTable {
     /// `size` field from the on-disk header. Reported raw for inspect.
     pub disk_size_field: u32,
@@ -163,6 +188,64 @@ impl X68kPartitionTable {
             disk_size_field,
             entries,
         }))
+    }
+
+    /// Serialize the parsed table back into the canonical on-disk 144-byte
+    /// block (16-byte header + 8 × 16-byte entries). Inactive slots are
+    /// emitted as all-zeros; the live entries are placed in slot order.
+    ///
+    /// Used by restore-side reconstruction (we read the parsed
+    /// `x68k.json` sidecar, optionally patch it with size overrides via
+    /// [`patch_x68k_entries`], then write the resulting block to byte
+    /// [`X68K_TABLE_OFFSET`] of the target image).
+    pub fn to_bytes(&self) -> [u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE] {
+        let mut buf = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
+        BigEndian::write_u32(&mut buf[0..4], X68K_MAGIC);
+        BigEndian::write_u32(&mut buf[4..8], self.disk_size_field);
+        BigEndian::write_u32(&mut buf[8..12], self.disk_size_field);
+        // Bytes 12..16 (`unknown`) stay zero — matches the convention in
+        // every MiSTer X68000 image we've seen.
+        for (i, e) in self.entries.iter().take(X68K_MAX_PARTITIONS).enumerate() {
+            let off = X68K_TABLE_HEADER_SIZE + i * X68K_ENTRY_SIZE;
+            buf[off..off + 8].copy_from_slice(&e.name_raw);
+            BigEndian::write_u32(&mut buf[off + 8..off + 12], e.start_sector & 0x00FF_FFFF);
+            BigEndian::write_u32(&mut buf[off + 12..off + 16], e.length_sectors);
+        }
+        buf
+    }
+}
+
+/// Patch an in-memory X68k table block (144 bytes, as produced by
+/// [`X68kPartitionTable::to_bytes`]) with restore-time partition size
+/// overrides. Mirrors the shape of
+/// [`crate::partition::mbr::patch_mbr_entries`].
+///
+/// For each override we look up the active entry whose `start_sector`
+/// matches `start_lba` and rewrite its `length` field (and `start_sector`
+/// if `new_start_lba` is set). Overrides for entries that don't match
+/// any live slot are silently ignored — same defensive shape as the
+/// MBR helper.
+pub fn patch_x68k_entries(
+    buf: &mut [u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
+    overrides: &[PartitionSizeOverride],
+) {
+    for ps in overrides {
+        if ps.index >= X68K_MAX_PARTITIONS {
+            continue;
+        }
+        let entry_off = X68K_TABLE_HEADER_SIZE + ps.index * X68K_ENTRY_SIZE;
+        let current_start = BigEndian::read_u32(&buf[entry_off + 8..entry_off + 12]) & 0x00FF_FFFF;
+        if current_start as u64 != ps.start_lba {
+            // Slot doesn't match — refuse to patch (same safety check
+            // as patch_mbr_entries). This catches sidecar drift.
+            continue;
+        }
+        let effective_start = ps.effective_start_lba() as u32 & 0x00FF_FFFF;
+        let new_sectors = (ps.export_size / X68K_DEFAULT_SECTOR_SIZE) as u32;
+        if ps.new_start_lba.is_some() {
+            BigEndian::write_u32(&mut buf[entry_off + 8..entry_off + 12], effective_start);
+        }
+        BigEndian::write_u32(&mut buf[entry_off + 12..entry_off + 16], new_sectors);
     }
 }
 
@@ -250,5 +333,182 @@ mod tests {
         BigEndian::write_u32(&mut buf[12..16], 16);
         let e = X68kEntry::parse(&buf).unwrap();
         assert_eq!(e.start_sector, 64);
+    }
+
+    #[test]
+    fn to_bytes_round_trips_through_detect() {
+        let img =
+            build_image_with_x68k_table(&[(b"Human   ", 64, 0x1000), (b"Human68k", 0x1040, 0x800)]);
+        let mut cur = Cursor::new(img);
+        let table = X68kPartitionTable::detect(&mut cur).unwrap().unwrap();
+        let bytes = table.to_bytes();
+
+        // Place the serialized block into a fresh image and re-detect.
+        let total_size = (X68K_FIRST_PARTITION_SECTOR as u64 + 16) * X68K_DEFAULT_SECTOR_SIZE;
+        let mut img2 = vec![0u8; total_size as usize];
+        let off = X68K_TABLE_OFFSET as usize;
+        img2[off..off + bytes.len()].copy_from_slice(&bytes);
+        let mut cur2 = Cursor::new(img2);
+        let table2 = X68kPartitionTable::detect(&mut cur2).unwrap().unwrap();
+        assert_eq!(table2.entries.len(), 2);
+        assert_eq!(table2.entries[0].start_sector, 64);
+        assert_eq!(table2.entries[0].length_sectors, 0x1000);
+        assert_eq!(&table2.entries[0].name_raw, b"Human   ");
+        assert_eq!(table2.entries[1].start_sector, 0x1040);
+        assert_eq!(table2.entries[1].length_sectors, 0x800);
+    }
+
+    #[test]
+    fn to_bytes_emits_x68k_magic_at_offset_0() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x00FF_0000,
+            entries: vec![],
+        };
+        let bytes = table.to_bytes();
+        assert_eq!(BigEndian::read_u32(&bytes[0..4]), X68K_MAGIC);
+        assert_eq!(BigEndian::read_u32(&bytes[4..8]), 0x00FF_0000);
+        // Header.size2 mirrors size — consistent with on-disk images.
+        assert_eq!(BigEndian::read_u32(&bytes[8..12]), 0x00FF_0000);
+        // Header `unknown` and all 8 entry slots are zero.
+        for &b in &bytes[12..] {
+            assert_eq!(b, 0);
+        }
+    }
+
+    #[test]
+    fn patch_x68k_entries_resizes_matching_entry() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x4000,
+            entries: vec![
+                X68kEntry {
+                    name_raw: *b"Human   ",
+                    name_display: "Human".into(),
+                    start_sector: 64,
+                    length_sectors: 0x1000,
+                },
+                X68kEntry {
+                    name_raw: *b"Human68k",
+                    name_display: "Human68k".into(),
+                    start_sector: 0x1040,
+                    length_sectors: 0x800,
+                },
+            ],
+        };
+        let mut buf = table.to_bytes();
+        let overrides = vec![
+            PartitionSizeOverride::size_only(0, 64, 0x1000 * 512, 0x2000 * 512),
+            PartitionSizeOverride::size_only(1, 0x1040, 0x800 * 512, 0x800 * 512),
+        ];
+        patch_x68k_entries(&mut buf, &overrides);
+
+        // Slot 0 grew to 0x2000 sectors; slot 1 unchanged.
+        let off0 = X68K_TABLE_HEADER_SIZE;
+        assert_eq!(
+            BigEndian::read_u32(&buf[off0 + 12..off0 + 16]),
+            0x2000,
+            "slot 0 length should be patched"
+        );
+        let off1 = X68K_TABLE_HEADER_SIZE + X68K_ENTRY_SIZE;
+        assert_eq!(
+            BigEndian::read_u32(&buf[off1 + 12..off1 + 16]),
+            0x800,
+            "slot 1 length should be unchanged"
+        );
+    }
+
+    #[test]
+    fn patch_x68k_entries_skips_when_start_lba_mismatches() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x4000,
+            entries: vec![X68kEntry {
+                name_raw: *b"Human   ",
+                name_display: "Human".into(),
+                start_sector: 64,
+                length_sectors: 0x1000,
+            }],
+        };
+        let mut buf = table.to_bytes();
+        // Override claims start_lba = 999, but the live slot is at 64.
+        let overrides = vec![PartitionSizeOverride::size_only(
+            0,
+            999,
+            0x1000 * 512,
+            0x2000 * 512,
+        )];
+        patch_x68k_entries(&mut buf, &overrides);
+
+        // Slot 0 length stays at 0x1000 (refused).
+        let off0 = X68K_TABLE_HEADER_SIZE;
+        assert_eq!(
+            BigEndian::read_u32(&buf[off0 + 12..off0 + 16]),
+            0x1000,
+            "slot 0 should be untouched on start_lba mismatch"
+        );
+    }
+
+    #[test]
+    fn patch_x68k_entries_honors_new_start_lba() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x4000,
+            entries: vec![X68kEntry {
+                name_raw: *b"Human   ",
+                name_display: "Human".into(),
+                start_sector: 64,
+                length_sectors: 0x1000,
+            }],
+        };
+        let mut buf = table.to_bytes();
+        let overrides = vec![PartitionSizeOverride {
+            index: 0,
+            start_lba: 64,
+            original_size: 0x1000 * 512,
+            export_size: 0x1000 * 512,
+            new_start_lba: Some(128),
+            heads: 0,
+            sectors_per_track: 0,
+        }];
+        patch_x68k_entries(&mut buf, &overrides);
+
+        let off0 = X68K_TABLE_HEADER_SIZE;
+        assert_eq!(
+            BigEndian::read_u32(&buf[off0 + 8..off0 + 12]) & 0x00FF_FFFF,
+            128,
+            "slot 0 start_sector should be rewritten"
+        );
+    }
+
+    #[test]
+    fn entry_round_trips_through_json() {
+        let entry = X68kEntry {
+            name_raw: *b"Human68k",
+            name_display: "Human68k".into(),
+            start_sector: 64,
+            length_sectors: 0x1234,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let entry2: X68kEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(entry.name_raw, entry2.name_raw);
+        assert_eq!(entry.name_display, entry2.name_display);
+        assert_eq!(entry.start_sector, entry2.start_sector);
+        assert_eq!(entry.length_sectors, entry2.length_sectors);
+    }
+
+    #[test]
+    fn table_round_trips_through_json() {
+        let table = X68kPartitionTable {
+            disk_size_field: 0x00FF_0000,
+            entries: vec![X68kEntry {
+                name_raw: *b"Human   ",
+                name_display: "Human".into(),
+                start_sector: 64,
+                length_sectors: 0x1000,
+            }],
+        };
+        let json = serde_json::to_string(&table).unwrap();
+        let table2: X68kPartitionTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(table.disk_size_field, table2.disk_size_field);
+        assert_eq!(table.entries.len(), table2.entries.len());
+        // Bytes round-trip the same.
+        assert_eq!(table.to_bytes(), table2.to_bytes());
     }
 }
