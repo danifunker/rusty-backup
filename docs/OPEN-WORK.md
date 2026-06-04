@@ -495,6 +495,19 @@ Out, not parked. Listed so the question doesn't get re-litigated.
 - **External `chdman`** — replaced by the in-tree MAME CHD core via
   `libchdman-rs`. The Windows-host elevation rework removed the
   separate `chdman.exe` dependency.
+- **BK0011M ANDOS write / extract / resize** — kept as **detect-only
+  forever**. The Soviet-era ANDOS filesystem on the BK0011M MiSTer
+  core has no English-language layout spec, no community-maintained
+  reader / writer to validate byte-truth against, and a vanishingly
+  small target audience among retro enthusiasts using rusty-backup.
+  Our scaffold detects an ANDOS-shaped volume (the four canonical
+  sector-0 signatures landed during CLI parity work — see
+  `detect_superfloppy`) and routes it to the engine, which surfaces
+  a clean `Unsupported` for read / write / resize. That's enough
+  for `rb-cli inspect` to report "ANDOS detected" without crashing.
+  Spine row 5 (BK0011M) is therefore complete at the detect floor.
+  Reopen only if (a) a credible spec turns up AND (b) someone steps
+  forward as the maintainer for the format.
 
 ---
 
