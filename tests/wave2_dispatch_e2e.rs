@@ -231,34 +231,37 @@ fn source_reader_strips_arculator_hdf_header_and_routes_to_adfs() {
 // ----------------------------------------------------------------------------
 
 fn build_qdos_qxlwin_disk() -> Vec<u8> {
-    const BLOCKS: u16 = 16;
-    const SECTOR_BYTES: usize = 512;
-    let header_bytes = 64usize;
-    let dir_bytes = SECTOR_BYTES;
-    let mut disk =
-        vec![0u8; header_bytes + BLOCKS as usize * 2 + dir_bytes + BLOCKS as usize * SECTOR_BYTES];
+    // Canonical QXL.WIN layout (verified against kilgus QXL.WIN sample +
+    // sQLux QDisk.c source): cluster 0 holds header + FAT, root dir is
+    // a regular file chain starting at header.root_cluster.
+    const CC: u16 = 16;
+    const SPC: u16 = 1;
+    const CLUSTER_SIZE: usize = 512;
+    const ROOT_CLUSTER: u16 = 1;
+    const ROOT_LEN: u32 = 128;
+    const FILE_CLUSTER: u16 = 5;
+    let mut disk = vec![0u8; CC as usize * CLUSTER_SIZE];
     disk[0..4].copy_from_slice(b"QLWA");
-    BigEndian::write_u16(&mut disk[6..8], 1);
-    BigEndian::write_u16(&mut disk[8..10], 1);
-    BigEndian::write_u16(&mut disk[10..12], 7);
-    BigEndian::write_u16(&mut disk[12..14], BLOCKS - 1);
-    BigEndian::write_u16(&mut disk[14..16], BLOCKS);
-    BigEndian::write_u16(&mut disk[16..18], 1);
-    BigEndian::write_u16(&mut disk[18..20], 16);
-    BigEndian::write_u16(&mut disk[20..22], 4);
-    BigEndian::write_u16(&mut disk[22..24], 1);
-    disk[24] = 8;
-    disk[25..33].copy_from_slice(b"AutoQL  ");
-    let fat_off = header_bytes;
-    BigEndian::write_u16(&mut disk[fat_off + 10..fat_off + 12], 0xFFFF);
-    let dir_off = header_bytes + BLOCKS as usize * 2;
-    BigEndian::write_u32(&mut disk[dir_off..dir_off + 4], 16);
-    BigEndian::write_u16(&mut disk[dir_off + 14..dir_off + 16], 5);
-    BigEndian::write_u16(&mut disk[dir_off + 22..dir_off + 24], 7);
-    disk[dir_off + 24..dir_off + 31].copy_from_slice(b"AUTODET");
-    let data_off = header_bytes + BLOCKS as usize * 2 + dir_bytes;
-    let block_5 = data_off + 5 * SECTOR_BYTES;
-    disk[block_5..block_5 + 16].copy_from_slice(b"qdos auto detect");
+    BigEndian::write_u16(&mut disk[0x04..0x06], 0x0005);
+    let mut name = [b' '; 20];
+    name[..6].copy_from_slice(b"AutoQL");
+    disk[0x06..0x1A].copy_from_slice(&name);
+    BigEndian::write_u16(&mut disk[0x22..0x24], SPC);
+    BigEndian::write_u16(&mut disk[0x2A..0x2C], CC);
+    BigEndian::write_u16(&mut disk[0x2C..0x2E], 8);
+    BigEndian::write_u16(&mut disk[0x32..0x34], 6);
+    BigEndian::write_u16(&mut disk[0x34..0x36], ROOT_CLUSTER);
+    BigEndian::write_u32(&mut disk[0x36..0x3A], ROOT_LEN);
+    // Root cluster's data lives at byte 512. Slot 0 left empty (volume
+    // self-reference). Slot 1 = AUTODET file pointing at cluster 5.
+    let dir_off = ROOT_CLUSTER as usize * CLUSTER_SIZE;
+    let slot1 = dir_off + 64;
+    BigEndian::write_u32(&mut disk[slot1..slot1 + 4], 16);
+    BigEndian::write_u16(&mut disk[slot1 + 0x0E..slot1 + 0x10], 7); // name length
+    disk[slot1 + 0x10..slot1 + 0x17].copy_from_slice(b"AUTODET");
+    BigEndian::write_u16(&mut disk[slot1 + 0x3A..slot1 + 0x3C], FILE_CLUSTER);
+    let file_off = FILE_CLUSTER as usize * CLUSTER_SIZE;
+    disk[file_off..file_off + 16].copy_from_slice(b"qdos auto detect");
     disk
 }
 

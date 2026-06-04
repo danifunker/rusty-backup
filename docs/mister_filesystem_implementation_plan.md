@@ -33,6 +33,38 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (QDOS read-path layout fix vs canonical QXL.WIN) — user
+  installed sQLux as the byte-truth oracle for QDOS work. The setup
+  surfaced a real bug: our `src/fs/qdos.rs` was parsing QXL.WIN to a
+  header layout that didn't match the canonical shape per sQLux
+  `QDisk.c:104-128` + cross-verified against two public real-world
+  samples (`QXL.WIN` 40 MB and `smsqe_mister.win` 10 MB, downloaded
+  from kilgus.net/ql/mister/). Fix: rewrite `QxlWinHeader` to the
+  correct layout — 20-byte volume name at offset 0x06, spc / cc /
+  fc / spm at 0x22 / 0x2A / 0x2C / 0x2E, root_cluster at 0x34,
+  rlen u32 at 0x36, FAT at 0x40. Directory is now a file chain
+  starting at `header.root_cluster` (length `header.rlen`), not a
+  fixed range after the FAT. Directory-entry fields also corrected:
+  name length at offset 0x0E (not 0x16), first cluster at 0x3A
+  (sQLux's `QWDE_FNUM`, not the bytes-14..16 the old code used).
+  Cluster-to-byte addressing: cluster N starts at `N × spc × 512`
+  from start of partition (cluster 0 holds header). Inline +
+  dispatch synthetic fixtures rebuilt against the canonical layout.
+  Validated end-to-end via `examples/qdos_probe`: kilgus sample
+  opens as `label="QL-SD"` and lists 8 real files (boot / easy / g /
+  qhelp / readme_txt / system / turbo / xchange); smsqe sample
+  opens as `label="SMSQE"` and lists 2 files (boot, smsqe_mister);
+  both read first 64 B cleanly. Real-world samples NOT committed
+  per fixture policy — they live in `/tmp/qxlwin_samples/` as
+  scouting references. 1624 lib + integration tests green
+  (+16 over Wave-2 prereq baseline). Headless sQLux harness
+  pattern confirmed working (`-d boot -b "<basic>"` without the
+  `--fast_startup` / `--skip_boot` flags) and ready to gate the
+  QDOS write path next session. Next: ship
+  `QdosFilesystem::EditableFilesystem` (16-bit BE FAT alloc/free,
+  64 B dir-entry insert/delete, header counter updates), validate
+  writes by having sQLux mount our output and copy files to a
+  host-mounted mdv1 directory, then move on to ADFS write path.
 - 2026-06-04 (Wave 2 close-out — X68000 SASI HDD partition scheme) —
   New `src/partition/x68k.rs` (~280 LOC) parses the Sharp X68000
   Human68k partition table: `"X68K"` magic (BE u32 `0x5836384B`) at

@@ -49,7 +49,7 @@ Legend for the **Support** column:
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
 | X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD partition table + Human68k partition dispatch yes (resize-on-restore deferred) |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — read yes for `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD; ADFS write path deferred |
-| QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read yes; `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
+| QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read end-to-end (byte-correct against kilgus + smsqe MiSTer samples); `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle); write paths pending sQLux byte-truth oracle |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |
 | AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **No** |
 | TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **No** |
