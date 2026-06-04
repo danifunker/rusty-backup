@@ -47,38 +47,6 @@ Provenance: hoglet67-uploaded Amstrad_CPC_TOSEC_2012_04_23 on
 archive.org. ManicMiner is a 40-year-old game; the TOSEC release is
 the community preservation reference.
 
-### `anchor_pcw_PAW.dsk.zst` (49 KB compressed, 190 KB raw)
-
-Real-world Amstrad PCW EDSK from TOSEC v2022-07-10
-("PAW (19xx)(Gilberts, Tim - Yeandle, Graeme)" — Professional
-Adventure Writer). Standard CPCEMU DSK format (40 trk × 9 sec ×
-512 B = 184320 B decoded), **PCW Format A boot disk** layout:
-track 0 holds the PCW BIOS, tracks 1..39 hold the CP/M directory
-and files. The dominant PCW shape in TOSEC.
-
-**Status: consumed.** `tests/pcw_e2e.rs` (4 tests, all green)
-reads this via the EDSK container decoder + CP/M engine with the
-`AMSTRAD_PCW` DPB. Verifies:
-- EDSK decodes to the expected 184320-byte flat
-- Root directory lists `ADDARTP.COM`, `DIFF.TXT`, `EDIT.COM`,
-  `EDIT.INS`, `EDIT.KEY`, `EDITINST.COM`, `PAWCOMP.COM`
-- `EDIT.COM` reads back with plausible CP/M-Plus binary shape
-- First directory entry sits at byte 4608 (= 1 × 9 × 512), proving
-  the reserved-track calculation is right post-fix
-
-Cross-validation oracle: `cpmls -f pcw` (cpmtools / libdsk `pcw180`)
-reads the same disk to byte-identity. Surfaced the long-standing
-reserved-bytes formula bug in `src/fs/cpm.rs` — every DPB with
-`off > 0` and `sector_size > 128` had been placing the directory
-4× too deep. PCW Format A (off=1, sector_size=512) was the first
-real-world fixture to exercise that path; the bug had hidden behind
-AMSTRAD_DATA (off=0) being the only DPB the existing tests touched.
-
-Provenance: TOSEC `tosec-full-2022-07-10` Amstrad PCW Applications
-archive on archive.org. PAW is a 1985–86 commercial adventure-
-writing system distributed on PCW; the TOSEC release is the
-community preservation reference.
-
 ### `anchor_atom_FROGGER.atm.zst` (2.5 KB) + `anchor_atom_INVADER.atm.zst` (2.9 KB)
 
 Two sample Acorn Atom files in the canonical `.atm` cassette/tape
