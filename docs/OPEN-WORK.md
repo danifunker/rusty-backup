@@ -346,18 +346,33 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   `docs/mister-deployment-testing-plan.md` §3.5. Build a 800 KB
   E-format ADFS disc with the synthetic-fixture pattern, mount as
   `:0`, `*CAT :0` lists the file, `*Type HELLO` reads back the
-  seed. Engine surface shipped (5 unit + 1 e2e); only real-hardware
-  boot outstanding. ADFS write path (`create_file` against the
-  new-map FSM) parked until a real-hardware oracle is in hand —
-  trying to land an FSM walker without one risks shipping a
-  format-mangling bug.
+  seed. Engine surface shipped (5 unit + 1 e2e + 3 cli); only
+  real-hardware boot outstanding. ADFS write path (`create_file`
+  against the new-map FSM) **scout passes done** — see
+  `docs/mister_filesystem_implementation_plan.md` session log for
+  the unresolved layout findings: (a) `dr.root` encoding for
+  E-format (`arc-04` sample has `dr.root=0x203` but zone-0 fragment
+  IDs only run 2..15 — not a fragment-ID lookup); (b) Linux
+  `map_addr` formula off by 66 sectors vs the kilgus blank256E HD
+  sample; (c) zone-0 layout has 4-byte zone header + 60-byte DR at
+  zone-byte offset 4 (= byte 0x404 for E-format floppy, byte
+  0x07E08400+4 for blank256E HD). DR scan candidate list now
+  includes 0x404. Walker still blocked on a non-blank reference
+  disc (RPCEmu manual `*FORMAT :4 ADFS` + hostfs file copy) plus
+  deeper RE of the formula mismatch — trying to land an FSM walker
+  without those risks shipping a format-mangling bug. Real samples
+  backed up under `C:\Temp\adfs_arc04_e_orig.adf` (800K E-format
+  populated, from 8bs.com/pool/arc/arc-04.zip), `C:\Temp\
+  adfs_blank256E.hdf` (256 MB blank E-format HD), `C:\Temp\
+  adfs_blank1024Eplus.hdf` (1 GB blank E+ format HD).
 - **MiSTer QL core boot test** — workflow A+C per
   `docs/mister-deployment-testing-plan.md` §3.6. Build a QXL.WIN
   hard-disk image, place at `/media/fat/games/QL/win1_`, boot
   the QL core, `DIR win1_`, `LOAD win1_HELLO` reads the seed.
-  Engine surface shipped (16 unit + 2 e2e — including write); the
-  write path now passes a headless sQLux byte-truth oracle (rb-cli
-  put → sQLux SuperBASIC COPY → host file round-trips byte-exact).
+  Engine surface shipped (20 unit + 2 e2e + 5 cli — including
+  write); the write path passes a headless sQLux byte-truth oracle
+  (rb-cli put → sQLux SuperBASIC COPY → host file round-trips
+  byte-exact, per-file 64-byte QDOS header convention honoured).
   Only the real-hardware mount + boot is outstanding. `.mdv`
   microdrive container (per-sector 60-byte records) deferred.
 - **MiSTer BK0011M ANDOS core boot test** — workflow A only per

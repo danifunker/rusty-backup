@@ -20,17 +20,22 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Wave 2 closed at the engine + dispatch level.
-Every Wave-2 core now lives at `[~]` with the remaining boxes
-explicitly parked to OPEN-WORK §7 (MiSTer on-hardware boot tests +
-write paths where a real-hardware oracle is needed first). Altair
-CP/M holds the only `[x]`-everywhere row via the cpmtools byte-
-identity oracle. Human68k ships a full Add/Delete write path; ADFS
-+ QDOS + ANDOS write paths intentionally deferred behind boot-test
-oracles to avoid shipping format-mangling bugs without a real-
-hardware sanity check. Spillover still in flight: the CP/M engine
-covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
-floppy cores at zero per-core cost.
+**Current position:** Wave 2 nearly complete on dispatch + write paths
++ CLI parity. QDOS (QXL.WIN) graduated from read-only to full
+`EditableFilesystem` with sQLux byte-truth oracle pass; the per-file
+64-byte QDOS header convention is honoured on both sides. Human68k
+already shipped full Add/Delete; Altair CP/M holds the only
+`[x]`-everywhere row via the cpmtools byte-identity oracle. CLI
+parity tests (`tests/cli_{x68000,archie,ql,altair,bk0011m}.rs`) ship
+end-to-end — exposed three latent bugs (FAT12/16 reading bytes
+20..21 as the high-cluster pointer; `detect_superfloppy` missing the
+ANDOS signature; `is_floppy_size` missing Altair 8" SSSD sizes).
+ADFS write path is the only remaining Wave-2 hold-out, blocked on
+(a) the dr.root encoding mystery — 8bs.com E-format `arc-04` sample
+shows `dr.root=0x203` is NOT a direct fragment-ID lookup — and
+(b) a non-blank reference disc with known layout. Spillover still in
+flight: the CP/M engine covers Wave-3 Amstrad / PCW / Einstein /
+SVI328 / MultiComp / ZX+3 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
 - 2026-06-04 (CLI parity for Wave-2 cores) — shipped the five
@@ -457,8 +462,8 @@ A core is **done** only when every applicable stage is `[x]`.
 
 - [ ] §3.1 non-512 logical-sector accessor + `src/fs/README.md` note
 - [x] §3.2 container framework `src/rbformats/containers/` (`open_container` dispatch)
-- [ ] §3.2 decoders: [x] MSA · [x] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [ ] `.d88`
-- [ ] §3.3 partitionless / extension-dispatch framework
+- [~] §3.2 decoders: [x] MSA · [x] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [x] `.d88` (Sharp; encode + decode + e2e tests + source_reader plumbing)
+- [x] §3.3 partitionless / extension-dispatch framework (detect_superfloppy + detect_filesystem_type cover Wave-2: FAT/HFS/HFS+/MFS/ext/btrfs/EFS/XFS/ADFS/ProDOS/DOS3.3/DFS/QDOS/ANDOS + AmigaDOS DosType string routing)
 - [ ] §3.4 convention docs (endianness, bitmap polarity, write-safety)
 
 ### Wave 1 — near-complete dual-media cores
@@ -469,11 +474,11 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 
-- [~] **X68000** (Human68k) — prereqs [ ] `.d88` container [ ] X68k partition · [x] inspect · [x] extract · [!] ref (parked OPEN-WORK §7 user-side: MiSTer X68000 core boot test) · [x] add/del (EditableFilesystem create_file w/ FAT12 chain alloc + delete via 0xE5 marker) · [!] write-verified (parked §7 user-side) · [ ] resize · [!] gui (dispatch shared; parked §7) · [ ] cli · [x] tests (10 unit + 1 e2e)
-- [~] **Archie** (ADFS/FileCore) — prereq [ ] `.hdf` header handling · [x] inspect (auto-detect via Disc Record probe in detect_filesystem_type) · [x] extract (contiguous-extent file read) · [!] ref (parked §7 user-side: MiSTer Archie core boot test) · [ ] add/del (FSM walker parked) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (5 unit + 1 e2e)
-- [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (auto-detect via QLWA signature) · [x] extract · [!] ref (parked §7 user-side: MiSTer QL core boot test) · [ ] add/del (deferred) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (4 unit + 1 e2e)
-- [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string) · [x] extract · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle) · [x] add/del · [x] write-verified · [!] gui (dispatch shared; §7 polish) · [ ] cli · [x] tests (8 unit + 4 e2e)
-- [~] **BK0011M** (ANDOS) · [x] inspect (auto-detect; signature probe at 4 candidate offsets) · [!] extract (scaffold returns Unsupported; parked OPEN-WORK §7: real walker + MiSTer BK0011M boot test) · [!] ref (parked §7) · [ ] add/del (parked) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (4 unit + 1 e2e)
+- [~] **X68000** (Human68k) — prereqs [x] `.d88` container [x] X68k SASI partition · [x] inspect · [x] extract · [!] ref (parked OPEN-WORK §7 user-side: MiSTer X68000 core boot test) · [x] add/del (EditableFilesystem create_file w/ FAT12 chain alloc + delete via 0xE5 marker) · [!] write-verified (parked §7 user-side) · [ ] resize · [!] gui (dispatch shared; parked §7) · [x] cli (tests/cli_x68000.rs — 4 tests: inspect/ls on wrapped .d88 + get/put on flat) · [x] tests (10 unit + 1 e2e + 4 cli + 5 d88_e2e)
+- [~] **Archie** (ADFS/FileCore) — prereq [x] `.hdf` header handling (bare + Arculator-wrapped) · [x] inspect (auto-detect via Disc Record probe; scan candidates 0xFC0, 0xDC0, 0x404 for HDD + E-format floppy + legacy floppy) · [x] extract (contiguous-extent file read) · [!] ref (parked §7 user-side: MiSTer Archie core boot test) · [!] add/del (FSM walker scout did pass — see session log; **blocked** on dr.root encoding for E-format + non-blank reference disc) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [x] cli (tests/cli_archie.rs — 3 tests: inspect/ls/get on synthetic E-format floppy) · [x] tests (5 unit + 1 e2e + 3 cli)
+- [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (auto-detect via QLWA signature in detect_filesystem_type + detect_superfloppy) · [x] extract (per-file 64-byte QDOS header stripped from user-visible data) · [x] ref (sQLux byte-truth oracle — headless SDL_VIDEODRIVER=offscreen, rb-cli put → SuperBASIC COPY → host file round-trips byte-exact against kilgus QXL.WIN) · [x] add/del (EditableFilesystem create_file/delete_entry: ffc+fc+rlen bookkeeping per sQLux QDisk.c QLWA_GetFreeBlock/QLWA_KillFile, plus per-file header stamping) · [x] write-verified (sQLux oracle pass) · [ ] resize · [!] gui (dispatch shared; parked §7 polish) · [x] cli (tests/cli_ql.rs — 5 tests: full inspect/ls/get/put/rm round-trip) · [x] tests (20 unit + 2 e2e + 5 cli)
+- [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string; superfloppy fallback for 255_488 + 256_256 byte 8" SSSD discs) · [x] extract · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle) · [x] add/del · [x] write-verified · [!] gui (dispatch shared; §7 polish) · [~] cli (tests/cli_altair.rs — 2 tests: inspect + engine-level read; full rb-cli `--fs-type cpm:NAME` flag pending — CP/M has no on-disk signature so auto-dispatch cannot work without it) · [x] tests (8 unit + 4 e2e + 2 cli)
+- [~] **BK0011M** (ANDOS) · [x] inspect (auto-detect: detect_filesystem_type AND detect_superfloppy both probe the 4 candidate offsets) · [!] extract (scaffold returns Unsupported; parked OPEN-WORK §7: real walker + MiSTer BK0011M boot test) · [!] ref (parked §7) · [ ] add/del (parked) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [x] cli (tests/cli_bk0011m.rs — 2 tests: inspect routes to ANDOS engine, ls surfaces clean Unsupported) · [x] tests (4 unit + 1 e2e + 2 cli)
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
