@@ -100,6 +100,8 @@ fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
         143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
+        | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 × 1024 B blocks)
+        | 256_256   // 8" SSSD 256K (77 trk × 26 spt × 128 B) — MITS Altair / IBM 3740 CP/M (raw)
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
@@ -170,6 +172,14 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // route for them.
     if &first_sector[0..4] == b"QLWA" {
         return Some("QDOS".to_string());
+    }
+
+    // Soviet BK0011M ANDOS: signature "ANDOS" at one of several
+    // well-known boot-block slots in sector 0. See src/fs/andos.rs.
+    for &cand in &[0x1F8usize, 0x1B0, 0xE0, 0x00] {
+        if first_sector.len() >= cand + 5 && &first_sector[cand..cand + 5] == b"ANDOS" {
+            return Some("ANDOS".to_string());
+        }
     }
 
     // AmigaDOS boot block: "DOS\x?" at offset 0 (variants 0..7 = OFS/FFS,

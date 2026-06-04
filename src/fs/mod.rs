@@ -1732,8 +1732,9 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        // Soviet BK0011M ANDOS scaffold (detect-only).
-        "andos" => Ok(Box::new(andos::AndosFilesystem::open(
+        // Soviet BK0011M ANDOS scaffold (detect-only). "andos" =
+        // explicit CLI/code call; "ANDOS" = auto-detect superfloppy hint.
+        "andos" | "ANDOS" => Ok(Box::new(andos::AndosFilesystem::open(
             reader,
             partition_offset,
         )?)),
