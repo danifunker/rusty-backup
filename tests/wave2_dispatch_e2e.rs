@@ -129,6 +129,23 @@ fn dispatch_via_auto_detect_routes_to_adfs() {
 }
 
 #[test]
+fn dispatch_via_auto_detect_routes_to_qdos_mdv() {
+    use rusty_backup::fs::qdos_mdv::{CART_NAME_OFFSET, MDV_CART_BYTES, MDV_SECTOR_BYTES};
+    let mut cart = vec![0u8; MDV_CART_BYTES];
+    // Sector-0 preamble + sync + cartridge name "TstCart".
+    cart[0x0A] = 0xFF;
+    cart[0x0B] = 0xFF;
+    cart[0x0C] = 0xFF;
+    cart[CART_NAME_OFFSET..CART_NAME_OFFSET + 7].copy_from_slice(b"TstCart");
+    cart[CART_NAME_OFFSET + 7..CART_NAME_OFFSET + 10].copy_from_slice(b"   ");
+    let _ = MDV_SECTOR_BYTES;
+    let cur = Cursor::new(cart);
+    let fs = rusty_backup::fs::open_filesystem(cur, 0, 0, None).unwrap();
+    assert_eq!(fs.fs_type(), "QDOS Microdrive");
+    assert_eq!(fs.volume_label(), Some("TstCart"));
+}
+
+#[test]
 fn partition_superfloppy_detects_bare_adfs_hdf() {
     use rusty_backup::partition::PartitionTable;
     let mut disk = std::io::Cursor::new(build_adfs_eformat_disk());

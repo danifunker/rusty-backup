@@ -33,6 +33,23 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (Wave 2 close-out — `.mdv` QDOS Microdrive scaffold) —
+  New `src/fs/qdos_mdv.rs` (~200 LOC) ships the detect-only scaffold
+  for QL microdrive cartridge images: 255 × 686 = 174,930 bytes per
+  cart, sector-0 preamble + sync + 10-byte ASCII cartridge name at
+  byte 0x0E. Two anchored fixtures `anchor_mister_GamesCart.mdv.zst`
+  (cart "MD") + `anchor_mister_crazy.mdv.zst` (cart "Test") both
+  validate against the detector. Dispatch wiring: `fs::detect_
+  filesystem_type` adds an exact-size + sector-0-shape probe that
+  returns `"qdos_mdv"`, plus a new arm in `open_filesystem`
+  routing to `QdosMdvFilesystem::open`. Full directory walking
+  (QDOS Reference Manual ch.12 sector chain) is parked behind a
+  real-hardware oracle (already in OPEN-WORK §7). Tests: 6 unit
+  (sector-0 shape acceptance + rejections, cart-name trimming,
+  open-and-list-unsupported) + 1 wave2_dispatch_e2e (auto-route
+  to QDOS Microdrive via the type-detection pipeline). Updated
+  full_MiSTer_support_status.md QL row + Filesystems list.
+  Next: X68000 partition scheme (SASI HDD).
 - 2026-06-04 (Wave 2 close-out — `.hdf` header handling for Archie) —
   Added ADFS Disc Record probe at byte 0xDC0 to `detect_superfloppy`
   in `src/partition/mod.rs` so bare `.hdf` files (the form RPCEmu +

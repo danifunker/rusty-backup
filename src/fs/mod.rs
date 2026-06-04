@@ -41,6 +41,7 @@ pub mod pfs3_clone;
 pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
+pub mod qdos_mdv;
 pub mod reiserfs;
 pub mod resource_fork;
 pub mod sfs;
@@ -368,6 +369,18 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // cheap.
     if andos::detect_andos_signature(&sector0).is_some() {
         return "andos";
+    }
+
+    // QDOS Microdrive cartridge: exact file size 174,930 bytes
+    // (255 × 686) AND a recognisable sector-0 cartridge header. The
+    // exact-size constraint keeps this from false-positiving on other
+    // formats — every real MiSTer-distributed `.mdv` we've seen lands
+    // exactly there.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        if end == qdos_mdv::MDV_CART_BYTES as u64 && qdos_mdv::looks_like_mdv_sector_zero(&sector0)
+        {
+            return "qdos_mdv";
+        }
     }
 
     "unknown"
@@ -1196,6 +1209,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos_mdv" => Ok(Box::new(qdos_mdv::QdosMdvFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
