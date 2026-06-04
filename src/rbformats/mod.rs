@@ -39,6 +39,9 @@ use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
+use crate::partition::x68k::{
+    patch_x68k_entries, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_TABLE_OFFSET,
+};
 use crate::partition::PartitionSizeOverride;
 
 // Re-exports keep the historical `crate::rbformats::write_zeros` /
@@ -104,6 +107,7 @@ pub fn reconstruct_disk_from_backup(
     let target_sectors = target_size / 512;
     let is_superfloppy = metadata.partition_table_type == "None";
     let is_rdb = metadata.partition_table_type == "RDB";
+    let is_x68k = metadata.partition_table_type == "X68k";
 
     if is_rdb {
         // Backup-folder restore for RDB-based Amiga disks is not yet wired
@@ -123,6 +127,42 @@ pub fn reconstruct_disk_from_backup(
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
         log_cb("Superfloppy: no partition table to write");
+    } else if is_x68k {
+        // X68000 SASI table lives at byte 2048 — read x68k.json, patch with
+        // overrides, write at the canonical offset. The 2048-byte IPL region
+        // before the table is zero-filled (real X68000 hardware would carry
+        // a boot loader here; the MiSTer X68000 core boots from the SD card
+        // image of the OS itself, so a zeroed IPL is fine for data drives).
+        let x68k_path = backup_folder.join("x68k.json");
+        let x68k_data = fs::read_to_string(&x68k_path)
+            .with_context(|| format!("failed to read {}", x68k_path.display()))?;
+        let mut table: X68kPartitionTable =
+            serde_json::from_str(&x68k_data).context("failed to parse x68k.json")?;
+        // Refresh disk_size_field to the new target so inspect tools and
+        // Human68k itself report the post-resize size (the field is
+        // disk-size in some unit — sectors for MiSTer images).
+        let new_disk_sectors = (target_size / X68K_DEFAULT_SECTOR_SIZE) as u32;
+        if table.disk_size_field > 0 {
+            table.disk_size_field = new_disk_sectors;
+        }
+        let mut block = table.to_bytes();
+        if !partition_sizes.is_empty() {
+            patch_x68k_entries(&mut block, partition_sizes);
+            log_cb("Patched X68k partition table with export sizes");
+        }
+        // Zero-fill the IPL region (bytes 0..2048) and write the 144-byte
+        // table block at offset 2048.
+        writer.seek(SeekFrom::Start(0))?;
+        write_zeros(writer, X68K_TABLE_OFFSET)?;
+        writer
+            .write_all(&block)
+            .context("failed to write X68k partition table")?;
+        total_written = X68K_TABLE_OFFSET + block.len() as u64;
+        log_cb(&format!(
+            "Wrote X68k partition table ({} bytes at offset {})",
+            block.len(),
+            X68K_TABLE_OFFSET
+        ));
     } else if let Some(gpt_data) = gpt {
         // GPT restore: write protective MBR + primary GPT (LBAs 0-33)
         let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);

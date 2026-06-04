@@ -1056,4 +1056,105 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, FilesystemError::InvalidData(_)));
     }
+
+    // Spine-stage-7 confirmation: resize_fat_in_place on a Human68k disk
+    // must extend the volume in place and Human68kFilesystem::open must
+    // still find every file on the resized image. Human68k is FAT12/16
+    // BPB-compatible so the same FAT machinery applies — these tests
+    // pin the contract so a future FAT refactor can't silently break
+    // X68000 HDD resize.
+    #[test]
+    fn resize_fat_in_place_grows_human68k_volume() {
+        use crate::fs::fat::resize_fat_in_place;
+        use std::io::Cursor;
+
+        let mut disk = build_fat12_synthetic();
+        // Extend the backing buffer to the larger target size so the
+        // resize call can write into it (resize doesn't allocate disk
+        // bytes itself — it requires the writer to already be large
+        // enough).
+        let old_sectors: u32 = 1440;
+        let new_sectors: u32 = 2880; // 720K -> 1.44M shape
+        let bps = 512usize;
+        disk.resize(new_sectors as usize * bps, 0);
+
+        let mut cur = Cursor::new(&mut disk);
+        let did_resize =
+            resize_fat_in_place(&mut cur, 0, new_sectors, &mut |_| {}).expect("resize ok");
+        assert!(did_resize, "resize should succeed on Human68k FAT12 BPB");
+
+        // BPB.total_sectors (offset 19..21 for u16) now reflects the new size.
+        assert_eq!(
+            u16::from_le_bytes([disk[19], disk[20]]) as u32,
+            new_sectors,
+            "BPB total_sectors should be patched in-place"
+        );
+
+        // The file we seeded into the FAT12 disk must still be reachable
+        // after the resize via the Human68k reader (BPB shape unchanged,
+        // FAT extended with free entries).
+        let mut fs = Human68kFilesystem::open(Cursor::new(&disk), 0).expect("reopen");
+        assert_eq!(fs.bpb.total_sectors, new_sectors);
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1, "DOC.TXT should survive resize");
+        assert_eq!(entries[0].name, "DOC.TXT");
+
+        let payload = fs.read_file(&entries[0], 1024).unwrap();
+        assert_eq!(&payload[..14], b"hello human68k");
+
+        // FAT12 stays FAT12 — old_sectors and new_sectors both
+        // produce <4085 clusters with 1 SPC + 1 reserved + 2 FATs at
+        // 3 sectors each. The resize path uses the spare-FAT-capacity
+        // branch (no data shift, BPB-only update).
+        let _ = old_sectors;
+    }
+
+    #[test]
+    fn resize_fat_in_place_shrinks_human68k_volume() {
+        use crate::fs::fat::resize_fat_in_place;
+        use std::io::Cursor;
+
+        // Build a FAT16 Human68k disk (16 MiB) so the resize_fat_in_place
+        // path has room to shrink without changing FAT type.
+        let total_sectors_old: u32 = 32_768; // 16 MiB / 512
+        let total_sectors_new: u32 = 16_384; // 8 MiB / 512
+        let bps = 512usize;
+        let mut disk =
+            crate::fs::fat::create_blank_fat(total_sectors_old as u64 * bps as u64, Some("X68K"))
+                .expect("blank FAT16");
+
+        // Sanity: Human68k can open the fresh blank.
+        let bpb_check_disk = disk.clone();
+        let _ = Human68kFilesystem::open(Cursor::new(bpb_check_disk), 0)
+            .expect("Human68k opens blank FAT16");
+
+        let mut cur = Cursor::new(&mut disk);
+        let did_resize =
+            resize_fat_in_place(&mut cur, 0, total_sectors_new, &mut |_| {}).expect("shrink ok");
+        assert!(did_resize, "shrink should succeed");
+
+        // BPB total_sectors slot for FAT16 with total > u16::MAX is in
+        // bytes 32..36 (large total). 16384 fits in u16 so it lives in
+        // bytes 19..21 instead — match how the FAT resize writer chose
+        // the field.
+        let small_total = u16::from_le_bytes([disk[19], disk[20]]) as u32;
+        let big_total = u32::from_le_bytes([disk[32], disk[33], disk[34], disk[35]]);
+        let observed = if small_total != 0 {
+            small_total
+        } else {
+            big_total
+        };
+        assert_eq!(observed, total_sectors_new);
+
+        // The blank disk has no files, but reopen + root listing must
+        // succeed end-to-end.
+        let mut fs = Human68kFilesystem::open(Cursor::new(&disk), 0).expect("reopen");
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(
+            entries.is_empty(),
+            "freshly-formatted volume has no files after shrink"
+        );
+    }
 }
