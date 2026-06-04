@@ -132,14 +132,18 @@ pub const AMSTRAD_DATA: Dpb = Dpb {
     tracks: 40,
 };
 
-/// Amstrad PCW 8256/8512 single-sided 80-track 512-B disk (9 sectors).
+/// Amstrad PCW Format A — the dominant PCW floppy in TOSEC: single-sided
+/// 40-track, 9 × 512 B sectors, 1 reserved (boot) track. Matches cpmtools'
+/// `pcw` diskdef and libdsk `pcw180`. Used for app and system disks on the
+/// original PCW 8256/8512 (the "CF2" 3" media). Format B (706 KB 80-track
+/// double-sided) would be a separate preset once a fixture surfaces.
 pub const AMSTRAD_PCW: Dpb = Dpb {
     name: "amstrad_pcw",
     spt: 36,
     bsh: 3,
     blm: 7,
     exm: 0,
-    dsm: 175,
+    dsm: 174,
     drm: 63,
     al0: 0xC0,
     al1: 0x00,
@@ -148,7 +152,7 @@ pub const AMSTRAD_PCW: Dpb = Dpb {
     psh: 2,
     phm: 3,
     sector_size: 512,
-    tracks: 80,
+    tracks: 40,
 };
 
 /// Tatung Einstein 80T DS 10×512 — the canonical Einstein floppy.

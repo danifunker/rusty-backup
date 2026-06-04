@@ -233,8 +233,7 @@ impl<R: Read + Seek + Send> CpmFilesystem<R> {
     /// Byte offset of allocation block `b` within the volume (after
     /// the reserved-track skip).
     fn block_byte_offset(&self, b: u16) -> u64 {
-        let reserved =
-            self.dpb.off as u64 * self.dpb.spt as u64 * 128 * (self.dpb.sector_size as u64 / 128);
+        let reserved = self.dpb.off as u64 * self.dpb.spt as u64 * 128;
         // Each block is `block_size` bytes; the data area starts at the
         // first non-reserved logical record. block 0 starts at the first
         // record of the data area.
@@ -361,7 +360,11 @@ fn read_directory<R: Read + Seek>(
     partition_offset: u64,
     dpb: &Dpb,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let reserved = dpb.off as u64 * dpb.spt as u64 * 128 * (dpb.sector_size as u64 / 128);
+    // `spt` is records-per-track (128-B records), so reserved-bytes is
+    // `off × spt × 128`. The old formula's extra `(sector_size / 128)`
+    // factor double-counted for sector_size > 128 (e.g. PCW 512-B sectors
+    // landed the directory at 4× the correct byte offset).
+    let reserved = dpb.off as u64 * dpb.spt as u64 * 128;
     let bs = dpb.block_size() as u64;
     let mut out = Vec::new();
     let bitmap = ((dpb.al0 as u16) << 8) | dpb.al1 as u16;
@@ -545,8 +548,7 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
         }
         self.dir_bytes_cache = new_bytes.clone();
         // Write back to the blocks indicated by al0/al1.
-        let reserved =
-            self.dpb.off as u64 * self.dpb.spt as u64 * 128 * (self.dpb.sector_size as u64 / 128);
+        let reserved = self.dpb.off as u64 * self.dpb.spt as u64 * 128;
         let bs = self.dpb.block_size() as u64;
         let bitmap = ((self.dpb.al0 as u16) << 8) | self.dpb.al1 as u16;
         let mut written: u64 = 0;
@@ -788,8 +790,10 @@ mod tests {
     /// per al0=0xC0).
     fn build_amstrad_disk_with_one_file() -> Vec<u8> {
         let dpb = AMSTRAD_DATA;
-        // Disk size: data_bytes + reserved_tracks * spt * 128.
-        let reserved = dpb.off as usize * dpb.spt as usize * 128 * (dpb.sector_size as usize / 128);
+        // Disk size: data_bytes + reserved_tracks * spt * 128. `spt` is
+        // already in 128-B records, so the reserved bytes are exactly
+        // `off × spt × 128` — no further sector-size scaling needed.
+        let reserved = dpb.off as usize * dpb.spt as usize * 128;
         let total = reserved + dpb.data_bytes() as usize;
         let mut disk = vec![0xE5u8; total];
 
