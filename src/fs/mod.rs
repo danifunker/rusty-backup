@@ -333,6 +333,43 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
+    // Re-read sector 0 (sector0 is already on hand from the top of
+    // this function but we re-seek for clarity / safety).
+    if &sector0[0..4] == b"QLWA" {
+        return "qdos";
+    }
+
+    // Acorn ADFS — Disc Record at byte 0xC00 + 0x1C0 = 0xDC0.
+    // Probe just enough to discriminate from random data: log2(sec_size)
+    // in 8..=11, heads in 1..=2, density in 0..=3, sane disc_size.
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 0xDC0))
+        .is_ok()
+    {
+        let mut dr = [0u8; 36];
+        if reader.read_exact(&mut dr).is_ok() {
+            let log2_sz = dr[0];
+            let heads = dr[2];
+            let density = dr[3];
+            let total = u32::from_le_bytes([dr[0x10], dr[0x11], dr[0x12], dr[0x13]]);
+            if (8..=11).contains(&log2_sz)
+                && (1..=2).contains(&heads)
+                && density <= 3
+                && (160..=1_048_576).contains(&total)
+            {
+                return "adfs";
+            }
+        }
+    }
+
+    // BK0011M ANDOS: signature "ANDOS" at one of several boot-block
+    // offsets per src/fs/andos.rs. Restrict to sector 0 to keep this
+    // cheap.
+    if andos::detect_andos_signature(&sector0).is_some() {
+        return "andos";
+    }
+
     "unknown"
 }
 
@@ -1154,6 +1191,18 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "andos" => Ok(Box::new(andos::AndosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1375,6 +1424,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                     *dpb,
+                )?));
+            }
+            "human68k" => {
+                return Ok(Box::new(human68k::Human68kFilesystem::open(
+                    reader,
+                    partition_offset,
                 )?));
             }
             _ => {
@@ -1628,6 +1683,32 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 *dpb,
             )?))
         }
+        // X68000 Human68k — FAT-derived BPB. Same dispatch shape as
+        // CP/M (caller declares the FS via partition_type_string)
+        // because the BPB alone can't reliably distinguish Human68k
+        // from a regular FAT12/16 volume without an X68000-specific
+        // OEM ID heuristic.
+        "human68k" => Ok(Box::new(human68k::Human68kFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Acorn ADFS / FileCore (Archimedes core). Auto-detected via
+        // the Disc Record probe in detect_filesystem_type, but the
+        // dispatch arm is also reachable via an explicit string.
+        "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Sinclair QL QXL.WIN container.
+        "qdos" | "qxlwin" => Ok(Box::new(qdos::QdosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Soviet BK0011M ANDOS scaffold (detect-only).
+        "andos" => Ok(Box::new(andos::AndosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);

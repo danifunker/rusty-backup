@@ -41,12 +41,14 @@
 //! emit Shift-JIS pairs as `\uXXXX` placeholders; the raw bytes are
 //! retained for round-trip writes.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{ByteOrder, LittleEndian};
 
-use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::entry::{EntryType, FileEntry};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 /// 18.3 filename: 8 name + 10 name-extension + 3 ext = 21 + dot.
 pub const MAX_NAME_LEN: usize = 21;
@@ -481,6 +483,343 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
     }
 }
 
+// ============================================================================
+// EditableFilesystem — Add/Delete on the root directory only
+// ============================================================================
+
+/// 8 + 10 + 3 byte encoded name slot returned by `encode_human68k_name`.
+type EncodedName = ([u8; 8], [u8; 10], [u8; 3]);
+
+/// Encode a candidate filename into 8 + 10 + 3 byte fields for a
+/// Human68k directory entry. Accepts ASCII or already-Shift-JIS-encoded
+/// raw bytes; rejects names containing '/', ':', or non-printable ASCII
+/// outside the SJIS first-byte range.
+fn encode_human68k_name(name: &str) -> Result<EncodedName, FilesystemError> {
+    if name.is_empty() {
+        return Err(FilesystemError::InvalidData(
+            "Human68k filename is empty".into(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return Err(FilesystemError::InvalidData(format!(
+            "Human68k filename '{name}' contains a path separator"
+        )));
+    }
+    let bytes = name.as_bytes();
+    // Split at the LAST '.' for ext (rightmost-dot convention).
+    let (name_part, ext_part) = match bytes.iter().rposition(|&b| b == b'.') {
+        Some(idx) => (&bytes[..idx], &bytes[idx + 1..]),
+        None => (bytes, &b""[..]),
+    };
+    if name_part.is_empty() || name_part.len() > 18 {
+        return Err(FilesystemError::InvalidData(format!(
+            "Human68k name '{name}' must have 1..=18 chars before the extension"
+        )));
+    }
+    if ext_part.len() > 3 {
+        return Err(FilesystemError::InvalidData(format!(
+            "Human68k extension exceeds 3 bytes (got {})",
+            ext_part.len()
+        )));
+    }
+    let mut n8 = [b' '; 8];
+    let mut ne10 = [b' '; 10];
+    let take = name_part.len().min(8);
+    n8[..take].copy_from_slice(&name_part[..take]);
+    if name_part.len() > 8 {
+        let etake = (name_part.len() - 8).min(10);
+        ne10[..etake].copy_from_slice(&name_part[8..8 + etake]);
+    }
+    let mut e3 = [b' '; 3];
+    e3[..ext_part.len()].copy_from_slice(ext_part);
+    Ok((n8, ne10, e3))
+}
+
+impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
+    /// Write the cached FAT bytes back to both FAT copies on disk.
+    fn fat_write_back(&mut self) -> Result<(), FilesystemError> {
+        let fat_byte_len = self.fat_bytes.len();
+        let bps = self.bpb.bytes_per_sector as u64;
+        for fat_idx in 0..self.bpb.num_fats {
+            let off = self.partition_offset
+                + (self.bpb.fat_start_sector() as u64
+                    + fat_idx as u64 * self.bpb.fat_sectors as u64)
+                    * bps;
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.write_all(&self.fat_bytes[..fat_byte_len])?;
+        }
+        Ok(())
+    }
+
+    /// Set a 12- or 16-bit FAT entry.
+    fn fat_set(&mut self, cluster: u16, value: u16) {
+        match self.bpb.fat_kind {
+            FatKind::Fat12 => {
+                let off = (cluster as usize * 3) / 2;
+                if off + 1 >= self.fat_bytes.len() {
+                    return;
+                }
+                let v = value & 0x0FFF;
+                if cluster.is_multiple_of(2) {
+                    self.fat_bytes[off] = (v & 0xFF) as u8;
+                    self.fat_bytes[off + 1] =
+                        (self.fat_bytes[off + 1] & 0xF0) | ((v >> 8) as u8 & 0x0F);
+                } else {
+                    self.fat_bytes[off] = (self.fat_bytes[off] & 0x0F) | ((v & 0x0F) as u8) << 4;
+                    self.fat_bytes[off + 1] = (v >> 4) as u8;
+                }
+            }
+            FatKind::Fat16 => {
+                let off = cluster as usize * 2;
+                if off + 1 >= self.fat_bytes.len() {
+                    return;
+                }
+                self.fat_bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
+    /// Allocate a chain of `count` clusters. Returns the first cluster
+    /// or `InvalidData` if the volume is full.
+    fn alloc_chain(&mut self, count: u32) -> Result<u16, FilesystemError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let max_cluster =
+            ((self.bpb.total_sectors / self.bpb.sectors_per_cluster as u32) + 2).min(0xFFF8) as u16;
+        let mut picked: Vec<u16> = Vec::with_capacity(count as usize);
+        for c in 2..max_cluster {
+            if self.fat_lookup(c) == 0 {
+                picked.push(c);
+                if picked.len() as u32 == count {
+                    break;
+                }
+            }
+        }
+        if (picked.len() as u32) < count {
+            return Err(FilesystemError::InvalidData(format!(
+                "Human68k volume full: need {count} clusters, found {}",
+                picked.len()
+            )));
+        }
+        for w in picked.windows(2) {
+            self.fat_set(w[0], w[1]);
+        }
+        let last = *picked.last().unwrap();
+        let end_marker = match self.bpb.fat_kind {
+            FatKind::Fat12 => 0xFFF,
+            FatKind::Fat16 => 0xFFFF,
+        };
+        self.fat_set(last, end_marker);
+        Ok(picked[0])
+    }
+
+    /// Walk a chain and zero every entry along the way.
+    fn free_chain(&mut self, first: u16) -> Result<(), FilesystemError> {
+        let chain = self.cluster_chain(first)?;
+        for c in chain {
+            self.fat_set(c, 0);
+        }
+        Ok(())
+    }
+
+    /// Write payload bytes into clusters starting at `first`.
+    fn write_chain(&mut self, first: u16, data: &[u8]) -> Result<(), FilesystemError> {
+        let cs = self.bpb.cluster_size() as usize;
+        let mut written = 0usize;
+        let chain = self.cluster_chain(first)?;
+        for c in chain {
+            if written >= data.len() {
+                break;
+            }
+            let want = cs.min(data.len() - written);
+            let off = self.cluster_byte_offset(c);
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.write_all(&data[written..written + want])?;
+            // Pad the rest of this cluster with zeros.
+            if want < cs {
+                let pad = vec![0u8; cs - want];
+                self.reader.write_all(&pad)?;
+            }
+            written += want;
+        }
+        Ok(())
+    }
+
+    /// Find a free 32-byte root-directory slot. Returns its byte offset
+    /// in the partition.
+    fn find_free_root_slot(&mut self) -> Result<u64, FilesystemError> {
+        let root_off = self.partition_offset
+            + self.bpb.root_dir_sector() as u64 * self.bpb.bytes_per_sector as u64;
+        let root_byte_len = self.bpb.root_entries as u64 * DIR_ENTRY_SIZE as u64;
+        self.reader.seek(SeekFrom::Start(root_off))?;
+        let mut buf = vec![0u8; root_byte_len as usize];
+        self.reader.read_exact(&mut buf)?;
+        for (i, slot) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
+            if slot[0] == 0x00 || slot[0] == 0xE5 {
+                return Ok(root_off + (i * DIR_ENTRY_SIZE) as u64);
+            }
+        }
+        Err(FilesystemError::InvalidData(
+            "Human68k root directory is full".into(),
+        ))
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn std::io::Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "Human68k subdir writes deferred — only root supported".into(),
+            ));
+        }
+        let (n8, ne10, e3) = encode_human68k_name(name)?;
+        // Reject duplicates.
+        let root = self.root()?;
+        let existing = self.list_directory(&root)?;
+        if existing.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+            return Err(FilesystemError::InvalidData(format!(
+                "Human68k file '{name}' already exists"
+            )));
+        }
+        if data_len > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(
+                "Human68k file exceeds u32::MAX bytes".into(),
+            ));
+        }
+        let mut payload = Vec::with_capacity(data_len as usize);
+        data.read_to_end(&mut payload)?;
+        if payload.len() as u64 != data_len {
+            return Err(FilesystemError::InvalidData(format!(
+                "data_len {data_len} != actual {}",
+                payload.len()
+            )));
+        }
+        let cs = self.bpb.cluster_size() as u64;
+        let cluster_count = if payload.is_empty() {
+            0u32
+        } else {
+            (payload.len() as u64).div_ceil(cs) as u32
+        };
+        let first_cluster = if cluster_count > 0 {
+            self.alloc_chain(cluster_count)?
+        } else {
+            0
+        };
+        if first_cluster != 0 {
+            self.write_chain(first_cluster, &payload)?;
+        }
+
+        // Stamp a new directory entry into the first free slot.
+        let slot_off = self.find_free_root_slot()?;
+        let mut entry = [0u8; DIR_ENTRY_SIZE];
+        entry[0..8].copy_from_slice(&n8);
+        entry[8..11].copy_from_slice(&e3);
+        entry[11] = attr::ARCHIVE;
+        entry[12..22].copy_from_slice(&ne10);
+        LittleEndian::write_u16(&mut entry[26..28], first_cluster);
+        LittleEndian::write_u32(&mut entry[28..32], payload.len() as u32);
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        self.reader.write_all(&entry)?;
+
+        self.fat_write_back()?;
+        self.reader.flush()?;
+        Ok(FileEntry::new_file(
+            name.to_string(),
+            format!("/{name}"),
+            payload.len() as u64,
+            first_cluster as u64,
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "Human68k subdir creation deferred".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "Human68k subdir deletion deferred".into(),
+            ));
+        }
+        if entry.entry_type != EntryType::File {
+            return Err(FilesystemError::InvalidData(
+                "Human68k only allows file deletion at this stage".into(),
+            ));
+        }
+        let first = entry.location as u16;
+        if first != 0 {
+            self.free_chain(first)?;
+        }
+        // Mark directory slot deleted: walk root entries to find the one
+        // matching this entry's name, stamp 0xE5 in byte 0.
+        let root_off = self.partition_offset
+            + self.bpb.root_dir_sector() as u64 * self.bpb.bytes_per_sector as u64;
+        let root_byte_len = self.bpb.root_entries as u64 * DIR_ENTRY_SIZE as u64;
+        self.reader.seek(SeekFrom::Start(root_off))?;
+        let mut buf = vec![0u8; root_byte_len as usize];
+        self.reader.read_exact(&mut buf)?;
+        for (i, slot) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
+            if slot[0] == 0x00 {
+                break;
+            }
+            if slot[0] == 0xE5 {
+                continue;
+            }
+            let arr: &[u8; DIR_ENTRY_SIZE] = slot.try_into().unwrap();
+            if let Some(de) = parse_dir_entry(arr) {
+                if de.display_name.eq_ignore_ascii_case(&entry.name) {
+                    let slot_off = root_off + (i * DIR_ENTRY_SIZE) as u64;
+                    self.reader.seek(SeekFrom::Start(slot_off))?;
+                    self.reader.write_all(&[0xE5])?;
+                    self.fat_write_back()?;
+                    self.reader.flush()?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(FilesystemError::NotFound(format!(
+            "Human68k entry '{}' not found in root directory",
+            entry.name
+        )))
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let max_cluster =
+            ((self.bpb.total_sectors / self.bpb.sectors_per_cluster as u32) + 2).min(0xFFF8) as u16;
+        let mut free: u64 = 0;
+        for c in 2..max_cluster {
+            if self.fat_lookup(c) == 0 {
+                free += self.bpb.cluster_size() as u64;
+            }
+        }
+        Ok(free)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +964,96 @@ mod tests {
         assert_eq!(parsed.display_name, "A?");
         // Raw bytes preserved for round-trip.
         assert_eq!(&parsed.raw_name, b"A\x82\xA0");
+    }
+
+    #[test]
+    fn encode_human68k_name_handles_8_3_and_18_3() {
+        let (n, ne, e) = encode_human68k_name("SHORT.TXT").unwrap();
+        assert_eq!(&n, b"SHORT   ");
+        assert_eq!(&ne, b"          ");
+        assert_eq!(&e, b"TXT");
+        let (n2, ne2, e2) = encode_human68k_name("LONGFILENAME1234.X").unwrap();
+        assert_eq!(&n2, b"LONGFILE");
+        assert_eq!(&ne2, b"NAME1234  ");
+        assert_eq!(&e2, b"X  ");
+    }
+
+    #[test]
+    fn encode_human68k_name_rejects_path_separator_and_oversize() {
+        assert!(encode_human68k_name("foo/bar").is_err());
+        let too_long = "X".repeat(19);
+        assert!(encode_human68k_name(&too_long).is_err());
+        assert!(encode_human68k_name("name.TOOLONGEXT").is_err());
+        assert!(encode_human68k_name("").is_err());
+    }
+
+    #[test]
+    fn create_file_persists_and_round_trips_through_sync() {
+        let disk = build_fat12_synthetic();
+        let cur = Cursor::new(disk);
+        let mut fs = Human68kFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+        let payload = b"created via human68k edit path".to_vec();
+        let mut src = Cursor::new(payload.clone());
+        let _fe = fs
+            .create_file(
+                &root,
+                "NEW.TXT",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+        let inner = fs.reader.clone();
+        let mut fs2 = Human68kFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        let new = entries.iter().find(|e| e.name == "NEW.TXT").unwrap();
+        assert_eq!(new.size, payload.len() as u64);
+        let got = fs2.read_file(new, 4096).unwrap();
+        assert_eq!(got, payload);
+
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        // 512 B cluster, 30 B payload → one cluster consumed.
+        assert_eq!(after_free, before_free - 512);
+    }
+
+    #[test]
+    fn delete_entry_frees_chain_and_marks_slot_deleted() {
+        let disk = build_fat12_synthetic();
+        let cur = Cursor::new(disk);
+        let mut fs = Human68kFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries
+            .iter()
+            .find(|e| e.name == "DOC.TXT")
+            .unwrap()
+            .clone();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+        fs.delete_entry(&root, &doc).unwrap();
+
+        let inner = fs.reader.clone();
+        let mut fs2 = Human68kFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert!(entries.iter().all(|e| e.name != "DOC.TXT"));
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        // One 512-B cluster gets freed.
+        assert_eq!(after_free, before_free + 512);
+    }
+
+    #[test]
+    fn create_file_rejects_duplicate_names() {
+        let disk = build_fat12_synthetic();
+        let mut fs = Human68kFilesystem::open(Cursor::new(disk), 0).unwrap();
+        let root = fs.root().unwrap();
+        let mut src = Cursor::new(b"x".to_vec());
+        let err = fs
+            .create_file(&root, "DOC.TXT", &mut src, 1, &CreateFileOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidData(_)));
     }
 }
