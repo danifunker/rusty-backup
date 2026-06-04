@@ -347,10 +347,11 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   E-format ADFS disc with the synthetic-fixture pattern, mount as
   `:0`, `*CAT :0` lists the file, `*Type HELLO` reads back the
   seed. Engine surface shipped (5 unit + 1 e2e + 3 cli); only
-  real-hardware boot outstanding. ADFS write path (`create_file`
-  against the new-map FSM) **scout passes done** — see
-  `docs/mister_filesystem_implementation_plan.md` session log for
-  the unresolved layout findings: (a) `dr.root` encoding for
+  real-hardware boot outstanding. **ADFS write path AND HDD resize
+  both blocked behind the same scout** (`create_file` against the
+  new-map FSM, and writing the DR + zone-0 map for size changes —
+  see `docs/mister_filesystem_implementation_plan.md` session log
+  for the unresolved layout findings): (a) `dr.root` encoding for
   E-format (`arc-04` sample has `dr.root=0x203` but zone-0 fragment
   IDs only run 2..15 — not a fragment-ID lookup); (b) Linux
   `map_addr` formula off by 66 sectors vs the kilgus blank256E HD
@@ -360,11 +361,12 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   includes 0x404. Walker still blocked on a non-blank reference
   disc (RPCEmu manual `*FORMAT :4 ADFS` + hostfs file copy) plus
   deeper RE of the formula mismatch — trying to land an FSM walker
-  without those risks shipping a format-mangling bug. Real samples
-  backed up under `C:\Temp\adfs_arc04_e_orig.adf` (800K E-format
-  populated, from 8bs.com/pool/arc/arc-04.zip), `C:\Temp\
-  adfs_blank256E.hdf` (256 MB blank E-format HD), `C:\Temp\
-  adfs_blank1024Eplus.hdf` (1 GB blank E+ format HD).
+  (let alone an FSM-rewriting resize) without those risks shipping
+  a format-mangling bug. Real samples backed up under
+  `C:\Temp\adfs_arc04_e_orig.adf` (800K E-format populated, from
+  8bs.com/pool/arc/arc-04.zip), `C:\Temp\adfs_blank256E.hdf`
+  (256 MB blank E-format HD), `C:\Temp\adfs_blank1024Eplus.hdf`
+  (1 GB blank E+ format HD).
 - **MiSTer QL core boot test** — workflow A+C per
   `docs/mister-deployment-testing-plan.md` §3.6. Build a QXL.WIN
   hard-disk image, place at `/media/fat/games/QL/win1_`, boot
