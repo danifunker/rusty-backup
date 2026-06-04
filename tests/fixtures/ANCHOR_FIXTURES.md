@@ -23,6 +23,30 @@ Human68k volume.
 ships, `src/fs/human68k.rs` (already implemented + write-path-ready)
 can validate against this disk byte-for-byte.
 
+### `anchor_cpc_ManicMiner.dsk.zst` (15 KB compressed, 190 KB raw)
+
+Real-world Amstrad CPC EDSK from TOSEC v2009-10-25 ("Manic Miner
+(1985)(Software Projects - Amsoft)"). Standard CPCEMU DSK format
+(40 trk × 9 sec × 512 B = 184320 B decoded), AMSDOS layout.
+
+**Status: consumed.** `tests/cpc_e2e.rs` (4 tests, all green) reads
+this via the existing EDSK container decoder + CP/M engine with the
+`AMSTRAD_DATA` DPB. Verifies:
+- EDSK decodes to the expected 184320-byte flat
+- Root directory lists `MANIC.BAS` (loader) + `MANIC.BIN` (game)
+- AMSDOS header bytes (1..12) carry the canonical filename stamp
+- `MANIC.BIN` size is ~21 KB and reads back zero-padded to the
+  CP/M extent record count
+
+Real-world cross-validation note: `cpmtools` 2.21 crashes with
+`malloc(): invalid size (unsorted)` on the same flat-decoded bytes.
+Our engine is more robust on this particular EDSK while extracting
+the canonical game pair every CPC emulator recognizes.
+
+Provenance: hoglet67-uploaded Amstrad_CPC_TOSEC_2012_04_23 on
+archive.org. ManicMiner is a 40-year-old game; the TOSEC release is
+the community preservation reference.
+
 ### `anchor_atom_FROGGER.atm.zst` (2.5 KB) + `anchor_atom_INVADER.atm.zst` (2.9 KB)
 
 Two sample Acorn Atom files in the canonical `.atm` cassette/tape
