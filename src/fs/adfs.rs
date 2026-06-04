@@ -69,15 +69,22 @@ use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
 
 /// Boot-block offset candidates for the Disc Record. Real-world ADFS
-/// new-map HDDs from marutan.net's blank pre-formatted samples
-/// (blank256E.hdf 256 MB E-format, blank1024Eplus.hdf 1 GB E+ format)
-/// both put the Disc Record at byte 0xFC0 — i.e. zone 0 is 4096 bytes
-/// long, DR sits in its last 64 B. Older docs / smaller floppy formats
-/// reported 0xDC0 (zone 0 = 3584 B). The 64-B-aligned probe in
-/// [`find_disc_record`] picks whichever holds a plausible DR.
+/// samples surveyed so far:
+///   * marutan.net blank HD samples (blank256E.hdf 256 MB E-format,
+///     blank1024Eplus.hdf 1 GB E+ format) put the DR at byte 0xFC0 —
+///     zone 0 = 4096 bytes (sector size 512), DR in its last 64 B.
+///   * Older docs / smaller floppy formats list 0xDC0 (zone 0 =
+///     3584 B; legacy floppy boot-block + 0x1C0).
+///   * 8bs.com Acorn archive ADFS 800K E-format floppies (arc-04 +
+///     arc-05 .800.adf samples) place zone 0 at byte 0x400 (sector 1)
+///     with the DR embedded at zone-byte offset 4 — i.e. byte 0x404.
+///
+/// The 64-B-aligned probe in [`find_disc_record`] tries each in turn
+/// and accepts the first that yields a syntactically valid record.
 const DISC_RECORD_CANDIDATES: &[u64] = &[
     0xFC0,  // canonical for E / E+ HDDs (zone_size 4096)
     0xDC0,  // legacy floppy boot-block + 0x1C0
+    0x404,  // E/F-format 800K floppy (zone 0 at sector 1, DR after 4-B header)
     0x1FC0, // some doubled-zone layouts
     0x3FC0, // 16 KB zone
 ];

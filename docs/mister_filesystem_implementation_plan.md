@@ -33,6 +33,35 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (ADFS non-blank reference scout via 8bs.com Acorn
+  archive) — downloaded the 8bs.com Acorn floppy archive samples
+  (`arc-01..arc-05` from <https://8bs.com/pool/arc/>). The 640K
+  variants (`arc-01..arc-03`) are OLD-MAP ADFS L-format (256-B
+  sectors, root dir at fixed sector 2 = byte 0x200, no Disc Record
+  field — a totally separate code path from the new-map HD work);
+  parked as "out of scope until the new-map reader is byte-correct."
+  The 800K variants (`arc-04` / `arc-05`) ARE new-map E-format —
+  same family as our blank256E.hdf target. Surfaced one more DR
+  scan location: zone 0 sits at **byte 0x400 (sector 1)** with the
+  DR embedded at byte **0x404** (4-byte zone header + DR fields).
+  Added 0x404 to the DR scan candidate list; `arc-04` now opens as
+  `type=ADFS (E-format) label="1_DataComm" total_size=819200`. Root
+  directory walk still blocked: `dr.root=515=0x203` and the zone-0
+  map shows visible fragment IDs 2..15 (sequential small numbers,
+  16-32 map bits each), with NO fragment 515 present. The dr.root
+  encoding for E-format is therefore NOT a direct fragment-ID
+  lookup — needs more RE. The actual `Nick` magic for the root
+  sits at byte 0x800 (sector 2), which corresponds to map_bit 16
+  inside fragment 2 (the special root frag matching the Linux
+  kernel's hardcoded ADFS_ROOT_FRAG=2 — that constant turns out to
+  be the actual disc convention, NOT just a Linux kernel idiom).
+  Real samples backed up to `C:\Temp\adfs_arc04_e_orig.adf` and
+  `/tmp/arc04_e_backup.adf`. Next session: figure out the dr.root
+  encoding for E-format (or just hardcode root_frag=2 since that's
+  the Filecore convention) + implement the FSM walker against the
+  E-format-with-1-zone layout (simpler than the HD 65-zone case),
+  then re-attack the blank256E.hdf walker question. Pivoting to
+  CLI parity for Wave-2 cores per user direction.
 - 2026-06-04 (QDOS QXL.WIN write path — sQLux byte-truth oracle
   passes) — Shipped `QdosFilesystem::EditableFilesystem` end-to-end
   with the full free-cluster linked-list semantics (ffc/fc/rlen
