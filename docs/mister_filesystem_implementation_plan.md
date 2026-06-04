@@ -33,6 +33,35 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (ADFS Disc Record scan + total_size repair) — user
+  downloaded the RPCEmu bundle (`C:\Temp\rpcemu-win32-0.9.5-bundle-
+  371-issue-1\RPCEmu - 371\`) and we grabbed two pre-formatted blank
+  ADFS HDDs from marutan.net (`blankdiscs/Blank256E.zip` + `Blank
+  1024Eplus.zip`) as byte-truth references. Same class of latent
+  layout bug as QDOS surfaced: our `src/fs/adfs.rs` was reading the
+  Disc Record at byte 0xDC0 (legacy floppy boot-block + 0x1C0), but
+  the canonical HDD location is **byte 0xFC0** (zone 0 = 4096 bytes,
+  DR in its last 64 B). Both real samples failed `AdfsFilesystem::
+  open` with `"log2(sector_size) 0 not 8..=11"` because byte 0xDC0
+  is zero-filled. Fix: `find_disc_record` scan tries
+  `[0xFC0, 0xDC0, 0x1FC0, 0x3FC0]` and picks the first plausible DR
+  (non-zero root + disc_size). Both samples now open as
+  `type=ADFS (HD)`. Also renamed `disc_size_sectors` →
+  `disc_size_bytes` and fixed `total_size()` to return the field
+  directly (was multiplying by sector_size = 512× too big — real
+  256 MB sample reported as 137 GB before). 5 inline + integration
+  tests green; full lib at 1624. Remaining open in ADFS read:
+  root-directory indirect-disc-address decode. For the kilgus blank
+  sample, `dr.root = 0x283 = 643` maps to byte `0x7E11800` (where
+  the `Hugo` magic sits); decoding requires walking the FSM (zone 0
+  allocation map) to resolve fragment ID → physical sector. The
+  blank1024Eplus sample has NO Hugo/Nick magic at all (truly blank —
+  needs RISC OS to format before use). Real samples kept transiently
+  at `/tmp/adfs_samples/` + `C:\Temp\adfs_blank*.hdf` as scouting
+  references; not committed. RPCEmu harness pattern not yet wired
+  (separate session). Next: implement the FSM walker to resolve
+  indirect-disc-address, then root directory + file reads work on
+  real samples, then ADFS write path.
 - 2026-06-04 (QDOS read-path layout fix vs canonical QXL.WIN) — user
   installed sQLux as the byte-truth oracle for QDOS work. The setup
   surfaced a real bug: our `src/fs/qdos.rs` was parsing QXL.WIN to a

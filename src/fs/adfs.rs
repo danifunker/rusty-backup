@@ -68,9 +68,19 @@ use byteorder::{ByteOrder, LittleEndian};
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
 
-/// Boot-block lives at byte 0xC00 of the disc. The Disc Record sits at
-/// boot-block offset 0x1C0.
-const DISC_RECORD_OFFSET: u64 = 0xC00 + 0x1C0;
+/// Boot-block offset candidates for the Disc Record. Real-world ADFS
+/// new-map HDDs from marutan.net's blank pre-formatted samples
+/// (blank256E.hdf 256 MB E-format, blank1024Eplus.hdf 1 GB E+ format)
+/// both put the Disc Record at byte 0xFC0 — i.e. zone 0 is 4096 bytes
+/// long, DR sits in its last 64 B. Older docs / smaller floppy formats
+/// reported 0xDC0 (zone 0 = 3584 B). The 64-B-aligned probe in
+/// [`find_disc_record`] picks whichever holds a plausible DR.
+const DISC_RECORD_CANDIDATES: &[u64] = &[
+    0xFC0,  // canonical for E / E+ HDDs (zone_size 4096)
+    0xDC0,  // legacy floppy boot-block + 0x1C0
+    0x1FC0, // some doubled-zone layouts
+    0x3FC0, // 16 KB zone
+];
 
 /// Directory entries are always 26 bytes regardless of format.
 const DIR_ENTRY_SIZE: usize = 26;
@@ -106,7 +116,11 @@ pub struct DiscRecord {
     pub zones: u8,
     pub zone_spare: u16,
     pub root: u32,
-    pub disc_size_sectors: u32,
+    /// Disc size in BYTES (low 32 bits). Confusingly named in older
+    /// docs as "size in sectors" — verified against marutan.net's
+    /// blank256E.hdf (256 MB) and blank1024Eplus.hdf (1 GB): the field
+    /// value equals the byte length of the file, not its sector count.
+    pub disc_size_bytes: u32,
     pub disc_id: u16,
     pub disc_name: String,
 }
@@ -135,7 +149,7 @@ impl DiscRecord {
         let zones = buf[0x09];
         let zone_spare = LittleEndian::read_u16(&buf[0x0A..0x0C]);
         let root = LittleEndian::read_u32(&buf[0x0C..0x10]);
-        let disc_size_sectors = LittleEndian::read_u32(&buf[0x10..0x14]);
+        let disc_size_bytes = LittleEndian::read_u32(&buf[0x10..0x14]);
         let disc_id = LittleEndian::read_u16(&buf[0x14..0x16]);
         let name_bytes = &buf[0x16..0x20];
         let disc_name = name_bytes
@@ -164,7 +178,7 @@ impl DiscRecord {
             zones,
             zone_spare,
             root,
-            disc_size_sectors,
+            disc_size_bytes,
             disc_id,
             disc_name,
         })
@@ -176,7 +190,9 @@ impl DiscRecord {
 
     pub fn classify(&self) -> AdfsFormat {
         let ss = self.sector_size();
-        let total = self.disc_size_sectors as u64 * ss as u64;
+        let total = self.disc_size_bytes as u64;
+        let _ = ss; // sector size kept in the match arms below
+
         match (ss, total) {
             (256, _) => AdfsFormat::DFormat,
             (1024, n) if n <= 800 * 1024 => AdfsFormat::EFormat,
@@ -245,6 +261,47 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<AdfsDirEntry> {
     })
 }
 
+/// Scan for the Disc Record across the four well-known candidate
+/// offsets. Returns `(byte_offset, parsed_dr)` on first hit. Each
+/// candidate is read into a 64-byte buffer and run through
+/// [`DiscRecord::parse`]; the first one that produces a syntactically
+/// valid record (plausible sector size, sane geometry, non-zero root
+/// and disc size) wins. Real-world samples we've cross-checked use
+/// `0xFC0` (the canonical zone-0-size-4096 location); older sources
+/// claimed `0xDC0` but neither marutan.net blank disc puts it there.
+fn find_disc_record<R: Read + Seek + Send>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(u64, DiscRecord), FilesystemError> {
+    let mut last_err: Option<FilesystemError> = None;
+    for &cand in DISC_RECORD_CANDIDATES {
+        if reader
+            .seek(SeekFrom::Start(partition_offset + cand))
+            .is_err()
+        {
+            continue;
+        }
+        let mut buf = [0u8; 64];
+        if reader.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        match DiscRecord::parse(&buf) {
+            Ok(dr) => {
+                // Extra sanity: root pointer + disc size must be non-zero
+                // (a zone of zeros happens to satisfy the per-byte range
+                // checks in `parse` if those fields aren't checked).
+                if dr.root != 0 && dr.disc_size_bytes != 0 {
+                    return Ok((cand, dr));
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        FilesystemError::InvalidData("ADFS: no Disc Record at any candidate offset".into())
+    }))
+}
+
 pub struct AdfsFilesystem<R: Read + Seek + Send> {
     reader: R,
     partition_offset: u64,
@@ -254,10 +311,7 @@ pub struct AdfsFilesystem<R: Read + Seek + Send> {
 
 impl<R: Read + Seek + Send> AdfsFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
-        reader.seek(SeekFrom::Start(partition_offset + DISC_RECORD_OFFSET))?;
-        let mut dr_buf = [0u8; 64];
-        reader.read_exact(&mut dr_buf)?;
-        let disc_record = DiscRecord::parse(&dr_buf)?;
+        let (_offset, disc_record) = find_disc_record(&mut reader, partition_offset)?;
         let format = disc_record.classify();
         Ok(Self {
             reader,
@@ -365,7 +419,7 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
     }
 
     fn total_size(&self) -> u64 {
-        self.disc_record.disc_size_sectors as u64 * self.disc_record.sector_size() as u64
+        self.disc_record.disc_size_bytes as u64
     }
 
     fn used_size(&self) -> u64 {
@@ -389,8 +443,10 @@ mod tests {
 
         let mut disk = vec![0u8; TOTAL_BYTES];
 
-        // Disc Record at byte 0xC00 + 0x1C0 = 0xDC0.
-        let dr_off = DISC_RECORD_OFFSET as usize;
+        // Disc Record at byte 0xDC0 (legacy floppy-style boot-block + 0x1C0).
+        // The scan in `find_disc_record` accepts this as a fallback after
+        // the canonical 0xFC0 (zone-size-4096) HDD location.
+        let dr_off = 0xDC0usize;
         disk[dr_off] = 10; // log2(1024)
         disk[dr_off + 0x01] = 5;
         disk[dr_off + 0x02] = 2;
@@ -448,7 +504,7 @@ mod tests {
         let cur = Cursor::new(disk);
         let fs = AdfsFilesystem::open(cur, 0).unwrap();
         assert_eq!(fs.disc_record.sector_size(), 1024);
-        assert_eq!(fs.disc_record.disc_size_sectors, 800);
+        assert_eq!(fs.disc_record.disc_size_bytes, 800);
         assert_eq!(fs.format, AdfsFormat::EFormat);
         assert_eq!(fs.fs_type(), "ADFS (E-format)");
         assert_eq!(fs.volume_label(), Some("TestDisc"));
