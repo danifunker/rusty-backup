@@ -18,8 +18,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
   (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein / etc.), `.d88`
-  (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Apple-II `.do` / `.po`
-  / `.dsk` sector-order, gzip-wrapped Amiga `.adz` / `.hdz`.
+  (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Acorn `.hdf` (bare +
+  Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
+  gzip-wrapped Amiga `.adz` / `.hdz`.
 - **Raw / superfloppy** (partitionless) images are handled.
 
 Legend for the **Support** column:
@@ -47,7 +48,7 @@ Legend for the **Support** column:
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
 | X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD pending X68k partition scheme |
-| Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **No** |
+| Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — read yes for `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD; ADFS write path deferred |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **No** |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |
 | AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **No** |

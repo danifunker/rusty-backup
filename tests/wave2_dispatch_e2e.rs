@@ -128,6 +128,48 @@ fn dispatch_via_auto_detect_routes_to_adfs() {
     assert_eq!(entries[0].name, "HELLO");
 }
 
+#[test]
+fn partition_superfloppy_detects_bare_adfs_hdf() {
+    use rusty_backup::partition::PartitionTable;
+    let mut disk = std::io::Cursor::new(build_adfs_eformat_disk());
+    let table = PartitionTable::detect(&mut disk).unwrap();
+    match table {
+        PartitionTable::None { fs_hint, .. } => {
+            assert_eq!(fs_hint, "ADFS", "bare ADFS should surface as fs_hint");
+        }
+        _ => panic!("expected PartitionTable::None for bare ADFS .hdf"),
+    }
+}
+
+#[test]
+fn source_reader_strips_arculator_hdf_header_and_routes_to_adfs() {
+    use rusty_backup::model::source_reader;
+    // Build an Arculator-wrapped synthetic: 512-byte header + bare ADFS.
+    let bare = build_adfs_eformat_disk();
+    let mut wrapped = vec![0u8; 0x200];
+    wrapped[..16].copy_from_slice(b"ARCHEADER 0x0001");
+    wrapped.extend_from_slice(&bare);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.hdf");
+    std::fs::write(&path, &wrapped).unwrap();
+    // is_arculator_hdf_path must accept the wrapped file but not the
+    // bare ADFS.
+    assert!(source_reader::is_arculator_hdf_path(&path));
+    let bare_path = dir.path().join("bare.hdf");
+    std::fs::write(&bare_path, &bare).unwrap();
+    assert!(
+        !source_reader::is_arculator_hdf_path(&bare_path),
+        "bare .hdf must NOT trigger the Arculator strip path"
+    );
+    // After open_read, the stream's first 0xDC0+32 bytes must match
+    // the bare ADFS image — i.e. the 512-byte header is gone.
+    let mut reader = source_reader::open_read(&path).unwrap();
+    use std::io::Read;
+    let mut got = vec![0u8; 0xDC0 + 32];
+    reader.read_exact(&mut got).unwrap();
+    assert_eq!(&got, &bare[..0xDC0 + 32]);
+}
+
 // ----------------------------------------------------------------------------
 // QDOS — auto-detect via QLWA signature
 // ----------------------------------------------------------------------------

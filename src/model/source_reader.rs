@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
 use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
+use crate::rbformats::containers::hdf::{decode_hdf_bytes, detect_hdf_offset};
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
@@ -127,6 +128,34 @@ pub fn is_d88_path(path: &Path) -> bool {
     matches!(f.read(&mut head), Ok(n) if n >= 0x24) && looks_like_d88_header(&head)
 }
 
+/// True when `path` ends in `.hdf` (case-insensitive) AND the bytes
+/// look like an Arculator-wrapped ADFS image. Pure bare `.hdf` files
+/// (RPCEmu / MiSTer Archie style) do NOT trigger this — they pass
+/// through as raw bytes since the partition layer's superfloppy probe
+/// already finds the Disc Record at byte 0xDC0. Only Arculator's
+/// 512-byte-header variant needs decoding, and only those return true.
+pub fn is_arculator_hdf_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("hdf"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    // Read enough of the file to span the candidate Disc Record at
+    // byte 0xFC0 (= ARCULATOR_HEADER_SIZE + 0xDC0 + 32).
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 0x200 + 0xDC0 + 32];
+    let n = f.read(&mut head).unwrap_or(0);
+    if n < head.len() {
+        return false;
+    }
+    matches!(detect_hdf_offset(&head), Some(off) if off > 0)
+}
+
 pub fn is_msa_path(path: &Path) -> bool {
     let ext_ok = path
         .extension()
@@ -202,6 +231,16 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let bytes = std::fs::read(path).with_context(|| format!("read D88 {}", path.display()))?;
         let flat =
             decode_d88_bytes(&bytes).with_context(|| format!("decode D88 {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_arculator_hdf_path(path) {
+        // Arculator-style .hdf with 512-byte header before the ADFS
+        // volume. Bare .hdf files (RPCEmu / MiSTer Archie) fall through
+        // to the generic open-as-File path below; the partition layer's
+        // superfloppy probe finds the Disc Record at byte 0xDC0
+        // unaided.
+        let bytes = std::fs::read(path).with_context(|| format!("read HDF {}", path.display()))?;
+        let flat =
+            decode_hdf_bytes(&bytes).with_context(|| format!("decode HDF {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_msa_path(path) {
         // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into

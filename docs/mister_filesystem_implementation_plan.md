@@ -33,6 +33,26 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (Wave 2 close-out — `.hdf` header handling for Archie) —
+  Added ADFS Disc Record probe at byte 0xDC0 to `detect_superfloppy`
+  in `src/partition/mod.rs` so bare `.hdf` files (the form RPCEmu +
+  MiSTer Archie use) route through partition::detect → ADFS engine
+  with no extension-specific handling needed. New
+  `src/rbformats/containers/hdf.rs` (~150 LOC) carries the
+  Arculator-wrapped variant: detects a 512-byte header by probing
+  for a Disc Record at byte 0xFC0 (= 0x200 + 0xDC0) and stripping
+  the wrapper before the ADFS layer sees it. `is_arculator_hdf_path`
+  in `source_reader` ONLY fires for the wrapped form, so bare
+  `.hdf` files keep falling through to the generic file-open path.
+  Wired into cli::resolve `is_streaming` for parity. Tests: 5 unit
+  (bare detection, wrapped detection, decode-strip, decode-passthrough,
+  random-bytes refusal) + 2 e2e in wave2_dispatch_e2e.rs (bare ADFS
+  surfaces as PartitionTable::None{fs_hint:"ADFS"}; wrapped .hdf is
+  detected, stripped, and the post-strip stream matches the bare ADFS
+  byte-for-byte). Updated full_MiSTer_support_status.md Archie row
+  to "Partial — read yes for .adf floppy + bare/wrapped .hdf HDD";
+  added Acorn .hdf to the Containers list. 1613 lib + 6
+  wave2_dispatch tests green. Next: `.mdv` reader for QL microdrive.
 - 2026-06-04 (Wave 2 close-out — .d88 container + Human68k floppy
   end-to-end) — `src/rbformats/containers/d88.rs` (~570 LOC) ships
   the Sharp `.d88` container layer: 32-byte disk-info header +

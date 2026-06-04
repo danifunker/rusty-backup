@@ -98,6 +98,7 @@ pub fn resolve_partition_streaming_with_password(
         || source_reader::is_msa_path(path)
         || source_reader::is_edsk_path(path)
         || source_reader::is_d88_path(path)
+        || source_reader::is_arculator_hdf_path(path)
         || source_reader::is_apple_ii_dsk_path(path);
     if is_streaming {
         let mut reader = source_reader::open_read_with_password(path, password)?;

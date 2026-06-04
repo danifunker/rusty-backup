@@ -220,6 +220,34 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // Acorn ADFS / FileCore Disc Record at byte 0xDC0 (= 0xC00 + 0x1C0).
+    // FileCore's spec: byte 0 = log2 sector size (8..11 → 256..2048 B),
+    // byte 1 = secs/track (>= 1), byte 2 = heads (1..4 for real disks),
+    // byte 9 = nzones (>= 1). A coincidental match in random bytes is
+    // very unlikely given these constraints combined.
+    if reader.seek(SeekFrom::Start(0xDC0)).is_ok() {
+        let mut dr = [0u8; 32];
+        if reader.read_exact(&mut dr).is_ok() {
+            let log2_sec = dr[0];
+            let secs_per_track = dr[1];
+            let heads = dr[2];
+            let nzones = dr[9];
+            if (8..=11).contains(&log2_sec)
+                && secs_per_track >= 1
+                && (1..=4).contains(&heads)
+                && nzones >= 1
+            {
+                return Some("ADFS".to_string());
+            }
+        }
+    }
+
+    // Acorn DFS catalog at sectors 0-1 (the small flat catalog FS used
+    // by BBC Micro / AcornElectron 5.25" disks). Title bytes 0..8 at
+    // sector 0 are ASCII, byte 0x105 holds nsectors-low, byte 0x106 the
+    // catalog cycle/version. We don't ship a DFS engine yet — this stub
+    // would return "DFS" once src/fs/dfs.rs lands.
+
     // Apple DOS 3.3 VTOC at byte 0x11000 (track 17, sector 0). The same
     // byte offset is a fixed point of the .do/.po sector interleave, so a
     // PO-ordered .dsk would also surface here — by the time bytes reach

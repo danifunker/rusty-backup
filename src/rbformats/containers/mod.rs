@@ -23,6 +23,7 @@
 
 pub mod d88;
 pub mod edsk;
+pub mod hdf;
 pub mod msa;
 pub mod sector_order;
 
