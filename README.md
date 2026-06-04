@@ -103,7 +103,8 @@ The app has four tabs:
     and SGI EFS, with **Repair** that uses replica blocks + lost+found
     where supported.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
-    ProDOS, EFS, and XFS (v4): stage create-file / new-folder /
+    ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
+    Human68k, and XFS (v4 + v5): stage create-file / new-folder /
     drag-and-drop / delete edits, then Apply atomically with snapshot
     rollback on error.
 - **Optical** — browse and extract files from CD/DVD images and physical

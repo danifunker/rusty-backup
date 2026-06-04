@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
 use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
@@ -103,6 +104,29 @@ pub fn is_edsk_path(path: &Path) -> bool {
     matches!(f.read(&mut head), Ok(n) if n >= 22) && looks_like_edsk_header(&head)
 }
 
+/// Cheap sniff: returns true when `path` looks like a Sharp `.d88` floppy
+/// container (X68000, PC-88, PC-98, MSX, FM-7). The format has no magic
+/// string, so we require the `.d88` extension AND a plausible-looking
+/// disk-info header (media-type byte ∈ {0x00, 0x10, 0x20}, write-protect
+/// byte ∈ {0x00, 0x10}, and the first track-offset table entry pointing
+/// past the 656-byte offset table). False positives on arbitrary
+/// `.d88`-named files are unlikely with those constraints combined.
+pub fn is_d88_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("d88"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 0x24];
+    matches!(f.read(&mut head), Ok(n) if n >= 0x24) && looks_like_d88_header(&head)
+}
+
 pub fn is_msa_path(path: &Path) -> bool {
     let ext_ok = path
         .extension()
@@ -171,6 +195,13 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let bytes = std::fs::read(path).with_context(|| format!("read EDSK {}", path.display()))?;
         let flat =
             decode_edsk_bytes(&bytes).with_context(|| format!("decode EDSK {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_d88_path(path) {
+        // Sharp .d88: X68000 / PC-88 / PC-98 / MSX / FM-7 floppy images.
+        // 2HD disks decode to ~1.26 MB flat; in-memory like EDSK / MSA.
+        let bytes = std::fs::read(path).with_context(|| format!("read D88 {}", path.display()))?;
+        let flat =
+            decode_d88_bytes(&bytes).with_context(|| format!("decode D88 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_msa_path(path) {
         // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into

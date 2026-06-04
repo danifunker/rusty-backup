@@ -7,9 +7,19 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 
 ## What Rusty Backup supports today
 
-- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, btrfs,
-  ProDOS, Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, ISO9660 (optical browse).
-- **Partition tables:** MBR, GPT, APM, Amiga RDB.
+- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
+  JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS, Apple DOS 3.3, MacPlus MFS,
+  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (multi-DPB:
+  amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
+  altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
+  QDOS (QXL.WIN read), ANDOS (detect-only scaffold), ISO9660
+  (optical browse).
+- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI.
+- **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
+  DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
+  (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein / etc.), `.d88`
+  (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Apple-II `.do` / `.po`
+  / `.dsk` sector-order, gzip-wrapped Amiga `.adz` / `.hdz`.
 - **Raw / superfloppy** (partitionless) images are handled.
 
 Legend for the **Support** column:
@@ -36,7 +46,7 @@ Legend for the **Support** column:
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
-| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **No** |
+| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD pending X68k partition scheme |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **No** |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **No** |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |

@@ -21,6 +21,7 @@
 //! plan.md`), all decoders are ported MIT source or hand-written; no new
 //! crate dependency.
 
+pub mod d88;
 pub mod edsk;
 pub mod msa;
 pub mod sector_order;
@@ -43,6 +44,9 @@ pub enum ContainerKind {
     /// CP/M floppies. Either "MV - CPCEMU Disk-File" (DSK) or
     /// "EXTENDED CPC DSK File" (EDSK) header magic.
     Edsk,
+    /// Sharp `.d88` floppy container — X68000 / PC-88 / PC-98 / MSX /
+    /// FM-7. 32-byte disk-info header + 164-entry track-offset table.
+    D88,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -53,6 +57,7 @@ impl ContainerKind {
         match self {
             ContainerKind::Msa => "Atari MSA",
             ContainerKind::Edsk => "CPCEMU DSK/EDSK",
+            ContainerKind::D88 => "Sharp .d88",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -71,6 +76,9 @@ pub fn detect_container_kind(head: &[u8], _path: Option<&Path>) -> ContainerKind
     }
     if edsk::looks_like_edsk_header(head) {
         return ContainerKind::Edsk;
+    }
+    if d88::looks_like_d88_header(head) {
+        return ContainerKind::D88;
     }
     ContainerKind::Raw
 }
@@ -95,6 +103,10 @@ pub fn open_container_bytes(
         ContainerKind::Edsk => {
             let flat = edsk::decode_edsk_bytes(&bytes)?;
             Ok((ContainerKind::Edsk, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::D88 => {
+            let flat = d88::decode_d88_bytes(&bytes)?;
+            Ok((ContainerKind::D88, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }

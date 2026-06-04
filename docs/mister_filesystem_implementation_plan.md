@@ -33,6 +33,37 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (Wave 2 close-out — .d88 container + Human68k floppy
+  end-to-end) — `src/rbformats/containers/d88.rs` (~570 LOC) ships
+  the Sharp `.d88` container layer: 32-byte disk-info header +
+  164-entry track-offset table + per-sector 16-byte FDC IDs sorted by
+  (cyl, head, sector_id), with both decode and encode primitives.
+  Wired through `model::source_reader::open_read` (auto-decode on
+  `.d88` extension + magic), `src/cli/resolve.rs` (added to
+  `is_streaming` list so rb-cli doesn't bypass the decoder), and
+  `gui::prepare_disk_image_path` (decodes to a `.img` tempfile for
+  GUI partition-by-path access). Synthetic fixture `tests/fixtures/
+  test_x68000_human68k_2dd.d88.zst` (3.5 KB compressed) built by
+  `scripts/generate-d88-fixture.sh` via `mkfs.fat` + our own Human68k
+  EditableFilesystem (not mtools mcopy — bytes 12-21 need to be
+  zero-filled so the Human68k parser doesn't read FAT-control bytes
+  as extended-name continuation). Tests added: 7 unit (decode/encode
+  round-trip, malformed-header refusals, oversized-data refusal) +
+  5 e2e (`tests/d88_e2e.rs` — D88→flat→Human68k chain reads HELLO.TXT
+  + NOTE.TXT byte-identical to the seed). Real-world scout: the
+  existing `anchor_mister_BLANK_disk_X68000.D88.zst` decodes to the
+  expected 1,261,568-byte flat (77 × 2 × 8 × 1024 = X68000 2HD
+  geometry) and our Human68k engine lists the canonical system-disk
+  contents (AUTOEXEC.BAT, COMMAND.X, HUMAN.SYS, ...). Test-fixture
+  policy: real-world anchors are scouting-only; only the synthesized
+  D88 is consumed in tests. Updated `docs/full_MiSTer_support_status.md`
+  X68000 row to `Partial — floppy yes; HDD pending X68k partition
+  scheme` and refreshed the "What Rusty Backup supports today"
+  filesystem/container lists. Updated `README.md` Edit-mode line to
+  mention Apple DOS 3.3 / MacPlus MFS / UFS / CP/M / Human68k / XFS
+  (v4+v5). 1608 lib + 6 d88_e2e tests green. Next: `.hdf` header
+  handling for Archie HDD, `.mdv` reader for QL microdrive, X68k
+  partition scheme for SASI HDD, then ADFS / QDOS write paths.
 - 2026-06-04 (PCW Format A anchor + CP/M reserved-bytes bug fix) — TOSEC
   v2022-07-10 Amstrad PCW Applications archive scouted (4 disks); only
   PAW is a true PCW Format A boot disk (off=1, sector_size=512), the

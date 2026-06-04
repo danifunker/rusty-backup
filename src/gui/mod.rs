@@ -105,11 +105,13 @@ fn file_dialog() -> rfd::FileDialog {
 /// worker code. Returns a path to a raw, seekable image — possibly the
 /// original (no work needed) or a tempfile.
 ///
-/// Handles two wrapper formats whose raw stream isn't seekable / flat:
+/// Handles three wrapper formats whose raw stream isn't seekable / flat:
 /// - `.adz` / `.hdz` — gzip-decompressed to a tempfile (gzip isn't
 ///   seekable).
 /// - `.msa` — Atari ST Magic Shadow Archiver, decoded to a flat `.st`
 ///   tempfile.
+/// - `.d88` — Sharp Japanese-emulator floppy container (X68000 / PC-88 /
+///   PC-98 / MSX / FM-7), decoded to a flat raw-sector tempfile.
 ///
 /// Everything else — including `.gho`/`.ghs`, `.imz`, `.chd` — passes
 /// through unchanged, since the inspect worker opens those via
@@ -135,6 +137,7 @@ pub fn prepare_disk_image_path(
         Some("adz") => "adf",
         Some("hdz") => "hdf",
         Some("msa") => "st",
+        Some("d88") => "img",
         _ => return Ok((path.to_path_buf(), None)),
     };
     let tmp = tempfile::tempdir()?;
@@ -151,6 +154,21 @@ pub fn prepare_disk_image_path(
         std::fs::write(&out_path, &flat)?;
         log::info!(
             "Materialized {} -> {} ({} bytes, MSA decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len()
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+    if target_ext == "img" && ext.as_deref() == Some("d88") {
+        // D88 → flat raw sectors. Same shape as MSA: small floppy
+        // (~1.5 MB max for 2HD), in-memory decode, tempfile drop-in.
+        let bytes = std::fs::read(path)?;
+        let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, D88 decoded)",
             path.display(),
             out_path.display(),
             flat.len()
