@@ -1362,6 +1362,17 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            s if s.starts_with("cpm:") => {
+                let preset_name = &s[4..];
+                let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                    FilesystemError::Unsupported(format!("unknown CP/M DPB preset '{preset_name}'"))
+                })?;
+                return Ok(Box::new(cpm::CpmFilesystem::open_with_dpb(
+                    reader,
+                    partition_offset,
+                    *dpb,
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -1590,6 +1601,29 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // CP/M with explicit DPB preset. CP/M floppies have no on-disk
+        // signature, so callers must declare which DPB applies via the
+        // `cpm:<preset_name>` partition_type_string convention. The
+        // preset list lives in src/fs/cpm_diskdefs.rs.
+        s if s.starts_with("cpm:") => {
+            let preset_name = &s[4..];
+            let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                FilesystemError::Unsupported(format!(
+                    "unknown CP/M DPB preset '{preset_name}' — \
+                     valid names: {}",
+                    cpm_diskdefs::ALL_PRESETS
+                        .iter()
+                        .map(|d| d.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            Ok(Box::new(cpm::CpmFilesystem::open_with_dpb(
+                reader,
+                partition_offset,
+                *dpb,
+            )?))
+        }
         // GPT Linux Filesystem GUID — host any of ext, btrfs, or xfs.
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4" => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
