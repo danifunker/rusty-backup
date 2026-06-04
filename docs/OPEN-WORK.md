@@ -355,10 +355,11 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   `docs/mister-deployment-testing-plan.md` §3.6. Build a QXL.WIN
   hard-disk image, place at `/media/fat/games/QL/win1_`, boot
   the QL core, `DIR win1_`, `LOAD win1_HELLO` reads the seed.
-  Engine surface shipped (4 unit + 1 e2e); write path can land
-  once the boot test confirms our QXL.WIN layout matches what the
-  core expects. `.mdv` microdrive container (per-sector 60-byte
-  records) deferred.
+  Engine surface shipped (16 unit + 2 e2e — including write); the
+  write path now passes a headless sQLux byte-truth oracle (rb-cli
+  put → sQLux SuperBASIC COPY → host file round-trips byte-exact).
+  Only the real-hardware mount + boot is outstanding. `.mdv`
+  microdrive container (per-sector 60-byte records) deferred.
 - **MiSTer BK0011M ANDOS core boot test** — workflow A only per
   `docs/mister-deployment-testing-plan.md` §3.8. Mount one of our
   ANDOS-scaffolded volumes and visually confirm the core boots

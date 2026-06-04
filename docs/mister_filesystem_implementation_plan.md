@@ -33,6 +33,36 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (QDOS QXL.WIN write path — sQLux byte-truth oracle
+  passes) — Shipped `QdosFilesystem::EditableFilesystem` end-to-end
+  with the full free-cluster linked-list semantics (ffc/fc/rlen
+  bookkeeping per sQLux `QDisk.c`: `QLWA_GetFreeBlock` /
+  `QLWA_CreateNewFile` / `QLWA_KillFile`). Then sQLux harness
+  surfaced one more latent layout bug — the **per-file 64-byte
+  QDOS header** convention. Every QXL.WIN file reserves bytes 0..63
+  of its cluster chain for a header mirroring the directory entry;
+  user data starts at byte 64; directory `file_length` = total
+  on-disk size = 64 + user data. We were treating `file_length` as
+  user-data length, so sQLux opened our files at 0 bytes (read
+  header from our payload, real data area empty). Fixed by stamping
+  the 64-byte file header in `create_file`, subtracting 64 in
+  `read_file` / `list_directory`, and rebuilding the synthetic
+  fixture. Headless sQLux harness (offscreen SDL, -d boot -b
+  "COPY WIN1_rbtest TO MDV1_rbtest_back") now round-trips a 17-byte
+  payload byte-exact through QDOS COPY into a host-mounted mdv1/.
+  Dispatch wiring: `partition::detect_superfloppy` recognises
+  "QLWA"; `open_filesystem_by_string` + `open_editable_filesystem`
+  accept the auto-detect "QDOS" hint alongside "qdos"/"qxlwin".
+  rb-cli now `put` / `get` / `rm` against raw .win files end-to-end.
+  Bonus: reads of real samples now skip the per-file header — kilgus
+  `boot` file surfaces as 2888 bytes of BASIC source starting `100
+  REMark *****` instead of 2952 bytes of header + source. 12 new
+  inline tests + 1 integration test; 1634 lib + all integration
+  green (+10 vs baseline). **Next**: ADFS write path is still
+  blocked behind the FSM scout findings — pick up the next priority
+  from the OPEN-WORK list (CLI parity for Wave-2 cores, HDD resize
+  for X68000/Archie/QL, or revisit ADFS once a non-blank reference
+  disc is in hand).
 - 2026-06-04 (ADFS FSM scout → QDOS write path pivot) — Scouted the
   kilgus blank256E.hdf to plan the FSM walker. Surfaced THREE
   unexpected layout findings that put the FSM work out of "well-
