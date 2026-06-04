@@ -363,6 +363,23 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   `docs/mister-deployment-testing-plan.md` §3.8. Mount one of our
   ANDOS-scaffolded volumes and visually confirm the core boots
   (full read path is parked behind the boot-test oracle).
+- **`.d88` container decoder** — `tests/fixtures/anchor_mister_
+  BLANK_disk_X68000.D88.zst` is a real Sharp `.d88` from the MiSTer
+  X68000 distribution waiting for a consumer. The format is a 32-byte
+  header + per-track LE-offset table + per-sector blocks. Once landed
+  in `src/rbformats/containers/d88.rs`, the existing Human68k engine
+  (read + EditableFilesystem write, all shipped) validates against
+  the BLANK byte-for-byte. Probably a 1-commit slice. Same decoder
+  also unlocks the X68000 ZIP (1.5 GB of real disks already on the
+  MiSTer SD card, not committed).
+- **`.mdv` QDOS microdrive reader** — `tests/fixtures/anchor_mister_
+  {GamesCart,crazy}.mdv.zst` are real QL microdrive cartridges from
+  the MiSTer QL distribution. The format is per-sector record
+  headers (visible in the first sector as `MD` / `Test` 8-byte cart
+  names) — completely separate from the QXL.WIN HDD format
+  `src/fs/qdos.rs` currently implements. Lives in *QDOS Reference
+  Manual* ch. 12; ~300 LOC engine + tests against the two anchored
+  fixtures.
 
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
