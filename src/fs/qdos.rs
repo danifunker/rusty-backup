@@ -72,6 +72,25 @@
 //! start of the partition. Cluster 0 holds the header. The first
 //! entry (slot 0) is conventionally a self-reference and may carry
 //! length 0 — skip it during enumeration.
+//!
+//! ### Per-file 64-byte header convention
+//!
+//! Every QXL.WIN file (NOT directories) reserves the first 64 bytes of
+//! its cluster chain for a per-file header — a mirror of the directory
+//! entry (same field layout). User-visible data starts at byte 64.
+//! The directory entry's `file_length` field stores the **total** stored
+//! bytes including this header — i.e. user-visible size + 64. sQLux
+//! source (`QLWA_GetFileLength`) confirms this:
+//!
+//! ```text
+//!     if (fn.file == root_fn().file) return root_flen() - 64;
+//!     h = GetFileHeader(fn);
+//!     return GET_FLEN(h) - 64;     /* user-visible length */
+//! ```
+//!
+//! Our read path subtracts 64 when surfacing the file size + content;
+//! `create_file` writes a 64-byte header at byte 0 of the first
+//! allocated cluster and stores `file_length = 64 + payload_len`.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -88,6 +107,10 @@ pub const QXLWIN_SIGNATURE: &[u8; 4] = b"QLWA";
 const HEADER_BYTES: usize = 64;
 const FAT_END_LO: u16 = 0xFFF8;
 const DIR_ENTRY_SIZE: usize = 64;
+/// Per-file QDOS header, 64 bytes, mirroring the directory entry layout.
+/// Sits at byte 0 of every regular file's cluster chain; user data starts
+/// at byte 64. Directories do NOT carry this prefix.
+const FILE_HEADER_BYTES: usize = 64;
 /// Logical sector size for QDOS volumes.
 const SECTOR_BYTES: u64 = 512;
 const MAX_CHAIN_HOPS: usize = 65536;
@@ -341,12 +364,11 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         let mut out = Vec::with_capacity(dir.len());
         for de in dir {
             let path = format!("/{}", de.name);
-            let mut fe = FileEntry::new_file(
-                de.name.clone(),
-                path,
-                de.file_length as u64,
-                de.first_block as u64,
-            );
+            // file_length stored on disk INCLUDES the 64-byte per-file
+            // header — surface the user-visible size to callers.
+            let user_size = (de.file_length as u64).saturating_sub(FILE_HEADER_BYTES as u64);
+            let mut fe =
+                FileEntry::new_file(de.name.clone(), path, user_size, de.first_block as u64);
             match de.file_type {
                 1 => fe.special_type = Some("Exec".into()),
                 2 => fe.special_type = Some("Reloc".into()),
@@ -364,9 +386,16 @@ impl<R: Read + Seek + Send> Filesystem for QdosFilesystem<R> {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
+        // Skip the 64-byte per-file header and return user data only,
+        // matching sQLux semantics. `entry.size` was already adjusted in
+        // `list_directory` to the user-visible length.
         let first = entry.location as u16;
         let want = (entry.size as usize).min(max_bytes);
-        self.read_chain_bytes(first, want)
+        let raw = self.read_chain_bytes(first, FILE_HEADER_BYTES + want)?;
+        if raw.len() < FILE_HEADER_BYTES {
+            return Ok(Vec::new());
+        }
+        Ok(raw[FILE_HEADER_BYTES..].to_vec())
     }
 
     fn fs_type(&self) -> &str {
@@ -657,32 +686,39 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
                 payload.len()
             )));
         }
+        // On-disk total = 64-byte per-file header + payload.
+        let on_disk_len = FILE_HEADER_BYTES + payload.len();
         let cluster_size = self.header.cluster_size() as usize;
-        let cluster_count: u16 = if payload.is_empty() {
-            0
-        } else {
-            let n = payload.len().div_ceil(cluster_size);
+        let cluster_count: u16 = {
+            let n = on_disk_len.div_ceil(cluster_size);
             if n > u16::MAX as usize {
                 return Err(FilesystemError::InvalidData(
                     "QDOS file requires more than 65535 clusters".into(),
                 ));
             }
-            n as u16
+            // Even a zero-length user file occupies one cluster for the
+            // 64-byte header.
+            n.max(1) as u16
         };
-        let first_cluster = if cluster_count > 0 {
-            self.alloc_chain(cluster_count)?
-        } else {
-            0
-        };
-        if first_cluster != 0 {
-            self.write_chain(first_cluster, &payload)?;
-        }
+        let first_cluster = self.alloc_chain(cluster_count)?;
 
-        // Stamp the directory entry.
+        // Compose the 64-byte file header (mirror of the directory entry)
+        // and prepend it to the payload before writing the chain.
+        let mut full = Vec::with_capacity(on_disk_len);
+        full.resize(FILE_HEADER_BYTES, 0);
+        BigEndian::write_u32(&mut full[0x00..0x04], on_disk_len as u32);
+        BigEndian::write_u16(&mut full[0x0E..0x10], name.len() as u16);
+        full[0x10..0x10 + name.len()].copy_from_slice(name.as_bytes());
+        BigEndian::write_u16(&mut full[0x3A..0x3C], first_cluster);
+        full.extend_from_slice(&payload);
+        self.write_chain(first_cluster, &full)?;
+
+        // Stamp the directory entry — file_length is the TOTAL on-disk
+        // size (includes the 64-byte header) per QDOS convention.
         let slot_index = self.allocate_dir_slot()?;
         let slot_off = self.dir_slot_byte_offset(slot_index)?;
         let mut entry = [0u8; DIR_ENTRY_SIZE];
-        BigEndian::write_u32(&mut entry[0x00..0x04], payload.len() as u32);
+        BigEndian::write_u32(&mut entry[0x00..0x04], on_disk_len as u32);
         // access_keys (0x04..0x06), file_type (0x06..0x08): leave 0 (data).
         BigEndian::write_u16(&mut entry[0x0E..0x10], name.len() as u16);
         entry[0x10..0x10 + name.len()].copy_from_slice(name.as_bytes());
@@ -760,7 +796,9 @@ mod tests {
     ///   - 16 clusters total
     ///   - cluster 0 holds header + FAT
     ///   - cluster 1 = root directory (rlen = 128 B = 2 entries)
-    ///   - cluster 5 = file "HELLO_QL" data (32 B)
+    ///   - cluster 5 = file "HELLO_QL" — 64-byte per-file header at
+    ///     offset 0, 32 bytes of user data at offset 64. Directory entry
+    ///     records file_length = 96 (header + data).
     ///   - free list: ffc=2, linked 2→3→4→6→7→8→9→10→11→12→13→14→15→0
     ///     (skips reserved/allocated clusters 0,1,5), fc=12
     pub fn build_synthetic_qxlwin() -> Vec<u8> {
@@ -805,17 +843,23 @@ mod tests {
         set(&mut disk, *free_order.last().unwrap(), 0); // tail = end of free list
 
         // Root directory: cluster 1 = byte 512. Slot 0 = self-ref (zeros).
+        // file_length = 96 = 64-byte per-file header + 32-byte user data.
         let dir_off = ROOT_CLUSTER as usize * CLUSTER_SIZE;
         let slot1 = dir_off + DIR_ENTRY_SIZE;
-        BigEndian::write_u32(&mut disk[slot1..slot1 + 4], 32);
+        BigEndian::write_u32(&mut disk[slot1..slot1 + 4], 96);
         BigEndian::write_u16(&mut disk[slot1 + 0x0E..slot1 + 0x10], 8);
         disk[slot1 + 0x10..slot1 + 0x18].copy_from_slice(b"HELLO_QL");
         BigEndian::write_u16(&mut disk[slot1 + 0x3A..slot1 + 0x3C], FILE_CLUSTER);
 
-        // File data at cluster 5 = byte 2560.
+        // Cluster 5: 64-byte per-file header at byte 0..63, payload at 64..95.
         let file_off = FILE_CLUSTER as usize * CLUSTER_SIZE;
+        BigEndian::write_u32(&mut disk[file_off..file_off + 4], 96);
+        BigEndian::write_u16(&mut disk[file_off + 0x0E..file_off + 0x10], 8);
+        disk[file_off + 0x10..file_off + 0x18].copy_from_slice(b"HELLO_QL");
+        BigEndian::write_u16(&mut disk[file_off + 0x3A..file_off + 0x3C], FILE_CLUSTER);
         let payload = b"qdos qxlwin synthetic content 32";
-        disk[file_off..file_off + payload.len()].copy_from_slice(payload);
+        let data_off = file_off + FILE_HEADER_BYTES;
+        disk[data_off..data_off + payload.len()].copy_from_slice(payload);
         disk
     }
 
@@ -1013,7 +1057,8 @@ mod tests {
         let cur = Cursor::new(disk);
         let mut fs = QdosFilesystem::open(cur, 0).unwrap();
         let root = fs.root().unwrap();
-        // 512-byte cluster × 3 = 1536-byte payload (will need 3 clusters).
+        // 1536-byte payload + 64-byte per-file header = 1600 bytes on
+        // disk = 4 clusters of 512 bytes each.
         let payload: Vec<u8> = (0..1536u32).map(|i| (i & 0xFF) as u8).collect();
         let entry = fs
             .create_file(
@@ -1024,11 +1069,16 @@ mod tests {
                 &CreateFileOptions::default(),
             )
             .unwrap();
+        // entry.size is the user-visible size (excludes the 64-byte header).
         assert_eq!(entry.size, 1536);
-        let got = fs.read_file(&entry, 4096).unwrap();
+        // list_directory's reported size = file_length - 64.
+        let listed = fs.list_directory(&root).unwrap();
+        let bigfile = listed.iter().find(|e| e.name == "BIGFILE").unwrap();
+        assert_eq!(bigfile.size, 1536);
+        let got = fs.read_file(bigfile, 4096).unwrap();
         assert_eq!(got, payload);
-        // 3 clusters allocated → fc should drop from 12 to 9.
-        assert_eq!(fs.header.fc, 9);
+        // 4 clusters allocated → fc should drop from 12 to 8.
+        assert_eq!(fs.header.fc, 8);
     }
 
     #[test]

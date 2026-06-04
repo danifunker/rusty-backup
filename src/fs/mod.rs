@@ -1449,6 +1449,12 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            "qdos" | "qxlwin" | "QDOS" => {
+                return Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -1507,6 +1513,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1716,8 +1726,9 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
-        // Sinclair QL QXL.WIN container.
-        "qdos" | "qxlwin" => Ok(Box::new(qdos::QdosFilesystem::open(
+        // Sinclair QL QXL.WIN container. Auto-detect / superfloppy hint
+        // returns "QDOS" uppercase; explicit CLI flag uses lowercase.
+        "qdos" | "qxlwin" | "QDOS" => Ok(Box::new(qdos::QdosFilesystem::open(
             reader,
             partition_offset,
         )?)),

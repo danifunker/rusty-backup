@@ -277,6 +277,92 @@ fn dispatch_via_auto_detect_routes_to_qdos() {
     assert_eq!(entries[0].name, "AUTODET");
 }
 
+/// Same shape as `build_qdos_qxlwin_disk` but with a proper free-cluster
+/// linked list (ffc=2, fc=12, chain 2→3→4→6→7→…→15→0), enough state for
+/// the editable-dispatch round-trip test to allocate and free clusters.
+fn build_qdos_qxlwin_disk_with_freelist() -> Vec<u8> {
+    const CC: u16 = 16;
+    const SPC: u16 = 1;
+    const CLUSTER_SIZE: usize = 512;
+    const ROOT_CLUSTER: u16 = 1;
+    const ROOT_LEN: u32 = 128;
+    const FILE_CLUSTER: u16 = 5;
+    let mut disk = vec![0u8; CC as usize * CLUSTER_SIZE];
+    disk[0..4].copy_from_slice(b"QLWA");
+    BigEndian::write_u16(&mut disk[0x04..0x06], 0x0005);
+    let mut name = [b' '; 20];
+    name[..6].copy_from_slice(b"EditQL");
+    disk[0x06..0x1A].copy_from_slice(&name);
+    BigEndian::write_u16(&mut disk[0x22..0x24], SPC);
+    BigEndian::write_u16(&mut disk[0x2A..0x2C], CC);
+    BigEndian::write_u16(&mut disk[0x2C..0x2E], 12);
+    BigEndian::write_u16(&mut disk[0x32..0x34], 2);
+    BigEndian::write_u16(&mut disk[0x34..0x36], ROOT_CLUSTER);
+    BigEndian::write_u32(&mut disk[0x36..0x3A], ROOT_LEN);
+    let fat_off = 64;
+    let set = |d: &mut [u8], cl: u16, val: u16| {
+        let o = fat_off + cl as usize * 2;
+        BigEndian::write_u16(&mut d[o..o + 2], val);
+    };
+    set(&mut disk, ROOT_CLUSTER, 0);
+    set(&mut disk, FILE_CLUSTER, 0);
+    let free_order: &[u16] = &[2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    for w in free_order.windows(2) {
+        set(&mut disk, w[0], w[1]);
+    }
+    set(&mut disk, *free_order.last().unwrap(), 0);
+    let dir_off = ROOT_CLUSTER as usize * CLUSTER_SIZE;
+    let slot1 = dir_off + 64;
+    BigEndian::write_u32(&mut disk[slot1..slot1 + 4], 16);
+    BigEndian::write_u16(&mut disk[slot1 + 0x0E..slot1 + 0x10], 7);
+    disk[slot1 + 0x10..slot1 + 0x17].copy_from_slice(b"PREEXST");
+    BigEndian::write_u16(&mut disk[slot1 + 0x3A..slot1 + 0x3C], FILE_CLUSTER);
+    let file_off = FILE_CLUSTER as usize * CLUSTER_SIZE;
+    disk[file_off..file_off + 16].copy_from_slice(b"qdos preexisting");
+    disk
+}
+
+#[test]
+fn editable_dispatch_via_qxlwin_string_round_trips_through_create_and_delete() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    let disk = build_qdos_qxlwin_disk_with_freelist();
+    let cur = Cursor::new(disk);
+    // String-keyed dispatch ("qxlwin") — the route the CLI / restore
+    // pipeline takes when a QDOS volume is declared explicitly.
+    let mut fs = rusty_backup::fs::open_editable_filesystem(cur, 0, 0, Some("qxlwin")).unwrap();
+    assert_eq!(fs.fs_type(), "QDOS (QXL.WIN)");
+    let root = fs.root().unwrap();
+    let before = fs.list_directory(&root).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name, "PREEXST");
+
+    let payload = b"editable dispatch round-trip ok";
+    let new_entry = fs
+        .create_file(
+            &root,
+            "NEWVIA_DISP",
+            &mut payload.as_slice(),
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(new_entry.size, payload.len() as u64);
+
+    let after = fs.list_directory(&root).unwrap();
+    assert_eq!(after.len(), 2);
+
+    let new_in_listing = after.iter().find(|e| e.name == "NEWVIA_DISP").unwrap();
+    let got = fs.read_file(new_in_listing, 1024).unwrap();
+    assert_eq!(&got, payload);
+
+    fs.delete_entry(&root, new_in_listing).unwrap();
+    let post_delete = fs.list_directory(&root).unwrap();
+    assert_eq!(post_delete.len(), 1);
+    assert_eq!(post_delete[0].name, "PREEXST");
+
+    fs.sync_metadata().unwrap();
+}
+
 // ----------------------------------------------------------------------------
 // ANDOS — auto-detect via signature probe
 // ----------------------------------------------------------------------------

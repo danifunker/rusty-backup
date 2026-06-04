@@ -164,6 +164,14 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("XFS".to_string());
     }
 
+    // Sinclair QL QXL.WIN container: 4-byte "QLWA" signature at byte 0.
+    // Raw .win images carry no partition table — they're a single QDOS
+    // volume rooted at byte 0 — so the superfloppy path is the right
+    // route for them.
+    if &first_sector[0..4] == b"QLWA" {
+        return Some("QDOS".to_string());
+    }
+
     // AmigaDOS boot block: "DOS\x?" at offset 0 (variants 0..7 = OFS/FFS,
     // Intl, DirCache, Long Names). PFS / SFS use the same shape for their
     // RDB DosType but never appear on bare ADFs — those are RDB-partitioned
