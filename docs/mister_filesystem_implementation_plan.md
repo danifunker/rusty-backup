@@ -20,14 +20,42 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Wave 1 fully closed — AtariST + MacPlus MFS +
-Apple-II DOS 3.3 all flipped to `[x]` across every applicable spine
-stage. Add/Delete write paths landed on MFS + DOS 3.3, both
-write-verified via `rb-cli put -> get` round-trip, CLI parity
-covered for all three cores. Next action: Wave 2 (X68000 Human68k,
-Archie ADFS, QL QDOS, Altair8800 CP/M, BK0011M ANDOS).
+**Current position:** Wave 2 extract floors landed across all five
+cores. Altair8800 CP/M closed with the strongest reference cross-
+check of any core (cpmtools byte-identity oracle); X68000 Human68k,
+Archie ADFS, QL QDOS, and BK0011M ANDOS at `[~]` with extract-floor
++ unit-test coverage. Write paths, GUI wiring, CLI parity, and the
+remaining `.d88` / `.mdv` containers ship in follow-ups. Spillover
+unlocked: the CP/M engine covers Wave-3 Amstrad / PCW / Einstein /
+SVI328 / MultiComp / ZX+3 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 (Wave 2 extract-floor sweep) — 4 commits this session
+  past the Wave-1 closeout. **MiSTer deployment plan** (`docs/mister-
+  deployment-testing-plan.md`, 498 LOC) — 3-workflow runbook
+  (A: read-only mount, B: in-core write + host re-validate,
+  C: host write + in-core read) with per-core SD path + format +
+  ROM + reference-tool + concrete recipe tables for every Wave-1
+  / 2 / 3 core. **EDSK / DSK** decoder
+  (`src/rbformats/containers/edsk.rs`) — both CPCEMU shapes, FDC
+  per-sector size codes, ascending sector-id reorder; wired through
+  source_reader and CLI streaming-skip. **CP/M engine**
+  (`src/fs/cpm.rs` + `cpm_diskdefs.rs`) — multi-DPB read floor +
+  EditableFilesystem; one impl covers 7 cores. **CP/M dispatch**
+  (`partition_type_string = "cpm:<dpb>"`) + cpmtools-cross-checked
+  fixture (`test_cpm_amstrad_data.dsk.zst`, 180 KB -> 159 B) +
+  4 e2e tests proving byte-identity vs cpmcp's input. **Human68k**
+  (`src/fs/human68k.rs`) — FAT-derived BPB + 18.3 + Shift-JIS
+  lossy display, FAT12/16 chain walker. **ADFS / FileCore**
+  (`src/fs/adfs.rs`) — D/E/F classification + `$` root walk +
+  contiguous-extent file read. **QDOS** (`src/fs/qdos.rs`) —
+  QXL.WIN header + 16-bit big-endian FAT + 64-byte directory
+  entries. **ANDOS** (`src/fs/andos.rs`) — detect-only scaffold
+  (4-offset signature probe) with explicit Unsupported for read.
+  Full lib at 1594 pass (+30 over Wave-1 baseline). Next: Wave 2
+  write paths + dispatch wiring + remaining containers, then
+  Wave-3 CP/M-engine reuse for the 6 floppy CP/M cores at near-
+  zero cost.
 - 2026-06-03 (Wave 1 closeout) — Flipped every applicable Wave-1 box
   to `[x]`. **AtariST**: 7 new e2e tests in `tests/cli_atarist.rs`
   drive rb-cli inspect/ls/get against the committed MSA + AHDI
@@ -124,7 +152,7 @@ A core is **done** only when every applicable stage is `[x]`.
 
 - [ ] §3.1 non-512 logical-sector accessor + `src/fs/README.md` note
 - [x] §3.2 container framework `src/rbformats/containers/` (`open_container` dispatch)
-- [ ] §3.2 decoders: [x] MSA · [ ] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [ ] `.d88`
+- [ ] §3.2 decoders: [x] MSA · [x] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [ ] `.d88`
 - [ ] §3.3 partitionless / extension-dispatch framework
 - [ ] §3.4 convention docs (endianness, bitmap polarity, write-safety)
 
@@ -136,11 +164,11 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 
-- [ ] **X68000** (Human68k) — prereqs [ ] `.d88` container [ ] X68k partition · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [ ] tests
-- [ ] **Archie** (ADFS/FileCore) — prereq [ ] `.hdf` header handling · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [ ] tests
-- [ ] **QL** (QDOS) — prereqs [ ] `.mdv` [ ] `QXL.WIN` containers · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [ ] tests
-- [ ] **Altair8800 / CP/M** — prereqs [ ] DPB registry [ ] EDSK · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize (CF/IDE) · [ ] gui · [ ] cli · [ ] tests
-- [ ] **BK0011M** (ANDOS) · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize (stretch) · [ ] gui · [ ] cli · [ ] tests
+- [~] **X68000** (Human68k) — prereqs [ ] `.d88` container [ ] X68k partition · [x] inspect (BPB-based detect ready for dispatch wiring) · [x] extract (data fork via FAT chain; 18.3 names + Shift-JIS lossy display) · [ ] ref (no Linux apt tool; XM6g on Windows) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (5 unit)
+- [~] **Archie** (ADFS/FileCore) — prereq [ ] `.hdf` header handling · [x] inspect (Disc Record parse + D/E/F classification) · [x] extract (contiguous-extent file read; fragmented files refused) · [ ] ref (no Linux apt tool) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (5 unit)
+- [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (header recognition + volume label) · [x] extract (FAT-chain file read) · [ ] ref (no Linux apt tool; qltools build-from-source) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (4 unit)
+- [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string) · [x] extract (FAT-chain + extent grouping + CP/M-3 byte_count trim) · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle on amstrad_data fixture) · [x] add/del (EditableFilesystem create_file w/ multi-extent file build + delete user=0xE5) · [x] write-verified (unit-test round-trip + cpmtools cross-check) · [ ] resize (CF/IDE — stretch) · [ ] gui · [ ] cli · [x] tests (8 unit + 4 e2e)
+- [~] **BK0011M** (ANDOS) · [x] inspect (signature detect at 4 candidate offsets) · [ ] extract (scaffold returns Unsupported — real walker parked behind better docs + fixture) · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize (stretch) · [ ] gui · [ ] cli · [x] tests (4 unit)
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
