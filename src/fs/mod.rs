@@ -77,6 +77,7 @@ pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
+pub use qdos::resize_qdos_in_place;
 pub use reiserfs::CompactReiserFsReader;
 pub use ufs::CompactUfsReader;
 
@@ -122,6 +123,7 @@ pub fn resize_filesystem_for(
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
 }
 
