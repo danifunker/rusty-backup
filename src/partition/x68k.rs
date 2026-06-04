@@ -1,0 +1,254 @@
+//! Sharp X68000 SASI/SCSI HDD partition table.
+//!
+//! Used by Human68k on every X68000 hard-disk image (.hds / .hdf / .hdm
+//! files, also raw `.img` files for the MiSTer X68000 core). Distinct
+//! from MBR, AHDI, APM, and the X68000 floppy `.d88` container.
+//!
+//! ## On-disk layout
+//!
+//! The partition table lives at **byte offset 2048** in the image,
+//! independent of logical sector size (= sector 4 with 512-B sectors,
+//! sector 2 with 1024-B sectors, sector 8 with 256-B sectors). 16-byte
+//! header followed by 8 fixed-size 16-byte partition entries:
+//!
+//! ```text
+//! 0x00..0x04  magic   "X68K" (BE u32 0x5836384B)
+//! 0x04..0x08  size    BE u32 — disk size in some unit (we don't rely
+//!                              on this)
+//! 0x08..0x0C  size2   BE u32 — copy of size
+//! 0x0C..0x10  unknown BE u32 — reserved
+//! 0x10..0x90  entries 8 × 16 bytes (see below)
+//! ```
+//!
+//! Each 16-byte partition entry:
+//!
+//! ```text
+//! 0x00..0x08  name    8 bytes Shift-JIS (space-padded). Real disks
+//!                     use "Human   " (or "Human68k" — full 8 chars)
+//!                     for Human68k partitions.
+//! 0x08..0x0C  start   BE u32 — first sector (lower 24 bits used; top
+//!                     byte carries "active" / flags bits in some
+//!                     refs, we mask to 24 bits for safety)
+//! 0x0C..0x10  length  BE u32 — partition length in sectors
+//! ```
+//!
+//! An entry with `name` all-zeros or all-space AND `length == 0` is
+//! treated as "unused". Conventionally, partitions start at sector 64
+//! (32,768 bytes with 512-B sectors).
+//!
+//! Reference: Aaru/DiscImageChef `Aaru.Partitions/Human68k.cs` (GPL-3,
+//! parser logic), reproduced here from the on-disk spec. All multi-
+//! byte fields are big-endian (M68k native).
+
+use byteorder::{BigEndian, ByteOrder};
+use std::io::{Read, Seek, SeekFrom};
+
+use crate::error::RustyBackupError;
+
+/// `"X68K"` in big-endian u32.
+pub const X68K_MAGIC: u32 = 0x5836_384B;
+
+/// Byte offset of the X68k partition table in the image. Same value
+/// regardless of logical sector size (sector 4 × 512, sector 2 × 1024,
+/// sector 8 × 256).
+pub const X68K_TABLE_OFFSET: u64 = 2048;
+
+/// Number of partition slots in the table.
+pub const X68K_MAX_PARTITIONS: usize = 8;
+
+/// Size of one partition entry in the table.
+pub const X68K_ENTRY_SIZE: usize = 16;
+
+/// Size of the table header before the entries.
+pub const X68K_TABLE_HEADER_SIZE: usize = 16;
+
+/// Conventional sector-0 of the first user partition.
+pub const X68K_FIRST_PARTITION_SECTOR: u32 = 64;
+
+/// Sector size assumed when computing byte offsets. Real X68000 SASI
+/// HDDs typically use 256 or 512 byte sectors; 512 is the MiSTer
+/// convention.
+pub const X68K_DEFAULT_SECTOR_SIZE: u64 = 512;
+
+/// One decoded partition entry.
+#[derive(Debug, Clone)]
+pub struct X68kEntry {
+    /// 8-byte name field (Shift-JIS, space-padded). Held as raw bytes
+    /// so the dispatch layer can route on the un-decoded name (most
+    /// real disks have ASCII "Human   ").
+    pub name_raw: [u8; 8],
+    /// Lossy ASCII rendering of the name for display (Shift-JIS
+    /// double-byte sequences surface as `?`). Trimmed of trailing
+    /// spaces.
+    pub name_display: String,
+    /// Start sector (lower 24 bits of the on-disk u32; high byte is
+    /// flags in some references — we ignore it).
+    pub start_sector: u32,
+    /// Length in sectors. 0 indicates an unused slot.
+    pub length_sectors: u32,
+}
+
+impl X68kEntry {
+    /// Parse a single 16-byte entry. Returns `None` for "unused"
+    /// entries (all-zero name AND length == 0).
+    pub fn parse(buf: &[u8; X68K_ENTRY_SIZE]) -> Option<Self> {
+        let mut name_raw = [0u8; 8];
+        name_raw.copy_from_slice(&buf[0..8]);
+        let start_raw = BigEndian::read_u32(&buf[8..12]);
+        let length_sectors = BigEndian::read_u32(&buf[12..16]);
+        if name_raw.iter().all(|b| *b == 0 || *b == b' ') && length_sectors == 0 {
+            return None;
+        }
+        let name_display = String::from_utf8_lossy(&name_raw)
+            .trim_end()
+            .trim_end_matches('\0')
+            .to_string();
+        Some(X68kEntry {
+            name_raw,
+            name_display,
+            start_sector: start_raw & 0x00FF_FFFF,
+            length_sectors,
+        })
+    }
+
+    /// True if the name field starts with "Human" (case-insensitive
+    /// against the ASCII bytes). This is the canonical Human68k
+    /// partition marker, used both as "Human   " and "Human68k".
+    pub fn is_human68k(&self) -> bool {
+        self.name_raw.starts_with(b"Human") || self.name_raw.starts_with(b"HUMAN")
+    }
+}
+
+/// Parsed X68k partition table.
+#[derive(Debug, Clone)]
+pub struct X68kPartitionTable {
+    /// `size` field from the on-disk header. Reported raw for inspect.
+    pub disk_size_field: u32,
+    /// Active partition entries (unused slots filtered out).
+    pub entries: Vec<X68kEntry>,
+}
+
+impl X68kPartitionTable {
+    /// True if `head` (≥ 4 bytes) starts with the X68k magic.
+    pub fn has_magic(head: &[u8]) -> bool {
+        head.len() >= 4 && BigEndian::read_u32(&head[0..4]) == X68K_MAGIC
+    }
+
+    /// Read and parse the partition table from a seekable reader.
+    /// Reads exactly `X68K_TABLE_HEADER_SIZE + 8 * X68K_ENTRY_SIZE`
+    /// bytes starting at `X68K_TABLE_OFFSET`.
+    pub fn detect<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>, RustyBackupError> {
+        reader
+            .seek(SeekFrom::Start(X68K_TABLE_OFFSET))
+            .map_err(RustyBackupError::Io)?;
+        let mut buf = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(_) => return Ok(None),
+        }
+        if !Self::has_magic(&buf[..4]) {
+            return Ok(None);
+        }
+        let disk_size_field = BigEndian::read_u32(&buf[4..8]);
+        let mut entries = Vec::with_capacity(X68K_MAX_PARTITIONS);
+        for i in 0..X68K_MAX_PARTITIONS {
+            let off = X68K_TABLE_HEADER_SIZE + i * X68K_ENTRY_SIZE;
+            let mut entry_buf = [0u8; X68K_ENTRY_SIZE];
+            entry_buf.copy_from_slice(&buf[off..off + X68K_ENTRY_SIZE]);
+            if let Some(e) = X68kEntry::parse(&entry_buf) {
+                entries.push(e);
+            }
+        }
+        Ok(Some(X68kPartitionTable {
+            disk_size_field,
+            entries,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn build_image_with_x68k_table(entries: &[(&[u8; 8], u32, u32)]) -> Vec<u8> {
+        // Headroom past the table so the dispatch layer can be tested
+        // against a "data area".
+        let total_size = (X68K_FIRST_PARTITION_SECTOR as u64 + 16) * X68K_DEFAULT_SECTOR_SIZE;
+        let mut buf = vec![0u8; total_size as usize];
+        let off = X68K_TABLE_OFFSET as usize;
+        // Magic + size + size2 + unknown.
+        BigEndian::write_u32(&mut buf[off..off + 4], X68K_MAGIC);
+        BigEndian::write_u32(&mut buf[off + 4..off + 8], 0x01_FF_FF_FF);
+        BigEndian::write_u32(&mut buf[off + 8..off + 12], 0x01_FF_FF_FF);
+        BigEndian::write_u32(&mut buf[off + 12..off + 16], 0);
+        for (i, (name, start, length)) in entries.iter().enumerate() {
+            let e_off = off + X68K_TABLE_HEADER_SIZE + i * X68K_ENTRY_SIZE;
+            buf[e_off..e_off + 8].copy_from_slice(*name);
+            BigEndian::write_u32(&mut buf[e_off + 8..e_off + 12], *start);
+            BigEndian::write_u32(&mut buf[e_off + 12..e_off + 16], *length);
+        }
+        buf
+    }
+
+    #[test]
+    fn detect_returns_none_on_random_bytes() {
+        let mut cur = Cursor::new(vec![0xCDu8; 4096]);
+        assert!(X68kPartitionTable::detect(&mut cur).unwrap().is_none());
+    }
+
+    #[test]
+    fn detect_parses_single_human68k_partition() {
+        let img = build_image_with_x68k_table(&[(b"Human   ", 64, 0x1000)]);
+        let mut cur = Cursor::new(img);
+        let table = X68kPartitionTable::detect(&mut cur).unwrap().unwrap();
+        assert_eq!(table.entries.len(), 1);
+        let e = &table.entries[0];
+        assert_eq!(e.name_display, "Human");
+        assert!(e.is_human68k());
+        assert_eq!(e.start_sector, 64);
+        assert_eq!(e.length_sectors, 0x1000);
+    }
+
+    #[test]
+    fn detect_filters_unused_slots() {
+        // Three entries; middle one is unused (zero name + length 0).
+        let img = build_image_with_x68k_table(&[
+            (b"Human   ", 64, 0x1000),
+            (&[0u8; 8], 0, 0),
+            (b"Human68k", 0x1040, 0x800),
+        ]);
+        let mut cur = Cursor::new(img);
+        let table = X68kPartitionTable::detect(&mut cur).unwrap().unwrap();
+        assert_eq!(table.entries.len(), 2);
+        assert_eq!(table.entries[0].start_sector, 64);
+        assert_eq!(table.entries[1].start_sector, 0x1040);
+    }
+
+    #[test]
+    fn entry_parse_returns_none_for_unused_slot() {
+        let mut buf = [0u8; X68K_ENTRY_SIZE];
+        // All zeros, length 0 — definition of "unused".
+        assert!(X68kEntry::parse(&buf).is_none());
+        // Space-name + length 0 also counts as unused.
+        for b in &mut buf[0..8] {
+            *b = b' ';
+        }
+        assert!(X68kEntry::parse(&buf).is_none());
+        // Non-zero length resurrects the entry.
+        BigEndian::write_u32(&mut buf[12..16], 1);
+        assert!(X68kEntry::parse(&buf).is_some());
+    }
+
+    #[test]
+    fn start_sector_masks_high_byte() {
+        let mut buf = [0u8; X68K_ENTRY_SIZE];
+        buf[0..8].copy_from_slice(b"Human   ");
+        // 0xFF in the high byte (some refs use it as "active" / flag).
+        // The masked start_sector must be 64.
+        BigEndian::write_u32(&mut buf[8..12], 0xFF00_0040);
+        BigEndian::write_u32(&mut buf[12..16], 16);
+        let e = X68kEntry::parse(&buf).unwrap();
+        assert_eq!(e.start_sector, 64);
+    }
+}

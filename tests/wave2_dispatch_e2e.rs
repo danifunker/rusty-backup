@@ -129,6 +129,45 @@ fn dispatch_via_auto_detect_routes_to_adfs() {
 }
 
 #[test]
+fn partition_detect_recognises_x68k_human68k_table() {
+    use rusty_backup::partition::x68k::{
+        X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_ENTRY_SIZE, X68K_MAGIC,
+        X68K_TABLE_HEADER_SIZE, X68K_TABLE_OFFSET,
+    };
+    use rusty_backup::partition::PartitionTable;
+    // Synthesize a 1 MB image with a single Human68k partition at
+    // sector 64 (= the conventional first-partition offset).
+    let total_bytes = 1024 * 1024usize;
+    let mut img = vec![0u8; total_bytes];
+    let off = X68K_TABLE_OFFSET as usize;
+    BigEndian::write_u32(&mut img[off..off + 4], X68K_MAGIC);
+    let e_off = off + X68K_TABLE_HEADER_SIZE;
+    img[e_off..e_off + 8].copy_from_slice(b"Human   ");
+    BigEndian::write_u32(&mut img[e_off + 8..e_off + 12], 64);
+    BigEndian::write_u32(&mut img[e_off + 12..e_off + 16], 64);
+    let _ = X68K_ENTRY_SIZE;
+    let _ = X68K_DEFAULT_SECTOR_SIZE;
+    let _: &X68kPartitionTable;
+    let mut cur = Cursor::new(img);
+    let table = PartitionTable::detect(&mut cur).unwrap();
+    assert!(
+        matches!(table, PartitionTable::X68k { .. }),
+        "expected X68k partition table; got {:?}",
+        table.type_name()
+    );
+    let parts = table.partitions();
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].type_name.contains("Human68k"));
+    assert_eq!(parts[0].start_lba, 64);
+    assert_eq!(parts[0].size_bytes, 64 * 512);
+    assert_eq!(
+        parts[0].partition_type_string.as_deref(),
+        Some("human68k"),
+        "Human68k partitions must dispatch to the Human68k engine"
+    );
+}
+
+#[test]
 fn dispatch_via_auto_detect_routes_to_qdos_mdv() {
     use rusty_backup::fs::qdos_mdv::{CART_NAME_OFFSET, MDV_CART_BYTES, MDV_SECTOR_BYTES};
     let mut cart = vec![0u8; MDV_CART_BYTES];

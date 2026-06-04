@@ -7,6 +7,7 @@ pub mod mbr;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod x68k;
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -17,6 +18,7 @@ use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
+use x68k::{X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE};
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
 
@@ -40,6 +42,16 @@ pub enum PartitionTable {
     /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
     /// no boot signature; see `src/partition/atari.rs`.
     Ahdi(AhdiTable),
+    /// Sharp X68000 SASI/SCSI HDD partition table — Human68k's native scheme.
+    /// 16-byte header + 8 × 16-byte partition entries at byte 2048, big-endian,
+    /// no boot signature; see `src/partition/x68k.rs`.
+    X68k {
+        table: X68kPartitionTable,
+        /// Total disk size in bytes (the in-table `size` field is in an
+        /// undefined unit and unreliable; this comes from the source
+        /// reader directly).
+        size_bytes: u64,
+    },
     /// Superfloppy / floppy: no partition table, filesystem at sector 0.
     None {
         /// Total disk size in bytes (needed to synthesize partition info).
@@ -378,6 +390,29 @@ impl PartitionTable {
                 .map_err(RustyBackupError::Io)?;
         }
 
+        // Check for X68000 / Human68k partition table. Magic "X68K" lives
+        // at byte 2048 (sector 4 with 512-B sectors, sector 2 with 1024-B
+        // sectors). No boot signature in sector 0, so this MUST run
+        // before the superfloppy probe — a FAT BPB at byte 0 would
+        // otherwise short-circuit detection on a multi-partition HDD.
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+        match X68kPartitionTable::detect(reader) {
+            Ok(Some(table)) => {
+                let size_bytes = reader
+                    .seek(SeekFrom::End(0))
+                    .map_err(RustyBackupError::Io)?;
+                return Ok(PartitionTable::X68k { table, size_bytes });
+            }
+            Ok(None) | Err(_) => {
+                // Restore reader for the superfloppy / MBR paths below.
+                reader
+                    .seek(SeekFrom::Start(0))
+                    .map_err(RustyBackupError::Io)?;
+            }
+        }
+
         // Check for superfloppy (no partition table) before MBR parsing
         if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
             // Get disk size via seek to end
@@ -645,6 +680,47 @@ impl PartitionTable {
                 }
                 out
             }
+            PartitionTable::X68k { table, .. } => {
+                table
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let is_human = e.is_human68k();
+                        let type_name = if is_human {
+                            format!("X68k Human68k ({})", e.name_display)
+                        } else {
+                            format!("X68k {}", e.name_display)
+                        };
+                        PartitionInfo {
+                            index: i,
+                            type_name,
+                            // Reuse the FAT12 byte (0x01) for Human68k so the
+                            // existing FAT auto-detect arm finds the
+                            // partition_type_string-less fallback. Human68k's
+                            // BPB is FAT-compatible so the read path Just
+                            // Works once the offset is right.
+                            partition_type_byte: if is_human { 0x01 } else { 0 },
+                            start_lba: e.start_sector as u64,
+                            size_bytes: e.length_sectors as u64 * X68K_DEFAULT_SECTOR_SIZE,
+                            bootable: false,
+                            is_logical: false,
+                            is_extended_container: false,
+                            // String dispatch into the Human68k engine for
+                            // accurate filesystem reporting (18.3 names +
+                            // Shift-JIS lossy display).
+                            partition_type_string: if is_human {
+                                Some("human68k".to_string())
+                            } else {
+                                None
+                            },
+                            hfs_block_size: None,
+                            rdb_part_block: None,
+                            drv_name: None,
+                        }
+                    })
+                    .collect()
+            }
             PartitionTable::None {
                 size_bytes,
                 fs_hint,
@@ -693,6 +769,7 @@ impl PartitionTable {
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
             PartitionTable::Ahdi(_) => "AHDI",
+            PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
         }
     }
@@ -707,6 +784,7 @@ impl PartitionTable {
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
             | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
             | PartitionTable::None { .. } => 0,
         }
     }

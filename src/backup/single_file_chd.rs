@@ -1901,6 +1901,11 @@ fn build_patched_head_segments(
                 "assemble_from_staging: AHDI sources are not yet supported by single-file CHD"
             );
         }
+        PartitionTable::X68k { .. } => {
+            anyhow::bail!(
+                "assemble_from_staging: X68000 Human68k sources are not yet supported by single-file CHD"
+            );
+        }
         PartitionTable::None { .. } => {
             anyhow::bail!("assemble_from_staging: superfloppy sources are not supported");
         }

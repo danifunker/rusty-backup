@@ -198,6 +198,9 @@ pub fn apply_edits(
         PartitionTable::Ahdi(_) => {
             bail!("AHDI partition-table editing is not yet implemented")
         }
+        PartitionTable::X68k { .. } => {
+            bail!("X68000 partition-table editing is not yet implemented")
+        }
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
     }
 }

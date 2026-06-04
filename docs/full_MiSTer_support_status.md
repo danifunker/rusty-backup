@@ -14,7 +14,7 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
   ANDOS (detect-only scaffold), ISO9660 (optical browse).
-- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI.
+- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
   (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein / etc.), `.d88`
@@ -47,7 +47,7 @@ Legend for the **Support** column:
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
-| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD pending X68k partition scheme |
+| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD partition table + Human68k partition dispatch yes (resize-on-restore deferred) |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — read yes for `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD; ADFS write path deferred |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read yes; `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |

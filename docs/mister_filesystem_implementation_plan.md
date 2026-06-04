@@ -33,6 +33,29 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (Wave 2 close-out — X68000 SASI HDD partition scheme) —
+  New `src/partition/x68k.rs` (~280 LOC) parses the Sharp X68000
+  Human68k partition table: `"X68K"` magic (BE u32 `0x5836384B`) at
+  byte offset 2048, 16-byte header + 8 × 16-byte entries (8-byte
+  Shift-JIS partition name + BE u32 start sector + BE u32 length).
+  Format pulled from Aaru/DiscImageChef's `Aaru.Partitions/Human68k.cs`
+  GPL-3 parser (reproduced from the on-disk spec, no source copy).
+  New `PartitionTable::X68k` variant + dispatch arms in `partitions()`
+  / `type_name()` / `disk_signature()` / the 5 other match sites the
+  trait reaches into. `partitions()` surfaces Human68k entries
+  (`name_raw` starts with "Human") with `partition_type_string:
+  Some("human68k")` so the existing Human68k engine dispatch route
+  catches them. Detection runs BEFORE the superfloppy probe in
+  `PartitionTable::detect` because the magic lives mid-disk (no
+  sector-0 boot signature). Tests: 5 unit (random-bytes refusal,
+  single-partition parse, unused-slot filter, all-zero entry returns
+  None, high-byte mask on start sector) + 1 wave2_dispatch e2e
+  (synthetic disk → PartitionTable::detect → partitions() →
+  Human68k engine dispatch). full_MiSTer_support_status.md X68000
+  row flips to "Partial — floppy yes; SASI HDD partition table +
+  Human68k partition dispatch yes". Sharp X68000 added to the
+  Partition tables list. 1624 lib + 8 wave2_dispatch tests green.
+  Next: ADFS write path (FSM walker), then QDOS write path.
 - 2026-06-04 (Wave 2 close-out — `.mdv` QDOS Microdrive scaffold) —
   New `src/fs/qdos_mdv.rs` (~200 LOC) ships the detect-only scaffold
   for QL microdrive cartridge images: 255 × 686 = 174,930 bytes per

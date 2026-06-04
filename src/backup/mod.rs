@@ -536,6 +536,20 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 .context("failed to write ahdi.json")?;
             log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
         }
+        PartitionTable::X68k { .. } => {
+            // X68000 Human68k partition layout: per-partition Human68k
+            // (FAT-derived) backup rides the existing FAT pipeline; the
+            // partition-table sidecar is not yet emitted because the
+            // X68kPartitionTable struct doesn't implement Serialize.
+            // Restore-side support for X68k tables is future work
+            // tracked in OPEN-WORK.
+            log(
+                &progress,
+                LogLevel::Info,
+                "X68k partition table detected; per-partition data backup only \
+                 (sidecar serialisation pending)",
+            );
+        }
         PartitionTable::None { fs_hint, .. } => {
             log(
                 &progress,
