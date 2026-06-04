@@ -21,6 +21,7 @@
 //! plan.md`), all decoders are ported MIT source or hand-written; no new
 //! crate dependency.
 
+pub mod edsk;
 pub mod msa;
 pub mod sector_order;
 
@@ -38,6 +39,10 @@ use super::ReadSeek;
 pub enum ContainerKind {
     /// Atari ST MSA (Magic Shadow Archiver) — `$0E0F` magic, per-track RLE.
     Msa,
+    /// CPCEMU DSK / EDSK — Amstrad CPC / PCW / Einstein / Oric / etc.
+    /// CP/M floppies. Either "MV - CPCEMU Disk-File" (DSK) or
+    /// "EXTENDED CPC DSK File" (EDSK) header magic.
+    Edsk,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -47,6 +52,7 @@ impl ContainerKind {
     pub fn display_name(self) -> &'static str {
         match self {
             ContainerKind::Msa => "Atari MSA",
+            ContainerKind::Edsk => "CPCEMU DSK/EDSK",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -62,6 +68,9 @@ impl ContainerKind {
 pub fn detect_container_kind(head: &[u8], _path: Option<&Path>) -> ContainerKind {
     if msa::looks_like_msa_header(head) {
         return ContainerKind::Msa;
+    }
+    if edsk::looks_like_edsk_header(head) {
+        return ContainerKind::Edsk;
     }
     ContainerKind::Raw
 }
@@ -82,6 +91,10 @@ pub fn open_container_bytes(
         ContainerKind::Msa => {
             let flat = msa::decode_msa_bytes(&bytes)?;
             Ok((ContainerKind::Msa, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::Edsk => {
+            let flat = edsk::decode_edsk_bytes(&bytes)?;
+            Ok((ContainerKind::Edsk, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }

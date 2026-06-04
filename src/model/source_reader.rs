@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
@@ -81,6 +82,27 @@ pub fn is_apple_ii_dsk_path(path: &Path) -> bool {
 /// image. MSA's `$0E 0F` magic is short; we additionally require the
 /// extension to be `.msa` (case-insensitive) to keep the detector from
 /// guessing on arbitrary files whose first two bytes coincide.
+/// Cheap sniff: returns true when `path` looks like a CPCEMU DSK / EDSK
+/// container (Amstrad CPC / PCW / Tatung Einstein CP/M floppies). Checks
+/// the `.dsk` extension AND the first 34 bytes for one of the two CPCEMU
+/// magic strings, so this never false-positives on raw `.dsk` files used
+/// by other cores.
+pub fn is_edsk_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("dsk"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 34];
+    matches!(f.read(&mut head), Ok(n) if n >= 22) && looks_like_edsk_header(&head)
+}
+
 pub fn is_msa_path(path: &Path) -> bool {
     let ext_ok = path
         .extension()
@@ -142,6 +164,14 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let imz = ImzReader::open_with_password(path, password)
             .with_context(|| format!("open IMZ {}", path.display()))?;
         Ok(Box::new(imz))
+    } else if is_edsk_path(path) {
+        // EDSK / DSK floppies: read into memory, decode to a flat
+        // sector stream, hand off as Cursor. Same shape as MSA — small
+        // images (~1 MB max), no streaming needed.
+        let bytes = std::fs::read(path).with_context(|| format!("read EDSK {}", path.display()))?;
+        let flat =
+            decode_edsk_bytes(&bytes).with_context(|| format!("decode EDSK {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_msa_path(path) {
         // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into
         // memory and wrapping in a Cursor is simpler than a streaming reader
