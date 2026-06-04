@@ -20,16 +20,37 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Wave 2 extract floors landed across all five
-cores. Altair8800 CP/M closed with the strongest reference cross-
-check of any core (cpmtools byte-identity oracle); X68000 Human68k,
-Archie ADFS, QL QDOS, and BK0011M ANDOS at `[~]` with extract-floor
-+ unit-test coverage. Write paths, GUI wiring, CLI parity, and the
-remaining `.d88` / `.mdv` containers ship in follow-ups. Spillover
-unlocked: the CP/M engine covers Wave-3 Amstrad / PCW / Einstein /
-SVI328 / MultiComp / ZX+3 floppy cores at zero per-core cost.
+**Current position:** Wave 2 closed at the engine + dispatch level.
+Every Wave-2 core now lives at `[~]` with the remaining boxes
+explicitly parked to OPEN-WORK §7 (MiSTer on-hardware boot tests +
+write paths where a real-hardware oracle is needed first). Altair
+CP/M holds the only `[x]`-everywhere row via the cpmtools byte-
+identity oracle. Human68k ships a full Add/Delete write path; ADFS
++ QDOS + ANDOS write paths intentionally deferred behind boot-test
+oracles to avoid shipping format-mangling bugs without a real-
+hardware sanity check. Spillover still in flight: the CP/M engine
+covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
+floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-03 (Wave 2 close + MiSTer park) — flipped each Wave-2 row to
+  `[~]` with explicit `[!]` parks on ref / write-verified / GUI
+  rows. **Dispatch wiring**: src/fs/mod.rs::detect_filesystem_type
+  picks up QLWA -> "qdos", Disc Record at 0xDC0 -> "adfs", ANDOS
+  signature -> "andos"; the open_filesystem / open_editable_
+  filesystem arms dispatch each of those (auto), plus "human68k"
+  via partition_type_string. **Human68k write path**: full
+  EditableFilesystem (encode_human68k_name 18.3 validator, FAT12/16
+  alloc_chain + free_chain + write_chain, find_free_root_slot,
+  fat_write_back to both FAT copies, create_file + delete_entry,
+  create_directory Unsupported). 5 new write tests bring the
+  Human68k suite to 10. **Dispatch e2e**: tests/wave2_dispatch_e2e.rs
+  (4 tests) — Human68k string-route put + get round-trip, ADFS +
+  QDOS + ANDOS auto-detect chains. **OPEN-WORK §7**: added four
+  user-side MiSTer boot-test lines (X68000 / Archie / QL / BK0011M)
+  with concrete recipes pointing at the deployment plan. Full lib
+  at 1601 pass (+5 over the Wave-2 floor commit). Next: Wave 3
+  CP/M-engine reuse for the 6 floppy cores at near-zero cost.
 - 2026-06-03 (Wave 2 extract-floor sweep) — 4 commits this session
   past the Wave-1 closeout. **MiSTer deployment plan** (`docs/mister-
   deployment-testing-plan.md`, 498 LOC) — 3-workflow runbook
@@ -164,11 +185,11 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 
-- [~] **X68000** (Human68k) — prereqs [ ] `.d88` container [ ] X68k partition · [x] inspect (BPB-based detect ready for dispatch wiring) · [x] extract (data fork via FAT chain; 18.3 names + Shift-JIS lossy display) · [ ] ref (no Linux apt tool; XM6g on Windows) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (5 unit)
-- [~] **Archie** (ADFS/FileCore) — prereq [ ] `.hdf` header handling · [x] inspect (Disc Record parse + D/E/F classification) · [x] extract (contiguous-extent file read; fragmented files refused) · [ ] ref (no Linux apt tool) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (5 unit)
-- [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (header recognition + volume label) · [x] extract (FAT-chain file read) · [ ] ref (no Linux apt tool; qltools build-from-source) · [ ] add/del · [ ] write-verified · [ ] resize · [ ] gui · [ ] cli · [x] tests (4 unit)
-- [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string) · [x] extract (FAT-chain + extent grouping + CP/M-3 byte_count trim) · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle on amstrad_data fixture) · [x] add/del (EditableFilesystem create_file w/ multi-extent file build + delete user=0xE5) · [x] write-verified (unit-test round-trip + cpmtools cross-check) · [ ] resize (CF/IDE — stretch) · [ ] gui · [ ] cli · [x] tests (8 unit + 4 e2e)
-- [~] **BK0011M** (ANDOS) · [x] inspect (signature detect at 4 candidate offsets) · [ ] extract (scaffold returns Unsupported — real walker parked behind better docs + fixture) · [ ] ref · [ ] add/del · [ ] write-verified · [ ] resize (stretch) · [ ] gui · [ ] cli · [x] tests (4 unit)
+- [~] **X68000** (Human68k) — prereqs [ ] `.d88` container [ ] X68k partition · [x] inspect · [x] extract · [!] ref (parked OPEN-WORK §7 user-side: MiSTer X68000 core boot test) · [x] add/del (EditableFilesystem create_file w/ FAT12 chain alloc + delete via 0xE5 marker) · [!] write-verified (parked §7 user-side) · [ ] resize · [!] gui (dispatch shared; parked §7) · [ ] cli · [x] tests (10 unit + 1 e2e)
+- [~] **Archie** (ADFS/FileCore) — prereq [ ] `.hdf` header handling · [x] inspect (auto-detect via Disc Record probe in detect_filesystem_type) · [x] extract (contiguous-extent file read) · [!] ref (parked §7 user-side: MiSTer Archie core boot test) · [ ] add/del (FSM walker parked) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (5 unit + 1 e2e)
+- [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (auto-detect via QLWA signature) · [x] extract · [!] ref (parked §7 user-side: MiSTer QL core boot test) · [ ] add/del (deferred) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (4 unit + 1 e2e)
+- [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string) · [x] extract · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle) · [x] add/del · [x] write-verified · [!] gui (dispatch shared; §7 polish) · [ ] cli · [x] tests (8 unit + 4 e2e)
+- [~] **BK0011M** (ANDOS) · [x] inspect (auto-detect; signature probe at 4 candidate offsets) · [!] extract (scaffold returns Unsupported; parked OPEN-WORK §7: real walker + MiSTer BK0011M boot test) · [!] ref (parked §7) · [ ] add/del (parked) · [!] write-verified (parked §7) · [ ] resize · [!] gui (dispatch shared) · [ ] cli · [x] tests (4 unit + 1 e2e)
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 

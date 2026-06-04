@@ -332,10 +332,37 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   our `rb-cli`-written images in CiderPress2 (Windows) to confirm the
   Apple-II-era tools accept our output. Engine + write-path are
   shipped (18 unit + 5 e2e + 4 cli tests, all green).
-
----
-
-## 8. Parked (could revisit; *not* deferred)
+- **MiSTer X68000 core boot test** — workflow A+C+B per
+  `docs/mister-deployment-testing-plan.md` §3.4. Build a 1.2 MB
+  Human68k floppy via `rb-cli put` against the synthetic disk
+  (engine ships full Add/Delete), `scp` to
+  `/media/fat/games/X68000/`, mount in the core, `dir A:` lists
+  the written file, `TYPE foo.txt` reads back the seeded bytes.
+  Reverse (workflow B) — `save` from Human68k, power down, pull
+  SD, `rb-cli ls / get` agrees. Engine surface is shipped (10 unit
+  + 1 e2e dispatch test); only the real-hardware mount + boot is
+  outstanding.
+- **MiSTer Archie / ADFS core boot test** — workflow A+C per
+  `docs/mister-deployment-testing-plan.md` §3.5. Build a 800 KB
+  E-format ADFS disc with the synthetic-fixture pattern, mount as
+  `:0`, `*CAT :0` lists the file, `*Type HELLO` reads back the
+  seed. Engine surface shipped (5 unit + 1 e2e); only real-hardware
+  boot outstanding. ADFS write path (`create_file` against the
+  new-map FSM) parked until a real-hardware oracle is in hand —
+  trying to land an FSM walker without one risks shipping a
+  format-mangling bug.
+- **MiSTer QL core boot test** — workflow A+C per
+  `docs/mister-deployment-testing-plan.md` §3.6. Build a QXL.WIN
+  hard-disk image, place at `/media/fat/games/QL/win1_`, boot
+  the QL core, `DIR win1_`, `LOAD win1_HELLO` reads the seed.
+  Engine surface shipped (4 unit + 1 e2e); write path can land
+  once the boot test confirms our QXL.WIN layout matches what the
+  core expects. `.mdv` microdrive container (per-sector 60-byte
+  records) deferred.
+- **MiSTer BK0011M ANDOS core boot test** — workflow A only per
+  `docs/mister-deployment-testing-plan.md` §3.8. Mount one of our
+  ANDOS-scaffolded volumes and visually confirm the core boots
+  (full read path is parked behind the boot-test oracle).
 
 Items that have a real shape but no schedule. Surface them here so they
 aren't lost.
