@@ -403,7 +403,7 @@ rb-cli ls rb_cpm.dsk /                     # same expectation via rb-cli
 |---|---|---|
 | Amstrad CPC 6128 (system) | `amstrad_sys` | 9 spt × 40 trk × 2 sides × 512 B, off=2 |
 | Amstrad CPC 6128 (data)   | `amstrad_data` | 9 spt × 40 trk × 2 sides × 512 B, off=0 |
-| Amstrad PCW 8256/8512     | `amstrad_pcw` | 9 spt × 80 trk × 1 side × 512 B |
+| Amstrad PCW 8256/8512     | `amstrad_pcw` | 9 spt × 40 trk × 1 side × 512 B, off=1 (Format A — the TOSEC default; cross-checked against PAW + cpmtools `pcw` 2026-06-04). Format B (706 KB DS 80-trk) would land as `amstrad_pcw_b`. |
 | Tatung Einstein           | `einstein` | 10 spt × 80 trk × 1 side × 512 B |
 | SVI-328                   | `svi328_cpm` | 17 spt × 40 trk × 2 sides × 256 B |
 | Altair8800 CF             | `altair_cf` | raw IDE block device, dpb varies by config |

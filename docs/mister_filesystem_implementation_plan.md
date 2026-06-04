@@ -33,6 +33,26 @@ covers Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3
 floppy cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (PCW Format A anchor + CP/M reserved-bytes bug fix) — TOSEC
+  v2022-07-10 Amstrad PCW Applications archive scouted (4 disks); only
+  PAW is a true PCW Format A boot disk (off=1, sector_size=512), the
+  other three are CPC-format mislabelled. Surfaced a long-standing
+  reserved-bytes formula bug in `src/fs/cpm.rs`: `off × spt × 128 ×
+  (sector_size / 128)` double-counted (spt is already records-per-track),
+  so PCW's directory landed at byte 18432 instead of 4608. Every off>0
+  DPB had been silently broken — AMSTRAD_DATA (off=0) was the only one
+  the existing tests exercised. **Fixed** the formula at 3 call sites
+  + test helper; **repaired** AMSTRAD_PCW to Format A correct
+  (tracks=40, dsm=174 matching cpmtools' `pcw` diskdef). **Anchored**
+  `tests/fixtures/anchor_pcw_PAW.dsk.zst` (49 KB) with 4 e2e tests
+  cross-validating against `cpmls -f pcw`. Added two scratch examples
+  (`pcw_scout`, `edsk_flat`) for future CP/M scouting. Deployed 5
+  representative PCW disks to MiSTer `/media/fat/games/Amstrad PCW/`
+  (PAW, APED 1+2, Routeplanner, Tristam Island r4). 1601 lib tests +
+  pcw_e2e (4) green. Wave-3 CP/M spillover now covers Amstrad PCW via
+  a real-hardware-ready engine; the spine row for PCW can flip to `[~]`
+  once on-MiSTer boot test confirms. Next: continue Wave-3 floppy
+  cores OR Atari ST commercial-software cross-check.
 - 2026-06-03 (Wave 2 close + MiSTer park) — flipped each Wave-2 row to
   `[~]` with explicit `[!]` parks on ref / write-verified / GUI
   rows. **Dispatch wiring**: src/fs/mod.rs::detect_filesystem_type
