@@ -4,6 +4,8 @@ pub mod affs_fsck;
 pub mod apple_dos;
 pub mod binhex;
 pub mod btrfs;
+pub mod cpm;
+pub mod cpm_diskdefs;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
