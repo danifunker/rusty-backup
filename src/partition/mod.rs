@@ -250,24 +250,43 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
-    // Acorn ADFS / FileCore Disc Record at byte 0xDC0 (= 0xC00 + 0x1C0).
+    // Acorn ADFS / FileCore Disc Record. Two probe sites match the
+    // Linux kernel paths:
+    //   * byte 0xDC0 (= 0xC00 + 0x1C0) — boot block, used by HD discs
+    //     and legacy floppy boot-block layouts (kernel
+    //     `adfs_validate_bblk`). CROS42 / ICEBIRD use this.
+    //   * byte 0x04 — DR embedded inside zone 0 after the 4-byte zone
+    //     header, used by single-zone E-format floppies (kernel
+    //     `adfs_validate_dr0`). 8bs.com arc-04 / arc-05 use this.
     // FileCore's spec: byte 0 = log2 sector size (8..11 → 256..2048 B),
-    // byte 1 = secs/track (>= 1), byte 2 = heads (1..4 for real disks),
-    // byte 9 = nzones (>= 1). A coincidental match in random bytes is
-    // very unlikely given these constraints combined.
-    if reader.seek(SeekFrom::Start(0xDC0)).is_ok() {
-        let mut dr = [0u8; 32];
-        if reader.read_exact(&mut dr).is_ok() {
-            let log2_sec = dr[0];
-            let secs_per_track = dr[1];
-            let heads = dr[2];
-            let nzones = dr[9];
-            if (8..=11).contains(&log2_sec)
-                && secs_per_track >= 1
-                && (1..=4).contains(&heads)
-                && nzones >= 1
-            {
-                return Some("ADFS".to_string());
+    // byte 1 = secs/track (>= 1), byte 2 = heads (>= 1; up to 9+ on
+    // emulator-side HDDs — CROS42 / ICEBIRD report heads=9, real
+    // hardware tops out lower but the field is u8 and FileCore HDs
+    // don't constrain it the way floppies do), byte 9 = nzones (>= 1).
+    // A coincidental match in random bytes is very unlikely given these
+    // constraints combined.
+    for cand in [0xDC0u64, 0x004u64] {
+        if reader.seek(SeekFrom::Start(cand)).is_ok() {
+            let mut dr = [0u8; 60];
+            if reader.read_exact(&mut dr).is_ok() {
+                let log2_sec = dr[0];
+                let secs_per_track = dr[1];
+                let heads = dr[2];
+                let idlen = dr[4];
+                let nzones = dr[9];
+                // Bytes 52..60 (`unused52` in the kernel struct) must
+                // be zero per `adfs_checkdiscrecord` — this is the
+                // strongest single false-positive guard.
+                let reserved_zero = dr[52..60].iter().all(|&b| b == 0);
+                if (8..=11).contains(&log2_sec)
+                    && secs_per_track >= 1
+                    && heads >= 1
+                    && nzones >= 1
+                    && idlen >= log2_sec + 3
+                    && reserved_zero
+                {
+                    return Some("ADFS".to_string());
+                }
             }
         }
     }

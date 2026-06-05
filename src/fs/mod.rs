@@ -343,25 +343,39 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return "qdos";
     }
 
-    // Acorn ADFS — Disc Record at byte 0xC00 + 0x1C0 = 0xDC0.
-    // Probe just enough to discriminate from random data: log2(sec_size)
-    // in 8..=11, heads in 1..=2, density in 0..=3, sane disc_size.
-    if reader
-        .seek(SeekFrom::Start(partition_offset + 0xDC0))
-        .is_ok()
-    {
-        let mut dr = [0u8; 36];
-        if reader.read_exact(&mut dr).is_ok() {
-            let log2_sz = dr[0];
-            let heads = dr[2];
-            let density = dr[3];
-            let total = u32::from_le_bytes([dr[0x10], dr[0x11], dr[0x12], dr[0x13]]);
-            if (8..=11).contains(&log2_sz)
-                && (1..=2).contains(&heads)
-                && density <= 3
-                && (160..=1_048_576).contains(&total)
-            {
-                return "adfs";
+    // Acorn ADFS — Disc Record at byte 0xC00 + 0x1C0 = 0xDC0 (HD /
+    // legacy floppy bblk path) or byte 0x04 (single-zone E-format
+    // floppy dr0 path). Probe just enough to discriminate from random
+    // data: log2(sec_size) in 8..=11, heads >= 1 (HD discs report up
+    // to 9+; the field is u8), density 0..=3, nzones >= 1. Matches the
+    // looser superfloppy probe in `partition::detect_superfloppy` —
+    // every disc that surfaces as "ADFS" there must also route here.
+    for cand in [0xDC0u64, 0x004u64] {
+        if reader
+            .seek(SeekFrom::Start(partition_offset + cand))
+            .is_ok()
+        {
+            let mut dr = [0u8; 60];
+            if reader.read_exact(&mut dr).is_ok() {
+                let log2_sz = dr[0];
+                let secs_per_track = dr[1];
+                let heads = dr[2];
+                let density = dr[3];
+                let idlen = dr[4];
+                let nzones = dr[9];
+                // Bytes 52..60 (`unused52` in the kernel struct) must
+                // be zero per `adfs_checkdiscrecord`.
+                let reserved_zero = dr[52..60].iter().all(|&b| b == 0);
+                if (8..=11).contains(&log2_sz)
+                    && secs_per_track >= 1
+                    && heads >= 1
+                    && density <= 3
+                    && nzones >= 1
+                    && idlen >= log2_sz + 3
+                    && reserved_zero
+                {
+                    return "adfs";
+                }
             }
         }
     }

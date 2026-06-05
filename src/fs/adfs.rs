@@ -675,6 +675,13 @@ impl AdfsDirEntry {
 
 /// Parse one directory entry. Returns `None` when the first byte == 0
 /// (end of directory).
+///
+/// Names are 10 bytes terminated by `\r` (0x0D, the canonical RISC-OS
+/// dir-entry separator), 0x00 (entry-not-set), or 0x20 (space — used
+/// by some older E-format floppies). Bytes past the terminator may be
+/// stale garbage from prior occupants of the slot and are ignored.
+/// The top bit of each name byte may carry attribute flags on some
+/// dir variants — strip it before printable-checking.
 pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<AdfsDirEntry> {
     if buf[0] == 0 {
         return None;
@@ -682,8 +689,9 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<AdfsDirEntry> {
     let name_bytes = &buf[0..10];
     let name: String = name_bytes
         .iter()
-        .take_while(|&&b| b != 0 && b != 0x20)
-        .map(|&b| {
+        .map(|&b| b & 0x7F)
+        .take_while(|&b| b != 0 && b != 0x0D && b != 0x20)
+        .map(|b| {
             if (0x20..=0x7E).contains(&b) {
                 b as char
             } else {
