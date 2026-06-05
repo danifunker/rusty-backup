@@ -2,64 +2,75 @@
 //! (Acorn Archimedes) core. Also seen on later BBC Micro / Electron via
 //! ADFS expansion ROMs.
 //!
-//! **Scope: extract floor.** FileCore's full storage model (old-map vs
-//! new-map FSMs, indirect zone allocation on E/F-format disks) is genuinely
-//! intricate; the long tail of write-side work lives behind this stage. For
-//! now we parse the boot block, recognize D / E / F formats, walk the `$`
-//! root directory, and read files under the assumption their extents are
-//! contiguous from `start_sector` (true for freshly-written disks and for
-//! virtually every Archimedes RISC OS distribution disk). Fragmented files
-//! return an `Unsupported` error.
+//! Read-side covers the **new-map** layouts (E, F, HD) end-to-end via
+//! [`AdfsFsm`], which mirrors the Linux kernel's `fs/adfs/map.c` walker
+//! (`__adfs_block_map` + `adfs_map_lookup` + the underlying
+//! `lookup_zone` / `scan_map` / `adfs_map_layout` primitives). Verified
+//! against `CROS42.hdf`, `ICEBIRD.hdf`, and the 8bs.com `arc-04`
+//! E-format floppy by `examples/adfs_fsm_probe.rs`. D-format (old-map)
+//! still uses the legacy direct-byte-offset fallback — there's no
+//! D-format real sample in tree to validate a walker against.
+//!
+//! Write path, HDD resize, and F+ big-directory entries are still
+//! TODO (tracked in `docs/OPEN-WORK.md` §7 Archie row).
 //!
 //! ## On-disk layout (FileCore spec; Acorn TechRef vol I)
 //!
 //! - **Boot block** at sector 0xC00 / 1024-B-sector 0xC: contains the
-//!   "Disc Record" (a 64-byte struct describing format, sector size,
-//!   tracks, density, FSM layout).
-//! - **Disc Record** (at boot-block offset 0x1C0, big-endian inside the
-//!   sector but the constituent fields are little-endian per the spec —
-//!   ARM is LE):
+//!   "Disc Record" (a 60-byte struct describing format, sector size,
+//!   tracks, density, FSM layout). Single-zone E-format floppies put a
+//!   copy of the DR inside zone 0 at byte 0x04 (kernel
+//!   `adfs_validate_dr0` path).
+//! - **Disc Record** (kernel `struct adfs_discrecord` in
+//!   `include/uapi/linux/adfs_fs.h`; all fields little-endian):
 //!
 //! ```text
-//! 0x00  log2(sector_size)        (8 = 256 B, 10 = 1024 B)
-//! 0x01  sectors_per_track
+//! 0x00  log2_secsize             (8 = 256 B, 9 = 512 B, 10 = 1024 B)
+//! 0x01  secs_per_track
 //! 0x02  heads
 //! 0x03  density                  (1 = single, 2 = double, 3 = high)
-//! 0x04  id_len
-//! 0x05  log2(map_bits)
+//! 0x04  idlen                    (fragment-id bit width)
+//! 0x05  log2bpmb                 (log2 bytes per map bit)
 //! 0x06  skew
-//! 0x07  boot_option
-//! 0x08  low_sector
-//! 0x09  zones                    (new-map only)
+//! 0x07  bootoption
+//! 0x08  lowsector
+//! 0x09  nzones                   (low byte; high byte at 0x2A)
 //! 0x0A..0x0C  zone_spare         (LE u16)
-//! 0x0C..0x10  root              (LE u32, indirect disc address of $)
-//! 0x10..0x14  disc_size         (LE u32, total sectors)
-//! 0x14..0x16  disc_id           (LE u16, randomly chosen)
-//! 0x16..0x26  disc_name         (10 chars, space-padded)
+//! 0x0C..0x10  root               (LE u32, indaddr of $; split as
+//!                                  frag_id = root >> 8, lo = root & 0xFF)
+//! 0x10..0x14  disc_size          (LE u32, low half of byte count)
+//! 0x14..0x16  disc_id            (LE u16)
+//! 0x16..0x20  disc_name          (10 chars, space-padded)
+//! 0x20..0x24  disc_type
+//! 0x24..0x28  disc_size_high     (high half of byte count, big-HDD only)
+//! 0x28 lo nibble  log2sharesize  (within-frag block-offset scale)
+//! 0x29 bit 0      big_flag
+//! 0x2A  nzones_high              (HD+ only; combined with 0x09)
+//! 0x2C..0x30  format_version     (non-zero on F+ variable-size dirs)
+//! 0x30..0x34  root_size          (F+ only; root dir byte size)
+//! 0x34..0x3C  unused52           (must be zero per checkdiscrecord)
 //! ```
 //!
-//! - **Directory `$`** — the root. Layout is identical for both small
-//!   ("D-format", 26-B entries, max 47 entries) and big ("E-format",
-//!   26-B entries, max 77 entries) directory variants:
+//! - **Directory `$`** — the root, plus every other small-format dir:
+//!   2048 bytes total (`ADFS_NEWDIR_SIZE`). Hugo (old-format) and Nick
+//!   (new-format) magics both use 26-byte entries here:
 //!
 //! ```text
-//! header (5 bytes): "Hugo" magic (or "Nick" for big-format), unused
+//! header (5 bytes): byte 0 + "Hugo" / "Nick" magic
 //!
-//! 26 entries × 26 bytes each:
-//!   0..10   name (space-padded; first byte 0 = end of directory)
+//! 77 entries × 26 bytes each:
+//!   0..10   name (CR-terminated; first byte 0 = end of directory;
+//!                 top bit of each byte may overlay attribute flags)
 //!   10..14  load_addr     LE u32
 //!   14..18  exec_addr     LE u32
 //!   18..22  file_length   LE u32
-//!   22..25  indirect_disc_address (24-bit LE — physical sector address
-//!           multiplied by sector size)
-//!   25      attrs (0x01 = R, 0x02 = W, 0x04 = locked, 0x08 = directory,
-//!                  0x10 = E (execute), 0x20 = pub R, 0x40 = pub W,
-//!                  0x80 = pub locked)
+//!   22..25  indirect_disc_address (24-bit LE; (frag_id, in-frag offset)
+//!                                   per __adfs_block_map)
+//!   25      attrs (0x01 R, 0x02 W, 0x04 locked, 0x08 directory,
+//!                  0x10 E, 0x20 pub R, 0x40 pub W, 0x80 pub locked)
 //!
-//! trailer: tail-marker ("Hugo" again) + cycle counter
+//! trailer: tail magic + cycle counter
 //! ```
-//!
-//! All multi-byte fields are little-endian (ARM native).
 
 use std::io::{Read, Seek, SeekFrom};
 
