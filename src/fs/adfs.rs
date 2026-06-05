@@ -1053,36 +1053,41 @@ fn clear_bits_le(buf: &mut [u8], start: u32, nbits: u32) {
 }
 
 impl AdfsFsm {
-    /// Scan a zone for the LAST fragment whose id is zero (= free
-    /// space the kernel's `lookup_zone` walks past harmlessly). Returns
-    /// `(start_bit, length_bits)` or `None` if no zero-id fragment is
-    /// present. This is the slot we carve allocations out of — for the
-    /// blank/lightly-used HD layouts the MiSTer Archie / Acorn discs
-    /// ship with, the tail of zone 0 (or one of the late zones) carries
-    /// one big zero-id free fragment that covers everything past the
-    /// last allocated block.
-    fn find_tail_free_in_zone(&self, zi: u32) -> Option<(u32, u32)> {
-        let (startbit, endbit, _) = self.zone_metadata(zi);
+    /// Walk the kernel's freelink chain in `zi` and return the head of
+    /// the chain — `(start_bit, length_bits)` for the first free
+    /// fragment plus its predecessor's chain pointer (8 if it's the
+    /// chain root at bit 8, otherwise the previous free entry's
+    /// position). The predecessor pointer is what we have to rewrite
+    /// when we carve from the chain head.
+    ///
+    /// Mirrors `scan_free_map` in `fs/adfs/map.c`. The chain root sits
+    /// at bit 8 of each zone: a 15-bit delta gives the offset to the
+    /// first free fragment; at each free fragment, a 15-bit frag-id
+    /// gives the offset to the next. A frag-id < `idlen + 1` marks
+    /// the end of the chain.
+    ///
+    /// Returns `None` when the chain is empty (bit-8 delta is 0).
+    fn find_chain_head(&self, zi: u32) -> Option<(u32, u32, u32)> {
+        let (_startbit, endbit, _) = self.zone_metadata(zi);
         let zone = self.zones.get(zi as usize)?;
-        let idmask = (1u32 << self.idlen) - 1;
-        let mut start = startbit;
-        let mut last: Option<(u32, u32)> = None;
-        let cap = 2 * (self.zone_size_bits / (self.idlen + 1)).max(1) + 16;
-        let mut iter = 0;
-        while start + self.idlen < endbit && iter < cap {
-            iter += 1;
-            let frag = Self::get_frag_id(zone, start, idmask);
-            let fragend = Self::find_next_set_bit(zone, start + self.idlen, endbit);
-            if fragend >= endbit {
-                break;
-            }
-            let length = fragend + 1 - start;
-            if frag == 0 {
-                last = Some((start, length));
-            }
-            start = fragend + 1;
+        let frag_idmask = (1u32 << self.idlen.min(15)) - 1;
+        // Bit 8 holds the 15-bit delta to the first free fragment.
+        let delta = Self::get_frag_id(zone, 8, 0x7FFF);
+        if delta == 0 {
+            return None;
         }
-        last
+        let head_start = 8 + delta;
+        let fragend = Self::find_next_set_bit(zone, head_start + self.idlen, endbit);
+        if fragend >= endbit {
+            return None;
+        }
+        let length = fragend + 1 - head_start;
+        // Sanity: the head's frag-id (low 15 bits) tells us whether
+        // there's a follow-on. We don't use that here, but we keep the
+        // mask-check pattern aligned with the kernel.
+        let _ = Self::get_frag_id(zone, head_start, frag_idmask);
+        // The predecessor pointer is bit 8.
+        Some((head_start, length, 8))
     }
 
     /// Find an allocatable zero-id fragment that holds at least
@@ -1090,11 +1095,11 @@ impl AdfsFsm {
     /// `(start_bit, length_bits)` of that fragment. Prefers the tail
     /// of the lowest-index zone so allocations cluster low (matches
     /// the kernel's monotonic search order).
-    fn find_alloc_slot(&self, min_bits: u32) -> Option<(u32, u32, u32)> {
+    fn find_alloc_slot(&self, min_bits: u32) -> Option<(u32, u32, u32, u32)> {
         for zi in 0..self.nzones {
-            if let Some((start, length)) = self.find_tail_free_in_zone(zi) {
+            if let Some((start, length, predecessor)) = self.find_chain_head(zi) {
                 if length > min_bits + self.idlen {
-                    return Some((zi, start, length));
+                    return Some((zi, start, length, predecessor));
                 }
             }
         }
@@ -1103,10 +1108,15 @@ impl AdfsFsm {
 
     /// Carve `length_bits` map bits off the head of the free-fragment
     /// at `(zi, free_start, free_length)` and stamp a new
-    /// `frag_id`-tagged fragment there. The remainder of the free
-    /// fragment is rewritten one step ahead with id 0. Caller is
-    /// responsible for re-stamping the zone checksum + cross-check
-    /// and writing the zone back to disc.
+    /// `frag_id`-tagged fragment there. The remainder becomes the new
+    /// chain head (frag-id 0 = chain terminator); the predecessor
+    /// pointer (bit 8 for the root) is rewritten to point to the new
+    /// position.
+    ///
+    /// **Free-list chain semantics** (kernel `scan_free_map`): bit 8
+    /// holds the 15-bit delta to the first free entry; each free
+    /// entry stores the 15-bit delta to the next, with delta <
+    /// `idlen + 1` marking the chain terminator.
     fn carve_fragment_into_zone(
         &mut self,
         zi: u32,
@@ -1114,6 +1124,7 @@ impl AdfsFsm {
         free_length: u32,
         frag_id: u32,
         length_bits: u32,
+        predecessor_bit: u32,
     ) -> Result<u64, FilesystemError> {
         debug_assert!(length_bits > self.idlen);
         debug_assert!(free_length > length_bits + self.idlen);
@@ -1122,21 +1133,27 @@ impl AdfsFsm {
             .get_mut(zi as usize)
             .ok_or_else(|| FilesystemError::InvalidData("ADFS FSM: bad zone index".into()))?;
 
-        // 1. Clear the old free fragment's id + terminator (the bits
-        //    we're overwriting plus the trailing free-frag's leading
-        //    zero word).
+        // 1. Clear the old free fragment's id + terminator.
         clear_bits_le(zone, free_start, free_length);
 
-        // 2. Write the new fragment.
+        // 2. Write the new fragment (frag_id then terminator).
         write_bits_le_inplace(zone, free_start, self.idlen, frag_id as u64);
         set_bit_le(zone, free_start + length_bits - 1, 1);
 
         // 3. Write the shortened free fragment one step ahead.
+        //    Its frag-id stays zero (chain terminator); set the
+        //    trailing terminator.
         let new_free_start = free_start + length_bits;
         let new_free_length = free_length - length_bits;
-        // frag_id 0 is already zero (we cleared it); set the new
-        // terminator at the tail.
         set_bit_le(zone, new_free_start + new_free_length - 1, 1);
+
+        // 4. Update the predecessor pointer in the chain.
+        //    For the root predecessor at bit 8: 15-bit delta to head.
+        //    For an inner predecessor: the predecessor's 15-bit
+        //    frag-id encodes the delta to the next free entry.
+        clear_bits_le(zone, predecessor_bit, 15);
+        let new_delta = new_free_start - predecessor_bit;
+        write_bits_le_inplace(zone, predecessor_bit, 15, new_delta as u64);
 
         // Compute the disc-sector address of the new fragment's start.
         let (startbit, _endbit, startblk) = self.zone_metadata(zi);
@@ -1335,16 +1352,16 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         }
         let frag_id = fsm_ref.next_free_frag_id();
 
-        let (zi, free_start, free_length) = self
+        let (zi, free_start, free_length, predecessor_bit) = self
             .fsm
             .as_ref()
             .unwrap()
             .find_alloc_slot(frag_bits)
             .ok_or_else(|| {
-            FilesystemError::Unsupported(
-                "ADFS: no free FSM slot large enough for this allocation".into(),
-            )
-        })?;
+                FilesystemError::Unsupported(
+                    "ADFS: no free FSM slot large enough for this allocation".into(),
+                )
+            })?;
 
         // Carve the fragment and capture the disc-sector start.
         let start_sector = self.fsm.as_mut().unwrap().carve_fragment_into_zone(
@@ -1353,6 +1370,7 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
             free_length,
             frag_id,
             frag_bits,
+            predecessor_bit,
         )?;
         // Re-stamp checksums across every zone (the cross-check
         // requires touching the last zone's byte 3 even if we wrote
@@ -1770,7 +1788,6 @@ mod tests {
 
         // Zone bitstream — sector 0 bytes 64..863 hold bits 512..6911.
         // dm_startbit = 32 + ADFS_DR_SIZE_BITS = 512.
-        // Free-list link at bit 8 stays zero (no free chain).
         // sectors 0..1 (FSM itself + 1 padding sector)
         write_frag(&mut disk[..SECTOR_SIZE], 512, IDLEN, 16, 0);
         // root dir at sectors 2..3
@@ -1780,6 +1797,9 @@ mod tests {
         // Tail "free" fragment closes the bitstream up to dm_endbit
         // (32 + 6880 = 6912). length = 6912 - 560 = 6352.
         write_frag(&mut disk[..SECTOR_SIZE], 560, IDLEN, 6352, 0);
+        // Free-list chain root at bit 8: 15-bit delta to first (and
+        // only) free fragment, which sits at bit 560. delta = 552.
+        write_bits_le(&mut disk[..SECTOR_SIZE], 8, 15, 560 - 8);
 
         // Root directory at byte 2048 (sector 2). Hugo magic + 1 entry.
         let root_off = ROOT_SECTOR as usize * SECTOR_SIZE;
