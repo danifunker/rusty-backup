@@ -347,73 +347,71 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   E-format ADFS disc with the synthetic-fixture pattern, mount as
   `:0`, `*CAT :0` lists the file, `*Type HELLO` reads back the
   seed. Engine surface shipped (5 unit + 1 e2e + 3 cli); only
-  real-hardware boot outstanding. **ADFS write path AND HDD resize
-  remain blocked behind the FSM walker** — but the RE picture is
-  now much clearer after the 2026-06-04 CROS42 session:
-  - **HD-format encoding fully understood (modulo one off-by
-    constant):** dr.root is a normal indirect-disc-address split with
-    idlen=14 → (frag_id, offset). Fragment IDs are SEQUENTIAL across
-    zones (zone N owns IDs `N*ids_per_zone..(N+1)*ids_per_zone-1`).
-    The FSM lives at a SECONDARY location (NOT byte 0x400 — for
-    CROS42 it's at byte 0xF740000, ~half-disc); each zone is one
-    sector apart. `examples/adfs_hd_zone_scout.rs` does the
-    multi-zone walk and locates the target frag.
-  - **CROS42 root location LOCKED IN via RPCEmu mount + dir
-    analysis:** root dir at byte **`0xF748400`** (sector 506434),
-    uses **old-format Hugo magic** (NOT Nick) with 26-byte entries,
-    self-parent-indaddr = 579 = dr.root confirms it's the root.
-    Earlier `0xDB2000` guess was wrong — that's `!DiscMedic` (an
-    application directory), not the root. The root lives ~16 KB
-    after the second FSM-DR-copy (FSM is replicated twice on HD
-    discs: zone-0-DR at 0xF740004 and 0xF744204, then root sits at
-    0xF748400 = FSM_BASE + 2×FSM_SIZE).
-  - **Root contents** (in order from the Hugo dir):
-    `!Boot` (indaddr 0x109401 = frag 5121 zone 19),
-    `Apps`, `Comms`, `Develop`, `Documents`, `Emulator`, `Emulators`,
-    `Files`, `Games`, `Media`, `Printing`, `ReadMe` (FILE),
-    `Swap`, `Utilities`, `Utils`. The tail name field is `$` —
-    canonical RISC OS root.
-  - **Critical encoding finding:** ADFS HD discs use BOTH old-format
-    (Hugo, 26-byte entries) AND new-format (Nick) dirs side by side.
-    Root + system dirs use Hugo; user app dirs use Nick. Our existing
-    `parse_dir_entry` in `src/fs/adfs.rs` only handles Nick — needs
-    Hugo branch.
-  - **Address formula puzzle:** with the correct root location, the
-    relationship is `frag 579 zone 2 bit 1096 → sector 506434`.
-    Linux's published `result = bit - dm_startbit + dm_startblk`
-    + `sector = result << map2blk` formula gives `dm_startblk(2) =
-    505370` (in sectors, assuming 1 map-bit = 1 sector NOT 1 map-unit
-    = 4096 bytes as `log2_map_bits=12` would suggest). The disc's
-    actual map-unit-byte-alignment is OFF — root at 0xF748400 is
-    only 512-B aligned, NOT 4096-B aligned, so `log2_map_bits=12`
-    can't mean what the docs say it does. The likely truth:
-    `dm_startblk` per zone is computed at mount time by walking the
-    FSM and summing per-fragment allocation bits — NOT a fixed
-    `N × const` formula. Linux's published macro is a documentation
-    error or describes an older/simpler ADFS variant.
-  - **What's needed for the FSM walker + write path + resize:** the
-    cumulative-walk model. At mount time, walk all 33 zones,
-    accumulating per-zone `dm_startblk` from the running total of
-    fragment allocation bits. Then lookups are O(zone-scan) + O(1).
-    ~150-200 LOC + tests. Both discs (CROS42 + ICEBIRD) available
-    to validate against.
-  - **E-format (`arc-04`) encoding still partially open:** the
-    `dr.root=0x203` idlen=15 split gives `frag 515` which doesn't
-    exist in the one-zone E-format FSM; ADFS_ROOT_FRAG=2 might be
-    the convention for E-format only (Linux uses it as a special
-    case in `adfs_map_lookup`). That theory matches our scout's
-    observation that frag 2 = root for E-format.
-  - **Next session unblocks BOTH write and resize:** with the HD
-    formula resolved (one focused look at the kernel's actual
-    `adfs_map_layout` source vs CROS42's bytes), the walker lands
-    in ~150 LOC; create_file + delete_entry build on top of it; and
-    resize is then a small DR-rewrite + zone-0-map-extend slice.
-  - **Samples on disc:**
-    - `C:\Temp\CROS42.hdf` (512 MB populated HD-format, the new
-      reference disc — TOSEC Acorn) — dr.root=0x243, frag 579 in
-      zone 2, root dir Nick magic at byte 0xDB1F01.
-    - `C:\Temp\adfs_arc04_e_orig.adf` (800 K E-format populated,
-      from 8bs.com/pool/arc/arc-04.zip).
+  real-hardware boot outstanding. **ADFS read-side FSM walker
+  landed 2026-06-04** — the formula was the Linux kernel's
+  published `adfs_map_layout` macro applied to the *correctly*
+  parsed disc record. Previous-session puzzles unwound:
+  - **dr.root split was wrong.** The kernel's `__adfs_block_map`
+    (`fs/adfs/adfs.h`) splits indaddr as
+    `frag_id = indaddr >> 8`, `block += ((indaddr & 0xFF) - 1) <<
+    log2sharesize`. CROS42's `dr.root = 0x243` is therefore
+    `(frag_id = 2, indaddr_lo = 0x43)` — `ADFS_ROOT_FRAG = 2`,
+    the same constant E-format uses. Not "frag 579 zone 2".
+  - **`log2bpmb` was misnamed.** Disc-record byte 0x05 is
+    log2(bytes per map bit) (kernel `log2bpmb`), not
+    `log2_map_bits`. `map2blk = log2bpmb - log2_secsize` is the
+    shift that converts a fragment's map-bit count to a sector
+    count. For CROS42 log2bpmb=12, sector=9, map2blk=+3 (1 map
+    bit = 8 sectors = 4096 B).
+  - **FSM is at middle of disc (kernel formula was right).**
+    `map_addr_sec = signed_asl((nzones>>1) * zone_size_bits -
+    ((nzones>1) ? 480 : 0), map2blk)`. For CROS42 (33 zones,
+    zone_size_bits=3986, map2blk=+3): map_addr_sec = 506368 =
+    byte 0xF740000. Matches.
+  - **Resolved end-to-end:** `frag 2`, zone 16, start_bit 40 →
+    result = 40-32+63296 = 63304 → sector 506432 → byte
+    0xF748000 → +secoff (2) → **byte 0xF748400**, where the
+    Hugo magic sits exactly. Same formula resolves ICEBIRD's
+    root and arc-04's E-format root (`dr.root=0x203` →
+    `(frag_id=2, indaddr_lo=3)` → bit 528, length 32 →
+    sector 2 → byte 0x800 Nick). Cross-verified by
+    `examples/adfs_fsm_probe.rs`.
+  - **Walker shipped** (`src/fs/adfs.rs::AdfsFsm`): full DR
+    parser (60 bytes, including `log2bpmb`, `log2sharesize`,
+    `nzones_high`, `disc_size_high`, `format_version`,
+    `root_size`), `map_lookup(indaddr, block)` mirroring
+    `__adfs_block_map` + `adfs_map_lookup`, `free_bytes()`
+    mirroring `adfs_map_statfs`. Wired into `list_directory`
+    + `read_file` for E/F/HD; D-format keeps direct-byte
+    addressing (old-map). Hugo + Nick directory magics treated
+    interchangeably (the layout is identical for 26-byte-entry
+    F-format dirs on this read path).
+  - **Still open:**
+    1. **Real-disc end-to-end** for CROS42 / ICEBIRD blocked
+       by an unrelated `detect_superfloppy` HD-heads check
+       (`heads ∈ 1..=4`, CROS42 has heads=9). Trivial relax,
+       held for the next slice with explicit log.
+    2. **Variable-size F+ directories** (`format_version != 0`,
+       `root_size` from DR). Walker handles size, but the
+       big-dir entry format (`adfs_bigdirentry`, 8-byte
+       indaddr, longer names) needs its own parser. Not
+       observed yet on our samples.
+    3. **Old-map (D-format) FSM** still uses the
+       "indaddr = byte offset" fallback. No D-format real
+       sample to validate against. Reopen if one surfaces.
+    4. **Write path + HDD resize** are still TODO — they
+       build on top of the walker (allocate fragment →
+       splice into bitstream + bump free-list) but each is
+       its own surface.
+  - **Samples on disc** (all confirmed in the 2026-06-04 probe):
+    - `C:\Temp\CROS42.hdf` (512 MB populated HD-format, TOSEC
+      Acorn) — dr.root=0x243, frag 2 zone 16 bit 40 → byte
+      0xF748400 (Hugo). Verified via probe.
+    - `C:\Temp\ICEBIRD.hdf` (512 MB populated HD-format) —
+      identical DR shape to CROS42; same address resolves.
+    - `C:\Temp\adfs_arc04_e_orig.adf` (800 K E-format
+      populated, from 8bs.com/pool/arc/arc-04.zip) — frag 2
+      zone 0 → byte 0x800 (Nick). Verified via probe.
     - `C:\Temp\adfs_blank256E.hdf` (256 MB blank E-format HD).
     - `C:\Temp\adfs_blank1024Eplus.hdf` (1 GB blank E+ format HD).
 - **MiSTer QL core boot test** — workflow A+C per
