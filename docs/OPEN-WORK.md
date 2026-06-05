@@ -358,24 +358,45 @@ see §10. Reopen when new CLI / GUI work surfaces.)
     CROS42 it's at byte 0xF740000, ~half-disc); each zone is one
     sector apart. `examples/adfs_hd_zone_scout.rs` does the
     multi-zone walk and locates the target frag.
-  - **One unresolved gap:** the exact `dm_startblk` formula. Linux
-    source quotes `dm_startblk(N) = N * zone_size_bits -
-    ADFS_DR_SIZE_BITS` (= 7492 for zone 2) but on CROS42 the
-    empirical value is 2442 for zone 2 (target derived from the
-    actual root location at byte 0xDB2000 = sector 28048 = map-unit
-    3506). ICEBIRD.hdf added as a second populated reference disc —
-    same DR + FSM layout as CROS42, but mostly empty (it only carries
-    the reserved `frag 2` markers in zones 0 + 16; no `frag 579`
-    anywhere). That confirms both discs are standard MiSTer Archie
-    HDF templates but means ICEBIRD can't cross-validate the address
-    formula (the lookup never triggers). What's needed to crack this
-    is the **verbatim** body of `adfs_map_layout()` and
-    `adfs_read_map()` from a recent Linux kernel `fs/adfs/map.c` —
-    the published-macro summary doesn't match the on-disc reality,
-    so the kernel must be doing something the docs don't capture.
-    Likely candidates: a non-linear per-zone offset (consumed-bits
-    cumulative), or a sign-flipped subtraction we've been parsing
-    backwards.
+  - **CROS42 root location LOCKED IN via RPCEmu mount + dir
+    analysis:** root dir at byte **`0xF748400`** (sector 506434),
+    uses **old-format Hugo magic** (NOT Nick) with 26-byte entries,
+    self-parent-indaddr = 579 = dr.root confirms it's the root.
+    Earlier `0xDB2000` guess was wrong — that's `!DiscMedic` (an
+    application directory), not the root. The root lives ~16 KB
+    after the second FSM-DR-copy (FSM is replicated twice on HD
+    discs: zone-0-DR at 0xF740004 and 0xF744204, then root sits at
+    0xF748400 = FSM_BASE + 2×FSM_SIZE).
+  - **Root contents** (in order from the Hugo dir):
+    `!Boot` (indaddr 0x109401 = frag 5121 zone 19),
+    `Apps`, `Comms`, `Develop`, `Documents`, `Emulator`, `Emulators`,
+    `Files`, `Games`, `Media`, `Printing`, `ReadMe` (FILE),
+    `Swap`, `Utilities`, `Utils`. The tail name field is `$` —
+    canonical RISC OS root.
+  - **Critical encoding finding:** ADFS HD discs use BOTH old-format
+    (Hugo, 26-byte entries) AND new-format (Nick) dirs side by side.
+    Root + system dirs use Hugo; user app dirs use Nick. Our existing
+    `parse_dir_entry` in `src/fs/adfs.rs` only handles Nick — needs
+    Hugo branch.
+  - **Address formula puzzle:** with the correct root location, the
+    relationship is `frag 579 zone 2 bit 1096 → sector 506434`.
+    Linux's published `result = bit - dm_startbit + dm_startblk`
+    + `sector = result << map2blk` formula gives `dm_startblk(2) =
+    505370` (in sectors, assuming 1 map-bit = 1 sector NOT 1 map-unit
+    = 4096 bytes as `log2_map_bits=12` would suggest). The disc's
+    actual map-unit-byte-alignment is OFF — root at 0xF748400 is
+    only 512-B aligned, NOT 4096-B aligned, so `log2_map_bits=12`
+    can't mean what the docs say it does. The likely truth:
+    `dm_startblk` per zone is computed at mount time by walking the
+    FSM and summing per-fragment allocation bits — NOT a fixed
+    `N × const` formula. Linux's published macro is a documentation
+    error or describes an older/simpler ADFS variant.
+  - **What's needed for the FSM walker + write path + resize:** the
+    cumulative-walk model. At mount time, walk all 33 zones,
+    accumulating per-zone `dm_startblk` from the running total of
+    fragment allocation bits. Then lookups are O(zone-scan) + O(1).
+    ~150-200 LOC + tests. Both discs (CROS42 + ICEBIRD) available
+    to validate against.
   - **E-format (`arc-04`) encoding still partially open:** the
     `dr.root=0x203` idlen=15 split gives `frag 515` which doesn't
     exist in the one-zone E-format FSM; ADFS_ROOT_FRAG=2 might be
