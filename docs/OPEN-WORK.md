@@ -382,24 +382,33 @@ see §10. Reopen when new CLI / GUI work surfaces.)
     `root_size`), `map_lookup(indaddr, block)` mirroring
     `__adfs_block_map` + `adfs_map_lookup`, `free_bytes()`
     mirroring `adfs_map_statfs`. Wired into `list_directory`
-    + `read_file` for E/F/HD; D-format keeps direct-byte
-    addressing (old-map). Hugo + Nick directory magics treated
-    interchangeably (the layout is identical for 26-byte-entry
-    F-format dirs on this read path).
+    (root + subdirs) + `read_file` for E/F/HD; D-format keeps
+    direct-byte addressing (old-map). Hugo + Nick directory
+    magics treated interchangeably (the layout is identical
+    for 26-byte-entry F-format dirs on this read path).
+  - **End-to-end byte-truth confirmed:**
+    `rb-cli ls 'C:\Temp\CROS42.hdf'` returns the full root
+    (!Boot / Apps / Comms / Develop / Documents / Emulator /
+    Emulators / Files / Games / Media / Printing / ReadMe
+    (FILE 607 B) / Swap / Utilities / Utils — exact match to
+    the 2026-06-04 RPCEmu-mount ground truth). Subdirs descend
+    too: `rb-cli ls 'C:\Temp\CROS42.hdf' Apps/!Clock` lists
+    !Help / !Run / !RunImage / !Sprites / !Sprites22 /
+    !Sprites23 / Messages. File extraction byte-exact:
+    `rb-cli get 'C:\Temp\CROS42.hdf' Apps/!Clock/!Help` pulls
+    the 363-byte help text verbatim. ICEBIRD lists
+    ClassicROS / Demos / Diskmags / Tools; arc-04 lists
+    1_DataComm.
   - **Still open:**
-    1. **Real-disc end-to-end** for CROS42 / ICEBIRD blocked
-       by an unrelated `detect_superfloppy` HD-heads check
-       (`heads ∈ 1..=4`, CROS42 has heads=9). Trivial relax,
-       held for the next slice with explicit log.
-    2. **Variable-size F+ directories** (`format_version != 0`,
+    1. **Variable-size F+ directories** (`format_version != 0`,
        `root_size` from DR). Walker handles size, but the
        big-dir entry format (`adfs_bigdirentry`, 8-byte
        indaddr, longer names) needs its own parser. Not
        observed yet on our samples.
-    3. **Old-map (D-format) FSM** still uses the
+    2. **Old-map (D-format) FSM** still uses the
        "indaddr = byte offset" fallback. No D-format real
        sample to validate against. Reopen if one surfaces.
-    4. **Write path + HDD resize** are still TODO — they
+    3. **Write path + HDD resize** are still TODO — they
        build on top of the walker (allocate fragment →
        splice into bitstream + bump free-list) but each is
        its own surface.

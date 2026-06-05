@@ -878,12 +878,6 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
         }
         Ok(entries)
     }
-
-    /// Read and parse the root directory.
-    fn read_root_directory(&mut self) -> Result<Vec<AdfsDirEntry>, FilesystemError> {
-        let block = self.read_dir_block(self.disc_record.root)?;
-        Self::parse_dir_block(&block)
-    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
@@ -892,13 +886,24 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        if entry.path != "/" {
-            return Ok(Vec::new()); // subdir traversal deferred
-        }
-        let entries = self.read_root_directory()?;
+        // Root takes its indaddr from the disc record; every other
+        // directory's indaddr rides on `entry.location` (set when its
+        // parent listed it as a `FileEntry::new_directory(.., indaddr)`).
+        let indaddr = if entry.path == "/" {
+            self.disc_record.root
+        } else {
+            entry.location as u32
+        };
+        let block = self.read_dir_block(indaddr)?;
+        let entries = Self::parse_dir_block(&block)?;
         let mut out = Vec::with_capacity(entries.len());
+        let prefix = if entry.path == "/" {
+            String::new()
+        } else {
+            entry.path.trim_end_matches('/').to_string()
+        };
         for de in entries {
-            let path = format!("/{}", de.name);
+            let path = format!("{}/{}", prefix, de.name);
             let mut fe = if de.is_directory() {
                 FileEntry::new_directory(de.name.clone(), path, de.indirect_disc_addr as u64)
             } else {
@@ -1151,6 +1156,30 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "HELLO");
         assert_eq!(entries[0].size, 32);
+    }
+
+    #[test]
+    fn list_directory_dispatches_on_entry_indaddr_for_non_root() {
+        // A non-root FileEntry must drive `list_directory` through its
+        // own `location` (the directory's indaddr), not the disc record
+        // root. We exercise that by pointing a synthetic subdir entry
+        // at the existing root dir's indaddr — same contents come back
+        // from a subdir call as from a root call.
+        let disk = build_eformat_with_one_file();
+        let cur = Cursor::new(disk);
+        let mut fs = AdfsFilesystem::open(cur, 0).unwrap();
+        let synthetic_sub = FileEntry::new_directory(
+            "RootClone".into(),
+            "/RootClone".into(),
+            0x200, // same indaddr as `dr.root` — points to the root dir.
+        );
+        let via_subdir = fs.list_directory(&synthetic_sub).unwrap();
+        let root = fs.root().unwrap();
+        let via_root = fs.list_directory(&root).unwrap();
+        assert_eq!(via_subdir.len(), via_root.len());
+        assert_eq!(via_subdir[0].name, via_root[0].name);
+        // Subdir entries should carry the prefixed path.
+        assert!(via_subdir[0].path.starts_with("/RootClone/"));
     }
 
     #[test]
