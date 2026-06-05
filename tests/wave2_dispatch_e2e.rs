@@ -77,29 +77,35 @@ fn dispatch_via_human68k_string_works_end_to_end_and_write_round_trips() {
 // ADFS — auto-detect via Disc Record probe
 // ----------------------------------------------------------------------------
 
+/// FSM-valid synthetic E-format ADFS floppy. Same layout as
+/// `tests/cli_archie.rs::build_adfs_eformat_disk` (and the in-tree
+/// `src/fs/adfs.rs::tests::build_eformat_with_one_file` unit-test
+/// fixture): single-zone disc, `dr.root = 0x200`, HELLO at indaddr
+/// `0x500`. The walker resolves these the kernel way.
 fn build_adfs_eformat_disk() -> Vec<u8> {
-    const TOTAL_BYTES: usize = 800 * 1024;
-    const SECTOR_SIZE: u32 = 1024;
-    const FILE_SECTOR: u32 = 0x10;
-    const ROOT_SECTOR: u32 = 0x20;
-    let dr_off = 0xC00usize + 0x1C0;
+    const SECTOR_SIZE: usize = 1024;
+    const TOTAL_BYTES: usize = 12 * SECTOR_SIZE;
+    const ROOT_SECTOR: u32 = 2;
+    const FILE_SECTOR: u32 = 4;
+    const IDLEN: u32 = 15;
     let mut disk = vec![0u8; TOTAL_BYTES];
-    disk[dr_off] = 10;
-    disk[dr_off + 0x01] = 5;
-    disk[dr_off + 0x02] = 2;
-    disk[dr_off + 0x03] = 2;
-    disk[dr_off + 0x04] = 15;
-    disk[dr_off + 0x05] = 7;
-    disk[dr_off + 0x09] = 2;
-    LittleEndian::write_u16(&mut disk[dr_off + 0x0A..dr_off + 0x0C], 32);
-    LittleEndian::write_u32(
-        &mut disk[dr_off + 0x0C..dr_off + 0x10],
-        ROOT_SECTOR * SECTOR_SIZE,
-    );
-    LittleEndian::write_u32(&mut disk[dr_off + 0x10..dr_off + 0x14], 800);
-    LittleEndian::write_u16(&mut disk[dr_off + 0x14..dr_off + 0x16], 0xABCD);
-    disk[dr_off + 0x16..dr_off + 0x20].copy_from_slice(b"AutoDisc  ");
-    let root_off = (ROOT_SECTOR * SECTOR_SIZE) as usize;
+
+    // DR at byte 4 (kernel adfs_validate_dr0) — populate the embedded
+    // copy AND the boot-block copy at byte 0xDC0 so both detect sites
+    // in `detect_superfloppy` / `detect_filesystem_type` succeed.
+    let dr_buf = build_dr_bytes(IDLEN, TOTAL_BYTES as u32);
+    disk[0x04..0x04 + 60].copy_from_slice(&dr_buf);
+    disk[0xDC0..0xDC0 + 60].copy_from_slice(&dr_buf);
+
+    // FSM bitstream in zone 0.
+    set_bit_le(&mut disk[..SECTOR_SIZE], 512 + 16 - 1); // frag 0  sectors 0..1
+    write_frag_bits(&mut disk[..SECTOR_SIZE], 528, IDLEN, 16, 2); // root  sectors 2..3
+    write_frag_bits(&mut disk[..SECTOR_SIZE], 544, IDLEN, 16, 5); // HELLO sectors 4..5
+    write_frag_bits(&mut disk[..SECTOR_SIZE], 560, IDLEN, 6352, 0); // tail free
+
+    // Root dir at byte 2048 with one entry "HELLO" of 16 bytes at
+    // frag 5 (indaddr 0x500).
+    let root_off = ROOT_SECTOR as usize * SECTOR_SIZE;
     disk[root_off + 1] = b'H';
     disk[root_off + 2] = b'u';
     disk[root_off + 3] = b'g';
@@ -107,13 +113,45 @@ fn build_adfs_eformat_disk() -> Vec<u8> {
     let e_off = root_off + 5;
     disk[e_off..e_off + 5].copy_from_slice(b"HELLO");
     LittleEndian::write_u32(&mut disk[e_off + 18..e_off + 22], 16);
-    let f = FILE_SECTOR * SECTOR_SIZE;
-    disk[e_off + 22] = (f & 0xFF) as u8;
-    disk[e_off + 23] = ((f >> 8) & 0xFF) as u8;
-    disk[e_off + 24] = ((f >> 16) & 0xFF) as u8;
+    disk[e_off + 22] = 0x00; // indaddr lo
+    disk[e_off + 23] = 0x05; // frag_id (>> 8)
+    disk[e_off + 24] = 0x00;
     disk[e_off + 25] = 0x03;
-    disk[f as usize..f as usize + 16].copy_from_slice(b"adfs auto detect");
+
+    // File payload at byte 4096 (sector 4).
+    let file_off = FILE_SECTOR as usize * SECTOR_SIZE;
+    disk[file_off..file_off + 16].copy_from_slice(b"adfs auto detect");
     disk
+}
+
+fn build_dr_bytes(idlen: u32, total_bytes: u32) -> [u8; 60] {
+    let mut dr = [0u8; 60];
+    dr[0x00] = 10; // log2_secsize
+    dr[0x01] = 5;
+    dr[0x02] = 2;
+    dr[0x03] = 2;
+    dr[0x04] = idlen as u8;
+    dr[0x05] = 7; // log2bpmb
+    dr[0x09] = 1; // nzones
+    LittleEndian::write_u16(&mut dr[0x0A..0x0C], 1312); // zone_spare
+    LittleEndian::write_u32(&mut dr[0x0C..0x10], 0x200); // dr.root
+    LittleEndian::write_u32(&mut dr[0x10..0x14], total_bytes);
+    LittleEndian::write_u16(&mut dr[0x14..0x16], 0xABCD);
+    dr[0x16..0x20].copy_from_slice(b"AutoDisc  ");
+    dr
+}
+
+fn set_bit_le(buf: &mut [u8], pos: u32) {
+    buf[(pos >> 3) as usize] |= 1 << (pos & 7);
+}
+
+fn write_frag_bits(buf: &mut [u8], start: u32, idlen: u32, length_bits: u32, frag_id: u32) {
+    for k in 0..idlen {
+        if (frag_id >> k) & 1 == 1 {
+            set_bit_le(buf, start + k);
+        }
+    }
+    set_bit_le(buf, start + length_bits - 1);
 }
 
 #[test]

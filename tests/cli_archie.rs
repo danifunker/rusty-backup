@@ -1,17 +1,13 @@
 //! End-to-end CLI tests for the Acorn Archimedes / ADFS spine.
 //!
-//! Synthesizes a tiny 800 KB E-format ADFS floppy at test time (the
-//! same shape as the inline `build_eformat_with_one_file` fixture in
+//! Synthesizes a tiny E-format ADFS floppy at test time (the same
+//! shape as the inline `build_eformat_with_one_file` fixture in
 //! `src/fs/adfs.rs`) and drives it through `rb-cli`.
 //!
-//! Scope is CURRENTLY READ-ONLY: ADFS write path is parked at
-//! OPEN-WORK §7 behind the FSM walker (see the session log in
-//! `docs/mister_filesystem_implementation_plan.md`). `inspect` /
-//! `ls` / `get` go through the engine's contiguous-extent assumption,
-//! which holds for the synthetic fixture and for freshly-written real
-//! discs but not for fragmented production volumes — the latter need
-//! the FSM walker. Stage 9 (CLI parity) for the Archie row is covered
-//! here; stage 6 (write-verified) ships once the FSM walker lands.
+//! The fixture has a structurally valid FSM with three named
+//! fragments (`0 = free`, `2 = root dir`, `5 = HELLO`), so the walker
+//! resolves `dr.root = 0x200` and the HELLO entry's `indaddr = 0x500`
+//! the same way it does on real arc-04 / CROS42 / ICEBIRD discs.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -38,35 +34,77 @@ fn run(args: &[&str]) -> std::process::Output {
     out
 }
 
-/// Build an 800 KB E-format ADFS floppy with one root-level file
-/// "HELLO" of 30 bytes at sector 0x10. DR at byte 0xDC0 (legacy floppy
-/// boot-block + 0x1C0). Root directory ($) at byte 0x8000 with the
-/// "Hugo" magic — small-format dir, 47-entry capacity.
+/// Write a single bit at LE bit position `pos` in `buf`.
+fn set_bit_le(buf: &mut [u8], pos: u32) {
+    buf[(pos >> 3) as usize] |= 1 << (pos & 7);
+}
+
+/// Write `nbits` LE bits of `value` starting at bit `start`.
+fn write_bits_le(buf: &mut [u8], start: u32, nbits: u32, value: u64) {
+    for k in 0..nbits {
+        let pos = start + k;
+        if (value >> k) & 1 == 1 {
+            set_bit_le(buf, pos);
+        }
+    }
+}
+
+/// Write a Filecore fragment of `length_bits` map bits at bit `start`:
+/// `idlen` bits of `frag_id`, zeros, then a 1-bit terminator at the
+/// tail. The same primitive the in-tree unit-test fixture uses.
+fn write_frag(buf: &mut [u8], start: u32, idlen: u32, length_bits: u32, frag_id: u32) {
+    write_bits_le(buf, start, idlen, frag_id as u64);
+    set_bit_le(buf, start + length_bits - 1);
+}
+
+/// Build a tiny FSM-valid E-format ADFS floppy with one root-level
+/// file "HELLO" (30 bytes). Mirrors the kernel `adfs_validate_dr0`
+/// single-zone layout: 4-byte zone header + 60-byte DR at byte 0,
+/// bitstream starting at bit 512 of zone 0.
+///
+/// FSM params: log2_secsize=10, idlen=15, log2bpmb=7, nzones=1,
+/// zone_spare=1312 (zone_size_bits = 6880, map2blk = -3 ⇒ 1 map bit
+/// = 128 B). Fragments laid out in zone 0:
+///
+/// ```text
+/// bit 512: frag 0  length 16  (FSM + 1 padding sector)
+/// bit 528: frag 2  length 16  (root dir at sectors 2..3)
+/// bit 544: frag 5  length 16  (HELLO payload at sectors 4..5)
+/// bit 560: frag 0  length 6352 (tail free; closes the bitstream)
+/// ```
 fn build_adfs_eformat_disk() -> Vec<u8> {
-    const TOTAL_BYTES: usize = 800 * 1024;
-    const SECTOR_SIZE: u32 = 1024;
-    const FILE_SECTOR: u32 = 0x10;
-    const ROOT_SECTOR: u32 = 0x20;
+    const SECTOR_SIZE: usize = 1024;
+    const TOTAL_BYTES: usize = 12 * SECTOR_SIZE;
+    const ROOT_SECTOR: u32 = 2;
+    const FILE_SECTOR: u32 = 4;
+    const IDLEN: u32 = 15;
     let mut disk = vec![0u8; TOTAL_BYTES];
 
-    let dr_off = 0xDC0usize;
-    disk[dr_off] = 10;
+    // Disc Record at byte 4 (zone-0-embedded — kernel
+    // `adfs_validate_dr0` path).
+    let dr_off = 0x04usize;
+    disk[dr_off] = 10; // log2(1024)
     disk[dr_off + 0x01] = 5;
     disk[dr_off + 0x02] = 2;
     disk[dr_off + 0x03] = 2;
-    disk[dr_off + 0x04] = 15;
-    disk[dr_off + 0x05] = 7;
-    disk[dr_off + 0x09] = 2;
-    LittleEndian::write_u16(&mut disk[dr_off + 0x0A..dr_off + 0x0C], 32);
-    LittleEndian::write_u32(
-        &mut disk[dr_off + 0x0C..dr_off + 0x10],
-        ROOT_SECTOR * SECTOR_SIZE,
-    );
-    LittleEndian::write_u32(&mut disk[dr_off + 0x10..dr_off + 0x14], 800);
+    disk[dr_off + 0x04] = IDLEN as u8;
+    disk[dr_off + 0x05] = 7; // log2bpmb -> 1 map bit = 128 B
+    disk[dr_off + 0x09] = 1; // nzones
+    LittleEndian::write_u16(&mut disk[dr_off + 0x0A..dr_off + 0x0C], 1312);
+    // dr.root = (frag 2, lo=0) = 0x200
+    LittleEndian::write_u32(&mut disk[dr_off + 0x0C..dr_off + 0x10], 0x200);
+    LittleEndian::write_u32(&mut disk[dr_off + 0x10..dr_off + 0x14], TOTAL_BYTES as u32);
     LittleEndian::write_u16(&mut disk[dr_off + 0x14..dr_off + 0x16], 0xABCD);
     disk[dr_off + 0x16..dr_off + 0x20].copy_from_slice(b"CliArchie ");
 
-    let root_off = (ROOT_SECTOR * SECTOR_SIZE) as usize;
+    // Populate the FSM zone-0 bitstream.
+    write_frag(&mut disk[..SECTOR_SIZE], 512, IDLEN, 16, 0); // sectors 0..1
+    write_frag(&mut disk[..SECTOR_SIZE], 528, IDLEN, 16, 2); // root sectors 2..3
+    write_frag(&mut disk[..SECTOR_SIZE], 544, IDLEN, 16, 5); // HELLO sectors 4..5
+    write_frag(&mut disk[..SECTOR_SIZE], 560, IDLEN, 6352, 0); // tail free
+
+    // Root directory at byte 2048 (sector 2): Hugo magic + 1 entry.
+    let root_off = ROOT_SECTOR as usize * SECTOR_SIZE;
     disk[root_off + 1] = b'H';
     disk[root_off + 2] = b'u';
     disk[root_off + 3] = b'g';
@@ -77,14 +115,16 @@ fn build_adfs_eformat_disk() -> Vec<u8> {
     LittleEndian::write_u32(&mut disk[e_off + 10..e_off + 14], 0xFFFFFFFF);
     LittleEndian::write_u32(&mut disk[e_off + 14..e_off + 18], 0);
     LittleEndian::write_u32(&mut disk[e_off + 18..e_off + 22], 30);
-    let file_byte_off = FILE_SECTOR * SECTOR_SIZE;
-    disk[e_off + 22] = (file_byte_off & 0xFF) as u8;
-    disk[e_off + 23] = ((file_byte_off >> 8) & 0xFF) as u8;
-    disk[e_off + 24] = ((file_byte_off >> 16) & 0xFF) as u8;
-    disk[e_off + 25] = 0x03;
+    // indaddr = (frag 5, lo=0) = 0x500
+    disk[e_off + 22] = 0x00;
+    disk[e_off + 23] = 0x05;
+    disk[e_off + 24] = 0x00;
+    disk[e_off + 25] = 0x03; // R + W
 
+    // File payload at byte 4096 (sector 4).
+    let file_byte_off = FILE_SECTOR as usize * SECTOR_SIZE;
     let payload = b"acorn archie cli parity test\x0d\x0a";
-    disk[file_byte_off as usize..file_byte_off as usize + payload.len()].copy_from_slice(payload);
+    disk[file_byte_off..file_byte_off + payload.len()].copy_from_slice(payload);
     disk
 }
 
