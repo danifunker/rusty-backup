@@ -20,28 +20,73 @@ below are the reference/design; this tracker is the live state.
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done ·
 `[!]` blocked (add a note).
 
-**Current position:** Wave 2 nearly complete on dispatch + write paths
-+ CLI parity + HDD resize for X68000 and QL. QDOS (QXL.WIN) graduated
+**Current position:** Wave 2 engine code complete on every row except
+HDD resize for Archie. ADFS read + write + create + delete shipped
+end-to-end on real discs (CROS42 / ICEBIRD / arc-04) via the FSM
+walker + freelink-chain carve. `rb-cli put` / `rb-cli get` /
+`rb-cli rm` round-trip byte-exact on a copy of CROS42. The ADFS
+read-side puzzle was the kernel's two-corrections: `log2bpmb` (byte
+0x05) is log2-bytes-per-map-bit (not log2-map-bits), and indaddrs
+split as `frag_id = indaddr >> 8` (not idlen-based), making
+`dr.root = 0x243` resolve via `ADFS_ROOT_FRAG = 2` with in-frag
+offset 0x43 — the same constant E-format uses. With those fixed,
+the kernel's published `adfs_map_layout` macro lines up cleanly.
+Write-verified parks on every Wave-2 row are user-side
+(RPCEmu / MiSTer mount). The only engine item still open on the
+spine is **Archie HDD resize**, deferred behind FSM relocation
+(growing nzones moves the physical FSM into the data area; no
+byte-truth oracle, and the workaround is the in-RISC-OS
+`*AddDrive` step on the real machine). QDOS (QXL.WIN) graduated
 from read-only to full `EditableFilesystem` with sQLux byte-truth
-oracle pass; the per-file 64-byte QDOS header convention is honoured
-on both sides. Human68k already shipped full Add/Delete; Altair CP/M
-holds the only `[x]`-everywhere row via the cpmtools byte-identity
-oracle. CLI parity tests
-(`tests/cli_{x68000,archie,ql,altair,bk0011m}.rs`) ship end-to-end —
-exposed three latent bugs (FAT12/16 reading bytes 20..21 as the
-high-cluster pointer; `detect_superfloppy` missing the ANDOS
-signature; `is_floppy_size` missing Altair 8" SSSD sizes). HDD
-resize round-trip tests (`tests/x68000_resize.rs`, `tests/ql_resize.rs`)
-exercise reconstruct_disk_from_backup → per-FS resize end-to-end on
-both Wave-2 HDD cores. ADFS write **and resize** remain the only
-remaining Wave-2 hold-out, blocked on (a) the dr.root encoding
-mystery — 8bs.com E-format `arc-04` sample shows `dr.root=0x203` is
-NOT a direct fragment-ID lookup — and (b) a non-blank reference disc
-with known layout. Spillover still in flight: the CP/M engine covers
-Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
+oracle pass. Human68k already shipped full Add/Delete; Altair
+CP/M holds the cpmtools byte-identity oracle. CLI parity tests
+(`tests/cli_{x68000,archie,ql,altair,bk0011m}.rs`) all green.
+HDD resize round-trip tests (`tests/x68000_resize.rs`,
+`tests/ql_resize.rs`) exercise reconstruct_disk_from_backup →
+per-FS resize end-to-end on the two Wave-2 HDD cores that aren't
+ADFS. Spillover still in flight: the CP/M engine covers Wave-3
+Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-05 (ADFS read+write end-to-end — closes Archie row to user-
+  side parks) — Cracked the ADFS read-side puzzle via Linux kernel
+  `fs/adfs/map.c` source-dive: `log2bpmb` (DR byte 0x05) is log2-bytes-
+  per-map-bit (not log2-map-bits), and indaddrs split as `frag_id =
+  indaddr >> 8` with the low byte as an in-frag sector offset (not
+  idlen-based). With both fixed, the kernel's published
+  `adfs_map_layout` macro lines up: CROS42 `dr.root = 0x243` resolves
+  via `ADFS_ROOT_FRAG = 2` + offset 67 → byte 0xF748400 byte-exact,
+  matching the Hugo magic position. Shipped `AdfsFsm` (full 60-byte
+  DR parser + `map_lookup` + `free_bytes`), wired into `list_directory`
+  + `read_file` end-to-end. Subdir traversal lifted from "deferred" —
+  `rb-cli ls 'Apps/!Clock'` lists 7 entries, `rb-cli get
+  'Apps/!Clock/!Help'` pulls 363 bytes of real RISC-OS docs byte-exact.
+  Write side built on top: `adfs_calczonecheck` + cross-check
+  re-stamp, `find_chain_head` walks the kernel-style `scan_free_map`
+  freelink chain, `carve_fragment_into_zone` allocates from the chain
+  root and rewrites the predecessor pointer (bit 8 for the chain
+  root; would be the prev-free-entry's 15-bit slot for inner chain
+  steps). Duplicate FSM copy at `map_addr + nzones * sector_size`
+  written via DR-fingerprint sniff so marutan.net blank discs (single
+  copy) work too. `EditableFilesystem` impl: `create_file` +
+  `create_directory` + `delete_entry` + `sync_metadata` (no-op,
+  every primitive flushes synchronously). `open_editable_filesystem`
+  + `_by_string` get `adfs` arms so `rb-cli put` / `rb-cli rm` /
+  `rb-cli mkdir` dispatch. End-to-end on a copy of CROS42:
+  `put MyTest`, `get MyTest` → byte-exact diff with original,
+  `rm MyTest` → file gone from listing, existing `Apps/!Clock/!Help`
+  still byte-identical across the cycle. ICEBIRD round-trips the
+  same way. 1658 lib tests pass (+11 over the prior baseline);
+  only the documented Windows enumerate-devices flake fails.
+  **Archie row now matches QL pattern**: every engine `[!]`
+  becomes `[x]` (add/del), `ref / write-verified / gui` stay
+  `[!]` as user-side parks. **HDD resize deferred** behind FSM
+  relocation (growing nzones moves `map_addr` into the data area;
+  no byte-truth oracle, and `*AddDrive` in RISC OS is the
+  workaround on real hardware). **Next**: user-side validation
+  (RPCEmu / MiSTer Archie mount of a put-modified disc), or
+  pick up Wave-3 floppy cores via the CP/M spillover.
 - 2026-06-04 (ADFS HD-format RE — populated reference disc + Linux
   source dive + frag 579 located in CROS42 zone 2) — Big unblock for
   Archie write+resize. User dropped a populated 512 MB HD-format disc
@@ -544,7 +589,7 @@ A core is **done** only when every applicable stage is `[x]`.
 ### Wave 2 — new dual-media cores (all carry the full spine incl. resize unless noted)
 
 - [~] **X68000** (Human68k) — prereqs [x] `.d88` container [x] X68k SASI partition · [x] inspect · [x] extract · [!] ref (parked OPEN-WORK §7 user-side: MiSTer X68000 core boot test) · [x] add/del (EditableFilesystem create_file w/ FAT12 chain alloc + delete via 0xE5 marker) · [!] write-verified (parked §7 user-side) · [x] resize (X68k sidecar + patch_x68k_entries + reconstruct_disk_from_backup branch; per-FS resize via existing resize_fat_in_place on the Human68k BPB; e2e round-trip in tests/x68000_resize.rs) · [!] gui (dispatch shared; parked §7) · [x] cli (tests/cli_x68000.rs — 4 tests: inspect/ls on wrapped .d88 + get/put on flat) · [x] tests (12 unit + 3 e2e + 4 cli + 5 d88_e2e + 7 x68k partition unit tests)
-- [~] **Archie** (ADFS/FileCore) — prereq [x] `.hdf` header handling (bare + Arculator-wrapped) · [x] inspect (auto-detect via Disc Record probe; scan candidates 0xFC0, 0xDC0, 0x404 for HDD + E-format floppy + legacy floppy) · [x] extract (contiguous-extent file read) · [!] ref (parked §7 user-side: MiSTer Archie core boot test) · [!] add/del (FSM walker scout did pass — see session log; **blocked** on dr.root encoding for E-format + non-blank reference disc) · [!] write-verified (parked §7) · [!] resize (**blocked** behind the same FSM walker + non-blank HD reference — resize writes the DR + extends zone-0 map, no oracle to validate against without those) · [!] gui (dispatch shared) · [x] cli (tests/cli_archie.rs — 3 tests: inspect/ls/get on synthetic E-format floppy) · [x] tests (5 unit + 1 e2e + 3 cli)
+- [~] **Archie** (ADFS/FileCore) — prereq [x] `.hdf` header handling (bare + Arculator-wrapped) · [x] inspect (full DR + FSM walker; auto-detect via byte-0xDC0 / byte-0x04 probe) · [x] extract (FSM-driven `__adfs_block_map` + `adfs_map_lookup`, fragmented files supported; verified byte-exact on CROS42 / ICEBIRD / arc-04) · [!] ref (parked §7 user-side: MiSTer Archie core boot test) · [x] add/del (full `EditableFilesystem`: `create_file` + `create_directory` + `delete_entry` with freelink-chain carve, zone-checksum + cross-check re-stamp, duplicate-FSM-copy write; CROS42 round-trip put → get → diff byte-exact, rm cleanly removes) · [!] write-verified (parked §7 user-side: RPCEmu / MiSTer Archie mount of a put-modified disc) · [!] resize (**deferred** behind FSM relocation — the kernel's `map_addr = (nzones>>1)*zone_size_bits` formula means growing nzones moves the physical FSM into the data area; would require walking every fragment + relocating any that overlap the new FSM position, with no byte-truth oracle to validate. Workaround: byte-exact restore + `*AddDrive` in RISC OS. See OPEN-WORK §7 for the full reasoning.) · [!] gui (dispatch shared) · [x] cli (tests/cli_archie.rs — 3 tests + rb-cli put/get/rm round-trip on CROS42 copy) · [x] tests (17 unit + 1 e2e + 3 cli)
 - [~] **QL** (QDOS) — prereqs [ ] `.mdv` [x] `QXL.WIN` container · [x] inspect (auto-detect via QLWA signature in detect_filesystem_type + detect_superfloppy) · [x] extract (per-file 64-byte QDOS header stripped from user-visible data) · [x] ref (sQLux byte-truth oracle — headless SDL_VIDEODRIVER=offscreen, rb-cli put → SuperBASIC COPY → host file round-trips byte-exact against kilgus QXL.WIN) · [x] add/del (EditableFilesystem create_file/delete_entry: ffc+fc+rlen bookkeeping per sQLux QDisk.c QLWA_GetFreeBlock/QLWA_KillFile, plus per-file header stamping) · [x] write-verified (sQLux oracle pass) · [x] resize (resize_qdos_in_place — growth + shrink with free-chain bookkeeping; wired into resize_filesystem_for; e2e in tests/ql_resize.rs; surfaced + fixed a latent blind-dispatch bug in resize_btrfs_in_place for small images) · [!] gui (dispatch shared; parked §7 polish) · [x] cli (tests/cli_ql.rs — 5 tests: full inspect/ls/get/put/rm round-trip) · [x] tests (25 unit + 3 e2e + 5 cli)
 - [~] **Altair8800 / CP/M** — prereqs [x] DPB registry [x] EDSK · [x] inspect (dispatch via `cpm:<dpb>` partition_type_string; superfloppy fallback for 255_488 + 256_256 byte 8" SSSD discs) · [x] extract · [x] ref (cpmtools cpmls/cpmcp byte-identity oracle) · [x] add/del · [x] write-verified · [!] gui (dispatch shared; §7 polish) · [~] cli (tests/cli_altair.rs — 2 tests: inspect + engine-level read; full rb-cli `--fs-type cpm:NAME` flag pending — CP/M has no on-disk signature so auto-dispatch cannot work without it) · [x] tests (8 unit + 4 e2e + 2 cli)
 - [x] **BK0011M** (ANDOS) — **detect-only by design** (see OPEN-WORK §9). · [x] inspect (auto-detect: detect_filesystem_type AND detect_superfloppy both probe the 4 candidate offsets) · n/a extract / ref / add+del / write-verified / resize — no English-language ANDOS spec, no community-maintained reader to validate against, tiny target audience among rusty-backup retro enthusiasts. The scaffold surfaces a clean `Unsupported` for every operation past inspect, which is the floor the spine row is now pegged to. · [x] cli (tests/cli_bk0011m.rs — 2 tests: inspect routes to ANDOS engine, ls surfaces clean Unsupported) · [x] tests (4 unit + 1 e2e + 2 cli)

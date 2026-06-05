@@ -386,7 +386,7 @@ see §10. Reopen when new CLI / GUI work surfaces.)
     direct-byte addressing (old-map). Hugo + Nick directory
     magics treated interchangeably (the layout is identical
     for 26-byte-entry F-format dirs on this read path).
-  - **End-to-end byte-truth confirmed:**
+  - **End-to-end byte-truth confirmed (read side):**
     `rb-cli ls 'C:\Temp\CROS42.hdf'` returns the full root
     (!Boot / Apps / Comms / Develop / Documents / Emulator /
     Emulators / Files / Games / Media / Printing / ReadMe
@@ -399,19 +399,50 @@ see §10. Reopen when new CLI / GUI work surfaces.)
     the 363-byte help text verbatim. ICEBIRD lists
     ClassicROS / Demos / Diskmags / Tools; arc-04 lists
     1_DataComm.
+  - **End-to-end byte-truth confirmed (write side):**
+    `rb-cli put cros42.hdf foo.txt MyTest` adds the file via
+    `EditableFilesystem`; `rb-cli get` round-trips byte-exact;
+    `rb-cli rm` removes it cleanly; existing files
+    (Apps/!Clock/!Help) stay byte-identical across the
+    put+rm cycle. Implementation honours the kernel
+    `scan_free_map` chain: bit-8 freelink delta, predecessor
+    pointer rewriting on carve.
   - **Still open:**
-    1. **Variable-size F+ directories** (`format_version != 0`,
+    1. **HDD resize.** Same-nzones grow is bounded by FSM
+       geometry — CROS42 can grow 512 MB → 537 MB without
+       crossing nzones (33 zones × ~15.6 MB each = 514 MB
+       theoretical, with some clamp slack). Anything past
+       that requires **FSM relocation**: `map_addr` lives at
+       `(nzones>>1) * zone_size_bits` shifted by `map2blk`,
+       so growing nzones moves the physical FSM forward by
+       up to several MB. The bytes at the new map_addr are
+       part of the existing data area, so resize would need
+       to walk every fragment, identify allocations that
+       overlap the new map_addr region, and relocate them
+       (updating dir entries' indaddrs). No byte-truth
+       oracle exists (Linux's `ADFS_FS_RW` flags itself
+       DANGEROUS / experimental, and RISC OS's resize tool
+       runs only inside the OS). **Deferred** until a
+       maintainer with an RPCEmu / real-Archie boot loop is
+       willing to validate. Workaround for grow-CF-card:
+       restore byte-for-byte, then `*AddDrive` inside
+       RISC OS.
+    2. **Variable-size F+ directories** (`format_version != 0`,
        `root_size` from DR). Walker handles size, but the
        big-dir entry format (`adfs_bigdirentry`, 8-byte
        indaddr, longer names) needs its own parser. Not
        observed yet on our samples.
-    2. **Old-map (D-format) FSM** still uses the
+    3. **Old-map (D-format) FSM** still uses the
        "indaddr = byte offset" fallback. No D-format real
        sample to validate against. Reopen if one surfaces.
-    3. **Write path + HDD resize** are still TODO — they
-       build on top of the walker (allocate fragment →
-       splice into bitstream + bump free-list) but each is
-       its own surface.
+    4. **Multi-deep freelink chain.** Today `find_chain_head`
+       only carves from the chain root. CROS42 / ICEBIRD
+       zones we've inspected carry a single chain entry per
+       zone, but a heavily-used disc could grow longer
+       chains; allocating from inner entries would need the
+       walker to thread the predecessor pointer through the
+       chain. Not blocking for the current MiSTer
+       distribution workflow.
   - **Samples on disc** (all confirmed in the 2026-06-04 probe):
     - `C:\Temp\CROS42.hdf` (512 MB populated HD-format, TOSEC
       Acorn) — dr.root=0x243, frag 2 zone 16 bit 40 → byte
