@@ -360,11 +360,22 @@ see §10. Reopen when new CLI / GUI work surfaces.)
     multi-zone walk and locates the target frag.
   - **One unresolved gap:** the exact `dm_startblk` formula. Linux
     source quotes `dm_startblk(N) = N * zone_size_bits -
-    ADFS_DR_SIZE_BITS` but on CROS42 the empirical value is 2442 for
-    zone 2 (target derived from sector 28048 = map-unit 3506).
-    Whatever the right formula is, it's a small constant off from
-    Linux's published macro — almost certainly a per-zone header
-    accounting quirk we haven't pinned down yet.
+    ADFS_DR_SIZE_BITS` (= 7492 for zone 2) but on CROS42 the
+    empirical value is 2442 for zone 2 (target derived from the
+    actual root location at byte 0xDB2000 = sector 28048 = map-unit
+    3506). ICEBIRD.hdf added as a second populated reference disc —
+    same DR + FSM layout as CROS42, but mostly empty (it only carries
+    the reserved `frag 2` markers in zones 0 + 16; no `frag 579`
+    anywhere). That confirms both discs are standard MiSTer Archie
+    HDF templates but means ICEBIRD can't cross-validate the address
+    formula (the lookup never triggers). What's needed to crack this
+    is the **verbatim** body of `adfs_map_layout()` and
+    `adfs_read_map()` from a recent Linux kernel `fs/adfs/map.c` —
+    the published-macro summary doesn't match the on-disc reality,
+    so the kernel must be doing something the docs don't capture.
+    Likely candidates: a non-linear per-zone offset (consumed-bits
+    cumulative), or a sign-flipped subtraction we've been parsing
+    backwards.
   - **E-format (`arc-04`) encoding still partially open:** the
     `dr.root=0x203` idlen=15 split gives `frag 515` which doesn't
     exist in the one-zone E-format FSM; ADFS_ROOT_FRAG=2 might be
