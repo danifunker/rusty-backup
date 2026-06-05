@@ -348,25 +348,42 @@ see §10. Reopen when new CLI / GUI work surfaces.)
   `:0`, `*CAT :0` lists the file, `*Type HELLO` reads back the
   seed. Engine surface shipped (5 unit + 1 e2e + 3 cli); only
   real-hardware boot outstanding. **ADFS write path AND HDD resize
-  both blocked behind the same scout** (`create_file` against the
-  new-map FSM, and writing the DR + zone-0 map for size changes —
-  see `docs/mister_filesystem_implementation_plan.md` session log
-  for the unresolved layout findings): (a) `dr.root` encoding for
-  E-format (`arc-04` sample has `dr.root=0x203` but zone-0 fragment
-  IDs only run 2..15 — not a fragment-ID lookup); (b) Linux
-  `map_addr` formula off by 66 sectors vs the kilgus blank256E HD
-  sample; (c) zone-0 layout has 4-byte zone header + 60-byte DR at
-  zone-byte offset 4 (= byte 0x404 for E-format floppy, byte
-  0x07E08400+4 for blank256E HD). DR scan candidate list now
-  includes 0x404. Walker still blocked on a non-blank reference
-  disc (RPCEmu manual `*FORMAT :4 ADFS` + hostfs file copy) plus
-  deeper RE of the formula mismatch — trying to land an FSM walker
-  (let alone an FSM-rewriting resize) without those risks shipping
-  a format-mangling bug. Real samples backed up under
-  `C:\Temp\adfs_arc04_e_orig.adf` (800K E-format populated, from
-  8bs.com/pool/arc/arc-04.zip), `C:\Temp\adfs_blank256E.hdf`
-  (256 MB blank E-format HD), `C:\Temp\adfs_blank1024Eplus.hdf`
-  (1 GB blank E+ format HD).
+  remain blocked behind the FSM walker** — but the RE picture is
+  now much clearer after the 2026-06-04 CROS42 session:
+  - **HD-format encoding fully understood (modulo one off-by
+    constant):** dr.root is a normal indirect-disc-address split with
+    idlen=14 → (frag_id, offset). Fragment IDs are SEQUENTIAL across
+    zones (zone N owns IDs `N*ids_per_zone..(N+1)*ids_per_zone-1`).
+    The FSM lives at a SECONDARY location (NOT byte 0x400 — for
+    CROS42 it's at byte 0xF740000, ~half-disc); each zone is one
+    sector apart. `examples/adfs_hd_zone_scout.rs` does the
+    multi-zone walk and locates the target frag.
+  - **One unresolved gap:** the exact `dm_startblk` formula. Linux
+    source quotes `dm_startblk(N) = N * zone_size_bits -
+    ADFS_DR_SIZE_BITS` but on CROS42 the empirical value is 2442 for
+    zone 2 (target derived from sector 28048 = map-unit 3506).
+    Whatever the right formula is, it's a small constant off from
+    Linux's published macro — almost certainly a per-zone header
+    accounting quirk we haven't pinned down yet.
+  - **E-format (`arc-04`) encoding still partially open:** the
+    `dr.root=0x203` idlen=15 split gives `frag 515` which doesn't
+    exist in the one-zone E-format FSM; ADFS_ROOT_FRAG=2 might be
+    the convention for E-format only (Linux uses it as a special
+    case in `adfs_map_lookup`). That theory matches our scout's
+    observation that frag 2 = root for E-format.
+  - **Next session unblocks BOTH write and resize:** with the HD
+    formula resolved (one focused look at the kernel's actual
+    `adfs_map_layout` source vs CROS42's bytes), the walker lands
+    in ~150 LOC; create_file + delete_entry build on top of it; and
+    resize is then a small DR-rewrite + zone-0-map-extend slice.
+  - **Samples on disc:**
+    - `C:\Temp\CROS42.hdf` (512 MB populated HD-format, the new
+      reference disc — TOSEC Acorn) — dr.root=0x243, frag 579 in
+      zone 2, root dir Nick magic at byte 0xDB1F01.
+    - `C:\Temp\adfs_arc04_e_orig.adf` (800 K E-format populated,
+      from 8bs.com/pool/arc/arc-04.zip).
+    - `C:\Temp\adfs_blank256E.hdf` (256 MB blank E-format HD).
+    - `C:\Temp\adfs_blank1024Eplus.hdf` (1 GB blank E+ format HD).
 - **MiSTer QL core boot test** — workflow A+C per
   `docs/mister-deployment-testing-plan.md` §3.6. Build a QXL.WIN
   hard-disk image, place at `/media/fat/games/QL/win1_`, boot

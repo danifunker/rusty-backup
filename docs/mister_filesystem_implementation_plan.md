@@ -42,6 +42,41 @@ Wave-3 Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-04 (ADFS HD-format RE — populated reference disc + Linux
+  source dive + frag 579 located in CROS42 zone 2) — Big unblock for
+  Archie write+resize. User dropped a populated 512 MB HD-format disc
+  (`C:\Temp\CROS42.hdf`) — clean reference for HD-format vs the
+  E-format floppy work that's been blocked. Read the Linux kernel
+  `fs/adfs/map.c` + `super.c` against the disc and confirmed: (a) HD
+  uses `dr.root` directly as the indirect-disc-address (no
+  ADFS_ROOT_FRAG=2 hack — that convention is E-format-specific); (b)
+  the idlen-15 split that fails arc-04 works cleanly on HD: CROS42
+  dr.root=0x243=579 split with idlen=14 → frag 579, zone 2 (per
+  `579/265 ids_per_zone = 2.18`); (c) HD-format fragment IDs are
+  SEQUENTIAL across zones (zone N has IDs N*265..N*265+264), confirmed
+  by manually decoding zone 2's first frag = 530, second = 531; (d)
+  the FSM does NOT live at byte 0x400 for HD discs — it sits at
+  `0xF740000` for CROS42 (≈ middle of disc), found by grepping for the
+  DR fingerprint bytes. Built `examples/adfs_hd_zone_scout.rs` that
+  multi-zone walks + locates the target frag — confirmed frag 579 at
+  zone-2 bit-position 1096. Remaining gap: the exact `dm_startblk`
+  formula. Linux source quoted `dm_startblk(N) = N * zone_size - DR_bits`
+  but applying it to CROS42 gives disc byte 0x216C000, while the
+  actual root (Nick magic at 0xDB1F01) is at byte 0xDB1F00 =
+  sector 28048 = map-unit 3506. Reverse-engineered target
+  `dm_startblk(zone 2) = 2442` — small-constant off from any obvious
+  formula, suggests Linux's published macro doesn't account for
+  per-zone header overhead in the way HD discs encode it. Next
+  session: side-by-side comparison of the kernel's actual struct
+  initialization (full `adfs_map_layout` source) vs the on-disc
+  reality of CROS42 should crack it in one focused pass; with the
+  formula resolved, FSM walker → ADFS create_file/delete_entry →
+  resize all unlock from one ~150 LOC + tests slice. Also: BK0011M
+  ANDOS closed detect-only-forever per OPEN-WORK §9 (no English spec
+  + no oracle + tiny audience); spine row flipped to `[x]`. CP/M
+  CLI parity closed via `--fs-type cpm:NAME` flag wired into ls /
+  get / put / rm — unblocks Wave-3 Amstrad / PCW / Einstein / SVI328
+  / MultiComp / ZX+3 floppy cores at zero per-core cost.
 - 2026-06-04 (HDD resize for X68000 and QL — spine stage 7 closes for
   both Wave-2 HDD cores) — Shipped the X68000 and QL halves of HDD
   resize end-to-end. X68000: X68kPartitionTable now derives serde,
