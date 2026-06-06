@@ -99,6 +99,11 @@ The app has four tabs:
   - **Export Disk Image…** to write VHD (fixed or dynamic), QCOW2,
     VMDK, Raw, 2MG, WOZ, DC42, HFV, or CHD (whole-disk or
     per-partition) — see `docs/vhd-export.md`.
+  - **Convert Floppy Container…** to convert between the four
+    X68000 / PC-98 / FM-7 floppy wrappers (XDF, HDM, DIM, D88) one
+    file at a time. Bulk folder conversion lives in the existing
+    **Bulk Convert** dialog, which now lists the same four formats
+    as output targets.
   - **Check** (`fsck`) on classic HFS, HFS+, AmigaDOS (Disk Validator),
     and SGI EFS, with **Repair** that uses replica blocks + lost+found
     where supported.
@@ -192,12 +197,25 @@ readable.
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
+| Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
-| Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. |
+| Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. Arculator-wrapped `.hdf` (Acorn) auto-detected. |
 | Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
+| Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
+| CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
+| Sharp D88      | `.d88`          | Yes            | Yes (convert)   | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container |
+| X68000 XDF     | `.xdf`          | Yes            | Yes (convert)   | Raw headerless X68000 floppy dump; geometry inferred from size |
+| PC-98 HDM      | `.hdm`          | Yes            | Yes (convert)   | DiskExplorer raw headerless floppy dump (byte-identical to XDF) |
+| DiskExplorer DIM | `.dim`        | Yes            | Yes (convert, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
+
+"Yes (convert)" means the format isn't a backup wrapper but is fully
+round-trippable via the **Convert Floppy Container…** dialog and
+`rb-cli floppy convert` — useful for moving images between MiSTer cores,
+real hardware utilities, and emulators that each prefer a different
+floppy container.
 
 ### Filesystems
 
@@ -279,6 +297,37 @@ images, partition table sidecars) for restore — see `docs/clonezilla.md`.
   backups currently require building a full seekable cache on open, which
   can be slow for large partitions — plan to work around this in a future
   release.
+
+### MiSTer FPGA cores
+
+Rusty Backup can build, browse, and convert images that drop straight
+into [MiSTer FPGA](https://misterfpga.org/) computer cores. The list
+below is the subset where the full filesystem + container + partition
+pipeline works end to end. Full per-core status (including outstanding
+cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_status.md).
+
+| MiSTer core | Filesystem(s) | Media path |
+|---|---|---|
+| **ao486** (486 PC)             | FAT12 / FAT16 / FAT32 (MBR), ISO9660 | Floppy, HDD, CD |
+| **PCXT**                       | FAT12 / FAT16 (MBR) | Floppy, HDD |
+| **MSX / MSX1 / TurboR**        | FAT12 / FAT16 (Nextor VHD) | Floppy, HDD |
+| **ZXNext** (ZX Spectrum Next)  | FAT32 / FAT16 / FAT12 | SD / HDD (VHD) |
+| **TSConf** (ZX-Evolution)      | FAT32 (non-MBR) | SD / HDD (VHD) |
+| **Minimig-AGA** (Amiga)        | AFFS (OFS/FFS), PFS3, SFS on RDB, ISO9660 | Floppy (`.adf`/`.adz`), HDD (`.hdf`/`.hdz`), CD |
+| **MacPlus**                    | HFS | HDD (.hda / .hfv) — 400K MFS floppy outstanding |
+| **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
+| **Apple-II**                   | ProDOS (DOS 3.3 outstanding) | `.dsk` / `.po` / `.do` / `.2mg` / `.woz` |
+| **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
+| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI HDD (`.hdf`) |
+| **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
+| **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
+
+For X68000 specifically, the floppy converter lets you take an image
+in any of the four formats Sharp tooling and MiSTer cores expect — XDF
+(headerless raw), HDM (PC-98 raw), DIM (DiskExplorer DIFC), or D88
+(sparse track-table) — and produce any of the others, single-file or
+in bulk. Geometry inference covers the X68000 + PC-98 set: 1.2 MB 2HD,
+1.44 MB 2HD, 720 KB 2DD, and 640 KB 2DD.
 
 ### Physical drive compatibility
 
