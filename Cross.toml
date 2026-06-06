@@ -3,17 +3,22 @@
 #
 # The MiSTer FPGA ships an Intel Cyclone V SoC (Cortex-A9, 32-bit ARM v7
 # hardfloat) running a Buildroot-based glibc rootfs. The libchdman-rs
-# prebuilt for `armv7-unknown-linux-gnueabihf` is being produced upstream
-# against Ubuntu 20.04's glibc 2.31; we match that baseline here so the
-# resulting rb-cli binary links cleanly against the same glibc symbols
-# the MiSTer Buildroot rootfs exports.
+# prebuilt for `armv7-unknown-linux-gnueabihf` is produced upstream
+# against Ubuntu 20.04's glibc 2.31 / GCC 9.4 libstdc++; we match that
+# baseline here so the resulting rb-cli binary links cleanly against
+# the same glibc + libstdc++ symbols the MiSTer Buildroot rootfs exports.
 #
-# `cross` v0.2.5's image is the last one based on Ubuntu 20.04 — pinning
-# to that tag keeps the toolchain stable across `cross` version bumps and
-# avoids accidentally picking up an Ubuntu-22-based image that produces
-# glibc-2.35-only binaries.
+# `cross-rs` v0.2.5 (the last semantic-version release) is Ubuntu **16.04**
+# with GCC 5.4 / glibc 2.23 — too old to have the C++11 `std::thread`
+# polymorphic-_State symbols the libchdman-rs prebuilt depends on, so it
+# fails to link with "undefined reference to std::thread::_M_start_thread".
+#
+# The `:main` tag tracks cross-rs's main branch and is Ubuntu 20.04 with
+# GCC 9.4 + glibc 2.31 — exactly the baseline we want. Pinned to a
+# verified digest so an upstream Ubuntu-22 bump can't silently produce a
+# glibc-2.35-only binary that refuses to start on MiSTer.
 [target.armv7-unknown-linux-gnueabihf]
-image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main@sha256:9014720a7d829bcd631835ca5d14cf43fbef1fac0b511a2632f4bd71a4990229"
 
 # Forward libchdman-rs's build-script env vars into the container so the
 # prebuilt fetcher can be steered from CI:

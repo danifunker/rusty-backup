@@ -216,8 +216,9 @@ openssl-sys dep for everyone.)
 cargo install cross --git https://github.com/cross-rs/cross --locked
 
 # From the rusty-backup repo root — Cross.toml pins this target's image
-# to cross-rs v0.2.5 (Ubuntu 20.04 / glibc 2.31), which matches both the
-# MiSTer Buildroot rootfs and the upstream libchdman-rs armv7 prebuilt.
+# to cross-rs's Ubuntu 20.04 / glibc 2.31 build (digest-pinned), which
+# matches both the MiSTer Buildroot rootfs and the upstream libchdman-rs
+# armv7 prebuilt's libstdc++.
 cross build --target armv7-unknown-linux-gnueabihf \
             --bin rb-cli \
             --release \
@@ -338,10 +339,14 @@ Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
 - CI workflow `.github/workflows/release.yml` ships a new
   `build-rb-cli-mini-armv7` job that uses `cross` to produce
   `rb-cli-mini-armv7-linux-<version>.tar.gz` as a release artifact.
-- `Cross.toml` pins the armv7 cross-compile image to `cross-rs` v0.2.5
-  (Ubuntu 20.04, glibc 2.31), matching the glibc baseline that both
-  the MiSTer Buildroot rootfs and the upstream libchdman-rs armv7
-  prebuilt use.
+- `Cross.toml` pins the armv7 cross-compile image to cross-rs's
+  Ubuntu-20.04-based build (GCC 9.4, glibc 2.31), referenced by SHA
+  digest. This matches the glibc + libstdc++ baseline both the MiSTer
+  Buildroot rootfs and the upstream libchdman-rs armv7 prebuilt use.
+  Note: cross-rs's last semver release (`v0.2.5`) is Ubuntu **16.04**
+  / GCC 5.4 / glibc 2.23 — too old to have the C++11 `std::thread`
+  polymorphic-`_State` symbols the prebuilt depends on, so we pin to
+  a digest of the `:main` rolling tag rather than `v0.2.5`.
 - The MiSTer job now builds with `--no-default-features --features chd`
   so the artifact includes CHD support via the libchdman-rs prebuilt —
   the GUI and optical stacks stay out, but `.chd` is in. The job is

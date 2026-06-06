@@ -91,10 +91,11 @@ scp target/armv7-unknown-linux-gnueabihf/release/rb-cli \
 ```
 
 The repo's [`Cross.toml`](Cross.toml) pins the cross-compile Docker
-image to `cross-rs` v0.2.5 (Ubuntu 20.04 base) so the binary links
-against the same glibc baseline as both the MiSTer Buildroot rootfs
-and the upstream libchdman-rs armv7 prebuilt — symbols line up
-without any version drift.
+image to `cross-rs`'s Ubuntu 20.04 / GCC 9.4 / glibc 2.31 build (at a
+verified SHA digest) so the binary links against the same glibc +
+libstdc++ baseline as both the MiSTer Buildroot rootfs and the
+upstream libchdman-rs armv7 prebuilt — symbols line up without any
+version drift.
 
 CI ships a prebuilt `rb-cli-mini-armv7-linux-<version>.tar.gz` as part
 of every release; grab it from the
