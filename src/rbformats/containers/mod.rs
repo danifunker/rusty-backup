@@ -25,6 +25,7 @@ pub mod d88;
 pub mod edsk;
 pub mod floppy_geom;
 pub mod hdf;
+pub mod hdm;
 pub mod msa;
 pub mod sector_order;
 pub mod xdf;
@@ -54,6 +55,10 @@ pub enum ContainerKind {
     /// from file size. Routed by extension; the decoder fails if the
     /// size doesn't match a supported floppy geometry.
     Xdf,
+    /// PC-98 / DiskExplorer HDM — byte-identical to XDF on disk; kept as
+    /// a distinct variant so the routing and log labels track the user's
+    /// chosen extension.
+    Hdm,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -66,6 +71,7 @@ impl ContainerKind {
             ContainerKind::Edsk => "CPCEMU DSK/EDSK",
             ContainerKind::D88 => "Sharp .d88",
             ContainerKind::Xdf => "X68000 XDF",
+            ContainerKind::Hdm => "PC-98 HDM",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -97,6 +103,9 @@ pub fn detect_container_kind(head: &[u8], path: Option<&Path>) -> ContainerKind 
     if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
         if ext.eq_ignore_ascii_case("xdf") {
             return ContainerKind::Xdf;
+        }
+        if ext.eq_ignore_ascii_case("hdm") {
+            return ContainerKind::Hdm;
         }
     }
     ContainerKind::Raw
@@ -130,6 +139,10 @@ pub fn open_container_bytes(
         ContainerKind::Xdf => {
             let (flat, _media) = xdf::decode_xdf_bytes(&bytes)?;
             Ok((ContainerKind::Xdf, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::Hdm => {
+            let (flat, _media) = hdm::decode_hdm_bytes(&bytes)?;
+            Ok((ContainerKind::Hdm, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }
