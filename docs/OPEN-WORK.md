@@ -515,8 +515,99 @@ bundled v5 fixture. **Implication for the entries below:** any park
 reason that names "tooling unavailable" or "no oracle" is wrong —
 both fixtures and oracles are accessible from this host.
 
-*(Currently empty — all previously-parked items either shipped to §10
-or moved to §9. New work that's "scoped but not started" goes here.)*
+### X68000 SASI / SCSI HDD format gaps (scoped 2026-06-05 via real-disc probes + IPL ROM disasm)
+
+Today's MiSTer manual-verify session surfaced concrete gaps between
+our `partition/x68k.rs` + `fs/human68k.rs` and real Sharp X68000 HDDs.
+All five anchored against probed bytes and the disassembled IPL ROM —
+no hand-waving.
+
+**Reference material in tree** (sibling repos, already cloned):
+- `../x68kd11s/iplrom/iplrom30.s` — disassembled X68030 IPL ROM. Two key citations:
+  - **Line 4761 `Lff09e8`**: SASI HDD descriptor template starting
+    `\x82w68000W\x00` followed by 31 bytes of geometry / partition
+    pointers. Exact field layout we'd map.
+  - **Line 16420 `Lff9488`**: SCSI signature check —
+    `cmpi.l #$53435349,(-$0014,a0)` (= `'SCSI'` at offset -0x14 from
+    boot-device pointer). `X68SCSI1` at byte 0 of `hd0.hds` matches.
+- `../dis68k/lib/libfat-human68k/ff.c` — Human68k-port of ChaN FatFs:
+  - **Line 2160**: `0xAA55` boot signature check commented out.
+  - **Lines 421–432**: standard BPB field offsets (still 8-byte OEM —
+    Hudson's 18-byte OEM is achieved by stuffing the extra 10 bytes
+    into the JMP/code area before the BPB fields).
+  - `_MAX_SS` / `_MIN_SS` + `SS(fs)` macro: variable sector size when
+    `_MAX_SS != _MIN_SS`.
+- `../X68000_MiSTer/Doc/diskemu.txt` + `rtl/diskemu/sasidev.vhd` —
+  describes the core's emulation architecture; the signature-checking
+  firmware runs on a Nios II soft-CPU compiled into
+  `diskemu_mainmem.hex` (binary, not source).
+
+**Real-image anchors (locally available, byte-probed today):**
+- `/c/Temp/Bomberman/games/X68000/media/Bomberman/Bomberman.hdf`
+  (10,441,728 B = 40788 × 256). Byte 0: `\x60\x00\x00\xca` (68000
+  BSR.W boot-IPL opcode) + `\x1b[6;32H X68000 HARD DISK IPL MENU` ASCII
+  at byte 0x40. X68K partition table at byte 0x400 with one Human68k
+  entry at start_lba 33. Sector size **256 B**. Custom Hudson Soft
+  game-data format inside the partition (NOT readable FAT).
+- `/c/Users/spam/AppData/Local/Temp/mister-tests/hd0.hds`
+  (104,857,600 B = 102400 × 1024). Byte 0: `X68SCSI1\x02\x00\x00\x03\x1f\xff\x01\x00`
+  + ASCII `Human68K SCSI-DISK by Keisoku Giken`. IPL boot code at byte
+  0x400, X68K partition table at byte 0x800 (= sector 2 in 1024-B
+  units). Sector size **1024 B**. Real Human68k FAT12 partition at
+  byte 0x8000, BPB starts with `\x60\x24SHARP/KG    1.` (18-byte OEM).
+- `/media/fat/games/X68000/boot3.vhd` original stub
+  (16,384 B). Byte 0: `\x82w68000W\x00\xc0\x00\x00\x00\xfe\x4f\xfc`.
+  Real SASI signature + 8 bytes of geometry / capacity descriptor.
+
+**Concrete code gaps (in dependency order):**
+
+1. **`partition/detect_superfloppy`** (`src/partition/mod.rs:139`)
+   accepts FAT VBR JMP byte `0xEB` / `0xE9` only. X68000 floppies
+   start with `0x60` (68000 BSR.S). Result: `rb-cli inspect/ls` on a
+   raw X68000 `.D88` decode fails detection even though the BPB is
+   valid (integration tests pass because they call the engine
+   directly).
+
+2. **`partition/x68k.rs`** hardcodes 512-byte sectors when computing
+   `partition_offset = start_lba * SECTOR_SIZE`. Reality: SASI HDDs
+   use 256-B sectors, SCSI HDDs use 1024-B sectors. With CROS42-style
+   math: probed offsets are off by 2× (Bomberman) or 0.5× (hd0.hds)
+   from where the FAT BPB actually lives. Causes
+   `bytes_per_sector 0 not in {256,512,1024,2048}` on `rb-cli ls
+   hd0.hds@1`.
+
+3. **`partition/x68k.rs`** has no byte-0 signature detector for the
+   two real Sharp formats:
+   - `X68SCSI1` (1024-B sector convention)
+   - `\x82w68000W` (256-B sector convention)
+   Without this, we can't derive sector size, and we can't refuse
+   non-Sharp HDDs that happen to have the `X68K` partition magic
+   somewhere (false positives possible).
+
+4. **`fs/human68k.rs`** FAT BPB parser doesn't tolerate the 18-byte
+   Hudson/Sharp OEM extension that pushes the standard BPB fields
+   forward. `dis68k/lib/libfat-human68k/ff.c` shows the right shape —
+   skip the `0xAA55` check, treat the OEM as variable-length, use
+   `_MAX_SS != _MIN_SS` style variable sector size.
+
+5. **No self-bootable IPL builder** in `examples/build_x68k_hdd.rs` —
+   the example produces a partition-table-only HDD that requires
+   booting from FDD0. Real-world workflow is HDD-bootable. The IPL
+   menu pattern (Bomberman: BSR.W → ANSI-positioned menu → boot
+   selected partition) is short — ~200 bytes of 68000 assembly.
+
+**Implementation estimate**: ~500 LOC + tests against `hd0.hds` and
+`Bomberman.HDF` as committed anchors. Phases: (a) signature detector +
+sector-size derivation in `partition/x68k.rs`; (b) extended-OEM BPB
+parser in `fs/human68k.rs`; (c) `examples/build_x68k_hdd.rs` upgrade
+to emit a SCSI-format bootable HDD with IPL menu; (d) `rb-cli put`
+round-trip against an injected `hd0.hds` clone on a MiSTer with
+Human68k v3.02 system disk.
+
+**What's blocked behind this**: closing the X68000 row's `[!] ref` +
+`[!] write-verified` user-side parks via real-hardware MiSTer
+verification. Today the engine-level surface is proven; the
+in-emulator surface needs the SCSI/SASI format work above.
 
 ---
 
