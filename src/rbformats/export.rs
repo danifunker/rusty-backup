@@ -1585,6 +1585,7 @@ pub fn export_whole_disk_chd(
 /// bulk-convert UI shows per-file progress (the per-CHD worker bumps the
 /// file index when it returns) which is granular enough for the dialog.
 #[cfg(feature = "chd")]
+#[allow(unused_variables, unused_mut)]
 pub fn export_whole_disk_chd_cd(
     source_path: &Path,
     dest_path: &Path,
@@ -1592,23 +1593,35 @@ pub fn export_whole_disk_chd_cd(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::optical::convert::{to_chd, ConvertProgress};
-    use std::sync::{Arc, Mutex};
+    // The CD ↔ CHD path lives in src/optical/convert.rs and uses the
+    // `opticaldiscs` crate to parse cuesheets and the data-track layout.
+    // When the `optical` feature is off (rb-cli-mini MiSTer build), the
+    // engine isn't present; bail cleanly rather than half-implementing it.
+    #[cfg(not(feature = "optical"))]
+    anyhow::bail!(
+        "CD CHD export requires the `optical` feature; \
+         this binary was built without it"
+    );
+    #[cfg(feature = "optical")]
+    {
+        use crate::optical::convert::{to_chd, ConvertProgress};
+        use std::sync::{Arc, Mutex};
 
-    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
-    if cancel_check() {
-        if let Ok(mut s) = shared.lock() {
-            s.cancel_requested = true;
+        let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+        if cancel_check() {
+            if let Ok(mut s) = shared.lock() {
+                s.cancel_requested = true;
+            }
         }
-    }
-    to_chd(source_path, dest_path, chd_options, Arc::clone(&shared))?;
+        to_chd(source_path, dest_path, chd_options, Arc::clone(&shared))?;
 
-    log_cb(&format!(
-        "CD CHD export complete: {} -> {}",
-        source_path.display(),
-        dest_path.display(),
-    ));
-    Ok(())
+        log_cb(&format!(
+            "CD CHD export complete: {} -> {}",
+            source_path.display(),
+            dest_path.display(),
+        ));
+        Ok(())
+    }
 }
 
 /// Export a CD CHD as a BIN/CUE pair (single-bin or multi-bin).
@@ -1617,6 +1630,7 @@ pub fn export_whole_disk_chd_cd(
 /// `<base> (Track NN).bin` per track and a multi-FILE cue — a feature beyond
 /// chdman built on top of libchdman-rs's track metadata.
 #[cfg(feature = "chd")]
+#[allow(unused_variables, unused_mut)]
 pub fn export_whole_disk_bincue(
     source_chd: &Path,
     dest_cue: &Path,
@@ -1624,27 +1638,39 @@ pub fn export_whole_disk_bincue(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::optical::convert::{chd_to_bincue, chd_to_bincue_multi, ConvertProgress};
-    use std::sync::{Arc, Mutex};
+    // Same shape as `export_whole_disk_chd_cd`: the CHD ↔ BIN/CUE engine
+    // lives under src/optical/, so without the `optical` feature the
+    // implementation isn't compiled in. The rb-cli-mini MiSTer build hits
+    // this branch — bail cleanly rather than silently doing nothing.
+    #[cfg(not(feature = "optical"))]
+    anyhow::bail!(
+        "BIN/CUE export requires the `optical` feature; \
+         this binary was built without it"
+    );
+    #[cfg(feature = "optical")]
+    {
+        use crate::optical::convert::{chd_to_bincue, chd_to_bincue_multi, ConvertProgress};
+        use std::sync::{Arc, Mutex};
 
-    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
-    if cancel_check() {
-        if let Ok(mut s) = shared.lock() {
-            s.cancel_requested = true;
+        let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+        if cancel_check() {
+            if let Ok(mut s) = shared.lock() {
+                s.cancel_requested = true;
+            }
         }
-    }
-    if multi_bin {
-        chd_to_bincue_multi(source_chd, dest_cue, Arc::clone(&shared))?;
-    } else {
-        chd_to_bincue(source_chd, dest_cue, Arc::clone(&shared))?;
-    }
+        if multi_bin {
+            chd_to_bincue_multi(source_chd, dest_cue, Arc::clone(&shared))?;
+        } else {
+            chd_to_bincue(source_chd, dest_cue, Arc::clone(&shared))?;
+        }
 
-    log_cb(&format!(
-        "BIN/CUE export complete ({}): {}",
-        if multi_bin { "multi-bin" } else { "single-bin" },
-        dest_cue.display(),
-    ));
-    Ok(())
+        log_cb(&format!(
+            "BIN/CUE export complete ({}): {}",
+            if multi_bin { "multi-bin" } else { "single-bin" },
+            dest_cue.display(),
+        ));
+        Ok(())
+    }
 }
 
 #[cfg(test)]
