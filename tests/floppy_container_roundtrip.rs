@@ -32,6 +32,10 @@ fn build_pattern() -> Vec<u8> {
 }
 
 fn write_format(tempdir: &Path, ext: &str, pattern: &[u8]) -> PathBuf {
+    write_format_with_stem(tempdir, "source", ext, pattern)
+}
+
+fn write_format_with_stem(tempdir: &Path, stem: &str, ext: &str, pattern: &[u8]) -> PathBuf {
     use rusty_backup::rbformats::containers::{
         d88::{encode_d88_bytes, D88Media},
         dim::encode_dim_bytes,
@@ -54,7 +58,7 @@ fn write_format(tempdir: &Path, ext: &str, pattern: &[u8]) -> PathBuf {
         .unwrap(),
         other => panic!("unknown format {other}"),
     };
-    let path = tempdir.join(format!("source.{ext}"));
+    let path = tempdir.join(format!("{stem}.{ext}"));
     std::fs::write(&path, &bytes).unwrap();
     path
 }
@@ -127,6 +131,75 @@ fn sixteen_cell_round_trip_all_formats() {
             }
         }
     }
+}
+
+#[test]
+fn bulk_convert_runner_routes_floppy_targets() {
+    // Confirms the bulk_convert_runner intercepts ExportFormat::Xdf/Hdm/Dim/D88
+    // and dispatches them through convert_floppy_container rather than the
+    // streaming export_whole_disk path (which would write a 1.2 MB raw blob
+    // instead of a real D88 sparse container).
+    use rusty_backup::rbformats::export::ExportFormat;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let temp_path = tempdir.path().to_path_buf();
+    let pattern = build_pattern();
+
+    // Make a 3-file fixture in different formats.
+    let src_dir = temp_path.join("src");
+    let out_dir = temp_path.join("out");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    write_format_with_stem(&src_dir, "disk_a", "xdf", &pattern);
+    write_format_with_stem(&src_dir, "disk_b", "dim", &pattern);
+    write_format_with_stem(&src_dir, "disk_c", "hdm", &pattern);
+
+    let files: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(files.len(), 3);
+
+    let status = rusty_backup::model::bulk_convert_runner::start_bulk_convert(
+        files,
+        out_dir.clone(),
+        ExportFormat::D88,
+        "d88".to_string(),
+        None,
+        false,
+    );
+
+    // Poll until finished (small files, finishes in milliseconds).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if status.lock().map(|s| s.finished).unwrap_or(false) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("bulk convert runner did not finish within 30s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let s = status.lock().unwrap();
+    let log_summary: Vec<String> = s.log_messages.iter().map(|(_, msg)| msg.clone()).collect();
+    assert_eq!(s.failed, 0, "bulk convert had failures: {log_summary:?}");
+    assert_eq!(s.succeeded, 3);
+
+    // Each output must be a valid D88 — decode it back to flat and compare.
+    let mut count = 0;
+    for entry in std::fs::read_dir(&out_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("d88") {
+            let bytes = std::fs::read(&path).unwrap();
+            let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes).unwrap();
+            assert_eq!(flat, pattern, "bulk-converted D88 didn't decode to pattern");
+            count += 1;
+        }
+    }
+    assert_eq!(count, 3, "expected 3 D88 outputs, got {count}");
 }
 
 #[test]

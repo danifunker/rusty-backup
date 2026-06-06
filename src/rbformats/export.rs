@@ -64,6 +64,15 @@ pub enum ExportFormat {
     /// so it never reaches `write_header`/`write_footer` or the whole-disk /
     /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
     Hfv,
+    /// X68000 XDF — raw headerless floppy dump. Intercepted by the bulk
+    /// runner and routed through [`crate::rbformats::containers::convert_floppy_container`].
+    Xdf,
+    /// PC-98 / DiskExplorer HDM — byte-identical layout to XDF.
+    Hdm,
+    /// DiskExplorer DIM — DIFC 256-byte header + flat payload.
+    Dim,
+    /// Sharp D88 — sparse 32-byte header + 164-entry track-offset table.
+    D88,
 }
 
 impl ExportFormat {
@@ -80,6 +89,10 @@ impl ExportFormat {
             Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
             Self::BinCue => "cue",
             Self::Hfv => "hfv",
+            Self::Xdf => "xdf",
+            Self::Hdm => "hdm",
+            Self::Dim => "dim",
+            Self::D88 => "d88",
         }
     }
 
@@ -100,6 +113,10 @@ impl ExportFormat {
             Self::ChdCd => "CD CHD",
             Self::BinCue => "BIN/CUE",
             Self::Hfv => "BasiliskII HFV",
+            Self::Xdf => "X68000 XDF",
+            Self::Hdm => "PC-98 HDM",
+            Self::Dim => "DiskExplorer DIM",
+            Self::D88 => "Sharp D88",
         }
     }
 
@@ -121,13 +138,42 @@ impl ExportFormat {
             Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
             Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
             Self::Hfv => ("BasiliskII HFV", &["hfv"]),
+            Self::Xdf => ("X68000 XDF", &["xdf"]),
+            Self::Hdm => ("PC-98 HDM", &["hdm"]),
+            Self::Dim => ("DiskExplorer DIM", &["dim"]),
+            Self::D88 => ("Sharp D88", &["d88"]),
         }
     }
 
     /// True if this format can only wrap a floppy-sized image.
     /// WOZ: 140K / 400K / 800K. DiskCopy 4.2: 400K / 720K / 800K / 1440K.
+    /// XDF / HDM / DIM / D88: the four-element X68k / PC-98 floppy geometry set.
     pub fn is_floppy_only(&self) -> bool {
-        matches!(self, Self::Woz | Self::Dc42)
+        matches!(
+            self,
+            Self::Woz | Self::Dc42 | Self::Xdf | Self::Hdm | Self::Dim | Self::D88
+        )
+    }
+
+    /// True if this format is one of the four X68000 / PC-98 floppy
+    /// containers handled by
+    /// [`crate::rbformats::containers::convert_floppy_container`].
+    pub fn is_x68k_floppy(&self) -> bool {
+        matches!(self, Self::Xdf | Self::Hdm | Self::Dim | Self::D88)
+    }
+
+    /// Map an X68k floppy export target to the corresponding
+    /// [`crate::rbformats::containers::ContainerKind`]. Returns `None` for
+    /// non-floppy formats.
+    pub fn to_floppy_container_kind(self) -> Option<crate::rbformats::containers::ContainerKind> {
+        use crate::rbformats::containers::ContainerKind;
+        match self {
+            Self::Xdf => Some(ContainerKind::Xdf),
+            Self::Hdm => Some(ContainerKind::Hdm),
+            Self::Dim => Some(ContainerKind::Dim),
+            Self::D88 => Some(ContainerKind::D88),
+            _ => None,
+        }
     }
 
     /// Write the format header (if any) to `writer`. Returns bytes written.

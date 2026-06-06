@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crate::model::status::{BulkConvertLogLevel as LogLevel, BulkConvertStatus};
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
+use crate::rbformats::containers::convert_floppy_container;
 use crate::rbformats::export::{
     export_whole_disk, export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd,
     ExportFormat,
@@ -74,6 +75,9 @@ pub fn scan_source_folder(
             ExportFormat::BinCue => matches!(ext_lower.as_deref(), Some("chd")),
             ExportFormat::Chd | ExportFormat::ChdDvd => {
                 !matches!(ext_lower.as_deref(), Some("cue" | "bin"))
+            }
+            f if f.is_x68k_floppy() => {
+                matches!(ext_lower.as_deref(), Some("xdf" | "hdm" | "dim" | "d88"))
             }
             _ => true,
         };
@@ -293,6 +297,30 @@ fn run_bulk_convert(
             ExportFormat::BinCue => {
                 let _ = progress_cb;
                 export_whole_disk_bincue(file, &dest, bincue_multi_bin, cancel_cb, log_cb)
+            }
+            f if f.is_x68k_floppy() => {
+                // Floppy containers don't go through the streaming
+                // `export_whole_disk` path — the engine reads the whole
+                // source into RAM, decodes, encodes the target wrapper,
+                // and writes it. Small (≤ 1.5 MB), so no progress reporting.
+                let _ = (progress_cb, cancel_cb);
+                match f.to_floppy_container_kind() {
+                    Some(kind) => convert_floppy_container(file, &dest, kind)
+                        .map(|r| {
+                            log_cb(&format!(
+                                "Converted floppy {} -> {} ({}, {} bytes)",
+                                r.source.display_name(),
+                                r.target.display_name(),
+                                r.media.display_label(),
+                                r.bytes_written,
+                            ));
+                        })
+                        .map_err(|e| anyhow::anyhow!("floppy convert failed: {e:#}")),
+                    None => Err(anyhow::anyhow!(
+                        "internal: is_x68k_floppy() returned true but \
+                         to_floppy_container_kind() returned None for {f:?}"
+                    )),
+                }
             }
             _ => export_whole_disk(
                 format,

@@ -1,14 +1,17 @@
 //! "Convert Floppy Container…" dialog for the Inspect tab.
 //!
 //! Single-file conversion between XDF / HDM / DIM / D88. Mirrors the shape
-//! of [`super::expand_hfs_dialog::ExpandHfsDialog`]: source path (passed in
-//! when the dialog opens), target-format radio group, "Save As…" picker,
+//! of [`super::expand_hfs_dialog::ExpandHfsDialog`]: source path (picked
+//! inside the dialog), target-format radio group, "Save As…" picker,
 //! worker thread that calls
 //! [`rusty_backup::rbformats::containers::convert_floppy_container`], status
 //! polled per frame.
 //!
-//! Bulk mode lives in [`super::bulk_convert_dialog`] / the new
-//! `rb-cli floppy convert` directory mode (Phase 5).
+//! Bulk mode lives in two places:
+//! - GUI: the existing [`super::bulk_convert_dialog`] now lists XDF /
+//!   HDM / DIM / D88 alongside the other output formats — point users
+//!   there for folder-of-floppies conversions.
+//! - CLI: `rb-cli floppy convert <dir> <dir> --to <fmt> [--recursive]`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -184,6 +187,14 @@ impl FloppyConvertDialog {
                 if let Some(err) = &self.source_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err.clone());
                 }
+                ui.label(
+                    egui::RichText::new(
+                        "Converting a folder of floppies? Use the main Bulk Convert dialog \
+                         (XDF / HDM / DIM / D88 are listed there as output formats).",
+                    )
+                    .small()
+                    .italics(),
+                );
 
                 ui.separator();
                 ui.label(egui::RichText::new("Target").strong());
