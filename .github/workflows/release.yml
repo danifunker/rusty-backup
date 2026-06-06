@@ -712,16 +712,19 @@ jobs:
   # upstream `libchdman-rs` armv7 prebuilt ships against Ubuntu 20.04 glibc,
   # which Cross.toml pins this job to as well so symbols line up.
   #
-  # This is intentionally OUT of the `release` job's `needs:` list — see the
-  # comment on that job. The artifact still ships in every release where the
-  # job finishes before the release step; it just doesn't gate the desktop
-  # builds while the libchdman-rs armv7 prebuilt is in flight upstream.
+  # The `release` job lists this build in its `needs:` so the workflow waits
+  # for the tarball to upload before publishing, and the upload glob picks it
+  # up alongside the desktop artifacts. `continue-on-error: true` below makes
+  # a transient cross-compile failure non-fatal — the release still proceeds,
+  # just without the MiSTer artifact for that one run.
   build-rb-cli-mini-armv7:
     name: Build rb-cli-mini (armv7 MiSTer)
     needs: generate-version
     runs-on: ubuntu-latest
-    # Don't fail the whole workflow if the cross-compile breaks (e.g. while
-    # upstream libchdman-rs is mid-update). The artifact is best-effort.
+    # Don't fail the whole workflow if the cross-compile breaks. Combined
+    # with the release job's `needs:` entry above, this still gates the
+    # release on the artifact existing — but a failure here lets the desktop
+    # release proceed without the MiSTer tarball rather than blocking it.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v5
@@ -799,11 +802,20 @@ jobs:
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    # The MiSTer armv7 build is intentionally OUT of `needs:` — it's a
-    # best-effort artifact while upstream libchdman-rs's armv7 prebuilt is
-    # in flight. When it succeeds it lands in the release via the `*.tar.gz`
-    # glob below; a failure doesn't block the desktop builds.
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
+    # The MiSTer armv7 build is in `needs:` so the release waits for its
+    # artifact to upload before publishing — combined with
+    # `continue-on-error: true` on the build job, a transient armv7 failure
+    # is still non-fatal: the release proceeds without the MiSTer artifact
+    # rather than being held indefinitely. When the build succeeds the
+    # tarball is picked up by the `*.tar.gz` glob below and ships in the
+    # release alongside the desktop downloads.
+    needs:
+      - generate-version
+      - build-windows
+      - build-macos
+      - build-linux-appimage
+      - build-linux-packages
+      - build-rb-cli-mini-armv7
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
