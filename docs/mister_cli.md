@@ -88,9 +88,19 @@ gnueabihf`. So the link step will fail.
   `libchdman-rs` is a Rust wrapper around the MAME CHD core; with
   the C++ source vendored it should cross-compile via `cc` + a
   proper ARM gnu++ toolchain. Half a day of work to validate.
+- **(C) Ship an armv7 prebuilt upstream** — extend `libchdman-rs`'s
+  `prebuilt` feature to publish an Ubuntu-20.04-compatible armv7
+  binary that matches the MiSTer Buildroot glibc baseline. Same shape
+  as the existing x64 / arm64 prebuilts; no compile-from-source
+  on the consumer side.
 
-**Recommendation: (A).** Keep the host build as-is; the on-device
-build trades CHD for portability.
+**Recommendation: (C), pursued upstream.** Keeps CHD on the MiSTer
+without dragging the MAME C++ toolchain into rusty-backup. The
+`chd` feature flag from (A) still ships (the desktop build sometimes
+wants to opt out for licensing reasons), but the MiSTer artifact
+turns it ON via `--features chd`. The repo's `Cross.toml` pins the
+cross-compile image to Ubuntu 20.04 so symbols line up with the
+upstream prebuilt.
 
 ### 2. GUI deps drift into rb-cli via the workspace lib
 
@@ -199,17 +209,19 @@ openssl-sys dep for everyone.)
 
 ---
 
-## Build incantation (target session)
+## Build incantation (host or CI)
 
 ```sh
 # Linux x64 host with Docker + cross:
-cargo install cross --git https://github.com/cross-rs/cross
+cargo install cross --git https://github.com/cross-rs/cross --locked
 
-# From the rusty-backup repo root:
+# From the rusty-backup repo root — Cross.toml pins this target's image
+# to cross-rs v0.2.5 (Ubuntu 20.04 / glibc 2.31), which matches both the
+# MiSTer Buildroot rootfs and the upstream libchdman-rs armv7 prebuilt.
 cross build --target armv7-unknown-linux-gnueabihf \
             --bin rb-cli \
             --release \
-            --no-default-features
+            --no-default-features --features chd
 
 # Output: target/armv7-unknown-linux-gnueabihf/release/rb-cli
 file target/armv7-unknown-linux-gnueabihf/release/rb-cli
@@ -326,6 +338,17 @@ Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
 - CI workflow `.github/workflows/release.yml` ships a new
   `build-rb-cli-mini-armv7` job that uses `cross` to produce
   `rb-cli-mini-armv7-linux-<version>.tar.gz` as a release artifact.
+- `Cross.toml` pins the armv7 cross-compile image to `cross-rs` v0.2.5
+  (Ubuntu 20.04, glibc 2.31), matching the glibc baseline that both
+  the MiSTer Buildroot rootfs and the upstream libchdman-rs armv7
+  prebuilt use.
+- The MiSTer job now builds with `--no-default-features --features chd`
+  so the artifact includes CHD support via the libchdman-rs prebuilt —
+  the GUI and optical stacks stay out, but `.chd` is in. The job is
+  marked `continue-on-error: true` and is intentionally OUT of the
+  `release` job's `needs:` list, so a transient cross-compile failure
+  (or the timing window while upstream libchdman-rs armv7 prebuilt is
+  in flight) does not block the desktop releases.
 - README has a `rb-cli-mini` section with the build incantation and
   the included/excluded feature matrix.
 

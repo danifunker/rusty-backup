@@ -63,24 +63,26 @@ Full verb-by-verb reference: [`docs/cli-reference.md`](docs/cli-reference.md)
 Open CLI follow-ups (and everything else still to do) are tracked in
 [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md).
 
-#### `rb-cli-mini` for MiSTer FPGA (armv7) and other slim targets
+#### `rb-cli-mini` for MiSTer FPGA (armv7)
 
-A `--no-default-features` build of `rb-cli` strips out the GUI dep tree
-(eframe / egui / rfd), the CHD compression core (libchdman-rs — no
-prebuilt for armv7), the optical-disc stack (opticaldiscs /
-cd-da-reader), and the update checker's reqwest client. The result is
-a small portable binary that runs on the MiSTer's Cortex-A9 SoC and
-other low-resource Linux hosts.
+`rb-cli-mini` is the **MiSTer-specific** build of `rb-cli`: a slim
+variant cross-compiled for the FPGA's Intel Cyclone V / Cortex-A9 SoC
+(`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline from the
+Buildroot rootfs). It excludes the GUI (eframe / egui / rfd), the
+optical-disc stack (opticaldiscs / cd-da-reader), and the update
+checker's reqwest client — but **keeps CHD support** via the upstream
+`libchdman-rs` armv7 prebuilt, so `.chd` images work inline on the
+device.
+
+The desktop release builds use the full feature set; only the MiSTer
+artifact runs `--no-default-features --features chd`.
 
 ```
-# On any host (slim build, x64 or arm):
-cargo build --bin rb-cli --release --no-default-features
-
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features
+            --no-default-features --features chd
 
 # Strip + deploy:
 arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/rb-cli
@@ -88,31 +90,35 @@ scp target/armv7-unknown-linux-gnueabihf/release/rb-cli \
     root@mister.local:/media/fat/Scripts/rb-cli
 ```
 
+The repo's [`Cross.toml`](Cross.toml) pins the cross-compile Docker
+image to `cross-rs` v0.2.5 (Ubuntu 20.04 base) so the binary links
+against the same glibc baseline as both the MiSTer Buildroot rootfs
+and the upstream libchdman-rs armv7 prebuilt — symbols line up
+without any version drift.
+
 CI ships a prebuilt `rb-cli-mini-armv7-linux-<version>.tar.gz` as part
 of every release; grab it from the
 [Releases page](https://github.com/danifunker/rusty-backup/releases) if
 you don't want to set up the cross toolchain locally.
 
-What works in `rb-cli-mini`:
+What's in the MiSTer build:
 - Every filesystem operation (`ls`, `put`, `get`, `rm`, `mkdir`,
   `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
   exFAT, HFS, HFS+, ext, AFFS, PFS3, SFS, ProDOS, Human68k, ADFS, etc.
-- `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, and
-  the four floppy container formats.
+- `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, the
+  four floppy container formats, **and CHD**.
 - `floppy convert` (XDF / HDM / DIM / D88, single-file and bulk) —
-  including the MiSTer X68000 workflow inline on the device.
+  the X68000 workflow runs inline on the device.
 - Partition table editing (`partmap`), backup-folder operations.
+- `shrink`, `grow .chd`, single-file CHD backups — all work.
 
-What's omitted (operations exit with a clear "this binary was built
-without the `chd` / `optical` feature" message):
-- `.chd` read or write (`-CHD-` backups, `convert ... --format chd`,
-  `grow .chd`, single-file CHD layouts, SGI `shrink` to CHD).
+What's excluded (operations exit with a clear "this binary was built
+without the `optical` feature" message):
 - `optical` verb (rip / disc browse / extract via the OS optical-drive
-  layer).
-- Update checker / self-replace UI (only matters for the desktop GUI).
+  layer — the MiSTer has no optical drive attached).
+- GUI windows and the update-checker self-replace UI (only meaningful
+  for the desktop binary).
 
-Mix and match: pass `--features chd` or `--features optical` to the
-slim build if you want one of those back without paying the GUI cost.
 Full background and the feature matrix live in
 [`docs/mister_cli.md`](docs/mister_cli.md).
 

@@ -1,0 +1,16 @@
+# Cross-compile pins used by `cross build` in the MiSTer CI job
+# (.github/workflows/release.yml -> build-rb-cli-mini-armv7).
+#
+# The MiSTer FPGA ships an Intel Cyclone V SoC (Cortex-A9, 32-bit ARM v7
+# hardfloat) running a Buildroot-based glibc rootfs. The libchdman-rs
+# prebuilt for `armv7-unknown-linux-gnueabihf` is being produced upstream
+# against Ubuntu 20.04's glibc 2.31; we match that baseline here so the
+# resulting rb-cli binary links cleanly against the same glibc symbols
+# the MiSTer Buildroot rootfs exports.
+#
+# `cross` v0.2.5's image is the last one based on Ubuntu 20.04 — pinning
+# to that tag keeps the toolchain stable across `cross` version bumps and
+# avoids accidentally picking up an Ubuntu-22-based image that produces
+# glibc-2.35-only binaries.
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"

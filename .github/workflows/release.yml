@@ -706,14 +706,23 @@ jobs:
           name: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
-  # Slim rb-cli build for the MiSTer FPGA (Intel Cyclone V, Cortex-A9, glibc
-  # Buildroot rootfs). Cross-compiled with --no-default-features so the
-  # eframe / egui / rfd / libchdman-rs / opticaldiscs / cd-da-reader / reqwest
-  # dep trees are excluded entirely — see docs/mister_cli.md.
+  # MiSTer-specific build of `rb-cli` for the FPGA's Intel Cyclone V / Cortex-A9
+  # / Buildroot rootfs (`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline).
+  # Cross-compiled with the GUI and optical features off, but CHD ON — the
+  # upstream `libchdman-rs` armv7 prebuilt ships against Ubuntu 20.04 glibc,
+  # which Cross.toml pins this job to as well so symbols line up.
+  #
+  # This is intentionally OUT of the `release` job's `needs:` list — see the
+  # comment on that job. The artifact still ships in every release where the
+  # job finishes before the release step; it just doesn't gate the desktop
+  # builds while the libchdman-rs armv7 prebuilt is in flight upstream.
   build-rb-cli-mini-armv7:
     name: Build rb-cli-mini (armv7 MiSTer)
     needs: generate-version
     runs-on: ubuntu-latest
+    # Don't fail the whole workflow if the cross-compile breaks (e.g. while
+    # upstream libchdman-rs is mid-update). The artifact is best-effort.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 
@@ -721,6 +730,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: armv7-unknown-linux-gnueabihf
+
+      - name: Install armv7 binutils (host-side strip + objdump)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-arm-linux-gnueabihf file
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -743,37 +757,32 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Build rb-cli-mini for armv7-unknown-linux-gnueabihf
+      - name: Build rb-cli-mini for MiSTer armv7 (CHD on, GUI / optical off)
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: |
+          # Cross.toml at the repo root pins the Docker image to cross-rs
+          # v0.2.5 (Ubuntu 20.04 base) so this binary links against the same
+          # glibc baseline as MiSTer's Buildroot rootfs and the upstream
+          # libchdman-rs armv7 prebuilt.
           cross build \
             --bin rb-cli \
             --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features
+            --no-default-features \
+            --features chd
 
       - name: Strip binary
         run: |
-          # The `cross` Docker image ships the armv7 strip tool; use it via
-          # docker exec rather than installing it on the host runner.
-          docker run --rm \
-            -v "$PWD":/work -w /work \
-            ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge \
-            arm-linux-gnueabihf-strip \
-            target/armv7-unknown-linux-gnueabihf/release/rb-cli
+          arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/rb-cli
 
-      - name: Verify ELF + report linkage
+      - name: Verify ELF + report glibc linkage
         run: |
           set -e
           ELF=target/armv7-unknown-linux-gnueabihf/release/rb-cli
           file "$ELF"
           ls -lh "$ELF"
-          docker run --rm \
-            -v "$PWD":/work -w /work \
-            ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge \
-            arm-linux-gnueabihf-objdump -p "$ELF" \
-            | grep -E 'NEEDED|GLIBC_'
+          arm-linux-gnueabihf-objdump -p "$ELF" | grep -E 'NEEDED|GLIBC_'
 
       - name: Package
         run: |
@@ -790,7 +799,11 @@ jobs:
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages, build-rb-cli-mini-armv7]
+    # The MiSTer armv7 build is intentionally OUT of `needs:` — it's a
+    # best-effort artifact while upstream libchdman-rs's armv7 prebuilt is
+    # in flight. When it succeeds it lands in the release via the `*.tar.gz`
+    # glob below; a failure doesn't block the desktop builds.
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
