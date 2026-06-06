@@ -14,3 +14,24 @@
 # glibc-2.35-only binaries.
 [target.armv7-unknown-linux-gnueabihf]
 image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:0.2.5"
+
+# Forward libchdman-rs's build-script env vars into the container so the
+# prebuilt fetcher can be steered from CI:
+#   - XDG_CACHE_HOME — points at /tmp so the cache dir resolves to a path
+#     the container user can write to (cross's HOME mount is read-only).
+#   - LIBCHDMAN_GLIBC — usually unset; the build script auto-picks 2.31 for
+#     armv7. Passed through anyway so a future "pin to glibc X" override
+#     works without touching this file.
+#   - LIBCHDMAN_PREBUILT_FALLBACK / _FORCE_SOURCE — escape hatches if the
+#     prebuilt fetch fails or upstream temporarily lacks an asset; the
+#     desktop release ships fine without us editing the workflow.
+#   - LIBCHDMAN_PREBUILT_LOCAL_ARCHIVE — lets the workflow stage the .a
+#     archive on the host (avoiding the per-build download) and hand it in.
+[target.armv7-unknown-linux-gnueabihf.env]
+passthrough = [
+    "XDG_CACHE_HOME",
+    "LIBCHDMAN_GLIBC",
+    "LIBCHDMAN_PREBUILT_FALLBACK",
+    "LIBCHDMAN_FORCE_SOURCE",
+    "LIBCHDMAN_PREBUILT_LOCAL_ARCHIVE",
+]
