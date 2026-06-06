@@ -34,7 +34,7 @@ pub mod xdf;
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::ReadSeek;
 
@@ -183,6 +183,168 @@ pub fn open_container_reader<R: Read + Seek>(
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes)?;
     open_container_bytes(bytes, path_hint)
+}
+
+/// Floppy-container conversion engine: shared by `rb-cli floppy convert`,
+/// the GUI's `FloppyConvertDialog`, and any future caller. Reads `in_path`,
+/// detects/decodes the source format, encodes to the format implied by the
+/// `target` argument, and writes the result to `out_path`.
+///
+/// Identity conversions (source kind == target) byte-copy the file instead
+/// of round-tripping through the flat-stream intermediate.
+pub fn convert_floppy_container(
+    in_path: &Path,
+    out_path: &Path,
+    target: ContainerKind,
+) -> Result<ConvertReport> {
+    let bytes =
+        std::fs::read(in_path).with_context(|| format!("reading source {}", in_path.display()))?;
+    let head_window = bytes.len().min(256);
+    let source = detect_container_kind(&bytes[..head_window], Some(in_path));
+
+    if !is_floppy_container(source) {
+        anyhow::bail!(
+            "input {} is not a recognised floppy container (got {})",
+            in_path.display(),
+            source.display_name()
+        );
+    }
+    if !is_floppy_container(target) {
+        anyhow::bail!(
+            "target {} is not a floppy container — expected one of XDF, HDM, DIM, D88",
+            target.display_name()
+        );
+    }
+
+    let (flat, media) = decode_any_floppy(&bytes, source)?;
+
+    if source == target {
+        std::fs::copy(in_path, out_path).with_context(|| {
+            format!(
+                "identity copy {} -> {}",
+                in_path.display(),
+                out_path.display()
+            )
+        })?;
+        return Ok(ConvertReport {
+            source,
+            target,
+            media,
+            identity: true,
+            bytes_written: bytes.len() as u64,
+        });
+    }
+
+    let encoded = encode_any_floppy(&flat, media, target)?;
+    std::fs::write(out_path, &encoded)
+        .with_context(|| format!("writing target {}", out_path.display()))?;
+    Ok(ConvertReport {
+        source,
+        target,
+        media,
+        identity: false,
+        bytes_written: encoded.len() as u64,
+    })
+}
+
+/// Returned by [`convert_floppy_container`] so the caller can log a single
+/// human-friendly summary line.
+#[derive(Debug, Clone)]
+pub struct ConvertReport {
+    pub source: ContainerKind,
+    pub target: ContainerKind,
+    pub media: floppy_geom::FloppyMedia,
+    pub identity: bool,
+    pub bytes_written: u64,
+}
+
+/// True if `kind` is one of the four floppy containers handled by
+/// [`convert_floppy_container`].
+pub fn is_floppy_container(kind: ContainerKind) -> bool {
+    matches!(
+        kind,
+        ContainerKind::Xdf | ContainerKind::Hdm | ContainerKind::Dim | ContainerKind::D88
+    )
+}
+
+/// Pick the floppy [`ContainerKind`] implied by an output file extension.
+/// Returns an error for any extension not in the four-format set.
+pub fn floppy_kind_from_extension(path: &Path) -> Result<ContainerKind> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "output path {} has no extension; cannot infer floppy format",
+                path.display()
+            )
+        })?;
+    match ext.as_str() {
+        "xdf" => Ok(ContainerKind::Xdf),
+        "hdm" => Ok(ContainerKind::Hdm),
+        "dim" => Ok(ContainerKind::Dim),
+        "d88" => Ok(ContainerKind::D88),
+        other => anyhow::bail!(
+            "output extension .{other} is not a floppy container \
+             (expected .xdf / .hdm / .dim / .d88)"
+        ),
+    }
+}
+
+fn decode_any_floppy(
+    bytes: &[u8],
+    kind: ContainerKind,
+) -> Result<(Vec<u8>, floppy_geom::FloppyMedia)> {
+    match kind {
+        ContainerKind::Xdf => xdf::decode_xdf_bytes(bytes),
+        ContainerKind::Hdm => hdm::decode_hdm_bytes(bytes),
+        ContainerKind::Dim => dim::decode_dim_bytes(bytes),
+        ContainerKind::D88 => {
+            let flat = d88::decode_d88_bytes(bytes)?;
+            let media = floppy_geom::require_media_from_size(flat.len())?;
+            Ok((flat, media))
+        }
+        other => anyhow::bail!(
+            "decode_any_floppy: {} is not a floppy container",
+            other.display_name()
+        ),
+    }
+}
+
+fn encode_any_floppy(
+    flat: &[u8],
+    media: floppy_geom::FloppyMedia,
+    target: ContainerKind,
+) -> Result<Vec<u8>> {
+    let geom = media.geometry();
+    match target {
+        ContainerKind::Xdf => xdf::encode_xdf_bytes(flat, geom),
+        ContainerKind::Hdm => hdm::encode_hdm_bytes(flat, geom),
+        ContainerKind::Dim => dim::encode_dim_bytes(flat, geom),
+        ContainerKind::D88 => {
+            let d88_media = match media {
+                floppy_geom::FloppyMedia::Hd1232 | floppy_geom::FloppyMedia::Hd1440 => {
+                    d88::D88Media::Dd2hd
+                }
+                floppy_geom::FloppyMedia::Dd720 | floppy_geom::FloppyMedia::Dd640 => {
+                    d88::D88Media::Dd2dd
+                }
+            };
+            d88::encode_d88_bytes(
+                flat,
+                geom.cyls,
+                geom.heads,
+                geom.spt,
+                geom.sec_size as usize,
+                d88_media,
+            )
+        }
+        other => anyhow::bail!(
+            "encode_any_floppy: {} is not a floppy container",
+            other.display_name()
+        ),
+    }
 }
 
 #[cfg(test)]

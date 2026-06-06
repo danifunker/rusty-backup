@@ -6,6 +6,7 @@ mod chd_options_ui;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
+mod floppy_convert_dialog;
 mod inspect_tab;
 mod journal_view;
 mod optical_tab;
@@ -138,6 +139,7 @@ pub fn prepare_disk_image_path(
         Some("hdz") => "hdf",
         Some("msa") => "st",
         Some("d88") => "img",
+        Some("xdf") | Some("hdm") | Some("dim") => "img",
         _ => return Ok((path.to_path_buf(), None)),
     };
     let tmp = tempfile::tempdir()?;
@@ -172,6 +174,45 @@ pub fn prepare_disk_image_path(
             path.display(),
             out_path.display(),
             flat.len()
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+    if target_ext == "img" && matches!(ext.as_deref(), Some("xdf") | Some("hdm") | Some("dim")) {
+        let bytes = std::fs::read(path)?;
+        let (flat, label) = match ext.as_deref() {
+            Some("xdf") => (
+                rusty_backup::rbformats::containers::xdf::decode_xdf_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "XDF",
+            ),
+            Some("hdm") => (
+                rusty_backup::rbformats::containers::hdm::decode_hdm_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "HDM",
+            ),
+            Some("dim") => (
+                rusty_backup::rbformats::containers::dim::decode_dim_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "DIM",
+            ),
+            _ => unreachable!("guarded by outer match arm"),
+        };
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, {} decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len(),
+            label
         );
         return Ok((out_path, Some(tmp)));
     }

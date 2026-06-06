@@ -16,6 +16,7 @@ pub mod completions;
 pub mod config;
 pub mod convert;
 pub mod expand;
+pub mod floppy;
 pub mod fsck;
 pub mod get;
 pub mod grow;

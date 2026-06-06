@@ -171,6 +171,12 @@ pub enum Command {
         cmd: verbs::optical::OpticalCommand,
     },
 
+    /// Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88.
+    Floppy {
+        #[command(subcommand)]
+        cmd: verbs::floppy::FloppyCommand,
+    },
+
     /// Edit the partition table (add / resize / delete / set-type /
     /// set-bootable). Partition *data* is never moved.
     Partmap {
@@ -250,6 +256,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
         Command::Optical { cmd } => verbs::optical::run(cmd),
+        Command::Floppy { cmd } => verbs::floppy::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Sit { cmd } => verbs::sit::run(cmd),
         Command::Terminal => verbs::terminal::run(),
