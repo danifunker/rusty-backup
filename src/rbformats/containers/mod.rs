@@ -23,9 +23,11 @@
 
 pub mod d88;
 pub mod edsk;
+pub mod floppy_geom;
 pub mod hdf;
 pub mod msa;
 pub mod sector_order;
+pub mod xdf;
 
 use std::io::{Cursor, Read, Seek};
 use std::path::Path;
@@ -48,6 +50,10 @@ pub enum ContainerKind {
     /// Sharp `.d88` floppy container — X68000 / PC-88 / PC-98 / MSX /
     /// FM-7. 32-byte disk-info header + 164-entry track-offset table.
     D88,
+    /// X68000 XDF — raw headerless flat-sector dump. Geometry inferred
+    /// from file size. Routed by extension; the decoder fails if the
+    /// size doesn't match a supported floppy geometry.
+    Xdf,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -59,6 +65,7 @@ impl ContainerKind {
             ContainerKind::Msa => "Atari MSA",
             ContainerKind::Edsk => "CPCEMU DSK/EDSK",
             ContainerKind::D88 => "Sharp .d88",
+            ContainerKind::Xdf => "X68000 XDF",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -68,10 +75,15 @@ impl ContainerKind {
 /// input we don't recognise — the caller can then pass the file through to
 /// the partition layer untouched.
 ///
-/// `path` is an optional hint used only to tiebreak against extension when
-/// the magic is empty or ambiguous (none today, but kept for future
-/// container formats that lack a header).
-pub fn detect_container_kind(head: &[u8], _path: Option<&Path>) -> ContainerKind {
+/// `path` is an optional hint used to tiebreak against file extension when
+/// the magic is absent (XDF — raw headerless dump with size-based geometry
+/// inference). Magic-strong formats win first.
+///
+/// **Note:** the headerless floppy formats (XDF and friends) need the full
+/// file *length* to validate the geometry, not just a header window. The
+/// detection here returns the bucket; the decoder validates the size and
+/// returns a typed error if it's wrong.
+pub fn detect_container_kind(head: &[u8], path: Option<&Path>) -> ContainerKind {
     if msa::looks_like_msa_header(head) {
         return ContainerKind::Msa;
     }
@@ -80,6 +92,12 @@ pub fn detect_container_kind(head: &[u8], _path: Option<&Path>) -> ContainerKind
     }
     if d88::looks_like_d88_header(head) {
         return ContainerKind::D88;
+    }
+    // Extension tiebreak for headerless raw floppy formats.
+    if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
+        if ext.eq_ignore_ascii_case("xdf") {
+            return ContainerKind::Xdf;
+        }
     }
     ContainerKind::Raw
 }
@@ -108,6 +126,10 @@ pub fn open_container_bytes(
         ContainerKind::D88 => {
             let flat = d88::decode_d88_bytes(&bytes)?;
             Ok((ContainerKind::D88, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::Xdf => {
+            let (flat, _media) = xdf::decode_xdf_bytes(&bytes)?;
+            Ok((ContainerKind::Xdf, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }
@@ -146,5 +168,60 @@ mod tests {
     fn detect_container_kind_unknown_is_raw() {
         let head = [0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 0];
         assert_eq!(detect_container_kind(&head, None), ContainerKind::Raw);
+    }
+
+    #[test]
+    fn detect_container_kind_xdf_by_extension() {
+        use std::path::PathBuf;
+        // Head that does NOT match any existing magic. Byte 0x1B is the D88
+        // media-type byte — picking 0xFE (a typical FAT BPB media descriptor)
+        // keeps the D88 sniffer from claiming this buffer.
+        let mut head = [0u8; 64];
+        head[0x1B] = 0xFE;
+        assert_eq!(detect_container_kind(&head, None), ContainerKind::Raw);
+        let path = PathBuf::from("disk.xdf");
+        assert_eq!(
+            detect_container_kind(&head, Some(path.as_path())),
+            ContainerKind::Xdf
+        );
+        let path_upper = PathBuf::from("DISK.XDF");
+        assert_eq!(
+            detect_container_kind(&head, Some(path_upper.as_path())),
+            ContainerKind::Xdf
+        );
+    }
+
+    #[test]
+    fn open_container_bytes_decodes_xdf() {
+        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+        let geom = FloppyMedia::Hd1232.geometry();
+        // Pattern where byte 0x1B is 0xFE so the D88 sniff doesn't claim it.
+        let pattern: Vec<u8> = (0..geom.flat_size())
+            .map(|i| if i == 0x1B { 0xFE } else { (i & 0xFF) as u8 })
+            .collect();
+        let path = std::path::PathBuf::from("disk.xdf");
+        let (kind, mut reader) = open_container_bytes(pattern.clone(), Some(&path)).unwrap();
+        assert_eq!(kind, ContainerKind::Xdf);
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, pattern);
+    }
+
+    #[test]
+    fn open_container_bytes_rejects_wrong_size_xdf() {
+        let path = std::path::PathBuf::from("disk.xdf");
+        // 1000 bytes, byte 0x1B = 0xFE so D88 sniff doesn't capture it.
+        let mut bytes = vec![0u8; 1000];
+        bytes[0x1B] = 0xFE;
+        // `Ok` payload contains `Box<dyn ReadSeek>` which is not `Debug`, so we
+        // hand-pattern the result instead of `unwrap_err`.
+        let err = match open_container_bytes(bytes, Some(&path)) {
+            Ok(_) => panic!("expected decode failure"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("no supported floppy geometry"),
+            "unexpected error: {err}"
+        );
     }
 }
