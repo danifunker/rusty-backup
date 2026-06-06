@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 
 use aes::Aes128;
 use anyhow::{anyhow, bail, Context, Result};
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+// `cipher` crate 0.6 split the old `BlockDecryptMut` trait into
+// `BlockModeDecrypt` (for block-mode types like cbc::Decryptor) and
+// `BlockCipherDecrypt` (for the raw cipher). For CBC we want the former.
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use md5::{Digest, Md5};
 
 /// IMZ magic = ZIP local file header signature.
@@ -174,14 +177,13 @@ fn decrypt_winimage_body(body: &[u8], password: &[u8]) -> Result<Vec<u8>> {
         let mut cipher = Aes128CbcDec::new(&key.into(), &iv.into());
         // decrypt_padded_mut requires PKCS#7-compatible padding which we
         // don't have here; decrypt the blocks in-place via the raw block API.
-        let blocks: &mut [aes::cipher::generic_array::GenericArray<u8, _>] = unsafe {
-            std::slice::from_raw_parts_mut(
-                buf.as_mut_ptr()
-                    as *mut aes::cipher::generic_array::GenericArray<u8, aes::cipher::consts::U16>,
-                ct_len / 16,
-            )
+        // `aes::Block` is a type alias for `cipher::array::Array<u8, U16>` —
+        // same memory layout as the old generic-array GenericArray<u8, U16>,
+        // so the raw transmute is still sound.
+        let blocks: &mut [aes::Block] = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut aes::Block, ct_len / 16)
         };
-        cipher.decrypt_blocks_mut(blocks);
+        cipher.decrypt_blocks(blocks);
         if pos >= end {
             // Last chunk: trim padding to the real plaintext length.
             if real_last_pt_len > buf.len() {
@@ -507,7 +509,7 @@ mod tests {
         // Build a small WinImage-format body around a known plaintext, then
         // feed it through decrypt_winimage_body and confirm we get the
         // plaintext back. Uses the same key derivation as the real format.
-        use aes::cipher::{generic_array::GenericArray, BlockEncryptMut, KeyIvInit};
+        use aes::cipher::{BlockModeEncrypt, KeyIvInit};
         type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
         let key = derive_winimage_key(b"password");
@@ -524,13 +526,10 @@ mod tests {
         let encrypt_chunk = |pt: &[u8]| -> Vec<u8> {
             let mut buf = pt.to_vec();
             let mut cipher = Aes128CbcEnc::new(&key.into(), &iv.into());
-            let blocks: &mut [GenericArray<u8, _>] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr() as *mut GenericArray<u8, aes::cipher::consts::U16>,
-                    pt.len() / 16,
-                )
+            let blocks: &mut [aes::Block] = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut aes::Block, pt.len() / 16)
             };
-            cipher.encrypt_blocks_mut(blocks);
+            cipher.encrypt_blocks(blocks);
             buf
         };
         let ct0 = encrypt_chunk(&pt0);
