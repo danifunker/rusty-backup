@@ -22,6 +22,7 @@
 //! crate dependency.
 
 pub mod d88;
+pub mod dim;
 pub mod edsk;
 pub mod floppy_geom;
 pub mod hdf;
@@ -59,6 +60,10 @@ pub enum ContainerKind {
     /// a distinct variant so the routing and log labels track the user's
     /// chosen extension.
     Hdm,
+    /// DiskExplorer DIM — 256-byte header + payload. Read path handles
+    /// both DIFC (signed `DIFC HEADER` at byte 0xAB) and generic
+    /// `header + flat` variants; write path always emits DIFC.
+    Dim,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -72,6 +77,7 @@ impl ContainerKind {
             ContainerKind::D88 => "Sharp .d88",
             ContainerKind::Xdf => "X68000 XDF",
             ContainerKind::Hdm => "PC-98 HDM",
+            ContainerKind::Dim => "DiskExplorer DIM",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -82,8 +88,12 @@ impl ContainerKind {
 /// the partition layer untouched.
 ///
 /// `path` is an optional hint used to tiebreak against file extension when
-/// the magic is absent (XDF — raw headerless dump with size-based geometry
-/// inference). Magic-strong formats win first.
+/// the magic is absent (XDF / HDM — raw headerless dumps with size-based
+/// geometry inference) or weak. Magic-strong formats win first.
+///
+/// **Head buffer size:** callers should pass at least 256 bytes so DIM's
+/// DIFC signature (at offset 0xAB) can be detected. The `open_container_*`
+/// helpers slice that much when invoking this function.
 ///
 /// **Note:** the headerless floppy formats (XDF and friends) need the full
 /// file *length* to validate the geometry, not just a header window. The
@@ -99,13 +109,19 @@ pub fn detect_container_kind(head: &[u8], path: Option<&Path>) -> ContainerKind 
     if d88::looks_like_d88_header(head) {
         return ContainerKind::D88;
     }
-    // Extension tiebreak for headerless raw floppy formats.
+    if dim::looks_like_dim_header(head) {
+        return ContainerKind::Dim;
+    }
+    // Extension tiebreak for headerless raw floppy formats and generic DIM.
     if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
         if ext.eq_ignore_ascii_case("xdf") {
             return ContainerKind::Xdf;
         }
         if ext.eq_ignore_ascii_case("hdm") {
             return ContainerKind::Hdm;
+        }
+        if ext.eq_ignore_ascii_case("dim") {
+            return ContainerKind::Dim;
         }
     }
     ContainerKind::Raw
@@ -122,7 +138,9 @@ pub fn open_container_bytes(
     bytes: Vec<u8>,
     path_hint: Option<&Path>,
 ) -> Result<(ContainerKind, Box<dyn ReadSeek>)> {
-    let kind = detect_container_kind(&bytes[..bytes.len().min(64)], path_hint);
+    // 256 bytes is enough to see the DIFC signature at offset 0xAB; smaller
+    // formats only consult their first dozen bytes.
+    let kind = detect_container_kind(&bytes[..bytes.len().min(256)], path_hint);
     match kind {
         ContainerKind::Msa => {
             let flat = msa::decode_msa_bytes(&bytes)?;
@@ -143,6 +161,10 @@ pub fn open_container_bytes(
         ContainerKind::Hdm => {
             let (flat, _media) = hdm::decode_hdm_bytes(&bytes)?;
             Ok((ContainerKind::Hdm, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::Dim => {
+            let (flat, _media) = dim::decode_dim_bytes(&bytes)?;
+            Ok((ContainerKind::Dim, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }
