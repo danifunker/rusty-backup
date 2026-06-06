@@ -305,6 +305,93 @@ see §10. Reopen when new CLI / GUI work surfaces.)
 
 ## 7. User-side verification (not coding)
 
+### 7.NH — Need help (user research blocking, surfaced 2026-06-05 MiSTer session)
+
+Two MiSTer Wave-2 manual-verify attempts each hit a wall that **isn't a
+rusty-backup issue** but needs the user to source / research the right
+real-hardware-side software before the engine work we shipped can be
+demonstrated in-emulator. Both blockers are well-scoped; both have
+proven engine paths host-side that can substitute as evidence for the
+spine rows. Captured here so the next session knows what's pending the
+user's research.
+
+**X68000 — need a Human68k system with the SCSI driver loaded**
+
+- The MiSTer X68000 core boots from `boot3.vhd` (16 KB stub on the
+  SD; valid SASI signature `\x82w68000W` but no real Human68k
+  install). With FDD0 = `BLANK_disk_X68000.D88` the floppy boots
+  Human68k v3.0 fine — but the floppy's CONFIG.SYS doesn't include
+  a SCSI device driver line (typically `DEVICE = \SYS\SCSIROM.SYS`
+  or similar), so even with a valid SCSI HDF mounted in the SASI
+  slot, Human68k can't see it as a drive letter.
+- Tried `hd0.hds` (the real 100 MB Sharp SCSI image from
+  `C:\Temp\hd0.zip`): byte-0 has `X68SCSI1` signature so the SASI
+  BIOS *should* recognise it, but without a SCSI driver in CONFIG.SYS
+  there's still no drive letter.
+- Tried `Bomberman.HDF` (real 10 MB Sharp self-bootable game disc):
+  IPL menu auto-boots straight into the game; no shell stop.
+- **What the user needs to source:** either (a) a Human68k system
+  floppy whose CONFIG.SYS already loads the SCSI driver — the
+  `Human 68k v3.02 (1993)(Sharp - Hudson)[a].dim` in `C:\Temp\hd0.zip`
+  is a strong candidate (matched-pair release with `hd0.hds`, would
+  need `.dim → .D88` conversion); or (b) a known-good HDF with
+  Human68k + SCSI driver pre-installed and editable from outside.
+- **What rusty-backup already validates** without this:
+  `tests/cli_x68000.rs` round-trip on the synthetic D88 fixture +
+  `tests/x68000_resize.rs` reconstruct → resize → re-open + the
+  Wave-2 spine close-out commit. Engine surface is complete.
+- Separate but related: the OPEN-WORK §8 entry "X68000 SASI / SCSI
+  HDD format gaps" captures the *code-side* follow-ups
+  (signature detection, sector-size derivation, IPL menu builder).
+  Closing those would land a self-bootable HDF that **doesn't need**
+  a working CONFIG.SYS workflow — a separate path to the same end.
+
+**QL — need a QXL-driver-capable system ROM**
+
+- The MiSTer QL setup ships `boot.rom` (stock Sinclair JS) and
+  `minerva+qlsd_ql.rom` (Minerva + Marcel Kilgus's QLSD SD-card
+  interface). QLSD exposes `sdc1_` for SD-card-image format,
+  **NOT** `win1_` for QXL.WIN.
+- Our `rb-cli put`-emitted file is a canonical QXL.WIN container —
+  byte 0 = `QLWA`, header layout matches `ql-filer`'s
+  `WinHeader.java` (`DISC_IDENTIFIER = {'Q','L','W','A'}`,
+  `SECTOR_LENGTH = 512`, `HEADER_LENGTH = 64`) and our
+  `src/fs/qdos.rs` documentation byte-exact. Three independent
+  references confirm: sQLux byte-truth oracle (passing host-side),
+  `ql-filer` `WinHeader.java`, our own engine. Format is canonical.
+- For the MiSTer QL core to surface our file as `win1_` it needs a
+  ROM with a QXL / Gold Card / Trump Card / Super GoldCard driver —
+  not what `minerva+qlsd_ql.rom` provides. With QLSD loaded, the
+  user types `DIR win1_` and gets "not found" because no driver
+  bound that device prefix; under `sdc1_` it might attach but as an
+  SD-card-image format (not QLWA).
+- **What the user needs to source:** a QXL.WIN-aware QL system ROM
+  for MiSTer. Candidates from QL community archives:
+  Trump Card + Minerva, Super GoldCard ROM, or kilgus's
+  `qlmister.rom` variant that bundles the QXL driver
+  (referenced in `docs/mister_filesystem_implementation_plan.md`
+  Wave-2 session log but not committed in tree).
+- **What rusty-backup already validates** without this:
+  sQLux byte-truth oracle (the kilgus headless harness has
+  `rb-cli put → SuperBASIC COPY → host file diff`, byte-exact, per
+  the Wave-2 close-out commit). Engine + container format are
+  complete.
+
+**Common shape**: both gaps are "MiSTer real-hardware setup needs
+software rusty-backup doesn't and shouldn't ship" — the
+ROMs/drivers in question are proprietary or community-distributed
+and live outside our scope. The user-side ref / write-verified parks
+on the Wave-2 spine rows stay `[!]` until the user runs these tests
+with the right setup; the engine-level surface is independently
+proven via the host-side oracles.
+
+Move these to the right §X8 sub-bucket once the user has gathered
+research or sourced the needed ROMs/disks.
+
+---
+
+### 7.0 — Original user-side verification list (pre-2026-06-05)
+
 - **HFV in BasiliskII / MAME** — boot/mount our blank + cloned HFVs
   against the bootable samples (`Mac OS 8.1.HFV`, `Starterdisk.hfv`).
   Our blank/cloned volumes fsck clean and round-trip byte-identically,
