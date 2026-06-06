@@ -305,5 +305,31 @@ in.
 ## Status
 
 Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
-No code touched yet. Pick up in a fresh session when ready; the
-spec above is self-contained.
+**Shipped 2026-06-06**:
+
+- `Cargo.toml` carries three optional features — `gui` (eframe / egui
+  / rfd / reqwest / webbrowser), `chd` (libchdman-rs), and `optical`
+  (opticaldiscs / cd-da-reader). `default = ["gui", "chd", "optical"]`
+  keeps the desktop release a single binary; the slim build is
+  `cargo build --bin rb-cli --no-default-features`.
+- `reqwest` flipped from `native-tls` to `rustls`, so the host build
+  no longer drags in `openssl-sys`.
+- Module-level gates throughout `src/`: `src/main.rs` (gui),
+  `src/update.rs`, `src/model/{update_runner,chd_expand_runner}`,
+  `src/optical/`, `src/cli/verbs/optical.rs`,
+  `src/rbformats/{chd,chd_edit,chd_options}`,
+  `src/backup/single_file_chd`. Runtime stubs in
+  `src/rbformats/mod.rs` keep call sites (e.g. `BackupConfig::chd_options`,
+  `BrowseSession::chd_edit_session`) compiling; calls into the stubs
+  return a clear "this binary was built without the `chd` feature"
+  error.
+- CI workflow `.github/workflows/release.yml` ships a new
+  `build-rb-cli-mini-armv7` job that uses `cross` to produce
+  `rb-cli-mini-armv7-linux-<version>.tar.gz` as a release artifact.
+- README has a `rb-cli-mini` section with the build incantation and
+  the included/excluded feature matrix.
+
+Remaining open: smoke-test the produced armv7 binary on a real MiSTer
+device (the X68000 / Archie / QL Workflow A+B+C parks in §7 of
+OPEN-WORK) — this requires hardware access and is tracked there
+rather than here.

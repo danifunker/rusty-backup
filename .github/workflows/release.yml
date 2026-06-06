@@ -706,10 +706,91 @@ jobs:
           name: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: Rusty-Backup-CLI-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
+  # Slim rb-cli build for the MiSTer FPGA (Intel Cyclone V, Cortex-A9, glibc
+  # Buildroot rootfs). Cross-compiled with --no-default-features so the
+  # eframe / egui / rfd / libchdman-rs / opticaldiscs / cd-da-reader / reqwest
+  # dep trees are excluded entirely — see docs/mister_cli.md.
+  build-rb-cli-mini-armv7:
+    name: Build rb-cli-mini (armv7 MiSTer)
+    needs: generate-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-armv7-mister-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build rb-cli-mini for armv7-unknown-linux-gnueabihf
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cross build \
+            --bin rb-cli \
+            --release \
+            --target armv7-unknown-linux-gnueabihf \
+            --no-default-features
+
+      - name: Strip binary
+        run: |
+          # The `cross` Docker image ships the armv7 strip tool; use it via
+          # docker exec rather than installing it on the host runner.
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge \
+            arm-linux-gnueabihf-strip \
+            target/armv7-unknown-linux-gnueabihf/release/rb-cli
+
+      - name: Verify ELF + report linkage
+        run: |
+          set -e
+          ELF=target/armv7-unknown-linux-gnueabihf/release/rb-cli
+          file "$ELF"
+          ls -lh "$ELF"
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:edge \
+            arm-linux-gnueabihf-objdump -p "$ELF" \
+            | grep -E 'NEEDED|GLIBC_'
+
+      - name: Package
+        run: |
+          TGZ="rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz"
+          tar -C target/armv7-unknown-linux-gnueabihf/release -czf "$TGZ" rb-cli
+          ls -lh "$TGZ"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
+
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
+    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages, build-rb-cli-mini-armv7]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
