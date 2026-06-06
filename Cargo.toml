@@ -75,7 +75,7 @@ optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 eframe = { version = "0.34", features = ["glow"], optional = true }
 egui = { version = "0.34", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.288.1", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.288.5", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
