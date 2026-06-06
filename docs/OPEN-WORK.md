@@ -782,6 +782,37 @@ Audit trail. Each was either shipped, closed-by-design, or moved into
 the structure above before its source plan doc was deleted in the
 docs-consolidation pass.
 
+- **X68000 floppy-container any-to-any conversion (XDF / HDM / DIM / D88
+  — Wave 2 prereq, 2026-06-06)** — closes the third-party-tool gap for
+  the X68000 row's floppy workflow. `src/rbformats/containers/floppy_geom.rs`
+  hosts the four-element media set (1.2 MB / 1.44 MB 2HD, 720 KB / 640 KB
+  2DD) with size-unique geometries so size-based inference is unambiguous;
+  `xdf.rs` / `hdm.rs` are raw-flat passthroughs delegating to the shared
+  helper; `dim.rs` handles DIFC (256-byte signed header + track-existence
+  bitmap, zero-fills missing tracks on decode, all-tracks-present on encode)
+  and a generic "256-byte header + flat payload" fallback for non-DIFC
+  `.dim` variants (e.g. IBM XDF DIM); DIFC has no 640 KB media byte so
+  DIM-encode rejects that geometry with a clear pointer to the other
+  three formats. The pre-existing `d88.rs` `encode_d88_bytes` /
+  `decode_d88_bytes` already round-trip-tested; the new
+  `convert_floppy_container` engine in `containers/mod.rs` is the shared
+  any-to-any entry point used by every surface. Surfaces: `rb-cli floppy
+  convert <in> <out>` (extension-driven), `rb-cli floppy convert <dir>
+  <dir> --to <fmt> [--recursive]` (bulk), `rb-cli floppy info <path>`
+  (geometry probe), `FloppyConvertDialog` in the Inspect tab (single-file
+  GUI), and the existing GUI Bulk Convert dialog gets `Xdf` / `Hdm` /
+  `Dim` / `D88` entries via four new `ExportFormat` variants intercepted
+  in `bulk_convert_runner` and routed through the same engine. The
+  inspect-tab materializer (`gui::prepare_disk_image_path`) now decodes
+  `.xdf` / `.hdm` / `.dim` to tempfile so the inner FAT / Human68k
+  filesystem is browsable directly. Tests: 65 container unit + 3
+  integration cells (`tests/floppy_container_roundtrip.rs` covers the
+  16-cell matrix, asserts DIM-DD640 rejection, and feeds a 3-file
+  mixed-format batch through `start_bulk_convert` to confirm runner
+  routing). Drops the `xdf2d88` Linux-tooling note from
+  `docs/mister-deployment-testing-plan.md` §3.4. Unblocks the X68000
+  Wave-2 spine row's floppy column.
+
 - **AtariST MiSTer-core prereqs (§5 MiSTer plan → §10)** — first slice
   of the MiSTer-core spine. `src/partition/atari.rs` parses AHDI root
   sectors (4 big-endian 12-byte slots at 0x1C6, GEM / BGM / XGM / RAW

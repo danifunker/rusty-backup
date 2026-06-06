@@ -277,11 +277,11 @@ hexdump -C /tmp/out | head -3        # compare against expected BASIC tokens
 | Field | Value |
 |---|---|
 | SD path | `/media/fat/games/X68000/` |
-| Floppy format | `.d88` (multi-track), `.dim` (raw), `.xdf` (sector dump) |
+| Floppy format | `.d88` (multi-track), `.dim` (DIFC + generic), `.xdf` / `.hdm` (sector dump) — any-to-any conversion via `rb-cli floppy convert` |
 | HDD format | `.hdf` (SASI HDD, Human68k partition scheme) |
 | ROMs | `/games/X68000/X68000_IPLROM.dat` + `/games/X68000/X68000_FONT.dat` |
 | Workflows | A + B + C |
-| Reference tool | None on Linux apt; use `xdf2d88` / `xm6g` (Windows) for cross-check |
+| Reference tool | `rb-cli floppy convert` + `rb-cli floppy info`; `xm6g` (Windows) for in-emulator cross-check |
 
 **Test recipe:**
 
