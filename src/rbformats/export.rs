@@ -8,7 +8,9 @@
 //! functions that delegate to the appropriate format-specific code.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(feature = "chd")]
+use std::io::BufReader;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -47,7 +49,9 @@ pub enum ExportFormat {
     Woz,
     /// DiskCopy 4.2 (Mac / Apple IIgs) — floppy-only: 400K / 720K / 800K / 1440K sources.
     Dc42,
-    /// MAME CHD, hard-disk profile (512-byte unit).
+    /// MAME CHD, hard-disk profile (512-byte unit). Behind the `chd`
+    /// feature; the slim rb-cli-mini build still exposes the variant for
+    /// API compatibility but the writer errors out at runtime.
     Chd,
     /// MAME CHD, DVD profile (2048-byte unit, MAME 0.287+).
     ChdDvd,
@@ -588,6 +592,7 @@ pub fn export_whole_disk(
     // CHD outputs go through libchdman-rs. Bulk-convert is the only caller
     // today and uses a separate entry point that threads `ChdOptions`; the
     // generic export path here defaults the codecs/hunk-size from chdman.
+    #[cfg(feature = "chd")]
     if format == ExportFormat::Chd || format == ExportFormat::ChdDvd {
         let profile = if format == ExportFormat::Chd {
             super::chd_options::ChdProfile::Hd
@@ -608,12 +613,25 @@ pub fn export_whole_disk(
         );
     }
 
+    #[cfg(feature = "chd")]
     if format == ExportFormat::ChdCd {
         return export_whole_disk_chd_cd(source_path, dest_path, None, cancel_check, log_cb);
     }
 
+    #[cfg(feature = "chd")]
     if format == ExportFormat::BinCue {
         return export_whole_disk_bincue(source_path, dest_path, false, cancel_check, log_cb);
+    }
+
+    #[cfg(not(feature = "chd"))]
+    if matches!(
+        format,
+        ExportFormat::Chd | ExportFormat::ChdDvd | ExportFormat::ChdCd | ExportFormat::BinCue
+    ) {
+        anyhow::bail!(
+            "this binary was built without the `chd` feature; \
+             CHD / BIN/CUE output is unavailable"
+        );
     }
 
     // WOZ and DiskCopy 4.2: floppy-only.  Reconstruct (or slurp) the source
@@ -1437,6 +1455,7 @@ fn export_whole_disk_vmdk_sparse(
 /// image files; full backup-folder reconstruction into CHD can be added later
 /// if needed.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "chd")]
 pub fn export_whole_disk_chd(
     source_path: &Path,
     backup_metadata: Option<&BackupMetadata>,
@@ -1565,6 +1584,7 @@ pub fn export_whole_disk_chd(
 /// `to_chd` writes into a shared `ConvertProgress` on its own clock. The
 /// bulk-convert UI shows per-file progress (the per-CHD worker bumps the
 /// file index when it returns) which is granular enough for the dialog.
+#[cfg(feature = "chd")]
 pub fn export_whole_disk_chd_cd(
     source_path: &Path,
     dest_path: &Path,
@@ -1596,6 +1616,7 @@ pub fn export_whole_disk_chd_cd(
 /// Single-bin output mirrors chdman's `extractcd`. Multi-bin output writes one
 /// `<base> (Track NN).bin` per track and a multi-FILE cue — a feature beyond
 /// chdman built on top of libchdman-rs's track metadata.
+#[cfg(feature = "chd")]
 pub fn export_whole_disk_bincue(
     source_chd: &Path,
     dest_cue: &Path,

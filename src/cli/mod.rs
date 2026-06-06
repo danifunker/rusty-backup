@@ -166,6 +166,7 @@ pub enum Command {
     },
 
     /// Optical-media verbs (rip / convert / browse / extract).
+    #[cfg(feature = "optical")]
     Optical {
         #[command(subcommand)]
         cmd: verbs::optical::OpticalCommand,
@@ -255,6 +256,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::BatchTemplate(args) => verbs::batch_template::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
+        #[cfg(feature = "optical")]
         Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Floppy { cmd } => verbs::floppy::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),

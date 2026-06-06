@@ -23,10 +23,15 @@ use crate::fs::fat::resize_fat_in_place;
 use crate::fs::hfs_max_growable_size;
 use crate::model::size_mode::SizeMode;
 use crate::partition::{self, PartitionInfo, PartitionSizeOverride};
+#[cfg(feature = "chd")]
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 use crate::rbformats::export::{
     export_clonezilla_disk, export_clonezilla_partition, export_partition, export_whole_disk,
-    export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd, ExportFormat,
+    ExportFormat,
+};
+#[cfg(feature = "chd")]
+use crate::rbformats::export::{
+    export_whole_disk_bincue, export_whole_disk_chd, export_whole_disk_chd_cd,
 };
 use crate::rbformats::vhd::build_vhd_footer;
 
@@ -284,6 +289,7 @@ pub fn start_native_whole_disk(
 /// route through `single_file_chd::run_export` (resize-capable) instead
 /// of the legacy raw-stream `export_whole_disk_chd`. Only meaningful for
 /// `Chd` / `ChdDvd` formats; the optical paths ignore it.
+#[cfg(feature = "chd")]
 pub struct NativeWholeDiskChdPartitionContext {
     pub partition_table: crate::partition::PartitionTable,
     pub partitions: Vec<PartitionInfo>,
@@ -294,6 +300,7 @@ pub struct NativeWholeDiskChdPartitionContext {
     pub resize_targets: Vec<(usize, u64)>,
 }
 
+#[cfg(feature = "chd")]
 pub fn start_native_whole_disk_chd(
     format: ExportFormat,
     source: PathBuf,
@@ -324,6 +331,7 @@ pub fn start_native_whole_disk_chd(
         };
 
         let result = match format {
+            #[cfg(feature = "chd")]
             ExportFormat::Chd | ExportFormat::ChdDvd if partition_context.is_some() => {
                 let ctx = partition_context.expect("checked just above");
                 let p_cb = progress_cb;
@@ -353,6 +361,7 @@ pub fn start_native_whole_disk_chd(
                     &mut l_cb_dyn,
                 )
             }
+            #[cfg(feature = "chd")]
             ExportFormat::Chd => export_whole_disk_chd(
                 &source,
                 None,
@@ -365,6 +374,7 @@ pub fn start_native_whole_disk_chd(
                 cancel_cb,
                 log_cb,
             ),
+            #[cfg(feature = "chd")]
             ExportFormat::ChdDvd => export_whole_disk_chd(
                 &source,
                 None,
@@ -377,9 +387,11 @@ pub fn start_native_whole_disk_chd(
                 cancel_cb,
                 log_cb,
             ),
+            #[cfg(feature = "chd")]
             ExportFormat::ChdCd => {
                 export_whole_disk_chd_cd(&source, &dest, chd_options, cancel_cb, log_cb)
             }
+            #[cfg(feature = "chd")]
             ExportFormat::BinCue => {
                 export_whole_disk_bincue(&source, &dest, bincue_multi_bin, cancel_cb, log_cb)
             }

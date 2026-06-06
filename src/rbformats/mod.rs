@@ -2,9 +2,168 @@
 // (reader, output path, sizes, callbacks, format options).
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(feature = "chd")]
 pub mod chd;
+#[cfg(feature = "chd")]
 pub mod chd_edit;
+#[cfg(feature = "chd")]
 pub mod chd_options;
+
+/// Compile-time stubs that let callers keep `Option<ChdOptions>` fields and
+/// `match` arms compiling on the slim rb-cli-mini build (no `chd` feature).
+/// Runtime entry points that actually need libchdman return a clear "this
+/// binary was built without the `chd` feature" error.
+#[cfg(not(feature = "chd"))]
+pub mod chd_options {
+    /// Stub. The real one wraps `libchdman_rs` codec / hunk choices; when the
+    /// `chd` feature is off, no CHD work happens and this type just satisfies
+    /// the type checker in shared structs like `BackupConfig`.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ChdOptions;
+
+    impl ChdOptions {
+        pub fn defaults_for(_profile: ChdProfile) -> Self {
+            ChdOptions
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChdProfile {
+        Hd,
+        Dvd,
+        Cd,
+    }
+}
+
+/// Stub for `ChdReader` when the `chd` feature is off. `open` always errors
+/// — the runtime guard for the rb-cli-mini build path.
+#[cfg(not(feature = "chd"))]
+pub mod chd {
+    use anyhow::{bail, Result};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
+
+    /// Runtime stub. Any attempt to open a `.chd` returns a clear error
+    /// pointing the user at the full build.
+    pub struct ChdReader;
+
+    impl ChdReader {
+        pub fn open<P: AsRef<Path>>(_path: P) -> Result<Self> {
+            bail!(
+                "this binary was built without the `chd` feature; \
+                 rebuild with --features chd (or use the desktop build) to open .chd files"
+            )
+        }
+
+        pub fn logical_size(&self) -> u64 {
+            0
+        }
+
+        pub fn logical_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    impl Read for ChdReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for ChdReader {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    /// CD-CHD cooked-mode reader stub. The real one decodes MODE1 frames;
+    /// here `open_path` always errors so the optical path never reaches a
+    /// runtime call.
+    pub struct CdCookedReader;
+
+    impl CdCookedReader {
+        pub fn open_path<P: AsRef<Path>>(_path: P) -> Result<Self> {
+            bail!("chd feature not built into this binary")
+        }
+
+        pub fn logical_size(&self) -> u64 {
+            0
+        }
+    }
+
+    impl Read for CdCookedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for CdCookedReader {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    pub fn format_chd_info(_path: &Path) -> Result<String> {
+        bail!("chd feature not built into this binary")
+    }
+
+    pub fn chd_is_cd(_path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub fn shrink_sgi_disk_to_chd(
+        _input: &Path,
+        _output: &Path,
+        _opts: super::chd_options::ChdOptions,
+    ) -> Result<()> {
+        bail!("chd feature not built into this binary")
+    }
+}
+
+/// Stubs for chd-edit types when the feature is off — only the type names
+/// callers reference in `Option<>` fields and constructor sites. Runtime
+/// methods always error.
+#[cfg(not(feature = "chd"))]
+pub mod chd_edit {
+    use anyhow::{bail, Result};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::{Arc, Mutex};
+
+    pub struct ChdEditSession;
+
+    pub struct ChdEditHandle;
+
+    impl ChdEditHandle {
+        pub fn from_arc(_arc: Arc<Mutex<ChdEditSession>>) -> Self {
+            ChdEditHandle
+        }
+    }
+
+    impl Read for ChdEditHandle {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for ChdEditHandle {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Write for ChdEditHandle {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    pub fn flatten_to_parent<P: AsRef<std::path::Path>>(_path: P, _backup: P) -> Result<()> {
+        bail!("chd feature not built into this binary")
+    }
+}
 pub mod compress;
 pub mod containers;
 pub mod dc42;
@@ -1189,6 +1348,9 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 if is_cd {
                     if let Ok(reader) = chd::CdCookedReader::open_path(p) {
                         let logical_size = reader.logical_size();
+                        // Real ChdReader owns OS resources we want released early;
+                        // stub builds compile this away (the stub has no Drop).
+                        #[cfg(feature = "chd")]
                         drop(reader);
                         return Ok(ImageFormat::ChdCdCooked {
                             path: p.to_path_buf(),
@@ -1198,6 +1360,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 }
                 if let Ok(reader) = chd::ChdReader::open(p) {
                     let logical_size = reader.logical_size();
+                    #[cfg(feature = "chd")]
                     drop(reader);
                     return Ok(ImageFormat::Chd {
                         path: p.to_path_buf(),

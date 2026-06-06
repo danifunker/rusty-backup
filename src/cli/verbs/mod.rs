@@ -25,6 +25,7 @@ pub mod locate;
 pub mod ls;
 pub mod mkdir;
 pub mod new;
+#[cfg(feature = "optical")]
 pub mod optical;
 pub mod partmap;
 pub mod put;

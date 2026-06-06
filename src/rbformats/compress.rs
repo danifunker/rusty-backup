@@ -71,6 +71,7 @@ pub fn compress_partition(
 /// `assemble_from_staging` and the container SHA-1 comes from the
 /// CHD header).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "chd"), allow(unused_variables))]
 pub(crate) fn compress_partition_hashed(
     reader: &mut impl Read,
     output_base: &Path,
@@ -117,6 +118,7 @@ pub(crate) fn compress_partition_hashed(
                 cancel_check,
             )
         }
+        #[cfg(feature = "chd")]
         CompressionType::Chd => {
             // compress_chd takes `&mut impl FnMut(...)` / `&impl Fn(...)`
             // (generic), not trait objects. Re-wrap our dyn refs in
@@ -135,6 +137,7 @@ pub(crate) fn compress_partition_hashed(
                 &mut l,
             )
         }
+        #[cfg(feature = "chd")]
         CompressionType::Dvd => {
             let mut p = |n: u64| progress_cb(n);
             let c = || cancel_check();
@@ -150,6 +153,11 @@ pub(crate) fn compress_partition_hashed(
                 &mut l,
             )
         }
+        #[cfg(not(feature = "chd"))]
+        CompressionType::Chd | CompressionType::Dvd => Err(anyhow::anyhow!(
+            "this binary was built without the `chd` feature; \
+             rebuild with --features chd to write .chd files"
+        )),
     }
 }
 
@@ -326,6 +334,7 @@ pub fn decompress_partition_to_file(
 }
 
 /// Compress a raw file to an archive using the given compression type.
+#[cfg_attr(not(feature = "chd"), allow(unused_variables))]
 pub fn compress_file_to_archive(
     input_path: &Path,
     output_path_base: &Path,
@@ -355,6 +364,7 @@ pub fn compress_file_to_archive(
             &mut p_dyn,
             &c_dyn,
         ),
+        #[cfg(feature = "chd")]
         "chd" => {
             let logical_size = reader.get_ref().metadata()?.len();
             chd::compress_chd(
@@ -368,6 +378,7 @@ pub fn compress_file_to_archive(
                 log_cb,
             )
         }
+        #[cfg(feature = "chd")]
         "chd-dvd" => {
             let logical_size = reader.get_ref().metadata()?.len();
             chd::compress_chd_dvd(
