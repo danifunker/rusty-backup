@@ -667,10 +667,14 @@ no hand-waving.
    `size_bytes` into 512-byte LBA units so every `start_lba * 512`
    consumer lands on the real partition. Verified read/browse/extract
    end-to-end against the BlueSCSI SxSI v3.02 `HD10/20/30/40_512.hda`
-   set (1024-B SCSI). *Still open*: the restore-side
-   `patch_x68k_entries` / reconstruct path computes `new_sectors`
-   against `X68K_DEFAULT_SECTOR_SIZE` (512), so resize-on-restore for
-   non-512-B disks is not yet correct.
+   set (1024-B SCSI). **Resolved (slice 4, 2026-06-07)** for the
+   partition-table side: `patch_x68k_entries` now takes the disk's
+   logical `sector_size`, and the `rbformats/mod.rs` X68k reconstruct
+   branch derives it from metadata to fix `new_sectors`, the
+   `disk_size_field`, and the table offset (0x400 SASI / 0x800 SCSI).
+   *Still open*: the shared reconstruct loop still writes partition
+   *data* at `effective_lba * 512` — correct for 1024-B SCSI (512-aligned
+   byte offset) but wrong for 256-B SASI.
 
 3. **[RESOLVED for read]** `partition/x68k.rs` geometry detection.
    `X68kPartitionTable::detect_with_geometry` now probes both table
@@ -684,9 +688,10 @@ no hand-waving.
    Verified read/browse/extract against `Bomberman.hdf` and the full
    `~/Downloads/X68000-fixtures` set (BlueSCSI / ZuluSCSI / HDS /
    Henkan Bancho / SCSI2SD `.ima`). *Still open*: we don't reject
-   non-Sharp HDDs that coincidentally carry the `X68K` magic, and
-   SASI backup/restore/resize still assume 512-B (the read path uses
-   `byte_offset()`, the write engine paths do not yet).
+   non-Sharp HDDs that coincidentally carry the `X68K` magic, and the
+   shared reconstruct loop's SASI 256-B partition-*data* write offset
+   still assumes 512-B (the read path + in-place FS resize use
+   `byte_offset()`; the reconstruct partition-data write does not yet).
 
 4. **[RESOLVED]** `fs/human68k.rs` FAT BPB parser now handles the Sharp
    / Keisoku Giken SCSI-HDD BPB: a 2-byte BRA.S + 16-byte OEM
@@ -746,22 +751,28 @@ sizes, and clone the filesystem — **full support**.
 - Unrelated build-blocker fixed: `completions::bin_stem` (Windows-path
   basename failed on Unix).
 
-**REMAINING:**
-
-- **Slice 4 — resize (`rb-cli resize IMG@N`, GUI resize):**
-  `fs::resize_fat_in_place` (`src/fs/fat.rs`) rejects boot byte != `0xEB/0xE9`
-  and reads a *little-endian* BPB at offset 11 + LE FAT. For Human68k
-  SHARP-KG disks it must: (1) accept the `0x60` BRA.S jump; (2) read the
-  big-endian BPB at `0x12` (reuse `Human68kBpb::parse`); (3) read/write
-  the FAT big-endian. Cleanest path is a dedicated `resize_human68k_in_place`
-  rather than overloading the FAT one. Also fix the restore/reconstruct
-  side: `rbformats/mod.rs` writes the X68k table at `X68K_TABLE_OFFSET`
-  (0x800) and `patch_x68k_entries` computes `new_sectors` against
-  `X68K_DEFAULT_SECTOR_SIZE` (512) — both must use the disk's real
-  `sector_size` (and SASI table offset 0x400). `PartitionInfo::byte_offset()`
-  is already threaded through the *read* path; the backup/restore/resize
-  *engine* paths still assume `start_lba * 512` and need converting for
-  256-byte SASI.
+**Slice 4 — resize — DONE (2026-06-07):** `resize_human68k_in_place`
+(`src/fs/human68k.rs`) is the Human68k peer of `fs::resize_fat_in_place`:
+it accepts the `0x60` BRA.S jump, reads the big-endian SHARP/KG BPB at
+`0x12` via `Human68kBpb::parse`, and reads/writes the FAT big-endian
+(FAT16). Grow extends the FAT (shifting root+data forward) and bumps
+`total_sectors`; shrink keeps the FAT size so every cluster keeps its byte
+offset (existing files stay byte-exact) and refuses to drop below the FAT16
+floor. Wired into `fs::resize_filesystem_for` (so `rb-cli resize` + GUI +
+the reconstruct-time call all route there) and the backup-folder restore
+site in `src/restore/mod.rs`. `patch_x68k_entries` now takes the disk's
+logical `sector_size` (1024 SCSI / 256 SASI / 512 synthetic), and the
+`rbformats/mod.rs` X68k reconstruct branch derives that sector size from
+metadata (`original_size_bytes / length_sectors`) to fix the `new_sectors`
+length math, the `disk_size_field`, and the table offset (0x400 SASI vs
+0x800 SCSI). Verified byte-exact on the BlueSCSI HD10 fixture across a
+grow→shrink round-trip (multi-cluster `COMMAND.X` with `HU` header +
+`HUMAN.SYS` + Japanese filenames all survive). **Still deferred:** the
+256-byte-SASI *partition-data* write offset in the shared reconstruct loop
+(`part_offset = effective_lba * 512`) — correct for 1024-byte SCSI (the
+byte offset is 512-aligned) but wrong for 256-byte SASI; converting the
+shared loop to `PartitionInfo::byte_offset()` touches every partition
+scheme's offset/metadata model, so it stays parked in §8.
 
 - **Slice 5 — defragmenting clone (`clone_human68k_volume`):** no clone
   path exists. Mirror `clone_pfs3_volume` / `clone_hfs_volume` (see

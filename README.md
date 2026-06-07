@@ -270,7 +270,7 @@ readable.
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
 | Sharp D88      | `.d88`          | Yes            | Yes (convert)   | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container |
 | X68000 XDF     | `.xdf`          | Yes            | Yes (convert)   | Raw headerless X68000 floppy dump; geometry inferred from size |
-| X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | No          | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16 read (browse + extract). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
+| X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
 | PC-98 HDM      | `.hdm`          | Yes            | Yes (convert)   | DiskExplorer raw headerless floppy dump (byte-identical to XDF) |
 | DiskExplorer DIM | `.dim`        | Yes            | Yes (convert, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
@@ -301,6 +301,7 @@ inspect-tab Edit Mode.
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. |
 | btrfs          | Yes    | No   | No              | —    | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes  | Yes             | —    | Apple II / IIgs |
+| Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink) | — | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. |
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |

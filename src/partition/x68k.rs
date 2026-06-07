@@ -323,25 +323,44 @@ impl X68kPartitionTable {
 /// if `new_start_lba` is set). Overrides for entries that don't match
 /// any live slot are silently ignored — same defensive shape as the
 /// MBR helper.
+///
+/// **`sector_size`** is the disk's logical sector size (1024 for SCSI, 256
+/// for SASI, 512 for the synthetic convention). The table's `start` /
+/// `length` fields count in these logical sectors, *not* 512-byte LBAs, so
+/// the new length is `export_size / sector_size`. The override's
+/// `start_lba` is a 512-byte LBA (floored from the true byte offset on
+/// non-512-aligned SASI disks), so the slot match converts the entry's
+/// logical `start_sector` into the same 512-LBA unit before comparing.
 pub fn patch_x68k_entries(
     buf: &mut [u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
     overrides: &[PartitionSizeOverride],
+    sector_size: u64,
 ) {
+    let sector_size = if sector_size == 0 {
+        X68K_DEFAULT_SECTOR_SIZE
+    } else {
+        sector_size
+    };
     for ps in overrides {
         if ps.index >= X68K_MAX_PARTITIONS {
             continue;
         }
         let entry_off = X68K_TABLE_HEADER_SIZE + ps.index * X68K_ENTRY_SIZE;
         let current_start = BigEndian::read_u32(&buf[entry_off + 8..entry_off + 12]) & 0x00FF_FFFF;
-        if current_start as u64 != ps.start_lba {
+        // The override carries a 512-byte-floored LBA; compare against the
+        // entry's logical start expressed in the same unit.
+        let current_start_lba = current_start as u64 * sector_size / 512;
+        if current_start_lba != ps.start_lba {
             // Slot doesn't match — refuse to patch (same safety check
             // as patch_mbr_entries). This catches sidecar drift.
             continue;
         }
-        let effective_start = ps.effective_start_lba() as u32 & 0x00FF_FFFF;
-        let new_sectors = (ps.export_size / X68K_DEFAULT_SECTOR_SIZE) as u32;
-        if ps.new_start_lba.is_some() {
-            BigEndian::write_u32(&mut buf[entry_off + 8..entry_off + 12], effective_start);
+        let new_sectors = (ps.export_size / sector_size) as u32;
+        if let Some(new_start_lba) = ps.new_start_lba {
+            // Convert the requested 512-byte start LBA back into logical
+            // sectors for the on-disk field.
+            let new_start_sector = (new_start_lba * 512 / sector_size) as u32 & 0x00FF_FFFF;
+            BigEndian::write_u32(&mut buf[entry_off + 8..entry_off + 12], new_start_sector);
         }
         BigEndian::write_u32(&mut buf[entry_off + 12..entry_off + 16], new_sectors);
     }
@@ -588,7 +607,7 @@ mod tests {
             PartitionSizeOverride::size_only(0, 64, 0x1000 * 512, 0x2000 * 512),
             PartitionSizeOverride::size_only(1, 0x1040, 0x800 * 512, 0x800 * 512),
         ];
-        patch_x68k_entries(&mut buf, &overrides);
+        patch_x68k_entries(&mut buf, &overrides, 512);
 
         // Slot 0 grew to 0x2000 sectors; slot 1 unchanged.
         let off0 = X68K_TABLE_HEADER_SIZE;
@@ -624,7 +643,7 @@ mod tests {
             0x1000 * 512,
             0x2000 * 512,
         )];
-        patch_x68k_entries(&mut buf, &overrides);
+        patch_x68k_entries(&mut buf, &overrides, 512);
 
         // Slot 0 length stays at 0x1000 (refused).
         let off0 = X68K_TABLE_HEADER_SIZE;
@@ -656,13 +675,47 @@ mod tests {
             heads: 0,
             sectors_per_track: 0,
         }];
-        patch_x68k_entries(&mut buf, &overrides);
+        patch_x68k_entries(&mut buf, &overrides, 512);
 
         let off0 = X68K_TABLE_HEADER_SIZE;
         assert_eq!(
             BigEndian::read_u32(&buf[off0 + 8..off0 + 12]) & 0x00FF_FFFF,
             128,
             "slot 0 start_sector should be rewritten"
+        );
+    }
+
+    #[test]
+    fn patch_x68k_entries_uses_logical_sector_size_for_scsi() {
+        // A 1024-byte SCSI disk: the table counts in 1024-byte sectors, and
+        // the override's start_lba is the 512-byte-floored byte offset
+        // (start_sector * 1024 / 512 = start_sector * 2).
+        let table = X68kPartitionTable {
+            disk_size_field: 0x4000,
+            entries: vec![X68kEntry {
+                name_raw: *b"Human68k",
+                name_display: "Human68k".into(),
+                start_sector: 32, // byte offset 32 * 1024 = 32768
+                length_sectors: 0x1000,
+            }],
+        };
+        let mut buf = table.to_bytes();
+        // start_lba = 32768 / 512 = 64; grow to 64 MiB.
+        let new_bytes = 64u64 * 1024 * 1024;
+        let overrides = vec![PartitionSizeOverride::size_only(
+            0,
+            64,
+            0x1000 * 1024,
+            new_bytes,
+        )];
+        patch_x68k_entries(&mut buf, &overrides, 1024);
+
+        let off0 = X68K_TABLE_HEADER_SIZE;
+        // Length must be expressed in 1024-byte sectors, not 512-byte ones.
+        assert_eq!(
+            BigEndian::read_u32(&buf[off0 + 12..off0 + 16]),
+            (new_bytes / 1024) as u32,
+            "slot 0 length should be in 1024-byte logical sectors"
         );
     }
 

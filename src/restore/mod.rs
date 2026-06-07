@@ -14,6 +14,7 @@ use crate::backup::LogLevel;
 use crate::clonezilla;
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::clonezilla::partclone::open_partclone_reader;
+use crate::fs::human68k::resize_human68k_in_place;
 use crate::fs::patch_hidden_sectors_for;
 use crate::fs::{
     resize_btrfs_in_place, resize_exfat_in_place, resize_ext_in_place, resize_fat_in_place,
@@ -1092,6 +1093,16 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
                     })?;
                 }
                 PartitionFsType::Fat | PartitionFsType::Unknown if needs_resize => {
+                    // Human68k SHARP/KG HDD volumes (0x60 BRA.S jump, big-endian
+                    // BPB + FAT) are detected as Unknown here and rejected by
+                    // resize_fat_in_place; route them to the Human68k resizer
+                    // first. Both are no-ops for the other's BPB, so calling
+                    // both in sequence is safe. (Offset is correct for 1024-byte
+                    // SCSI disks, where start_lba*512 lands on the partition;
+                    // 256-byte SASI disks are the documented engine-path gap.)
+                    resize_human68k_in_place(inner_file, part_offset, export_size, &mut |msg| {
+                        log(&progress, LogLevel::Info, msg)
+                    })?;
                     let new_sectors = (export_size / 512) as u32;
                     resize_fat_in_place(inner_file, part_offset, new_sectors, &mut |msg| {
                         log(&progress, LogLevel::Info, msg)

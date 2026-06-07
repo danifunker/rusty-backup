@@ -53,6 +53,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use anyhow::Context as _;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 use super::entry::{EntryType, FileEntry};
@@ -1108,6 +1109,240 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
     }
 }
 
+// ============================================================================
+// In-place filesystem resize (SHARP / Keisoku Giken big-endian HDD BPB)
+// ============================================================================
+
+/// Sectors-per-FAT needed to address every cluster of a FAT16 volume of
+/// `total_sectors`. Closed form, matching `fat::compute_fat_sectors` for
+/// `fat_bits == 16`.
+fn human68k_fat16_sectors(
+    total_sectors: u32,
+    reserved: u32,
+    num_fats: u32,
+    root_dir_sectors: u32,
+    spc: u32,
+    bps: u32,
+) -> u32 {
+    let avail = total_sectors.saturating_sub(reserved + root_dir_sectors) as u64;
+    let spc = spc as u64;
+    // ceil(2 * (avail + 2*spc) / (bps*spc + 2*num_fats))
+    let num = 2 * (avail + 2 * spc);
+    let den = bps as u64 * spc + 2 * num_fats as u64;
+    num.div_ceil(den) as u32
+}
+
+/// Shift the byte region `[src_start, src_end)` of `file` forward by `shift`
+/// bytes, copying from the end backward so the overlapping source/destination
+/// ranges stay intact, then zero-filling the gap left behind. Local peer of
+/// `fat::shift_region_forward` — kept here so the Human68k resize is
+/// self-contained over the big-endian BPB/FAT the FAT resizer rejects.
+fn shift_region_forward(
+    file: &mut (impl Read + Write + Seek),
+    src_start: u64,
+    src_end: u64,
+    shift: u64,
+) -> anyhow::Result<()> {
+    let data_len = src_end.saturating_sub(src_start);
+    if data_len == 0 || shift == 0 {
+        return Ok(());
+    }
+    const CHUNK: usize = 1 << 20; // 1 MiB
+    let mut buf = vec![0u8; CHUNK];
+    let mut remaining = data_len;
+    while remaining > 0 {
+        let chunk = remaining.min(CHUNK as u64);
+        let read_pos = src_start + remaining - chunk;
+        file.seek(SeekFrom::Start(read_pos))?;
+        file.read_exact(&mut buf[..chunk as usize])?;
+        file.seek(SeekFrom::Start(read_pos + shift))?;
+        file.write_all(&buf[..chunk as usize])?;
+        remaining -= chunk;
+    }
+    // Zero the gap left in front of the shifted region (the freshly enlarged
+    // FAT copies are written over part of it afterward).
+    let zeros = vec![0u8; CHUNK];
+    let mut gap = shift;
+    file.seek(SeekFrom::Start(src_start))?;
+    while gap > 0 {
+        let n = (gap as usize).min(CHUNK);
+        file.write_all(&zeros[..n])?;
+        gap -= n as u64;
+    }
+    Ok(())
+}
+
+/// Patch the big-endian SHARP/KG BPB header for a resize: total sectors
+/// (16-bit at 0x1A and/or 32-bit at 0x1E) and sectors-per-FAT (one byte at
+/// 0x1D). Every other field is left untouched.
+fn patch_sharp_kg_bpb(bpb_buf: &mut [u8; 512], new_total: u32, new_spf: u8) {
+    // Preserve which total-sectors field the disk used: real HDDs are large
+    // and keep the 16-bit field zero with the count in the 32-bit field, but
+    // honor a small-volume layout that populated the 16-bit field instead.
+    let old_total16 = BigEndian::read_u16(&bpb_buf[0x1A..0x1C]);
+    if old_total16 != 0 && new_total <= u16::MAX as u32 {
+        BigEndian::write_u16(&mut bpb_buf[0x1A..0x1C], new_total as u16);
+        BigEndian::write_u32(&mut bpb_buf[0x1E..0x22], 0);
+    } else {
+        BigEndian::write_u16(&mut bpb_buf[0x1A..0x1C], 0);
+        BigEndian::write_u32(&mut bpb_buf[0x1E..0x22], new_total);
+    }
+    bpb_buf[0x1D] = new_spf;
+}
+
+/// Resize the Human68k (SHARP / Keisoku Giken big-endian HDD) filesystem at
+/// `partition_offset` so it inhabits `new_size_bytes`.
+///
+/// This is the Human68k peer of [`crate::fs::fat::resize_fat_in_place`],
+/// needed because real X68000 SCSI/SASI hard disks use the Sharp/KG BPB
+/// convention that the FAT resizer rejects:
+///   - the boot sector starts with `0x60` (BRA.S), not `0xEB` / `0xE9`;
+///   - the BPB fields are **big-endian** at offset `0x12`;
+///   - the FAT table itself is **big-endian** (FAT16).
+///
+/// Standard little-endian Human68k floppies are left to
+/// `resize_fat_in_place` (this returns `Ok(false)` for them), so the two
+/// coexist in the [`crate::fs::resize_filesystem_for`] dispatch chain without
+/// double-handling.
+///
+/// **Grow** extends the FAT — shifting the root directory + data region
+/// forward when a larger FAT is needed — and bumps `total_sectors`. **Shrink**
+/// keeps the FAT size (so every cluster keeps its byte offset and existing
+/// files stay byte-exact) and only reduces `total_sectors`. Returns
+/// `Ok(true)` when a resize was performed, `Ok(false)` when the BPB isn't a
+/// SHARP/KG HDD BPB or the size already matches.
+pub fn resize_human68k_in_place(
+    file: &mut (impl Read + Write + Seek),
+    partition_offset: u64,
+    new_size_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<bool> {
+    // --- 1. Read + validate the SHARP/KG big-endian HDD BPB ---
+    file.seek(SeekFrom::Start(partition_offset))?;
+    let mut bpb_buf = [0u8; 512];
+    file.read_exact(&mut bpb_buf)?;
+    // Only the SHARP/KG HDD convention (0x60 BRA.S + big-endian fields +
+    // big-endian FAT) is handled here; LE floppy BPBs flow through
+    // resize_fat_in_place.
+    if bpb_buf[0] != 0x60 {
+        return Ok(false);
+    }
+    let bpb = match Human68kBpb::parse(&bpb_buf) {
+        Ok(b) if b.fat_big_endian => b,
+        _ => return Ok(false),
+    };
+    // The big-endian FAT path is FAT16 on every real HDD; FAT12-BE isn't a
+    // shape we read, so we don't resize it either.
+    if bpb.fat_kind != FatKind::Fat16 {
+        return Ok(false);
+    }
+
+    let bps = bpb.bytes_per_sector as u32;
+    let bps64 = bps as u64;
+    let new_total = (new_size_bytes / bps64) as u32;
+    let old_total = bpb.total_sectors;
+    if new_total == old_total {
+        return Ok(false);
+    }
+
+    let spc = bpb.sectors_per_cluster as u32;
+    let num_fats = bpb.num_fats as u32;
+    let reserved = bpb.reserved_sectors as u32;
+    let root_entries = bpb.root_entries as u32;
+    let root_dir_sectors = (root_entries * 32).div_ceil(bps);
+    let old_spf = bpb.fat_sectors as u32;
+
+    let growing = new_total > old_total;
+
+    // Choose the new sectors-per-FAT. Only ever GROW the FAT: on shrink we
+    // keep the old (now slightly oversized) FAT so the data-region start
+    // sector is unchanged and every existing cluster keeps its byte offset.
+    let needed_spf =
+        human68k_fat16_sectors(new_total, reserved, num_fats, root_dir_sectors, spc, bps);
+    let new_spf = if growing {
+        needed_spf.max(old_spf)
+    } else {
+        old_spf
+    };
+
+    // The SHARP/KG BPB stores sectors-per-FAT in a single byte (offset 0x1D).
+    if new_spf > u8::MAX as u32 {
+        anyhow::bail!(
+            "Human68k resize: FAT would need {new_spf} sectors, but the SHARP/KG BPB \
+             sectors-per-FAT field is only one byte (max 255)"
+        );
+    }
+
+    // Refuse a shrink that would drop the cluster count below the FAT16 floor:
+    // the on-disk FAT would then be reinterpreted as FAT12 and every chain
+    // would decode wrong on the next mount.
+    let new_data_start = reserved + num_fats * new_spf + root_dir_sectors;
+    let new_clusters = new_total.saturating_sub(new_data_start) / spc;
+    if new_clusters < 4085 {
+        anyhow::bail!(
+            "Human68k resize: target size {new_size_bytes} yields {new_clusters} clusters, \
+             below the FAT16 minimum (4085); shrinking a big-endian Human68k volume into \
+             FAT12 territory is not supported"
+        );
+    }
+
+    log_cb(&format!(
+        "Human68k FAT16: total sectors {old_total} -> {new_total} ({bps} B/sector), \
+         spf {old_spf} -> {new_spf}, clusters -> {new_clusters}"
+    ));
+
+    // --- 2. Grow the FAT (shift root+data forward) when more FAT is needed ---
+    if growing && new_spf > old_spf {
+        let shift_sectors = (new_spf - old_spf) * num_fats;
+        let shift_bytes = shift_sectors as u64 * bps64;
+
+        // Read FAT copy 0 (all copies are identical) before moving anything.
+        let fat_start = partition_offset + reserved as u64 * bps64;
+        file.seek(SeekFrom::Start(fat_start))?;
+        let mut fat_data = vec![0u8; old_spf as usize * bps as usize];
+        file.read_exact(&mut fat_data)?;
+
+        // Shift the root directory + data region forward to make room for the
+        // larger FAT copies. This moves every cluster by exactly `shift_bytes`,
+        // which matches the new data-region start, so chains stay valid.
+        let move_start = partition_offset + (reserved + num_fats * old_spf) as u64 * bps64;
+        let move_end = partition_offset + old_total as u64 * bps64;
+        if move_end > move_start {
+            shift_region_forward(file, move_start, move_end, shift_bytes)?;
+            log_cb(&format!(
+                "Shifted root+data region forward by {shift_sectors} sectors"
+            ));
+        }
+
+        // Extend the FAT with free (zero) entries and write every copy at the
+        // new stride. Free == 0x0000 is endian-agnostic, so the big-endian
+        // table tolerates zero-padding directly.
+        fat_data.resize(new_spf as usize * bps as usize, 0);
+        for i in 0..num_fats as u64 {
+            let pos = partition_offset + reserved as u64 * bps64 + i * new_spf as u64 * bps64;
+            file.seek(SeekFrom::Start(pos))?;
+            file.write_all(&fat_data)
+                .with_context(|| format!("failed to write Human68k FAT copy {i}"))?;
+        }
+        file.flush()
+            .context("failed to flush Human68k FAT writes")?;
+        log_cb(&format!(
+            "Extended FAT: {old_spf} -> {new_spf} sectors per copy"
+        ));
+    } else if growing {
+        log_cb("Human68k FAT has spare capacity, no table extension needed");
+    }
+
+    // --- 3. Patch the big-endian BPB header (total sectors + spf) ---
+    patch_sharp_kg_bpb(&mut bpb_buf, new_total, new_spf as u8);
+    file.seek(SeekFrom::Start(partition_offset))?;
+    file.write_all(&bpb_buf)
+        .context("failed to write updated Human68k BPB")?;
+    file.flush().context("failed to flush Human68k BPB")?;
+    log_cb("Human68k resize complete");
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1818,5 +2053,227 @@ mod tests {
             entries.is_empty(),
             "freshly-formatted volume has no files after shrink"
         );
+    }
+
+    // --- SHARP/KG big-endian-FAT HDD resize (slice 4) -----------------------
+
+    /// FAT16 sub-type floor (cluster count) — must stay above this through a
+    /// resize or the on-disk big-endian FAT would be reinterpreted as FAT12.
+    const FAT16_FLOOR: u32 = 4085;
+
+    /// Build a SHARP/KG FAT16 HDD volume (big-endian BPB *and* FAT) sized so
+    /// it has headroom to grow (forcing a FAT extension + data shift) and to
+    /// shrink while staying comfortably FAT16. Returns
+    /// `(disk, command_x_payload, readme_payload)`. 512-byte sectors, 1
+    /// sector/cluster, 2 FATs. `COMMAND.X` spans three clusters and starts
+    /// with the Human68k `HU` (0x4855) executable header; `README.TXT` is a
+    /// single-cluster bystander file used to prove unrelated data survives.
+    fn build_sharp_kg_fat16_resizable() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        const BPS: usize = 512;
+        const NFATS: usize = 2;
+        const RESERVED: usize = 1;
+        const ROOT_ENTRIES: usize = 16; // -> 1 root-dir sector
+        const FATSZ: usize = 32; // covers 8200-sector volume (verified below)
+        const TOTAL: usize = 8200; // -> ~8134 data clusters -> FAT16
+
+        let mut disk = vec![0u8; TOTAL * BPS];
+
+        // BPB: 2-byte BRA.S + 16-byte OEM, then big-endian fields at 0x12.
+        disk[0] = 0x60;
+        disk[1] = 0x24;
+        disk[2..18].copy_from_slice(b"SHARP/KG    1.00");
+        BigEndian::write_u16(&mut disk[0x12..0x14], BPS as u16);
+        disk[0x14] = 1; // sectors per cluster
+        disk[0x15] = NFATS as u8;
+        BigEndian::write_u16(&mut disk[0x16..0x18], RESERVED as u16);
+        BigEndian::write_u16(&mut disk[0x18..0x1A], ROOT_ENTRIES as u16);
+        BigEndian::write_u16(&mut disk[0x1A..0x1C], 0); // total16 unused
+        disk[0x1C] = 0xF8; // media descriptor
+        disk[0x1D] = FATSZ as u8;
+        BigEndian::write_u32(&mut disk[0x1E..0x22], TOTAL as u32); // total32
+
+        // Big-endian FAT: clusters 2->3->4 (COMMAND.X), 5 EOC (README.TXT).
+        let write_fat = |disk: &mut [u8], fat_base: usize| {
+            BigEndian::write_u16(&mut disk[fat_base..fat_base + 2], 0xFFF8); // entry 0
+            BigEndian::write_u16(&mut disk[fat_base + 2..fat_base + 4], 0xFFFF); // entry 1
+            BigEndian::write_u16(&mut disk[fat_base + 4..fat_base + 6], 3); // 2 -> 3
+            BigEndian::write_u16(&mut disk[fat_base + 6..fat_base + 8], 4); // 3 -> 4
+            BigEndian::write_u16(&mut disk[fat_base + 8..fat_base + 10], 0xFFFF); // 4 EOC
+            BigEndian::write_u16(&mut disk[fat_base + 10..fat_base + 12], 0xFFFF);
+            // 5 EOC
+        };
+        let fat0 = RESERVED * BPS;
+        write_fat(&mut disk, fat0);
+        write_fat(&mut disk, fat0 + FATSZ * BPS);
+
+        // Root directory entries.
+        let root = (RESERVED + NFATS * FATSZ) * BPS;
+        let cmd_size = 2 * BPS + 200; // spans clusters 2,3,4
+        {
+            let e = &mut disk[root..root + 32];
+            e[0..8].copy_from_slice(b"COMMAND ");
+            e[8..11].copy_from_slice(b"X  ");
+            e[11] = attr::ARCHIVE;
+            LittleEndian::write_u16(&mut e[26..28], 2);
+            LittleEndian::write_u32(&mut e[28..32], cmd_size as u32);
+        }
+        let readme_size = 100usize;
+        {
+            let e = &mut disk[root + 32..root + 64];
+            e[0..8].copy_from_slice(b"README  ");
+            e[8..11].copy_from_slice(b"TXT");
+            e[11] = attr::ARCHIVE;
+            LittleEndian::write_u16(&mut e[26..28], 5);
+            LittleEndian::write_u32(&mut e[28..32], readme_size as u32);
+        }
+
+        // Data area. Cluster N starts at data_start_sector + (N-2).
+        let data_start = (RESERVED + NFATS * FATSZ + 1) * BPS;
+        let mut command = vec![0u8; cmd_size];
+        for (i, b) in command.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        command[0] = 0x48; // 'H'
+        command[1] = 0x55; // 'U' — Human68k .X executable header
+        disk[data_start..data_start + cmd_size].copy_from_slice(&command);
+
+        let readme_off = data_start + 3 * BPS; // cluster 5
+        let mut readme = vec![0u8; readme_size];
+        for (i, b) in readme.iter_mut().enumerate() {
+            *b = (0xC0u8) ^ (i as u8);
+        }
+        disk[readme_off..readme_off + readme_size].copy_from_slice(&readme);
+
+        (disk, command, readme)
+    }
+
+    /// Read both seeded files back and assert byte-exact, including the `HU`
+    /// header. Shared by the grow / shrink / round-trip resize tests.
+    fn assert_seeded_files_intact(disk: &[u8], command: &[u8], readme: &[u8]) {
+        let mut fs = Human68kFilesystem::open(Cursor::new(disk), 0).expect("reopen");
+        assert!(fs.bpb.fat_big_endian, "must stay big-endian FAT");
+        assert_eq!(fs.bpb.fat_kind, FatKind::Fat16, "must stay FAT16");
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+        assert!(
+            names.contains(&"COMMAND.X".to_string()),
+            "COMMAND.X survives"
+        );
+        assert!(
+            names.contains(&"README.TXT".to_string()),
+            "unrelated README.TXT survives"
+        );
+
+        let cmd = entries.iter().find(|e| e.name == "COMMAND.X").unwrap();
+        let got = fs.read_file(cmd, command.len() + 16).unwrap();
+        assert_eq!(got.len(), command.len(), "COMMAND.X full size");
+        assert_eq!(&got[..2], b"HU", "Human68k .X header intact");
+        assert_eq!(got, command, "multi-cluster COMMAND.X is byte-exact");
+
+        let rd = entries.iter().find(|e| e.name == "README.TXT").unwrap();
+        let got_rd = fs.read_file(rd, readme.len() + 16).unwrap();
+        assert_eq!(got_rd, readme, "README.TXT is byte-exact");
+    }
+
+    #[test]
+    fn resize_human68k_grows_sharp_kg_volume_and_preserves_multicluster_file() {
+        let (mut disk, command, readme) = build_sharp_kg_fat16_resizable();
+        let new_total: usize = 16_400; // forces spf 32 -> 64 (FAT extension + data shift)
+        disk.resize(new_total * 512, 0);
+
+        let mut cur = Cursor::new(&mut disk);
+        let did = resize_human68k_in_place(&mut cur, 0, new_total as u64 * 512, &mut |_| {})
+            .expect("grow ok");
+        assert!(did, "SHARP/KG grow performs a resize");
+
+        // BPB now reports the new size, the FAT grew, and clusters stay FAT16.
+        let fs = Human68kFilesystem::open(Cursor::new(&disk), 0).expect("reopen");
+        assert_eq!(fs.bpb.total_sectors, new_total as u32);
+        assert!(fs.bpb.fat_sectors > 32, "FAT must have grown");
+        let clusters =
+            (new_total as u32 - fs.bpb.data_start_sector()) / fs.bpb.sectors_per_cluster as u32;
+        assert!(clusters > FAT16_FLOOR);
+        drop(fs);
+
+        assert_seeded_files_intact(&disk, &command, &readme);
+    }
+
+    #[test]
+    fn resize_human68k_shrinks_sharp_kg_volume_and_preserves_files() {
+        let (mut disk, command, readme) = build_sharp_kg_fat16_resizable();
+        // Grow first (so the FAT is oversized), then shrink to a size still
+        // well above the FAT16 floor.
+        let grown: usize = 16_400;
+        disk.resize(grown * 512, 0);
+        {
+            let mut cur = Cursor::new(&mut disk);
+            resize_human68k_in_place(&mut cur, 0, grown as u64 * 512, &mut |_| {}).unwrap();
+        }
+        let shrunk: usize = 9_000;
+        {
+            let mut cur = Cursor::new(&mut disk);
+            let did = resize_human68k_in_place(&mut cur, 0, shrunk as u64 * 512, &mut |_| {})
+                .expect("shrink ok");
+            assert!(did, "SHARP/KG shrink performs a resize");
+        }
+        let fs = Human68kFilesystem::open(Cursor::new(&disk), 0).unwrap();
+        assert_eq!(fs.bpb.total_sectors, shrunk as u32);
+        drop(fs);
+        assert_seeded_files_intact(&disk, &command, &readme);
+    }
+
+    #[test]
+    fn resize_human68k_round_trip_grow_then_shrink_is_byte_exact() {
+        // Mirrors the manual verification: grow then shrink, files survive.
+        let (mut disk, command, readme) = build_sharp_kg_fat16_resizable();
+        disk.resize(20_000 * 512, 0);
+        {
+            let mut cur = Cursor::new(&mut disk);
+            resize_human68k_in_place(&mut cur, 0, 18_000 * 512, &mut |_| {}).expect("grow");
+        }
+        {
+            let mut cur = Cursor::new(&mut disk);
+            resize_human68k_in_place(&mut cur, 0, 8_300 * 512, &mut |_| {}).expect("shrink");
+        }
+        let fs = Human68kFilesystem::open(Cursor::new(&disk), 0).unwrap();
+        assert_eq!(fs.bpb.total_sectors, 8_300);
+        drop(fs);
+        assert_seeded_files_intact(&disk, &command, &readme);
+    }
+
+    #[test]
+    fn resize_human68k_refuses_shrink_below_fat16_floor() {
+        let (mut disk, _command, _readme) = build_sharp_kg_fat16_resizable();
+        let mut cur = Cursor::new(&mut disk);
+        // 256 KiB / 512 = 512 sectors -> far below 4085 clusters.
+        let err = resize_human68k_in_place(&mut cur, 0, 256 * 1024, &mut |_| {}).unwrap_err();
+        assert!(
+            err.to_string().contains("FAT16 minimum"),
+            "shrink into FAT12 territory must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resize_human68k_ignores_little_endian_floppy_bpb() {
+        // A standard LE Human68k floppy (0xEB jump) is resize_fat_in_place's
+        // job; resize_human68k_in_place must decline it.
+        let mut disk = build_fat12_synthetic();
+        disk.resize(2880 * 512, 0);
+        let mut cur = Cursor::new(&mut disk);
+        let did = resize_human68k_in_place(&mut cur, 0, 2880 * 512, &mut |_| {}).unwrap();
+        assert!(
+            !did,
+            "LE floppy BPB is declined (handled by resize_fat_in_place)"
+        );
+    }
+
+    #[test]
+    fn resize_human68k_noop_when_size_unchanged() {
+        let (mut disk, _c, _r) = build_sharp_kg_fat16_resizable();
+        let same = disk.len() as u64;
+        let mut cur = Cursor::new(&mut disk);
+        let did = resize_human68k_in_place(&mut cur, 0, same, &mut |_| {}).unwrap();
+        assert!(!did, "same-size resize is a no-op");
     }
 }

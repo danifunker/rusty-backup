@@ -200,6 +200,7 @@ use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
 use crate::partition::x68k::{
     patch_x68k_entries, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_TABLE_OFFSET,
+    X68K_TABLE_OFFSET_SASI,
 };
 use crate::partition::PartitionSizeOverride;
 
@@ -297,30 +298,60 @@ pub fn reconstruct_disk_from_backup(
             .with_context(|| format!("failed to read {}", x68k_path.display()))?;
         let mut table: X68kPartitionTable =
             serde_json::from_str(&x68k_data).context("failed to parse x68k.json")?;
+
+        // The X68k table's start/length fields count in the disk's *logical*
+        // sectors (1024 B for SCSI, 256 B for SASI, 512 B for the synthetic
+        // convention) — NOT 512-byte LBAs. x68k.json doesn't persist the
+        // geometry, so derive the logical sector size from the relationship
+        // metadata records between a partition's byte size and its length in
+        // table sectors (`original_size_bytes == length_sectors * sector_size`).
+        // Fall back to 512 when no partition is available to derive from.
+        let x68k_sector_size = metadata
+            .partitions
+            .iter()
+            .find_map(|pm| {
+                let e = table.entries.get(pm.index)?;
+                if e.length_sectors == 0 || pm.original_size_bytes == 0 {
+                    return None;
+                }
+                let ss = pm.original_size_bytes / e.length_sectors as u64;
+                matches!(ss, 256 | 512 | 1024 | 2048).then_some(ss)
+            })
+            .unwrap_or(X68K_DEFAULT_SECTOR_SIZE);
+
+        // The table lives at byte 0x400 on 256-byte SASI disks and byte 0x800
+        // on 1024-byte SCSI (and the 512-byte synthetic) disks.
+        let x68k_table_offset = if x68k_sector_size == 256 {
+            X68K_TABLE_OFFSET_SASI
+        } else {
+            X68K_TABLE_OFFSET
+        };
+
         // Refresh disk_size_field to the new target so inspect tools and
-        // Human68k itself report the post-resize size (the field is
-        // disk-size in some unit — sectors for MiSTer images).
-        let new_disk_sectors = (target_size / X68K_DEFAULT_SECTOR_SIZE) as u32;
+        // Human68k itself report the post-resize size (the field is the disk
+        // size in logical sectors).
+        let new_disk_sectors = (target_size / x68k_sector_size) as u32;
         if table.disk_size_field > 0 {
             table.disk_size_field = new_disk_sectors;
         }
         let mut block = table.to_bytes();
         if !partition_sizes.is_empty() {
-            patch_x68k_entries(&mut block, partition_sizes);
+            patch_x68k_entries(&mut block, partition_sizes, x68k_sector_size);
             log_cb("Patched X68k partition table with export sizes");
         }
-        // Zero-fill the IPL region (bytes 0..2048) and write the 144-byte
-        // table block at offset 2048.
+        // Zero-fill the IPL region before the table and write the 144-byte
+        // table block at its sector-size-appropriate offset.
         writer.seek(SeekFrom::Start(0))?;
-        write_zeros(writer, X68K_TABLE_OFFSET)?;
+        write_zeros(writer, x68k_table_offset)?;
         writer
             .write_all(&block)
             .context("failed to write X68k partition table")?;
-        total_written = X68K_TABLE_OFFSET + block.len() as u64;
+        total_written = x68k_table_offset + block.len() as u64;
         log_cb(&format!(
-            "Wrote X68k partition table ({} bytes at offset {})",
+            "Wrote X68k partition table ({} bytes at offset {}, {}-byte sectors)",
             block.len(),
-            X68K_TABLE_OFFSET
+            x68k_table_offset,
+            x68k_sector_size
         ));
     } else if let Some(gpt_data) = gpt {
         // GPT restore: write protective MBR + primary GPT (LBAs 0-33)

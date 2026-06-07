@@ -113,6 +113,11 @@ pub fn resize_filesystem_for(
     let new_sectors_u32 = (new_size_bytes / 512) as u32;
     let new_sectors_u64 = new_size_bytes / 512;
     fat::resize_fat_in_place(file, partition_offset, new_sectors_u32, log_cb)?;
+    // Human68k SHARP/KG HDD volumes (0x60 BRA.S jump, big-endian BPB + FAT)
+    // are rejected by resize_fat_in_place; route them to the Human68k resizer.
+    // It takes a byte size because these disks use 1024-byte logical sectors,
+    // not the 512-byte unit the FAT path assumes. No-op for non-SHARP/KG BPBs.
+    human68k::resize_human68k_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
     exfat::resize_exfat_in_place(file, partition_offset, new_sectors_u64, log_cb)?;
     hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
