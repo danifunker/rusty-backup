@@ -3,6 +3,35 @@
 
 mod gui;
 
+use std::path::PathBuf;
+
+/// Scan `std::env::args()` for the first non-flag positional that exists as
+/// a file on disk, and return it as a candidate to auto-open in the Inspect
+/// tab.
+///
+/// Triggered by:
+/// - Windows: file-association double-click in Explorer (the registered
+///   ProgID launches `rusty-backup.exe "C:\path\to\file.d88"`).
+/// - macOS: `open file.d88` from Finder runs
+///   `App.app/Contents/MacOS/rusty-backup <path>`.
+/// - Linux: `.desktop` MimeType handlers pass the file through `%F`/`%U`.
+///
+/// Skips:
+/// - argv[0] (the executable path itself).
+/// - Anything starting with `-` or `--` (flags, including the Windows
+///   association registrar's own `--register-file-associations` /
+///   `--unregister-file-associations`).
+/// - Strings that don't exist on disk as files (a stray non-flag token —
+///   e.g. an unexpected verb — shouldn't crash the GUI or silently produce
+///   a "file not found" error inside the Inspect tab).
+fn extract_initial_image_arg() -> Option<PathBuf> {
+    std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
 /// Windows: handle the installer/uninstaller association hooks
 /// (`--register-file-associations` / `--unregister-file-associations`) and the
 /// launch-time re-registration that picks up newly supported extensions after
@@ -160,13 +189,18 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Pick up the file argv before the closure runs; the closure can fire
+    // multiple times under wgpu→glow fallback, and the arg should only be
+    // honored once (the first attempt).
+    let initial_image = extract_initial_image_arg();
     let run = |renderer: eframe::Renderer| {
+        let initial = initial_image.clone();
         eframe::run_native(
             "Rusty Backup",
             make_options(renderer),
-            Box::new(|cc| {
+            Box::new(move |cc| {
                 gui::ui_logger::set_repaint_ctx(cc.egui_ctx.clone());
-                Ok(Box::new(gui::RustyBackupApp::default()))
+                Ok(Box::new(gui::RustyBackupApp::with_initial_image(initial)))
             }),
         )
     };

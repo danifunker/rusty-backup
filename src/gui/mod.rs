@@ -388,6 +388,12 @@ pub struct RustyBackupApp {
     bulk_convert_dialog: Option<BulkConvertDialog>,
     /// Background bulk-convert worker progress (None = idle).
     bulk_convert_status: Option<Arc<Mutex<BulkConvertStatus>>>,
+    /// File path passed on the command line (Windows file-association
+    /// double-click, macOS `open file.d88`, Linux `.desktop` MimeType
+    /// launch). Taken on the first `update()` tick, routed into the
+    /// Inspect tab, and the tab is switched to it. `None` for normal
+    /// launches without a file argv.
+    pending_initial_image: Option<PathBuf>,
 }
 
 impl Default for RustyBackupApp {
@@ -472,7 +478,54 @@ impl Default for RustyBackupApp {
             loaded_backup_folder: None,
             bulk_convert_dialog: None,
             bulk_convert_status: None,
+            pending_initial_image: None,
         }
+    }
+}
+
+impl RustyBackupApp {
+    /// Construct the app with an optional file path to auto-open on first
+    /// frame. Used by `main.rs` to wire up Windows file-association
+    /// double-clicks, macOS `open file.ext` launches, and Linux .desktop
+    /// MimeType handlers — all of them launch the binary with the file
+    /// path in argv.
+    pub fn with_initial_image(image: Option<PathBuf>) -> Self {
+        // Struct-update syntax keeps `field_reassign_with_default` happy:
+        // build everything through Default, then override the one field
+        // we care about. Default does the heavy device-enumeration + log
+        // priming so we don't want to duplicate it.
+        Self {
+            pending_initial_image: image,
+            ..Self::default()
+        }
+    }
+
+    /// Open a path in the Inspect tab and switch to it. Used by both the
+    /// command-line initial-image hand-off (one-shot at app start) and
+    /// the drag-and-drop handler (any time during the session).
+    ///
+    /// Routes through [`prepare_disk_image_path`] so wrapper formats with
+    /// no native seekable view (`.adz` / `.hdz` / `.msa` / `.d88` / `.xdf`
+    /// / `.hdm` / `.dim`) are decompressed to a flat tempfile first. Same
+    /// path the "Open File..." button uses — keeps DnD / double-click
+    /// behavior identical to the picker.
+    fn open_in_inspect(&mut self, path: PathBuf) {
+        self.log_panel.info(format!("Opening {}", path.display()));
+        match prepare_disk_image_path(&path) {
+            Ok((materialized, guard)) => {
+                self.inspect_tab
+                    .load_image_with_tempdir(materialized, guard);
+            }
+            Err(e) => {
+                self.log_panel.warn(format!(
+                    "Failed to materialize {}: {} — opening raw bytes",
+                    path.display(),
+                    e
+                ));
+                self.inspect_tab.load_image_with_tempdir(path, None);
+            }
+        }
+        self.active_tab = Tab::Inspect;
     }
 }
 
@@ -640,6 +693,25 @@ impl eframe::App for RustyBackupApp {
             || self.bulk_convert_status.is_some()
         {
             ctx.request_repaint();
+        }
+
+        // One-shot: drain the file path handed in on the command line
+        // (Windows file-association double-click, macOS `open ...`, Linux
+        // .desktop MimeType launch). Done in update() rather than the
+        // constructor because the inspect tab's lazy-load path needs the
+        // egui context to be alive.
+        if let Some(path) = self.pending_initial_image.take() {
+            self.open_in_inspect(path);
+        }
+
+        // Drag-and-drop: if the user dragged one or more files onto the
+        // app window, take the first one with a real filesystem path and
+        // open it in the Inspect tab. `with_drag_and_drop(true)` is set
+        // on the viewport in main.rs so eframe surfaces these events.
+        let dropped: Option<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            self.open_in_inspect(path);
         }
 
         // Drain `log` crate records (incl. worker-thread log::info! from the
