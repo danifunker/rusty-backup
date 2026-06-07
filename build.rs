@@ -1,6 +1,18 @@
 fn main() {
     // Set version at compile time
     // Reads from RELEASE_VERSION env var (set by CI) or falls back to Cargo.toml version
+    //
+    // Re-run the build script whenever either input changes. This is critical:
+    // emitting any `rerun-if-*` directive (see CARGO_FEATURE_CHD below) disables
+    // Cargo's default "re-run on any source change" heuristic, so without these
+    // lines a cached build-script run pins APP_VERSION forever. In CI the build
+    // job runs `cargo test` (no RELEASE_VERSION -> APP_VERSION baked as the
+    // 0.1.0 CARGO_PKG_VERSION fallback) before `cargo build` (RELEASE_VERSION
+    // set); without rerun-if-env-changed the build step reuses the stale 0.1.0
+    // and every released artifact reports 0.1.0, tripping the auto-updater on
+    // every launch.
+    println!("cargo:rerun-if-env-changed=RELEASE_VERSION");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     let version = std::env::var("RELEASE_VERSION")
         .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap());
 

@@ -31,6 +31,13 @@ jobs:
     name: Build Windows
     needs: generate-version
     runs-on: windows-latest
+    # Bake the release version for every cargo invocation in the job (Test and
+    # Build alike). build.rs reads RELEASE_VERSION into APP_VERSION; if only the
+    # Build step set it, the earlier `cargo test` would bake the 0.1.0 fallback
+    # and (now that build.rs reruns on RELEASE_VERSION changes) force a needless
+    # recompile in Build. Setting it job-wide keeps APP_VERSION consistent.
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     strategy:
       # Run both arches to completion — don't let a 32-bit failure cancel the
       # x64 leg (we want to see both results when diagnosing arch-specific bugs).
@@ -89,8 +96,6 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
-        env:
-          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -154,6 +159,8 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      # See build-windows: keep APP_VERSION consistent across Test and Build.
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     strategy:
       matrix:
         include:
@@ -196,8 +203,6 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
-        env:
-          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: |
           # Build main app
           cargo build --release --target ${{ matrix.target }}
@@ -407,6 +412,8 @@ jobs:
       ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
       # Pinned appimagetool release; quick-sharun honours APPIMAGETOOL_LINK.
       APPIMAGETOOL_VERSION: "0.3.0"
+      # See build-windows: keep APP_VERSION consistent across Test and Build.
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -464,8 +471,6 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
-        env:
-          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Install debloated runtime packages
@@ -498,8 +503,6 @@ jobs:
           EOF
 
       - name: Bundle with quick-sharun
-        env:
-          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: |
           VERSION="${{ needs.generate-version.outputs.version }}"
           OUT="Rusty-Backup-linux-${{ matrix.arch }}-${VERSION}.AppImage"
@@ -584,6 +587,9 @@ jobs:
     name: Build Linux Packages
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
+    # See build-windows: keep APP_VERSION consistent across Test and Build.
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     strategy:
       matrix:
         include:
@@ -637,8 +643,6 @@ jobs:
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
-        env:
-          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build Debian package

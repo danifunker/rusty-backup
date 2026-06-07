@@ -20,8 +20,12 @@
 [target.armv7-unknown-linux-gnueabihf]
 image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main@sha256:9014720a7d829bcd631835ca5d14cf43fbef1fac0b511a2632f4bd71a4990229"
 
-# Forward libchdman-rs's build-script env vars into the container so the
-# prebuilt fetcher can be steered from CI:
+# Forward build-script env vars into the container so the build can be
+# steered from CI:
+#   - RELEASE_VERSION — build.rs bakes APP_VERSION from this; cross only
+#     forwards env vars listed here, so without it the cross-built
+#     rb-cli-mini reports the 0.1.0 CARGO_PKG_VERSION fallback and trips
+#     the auto-updater on every launch.
 #   - XDG_CACHE_HOME — points at /tmp so the cache dir resolves to a path
 #     the container user can write to (cross's HOME mount is read-only).
 #   - LIBCHDMAN_GLIBC — usually unset; the build script auto-picks 2.31 for
@@ -34,6 +38,7 @@ image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main@sha256:9014720a7d82
 #     archive on the host (avoiding the per-build download) and hand it in.
 [target.armv7-unknown-linux-gnueabihf.env]
 passthrough = [
+    "RELEASE_VERSION",
     "XDG_CACHE_HOME",
     "LIBCHDMAN_GLIBC",
     "LIBCHDMAN_PREBUILT_FALLBACK",
