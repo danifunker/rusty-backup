@@ -17,10 +17,16 @@
 /// uppercase variants of the case-sensitive container formats (rfd matches
 /// extensions case-sensitively on some platforms, so `.GHO` / `.HFV` need
 /// explicit entries to be selectable).
+///
+/// The Sharp / X68000 / PC-98 / FM-7 floppy-container family (`d88` / `xdf`
+/// / `hdm` / `dim`) is included with both cases — historical X68000 / PC-98
+/// archives ship a mix of `.D88` / `.XDF` (DOS-era uppercase legacy) and
+/// the modern lowercase emulator convention, so the picker needs both to
+/// match either.
 pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
-    "GHS", "hfv", "HFV",
+    "GHS", "hfv", "HFV", "d88", "D88", "xdf", "XDF", "hdm", "HDM", "dim", "DIM",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -76,6 +82,21 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn floppy_container_family_present() {
+        // X68000 / PC-98 / FM-7 floppy containers — engine support
+        // (`rbformats::containers::{d88,xdf,hdm,dim}`) and the GUI
+        // `Convert Floppy Container...` dialog all assume the pickers
+        // surface these. Regression-pin them here so a future cleanup
+        // pass that prunes the disk-image list has to do it deliberately.
+        for must in ["d88", "xdf", "hdm", "dim"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing floppy-container extension {must}"
             );
         }
     }
