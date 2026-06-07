@@ -763,7 +763,7 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
             }
             out.push(fe);
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         Ok(out)
     }
 

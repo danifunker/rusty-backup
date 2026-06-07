@@ -18,7 +18,7 @@ use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
-use x68k::{X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE};
+use x68k::X68kPartitionTable;
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
 
@@ -51,6 +51,12 @@ pub enum PartitionTable {
         /// undefined unit and unreliable; this comes from the source
         /// reader directly).
         size_bytes: u64,
+        /// Logical sector size in bytes, derived from the Sharp boot
+        /// signature (`X68SCSI1` -> 1024, `\x82w68000W` -> 256, else 512).
+        /// The table's `start_sector` / `length_sectors` are counted in
+        /// these sectors; partition byte offsets are `start_sector *
+        /// sector_size`. See [`x68k::detect_sector_size`].
+        sector_size: u64,
     },
     /// Superfloppy / floppy: no partition table, filesystem at sector 0.
     None {
@@ -69,6 +75,14 @@ pub struct PartitionInfo {
     /// Raw partition type byte (MBR type ID; 0 for GPT).
     pub partition_type_byte: u8,
     pub start_lba: u64,
+    /// Authoritative partition start in bytes. `None` for the overwhelming
+    /// majority of tables, where the start is exactly `start_lba * 512`.
+    /// Set explicitly only when that identity does not hold — X68000 SASI
+    /// disks use 256-byte logical sectors, so a partition can begin on a
+    /// byte that is not 512-aligned (e.g. sector 33 -> byte 8448). Read
+    /// the start through [`PartitionInfo::byte_offset`], never by
+    /// recomputing `start_lba * 512`.
+    pub start_byte: Option<u64>,
     pub size_bytes: u64,
     pub bootable: bool,
     /// True for logical partitions inside an extended container.
@@ -89,6 +103,16 @@ pub struct PartitionInfo {
     /// from the volume label, which is the disk name in the AFFS/PFS3/SFS
     /// root block. `None` for non-RDB partitions.
     pub drv_name: Option<String>,
+}
+
+impl PartitionInfo {
+    /// Byte offset of the partition's first sector. Use this everywhere an
+    /// absolute partition offset is needed (filesystem open, backup,
+    /// export) instead of recomputing `start_lba * 512` — it honors the
+    /// `start_byte` override that X68000 SASI (256-byte-sector) disks set.
+    pub fn byte_offset(&self) -> u64 {
+        self.start_byte.unwrap_or(self.start_lba * 512)
+    }
 }
 
 /// Standard floppy disk image sizes (bytes).
@@ -435,12 +459,16 @@ impl PartitionTable {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
-        match X68kPartitionTable::detect(reader) {
-            Ok(Some(table)) => {
+        match X68kPartitionTable::detect_with_geometry(reader) {
+            Ok(Some((table, _table_offset, sector_size))) => {
                 let size_bytes = reader
                     .seek(SeekFrom::End(0))
                     .map_err(RustyBackupError::Io)?;
-                return Ok(PartitionTable::X68k { table, size_bytes });
+                return Ok(PartitionTable::X68k {
+                    table,
+                    size_bytes,
+                    sector_size,
+                });
             }
             Ok(None) | Err(_) => {
                 // Restore reader for the superfloppy / MBR paths below.
@@ -533,6 +561,7 @@ impl PartitionTable {
                         type_name: e.partition_type_name().to_string(),
                         partition_type_byte: e.partition_type,
                         start_lba: e.start_lba as u64,
+                        start_byte: None,
                         size_bytes: e.size_bytes(),
                         bootable: e.bootable,
                         is_logical: false,
@@ -551,6 +580,7 @@ impl PartitionTable {
                         type_name: e.partition_type_name().to_string(),
                         partition_type_byte: e.partition_type,
                         start_lba: e.start_lba as u64,
+                        start_byte: None,
                         size_bytes: e.size_bytes(),
                         bootable: e.bootable,
                         is_logical: true,
@@ -573,6 +603,7 @@ impl PartitionTable {
                     type_name: format!("{} ({})", e.type_name(), e.name),
                     partition_type_byte: 0,
                     start_lba: e.first_lba,
+                    start_byte: None,
                     size_bytes: e.size_bytes(),
                     bootable: false,
                     is_logical: false,
@@ -594,6 +625,7 @@ impl PartitionTable {
                         type_name: format!("{} ({})", e.partition_type, e.name),
                         partition_type_byte: 0,
                         start_lba: e.start_block as u64 * block_size as u64 / 512,
+                        start_byte: None,
                         size_bytes: e.size_bytes(block_size),
                         bootable: e.is_bootable(),
                         is_logical: false,
@@ -634,6 +666,7 @@ impl PartitionTable {
                             type_name,
                             partition_type_byte,
                             start_lba: e.first as u64,
+                            start_byte: None,
                             size_bytes: e.size_bytes(),
                             bootable: false,
                             is_logical: false,
@@ -665,6 +698,7 @@ impl PartitionTable {
                     ),
                     partition_type_byte: 0,
                     start_lba: p.start_lba_512(),
+                    start_byte: None,
                     size_bytes: p.size_bytes(),
                     bootable: p.is_bootable(),
                     is_logical: false,
@@ -689,6 +723,7 @@ impl PartitionTable {
                         type_name: format!("AHDI {}", e.kind.display_name()),
                         partition_type_byte: e.kind.synthetic_type_byte(),
                         start_lba: e.start_sector as u64,
+                        start_byte: None,
                         size_bytes: e.size_bytes(),
                         bootable: e.bootable(),
                         is_logical: false,
@@ -705,6 +740,7 @@ impl PartitionTable {
                         type_name: format!("AHDI {}", e.kind.display_name()),
                         partition_type_byte: e.kind.synthetic_type_byte(),
                         start_lba: e.start_sector as u64,
+                        start_byte: None,
                         size_bytes: e.size_bytes(),
                         bootable: e.bootable(),
                         is_logical: true,
@@ -717,12 +753,23 @@ impl PartitionTable {
                 }
                 out
             }
-            PartitionTable::X68k { table, .. } => {
+            PartitionTable::X68k {
+                table, sector_size, ..
+            } => {
+                // The table counts in logical sectors of `sector_size`
+                // (1024 B for SCSI, 256 B for SASI, 512 B for the synthetic
+                // test convention). The true partition offset is
+                // `start_sector * sector_size`; carry it in `start_byte`
+                // (read via `byte_offset()`) because 256-byte SASI disks can
+                // start on a non-512-aligned byte that `start_lba * 512`
+                // cannot express. `start_lba` keeps the floored 512-LBA
+                // value for the inspect display and legacy consumers.
                 table
                     .entries
                     .iter()
                     .enumerate()
                     .map(|(i, e)| {
+                        let start_byte = e.start_sector as u64 * *sector_size;
                         let is_human = e.is_human68k();
                         let type_name = if is_human {
                             format!("X68k Human68k ({})", e.name_display)
@@ -738,8 +785,9 @@ impl PartitionTable {
                             // BPB is FAT-compatible so the read path Just
                             // Works once the offset is right.
                             partition_type_byte: if is_human { 0x01 } else { 0 },
-                            start_lba: e.start_sector as u64,
-                            size_bytes: e.length_sectors as u64 * X68K_DEFAULT_SECTOR_SIZE,
+                            start_lba: start_byte / 512,
+                            start_byte: Some(start_byte),
+                            size_bytes: e.length_sectors as u64 * *sector_size,
                             bootable: false,
                             is_logical: false,
                             is_extended_container: false,
@@ -780,6 +828,7 @@ impl PartitionTable {
                     type_name: display_name,
                     partition_type_byte: 0,
                     start_lba: 0,
+                    start_byte: None,
                     size_bytes: *size_bytes,
                     bootable: false,
                     is_logical: false,
@@ -886,6 +935,56 @@ impl PartitionSizeOverride {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn byte_offset_honors_start_byte_override() {
+        let mut p = PartitionInfo {
+            index: 0,
+            type_name: "t".into(),
+            partition_type_byte: 0,
+            start_lba: 64,
+            start_byte: None,
+            size_bytes: 0,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: None,
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        };
+        // No override -> start_lba * 512.
+        assert_eq!(p.byte_offset(), 64 * 512);
+        // Override -> the exact (possibly non-512-aligned) byte.
+        p.start_byte = Some(8448);
+        assert_eq!(p.byte_offset(), 8448);
+    }
+
+    #[test]
+    fn x68k_sasi_partition_info_carries_non_aligned_byte_offset() {
+        // SASI table at byte 0x400, 256-byte sectors, partition at sector 33.
+        let table = X68kPartitionTable {
+            disk_size_field: 0,
+            entries: vec![x68k::X68kEntry {
+                name_raw: *b"Human68k",
+                name_display: "Human68k".into(),
+                start_sector: 33,
+                length_sectors: 40750,
+            }],
+        };
+        let pt = PartitionTable::X68k {
+            table,
+            size_bytes: 10_441_728,
+            sector_size: 256,
+        };
+        let infos = pt.partitions();
+        assert_eq!(infos.len(), 1);
+        // byte_offset() must be the exact 256-byte-sector offset, which is
+        // NOT recoverable from start_lba * 512.
+        assert_eq!(infos[0].byte_offset(), 33 * 256);
+        assert_eq!(infos[0].size_bytes, 40750 * 256);
+        assert_ne!(infos[0].start_lba * 512, infos[0].byte_offset());
+    }
 
     /// (type, start_lba, sectors, start_head, start_sec, start_cyl,
     /// end_head, end_sec, end_cyl) — test-only MBR entry tuple.

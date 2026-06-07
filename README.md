@@ -270,6 +270,7 @@ readable.
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
 | Sharp D88      | `.d88`          | Yes            | Yes (convert)   | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container |
 | X68000 XDF     | `.xdf`          | Yes            | Yes (convert)   | Raw headerless X68000 floppy dump; geometry inferred from size |
+| X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | No          | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16 read (browse + extract). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
 | PC-98 HDM      | `.hdm`          | Yes            | Yes (convert)   | DiskExplorer raw headerless floppy dump (byte-identical to XDF) |
 | DiskExplorer DIM | `.dim`        | Yes            | Yes (convert, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
@@ -381,7 +382,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
 | **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
 | **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
-| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI HDD (`.hdf`) |
+| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images) |
 | **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
 | **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
 | **Amstrad CPC**                | AMSDOS + CP/M 2.2 / Plus (`amstrad_data` + `amstrad_sys` DPBs) | Floppy `.dsk` |

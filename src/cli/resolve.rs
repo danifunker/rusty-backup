@@ -151,7 +151,7 @@ fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<Part
     };
 
     Ok(PartitionContext {
-        offset: info.start_lba * 512,
+        offset: info.byte_offset(),
         type_byte: info.partition_type_byte,
         type_string: info.partition_type_string.clone(),
         size: info.size_bytes,

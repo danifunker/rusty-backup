@@ -222,11 +222,10 @@ fn main() {
     println!();
 
     // Locate target frag's zone via Linux formula.
-    let target_zone = if ids_per_zone > 0 {
-        (target_frag as u64 / ids_per_zone) as u32
-    } else {
-        0
-    };
+    let target_zone = (target_frag as u64)
+        .checked_div(ids_per_zone)
+        .map(|q| q as u32)
+        .unwrap_or(0);
     println!("Linux ids_per_zone says: target_frag {target_frag} lives in zone {target_zone}");
 
     // Sweep all zones for the target frag (in case the formula is off).

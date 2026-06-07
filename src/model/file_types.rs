@@ -20,7 +20,7 @@
 pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
-    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim",
+    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -76,6 +76,19 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn x68000_hdd_extensions_present() {
+        // Sharp X68000 SASI/SCSI HDD images — `.hda` (BlueSCSI),
+        // `.hdf`, and `.hds`. The Human68k engine opens all three; pin
+        // them so the picker keeps surfacing X68000 hard-disk images.
+        for must in ["hda", "hdf", "hds"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing X68000 HDD extension {must}"
             );
         }
     }

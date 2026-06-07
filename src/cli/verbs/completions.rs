@@ -91,13 +91,25 @@ pub fn run_emit(args: EmitArgs) -> Result<()> {
 /// user actually typed to launch this process. Returns `None` for the
 /// pathological cases (`argv[0]` empty / the OS gave us garbage) so the
 /// caller can fall back to the static clap name.
+/// Extract the program name from an `argv[0]`-style string: strip the
+/// directory components and a trailing file extension.
+///
+/// Splits on **both** `/` and `\` regardless of host OS — `std::path::Path`
+/// only treats `\` as a separator on Windows, so a Windows-style argv0
+/// (`C:\...\rb-cli.exe`) seen on a Unix build would otherwise keep its
+/// whole path. Shared with the unit test so the two can't drift.
+fn bin_stem(arg0: &str) -> Option<String> {
+    let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
+    // Strip a single trailing extension (".exe"), but keep dotfiles intact.
+    let stem = match base.rfind('.') {
+        Some(idx) if idx > 0 => &base[..idx],
+        _ => base,
+    };
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
 fn detect_invoked_bin_name() -> Option<String> {
-    std::env::args().next().and_then(|arg0| {
-        std::path::Path::new(&arg0)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|s| !s.is_empty())
-    })
+    std::env::args().next().and_then(|arg0| bin_stem(&arg0))
 }
 
 pub fn run_install(args: InstallArgs) -> Result<()> {
@@ -237,27 +249,20 @@ mod tests {
 
     #[test]
     fn detect_invoked_bin_name_strips_path_and_extension() {
-        // We can't override `std::env::args()` from a test, so exercise the
-        // same logic over a synthetic input via a private helper. Keep the
-        // shape identical to `detect_invoked_bin_name`'s implementation so
-        // a regression on the basename / extension stripping gets caught.
-        fn basename(arg0: &str) -> Option<String> {
-            std::path::Path::new(arg0)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .filter(|s| !s.is_empty())
-        }
-        assert_eq!(basename("rb-cli"), Some("rb-cli".to_string()));
-        assert_eq!(basename("./rb-cli-mini"), Some("rb-cli-mini".to_string()));
+        // Exercise the real `bin_stem` helper that `detect_invoked_bin_name`
+        // uses, so the test can't drift from the implementation.
+        assert_eq!(bin_stem("rb-cli"), Some("rb-cli".to_string()));
+        assert_eq!(bin_stem("./rb-cli-mini"), Some("rb-cli-mini".to_string()));
         assert_eq!(
-            basename("/media/fat/Scripts/rb-cli-mini"),
+            bin_stem("/media/fat/Scripts/rb-cli-mini"),
             Some("rb-cli-mini".to_string())
         );
+        // Windows-style argv0 must work on every host (not just Windows).
         assert_eq!(
-            basename("C:\\Users\\x\\rb-cli.exe"),
+            bin_stem("C:\\Users\\x\\rb-cli.exe"),
             Some("rb-cli".to_string())
         );
-        assert_eq!(basename(""), None);
+        assert_eq!(bin_stem(""), None);
     }
 
     #[test]

@@ -607,6 +607,7 @@ mod tests {
                     type_name: "FAT32".to_string(),
                     partition_type_byte: 0x0C,
                     start_lba,
+                    start_byte: None,
                     size_bytes,
                     bootable: false,
                     is_logical,

@@ -1904,7 +1904,7 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
         // v1's direct-only file layout each direct[i] is a `frag`-long
         // block, so we can collapse into runs trivially when neighbors
         // line up; the dumb path is correct and slow.
-        for f in data_frags.into_iter().chain(indirect_frags.into_iter()) {
+        for f in data_frags.into_iter().chain(indirect_frags) {
             if f == 0 {
                 continue;
             }

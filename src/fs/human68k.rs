@@ -9,8 +9,16 @@
 //!
 //! ## On-disk layout
 //!
-//! - BPB at sector 0 — identical layout to FAT12/16 (jump, OEM, bytes
-//!   per sector, etc). The X68000's IPL is in the boot bytes.
+//! - BPB at the partition's first sector, in one of two conventions
+//!   (see [`Human68kBpb::parse`]):
+//!     - **Standard FAT** — little-endian fields at offset 11 after a
+//!       3-byte jump + 8-byte OEM. X68000 floppies use this.
+//!     - **Sharp / Keisoku Giken SCSI-HDD** — *big-endian* fields at
+//!       offset 0x12 after a 2-byte BRA.S + 16-byte OEM (e.g.
+//!       "SHARP/KG    1.00"). Real SCSI hard-disk images (`X68SCSI1`
+//!       signature, 1024-byte logical sectors) use this. The FAT table
+//!       and directory entries stay little-endian (MS-DOS compatible);
+//!       only the BPB header is big-endian.
 //! - FAT table immediately after the reserved sectors (DPB style).
 //! - Root directory immediately after the FAT (FAT12/16 convention).
 //! - Data area after that.
@@ -43,7 +51,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use byteorder::{ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
@@ -80,6 +88,14 @@ pub struct Human68kBpb {
     pub total_sectors: u32,
     pub fat_sectors: u16,
     pub fat_kind: FatKind,
+    /// True when FAT entries are stored **big-endian** (the Sharp / Keisoku
+    /// Giken SCSI/SASI HDD convention). Floppies and standard-FAT BPBs use
+    /// little-endian. Directory entries are little-endian on every variant;
+    /// only the FAT table itself differs. A FAT16 entry read with the wrong
+    /// endianness byteswaps the next-cluster link, truncating multi-cluster
+    /// files — short files appear fine because `read_file` returns `size`
+    /// bytes regardless of chain length.
+    pub fat_big_endian: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,29 +106,108 @@ pub enum FatKind {
 
 impl Human68kBpb {
     pub fn parse(bpb_buf: &[u8; 512]) -> Result<Self, FilesystemError> {
-        let bytes_per_sector = LittleEndian::read_u16(&bpb_buf[11..13]);
+        // Human68k has two on-disk BPB conventions:
+        //
+        // 1. Standard MS-DOS FAT BPB — little-endian, fields at offset 11
+        //    (after a 3-byte jump + 8-byte OEM). X68000 floppies and our
+        //    synthetic test images use this.
+        //
+        // 2. Sharp / Keisoku Giken SCSI-HDD BPB — big-endian, fields at
+        //    offset 0x12 (after a 2-byte BRA.S + 16-byte OEM such as
+        //    "SHARP/KG    1.00"). Real BlueSCSI / SxSI hard-disk images
+        //    (`X68SCSI1` signature, 1024-byte sectors) use this.
+        //
+        // The two layouts are incompatible (different field offsets *and*
+        // endianness), so the SCSI-HDD form was rejected with
+        // "bytes_per_sector 0 / 8224 not in {...}" before this path
+        // existed. Prefer the standard layout whenever its
+        // bytes-per-sector field is already valid — that keeps every
+        // floppy / test image on the exact code path it had before — and
+        // only fall back to the Sharp/KG layout when the standard field is
+        // invalid and the disk carries the 0x60 (BRA.S) boot opcode with a
+        // sane big-endian sector size at 0x12.
+        let std_bps = LittleEndian::read_u16(&bpb_buf[11..13]);
+        if !matches!(std_bps, 256 | 512 | 1024 | 2048) && bpb_buf[0] == 0x60 {
+            let be_bps = BigEndian::read_u16(&bpb_buf[0x12..0x14]);
+            if matches!(be_bps, 256 | 512 | 1024 | 2048) {
+                return Self::parse_sharp_kg(bpb_buf);
+            }
+        }
+        Self::from_fields(
+            std_bps,
+            bpb_buf[13],
+            LittleEndian::read_u16(&bpb_buf[14..16]),
+            bpb_buf[16],
+            LittleEndian::read_u16(&bpb_buf[17..19]),
+            LittleEndian::read_u16(&bpb_buf[19..21]) as u32,
+            LittleEndian::read_u16(&bpb_buf[22..24]),
+            LittleEndian::read_u32(&bpb_buf[32..36]),
+            false, // standard FAT BPB -> little-endian FAT table
+        )
+    }
+
+    /// Parse the Sharp / Keisoku Giken SCSI-HDD BPB (big-endian, fields at
+    /// offset 0x12). Layout verified byte-for-byte against real BlueSCSI
+    /// `X68SCSI1` images (HD10/HD20):
+    ///
+    /// ```text
+    /// 0x12  u16 BE  bytes per sector      (1024)
+    /// 0x14  u8      sectors per cluster   (16 / 32)
+    /// 0x15  u8      number of FATs        (2)
+    /// 0x16  u16 BE  reserved sectors      (1)
+    /// 0x18  u16 BE  root dir entries      (512)
+    /// 0x1A  u16 BE  total sectors (16-bit, 0 when 32-bit form is used)
+    /// 0x1C  u8      media descriptor      (0xF7)
+    /// 0x1D  u8      sectors per FAT       (118 / 120)
+    /// 0x1E  u32 BE  total sectors (32-bit) == X68K partition length
+    /// ```
+    ///
+    /// The FAT table on these disks is **big-endian** too (verified against
+    /// real images: contiguous files give sequential BE next-cluster
+    /// links); directory entries stay little-endian.
+    fn parse_sharp_kg(bpb_buf: &[u8; 512]) -> Result<Self, FilesystemError> {
+        Self::from_fields(
+            BigEndian::read_u16(&bpb_buf[0x12..0x14]),
+            bpb_buf[0x14],
+            BigEndian::read_u16(&bpb_buf[0x16..0x18]),
+            bpb_buf[0x15],
+            BigEndian::read_u16(&bpb_buf[0x18..0x1A]),
+            BigEndian::read_u16(&bpb_buf[0x1A..0x1C]) as u32,
+            bpb_buf[0x1D] as u16,
+            BigEndian::read_u32(&bpb_buf[0x1E..0x22]),
+            true, // Sharp/KG HDD -> big-endian FAT table
+        )
+    }
+
+    /// Validate the raw BPB fields (shared by both layouts) and derive the
+    /// FAT12/16 sub-type from the cluster count.
+    #[allow(clippy::too_many_arguments)]
+    fn from_fields(
+        bytes_per_sector: u16,
+        sectors_per_cluster: u8,
+        reserved_sectors: u16,
+        num_fats: u8,
+        root_entries: u16,
+        small_total: u32,
+        fat_sectors: u16,
+        big_total: u32,
+        fat_big_endian: bool,
+    ) -> Result<Self, FilesystemError> {
         if !matches!(bytes_per_sector, 256 | 512 | 1024 | 2048) {
             return Err(FilesystemError::InvalidData(format!(
                 "Human68k BPB bytes_per_sector {bytes_per_sector} not in {{256,512,1024,2048}}"
             )));
         }
-        let sectors_per_cluster = bpb_buf[13];
         if sectors_per_cluster == 0 || !sectors_per_cluster.is_power_of_two() {
             return Err(FilesystemError::InvalidData(format!(
                 "Human68k BPB sectors_per_cluster {sectors_per_cluster} must be a power of two"
             )));
         }
-        let reserved_sectors = LittleEndian::read_u16(&bpb_buf[14..16]);
-        let num_fats = bpb_buf[16];
         if num_fats == 0 || num_fats > 2 {
             return Err(FilesystemError::InvalidData(format!(
                 "Human68k BPB num_fats {num_fats} not 1 or 2"
             )));
         }
-        let root_entries = LittleEndian::read_u16(&bpb_buf[17..19]);
-        let small_total = LittleEndian::read_u16(&bpb_buf[19..21]) as u32;
-        let fat_sectors = LittleEndian::read_u16(&bpb_buf[22..24]);
-        let big_total = LittleEndian::read_u32(&bpb_buf[32..36]);
         let total_sectors = if small_total != 0 {
             small_total
         } else {
@@ -140,6 +235,7 @@ impl Human68kBpb {
             total_sectors,
             fat_sectors,
             fat_kind,
+            fat_big_endian,
         })
     }
 
@@ -348,7 +444,12 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
                 if off + 1 >= self.fat_bytes.len() {
                     return 0xFFFF;
                 }
-                u16::from_le_bytes([self.fat_bytes[off], self.fat_bytes[off + 1]])
+                let bytes = [self.fat_bytes[off], self.fat_bytes[off + 1]];
+                if self.bpb.fat_big_endian {
+                    u16::from_be_bytes(bytes)
+                } else {
+                    u16::from_le_bytes(bytes)
+                }
             }
         }
     }
@@ -375,23 +476,65 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         self.reader.seek(SeekFrom::Start(root_off))?;
         let mut buf = vec![0u8; root_byte_len as usize];
         self.reader.read_exact(&mut buf)?;
-        let mut out = Vec::new();
-        for slot in buf.chunks_exact(DIR_ENTRY_SIZE) {
-            if slot[0] == 0x00 {
-                break; // end of directory
-            }
-            if slot[0] == 0xE5 {
-                continue; // deleted
-            }
-            let arr: &[u8; DIR_ENTRY_SIZE] = slot.try_into().unwrap();
-            if let Some(e) = parse_dir_entry(arr) {
-                if !e.is_volume_label() {
-                    out.push(e);
-                }
-            }
-        }
-        Ok(out)
+        Ok(parse_directory_buffer(&buf))
     }
+
+    /// Read a subdirectory by following its cluster chain from
+    /// `first_cluster`, parsing 32-byte entries across cluster boundaries.
+    /// Stops at the end-of-directory marker (`0x00` first byte) or when the
+    /// chain terminates.
+    fn read_subdirectory(
+        &mut self,
+        first_cluster: u16,
+    ) -> Result<Vec<Human68kDirEntry>, FilesystemError> {
+        let chain = self.cluster_chain(first_cluster)?;
+        let csize = self.bpb.cluster_size() as usize;
+        let mut buf = Vec::with_capacity(chain.len() * csize);
+        for cluster in chain {
+            let off = self.cluster_byte_offset(cluster);
+            self.reader.seek(SeekFrom::Start(off))?;
+            let mut cbuf = vec![0u8; csize];
+            self.reader.read_exact(&mut cbuf)?;
+            buf.extend_from_slice(&cbuf);
+        }
+        Ok(parse_directory_buffer(&buf))
+    }
+}
+
+/// Write a `.` or `..` self/parent link into a 32-byte directory slot.
+/// `name8` is the space-padded 8-byte name (`b".       "` / `b"..      "`),
+/// `cluster` the first cluster it points at (0 for the parent of a
+/// root-level directory, per FAT convention).
+fn write_dot_entry(slot: &mut [u8], name8: &[u8; 8], cluster: u16) {
+    slot[..DIR_ENTRY_SIZE].fill(0);
+    slot[0..8].copy_from_slice(name8);
+    slot[8..11].copy_from_slice(b"   ");
+    slot[11] = attr::DIRECTORY;
+    LittleEndian::write_u16(&mut slot[26..28], cluster);
+    LittleEndian::write_u32(&mut slot[28..32], 0);
+}
+
+/// Parse a directory region (root or subdirectory) into active entries.
+/// Skips deleted slots (`0xE5`), volume labels, and the `.` / `..`
+/// self/parent links; stops at the end-of-directory marker (`0x00`).
+fn parse_directory_buffer(buf: &[u8]) -> Vec<Human68kDirEntry> {
+    let mut out = Vec::new();
+    for slot in buf.chunks_exact(DIR_ENTRY_SIZE) {
+        if slot[0] == 0x00 {
+            break; // end of directory
+        }
+        if slot[0] == 0xE5 {
+            continue; // deleted
+        }
+        let arr: &[u8; DIR_ENTRY_SIZE] = slot.try_into().unwrap();
+        if let Some(e) = parse_dir_entry(arr) {
+            if e.is_volume_label() || e.display_name == "." || e.display_name == ".." {
+                continue;
+            }
+            out.push(e);
+        }
+    }
+    out
 }
 
 impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
@@ -400,29 +543,33 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        if entry.path != "/" {
-            return Ok(Vec::new()); // subdirs left as future work
-        }
-        let dir = self.read_root_directory()?;
+        // Root directory lives in the fixed root region (location 0);
+        // subdirectories are walked through their cluster chain.
+        let dir = if entry.path == "/" {
+            self.read_root_directory()?
+        } else {
+            self.read_subdirectory(entry.location as u16)?
+        };
+        let parent = if entry.path == "/" {
+            String::new()
+        } else {
+            entry.path.trim_end_matches('/').to_string()
+        };
         let mut out = Vec::with_capacity(dir.len());
         for de in dir {
             let name = de.display_name.clone();
+            let path = format!("{parent}/{name}");
             let mut fe = if de.is_directory() {
-                FileEntry::new_directory(name.clone(), format!("/{name}"), de.first_cluster as u64)
+                FileEntry::new_directory(name.clone(), path, de.first_cluster as u64)
             } else {
-                FileEntry::new_file(
-                    name.clone(),
-                    format!("/{name}"),
-                    de.size as u64,
-                    de.first_cluster as u64,
-                )
+                FileEntry::new_file(name.clone(), path, de.size as u64, de.first_cluster as u64)
             };
             if de.attr & attr::READ_ONLY != 0 {
                 fe.special_type = Some("R/O".to_string());
             }
             out.push(fe);
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         Ok(out)
     }
 
@@ -574,7 +721,12 @@ impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
                 if off + 1 >= self.fat_bytes.len() {
                     return;
                 }
-                self.fat_bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
+                let encoded = if self.bpb.fat_big_endian {
+                    value.to_be_bytes()
+                } else {
+                    value.to_le_bytes()
+                };
+                self.fat_bytes[off..off + 2].copy_from_slice(&encoded);
             }
         }
     }
@@ -646,23 +798,135 @@ impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
         Ok(())
     }
 
-    /// Find a free 32-byte root-directory slot. Returns its byte offset
-    /// in the partition.
-    fn find_free_root_slot(&mut self) -> Result<u64, FilesystemError> {
-        let root_off = self.partition_offset
-            + self.bpb.root_dir_sector() as u64 * self.bpb.bytes_per_sector as u64;
-        let root_byte_len = self.bpb.root_entries as u64 * DIR_ENTRY_SIZE as u64;
-        self.reader.seek(SeekFrom::Start(root_off))?;
-        let mut buf = vec![0u8; root_byte_len as usize];
-        self.reader.read_exact(&mut buf)?;
-        for (i, slot) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
-            if slot[0] == 0x00 || slot[0] == 0xE5 {
-                return Ok(root_off + (i * DIR_ENTRY_SIZE) as u64);
+    /// Byte offsets of every 32-byte directory slot for the directory
+    /// whose first cluster is `first_cluster` (0 = the fixed root
+    /// directory). Subdirectories are walked through their cluster chain.
+    fn dir_slot_offsets(&self, first_cluster: u16) -> Result<Vec<u64>, FilesystemError> {
+        if first_cluster == 0 {
+            let root_off = self.partition_offset
+                + self.bpb.root_dir_sector() as u64 * self.bpb.bytes_per_sector as u64;
+            let n = self.bpb.root_entries as u64;
+            Ok((0..n)
+                .map(|i| root_off + i * DIR_ENTRY_SIZE as u64)
+                .collect())
+        } else {
+            let chain = self.cluster_chain(first_cluster)?;
+            let per_cluster = self.bpb.cluster_size() as u64 / DIR_ENTRY_SIZE as u64;
+            let mut out = Vec::with_capacity(chain.len() * per_cluster as usize);
+            for c in chain {
+                let base = self.cluster_byte_offset(c);
+                for i in 0..per_cluster {
+                    out.push(base + i * DIR_ENTRY_SIZE as u64);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// Grow a subdirectory by one cluster: allocate it, link the current
+    /// last cluster to it, and zero-fill it on disk. Returns the new
+    /// cluster. The FAT mutations are in-memory until `fat_write_back`.
+    fn grow_dir_chain(&mut self, first_cluster: u16) -> Result<u16, FilesystemError> {
+        let chain = self.cluster_chain(first_cluster)?;
+        let last = *chain.last().ok_or_else(|| {
+            FilesystemError::InvalidData("Human68k directory has an empty cluster chain".into())
+        })?;
+        let new_cluster = self.alloc_chain(1)?;
+        self.fat_set(last, new_cluster);
+        let off = self.cluster_byte_offset(new_cluster);
+        self.reader.seek(SeekFrom::Start(off))?;
+        let zeros = vec![0u8; self.bpb.cluster_size() as usize];
+        self.reader.write_all(&zeros)?;
+        Ok(new_cluster)
+    }
+
+    /// Find a free 32-byte directory slot in `first_cluster` (0 = root).
+    /// Subdirectories that are full are grown by one cluster; the root
+    /// directory is fixed-size and errors when full.
+    fn find_free_slot_in_dir(&mut self, first_cluster: u16) -> Result<u64, FilesystemError> {
+        for off in self.dir_slot_offsets(first_cluster)? {
+            self.reader.seek(SeekFrom::Start(off))?;
+            let mut b = [0u8; 1];
+            self.reader.read_exact(&mut b)?;
+            if b[0] == 0x00 || b[0] == 0xE5 {
+                return Ok(off);
             }
         }
-        Err(FilesystemError::InvalidData(
-            "Human68k root directory is full".into(),
-        ))
+        if first_cluster == 0 {
+            return Err(FilesystemError::InvalidData(
+                "Human68k root directory is full".into(),
+            ));
+        }
+        let new_cluster = self.grow_dir_chain(first_cluster)?;
+        Ok(self.cluster_byte_offset(new_cluster))
+    }
+
+    /// Find the slot byte offset of the entry named `name` in directory
+    /// `first_cluster` (0 = root). Case-insensitive, matches the browse /
+    /// list display name.
+    fn find_entry_slot_in_dir(
+        &mut self,
+        first_cluster: u16,
+        name: &str,
+    ) -> Result<Option<u64>, FilesystemError> {
+        for off in self.dir_slot_offsets(first_cluster)? {
+            self.reader.seek(SeekFrom::Start(off))?;
+            let mut buf = [0u8; DIR_ENTRY_SIZE];
+            self.reader.read_exact(&mut buf)?;
+            if buf[0] == 0x00 {
+                break;
+            }
+            if buf[0] == 0xE5 {
+                continue;
+            }
+            if let Some(de) = parse_dir_entry(&buf) {
+                if de.display_name.eq_ignore_ascii_case(name) {
+                    return Ok(Some(off));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// True if directory `first_cluster` contains no live entries other
+    /// than the `.` / `..` self/parent links and volume label.
+    fn dir_is_empty(&mut self, first_cluster: u16) -> Result<bool, FilesystemError> {
+        let chain = self.cluster_chain(first_cluster)?;
+        let cs = self.bpb.cluster_size() as usize;
+        for c in chain {
+            self.reader
+                .seek(SeekFrom::Start(self.cluster_byte_offset(c)))?;
+            let mut buf = vec![0u8; cs];
+            self.reader.read_exact(&mut buf)?;
+            for slot in buf.chunks_exact(DIR_ENTRY_SIZE) {
+                if slot[0] == 0x00 {
+                    return Ok(true); // end of directory
+                }
+                if slot[0] == 0xE5 {
+                    continue;
+                }
+                let arr: &[u8; DIR_ENTRY_SIZE] = slot.try_into().unwrap();
+                if let Some(de) = parse_dir_entry(arr) {
+                    if !de.is_volume_label() && de.display_name != "." && de.display_name != ".." {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Resolve a parent `FileEntry` to its directory's first cluster
+    /// (0 for the root). Builds child paths consistently for both.
+    fn parent_cluster_and_path(parent: &FileEntry) -> (u16, String) {
+        if parent.path == "/" {
+            (0, String::new())
+        } else {
+            (
+                parent.location as u16,
+                parent.path.trim_end_matches('/').to_string(),
+            )
+        }
     }
 }
 
@@ -675,17 +939,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         data_len: u64,
         _options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        if parent.path != "/" {
-            return Err(FilesystemError::Unsupported(
-                "Human68k subdir writes deferred — only root supported".into(),
-            ));
-        }
+        let (parent_cluster, parent_path) = Self::parent_cluster_and_path(parent);
         let (n8, ne10, e3) = encode_human68k_name(name)?;
-        // Reject duplicates.
-        let root = self.root()?;
-        let existing = self.list_directory(&root)?;
-        if existing.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
-            return Err(FilesystemError::InvalidData(format!(
+        // Reject duplicates within the target directory.
+        if self.find_entry_slot_in_dir(parent_cluster, name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(format!(
                 "Human68k file '{name}' already exists"
             )));
         }
@@ -717,8 +975,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             self.write_chain(first_cluster, &payload)?;
         }
 
-        // Stamp a new directory entry into the first free slot.
-        let slot_off = self.find_free_root_slot()?;
+        // Stamp a new directory entry into the first free slot of the
+        // target directory (growing a subdirectory's chain if needed).
+        let slot_off = self.find_free_slot_in_dir(parent_cluster)?;
         let mut entry = [0u8; DIR_ENTRY_SIZE];
         entry[0..8].copy_from_slice(&n8);
         entry[8..11].copy_from_slice(&e3);
@@ -733,7 +992,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         self.reader.flush()?;
         Ok(FileEntry::new_file(
             name.to_string(),
-            format!("/{name}"),
+            format!("{parent_path}/{name}"),
             payload.len() as u64,
             first_cluster as u64,
         ))
@@ -741,12 +1000,52 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
 
     fn create_directory(
         &mut self,
-        _parent: &FileEntry,
-        _name: &str,
+        parent: &FileEntry,
+        name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "Human68k subdir creation deferred".into(),
+        let (parent_cluster, parent_path) = Self::parent_cluster_and_path(parent);
+        let (n8, ne10, e3) = encode_human68k_name(name)?;
+        if self.find_entry_slot_in_dir(parent_cluster, name)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(format!(
+                "Human68k entry '{name}' already exists"
+            )));
+        }
+
+        // A directory occupies one cluster, holding its `.` / `..` links.
+        let dir_cluster = self.alloc_chain(1)?;
+        let cs = self.bpb.cluster_size() as usize;
+        let mut dir_buf = vec![0u8; cs];
+        // `.` -> itself, `..` -> parent (0 for root, per FAT convention).
+        write_dot_entry(&mut dir_buf[0..DIR_ENTRY_SIZE], b".       ", dir_cluster);
+        write_dot_entry(
+            &mut dir_buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE],
+            b"..      ",
+            parent_cluster,
+        );
+        let dir_off = self.cluster_byte_offset(dir_cluster);
+        self.reader.seek(SeekFrom::Start(dir_off))?;
+        self.reader.write_all(&dir_buf)?;
+
+        // Stamp the directory entry into the parent.
+        let slot_off = self.find_free_slot_in_dir(parent_cluster)?;
+        let mut entry = [0u8; DIR_ENTRY_SIZE];
+        entry[0..8].copy_from_slice(&n8);
+        entry[8..11].copy_from_slice(&e3);
+        entry[11] = attr::DIRECTORY;
+        entry[12..22].copy_from_slice(&ne10);
+        LittleEndian::write_u16(&mut entry[26..28], dir_cluster);
+        // Directories report size 0 in the entry; the chain is authoritative.
+        LittleEndian::write_u32(&mut entry[28..32], 0);
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        self.reader.write_all(&entry)?;
+
+        self.fat_write_back()?;
+        self.reader.flush()?;
+        Ok(FileEntry::new_directory(
+            name.to_string(),
+            format!("{parent_path}/{name}"),
+            dir_cluster as u64,
         ))
     }
 
@@ -755,51 +1054,38 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        if parent.path != "/" {
-            return Err(FilesystemError::Unsupported(
-                "Human68k subdir deletion deferred".into(),
-            ));
+        let (parent_cluster, _) = Self::parent_cluster_and_path(parent);
+        // Directories must be empty (the default `delete_recursive` empties
+        // them first); refuse a non-empty directory to match the trait
+        // contract.
+        if entry.entry_type == EntryType::Directory {
+            let dir_cluster = entry.location as u16;
+            if dir_cluster != 0 && !self.dir_is_empty(dir_cluster)? {
+                return Err(FilesystemError::InvalidData(format!(
+                    "Human68k directory '{}' is not empty",
+                    entry.name
+                )));
+            }
         }
-        if entry.entry_type != EntryType::File {
-            return Err(FilesystemError::InvalidData(
-                "Human68k only allows file deletion at this stage".into(),
-            ));
-        }
+
+        let slot_off = self
+            .find_entry_slot_in_dir(parent_cluster, &entry.name)?
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "Human68k entry '{}' not found in '{}'",
+                    entry.name, parent.path
+                ))
+            })?;
+
         let first = entry.location as u16;
         if first != 0 {
             self.free_chain(first)?;
         }
-        // Mark directory slot deleted: walk root entries to find the one
-        // matching this entry's name, stamp 0xE5 in byte 0.
-        let root_off = self.partition_offset
-            + self.bpb.root_dir_sector() as u64 * self.bpb.bytes_per_sector as u64;
-        let root_byte_len = self.bpb.root_entries as u64 * DIR_ENTRY_SIZE as u64;
-        self.reader.seek(SeekFrom::Start(root_off))?;
-        let mut buf = vec![0u8; root_byte_len as usize];
-        self.reader.read_exact(&mut buf)?;
-        for (i, slot) in buf.chunks_exact(DIR_ENTRY_SIZE).enumerate() {
-            if slot[0] == 0x00 {
-                break;
-            }
-            if slot[0] == 0xE5 {
-                continue;
-            }
-            let arr: &[u8; DIR_ENTRY_SIZE] = slot.try_into().unwrap();
-            if let Some(de) = parse_dir_entry(arr) {
-                if de.display_name.eq_ignore_ascii_case(&entry.name) {
-                    let slot_off = root_off + (i * DIR_ENTRY_SIZE) as u64;
-                    self.reader.seek(SeekFrom::Start(slot_off))?;
-                    self.reader.write_all(&[0xE5])?;
-                    self.fat_write_back()?;
-                    self.reader.flush()?;
-                    return Ok(());
-                }
-            }
-        }
-        Err(FilesystemError::NotFound(format!(
-            "Human68k entry '{}' not found in root directory",
-            entry.name
-        )))
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        self.reader.write_all(&[0xE5])?;
+        self.fat_write_back()?;
+        self.reader.flush()?;
+        Ok(())
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
@@ -896,6 +1182,111 @@ mod tests {
         assert_eq!(fs.fs_type(), "Human68k (FAT12)");
     }
 
+    /// Build a minimal Sharp/KG FAT16 volume (big-endian BPB *and* FAT)
+    /// with one 2-cluster file `BIG.BIN`, whose FAT chain is stored
+    /// big-endian. 512-byte sectors, 1 sector/cluster, ~4090 clusters
+    /// (the FAT16 floor).
+    fn build_sharp_kg_fat16_with_2cluster_file() -> Vec<u8> {
+        const BPS: usize = 512;
+        const NFATS: usize = 1;
+        const FATSZ: usize = 16;
+        const RESERVED: usize = 1;
+        const ROOT_ENTRIES: usize = 16;
+        const TOTAL: usize = 4108; // -> 4090 data clusters -> FAT16
+
+        let mut disk = vec![0u8; TOTAL * BPS];
+        // BPB: 2-byte BRA.S + 16-byte OEM, then big-endian fields at 0x12.
+        disk[0] = 0x60;
+        disk[1] = 0x24;
+        disk[2..18].copy_from_slice(b"SHARP/KG TEST   ");
+        BigEndian::write_u16(&mut disk[0x12..0x14], BPS as u16);
+        disk[0x14] = 1; // sectors per cluster
+        disk[0x15] = NFATS as u8;
+        BigEndian::write_u16(&mut disk[0x16..0x18], RESERVED as u16);
+        BigEndian::write_u16(&mut disk[0x18..0x1A], ROOT_ENTRIES as u16);
+        BigEndian::write_u16(&mut disk[0x1A..0x1C], TOTAL as u16);
+        disk[0x1C] = 0xF8;
+        disk[0x1D] = FATSZ as u8;
+
+        // Big-endian FAT16: cluster 2 -> 3, cluster 3 -> EOC.
+        let fat = RESERVED * BPS;
+        BigEndian::write_u16(&mut disk[fat..fat + 2], 0xFFF8); // entry 0
+        BigEndian::write_u16(&mut disk[fat + 2..fat + 4], 0xFFFF); // entry 1
+        BigEndian::write_u16(&mut disk[fat + 4..fat + 6], 3); // cluster 2 -> 3
+        BigEndian::write_u16(&mut disk[fat + 6..fat + 8], 0xFFFF); // cluster 3 EOC
+
+        // Root entry for BIG.BIN, first_cluster + size little-endian.
+        let root = (RESERVED + NFATS * FATSZ) * BPS;
+        let e = &mut disk[root..root + 32];
+        e[0..8].copy_from_slice(b"BIG     ");
+        e[8..11].copy_from_slice(b"BIN");
+        e[11] = attr::ARCHIVE;
+        LittleEndian::write_u16(&mut e[26..28], 2);
+        LittleEndian::write_u32(&mut e[28..32], 768); // spans 2 clusters
+
+        // Data: cluster 2 = 512 * 0xAA, cluster 3 = 256 * 0xBB.
+        let data_start = (RESERVED + NFATS * FATSZ + 1) * BPS;
+        for b in &mut disk[data_start..data_start + 512] {
+            *b = 0xAA;
+        }
+        for b in &mut disk[data_start + 512..data_start + 512 + 256] {
+            *b = 0xBB;
+        }
+        disk
+    }
+
+    #[test]
+    fn reads_big_endian_fat_chain_across_clusters() {
+        let mut fs =
+            Human68kFilesystem::open(Cursor::new(build_sharp_kg_fat16_with_2cluster_file()), 0)
+                .unwrap();
+        assert!(fs.bpb.fat_big_endian, "Sharp/KG BPB -> big-endian FAT");
+        assert_eq!(fs.bpb.fat_kind, FatKind::Fat16);
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "BIG.BIN");
+        assert_eq!(entries[0].size, 768);
+        // The whole file must come back: the second cluster is only
+        // reachable by decoding the FAT link big-endian. Reading it
+        // little-endian truncates the chain to a single cluster.
+        let data = fs.read_file(&entries[0], 4096).unwrap();
+        assert_eq!(data.len(), 768, "big-endian chain must yield both clusters");
+        assert!(data[..512].iter().all(|&b| b == 0xAA));
+        assert!(data[512..768].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn parses_sharp_kg_scsi_hdd_bpb() {
+        // Real BPB bytes from a BlueSCSI `X68SCSI1` image (HD10_512.hda):
+        // 2-byte BRA.S + 16-byte "SHARP/KG    1.00" OEM, then big-endian
+        // BPB fields at offset 0x12. bytes/sector 1024, 16 sec/cluster,
+        // 2 FATs, 1 reserved, 512 root entries, FAT size 118, total
+        // 966656 sectors (the X68K partition length).
+        let mut bpb = [0u8; 512];
+        bpb[0..18].copy_from_slice(b"\x60\x24SHARP/KG    1.00");
+        bpb[0x12..0x14].copy_from_slice(&1024u16.to_be_bytes()); // bytes/sector
+        bpb[0x14] = 16; // sectors per cluster
+        bpb[0x15] = 2; // num FATs
+        bpb[0x16..0x18].copy_from_slice(&1u16.to_be_bytes()); // reserved
+        bpb[0x18..0x1A].copy_from_slice(&512u16.to_be_bytes()); // root entries
+        bpb[0x1A..0x1C].copy_from_slice(&0u16.to_be_bytes()); // total16 (unused)
+        bpb[0x1C] = 0xF7; // media descriptor
+        bpb[0x1D] = 118; // sectors per FAT
+        bpb[0x1E..0x22].copy_from_slice(&966_656u32.to_be_bytes()); // total32
+
+        let parsed = Human68kBpb::parse(&bpb).unwrap();
+        assert_eq!(parsed.bytes_per_sector, 1024);
+        assert_eq!(parsed.sectors_per_cluster, 16);
+        assert_eq!(parsed.num_fats, 2);
+        assert_eq!(parsed.reserved_sectors, 1);
+        assert_eq!(parsed.root_entries, 512);
+        assert_eq!(parsed.fat_sectors, 118);
+        assert_eq!(parsed.total_sectors, 966_656);
+        // ~60k clusters of 16 KiB -> FAT16.
+        assert_eq!(parsed.fat_kind, FatKind::Fat16);
+    }
+
     #[test]
     fn lists_root_directory_with_18_3_filename() {
         let disk = build_fat12_synthetic();
@@ -919,6 +1310,111 @@ mod tests {
         // Synthetic payload has a final null byte; full 32 B read returns it.
         assert_eq!(data.len(), 32);
         assert_eq!(&data[..30], b"hello human68k synthetic disk!");
+    }
+
+    /// Build a synthetic FAT12 disk with one subdirectory `SUB` (cluster 2)
+    /// holding `.`, `..`, and a file `CHILD.TXT` (cluster 3).
+    fn build_fat12_with_subdir() -> Vec<u8> {
+        const BYTES_PER_SECTOR: usize = 512;
+        const NUM_FATS: usize = 2;
+        const FAT_SECTORS: usize = 3;
+        const RESERVED_SECTORS: usize = 1;
+        const ROOT_ENTRIES: usize = 112;
+
+        let mut disk = build_fat12_synthetic();
+        // Re-point root entry 0 to be the directory "SUB" at cluster 2.
+        let root_off =
+            RESERVED_SECTORS * BYTES_PER_SECTOR + FAT_SECTORS * NUM_FATS * BYTES_PER_SECTOR;
+        let entry = &mut disk[root_off..root_off + 32];
+        entry.fill(0);
+        entry[0..8].copy_from_slice(b"SUB     ");
+        entry[8..11].copy_from_slice(b"   ");
+        entry[11] = attr::DIRECTORY;
+        for b in &mut entry[12..22] {
+            *b = 0x20;
+        }
+        LittleEndian::write_u16(&mut entry[26..28], 2); // first cluster
+        LittleEndian::write_u32(&mut entry[28..32], 0); // dirs report size 0
+
+        // FAT: cluster 2 and cluster 3 both end-of-chain (0xFFF each).
+        let fat0 = RESERVED_SECTORS * BYTES_PER_SECTOR;
+        disk[fat0 + 3] = 0xFF; // cluster 2 low byte
+        disk[fat0 + 4] = 0xFF; // cluster 2 high nibble + cluster 3 low nibble
+        disk[fat0 + 5] = 0xFF; // cluster 3 high byte
+
+        // Cluster 2 data = subdirectory contents.
+        let root_byte_len = ROOT_ENTRIES * 32;
+        let clus2_off = root_off + root_byte_len;
+        let write_dirent = |disk: &mut [u8],
+                            off: usize,
+                            name: &[u8; 8],
+                            ext: &[u8; 3],
+                            attr: u8,
+                            clus: u16,
+                            size: u32| {
+            let e = &mut disk[off..off + 32];
+            e.fill(0);
+            e[0..8].copy_from_slice(name);
+            e[8..11].copy_from_slice(ext);
+            e[11] = attr;
+            LittleEndian::write_u16(&mut e[26..28], clus);
+            LittleEndian::write_u32(&mut e[28..32], size);
+        };
+        write_dirent(
+            &mut disk,
+            clus2_off,
+            b".       ",
+            b"   ",
+            attr::DIRECTORY,
+            2,
+            0,
+        );
+        write_dirent(
+            &mut disk,
+            clus2_off + 32,
+            b"..      ",
+            b"   ",
+            attr::DIRECTORY,
+            0,
+            0,
+        );
+        write_dirent(
+            &mut disk,
+            clus2_off + 64,
+            b"CHILD   ",
+            b"TXT",
+            attr::ARCHIVE,
+            3,
+            5,
+        );
+
+        // Cluster 3 data = the child file payload.
+        let clus3_off = clus2_off + BYTES_PER_SECTOR;
+        disk[clus3_off..clus3_off + 5].copy_from_slice(b"child");
+        disk
+    }
+
+    #[test]
+    fn lists_subdirectory_via_cluster_chain() {
+        let disk = build_fat12_with_subdir();
+        let mut fs = Human68kFilesystem::open(Cursor::new(disk), 0).unwrap();
+        let root = fs.root().unwrap();
+        let root_entries = fs.list_directory(&root).unwrap();
+        assert_eq!(root_entries.len(), 1);
+        let sub = &root_entries[0];
+        assert_eq!(sub.name, "SUB");
+        assert_eq!(sub.path, "/SUB");
+
+        // Listing the subdirectory follows its cluster chain and skips
+        // the `.` / `..` self/parent links.
+        let kids = fs.list_directory(sub).unwrap();
+        assert_eq!(kids.len(), 1, "expected only CHILD.TXT, not . / ..");
+        assert_eq!(kids[0].name, "CHILD.TXT");
+        assert_eq!(kids[0].path, "/SUB/CHILD.TXT");
+        assert_eq!(kids[0].size, 5);
+
+        let data = fs.read_file(&kids[0], 4096).unwrap();
+        assert_eq!(&data, b"child");
     }
 
     #[test]
@@ -1054,7 +1550,130 @@ mod tests {
         let err = fs
             .create_file(&root, "DOC.TXT", &mut src, 1, &CreateFileOptions::default())
             .unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn create_directory_then_file_inside_round_trips() {
+        let mut fs = Human68kFilesystem::open(Cursor::new(build_fat12_synthetic()), 0).unwrap();
+        let root = fs.root().unwrap();
+        // mkdir /SUB
+        let sub = fs
+            .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+        assert_eq!(sub.path, "/SUB");
+        assert!(sub.is_directory());
+        // A brand-new directory lists empty (the `.`/`..` links are hidden).
+        assert!(fs.list_directory(&sub).unwrap().is_empty());
+
+        // Create a file inside the subdirectory.
+        let payload = b"inside the subdir".to_vec();
+        let mut src = Cursor::new(payload.clone());
+        let child = fs
+            .create_file(
+                &sub,
+                "INNER.TXT",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(child.path, "/SUB/INNER.TXT");
+
+        // List the subdir and read the file back byte-exact.
+        let kids = fs.list_directory(&sub).unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].name, "INNER.TXT");
+        assert_eq!(fs.read_file(&kids[0], 4096).unwrap(), payload);
+
+        // The root still shows exactly the SUB directory plus the original
+        // synthetic DOC.TXT.
+        let root_names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(root_names.contains(&"SUB".to_string()));
+        assert!(root_names.contains(&"DOC.TXT".to_string()));
+    }
+
+    #[test]
+    fn delete_entry_refuses_nonempty_directory() {
+        let mut fs = Human68kFilesystem::open(Cursor::new(build_fat12_synthetic()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let sub = fs
+            .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+        let mut src = Cursor::new(b"x".to_vec());
+        fs.create_file(&sub, "F.TXT", &mut src, 1, &CreateFileOptions::default())
+            .unwrap();
+        // delete_entry must refuse the non-empty directory.
+        let err = fs.delete_entry(&root, &sub).unwrap_err();
         assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn delete_recursive_removes_subtree_and_frees_clusters() {
+        let mut fs = Human68kFilesystem::open(Cursor::new(build_fat12_synthetic()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let free_before = EditableFilesystem::free_space(&mut fs).unwrap();
+
+        // Build /SUB/{NESTED/, A.TXT}
+        let sub = fs
+            .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+        let nested = fs
+            .create_directory(&sub, "NESTED", &CreateDirectoryOptions::default())
+            .unwrap();
+        let mut a = Cursor::new(b"aaaa".to_vec());
+        fs.create_file(&sub, "A.TXT", &mut a, 4, &CreateFileOptions::default())
+            .unwrap();
+        let mut b = Cursor::new(b"bbbb".to_vec());
+        fs.create_file(&nested, "B.TXT", &mut b, 4, &CreateFileOptions::default())
+            .unwrap();
+
+        // Recursively delete /SUB.
+        fs.delete_recursive(&root, &sub).unwrap();
+
+        // SUB is gone from the root and all clusters are reclaimed.
+        let root_names: Vec<_> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!root_names.contains(&"SUB".to_string()));
+        let free_after = EditableFilesystem::free_space(&mut fs).unwrap();
+        assert_eq!(
+            free_after, free_before,
+            "every cluster allocated for the subtree must be freed"
+        );
+    }
+
+    #[test]
+    fn create_file_grows_subdirectory_chain_past_one_cluster() {
+        // 512-byte cluster holds 16 dir slots; `.`/`..` use 2, so the 15th
+        // created file forces the subdirectory to grow a second cluster.
+        let mut fs = Human68kFilesystem::open(Cursor::new(build_fat12_synthetic()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let sub = fs
+            .create_directory(&root, "BIG", &CreateDirectoryOptions::default())
+            .unwrap();
+        for i in 0..20 {
+            let name = format!("F{i:02}.TXT");
+            let mut src = Cursor::new(vec![i as u8]);
+            fs.create_file(&sub, &name, &mut src, 1, &CreateFileOptions::default())
+                .unwrap();
+        }
+        let kids = fs.list_directory(&sub).unwrap();
+        assert_eq!(kids.len(), 20, "all 20 files survive the chain growth");
+        // The subdirectory chain must now span more than one cluster.
+        let chain = fs.cluster_chain(sub.location as u16).unwrap();
+        assert!(
+            chain.len() >= 2,
+            "directory should have grown a 2nd cluster"
+        );
     }
 
     // Spine-stage-7 confirmation: resize_fat_in_place on a Human68k disk

@@ -6,10 +6,19 @@
 //!
 //! ## On-disk layout
 //!
-//! The partition table lives at **byte offset 2048** in the image,
-//! independent of logical sector size (= sector 4 with 512-B sectors,
-//! sector 2 with 1024-B sectors, sector 8 with 256-B sectors). 16-byte
-//! header followed by 8 fixed-size 16-byte partition entries:
+//! The partition table location and the logical sector size depend on the
+//! disk's controller convention (see [`X68kPartitionTable::detect_with_geometry`]):
+//!
+//! | controller (byte-0 signature) | table offset | sector size |
+//! |-------------------------------|--------------|-------------|
+//! | SCSI / SxSI (`X68SCSI1`)       | 2048 (0x800) | 1024 B      |
+//! | SASI (`\x82w68000W` or custom IPL) | 1024 (0x400) | 256 B  |
+//! | synthetic test default        | 2048 (0x800) | 512 B       |
+//!
+//! `start_sector` / `length_sectors` count in those logical sectors, so a
+//! partition's byte offset is `start_sector * sector_size` — which can be
+//! non-512-aligned on SASI disks. The table itself is a 16-byte header
+//! followed by 8 fixed-size 16-byte partition entries:
 //!
 //! ```text
 //! 0x00..0x04  magic   "X68K" (BE u32 0x5836384B)
@@ -51,10 +60,13 @@ use super::PartitionSizeOverride;
 /// `"X68K"` in big-endian u32.
 pub const X68K_MAGIC: u32 = 0x5836_384B;
 
-/// Byte offset of the X68k partition table in the image. Same value
-/// regardless of logical sector size (sector 4 × 512, sector 2 × 1024,
-/// sector 8 × 256).
+/// Byte offset of the X68k partition table on SCSI (`X68SCSI1`, 1024-byte
+/// sectors -> sector 2) and synthetic 512-byte (sector 4) disks.
 pub const X68K_TABLE_OFFSET: u64 = 2048;
+
+/// Byte offset of the X68k partition table on SASI disks (256-byte sectors
+/// -> sector 4). Real SASI game images (e.g. Bomberman) place it here.
+pub const X68K_TABLE_OFFSET_SASI: u64 = 1024;
 
 /// Number of partition slots in the table.
 pub const X68K_MAX_PARTITIONS: usize = 8;
@@ -68,10 +80,46 @@ pub const X68K_TABLE_HEADER_SIZE: usize = 16;
 /// Conventional sector-0 of the first user partition.
 pub const X68K_FIRST_PARTITION_SECTOR: u32 = 64;
 
-/// Sector size assumed when computing byte offsets. Real X68000 SASI
-/// HDDs typically use 256 or 512 byte sectors; 512 is the MiSTer
-/// convention.
+/// Sector size assumed when no Sharp HDD signature is present (e.g. the
+/// synthetic 512-byte test images). Real disks are detected via
+/// [`detect_sector_size`].
 pub const X68K_DEFAULT_SECTOR_SIZE: u64 = 512;
+
+/// Keisoku Giken SCSI HDD boot signature at byte 0 (`"X68SCSI1"`). These
+/// disks use 1024-byte logical sectors. The Human68k FAT BPB lives at the
+/// partition start with a big-endian Sharp/KG layout.
+pub const X68K_SCSI_SIGNATURE: &[u8; 8] = b"X68SCSI1";
+
+/// SASI HDD boot signature at byte 0 (`\x82w68000W`). These disks use
+/// 256-byte logical sectors.
+pub const X68K_SASI_SIGNATURE: &[u8; 8] = &[0x82, b'w', b'6', b'8', b'0', b'0', b'0', b'W'];
+
+/// Derive the logical sector size of an X68000 HDD image from the Sharp
+/// boot signature at byte 0.
+///
+/// - `X68SCSI1` (Keisoku Giken SCSI BIOS / SxSI / BlueSCSI) -> **1024 B**.
+/// - `\x82w68000W` (SASI) -> **256 B**.
+/// - anything else -> [`X68K_DEFAULT_SECTOR_SIZE`] (512), the synthetic
+///   test convention.
+///
+/// The partition table's `start_sector` / `length_sectors` fields are in
+/// these logical sectors, so the byte offset of a partition is
+/// `start_sector * sector_size`. Getting this wrong points the filesystem
+/// reader at a zero-filled gap and surfaces as
+/// `Human68k BPB bytes_per_sector 0 not in {...}`.
+pub fn detect_sector_size<R: Read + Seek>(reader: &mut R) -> u64 {
+    let mut sig = [0u8; 8];
+    if reader.seek(SeekFrom::Start(0)).is_err() || reader.read_exact(&mut sig).is_err() {
+        return X68K_DEFAULT_SECTOR_SIZE;
+    }
+    if &sig == X68K_SCSI_SIGNATURE {
+        1024
+    } else if &sig == X68K_SASI_SIGNATURE {
+        256
+    } else {
+        X68K_DEFAULT_SECTOR_SIZE
+    }
+}
 
 /// One decoded partition entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,12 +207,20 @@ impl X68kPartitionTable {
         head.len() >= 4 && BigEndian::read_u32(&head[0..4]) == X68K_MAGIC
     }
 
-    /// Read and parse the partition table from a seekable reader.
-    /// Reads exactly `X68K_TABLE_HEADER_SIZE + 8 * X68K_ENTRY_SIZE`
-    /// bytes starting at `X68K_TABLE_OFFSET`.
+    /// Read and parse the partition table from a seekable reader at the
+    /// canonical SCSI/synthetic offset [`X68K_TABLE_OFFSET`] (byte 2048).
     pub fn detect<R: Read + Seek>(reader: &mut R) -> Result<Option<Self>, RustyBackupError> {
+        Self::detect_at(reader, X68K_TABLE_OFFSET)
+    }
+
+    /// Read and parse the partition table from `table_offset`. Returns
+    /// `None` (not an error) when the X68K magic isn't present there.
+    pub fn detect_at<R: Read + Seek>(
+        reader: &mut R,
+        table_offset: u64,
+    ) -> Result<Option<Self>, RustyBackupError> {
         reader
-            .seek(SeekFrom::Start(X68K_TABLE_OFFSET))
+            .seek(SeekFrom::Start(table_offset))
             .map_err(RustyBackupError::Io)?;
         let mut buf = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
         match reader.read_exact(&mut buf) {
@@ -188,6 +244,48 @@ impl X68kPartitionTable {
             disk_size_field,
             entries,
         }))
+    }
+
+    /// Detect the table *and* the disk geometry (table byte offset +
+    /// logical sector size), probing the two real Sharp conventions:
+    ///
+    /// | byte-0 signature | table offset | sector size |
+    /// |------------------|--------------|-------------|
+    /// | `X68SCSI1`       | 0x800        | 1024        |
+    /// | `\x82w68000W`    | 0x400        | 256         |
+    /// | (none)           | 0x800 or 0x400 | 512 / 256 |
+    ///
+    /// The table *location* is the reliable SASI marker: real SASI game
+    /// disks (e.g. Bomberman) carry a custom IPL with no Sharp signature
+    /// but place the `X68K` table at byte 0x400 with 256-byte sectors. The
+    /// 0x800 / 512 combination is the synthetic-test convention.
+    ///
+    /// Returns `(table, table_offset, sector_size)`.
+    pub fn detect_with_geometry<R: Read + Seek>(
+        reader: &mut R,
+    ) -> Result<Option<(Self, u64, u64)>, RustyBackupError> {
+        let mut sig = [0u8; 8];
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+        let have_sig = reader.read_exact(&mut sig).is_ok();
+        // (table_offset, sector_size) candidates in priority order.
+        let candidates: &[(u64, u64)] = if have_sig && &sig == X68K_SCSI_SIGNATURE {
+            &[(X68K_TABLE_OFFSET, 1024)]
+        } else if have_sig && &sig == X68K_SASI_SIGNATURE {
+            &[(X68K_TABLE_OFFSET_SASI, 256), (X68K_TABLE_OFFSET, 256)]
+        } else {
+            &[
+                (X68K_TABLE_OFFSET, X68K_DEFAULT_SECTOR_SIZE),
+                (X68K_TABLE_OFFSET_SASI, 256),
+            ]
+        };
+        for &(off, sector_size) in candidates {
+            if let Some(table) = Self::detect_at(reader, off)? {
+                return Ok(Some((table, off, sector_size)));
+            }
+        }
+        Ok(None)
     }
 
     /// Serialize the parsed table back into the canonical on-disk 144-byte
@@ -274,10 +372,101 @@ mod tests {
         buf
     }
 
+    /// Build an image with the X68K table at an arbitrary byte offset and
+    /// an optional 8-byte boot signature at byte 0.
+    fn build_image_with_table_at(
+        table_off: usize,
+        signature: Option<&[u8; 8]>,
+        entries: &[(&[u8; 8], u32, u32)],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; table_off + 4096];
+        if let Some(sig) = signature {
+            buf[0..8].copy_from_slice(sig);
+        }
+        BigEndian::write_u32(&mut buf[table_off..table_off + 4], X68K_MAGIC);
+        BigEndian::write_u32(&mut buf[table_off + 4..table_off + 8], 0x01_FF_FF_FF);
+        BigEndian::write_u32(&mut buf[table_off + 8..table_off + 12], 0x01_FF_FF_FF);
+        for (i, (name, start, length)) in entries.iter().enumerate() {
+            let e_off = table_off + X68K_TABLE_HEADER_SIZE + i * X68K_ENTRY_SIZE;
+            buf[e_off..e_off + 8].copy_from_slice(*name);
+            BigEndian::write_u32(&mut buf[e_off + 8..e_off + 12], *start);
+            BigEndian::write_u32(&mut buf[e_off + 12..e_off + 16], *length);
+        }
+        buf
+    }
+
     #[test]
     fn detect_returns_none_on_random_bytes() {
         let mut cur = Cursor::new(vec![0xCDu8; 4096]);
         assert!(X68kPartitionTable::detect(&mut cur).unwrap().is_none());
+    }
+
+    #[test]
+    fn geometry_scsi_signature_is_1024_at_0x800() {
+        let img = build_image_with_table_at(
+            X68K_TABLE_OFFSET as usize,
+            Some(X68K_SCSI_SIGNATURE),
+            &[(b"Human68k", 32, 0x1000)],
+        );
+        let (_, off, ss) = X68kPartitionTable::detect_with_geometry(&mut Cursor::new(img))
+            .unwrap()
+            .unwrap();
+        assert_eq!(off, X68K_TABLE_OFFSET);
+        assert_eq!(ss, 1024);
+    }
+
+    #[test]
+    fn geometry_no_signature_at_0x800_is_512() {
+        let img = build_image_with_table_at(
+            X68K_TABLE_OFFSET as usize,
+            None,
+            &[(b"Human68k", 64, 0x1000)],
+        );
+        let (_, off, ss) = X68kPartitionTable::detect_with_geometry(&mut Cursor::new(img))
+            .unwrap()
+            .unwrap();
+        assert_eq!(off, X68K_TABLE_OFFSET);
+        assert_eq!(ss, X68K_DEFAULT_SECTOR_SIZE);
+    }
+
+    #[test]
+    fn geometry_sasi_table_at_0x400_is_256() {
+        // Bomberman shape: custom IPL (no Sharp signature), table at 0x400.
+        let img = build_image_with_table_at(
+            X68K_TABLE_OFFSET_SASI as usize,
+            None,
+            &[(b"Human68k", 33, 40750)],
+        );
+        let (table, off, ss) = X68kPartitionTable::detect_with_geometry(&mut Cursor::new(img))
+            .unwrap()
+            .unwrap();
+        assert_eq!(off, X68K_TABLE_OFFSET_SASI);
+        assert_eq!(ss, 256);
+        assert_eq!(table.entries[0].start_sector, 33);
+        // The true partition offset is start_sector * sector_size = a
+        // non-512-aligned byte that start_lba * 512 cannot express.
+        assert_eq!(33u64 * ss, 8448);
+        assert_ne!(8448 % 512, 0);
+    }
+
+    #[test]
+    fn detect_sector_size_reads_sharp_signatures() {
+        // SCSI (Keisoku Giken / SxSI / BlueSCSI) -> 1024-byte sectors.
+        let mut scsi = vec![0u8; 4096];
+        scsi[0..8].copy_from_slice(X68K_SCSI_SIGNATURE);
+        assert_eq!(detect_sector_size(&mut Cursor::new(scsi)), 1024);
+
+        // SASI -> 256-byte sectors.
+        let mut sasi = vec![0u8; 4096];
+        sasi[0..8].copy_from_slice(X68K_SASI_SIGNATURE);
+        assert_eq!(detect_sector_size(&mut Cursor::new(sasi)), 256);
+
+        // No recognized signature -> the 512-byte synthetic default.
+        let plain = vec![0u8; 4096];
+        assert_eq!(
+            detect_sector_size(&mut Cursor::new(plain)),
+            X68K_DEFAULT_SECTOR_SIZE
+        );
     }
 
     #[test]

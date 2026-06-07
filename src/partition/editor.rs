@@ -105,6 +105,7 @@ pub fn validate_edits(
                     type_name: String::new(),
                     partition_type_byte: 0,
                     start_lba: *start_lba,
+                    start_byte: None,
                     size_bytes: *size_bytes,
                     bootable: false,
                     is_logical: false,

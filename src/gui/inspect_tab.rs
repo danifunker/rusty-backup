@@ -1034,7 +1034,7 @@ impl InspectTab {
         let disk_size = self
             .partitions
             .iter()
-            .map(|p| (p.start_lba * 512) + p.size_bytes)
+            .map(|p| p.byte_offset() + p.size_bytes)
             .max()
             .unwrap_or(0);
 
@@ -2683,7 +2683,7 @@ impl InspectTab {
                                 .unwrap_or("")
                                 .to_string();
 
-                            let part_offset = part.start_lba * 512;
+                            let part_offset = part.byte_offset();
                             let detected = make_probe_reader()
                                 .map(|mut br| {
                                     rusty_backup::fs::probe_apple_hfs_type(&mut br, part_offset)
@@ -2779,12 +2779,10 @@ impl InspectTab {
                             continue;
                         }
                         if let Some(mut br) = make_probe_reader() {
-                            match rusty_backup::fs::probe_0x83_fs_type(
-                                &mut br,
-                                part.start_lba * 512,
-                            ) {
+                            match rusty_backup::fs::probe_0x83_fs_type(&mut br, part.byte_offset())
+                            {
                                 Some("FAT") if is_linux_mbr => {
-                                    let part_offset = part.start_lba * 512;
+                                    let part_offset = part.byte_offset();
                                     let subtype = make_probe_reader().and_then(|br2| {
                                         rusty_backup::fs::fat::FatFilesystem::open(br2, part_offset)
                                             .ok()
@@ -2830,7 +2828,7 @@ impl InspectTab {
                         if let Some(mut br) = make_probe_reader() {
                             part.hfs_block_size = rusty_backup::fs::hfs_block_size_at_offset(
                                 &mut br,
-                                part.start_lba * 512,
+                                part.byte_offset(),
                             );
                         }
                     }
@@ -2896,7 +2894,7 @@ impl InspectTab {
 
                         let label_opt: Option<String> = if is_fat_byte || is_fat_superfloppy {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::fat::FatFilesystem::open(br, part.start_lba * 512)
+                                rusty_backup::fs::fat::FatFilesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -2905,31 +2903,25 @@ impl InspectTab {
                             })
                         } else if is_amiga_dos {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::affs::AffsFilesystem::open(
-                                    br,
-                                    part.start_lba * 512,
-                                )
-                                .ok()
-                                .and_then(|fs| {
-                                    use rusty_backup::fs::Filesystem;
-                                    fs.volume_label().map(str::to_string)
-                                })
+                                rusty_backup::fs::affs::AffsFilesystem::open(br, part.byte_offset())
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
                             })
                         } else if is_amiga_pfs3 {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::pfs3::Pfs3Filesystem::open(
-                                    br,
-                                    part.start_lba * 512,
-                                )
-                                .ok()
-                                .and_then(|fs| {
-                                    use rusty_backup::fs::Filesystem;
-                                    fs.volume_label().map(str::to_string)
-                                })
+                                rusty_backup::fs::pfs3::Pfs3Filesystem::open(br, part.byte_offset())
+                                    .ok()
+                                    .and_then(|fs| {
+                                        use rusty_backup::fs::Filesystem;
+                                        fs.volume_label().map(str::to_string)
+                                    })
                             })
                         } else if is_amiga_sfs {
                             make_probe_reader().and_then(|br| {
-                                rusty_backup::fs::sfs::SfsFilesystem::open(br, part.start_lba * 512)
+                                rusty_backup::fs::sfs::SfsFilesystem::open(br, part.byte_offset())
                                     .ok()
                                     .and_then(|fs| {
                                         use rusty_backup::fs::Filesystem;
@@ -2997,7 +2989,7 @@ impl InspectTab {
                                 };
                                 rusty_backup::fs::partition_minimum_size(
                                     r,
-                                    part.start_lba * 512,
+                                    part.byte_offset(),
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
@@ -3013,7 +3005,7 @@ impl InspectTab {
                             if is_device {
                                 rusty_backup::fs::partition_minimum_size(
                                     rusty_backup::os::SectorAlignedReader::new(f),
-                                    part.start_lba * 512,
+                                    part.byte_offset(),
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
@@ -3024,7 +3016,7 @@ impl InspectTab {
                             } else {
                                 rusty_backup::fs::partition_minimum_size(
                                     BufReader::new(f),
-                                    part.start_lba * 512,
+                                    part.byte_offset(),
                                     part.partition_type_byte,
                                     part.partition_type_string.as_deref(),
                                     part.size_bytes,
@@ -3526,7 +3518,7 @@ impl InspectTab {
                             if ui.small_button("Browse").clicked() {
                                 browse_request = Some((
                                     part.index,
-                                    part.start_lba * 512,
+                                    part.byte_offset(),
                                     ptype,
                                     part.partition_type_string.clone(),
                                 ));
@@ -3536,7 +3528,7 @@ impl InspectTab {
                                 && ui.small_button("Check").clicked()
                             {
                                 check_request = Some((
-                                    part.start_lba * 512,
+                                    part.byte_offset(),
                                     ptype,
                                     part.partition_type_string.clone(),
                                 ));
@@ -3553,7 +3545,7 @@ impl InspectTab {
                                 )
                                 .clicked()
                             {
-                                expand_request = Some((part.start_lba * 512, part.size_bytes));
+                                expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
                         } else {
                             ui.label("");
@@ -3990,7 +3982,7 @@ impl InspectTab {
 
         let req = rusty_backup::model::min_size_runner::MinSizeRequest {
             source,
-            partition_offset: part.start_lba * 512,
+            partition_offset: part.byte_offset(),
             partition_type: part.partition_type_byte,
             partition_type_string: part.partition_type_string.clone(),
             partition_size: part.size_bytes,

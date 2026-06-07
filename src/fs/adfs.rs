@@ -598,10 +598,13 @@ impl AdfsFsm {
 
         let zone = if frag_id == ADFS_ROOT_FRAG {
             self.nzones >> 1
-        } else if self.ids_per_zone > 0 {
-            (frag_id / self.ids_per_zone) % self.nzones
         } else {
-            0
+            // checked_div yields None (-> zone 0) when ids_per_zone is 0,
+            // matching the previous `> 0` guard.
+            frag_id
+                .checked_div(self.ids_per_zone)
+                .map(|q| q % self.nzones)
+                .unwrap_or(0)
         };
         if zone >= self.nzones {
             return None;
@@ -932,7 +935,7 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
             }
             out.push(fe);
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         Ok(out)
     }
 

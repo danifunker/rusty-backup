@@ -655,27 +655,48 @@ no hand-waving.
    valid (integration tests pass because they call the engine
    directly).
 
-2. **`partition/x68k.rs`** hardcodes 512-byte sectors when computing
-   `partition_offset = start_lba * SECTOR_SIZE`. Reality: SASI HDDs
-   use 256-B sectors, SCSI HDDs use 1024-B sectors. With CROS42-style
-   math: probed offsets are off by 2× (Bomberman) or 0.5× (hd0.hds)
-   from where the FAT BPB actually lives. Causes
-   `bytes_per_sector 0 not in {256,512,1024,2048}` on `rb-cli ls
-   hd0.hds@1`.
+2. **[RESOLVED for SCSI read]** `partition/x68k.rs` hardcoded 512-byte
+   sectors when computing `partition_offset = start_lba *
+   SECTOR_SIZE`. Reality: SASI HDDs use 256-B sectors, SCSI HDDs use
+   1024-B sectors. With the old math: probed offsets are off by 2×
+   (Bomberman) or 0.5× (hd0.hds) from where the FAT BPB actually lives,
+   causing `bytes_per_sector 0 not in {256,512,1024,2048}` on
+   `rb-cli ls hd0.hds@1`. **Fixed**: `x68k::detect_sector_size` reads
+   the boot signature and `PartitionTable::X68k` now carries
+   `sector_size`; `to_partition_info` normalizes `start_lba` /
+   `size_bytes` into 512-byte LBA units so every `start_lba * 512`
+   consumer lands on the real partition. Verified read/browse/extract
+   end-to-end against the BlueSCSI SxSI v3.02 `HD10/20/30/40_512.hda`
+   set (1024-B SCSI). *Still open*: the restore-side
+   `patch_x68k_entries` / reconstruct path computes `new_sectors`
+   against `X68K_DEFAULT_SECTOR_SIZE` (512), so resize-on-restore for
+   non-512-B disks is not yet correct.
 
-3. **`partition/x68k.rs`** has no byte-0 signature detector for the
-   two real Sharp formats:
-   - `X68SCSI1` (1024-B sector convention)
-   - `\x82w68000W` (256-B sector convention)
-   Without this, we can't derive sector size, and we can't refuse
-   non-Sharp HDDs that happen to have the `X68K` partition magic
-   somewhere (false positives possible).
+3. **[RESOLVED for read]** `partition/x68k.rs` geometry detection.
+   `X68kPartitionTable::detect_with_geometry` now probes both table
+   offsets and derives the sector size: `X68SCSI1` -> (0x800, 1024);
+   `\x82w68000W` -> (0x400, 256); otherwise it tries (0x800, 512) then
+   (0x400, 256). The table *location* is the reliable SASI marker —
+   real SASI game disks (Bomberman) carry a custom IPL with no Sharp
+   signature but put the `X68K` table at 0x400 with 256-B sectors. The
+   non-512-aligned partition offset that 256-B sectors produce is
+   carried through `PartitionInfo::start_byte` / `byte_offset()`.
+   Verified read/browse/extract against `Bomberman.hdf` and the full
+   `~/Downloads/X68000-fixtures` set (BlueSCSI / ZuluSCSI / HDS /
+   Henkan Bancho / SCSI2SD `.ima`). *Still open*: we don't reject
+   non-Sharp HDDs that coincidentally carry the `X68K` magic, and
+   SASI backup/restore/resize still assume 512-B (the read path uses
+   `byte_offset()`, the write engine paths do not yet).
 
-4. **`fs/human68k.rs`** FAT BPB parser doesn't tolerate the 18-byte
-   Hudson/Sharp OEM extension that pushes the standard BPB fields
-   forward. `dis68k/lib/libfat-human68k/ff.c` shows the right shape —
-   skip the `0xAA55` check, treat the OEM as variable-length, use
-   `_MAX_SS != _MIN_SS` style variable sector size.
+4. **[RESOLVED]** `fs/human68k.rs` FAT BPB parser now handles the Sharp
+   / Keisoku Giken SCSI-HDD BPB: a 2-byte BRA.S + 16-byte OEM
+   ("SHARP/KG    1.00") with **big-endian** fields at offset 0x12.
+   Layout verified byte-for-byte against HD10/HD20 (see
+   `Human68kBpb::parse_sharp_kg`). The standard little-endian FAT BPB
+   path is preserved for floppies. Note `dis68k/lib/libfat-human68k`
+   sidesteps this entirely by replacing sector 0 with a synthetic
+   standard boot sector (`FS_REPLACE_SECTOR0` / `fake_bootsect`); we
+   parse the real on-disk BPB instead.
 
 5. **No self-bootable IPL builder** in `examples/build_x68k_hdd.rs` —
    the example produces a partition-table-only HDD that requires
@@ -695,6 +716,70 @@ Human68k v3.02 system disk.
 `[!] write-verified` user-side parks via real-hardware MiSTer
 verification. Today the engine-level surface is proven; the
 in-emulator surface needs the SCSI/SASI format work above.
+
+### 8a. Full read/write support — progress + remaining plan (2026-06-07)
+
+Driven by the real `~/Downloads/X68000-fixtures` set (BlueSCSI / ZuluSCSI
+/ HDS / Henkan Bancho `.hda`/`.hds`, `Bomberman.hdf` SASI, SCSI2SD `.ima`).
+Goal stated by the user: create / delete / extract files, change partition
+sizes, and clone the filesystem — **full support**.
+
+**DONE (uncommitted on `main`):**
+- **Read** — every fixture inspects / browses / extracts. SHARP-KG
+  big-endian BPB parser (`Human68kBpb::parse_sharp_kg`), geometry
+  detection (`X68kPartitionTable::detect_with_geometry`), and the
+  `PartitionInfo::start_byte` / `byte_offset()` accessor for the
+  non-512-aligned SASI offset.
+- **🐛 Big-endian FAT fix** — the FAT table is big-endian on real X68000
+  disks (dir entries stay LE). `Human68kBpb::fat_big_endian` gates
+  `fat_lookup` / `fat_set` (FAT16). Was silently truncating every file
+  > 1 cluster on *both* SCSI and SASI. Regression test
+  `reads_big_endian_fat_chain_across_clusters`.
+- **Slices 1–3 (file management)** — `create_file` / `create_directory` /
+  `delete_entry` are subdir-aware (helpers `dir_slot_offsets`,
+  `find_free_slot_in_dir`, `grow_dir_chain`, `find_entry_slot_in_dir`,
+  `dir_is_empty`); recursive delete uses the trait default over the new
+  subdir-aware `delete_entry`. Verified via CLI `mkdir`/`put`/`get`/`rm`
+  on a Bomberman copy + multi-cluster byte-exact round-trip.
+- Picker: `.hds` + `.ima` added to `DISK_IMAGE_EXTS`. Docs (README
+  formats + per-core tables, `full_MiSTer_support_status.md`) updated.
+- Unrelated build-blocker fixed: `completions::bin_stem` (Windows-path
+  basename failed on Unix).
+
+**REMAINING:**
+
+- **Slice 4 — resize (`rb-cli resize IMG@N`, GUI resize):**
+  `fs::resize_fat_in_place` (`src/fs/fat.rs`) rejects boot byte != `0xEB/0xE9`
+  and reads a *little-endian* BPB at offset 11 + LE FAT. For Human68k
+  SHARP-KG disks it must: (1) accept the `0x60` BRA.S jump; (2) read the
+  big-endian BPB at `0x12` (reuse `Human68kBpb::parse`); (3) read/write
+  the FAT big-endian. Cleanest path is a dedicated `resize_human68k_in_place`
+  rather than overloading the FAT one. Also fix the restore/reconstruct
+  side: `rbformats/mod.rs` writes the X68k table at `X68K_TABLE_OFFSET`
+  (0x800) and `patch_x68k_entries` computes `new_sectors` against
+  `X68K_DEFAULT_SECTOR_SIZE` (512) — both must use the disk's real
+  `sector_size` (and SASI table offset 0x400). `PartitionInfo::byte_offset()`
+  is already threaded through the *read* path; the backup/restore/resize
+  *engine* paths still assume `start_lba * 512` and need converting for
+  256-byte SASI.
+
+- **Slice 5 — defragmenting clone (`clone_human68k_volume`):** no clone
+  path exists. Mirror `clone_pfs3_volume` / `clone_hfs_volume` (see
+  `docs/export_pipelines.md`): walk the source catalog, create a fresh
+  blank Human68k volume (`create_blank_human68k` — does not exist yet,
+  add it), replay dirs+files contiguously. This is the practical
+  "shrink/repack my partition" path. Wire into `rb-cli` (a `clone` or
+  `convert` verb) + GUI.
+
+- **GUI/CLI parity:** the write slices flow through `cli/resolve.rs`
+  (`byte_offset()`) and `gui/inspect_tab.rs` (converted) — both work for
+  SASI today. Confirm the GUI browse-edit toolbar exposes mkdir / add /
+  delete for Human68k partitions.
+
+Reference fixtures live at `~/Downloads/X68000-fixtures`; reference C
+sources at `~/repos/dis68k/lib/libfat-human68k` (FatFs port; fakes
+sector 0), `~/repos/x68kd11s` (Human68k 3.02 source). See memory note
+`x68000_scsi_hdd.md`.
 
 ---
 
