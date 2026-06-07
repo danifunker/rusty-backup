@@ -43,11 +43,13 @@
 //! Entry 0 first byte == 0x00 means "no more entries", 0xE5 means
 //! "deleted slot" (same as FAT).
 //!
-//! Multi-byte Shift-JIS bytes occupy two slots: the first byte is in
-//! the range `0x81..0x9F` or `0xE0..0xFC`, the second is `0x40..0xFC`
-//! (excluding `0x7F`). For display we transcode ASCII verbatim and
-//! emit Shift-JIS pairs as `\uXXXX` placeholders; the raw bytes are
-//! retained for round-trip writes.
+//! Filenames are Shift-JIS: ASCII, single-byte half-width katakana
+//! (`0xA1..0xDF`), and double-byte kanji/kana (first byte `0x81..0x9F` /
+//! `0xE0..0xFC`, second `0x40..0xFC` excl. `0x7F`). We decode to UTF-8 for
+//! display and encode UTF-8 back to Shift-JIS on write via `encoding_rs`,
+//! so Japanese names round-trip; the raw bytes are also retained on the
+//! parsed entry. Length limits are counted in Shift-JIS bytes (18 for the
+//! name, 3 for the extension).
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -334,12 +336,14 @@ pub fn parse_dir_entry(buf: &[u8; DIR_ENTRY_SIZE]) -> Option<Human68kDirEntry> {
     })
 }
 
-/// Lossy Shift-JIS decode for display only. ASCII verbatim, double-byte
-/// pairs become `?` so users see "something is non-ASCII here" instead
-/// of garbage. Round-trip writes go through `raw_name` / `raw_ext`.
+/// Decode a Human68k name + extension from Shift-JIS to UTF-8 for display.
+/// Handles the full Shift-JIS range — ASCII, single-byte half-width
+/// katakana (0xA1..0xDF), and double-byte kanji/kana — via `encoding_rs`.
+/// Undecodable bytes become U+FFFD. Round-trip writes still go through the
+/// raw `raw_name` / `raw_ext` bytes preserved on the entry.
 fn shift_jis_lossy_display(name: &[u8], ext: &[u8]) -> String {
-    let n = lossy_one(name);
-    let e = lossy_one(ext);
+    let n = decode_shift_jis(name);
+    let e = decode_shift_jis(ext);
     if e.is_empty() {
         n
     } else {
@@ -347,28 +351,9 @@ fn shift_jis_lossy_display(name: &[u8], ext: &[u8]) -> String {
     }
 }
 
-fn lossy_one(bytes: &[u8]) -> String {
-    let mut s = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if (0x20..=0x7E).contains(&b) {
-            s.push(b as char);
-            i += 1;
-        } else if is_sjis_first_byte(b) && i + 1 < bytes.len() {
-            // Shift-JIS double-byte; emit placeholder.
-            s.push('?');
-            i += 2;
-        } else {
-            s.push('_');
-            i += 1;
-        }
-    }
-    s
-}
-
-fn is_sjis_first_byte(b: u8) -> bool {
-    matches!(b, 0x81..=0x9F | 0xE0..=0xFC)
+/// Decode a Shift-JIS byte string to a UTF-8 `String`.
+fn decode_shift_jis(bytes: &[u8]) -> String {
+    encoding_rs::SHIFT_JIS.decode(bytes).0.into_owned()
 }
 
 /// Live Human68k reader.
@@ -637,10 +622,11 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
 /// 8 + 10 + 3 byte encoded name slot returned by `encode_human68k_name`.
 type EncodedName = ([u8; 8], [u8; 10], [u8; 3]);
 
-/// Encode a candidate filename into 8 + 10 + 3 byte fields for a
-/// Human68k directory entry. Accepts ASCII or already-Shift-JIS-encoded
-/// raw bytes; rejects names containing '/', ':', or non-printable ASCII
-/// outside the SJIS first-byte range.
+/// Encode a UTF-8 filename into the 8 + 10 + 3 byte fields of a Human68k
+/// directory entry, transcoding to Shift-JIS. Accepts Japanese (the CLI /
+/// GUI pass names as UTF-8); rejects path separators and names that don't
+/// fit the 18-byte name / 3-byte extension SJIS budget. Length limits are
+/// in **Shift-JIS bytes** (a kanji is 2 bytes, half-width katakana 1).
 fn encode_human68k_name(name: &str) -> Result<EncodedName, FilesystemError> {
     if name.is_empty() {
         return Err(FilesystemError::InvalidData(
@@ -652,34 +638,50 @@ fn encode_human68k_name(name: &str) -> Result<EncodedName, FilesystemError> {
             "Human68k filename '{name}' contains a path separator"
         )));
     }
-    let bytes = name.as_bytes();
-    // Split at the LAST '.' for ext (rightmost-dot convention).
-    let (name_part, ext_part) = match bytes.iter().rposition(|&b| b == b'.') {
-        Some(idx) => (&bytes[..idx], &bytes[idx + 1..]),
-        None => (bytes, &b""[..]),
+    // Split at the LAST '.' for the extension (rightmost-dot convention).
+    // '.' is ASCII so splitting the &str is byte-safe.
+    let (name_part, ext_part) = match name.rfind('.') {
+        Some(idx) => (&name[..idx], &name[idx + 1..]),
+        None => (name, ""),
     };
-    if name_part.is_empty() || name_part.len() > 18 {
+    let name_sjis = encode_shift_jis(name_part, name)?;
+    let ext_sjis = encode_shift_jis(ext_part, name)?;
+
+    if name_sjis.is_empty() || name_sjis.len() > 18 {
         return Err(FilesystemError::InvalidData(format!(
-            "Human68k name '{name}' must have 1..=18 chars before the extension"
+            "Human68k name '{name}' must be 1..=18 Shift-JIS bytes before the extension"
         )));
     }
-    if ext_part.len() > 3 {
+    if ext_sjis.len() > 3 {
         return Err(FilesystemError::InvalidData(format!(
-            "Human68k extension exceeds 3 bytes (got {})",
-            ext_part.len()
+            "Human68k extension of '{name}' exceeds 3 Shift-JIS bytes (got {})",
+            ext_sjis.len()
         )));
     }
     let mut n8 = [b' '; 8];
     let mut ne10 = [b' '; 10];
-    let take = name_part.len().min(8);
-    n8[..take].copy_from_slice(&name_part[..take]);
-    if name_part.len() > 8 {
-        let etake = (name_part.len() - 8).min(10);
-        ne10[..etake].copy_from_slice(&name_part[8..8 + etake]);
+    let take = name_sjis.len().min(8);
+    n8[..take].copy_from_slice(&name_sjis[..take]);
+    if name_sjis.len() > 8 {
+        let etake = name_sjis.len() - 8;
+        ne10[..etake].copy_from_slice(&name_sjis[8..8 + etake]);
     }
     let mut e3 = [b' '; 3];
-    e3[..ext_part.len()].copy_from_slice(ext_part);
+    e3[..ext_sjis.len()].copy_from_slice(&ext_sjis);
     Ok((n8, ne10, e3))
+}
+
+/// Transcode a UTF-8 fragment to Shift-JIS, rejecting characters that have
+/// no Shift-JIS mapping (so we never silently write `?` substitutions into
+/// an on-disk name). `full` is the original name, for the error message.
+fn encode_shift_jis(part: &str, full: &str) -> Result<Vec<u8>, FilesystemError> {
+    let (bytes, _, had_unmappable) = encoding_rs::SHIFT_JIS.encode(part);
+    if had_unmappable {
+        return Err(FilesystemError::InvalidData(format!(
+            "Human68k filename '{full}' contains characters with no Shift-JIS mapping"
+        )));
+    }
+    Ok(bytes.into_owned())
 }
 
 impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
@@ -1437,9 +1439,8 @@ mod tests {
     }
 
     #[test]
-    fn shift_jis_double_byte_renders_as_placeholder() {
-        // Build a name with one ASCII char + one Shift-JIS double-byte
-        // pair (0x82 0xA0 is 'あ'). Expect "A?" display + "A?" extension.
+    fn shift_jis_double_byte_decodes_to_japanese() {
+        // One ASCII char + one Shift-JIS double-byte pair (0x82 0xA0 = 'あ').
         let mut buf = [0u8; 32];
         buf[0] = b'A';
         buf[1] = 0x82;
@@ -1456,10 +1457,52 @@ mod tests {
         buf[11] = attr::ARCHIVE;
         LittleEndian::write_u16(&mut buf[26..28], 2);
         let parsed = parse_dir_entry(&buf).unwrap();
-        // Name byte 0 = 'A' (ASCII), bytes 1..3 = SJIS pair = '?'.
-        assert_eq!(parsed.display_name, "A?");
+        // Decoded to real Unicode, not a placeholder.
+        assert_eq!(parsed.display_name, "Aあ");
         // Raw bytes preserved for round-trip.
         assert_eq!(&parsed.raw_name, b"A\x82\xA0");
+    }
+
+    #[test]
+    fn half_width_katakana_decodes_to_unicode() {
+        // 0xBC 0xAC 0xB0 0xCD 0xDF 0xDD = "ｼｬｰﾍﾟﾝ" (real disk: "Sharpen").
+        let mut buf = [0u8; 32];
+        buf[0..6].copy_from_slice(&[0xBC, 0xAC, 0xB0, 0xCD, 0xDF, 0xDD]);
+        for b in &mut buf[6..8] {
+            *b = 0x20;
+        }
+        for b in &mut buf[8..11] {
+            *b = 0x20;
+        }
+        for b in &mut buf[12..22] {
+            *b = 0x20;
+        }
+        buf[11] = attr::DIRECTORY;
+        let parsed = parse_dir_entry(&buf).unwrap();
+        assert_eq!(parsed.display_name, "ｼｬｰﾍﾟﾝ");
+    }
+
+    #[test]
+    fn encode_decode_japanese_name_round_trips() {
+        // Encode a Japanese name to SJIS fields, stamp into a dir entry,
+        // parse it back, and confirm the decoded display matches.
+        let (n8, ne10, e3) = encode_human68k_name("アクセサリ").unwrap();
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&n8);
+        buf[8..11].copy_from_slice(&e3);
+        buf[11] = attr::DIRECTORY;
+        buf[12..22].copy_from_slice(&ne10);
+        let parsed = parse_dir_entry(&buf).unwrap();
+        assert_eq!(parsed.display_name, "アクセサリ");
+    }
+
+    #[test]
+    fn encode_rejects_unmappable_characters() {
+        // An emoji has no Shift-JIS mapping.
+        assert!(matches!(
+            encode_human68k_name("hi😀.txt"),
+            Err(FilesystemError::InvalidData(_))
+        ));
     }
 
     #[test]
