@@ -308,7 +308,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     if matches!(table, PartitionTable::Apm(_)) {
         for part in &mut partitions {
             if part.partition_type_string.as_deref() == Some("Apple_HFS") {
-                let part_offset = part.start_lba * 512;
+                let part_offset = part.byte_offset();
                 if let Ok(clone) = source.get_ref().try_clone() {
                     let mut br = std::io::BufReader::new(clone);
                     let detected = fs::probe_apple_hfs_type(&mut br, part_offset);
@@ -343,7 +343,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             continue;
         };
         let mut br = std::io::BufReader::new(clone);
-        let part_offset = part.start_lba * 512;
+        let part_offset = part.byte_offset();
         match fs::probe_0x83_fs_type(&mut br, part_offset) {
             Some("FAT") if is_linux_mbr => {
                 let subtype = source.get_ref().try_clone().ok().and_then(|c| {
@@ -1068,7 +1068,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                     },
                 ),
             );
-            let part_offset = part.start_lba * 512;
+            let part_offset = part.byte_offset();
             let part_size = part.size_bytes;
             let producer_clone = source
                 .get_ref()
@@ -1214,7 +1214,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 LogLevel::Info,
                 format!("Creating compact reader for {}", part_label),
             );
-            let part_offset = part.start_lba * 512;
+            let part_offset = part.byte_offset();
             let clone = source
                 .get_ref()
                 .try_clone()
@@ -1265,7 +1265,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
                 LogLevel::Info,
                 format!("Using trim-based read for {}", part_label),
             );
-            let part_offset = part.start_lba * 512;
+            let part_offset = part.byte_offset();
             log(
                 &progress,
                 LogLevel::Info,
@@ -1405,6 +1405,10 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             type_name: part.type_name.clone(),
             partition_type_byte: part.partition_type_byte,
             start_lba: part.start_lba,
+            // Persist the true byte offset only when it isn't the floored
+            // `start_lba * 512` (i.e. non-512-aligned X68000 SASI partitions);
+            // otherwise leave it None so 512-aligned metadata is unchanged.
+            start_byte: part.start_byte.filter(|&b| b != part.start_lba * 512),
             original_size_bytes: part.size_bytes,
             imaged_size_bytes: image_size,
             compressed_files,
@@ -1751,6 +1755,10 @@ fn run_single_file_chd_path(
                 type_name: part.type_name.clone(),
                 partition_type_byte: part.partition_type_byte,
                 start_lba: new_start_lba,
+                // Single-file CHD relocates partitions and is not used for
+                // X68000 sources (the only non-512-aligned scheme), so the
+                // floored 512-LBA offset is authoritative here.
+                start_byte: None,
                 original_size_bytes: part.size_bytes,
                 imaged_size_bytes: range.length,
                 compressed_files: vec![], // data is inside the container

@@ -139,6 +139,7 @@ fn write_backup_folder(
             type_name: "X68k Human68k (Human)".to_string(),
             partition_type_byte: 0x01,
             start_lba: PART_START_SECTOR,
+            start_byte: None,
             original_size_bytes: part_body.len() as u64,
             imaged_size_bytes: part_body.len() as u64,
             compressed_files: vec!["partition-0.raw".to_string()],
@@ -320,6 +321,178 @@ fn x68k_disk_round_trips_through_restore_with_resize() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "HELLO.TXT");
     assert_eq!(fs.read_file(&entries[0], 1024).unwrap(), seed_payload);
+}
+
+/// 256-byte SASI disks place their Human68k partition on a
+/// **non-512-aligned** byte (`start_sector * 256`). Restore must read,
+/// place, and reopen the partition at that true byte offset — carried in
+/// metadata as `start_byte` — not at the floored `start_lba * 512`.
+///
+/// This builds a synthetic SASI disk whose partition starts at sector 33
+/// (byte 8448, which `8448 / 512 = 16` floors to byte 8192), backs it up
+/// with `start_byte = 8448`, reconstructs, and asserts:
+///   - the X68k table lands at the SASI offset 0x400 (derived sector size),
+///   - the reconstructed partition body is byte-identical to the source,
+///   - Human68k opens at byte 8448 and the seed file survives.
+#[test]
+fn x68k_sasi_256byte_partition_round_trips_at_true_byte_offset() {
+    use rusty_backup::partition::x68k::X68K_TABLE_OFFSET_SASI;
+
+    const SASI_SECTOR: u64 = 256;
+    const START_SECTOR: u64 = 33; // 33 * 256 = 8448, NOT 512-aligned
+    const PART_BYTES: u64 = 1024 * 1024;
+    let start_byte = START_SECTOR * SASI_SECTOR; // 8448
+    assert_ne!(start_byte % 512, 0, "test premise: non-512-aligned start");
+    let floored_lba = start_byte / 512; // 16 -> *512 = 8192 (wrong place)
+    let disk_total = start_byte + PART_BYTES;
+    let length_sectors = PART_BYTES / SASI_SECTOR; // 4096
+
+    let seed: &[u8] = b"X68000 SASI 256-byte-sector non-512-aligned partition seed.";
+    let part_body = build_human68k_partition(PART_BYTES, "SASI.TXT", seed);
+
+    // Sidecar table: one Human68k entry at sector 33, length in 256-B sectors.
+    let table = X68kPartitionTable {
+        disk_size_field: (disk_total / SASI_SECTOR) as u32,
+        entries: vec![X68kEntry {
+            name_raw: *b"Human68k",
+            name_display: "Human68k".to_string(),
+            start_sector: START_SECTOR as u32,
+            length_sectors: length_sectors as u32,
+        }],
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("partition-0.raw"), &part_body).unwrap();
+    std::fs::write(
+        tmp.path().join("x68k.json"),
+        serde_json::to_string_pretty(&table).unwrap(),
+    )
+    .unwrap();
+    let metadata = BackupMetadata {
+        version: 1,
+        created: "2026-06-07T00:00:00Z".to_string(),
+        source_device: "synthetic-sasi-x68k".to_string(),
+        source_size_bytes: disk_total,
+        partition_table_type: "X68k".to_string(),
+        checksum_type: "sha256".to_string(),
+        compression_type: "none".to_string(),
+        split_size_mib: None,
+        sector_by_sector: false,
+        layout: BackupLayout::PerPartition,
+        container: None,
+        container_logical_size: None,
+        container_sha1: None,
+        size_policy: None,
+        alignment: AlignmentMetadata {
+            detected_type: "Custom".to_string(),
+            first_partition_lba: floored_lba,
+            alignment_sectors: 1,
+            heads: 0,
+            sectors_per_track: 0,
+        },
+        partitions: vec![PartitionMetadata {
+            index: 0,
+            type_name: "X68k Human68k (Human68k)".to_string(),
+            partition_type_byte: 0x01,
+            start_lba: floored_lba,
+            start_byte: Some(start_byte),
+            original_size_bytes: PART_BYTES,
+            imaged_size_bytes: PART_BYTES,
+            compressed_files: vec!["partition-0.raw".to_string()],
+            checksum: String::new(),
+            resized: false,
+            compacted: false,
+            is_logical: false,
+            partition_type_string: Some("human68k".to_string()),
+            minimum_size_bytes: None,
+            defragmented_min_size_bytes: None,
+            hfsplus_signature: None,
+            defragmented_clone: false,
+        }],
+        bad_sectors: vec![],
+        extended_container: None,
+    };
+    std::fs::write(
+        tmp.path().join("metadata.json"),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let restored_path = tmp.path().join("restored.hdf");
+    {
+        let mut out = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&restored_path)
+            .unwrap();
+        out.set_len(disk_total).unwrap();
+        reconstruct_disk_from_backup(
+            tmp.path(),
+            &metadata,
+            None,
+            &[],
+            disk_total,
+            &mut out,
+            false,
+            true,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("reconstruct SASI");
+        out.flush().unwrap();
+    }
+
+    let restored = std::fs::read(&restored_path).unwrap();
+    assert_eq!(restored.len() as u64, disk_total);
+
+    // The X68k table must land at the SASI offset 0x400 (sector size 256
+    // derived from original_size_bytes / length_sectors), NOT 0x800.
+    assert_eq!(
+        BigEndian::read_u32(&restored[X68K_TABLE_OFFSET_SASI as usize..]),
+        X68K_MAGIC,
+        "SASI table written at 0x400"
+    );
+
+    // The partition body landed at the TRUE byte offset 8448. It's
+    // byte-identical to the source except for the BPB "hidden sectors" field
+    // (offset 28..32), which reconstruct legitimately patches to the
+    // partition's LBA — and finding a FAT BPB there to patch is itself proof
+    // the body landed at 8448.
+    let placed = &restored[start_byte as usize..(start_byte + PART_BYTES) as usize];
+    assert_eq!(
+        &placed[..28],
+        &part_body[..28],
+        "BPB head byte-identical at 8448"
+    );
+    assert_eq!(
+        &placed[32..],
+        &part_body[32..],
+        "body byte-identical past the patched field"
+    );
+    assert_eq!(
+        placed[0], 0xEB,
+        "FAT boot jump sits at the true offset 8448"
+    );
+    // The floored offset (8192) is in the gap between table and partition —
+    // it must be zero-fill, not the misplaced BPB.
+    assert_eq!(
+        restored[floored_lba as usize * 512],
+        0,
+        "nothing is written at the floored 8192 offset"
+    );
+
+    // Human68k opens at the true offset and the seed file survives byte-exact.
+    let mut fs = Human68kFilesystem::open(Cursor::new(&restored), start_byte).expect("reopen SASI");
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "SASI.TXT");
+    assert_eq!(fs.read_file(&entries[0], 1024).unwrap(), seed);
 }
 
 /// Round-trip without resize — useful as a smoke check that the X68k

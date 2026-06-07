@@ -667,14 +667,18 @@ no hand-waving.
    `size_bytes` into 512-byte LBA units so every `start_lba * 512`
    consumer lands on the real partition. Verified read/browse/extract
    end-to-end against the BlueSCSI SxSI v3.02 `HD10/20/30/40_512.hda`
-   set (1024-B SCSI). **Resolved (slice 4, 2026-06-07)** for the
-   partition-table side: `patch_x68k_entries` now takes the disk's
-   logical `sector_size`, and the `rbformats/mod.rs` X68k reconstruct
-   branch derives it from metadata to fix `new_sectors`, the
-   `disk_size_field`, and the table offset (0x400 SASI / 0x800 SCSI).
-   *Still open*: the shared reconstruct loop still writes partition
-   *data* at `effective_lba * 512` — correct for 1024-B SCSI (512-aligned
-   byte offset) but wrong for 256-B SASI.
+   set (1024-B SCSI). **Resolved (slice 4 + follow-up, 2026-06-07).**
+   Partition-table side: `patch_x68k_entries` takes the disk's logical
+   `sector_size`, and the `rbformats/mod.rs` X68k reconstruct branch
+   derives it from metadata to fix `new_sectors`, the `disk_size_field`,
+   and the table offset (0x400 SASI / 0x800 SCSI). Partition-*data* side:
+   `PartitionMetadata` now persists `start_byte` (the true non-512-aligned
+   byte offset), the backup engine reads at `PartitionInfo::byte_offset()`,
+   and the reconstruct loop + restore sites write/resize at
+   `PartitionMetadata::byte_offset()`. Verified on real 256-B SASI game
+   disks (Populous / Lemmings / SSF2 / Votoms) — backup→restore now lands
+   the partition region byte-identical at byte 8448, and in-place
+   `rb-cli resize` is byte-exact on SASI too.
 
 3. **[RESOLVED for read]** `partition/x68k.rs` geometry detection.
    `X68kPartitionTable::detect_with_geometry` now probes both table
@@ -688,10 +692,10 @@ no hand-waving.
    Verified read/browse/extract against `Bomberman.hdf` and the full
    `~/Downloads/X68000-fixtures` set (BlueSCSI / ZuluSCSI / HDS /
    Henkan Bancho / SCSI2SD `.ima`). *Still open*: we don't reject
-   non-Sharp HDDs that coincidentally carry the `X68K` magic, and the
-   shared reconstruct loop's SASI 256-B partition-*data* write offset
-   still assumes 512-B (the read path + in-place FS resize use
-   `byte_offset()`; the reconstruct partition-data write does not yet).
+   non-Sharp HDDs that coincidentally carry the `X68K` magic. (The SASI
+   256-B partition-*data* offset across backup / restore / reconstruct is
+   now handled via the persisted `PartitionMetadata::start_byte` —
+   resolved 2026-06-07.)
 
 4. **[RESOLVED]** `fs/human68k.rs` FAT BPB parser now handles the Sharp
    / Keisoku Giken SCSI-HDD BPB: a 2-byte BRA.S + 16-byte OEM
@@ -767,12 +771,21 @@ metadata (`original_size_bytes / length_sectors`) to fix the `new_sectors`
 length math, the `disk_size_field`, and the table offset (0x400 SASI vs
 0x800 SCSI). Verified byte-exact on the BlueSCSI HD10 fixture across a
 grow→shrink round-trip (multi-cluster `COMMAND.X` with `HU` header +
-`HUMAN.SYS` + Japanese filenames all survive). **Still deferred:** the
-256-byte-SASI *partition-data* write offset in the shared reconstruct loop
-(`part_offset = effective_lba * 512`) — correct for 1024-byte SCSI (the
-byte offset is 512-aligned) but wrong for 256-byte SASI; converting the
-shared loop to `PartitionInfo::byte_offset()` touches every partition
-scheme's offset/metadata model, so it stays parked in §8.
+`HUMAN.SYS` + Japanese filenames all survive).
+
+**256-byte-SASI partition-data offset — DONE (follow-up, 2026-06-07).**
+Once real 256-byte SASI game disks with readable Human68k FAT volumes
+landed in the fixture set (Populous / Lemmings / SSF2 / Votoms — partition
+at sector 33 = byte 8448, non-512-aligned, with a Sharp/KG big-endian BPB
+declaring 1024-byte FS sectors), the engine paths were converted off the
+floored `start_lba * 512`: `PartitionMetadata` gained a persisted
+`start_byte`, the backup engine reads at `PartitionInfo::byte_offset()`,
+and the reconstruct loop + restore sites write/resize at
+`PartitionMetadata::byte_offset()` (falling back to `start_lba * 512`
+when `start_byte` is absent, so old backups round-trip unchanged).
+Verified: in-place `rb-cli resize` grow+shrink byte-exact on SASI, and
+backup→restore lands the partition region byte-identical at byte 8448
+(`tests/x68000_resize.rs::x68k_sasi_256byte_partition_round_trips_at_true_byte_offset`).
 
 - **Slice 5 — defragmenting clone (`clone_human68k_volume`):** no clone
   path exists. Mirror `clone_pfs3_volume` / `clone_hfs_volume` (see

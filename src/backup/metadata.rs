@@ -88,6 +88,18 @@ pub struct PartitionMetadata {
     #[serde(default)]
     pub partition_type_byte: u8,
     pub start_lba: u64,
+    /// True partition byte offset, carried for schemes whose partitions are
+    /// *not* 512-aligned — specifically Sharp X68000 SASI disks with 256-byte
+    /// logical sectors, where the partition starts on a non-512-aligned byte
+    /// (`start_sector * 256`) that `start_lba * 512` floors away. `None` for
+    /// every 512-aligned scheme (MBR/GPT/APM/SCSI X68k/…), where consumers
+    /// fall back to `start_lba * 512`. Restore reads/writes/resizes the
+    /// partition at this offset so the on-disk FS lands exactly where its
+    /// partition-table entry points. `#[serde(default)]` keeps pre-existing
+    /// backups (which floored to `start_lba * 512` on both read and write)
+    /// round-tripping unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<u64>,
     pub original_size_bytes: u64,
     /// Actual bytes captured from the partition. Equals `original_size_bytes`
     /// for sector-by-sector backups; may be smaller when smart trimming is used.
@@ -134,6 +146,17 @@ pub struct PartitionMetadata {
     /// metadata loads unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defragmented_clone: bool,
+}
+
+impl PartitionMetadata {
+    /// True partition byte offset for read/write/resize. Uses the persisted
+    /// non-512-aligned `start_byte` (Sharp X68000 SASI 256-byte-sector disks)
+    /// when present, falling back to `start_lba * 512` for every 512-aligned
+    /// scheme and for pre-`start_byte` backups. Peer of
+    /// [`crate::partition::PartitionInfo::byte_offset`].
+    pub fn byte_offset(&self) -> u64 {
+        self.start_byte.unwrap_or(self.start_lba * 512)
+    }
 }
 
 /// Partition alignment information for the backup.
@@ -202,6 +225,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byte_offset_prefers_start_byte_then_falls_back_to_floored_lba() {
+        let mut pm = PartitionMetadata {
+            index: 0,
+            type_name: "X68k Human68k".to_string(),
+            partition_type_byte: 0x01,
+            start_lba: 16,          // 16 * 512 = 8192 (the floored value)
+            start_byte: Some(8448), // true 256-byte-SASI offset (33 * 256)
+            original_size_bytes: 1 << 20,
+            imaged_size_bytes: 1 << 20,
+            compressed_files: vec![],
+            checksum: String::new(),
+            resized: false,
+            compacted: false,
+            is_logical: false,
+            partition_type_string: Some("human68k".to_string()),
+            minimum_size_bytes: None,
+            defragmented_min_size_bytes: None,
+            hfsplus_signature: None,
+            defragmented_clone: false,
+        };
+        assert_eq!(
+            pm.byte_offset(),
+            8448,
+            "honors the non-512-aligned start_byte"
+        );
+        pm.start_byte = None;
+        assert_eq!(pm.byte_offset(), 16 * 512, "falls back to start_lba * 512");
+    }
+
+    #[test]
+    fn start_byte_is_omitted_from_json_when_none() {
+        let pm = PartitionMetadata {
+            index: 0,
+            type_name: "FAT32".to_string(),
+            partition_type_byte: 0x0C,
+            start_lba: 2048,
+            start_byte: None,
+            original_size_bytes: 1 << 20,
+            imaged_size_bytes: 1 << 20,
+            compressed_files: vec![],
+            checksum: String::new(),
+            resized: false,
+            compacted: false,
+            is_logical: false,
+            partition_type_string: None,
+            minimum_size_bytes: None,
+            defragmented_min_size_bytes: None,
+            hfsplus_signature: None,
+            defragmented_clone: false,
+        };
+        let json = serde_json::to_string(&pm).unwrap();
+        assert!(
+            !json.contains("start_byte"),
+            "512-aligned partitions keep metadata clean (start_byte skipped)"
+        );
+        // And a pre-`start_byte` backup (field absent) deserializes to None.
+        let back: PartitionMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.start_byte, None);
+    }
+
+    #[test]
     fn test_metadata_round_trip() {
         let metadata = BackupMetadata {
             version: 1,
@@ -230,6 +314,7 @@ mod tests {
                 type_name: "FAT32 (LBA)".to_string(),
                 partition_type_byte: 0x0C,
                 start_lba: 63,
+                start_byte: None,
                 original_size_bytes: 2_000_000_000,
                 imaged_size_bytes: 500_000_000,
                 compressed_files: vec!["partition-0.zst".to_string()],
@@ -329,6 +414,7 @@ mod tests {
                 type_name: "HFS+".to_string(),
                 partition_type_byte: 0xAF,
                 start_lba: 63,
+                start_byte: None,
                 original_size_bytes: 1_000_000_000,
                 imaged_size_bytes: 1_000_000_000,
                 compressed_files: vec![],
@@ -409,6 +495,7 @@ mod tests {
                 type_name: "FAT32 (LBA)".to_string(),
                 partition_type_byte: 0x0C,
                 start_lba: 63,
+                start_byte: None,
                 original_size_bytes: 2_000_000_000,
                 imaged_size_bytes: 600_000_000,
                 compressed_files: vec![],

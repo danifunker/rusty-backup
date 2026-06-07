@@ -524,7 +524,15 @@ pub fn reconstruct_disk_from_backup(
         }
 
         let effective_lba = get_partition_lba(pm);
-        let part_offset = effective_lba * 512;
+        // Honor a persisted non-512-aligned byte offset (X68000 SASI 256-byte
+        // sectors) when the partition isn't being relocated; relocated
+        // partitions fall back to the 512-LBA layout. Keeps every 512-aligned
+        // scheme on `effective_lba * 512` exactly as before.
+        let part_offset = if effective_lba == pm.start_lba {
+            pm.byte_offset()
+        } else {
+            effective_lba * 512
+        };
         let export_size = get_export_size(pm.index, pm.original_size_bytes);
 
         log_cb(&format!(

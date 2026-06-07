@@ -2680,6 +2680,7 @@ mod tests {
                 type_name: "Linux".to_string(),
                 partition_type_byte: 0x83,
                 start_lba: 1,
+                start_byte: None,
                 original_size_bytes: part_bytes,
                 imaged_size_bytes: part_bytes,
                 compressed_files: vec![],

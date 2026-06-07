@@ -122,6 +122,7 @@ fn write_backup_folder(dir: &std::path::Path, body: &[u8]) {
             type_name: "QDOS (QXL.WIN)".to_string(),
             partition_type_byte: 0,
             start_lba: 0,
+            start_byte: None,
             original_size_bytes: body.len() as u64,
             imaged_size_bytes: body.len() as u64,
             compressed_files: vec!["partition-0.raw".to_string()],
