@@ -31,6 +31,7 @@ pub mod partmap;
 pub mod put;
 pub mod put_macbinary;
 pub mod reformat;
+pub mod repack;
 pub mod resize;
 pub mod restore;
 pub mod rm;

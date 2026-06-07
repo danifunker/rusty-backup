@@ -119,6 +119,11 @@ pub enum Command {
     /// ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches).
     Resize(verbs::resize::ResizeArgs),
 
+    /// Defragment a Human68k (X68000) partition in place: clone it into a
+    /// fresh, contiguously-packed volume and write that back. Reclaims
+    /// holes the in-place resizer can't (it keeps cluster byte-offsets).
+    Repack(verbs::repack::RepackArgs),
+
     /// Expand a classic-HFS volume to a new size + allocation block size
     /// by cloning into a fresh APM disk image (default) or a bare HFS
     /// image (`--to-hfv`). Accepts APM-wrapped sources or raw single-
@@ -245,6 +250,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::PutBinHex(args) => verbs::binhex::run_put(args),
         Command::GetBinHex(args) => verbs::binhex::run_get(args),
         Command::Resize(args) => verbs::resize::run(args),
+        Command::Repack(args) => verbs::repack::run(args),
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),

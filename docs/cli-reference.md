@@ -880,6 +880,22 @@ Usage: reformat [OPTIONS] --fs <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes. Defaults to hformat-style scaling (~0.5% of the partition)
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Defaults to ~half the catalog size
 
+### `repack`
+
+Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place `resize` can't (it keeps cluster byte-offsets, so it only trims trailing free space). Human68k FAT16 volumes only; the partition table is left untouched.
+
+```
+Usage: repack [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+
+**Options**
+
+- `--size` — New filesystem size in bytes (default: the partition's current filesystem size). Accepts suffixes (`K`, `M`, `G`). Must not exceed the partition capacity
+
 ### `resize`
 
 Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)
