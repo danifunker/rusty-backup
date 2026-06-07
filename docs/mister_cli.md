@@ -233,13 +233,17 @@ file target/armv7-unknown-linux-gnueabihf/release/rb-cli
 arm-linux-gnueabihf-objdump -p target/.../rb-cli \
   | grep -i 'NEEDED\|GLIBC_'
 
-# Deploy:
+# Deploy. The CI release tarball ships the binary as `rb-cli-mini`; do
+# the local rename here too so the device-side filename matches the
+# downloads-page artifact and so `rb-cli-mini install-completions`
+# writes its script to bash-completion/completions/rb-cli-mini (which
+# is where bash looks when the user types `rb-cli-mini<TAB>`).
 scp target/armv7-unknown-linux-gnueabihf/release/rb-cli \
-    root@mister.local:/media/fat/Scripts/rb-cli
-ssh root@mister.local 'chmod +x /media/fat/Scripts/rb-cli'
+    root@mister.local:/media/fat/Scripts/rb-cli-mini
+ssh root@mister.local 'chmod +x /media/fat/Scripts/rb-cli-mini'
 
 # Smoke test (replace with a real image already on the SD):
-ssh root@mister.local '/media/fat/Scripts/rb-cli inspect /media/fat/games/Archie/CROS42.hdf'
+ssh root@mister.local '/media/fat/Scripts/rb-cli-mini inspect /media/fat/games/Archie/CROS42.hdf'
 ```
 
 Strip the binary for size:

@@ -84,10 +84,13 @@ cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
             --no-default-features --features chd
 
-# Strip + deploy:
+# Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
+# do the local rename here too so the on-MiSTer filename matches the
+# downloads-page artifact (and so completion lookups land in the right
+# spot — see below).
 arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/rb-cli
 scp target/armv7-unknown-linux-gnueabihf/release/rb-cli \
-    root@mister.local:/media/fat/Scripts/rb-cli
+    root@mister.local:/media/fat/Scripts/rb-cli-mini
 ```
 
 The repo's [`Cross.toml`](Cross.toml) pins the cross-compile Docker

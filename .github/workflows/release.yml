@@ -800,8 +800,21 @@ jobs:
 
       - name: Package
         run: |
+          # Ship the binary as `rb-cli-mini` inside the tarball so it lives
+          # on the MiSTer SD card under a name that disambiguates it from
+          # a desktop rb-cli copy. `--transform` rewrites the entry name
+          # in the archive without touching the on-disk file, so all the
+          # build/strip/objdump steps above can keep referring to `rb-cli`.
+          # Completion-script generation reads the bin name from argv[0]
+          # at runtime, so `rb-cli-mini install-completions` writes its
+          # script to `bash-completion/completions/rb-cli-mini` and bash
+          # finds it via the standard filename-based lookup.
           TGZ="rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz"
-          tar -C target/armv7-unknown-linux-gnueabihf/release -czf "$TGZ" rb-cli
+          tar -C target/armv7-unknown-linux-gnueabihf/release \
+              --transform 's,^rb-cli$,rb-cli-mini,' \
+              -czf "$TGZ" rb-cli
+          # Sanity: the archive should hold `rb-cli-mini`, not `rb-cli`.
+          tar -tzf "$TGZ"
           ls -lh "$TGZ"
 
       - name: Upload artifact
@@ -865,7 +878,8 @@ jobs:
             "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
-            "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz"; do
+            "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
+            "rb-cli-mini-armv7-linux-${VER}.tar.gz"; do
             [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
           done
 
@@ -882,8 +896,9 @@ jobs:
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
           | **Linux** (glibc >= 2.39) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
           | **Linux** (glibc >= 2.39) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
+          | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
-          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
 
           ---
           EOF
