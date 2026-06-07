@@ -787,13 +787,26 @@ Verified: in-place `rb-cli resize` grow+shrink byte-exact on SASI, and
 backup→restore lands the partition region byte-identical at byte 8448
 (`tests/x68000_resize.rs::x68k_sasi_256byte_partition_round_trips_at_true_byte_offset`).
 
-- **Slice 5 — defragmenting clone (`clone_human68k_volume`):** no clone
-  path exists. Mirror `clone_pfs3_volume` / `clone_hfs_volume` (see
-  `docs/export_pipelines.md`): walk the source catalog, create a fresh
-  blank Human68k volume (`create_blank_human68k` — does not exist yet,
-  add it), replay dirs+files contiguously. This is the practical
-  "shrink/repack my partition" path. Wire into `rb-cli` (a `clone` or
-  `convert` verb) + GUI.
+**Slice 5 — defragmenting clone — DONE (2026-06-07):**
+`create_blank_human68k` + `Human68kFormatTemplate` + `format_template()`
+in `src/fs/human68k.rs` format a fresh FAT16 volume matching a source's
+conventions (sector size, FAT count, root entries, endianness, OEM/boot
+stub), re-patching only total-sectors + sectors-per-FAT. The new
+`src/fs/human68k_clone.rs` hosts `clone_human68k_volume` (DFS walk +
+contiguous replay, peer of `clone_pfs3_volume`) and
+`stream_defragmented_human68k` (tempfile-backed streaming wrapper).
+FAT16-only (FAT12 floppies use the floppy-container converter);
+read-only attr / mtimes aren't carried over (same as the interactive
+edit path) and surface as a warning. Wired into the CLI as `rb-cli
+repack IMG[@N] [--size]` (in-place defragment; defaults to the FS's own
+declared size, not the partition-table length, so 256-byte-SASI disks
+work) and into the GUI as a per-partition "Defragment…" button (Inspect
+tab, image-file sources only) backed by `model::repack_runner`. The
+in-place resizer can only trim trailing free space (it keeps cluster
+byte-offsets); the clone reclaims holes left by deleted/relocated files.
+Validated end-to-end on the real `Populous.hdf` 256-byte-SASI fixture
+(tree identical, POP.X / LOAD.DAT / HUMAN.SYS byte-exact, X68k table
+intact). **This closes the X68000 full read/write/resize/clone goal.**
 
 - **GUI/CLI parity:** the write slices flow through `cli/resolve.rs`
   (`byte_offset()`) and `gui/inspect_tab.rs` (converted) — both work for

@@ -24,6 +24,7 @@ work and required a follow-up; it's now an explicit step in the recipe).
 Reference implementations in tree:
 - `src/fs/affs.rs`, `src/fs/pfs3.rs`, `src/fs/sfs.rs`, `src/fs/pfs3_clone.rs` — Amiga in-place resize + PFS3 defragmenting clone.
 - `src/fs/hfsplus_defrag.rs`, `src/fs/hfsplus_clone.rs` — HFS+ defrag clone planner + streamer.
+- `src/fs/human68k_clone.rs` — Human68k (X68000) defragmenting clone (`create_blank_human68k` + `clone_human68k_volume` + `stream_defragmented_human68k`). Standalone "repack my partition" path exposed via `rb-cli repack` + the GUI Inspect-tab "Defragment…" button; NOT wired into the backup-time `DefragCloneShape` shrink pipeline (X68000 uses a custom partition table, not RDB/APM/MBR).
 
 ---
 
