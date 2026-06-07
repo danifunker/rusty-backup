@@ -139,3 +139,33 @@ All OS-specific code lives in `src/os/`:
 - Disable UI controls during active operations to prevent conflicts.
 - Use `Result<T>` and `?` for error propagation throughout.
 - **No Unicode glyphs in UI text or log messages.** The default egui font does not include emoji or symbol glyphs (e.g. `✓ ✗ ⚠ ← → • ✖ ℹ`), so they render as blank boxes on the user's screen. Use plain ASCII alternatives instead — `OK`, `Skipped`, `Warning`, `Back`, `->`, `-`, `X`, `Info:` — for log lines, button labels, dialog text, and any other user-visible string. The only exception is content read directly from a filesystem (e.g. symlink target arrows in the optical browse view), which we render verbatim.
+
+### Pre-commit documentation sync
+
+**Before staging a commit for any user-facing change, run a quick parity pass over three surfaces and update them in the same commit if they drifted.** These have all gone stale in real-world commits — adding a filesystem driver but forgetting the README table, shipping a new container format but leaving the picker filter behind, adding a CP/M DPB but never updating the per-core matrix. The sync is cheap (usually one extra section in the diff); diagnosing the drift from a user-reported issue is expensive.
+
+The three surfaces:
+
+1. **[README.md](README.md)** — user-facing feature lists.
+   - **Image / backup formats table** (§ Compatibility) — every new wrapper / container format gets a row with extension, read/write columns, and a one-line note.
+   - **Filesystems table** — every new fs gets a row covering Browse / Edit / Shrink-expand / fsck / Notes.
+   - **MiSTer FPGA cores table** — when a new fs / container makes a previously-Partial core go end-to-end, the cell moves to **Yes** and the media-path column gains the new extensions.
+   - **Inspect tab bullet list** — when a new dialog ships (e.g. "Convert Floppy Container..."), add the bullet.
+
+2. **[docs/full_MiSTer_support_status.md](docs/full_MiSTer_support_status.md)** — per-core status matrix.
+   - The intro § "What Rusty Backup supports today" lists filesystems / containers / partition tables; add the new entry there.
+   - The per-core table further down maps each MiSTer computer core to its FS shape and Yes/Partial/No status. When you ship support for a new filesystem (or a new DPB on a multi-DPB driver like CP/M), walk this table and re-grade every core that uses that FS. The intro and table have drifted multiple times — most recently CP/M DPBs and Apple DOS 3.3 were in the intro but the per-core matrix still marked seven cores as "No".
+
+3. **`DISK_IMAGE_EXTS` in [src/model/file_types.rs](src/model/file_types.rs)** — the single source of truth for picker extension filters and OS file-association registration.
+   - Every container format the engine knows how to open should appear here so the GUI's "Open File…" picker dropdown shows it, and so Windows Explorer / macOS Finder / Linux MIME handlers route double-clicks at us.
+   - Lowercase only for new entries (the existing `GHO` / `HFV` / `GHS` uppercase variants cover a long-standing rfd quirk; we don't grow that pattern).
+   - Add a row to the `floppy_container_family_present`-style regression test so a future cleanup that drops the extension has to do it deliberately.
+
+The quick checklist when finishing a feature:
+
+- [ ] Does this add or change a filesystem / container / partition format the user can open?
+- [ ] If yes — README Image-formats / Filesystems / MiSTer-cores table updated?
+- [ ] If yes — `docs/full_MiSTer_support_status.md` intro + per-core matrix walked?
+- [ ] If a new picker-visible file extension — `DISK_IMAGE_EXTS` updated + regression test extended?
+
+If the answer to all four is "no, nothing user-visible changed," commit as normal. Otherwise the doc / picker updates land in the same commit as the code change so reviewers see the intent.

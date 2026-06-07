@@ -20,7 +20,7 @@
 pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
-    "GHS", "hfv", "HFV",
+    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -76,6 +76,21 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn floppy_container_family_present() {
+        // X68000 / PC-98 / FM-7 floppy containers — engine support
+        // (`rbformats::containers::{d88,xdf,hdm,dim}`) and the GUI
+        // `Convert Floppy Container...` dialog all assume the pickers
+        // surface these. Regression-pin them here so a future cleanup
+        // pass that prunes the disk-image list has to do it deliberately.
+        for must in ["d88", "xdf", "hdm", "dim"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing floppy-container extension {must}"
             );
         }
     }
