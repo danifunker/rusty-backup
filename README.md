@@ -376,11 +376,16 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **Minimig-AGA** (Amiga)        | AFFS (OFS/FFS), PFS3, SFS on RDB, ISO9660 | Floppy (`.adf`/`.adz`), HDD (`.hdf`/`.hdz`), CD |
 | **MacPlus**                    | HFS | HDD (.hda / .hfv) — 400K MFS floppy outstanding |
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
-| **Apple-II**                   | ProDOS (DOS 3.3 outstanding) | `.dsk` / `.po` / `.do` / `.2mg` / `.woz` |
+| **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
 | **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
 | **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI HDD (`.hdf`) |
 | **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
 | **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
+| **Amstrad CPC**                | AMSDOS + CP/M 2.2 / Plus (`amstrad_data` + `amstrad_sys` DPBs) | Floppy `.dsk` |
+| **AmstradPCW**                 | CP/M Plus (`amstrad_pcw` DPB) | Floppy `.dsk` |
+| **TatungEinstein**             | Xtal-DOS / CP/M (`einstein` DPB) | Floppy `.dsk` |
+| **Altair8800**                 | CP/M (`altair_8in` 8-inch floppy + `altair_cf` CF/HDD DPBs) | Floppy + IDE/CF |
+| **MultiComp**                  | CP/M (`multicomp` DPB) | Floppy `.dsk` |
 
 For X68000 specifically, the floppy converter lets you take an image
 in any of the four formats Sharp tooling and MiSTer cores expect — XDF

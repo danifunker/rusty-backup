@@ -45,17 +45,17 @@ Legend for the **Support** column:
 | Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Partial** — HFS yes; MFS 400K floppy no |
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
-| Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
+| Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + fsck) + Apple DOS 3.3 (read + edit on 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
 | X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD partition table + Human68k partition dispatch yes; CLI parity tests cover inspect/ls on wrapped .d88 + get/put on flat; resize-on-restore deferred |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — Disc Record scan now spans the HD, E-format-floppy, and legacy-floppy candidate offsets (0xFC0/0x404/0xDC0); byte-correct against marutan.net blank pre-formatted HD samples (`blank256E.hdf`, `blank1024Eplus.hdf`) and the 8bs.com Acorn archive `arc-04.800.adf` (E-format populated); `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD container handling shipped; CLI parity tests cover inspect/ls/get on the synthetic E-format fixture; root-directory lookup via FSM indirect-disc-address still pending (dr.root encoding mystery + non-blank HD reference both required); ADFS write path parked behind the FSM walker |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read + write end-to-end (byte-correct against kilgus + smsqe MiSTer samples; write path validated against headless sQLux oracle — rb-cli put → SuperBASIC COPY → host file round-trips byte-exact, per-file 64-byte QDOS header convention honoured); `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
-| Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |
-| AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **No** |
-| TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **No** |
-| SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **No** |
-| Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **No** |
-| MultiComp | Grant Searle MultiComp | Floppy | CP/M | **No** |
+| Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **Yes** — `fs::cpm` ships the `amstrad_data` + `amstrad_sys` DPBs covering both CPC data + system formats. |
+| AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **Yes** — `fs::cpm` `amstrad_pcw` DPB. |
+| TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **Yes** — `fs::cpm` `einstein` DPB. |
+| SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **Partial** — CP/M side covered by `svi328_cpm` DPB; the MSX-DOS / FAT12 floppy variant routes through the existing FAT driver but no SV-specific BPB quirks have been validated. |
+| Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **Yes** — `fs::cpm` ships both `altair_8in` (8-inch floppy) and `altair_cf` (CompactFlash HDD) DPBs. |
+| MultiComp | Grant Searle MultiComp | Floppy | CP/M | **Yes** — `fs::cpm` `multicomp` DPB. |
 | C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **No** |
 | C128 | Commodore 128 | Floppy | CBM DOS | **No** |
 | C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **No** |
@@ -74,7 +74,7 @@ Legend for the **Support** column:
 | PC88 | NEC PC-8801 mkII SR | Floppy | N88-BASIC Disk BASIC | **No** |
 | SAM-Coupe | SAM Coupe | Floppy | SAM DOS / MasterDOS | **No** |
 | ColecoAdam | Coleco Adam | Floppy, DDP tape | EOS (read-only in core) | **No** |
-| BK0011M | Elektronika BK | Floppy, HDD (VHD) | ANDOS / CSIDOS | **No** |
+| BK0011M | Elektronika BK | Floppy, HDD (VHD) | ANDOS / CSIDOS | **Partial** — `fs::andos` ships a detect-only scaffold (boot-block signature probe surfaces "ANDOS" through `fs_type()`). Browse / extract returns `Unsupported`; CSIDOS not started. Sparse public docs limit the work to what real-disc fixtures can validate. |
 | Vector-06C | Vector-06C | Floppy | MicroDOS | **No** |
 | Specialist | Specialist | Floppy | Specialist-MX FS | **No** |
 | ZX81 | Sinclair ZX80/ZX81 | Tape | — | **N/A** |
