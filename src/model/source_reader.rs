@@ -352,6 +352,16 @@ pub fn is_flat_floppy_container_path(path: &Path) -> bool {
         || is_apple_ii_dsk_path(path)
 }
 
+/// The four floppy containers that support in-place editing via
+/// [`crate::model::container_edit`] (decode -> edit -> re-encode): XDF, HDM,
+/// DIM, D88. Subset of [`is_flat_floppy_container_path`] excluding the
+/// read-only-wrapped formats (MSA / EDSK / Apple-II / Arculator HDF) which
+/// have no re-encoder wired up — `containers::is_floppy_container` is the
+/// matching engine-side predicate.
+pub fn is_editable_container_path(path: &Path) -> bool {
+    is_xdf_path(path) || is_hdm_path(path) || is_dim_path(path) || is_d88_path(path)
+}
+
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
 /// flat-sector stream — any CHD / GHO / IMZ streaming reader or flat floppy
 /// container. Callers that build their own reader use this to decide whether

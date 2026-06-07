@@ -292,6 +292,45 @@ pub fn floppy_kind_from_extension(path: &Path) -> Result<ContainerKind> {
     }
 }
 
+/// Decode a floppy-container file into `(kind, flat_sector_stream)`. Errors
+/// if `path` is not one of the four editable floppy containers (XDF / HDM /
+/// DIM / D88). This is the read half of the in-place edit round-trip used by
+/// [`crate::model::container_edit`].
+pub fn decode_floppy_container_file(path: &Path) -> Result<(ContainerKind, Vec<u8>)> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading container {}", path.display()))?;
+    let kind = detect_container_kind(&bytes[..bytes.len().min(256)], Some(path));
+    if !is_floppy_container(kind) {
+        anyhow::bail!(
+            "{} is not an editable floppy container (got {})",
+            path.display(),
+            kind.display_name()
+        );
+    }
+    let (flat, _media) = decode_any_floppy(&bytes, kind)?;
+    Ok((kind, flat))
+}
+
+/// Re-encode an edited flat sector stream into floppy container `kind`. The
+/// media / geometry is inferred from `flat.len()`. `kind` must be a floppy
+/// container (XDF / HDM / DIM / D88). This is the write half of the in-place
+/// edit round-trip — the inverse of [`decode_floppy_container_file`].
+///
+/// Note D88 re-encodes to a normalized layout (all tracks present, sectors in
+/// (C,H,R) order); that's lossless for the FAT floppies we edit but does not
+/// preserve copy-protection track quirks. The same is already true of
+/// [`convert_floppy_container`].
+pub fn encode_floppy_container(flat: &[u8], kind: ContainerKind) -> Result<Vec<u8>> {
+    if !is_floppy_container(kind) {
+        anyhow::bail!(
+            "{} is not a floppy container; cannot re-encode",
+            kind.display_name()
+        );
+    }
+    let media = floppy_geom::require_media_from_size(flat.len())?;
+    encode_any_floppy(flat, media, kind)
+}
+
 fn decode_any_floppy(
     bytes: &[u8],
     kind: ContainerKind,
