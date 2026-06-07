@@ -18,6 +18,7 @@ Usage: rb-cli [OPTIONS] <COMMAND>
 - `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
+- `-V` / `--version` — Print the `rb-cli` version and exit. Matches the version the GUI reports
 
 ## Verbs
 

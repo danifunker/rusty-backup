@@ -35,6 +35,10 @@ pub mod verbs;
 #[derive(Parser, Debug)]
 #[command(
     name = "rb-cli",
+    // Same compile-time APP_VERSION the GUI reports (build.rs bakes it from
+    // the CI RELEASE_VERSION, falling back to CARGO_PKG_VERSION). Gives the
+    // CLI a `--version` / `-V` flag at parity with the GUI's version display.
+    version = env!("APP_VERSION"),
     about = "Headless image-construction CLI for rusty-backup",
     disable_help_subcommand = true
 )]
