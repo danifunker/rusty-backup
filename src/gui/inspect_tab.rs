@@ -280,6 +280,19 @@ impl InspectTab {
         self.backup_folder_path.is_some()
     }
 
+    /// True when a source (image file, backup folder, or selected physical
+    /// device) is currently loaded in the Inspect tab. The App uses this to
+    /// decide whether a dropped file should open as a NEW source (only when
+    /// nothing is loaded) or be left to the filesystem browser's own
+    /// drag-and-drop handler (which adds the file into the open volume while
+    /// in edit mode). Without this gate the App's drop handler would re-open
+    /// the dropped file over the loaded one, making drag-to-add impossible.
+    pub fn has_loaded_source(&self) -> bool {
+        self.image_file_path.is_some()
+            || self.backup_folder_path.is_some()
+            || self.selected_device_idx.is_some()
+    }
+
     /// Returns and clears the "user clicked Close Backup" signal. The App-level
     /// update loop calls this each frame to know when to clear the cross-tab
     /// `loaded_backup_folder` (which would otherwise re-open the backup via

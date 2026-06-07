@@ -709,10 +709,19 @@ impl eframe::App for RustyBackupApp {
         // app window, take the first one with a real filesystem path and
         // open it in the Inspect tab. `with_drag_and_drop(true)` is set
         // on the viewport in main.rs so eframe surfaces these events.
-        let dropped: Option<PathBuf> =
-            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.open_in_inspect(path);
+        //
+        // Only steal the drop to open a NEW source when nothing is loaded.
+        // Once a source is loaded, drops belong to the filesystem browser's
+        // own handler (BrowseView::handle_dropped_files), which adds the
+        // dropped file into the open volume while in edit mode — re-opening
+        // the drop as a new image here would clobber the loaded source and
+        // make drag-to-add impossible.
+        if !self.inspect_tab.has_loaded_source() {
+            let dropped: Option<PathBuf> =
+                ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+            if let Some(path) = dropped {
+                self.open_in_inspect(path);
+            }
         }
 
         // Drain `log` crate records (incl. worker-thread log::info! from the

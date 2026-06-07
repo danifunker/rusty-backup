@@ -80,7 +80,11 @@ pub fn run(args: RepackArgs) -> Result<()> {
     // The clone reads the source fully into a tempfile before draining it
     // back to the writer, so the separate RW handle below never races the
     // read side even though both point at the same file.
-    let (mut rw_file, _) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    // repack is documented HDD-only (FAT16); .hda/.hdf images aren't editable
+    // containers, so this commit is a no-op. (A floppy-container path fails
+    // earlier at the read-only Human68k open above, which is the intended
+    // scope boundary — floppies use `floppy convert` / put/rm/mkdir.)
+    let (mut rw_file, _, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     rw_file.seek(SeekFrom::Start(ctx.offset))?;
 
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
@@ -93,6 +97,8 @@ pub fn run(args: RepackArgs) -> Result<()> {
     )
     .context("repack failed")?;
     rw_file.flush().context("flushing repacked partition")?;
+    drop(rw_file);
+    commit.commit()?;
 
     for w in &report.warnings {
         log_stderr(format!("  warning: {w}"));

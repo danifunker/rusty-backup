@@ -42,7 +42,7 @@ pub struct RmArgs {
 }
 
 pub fn run(args: RmArgs) -> Result<()> {
-    let (file, mut ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, mut ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
@@ -92,6 +92,8 @@ pub fn run(args: RmArgs) -> Result<()> {
         }
         fs.sync_metadata()
             .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+        drop(fs);
+        commit.commit()?;
         out_stdout(format!(
             "Removed {count_files} file(s) and {count_dirs} directory tree(s)"
         ));
@@ -127,6 +129,8 @@ pub fn run(args: RmArgs) -> Result<()> {
     }
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
     Ok(())
 }
 

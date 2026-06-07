@@ -145,7 +145,7 @@ fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
 }
 
 fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
-    let (file, ctx) = resolve_partition_rw(&image.path, image.partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition)?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -193,6 +193,11 @@ fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
     }
 
     let repair = fs.repair().map_err(|e| anyhow!("repair: {e}"))?;
+    // Persist: re-encode the temp flat back into the container (no-op for raw
+    // images). The clean / unrepairable paths above return before mutating, so
+    // they leave the container untouched.
+    drop(fs);
+    commit.commit()?;
 
     if format.is_structured() {
         let env = Envelope::ok(RepairPayload {

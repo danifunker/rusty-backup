@@ -451,7 +451,7 @@ fn run_fs_ops_on_path(
     defaults: &DefaultOptions,
     continue_on_error: bool,
 ) -> Result<(usize, Vec<(usize, String)>)> {
-    let (file, ctx) = resolve_partition_rw(path, partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(path, partition)?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -463,6 +463,10 @@ fn run_fs_ops_on_path(
 
     let mut applied = fs_ops_start;
     let mut failures: Vec<(usize, String)> = Vec::new();
+    // Set when an op fails without --continue-on-error: we still sync + persist
+    // the ops that succeeded so far (matching the raw-image behavior where the
+    // synced writes land), then report the abort after committing.
+    let mut abort_msg: Option<String> = None;
     for (i, op) in operations.iter().enumerate().skip(fs_ops_start) {
         let res = apply_op(&mut *fs, op, defaults);
         match res {
@@ -480,14 +484,23 @@ fn run_fs_ops_on_path(
                 log_stderr(format!("  ! {msg}"));
                 failures.push((i + 1, msg));
                 if !continue_on_error {
-                    fs.sync_metadata().ok();
-                    bail!("batch aborted after {applied} successful op(s); rerun with --continue-on-error to keep going");
+                    abort_msg = Some(format!(
+                        "batch aborted after {applied} successful op(s); rerun with --continue-on-error to keep going"
+                    ));
+                    break;
                 }
             }
         }
     }
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    // Persist: re-encode the temp flat back into the container (no-op for raw
+    // images). Done before reporting an abort so partial work is saved.
+    drop(fs);
+    commit.commit()?;
+    if let Some(msg) = abort_msg {
+        bail!("{msg}");
+    }
     Ok((applied, failures))
 }
 

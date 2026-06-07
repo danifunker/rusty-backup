@@ -23,7 +23,7 @@ pub struct SetRsrcArgs {
 }
 
 pub fn run(args: SetRsrcArgs) -> Result<()> {
-    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -43,6 +43,8 @@ pub fn run(args: SetRsrcArgs) -> Result<()> {
         .map_err(|e| anyhow!("write_resource_fork: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
     log_stderr(format!("{}: wrote {} byte resource fork", args.path, len));
     Ok(())
 }

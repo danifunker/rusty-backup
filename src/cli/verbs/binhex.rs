@@ -83,7 +83,7 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
         bail!("BinHex: empty filename");
     }
 
-    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -163,6 +163,8 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
 
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
 
     log_stderr(format!(
         "put-binhex: {} ({} data, {} rsrc, type={} creator={} flags=0x{:04x})",

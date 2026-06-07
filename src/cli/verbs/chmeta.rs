@@ -27,7 +27,7 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
     if args.type_code.is_none() && args.creator.is_none() {
         bail!("chmeta: pass at least one of --type or --creator");
     }
-    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -52,6 +52,8 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
         .map_err(|e| anyhow!("set_type_creator: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
     log_stderr(format!(
         "{}: type={new_type} creator={new_creator}",
         args.path

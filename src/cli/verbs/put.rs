@@ -101,7 +101,7 @@ pub fn run(args: PutArgs) -> Result<()> {
         bail!("destination path has no filename");
     }
 
-    let (file, mut ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, mut ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
@@ -176,10 +176,14 @@ pub fn run(args: PutArgs) -> Result<()> {
     fs.sync_metadata()
         .map_err(|e| anyhow!("sync_metadata: {e}"))?;
 
+    // Drop the editable handle, then persist. For a floppy container this
+    // re-encodes the temp flat back into the .d88/.xdf/.hdm/.dim file; for a
+    // raw image it's a no-op. Must happen before the print_offset re-open so
+    // locate sees the post-edit on-disk state.
+    drop(fs);
+    commit.commit()?;
+
     if args.print_offset {
-        // Drop the editable handle before re-opening read-only via the
-        // locate path — we want the post-sync on-disk state.
-        drop(fs);
         let payload = super::locate::locate_payload(&args.image, &dst)?;
         super::locate::emit_locate(crate::cli::output::OutputFormat::Json, &payload)?;
     }
@@ -206,7 +210,7 @@ fn put_boot(
         );
     }
 
-    let (mut file, ctx) = resolve_partition_rw(image, partition)?;
+    let (mut file, ctx, commit) = resolve_partition_rw(image, partition)?;
     log_stderr(&ctx.label);
 
     // Same type check `locate` uses — keeps `--boot` from silently
@@ -229,5 +233,7 @@ fn put_boot(
     file.seek(SeekFrom::Start(ctx.offset))?;
     file.write_all(&bb)?;
     file.flush()?;
+    drop(file);
+    commit.commit()?;
     Ok(())
 }

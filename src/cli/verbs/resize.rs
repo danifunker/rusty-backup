@@ -35,7 +35,7 @@ pub struct ResizeArgs {
 
 pub fn run(args: ResizeArgs) -> Result<()> {
     let new_size = parse_size(&args.size).context("parsing --size")?;
-    let (mut file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (mut file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
     log_stderr(format!(
         "resize: target size {} ({} bytes), partition offset {} ({} bytes available)",
@@ -55,6 +55,11 @@ pub fn run(args: ResizeArgs) -> Result<()> {
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
     crate::fs::resize_filesystem_for(&mut file, ctx.offset, new_size, &mut log_cb)
         .context("resize failed")?;
+    drop(file);
+    // No-op for raw images. For a fixed-geometry floppy container a resize that
+    // changed the flat length can't be re-encoded; commit() surfaces that as a
+    // clear error rather than writing a malformed container.
+    commit.commit()?;
     log_stderr("resize complete");
     Ok(())
 }

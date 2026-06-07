@@ -57,16 +57,67 @@ pub fn resolve_partition_ro(
     Ok((file, ctx))
 }
 
+/// Returned by [`resolve_partition_rw`] alongside the read+write file handle.
+/// Call [`RwCommit::commit`] once a mutation has succeeded (after the
+/// `EditableFilesystem` has been synced) to persist it.
+///
+/// For a raw image this is a no-op — writes already landed in the file. For a
+/// floppy container (.d88 / .xdf / .hdm / .dim) the file handle points at a
+/// decoded temp flat, and `commit` re-encodes that flat back into the
+/// container format, atomically replacing the original. **Dropping without
+/// committing discards container edits**, so a verb that errors out before
+/// calling `commit` leaves the original container untouched.
+#[must_use = "call commit() to persist edits made to a floppy container"]
+pub struct RwCommit {
+    session: Option<crate::model::container_edit::ContainerEditSession>,
+}
+
+impl RwCommit {
+    /// Persist the edit. No-op for raw images; re-encodes for containers.
+    pub fn commit(self) -> Result<()> {
+        match self.session {
+            Some(session) => {
+                let kind = session.kind();
+                session
+                    .commit()
+                    .map_err(|e| anyhow!("re-encoding {} container: {e:#}", kind.display_name()))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 /// Same as [`resolve_partition_ro`] but the file handle is open
 /// read+write. Caller is responsible for ensuring the path resolves to
 /// a regular file (device-write safety lives in Phase C).
+///
+/// Returns a [`RwCommit`] the caller must `commit()` after a successful
+/// mutation. For floppy containers the returned file handle is a decoded temp
+/// flat; `commit` re-encodes it back into the container. See [`RwCommit`].
 pub fn resolve_partition_rw(
     path: &std::path::Path,
     selector: Option<u32>,
-) -> Result<(File, PartitionContext)> {
-    let mut file = open_image_rw(path)?;
-    let ctx = resolve(&mut file, selector)?;
-    Ok((file, ctx))
+) -> Result<(File, PartitionContext, RwCommit)> {
+    if source_reader::is_editable_container_path(path) {
+        // Floppy container: decode to a temp flat, edit that, re-encode on
+        // commit. open_image_rw on the temp gives the same File the raw path
+        // would, so downstream dispatch is identical.
+        let session = crate::model::container_edit::ContainerEditSession::open(path)
+            .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
+        let mut file = open_image_rw(session.flat_path())?;
+        let ctx = resolve(&mut file, selector)?;
+        Ok((
+            file,
+            ctx,
+            RwCommit {
+                session: Some(session),
+            },
+        ))
+    } else {
+        let mut file = open_image_rw(path)?;
+        let ctx = resolve(&mut file, selector)?;
+        Ok((file, ctx, RwCommit { session: None }))
+    }
 }
 
 /// Like [`resolve_partition_ro`] but returns a boxed `Read + Seek`,
