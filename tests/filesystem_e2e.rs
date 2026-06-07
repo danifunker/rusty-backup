@@ -1461,6 +1461,90 @@ fn test_expand_runner_writes_flat_hfv() {
     assert!(out.fsck().unwrap().errors.is_empty());
 }
 
+/// Model-layer expand → APM disk against a **non-APM** source: a raw
+/// single-partition HFS image (e.g. `partition-0.img`, no DDR at sector 0)
+/// is a valid input. The runner wraps it in a fresh APM disk with one
+/// `Apple_HFS` partition at block 64 and zero drivers carried over.
+#[test]
+fn test_expand_runner_wraps_non_apm_source_in_apm() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+    use rusty_backup::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use rusty_backup::model::hfs_expand_runner::{
+        start_hfs_expand, summarize_source, ExpandOutput,
+    };
+    use rusty_backup::partition::apm::Apm;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src_path = tmp.path().join("partition-0.img");
+    let out_path = tmp.path().join("wrapped.hda");
+
+    // Source: a bare HFS image with one file. No partition table.
+    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "RawHFS").unwrap();
+    {
+        let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
+        let root = efs.root().unwrap();
+        let payload = b"wrap me in APM";
+        let mut data = Cursor::new(payload.as_slice());
+        efs.create_file(
+            &root,
+            "doc.txt",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    std::fs::write(&src_path, &img).unwrap();
+
+    let source = summarize_source(&src_path, 0, img.len() as u64).unwrap();
+    let status = start_hfs_expand(
+        source,
+        16 * 1024 * 1024,
+        4096,
+        out_path.clone(),
+        ExpandOutput::ApmDisk,
+    );
+
+    let mut finished = false;
+    let mut err = None;
+    let mut emit = None;
+    for _ in 0..200 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                finished = true;
+                err = g.error.clone();
+                emit = g.emit_report.clone();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(finished, "expand worker did not finish in time");
+    assert!(err.is_none(), "expand failed: {err:?}");
+    let emit = emit.expect("APM output produces an EmitReport");
+    assert_eq!(emit.drivers_copied, 0);
+    assert_eq!(emit.hfs_start_block, 64);
+
+    // Output parses as APM with self-entry + Apple_HFS only, and the wrapped
+    // HFS volume is fsck-clean and holds the file we wrote into the source.
+    let mut f = std::fs::File::open(&out_path).unwrap();
+    let parsed = Apm::parse(&mut f).expect("emitted APM parses");
+    assert_eq!(parsed.entries.len(), 2);
+    assert_eq!(parsed.entries[0].partition_type, "Apple_partition_map");
+    assert_eq!(parsed.entries[1].partition_type, "Apple_HFS");
+    assert_eq!(parsed.entries[1].start_block, 64);
+
+    let f = std::fs::File::open(&out_path).unwrap();
+    let mut out = HfsFilesystem::open(f, emit.hfs_start_block as u64 * 512).unwrap();
+    assert_eq!(out.volume_summary().volume_name, "RawHFS");
+    let root = out.root().unwrap();
+    let kids = out.list_directory(&root).unwrap();
+    assert!(kids.iter().any(|e| e.name == "doc.txt"));
+    assert!(out.fsck().unwrap().errors.is_empty());
+}
+
 /// Export dialog → HFV: drive `start_per_partition_hfv` (the worker behind the
 /// "HFV (BasiliskII)" Export option) against a flat-HFS source image and verify
 /// it writes a valid `partition-0.hfv` holding the source's file. Uses the real

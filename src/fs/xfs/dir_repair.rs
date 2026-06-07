@@ -36,9 +36,9 @@ use super::{read_at_aligned, XfsFilesystem};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
 use crate::fs::fsck::RepairReport;
 
-/// inobt leaf record layout (v4 short header): startino(4) freecount(4) free(8).
+/// inobt leaf record layout: startino(4) freecount(4) free(8). Same on v4
+/// and v5; the leading header size differs (see `XfsSuperblock::sblock_hdr_len`).
 const INOBT_REC_SIZE: usize = 16;
-const INOBT_HDR_LEN: usize = 16;
 
 /// Inode-core field offsets.
 const DI_SIZE_OFF: usize = 56; // di_size (u64)
@@ -55,17 +55,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            // v5 inode cores are CRC-protected; rewriting would invalidate
-            // them. R6 is v4-only (silent, not a failure).
-            return Ok(report);
-        }
-
+        // §2.1 (E.5d): v5 lifted. `repair_shortform_dir` rewrites the
+        // inode via `write_inode_region` (E.2), which re-stamps the v3
+        // inode core. Tree-walk offsets pick up the v5 sblock-crc header.
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
         let bs = sb.blocksize as usize;
         let ino_shift = sb.agblklog + sb.inopblog;
+        let hdr_len = sb.sblock_hdr_len();
         let mut any_change = false;
 
         for agno in 0..sb.agcount as u64 {
@@ -90,12 +88,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     continue;
                 }
                 let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-                let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+                let max_leaf = (bs - hdr_len) / INOBT_REC_SIZE;
                 if numrecs > max_leaf {
                     continue;
                 }
                 for r in 0..numrecs {
-                    let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+                    let off = hdr_len + r * INOBT_REC_SIZE;
                     let start_agino = BigEndian::read_u32(&block[off..off + 4]) as u64;
                     let free = BigEndian::read_u64(&block[off + 8..off + 16]);
                     for slot in 0..XFS_INODES_PER_CHUNK as u64 {
@@ -143,9 +141,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            return Ok(report);
-        }
+        // §2.1 (E.5d): v5 lifted. `fix_inode_nlink` writes via
+        // `write_inode_region` (E.2), which re-stamps the v3 inode core.
 
         let root = match self.root() {
             Ok(r) => r,
@@ -296,9 +293,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             new_fork.extend_from_slice(s);
         }
 
-        // Splice the new fork into the inode buffer, zeroing the old tail, then
-        // fix di_size and the (version-correct) link count.
-        let fork_start = super::inode::fork_offset(false); // v4
+        // Splice the new fork into the inode buffer, zeroing the old tail,
+        // then fix di_size and the (version-correct) link count. Fork starts
+        // at byte 100 in v4, byte 176 in v5 — `sb.fork_offset()` picks the
+        // right one. (Pre-CL.1 this was hardcoded to 100, silently corrupting
+        // a v5 short-form dir if R6 ever rewrote it.)
+        let fork_start = sb.fork_offset();
         let old_end = fork_start + core.size as usize;
         let mut buf = inode_buf;
         if old_end > buf.len() || fork_start + new_fork.len() > buf.len() {

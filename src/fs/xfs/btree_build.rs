@@ -12,18 +12,18 @@
 //! record**, which holds for all of them (alloc key = startblock+blockcount;
 //! inobt key = startino).
 //!
-//! This module is **v4-only** (16-byte short-form block header, no CRC/UUID)
-//! and pure: it takes block numbers to place the new btree blocks at and
-//! returns the block bytes, with no disk I/O. Wiring it into a live AGF/AGI
-//! rewrite (allocating those blocks, updating roots/levels/counters) is a
-//! separate, oracle-gated step.
+//! Pass `Some(sb)` for v5 (56-byte CRC header per `XFS_BTREE_SBLOCK_CRC_LEN`,
+//! with uuid + blkno + lsn + owner + crc all stamped per
+//! `libxfs/xfs_format.h`); pass `None` for v4 (16-byte header).
 //!
 //! Porting reference: `xfs_repair` @ v3.1.11 `repair/phase5.c`
-//! (`build_freespace_tree` / `build_ino_tree`).
+//! (`build_freespace_tree` / `build_ino_tree`), plus `xfs_btree_init_buf`
+//! for the v5 header.
 
 use byteorder::{BigEndian, ByteOrder};
 
-use super::types::{NULLAGBLOCK, XFS_BTREE_SBLOCK_LEN};
+use super::sb::XfsSuperblock;
+use super::types::{NULLAGBLOCK, XFS_BTREE_SBLOCK_CRC_LEN, XFS_BTREE_SBLOCK_LEN};
 
 /// Short-form btree pointers are always 4 bytes (AG-relative block numbers).
 const PTR_SIZE: usize = 4;
@@ -55,10 +55,20 @@ pub struct BuiltBtree {
     pub levels: u32,
 }
 
+/// Header length per format. v5 trades 40 bytes of payload for the
+/// uuid/blkno/lsn/owner/crc CRC-header tuple.
+fn hdr_len(is_v5: bool) -> usize {
+    if is_v5 {
+        XFS_BTREE_SBLOCK_CRC_LEN
+    } else {
+        XFS_BTREE_SBLOCK_LEN
+    }
+}
+
 /// Max records in a leaf and max keys/ptrs in an internal node for the given
-/// block size and record/key widths (v4 short-form header).
-fn capacities(blocksize: usize, rec_size: usize, key_size: usize) -> (usize, usize) {
-    let avail = blocksize - XFS_BTREE_SBLOCK_LEN;
+/// block size, record/key widths, and v4-vs-v5 header.
+fn capacities(blocksize: usize, rec_size: usize, key_size: usize, is_v5: bool) -> (usize, usize) {
+    let avail = blocksize - hdr_len(is_v5);
     let max_leaf = avail / rec_size;
     let max_intern = avail / (key_size + PTR_SIZE);
     (max_leaf, max_intern)
@@ -66,13 +76,15 @@ fn capacities(blocksize: usize, rec_size: usize, key_size: usize) -> (usize, usi
 
 /// Number of btree blocks needed to hold `nrecs` records of the given widths,
 /// summed across all levels. Used to know how many block numbers to reserve.
+/// `is_v5` shrinks the capacities by the 40-byte CRC-header overhead.
 pub fn blocks_needed_for(
     nrecs: usize,
     blocksize: usize,
     rec_size: usize,
     key_size: usize,
+    is_v5: bool,
 ) -> usize {
-    let (max_leaf, max_intern) = capacities(blocksize, rec_size, key_size);
+    let (max_leaf, max_intern) = capacities(blocksize, rec_size, key_size, is_v5);
     if nrecs == 0 {
         return 1; // an empty root leaf
     }
@@ -86,18 +98,27 @@ pub fn blocks_needed_for(
 }
 
 /// Blocks needed for a free-space (alloc) btree of `nrecs` records.
-pub fn blocks_needed(nrecs: usize, blocksize: usize) -> usize {
-    blocks_needed_for(nrecs, blocksize, ALLOC_REC_SIZE, ALLOC_KEY_SIZE)
+pub fn blocks_needed(nrecs: usize, blocksize: usize, is_v5: bool) -> usize {
+    blocks_needed_for(nrecs, blocksize, ALLOC_REC_SIZE, ALLOC_KEY_SIZE, is_v5)
 }
 
-/// Build a v4 short-form btree from flat, pre-sorted record bytes.
+/// Build a short-form btree from flat, pre-sorted record bytes.
 ///
 /// `records` is `nrecs * rec_size` bytes, already sorted in the btree's key
 /// order. The key for every record (and the key a child propagates to its
 /// parent) is the record's first `key_size` bytes. `magic` selects the tree;
 /// `avail` supplies the AG-relative block numbers to place new blocks at and
 /// must hold at least `blocks_needed_for(nrecs, ..)` entries. Block layout:
-/// leaf = `[recs]`; internal node = `[keys[max_intern]][ptrs[max_intern]]`.
+/// leaf = `[recs]`; internal node = `[keys[max_intern]][ptrs[max_intern]]`,
+/// with the records/keys/ptrs starting at the header end (`hdr_len(is_v5)`).
+///
+/// **v5 (CRC)**: pass `Some(sb)` to emit v5 headers (56 B, with
+/// uuid/blkno/lsn/owner/crc stamped per the standard
+/// `xfs_btree_block_shdr`). `seqno` is the owner AG number — it travels
+/// straight into `bb_owner`. Pass `None` for v4 (16 B header). The `magic`
+/// argument should match the format (`XFS_*_CRC_MAGIC` for v5, plain
+/// `XFS_*_MAGIC` for v4).
+#[allow(clippy::too_many_arguments)] // 7 args: structural shape + v5-stamping superblock
 pub fn build_sblock_btree(
     records: &[u8],
     rec_size: usize,
@@ -106,8 +127,11 @@ pub fn build_sblock_btree(
     blocksize: usize,
     seqno: u32,
     avail: &[u32],
+    sb_v5: Option<&XfsSuperblock>,
 ) -> BuiltBtree {
-    let (max_leaf, max_intern) = capacities(blocksize, rec_size, key_size);
+    let is_v5 = sb_v5.is_some();
+    let hdr = hdr_len(is_v5);
+    let (max_leaf, max_intern) = capacities(blocksize, rec_size, key_size, is_v5);
     let nrecs = records.len() / rec_size;
     let mut blocks: Vec<BuiltBlock> = Vec::new();
     let mut next = 0usize; // index into `avail`
@@ -143,7 +167,10 @@ pub fn build_sblock_btree(
         };
         let mut buf = vec![0u8; blocksize];
         write_header(&mut buf, magic, 0, chunk_recs as u16, left, right, seqno);
-        buf[XFS_BTREE_SBLOCK_LEN..XFS_BTREE_SBLOCK_LEN + chunk.len()].copy_from_slice(chunk);
+        buf[hdr..hdr + chunk.len()].copy_from_slice(chunk);
+        if let Some(sb) = sb_v5 {
+            super::v5_crc::stamp_sblock_hdr_for_ag(&mut buf, sb, seqno as u64, agbno);
+        }
         // The leaf's first record's key is its key in the parent.
         let mut key = vec![0u8; key_size];
         if chunk_recs > 0 {
@@ -174,13 +201,17 @@ pub fn build_sblock_btree(
                 NULLAGBLOCK,
                 seqno,
             );
-            // Layout: keys[maxrecs] then ptrs[maxrecs].
-            let ptr_base = XFS_BTREE_SBLOCK_LEN + max_intern * key_size;
+            // Layout: keys[maxrecs] then ptrs[maxrecs], packed from the
+            // header end (16 B v4 / 56 B v5).
+            let ptr_base = hdr + max_intern * key_size;
             for (j, (child_agbno, child_key)) in chunk.iter().enumerate() {
-                let koff = XFS_BTREE_SBLOCK_LEN + j * key_size;
+                let koff = hdr + j * key_size;
                 buf[koff..koff + key_size].copy_from_slice(child_key);
                 let poff = ptr_base + j * PTR_SIZE;
                 BigEndian::write_u32(&mut buf[poff..poff + PTR_SIZE], *child_agbno);
+            }
+            if let Some(sb) = sb_v5 {
+                super::v5_crc::stamp_sblock_hdr_for_ag(&mut buf, sb, seqno as u64, agbno);
             }
             // This node's key in its parent is its first child's key.
             let key = chunk[0].1.clone();
@@ -200,17 +231,19 @@ pub fn build_sblock_btree(
     }
 }
 
-/// Build a v4 alloc btree from `extents` (already sorted by the caller in the
+/// Build an alloc btree from `extents` (already sorted by the caller in the
 /// btree's key order — by startblock for bnobt, by (blockcount, startblock)
-/// for cntbt). `magic` selects the tree (`XFS_ABTB_MAGIC` / `XFS_ABTC_MAGIC`).
-/// Thin wrapper over `build_sblock_btree` that packs each extent into the
-/// 8-byte alloc record `[startblock(4)][blockcount(4)]`.
+/// for cntbt). `magic` selects the tree (`XFS_ABTB[_CRC]_MAGIC` /
+/// `XFS_ABTC[_CRC]_MAGIC`). Thin wrapper over [`build_sblock_btree`] that
+/// packs each extent into the 8-byte alloc record
+/// `[startblock(4)][blockcount(4)]`. Pass `Some(sb)` for v5 stamping.
 pub fn build_alloc_btree(
     extents: &[FreeExtent],
     magic: u32,
     blocksize: usize,
     seqno: u32,
     avail: &[u32],
+    sb_v5: Option<&XfsSuperblock>,
 ) -> BuiltBtree {
     let mut records = vec![0u8; extents.len() * ALLOC_REC_SIZE];
     for (i, ext) in extents.iter().enumerate() {
@@ -226,6 +259,7 @@ pub fn build_alloc_btree(
         blocksize,
         seqno,
         avail,
+        sb_v5,
     )
 }
 
@@ -275,12 +309,14 @@ mod tests {
 
     /// Walk a built btree back out of a flat AG buffer and collect its leaf
     /// records, mirroring the verifier's reader. Used to round-trip-test the
-    /// builder without a full filesystem.
+    /// builder without a full filesystem. `is_v5` selects the header size
+    /// (16 B for v4, 56 B for v5).
     fn read_back(
         blocks: &[BuiltBlock],
         root: u32,
         blocksize: usize,
         magic: u32,
+        is_v5: bool,
     ) -> Vec<FreeExtent> {
         let find = |agbno: u32| -> &[u8] {
             &blocks
@@ -289,7 +325,8 @@ mod tests {
                 .expect("block present")
                 .bytes
         };
-        let (_, max_intern) = capacities(blocksize, ALLOC_REC_SIZE, ALLOC_KEY_SIZE);
+        let hdr = hdr_len(is_v5);
+        let (_, max_intern) = capacities(blocksize, ALLOC_REC_SIZE, ALLOC_KEY_SIZE, is_v5);
         let mut out = Vec::new();
         let mut stack = vec![root];
         while let Some(agbno) = stack.pop() {
@@ -302,14 +339,14 @@ mod tests {
             let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
             if level == 0 {
                 for j in 0..numrecs {
-                    let off = XFS_BTREE_SBLOCK_LEN + j * ALLOC_REC_SIZE;
+                    let off = hdr + j * ALLOC_REC_SIZE;
                     out.push(FreeExtent {
                         startblock: BigEndian::read_u32(&block[off..off + 4]),
                         blockcount: BigEndian::read_u32(&block[off + 4..off + 8]),
                     });
                 }
             } else {
-                let ptr_base = XFS_BTREE_SBLOCK_LEN + max_intern * ALLOC_KEY_SIZE;
+                let ptr_base = hdr + max_intern * ALLOC_KEY_SIZE;
                 // Push children in reverse so we pop them left-to-right.
                 for j in (0..numrecs).rev() {
                     let poff = ptr_base + j * PTR_SIZE;
@@ -336,11 +373,14 @@ mod tests {
         let magic = super::super::types::XFS_ABTB_MAGIC;
         let bs = 4096;
         let exts = make_extents(5);
-        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs) as u32).collect();
-        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail);
+        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs, false) as u32).collect();
+        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail, None);
         assert_eq!(tree.levels, 1);
         assert_eq!(tree.blocks.len(), 1);
-        assert_eq!(read_back(&tree.blocks, tree.root_agbno, bs, magic), exts);
+        assert_eq!(
+            read_back(&tree.blocks, tree.root_agbno, bs, magic, false),
+            exts
+        );
     }
 
     #[test]
@@ -350,10 +390,13 @@ mod tests {
         let magic = super::super::types::XFS_ABTB_MAGIC;
         let bs = 512; // small block: max_leaf=(512-16)/8=62, max_intern=(496)/12=41
         let exts = make_extents(5000); // 5000/62 = 81 leaves -> 81/41=2 nodes -> 1 root
-        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs) as u32 + 5).collect();
-        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail);
+        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs, false) as u32 + 5).collect();
+        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail, None);
         assert!(tree.levels >= 3, "expected >=3 levels, got {}", tree.levels);
-        assert_eq!(read_back(&tree.blocks, tree.root_agbno, bs, magic), exts);
+        assert_eq!(
+            read_back(&tree.blocks, tree.root_agbno, bs, magic, false),
+            exts
+        );
     }
 
     #[test]
@@ -373,9 +416,9 @@ mod tests {
             BigEndian::write_u32(&mut records[off + 4..off + 8], i as u32 % 64);
             BigEndian::write_u64(&mut records[off + 8..off + 16], 0xDEAD_0000 | i as u64);
         }
-        let need = blocks_needed_for(n, bs, rec_size, key_size);
+        let need = blocks_needed_for(n, bs, rec_size, key_size, false);
         let avail: Vec<u32> = (1..=need as u32).collect();
-        let tree = build_sblock_btree(&records, rec_size, key_size, magic, bs, 0, &avail);
+        let tree = build_sblock_btree(&records, rec_size, key_size, magic, bs, 0, &avail, None);
         assert!(tree.levels >= 3, "expected >=3 levels, got {}", tree.levels);
         assert_eq!(tree.blocks.len(), need);
 
@@ -388,7 +431,7 @@ mod tests {
                 .expect("block present")
                 .bytes
         };
-        let (_, max_intern) = capacities(bs, rec_size, key_size);
+        let (_, max_intern) = capacities(bs, rec_size, key_size, false);
         let mut out: Vec<u8> = Vec::new();
         // Find the leftmost leaf by descending child slot 0, then walk the
         // level-0 sibling chain so records come out in key order.
@@ -446,10 +489,111 @@ mod tests {
         let bs = 512;
         for n in [0usize, 1, 62, 63, 1000, 5000] {
             let exts = make_extents(n);
-            let need = blocks_needed(n, bs);
+            let need = blocks_needed(n, bs, false);
             let avail: Vec<u32> = (1..=need as u32).collect();
-            let tree = build_alloc_btree(&exts, super::super::types::XFS_ABTB_MAGIC, bs, 0, &avail);
+            let tree = build_alloc_btree(
+                &exts,
+                super::super::types::XFS_ABTB_MAGIC,
+                bs,
+                0,
+                &avail,
+                None,
+            );
             assert_eq!(tree.blocks.len(), need, "n={n}");
         }
+    }
+
+    /// Minimal `XfsSuperblock` instance whose only purpose is to feed the
+    /// v5 sblock stampers: `meta_uuid()`, `blocklog` (for `fsblock_to_daddr`),
+    /// `agblklog` (for the AG-relative -> fsblock shift). Every other field
+    /// stays zero; the stampers don't touch them.
+    fn synthetic_v5_sb(meta_byte: u8, blocksize: u32, agblklog: u8) -> XfsSuperblock {
+        XfsSuperblock {
+            magicnum: 0,
+            blocksize,
+            dblocks: 0,
+            rblocks: 0,
+            rextents: 0,
+            logstart: 0,
+            logblocks: 0,
+            rootino: 0,
+            rbmino: 0,
+            rsumino: 0,
+            uquotino: 0,
+            gquotino: 0,
+            agblocks: 0,
+            agcount: 0,
+            versionnum: 0x0005,
+            sectsize: 512,
+            inodesize: 256,
+            inopblock: 0,
+            fname: [0; 12],
+            blocklog: blocksize.trailing_zeros() as u8,
+            sectlog: 9,
+            inodelog: 8,
+            inopblog: 4,
+            agblklog,
+            dirblklog: 0,
+            inoalignmt: 0,
+            features2: 0,
+            features_compat: 0,
+            features_ro_compat: 0,
+            features_incompat: 0,
+            sb_uuid: [meta_byte; 16],
+            sb_meta_uuid: [meta_byte; 16],
+        }
+    }
+
+    /// §2.1 hole (E.4): v5 sblock-crc round-trip — build a small bnobt with
+    /// `Some(sb)`, verify (a) the leaf bytes round-trip, (b) every block's
+    /// CRC is stamped to a self-consistent value, (c) the magic is the v5
+    /// `XFS_ABTB_CRC_MAGIC`.
+    #[test]
+    fn v5_alloc_btree_stamps_sblock_crc_headers() {
+        use super::super::v5_crc::{crc_valid, SBLOCK_CRC_CRC_OFF};
+        let bs = 4096;
+        let sb = synthetic_v5_sb(0x42, bs as u32, 16);
+        let magic = super::super::types::XFS_ABTB_CRC_MAGIC;
+        let exts = make_extents(8);
+        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs, true) as u32).collect();
+        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail, Some(&sb));
+        assert_eq!(tree.levels, 1, "expected single-leaf root");
+        assert_eq!(tree.blocks.len(), 1, "expected exactly one v5 leaf block");
+        let leaf = &tree.blocks[0].bytes;
+        assert_eq!(BigEndian::read_u32(&leaf[0..4]), magic, "AB3B magic");
+        assert!(
+            crc_valid(leaf, SBLOCK_CRC_CRC_OFF),
+            "v5 sblock CRC must verify"
+        );
+        // Records round-trip through the v5-aware read_back.
+        assert_eq!(
+            read_back(&tree.blocks, tree.root_agbno, bs, magic, true),
+            exts
+        );
+    }
+
+    /// v5 multi-level case: large record set with small block forces an
+    /// internal node, every block (leaf + node) must carry a valid CRC.
+    #[test]
+    fn v5_alloc_btree_multi_level_every_block_crc_valid() {
+        use super::super::v5_crc::{crc_valid, SBLOCK_CRC_CRC_OFF};
+        let bs = 512usize; // v5 max_leaf=(512-56)/8=57 -> 4 leaves at 200 records
+        let sb = synthetic_v5_sb(0x77, bs as u32, 16);
+        let magic = super::super::types::XFS_ABTB_CRC_MAGIC;
+        let exts = make_extents(200);
+        let avail: Vec<u32> = (1..=blocks_needed(exts.len(), bs, true) as u32 + 4).collect();
+        let tree = build_alloc_btree(&exts, magic, bs, 0, &avail, Some(&sb));
+        assert!(tree.levels >= 2, "expected multi-level tree");
+        for blk in &tree.blocks {
+            assert!(
+                crc_valid(&blk.bytes, SBLOCK_CRC_CRC_OFF),
+                "block {} CRC invalid",
+                blk.agbno
+            );
+        }
+        assert_eq!(
+            read_back(&tree.blocks, tree.root_agbno, bs, magic, true),
+            exts
+        );
     }
 }

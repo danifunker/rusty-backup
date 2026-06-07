@@ -190,6 +190,25 @@ impl BulkConvertDialog {
                         .on_hover_text("MAME CD CHD — input must be .iso or .cue");
                     ui.radio_value(&mut self.format, ExportFormat::BinCue, "BIN/CUE")
                         .on_hover_text("Extract a CD CHD into a BIN/CUE pair");
+                    ui.radio_value(&mut self.format, ExportFormat::Xdf, "XDF (.xdf)")
+                        .on_hover_text(
+                            "X68000 raw headerless floppy dump. \
+                             Floppy only (.xdf/.hdm/.dim/.d88 sources).",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::Hdm, "HDM (.hdm)")
+                        .on_hover_text(
+                            "PC-98 / DiskExplorer raw floppy dump. \
+                             Byte-identical layout to XDF.",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::Dim, "DIM (.dim)")
+                        .on_hover_text(
+                            "DiskExplorer DIFC DIM (256-byte header + payload). \
+                             Floppy only; 640 KB 2DD not representable here.",
+                        );
+                    ui.radio_value(&mut self.format, ExportFormat::D88, "D88 (.d88)")
+                        .on_hover_text(
+                            "Sharp D88 sparse track-table container (X68000 / PC-88 / PC-98 / FM-7).",
+                        );
                 });
 
                 match self.format {

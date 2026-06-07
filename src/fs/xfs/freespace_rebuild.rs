@@ -116,10 +116,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         };
         let sb = self.superblock().clone();
 
-        if sb.is_v5() {
-            // v5 adds finobt/rmapbt/refcountbt metadata we don't model, so a
-            // block-completeness map would be wrong. R2 simply doesn't apply to
-            // v5 — return silently (not a failure) and leave it to R4/R4b.
+        // v5 with rmapbt or reflink enabled: silently skip. Rebuilding
+        // bnobt/cntbt without resyncing rmapbt would leave reverse-
+        // mapping records pointing at the OLD tree blocks; same risk
+        // for refcountbt under reflink. Until the rmapbt-rebuild and
+        // refcountbt-rebuild slices land, R2 is a no-op on those
+        // volumes. Silent (not surfaced via `fixes_failed`) to
+        // preserve the "no-op on clean volume" promise the repair()
+        // driver relies on.
+        if sb.has_rmapbt() || sb.has_reflink() {
             return Ok(report);
         }
 
@@ -323,9 +328,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(map)
     }
 
-    /// Mark one allocated inode's data-fork blocks in use. Returns a skip
-    /// reason if the inode is btree-format (unmappable bmap blocks), if a
-    /// block is cross-linked, or on any read/decode failure.
+    /// Mark one allocated inode's data-fork blocks in use. For inline-extents
+    /// format, mark the extents directly; for btree format, walk the bmbt to
+    /// collect every block the tree physically occupies (intermediate nodes
+    /// plus leaves — the root sits in the inode literal area), mark them,
+    /// then mark every extent record's blocks. Returns a skip reason on any
+    /// read/decode failure or block cross-link.
     pub(crate) fn mark_inode_blocks(
         &mut self,
         sb: &XfsSuperblock,
@@ -341,10 +349,33 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         match core.format {
             DiFormat::Local | DiFormat::Other(_) => return Ok(()), // owns no blocks
             DiFormat::Btree => {
-                return Err(format!(
-                    "inode {ino} is bmap-btree format (di_format 3) — \
-                     intermediate map blocks not yet accounted; skipping rebuild"
-                ));
+                // Account every block the bmap btree physically occupies
+                // (root sits in the inode literal area, so only intermediate
+                // nodes + leaves consume separate blocks). The decoded extents
+                // come from the same walk path the reader uses.
+                let fork_len = self.data_fork(&core, &inode_buf).len();
+                let (root_level, first_child) = {
+                    let fork = self.data_fork(&core, &inode_buf);
+                    super::parse_bmbt_root(fork, fork_len)
+                        .map_err(|e| format!("inode {ino}: bmbt root parse: {e}"))?
+                };
+                let bmbt_blocks = self
+                    .collect_bmbt_blocks(root_level, first_child)
+                    .map_err(|e| format!("inode {ino}: bmbt walk: {e}"))?;
+                let agblocks = sb.agblocks as u64;
+                let agmask = (1u64 << sb.agblklog) - 1;
+                for fsb in &bmbt_blocks {
+                    let agno = fsb >> sb.agblklog;
+                    let agbno = fsb & agmask;
+                    if agno >= sb.agcount as u64 || agbno >= agblocks {
+                        return Err(format!("inode {ino}: bmbt block {fsb} outside volume"));
+                    }
+                    if map.mark(agno * agblocks + agbno) {
+                        return Err(format!("inode {ino}: bmbt block {fsb} double-allocated"));
+                    }
+                }
+                // Fall through to extent-marking below; decode_data_extents
+                // handles Btree format identically to Extents.
             }
             DiFormat::Extents => {}
         }
@@ -503,8 +534,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         derived: &[FreeExtent],
     ) -> Result<u64, FilesystemError> {
         let bs = sb.blocksize as usize;
+        let is_v5 = sb.is_v5();
         // Per-tree block count is the same for bno and cnt (same record set).
-        let per_tree = blocks_needed(derived.len(), bs);
+        let per_tree = blocks_needed(derived.len(), bs, is_v5);
         let total_needed = 2 * per_tree;
 
         // Carve the btree blocks off the end of the largest free extent so the
@@ -520,7 +552,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         debug_assert_eq!(carved.len(), total_needed);
         // The shortened largest extent might change which tree is bigger? No —
         // count is unchanged, so blocks_needed is unchanged.
-        debug_assert_eq!(blocks_needed(reduced.len(), bs), per_tree);
+        debug_assert_eq!(blocks_needed(reduced.len(), bs, is_v5), per_tree);
 
         let bno_blocks = &carved[0..per_tree];
         let cnt_blocks = &carved[per_tree..total_needed];
@@ -535,8 +567,26 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 .then(a.startblock.cmp(&b.startblock))
         });
 
-        let bno = build_alloc_btree(&bno_recs, XFS_ABTB_MAGIC, bs, agno as u32, bno_blocks);
-        let cnt = build_alloc_btree(&cnt_recs, XFS_ABTC_MAGIC, bs, agno as u32, cnt_blocks);
+        // v4 + v5: build_alloc_btree branches on `Some(sb)` to emit the CRC
+        // sblock header tuple. Magics dispatch on is_v5 via the canonical
+        // `XfsSuperblock` accessors.
+        let sb_for_v5: Option<&XfsSuperblock> = if is_v5 { Some(sb) } else { None };
+        let bno = build_alloc_btree(
+            &bno_recs,
+            sb.bnobt_magic(),
+            bs,
+            agno as u32,
+            bno_blocks,
+            sb_for_v5,
+        );
+        let cnt = build_alloc_btree(
+            &cnt_recs,
+            sb.cntbt_magic(),
+            bs,
+            agno as u32,
+            cnt_blocks,
+            sb_for_v5,
+        );
 
         // Write every built block at its fsblock location.
         for blk in bno.blocks.iter().chain(cnt.blocks.iter()) {
@@ -603,9 +653,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             btreeblks,
         );
 
-        self.reader.seek(SeekFrom::Start(agf_byte))?;
-        self.reader.write_all(&agf)?;
-        Ok(())
+        self.write_agf_sector(sb, agf_byte, &mut agf)
     }
 
     /// Write one filesystem block at `fsblock`.
@@ -649,9 +697,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             &mut primary,
         )?;
         BigEndian::write_u64(&mut primary[SB_FDBLOCKS_OFF..SB_FDBLOCKS_OFF + 8], total);
-        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
-        self.reader.write_all(&primary)?;
-        Ok(())
+        self.write_sb_primary(sb, &mut primary)
     }
 }
 
@@ -722,6 +768,60 @@ pub(crate) fn carve_from_largest(
     Some((carved, reduced))
 }
 
+/// Like `carve_from_largest(n)` but requires the carved run to start on a
+/// multiple of `alignment` (AG-relative blocks). Returns `(start_agbno,
+/// reduced)` where `start_agbno % alignment == 0` and `reduced` is the input
+/// extents with `[start_agbno, start_agbno + n)` removed (the host extent
+/// splits in two if both sides are non-empty, otherwise shrinks or vanishes).
+///
+/// Scans extents largest-first and uses the highest aligned position that
+/// fits within the chosen extent — tail-anchoring matches the alignment
+/// behaviour of `xfs_repair`'s allocator and keeps the alignment gap on the
+/// low side, where it tends to coalesce with neighbouring free runs on later
+/// allocations. Unlike `carve_from_largest` this may produce *one extra* free
+/// extent (a tail carve that doesn't reach the start splits the host in two);
+/// the caller's freespace rebuild handles the new shape without further
+/// constraint.
+pub(crate) fn carve_aligned_from_largest(
+    extents: &[FreeExtent],
+    n: u32,
+    alignment: u32,
+) -> Option<(u32, Vec<FreeExtent>)> {
+    if n == 0 || alignment == 0 {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..extents.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(extents[i].blockcount));
+    for i in order {
+        let e = extents[i];
+        let end = e.startblock.checked_add(e.blockcount)?;
+        if e.blockcount < n {
+            continue;
+        }
+        let highest_fit = (end - n) / alignment * alignment;
+        if highest_fit < e.startblock {
+            continue;
+        }
+        let mut out = extents.to_vec();
+        out.remove(i);
+        if highest_fit > e.startblock {
+            out.push(FreeExtent {
+                startblock: e.startblock,
+                blockcount: highest_fit - e.startblock,
+            });
+        }
+        let after = highest_fit + n;
+        if after < end {
+            out.push(FreeExtent {
+                startblock: after,
+                blockcount: end - after,
+            });
+        }
+        return Some((highest_fit, out));
+    }
+    None
+}
+
 /// Sort by startblock and merge adjacent/touching extents into maximal runs.
 /// Input extents must be non-overlapping (they come from disjoint sources:
 /// free records plus the trees' own distinct blocks).
@@ -773,6 +873,62 @@ mod tests {
     fn carve_refuses_when_largest_too_small() {
         let exts = vec![fe(1, 2), fe(4, 3)];
         assert!(carve_from_largest(&exts, 4).is_none());
+    }
+
+    #[test]
+    fn aligned_carve_tail_anchors_at_largest_extent() {
+        // Largest is the 100-block extent at start=12. End=112. n=8, align=8.
+        // Highest aligned fit = ((112 - 8) / 8) * 8 = 104. Tail carve leaves
+        // [12, 104) (92 blocks) intact and [112, 112) empty.
+        let exts = vec![fe(1, 2), fe(4, 4), fe(12, 100)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 8).unwrap();
+        assert_eq!(start, 104);
+        let mut got = reduced;
+        got.sort_by_key(|e| e.startblock);
+        assert_eq!(got, vec![fe(1, 2), fe(4, 4), fe(12, 92)]);
+    }
+
+    #[test]
+    fn aligned_carve_splits_host_when_both_sides_left() {
+        // One extent [16, 80), n=8, alignment=16. End=80; highest aligned fit
+        // = (80 - 8) / 16 * 16 = 64. Carve [64, 72) splits host into [16, 64)
+        // and [72, 80).
+        let exts = vec![fe(16, 64)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 16).unwrap();
+        assert_eq!(start, 64);
+        let mut got = reduced;
+        got.sort_by_key(|e| e.startblock);
+        assert_eq!(got, vec![fe(16, 48), fe(72, 8)]);
+    }
+
+    #[test]
+    fn aligned_carve_consumes_extent_when_perfect_fit() {
+        // One extent [32, 40), n=8, alignment=8. Highest aligned fit = 32.
+        // Both sides empty → extent vanishes.
+        let exts = vec![fe(8, 4), fe(32, 8)];
+        let (start, reduced) = carve_aligned_from_largest(&exts, 8, 8).unwrap();
+        assert_eq!(start, 32);
+        assert_eq!(reduced, vec![fe(8, 4)]);
+    }
+
+    #[test]
+    fn aligned_carve_skips_extent_whose_aligned_run_overflows_start() {
+        // [5, 8): 3 blocks, but alignment=8 wants the start at 0 or 8 — both
+        // outside the extent. Skip; fall through to a smaller extent that
+        // happens to fit (none in this set), so return None.
+        let exts = vec![fe(5, 3)];
+        assert!(carve_aligned_from_largest(&exts, 1, 8).is_none());
+    }
+
+    #[test]
+    fn aligned_carve_picks_smaller_extent_when_largest_misaligned() {
+        // The "biggest" extent [9, 14) (5 blocks) can't host an 8-aligned
+        // 1-block run (no multiple of 8 in [9, 14)); the smaller [16, 20)
+        // can (16). Largest-first ordering tries [9,14) first, falls
+        // through, then takes [16, 20).
+        let exts = vec![fe(9, 5), fe(16, 4)];
+        let (start, _reduced) = carve_aligned_from_largest(&exts, 1, 8).unwrap();
+        assert_eq!(start, 16);
     }
 
     #[test]

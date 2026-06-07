@@ -334,6 +334,184 @@ fn ls_and_rm_support_glob_patterns() {
 }
 
 #[test]
+fn get_glob_extracts_each_match_under_destination() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GetGlob",
+    ]);
+
+    // Populate three files. Distinct content per file so we can spot
+    // any wrong-target write.
+    for (name, content) in &[
+        ("a.txt", b"alpha".as_slice()),
+        ("b.txt", b"beta".as_slice()),
+        ("c.md", b"gamma".as_slice()),
+    ] {
+        let host = dir.path().join(name);
+        std::fs::write(&host, content).unwrap();
+        run(&["put", img_s, host.to_str().unwrap(), &format!("/{name}")]);
+    }
+
+    // `get '/*.txt' OUT/` extracts a.txt + b.txt into OUT, leaves c.md.
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    run(&[
+        "get",
+        img_s,
+        "/*.txt",
+        // Trailing separator handled by ensure_dir() in the verb.
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"beta");
+    assert!(
+        !out.join("c.md").exists(),
+        "non-matching c.md should not have been extracted"
+    );
+}
+
+#[test]
+fn get_recursive_extracts_subdir_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GetRecur",
+    ]);
+
+    // Populate /Apps/ with one direct file + one nested dir + nested file.
+    run(&["mkdir", img_s, "/Apps"]);
+    run(&["mkdir", img_s, "/Apps/Sub"]);
+
+    let a = dir.path().join("a.txt");
+    std::fs::write(&a, b"top").unwrap();
+    let b = dir.path().join("nested.txt");
+    std::fs::write(&b, b"deep").unwrap();
+    run(&["put", img_s, a.to_str().unwrap(), "/Apps/a.txt"]);
+    run(&["put", img_s, b.to_str().unwrap(), "/Apps/Sub/nested.txt"]);
+
+    let out = dir.path().join("out");
+    run(&["get", img_s, "/Apps", out.to_str().unwrap(), "-r"]);
+
+    // cp-like convention: the basename of the source rides under DST.
+    let apps_dir = out.join("Apps");
+    assert!(apps_dir.is_dir(), "Apps/ should exist under DST");
+    assert_eq!(std::fs::read(apps_dir.join("a.txt")).unwrap(), b"top");
+    assert!(apps_dir.join("Sub").is_dir(), "nested dir should exist");
+    assert_eq!(
+        std::fs::read(apps_dir.join("Sub").join("nested.txt")).unwrap(),
+        b"deep"
+    );
+}
+
+#[test]
+fn get_literal_directory_without_recursive_is_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetNoR",
+    ]);
+    run(&["mkdir", img_s, "/Empty"]);
+
+    let out = dir.path().join("out");
+    let outs = out.to_str().unwrap();
+    let err = run_expect_fail(&["get", img_s, "/Empty", outs]);
+    let stderr = String::from_utf8_lossy(&err.stderr);
+    assert!(
+        stderr.contains("directory") && (stderr.contains("--recursive") || stderr.contains("-r")),
+        "expected directory + recursive hint in stderr; got: {stderr}"
+    );
+}
+
+#[test]
+fn get_force_overwrites_existing_host_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetForce",
+    ]);
+
+    let host_src = dir.path().join("src.txt");
+    std::fs::write(&host_src, b"new content").unwrap();
+    run(&["put", img_s, host_src.to_str().unwrap(), "/src.txt"]);
+
+    // Pre-populate DST with stale content.
+    let back = dir.path().join("back.txt");
+    std::fs::write(&back, b"old content").unwrap();
+
+    // Without --force, the existing host file is a hard error.
+    let err = run_expect_fail(&["get", img_s, "/src.txt", back.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&err.stderr);
+    assert!(
+        stderr.contains("destination exists") || stderr.contains("already exists"),
+        "expected existence error; got: {stderr}"
+    );
+
+    // --force replaces the host bytes.
+    run(&["get", img_s, "/src.txt", back.to_str().unwrap(), "--force"]);
+    assert_eq!(std::fs::read(&back).unwrap(), b"new content");
+}
+
+#[test]
+fn get_skip_existing_leaves_old_content_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetSkip",
+    ]);
+
+    let host_src = dir.path().join("src.txt");
+    std::fs::write(&host_src, b"new content").unwrap();
+    run(&["put", img_s, host_src.to_str().unwrap(), "/src.txt"]);
+
+    let back = dir.path().join("back.txt");
+    std::fs::write(&back, b"keep me").unwrap();
+    run(&[
+        "get",
+        img_s,
+        "/src.txt",
+        back.to_str().unwrap(),
+        "--skip-existing",
+    ]);
+    assert_eq!(std::fs::read(&back).unwrap(), b"keep me");
+}
+
+#[test]
+fn get_glob_exclude_filters_matches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("disk.dsk");
+    let img_s = img.to_str().unwrap();
+    run(&[
+        "new", img_s, "--fs", "hfs", "--size", "10M", "--name", "GetExcl",
+    ]);
+
+    for name in &["a.txt", "b.txt", "c.txt"] {
+        let host = dir.path().join(name);
+        std::fs::write(&host, name.as_bytes()).unwrap();
+        run(&["put", img_s, host.to_str().unwrap(), &format!("/{name}")]);
+    }
+
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    run(&[
+        "get",
+        img_s,
+        "/*.txt",
+        out.to_str().unwrap(),
+        "--exclude",
+        "/b.txt",
+    ]);
+    assert!(out.join("a.txt").exists());
+    assert!(!out.join("b.txt").exists(), "excluded file extracted");
+    assert!(out.join("c.txt").exists());
+}
+
+#[test]
 fn backup_then_restore_round_trip_file_to_file() {
     // Phase C: rb-cli backup IMG DIR  ->  rb-cli restore DIR OUT
     // Smoke-tests that the two flat verbs hand off through the on-disk

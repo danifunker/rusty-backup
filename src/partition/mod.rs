@@ -1,20 +1,24 @@
 pub mod alignment;
 pub mod apm;
+pub mod atari;
 pub mod editor;
 pub mod gpt;
 pub mod mbr;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod x68k;
 
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::RustyBackupError;
 use apm::Apm;
+use atari::{looks_like_ahdi_root, AhdiPartitionKind, AhdiTable, AHDI_NUM_SLOTS};
 use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
+use x68k::{X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE};
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
 
@@ -34,6 +38,20 @@ pub enum PartitionTable {
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
     Sgi(SgiVolumeHeader),
+    /// Atari HD File System Driver — MBR-equivalent for Atari ST / TT / Falcon
+    /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
+    /// no boot signature; see `src/partition/atari.rs`.
+    Ahdi(AhdiTable),
+    /// Sharp X68000 SASI/SCSI HDD partition table — Human68k's native scheme.
+    /// 16-byte header + 8 × 16-byte partition entries at byte 2048, big-endian,
+    /// no boot signature; see `src/partition/x68k.rs`.
+    X68k {
+        table: X68kPartitionTable,
+        /// Total disk size in bytes (the in-table `size` field is in an
+        /// undefined unit and unreliable; this comes from the source
+        /// reader directly).
+        size_bytes: u64,
+    },
     /// Superfloppy / floppy: no partition table, filesystem at sector 0.
     None {
         /// Total disk size in bytes (needed to synthesize partition info).
@@ -82,6 +100,8 @@ fn is_floppy_size(size: u64) -> bool {
     matches!(
         size,
         143_360     // 5.25" 140K (35 tracks × 16 sectors × 256 bytes)
+        | 255_488   // 8" SSSD CP/M data area (Altair `altair_8in` DPB: 2 reserved trk + 243 × 1024 B blocks)
+        | 256_256   // 8" SSSD 256K (77 trk × 26 spt × 128 B) — MITS Altair / IBM 3740 CP/M (raw)
         | 409_600   // 3.5" 400K single-sided GCR
         | 819_200   // 3.5" 800K double-sided GCR
         | 737_280   // 3.5" 720K MFM (PC double-density)
@@ -146,6 +166,22 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("XFS".to_string());
     }
 
+    // Sinclair QL QXL.WIN container: 4-byte "QLWA" signature at byte 0.
+    // Raw .win images carry no partition table — they're a single QDOS
+    // volume rooted at byte 0 — so the superfloppy path is the right
+    // route for them.
+    if &first_sector[0..4] == b"QLWA" {
+        return Some("QDOS".to_string());
+    }
+
+    // Soviet BK0011M ANDOS: signature "ANDOS" at one of several
+    // well-known boot-block slots in sector 0. See src/fs/andos.rs.
+    for &cand in &[0x1F8usize, 0x1B0, 0xE0, 0x00] {
+        if first_sector.len() >= cand + 5 && &first_sector[cand..cand + 5] == b"ANDOS" {
+            return Some("ANDOS".to_string());
+        }
+    }
+
     // AmigaDOS boot block: "DOS\x?" at offset 0 (variants 0..7 = OFS/FFS,
     // Intl, DirCache, Long Names). PFS / SFS use the same shape for their
     // RDB DosType but never appear on bare ADFs — those are RDB-partitioned
@@ -165,6 +201,9 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             match sig {
                 0x4244 => return Some("HFS".to_string()),
                 0x482B | 0x4858 => return Some("HFS+".to_string()),
+                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                // single-sided floppies. Same byte-1024 MDB convention as HFS.
+                0xD2D7 => return Some("MFS".to_string()),
                 _ => {}
             }
             // ext2/3/4 superblock magic 0xEF53 (LE u16) at byte 0x38 of the
@@ -207,6 +246,78 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             let magic = u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]);
             if magic == 0x0007_2959 || magic == 0x0007_295A {
                 return Some("EFS".to_string());
+            }
+        }
+    }
+
+    // Acorn ADFS / FileCore Disc Record. Two probe sites match the
+    // Linux kernel paths:
+    //   * byte 0xDC0 (= 0xC00 + 0x1C0) — boot block, used by HD discs
+    //     and legacy floppy boot-block layouts (kernel
+    //     `adfs_validate_bblk`). CROS42 / ICEBIRD use this.
+    //   * byte 0x04 — DR embedded inside zone 0 after the 4-byte zone
+    //     header, used by single-zone E-format floppies (kernel
+    //     `adfs_validate_dr0`). 8bs.com arc-04 / arc-05 use this.
+    // FileCore's spec: byte 0 = log2 sector size (8..11 → 256..2048 B),
+    // byte 1 = secs/track (>= 1), byte 2 = heads (>= 1; up to 9+ on
+    // emulator-side HDDs — CROS42 / ICEBIRD report heads=9, real
+    // hardware tops out lower but the field is u8 and FileCore HDs
+    // don't constrain it the way floppies do), byte 9 = nzones (>= 1).
+    // A coincidental match in random bytes is very unlikely given these
+    // constraints combined.
+    for cand in [0xDC0u64, 0x004u64] {
+        if reader.seek(SeekFrom::Start(cand)).is_ok() {
+            let mut dr = [0u8; 60];
+            if reader.read_exact(&mut dr).is_ok() {
+                let log2_sec = dr[0];
+                let secs_per_track = dr[1];
+                let heads = dr[2];
+                let idlen = dr[4];
+                let nzones = dr[9];
+                // Bytes 52..60 (`unused52` in the kernel struct) must
+                // be zero per `adfs_checkdiscrecord` — this is the
+                // strongest single false-positive guard.
+                let reserved_zero = dr[52..60].iter().all(|&b| b == 0);
+                if (8..=11).contains(&log2_sec)
+                    && secs_per_track >= 1
+                    && heads >= 1
+                    && nzones >= 1
+                    && idlen >= log2_sec + 3
+                    && reserved_zero
+                {
+                    return Some("ADFS".to_string());
+                }
+            }
+        }
+    }
+
+    // Acorn DFS catalog at sectors 0-1 (the small flat catalog FS used
+    // by BBC Micro / AcornElectron 5.25" disks). Title bytes 0..8 at
+    // sector 0 are ASCII, byte 0x105 holds nsectors-low, byte 0x106 the
+    // catalog cycle/version. We don't ship a DFS engine yet — this stub
+    // would return "DFS" once src/fs/dfs.rs lands.
+
+    // Apple DOS 3.3 VTOC at byte 0x11000 (track 17, sector 0). The same
+    // byte offset is a fixed point of the .do/.po sector interleave, so a
+    // PO-ordered .dsk would also surface here — by the time bytes reach
+    // this function the source_reader has already converted PO to DO.
+    // Skip the lookup unless the disk is exactly 140 KB (the only Apple-II
+    // floppy geometry); otherwise the offset might be inside a different
+    // filesystem and false-positive.
+    if let Ok(size) = reader.seek(SeekFrom::End(0)) {
+        if size == 143_360 && reader.seek(SeekFrom::Start(0x11000)).is_ok() {
+            let mut vtoc = [0u8; 256];
+            if reader.read_exact(&mut vtoc).is_ok()
+                && vtoc[0x01] == 17
+                && vtoc[0x02] == 15
+                && (1..=4).contains(&vtoc[0x03])
+                && vtoc[0x27] == 122
+                && vtoc[0x34] == 35
+                && vtoc[0x35] == 16
+                && vtoc[0x36] == 0x00
+                && vtoc[0x37] == 0x01
+            {
+                return Some("DOS 3.3".to_string());
             }
         }
     }
@@ -285,6 +396,58 @@ impl PartitionTable {
             // Fall through if parsing failed (bad checksum etc.) — surface
             // the lower-level error from MBR/superfloppy paths instead.
             reader.seek(SeekFrom::Start(0))?;
+        }
+
+        // Check for AHDI (Atari ST/TT/Falcon hard disks). AHDI has no magic
+        // number; the probe runs only on sectors that lack the 0xAA55 MBR
+        // signature and have at least one validly-shaped partition entry
+        // whose geometry fits the disk size. This must come BEFORE the
+        // superfloppy probe because AHDI disks are HDD-shaped (start at
+        // sector > 0) — superfloppy would not match them anyway, but the
+        // ordering keeps the intent clear.
+        let disk_size_bytes = reader
+            .seek(SeekFrom::End(0))
+            .map_err(RustyBackupError::Io)?;
+        if looks_like_ahdi_root(&mbr_data, disk_size_bytes) {
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+            if let Ok(table) = AhdiTable::detect_and_walk(reader, disk_size_bytes) {
+                return Ok(PartitionTable::Ahdi(table));
+            }
+            // Fall through if walking failed (XGM cycle, etc.) — the
+            // superfloppy / MBR paths still get a chance below.
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+        } else {
+            // Restore reader position for the superfloppy probe.
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(RustyBackupError::Io)?;
+        }
+
+        // Check for X68000 / Human68k partition table. Magic "X68K" lives
+        // at byte 2048 (sector 4 with 512-B sectors, sector 2 with 1024-B
+        // sectors). No boot signature in sector 0, so this MUST run
+        // before the superfloppy probe — a FAT BPB at byte 0 would
+        // otherwise short-circuit detection on a multi-partition HDD.
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+        match X68kPartitionTable::detect(reader) {
+            Ok(Some(table)) => {
+                let size_bytes = reader
+                    .seek(SeekFrom::End(0))
+                    .map_err(RustyBackupError::Io)?;
+                return Ok(PartitionTable::X68k { table, size_bytes });
+            }
+            Ok(None) | Err(_) => {
+                // Restore reader for the superfloppy / MBR paths below.
+                reader
+                    .seek(SeekFrom::Start(0))
+                    .map_err(RustyBackupError::Io)?;
+            }
         }
 
         // Check for superfloppy (no partition table) before MBR parsing
@@ -512,6 +675,89 @@ impl PartitionTable {
                     drv_name: Some(p.drv_name.clone()),
                 })
                 .collect(),
+            PartitionTable::Ahdi(table) => {
+                let mut out: Vec<PartitionInfo> = Vec::new();
+                for (i, e) in table.primary.iter().enumerate() {
+                    if e.is_empty() || !e.exists() {
+                        continue;
+                    }
+                    // XGM is a container, not a filesystem — surface it so the
+                    // user sees the table shape but don't emit a separate row
+                    // when its logical children are about to follow.
+                    out.push(PartitionInfo {
+                        index: i,
+                        type_name: format!("AHDI {}", e.kind.display_name()),
+                        partition_type_byte: e.kind.synthetic_type_byte(),
+                        start_lba: e.start_sector as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable(),
+                        is_logical: false,
+                        is_extended_container: matches!(e.kind, AhdiPartitionKind::Xgm),
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    });
+                }
+                for (j, e) in table.logical.iter().enumerate() {
+                    out.push(PartitionInfo {
+                        index: AHDI_NUM_SLOTS + j,
+                        type_name: format!("AHDI {}", e.kind.display_name()),
+                        partition_type_byte: e.kind.synthetic_type_byte(),
+                        start_lba: e.start_sector as u64,
+                        size_bytes: e.size_bytes(),
+                        bootable: e.bootable(),
+                        is_logical: true,
+                        is_extended_container: false,
+                        partition_type_string: None,
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    });
+                }
+                out
+            }
+            PartitionTable::X68k { table, .. } => {
+                table
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let is_human = e.is_human68k();
+                        let type_name = if is_human {
+                            format!("X68k Human68k ({})", e.name_display)
+                        } else {
+                            format!("X68k {}", e.name_display)
+                        };
+                        PartitionInfo {
+                            index: i,
+                            type_name,
+                            // Reuse the FAT12 byte (0x01) for Human68k so the
+                            // existing FAT auto-detect arm finds the
+                            // partition_type_string-less fallback. Human68k's
+                            // BPB is FAT-compatible so the read path Just
+                            // Works once the offset is right.
+                            partition_type_byte: if is_human { 0x01 } else { 0 },
+                            start_lba: e.start_sector as u64,
+                            size_bytes: e.length_sectors as u64 * X68K_DEFAULT_SECTOR_SIZE,
+                            bootable: false,
+                            is_logical: false,
+                            is_extended_container: false,
+                            // String dispatch into the Human68k engine for
+                            // accurate filesystem reporting (18.3 names +
+                            // Shift-JIS lossy display).
+                            partition_type_string: if is_human {
+                                Some("human68k".to_string())
+                            } else {
+                                None
+                            },
+                            hfs_block_size: None,
+                            rdb_part_block: None,
+                            drv_name: None,
+                        }
+                    })
+                    .collect()
+            }
             PartitionTable::None {
                 size_bytes,
                 fs_hint,
@@ -559,6 +805,8 @@ impl PartitionTable {
             PartitionTable::Apm(_) => "APM",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
+            PartitionTable::Ahdi(_) => "AHDI",
+            PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
         }
     }
@@ -572,6 +820,8 @@ impl PartitionTable {
             PartitionTable::Apm(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
+            | PartitionTable::Ahdi(_)
+            | PartitionTable::X68k { .. }
             | PartitionTable::None { .. } => 0,
         }
     }
@@ -1051,6 +1301,83 @@ mod tests {
             xfs.partition_type_string.is_none(),
             "SGI partitions must route by type byte, not string"
         );
+    }
+
+    #[test]
+    fn test_detect_ahdi_two_partitions() {
+        use byteorder::{BigEndian, ByteOrder};
+        // Build a synthetic AHDI disk: 32 MiB, with GEM @ sector 2 (8 MiB)
+        // and BGM @ sector 16386 (8 MiB). No 0xAA55 trailing signature.
+        let disk_sectors: usize = 65_536;
+        let mut disk = vec![0u8; disk_sectors * 512];
+
+        // GEM at slot 0
+        let s0 = 0x1C6;
+        disk[s0] = 0x01;
+        disk[s0 + 1..s0 + 4].copy_from_slice(b"GEM");
+        BigEndian::write_u32(&mut disk[s0 + 4..s0 + 8], 2);
+        BigEndian::write_u32(&mut disk[s0 + 8..s0 + 12], 16_384);
+
+        // BGM at slot 1
+        let s1 = 0x1C6 + 12;
+        disk[s1] = 0x01;
+        disk[s1 + 1..s1 + 4].copy_from_slice(b"BGM");
+        BigEndian::write_u32(&mut disk[s1 + 4..s1 + 8], 16_386);
+        BigEndian::write_u32(&mut disk[s1 + 8..s1 + 12], 16_384);
+
+        // Disk size field
+        BigEndian::write_u32(&mut disk[0x1F6..0x1FA], disk_sectors as u32);
+
+        // Stamp the AHDI checksum so checksum_valid is true.
+        let mut sum: u32 = 0;
+        for chunk in disk[..512].chunks_exact(2) {
+            sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+        }
+        let cksum = ((0x1234u32.wrapping_sub(sum)) & 0xFFFF) as u16;
+        BigEndian::write_u16(&mut disk[0x1FE..0x200], cksum);
+
+        let mut cursor = Cursor::new(disk);
+        let table = PartitionTable::detect(&mut cursor).expect("AHDI detected");
+        assert_eq!(table.type_name(), "AHDI");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].type_name, "AHDI GEM");
+        assert_eq!(parts[0].start_lba, 2);
+        assert_eq!(parts[0].size_bytes, 16_384u64 * 512);
+        assert_eq!(parts[0].partition_type_byte, 0x01); // FAT12
+        assert_eq!(parts[1].type_name, "AHDI BGM");
+        assert_eq!(parts[1].partition_type_byte, 0x06); // FAT16
+        assert!(!parts[0].is_logical);
+        assert!(!parts[0].is_extended_container);
+    }
+
+    #[test]
+    fn test_detect_ahdi_does_not_fire_on_fat_superfloppy() {
+        // A FAT12 floppy must still resolve to PartitionTable::None — the
+        // AHDI probe should reject when the BPB is valid (`0xEB` JMP + valid
+        // BPB fields) and there is no clean AHDI partition entry shape at
+        // 0x1C6+.
+        let mut data = vec![0u8; 1_474_560];
+        data[0] = 0xEB;
+        data[1] = 0x3C;
+        data[2] = 0x90;
+        data[3..11].copy_from_slice(b"MSDOS5.0");
+        data[11] = 0x00; // 512 bps
+        data[12] = 0x02;
+        data[13] = 0x01;
+        data[14] = 0x01;
+        data[15] = 0x00;
+        data[16] = 0x02;
+        data[21] = 0xF0;
+        // Leave bytes 446..510 zero so the AHDI entries at 0x1C6 are all
+        // empty. AHDI would reject — no exists() entry.
+        data[510] = 0x55;
+        data[511] = 0xAA;
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        assert_eq!(table.partitions()[0].type_name, "FAT");
     }
 
     #[test]

@@ -45,9 +45,9 @@ Actions release workflow already handles this.
 ## Why this changed
 
 Earlier versions of rusty-backup shelled out to a user-installed
-`chdman` for compress/extract operations. The native swap (planned in
-`docs/chdman_replacement.md`) removed that dependency, simplified the
-install story (no PATH tweaking, no per-platform binary fetch), and
-opened the door to features that were awkward across a subprocess
-boundary — most notably the single-file CHD backup layout
-(`docs/whole_disk_chd_backup.md`) and the parent/child diff edit flow.
+`chdman` for compress/extract operations. The native swap removed that
+dependency, simplified the install story (no PATH tweaking, no
+per-platform binary fetch), and opened the door to features that were
+awkward across a subprocess boundary — most notably the single-file CHD
+backup layout (`src/backup/single_file_chd.rs`) and the parent/child
+diff edit flow.

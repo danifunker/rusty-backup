@@ -709,10 +709,124 @@ jobs:
           name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
+  # MiSTer-specific build of `rb-cli` for the FPGA's Intel Cyclone V / Cortex-A9
+  # / Buildroot rootfs (`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline).
+  # Cross-compiled with the GUI and optical features off, but CHD ON — the
+  # upstream `libchdman-rs` armv7 prebuilt ships against Ubuntu 20.04 glibc,
+  # which Cross.toml pins this job to as well so symbols line up.
+  #
+  # The `release` job lists this build in its `needs:` so the workflow waits
+  # for the tarball to upload before publishing, and the upload glob picks it
+  # up alongside the desktop artifacts. `continue-on-error: true` below makes
+  # a transient cross-compile failure non-fatal — the release still proceeds,
+  # just without the MiSTer artifact for that one run.
+  build-rb-cli-mini-armv7:
+    name: Build rb-cli-mini (armv7 MiSTer)
+    needs: generate-version
+    runs-on: ubuntu-latest
+    # Don't fail the whole workflow if the cross-compile breaks. Combined
+    # with the release job's `needs:` entry above, this still gates the
+    # release on the artifact existing — but a failure here lets the desktop
+    # release proceed without the MiSTer tarball rather than blocking it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Install armv7 binutils (host-side strip + objdump)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-arm-linux-gnueabihf file
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-armv7-mister-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build rb-cli-mini for MiSTer armv7 (CHD on, GUI / optical off)
+        env:
+          RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+          # libchdman-rs's build.rs falls back to $HOME/.cache/libchdman-rs
+          # for the prebuilt-archive cache; inside the cross container that
+          # path is on a read-only mount and the build script panics with
+          # "create cache dir: Permission denied". /tmp is a writable tmpfs
+          # in the container, so steering XDG_CACHE_HOME there gives the
+          # fetcher somewhere to land the .a archive. Passthrough for this
+          # var is declared in Cross.toml.
+          XDG_CACHE_HOME: /tmp/libchdman-cache
+        run: |
+          # Cross.toml at the repo root pins the Docker image to cross-rs
+          # v0.2.5 (Ubuntu 20.04 base) so this binary links against the same
+          # glibc baseline as MiSTer's Buildroot rootfs and the upstream
+          # libchdman-rs armv7 prebuilt.
+          cross build \
+            --bin rb-cli \
+            --release \
+            --target armv7-unknown-linux-gnueabihf \
+            --no-default-features \
+            --features chd
+
+      - name: Strip binary
+        run: |
+          arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/rb-cli
+
+      - name: Verify ELF + report glibc linkage
+        run: |
+          set -e
+          ELF=target/armv7-unknown-linux-gnueabihf/release/rb-cli
+          file "$ELF"
+          ls -lh "$ELF"
+          arm-linux-gnueabihf-objdump -p "$ELF" | grep -E 'NEEDED|GLIBC_'
+
+      - name: Package
+        run: |
+          TGZ="rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz"
+          tar -C target/armv7-unknown-linux-gnueabihf/release -czf "$TGZ" rb-cli
+          ls -lh "$TGZ"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
+
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    needs: [generate-version, build-windows, build-macos, build-linux-appimage, build-linux-packages]
+    # The MiSTer armv7 build is in `needs:` so the release waits for its
+    # artifact to upload before publishing — combined with
+    # `continue-on-error: true` on the build job, a transient armv7 failure
+    # is still non-fatal: the release proceeds without the MiSTer artifact
+    # rather than being held indefinitely. When the build succeeds the
+    # tarball is picked up by the `*.tar.gz` glob below and ships in the
+    # release alongside the desktop downloads.
+    needs:
+      - generate-version
+      - build-windows
+      - build-macos
+      - build-linux-appimage
+      - build-linux-packages
+      - build-rb-cli-mini-armv7
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

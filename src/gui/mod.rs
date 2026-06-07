@@ -6,6 +6,7 @@ mod chd_options_ui;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
+mod floppy_convert_dialog;
 mod inspect_tab;
 mod journal_view;
 mod optical_tab;
@@ -105,11 +106,18 @@ fn file_dialog() -> rfd::FileDialog {
 /// worker code. Returns a path to a raw, seekable image — possibly the
 /// original (no work needed) or a tempfile.
 ///
-/// Only handles `.adz` / `.hdz` (gzip-decompressed to a tempfile —
-/// gzip isn't seekable). Everything else — including `.gho`/`.ghs`,
-/// `.imz`, `.chd` — passes through unchanged, since the inspect worker
-/// opens those via [`open_disk_image_for_reading`] (streaming
-/// `Read + Seek` readers, no tempfile).
+/// Handles three wrapper formats whose raw stream isn't seekable / flat:
+/// - `.adz` / `.hdz` — gzip-decompressed to a tempfile (gzip isn't
+///   seekable).
+/// - `.msa` — Atari ST Magic Shadow Archiver, decoded to a flat `.st`
+///   tempfile.
+/// - `.d88` — Sharp Japanese-emulator floppy container (X68000 / PC-88 /
+///   PC-98 / MSX / FM-7), decoded to a flat raw-sector tempfile.
+///
+/// Everything else — including `.gho`/`.ghs`, `.imz`, `.chd` — passes
+/// through unchanged, since the inspect worker opens those via
+/// [`open_disk_image_for_reading`] (streaming `Read + Seek` readers,
+/// no tempfile).
 ///
 /// The output file lives inside a fresh `tempfile::tempdir`; callers
 /// must hold the returned `TempDir` (second tuple element) for the
@@ -129,8 +137,87 @@ pub fn prepare_disk_image_path(
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
         Some("hdz") => "hdf",
+        Some("msa") => "st",
+        Some("d88") => "img",
+        Some("xdf") | Some("hdm") | Some("dim") => "img",
         _ => return Ok((path.to_path_buf(), None)),
     };
+    let tmp = tempfile::tempdir()?;
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
+
+    if target_ext == "st" {
+        // MSA → flat raw sectors, written to a tempfile so the rest of the
+        // GUI pipeline (which addresses partitions by byte offset on a
+        // path) sees a plain `.st` image.
+        let bytes = std::fs::read(path)?;
+        let flat = rusty_backup::rbformats::containers::msa::decode_msa_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, MSA decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len()
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+    if target_ext == "img" && ext.as_deref() == Some("d88") {
+        // D88 → flat raw sectors. Same shape as MSA: small floppy
+        // (~1.5 MB max for 2HD), in-memory decode, tempfile drop-in.
+        let bytes = std::fs::read(path)?;
+        let flat = rusty_backup::rbformats::containers::d88::decode_d88_bytes(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}")))?;
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, D88 decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len()
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+    if target_ext == "img" && matches!(ext.as_deref(), Some("xdf") | Some("hdm") | Some("dim")) {
+        let bytes = std::fs::read(path)?;
+        let (flat, label) = match ext.as_deref() {
+            Some("xdf") => (
+                rusty_backup::rbformats::containers::xdf::decode_xdf_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "XDF",
+            ),
+            Some("hdm") => (
+                rusty_backup::rbformats::containers::hdm::decode_hdm_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "HDM",
+            ),
+            Some("dim") => (
+                rusty_backup::rbformats::containers::dim::decode_dim_bytes(&bytes)
+                    .map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:#}"))
+                    })?
+                    .0,
+                "DIM",
+            ),
+            _ => unreachable!("guarded by outer match arm"),
+        };
+        std::fs::write(&out_path, &flat)?;
+        log::info!(
+            "Materialized {} -> {} ({} bytes, {} decoded)",
+            path.display(),
+            out_path.display(),
+            flat.len(),
+            label
+        );
+        return Ok((out_path, Some(tmp)));
+    }
+
+    // Gzip-wrapped Amiga images (.adz / .hdz).
     let mut input = std::fs::File::open(path)?;
     // Spot-check the gzip magic so we surface a clear error if the
     // user renamed something to .adz that isn't actually gzipped.
@@ -145,9 +232,6 @@ pub fn prepare_disk_image_path(
     }
     use std::io::Seek;
     input.seek(std::io::SeekFrom::Start(0))?;
-    let tmp = tempfile::tempdir()?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("amiga");
-    let out_path = tmp.path().join(format!("{}.{}", stem, target_ext));
     let mut decoder = flate2::read::GzDecoder::new(input);
     let mut out = std::fs::File::create(&out_path)?;
     std::io::copy(&mut decoder, &mut out)?;
@@ -396,14 +480,20 @@ impl Default for RustyBackupApp {
 /// `NeedsElevation`/`Elevated` are only constructed on Windows; on other
 /// platforms `elevation_gate()` always returns `NotApplicable`.
 #[derive(Clone, Copy, PartialEq)]
-#[cfg_attr(not(windows), allow(dead_code))]
 enum ElevationGate {
     /// Not a gated platform (Linux/macOS handle elevation their own way) — the
-    /// normal "Refresh Devices" control applies.
+    /// normal "Refresh Devices" control applies. Only constructed on
+    /// non-Windows builds; the cfg_attr below silences the resulting
+    /// "variant never constructed" warning on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     NotApplicable,
     /// Windows, not elevated — show the shielded "Show Physical Devices" button.
+    /// Constructed only inside `#[cfg(windows)]` paths.
+    #[cfg_attr(not(windows), allow(dead_code))]
     NeedsElevation,
     /// Windows, already elevated — devices are available, show "Refresh Devices".
+    /// Constructed only inside `#[cfg(windows)]` paths.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Elevated,
 }
 
@@ -882,6 +972,16 @@ impl eframe::App for RustyBackupApp {
                 self.archives_tab.show(ui, &mut self.log_panel);
             }
         });
+
+        // Workflow D.2 auto-unwrap: the Archives tab queues a payload
+        // when the user clicks "Mount in new Inspect tab". Drain here,
+        // hand it to the Inspect tab (which owns the tempdir guard so
+        // the file survives), and switch tabs.
+        if let Some(open) = self.archives_tab.take_pending_inspect_open() {
+            self.inspect_tab
+                .load_image_with_tempdir(open.path, Some(open.guard));
+            self.active_tab = Tab::Inspect;
+        }
 
         // Show settings dialog if open
         self.settings_dialog.show(ctx);

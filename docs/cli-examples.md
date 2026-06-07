@@ -1,9 +1,8 @@
 # `rb-cli` examples
 
 Recipe-style snippets. Each block is self-contained and runs against the
-tempdir / fixture images noted at the top. The grammar is the stable
-flat-verb surface defined in `docs/cli-todo.md` and reflected in
-`docs/cli-reference.md`.
+tempdir / fixture images noted at the top. The canonical grammar lives in
+`rb-cli --help` and the auto-generated `docs/cli-reference.md`.
 
 Topics:
 

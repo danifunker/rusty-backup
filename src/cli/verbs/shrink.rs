@@ -19,5 +19,16 @@ pub struct ShrinkArgs {
 }
 
 pub fn run(args: ShrinkArgs) -> Result<()> {
-    crate::cli::api::sgi::cmd_shrink(args.input, args.output)
+    #[cfg(feature = "chd")]
+    {
+        crate::cli::api::sgi::cmd_shrink(args.input, args.output)
+    }
+    #[cfg(not(feature = "chd"))]
+    {
+        let _ = args;
+        anyhow::bail!(
+            "this binary was built without the `chd` feature; \
+             `rb-cli shrink` writes a CHD output and is unavailable"
+        )
+    }
 }

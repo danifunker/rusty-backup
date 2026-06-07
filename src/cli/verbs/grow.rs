@@ -10,12 +10,16 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::path::PathBuf;
+#[cfg(feature = "chd")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "chd")]
 use std::time::Duration;
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
+#[cfg(feature = "chd")]
 use crate::model::chd_expand_runner;
+#[cfg(feature = "chd")]
 use crate::model::status::ChdExpandStatus;
 use crate::partition::format_size;
 
@@ -42,13 +46,23 @@ pub fn run(args: GrowArgs) -> Result<()> {
         .unwrap_or(false);
 
     if is_chd {
-        log_stderr(format!(
-            "rb-cli grow: re-encoding {} (+{})",
-            args.image.display(),
-            format_size(add)
-        ));
-        let status = chd_expand_runner::spawn(args.image.clone(), add);
-        drain_chd(status)
+        #[cfg(feature = "chd")]
+        {
+            log_stderr(format!(
+                "rb-cli grow: re-encoding {} (+{})",
+                args.image.display(),
+                format_size(add)
+            ));
+            let status = chd_expand_runner::spawn(args.image.clone(), add);
+            drain_chd(status)
+        }
+        #[cfg(not(feature = "chd"))]
+        {
+            bail!(
+                "this binary was built without the `chd` feature; \
+                 growing a .chd image requires the full build"
+            )
+        }
     } else {
         let mut f = std::fs::OpenOptions::new()
             .read(true)
@@ -77,6 +91,7 @@ pub fn run(args: GrowArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "chd")]
 fn drain_chd(status: Arc<Mutex<ChdExpandStatus>>) -> Result<()> {
     let mut last_pct: i32 = -1;
     loop {

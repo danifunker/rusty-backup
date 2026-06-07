@@ -1,7 +1,32 @@
 pub mod disk_image_stream;
 pub mod format;
 pub mod metadata;
+#[cfg(feature = "chd")]
 pub mod single_file_chd;
+/// Stub for `single_file_chd` when the `chd` feature is off — provides
+/// the public surface (`is_supported`, `run_export`, `SingleFileChdExportInputs`)
+/// that callers reference, all routing to a typed error or `false`.
+#[cfg(not(feature = "chd"))]
+pub mod single_file_chd {
+    use crate::partition::PartitionTable;
+    use anyhow::{bail, Result};
+    use std::path::PathBuf;
+
+    pub fn is_supported(_table: &PartitionTable) -> bool {
+        false
+    }
+
+    /// Stand-in for the real input struct; the runner never reads these
+    /// because [`run_export`] always errors first.
+    pub struct SingleFileChdExportInputs {
+        pub source_path: PathBuf,
+        pub output_path: PathBuf,
+    }
+
+    pub fn run_export(_inputs: SingleFileChdExportInputs) -> Result<()> {
+        bail!("chd feature not built into this binary")
+    }
+}
 mod sizes;
 pub mod verify;
 
@@ -524,6 +549,30 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             );
             bail!("backing up SGI disks is not yet supported (browse only)");
         }
+        PartitionTable::Ahdi(table) => {
+            // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
+            // restore knows the AHDI primary slots, XGM chain, and disk-size
+            // / bad-sector fields. Per-partition FAT data backup rides the
+            // standard layout-preserving path through the existing FAT
+            // pipeline.
+            let json = serde_json::to_string_pretty(table)
+                .context("failed to serialize AHDI table to JSON")?;
+            std::fs::write(backup_folder.join("ahdi.json"), json)
+                .context("failed to write ahdi.json")?;
+            log(&progress, LogLevel::Info, "Exported AHDI (ahdi.json)");
+        }
+        PartitionTable::X68k { table, .. } => {
+            // Mirror the AHDI sidecar shape: emit x68k.json so restore
+            // knows the X68k SASI slots, disk-size field, and partition
+            // start/length. Per-partition Human68k (FAT-derived) backup
+            // rides the standard layout-preserving path through the
+            // existing FAT pipeline.
+            let json = serde_json::to_string_pretty(table)
+                .context("failed to serialize X68k table to JSON")?;
+            std::fs::write(backup_folder.join("x68k.json"), json)
+                .context("failed to write x68k.json")?;
+            log(&progress, LogLevel::Info, "Exported X68k (x68k.json)");
+        }
         PartitionTable::None { fs_hint, .. } => {
             log(
                 &progress,
@@ -719,6 +768,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
     // source has a partition table single_file_chd can handle, synthesise a
     // whole-disk image into one CHD and skip the per-partition loop. Falls
     // through to the legacy per-partition path otherwise.
+    #[cfg(feature = "chd")]
     if single_file_chd_planned {
         return run_single_file_chd_path(
             &config,
@@ -734,6 +784,13 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
             &defragmented_min_sizes,
             &clone_target_sizes,
             &clone_shapes,
+        );
+    }
+    #[cfg(not(feature = "chd"))]
+    if single_file_chd_planned {
+        anyhow::bail!(
+            "this binary was built without the `chd` feature; \
+             single-file CHD backups are unavailable"
         );
     }
     // CHD/DVD selected on a source single_file_chd can't handle (only
@@ -1439,6 +1496,7 @@ pub fn run_backup(config: BackupConfig, progress: Arc<Mutex<BackupProgress>>) ->
 /// partition's bytes as zstd into a temp dir, then folds the staging
 /// files into the final CHD without a whole-disk scratch image.
 #[allow(clippy::too_many_arguments)] // intentional — pulls run_backup's locals
+#[cfg(feature = "chd")]
 fn run_single_file_chd_path(
     config: &BackupConfig,
     progress: &Arc<Mutex<BackupProgress>>,

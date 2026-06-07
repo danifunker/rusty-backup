@@ -85,17 +85,6 @@ impl XfsDinodeCore {
     }
 }
 
-/// Byte offset of the data fork inside an on-disk inode. v1/v2 inodes have a
-/// 100-byte core (offsetof(`di_crc`)); v3 (v5/CRC) inodes grow the core to
-/// 176 bytes (offsetof(`di_literal_area`)).
-pub fn fork_offset(is_v5: bool) -> usize {
-    if is_v5 {
-        176
-    } else {
-        100
-    }
-}
-
 /// Translate an XFS inode number into a byte offset relative to the start of
 /// the partition.
 ///

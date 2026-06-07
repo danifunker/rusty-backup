@@ -8,7 +8,9 @@
 //! functions that delegate to the appropriate format-specific code.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+#[cfg(feature = "chd")]
+use std::io::BufReader;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -47,7 +49,9 @@ pub enum ExportFormat {
     Woz,
     /// DiskCopy 4.2 (Mac / Apple IIgs) — floppy-only: 400K / 720K / 800K / 1440K sources.
     Dc42,
-    /// MAME CHD, hard-disk profile (512-byte unit).
+    /// MAME CHD, hard-disk profile (512-byte unit). Behind the `chd`
+    /// feature; the slim rb-cli-mini build still exposes the variant for
+    /// API compatibility but the writer errors out at runtime.
     Chd,
     /// MAME CHD, DVD profile (2048-byte unit, MAME 0.287+).
     ChdDvd,
@@ -64,6 +68,15 @@ pub enum ExportFormat {
     /// so it never reaches `write_header`/`write_footer` or the whole-disk /
     /// per-partition streaming functions. HFS-only, per-partition only, ≤2047 MB.
     Hfv,
+    /// X68000 XDF — raw headerless floppy dump. Intercepted by the bulk
+    /// runner and routed through [`crate::rbformats::containers::convert_floppy_container`].
+    Xdf,
+    /// PC-98 / DiskExplorer HDM — byte-identical layout to XDF.
+    Hdm,
+    /// DiskExplorer DIM — DIFC 256-byte header + flat payload.
+    Dim,
+    /// Sharp D88 — sparse 32-byte header + 164-entry track-offset table.
+    D88,
 }
 
 impl ExportFormat {
@@ -80,6 +93,10 @@ impl ExportFormat {
             Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
             Self::BinCue => "cue",
             Self::Hfv => "hfv",
+            Self::Xdf => "xdf",
+            Self::Hdm => "hdm",
+            Self::Dim => "dim",
+            Self::D88 => "d88",
         }
     }
 
@@ -100,6 +117,10 @@ impl ExportFormat {
             Self::ChdCd => "CD CHD",
             Self::BinCue => "BIN/CUE",
             Self::Hfv => "BasiliskII HFV",
+            Self::Xdf => "X68000 XDF",
+            Self::Hdm => "PC-98 HDM",
+            Self::Dim => "DiskExplorer DIM",
+            Self::D88 => "Sharp D88",
         }
     }
 
@@ -121,13 +142,42 @@ impl ExportFormat {
             Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
             Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
             Self::Hfv => ("BasiliskII HFV", &["hfv"]),
+            Self::Xdf => ("X68000 XDF", &["xdf"]),
+            Self::Hdm => ("PC-98 HDM", &["hdm"]),
+            Self::Dim => ("DiskExplorer DIM", &["dim"]),
+            Self::D88 => ("Sharp D88", &["d88"]),
         }
     }
 
     /// True if this format can only wrap a floppy-sized image.
     /// WOZ: 140K / 400K / 800K. DiskCopy 4.2: 400K / 720K / 800K / 1440K.
+    /// XDF / HDM / DIM / D88: the four-element X68k / PC-98 floppy geometry set.
     pub fn is_floppy_only(&self) -> bool {
-        matches!(self, Self::Woz | Self::Dc42)
+        matches!(
+            self,
+            Self::Woz | Self::Dc42 | Self::Xdf | Self::Hdm | Self::Dim | Self::D88
+        )
+    }
+
+    /// True if this format is one of the four X68000 / PC-98 floppy
+    /// containers handled by
+    /// [`crate::rbformats::containers::convert_floppy_container`].
+    pub fn is_x68k_floppy(&self) -> bool {
+        matches!(self, Self::Xdf | Self::Hdm | Self::Dim | Self::D88)
+    }
+
+    /// Map an X68k floppy export target to the corresponding
+    /// [`crate::rbformats::containers::ContainerKind`]. Returns `None` for
+    /// non-floppy formats.
+    pub fn to_floppy_container_kind(self) -> Option<crate::rbformats::containers::ContainerKind> {
+        use crate::rbformats::containers::ContainerKind;
+        match self {
+            Self::Xdf => Some(ContainerKind::Xdf),
+            Self::Hdm => Some(ContainerKind::Hdm),
+            Self::Dim => Some(ContainerKind::Dim),
+            Self::D88 => Some(ContainerKind::D88),
+            _ => None,
+        }
     }
 
     /// Write the format header (if any) to `writer`. Returns bytes written.
@@ -542,6 +592,7 @@ pub fn export_whole_disk(
     // CHD outputs go through libchdman-rs. Bulk-convert is the only caller
     // today and uses a separate entry point that threads `ChdOptions`; the
     // generic export path here defaults the codecs/hunk-size from chdman.
+    #[cfg(feature = "chd")]
     if format == ExportFormat::Chd || format == ExportFormat::ChdDvd {
         let profile = if format == ExportFormat::Chd {
             super::chd_options::ChdProfile::Hd
@@ -562,12 +613,25 @@ pub fn export_whole_disk(
         );
     }
 
+    #[cfg(feature = "chd")]
     if format == ExportFormat::ChdCd {
         return export_whole_disk_chd_cd(source_path, dest_path, None, cancel_check, log_cb);
     }
 
+    #[cfg(feature = "chd")]
     if format == ExportFormat::BinCue {
         return export_whole_disk_bincue(source_path, dest_path, false, cancel_check, log_cb);
+    }
+
+    #[cfg(not(feature = "chd"))]
+    if matches!(
+        format,
+        ExportFormat::Chd | ExportFormat::ChdDvd | ExportFormat::ChdCd | ExportFormat::BinCue
+    ) {
+        anyhow::bail!(
+            "this binary was built without the `chd` feature; \
+             CHD / BIN/CUE output is unavailable"
+        );
     }
 
     // WOZ and DiskCopy 4.2: floppy-only.  Reconstruct (or slurp) the source
@@ -1391,6 +1455,7 @@ fn export_whole_disk_vmdk_sparse(
 /// image files; full backup-folder reconstruction into CHD can be added later
 /// if needed.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "chd")]
 pub fn export_whole_disk_chd(
     source_path: &Path,
     backup_metadata: Option<&BackupMetadata>,
@@ -1519,6 +1584,8 @@ pub fn export_whole_disk_chd(
 /// `to_chd` writes into a shared `ConvertProgress` on its own clock. The
 /// bulk-convert UI shows per-file progress (the per-CHD worker bumps the
 /// file index when it returns) which is granular enough for the dialog.
+#[cfg(feature = "chd")]
+#[allow(unused_variables, unused_mut)]
 pub fn export_whole_disk_chd_cd(
     source_path: &Path,
     dest_path: &Path,
@@ -1526,23 +1593,35 @@ pub fn export_whole_disk_chd_cd(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::optical::convert::{to_chd, ConvertProgress};
-    use std::sync::{Arc, Mutex};
+    // The CD ↔ CHD path lives in src/optical/convert.rs and uses the
+    // `opticaldiscs` crate to parse cuesheets and the data-track layout.
+    // When the `optical` feature is off (rb-cli-mini MiSTer build), the
+    // engine isn't present; bail cleanly rather than half-implementing it.
+    #[cfg(not(feature = "optical"))]
+    anyhow::bail!(
+        "CD CHD export requires the `optical` feature; \
+         this binary was built without it"
+    );
+    #[cfg(feature = "optical")]
+    {
+        use crate::optical::convert::{to_chd, ConvertProgress};
+        use std::sync::{Arc, Mutex};
 
-    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
-    if cancel_check() {
-        if let Ok(mut s) = shared.lock() {
-            s.cancel_requested = true;
+        let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+        if cancel_check() {
+            if let Ok(mut s) = shared.lock() {
+                s.cancel_requested = true;
+            }
         }
-    }
-    to_chd(source_path, dest_path, chd_options, Arc::clone(&shared))?;
+        to_chd(source_path, dest_path, chd_options, Arc::clone(&shared))?;
 
-    log_cb(&format!(
-        "CD CHD export complete: {} -> {}",
-        source_path.display(),
-        dest_path.display(),
-    ));
-    Ok(())
+        log_cb(&format!(
+            "CD CHD export complete: {} -> {}",
+            source_path.display(),
+            dest_path.display(),
+        ));
+        Ok(())
+    }
 }
 
 /// Export a CD CHD as a BIN/CUE pair (single-bin or multi-bin).
@@ -1550,6 +1629,8 @@ pub fn export_whole_disk_chd_cd(
 /// Single-bin output mirrors chdman's `extractcd`. Multi-bin output writes one
 /// `<base> (Track NN).bin` per track and a multi-FILE cue — a feature beyond
 /// chdman built on top of libchdman-rs's track metadata.
+#[cfg(feature = "chd")]
+#[allow(unused_variables, unused_mut)]
 pub fn export_whole_disk_bincue(
     source_chd: &Path,
     dest_cue: &Path,
@@ -1557,27 +1638,39 @@ pub fn export_whole_disk_bincue(
     cancel_check: impl Fn() -> bool,
     mut log_cb: impl FnMut(&str),
 ) -> Result<()> {
-    use crate::optical::convert::{chd_to_bincue, chd_to_bincue_multi, ConvertProgress};
-    use std::sync::{Arc, Mutex};
+    // Same shape as `export_whole_disk_chd_cd`: the CHD ↔ BIN/CUE engine
+    // lives under src/optical/, so without the `optical` feature the
+    // implementation isn't compiled in. The rb-cli-mini MiSTer build hits
+    // this branch — bail cleanly rather than silently doing nothing.
+    #[cfg(not(feature = "optical"))]
+    anyhow::bail!(
+        "BIN/CUE export requires the `optical` feature; \
+         this binary was built without it"
+    );
+    #[cfg(feature = "optical")]
+    {
+        use crate::optical::convert::{chd_to_bincue, chd_to_bincue_multi, ConvertProgress};
+        use std::sync::{Arc, Mutex};
 
-    let shared = Arc::new(Mutex::new(ConvertProgress::new()));
-    if cancel_check() {
-        if let Ok(mut s) = shared.lock() {
-            s.cancel_requested = true;
+        let shared = Arc::new(Mutex::new(ConvertProgress::new()));
+        if cancel_check() {
+            if let Ok(mut s) = shared.lock() {
+                s.cancel_requested = true;
+            }
         }
-    }
-    if multi_bin {
-        chd_to_bincue_multi(source_chd, dest_cue, Arc::clone(&shared))?;
-    } else {
-        chd_to_bincue(source_chd, dest_cue, Arc::clone(&shared))?;
-    }
+        if multi_bin {
+            chd_to_bincue_multi(source_chd, dest_cue, Arc::clone(&shared))?;
+        } else {
+            chd_to_bincue(source_chd, dest_cue, Arc::clone(&shared))?;
+        }
 
-    log_cb(&format!(
-        "BIN/CUE export complete ({}): {}",
-        if multi_bin { "multi-bin" } else { "single-bin" },
-        dest_cue.display(),
-    ));
-    Ok(())
+        log_cb(&format!(
+            "BIN/CUE export complete ({}): {}",
+            if multi_bin { "multi-bin" } else { "single-bin" },
+            dest_cue.display(),
+        ));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

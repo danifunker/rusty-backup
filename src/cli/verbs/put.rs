@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::{split_mac_path, ZeroReader};
-use crate::cli::resolve::resolve_partition_rw;
+use crate::cli::resolve::{resolve_partition_rw, FsDispatchOverride};
 use crate::fs::filesystem::CreateFileOptions;
 
 #[derive(Debug, Args)]
@@ -71,6 +71,9 @@ pub struct PutArgs {
     /// describe.
     #[arg(long = "print-offset")]
     pub print_offset: bool,
+
+    #[command(flatten)]
+    pub fs_override: FsDispatchOverride,
 }
 
 pub fn run(args: PutArgs) -> Result<()> {
@@ -98,7 +101,8 @@ pub fn run(args: PutArgs) -> Result<()> {
         bail!("destination path has no filename");
     }
 
-    let (file, ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, mut ctx) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,

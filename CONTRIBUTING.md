@@ -1,6 +1,6 @@
 # Contributing to Rusty Backup
 
-This document describes how to contribute code to Rusty Backup. The first half is the usual setup / build / test / commit info. The second half — **Architecture & code-placement rules** — is the important part: it captures the lessons from the large late april refactor (`docs/codecleanup.md`) so that future code lands in the right place the first time and we don't have to do that kind of cleanup pass again.
+This document describes how to contribute code to Rusty Backup. The first half is the usual setup / build / test / commit info. The second half — **Architecture & code-placement rules** — is the important part: it captures the lessons from the large late-april refactor (the in-tree audit checklist that drove it has since been retired) so that future code lands in the right place the first time and we don't have to do that kind of cleanup pass again.
 
 If you only read one section, read **"Where code lives"** and **"Adding a feature: the playbook"**.
 
@@ -201,7 +201,7 @@ When parsing an on-disk structure (BPB, MFT record, MDB, ext superblock, GPT ent
 
 ## Patterns to avoid (the things we considered and rejected)
 
-The refactor explicitly considered and rejected several "obvious cleanups" that would have made things worse. **Don't propose these in PRs without strong new evidence.** The full reasoning is in `docs/codecleanup.md` §2 and §6; the short version:
+The refactor explicitly considered and rejected several "obvious cleanups" that would have made things worse. **Don't propose these in PRs without strong new evidence.** The short version:
 
 - **Trait splits (Reader / Inspector / Repair).** Every consumer uses the full `Filesystem` trait. Splitting forces dispatch duplication and per-module preferred slices for no payoff.
 - **Capability bitset (`fn capabilities() -> Capabilities`).** GUI gates buttons by partition type byte using `is_browsable_type`, `is_checkable_type`, `is_classic_hfs`, etc. — the existing pattern works without opening the filesystem first. A bitset would duplicate type-byte logic.
@@ -211,7 +211,7 @@ The refactor explicitly considered and rejected several "obvious cleanups" that 
 - **mpsc-channel migration of progress reporting.** See "Background work" above.
 - **Rolling per-revision ext modules (ext2/ext3/ext4).** They're feature bits on one superblock, not separate codebases.
 
-If you think one of these *now* makes sense for new work, that's fine — but the bar is real new evidence (e.g. a third consumer with a genuinely different shape), not "this would be cleaner." Cite the codecleanup.md entry when proposing it.
+If you think one of these *now* makes sense for new work, that's fine — but the bar is real new evidence (e.g. a third consumer with a genuinely different shape), not "this would be cleaner." Spell out the new evidence in the PR description.
 
 ---
 
@@ -250,7 +250,7 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 ## Commit & PR guidelines
 
 - Write commit messages that explain the **why**, not the **what** — the diff shows what changed.
-- Reference an issue or doc section if applicable (e.g. `docs/codecleanup.md §5`).
+- Reference an issue or doc section if applicable (e.g. `docs/OPEN-WORK.md §2.1`).
 - One logical change per commit. The pre-commit hook runs `cargo fmt`, so don't bundle formatting noise.
 - Before opening a PR: `cargo build --all-targets` (zero warnings), `cargo test --lib` (green), `cargo clippy` (no new warnings on touched files).
 - PR description: what changed, why, and any architectural decisions worth flagging (especially if you went near a "considered and rejected" pattern).
@@ -260,12 +260,10 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 ## Reference docs
 
 - [`CLAUDE.md`](CLAUDE.md) — top-level architecture overview and per-area pointers
-- [`docs/codecleanup.md`](docs/codecleanup.md) — the refactor checklist; reasoning behind every "yes we did this" and "no we rejected this"
+- [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) — every open feature gap, with design detail per item. Start here when picking up new work.
+- [`docs/mister_filesystem_implementation_plan.md`](docs/mister_filesystem_implementation_plan.md) — the multi-wave MiSTer parity plan (its own track)
 - [`docs/progress_pattern.md`](docs/progress_pattern.md) — background-work pattern (callbacks + Status + GUI poll)
 - [`src/fs/README.md`](src/fs/README.md) — filesystem trait + compact-reader sizing model
 - [`src/rbformats/README.md`](src/rbformats/README.md) — backup format codecs
 - [`docs/fsck.md`](docs/fsck.md) — fsck architecture (shared types, per-FS phases)
 - [`docs/editing.md`](docs/editing.md) — staged-edit / EditableFilesystem pattern
-- [`docs/TODO_missing_features.md`](docs/TODO_missing_features.md) — feature gaps (not refactor work)
-
-When in doubt: read the relevant `codecleanup.md` section before adding code. It will tell you whether the shape you're about to add was considered and rejected, and why.

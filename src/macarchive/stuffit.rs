@@ -344,8 +344,7 @@ pub enum WriteMethod {
     Rle,
 }
 
-/// A single file to place into a StuffIt archive (top level; folders are not
-/// emitted by the writer yet).
+/// A single file to place into a StuffIt archive.
 #[derive(Debug, Clone)]
 pub struct StuffItInput {
     /// Mac filename (truncated to 31 bytes).
@@ -358,6 +357,26 @@ pub struct StuffItInput {
     pub mod_date: u32,
     pub data_fork: Vec<u8>,
     pub resource_fork: Vec<u8>,
+}
+
+/// A node in a StuffIt input tree — either a file or a folder containing
+/// further nodes. Used by [`build_archive_tree`] to emit nested directory
+/// structures via the START_FOLDER (0x20) / END_FOLDER (0x21) marker
+/// entries that classic StuffIt uses for hierarchy.
+#[derive(Debug, Clone)]
+pub enum StuffItInputNode {
+    File(StuffItInput),
+    Folder {
+        /// Mac folder name (truncated to 31 bytes).
+        name: String,
+        /// Finder flags; usually 0 for ordinary folders.
+        finder_flags: u16,
+        /// Mac 1904-epoch timestamps; 0 is acceptable.
+        create_date: u32,
+        mod_date: u32,
+        /// Nested entries inside this folder, in archive order.
+        children: Vec<StuffItInputNode>,
+    },
 }
 
 /// Compress a fork for writing, returning `(method_byte, bytes)`.
@@ -382,54 +401,35 @@ fn compress_fork(data: &[u8], method: WriteMethod) -> (u8, Vec<u8>) {
 /// [`parse`] and is accepted by The Unarchiver. The 16-bit archive-header field
 /// at offset 20 (whose derivation is unknown and which XAD ignores) is written
 /// as zero.
+///
+/// Use [`build_archive_tree`] when you need to emit nested directory
+/// structures; this entry point keeps the older flat-file shape for callers
+/// that build a single top-level entry list.
 pub fn build_archive(files: &[StuffItInput], method: WriteMethod) -> Result<Vec<u8>> {
+    let nodes: Vec<StuffItInputNode> = files.iter().cloned().map(StuffItInputNode::File).collect();
+    build_archive_tree(&nodes, method)
+}
+
+/// Build a classic StuffIt (`.sit`) archive from a node tree, emitting
+/// START_FOLDER (0x20) / END_FOLDER (0x21) marker entries for nested
+/// directories. Children of a `Folder` node appear between its start
+/// and end markers; the round-trip through [`parse`] reconstructs the
+/// directory path in each entry's `path` field.
+///
+/// The archive-header `num_files` field is written as the **top-level**
+/// entry count, matching what classic StuffIt produced. Readers
+/// (including ours) iterate entries until they hit `archiveLength`,
+/// so this field is informational.
+pub fn build_archive_tree(tree: &[StuffItInputNode], method: WriteMethod) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-
-    for f in files {
-        let name_bytes = mac_name_bytes(&f.name);
-        let namelen = name_bytes.len();
-
-        let (rmethod, rcomp) = if f.resource_fork.is_empty() {
-            (0u8, Vec::new())
-        } else {
-            compress_fork(&f.resource_fork, method)
-        };
-        let (dmethod, dcomp) = compress_fork(&f.data_fork, method);
-
-        let mut h = [0u8; ENTRY_HEADER_LEN];
-        h[0] = rmethod;
-        h[1] = dmethod;
-        h[2] = namelen as u8;
-        h[3..3 + namelen].copy_from_slice(&name_bytes);
-        // [34..36] filename CRC (size byte + name); not verified by readers.
-        let fname_crc = crc16_arc(&h[2..3 + namelen]);
-        BigEndian::write_u16(&mut h[34..36], fname_crc);
-        h[66..70].copy_from_slice(&f.type_code);
-        h[70..74].copy_from_slice(&f.creator_code);
-        BigEndian::write_u16(&mut h[74..76], f.finder_flags);
-        BigEndian::write_u32(&mut h[76..80], f.create_date);
-        BigEndian::write_u32(&mut h[80..84], f.mod_date);
-        BigEndian::write_u32(&mut h[84..88], f.resource_fork.len() as u32);
-        BigEndian::write_u32(&mut h[88..92], f.data_fork.len() as u32);
-        BigEndian::write_u32(&mut h[92..96], rcomp.len() as u32);
-        BigEndian::write_u32(&mut h[96..100], dcomp.len() as u32);
-        BigEndian::write_u16(&mut h[100..102], crc16_arc(&f.resource_fork));
-        BigEndian::write_u16(&mut h[102..104], crc16_arc(&f.data_fork));
-        // [62..66] child offset: -1 marks a file entry (as real archives do).
-        h[62..66].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
-        // Header CRC over the first 110 bytes.
-        let hdr_crc = crc16_arc(&h[0..110]);
-        BigEndian::write_u16(&mut h[110..112], hdr_crc);
-
-        body.extend_from_slice(&h);
-        body.extend_from_slice(&rcomp);
-        body.extend_from_slice(&dcomp);
+    for node in tree {
+        emit_node(&mut body, node, method);
     }
 
     let total = (ARCHIVE_HEADER_LEN + body.len()) as u32;
     let mut out = Vec::with_capacity(total as usize);
     out.extend_from_slice(b"SIT!");
-    out.extend_from_slice(&(files.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(tree.len() as u16).to_be_bytes());
     out.extend_from_slice(&total.to_be_bytes());
     out.extend_from_slice(b"rLau");
     out.push(1); // version
@@ -439,6 +439,118 @@ pub fn build_archive(files: &[StuffItInput], method: WriteMethod) -> Result<Vec<
     debug_assert_eq!(out.len(), ARCHIVE_HEADER_LEN);
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Serialize a single node (file or folder) into `body`. For folders this
+/// emits the START marker, recurses into each child, and emits the END
+/// marker; for files it writes the standard 112-byte header + forks.
+fn emit_node(body: &mut Vec<u8>, node: &StuffItInputNode, method: WriteMethod) {
+    match node {
+        StuffItInputNode::File(f) => emit_file_entry(body, f, method),
+        StuffItInputNode::Folder {
+            name,
+            finder_flags,
+            create_date,
+            mod_date,
+            children,
+        } => {
+            emit_folder_marker(
+                body,
+                name,
+                *finder_flags,
+                *create_date,
+                *mod_date,
+                START_FOLDER,
+            );
+            for child in children {
+                emit_node(body, child, method);
+            }
+            emit_folder_marker(body, "", 0, 0, 0, END_FOLDER);
+        }
+    }
+}
+
+fn emit_file_entry(body: &mut Vec<u8>, f: &StuffItInput, method: WriteMethod) {
+    let name_bytes = mac_name_bytes(&f.name);
+    let namelen = name_bytes.len();
+
+    let (rmethod, rcomp) = if f.resource_fork.is_empty() {
+        (0u8, Vec::new())
+    } else {
+        compress_fork(&f.resource_fork, method)
+    };
+    let (dmethod, dcomp) = compress_fork(&f.data_fork, method);
+
+    let mut h = [0u8; ENTRY_HEADER_LEN];
+    h[0] = rmethod;
+    h[1] = dmethod;
+    h[2] = namelen as u8;
+    h[3..3 + namelen].copy_from_slice(&name_bytes);
+    // [34..36] filename CRC (size byte + name); not verified by readers.
+    let fname_crc = crc16_arc(&h[2..3 + namelen]);
+    BigEndian::write_u16(&mut h[34..36], fname_crc);
+    h[66..70].copy_from_slice(&f.type_code);
+    h[70..74].copy_from_slice(&f.creator_code);
+    BigEndian::write_u16(&mut h[74..76], f.finder_flags);
+    BigEndian::write_u32(&mut h[76..80], f.create_date);
+    BigEndian::write_u32(&mut h[80..84], f.mod_date);
+    BigEndian::write_u32(&mut h[84..88], f.resource_fork.len() as u32);
+    BigEndian::write_u32(&mut h[88..92], f.data_fork.len() as u32);
+    BigEndian::write_u32(&mut h[92..96], rcomp.len() as u32);
+    BigEndian::write_u32(&mut h[96..100], dcomp.len() as u32);
+    BigEndian::write_u16(&mut h[100..102], crc16_arc(&f.resource_fork));
+    BigEndian::write_u16(&mut h[102..104], crc16_arc(&f.data_fork));
+    // [62..66] child offset: -1 marks a file entry (as real archives do).
+    h[62..66].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+    // Header CRC over the first 110 bytes.
+    let hdr_crc = crc16_arc(&h[0..110]);
+    BigEndian::write_u16(&mut h[110..112], hdr_crc);
+
+    body.extend_from_slice(&h);
+    body.extend_from_slice(&rcomp);
+    body.extend_from_slice(&dcomp);
+}
+
+/// Emit a folder-start or folder-end marker. The parser keys off the
+/// method byte (`START_FOLDER` or `END_FOLDER`) after masking the
+/// encryption + "contains encrypted" bits; the rest of the 112-byte
+/// header follows the same layout as a file entry, with zeroed forks.
+fn emit_folder_marker(
+    body: &mut Vec<u8>,
+    name: &str,
+    finder_flags: u16,
+    create_date: u32,
+    mod_date: u32,
+    marker: u8,
+) {
+    let name_bytes = if marker == START_FOLDER {
+        mac_name_bytes(name)
+    } else {
+        Vec::new()
+    };
+    let namelen = name_bytes.len();
+
+    let mut h = [0u8; ENTRY_HEADER_LEN];
+    // Both fork-method bytes carry the marker. The parser accepts either
+    // position; we write both so the resulting archive is unambiguous.
+    h[0] = marker;
+    h[1] = marker;
+    h[2] = namelen as u8;
+    if namelen > 0 {
+        h[3..3 + namelen].copy_from_slice(&name_bytes);
+        let fname_crc = crc16_arc(&h[2..3 + namelen]);
+        BigEndian::write_u16(&mut h[34..36], fname_crc);
+    }
+    // No type / creator codes on folder markers (the parser zeros them out).
+    BigEndian::write_u16(&mut h[74..76], finder_flags);
+    BigEndian::write_u32(&mut h[76..80], create_date);
+    BigEndian::write_u32(&mut h[80..84], mod_date);
+    // Fork lengths and compressed lengths stay zero — folders carry no data.
+    // [62..66] child offset is left at zero for folder markers.
+    let hdr_crc = crc16_arc(&h[0..110]);
+    BigEndian::write_u16(&mut h[110..112], hdr_crc);
+
+    body.extend_from_slice(&h);
 }
 
 /// Encode a name to at most 31 Mac Roman bytes (lossy ASCII fallback).
@@ -519,6 +631,143 @@ mod tests {
             let data1 = decompress_fork(&bytes, e1.data.as_ref().unwrap()).unwrap();
             assert_eq!(data1, files[1].data_fork);
         }
+    }
+
+    fn make_file(name: &str, body: &[u8]) -> StuffItInputNode {
+        StuffItInputNode::File(StuffItInput {
+            name: name.to_string(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: body.to_vec(),
+            resource_fork: Vec::new(),
+        })
+    }
+
+    fn make_folder(name: &str, children: Vec<StuffItInputNode>) -> StuffItInputNode {
+        StuffItInputNode::Folder {
+            name: name.to_string(),
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            children,
+        }
+    }
+
+    #[test]
+    fn empty_folder_round_trips() {
+        // An empty folder is two markers (start + end) and nothing in
+        // between. The parser should surface a single dir entry.
+        let tree = vec![make_folder("Apps", vec![])];
+        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
+        let archive = parse(&bytes).expect("parse empty folder");
+
+        assert_eq!(archive.entries.len(), 1);
+        let only = &archive.entries[0];
+        assert!(only.is_dir, "empty folder marker should be is_dir");
+        assert_eq!(only.name, "Apps");
+        assert_eq!(only.path, vec!["Apps".to_string()]);
+    }
+
+    #[test]
+    fn folder_with_two_files_round_trips() {
+        let tree = vec![make_folder(
+            "Docs",
+            vec![
+                make_file("ReadMe", b"hello"),
+                make_file("Notes", b"more text"),
+            ],
+        )];
+        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
+        let archive = parse(&bytes).expect("parse folder with files");
+
+        // 1 start marker + 2 files + (end marker is consumed silently).
+        assert_eq!(archive.entries.len(), 3);
+        assert!(archive.entries[0].is_dir);
+        assert_eq!(archive.entries[0].name, "Docs");
+        assert_eq!(archive.entries[1].name, "ReadMe");
+        assert_eq!(archive.entries[1].path, vec!["Docs", "ReadMe"]);
+        assert_eq!(archive.entries[2].name, "Notes");
+        assert_eq!(archive.entries[2].path, vec!["Docs", "Notes"]);
+
+        // Verify fork data round-trips for files inside the folder.
+        let data = decompress_fork(&bytes, archive.entries[1].data.as_ref().unwrap()).unwrap();
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn deeply_nested_folders_preserve_paths() {
+        // Apps/
+        //   Word/
+        //     Templates/
+        //       Letter.txt
+        let tree = vec![make_folder(
+            "Apps",
+            vec![make_folder(
+                "Word",
+                vec![make_folder(
+                    "Templates",
+                    vec![make_file("Letter.txt", b"Dear ___,")],
+                )],
+            )],
+        )];
+        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
+        let archive = parse(&bytes).expect("parse nested folders");
+
+        // 3 start markers + 1 file (ends are silent).
+        assert_eq!(archive.entries.len(), 4);
+        assert_eq!(
+            archive.entries[3].path,
+            vec!["Apps", "Word", "Templates", "Letter.txt"]
+        );
+        let body = decompress_fork(&bytes, archive.entries[3].data.as_ref().unwrap()).unwrap();
+        assert_eq!(body, b"Dear ___,");
+    }
+
+    #[test]
+    fn top_level_files_after_folder_end_back_at_root() {
+        // Mixing folders and top-level files exercises currdir popping
+        // back to root after END_FOLDER.
+        //   Folder1/
+        //     Inner.txt
+        //   TopLevel.txt
+        let tree = vec![
+            make_folder("Folder1", vec![make_file("Inner.txt", b"inside")]),
+            make_file("TopLevel.txt", b"outside"),
+        ];
+        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
+        let archive = parse(&bytes).expect("parse mixed tree");
+
+        // Folder start + Inner.txt + TopLevel.txt.
+        assert_eq!(archive.entries.len(), 3);
+        assert!(archive.entries[0].is_dir);
+        assert_eq!(archive.entries[0].path, vec!["Folder1"]);
+        assert_eq!(archive.entries[1].path, vec!["Folder1", "Inner.txt"]);
+        // After the END_FOLDER, currdir is back at root.
+        assert_eq!(archive.entries[2].path, vec!["TopLevel.txt"]);
+    }
+
+    #[test]
+    fn flat_build_archive_still_works_after_refactor() {
+        // The original flat-file build_archive now delegates to
+        // build_archive_tree; confirm the existing call shape stays valid.
+        let files = vec![StuffItInput {
+            name: "Sole".to_string(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"just one file".to_vec(),
+            resource_fork: Vec::new(),
+        }];
+        let bytes = build_archive(&files, WriteMethod::Store).unwrap();
+        let archive = parse(&bytes).expect("parse flat");
+        assert_eq!(archive.entries.len(), 1);
+        assert!(!archive.entries[0].is_dir);
+        assert_eq!(archive.entries[0].path, vec!["Sole"]);
     }
 
     /// Parses real `.sit` samples if present (decoded from `.sit.hqx` on the

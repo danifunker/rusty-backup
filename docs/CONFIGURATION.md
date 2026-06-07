@@ -20,7 +20,9 @@ All settings can be configured through the GUI (Settings button in top bar) or b
     "repository_url": "https://github.com/danifunker/rusty-backup"
   },
   "last_chd_codecs": null,
-  "last_chd_hunk_size": null
+  "last_chd_hunk_size": null,
+  "file_associations_enabled": false,
+  "assoc_registered_version": null
 }
 ```
 
@@ -30,6 +32,26 @@ All settings can be configured through the GUI (Settings button in top bar) or b
   remembered across launches. `null` = profile default.
 - **last_chd_hunk_size**: Last-used CHD hunk size in bytes. `null` = profile
   default.
+- **file_associations_enabled** *(Windows only)*: When `true`, the app
+  registers itself as a handler for its supported disk-image extensions in
+  `HKCU\Software\Classes` on launch. Toggled by the Settings dialog and by
+  the Inno installer's optional "Associate disk image files" checkbox.
+  Registration is per-user (no elevation), idempotent, and refreshed
+  automatically after a self-update adds new extensions. Windows still
+  prompts the user before changing the *default* handler — this only
+  enrolls the app in "Open with".
+- **assoc_registered_version** *(Windows only)*: Internal marker recording
+  which `APP_VERSION` registered associations last; lets a self-update
+  trigger re-registration when the central extension list has grown.
+
+### Windows install + self-update
+
+`Setup.exe` writes a per-user install to `%LocalAppData%\Programs\Rusty Backup`
+by default; in-app "Download & Install Update" replaces both `rusty-backup.exe`
+and `rb-cli.exe` in place and refreshes the "Add/Remove Programs"
+`DisplayVersion` so the ARP entry never goes stale. Portable ZIP copies also
+self-update, but they skip every registry write (no ARP entry, no file
+associations) — they remain truly portable.
 
 CHD compression and decompression are built into the binary via
 [libchdman-rs](https://github.com/danifunker/libchdman-rs); there is no

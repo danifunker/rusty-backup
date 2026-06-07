@@ -7,6 +7,7 @@ pub mod archive_edit;
 pub mod backup_loader;
 pub mod browse_session;
 pub mod bulk_convert_runner;
+#[cfg(feature = "chd")]
 pub mod chd_expand_runner;
 pub mod edit_queue;
 pub mod export_runner;
@@ -19,5 +20,8 @@ pub mod physical_write_runner;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;
+// `update_runner` wraps the GUI's update-download/install flow on top of
+// `src/update.rs` — both depend on `reqwest`, which is GUI-feature-only.
+#[cfg(feature = "gui")]
 pub mod update_runner;
 pub mod volume_label_runner;

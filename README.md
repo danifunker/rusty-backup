@@ -18,11 +18,13 @@ Rusty Backup ships as a single self-contained binary per platform.
 1. Grab the latest build for your OS from the
    [GitHub Releases page](https://github.com/danifunker/rusty-backup/releases).
 2. Drop the binary where you want it:
-   - **Windows** — run the installer (`.exe`) to register file
-     associations and "Add/Remove Programs" support, or extract the
-     portable ZIP and run `rusty-backup.exe` directly. The app can
-     download and install its own updates in place from within the
-     **About / Update** UI.
+   - **Windows** — run `Setup.exe` for the installed experience
+     (Start-Menu shortcut, "Add/Remove Programs" entry, optional
+     file-association registration, `rb-cli` on `PATH`), or extract the
+     portable ZIP and run `rusty-backup.exe` directly. Either install
+     can self-update in place from within the **About / Update** UI;
+     existing portable-ZIP users can run `Setup.exe` once to gain the
+     Start-Menu / ARP integration without re-downloading later updates.
    - **macOS** — open the DMG and drag `Rusty Backup.app` into `/Applications`.
    - **Linux** — `chmod +x rusty-backup-*.AppImage` and launch it.
 3. Raw physical disks require elevated privileges (admin on Windows, root on
@@ -58,7 +60,68 @@ rb-cli completions zsh > _rb-cli    # emit-to-stdout for packagers
 
 Full verb-by-verb reference: [`docs/cli-reference.md`](docs/cli-reference.md)
 (regenerated from `cargo run --example generate_cli_reference`).
-Grammar plan: [`docs/cli-todo.md`](docs/cli-todo.md).
+Open CLI follow-ups (and everything else still to do) are tracked in
+[`docs/OPEN-WORK.md`](docs/OPEN-WORK.md).
+
+#### `rb-cli-mini` for MiSTer FPGA (armv7)
+
+`rb-cli-mini` is the **MiSTer-specific** build of `rb-cli`: a slim
+variant cross-compiled for the FPGA's Intel Cyclone V / Cortex-A9 SoC
+(`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline from the
+Buildroot rootfs). It excludes the GUI (eframe / egui / rfd), the
+optical-disc stack (opticaldiscs / cd-da-reader), and the update
+checker's reqwest client — but **keeps CHD support** via the upstream
+`libchdman-rs` armv7 prebuilt, so `.chd` images work inline on the
+device.
+
+The desktop release builds use the full feature set; only the MiSTer
+artifact runs `--no-default-features --features chd`.
+
+```
+# Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
+cargo install cross --git https://github.com/cross-rs/cross --locked
+cross build --bin rb-cli --release \
+            --target armv7-unknown-linux-gnueabihf \
+            --no-default-features --features chd
+
+# Strip + deploy:
+arm-linux-gnueabihf-strip target/armv7-unknown-linux-gnueabihf/release/rb-cli
+scp target/armv7-unknown-linux-gnueabihf/release/rb-cli \
+    root@mister.local:/media/fat/Scripts/rb-cli
+```
+
+The repo's [`Cross.toml`](Cross.toml) pins the cross-compile Docker
+image to `cross-rs`'s Ubuntu 20.04 / GCC 9.4 / glibc 2.31 build (at a
+verified SHA digest) so the binary links against the same glibc +
+libstdc++ baseline as both the MiSTer Buildroot rootfs and the
+upstream libchdman-rs armv7 prebuilt — symbols line up without any
+version drift.
+
+CI ships a prebuilt `rb-cli-mini-armv7-linux-<version>.tar.gz` as part
+of every release; grab it from the
+[Releases page](https://github.com/danifunker/rusty-backup/releases) if
+you don't want to set up the cross toolchain locally.
+
+What's in the MiSTer build:
+- Every filesystem operation (`ls`, `put`, `get`, `rm`, `mkdir`,
+  `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
+  exFAT, HFS, HFS+, ext, AFFS, PFS3, SFS, ProDOS, Human68k, ADFS, etc.
+- `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, the
+  four floppy container formats, **and CHD**.
+- `floppy convert` (XDF / HDM / DIM / D88, single-file and bulk) —
+  the X68000 workflow runs inline on the device.
+- Partition table editing (`partmap`), backup-folder operations.
+- `shrink`, `grow .chd`, single-file CHD backups — all work.
+
+What's excluded (operations exit with a clear "this binary was built
+without the `optical` feature" message):
+- `optical` verb (rip / disc browse / extract via the OS optical-drive
+  layer — the MiSTer has no optical drive attached).
+- GUI windows and the update-checker self-replace UI (only meaningful
+  for the desktop binary).
+
+Full background and the feature matrix live in
+[`docs/mister_cli.md`](docs/mister_cli.md).
 
 ## Usage
 
@@ -96,13 +159,19 @@ The app has four tabs:
   - **Export Disk Image…** to write VHD (fixed or dynamic), QCOW2,
     VMDK, Raw, 2MG, WOZ, DC42, HFV, or CHD (whole-disk or
     per-partition) — see `docs/vhd-export.md`.
+  - **Convert Floppy Container…** to convert between the four
+    X68000 / PC-98 / FM-7 floppy wrappers (XDF, HDM, DIM, D88) one
+    file at a time. Bulk folder conversion lives in the existing
+    **Bulk Convert** dialog, which now lists the same four formats
+    as output targets.
   - **Check** (`fsck`) on classic HFS, HFS+, AmigaDOS (Disk Validator),
     and SGI EFS, with **Repair** that uses replica blocks + lost+found
     where supported.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
-    ProDOS, and EFS: stage create-file / new-folder / drag-and-drop /
-    delete edits, then Apply atomically with snapshot rollback on
-    error.
+    ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
+    Human68k, and XFS (v4 + v5): stage create-file / new-folder /
+    drag-and-drop / delete edits, then Apply atomically with snapshot
+    rollback on error.
 - **Optical** — browse and extract files from CD/DVD images and physical
   optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
   discs. Re-opens automatically when the underlying disc changes.
@@ -188,12 +257,25 @@ readable.
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
+| Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
 | Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
-| Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. |
+| Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. Arculator-wrapped `.hdf` (Acorn) auto-detected. |
 | Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
+| Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
+| CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
+| Sharp D88      | `.d88`          | Yes            | Yes (convert)   | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container |
+| X68000 XDF     | `.xdf`          | Yes            | Yes (convert)   | Raw headerless X68000 floppy dump; geometry inferred from size |
+| PC-98 HDM      | `.hdm`          | Yes            | Yes (convert)   | DiskExplorer raw headerless floppy dump (byte-identical to XDF) |
+| DiskExplorer DIM | `.dim`        | Yes            | Yes (convert, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
+
+"Yes (convert)" means the format isn't a backup wrapper but is fully
+round-trippable via the **Convert Floppy Container…** dialog and
+`rb-cli floppy convert` — useful for moving images between MiSTer cores,
+real hardware utilities, and emulators that each prefer a different
+floppy container.
 
 ### Filesystems
 
@@ -219,7 +301,7 @@ inspect-tab Edit Mode.
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
-| SGI XFS (v4 / v5) | Yes (read-only) | No | No           | —    | IRIX 6.x and Linux. Disk-level expansion supported via the "Add free space" workflow + in-OS `xfs_growfs`. |
+| SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
 
 ### Partition tables
 
@@ -250,10 +332,14 @@ images, partition table sidecars) for restore — see `docs/clonezilla.md`.
   block size and a verified-bootable APM layout (DDR + APM map + driver
   partitions + alt MDB). Useful when an old 2 GB classic-HFS volume runs
   out of 16-bit block addresses.
-- **SGI EFS / XFS**: EFS is fully read/write/resize; XFS is read-only
-  (browsing + display only). XFS growth is handled at the disk-layout
-  level (Add free space → in-OS `xfs_growfs`), not by patching the
-  filesystem.
+- **SGI EFS / XFS**: EFS is fully read/write/resize. XFS gained a full
+  edit + repair surface (R1-R8 repair pipeline; oracle-validated against
+  `xfs_repair`) on the v4 format. Open XFS holes (multi-block leaf/node
+  directories, bmap-btree forks, v5/CRC write side) and the planned
+  shrink-via-clone path are tracked in
+  [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.1 and §2.2. XFS grow is
+  still done at the disk-layout level ("Add free space" + in-OS
+  `xfs_growfs`).
 - **ProDOS → VHD** is not implemented yet; restore to raw / CHD / Zstd /
   physical disk works.
 - **Raw → raw** restore always works regardless of filesystem; only the
@@ -271,6 +357,37 @@ images, partition table sidecars) for restore — see `docs/clonezilla.md`.
   backups currently require building a full seekable cache on open, which
   can be slow for large partitions — plan to work around this in a future
   release.
+
+### MiSTer FPGA cores
+
+Rusty Backup can build, browse, and convert images that drop straight
+into [MiSTer FPGA](https://misterfpga.org/) computer cores. The list
+below is the subset where the full filesystem + container + partition
+pipeline works end to end. Full per-core status (including outstanding
+cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_status.md).
+
+| MiSTer core | Filesystem(s) | Media path |
+|---|---|---|
+| **ao486** (486 PC)             | FAT12 / FAT16 / FAT32 (MBR), ISO9660 | Floppy, HDD, CD |
+| **PCXT**                       | FAT12 / FAT16 (MBR) | Floppy, HDD |
+| **MSX / MSX1 / TurboR**        | FAT12 / FAT16 (Nextor VHD) | Floppy, HDD |
+| **ZXNext** (ZX Spectrum Next)  | FAT32 / FAT16 / FAT12 | SD / HDD (VHD) |
+| **TSConf** (ZX-Evolution)      | FAT32 (non-MBR) | SD / HDD (VHD) |
+| **Minimig-AGA** (Amiga)        | AFFS (OFS/FFS), PFS3, SFS on RDB, ISO9660 | Floppy (`.adf`/`.adz`), HDD (`.hdf`/`.hdz`), CD |
+| **MacPlus**                    | HFS | HDD (.hda / .hfv) — 400K MFS floppy outstanding |
+| **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
+| **Apple-II**                   | ProDOS (DOS 3.3 outstanding) | `.dsk` / `.po` / `.do` / `.2mg` / `.woz` |
+| **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
+| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI HDD (`.hdf`) |
+| **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
+| **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
+
+For X68000 specifically, the floppy converter lets you take an image
+in any of the four formats Sharp tooling and MiSTer cores expect — XDF
+(headerless raw), HDM (PC-98 raw), DIM (DiskExplorer DIFC), or D88
+(sparse track-table) — and produce any of the others, single-file or
+in bulk. Geometry inference covers the X68000 + PC-98 set: 1.2 MB 2HD,
+1.44 MB 2HD, 720 KB 2DD, and 640 KB 2DD.
 
 ### Physical drive compatibility
 

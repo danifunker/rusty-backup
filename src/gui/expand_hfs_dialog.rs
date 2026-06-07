@@ -51,13 +51,12 @@ impl ExpandHfsDialog {
         let suggested_mib =
             (suggested_bytes.div_ceil(1024 * 1024)).clamp(1, u32::MAX as u64) as u32;
         let suggested_bs = suggest_block_size(suggested_bytes);
-        // If the source itself is a .hfv, default to flat-HFV output.
-        let output_hfv = source
-            .source_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("hfv"))
-            .unwrap_or(false);
+        // Default to bare-HFS output whenever the source isn't APM-wrapped:
+        // a `.hfv` BasiliskII image, or any raw single-partition HFS image
+        // (e.g. `partition-0.img` from a per-partition backup). Both open
+        // at byte offset 0; APM-wrapped HFS partitions start at the disk's
+        // HFS partition offset (typically block 64 → byte 32768).
+        let output_hfv = source.partition_offset == 0;
         Self {
             open: true,
             source,
@@ -128,13 +127,14 @@ impl ExpandHfsDialog {
                     ui.horizontal(|ui| {
                         ui.label("Output format:");
                         ui.radio_value(&mut self.output_hfv, false, "APM disk (.hda)");
-                        ui.radio_value(&mut self.output_hfv, true, "Flat HFV (.hfv)");
+                        ui.radio_value(&mut self.output_hfv, true, "Bare HFS image (.hfv / .img)");
                     });
                     if self.output_hfv {
                         ui.label(
                             egui::RichText::new(
-                                "HFV: bare classic-HFS volume for BasiliskII / SheepShaver; \
-                                 capped at 2047 MB.",
+                                "Bare classic-HFS volume with no partition table — mountable in \
+                                 BasiliskII / SheepShaver as `.hfv`, or usable as a raw single- \
+                                 partition image. Capped at 2047 MB (classic HFS limit).",
                             )
                             .small()
                             .italics(),
@@ -251,10 +251,21 @@ impl ExpandHfsDialog {
 
         if pick_output_clicked {
             let stem = sanitize_filename(&self.source.volume_name);
+            // For bare-HFS output, default the suggested extension to whatever
+            // the source uses — `.hfv` for a BasiliskII image stays `.hfv`, a
+            // raw `partition-0.img` stays `.img`. Filter accepts either.
             let dialog = if self.output_hfv {
+                let ext = self
+                    .source
+                    .source_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .filter(|e| e.eq_ignore_ascii_case("hfv"))
+                    .map(|_| "hfv")
+                    .unwrap_or("img");
                 super::file_dialog()
-                    .set_file_name(format!("{stem}-expanded.hfv"))
-                    .add_filter("BasiliskII HFV", &["hfv"])
+                    .set_file_name(format!("{stem}-expanded.{ext}"))
+                    .add_filter("Bare HFS image", &["hfv", "img", "dsk"])
             } else {
                 super::file_dialog()
                     .set_file_name(format!("{stem}-expanded.hda"))
@@ -300,7 +311,7 @@ impl ExpandHfsDialog {
             target_bs / 1024,
             output.display(),
             if self.output_hfv {
-                "flat HFV"
+                "bare HFS image"
             } else {
                 "APM disk"
             }

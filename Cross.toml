@@ -1,0 +1,42 @@
+# Cross-compile pins used by `cross build` in the MiSTer CI job
+# (.github/workflows/release.yml -> build-rb-cli-mini-armv7).
+#
+# The MiSTer FPGA ships an Intel Cyclone V SoC (Cortex-A9, 32-bit ARM v7
+# hardfloat) running a Buildroot-based glibc rootfs. The libchdman-rs
+# prebuilt for `armv7-unknown-linux-gnueabihf` is produced upstream
+# against Ubuntu 20.04's glibc 2.31 / GCC 9.4 libstdc++; we match that
+# baseline here so the resulting rb-cli binary links cleanly against
+# the same glibc + libstdc++ symbols the MiSTer Buildroot rootfs exports.
+#
+# `cross-rs` v0.2.5 (the last semantic-version release) is Ubuntu **16.04**
+# with GCC 5.4 / glibc 2.23 — too old to have the C++11 `std::thread`
+# polymorphic-_State symbols the libchdman-rs prebuilt depends on, so it
+# fails to link with "undefined reference to std::thread::_M_start_thread".
+#
+# The `:main` tag tracks cross-rs's main branch and is Ubuntu 20.04 with
+# GCC 9.4 + glibc 2.31 — exactly the baseline we want. Pinned to a
+# verified digest so an upstream Ubuntu-22 bump can't silently produce a
+# glibc-2.35-only binary that refuses to start on MiSTer.
+[target.armv7-unknown-linux-gnueabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf:main@sha256:9014720a7d829bcd631835ca5d14cf43fbef1fac0b511a2632f4bd71a4990229"
+
+# Forward libchdman-rs's build-script env vars into the container so the
+# prebuilt fetcher can be steered from CI:
+#   - XDG_CACHE_HOME — points at /tmp so the cache dir resolves to a path
+#     the container user can write to (cross's HOME mount is read-only).
+#   - LIBCHDMAN_GLIBC — usually unset; the build script auto-picks 2.31 for
+#     armv7. Passed through anyway so a future "pin to glibc X" override
+#     works without touching this file.
+#   - LIBCHDMAN_PREBUILT_FALLBACK / _FORCE_SOURCE — escape hatches if the
+#     prebuilt fetch fails or upstream temporarily lacks an asset; the
+#     desktop release ships fine without us editing the workflow.
+#   - LIBCHDMAN_PREBUILT_LOCAL_ARCHIVE — lets the workflow stage the .a
+#     archive on the host (avoiding the per-build download) and hand it in.
+[target.armv7-unknown-linux-gnueabihf.env]
+passthrough = [
+    "XDG_CACHE_HOME",
+    "LIBCHDMAN_GLIBC",
+    "LIBCHDMAN_PREBUILT_FALLBACK",
+    "LIBCHDMAN_FORCE_SOURCE",
+    "LIBCHDMAN_PREBUILT_LOCAL_ARCHIVE",
+]

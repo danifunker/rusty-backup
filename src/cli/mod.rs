@@ -65,7 +65,8 @@ pub enum Command {
     /// Copy a host file (or zero-fill / write boot blocks) into a filesystem.
     Put(verbs::put::PutArgs),
 
-    /// Extract a file from a filesystem to the host.
+    /// Extract a file, directory tree, or glob match from a filesystem
+    /// to the host.
     Get(verbs::get::GetArgs),
 
     /// Delete a file or directory from a filesystem.
@@ -119,7 +120,9 @@ pub enum Command {
     Resize(verbs::resize::ResizeArgs),
 
     /// Expand a classic-HFS volume to a new size + allocation block size
-    /// by cloning into a fresh APM disk image.
+    /// by cloning into a fresh APM disk image (default) or a bare HFS
+    /// image (`--to-hfv`). Accepts APM-wrapped sources or raw single-
+    /// partition HFS images.
     Expand(verbs::expand::ExpandArgs),
 
     /// Grow a disk image by `--add SIZE` of trailing zero-padding so a
@@ -163,9 +166,16 @@ pub enum Command {
     },
 
     /// Optical-media verbs (rip / convert / browse / extract).
+    #[cfg(feature = "optical")]
     Optical {
         #[command(subcommand)]
         cmd: verbs::optical::OpticalCommand,
+    },
+
+    /// Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88.
+    Floppy {
+        #[command(subcommand)]
+        cmd: verbs::floppy::FloppyCommand,
     },
 
     /// Edit the partition table (add / resize / delete / set-type /
@@ -246,7 +256,9 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::BatchTemplate(args) => verbs::batch_template::run(args),
         Command::Config { cmd } => verbs::config::run(cmd),
         Command::Show { cmd } => verbs::show::run(cmd),
+        #[cfg(feature = "optical")]
         Command::Optical { cmd } => verbs::optical::run(cmd),
+        Command::Floppy { cmd } => verbs::floppy::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Sit { cmd } => verbs::sit::run(cmd),
         Command::Terminal => verbs::terminal::run(),

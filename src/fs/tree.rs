@@ -91,7 +91,12 @@ fn walk_tree(
 
     for (i, child) in children.iter().enumerate() {
         let is_last = i == count - 1;
-        let connector = if is_last { "└── " } else { "├── " };
+        // ASCII tree connectors. The output is rendered in an egui
+        // multiline text edit which uses the default sans/monospace font
+        // that doesn't ship the Unicode box-drawing glyphs (`└── `,
+        // `├── `, `│`); they'd render as blank boxes. CLAUDE.md "no
+        // Unicode glyphs in UI text" rule.
+        let connector = if is_last { "\\-- " } else { "|-- " };
 
         out.push_str(prefix);
         out.push_str(connector);
@@ -113,7 +118,7 @@ fn walk_tree(
             let child_prefix = if is_last {
                 format!("{prefix}    ")
             } else {
-                format!("{prefix}│   ")
+                format!("{prefix}|   ")
             };
             walk_tree(
                 fs,
@@ -264,11 +269,13 @@ mod tests {
     fn test_format_tree() {
         let mut fs = MockFs;
         let result = format_tree(&mut fs).unwrap();
+        // ASCII connectors only — see the comment in walk_tree about
+        // egui's default font + CLAUDE.md's "no Unicode glyphs" rule.
         let expected = "\
 TestVolume
-├── Documents
-│   └── Report.doc  [2.0 KiB]
-└── ReadMe  [1.5 KiB]
+|-- Documents
+|   \\-- Report.doc  [2.0 KiB]
+\\-- ReadMe  [1.5 KiB]
 
 1 directories, 2 files\n";
         assert_eq!(result, expected);

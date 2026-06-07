@@ -26,6 +26,7 @@ use super::chd_options_ui::ChdOptionsControl;
 use super::browse_view::BrowseView;
 use super::context::TabContext;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
+use super::floppy_convert_dialog::FloppyConvertDialog;
 use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 
 /// State for the Inspect tab.
@@ -167,6 +168,8 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
+    /// "Convert Floppy Container..." dialog (XDF/HDM/DIM/D88).
+    floppy_convert_dialog: Option<FloppyConvertDialog>,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
     /// When the user opens a single-file-chd backup folder, the redirect
@@ -236,6 +239,7 @@ impl Default for InspectTab {
             repair_report: None,
             repair_context: None,
             expand_hfs_dialog: None,
+            floppy_convert_dialog: None,
             chd_info_text: None,
             single_file_chd_backup_folder: None,
             physical_disk_export: PhysicalDiskExport::default(),
@@ -266,6 +270,22 @@ impl InspectTab {
             // Force reload on next show
             self.prev_backup_path = None;
         }
+    }
+
+    /// Programmatically open a disk-image path in this tab, optionally
+    /// owning a [`tempfile::TempDir`] that contains it. Used by the
+    /// Archives tab's "Mount in new Inspect tab" auto-unwrap hook
+    /// (Workflow D.2) to hand off a decoded payload extracted from a
+    /// `.hqx` / `.sit` / `.sea` to this tab without going through the
+    /// user-facing file-picker. The tempdir guard is kept alive on this
+    /// tab so the temp file outlives the Archives tab's frame; clearing
+    /// the tab or picking a new file drops it.
+    pub fn load_image_with_tempdir(&mut self, path: PathBuf, guard: Option<tempfile::TempDir>) {
+        self.selected_device_idx = None;
+        self.backup_folder_path = None;
+        self.image_file_path = Some(path);
+        self.amiga_tempdir = guard;
+        self.clear_results();
     }
 
     pub fn clear_backup(&mut self) {
@@ -348,6 +368,10 @@ impl InspectTab {
                             .add_filter(
                                 "Disk Images",
                                 rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+                            )
+                            .add_filter(
+                                "Mac archives",
+                                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
                             )
                             .add_filter("All Files", &["*"])
                             .pick_file()
@@ -467,6 +491,20 @@ impl InspectTab {
             {
                 self.init_export_configs();
                 self.export_popup = true;
+            }
+
+            // Floppy container converter (XDF / HDM / DIM / D88). Always
+            // available — the dialog picks its own source so the inspect tab
+            // doesn't need to track the originally-picked file extension.
+            if ui
+                .button("Convert Floppy Container...")
+                .on_hover_text(
+                    "Convert between XDF, HDM, DIM, and D88 floppy container \
+                     formats (X68000 / PC-98 / FM-7).",
+                )
+                .clicked()
+            {
+                self.floppy_convert_dialog = Some(FloppyConvertDialog::empty());
             }
 
             // Edit Partition Table button — only for devices and image files (not backups)
@@ -3558,6 +3596,14 @@ impl InspectTab {
             let still_open = dlg.show(ui.ctx(), ctx.log);
             if !still_open {
                 self.expand_hfs_dialog = None;
+            }
+        }
+
+        // Floppy-container convert dialog
+        if let Some(dlg) = &mut self.floppy_convert_dialog {
+            let still_open = dlg.show(ui.ctx(), ctx.log);
+            if !still_open {
+                self.floppy_convert_dialog = None;
             }
         }
     }

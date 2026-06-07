@@ -57,6 +57,13 @@ pub enum StagedEdit {
         type_byte: u8,
         aux_type: u16,
     },
+    /// Set the ProDOS access byte on an existing entry (file or subdir).
+    /// `0xC3` = unlocked; `0x21` = locked. ProDOS-only — applied via
+    /// `EditableFilesystem::set_prodos_access`.
+    SetProdosAccess {
+        entry: FileEntry,
+        access: u8,
+    },
     BlessFolder {
         entry: FileEntry,
     },
@@ -181,6 +188,7 @@ pub fn apply_edit(
             type_byte,
             aux_type,
         } => efs.set_prodos_type(entry, *type_byte, *aux_type),
+        StagedEdit::SetProdosAccess { entry, access } => efs.set_prodos_access(entry, *access),
         StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
         StagedEdit::SetTypeCreator {
             entry,
@@ -471,6 +479,32 @@ impl EditQueue {
             type_byte,
             aux_type,
         });
+    }
+
+    /// Push a `SetProdosAccess` edit, replacing any prior one targeting the
+    /// same on-disk path.
+    pub fn replace_set_prodos_access(&mut self, entry: &FileEntry, access: u8) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetProdosAccess { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetProdosAccess {
+            entry: entry.clone(),
+            access,
+        });
+    }
+
+    /// Return the access byte the user has staged for `entry_path`, if any.
+    /// Used by the GUI to render the staged access value back into the lock
+    /// toggle before the user clicks Apply.
+    pub fn pending_prodos_access_for(&self, entry_path: &str) -> Option<u8> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetProdosAccess { entry, access } if entry.path == entry_path => {
+                Some(*access)
+            }
+            _ => None,
+        })
     }
 
     /// Push a `SetTypeCreator` edit, replacing any prior one targeting the

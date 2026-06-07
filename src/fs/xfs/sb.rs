@@ -19,6 +19,11 @@ const XFS_SB_FEAT_INCOMPAT_NREXT64: u32 = 1 << 5;
 const XFS_SB_FEAT_INCOMPAT_METADIR: u32 = 1 << 8;
 const XFS_SB_FEAT_INCOMPAT_ZONED: u32 = 1 << 9;
 
+/// `META_UUID` incompat bit. When set, metadata block CRC headers carry
+/// `sb_meta_uuid` instead of `sb_uuid` — every metadata-stamping site must
+/// route through [`XfsSuperblock::meta_uuid`].
+const XFS_SB_FEAT_INCOMPAT_META_UUID: u32 = 1 << 2;
+
 /// Parsed XFS superblock. Only the fields Step 5 needs to look up the root
 /// inode (and a few cosmetic fields for `fs_type` / `volume_label`).
 #[derive(Debug, Clone)]
@@ -64,6 +69,15 @@ pub struct XfsSuperblock {
     pub features_compat: u32,
     pub features_ro_compat: u32,
     pub features_incompat: u32,
+    /// `sb_uuid` (offset 32, 16 bytes). User-visible filesystem identity;
+    /// also stamped on every metadata block's CRC header when META_UUID is
+    /// not set (the common case).
+    pub sb_uuid: [u8; 16],
+    /// `sb_meta_uuid` (v5 only, offset 248, 16 bytes). Stamped on metadata
+    /// when the META_UUID incompat bit is set. Defaults to a copy of
+    /// `sb_uuid` on v4 / when META_UUID is off; [`meta_uuid`] picks the
+    /// right one.
+    pub sb_meta_uuid: [u8; 16],
 }
 
 impl XfsSuperblock {
@@ -132,6 +146,16 @@ impl XfsSuperblock {
             }
         }
 
+        let mut sb_uuid = [0u8; 16];
+        sb_uuid.copy_from_slice(&buf[32..48]);
+        // sb_meta_uuid only exists on v5 (offset 248, needs the buffer to be
+        // at least 264 bytes). On v4 we just mirror sb_uuid so callers can
+        // unconditionally `meta_uuid()` without v5 dispatch.
+        let mut sb_meta_uuid = sb_uuid;
+        if is_v5 && buf.len() >= 264 {
+            sb_meta_uuid.copy_from_slice(&buf[248..264]);
+        }
+
         Ok(XfsSuperblock {
             magicnum,
             blocksize,
@@ -163,6 +187,8 @@ impl XfsSuperblock {
             features_compat,
             features_ro_compat,
             features_incompat,
+            sb_uuid,
+            sb_meta_uuid,
         })
     }
 
@@ -188,6 +214,129 @@ impl XfsSuperblock {
     /// True iff this is a v5 (CRC-enabled, dir3) filesystem.
     pub fn is_v5(&self) -> bool {
         (self.versionnum & XFS_SB_VERSION_NUMBITS) == XFS_SB_VERSION_5
+    }
+
+    /// The UUID every metadata-block CRC header carries. v5 with the
+    /// META_UUID incompat bit set uses `sb_meta_uuid`; everything else uses
+    /// `sb_uuid`. v4 callers can still use this — `sb_meta_uuid` is mirrored
+    /// from `sb_uuid` at parse time.
+    pub fn meta_uuid(&self) -> &[u8; 16] {
+        if self.is_v5() && (self.features_incompat & XFS_SB_FEAT_INCOMPAT_META_UUID) != 0 {
+            &self.sb_meta_uuid
+        } else {
+            &self.sb_uuid
+        }
+    }
+
+    // ----- format-dependent layout dispatch --------------------------------
+    //
+    // The methods below hide the v4/v5 split for every site that just wants
+    // to know "where does the fork start" or "how big is the btree header".
+    // Each is the canonical reference; ad-hoc `if sb.is_v5()` checks at the
+    // call sites should call these instead.
+
+    /// Byte offset of the data fork inside an on-disk inode. v1/v2 inodes
+    /// have a 100-byte core (`offsetof(di_crc)`); v3 (v5/CRC) inodes grow
+    /// the core to 176 bytes (`offsetof(di_literal_area)`).
+    pub fn fork_offset(&self) -> usize {
+        if self.is_v5() {
+            176
+        } else {
+            100
+        }
+    }
+
+    /// Short-form (AG-relative) btree block header length — inobt / bnobt /
+    /// cntbt. v4 is 16 bytes (`xfs_btree_block_shdr` without CRC suffix);
+    /// v5 is 56 bytes (adds `bb_blkno`/`bb_lsn`/`bb_uuid`/`bb_owner`/`bb_crc`
+    /// at offsets 16..56).
+    pub fn sblock_hdr_len(&self) -> usize {
+        if self.is_v5() {
+            super::types::XFS_BTREE_SBLOCK_CRC_LEN
+        } else {
+            super::types::XFS_BTREE_SBLOCK_LEN
+        }
+    }
+
+    /// Long-form (full-fsblock) btree block header length — bmbt. v4 is
+    /// 24 bytes; v5 is 72 bytes.
+    pub fn lblock_hdr_len(&self) -> usize {
+        if self.is_v5() {
+            super::bmap::XFS_BTREE_LBLOCK_CRC_LEN
+        } else {
+            super::bmap::XFS_BTREE_LBLOCK_LEN
+        }
+    }
+
+    /// Inode-allocation btree magic (`bb_magic`). `IAB3` on v5, `IABT` on
+    /// v4 — both are accepted by readers; writers pick the matching one.
+    pub fn inobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_IBT_CRC_MAGIC
+        } else {
+            super::types::XFS_IBT_MAGIC
+        }
+    }
+
+    /// Free-inode btree magic. v5-only (`FIB3`); the FINOBT feature is
+    /// itself ro_compat → exclusive to v5 superblocks. Calling this on
+    /// a v4 SB returns 0 (the caller should gate on FEAT_RO_FINOBT
+    /// before touching the finobt).
+    pub fn finobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_FIBT_CRC_MAGIC
+        } else {
+            0
+        }
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// FINOBT (free-inode btree) feature. Modern mkfs.xfs defaults on.
+    pub fn has_finobt(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_FINOBT) != 0
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// RMAPBT (reverse-mapping btree) feature. Modern xfsprogs 6.6.0
+    /// defaults on; the rmapbt is allocated whether or not records are
+    /// populated.
+    pub fn has_rmapbt(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_RMAPBT) != 0
+    }
+
+    /// True iff this filesystem's `features_ro_compat` advertises the
+    /// REFLINK (refcountbt) feature. Modern mkfs.xfs defaults on; the
+    /// refcountbt is allocated whether or not reflinks have ever been
+    /// created.
+    pub fn has_reflink(&self) -> bool {
+        self.is_v5() && (self.features_ro_compat & super::types::XFS_SB_FEAT_RO_REFLINK) != 0
+    }
+
+    /// Free-space-by-block btree magic. `AB3B` on v5, `ABTB` on v4.
+    pub fn bnobt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_ABTB_CRC_MAGIC
+        } else {
+            super::types::XFS_ABTB_MAGIC
+        }
+    }
+
+    /// Free-space-by-count btree magic. `AB3C` on v5, `ABTC` on v4.
+    pub fn cntbt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::types::XFS_ABTC_CRC_MAGIC
+        } else {
+            super::types::XFS_ABTC_MAGIC
+        }
+    }
+
+    /// Bmap-btree (long-form) block magic. `BMA3` on v5, `BMAP` on v4.
+    pub fn bmbt_magic(&self) -> u32 {
+        if self.is_v5() {
+            super::bmap::XFS_BMAP_CRC_MAGIC
+        } else {
+            super::bmap::XFS_BMAP_MAGIC
+        }
     }
 
     /// True iff the DIRV2 bit is set (dir2 layout). v5 implies dir3 which is

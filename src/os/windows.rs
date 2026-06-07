@@ -761,8 +761,15 @@ mod tests {
         assert_eq!(string_from_buffer_offset(buf, 100), "");
     }
 
+    /// Smoke test that `enumerate_devices()` finds at least one
+    /// physical drive. Requires a real disk visible to the test
+    /// process — CI runners and Windows VMs without
+    /// `\\.\PhysicalDriveX` access surface an empty list, so this is
+    /// marked `#[ignore]`. Run manually on a workstation with
+    /// `cargo test -- --ignored`.
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "needs real \\\\.\\PhysicalDriveX; run with --ignored"]
     fn test_enumerate_devices_nonempty() {
         let devices = enumerate_devices();
         assert!(

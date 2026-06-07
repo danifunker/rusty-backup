@@ -10,12 +10,19 @@ repository = "https://github.com/dani/rusty-backup"
 resolver = "2"
 default-run = "rusty-backup"
 
-# Main GUI binary
+# Main GUI binary — requires the `gui` feature (off in --no-default-features
+# rb-cli-mini builds so the eframe / egui / rfd dep tree doesn't enter the
+# link line on slim/cross-compiled targets like armv7 MiSTer).
 [[bin]]
 name = "rusty-backup"
 path = "src/main.rs"
+required-features = ["gui"]
 
 # Headless CLI binary — scripted image construction, no eframe dependency.
+# Builds against all three optional features by default (so the desktop
+# release ships the same binary), but `cargo build --bin rb-cli
+# --no-default-features` produces an `rb-cli-mini` artifact that skips the
+# GUI dep tree, libchdman, and the optical-disc stack — see docs/mister_cli.md.
 [[bin]]
 name = "rb-cli"
 path = "src/bin/rb_cli.rs"
@@ -49,12 +56,35 @@ name = "decrypt_real_imz"
 path = "example/decrypt_real_imz.rs"
 
 [features]
-default = []
+# The desktop release ships every feature on. The slim rb-cli-mini build is
+# `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
+# / `--features optical` if you want one of those without the GUI).
+default = ["gui", "chd", "optical"]
+# Pull in eframe / egui / rfd plus the update-checker's reqwest client.
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+# MAME CHD core. Prebuilt binary not available for armv7-linux — leave this
+# off for MiSTer cross-compiles. ADFS / QXL.WIN / .d88 / .adf / .hdf / .vhd /
+# .img / .zst all still work without it.
+chd = ["dep:libchdman-rs"]
+# Physical optical-drive I/O (rip / data-track read). MiSTer has no optical
+# drive; leaving this off also drops a libcdio Buildroot dep.
+optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 
 [dependencies]
-eframe = { version = "0.34", features = ["glow"] }
-egui = "0.34"
-rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+# Optional, gated behind feature flags. See [features] above.
+eframe = { version = "0.34", features = ["glow"], optional = true }
+egui = { version = "0.34", optional = true }
+rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
+libchdman-rs = { version = "0.288.5", features = ["prebuilt"], optional = true }
+# rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
+# in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
+# (it's behind `gui`).
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
+webbrowser = { version = "1.0", optional = true }
+opticaldiscs = { version = "0.4.2", features = ["drives"], optional = true }
+cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1", optional = true }
+
+# Always-on dependencies — used by rb-cli (mini included).
 anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
@@ -63,28 +93,23 @@ serde_json = "1"
 byteorder = "1"
 log = "0.4"
 env_logger = "0.11"
-libchdman-rs = { version = "0.288.1", features = ["prebuilt"] }
 zstd = "0.13"
 zeekstd = "0.6"
 sha2 = "0.11"
-md-5 = "0.10"
-aes = "0.8"
-cbc = "0.1"
+md-5 = "0.11"
+aes = "0.9"
+cbc = "0.2"
 crc32c = "0.6"
 crc32fast = "1"
 chrono = "0.4"
 tempfile = "3"
 image = "0.25"
-reqwest = { version = "0.13", features = ["blocking", "json"] }
-webbrowser = "1.0"
 dirs = "6"
 unicode-normalization = "0.1"
 flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"
-opticaldiscs = { version = "0.4.2", features = ["drives"] }
-cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1" }
 serde_yml = "0.0.13"
 csv = "1"
 clap_complete = "4"
@@ -111,7 +136,7 @@ objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
 # Windows locked-running-image problem. See docs/windows_self_update.md.
 self-replace = "1"
 # Per-user file-association registration (HKCU\Software\Classes).
-winreg = "0.55"
+winreg = "0.56"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Ioctl",

@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
+#[cfg(feature = "chd")]
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -24,10 +25,17 @@ pub enum SgiCommand {
 
 pub fn run(verb: SgiCommand) -> Result<()> {
     match verb {
+        #[cfg(feature = "chd")]
         SgiCommand::Shrink { input, output } => cmd_shrink(input, output),
+        #[cfg(not(feature = "chd"))]
+        SgiCommand::Shrink { .. } => anyhow::bail!(
+            "this binary was built without the `chd` feature; \
+             `api sgi shrink` produces a CHD output and is unavailable"
+        ),
     }
 }
 
+#[cfg(feature = "chd")]
 pub(crate) fn cmd_shrink(input: PathBuf, output: PathBuf) -> Result<()> {
     use std::sync::atomic::AtomicBool;
 

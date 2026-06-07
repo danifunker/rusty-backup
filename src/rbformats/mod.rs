@@ -2,10 +2,170 @@
 // (reader, output path, sizes, callbacks, format options).
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(feature = "chd")]
 pub mod chd;
+#[cfg(feature = "chd")]
 pub mod chd_edit;
+#[cfg(feature = "chd")]
 pub mod chd_options;
+
+/// Compile-time stubs that let callers keep `Option<ChdOptions>` fields and
+/// `match` arms compiling on the slim rb-cli-mini build (no `chd` feature).
+/// Runtime entry points that actually need libchdman return a clear "this
+/// binary was built without the `chd` feature" error.
+#[cfg(not(feature = "chd"))]
+pub mod chd_options {
+    /// Stub. The real one wraps `libchdman_rs` codec / hunk choices; when the
+    /// `chd` feature is off, no CHD work happens and this type just satisfies
+    /// the type checker in shared structs like `BackupConfig`.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ChdOptions;
+
+    impl ChdOptions {
+        pub fn defaults_for(_profile: ChdProfile) -> Self {
+            ChdOptions
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChdProfile {
+        Hd,
+        Dvd,
+        Cd,
+    }
+}
+
+/// Stub for `ChdReader` when the `chd` feature is off. `open` always errors
+/// — the runtime guard for the rb-cli-mini build path.
+#[cfg(not(feature = "chd"))]
+pub mod chd {
+    use anyhow::{bail, Result};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
+
+    /// Runtime stub. Any attempt to open a `.chd` returns a clear error
+    /// pointing the user at the full build.
+    pub struct ChdReader;
+
+    impl ChdReader {
+        pub fn open<P: AsRef<Path>>(_path: P) -> Result<Self> {
+            bail!(
+                "this binary was built without the `chd` feature; \
+                 rebuild with --features chd (or use the desktop build) to open .chd files"
+            )
+        }
+
+        pub fn logical_size(&self) -> u64 {
+            0
+        }
+
+        pub fn logical_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    impl Read for ChdReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for ChdReader {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    /// CD-CHD cooked-mode reader stub. The real one decodes MODE1 frames;
+    /// here `open_path` always errors so the optical path never reaches a
+    /// runtime call.
+    pub struct CdCookedReader;
+
+    impl CdCookedReader {
+        pub fn open_path<P: AsRef<Path>>(_path: P) -> Result<Self> {
+            bail!("chd feature not built into this binary")
+        }
+
+        pub fn logical_size(&self) -> u64 {
+            0
+        }
+    }
+
+    impl Read for CdCookedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for CdCookedReader {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    pub fn format_chd_info(_path: &Path) -> Result<String> {
+        bail!("chd feature not built into this binary")
+    }
+
+    pub fn chd_is_cd(_path: &Path) -> Result<bool> {
+        Ok(false)
+    }
+
+    pub fn shrink_sgi_disk_to_chd(
+        _input: &Path,
+        _output: &Path,
+        _opts: super::chd_options::ChdOptions,
+    ) -> Result<()> {
+        bail!("chd feature not built into this binary")
+    }
+}
+
+/// Stubs for chd-edit types when the feature is off — only the type names
+/// callers reference in `Option<>` fields and constructor sites. Runtime
+/// methods always error.
+#[cfg(not(feature = "chd"))]
+pub mod chd_edit {
+    use anyhow::{bail, Result};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::{Arc, Mutex};
+
+    pub struct ChdEditSession;
+
+    pub struct ChdEditHandle;
+
+    impl ChdEditHandle {
+        pub fn from_arc(_arc: Arc<Mutex<ChdEditSession>>) -> Self {
+            ChdEditHandle
+        }
+    }
+
+    impl Read for ChdEditHandle {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Seek for ChdEditHandle {
+        fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    impl Write for ChdEditHandle {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("chd feature not built"))
+        }
+    }
+
+    pub fn flatten_to_parent<P: AsRef<std::path::Path>>(_path: P, _backup: P) -> Result<()> {
+        bail!("chd feature not built into this binary")
+    }
+}
 pub mod compress;
+pub mod containers;
 pub mod dc42;
 pub mod dmg;
 pub mod export;
@@ -38,6 +198,9 @@ use crate::partition::apm::Apm;
 use crate::partition::gpt::Gpt;
 use crate::partition::mbr::patch_mbr_entries;
 use crate::partition::rdb::{Rdb, RDB_SCAN_BLOCKS, RDSK_SIGNATURE};
+use crate::partition::x68k::{
+    patch_x68k_entries, X68kPartitionTable, X68K_DEFAULT_SECTOR_SIZE, X68K_TABLE_OFFSET,
+};
 use crate::partition::PartitionSizeOverride;
 
 // Re-exports keep the historical `crate::rbformats::write_zeros` /
@@ -103,6 +266,7 @@ pub fn reconstruct_disk_from_backup(
     let target_sectors = target_size / 512;
     let is_superfloppy = metadata.partition_table_type == "None";
     let is_rdb = metadata.partition_table_type == "RDB";
+    let is_x68k = metadata.partition_table_type == "X68k";
 
     if is_rdb {
         // Backup-folder restore for RDB-based Amiga disks is not yet wired
@@ -122,6 +286,42 @@ pub fn reconstruct_disk_from_backup(
     } else if is_superfloppy {
         // Superfloppy: no partition table to write — data starts at offset 0
         log_cb("Superfloppy: no partition table to write");
+    } else if is_x68k {
+        // X68000 SASI table lives at byte 2048 — read x68k.json, patch with
+        // overrides, write at the canonical offset. The 2048-byte IPL region
+        // before the table is zero-filled (real X68000 hardware would carry
+        // a boot loader here; the MiSTer X68000 core boots from the SD card
+        // image of the OS itself, so a zeroed IPL is fine for data drives).
+        let x68k_path = backup_folder.join("x68k.json");
+        let x68k_data = fs::read_to_string(&x68k_path)
+            .with_context(|| format!("failed to read {}", x68k_path.display()))?;
+        let mut table: X68kPartitionTable =
+            serde_json::from_str(&x68k_data).context("failed to parse x68k.json")?;
+        // Refresh disk_size_field to the new target so inspect tools and
+        // Human68k itself report the post-resize size (the field is
+        // disk-size in some unit — sectors for MiSTer images).
+        let new_disk_sectors = (target_size / X68K_DEFAULT_SECTOR_SIZE) as u32;
+        if table.disk_size_field > 0 {
+            table.disk_size_field = new_disk_sectors;
+        }
+        let mut block = table.to_bytes();
+        if !partition_sizes.is_empty() {
+            patch_x68k_entries(&mut block, partition_sizes);
+            log_cb("Patched X68k partition table with export sizes");
+        }
+        // Zero-fill the IPL region (bytes 0..2048) and write the 144-byte
+        // table block at offset 2048.
+        writer.seek(SeekFrom::Start(0))?;
+        write_zeros(writer, X68K_TABLE_OFFSET)?;
+        writer
+            .write_all(&block)
+            .context("failed to write X68k partition table")?;
+        total_written = X68K_TABLE_OFFSET + block.len() as u64;
+        log_cb(&format!(
+            "Wrote X68k partition table ({} bytes at offset {})",
+            block.len(),
+            X68K_TABLE_OFFSET
+        ));
     } else if let Some(gpt_data) = gpt {
         // GPT restore: write protective MBR + primary GPT (LBAs 0-33)
         let patched_gpt = gpt_data.patch_for_restore(partition_sizes, target_sectors);
@@ -1148,6 +1348,9 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 if is_cd {
                     if let Ok(reader) = chd::CdCookedReader::open_path(p) {
                         let logical_size = reader.logical_size();
+                        // Real ChdReader owns OS resources we want released early;
+                        // stub builds compile this away (the stub has no Drop).
+                        #[cfg(feature = "chd")]
                         drop(reader);
                         return Ok(ImageFormat::ChdCdCooked {
                             path: p.to_path_buf(),
@@ -1157,6 +1360,7 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 }
                 if let Ok(reader) = chd::ChdReader::open(p) {
                     let logical_size = reader.logical_size();
+                    #[cfg(feature = "chd")]
                     drop(reader);
                     return Ok(ImageFormat::Chd {
                         path: p.to_path_buf(),

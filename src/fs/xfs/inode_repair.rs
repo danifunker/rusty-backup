@@ -44,9 +44,9 @@ use super::{read_at_aligned, XfsFilesystem, SECTOR};
 use crate::fs::filesystem::FilesystemError;
 use crate::fs::fsck::RepairReport;
 
-/// inobt leaf record layout (v4 short header): startino(4) freecount(4) free(8).
+/// inobt leaf record layout: startino(4) freecount(4) free(8). Same on v4
+/// and v5; the leading header size differs (see `XfsSuperblock::sblock_hdr_len`).
 const INOBT_REC_SIZE: usize = 16;
-const INOBT_HDR_LEN: usize = 16; // XFS_BTREE_SBLOCK_LEN
 
 /// di_nblocks (u64) and di_nextents (u32) offsets within an on-disk inode.
 const DI_NBLOCKS_OFF: usize = 64;
@@ -63,17 +63,15 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            // v5 inode cores are CRC-protected; rewriting would invalidate
-            // them. R5 is v4-only (silent, not a failure).
-            return Ok(report);
-        }
-
+        // §2.1 (E.5d): v5 lifted. `write_inode_region` (E.2) re-stamps the
+        // v3 inode core's CRC tuple on every rewrite, so recomputing
+        // `di_nblocks` / `di_nextents` is safe on v5 too.
         let sectsize = sb.sectsize as u64;
         let agblocks = sb.agblocks as u64;
         let blocksize = sb.blocksize as u64;
         let bs = sb.blocksize as usize;
         let ino_shift = sb.agblklog + sb.inopblog;
+        let hdr_len = sb.sblock_hdr_len();
 
         let mut any_change = false;
 
@@ -104,12 +102,12 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     continue;
                 }
                 let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
-                let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+                let max_leaf = (bs - hdr_len) / INOBT_REC_SIZE;
                 if numrecs > max_leaf {
                     continue;
                 }
                 for r in 0..numrecs {
-                    let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+                    let off = hdr_len + r * INOBT_REC_SIZE;
                     let start_agino = BigEndian::read_u32(&block[off..off + 4]) as u64;
                     let free = BigEndian::read_u64(&block[off + 8..off + 16]);
                     for slot in 0..super::types::XFS_INODES_PER_CHUNK as u64 {
@@ -194,9 +192,26 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 if !self.extents_in_bounds(sb, &extents) {
                     return Ok(false);
                 }
-                // Btree data fork also owns its bmbt blocks; we can't count
-                // those here, so recompute nextents only and leave nblocks.
-                (Some(extents.len() as u32), None)
+                // Btree data fork owns its bmbt blocks too. Walk the tree once
+                // more and sum (extent blocks + bmbt blocks); a parse failure
+                // means the fork is damaged and any nblocks recompute would
+                // ratify a bad layout, so leave both counters alone.
+                let fork_len = self.data_fork(&core, &inode_buf).len();
+                let root_parse = {
+                    let fork = self.data_fork(&core, &inode_buf);
+                    super::parse_bmbt_root(fork, fork_len)
+                };
+                let (root_level, first_child) = match root_parse {
+                    Ok(v) => v,
+                    Err(_) => return Ok(false),
+                };
+                let bmbt_blocks = match self.collect_bmbt_blocks(root_level, first_child) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(false),
+                };
+                let blocks: u64 =
+                    extents.iter().map(|e| e.blockcount).sum::<u64>() + bmbt_blocks.len() as u64;
+                (Some(extents.len() as u32), Some(blocks))
             }
             DiFormat::Other(_) => return Ok(false),
         };
@@ -258,6 +273,16 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
     /// Read-modify-write one inode's `inodesize` bytes back to disk. Mirrors
     /// `read_inode_buf`'s offset math; reads the containing sector span, patches
     /// the inode region, and writes the span (inodes are smaller than a sector).
+    ///
+    /// **v5 (CRC) volumes**: every caller's edits live in `inode_buf`. Before
+    /// we commit the sector span, the v3 inode core's CRC tuple
+    /// (`di_uuid`/`di_ino`/`di_lsn`/`di_changecount`/`di_crc`) is stamped via
+    /// [`v5_crc::stamp_inode_v3`] over the (mutable) `isz`-sized window. That
+    /// keeps every callsite (`do_create_file`, `do_sync_metadata`, R5/R6) free
+    /// of v5 plumbing — they prepare the inode body the same way for v4 and
+    /// v5, and the stamp lands here, just before the write. Upstream callers
+    /// still gate on v5 (`alloc_inode_slot`, repair entry points); E.4 / E.5
+    /// will lift those gates.
     pub(crate) fn write_inode_region(
         &mut self,
         sb: &super::sb::XfsSuperblock,
@@ -285,6 +310,11 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         )?;
         let off_in = (part_off - sector_start) as usize;
         buf[off_in..off_in + isz as usize].copy_from_slice(&inode_buf[..isz as usize]);
+        if sb.is_v5() {
+            // Stamp the v3 inode core in place over the freshly-copied bytes,
+            // so the CRC covers exactly the body that lands on disk.
+            super::v5_crc::stamp_inode_v3(&mut buf[off_in..off_in + isz as usize], ino, sb);
+        }
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + sector_start))?;
         self.reader.write_all(&buf)?;

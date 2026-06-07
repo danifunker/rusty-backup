@@ -18,6 +18,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
+use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
+use crate::rbformats::containers::hdf::{decode_hdf_bytes, detect_hdf_offset};
+use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
+use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::ReadSeek;
@@ -50,6 +55,121 @@ pub fn is_imz_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 4];
     matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == IMZ_MAGIC
+}
+
+/// True when `path` is a 140 KB Apple-II disk image (`.do`, `.po`, or
+/// `.dsk`). Used by [`open_read`] to decide whether to run
+/// [`open_apple_ii_dsk`], which converts a ProDOS-order DOS 3.3 disk
+/// to DOS-order at file-open time so the downstream `apple_dos` driver
+/// reads bytes at the right offsets. Pure-ProDOS disks (any order) and
+/// DOS-order DOS 3.3 disks pass through unchanged.
+pub fn is_apple_ii_dsk_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| {
+            let s = s.to_ascii_lowercase();
+            s == "do" || s == "po" || s == "dsk"
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    std::fs::metadata(path)
+        .map(|m| m.len() as usize == APPLE_II_DISK_BYTES)
+        .unwrap_or(false)
+}
+
+/// Cheap sniff: returns true when `path` looks like an Atari MSA floppy
+/// image. MSA's `$0E 0F` magic is short; we additionally require the
+/// extension to be `.msa` (case-insensitive) to keep the detector from
+/// guessing on arbitrary files whose first two bytes coincide.
+/// Cheap sniff: returns true when `path` looks like a CPCEMU DSK / EDSK
+/// container (Amstrad CPC / PCW / Tatung Einstein CP/M floppies). Checks
+/// the `.dsk` extension AND the first 34 bytes for one of the two CPCEMU
+/// magic strings, so this never false-positives on raw `.dsk` files used
+/// by other cores.
+pub fn is_edsk_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("dsk"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 34];
+    matches!(f.read(&mut head), Ok(n) if n >= 22) && looks_like_edsk_header(&head)
+}
+
+/// Cheap sniff: returns true when `path` looks like a Sharp `.d88` floppy
+/// container (X68000, PC-88, PC-98, MSX, FM-7). The format has no magic
+/// string, so we require the `.d88` extension AND a plausible-looking
+/// disk-info header (media-type byte ∈ {0x00, 0x10, 0x20}, write-protect
+/// byte ∈ {0x00, 0x10}, and the first track-offset table entry pointing
+/// past the 656-byte offset table). False positives on arbitrary
+/// `.d88`-named files are unlikely with those constraints combined.
+pub fn is_d88_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("d88"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 0x24];
+    matches!(f.read(&mut head), Ok(n) if n >= 0x24) && looks_like_d88_header(&head)
+}
+
+/// True when `path` ends in `.hdf` (case-insensitive) AND the bytes
+/// look like an Arculator-wrapped ADFS image. Pure bare `.hdf` files
+/// (RPCEmu / MiSTer Archie style) do NOT trigger this — they pass
+/// through as raw bytes since the partition layer's superfloppy probe
+/// already finds the Disc Record at byte 0xDC0. Only Arculator's
+/// 512-byte-header variant needs decoding, and only those return true.
+pub fn is_arculator_hdf_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("hdf"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    // Read enough of the file to span the candidate Disc Record at
+    // byte 0xFC0 (= ARCULATOR_HEADER_SIZE + 0xDC0 + 32).
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 0x200 + 0xDC0 + 32];
+    let n = f.read(&mut head).unwrap_or(0);
+    if n < head.len() {
+        return false;
+    }
+    matches!(detect_hdf_offset(&head), Some(off) if off > 0)
+}
+
+pub fn is_msa_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("msa"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == MSA_MAGIC
 }
 
 /// Cheap magic sniff: returns true when `path` starts with the Norton
@@ -97,6 +217,52 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let imz = ImzReader::open_with_password(path, password)
             .with_context(|| format!("open IMZ {}", path.display()))?;
         Ok(Box::new(imz))
+    } else if is_edsk_path(path) {
+        // EDSK / DSK floppies: read into memory, decode to a flat
+        // sector stream, hand off as Cursor. Same shape as MSA — small
+        // images (~1 MB max), no streaming needed.
+        let bytes = std::fs::read(path).with_context(|| format!("read EDSK {}", path.display()))?;
+        let flat =
+            decode_edsk_bytes(&bytes).with_context(|| format!("decode EDSK {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_d88_path(path) {
+        // Sharp .d88: X68000 / PC-88 / PC-98 / MSX / FM-7 floppy images.
+        // 2HD disks decode to ~1.26 MB flat; in-memory like EDSK / MSA.
+        let bytes = std::fs::read(path).with_context(|| format!("read D88 {}", path.display()))?;
+        let flat =
+            decode_d88_bytes(&bytes).with_context(|| format!("decode D88 {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_arculator_hdf_path(path) {
+        // Arculator-style .hdf with 512-byte header before the ADFS
+        // volume. Bare .hdf files (RPCEmu / MiSTer Archie) fall through
+        // to the generic open-as-File path below; the partition layer's
+        // superfloppy probe finds the Disc Record at byte 0xDC0
+        // unaided.
+        let bytes = std::fs::read(path).with_context(|| format!("read HDF {}", path.display()))?;
+        let flat =
+            decode_hdf_bytes(&bytes).with_context(|| format!("decode HDF {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_msa_path(path) {
+        // MSA is a small floppy container (≤ 1.5 MiB raw); decoding into
+        // memory and wrapping in a Cursor is simpler than a streaming reader
+        // and matches how the container framework hands out flat sectors.
+        let bytes = std::fs::read(path).with_context(|| format!("read MSA {}", path.display()))?;
+        let flat =
+            decode_msa_bytes(&bytes).with_context(|| format!("decode MSA {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_apple_ii_dsk_path(path) {
+        // 140 KB Apple-II floppy. `open_apple_ii_dsk` converts a
+        // ProDOS-order DOS 3.3 disk to DOS-order; pure-ProDOS and
+        // already-DOS-order disks pass through unchanged.
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("read Apple-II disk {}", path.display()))?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_string());
+        let flat = open_apple_ii_dsk(bytes, ext.as_deref())
+            .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
@@ -167,6 +333,84 @@ mod tests {
         let mut f = File::create(&path).unwrap();
         f.write_all(&[0xFE, 0xEF, 0x01]).unwrap();
         assert!(is_gho_path(&path));
+    }
+
+    #[test]
+    fn is_msa_path_requires_both_extension_and_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Right magic, wrong extension.
+        let no_ext = dir.path().join("disk.bin");
+        std::fs::write(&no_ext, b"\x0E\x0Frest").unwrap();
+        assert!(!is_msa_path(&no_ext), "magic without .msa extension");
+
+        // Right extension, wrong magic.
+        let wrong_magic = dir.path().join("fake.msa");
+        std::fs::write(&wrong_magic, b"NOPE").unwrap();
+        assert!(
+            !is_msa_path(&wrong_magic),
+            ".msa extension without 0E 0F magic"
+        );
+
+        // Both.
+        let real = dir.path().join("real.msa");
+        std::fs::write(&real, b"\x0E\x0F\0\0").unwrap();
+        assert!(is_msa_path(&real));
+    }
+
+    #[test]
+    fn open_read_routes_msa_through_decoder_and_partition_detect_finds_fat() {
+        use crate::partition::PartitionTable;
+        use crate::rbformats::containers::msa::{encode_msa_bytes, MsaHeader};
+
+        // Build a 720K raw FAT12 floppy in memory: BPB at byte 0, 0xAA55 at
+        // 510-511. No partition table — `detect` should report
+        // `PartitionTable::None { fs_hint: "FAT" }`.
+        let header = MsaHeader {
+            sectors_per_track: 9,
+            sides: 1,
+            start_track: 0,
+            end_track: 79,
+        };
+        let total = 720 * 1024;
+        let mut raw = vec![0u8; total];
+        // Minimal valid BPB.
+        raw[0] = 0xEB; // JMP short
+        raw[1] = 0x3C;
+        raw[2] = 0x90;
+        raw[3..11].copy_from_slice(b"MSDOS5.0");
+        raw[11] = 0x00; // 512 bps
+        raw[12] = 0x02;
+        raw[13] = 0x01; // 1 spc
+        raw[14] = 0x01; // 1 reserved
+        raw[15] = 0x00;
+        raw[16] = 0x02; // 2 FATs
+        raw[21] = 0xF9; // media descriptor for 720K
+        raw[510] = 0x55;
+        raw[511] = 0xAA;
+
+        let msa = encode_msa_bytes(header, &raw);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atari.msa");
+        std::fs::write(&path, &msa).unwrap();
+        assert!(is_msa_path(&path));
+
+        let mut reader = open_read(&path).unwrap();
+        // First 512 bytes should be the BPB-bearing boot sector.
+        let mut sector = [0u8; 512];
+        reader.read_exact(&mut sector).unwrap();
+        assert_eq!(&sector[3..11], b"MSDOS5.0");
+        assert_eq!(sector[510], 0x55);
+        assert_eq!(sector[511], 0xAA);
+
+        // And the partition detector should treat it as a FAT superfloppy.
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "FAT");
+        assert_eq!(parts[0].size_bytes, total as u64);
     }
 
     /// SECTOR-mode uncompressed GHO opens as a GhoReader via the

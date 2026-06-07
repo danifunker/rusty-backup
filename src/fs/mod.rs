@@ -1,8 +1,13 @@
+pub mod adfs;
 pub mod affs;
 pub mod affs_common;
 pub mod affs_fsck;
+pub mod andos;
+pub mod apple_dos;
 pub mod binhex;
 pub mod btrfs;
+pub mod cpm;
+pub mod cpm_diskdefs;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
@@ -23,17 +28,26 @@ pub mod hfsplus_fsck;
 pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
+pub mod human68k;
+pub mod jfs;
+pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
+pub mod mfs;
 pub mod ntfs;
 pub mod patch;
 pub mod pfs3;
 pub mod pfs3_clone;
 pub mod prodos;
 pub mod prodos_types;
+pub mod qdos;
+pub mod qdos_mdv;
+pub mod reiserfs;
 pub mod resource_fork;
 pub mod sfs;
 pub mod tree;
+pub mod ufs;
+pub mod ufs_fsck;
 pub mod unix_common;
 pub mod xfs;
 pub mod zstd_stream;
@@ -58,10 +72,14 @@ pub use hfs::{
     hfs_max_growable_size, resize_hfs_in_place, validate_hfs_integrity, CompactHfsReader,
 };
 pub use hfsplus::{resize_hfsplus_in_place, validate_hfsplus_integrity, CompactHfsPlusReader};
+pub use jfs::CompactJfsReader;
 pub use ntfs::{
     patch_ntfs_hidden_sectors, resize_ntfs_in_place, validate_ntfs_integrity, CompactNtfsReader,
 };
 pub use prodos::{resize_prodos_in_place, validate_prodos_integrity, CompactProDosReader};
+pub use qdos::resize_qdos_in_place;
+pub use reiserfs::CompactReiserFsReader;
+pub use ufs::CompactUfsReader;
 
 /// Update the BPB/VBR hidden-sectors / partition-offset field for whichever
 /// filesystem is present at `partition_offset`. Each per-FS patcher checks
@@ -105,6 +123,7 @@ pub fn resize_filesystem_for(
     pfs3::resize_pfs3_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
 }
 
@@ -152,9 +171,8 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return "fat";
     }
     // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
-    // (IRIX-compatible) and v5/CRC superblocks share this magic; the
-    // XfsFilesystem parser will return a clear "v5 not supported" error
-    // on v5 disks until that work lands.
+    // (IRIX-compatible) and v5/CRC superblocks share this magic and are
+    // fully supported for read + edit + fsck (§2.1 hole (E)).
     if &sector0[0..4] == b"XFSB" {
         return "xfs";
     }
@@ -180,6 +198,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                     return "hfs";
                 }
                 0x482B | 0x4858 => return "hfsplus",
+                // MFS — pre-HFS, used by Mac 128K/512K and Mac Plus on 400 KB
+                // single-sided floppies. Same byte-1024 MDB convention as HFS.
+                0xD2D7 => return "mfs",
                 _ => {}
             }
             // ext superblock magic at offset 0x38 (56) within this sector
@@ -221,16 +242,160 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         return "affs";
     }
 
-    // Sector 128 (offset 65536 = 0x10000): btrfs superblock.
-    // btrfs magic "_BHRfS_M" is at offset 0x40 (64) within the superblock,
-    // i.e. byte 64 of a sector-aligned read from offset 65536.
+    // Sector 128 (offset 65536 = 0x10000): btrfs superblock AND ReiserFS
+    // superblock share this offset. btrfs magic "_BHRfS_M" sits at offset
+    // 0x40 within the superblock; ReiserFS magic sits at offset 52
+    // (0x34) of the same superblock. One sector-aligned 512-byte read
+    // disambiguates both. UFS2's modern superblock lives at the same
+    // offset; its magic lands at +1372 (= byte 66908 absolute) so the
+    // sector-aligned 512-byte read at 66560 covers it too.
     if reader
         .seek(SeekFrom::Start(partition_offset + 0x10000))
         .is_ok()
     {
-        let mut btrfs_buf = [0u8; 512];
-        if reader.read_exact(&mut btrfs_buf).is_ok() && &btrfs_buf[0x40..0x48] == b"_BHRfS_M" {
-            return "btrfs";
+        let mut sb64k = [0u8; 512];
+        if reader.read_exact(&mut sb64k).is_ok() {
+            if &sb64k[0x40..0x48] == b"_BHRfS_M" {
+                return "btrfs";
+            }
+            // ReiserFS magics live at offset 52. v3.5 = "ReIsErFs",
+            // v3.6 = "ReIsEr2Fs", reiser4 = "ReIsEr4" (rejected at open).
+            let rmagic = &sb64k[52..62];
+            if rmagic.starts_with(b"ReIsErFs")
+                || rmagic.starts_with(b"ReIsEr2Fs")
+                || rmagic.starts_with(b"ReIsEr4")
+            {
+                return "reiserfs";
+            }
+        }
+    }
+
+    // UFS magic probes. UFS1 lives at byte 8192 (SBLOCK_UFS1) with magic
+    // 0x00011954 at +1372 → absolute byte 9564; UFS2 may live at byte
+    // 8192 (NetBSD makefs default for small images) OR byte 65536
+    // (FreeBSD newfs default) with magic 0x19540119 at the same offset.
+    // We probe both candidate locations with one 4-byte read each.
+    let mut ufs_magic = [0u8; 4];
+    for &cand in &[8192u64, 65536u64] {
+        if reader
+            .seek(SeekFrom::Start(partition_offset + cand + 1372))
+            .is_err()
+        {
+            continue;
+        }
+        if reader.read_exact(&mut ufs_magic).is_err() {
+            continue;
+        }
+        let le = u32::from_le_bytes(ufs_magic);
+        let be = u32::from_be_bytes(ufs_magic);
+        if le == 0x0001_1954 || le == 0x1954_0119 || be == 0x0001_1954 || be == 0x1954_0119 {
+            return "ufs";
+        }
+    }
+
+    // JFS2 magic probe. The primary aggregate superblock lives at byte
+    // 32768 (`SUPER1_OFF`) and starts with the 4-byte ASCII magic
+    // "JFS1" (Linux JFS2; AIX JFS1 is a different on-disk format with
+    // different magic — rejected implicitly).
+    if reader
+        .seek(SeekFrom::Start(partition_offset + 0x8000))
+        .is_ok()
+    {
+        let mut jfs_magic = [0u8; 4];
+        if reader.read_exact(&mut jfs_magic).is_ok() && &jfs_magic == b"JFS1" {
+            return "jfs";
+        }
+    }
+
+    // Apple DOS 3.3 VTOC at byte 0x11000 (track 17, sector 0). Same gate
+    // as `partition::detect_superfloppy`: only fire on the exact 140 KB
+    // Apple-II floppy geometry, since the VTOC offset would otherwise be
+    // mid-stream on a different filesystem.
+    let partition_size = reader
+        .seek(SeekFrom::End(0))
+        .ok()
+        .and_then(|end| end.checked_sub(partition_offset))
+        .unwrap_or(0);
+    if partition_size == 143_360
+        && reader
+            .seek(SeekFrom::Start(partition_offset + 0x11000))
+            .is_ok()
+    {
+        let mut vtoc = [0u8; 256];
+        if reader.read_exact(&mut vtoc).is_ok()
+            && vtoc[0x01] == 17
+            && vtoc[0x02] == 15
+            && (1..=4).contains(&vtoc[0x03])
+            && vtoc[0x27] == 122
+            && vtoc[0x34] == 35
+            && vtoc[0x35] == 16
+            && vtoc[0x36] == 0x00
+            && vtoc[0x37] == 0x01
+        {
+            return "applesdos33";
+        }
+    }
+
+    // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
+    // Re-read sector 0 (sector0 is already on hand from the top of
+    // this function but we re-seek for clarity / safety).
+    if &sector0[0..4] == b"QLWA" {
+        return "qdos";
+    }
+
+    // Acorn ADFS — Disc Record at byte 0xC00 + 0x1C0 = 0xDC0 (HD /
+    // legacy floppy bblk path) or byte 0x04 (single-zone E-format
+    // floppy dr0 path). Probe just enough to discriminate from random
+    // data: log2(sec_size) in 8..=11, heads >= 1 (HD discs report up
+    // to 9+; the field is u8), density 0..=3, nzones >= 1. Matches the
+    // looser superfloppy probe in `partition::detect_superfloppy` —
+    // every disc that surfaces as "ADFS" there must also route here.
+    for cand in [0xDC0u64, 0x004u64] {
+        if reader
+            .seek(SeekFrom::Start(partition_offset + cand))
+            .is_ok()
+        {
+            let mut dr = [0u8; 60];
+            if reader.read_exact(&mut dr).is_ok() {
+                let log2_sz = dr[0];
+                let secs_per_track = dr[1];
+                let heads = dr[2];
+                let density = dr[3];
+                let idlen = dr[4];
+                let nzones = dr[9];
+                // Bytes 52..60 (`unused52` in the kernel struct) must
+                // be zero per `adfs_checkdiscrecord`.
+                let reserved_zero = dr[52..60].iter().all(|&b| b == 0);
+                if (8..=11).contains(&log2_sz)
+                    && secs_per_track >= 1
+                    && heads >= 1
+                    && density <= 3
+                    && nzones >= 1
+                    && idlen >= log2_sz + 3
+                    && reserved_zero
+                {
+                    return "adfs";
+                }
+            }
+        }
+    }
+
+    // BK0011M ANDOS: signature "ANDOS" at one of several boot-block
+    // offsets per src/fs/andos.rs. Restrict to sector 0 to keep this
+    // cheap.
+    if andos::detect_andos_signature(&sector0).is_some() {
+        return "andos";
+    }
+
+    // QDOS Microdrive cartridge: exact file size 174,930 bytes
+    // (255 × 686) AND a recognisable sector-0 cartridge header. The
+    // exact-size constraint keeps this from false-positiving on other
+    // formats — every real MiSTer-distributed `.mdv` we've seen lands
+    // exactly there.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        if end == qdos_mdv::MDV_CART_BYTES as u64 && qdos_mdv::looks_like_mdv_sector_zero(&sector0)
+        {
+            return "qdos_mdv";
         }
     }
 
@@ -244,8 +409,9 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
 /// type-name column use this to replace the generic "Linux" label with the
 /// actual filesystem family.
 ///
-/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, or `None` when the
-/// content isn't a filesystem this function recognizes.
+/// Returns one of: `"FAT"`, `"ext"`, `"btrfs"`, `"XFS"`, `"ReiserFS"`,
+/// `"UFS"`, or `None` when the content isn't a filesystem this function
+/// recognizes.
 pub fn probe_0x83_fs_type<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -255,6 +421,9 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "ext" => Some("ext"),
         "btrfs" => Some("btrfs"),
         "xfs" => Some("XFS"),
+        "reiserfs" => Some("ReiserFS"),
+        "ufs" => Some("UFS"),
+        "jfs" => Some("JFS2"),
         _ => None,
     }
 }
@@ -351,6 +520,19 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
+                "reiserfs" => {
+                    let (reader, info) =
+                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "ufs" => {
+                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "jfs" => {
+                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
                 "prodos" => {
                     let (reader, info) = CompactProDosReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
@@ -378,8 +560,9 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 _ => None,
             }
         }
-        // Linux (ext2/3/4, btrfs). Also FAT for MSX HDDs that mis-stamp
-        // the type byte (Nextor / similar write 0x83 for FAT partitions).
+        // Linux (ext2/3/4, btrfs, reiserfs). Also FAT for MSX HDDs that
+        // mis-stamp the type byte (Nextor / similar write 0x83 for FAT
+        // partitions).
         0x83 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
@@ -389,6 +572,19 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                 }
                 "btrfs" => {
                     let (reader, info) = CompactBtrfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "reiserfs" => {
+                    let (reader, info) =
+                        CompactReiserFsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "ufs" => {
+                    let (reader, info) = CompactUfsReader::new(reader, partition_offset).ok()?;
+                    Some((Box::new(reader), info))
+                }
+                "jfs" => {
+                    let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
                 "fat" => {
@@ -682,14 +878,14 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
-            "Apple_UNIX_SVR2" => "ext/btrfs",
-            "Linux" => "ext/btrfs",
+            "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             _ => "unknown",
         };
     }
     match partition_type {
         0xAF => "HFS/HFS+",
-        0x83 => "ext/btrfs/xfs",
+        0x83 => "ext/btrfs/xfs/reiserfs/UFS/JFS",
         0xA8 => "ProDOS",
         0x07 => "NTFS/exFAT",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
@@ -1004,6 +1200,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
                     reader,
                     partition_offset,
@@ -1016,7 +1216,39 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "applesdos33" => Ok(Box::new(apple_dos::AppleDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos_mdv" => Ok(Box::new(qdos_mdv::QdosMdvFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "andos" => Ok(Box::new(andos::AndosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "reiserfs" => Ok(Box::new(reiserfs::ReiserFsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1080,6 +1312,18 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "reiserfs" => Ok(Box::new(reiserfs::ReiserFsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1204,6 +1448,35 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            s if s.starts_with("cpm:") => {
+                let preset_name = &s[4..];
+                let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                    FilesystemError::Unsupported(format!("unknown CP/M DPB preset '{preset_name}'"))
+                })?;
+                return Ok(Box::new(cpm::CpmFilesystem::open_with_dpb(
+                    reader,
+                    partition_offset,
+                    *dpb,
+                )?));
+            }
+            "human68k" => {
+                return Ok(Box::new(human68k::Human68kFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
+            "qdos" | "qxlwin" | "QDOS" => {
+                return Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
+            "adfs" | "ADFS" => {
+                return Ok(Box::new(adfs::AdfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -1241,7 +1514,15 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     fs.prepare_for_edit()?;
                     Ok(Box::new(fs))
                 }
+                "mfs" => Ok(Box::new(mfs::MfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "prodos" => Ok(Box::new(prodos::ProDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "applesdos33" => Ok(Box::new(apple_dos::AppleDosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1254,6 +1535,14 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "qdos" => Ok(Box::new(qdos::QdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -1421,6 +1710,57 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // SFS family — `SFS\0`, `SFS\2`. Read-only browse + backup
         // (Phase 7); editing arrives in Phase 8.
         s if is_amiga_sfs_type(s) => Ok(Box::new(sfs::SfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // CP/M with explicit DPB preset. CP/M floppies have no on-disk
+        // signature, so callers must declare which DPB applies via the
+        // `cpm:<preset_name>` partition_type_string convention. The
+        // preset list lives in src/fs/cpm_diskdefs.rs.
+        s if s.starts_with("cpm:") => {
+            let preset_name = &s[4..];
+            let dpb = cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                FilesystemError::Unsupported(format!(
+                    "unknown CP/M DPB preset '{preset_name}' — \
+                     valid names: {}",
+                    cpm_diskdefs::ALL_PRESETS
+                        .iter()
+                        .map(|d| d.name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            Ok(Box::new(cpm::CpmFilesystem::open_with_dpb(
+                reader,
+                partition_offset,
+                *dpb,
+            )?))
+        }
+        // X68000 Human68k — FAT-derived BPB. Same dispatch shape as
+        // CP/M (caller declares the FS via partition_type_string)
+        // because the BPB alone can't reliably distinguish Human68k
+        // from a regular FAT12/16 volume without an X68000-specific
+        // OEM ID heuristic.
+        "human68k" => Ok(Box::new(human68k::Human68kFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Acorn ADFS / FileCore (Archimedes core). Auto-detected via
+        // the Disc Record probe in detect_filesystem_type, but the
+        // dispatch arm is also reachable via an explicit string.
+        "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Sinclair QL QXL.WIN container. Auto-detect / superfloppy hint
+        // returns "QDOS" uppercase; explicit CLI flag uses lowercase.
+        "qdos" | "qxlwin" | "QDOS" => Ok(Box::new(qdos::QdosFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Soviet BK0011M ANDOS scaffold (detect-only). "andos" =
+        // explicit CLI/code call; "ANDOS" = auto-detect superfloppy hint.
+        "andos" | "ANDOS" => Ok(Box::new(andos::AndosFilesystem::open(
             reader,
             partition_offset,
         )?)),

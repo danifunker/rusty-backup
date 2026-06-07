@@ -80,9 +80,18 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             unrepairable_count: 0,
         };
         let sb = self.superblock().clone();
-        if sb.is_v5() {
-            // v5 inobt blocks are CRC-protected; rewriting would invalidate
-            // them. R3 is v4-only (silent, not a failure).
+        // v5 sblock-CRC writers (E.4) handle the inobt block stamps.
+        // FINOBT support (slice 5): the walkable path now ALSO updates
+        // the corresponding finobt record after each inobt mask
+        // rewrite (`sync_finobt_for_record`). Insert / remove
+        // transitions (chunk became fully allocated or fully free)
+        // refuse cleanly per-AG so the inobt change rolls into the
+        // dirtied-but-skipped path without leaving finobt skew.
+        //
+        // RMAPBT still bars R3 entirely: every inobt block we rewrite
+        // would be referenced by a stale rmapbt record. Awaits the
+        // rmapbt-rebuild slice.
+        if sb.has_rmapbt() {
             return Ok(report);
         }
 
@@ -131,18 +140,21 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 Ok(leaves) => {
                     // Walkable: recompute each existing leaf's masks in place.
                     let mut leaves_fixed = 0u32;
+                    let mut record_changes: Vec<InobtRecordChange> = Vec::new();
                     for leaf_agbno in leaves {
                         match self.repair_inobt_leaf(&sb, agno, leaf_agbno, &internal) {
                             Ok(LeafResult {
                                 count,
                                 freecount,
                                 rewritten,
+                                updated,
                             }) => {
                                 ag_count += count;
                                 ag_freecount += freecount;
                                 if rewritten {
                                     leaves_fixed += 1;
                                 }
+                                record_changes.extend(updated);
                             }
                             Err(e) => {
                                 report.fixes_failed.push(format!(
@@ -150,6 +162,35 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                                 ));
                                 ag_failed = true;
                                 break;
+                            }
+                        }
+                    }
+                    // Slice 5: v5 + FINOBT sync. Every inobt mask change
+                    // is mirrored into the finobt record for the same
+                    // chunk so the free-inode btree doesn't go stale.
+                    // Pure-update transitions (chunk stays in finobt
+                    // both before and after) are propagated. Insert /
+                    // remove transitions (chunk crosses the 0-free
+                    // boundary) refuse cleanly — the inobt change is
+                    // already on disk; the caller surfaces a failure
+                    // entry instead of advertising the fix.
+                    if !ag_failed && sb.has_finobt() && !record_changes.is_empty() {
+                        let finobt_root = agi.free_root;
+                        match self.sync_finobt_for_changes(&sb, agno, finobt_root, &record_changes)
+                        {
+                            Ok(synced) => {
+                                if synced > 0 {
+                                    report.fixes_applied.push(format!(
+                                        "AG {agno}: also updated {synced} finobt record(s) \
+                                         to match inobt"
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                report.fixes_failed.push(format!(
+                                    "AG {agno}: inobt repaired but finobt resync failed: {e}"
+                                ));
+                                ag_failed = true;
                             }
                         }
                     }
@@ -236,8 +277,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                     BigEndian::write_u32(&mut agi_sec[AGI_ROOT_OFF..AGI_ROOT_OFF + 4], root);
                     BigEndian::write_u32(&mut agi_sec[AGI_LEVEL_OFF..AGI_LEVEL_OFF + 4], level);
                 }
-                self.reader.seek(SeekFrom::Start(agi_byte))?;
-                self.reader.write_all(&agi_sec)?;
+                self.write_agi_sector(&sb, agi_byte, &mut agi_sec)?;
                 any_change = true;
                 let what = if new_root_level.is_some() {
                     "AGI root/level/count/freecount"
@@ -295,8 +335,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         }
         BigEndian::write_u64(&mut primary[SB_ICOUNT_OFF..SB_ICOUNT_OFF + 8], icount);
         BigEndian::write_u64(&mut primary[SB_IFREE_OFF..SB_IFREE_OFF + 8], ifree);
-        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
-        self.reader.write_all(&primary)?;
+        self.write_sb_primary(sb, &mut primary)?;
         Ok(true)
     }
 
@@ -309,10 +348,57 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         agno: u64,
         root: u32,
     ) -> Result<Vec<u32>, FilesystemError> {
+        let (leaves, _all) = self.walk_inobt(sb, agno, root)?;
+        Ok(leaves)
+    }
+
+    /// Descend the inobt from `root`, returning the AG-relative block numbers
+    /// of **every** block visited (leaves + internal nodes). Used by the inobt
+    /// growth path in `edit.rs` to free the old tree blocks when replacing it
+    /// with a freshly-built one. Errors on the same conditions as
+    /// [`collect_inobt_leaf_blocks`].
+    pub(crate) fn collect_inobt_all_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+    ) -> Result<Vec<u32>, FilesystemError> {
+        let (_leaves, all) = self.walk_inobt(sb, agno, root)?;
+        Ok(all)
+    }
+
+    /// Shared inobt traversal: returns `(leaves, all_blocks)` where `leaves`
+    /// is the level-0 block subset and `all_blocks` is every block visited
+    /// (including the root and any intermediate nodes).
+    fn walk_inobt(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+    ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
+        self.walk_short_btree_blocks(sb, agno, root, sb.inobt_magic(), "inobt")
+    }
+
+    /// Generalised AG-relative B+tree traversal. Reuses the same descent
+    /// shape as `walk_inobt` but parameterises the magic + the
+    /// debug-context label so it can drive finobt / rmapbt / refcountbt
+    /// walks the same way. Caller supplies the expected magic via
+    /// `sb.inobt_magic()` / `sb.finobt_magic()` / etc. (or, for the
+    /// other side-tree magics, hard-coded constants for now).
+    pub(crate) fn walk_short_btree_blocks(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        root: u32,
+        want_magic: u32,
+        ctx: &'static str,
+    ) -> Result<(Vec<u32>, Vec<u32>), FilesystemError> {
         let bs = sb.blocksize as usize;
-        let max_intern = (bs - INOBT_HDR_LEN) / (4 + 4); // 4-byte key + 4-byte ptr
+        let hdr = sb.sblock_hdr_len();
+        let max_intern = (bs - hdr) / (4 + 4); // 4-byte key + 4-byte ptr
         let mut block = vec![0u8; bs];
         let mut leaves = Vec::new();
+        let mut all = Vec::new();
         let mut stack = vec![root];
         let mut visited: HashSet<u32> = HashSet::new();
 
@@ -322,15 +408,17 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             }
             if !visited.insert(agbno) {
                 return Err(FilesystemError::Parse(format!(
-                    "AG {agno} inobt block {agbno} visited twice (cycle)"
+                    "AG {agno} {ctx} block {agbno} visited twice (cycle)"
                 )));
             }
+            all.push(agbno);
             let fsblock = (agno << sb.agblklog) | agbno as u64;
             self.read_fsblock(fsblock, &mut block)?;
             let magic = BigEndian::read_u32(&block[0..4]);
-            if magic != XFS_IBT_MAGIC {
+            if magic != want_magic {
                 return Err(FilesystemError::Parse(format!(
-                    "bad inobt magic 0x{magic:08X} at AG {agno} block {agbno}"
+                    "bad {ctx} magic 0x{magic:08X} at AG {agno} block {agbno} \
+                     (expected 0x{want_magic:08X})"
                 )));
             }
             let level = BigEndian::read_u16(&block[4..6]);
@@ -340,21 +428,23 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             } else {
                 if numrecs > max_intern {
                     return Err(FilesystemError::Parse(format!(
-                        "AG {agno} inobt node numrecs {numrecs} > max {max_intern}"
+                        "AG {agno} {ctx} node numrecs {numrecs} > max {max_intern}"
                     )));
                 }
-                let ptr_base = INOBT_HDR_LEN + max_intern * 4;
+                let ptr_base = hdr + max_intern * 4;
                 for i in 0..numrecs {
                     let off = ptr_base + i * 4;
                     stack.push(BigEndian::read_u32(&block[off..off + 4]));
                 }
             }
         }
-        Ok(leaves)
+        Ok((leaves, all))
     }
 
     /// Recompute every record's free mask/freecount in one inobt leaf block
     /// from its inodes, rewriting the block only if something changed.
+    /// Returns the per-record (start_agino, new_free, new_freecount)
+    /// tuples so the caller can propagate into finobt on v5.
     fn repair_inobt_leaf(
         &mut self,
         sb: &XfsSuperblock,
@@ -363,7 +453,8 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         internal: &HashSet<u64>,
     ) -> Result<LeafResult, FilesystemError> {
         let bs = sb.blocksize as usize;
-        let max_leaf = (bs - INOBT_HDR_LEN) / INOBT_REC_SIZE;
+        let hdr = sb.sblock_hdr_len();
+        let max_leaf = (bs - hdr) / INOBT_REC_SIZE;
         let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
         let mut block = vec![0u8; bs];
         self.read_fsblock(fsblock, &mut block)?;
@@ -378,9 +469,10 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         let mut count: u64 = 0;
         let mut freecount: u64 = 0;
         let mut changed = false;
+        let mut updated: Vec<InobtRecordChange> = Vec::new();
 
         for r in 0..numrecs {
-            let off = INOBT_HDR_LEN + r * INOBT_REC_SIZE;
+            let off = hdr + r * INOBT_REC_SIZE;
             let start_agino = BigEndian::read_u32(&block[off..off + 4]);
             let old_freecount = BigEndian::read_u32(&block[off + REC_FREECOUNT_OFF..off + 8]);
             let old_free = BigEndian::read_u64(&block[off + REC_FREE_OFF..off + 16]);
@@ -395,10 +487,20 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
                 BigEndian::write_u32(&mut block[off + REC_FREECOUNT_OFF..off + 8], new_freecount);
                 BigEndian::write_u64(&mut block[off + REC_FREE_OFF..off + 16], new_free);
                 changed = true;
+                updated.push(InobtRecordChange {
+                    start_agino,
+                    old_freecount,
+                    new_free,
+                    new_freecount,
+                });
             }
         }
 
         if changed {
+            // v5: stamp the leaf's sblock-crc tuple before writing.
+            if sb.is_v5() {
+                super::v5_crc::stamp_sblock_hdr_for_ag(&mut block, sb, agno, leaf_agbno);
+            }
             let part_byte =
                 fsblock_to_partition_byte(fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
             self.reader
@@ -410,7 +512,127 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             count,
             freecount,
             rewritten: changed,
+            updated,
         })
+    }
+
+    /// Slice 5 — finobt resync. For each `InobtRecordChange` (chunks
+    /// whose inobt record was just rewritten), find the matching
+    /// record in finobt by `start_agino` key and propagate the new
+    /// mask + freecount. Returns the count of finobt records updated.
+    ///
+    /// Refuses cleanly when the change crosses the finobt-membership
+    /// boundary (chunk transitioning 0-free ↔ >0-free), since
+    /// insert/remove in finobt is a separate slice (full B+tree
+    /// manipulation). On refuse: the inobt change is already on disk
+    /// and the caller surfaces a failure entry to flag this AG.
+    fn sync_finobt_for_changes(
+        &mut self,
+        sb: &XfsSuperblock,
+        agno: u64,
+        finobt_root: u32,
+        changes: &[InobtRecordChange],
+    ) -> Result<u32, FilesystemError> {
+        // Quick bail: a 0 finobt_root means the AGI didn't surface a
+        // free-inode tree even though FINOBT was advertised. Treat as
+        // a refusal — caller flags AG.
+        if finobt_root == 0 || finobt_root == NULLAGBLOCK {
+            return Err(FilesystemError::Parse(format!(
+                "AG {agno}: FINOBT feature advertised but agi_free_root \
+                 is null — refusing finobt sync"
+            )));
+        }
+        // Pre-flight: any change that requires insert/remove is not
+        // supported in this slice. (`old_freecount == 0` → would
+        // need insert; `new_freecount == 0` → would need remove.)
+        for c in changes {
+            let old_in_finobt = c.old_freecount > 0;
+            let new_in_finobt = c.new_freecount > 0;
+            if old_in_finobt != new_in_finobt {
+                return Err(FilesystemError::Unsupported(format!(
+                    "AG {agno}: chunk {} freecount crossed 0-boundary \
+                     (old={}, new={}); finobt insert/remove not yet \
+                     implemented",
+                    c.start_agino, c.old_freecount, c.new_freecount
+                )));
+            }
+        }
+        // Walk finobt leaves, looking up each change's start_agino.
+        // We collect leaf-block lookups once per leaf to avoid
+        // re-reading the same block multiple times.
+        let leaves = self
+            .walk_short_btree_blocks(sb, agno, finobt_root, sb.finobt_magic(), "finobt")?
+            .0;
+        if leaves.is_empty() {
+            // Pure update path can't apply without target records.
+            // If any change wants update (old_freecount > 0), this is
+            // skew — surface as a failure.
+            for c in changes {
+                if c.old_freecount > 0 {
+                    return Err(FilesystemError::Parse(format!(
+                        "AG {agno}: finobt has no leaves but inobt record \
+                         at start_agino {} was previously free",
+                        c.start_agino
+                    )));
+                }
+            }
+            return Ok(0);
+        }
+        let bs = sb.blocksize as usize;
+        let hdr = sb.sblock_hdr_len();
+        let max_leaf = (bs - hdr) / INOBT_REC_SIZE;
+        let mut applied: u32 = 0;
+        // Walk every leaf once, scan its records, and apply any
+        // matching change. Per-leaf write is single-shot at the end.
+        for leaf_agbno in leaves {
+            let fsblock = (agno << sb.agblklog) | leaf_agbno as u64;
+            let mut block = vec![0u8; bs];
+            self.read_fsblock(fsblock, &mut block)?;
+            let numrecs = BigEndian::read_u16(&block[6..8]) as usize;
+            if numrecs > max_leaf {
+                return Err(FilesystemError::Parse(format!(
+                    "AG {agno}: finobt leaf {leaf_agbno} numrecs {numrecs} > max {max_leaf}"
+                )));
+            }
+            let mut leaf_changed = false;
+            for r in 0..numrecs {
+                let off = hdr + r * INOBT_REC_SIZE;
+                let rec_start = BigEndian::read_u32(&block[off..off + 4]);
+                // Match against any pending change.
+                for c in changes {
+                    if c.start_agino != rec_start {
+                        continue;
+                    }
+                    // Pure-update: write the new mask + freecount.
+                    let cur_freecount =
+                        BigEndian::read_u32(&block[off + REC_FREECOUNT_OFF..off + 8]);
+                    let cur_free = BigEndian::read_u64(&block[off + REC_FREE_OFF..off + 16]);
+                    if cur_freecount == c.new_freecount && cur_free == c.new_free {
+                        // Already in sync (rare — caller already
+                        // detected the inobt change but finobt was
+                        // somehow already correct).
+                        continue;
+                    }
+                    BigEndian::write_u32(
+                        &mut block[off + REC_FREECOUNT_OFF..off + 8],
+                        c.new_freecount,
+                    );
+                    BigEndian::write_u64(&mut block[off + REC_FREE_OFF..off + 16], c.new_free);
+                    leaf_changed = true;
+                    applied += 1;
+                }
+            }
+            if leaf_changed {
+                // v5: re-stamp CRC since finobt is v5-only.
+                super::v5_crc::stamp_sblock_hdr_for_ag(&mut block, sb, agno, leaf_agbno);
+                let part_byte =
+                    fsblock_to_partition_byte(fsblock, sb.agblocks, sb.agblklog, sb.blocksize);
+                self.reader
+                    .seek(SeekFrom::Start(self.partition_offset + part_byte))?;
+                self.reader.write_all(&block)?;
+            }
+        }
+        Ok(applied)
     }
 
     /// Rebuild a trashed single-level inobt from already-discovered `chunks`:
@@ -491,7 +713,9 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
 
         // (2) free extents of this AG, carve the tree's blocks off the largest.
         let derived = derive_free_extents(&map, agno, agblocks, expected_len);
-        let need = blocks_needed_for(chunks.len(), bs, INOBT_REC_SIZE, INOBT_KEY_SIZE);
+        // R3 currently rejects v5 at the entry point above, so this AG-rebuild
+        // is always v4 today; passing `false` preserves that.
+        let need = blocks_needed_for(chunks.len(), bs, INOBT_REC_SIZE, INOBT_KEY_SIZE, false);
         let (carved, _reduced) = carve_from_largest(&derived, need as u32).ok_or_else(|| {
             FilesystemError::Unsupported(format!(
                 "AG {agno}: largest free extent too small for a {need}-block inobt"
@@ -517,6 +741,7 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
             bs,
             agno as u32,
             &carved,
+            None,
         );
         for blk in &tree.blocks {
             let fsblock = (agno << sb.agblklog) | blk.agbno as u64;
@@ -740,4 +965,166 @@ struct LeafResult {
     count: u64,
     freecount: u64,
     rewritten: bool,
+    /// Per-record changes the caller propagates into finobt on v5.
+    updated: Vec<InobtRecordChange>,
+}
+
+/// One record's new state after R3 recomputed its mask from on-disk
+/// inodes. `old_freecount` tells the finobt-resync path whether this
+/// record was previously in finobt (≥1 free inode → recorded) and
+/// whether the new state needs an insert/update/remove.
+#[derive(Clone, Copy)]
+struct InobtRecordChange {
+    start_agino: u32,
+    old_freecount: u32,
+    new_free: u64,
+    new_freecount: u32,
+}
+
+#[cfg(test)]
+mod finobt_sync_tests {
+    use super::super::XfsFilesystem;
+    use std::io::Cursor;
+
+    // Decompress the bundled v5 fixture, helper mirrors mod.rs's.
+    fn load_modern_fixture() -> Vec<u8> {
+        let bytes = include_bytes!("../../../tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
+        let mut decoder = zstd::stream::read::Decoder::new(&bytes[..]).unwrap();
+        let mut out = Vec::new();
+        std::io::copy(&mut decoder, &mut out).unwrap();
+        out
+    }
+
+    /// Slice 5 happy-path: run `sync_finobt_for_changes` against the
+    /// real v5 fixture with synthetic changes that LOOK like inobt
+    /// repaired a record's mask. The finobt's matching record must
+    /// pick up the new mask + freecount and re-stamp its CRC.
+    #[test]
+    fn sync_finobt_propagates_pure_update_into_matching_leaf_record() {
+        let img = load_modern_fixture();
+        let mut cursor = Cursor::new(img);
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+        assert!(
+            fs.superblock().has_finobt(),
+            "modern v5 fixture must advertise FINOBT"
+        );
+
+        // Find AG 0's finobt root + an existing finobt record we can
+        // legitimately rewrite. The fixture's AG 0 carries the root
+        // inode chunk, which always has at least one free slot
+        // post-mkfs.
+        let sb = fs.superblock().clone();
+        let agno = 0u64;
+        let sectsize = sb.sectsize as u64;
+        let agi_byte = fs.partition_offset + 2 * sectsize;
+        let mut sector = vec![0u8; sectsize as usize];
+        super::super::read_at_aligned(&mut fs.reader, agi_byte, sectsize, &mut sector)
+            .expect("read AGI 0");
+        let agi = super::super::ag::XfsAgi::parse(&sector).expect("parse AGI 0");
+        assert!(agi.free_root > 0, "AG 0 finobt root must be populated");
+
+        // Walk finobt leaves to find a record. We re-use the public
+        // generalised walker.
+        let (leaves, _) = fs
+            .walk_short_btree_blocks(&sb, agno, agi.free_root, sb.finobt_magic(), "finobt-test")
+            .expect("walk finobt");
+        assert!(
+            !leaves.is_empty(),
+            "expected at least one finobt leaf on the modern fixture"
+        );
+        // Read leaf 0 to pluck a record's start_agino and orig (free,
+        // freecount).
+        let bs = sb.blocksize as usize;
+        let hdr = sb.sblock_hdr_len();
+        let fsblock = (agno << sb.agblklog) | leaves[0] as u64;
+        let mut block = vec![0u8; bs];
+        fs.read_fsblock(fsblock, &mut block).expect("read leaf 0");
+        use byteorder::{BigEndian, ByteOrder};
+        let off = hdr; // first record
+        let start_agino = BigEndian::read_u32(&block[off..off + 4]);
+        let orig_freecount = BigEndian::read_u32(&block[off + super::REC_FREECOUNT_OFF..off + 8]);
+        let orig_free = BigEndian::read_u64(&block[off + super::REC_FREE_OFF..off + 16]);
+        assert!(
+            orig_freecount > 0,
+            "expected finobt's first record to have ≥1 free slot"
+        );
+
+        // Synthesise a change: flip one free bit. The new mask MUST
+        // keep at least one free slot to stay in finobt (no insert /
+        // remove transition).
+        let flip_bit = orig_free.trailing_zeros();
+        let new_free = orig_free & !(1u64 << flip_bit);
+        let new_freecount = new_free.count_ones();
+        assert!(
+            new_freecount > 0,
+            "test setup: flipped mask still has free slots"
+        );
+        let changes = vec![super::InobtRecordChange {
+            start_agino,
+            old_freecount: orig_freecount,
+            new_free,
+            new_freecount,
+        }];
+
+        let applied = fs
+            .sync_finobt_for_changes(&sb, agno, agi.free_root, &changes)
+            .expect("sync finobt");
+        assert_eq!(
+            applied, 1,
+            "expected exactly one finobt record to be updated"
+        );
+
+        // Re-read the leaf and assert the new bytes landed and the CRC
+        // re-validates.
+        let mut after = vec![0u8; bs];
+        fs.read_fsblock(fsblock, &mut after)
+            .expect("re-read leaf 0");
+        let new_freecount_disk =
+            BigEndian::read_u32(&after[off + super::REC_FREECOUNT_OFF..off + 8]);
+        let new_free_disk = BigEndian::read_u64(&after[off + super::REC_FREE_OFF..off + 16]);
+        assert_eq!(new_freecount_disk, new_freecount);
+        assert_eq!(new_free_disk, new_free);
+        assert!(
+            super::super::v5_crc::crc_valid(&after, super::super::v5_crc::SBLOCK_CRC_CRC_OFF,),
+            "finobt leaf CRC must validate after re-stamp"
+        );
+    }
+
+    /// Slice 5 refusal path: a freecount transition across 0 (the
+    /// chunk would be inserted into / removed from finobt) returns
+    /// Unsupported. No bytes are written.
+    #[test]
+    fn sync_finobt_refuses_freecount_zero_boundary_transition() {
+        let img = load_modern_fixture();
+        let mut cursor = Cursor::new(img);
+        let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable v5");
+        let sb = fs.superblock().clone();
+        let agno = 0u64;
+        let sectsize = sb.sectsize as u64;
+        let agi_byte = fs.partition_offset + 2 * sectsize;
+        let mut sector = vec![0u8; sectsize as usize];
+        super::super::read_at_aligned(&mut fs.reader, agi_byte, sectsize, &mut sector)
+            .expect("read AGI 0");
+        let agi = super::super::ag::XfsAgi::parse(&sector).expect("parse AGI 0");
+
+        // Synthesise a "chunk became fully allocated" transition.
+        let changes = vec![super::InobtRecordChange {
+            start_agino: 0,
+            old_freecount: 5,
+            new_free: 0,
+            new_freecount: 0,
+        }];
+        let err = fs
+            .sync_finobt_for_changes(&sb, agno, agi.free_root, &changes)
+            .expect_err("must refuse zero-boundary transition");
+        match err {
+            crate::fs::filesystem::FilesystemError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("freecount crossed 0-boundary"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
 }

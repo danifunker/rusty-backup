@@ -38,6 +38,26 @@ fn main() {
         }
     }
 
+    // libchdman-rs's prebuilt static archive uses C++ `std::thread`, whose
+    // symbols (e.g. `std::thread::_M_start_thread`, `std::thread::_State::~_
+    // State`) live in `libpthread.so` on glibc < 2.34 (Ubuntu 20.04 ships
+    // glibc 2.31). The crate emits `cargo:rustc-link-lib=stdc++` for linux-
+    // gnu targets but not `pthread`, so the link step fails on the armv7
+    // MiSTer cross-compile with "undefined reference to std::thread::*".
+    // Add it here whenever the `chd` feature is on and the target is glibc
+    // Linux — applies to the x86_64 / aarch64 desktop builds too, but they
+    // already pick up libpthread transitively so it's a no-op there.
+    //
+    // build.rs sees features via CARGO_FEATURE_<NAME> env vars rather than
+    // the `cfg!(feature = ...)` macro, so we check that env var instead.
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHD");
+    if std::env::var("CARGO_FEATURE_CHD").is_ok() {
+        let target = std::env::var("TARGET").unwrap_or_default();
+        if target.contains("unknown-linux-gnu") {
+            println!("cargo:rustc-link-lib=pthread");
+        }
+    }
+
     // NOTE: The GUI no longer embeds a `requireAdministrator` manifest. It used
     // to (release-only, GUI binary only), which forced a UAC prompt at *launch*
     // for every run and — more importantly — made the per-user installer's

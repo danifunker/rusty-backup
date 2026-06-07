@@ -7,9 +7,20 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 
 ## What Rusty Backup supports today
 
-- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, btrfs,
-  ProDOS, Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, ISO9660 (optical browse).
-- **Partition tables:** MBR, GPT, APM, Amiga RDB.
+- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
+  JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS, Apple DOS 3.3, MacPlus MFS,
+  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (multi-DPB:
+  amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
+  altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
+  QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
+  ANDOS (detect-only scaffold), ISO9660 (optical browse).
+- **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
+- **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
+  DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
+  (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein / etc.), `.d88`
+  (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Acorn `.hdf` (bare +
+  Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
+  gzip-wrapped Amiga `.adz` / `.hdz`.
 - **Raw / superfloppy** (partitionless) images are handled.
 
 Legend for the **Support** column:
@@ -36,9 +47,9 @@ Legend for the **Support** column:
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Partial** — ProDOS yes; DOS 3.3 no |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
-| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **No** |
-| Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **No** |
-| QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **No** |
+| X68000 | Sharp X68000 | Floppy, SASI HDD | Human68k (FAT-derived dialect) | **Partial** — floppy yes (Human68k read + Add/Delete via Sharp `.d88` container); SASI HDD partition table + Human68k partition dispatch yes; CLI parity tests cover inspect/ls on wrapped .d88 + get/put on flat; resize-on-restore deferred |
+| Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — Disc Record scan now spans the HD, E-format-floppy, and legacy-floppy candidate offsets (0xFC0/0x404/0xDC0); byte-correct against marutan.net blank pre-formatted HD samples (`blank256E.hdf`, `blank1024Eplus.hdf`) and the 8bs.com Acorn archive `arc-04.800.adf` (E-format populated); `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD container handling shipped; CLI parity tests cover inspect/ls/get on the synthetic E-format fixture; root-directory lookup via FSM indirect-disc-address still pending (dr.root encoding mystery + non-blank HD reference both required); ADFS write path parked behind the FSM walker |
+| QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read + write end-to-end (byte-correct against kilgus + smsqe MiSTer samples; write path validated against headless sQLux oracle — rb-cli put → SuperBASIC COPY → host file round-trips byte-exact, per-file 64-byte QDOS header convention honoured); `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **No** |
 | AmstradPCW | Amstrad PCW | Floppy | CP/M Plus | **No** |
 | TatungEinstein | Tatung Einstein | Floppy | Xtal/DOS (CP/M-compatible) | **No** |

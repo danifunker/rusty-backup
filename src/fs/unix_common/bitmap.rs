@@ -106,6 +106,43 @@ impl<'a> BitmapReader<'a> {
         None
     }
 
+    /// Find the index of the highest **clear** (0) bit, scanning from the
+    /// end. Useful for "set = free" bitmaps (UFS / JFS / AFFS) where the
+    /// last-allocated position translates to the highest clear bit.
+    ///
+    /// Returns `None` if all bits in the valid range are set.
+    pub fn highest_clear_bit(&self) -> Option<u64> {
+        if self.bit_count == 0 {
+            return None;
+        }
+
+        let full_bytes = (self.bit_count / 8) as usize;
+        let remaining_bits = (self.bit_count % 8) as u32;
+
+        // Partial last byte first — invert before scanning so we can reuse
+        // the same `leading_zeros` trick.
+        if remaining_bits > 0 && full_bytes < self.data.len() {
+            let mask = (1u8 << remaining_bits) - 1;
+            let inv = (!self.data[full_bytes]) & mask;
+            if inv != 0 {
+                let top_bit = 7 - inv.leading_zeros();
+                // `mask` guarantees `top_bit < remaining_bits`, so the
+                // result is already inside the valid range.
+                return Some(full_bytes as u64 * 8 + top_bit as u64);
+            }
+        }
+
+        for i in (0..full_bytes).rev() {
+            let inv = !self.data[i];
+            if inv != 0 {
+                let top_bit = 7 - inv.leading_zeros();
+                return Some(i as u64 * 8 + top_bit as u64);
+            }
+        }
+
+        None
+    }
+
     /// Find the index of the lowest clear (0) bit, scanning from the start.
     ///
     /// Returns `None` if all bits are set.
@@ -344,6 +381,56 @@ mod tests {
         let data = [0x00, 0x00];
         let bm = BitmapReader::new(&data, 16);
         assert_eq!(bm.highest_set_bit(), None);
+    }
+
+    #[test]
+    fn test_highest_clear_bit_basic() {
+        // 0b10110101: bits 1, 3, 6 clear; bits 0,2,4,5,7 set.
+        let data = [0b10110101u8];
+        let bm = BitmapReader::new(&data, 8);
+        assert_eq!(bm.highest_clear_bit(), Some(6));
+    }
+
+    #[test]
+    fn test_highest_clear_bit_all_set() {
+        let data = [0xFF, 0xFF];
+        let bm = BitmapReader::new(&data, 16);
+        assert_eq!(bm.highest_clear_bit(), None);
+    }
+
+    #[test]
+    fn test_highest_clear_bit_partial() {
+        // Last byte partial: only bits 0,1,2 valid; byte is 0xFF, all set.
+        let data = [0xFE, 0xFF];
+        let bm = BitmapReader::new(&data, 11);
+        // Byte 0 has bit 0 clear → highest clear bit is 0.
+        assert_eq!(bm.highest_clear_bit(), Some(0));
+    }
+
+    #[test]
+    fn test_highest_clear_bit_partial_with_clear() {
+        // Byte 1 partial (bits 8,9,10 valid). Bit 10 set, bit 9 clear, bit 8 clear.
+        let data = [0xFF, 0b00000101]; // byte 1: bits 0, 2 set; bits 1, 3..7 clear
+        let bm = BitmapReader::new(&data, 11);
+        // Valid bits in byte 1: bit 0 (=set), 1 (=clear), 2 (=set). Highest clear = 1 → index 9.
+        assert_eq!(bm.highest_clear_bit(), Some(9));
+    }
+
+    #[test]
+    fn test_highest_clear_bit_middle_byte() {
+        // byte 0 = 0xFF (no clear), byte 1 = 0b01111111 (bit 7 clear),
+        // byte 2 = 0xFF.
+        let data = [0xFF, 0b01111111, 0xFF];
+        let bm = BitmapReader::new(&data, 24);
+        // Highest clear bit: byte 1 bit 7 = index 15.
+        assert_eq!(bm.highest_clear_bit(), Some(15));
+    }
+
+    #[test]
+    fn test_highest_clear_bit_empty() {
+        let data: [u8; 0] = [];
+        let bm = BitmapReader::new(&data, 0);
+        assert_eq!(bm.highest_clear_bit(), None);
     }
 
     #[test]

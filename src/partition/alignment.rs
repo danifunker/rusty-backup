@@ -66,6 +66,8 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
         PartitionTable::Apm(_)
         | PartitionTable::Rdb(_)
         | PartitionTable::Sgi(_)
+        | PartitionTable::Ahdi(_)
+        | PartitionTable::X68k { .. }
         | PartitionTable::None { .. } => (0, 0),
     };
 

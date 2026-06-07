@@ -558,8 +558,20 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 short_name
             };
 
-            // Cluster number
-            let cluster_hi = u16::from_le_bytes([entry_bytes[20], entry_bytes[21]]) as u32;
+            // Cluster number. Bytes 20..21 are the high half of the
+            // first-cluster pointer ONLY on FAT32 — on FAT12/16 those
+            // bytes are reserved (often zero, but some formatters leak
+            // timestamp / NT bits there, which spuriously inflate the
+            // cluster value if read unconditionally). Mask them off
+            // when the volume isn't FAT32. See the X68000 d88 fixture
+            // for a real-world FAT12 disc that triggers this — its
+            // bytes 20..21 read `20 20` and corrupted the inferred
+            // first cluster into the hundred-millions range.
+            let cluster_hi = if matches!(self.fat_type, FatType::Fat32) {
+                u16::from_le_bytes([entry_bytes[20], entry_bytes[21]]) as u32
+            } else {
+                0
+            };
             let cluster_lo = u16::from_le_bytes([entry_bytes[26], entry_bytes[27]]) as u32;
             let cluster = (cluster_hi << 16) | cluster_lo;
 

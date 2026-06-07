@@ -111,13 +111,13 @@ Amiga images (`.adf`, `.hdf`, `.adz`, `.hdz`, and CHD-wrapped HDFs) and the thre
 - **Endianness**: every multi-byte field on Amiga disks is big-endian. Easy bug source #2.
 - **`.adz` / `.hdz`**: the GUI helper `gui::materialize_amiga_image_path` decompresses gzip-wrapped images to a tempfile at file-pick time. Each tab keeps a `tempfile::TempDir` guard alive for the lifetime of `image_file_path`.
 
-See `docs/amiga_support.md` for the full phased implementation plan + reference C-source pointers (`~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`).
+Reference C sources for the three filesystems live at `~/repos/amigasources/{ADFlib,amitools,pfs3aio,smartfilesystem}`. Read + edit + in-place resize all shipped; any new Amiga work lives under `src/fs/{affs,pfs3,sfs}.rs` and follows the existing patterns there.
 
 ### BasiliskII HFV Support
 
 `.hfv` / `.HFV` files are flat, partition-less raw images of a single **classic HFS** volume (boot blocks at sector 0, MDB at byte 1024, no MBR/GPT/APM) used by the BasiliskII / SheepShaver 68k Mac emulators. They flow through the existing **superfloppy** path: `partition::detect_superfloppy` finds the MDB at offset 1024 → `PartitionTable::None { fs_hint: "HFS" }` → `open_filesystem(.., 0, 0, None)` auto-detects HFS at offset 0. So read / inspect / browse / fsck / edit / backup / restore all work with no HFV-specific code — only the file-picker extensions and a few superfloppy-HFS gating helpers (`is_superfloppy_hfs`) needed touching.
 
-The **write** side lives in `src/fs/hfv.rs`, the single source of truth for the HFV limits: **classic HFS only** (never HFS+) and **≤ 2047 MB** (the 2 GiB signed-32-bit boundary classic Mac OS won't cross). `build_blank_hfv` / `clone_into_hfv` produce a flat HFS image with **no** APM wrapper (an HFV is the bare volume). Creation is `rb-cli new --fs hfv`; conversion/resize to HFV is `rb-cli expand --to-hfv` (and the GUI "Expand HFS Volume…" dialog's "Flat HFV" output mode), which reuse the HFS clone path and skip `emit_apm_disk_with_hfs`. See `docs/basilisk_hfv.md` for the full plan + progress tracker.
+The **write** side lives in `src/fs/hfv.rs`, the single source of truth for the HFV limits: **classic HFS only** (never HFS+) and **≤ 2047 MB** (the 2 GiB signed-32-bit boundary classic Mac OS won't cross). `build_blank_hfv` / `clone_into_hfv` produce a flat HFS image with **no** APM wrapper (an HFV is the bare volume). Creation is `rb-cli new --fs hfv`; conversion/resize to HFV is `rb-cli expand --to-hfv` (and the GUI "Expand HFS Volume…" dialog's "Flat HFV" output mode), which reuse the HFS clone path and skip `emit_apm_disk_with_hfs`.
 
 ### Platform-Specific Concerns
 
@@ -132,8 +132,8 @@ All OS-specific code lives in `src/os/`:
 ## Development Guidelines
 
 - Separate business logic from GUI code; core modules should be independently testable.
-- **GUI / CLI feature parity.** When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. The CLI grammar and phasing live in `docs/cli-todo.md`; consult it before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
-- **Shared business logic between GUI and CLI.** When implementing a feature, put the logic in a core module (e.g. `src/backup/`, `src/fs/`, `src/model/`) and have both `src/gui/` and `src/cli.rs` call into it. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules — see the `src/model/batch_preflight.rs` plan in `cli-todo.md`.
+- **GUI / CLI feature parity.** When adding a user-facing feature, consider whether it belongs in the CLI (`rb-cli`, formerly `rusty-backup-cli`) as well. The CLI mirrors the GUI's scriptable surface — backup, restore, inspect, browse-view editing, optical, resize/expand, etc. Rule of thumb: if it's a one-shot operation a user might want to script, it should land in both. Check `rb-cli --help` and `docs/cli-reference.md` for the canonical grammar before adding a new verb or flag so naming stays consistent. Interactive-only dialogs (Settings, elevation prompts, free-form review modals) stay GUI-only — those are explicitly out of scope for the CLI.
+- **Shared business logic between GUI and CLI.** When implementing a feature, put the logic in a core module (e.g. `src/backup/`, `src/fs/`, `src/model/`) and have both `src/gui/` and `src/cli.rs` call into it. Don't reimplement the same operation twice. Preflight checks (free-space projection, duplicate-name detection, type/creator validation) especially need lifting into shared modules.
 - Use streaming I/O with large blocks (64KB-1MB chunks) for disk operations; never load entire partitions into RAM.
 - Disk I/O must be sector-aligned (512 bytes or 4KB).
 - Disable UI controls during active operations to prevent conflicts.
