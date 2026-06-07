@@ -156,6 +156,8 @@ winres = "0.1"
 
 [dev-dependencies]
 cargo-husky = { version = "1.5.0", features = ["user-hooks"] }
+# Verify the bundled CJK font actually covers Japanese (same parser egui uses).
+ab_glyph = "0.2"
 
 # Debian package metadata
 [package.metadata.deb]

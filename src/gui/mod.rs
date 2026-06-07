@@ -7,6 +7,7 @@ mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
 mod floppy_convert_dialog;
+pub mod fonts;
 mod inspect_tab;
 mod journal_view;
 mod optical_tab;

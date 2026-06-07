@@ -200,6 +200,9 @@ fn main() -> eframe::Result {
             make_options(renderer),
             Box::new(move |cc| {
                 gui::ui_logger::set_repaint_ctx(cc.egui_ctx.clone());
+                // Bundle a CJK font so Japanese (Shift-JIS Human68k) and
+                // other CJK filenames render instead of tofu boxes.
+                gui::fonts::install_cjk_font(&cc.egui_ctx);
                 Ok(Box::new(gui::RustyBackupApp::with_initial_image(initial)))
             }),
         )
