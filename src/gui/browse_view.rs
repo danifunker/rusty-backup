@@ -29,6 +29,15 @@ use rusty_backup::rbformats::chd_edit::{
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
+/// Upper bound on bytes read off the disk image to sniff whether the
+/// selected file is a Mac archive (drives the "Save as Mac archive..." /
+/// "Browse archive..." button visibility). The magics for SIT / SIT5 /
+/// SEA sit at or near the start, and BinHex's banner is at byte 0, so a
+/// generous prefix is enough to classify every archive we'd practically
+/// meet on a vintage Mac volume while keeping the per-selection read
+/// bounded. The click handlers still read the full file authoritatively.
+const ARCHIVE_SNIFF_LIMIT: usize = 16 * 1024 * 1024; // 16 MB
+
 /// Beyond this many bytes, the tree-view popup's `TextEdit::multiline` widget
 /// becomes unresponsive (egui re-lays the entire text every frame). We route
 /// past the threshold straight to a save-to-file dialog with a "show anyway"
@@ -202,6 +211,14 @@ pub struct BrowseView {
     /// fork-format dropdown + Extract All / Extract Selected, mirroring
     /// the standalone Archives tab shape.
     mac_archive_window: Option<MacArchiveWindow>,
+    /// Cached Mac-archive sniff for the current selection, keyed by path.
+    /// `Some((path, Some(kind)))` means the file at `path` is a Mac
+    /// archive of `kind`; `Some((path, None))` means it was sniffed and
+    /// is not one. Gates the "Save as Mac archive..." / "Browse
+    /// archive..." buttons so they only appear for actual archives rather
+    /// than showing always and erroring on click. Recomputed only when
+    /// the selected path changes — see [`Self::ensure_archive_sniff`].
+    archive_sniff: Option<(String, Option<MacArchiveKind>)>,
 }
 
 /// Workflow C state: the selected entry on the disk image is a Mac
@@ -399,6 +416,7 @@ impl Default for BrowseView {
             archive_import_tempdir: None,
             pending_archive_extract: None,
             mac_archive_window: None,
+            archive_sniff: None,
         }
     }
 }
@@ -603,6 +621,7 @@ impl BrowseView {
         self.archive_import_tempdir = None;
         self.pending_archive_extract = None;
         self.mac_archive_window = None;
+        self.archive_sniff = None;
         // Detach any in-flight open worker. The thread keeps running but its
         // result will be dropped when the Arc dies on completion.
         self.pending_open = None;
@@ -651,6 +670,50 @@ impl BrowseView {
     /// Returns true if the current filesystem is ProDOS.
     fn is_prodos_type(&self) -> bool {
         self.fs_type == "ProDOS"
+    }
+
+    /// Returns true if the current filesystem is a Mac-native one (HFS,
+    /// HFS+, HFSX, MFS, or APFS). Gates the Mac-archive workflows — "Save
+    /// as Mac archive...", "Browse archive...", and the "Export Mac
+    /// archive" bundling row — so they only appear when the source volume
+    /// is one whose files actually carry forks / type / creator codes.
+    /// (APFS and MFS aren't fully readable yet, but they're listed so the
+    /// gate is correct the day a driver reports them.)
+    fn is_mac_filesystem(&self) -> bool {
+        matches!(
+            self.fs_type.as_str(),
+            "HFS" | "HFS+" | "HFSX" | "MFS" | "APFS"
+        )
+    }
+
+    /// Sniff the selected file for Mac-archive content, caching the result
+    /// by path so the disk read + [`detect_mac_archive`] runs once per
+    /// selection rather than every frame. Returns the detected kind, if
+    /// any. No-op (returns `None`) for non-files, non-Mac filesystems, or
+    /// when the bytes can't be read. The read is bounded by
+    /// [`ARCHIVE_SNIFF_LIMIT`]; the click handlers re-detect on the full
+    /// file, so a >16 MB archive (vanishingly rare on a vintage volume)
+    /// simply won't surface the buttons rather than mis-detecting.
+    fn ensure_archive_sniff(&mut self, entry: &FileEntry) -> Option<MacArchiveKind> {
+        if !entry.is_file() || !self.is_mac_filesystem() {
+            self.archive_sniff = None;
+            return None;
+        }
+        if let Some((path, kind)) = &self.archive_sniff {
+            if path == &entry.path {
+                return *kind;
+            }
+        }
+        let Some(mut fs) = self.take_or_open_fs() else {
+            // Couldn't open the filesystem this frame — leave the cache
+            // untouched so we retry on the next paint.
+            return None;
+        };
+        let result = fs.read_file(entry, ARCHIVE_SNIFF_LIMIT);
+        self.return_fs(fs);
+        let kind = result.ok().and_then(|bytes| detect_mac_archive(&bytes));
+        self.archive_sniff = Some((entry.path.clone(), kind));
+        kind
     }
 
     /// Validate a filename against the current filesystem's rules at
@@ -1487,6 +1550,15 @@ impl BrowseView {
                 let extraction_running = self.extraction_progress.is_some();
                 let is_extractable = entry.is_file() || entry.is_directory() || entry.is_symlink();
 
+                // The Mac-archive workflows only make sense on Mac-native
+                // volumes. Sniff the selection once per change so the
+                // "Save as / Browse archive" buttons appear strictly for
+                // files that are actually archives (preflight, not
+                // error-on-click). The bundling row needs only the
+                // filesystem gate — you can wrap any file/folder.
+                let is_mac_fs = self.is_mac_filesystem();
+                let show_archive_actions = is_mac_fs && self.ensure_archive_sniff(&entry).is_some();
+
                 if is_extractable && !extraction_running {
                     ui.horizontal(|ui| {
                         // Resource fork mode dropdown (HFS/HFS+ only)
@@ -1534,15 +1606,15 @@ impl BrowseView {
                             self.start_extraction(&entry);
                         }
 
-                        // Workflow C: sniff the selected file's bytes
-                        // for a Mac archive; if so, pop the C modal
-                        // (Save as-is vs Decode-and-save).
-                        if entry.is_file()
+                        // Workflow C: the selection already sniffed as a
+                        // Mac archive (see show_archive_actions), so pop
+                        // the C modal (Save as-is vs Decode-and-save).
+                        if show_archive_actions
                             && ui
                                 .button("Save as Mac archive...")
                                 .on_hover_text(
-                                    "If this file is a Mac archive (BinHex / StuffIt / \
-                                     SEA), open a dialog to either save it raw or \
+                                    "This file is a Mac archive (BinHex / StuffIt / \
+                                     SEA): open a dialog to either save it raw or \
                                      decode and save its contents in a fork-preserving \
                                      container.",
                                 )
@@ -1554,13 +1626,13 @@ impl BrowseView {
                         // Workflow E: open a floating viewer that lets
                         // the user browse the archive's entries and
                         // extract any subset.
-                        if entry.is_file()
+                        if show_archive_actions
                             && ui
                                 .button("Browse archive...")
                                 .on_hover_text(
-                                    "If this file is a Mac archive, open a viewer to \
-                                     browse its entries and extract any subset (per-entry \
-                                     selection, fork-preserving containers).",
+                                    "Open a viewer to browse this Mac archive's entries \
+                                     and extract any subset (per-entry selection, \
+                                     fork-preserving containers).",
                                 )
                                 .clicked()
                         {
@@ -1571,43 +1643,49 @@ impl BrowseView {
                     // Workflow B: bundle the current selection as a Mac
                     // archive on the host. BinHex is single-file only;
                     // SIT / SIT.HQX accept any single entry (folders
-                    // walk recursively).
-                    ui.horizontal(|ui| {
-                        ui.label("Export Mac archive:");
-                        let is_single_file = entry.is_file();
-                        if ui
-                            .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
-                            .on_hover_text(
-                                "Encode the selected file's data fork, resource fork, \
+                    // walk recursively). Only offered on Mac volumes,
+                    // where forks / type / creator codes exist to bundle.
+                    if is_mac_fs {
+                        ui.horizontal(|ui| {
+                            ui.label("Export Mac archive:");
+                            let is_single_file = entry.is_file();
+                            if ui
+                                .add_enabled(is_single_file, egui::Button::new("BinHex (.hqx)"))
+                                .on_hover_text(
+                                    "Encode the selected file's data fork, resource fork, \
                                  and type/creator codes as printable ASCII (BinHex 4.0). \
                                  The only flat format that survives a non-HFS roundtrip.",
-                            )
-                            .clicked()
-                        {
-                            self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
-                        }
-                        if ui
-                            .button("StuffIt (.sit)")
-                            .on_hover_text(
-                                "Multi-file compressed archive in classic StuffIt format. \
+                                )
+                                .clicked()
+                            {
+                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Hqx);
+                            }
+                            if ui
+                                .button("StuffIt (.sit)")
+                                .on_hover_text(
+                                    "Multi-file compressed archive in classic StuffIt format. \
                                  Preserves forks on HFS or inside a .hqx wrapper. \
                                  Folders walk recursively.",
-                            )
-                            .clicked()
-                        {
-                            self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
-                        }
-                        if ui
-                            .button("StuffIt-over-BinHex (.sit.hqx)")
-                            .on_hover_text(
-                                "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
+                                )
+                                .clicked()
+                            {
+                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Sit);
+                            }
+                            if ui
+                                .button("StuffIt-over-BinHex (.sit.hqx)")
+                                .on_hover_text(
+                                    "StuffIt bundle wrapped in BinHex for transport-safe ASCII. \
                                  The classic \"emailed me a Mac app\" format.",
-                            )
-                            .clicked()
-                        {
-                            self.export_selection_as_archive(&entry, ArchiveExportFormat::SitHqx);
-                        }
-                    });
+                                )
+                                .clicked()
+                            {
+                                self.export_selection_as_archive(
+                                    &entry,
+                                    ArchiveExportFormat::SitHqx,
+                                );
+                            }
+                        });
+                    }
                 }
 
                 ui.separator();

@@ -454,6 +454,28 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         self.partition_offset + data_sector * self.bpb.bytes_per_sector as u64
     }
 
+    /// Consume the filesystem and hand back the underlying reader. Used by
+    /// the defragmenting clone's streaming wrapper to drain a cloned
+    /// tempfile after the volume has been written.
+    pub(crate) fn into_reader(self) -> R {
+        self.reader
+    }
+
+    /// Capture this volume's on-disk format (the reserved region — boot
+    /// sector + BPB — plus the parsed BPB) so [`create_blank_human68k`]
+    /// can re-emit a blank target in the exact same shape (sector size,
+    /// FAT count, endianness, OEM string, boot stub) at a new size.
+    pub fn format_template(&mut self) -> Result<Human68kFormatTemplate, FilesystemError> {
+        let reserved_len = self.bpb.reserved_sectors as usize * self.bpb.bytes_per_sector as usize;
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut reserved_region = vec![0u8; reserved_len.max(512)];
+        self.reader.read_exact(&mut reserved_region)?;
+        Ok(Human68kFormatTemplate {
+            reserved_region,
+            bpb: self.bpb,
+        })
+    }
+
     /// Read root-directory sectors and parse all 32-byte entries.
     fn read_root_directory(&mut self) -> Result<Vec<Human68kDirEntry>, FilesystemError> {
         let root_off = self.partition_offset
@@ -1116,7 +1138,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
 /// Sectors-per-FAT needed to address every cluster of a FAT16 volume of
 /// `total_sectors`. Closed form, matching `fat::compute_fat_sectors` for
 /// `fat_bits == 16`.
-fn human68k_fat16_sectors(
+pub(crate) fn human68k_fat16_sectors(
     total_sectors: u32,
     reserved: u32,
     num_fats: u32,
@@ -1174,8 +1196,10 @@ fn shift_region_forward(
 
 /// Patch the big-endian SHARP/KG BPB header for a resize: total sectors
 /// (16-bit at 0x1A and/or 32-bit at 0x1E) and sectors-per-FAT (one byte at
-/// 0x1D). Every other field is left untouched.
-fn patch_sharp_kg_bpb(bpb_buf: &mut [u8; 512], new_total: u32, new_spf: u8) {
+/// 0x1D). Every other field is left untouched. Takes a `&mut [u8]` (not a
+/// fixed array) so both the resize path (a `[u8; 512]` boot buffer) and
+/// the blank-volume formatter (a `Vec<u8>` reserved region) can call it.
+pub(crate) fn patch_sharp_kg_bpb(bpb_buf: &mut [u8], new_total: u32, new_spf: u8) {
     // Preserve which total-sectors field the disk used: real HDDs are large
     // and keep the 16-bit field zero with the count in the 32-bit field, but
     // honor a small-volume layout that populated the 16-bit field instead.
@@ -1341,6 +1365,151 @@ pub fn resize_human68k_in_place(
     file.flush().context("failed to flush Human68k BPB")?;
     log_cb("Human68k resize complete");
     Ok(true)
+}
+
+// ============================================================================
+// Blank-volume formatting (for the defragmenting clone)
+// ============================================================================
+
+/// A reusable Human68k format descriptor captured from a source volume via
+/// [`Human68kFilesystem::format_template`]. Carries the volume's reserved
+/// region (boot sector + BPB, verbatim — so the OEM string, boot stub, and
+/// BPB convention survive) plus the parsed BPB. [`create_blank_human68k`]
+/// re-emits a blank volume in the same shape at a new size, re-patching
+/// only the total-sectors and sectors-per-FAT fields.
+#[derive(Debug, Clone)]
+pub struct Human68kFormatTemplate {
+    /// The reserved region (`reserved_sectors × bytes_per_sector`, at least
+    /// 512 bytes), captured verbatim. The BPB in the first 512 bytes is
+    /// re-patched for the target size; any boot code after it survives.
+    reserved_region: Vec<u8>,
+    bpb: Human68kBpb,
+}
+
+impl Human68kFormatTemplate {
+    /// Sector size of the captured volume, in bytes.
+    pub fn bytes_per_sector(&self) -> u32 {
+        self.bpb.bytes_per_sector as u32
+    }
+}
+
+/// Patch a standard little-endian FAT BPB for a new size: total sectors
+/// (16-bit at 19, 32-bit at 32) and sectors-per-FAT (16-bit at 22). The
+/// peer of [`patch_sharp_kg_bpb`] for the non-SHARP/KG convention.
+fn patch_std_bpb(bpb_buf: &mut [u8], new_total: u32, new_spf: u16) {
+    let old_total16 = LittleEndian::read_u16(&bpb_buf[19..21]);
+    if old_total16 != 0 && new_total <= u16::MAX as u32 {
+        LittleEndian::write_u16(&mut bpb_buf[19..21], new_total as u16);
+        LittleEndian::write_u32(&mut bpb_buf[32..36], 0);
+    } else {
+        LittleEndian::write_u16(&mut bpb_buf[19..21], 0);
+        LittleEndian::write_u32(&mut bpb_buf[32..36], new_total);
+    }
+    LittleEndian::write_u16(&mut bpb_buf[22..24], new_spf);
+}
+
+/// Format a blank Human68k volume of exactly `target_size_bytes`, matching
+/// the conventions captured in `template` (sector size, sectors-per-cluster,
+/// FAT count, root-entry count, FAT endianness, OEM string, boot stub).
+///
+/// FAT16 only — every real X68000 SCSI/SASI HDD volume is FAT16, and FAT12
+/// floppies route through the floppy-container converter rather than the
+/// defragmenting clone. The returned image carries the patched BPB, the FAT
+/// reserved entries (cluster 0 = `0xFF00 | media`, cluster 1 = end-of-chain)
+/// in each FAT copy, and a zeroed root directory + data region — ready to be
+/// opened with [`Human68kFilesystem::open`] for the clone replay.
+///
+/// Errors when the template is FAT12, when `target_size_bytes` isn't a
+/// non-zero multiple of the sector size, when the FAT would overflow the
+/// BPB's sectors-per-FAT field (one byte on SHARP/KG, two on standard), or
+/// when the target is too small to keep the cluster count at the FAT16
+/// floor (4085).
+pub fn create_blank_human68k(
+    template: &Human68kFormatTemplate,
+    target_size_bytes: u64,
+) -> Result<Vec<u8>, FilesystemError> {
+    let bpb = &template.bpb;
+    if bpb.fat_kind != FatKind::Fat16 {
+        return Err(FilesystemError::InvalidData(
+            "create_blank_human68k: only FAT16 Human68k volumes are supported \
+             (FAT12 floppies use the floppy-container converter)"
+                .into(),
+        ));
+    }
+    let bps = bpb.bytes_per_sector as u32;
+    let bps64 = bps as u64;
+    if target_size_bytes == 0 || !target_size_bytes.is_multiple_of(bps64) {
+        return Err(FilesystemError::InvalidData(format!(
+            "create_blank_human68k: target size {target_size_bytes} is not a non-zero \
+             multiple of the sector size {bps}"
+        )));
+    }
+    let new_total = (target_size_bytes / bps64) as u32;
+    let spc = bpb.sectors_per_cluster as u32;
+    let num_fats = bpb.num_fats as u32;
+    let reserved = bpb.reserved_sectors as u32;
+    let root_entries = bpb.root_entries as u32;
+    let root_dir_sectors = (root_entries * 32).div_ceil(bps);
+
+    let new_spf = human68k_fat16_sectors(new_total, reserved, num_fats, root_dir_sectors, spc, bps);
+
+    // The SHARP/KG BPB stores sectors-per-FAT in one byte (offset 0x1D);
+    // the standard BPB has a two-byte field (offset 22).
+    let spf_max = if bpb.fat_big_endian {
+        u8::MAX as u32
+    } else {
+        u16::MAX as u32
+    };
+    if new_spf > spf_max {
+        return Err(FilesystemError::InvalidData(format!(
+            "create_blank_human68k: FAT needs {new_spf} sectors, exceeding the {}-byte \
+             sectors-per-FAT field",
+            if bpb.fat_big_endian { 1 } else { 2 }
+        )));
+    }
+
+    let data_start = reserved + num_fats * new_spf + root_dir_sectors;
+    let clusters = new_total.saturating_sub(data_start) / spc;
+    if clusters < 4085 {
+        return Err(FilesystemError::InvalidData(format!(
+            "create_blank_human68k: target size {target_size_bytes} yields {clusters} \
+             clusters, below the FAT16 minimum (4085)"
+        )));
+    }
+
+    let mut image = vec![0u8; target_size_bytes as usize];
+
+    // Reserved region: copy the template verbatim (boot stub + OEM), then
+    // re-patch the size fields of the BPB in the first 512 bytes.
+    let mut reserved_region = template.reserved_region.clone();
+    let media = if bpb.fat_big_endian {
+        reserved_region[0x1C]
+    } else {
+        reserved_region[21]
+    };
+    if bpb.fat_big_endian {
+        patch_sharp_kg_bpb(&mut reserved_region, new_total, new_spf as u8);
+    } else {
+        patch_std_bpb(&mut reserved_region, new_total, new_spf as u16);
+    }
+    let copy_len = reserved_region.len().min(image.len());
+    image[..copy_len].copy_from_slice(&reserved_region[..copy_len]);
+
+    // FAT reserved entries in each FAT copy, honoring the table endianness.
+    let entry0 = 0xFF00u16 | media as u16;
+    let entry1 = 0xFFFFu16;
+    let (e0, e1) = if bpb.fat_big_endian {
+        (entry0.to_be_bytes(), entry1.to_be_bytes())
+    } else {
+        (entry0.to_le_bytes(), entry1.to_le_bytes())
+    };
+    for i in 0..num_fats {
+        let fat_off = (reserved + i * new_spf) as usize * bps as usize;
+        image[fat_off..fat_off + 2].copy_from_slice(&e0);
+        image[fat_off + 2..fat_off + 4].copy_from_slice(&e1);
+    }
+
+    Ok(image)
 }
 
 #[cfg(test)]

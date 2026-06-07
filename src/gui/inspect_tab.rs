@@ -29,6 +29,15 @@ use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandH
 use super::floppy_convert_dialog::FloppyConvertDialog;
 use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 
+/// Upper size bound for a file to be considered a floppy container by
+/// [`InspectTab::detect_source_is_floppy`]. The largest format we handle
+/// is a 1.44 MB 2HD image (1,474,560 B flat); D88's per-sector overhead
+/// pushes a worst-case `.d88` to roughly 1.52 MB. 2 MiB leaves headroom
+/// for any odd dump while still excluding every HDD image (the smallest
+/// vintage HDDs are several MB), which is what stops a zeroed-header
+/// `.hdf` from false-positiving against the loose D88 sniffer.
+const MAX_FLOPPY_CONTAINER_BYTES: u64 = 2 * 1024 * 1024;
+
 /// State for the Inspect tab.
 pub struct InspectTab {
     /// Index into the device list, or None if "Open Image File..." is selected
@@ -41,6 +50,12 @@ pub struct InspectTab {
     amiga_tempdir: Option<tempfile::TempDir>,
     /// Detected image format label (e.g. "WOZ 3.5\"", "Fixed VHD", "2MG")
     image_format_label: Option<String>,
+    /// True when the currently-loaded image file sniffs as a floppy
+    /// container (XDF / HDM / DIM / D88). Drives the visibility of the
+    /// "Convert Floppy Container..." button so it only appears when there
+    /// is actually a floppy to convert. Recomputed when the source path
+    /// changes; `false` for devices, backups, and non-floppy images.
+    source_is_floppy: bool,
     /// Path to a backup folder (loaded via metadata.json)
     backup_folder_path: Option<PathBuf>,
     /// Set when the user explicitly closes a backup via "Close Backup".
@@ -189,6 +204,7 @@ impl Default for InspectTab {
             image_file_path: None,
             amiga_tempdir: None,
             image_format_label: None,
+            source_is_floppy: false,
             backup_folder_path: None,
             close_backup_requested: false,
             partitions_layout_dirty: false,
@@ -286,6 +302,40 @@ impl InspectTab {
         self.image_file_path = Some(path);
         self.amiga_tempdir = guard;
         self.clear_results();
+    }
+
+    /// Sniff `path` to decide whether it is a floppy container (XDF / HDM
+    /// / DIM / D88) and thus a valid source for the floppy converter.
+    ///
+    /// Two gates, both required:
+    ///  1. **Size.** `detect_container_kind`'s D88 / DIM sniffers are
+    ///     deliberately loose (D88 has no magic string — an all-zero
+    ///     header trivially matches "empty 2D disk"), so a raw HDD image
+    ///     with a zeroed header region would otherwise false-positive.
+    ///     Real floppy containers top out around 1.5 MB (1.44 MB flat
+    ///     plus D88 per-sector overhead), so anything larger than
+    ///     [`MAX_FLOPPY_CONTAINER_BYTES`] cannot be one. This is what
+    ///     keeps X68000 `.hdf` images (and every other HDD) from showing
+    ///     the button.
+    ///  2. **Container kind.** Within the size bound, the header + the
+    ///     extension must classify as one of the four floppy formats.
+    ///
+    /// Returns `false` on any read error.
+    fn detect_source_is_floppy(path: &Path) -> bool {
+        // Size gate first — a stat() is cheaper than a read and rejects
+        // every HDD image outright.
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() <= MAX_FLOPPY_CONTAINER_BYTES => {}
+            _ => return false,
+        }
+        let mut head = [0u8; 256];
+        let n = match File::open(path).and_then(|mut f| f.read(&mut head)) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let kind =
+            rusty_backup::rbformats::containers::detect_container_kind(&head[..n], Some(path));
+        rusty_backup::rbformats::containers::is_floppy_container(kind)
     }
 
     pub fn clear_backup(&mut self) {
@@ -425,6 +475,13 @@ impl InspectTab {
                 self.prev_device_idx = self.selected_device_idx;
                 self.prev_image_path = self.image_file_path.clone();
                 self.prev_backup_path = self.backup_folder_path.clone();
+                // Re-sniff floppy-ness on every source change so the
+                // "Convert Floppy Container..." button tracks the source.
+                self.source_is_floppy = self
+                    .image_file_path
+                    .as_deref()
+                    .map(Self::detect_source_is_floppy)
+                    .unwrap_or(false);
                 if self.backup_folder_path.is_some() {
                     self.load_backup_metadata(ctx);
                 } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
@@ -493,18 +550,23 @@ impl InspectTab {
                 self.export_popup = true;
             }
 
-            // Floppy container converter (XDF / HDM / DIM / D88). Always
-            // available — the dialog picks its own source so the inspect tab
-            // doesn't need to track the originally-picked file extension.
-            if ui
-                .button("Convert Floppy Container...")
-                .on_hover_text(
-                    "Convert between XDF, HDM, DIM, and D88 floppy container \
-                     formats (X68000 / PC-98 / FM-7).",
-                )
-                .clicked()
-            {
-                self.floppy_convert_dialog = Some(FloppyConvertDialog::empty());
+            // Floppy container converter (XDF / HDM / DIM / D88). Shown
+            // only when the loaded image is itself a floppy container, so
+            // the long button doesn't crowd the bar for the common HDD
+            // case. The current source path is pre-loaded into the dialog.
+            if self.source_is_floppy {
+                if let Some(src) = self.image_file_path.clone() {
+                    if ui
+                        .button("Convert Floppy Container...")
+                        .on_hover_text(
+                            "Convert between XDF, HDM, DIM, and D88 floppy container \
+                             formats (X68000 / PC-98 / FM-7).",
+                        )
+                        .clicked()
+                    {
+                        self.floppy_convert_dialog = Some(FloppyConvertDialog::with_source(src));
+                    }
+                }
             }
 
             // Edit Partition Table button — only for devices and image files (not backups)
@@ -5266,5 +5328,47 @@ mod tests {
     fn apply_volume_label_non_hfs_left_alone() {
         // No HFS variant tag found -> nothing to strip; just append.
         assert_eq!(apply_volume_label("Linux", "label"), "Linux label");
+    }
+
+    /// A 10 MB X68000 `.hdf` whose header region is mostly zero (the real
+    /// shape — see the Populous/Lemmings fixtures) must NOT be treated as
+    /// a floppy: it trips the loose D88 sniffer but is far over the size
+    /// cap. Regression for the "Convert Floppy Container..." button
+    /// showing on every HDD image.
+    #[test]
+    fn detect_source_is_floppy_rejects_zeroed_hdf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Populous.hdf");
+        // 10 MB of zeros with the X68000 SCSI signature at byte 0 — the
+        // header region (write-protect / media-type / first-track-offset
+        // bytes the D88 sniffer reads) is all zero, the worst case.
+        let mut bytes = vec![0u8; 10 * 1024 * 1024];
+        bytes[0] = 0x60;
+        bytes[1] = 0x00;
+        bytes[2] = 0x00;
+        bytes[3] = 0xca;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            !InspectTab::detect_source_is_floppy(&path),
+            "10 MB HDF should not be classified as a floppy container"
+        );
+    }
+
+    /// A floppy-sized container DOES surface the button. Uses a 1.2 MB
+    /// `.xdf` (X68000 2HD flat size) — XDF is detected by extension, so
+    /// this exercises the positive path without relying on the loose
+    /// header sniffers.
+    #[test]
+    fn detect_source_is_floppy_accepts_xdf() {
+        use rusty_backup::rbformats::containers::floppy_geom::FloppyMedia;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.xdf");
+        let flat = vec![0u8; FloppyMedia::Hd1232.geometry().flat_size()];
+        assert!(flat.len() as u64 <= MAX_FLOPPY_CONTAINER_BYTES);
+        std::fs::write(&path, &flat).unwrap();
+        assert!(
+            InspectTab::detect_source_is_floppy(&path),
+            "a 1.2 MB .xdf should be classified as a floppy container"
+        );
     }
 }

@@ -104,6 +104,16 @@ impl FloppyConvertDialog {
         }
     }
 
+    /// Open with `path` pre-loaded as the source. Used by the Inspect tab,
+    /// which only offers the converter when the loaded image already
+    /// sniffs as a floppy container — `set_source` re-detects the kind so
+    /// the target radio defaults sensibly and surfaces any read error.
+    pub fn with_source(path: PathBuf) -> Self {
+        let mut dialog = Self::empty();
+        dialog.set_source(path);
+        dialog
+    }
+
     fn set_source(&mut self, path: PathBuf) {
         // Detect the container kind by reading the first 256 bytes + extension.
         let bytes = match std::fs::read(&path) {

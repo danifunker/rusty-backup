@@ -29,6 +29,7 @@ pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
 pub mod human68k;
+pub mod human68k_clone;
 pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
