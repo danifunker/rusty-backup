@@ -271,11 +271,11 @@ readable.
 | Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
 | Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
-| Sharp D88      | `.d88`          | Yes            | Yes (convert)   | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container |
-| X68000 XDF     | `.xdf`          | Yes            | Yes (convert)   | Raw headerless X68000 floppy dump; geometry inferred from size |
+| Sharp D88      | `.d88`          | Yes            | Yes (convert + in-place edit) | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container. Add/delete/mkdir on the contained Human68k FAT volume persist back into the container (decode -> edit -> re-encode). |
+| X68000 XDF     | `.xdf`          | Yes            | Yes (convert + in-place edit) | Raw headerless X68000 floppy dump; geometry inferred from size. In-place file add/delete/edit supported. |
 | X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize + defrag repack) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink + contiguous repack (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
-| PC-98 HDM      | `.hdm`          | Yes            | Yes (convert)   | DiskExplorer raw headerless floppy dump (byte-identical to XDF) |
-| DiskExplorer DIM | `.dim`        | Yes            | Yes (convert, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read |
+| PC-98 HDM      | `.hdm`          | Yes            | Yes (convert + in-place edit) | DiskExplorer raw headerless floppy dump (byte-identical to XDF). In-place file add/delete/edit supported. |
+| DiskExplorer DIM | `.dim`        | Yes            | Yes (convert + in-place edit, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read. Add/delete/edit persist back into the container. |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 "Yes (convert)" means the format isn't a backup wrapper but is fully

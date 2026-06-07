@@ -840,7 +840,9 @@ impl BrowseView {
                             // the journaled-HFS+ refusal surface as a toast
                             // instead of being deferred to the first edit.
                             match self.session.open_editable() {
-                                Ok(_efs) => {
+                                // Probe only: discard the fs + commit guard
+                                // (no mutation, so a container is left intact).
+                                Ok((_efs, _commit)) => {
                                     self.edit_mode = true;
                                 }
                                 Err(e) => {
@@ -2415,8 +2417,9 @@ impl BrowseView {
 
             ui.add_space(8.0);
 
-            // Free space indicator with projected space after staged edits
-            if let Ok(mut efs) = self.session.open_editable() {
+            // Free space indicator with projected space after staged edits.
+            // Read-only use — the commit guard is dropped (no re-encode).
+            if let Ok((mut efs, _commit)) = self.session.open_editable() {
                 if let Ok(free) = efs.free_space() {
                     ui.label(format!("Free: {}", partition::format_size(free)));
 
@@ -3044,8 +3047,8 @@ impl BrowseView {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default()
         );
-        let mut efs = match self.session.open_editable() {
-            Ok(fs) => fs,
+        let (mut efs, commit) = match self.session.open_editable() {
+            Ok(pair) => pair,
             Err(e) => {
                 log::error!("Failed to open editable filesystem: {e}");
                 self.edit_result = Some(format!("Error opening filesystem: {e}"));
@@ -3065,6 +3068,15 @@ impl BrowseView {
 
         if let Err(e) = efs.sync_metadata() {
             self.edit_result = Some(format!("Error saving to disk: {e}"));
+            return;
+        }
+
+        // Persist: re-encode the temp flat back into the container (no-op for
+        // raw images). Drop the editable handle first so its writes are
+        // flushed to the temp before the re-encode reads it.
+        drop(efs);
+        if let Err(e) = commit.commit() {
+            self.edit_result = Some(format!("Error writing container: {e}"));
             return;
         }
 
@@ -4498,12 +4510,20 @@ impl BrowseView {
     /// Execute repair on the filesystem and re-run check.
     fn run_repair(&mut self) {
         match self.session.open_editable() {
-            Ok(mut efs) => match efs.repair() {
+            Ok((mut efs, commit)) => match efs.repair() {
                 Ok(report) => {
                     self.repair_report = Some(report);
                     // Re-run fsck to show updated state. Repair wrote to
                     // disk, so any cached read-only fs is stale.
                     drop(efs);
+                    // Persist: re-encode the temp flat back into the container
+                    // (no-op for raw images).
+                    if let Err(e) = commit.commit() {
+                        self.error = Some(format!(
+                            "Repair succeeded but writing container failed: {e}"
+                        ));
+                        return;
+                    }
                     self.invalidate_cached_fs();
                     match self.take_or_open_fs() {
                         Some(mut fs) => {

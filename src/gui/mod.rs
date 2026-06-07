@@ -125,6 +125,7 @@ fn file_dialog() -> rfd::FileDialog {
 /// duration they need the materialized file.
 pub fn prepare_disk_image_path(
     path: &std::path::Path,
+    decode_floppy_containers: bool,
 ) -> std::io::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
     let ext = path
         .extension()
@@ -135,12 +136,22 @@ pub fn prepare_disk_image_path(
     // ImzReader) — the inspect worker opens them via open_read, so
     // the path passes through unchanged. No tempfile needed.
 
+    // `decode_floppy_containers` controls the floppy-wrapper formats
+    // (.msa/.d88/.xdf/.hdm/.dim). The Backup / Restore tabs pass `true`: they
+    // need a flat sector stream to compress / write. The Inspect tab (and the
+    // drag-drop / file-association open path) pass `false` so the original
+    // container is opened directly — the read paths are container-aware via
+    // source_reader::open_read, and editing persists back into the container
+    // through BrowseSession::open_editable's ContainerEditSession. Pre-decoding
+    // to a throwaway tempfile would orphan edits and hide the real file name.
+    // The gzip-wrapped Amiga images (.adz/.hdz) are decoded regardless, since
+    // gzip isn't seekable and there's no container-aware reader for them.
     let target_ext = match ext.as_deref() {
         Some("adz") => "adf",
         Some("hdz") => "hdf",
-        Some("msa") => "st",
-        Some("d88") => "img",
-        Some("xdf") | Some("hdm") | Some("dim") => "img",
+        Some("msa") if decode_floppy_containers => "st",
+        Some("d88") if decode_floppy_containers => "img",
+        Some("xdf") | Some("hdm") | Some("dim") if decode_floppy_containers => "img",
         _ => return Ok((path.to_path_buf(), None)),
     };
     let tmp = tempfile::tempdir()?;
@@ -280,7 +291,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = tmp.path().join("disk.adf");
         std::fs::write(&raw, b"raw bytes").unwrap();
-        let (out, guard) = prepare_disk_image_path(&raw).unwrap();
+        let (out, guard) = prepare_disk_image_path(&raw, true).unwrap();
         assert_eq!(out, raw);
         assert!(guard.is_none());
     }
@@ -295,7 +306,7 @@ mod materialize_tests {
         let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
         enc.write_all(payload).unwrap();
         enc.finish().unwrap();
-        let (out, guard) = prepare_disk_image_path(&adz_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&adz_path, true).unwrap();
         assert!(guard.is_some(), "decompressed path needs a tempdir guard");
         assert_eq!(out.extension().and_then(|s| s.to_str()), Some("adf"));
         let actual = std::fs::read(&out).unwrap();
@@ -307,7 +318,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let adz = tmp.path().join("bogus.adz");
         std::fs::write(&adz, b"not gzip data").unwrap();
-        let err = prepare_disk_image_path(&adz).unwrap_err();
+        let err = prepare_disk_image_path(&adz, true).unwrap_err();
         assert!(err.to_string().contains("gzip magic"));
     }
 
@@ -319,7 +330,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let imz_path = tmp.path().join("floppy.imz");
         std::fs::write(&imz_path, b"PK\x03\x04anything").unwrap();
-        let (out, guard) = prepare_disk_image_path(&imz_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&imz_path, true).unwrap();
         assert_eq!(out, imz_path);
         assert!(guard.is_none());
     }
@@ -329,7 +340,7 @@ mod materialize_tests {
         let tmp = tempfile::tempdir().unwrap();
         let gho_path = tmp.path().join("test.gho");
         std::fs::write(&gho_path, [0xFE, 0xEF, 0x01, 0x00]).unwrap();
-        let (out, guard) = prepare_disk_image_path(&gho_path).unwrap();
+        let (out, guard) = prepare_disk_image_path(&gho_path, true).unwrap();
         assert_eq!(out, gho_path);
         assert!(guard.is_none());
     }
@@ -343,7 +354,7 @@ mod materialize_tests {
         for name in ["disk.hfv", "DISK.HFV"] {
             let hfv_path = tmp.path().join(name);
             std::fs::write(&hfv_path, b"\x00\x00\x00\x00").unwrap();
-            let (out, guard) = prepare_disk_image_path(&hfv_path).unwrap();
+            let (out, guard) = prepare_disk_image_path(&hfv_path, true).unwrap();
             assert_eq!(out, hfv_path);
             assert!(guard.is_none());
         }
@@ -512,7 +523,9 @@ impl RustyBackupApp {
     /// behavior identical to the picker.
     fn open_in_inspect(&mut self, path: PathBuf) {
         self.log_panel.info(format!("Opening {}", path.display()));
-        match prepare_disk_image_path(&path) {
+        // Inspect: open floppy containers directly (don't pre-decode) so edits
+        // persist back into the container. See prepare_disk_image_path.
+        match prepare_disk_image_path(&path, false) {
             Ok((materialized, guard)) => {
                 self.inspect_tab
                     .load_image_with_tempdir(materialized, guard);

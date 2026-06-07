@@ -265,7 +265,10 @@ impl BackupTab {
                                 .pick_file()
                             {
                                 self.selected_device_idx = None;
-                                match super::prepare_disk_image_path(&path) {
+                                // Backup decodes floppy containers to a flat
+                                // image (true): it needs a raw sector stream to
+                                // compress.
+                                match super::prepare_disk_image_path(&path, true) {
                                     Ok((materialized, guard)) => {
                                         self.image_file_path = Some(materialized);
                                         self.amiga_tempdir = guard;

@@ -758,7 +758,7 @@ impl RestoreTab {
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::prepare_disk_image_path(&path) {
+                        match super::prepare_disk_image_path(&path, true) {
                             Ok((materialized, guard)) => {
                                 self.sp_image_file = Some(materialized);
                                 self.sp_amiga_tempdir = guard;
@@ -1696,7 +1696,7 @@ impl RestoreTab {
                         .add_filter("All Files", &["*"])
                         .pick_file()
                     {
-                        match super::prepare_disk_image_path(&path) {
+                        match super::prepare_disk_image_path(&path, true) {
                             Ok((materialized, guard)) => {
                                 self.sp_image_file = Some(materialized);
                                 self.sp_amiga_tempdir = guard;

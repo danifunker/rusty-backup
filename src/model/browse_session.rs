@@ -361,18 +361,30 @@ impl BrowseSession {
     /// Unlike [`open`](Self::open) this requires a real `source_path` (or a
     /// live CHD edit session) — partclone / zstd / preopen paths are
     /// read-only.
-    pub fn open_editable(&self) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    ///
+    /// Returns the editable filesystem **and** a [`ContainerEditCommit`] guard.
+    /// After a successful, synced mutation the caller must call
+    /// [`ContainerEditCommit::commit`] to persist it. For a raw image / device
+    /// / CHD that's a no-op (writes already landed); for a floppy container
+    /// (.d88 / .xdf / .hdm / .dim) the returned handle edits a decoded temp
+    /// flat and `commit` re-encodes it back into the container. A caller that
+    /// only reads (e.g. a free-space probe) or only checks that edit mode can
+    /// be entered just drops the guard.
+    pub fn open_editable(
+        &self,
+    ) -> Result<(Box<dyn EditableFilesystem>, ContainerEditCommit), FilesystemError> {
         // Live CHD edit session: writes go through the diff (compressed
         // parent) or in-place (uncompressed). No File handle to source_path
         // is opened.
         if let Some(arc) = &self.chd_edit_session {
             let handle = ChdEditHandle::from_arc(Arc::clone(arc));
-            return fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem(
                 handle,
                 self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
-            );
+            )?;
+            return Ok((fs, ContainerEditCommit { session: None }));
         }
 
         let path = self
@@ -380,18 +392,68 @@ impl BrowseSession {
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
 
+        // Floppy container: edit a decoded temp flat, re-encode on commit.
+        if crate::model::source_reader::is_editable_container_path(path) {
+            let session =
+                crate::model::container_edit::ContainerEditSession::open(path).map_err(|e| {
+                    FilesystemError::Parse(format!("opening container for edit: {e:#}"))
+                })?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(session.flat_path())
+                .map_err(FilesystemError::Io)?;
+            let fs = fs::open_editable_filesystem(
+                file,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )?;
+            return Ok((
+                fs,
+                ContainerEditCommit {
+                    session: Some(session),
+                },
+            ));
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(FilesystemError::Io)?;
 
-        fs::open_editable_filesystem(
+        let fs = fs::open_editable_filesystem(
             file,
             self.partition_offset,
             self.partition_type,
             self.partition_type_string.as_deref(),
-        )
+        )?;
+        Ok((fs, ContainerEditCommit { session: None }))
+    }
+}
+
+/// Returned alongside the editable filesystem from
+/// [`BrowseSession::open_editable`]. Call [`commit`](Self::commit) after a
+/// successful, synced mutation to persist it. No-op for raw images / devices /
+/// CHD; for a floppy container it re-encodes the decoded temp flat back into
+/// the container and atomically replaces the original. Dropping without
+/// committing discards container edits (so a failed/aborted edit leaves the
+/// original container untouched).
+#[must_use = "call commit() to persist edits to a floppy container"]
+pub struct ContainerEditCommit {
+    session: Option<crate::model::container_edit::ContainerEditSession>,
+}
+
+impl ContainerEditCommit {
+    /// Persist the edit. No-op for raw sources; re-encodes for containers.
+    pub fn commit(self) -> Result<(), FilesystemError> {
+        match self.session {
+            Some(session) => session
+                .commit()
+                .map_err(|e| FilesystemError::Parse(format!("re-encoding container: {e:#}"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -438,5 +500,97 @@ impl BrowseOpenStatus {
             needs_password: false,
             fs: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::filesystem::CreateFileOptions;
+
+    /// GUI edit-mode write path: opening a floppy container for editing, adding
+    /// a file, and committing must persist the file back INTO the container
+    /// (not into a discarded temp). Regression guard for the bug where GUI
+    /// edits to .d88/.xdf/.hdm/.dim were silently lost.
+    #[test]
+    fn open_editable_persists_edits_into_floppy_container() {
+        // Blank 720K FAT12 floppy wrapped as a headerless .xdf. (num_heads=2
+        // lands at offset 0x1A, so the d88 header sniffer doesn't claim it and
+        // detection routes by the .xdf extension.) Human68k floppies are
+        // standard little-endian FAT12, which Human68kFilesystem opens.
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("TEST")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let xdf = dir.path().join("disk.xdf");
+        std::fs::write(&xdf, &flat).unwrap();
+
+        let session = BrowseSession {
+            source_path: Some(xdf.clone()),
+            partition_type_string: Some("human68k".to_string()),
+            ..Default::default()
+        };
+
+        // Edit via the editable handle, sync, then commit (re-encode -> .xdf).
+        let (mut efs, commit) = session.open_editable().expect("open_editable");
+        let root = efs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"hello container".to_vec());
+        efs.create_file(
+            &root,
+            "HELLO.TXT",
+            &mut data,
+            15,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        efs.sync_metadata().expect("sync");
+        drop(efs);
+        commit.commit().expect("commit re-encode");
+
+        // The file must be visible when the container is re-opened read-only,
+        // and the container must still be its original fixed size.
+        let mut fs = session.open().expect("re-open");
+        let root = fs.root().unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "HELLO.TXT"),
+            "edit persisted into .xdf container: {names:?}"
+        );
+        assert_eq!(std::fs::metadata(&xdf).unwrap().len(), 737280);
+    }
+
+    /// A raw (non-container) image returns a no-op commit and edits land
+    /// directly in the file — committing must not error or alter behavior.
+    #[test]
+    fn open_editable_raw_image_commit_is_noop() {
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("RAW")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img"); // not a container extension
+        std::fs::write(&img, &flat).unwrap();
+
+        let session = BrowseSession {
+            source_path: Some(img.clone()),
+            partition_type_string: Some("human68k".to_string()),
+            ..Default::default()
+        };
+        let (mut efs, commit) = session.open_editable().expect("open_editable");
+        let root = efs.root().unwrap();
+        let mut data = std::io::Cursor::new(b"x".to_vec());
+        efs.create_file(&root, "R.TXT", &mut data, 1, &CreateFileOptions::default())
+            .unwrap();
+        efs.sync_metadata().unwrap();
+        drop(efs);
+        commit.commit().expect("no-op commit");
+
+        let mut fs = session.open().expect("re-open");
+        let root = fs.root().unwrap();
+        assert!(fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "R.TXT"));
     }
 }

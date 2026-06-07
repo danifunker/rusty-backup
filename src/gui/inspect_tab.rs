@@ -451,8 +451,12 @@ impl InspectTab {
                             self.backup_folder_path = None;
                             // Transparently decompress .adz / .hdz so the
                             // rest of the pipeline (PartitionTable::detect,
-                            // backup, browse) sees a raw image.
-                            match super::prepare_disk_image_path(&path) {
+                            // backup, browse) sees a raw image. Floppy
+                            // containers (.d88/.xdf/.hdm/.dim) are NOT decoded
+                            // here (false) — they open directly so edits
+                            // persist back into the container via the browse
+                            // view's ContainerEditSession writeback.
+                            match super::prepare_disk_image_path(&path, false) {
                                 Ok((materialized, guard)) => {
                                     self.image_file_path = Some(materialized);
                                     self.amiga_tempdir = guard;
