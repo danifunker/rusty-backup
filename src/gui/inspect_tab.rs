@@ -2564,11 +2564,15 @@ impl InspectTab {
             let is_device = path.to_string_lossy().starts_with("/dev/")
                 || path.to_string_lossy().starts_with("\\\\.\\");
 
-            // Streaming containers (GHO, IMZ) are opened via
+            // File containers decode to a flat sector stream via
             // source_reader::open_read — no tempfile, no elevation needed.
+            // This covers GHO/IMZ plus the floppy wrappers (MSA / EDSK / D88
+            // / DIM / XDF / HDM / Apple-II / Arculator HDF). CHD is also a
+            // container but keeps its own specialized detection below (CD-CHD
+            // cooked sectors, format metadata + sidecar), so exclude it here.
             let uses_streaming_reader = !is_device
-                && (rusty_backup::model::source_reader::is_gho_path(&path)
-                    || rusty_backup::model::source_reader::is_imz_path(&path));
+                && rusty_backup::model::source_reader::is_container_path(&path)
+                && !rusty_backup::model::source_reader::is_chd_path(&path);
 
             // Open the device/file with full elevation: unmounts volumes and
             // claims exclusive DA access for the duration of the inspect.
@@ -2625,6 +2629,14 @@ impl InspectTab {
                     let label = match ext.as_deref() {
                         Some("gho") | Some("ghs") => "Norton Ghost (GHO)",
                         Some("imz") => "WinImage (IMZ)",
+                        Some("msa") => "Atari ST MSA floppy",
+                        Some("dsk") => "CPCEMU DSK/EDSK floppy",
+                        Some("d88") => "Sharp .d88 floppy",
+                        Some("dim") => "DiskExplorer DIM floppy",
+                        Some("xdf") => "X68000 XDF floppy",
+                        Some("hdm") => "PC-98 HDM floppy",
+                        Some("hdf") => "Acorn ADFS image",
+                        Some("do") | Some("po") => "Apple II floppy",
                         _ => "Streaming image",
                     };
                     push_log(format!("Detected format: {}", label));

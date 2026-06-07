@@ -19,10 +19,13 @@ use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
+use crate::rbformats::containers::dim::{decode_dim_bytes, looks_like_dim_header};
 use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
 use crate::rbformats::containers::hdf::{decode_hdf_bytes, detect_hdf_offset};
+use crate::rbformats::containers::hdm::decode_hdm_bytes;
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
 use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DISK_BYTES};
+use crate::rbformats::containers::xdf::decode_xdf_bytes;
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
 use crate::rbformats::ReadSeek;
@@ -126,6 +129,49 @@ pub fn is_d88_path(path: &Path) -> bool {
     };
     let mut head = [0u8; 0x24];
     matches!(f.read(&mut head), Ok(n) if n >= 0x24) && looks_like_d88_header(&head)
+}
+
+/// Cheap sniff: returns true when `path` is an X68000 `.xdf` floppy — a raw
+/// headerless flat-sector dump whose geometry is inferred from the file
+/// size. XDF has no header magic, so this is extension-only (case-
+/// insensitive); `decode_xdf_bytes` validates the size and errors if it
+/// doesn't match a supported floppy geometry.
+pub fn is_xdf_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("xdf"))
+        .unwrap_or(false)
+}
+
+/// Cheap sniff: returns true when `path` is a PC-98 `.hdm` floppy. HDM is
+/// byte-identical to XDF on disk; like XDF it has no magic and is routed by
+/// extension, with `decode_hdm_bytes` validating the geometry.
+pub fn is_hdm_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("hdm"))
+        .unwrap_or(false)
+}
+
+/// Cheap sniff: returns true when `path` is a DiskExplorer `.dim` floppy.
+/// True for the `.dim` extension OR a `DIFC` signature at byte 0xAB (so a
+/// mis-named DIFC image still decodes), mirroring `detect_container_kind`'s
+/// DIM routing.
+pub fn is_dim_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("dim"))
+        .unwrap_or(false);
+    if ext_ok {
+        return true;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 256];
+    let n = f.read(&mut head).unwrap_or(0);
+    looks_like_dim_header(&head[..n])
 }
 
 /// True when `path` ends in `.hdf` (case-insensitive) AND the bytes
@@ -232,6 +278,25 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let flat =
             decode_d88_bytes(&bytes).with_context(|| format!("decode D88 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_dim_path(path) {
+        // DiskExplorer .dim floppy (X68000 / PC-98): 256-byte header + flat
+        // payload, decodes to ~1.2 MB. In-memory like EDSK / MSA / D88.
+        let bytes = std::fs::read(path).with_context(|| format!("read DIM {}", path.display()))?;
+        let (flat, _media) =
+            decode_dim_bytes(&bytes).with_context(|| format!("decode DIM {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_xdf_path(path) {
+        // X68000 .xdf — raw headerless floppy dump; geometry from file size.
+        let bytes = std::fs::read(path).with_context(|| format!("read XDF {}", path.display()))?;
+        let (flat, _media) =
+            decode_xdf_bytes(&bytes).with_context(|| format!("decode XDF {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_hdm_path(path) {
+        // PC-98 .hdm — byte-identical to XDF on disk.
+        let bytes = std::fs::read(path).with_context(|| format!("read HDM {}", path.display()))?;
+        let (flat, _media) =
+            decode_hdm_bytes(&bytes).with_context(|| format!("decode HDM {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_arculator_hdf_path(path) {
         // Arculator-style .hdf with 512-byte header before the ADFS
         // volume. Bare .hdf files (RPCEmu / MiSTer Archie) fall through
@@ -267,6 +332,37 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
+}
+
+/// Subset of [`is_container_path`] that [`open_read`] decodes fully into an
+/// in-memory flat-sector `Cursor` (no streaming, no password): the floppy
+/// wrappers MSA / EDSK / D88 / DIM / XDF / HDM / Arculator-HDF and the
+/// 140 KB Apple-II disks. Excludes the streaming / password formats (CHD /
+/// GHO / IMZ); callers that special-case those (e.g. the browse session,
+/// which threads a password through their dedicated readers) keep handling
+/// them directly and use this to route only the plain floppy containers.
+pub fn is_flat_floppy_container_path(path: &Path) -> bool {
+    is_msa_path(path)
+        || is_edsk_path(path)
+        || is_d88_path(path)
+        || is_dim_path(path)
+        || is_xdf_path(path)
+        || is_hdm_path(path)
+        || is_arculator_hdf_path(path)
+        || is_apple_ii_dsk_path(path)
+}
+
+/// True when [`open_read`] would transparently unwrap `path` into a decoded
+/// flat-sector stream — any CHD / GHO / IMZ streaming reader or flat floppy
+/// container. Callers that build their own reader use this to decide whether
+/// to route through `open_read` instead of opening the file raw, so the
+/// "what counts as a container" list lives in one place instead of being
+/// re-listed (and drifting) at every call site.
+pub fn is_container_path(path: &Path) -> bool {
+    is_chd_path(path)
+        || is_gho_path(path)
+        || is_imz_path(path)
+        || is_flat_floppy_container_path(path)
 }
 
 #[cfg(test)]
@@ -452,5 +548,72 @@ mod tests {
         r.seek(SeekFrom::Start(512)).unwrap();
         r.read_exact(&mut sector).unwrap();
         assert_eq!(&sector[..16], b"sector one  data");
+    }
+
+    /// X68000 `.xdf` (headerless raw floppy) routes through `open_read` and
+    /// the decoded stream is recognised as a FAT superfloppy. Regression
+    /// guard for the bug where the inspect path MBR-parsed the raw container
+    /// bytes and failed with "invalid boot signature".
+    #[test]
+    fn open_read_routes_xdf_and_partition_detect_finds_fat() {
+        use crate::partition::PartitionTable;
+        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+
+        // 720K geometry with a minimal FAT12 BPB + 0xAA55 boot signature —
+        // no MBR, so detection should report a FAT superfloppy.
+        let geom = FloppyMedia::Dd720.geometry();
+        let total = geom.flat_size();
+        let mut flat = vec![0u8; total];
+        flat[0] = 0xEB; // JMP short
+        flat[1] = 0x3C;
+        flat[2] = 0x90;
+        flat[3..11].copy_from_slice(b"MSDOS5.0");
+        flat[11] = 0x00; // 512 bytes/sector
+        flat[12] = 0x02;
+        flat[13] = 0x01; // 1 sector/cluster
+        flat[14] = 0x01; // 1 reserved sector
+        flat[16] = 0x02; // 2 FATs
+        flat[21] = 0xF9; // media descriptor for 720K
+        flat[510] = 0x55;
+        flat[511] = 0xAA;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.xdf");
+        std::fs::write(&path, &flat).unwrap();
+
+        assert!(is_xdf_path(&path));
+        assert!(is_container_path(&path));
+
+        let mut reader = open_read(&path).unwrap();
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        assert_eq!(table.type_name(), "None"); // superfloppy, no partition table
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "FAT");
+        assert_eq!(parts[0].size_bytes, total as u64);
+    }
+
+    /// DiskExplorer `.dim` (256-byte header + payload) routes through
+    /// `open_read` and decodes back to the original flat sector stream.
+    #[test]
+    fn open_read_round_trips_dim_floppy() {
+        use crate::rbformats::containers::dim::encode_dim_bytes;
+        use crate::rbformats::containers::floppy_geom::FloppyMedia;
+
+        let dir = tempfile::tempdir().unwrap();
+        let geom = FloppyMedia::Hd1232.geometry();
+        let flat: Vec<u8> = (0..geom.flat_size())
+            .map(|i| ((i.wrapping_mul(7)) & 0xFF) as u8)
+            .collect();
+        let dim = encode_dim_bytes(&flat, geom).unwrap();
+        let path = dir.path().join("disk.dim");
+        std::fs::write(&path, &dim).unwrap();
+
+        assert!(is_dim_path(&path));
+        assert!(is_container_path(&path));
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, flat);
     }
 }

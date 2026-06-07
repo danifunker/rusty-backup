@@ -192,6 +192,28 @@ impl BrowseSession {
             }
         }
 
+        // Flat floppy containers (MSA / EDSK / D88 / DIM / XDF / HDM /
+        // Arculator HDF / 140 KB Apple-II). open_read sniffs the format and
+        // decodes it into an in-memory flat sector stream; the decoded image
+        // is a superfloppy, so it opens at offset 0. CHD / GHO / IMZ are
+        // handled above with their password-aware streaming readers, so this
+        // only covers the plain in-memory decoders.
+        if crate::model::source_reader::is_flat_floppy_container_path(path) {
+            let reader = crate::model::source_reader::open_read(path)
+                .map_err(|e| FilesystemError::Parse(format!("failed to open container: {e:#}")))?;
+            let effective_offset = if self.partition_type == 0 {
+                0
+            } else {
+                self.partition_offset
+            };
+            return fs::open_filesystem(
+                reader,
+                effective_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         // Seekable zstd cache files — keep extension-based detection since
         // there is no reliable content-level signal distinguishing them from
         // other zstd files.

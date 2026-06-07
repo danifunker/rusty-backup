@@ -184,6 +184,23 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // X68000 Human68k floppy. The IPL boot sector starts with a 68000 BRA.S
+    // (0x60) rather than an x86 JMP (0xEB / 0xE9), so the FAT check above
+    // skips it. The BPB is either a standard little-endian one at offset 11
+    // ("X68IPL30" disks) or the Sharp/KG big-endian layout at offset 0x12
+    // ("Hudson soft" game disks); Human68kBpb::parse handles both and
+    // validates bytes-per-sector / sectors-per-cluster / FAT count, so a
+    // successful parse together with the 0x60 opcode is a strong signal.
+    // These floppies (.d88 / .xdf / .hdm / .dim, decoded upstream) carry no
+    // partition table — they're a bare Human68k FAT volume rooted at byte 0.
+    if first_sector[0] == 0x60 {
+        if let Ok(bpb) = crate::fs::human68k::Human68kBpb::parse(first_sector) {
+            if bpb.total_sectors > 0 {
+                return Some("human68k".to_string());
+            }
+        }
+    }
+
     // XFS superblock magic "XFSB" at byte 0 of the partition. v4 and v5/CRC
     // share the magic; the XfsFilesystem parser handles version routing.
     if &first_sector[0..4] == b"XFSB" {
@@ -812,14 +829,20 @@ impl PartitionTable {
             } => {
                 // AmigaDOS superfloppies report their DosType as the fs_hint
                 // (e.g. "DOS\\1"); route that through `partition_type_string`
-                // so the AFFS driver gets dispatched. Other hints (FAT, HFS,
+                // so the AFFS driver gets dispatched. X68000 Human68k floppies
+                // report "human68k" and route the same way so the Human68k
+                // driver is dispatched (the FAT byte alone can't distinguish
+                // the big-endian Sharp/KG variant). Other hints (FAT, HFS,
                 // ext, etc.) keep `partition_type_string: None` so dispatch
                 // falls back to MBR type-byte detection.
                 let is_amiga_dos = fs_hint.starts_with("DOS\\") && fs_hint.len() == 5;
+                let is_human68k = fs_hint == "human68k";
                 let display_name = if is_amiga_dos {
                     let variant = fs_hint.as_bytes()[4] - b'0';
                     let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
                     rdb::dos_type_display_name(raw)
+                } else if is_human68k {
+                    "Human68k (FAT)".to_string()
                 } else {
                     fs_hint.clone()
                 };
@@ -833,7 +856,7 @@ impl PartitionTable {
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: if is_amiga_dos {
+                    partition_type_string: if is_amiga_dos || is_human68k {
                         Some(fs_hint.clone())
                     } else {
                         None
@@ -1503,5 +1526,75 @@ mod tests {
         let table = PartitionTable::detect(&mut cursor).expect("SGI detected");
         assert_eq!(table.type_name(), "SGI");
         assert_eq!(table.partitions().len(), 1);
+    }
+
+    /// X68000 Human68k floppy with the standard little-endian BPB at offset
+    /// 11 ("X68IPL30" disks) and a 68000 BRA.S (0x60) boot opcode. Must be
+    /// detected as a `human68k` superfloppy, not misparsed as an MBR — the
+    /// regression behind "invalid boot signature: expected 0xAA55".
+    #[test]
+    fn human68k_floppy_le_bpb_detected_as_superfloppy() {
+        // 1232 sectors x 1024 B = 1,261,568 B (X68000 2HD), matching the
+        // real MasterDisk_V2.xdf geometry.
+        let total = 1232usize * 1024;
+        let mut buf = vec![0u8; total];
+        buf[0] = 0x60; // BRA.S (68000), not x86 JMP
+        buf[1] = 0x3c;
+        buf[3..11].copy_from_slice(b"X68IPL30");
+        buf[11] = 0x00; // bytes/sector LE = 1024
+        buf[12] = 0x04;
+        buf[13] = 0x01; // sectors/cluster
+        buf[14] = 0x01; // reserved sectors LE = 1
+        buf[15] = 0x00;
+        buf[16] = 0x02; // num FATs
+        buf[17] = 0xc0; // root entries LE = 192
+        buf[18] = 0x00;
+        buf[19] = 0xd0; // total sectors (16-bit) LE = 1232
+        buf[20] = 0x04;
+        buf[21] = 0xfe; // media descriptor
+        buf[22] = 0x02; // sectors/FAT LE = 2
+        buf[23] = 0x00;
+        // No 0xAA55 signature — Human68k floppies don't carry one.
+
+        let mut cursor = Cursor::new(buf);
+        let table = PartitionTable::detect(&mut cursor).expect("human68k detected");
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "Human68k (FAT)");
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("human68k"));
+        assert_eq!(parts[0].size_bytes, total as u64);
+    }
+
+    /// Same, but with the Sharp/KG big-endian BPB at offset 0x12 ("Hudson
+    /// soft" game disks). Human68kBpb::parse handles both layouts.
+    #[test]
+    fn human68k_floppy_be_bpb_detected_as_superfloppy() {
+        let total = 1232usize * 1024;
+        let mut buf = vec![0u8; total];
+        buf[0] = 0x60; // BRA.S
+        buf[1] = 0x1c;
+        buf[2..16].copy_from_slice(b"Hudson soft 2.");
+        // Big-endian BPB at 0x12.
+        buf[0x12] = 0x04; // bytes/sector BE = 1024
+        buf[0x13] = 0x00;
+        buf[0x14] = 0x01; // sectors/cluster
+        buf[0x15] = 0x02; // num FATs
+        buf[0x16] = 0x00; // reserved sectors BE = 1
+        buf[0x17] = 0x01;
+        buf[0x18] = 0x00; // root entries BE = 192
+        buf[0x19] = 0xc0;
+        buf[0x1a] = 0x04; // total sectors (16-bit) BE = 1232
+        buf[0x1b] = 0xd0;
+        buf[0x1c] = 0xfe; // media descriptor
+        buf[0x1d] = 0x02; // sectors/FAT
+
+        let mut cursor = Cursor::new(buf);
+        let table = PartitionTable::detect(&mut cursor).expect("human68k detected");
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "Human68k (FAT)");
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("human68k"));
     }
 }

@@ -8,6 +8,9 @@ Rusty Backup is a cross-platform GUI application (Rust, egui/eframe) for backing
 
 Licensed under AGPL-3.0. The full specification lives in `PROJECT-SPEC.md`.
 
+## Coding Style
+Read CONTRIBUTING.md prior to making code changes in this repository.
+
 ## Build Commands
 
 ```bash
