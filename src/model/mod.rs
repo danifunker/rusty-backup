@@ -17,6 +17,7 @@ pub mod hfs_expand_runner;
 pub mod min_size_runner;
 pub mod partition_editor;
 pub mod physical_write_runner;
+pub mod repack_runner;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;

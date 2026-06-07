@@ -131,6 +131,18 @@ pub struct ExpandStatus {
     pub emit_report: Option<EmitReport>,
 }
 
+/// Status of a Human68k "Defragment" (repack) run on a background thread.
+#[derive(Default)]
+pub struct RepackStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    pub log_messages: Vec<String>,
+    pub current_bytes: u64,
+    pub total_bytes: u64,
+    /// One-line completion summary (dirs / files / bytes packed).
+    pub summary: Option<String>,
+}
+
 /// Log level for `BulkConvertStatus.log_messages`.
 #[derive(Clone, Copy)]
 pub enum BulkConvertLogLevel {

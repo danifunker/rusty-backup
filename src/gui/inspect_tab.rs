@@ -185,6 +185,12 @@ pub struct InspectTab {
     expand_hfs_dialog: Option<ExpandHfsDialog>,
     /// "Convert Floppy Container..." dialog (XDF/HDM/DIM/D88).
     floppy_convert_dialog: Option<FloppyConvertDialog>,
+    /// Pending Human68k defragment awaiting confirmation: (partition byte
+    /// offset, partition label). `Some` while the confirm modal is open.
+    pending_repack: Option<(u64, String)>,
+    /// Status of the background Human68k defragment (repack) worker. `None`
+    /// when none is running.
+    repack_status: Option<Arc<Mutex<rusty_backup::model::status::RepackStatus>>>,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
     /// When the user opens a single-file-chd backup folder, the redirect
@@ -256,6 +262,8 @@ impl Default for InspectTab {
             repair_context: None,
             expand_hfs_dialog: None,
             floppy_convert_dialog: None,
+            pending_repack: None,
+            repack_status: None,
             chd_info_text: None,
             single_file_chd_backup_folder: None,
             physical_disk_export: PhysicalDiskExport::default(),
@@ -500,6 +508,7 @@ impl InspectTab {
         self.poll_min_size_calcs(ctx);
         self.poll_volume_label_probes(ctx);
         self.poll_chd_expand_status(ctx);
+        self.poll_repack_status(ctx);
 
         // Background workers (min-size + volume-label probes) finish off the
         // GUI thread; without an explicit repaint request egui only paints
@@ -3380,8 +3389,17 @@ impl InspectTab {
         let mut check_request: Option<(u64, u8, Option<String>)> = None;
         // Expand-HFS request: (offset, partition_size_bytes)
         let mut expand_request: Option<(u64, u64)> = None;
+        // Defragment (Human68k repack) request: (offset, partition label).
+        let mut defrag_request: Option<(u64, String)> = None;
         // "Calc min" button click: partition index to compute minimum size for.
         let mut min_size_calc_request: Option<usize> = None;
+
+        // The in-place Human68k defragment worker rewrites the partition
+        // region of the underlying file, so it's offered for image-file
+        // sources only (not devices or loaded backups).
+        let is_image_source = self.image_file_path.is_some()
+            && self.selected_device_idx.is_none()
+            && self.backup_folder_path.is_none();
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -3609,6 +3627,23 @@ impl InspectTab {
                             {
                                 expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
+                            // Defragment (repack) a Human68k volume in place.
+                            // Image files only — the worker rewrites the
+                            // partition region of the file on disk.
+                            if part.partition_type_string.as_deref() == Some("human68k")
+                                && is_image_source
+                                && self.repack_status.is_none()
+                                && ui
+                                    .small_button("Defragment…")
+                                    .on_hover_text(
+                                        "Repack this Human68k volume so its files are stored \
+                                         contiguously, reclaiming holes left by deleted files. \
+                                         Rewrites the partition in place — back up first.",
+                                    )
+                                    .clicked()
+                            {
+                                defrag_request = Some((part.byte_offset(), part.type_name.clone()));
+                            }
                         } else {
                             ui.label("");
                         }
@@ -3632,6 +3667,12 @@ impl InspectTab {
         // Handle expand-HFS request: probe the source, then open the dialog.
         if let Some((offset, partition_size)) = expand_request {
             self.open_expand_hfs(offset, partition_size, ctx);
+        }
+
+        // Handle defragment request: stash it for the confirmation modal
+        // (the worker rewrites the partition in place).
+        if let Some((offset, label)) = defrag_request {
+            self.pending_repack = Some((offset, label));
         }
 
         // Handle "Calc min" click: spawn a worker for this partition.
@@ -3658,6 +3699,118 @@ impl InspectTab {
             let still_open = dlg.show(ui.ctx(), ctx.log);
             if !still_open {
                 self.floppy_convert_dialog = None;
+            }
+        }
+
+        // Human68k defragment: confirmation modal + in-progress window.
+        self.render_repack_ui(ui, ctx);
+    }
+
+    /// Render the Human68k defragment confirmation modal (when a partition's
+    /// "Defragment…" button was clicked) and the in-progress window (while
+    /// the worker runs). Split out of `show` to keep that method readable.
+    fn render_repack_ui(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        if let Some((offset, label)) = self.pending_repack.clone() {
+            let mut keep_open = true;
+            let mut start = false;
+            let mut cancel = false;
+            egui::Window::new("Defragment Human68k partition")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!("Defragment \"{label}\"?"));
+                    ui.label(
+                        "Repacks the volume so files are stored contiguously, reclaiming \
+                         holes left by deleted files.",
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 180, 80),
+                        "The partition is rewritten in place. Back up the image first.",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Defragment").clicked() {
+                            start = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if start {
+                self.pending_repack = None;
+                self.start_repack(offset, ctx);
+            } else if cancel || !keep_open {
+                self.pending_repack = None;
+            }
+        }
+
+        if let Some(arc) = &self.repack_status {
+            let frac = arc
+                .lock()
+                .ok()
+                .map(|s| {
+                    if s.total_bytes > 0 {
+                        s.current_bytes as f32 / s.total_bytes as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0);
+            egui::Window::new("Defragmenting…")
+                .collapsible(false)
+                .resizable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.add(egui::ProgressBar::new(frac).show_percentage());
+                    ui.label("Repacking Human68k volume — please wait.");
+                });
+            // Keep the UI repainting so progress + completion are reflected
+            // without needing mouse movement.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(120));
+        }
+    }
+
+    /// Spawn the background defragment worker for the Human68k partition at
+    /// `offset` in the currently-loaded image file. Releases any cached
+    /// browse handle first so the worker can rewrite the file.
+    fn start_repack(&mut self, offset: u64, ctx: &mut TabContext) {
+        let path = match &self.image_file_path {
+            Some(p) => p.clone(),
+            None => {
+                ctx.log.error("No image file loaded to defragment.");
+                return;
+            }
+        };
+        self.browse_view.close();
+        ctx.log.info("Starting Human68k defragment (repack)...");
+        self.repack_status = Some(rusty_backup::model::repack_runner::spawn(path, offset));
+    }
+
+    /// Drain log lines from the defragment worker and finalize on
+    /// completion (re-inspect so the refreshed layout is shown).
+    fn poll_repack_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.repack_status {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            ctx.log.info(msg);
+        }
+        if status.finished {
+            let ok = status.error.is_none();
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Defragment failed: {err}"));
+            } else {
+                ctx.log.info("Defragment complete.");
+            }
+            drop(status);
+            self.repack_status = None;
+            if ok {
+                // Layout inside the partition changed; refresh the view.
+                self.run_inspect(ctx);
             }
         }
     }
