@@ -128,7 +128,7 @@ Full background and the feature matrix live in
 
 ## Usage
 
-The app has four tabs:
+The app has five tabs:
 
 - **Backup** — pick a source (physical device or image file), choose a
   destination folder, pick an output format and checksum type, and start.
@@ -181,6 +181,16 @@ The app has four tabs:
 - **Optical** — browse and extract files from CD/DVD images and physical
   optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
   discs. Re-opens automatically when the underlying disc changes.
+- **Archives** — browse and extract classic Macintosh archives. Auto-detects
+  StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), and
+  BinHex (`.hqx`) wrappers around any of them. Pick an archive, browse the
+  entry tree (name / type / creator / size / codec), tick the entries to
+  keep, and extract to a folder in your choice of fork-preserving
+  container — BinHex, MacBinary, AppleDouble, or raw data + `.rsrc`
+  sidecar. Single-entry archives whose payload is itself a disk image
+  (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click "Mount in new
+  Inspect tab" handoff. `rb-cli sit list` / `sit extract` is the
+  scriptable counterpart.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
 restore-tab partition list) use a shared **Size Mode** radio set
@@ -386,7 +396,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
 | **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
 | **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
-| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion shipped), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images) |
+| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion + in-place add/delete/mkdir), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract + add/delete/mkdir + in-place grow/shrink + defragmenting repack, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images) |
 | **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
 | **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
 | **Amstrad CPC**                | AMSDOS + CP/M 2.2 / Plus (`amstrad_data` + `amstrad_sys` DPBs) | Floppy `.dsk` |
