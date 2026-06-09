@@ -18,7 +18,6 @@ Usage: rb-cli [OPTIONS] <COMMAND>
 - `--color` — ANSI color usage. Honors the `NO_COLOR` env var when set. Built-in default `auto`
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
-- `-V` / `--version` — Print the `rb-cli` version and exit. Matches the version the GUI reports
 
 ## Verbs
 
@@ -301,16 +300,48 @@ Usage: batch-template [OPTIONS] --target <TARGET> <HOSTDIR>
 
 ### `bless`
 
-Mark an HFS / HFS+ folder as the bootable System Folder
+Inspect or set the bootable System Folder on an HFS / HFS+ volume (`set` / `show` / `pick`)
 
 ```
-Usage: bless <IMAGE> <PATH>
+Usage: bless <COMMAND>
+```
+
+### `bless pick`
+
+Interactively browse the volume's folders and pick one to bless
+
+```
+Usage: pick <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+
+### `bless set`
+
+Bless the folder at PATH (mark it as the bootable System Folder)
+
+```
+Usage: set <IMAGE> <PATH>
 ```
 
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
 - `<PATH>` — Absolute Mac path of the folder to bless (e.g. `/System Folder`)
+
+### `bless show`
+
+Print the volume's current blessed System Folder
+
+```
+Usage: show <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
 
 ### `chmeta`
 
@@ -405,7 +436,7 @@ Usage: convert [OPTIONS] <IN> <OUT>
 
 ### `expand`
 
-Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single-partition HFS images.
+Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images
 
 ```
 Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
@@ -421,6 +452,44 @@ Usage: expand [OPTIONS] --size <SIZE> --output <OUTPUT> <IMAGE>
 - `--block-size` — Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`
 - `--output` — Destination path for the new image. Created (or truncated)
 - `--to-hfv` — Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 2047 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver
+
+### `floppy`
+
+Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88
+
+```
+Usage: floppy <COMMAND>
+```
+
+### `floppy convert`
+
+Convert a floppy image between XDF / HDM / DIM / D88 formats. The output format is inferred from the destination extension
+
+```
+Usage: convert [OPTIONS] <INPUT> <OUTPUT>
+```
+
+**Arguments**
+
+- `<INPUT>` — Source floppy image (.xdf, .hdm, .dim, .d88) — or a directory of floppy images when paired with `--to`
+- `<OUTPUT>` — Destination path. For a file input the target format is taken from the extension; for a directory input pass a directory here and use `--to <fmt>` to pick the output format
+
+**Options**
+
+- `--to` — Output format for directory (bulk) mode. Required when `input` is a directory; ignored for single-file mode (extension wins there)
+- `--recursive` — Walk the input directory recursively. Only meaningful in bulk mode
+
+### `floppy info`
+
+Print the detected container kind and geometry for a floppy image
+
+```
+Usage: info <INPUT>
+```
+
+**Arguments**
+
+- `<INPUT>` — Floppy image to inspect
 
 ### `fsck`
 
@@ -464,6 +533,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 
 ### `get-binhex`
 
@@ -567,6 +637,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 
 ### `mkdir`
 
@@ -822,6 +893,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path
 - `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 
 ### `put-binhex`
 
@@ -883,7 +955,7 @@ Usage: reformat [OPTIONS] --fs <FS> <IMAGE>
 
 ### `repack`
 
-Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place `resize` can't (it keeps cluster byte-offsets, so it only trims trailing free space). Human68k FAT16 volumes only; the partition table is left untouched.
+Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place resizer can't (it keeps cluster byte-offsets)
 
 ```
 Usage: repack [OPTIONS] <IMAGE>
@@ -895,7 +967,7 @@ Usage: repack [OPTIONS] <IMAGE>
 
 **Options**
 
-- `--size` — New filesystem size in bytes (default: the partition's current filesystem size). Accepts suffixes (`K`, `M`, `G`). Must not exceed the partition capacity
+- `--size` — New filesystem size in bytes (default: the partition's current size). Accepts suffixes (`K`, `M`, `G`). Must not exceed the partition capacity
 
 ### `resize`
 
@@ -955,6 +1027,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--exclude` — Exclude paths matching this glob from deletion. Repeatable. Exclude always wins over the positional pattern
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 
 ### `setrsrc`
 

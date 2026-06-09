@@ -118,6 +118,7 @@ clap_complete = "4"
 clap_mangen = "0.3"
 globset = "0.4"
 rustyline = { version = "18.0.0", features = ["with-file-history"] }
+crossterm = "0.28"
 shell-words = "1.1.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
