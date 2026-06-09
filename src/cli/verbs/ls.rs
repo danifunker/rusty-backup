@@ -64,6 +64,17 @@ pub fn run(args: LsArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
+    // Volume-level advisory: surface the blessed System Folder (HFS / HFS+)
+    // so users see what's currently bootable without a separate `bless show`.
+    // Goes to stderr to keep stdout parse-clean. No-op on filesystems that
+    // don't support blessing or volumes with none set.
+    if let Some(info) = super::bless::blessed_info(&mut *fs) {
+        log_stderr(format!(
+            "Blessed System Folder: {}",
+            super::bless::format_blessed(&info)
+        ));
+    }
+
     // Default case rule: insensitive on classic case-insensitive
     // filesystems, sensitive elsewhere. Phase B is conservative and
     // simply leaves the default insensitive on every filesystem because

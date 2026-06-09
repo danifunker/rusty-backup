@@ -86,8 +86,12 @@ pub enum Command {
     /// dropped (SGI/IRIX today).
     Shrink(verbs::shrink::ShrinkArgs),
 
-    /// Mark an HFS / HFS+ folder as the bootable System Folder.
-    Bless(verbs::bless::BlessArgs),
+    /// Inspect or set the bootable System Folder on an HFS / HFS+ volume
+    /// (`set` / `show` / `pick`).
+    Bless {
+        #[command(subcommand)]
+        cmd: verbs::bless::BlessCommand,
+    },
 
     /// Change the type and/or creator code on an existing HFS / HFS+ /
     /// ProDOS file.
@@ -245,7 +249,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),
         Command::Shrink(args) => verbs::shrink::run(args),
-        Command::Bless(args) => verbs::bless::run(args),
+        Command::Bless { cmd } => verbs::bless::run(cmd),
         Command::Chmeta(args) => verbs::chmeta::run(args),
         Command::Setrsrc(args) => verbs::setrsrc::run(args),
         Command::Setvolname(args) => verbs::setvolname::run(args),

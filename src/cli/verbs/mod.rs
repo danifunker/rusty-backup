@@ -11,6 +11,7 @@ pub mod batch;
 pub mod batch_template;
 pub mod binhex;
 pub mod bless;
+pub mod bless_pick;
 pub mod chmeta;
 pub mod completions;
 pub mod config;

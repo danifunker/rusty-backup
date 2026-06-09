@@ -300,16 +300,48 @@ Usage: batch-template [OPTIONS] --target <TARGET> <HOSTDIR>
 
 ### `bless`
 
-Mark an HFS / HFS+ folder as the bootable System Folder
+Inspect or set the bootable System Folder on an HFS / HFS+ volume (`set` / `show` / `pick`)
 
 ```
-Usage: bless <IMAGE> <PATH>
+Usage: bless <COMMAND>
+```
+
+### `bless pick`
+
+Interactively browse the volume's folders and pick one to bless
+
+```
+Usage: pick <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+
+### `bless set`
+
+Bless the folder at PATH (mark it as the bootable System Folder)
+
+```
+Usage: set <IMAGE> <PATH>
 ```
 
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
 - `<PATH>` — Absolute Mac path of the folder to bless (e.g. `/System Folder`)
+
+### `bless show`
+
+Print the volume's current blessed System Folder
+
+```
+Usage: show <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
 
 ### `chmeta`
 

@@ -173,8 +173,22 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     if &sector0[3..11] == b"EXFAT   " {
         return "exfat";
     }
+    // FAT boot sectors begin with a JMP (0xEB short or 0xE9 near). But a JMP
+    // opcode alone is a weak signal: syslinux/extlinux install their boot code
+    // into the reserved first 1024 bytes of an ext2/3/4 volume, and that code
+    // also begins `EB 58 90`. Only treat this as FAT when the BPB is plausible
+    // — a nonzero bytes-per-sector within range and a nonzero
+    // sectors-per-cluster — so an ext partition with a boot loader falls
+    // through to the ext2 superblock-magic check below. The gate mirrors
+    // `fat::FatFilesystem::open`, which rejects bytes_per_sector 0 / >4096 and
+    // sectors_per_cluster 0.
     if sector0[0] == 0xEB || sector0[0] == 0xE9 {
-        return "fat";
+        let bytes_per_sector = u16::from_le_bytes([sector0[11], sector0[12]]);
+        let sectors_per_cluster = sector0[13];
+        if bytes_per_sector != 0 && bytes_per_sector <= 4096 && sectors_per_cluster != 0 {
+            return "fat";
+        }
+        // Otherwise the JMP is a boot loader, not a FAT BPB — fall through.
     }
     // XFS superblock magic ("XFSB") at byte 0 of the partition. Both v4
     // (IRIX-compatible) and v5/CRC superblocks share this magic and are
@@ -2253,6 +2267,38 @@ mod tests {
         // We deliberately don't poke at the trait — just opening successfully
         // is the regression signal.
         drop(fs);
+    }
+
+    /// Build a 4 KiB buffer that looks like an ext2/3/4 partition with a
+    /// boot loader (syslinux/extlinux) installed in the reserved first 1024
+    /// bytes. The boot code begins `EB 58 90 "SYSLINUX"` — the same JMP a FAT
+    /// VBR starts with — but the BPB is degenerate (sectors_per_cluster == 0).
+    /// The ext2 superblock magic (0xEF53 LE) sits at byte 1080 (1024 + 0x38).
+    /// Mirrors the real `shork-486` disk.
+    fn extlinux_ext2_sector() -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        buf[0] = 0xEB;
+        buf[1] = 0x58;
+        buf[2] = 0x90;
+        buf[3..11].copy_from_slice(b"SYSLINUX");
+        buf[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes/sector (valid)
+        buf[13] = 0; // sectors/cluster == 0 -> not a real FAT BPB
+                     // ext2 superblock magic (0xEF53 LE) at offset 1024 + 0x38.
+        buf[1024 + 0x38] = 0x53;
+        buf[1024 + 0x39] = 0xEF;
+        buf
+    }
+
+    #[test]
+    fn detect_filesystem_type_extlinux_boot_block_is_ext_not_fat() {
+        // Regression: an ext2 partition with extlinux in the reserved boot
+        // block leads with an `EB 58 90` JMP. The old code short-circuited to
+        // "fat" on the jump byte alone and the FAT parser then died with
+        // "invalid sectors per cluster: 0". The BPB sanity gate must let it
+        // fall through to the ext2 magic check.
+        let buf = extlinux_ext2_sector();
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(detect_filesystem_type(&mut cursor, 0), "ext");
     }
 
     #[test]
