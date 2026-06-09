@@ -3607,10 +3607,13 @@ impl BrowseView {
 
         let title = match pending.kind {
             MacArchiveKind::BinHexSingleFile => "Convert HQX file?",
-            MacArchiveKind::Sit | MacArchiveKind::Sit5 | MacArchiveKind::Sea => "Expand archive?",
-            MacArchiveKind::BinHexOverSit | MacArchiveKind::BinHexOverSea => {
-                "Convert and/or expand?"
-            }
+            MacArchiveKind::Sit
+            | MacArchiveKind::Sit5
+            | MacArchiveKind::Sea
+            | MacArchiveKind::CompactPro => "Expand archive?",
+            MacArchiveKind::BinHexOverSit
+            | MacArchiveKind::BinHexOverSea
+            | MacArchiveKind::BinHexOverCompactPro => "Convert and/or expand?",
         };
 
         egui::Window::new(title)
@@ -3625,10 +3628,15 @@ impl BrowseView {
                     MacArchiveKind::BinHexSingleFile => {
                         format!("Would you like to convert {filename} to binary?")
                     }
-                    MacArchiveKind::Sit | MacArchiveKind::Sit5 | MacArchiveKind::Sea => {
+                    MacArchiveKind::Sit
+                    | MacArchiveKind::Sit5
+                    | MacArchiveKind::Sea
+                    | MacArchiveKind::CompactPro => {
                         format!("Would you like to expand the contents of {filename}?")
                     }
-                    MacArchiveKind::BinHexOverSit | MacArchiveKind::BinHexOverSea => {
+                    MacArchiveKind::BinHexOverSit
+                    | MacArchiveKind::BinHexOverSea
+                    | MacArchiveKind::BinHexOverCompactPro => {
                         format!(
                             "Would you like to convert {filename} to binary and/or expand the contents?"
                         )
@@ -3659,7 +3667,10 @@ impl BrowseView {
                             action = Some(ImportAction::Cancel);
                         }
                     }
-                    MacArchiveKind::Sit | MacArchiveKind::Sit5 | MacArchiveKind::Sea => {
+                    MacArchiveKind::Sit
+                    | MacArchiveKind::Sit5
+                    | MacArchiveKind::Sea
+                    | MacArchiveKind::CompactPro => {
                         if ui
                             .button("Expand")
                             .on_hover_text(
@@ -3681,7 +3692,9 @@ impl BrowseView {
                             action = Some(ImportAction::Cancel);
                         }
                     }
-                    MacArchiveKind::BinHexOverSit | MacArchiveKind::BinHexOverSea => {
+                    MacArchiveKind::BinHexOverSit
+                    | MacArchiveKind::BinHexOverSea
+                    | MacArchiveKind::BinHexOverCompactPro => {
                         if ui
                             .button("Convert and expand")
                             .on_hover_text(
@@ -3694,6 +3707,9 @@ impl BrowseView {
                         }
                         let convert_only_label = match pending.kind {
                             MacArchiveKind::BinHexOverSea => "Convert only (.sea lands here)",
+                            MacArchiveKind::BinHexOverCompactPro => {
+                                "Convert only (inner archive lands here)"
+                            }
                             _ => "Convert only (.sit lands here)",
                         };
                         if ui

@@ -7,10 +7,13 @@
 //!
 //! - [`stuffit`] — classic StuffIt (`.sit`, `SIT!` magic) and StuffIt
 //!   self-extracting archives (`.sea`).
+//! - [`compactpro`] — Compact Pro (`.cpt`, and `.sea` self-extracting),
+//!   commonly distributed BinHex-wrapped.
 //!
 //! See `docs/native_mac_archives.md` for the format references and roadmap.
 
 pub mod bitreader_be;
+pub mod compactpro;
 pub mod detect;
 pub mod extract;
 pub mod stuffit;

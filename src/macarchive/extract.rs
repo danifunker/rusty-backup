@@ -2,6 +2,7 @@
 //! and the GUI archive-browse tab.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::fs::binhex;
@@ -79,6 +80,16 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
             let bh = binhex::parse_binhex(&raw)?;
             parse_sit_family(bh.data_fork)
         }
+        Some(MacArchiveKind::BinHexOverCompactPro) => {
+            // Peel the HQX, then parse the inner Compact Pro archive.
+            let bh = binhex::parse_binhex(&raw)?;
+            let archive = super::compactpro::parse(&bh.data_fork)?;
+            Ok((bh.data_fork, archive))
+        }
+        Some(MacArchiveKind::CompactPro) => {
+            let archive = super::compactpro::parse(&raw)?;
+            Ok((raw, archive))
+        }
         Some(MacArchiveKind::Sit) | Some(MacArchiveKind::Sit5) | Some(MacArchiveKind::Sea) => {
             parse_sit_family(raw)
         }
@@ -131,19 +142,23 @@ fn synth_single_file_archive(bh: binhex::BinHexFile) -> (Vec<u8>, StuffItArchive
         mod_date: 0,
         data: Some(stuffit::ForkInfo {
             method: 0,
+            codec: stuffit::ForkCodec::StuffIt,
             encrypted: false,
             uncompressed_len: data_len,
             compressed_len: data_len,
             crc: data_crc,
+            crc32: 0,
             offset: 0,
         }),
         rsrc: if rsrc_len > 0 {
             Some(stuffit::ForkInfo {
                 method: 0,
+                codec: stuffit::ForkCodec::StuffIt,
                 encrypted: false,
                 uncompressed_len: rsrc_len,
                 compressed_len: rsrc_len,
                 crc: rsrc_crc,
+                crc32: 0,
                 offset: data_len as u64,
             })
         } else {
@@ -200,15 +215,31 @@ pub fn extract_filtered(
         .enumerate()
         .filter(|(i, e)| !e.is_dir && keep(*i))
         .count();
+
+    // Raw format only: an entry's resource fork is written to a `name.rsrc`
+    // sidecar, which collides when a *sibling* entry is literally named
+    // `name.rsrc` (e.g. classic THINK projects ship `Foo.pi` alongside a
+    // `Foo.pi.rsrc` resource file). Reserve every data-fork destination up
+    // front so sidecars dodge them — data-fork names always keep their
+    // natural path, sidecars yield to a non-colliding `.rsrc.N` variant.
+    let reserved_data_paths: HashSet<PathBuf> = if format == ForkFormat::Raw {
+        archive
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| !e.is_dir && keep(*i))
+            .map(|(_, e)| entry_target(dest, e))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut used_sidecars: HashSet<PathBuf> = HashSet::new();
+
     let mut stats = ExtractStats::default();
     let mut done = 0usize;
 
     for (idx, e) in archive.entries.iter().enumerate() {
-        let mut rel = PathBuf::new();
-        for comp in &e.path {
-            rel.push(sanitize_filename(comp));
-        }
-        let target = dest.join(&rel);
+        let target = entry_target(dest, e);
 
         if e.is_dir {
             // Always create directory markers — a subsequent kept file
@@ -240,11 +271,53 @@ pub fn extract_filtered(
             }
         };
 
-        write_entry(&target, e, &data, &rsrc, format)?;
+        // Compact Pro stores one CRC-32 per file over (resource fork ++ data
+        // fork); verify it now that both forks are decompressed. This is the
+        // format's only integrity check, so it covers single-fork, dual-fork,
+        // and empty entries alike.
+        if let Some(expected) = compactpro_entry_crc(e) {
+            if let Err(err) = super::compactpro::verify_entry_crc(&rsrc, &data, expected) {
+                log(format!("Skipped {}: {err}", e.display_path()));
+                stats.skipped += 1;
+                continue;
+            }
+        }
+
+        // Resolve the raw resource-fork sidecar path, dodging any sibling
+        // data fork that already owns `name.rsrc`. Other formats prefix the
+        // sidecar (`._name`) or change its extension (`.hqx` / `.bin`), so
+        // they never collide and pass `None`.
+        let raw_rsrc_path = if format == ForkFormat::Raw && !rsrc.is_empty() {
+            let natural = with_added_extension(&target, "rsrc");
+            let chosen = raw_rsrc_sidecar_path(&target, &reserved_data_paths, &mut used_sidecars);
+            if chosen != natural {
+                log(format!(
+                    "Note: resource fork of '{}' written as '{}' to avoid overwriting a sibling file named '{}'",
+                    e.display_path(),
+                    chosen.file_name().unwrap_or_default().to_string_lossy(),
+                    natural.file_name().unwrap_or_default().to_string_lossy(),
+                ));
+            }
+            Some(chosen)
+        } else {
+            None
+        };
+
+        write_entry(&target, e, &data, &rsrc, format, raw_rsrc_path.as_deref())?;
         stats.files += 1;
     }
 
     Ok(stats)
+}
+
+/// The per-file CRC-32 for a Compact Pro entry (carried identically on both
+/// forks), or `None` for StuffIt entries which checksum each fork on decode.
+fn compactpro_entry_crc(e: &StuffItEntry) -> Option<u32> {
+    [e.rsrc.as_ref(), e.data.as_ref()]
+        .into_iter()
+        .flatten()
+        .find(|f| matches!(f.codec, stuffit::ForkCodec::CompactPro { .. }))
+        .map(|f| f.crc32)
 }
 
 fn decompress_named(
@@ -254,24 +327,38 @@ fn decompress_named(
     log: &mut impl FnMut(String),
 ) -> Result<Vec<u8>, ()> {
     match fork {
-        Some(f) if f.uncompressed_len > 0 => match stuffit::decompress_fork(bytes, f) {
-            Ok(d) => Ok(d),
-            Err(err) => {
-                log(format!("Skipped {}: {err}", e.display_path()));
-                Err(())
+        Some(f) if f.uncompressed_len > 0 => {
+            let result = match f.codec {
+                stuffit::ForkCodec::StuffIt => stuffit::decompress_fork(bytes, f),
+                stuffit::ForkCodec::CompactPro { .. } => {
+                    super::compactpro::decompress_fork(bytes, f)
+                }
+            };
+            match result {
+                Ok(d) => Ok(d),
+                Err(err) => {
+                    log(format!("Skipped {}: {err}", e.display_path()));
+                    Err(())
+                }
             }
-        },
+        }
         _ => Ok(Vec::new()),
     }
 }
 
 /// Write one extracted file's forks to the host in the chosen container format.
+///
+/// `raw_rsrc_path` overrides where a [`ForkFormat::Raw`] resource sidecar is
+/// written; the orchestrator passes a collision-free path here (see
+/// [`raw_rsrc_sidecar_path`]). It is ignored for every other format, and a
+/// `None` falls back to the natural `name.rsrc` next to `target`.
 pub fn write_entry(
     target: &Path,
     entry: &StuffItEntry,
     data: &[u8],
     rsrc: &[u8],
     format: ForkFormat,
+    raw_rsrc_path: Option<&Path>,
 ) -> Result<()> {
     match format {
         ForkFormat::BinHex => {
@@ -309,11 +396,46 @@ pub fn write_entry(
         ForkFormat::Raw => {
             std::fs::write(target, data)?;
             if !rsrc.is_empty() {
-                std::fs::write(with_added_extension(target, "rsrc"), rsrc)?;
+                let rsrc_dst = raw_rsrc_path
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| with_added_extension(target, "rsrc"));
+                std::fs::write(rsrc_dst, rsrc)?;
             }
         }
     }
     Ok(())
+}
+
+/// Destination path for an entry's data fork: `dest` joined with the entry's
+/// path components, each [`sanitize_filename`]d. Shared by the extraction loop
+/// and the up-front data-path reservation so both agree on every name.
+fn entry_target(dest: &Path, entry: &StuffItEntry) -> PathBuf {
+    let mut rel = PathBuf::new();
+    for comp in &entry.path {
+        rel.push(sanitize_filename(comp));
+    }
+    dest.join(rel)
+}
+
+/// Pick a raw resource-fork sidecar path that won't clobber any data fork.
+/// The natural name is `<target>.rsrc`; if a different entry's data fork
+/// already owns that path (it's in `reserved`) or a previous sidecar took it
+/// (`used`), fall back to `<target>.rsrc.1`, `.2`, ... until free. Records the
+/// chosen path in `used` so two sidecars can't collide either.
+fn raw_rsrc_sidecar_path(
+    target: &Path,
+    reserved: &HashSet<PathBuf>,
+    used: &mut HashSet<PathBuf>,
+) -> PathBuf {
+    let base = with_added_extension(target, "rsrc");
+    let mut candidate = base.clone();
+    let mut n = 1u32;
+    while reserved.contains(&candidate) || used.contains(&candidate) {
+        candidate = with_added_extension(&base, &n.to_string());
+        n += 1;
+    }
+    used.insert(candidate.clone());
+    candidate
 }
 
 /// Append `.ext` to a path (keeping any existing extension).
@@ -457,6 +579,63 @@ mod tests {
             "file2 should be skipped"
         );
         assert!(dir.path().join("subdir/file3.txt").exists());
+    }
+
+    /// Raw extraction must not lose a resource fork when a sibling entry is
+    /// literally named `<name>.rsrc` and would otherwise overwrite the
+    /// sidecar. The data fork of the `.rsrc`-named file keeps its natural
+    /// path; the colliding resource fork is parked at `<name>.rsrc.1`.
+    /// (Reproduces the macppp `ppp.pi` / `ppp.pi.rsrc` data loss from the
+    /// real archive.)
+    #[test]
+    fn raw_extract_preserves_forks_on_dot_rsrc_name_collision() {
+        use super::super::stuffit::{build_archive_tree, StuffItInputNode, WriteMethod};
+        let mk = |name: &str, data: &[u8], rsrc: &[u8]| super::super::stuffit::StuffItInput {
+            name: name.into(),
+            type_code: [0; 4],
+            creator_code: [0; 4],
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: data.to_vec(),
+            resource_fork: rsrc.to_vec(),
+        };
+        // `Doc` carries a resource fork; `Doc.rsrc` is a *separate* file
+        // whose data fork would land on `Doc`'s sidecar path.
+        let tree = vec![
+            StuffItInputNode::File(mk("Doc", b"DOC-DATA", b"DOC-RSRC")),
+            StuffItInputNode::File(mk("Doc.rsrc", b"SIBLING-DATA", b"")),
+        ];
+        let arc_bytes = build_archive_tree(&tree, WriteMethod::Store).expect("build");
+        let (bytes, archive) = open_bytes(arc_bytes).expect("open");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stats = extract_all(
+            &bytes,
+            &archive,
+            dir.path(),
+            ForkFormat::Raw,
+            |_, _, _| {},
+            |_| {},
+        )
+        .expect("extract");
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.skipped, 0);
+
+        // The sibling file's data fork keeps `Doc.rsrc` intact.
+        assert_eq!(
+            std::fs::read(dir.path().join("Doc.rsrc")).unwrap(),
+            b"SIBLING-DATA",
+            "sibling data fork must not be clobbered"
+        );
+        // `Doc`'s data fork is untouched.
+        assert_eq!(std::fs::read(dir.path().join("Doc")).unwrap(), b"DOC-DATA");
+        // `Doc`'s resource fork survives at the de-conflicted sidecar.
+        assert_eq!(
+            std::fs::read(dir.path().join("Doc.rsrc.1")).unwrap(),
+            b"DOC-RSRC",
+            "Doc resource fork must be preserved at a non-colliding path"
+        );
     }
 
     /// `open_bytes` on truly opaque bytes returns the new

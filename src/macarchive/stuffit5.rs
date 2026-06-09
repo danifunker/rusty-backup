@@ -11,7 +11,7 @@
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 
-use super::stuffit::{ForkInfo, StuffItArchive, StuffItEntry};
+use super::stuffit::{ForkCodec, ForkInfo, StuffItArchive, StuffItEntry};
 
 const SIT5_MAGIC: &[u8] = b"StuffIt (c)1997";
 const SIT5_ID: u32 = 0xA5A5_A5A5;
@@ -229,10 +229,12 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
             let rsrc = if has_resource && (resourcelength > 0 || resourcecomplen > 0) {
                 Some(ForkInfo {
                     method: resourcemethod,
+                    codec: ForkCodec::StuffIt,
                     encrypted: false,
                     uncompressed_len: resourcelength,
                     compressed_len: resourcecomplen,
                     crc: resourcecrc,
+                    crc32: 0,
                     offset: datastart,
                 })
             } else {
@@ -240,10 +242,12 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
             };
             let data_fork = Some(ForkInfo {
                 method: datamethod,
+                codec: ForkCodec::StuffIt,
                 encrypted: false,
                 uncompressed_len: datalength,
                 compressed_len: datacomplen,
                 crc: datacrc,
+                crc32: 0,
                 offset: datastart + resourcecomplen as u64,
             });
             entries.push(StuffItEntry {

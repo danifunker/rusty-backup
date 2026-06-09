@@ -23,6 +23,7 @@ use std::io::Cursor;
 use crate::fs::binhex;
 use crate::rbformats::dc42;
 
+use super::compactpro::is_compactpro;
 use super::extract::is_stuffitx;
 use super::stuffit::{find_sea_archive, is_stuffit};
 use super::stuffit5::is_stuffit5;
@@ -49,6 +50,11 @@ pub enum MacArchiveKind {
     /// A self-extracting StuffIt archive: a Mac application carrying a
     /// SIT! signature inside its data fork.
     Sea,
+    /// A Compact Pro archive (`.cpt`, or a `.sea` self-extracting one). The
+    /// `0x01` marker plus a CRC-validated index identify it.
+    CompactPro,
+    /// A `.cpt.hqx` / `.sea.hqx`: BinHex-wrapped Compact Pro archive.
+    BinHexOverCompactPro,
 }
 
 impl MacArchiveKind {
@@ -63,6 +69,8 @@ impl MacArchiveKind {
             MacArchiveKind::Sit => "StuffIt",
             MacArchiveKind::Sit5 => "StuffIt 5",
             MacArchiveKind::Sea => "SEA",
+            MacArchiveKind::CompactPro => "Compact Pro",
+            MacArchiveKind::BinHexOverCompactPro => "Compact-Pro-over-BinHex",
         }
     }
 
@@ -74,6 +82,7 @@ impl MacArchiveKind {
             MacArchiveKind::BinHexSingleFile
                 | MacArchiveKind::BinHexOverSit
                 | MacArchiveKind::BinHexOverSea
+                | MacArchiveKind::BinHexOverCompactPro
         )
     }
 
@@ -103,6 +112,9 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
         if is_stuffit(inner) || is_stuffit5(inner) {
             return Some(MacArchiveKind::BinHexOverSit);
         }
+        if is_compactpro(inner) {
+            return Some(MacArchiveKind::BinHexOverCompactPro);
+        }
         if find_sea_archive(inner).is_some() {
             return Some(MacArchiveKind::BinHexOverSea);
         }
@@ -124,6 +136,9 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
         // the file as-is; the existing extractor bails with a clearer
         // message when they try to expand it.
         return None;
+    }
+    if is_compactpro(bytes) {
+        return Some(MacArchiveKind::CompactPro);
     }
     if find_sea_archive(bytes).is_some() {
         return Some(MacArchiveKind::Sea);

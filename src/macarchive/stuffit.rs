@@ -48,27 +48,52 @@ const END_FOLDER: u8 = 0x21;
 /// folder marker (or the raw method) behind.
 const FOLDER_MASK: u8 = !(ENCRYPTED_FLAG | FOLDER_CONTAINS_ENCRYPTED);
 
-/// One fork (data or resource) of a StuffIt entry.
+/// Which decompressor a [`ForkInfo`] needs. StuffIt and Compact Pro share the
+/// same entry/fork plumbing (the directory tree in [`StuffItEntry`] and every
+/// output format in `extract`) but use entirely different fork codecs and
+/// checksums, so the codec tag picks the right decompressor at extract time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkCodec {
+    /// StuffIt method lives in [`ForkInfo::method`]; checksum is the
+    /// CRC-16/ARC in [`ForkInfo::crc`].
+    StuffIt,
+    /// Compact Pro (`super::compactpro`): byte-level RLE, optionally preceded
+    /// by an LZH (LZSS + Huffman) layer. Compact Pro stores one CRC-32 per
+    /// file (in [`ForkInfo::crc32`]) over the resource fork followed by the
+    /// data fork, so it's verified once per entry rather than per fork.
+    CompactPro { lzh: bool },
+}
+
+/// One fork (data or resource) of a StuffIt or Compact Pro entry.
 #[derive(Debug, Clone)]
 pub struct ForkInfo {
-    /// Compression method (low nibble: 0=none, 1=RLE90, 3=Huffman, 13=LZ+Huffman, 15=Arsenic, …).
+    /// StuffIt compression method (low nibble: 0=none, 1=RLE90, 3=Huffman,
+    /// 13=LZ+Huffman, 15=Arsenic, …). Ignored for [`ForkCodec::CompactPro`].
     pub method: u8,
+    /// Which codec decompresses this fork.
+    pub codec: ForkCodec,
     /// True when the fork is password-encrypted (not supported for extraction).
     pub encrypted: bool,
     /// Decompressed length in bytes.
     pub uncompressed_len: u32,
     /// Compressed length in bytes (as stored in the archive).
     pub compressed_len: u32,
-    /// Stored CRC-16/ARC of the decompressed fork.
+    /// Stored CRC-16/ARC of the decompressed fork (StuffIt forks only).
     pub crc: u16,
+    /// Stored CRC-32 of the decompressed fork (Compact Pro forks only).
+    pub crc32: u32,
     /// Absolute byte offset of the compressed data within the archive.
     pub offset: u64,
 }
 
 impl ForkInfo {
-    /// Human-readable compression method name.
+    /// Human-readable compression method name, codec-aware.
     pub fn method_name(&self) -> &'static str {
-        method_name(self.method)
+        match self.codec {
+            ForkCodec::StuffIt => method_name(self.method),
+            ForkCodec::CompactPro { lzh: true } => "Compact Pro (LZH+RLE)",
+            ForkCodec::CompactPro { lzh: false } => "Compact Pro (RLE)",
+        }
     }
 }
 
@@ -235,10 +260,12 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         let rsrc = if rsrc_len > 0 || rsrc_clen > 0 {
             Some(ForkInfo {
                 method: rmethod & !ENCRYPTED_FLAG,
+                codec: ForkCodec::StuffIt,
                 encrypted: rmethod & ENCRYPTED_FLAG != 0,
                 uncompressed_len: rsrc_len,
                 compressed_len: rsrc_clen,
                 crc: rsrc_crc,
+                crc32: 0,
                 offset: data_start,
             })
         } else {
@@ -246,10 +273,12 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         };
         let data = Some(ForkInfo {
             method: dmethod & !ENCRYPTED_FLAG,
+            codec: ForkCodec::StuffIt,
             encrypted: dmethod & ENCRYPTED_FLAG != 0,
             uncompressed_len: data_len,
             compressed_len: data_clen,
             crc: data_crc,
+            crc32: 0,
             offset: data_start + rsrc_clen as u64,
         });
 
