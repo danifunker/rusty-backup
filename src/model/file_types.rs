@@ -26,9 +26,10 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
 pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
 
-/// Macintosh archive / encoding extensions (StuffIt + BinHex), a picker group
-/// for the Archives tab. Includes uppercase variants for case-sensitive pickers.
-pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "SIT", "HQX", "SEA"];
+/// Macintosh archive / encoding extensions (StuffIt + Compact Pro + BinHex), a
+/// picker group for the Archives tab. Includes uppercase variants for
+/// case-sensitive pickers; new entries are lowercase-only (`cpt`).
+pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "cpt", "SIT", "HQX", "SEA"];
 
 /// ProgId registered under `HKCU\Software\Classes` for disk-image associations.
 pub const DISK_IMAGE_PROGID: &str = "RustyBackup.DiskImage";
@@ -89,6 +90,19 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing X68000 HDD extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn mac_archive_family_present() {
+        // StuffIt (.sit/.sea), BinHex (.hqx), and Compact Pro (.cpt) all flow
+        // through `macarchive` detection + the Archives tab. Pin them so a
+        // picker-list cleanup can't silently drop a supported archive format.
+        for must in ["sit", "hqx", "sea", "cpt"] {
+            assert!(
+                MAC_ARCHIVE_EXTS.contains(&must),
+                "missing Mac archive extension {must}"
             );
         }
     }

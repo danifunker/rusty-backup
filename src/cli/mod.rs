@@ -194,8 +194,8 @@ pub enum Command {
         cmd: verbs::partmap::PartmapCommand,
     },
 
-    /// Read classic StuffIt archives (list / extract; accepts .sit, .sea,
-    /// and BinHex-wrapped .sit.hqx).
+    /// Read classic StuffIt and Compact Pro archives (list / extract; accepts
+    /// .sit, .sea, .cpt, and their BinHex-wrapped .hqx forms).
     Sit {
         #[command(subcommand)]
         cmd: verbs::sit::SitCommand,

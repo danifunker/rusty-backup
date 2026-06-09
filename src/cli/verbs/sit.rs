@@ -1,13 +1,13 @@
-//! `rb-cli sit <SUBCOMMAND>` — read classic StuffIt archives.
+//! `rb-cli sit <SUBCOMMAND>` — read classic StuffIt and Compact Pro archives.
 //!
 //! `sit list ARCHIVE` prints the entries; `sit extract ARCHIVE DEST` unpacks
 //! them to the host, preserving both forks and Finder info via a chosen
 //! container format (BinHex by default).
 //!
-//! ARCHIVE may be a raw `.sit`, a self-extracting `.sea`, or a BinHex-wrapped
-//! `.sit.hqx` — the latter is decoded transparently. Only the classic StuffIt
-//! format (`SIT!`) is supported; the newer StuffIt 5 (`.sitx`-era) format is a
-//! separate container and is rejected with a clear message.
+//! ARCHIVE may be a raw `.sit` / `.cpt`, a self-extracting `.sea`, or any of
+//! these BinHex-wrapped as `.hqx` — the wrapper is decoded transparently, and
+//! the format (classic StuffIt, StuffIt 5, or Compact Pro) is detected from
+//! content. StuffIt X (`.sitx`) is recognized but not yet extractable.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -47,13 +47,13 @@ pub struct CreateArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// StuffIt archive (`.sit`, `.sea`, or `.sit.hqx`).
+    /// StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`).
     pub archive: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct ExtractArgs {
-    /// StuffIt archive (`.sit`, `.sea`, or `.sit.hqx`).
+    /// StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`).
     pub archive: PathBuf,
 
     /// Destination directory on the host (created if missing).
