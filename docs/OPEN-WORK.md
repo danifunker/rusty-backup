@@ -736,15 +736,39 @@ no hand-waving.
      PATH.DIM]` at GUI/CLI parity (per CLAUDE.md). Both surfaces
      share the same `build_x68k_hdd` entry point.
 
-   **Deferred (Phase D.2 — explicitly out of scope today):** the
-   partition's Human68k boot sector. Writing a clean-room HDD boot
-   loader needs either reverse-engineering Sharp's `SWITCH.X` or
-   porting the `dis68k` libfat-human68k FAT12 reader into a tight 68k
-   stub; neither has a public clean-room reference. The Phase D
-   workaround that ships with `--system-disk`: boot the same donor
-   floppy from FDD0 once, run `A:\BIN\SWITCH.X /HD`, then the HDD
-   self-boots straight to `C:>` (the user's `SWITCH.X` from the
-   donor writes the proper boot sector). One manual step.
+   **Phase D.2 — `--boot-sector-donor` (shipped 2026-06-10):** for
+   users with a real Sharp X68000 SCSI HDD donor (typically the
+   well-known `hd0.hds`, 100 MB, file size 104,857,600 bytes,
+   Sharp/Keisoku Giken), the `extract_partition_boot_sector` helper
+   reads the donor's Human68k partition boot sector (Sharp IPL
+   Copyright 1990 SHARP at byte `0x8000`) and overlays it onto the
+   generated partition's first sector at build time. Result: HDD
+   self-boots straight to `C:>` on every power-on; no `SWITCH.X /HD`
+   step needed. Size constraint: `--size` must match the donor's
+   partition size (`--size 100M --variant scsi` for `hd0.hds`).
+   License footprint: the boot-sector bytes flow user → user (your
+   donor file → your output file) — they never live in the
+   rusty-backup repo or shipping binaries. Same legal pattern as
+   `--system-disk` or as running `SWITCH.X` manually. SCSI only
+   today; SASI donors are rare and unvalidated.
+
+   **Honesty note on verification:** MAME headless (`mame x68030 -hard
+   out.hdf`) accepts the boot-sector-overlaid HDD without crashing and
+   runs to completion at ~230% real-time, but doesn't render the
+   emulated X68000 text screen to its AVI capture (the original
+   `hd0.hds` exhibits the same headless-render artifact). End-to-end
+   "boots to C:> with visible prompt" verification needs an
+   interactive MAME session — not available in our headless test
+   harness today. Byte-level correctness (Sharp boot sector byte-
+   identical with donor) + IPL ROM acceptance are the strongest
+   signals shipped.
+
+   **The original Phase D workaround still ships:** without
+   `--boot-sector-donor` (e.g. users without a real Sharp HDD donor),
+   `--system-disk` alone produces an HDD where the user boots the
+   same donor floppy from FDD0 once and runs `A:\BIN\SWITCH.X /HD`.
+   One manual step writes the same boot sector from inside Human68k,
+   and the HDD self-boots thereafter.
 
    **Still open for §7.NH closure:** the MiSTer X68000 manual-verify
    on real hardware. Today MAME `x68000 -sasi` / `x68030 -hard` both

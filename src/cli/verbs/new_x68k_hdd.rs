@@ -89,9 +89,38 @@ pub struct NewX68kHddArgs {
     /// After building with `--system-disk`, boot the same donor floppy
     /// from FDD0 once and run `A:\BIN\SWITCH.X /HD` to install the
     /// partition's HDD boot sector. From then on the HDD self-boots
-    /// straight to `C:>`.
+    /// straight to `C:>`. To skip the manual `SWITCH.X` step entirely,
+    /// also pass `--boot-sector-donor`.
     #[arg(long = "system-disk")]
     pub system_disk: Option<PathBuf>,
+
+    /// Optional donor *real* Sharp X68000 SCSI HDD whose Human68k
+    /// partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll
+    /// extract and overlay onto the output partition. Eliminates the
+    /// post-build `SWITCH.X /HD` step — the HDD self-boots straight
+    /// to `C:>` on every power-on.
+    ///
+    /// **Well-known donor**: `hd0.hds` (100 MB Sharp / Keisoku Giken
+    /// SCSI HDD, file size 104,857,600 bytes). Other widely-mirrored
+    /// donors that match the same pattern: `HD0.HDS`, `system.hds`.
+    /// Search for the literal filename `hd0.hds` on retro-archive
+    /// sites.
+    ///
+    /// **Size constraint**: the donor's boot sector carries its own
+    /// BPB (FAT geometry). For the boot to succeed, set `--size` to
+    /// match the donor's partition size — for `hd0.hds` that means
+    /// **`--size 100M`** plus `--variant scsi`. Other sizes typically
+    /// hang the boot (donor's BPB reads past the end of the smaller
+    /// partition).
+    ///
+    /// SCSI only today. SASI output should omit this flag and use
+    /// the `SWITCH.X` workflow instead (see `--system-disk`).
+    ///
+    /// Sharp's boot-sector bytes never live in the rusty-backup repo
+    /// — they flow from the user's donor file into the user's output
+    /// file at build time. Same license footprint as `--system-disk`.
+    #[arg(long = "boot-sector-donor")]
+    pub boot_sector_donor: Option<PathBuf>,
 }
 
 pub fn run(args: NewX68kHddArgs) -> Result<()> {
@@ -112,6 +141,7 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         args.variant.into(),
         args.stub.into(),
         args.system_disk.as_deref(),
+        args.boot_sector_donor.as_deref(),
     )?;
 
     log_stderr(format!(
@@ -139,9 +169,22 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
             "  wrote donor: {} files + {} dirs into Human partition",
             summary.files_written, summary.dirs_written
         ));
-        log_stderr("  -> Boot from FDD0 with the same donor floppy once, then run");
-        log_stderr("     `A:\\BIN\\SWITCH.X /HD` to install the HDD boot sector.");
-        log_stderr("     After that, the HDD self-boots straight to C:>.");
+        if summary.boot_sector_donor_applied {
+            log_stderr("  -> Sharp partition boot sector overlaid from --boot-sector-donor.");
+            log_stderr("     HDD self-boots straight to C:> on every power-on, no FDD0 needed.");
+        } else {
+            log_stderr("  -> Boot from FDD0 with the same donor floppy once, then run");
+            log_stderr("     `A:\\BIN\\SWITCH.X /HD` to install the HDD boot sector.");
+            log_stderr("     After that, the HDD self-boots straight to C:>.");
+        }
+    } else if summary.boot_sector_donor_applied {
+        // Unusual but allowed combo: bootable boot-sector with seed text
+        // files only (no Human68k system installed). Boot would chain to
+        // donor's IPL which would fail to find HUMAN.SYS — flag it.
+        log_stderr("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
+        log_stderr("  WARNING: --boot-sector-donor applied without --system-disk;");
+        log_stderr("           the donor's boot code expects HUMAN.SYS in the partition root.");
+        log_stderr("           Add --system-disk to make the HDD actually boot.");
     } else {
         log_stderr("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
     }

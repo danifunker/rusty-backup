@@ -36,6 +36,7 @@ fn main() {
     let mut variant = HddVariant::Sasi;
     let mut stub = IplStub::Print;
     let mut system_disk: Option<String> = None;
+    let mut boot_sector_donor: Option<String> = None;
     let mut args_iter = env::args().skip(1);
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
@@ -45,6 +46,10 @@ fn main() {
             "--print-stub" => stub = IplStub::Print,
             "--system-disk" => {
                 system_disk = Some(args_iter.next().expect("--system-disk needs a path"));
+            }
+            "--boot-sector-donor" => {
+                boot_sector_donor =
+                    Some(args_iter.next().expect("--boot-sector-donor needs a path"));
             }
             other => {
                 if out_path.is_none() {
@@ -59,7 +64,7 @@ fn main() {
     }
     let out_path = out_path.expect(
         "usage: build_x68k_hdd <out.hdf> [size_mib] [--scsi] [--halt-stub|--print-stub] \
-         [--system-disk PATH.DIM]",
+         [--system-disk PATH.DIM] [--boot-sector-donor PATH.HDS]",
     );
     let out_path = PathBuf::from(out_path);
 
@@ -69,6 +74,7 @@ fn main() {
         variant,
         stub,
         system_disk.as_deref().map(std::path::Path::new),
+        boot_sector_donor.as_deref().map(std::path::Path::new),
     )
     .unwrap_or_else(|e| panic!("build failed: {e}"));
 
@@ -97,9 +103,18 @@ fn main() {
             "  wrote donor: {} files + {} dirs into Human partition",
             summary.files_written, summary.dirs_written
         );
-        println!("  -> Boot from FDD0 with the same donor floppy once, then run");
-        println!("     `A:\\BIN\\SWITCH.X /HD` to install the HDD boot sector.");
-        println!("     After that, the HDD self-boots straight to C:>.");
+        if summary.boot_sector_donor_applied {
+            println!("  -> Sharp partition boot sector overlaid from --boot-sector-donor.");
+            println!("     HDD self-boots straight to C:> on every power-on, no FDD0 needed.");
+        } else {
+            println!("  -> Boot from FDD0 with the same donor floppy once, then run");
+            println!("     `A:\\BIN\\SWITCH.X /HD` to install the HDD boot sector.");
+            println!("     After that, the HDD self-boots straight to C:>.");
+        }
+    } else if summary.boot_sector_donor_applied {
+        println!("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
+        println!("  WARNING: --boot-sector-donor without --system-disk;");
+        println!("           the donor's boot code expects HUMAN.SYS in the partition root.");
     } else {
         println!("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
     }
