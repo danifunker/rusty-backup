@@ -49,7 +49,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             arch: x64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -171,7 +171,7 @@ jobs:
             arch: x64
             runs-on: macos-26-intel
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -415,7 +415,7 @@ jobs:
       # See build-windows: keep APP_VERSION consistent across Test and Build.
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Arch build prerequisites
         run: |
@@ -600,7 +600,7 @@ jobs:
             arch: arm64
             runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -734,7 +734,7 @@ jobs:
     # release proceed without the MiSTer tarball rather than blocking it.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -822,7 +822,7 @@ jobs:
           ls -lh "$TGZ"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz

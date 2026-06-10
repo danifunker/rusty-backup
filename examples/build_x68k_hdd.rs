@@ -217,7 +217,7 @@ fn main() {
     println!("To verify in MAME (WSL):");
     match variant {
         Variant::Sasi => println!(
-            "  mame -rompath /mnt/c/Temp/x68000/roms -bios ipl10 \\\n\
+            "  mame -rompath /mnt/c/Temp/x68000/roms \\\n\
              \x20    -window -nothrottle -seconds_to_run 5 x68000 -sasi {out_path}"
         ),
         Variant::Scsi => println!(
