@@ -122,8 +122,20 @@ pub struct NewX68kHddArgs {
     /// 1 MiB and ~512 MiB works (the upper bound is the Sharp/KG BPB's
     /// u8 `sectors_per_fat` field at offset `0x1D`).
     ///
-    /// SCSI only today. SASI output should omit this flag and use
-    /// the `SWITCH.X` workflow instead (see `--system-disk`).
+    /// **SCSI variant**: validated end-to-end against `hd0.hds`. The
+    /// donor's Sharp/KG BPB is patched with the output partition's
+    /// FAT geometry, so any `--size` works.
+    ///
+    /// **SASI variant**: shipped experimental — accepts donors whose
+    /// byte 0 carries either the `\x82w68000W` Sharp empty-marker or a
+    /// `0x60` BRA opcode (self-bootable IPL discs like `Bomberman.hdf`).
+    /// OEM marker can be `SHARP/KG    ` or `Hudson...` — the latter
+    /// only logs a warning rather than failing. The donor's BPB ships
+    /// verbatim (no patching) since we don't have a validated Sharp/KG
+    /// SASI donor to develop the patch against, so for the boot to
+    /// succeed the output `--size` needs to match the donor's
+    /// partition size and FAT geometry exactly. If the boot hangs,
+    /// fall back to `--system-disk` + the SWITCH.X workflow.
     ///
     /// Sharp's boot-sector bytes never live in the rusty-backup repo
     /// — they flow from the user's donor file into the user's output

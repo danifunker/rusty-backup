@@ -338,10 +338,33 @@ pub fn build_x68k_hdd(
             (p0.len() as u64) >= sector_size,
             "partition 0 is smaller than one sector — can't overlay boot sector",
         );
-        // Read our generated FAT BPB (standard PC layout, little-endian
-        // at offsets 0x0B..0x24) and re-encode the same fields into the
-        // donor's Sharp/KG layout (big-endian at offsets 0x12..0x22).
-        patch_sharp_kg_bpb_from_pc_bpb(&mut donor_sector, p0)?;
+        match variant {
+            HddVariant::Scsi => {
+                // Read our generated FAT BPB (standard PC layout, LE at
+                // offsets 0x0B..0x24) and re-encode the same fields into
+                // the donor's Sharp/KG BE layout at 0x12..0x22 so the
+                // donor's boot code reads our actual partition geometry.
+                // Tested + MAME-oracle-validated on hd0.hds.
+                patch_sharp_kg_bpb_from_pc_bpb(&mut donor_sector, p0)?;
+            }
+            HddVariant::Sasi => {
+                // SASI overlay is experimental — we don't have a validated
+                // Sharp/KG SASI donor to develop the BPB-patch against, so
+                // the donor's BPB ships verbatim. For the boot to succeed,
+                // the output partition needs to match the donor's size and
+                // FAT geometry exactly. If the donor is a Hudson game disc
+                // (Bomberman-style), the partition body needs to match its
+                // custom format too — which our FAT-formatted partition
+                // doesn't.
+                eprintln!(
+                    "warning: --boot-sector-donor on SASI variant is experimental and \
+                     unverified. The donor's BPB ships verbatim (no patching), so the \
+                     output partition needs to match the donor's geometry exactly. If \
+                     the output HDD doesn't boot in MAME `x68000 -sasi`, fall back to \
+                     `--system-disk` + the SWITCH.X /HD workflow on first FDD0 boot."
+                );
+            }
+        }
         partition_bodies[0][..donor_sector.len()].copy_from_slice(&donor_sector);
         true
     } else {
@@ -400,12 +423,11 @@ pub fn build_x68k_hdd(
 
 /// Extract the partition boot sector from a real Sharp X68000 HDD donor.
 ///
-/// Opens `donor_path`, validates that it carries a Sharp `X68SCSI1`
-/// signature header + a parseable X68K partition table, locates the
-/// first Human68k partition, and reads its first sector. The returned
-/// bytes are the donor's Sharp IPL Copyright 1990 SHARP boot block —
-/// the same bytes Sharp's `SWITCH.X` writes when run from inside
-/// Human68k.
+/// Opens `donor_path`, validates that it carries a parseable X68K
+/// partition table, locates the first Human68k partition, and reads
+/// its first sector. The returned bytes are the donor's Human68k boot
+/// block — typically Sharp's IPL Copyright 1990 SHARP for SCSI, or
+/// Hudson Soft's IPL for SASI game discs.
 ///
 /// `variant` controls the expected donor convention:
 ///
@@ -413,56 +435,88 @@ pub fn build_x68k_hdd(
 ///   X68K table at byte `0x800`, 1024-byte sectors. The canonical
 ///   donor is **`hd0.hds`** (100 MB Sharp/Keisoku Giken SCSI HDD,
 ///   `file size = 104,857,600`). Other widely-mirrored variants include
-///   `HD0.HDS` and `system.hds`.
-/// - [`HddVariant::Sasi`] — not currently supported. SASI Human68k
-///   HDDs in the wild are rare and our test fixtures (`Bomberman.hdf`)
-///   use a custom Hudson Soft IPL rather than the standard Sharp/KG
-///   one. Returns an error pointing at the SWITCH.X workflow.
+///   `HD0.HDS` and `system.hds`. The extracted boot code carries the
+///   `SHARP/KG    1.00` OEM marker; the patcher then rewrites the BPB
+///   region with our output partition's geometry.
+/// - [`HddVariant::Sasi`] — **shipped untested** (no validated SASI
+///   donor available at build time). The expected SASI convention is
+///   X68K table at byte `0x400`, 256-byte sectors. Byte 0 of the donor
+///   may carry the SASI signature `\x82w68000W` (empty / formatted
+///   marker) OR a BRA opcode (`0x60`) for self-bootable game discs.
+///   The extracted boot code's OEM marker can be `SHARP/KG    ` (Sharp
+///   Sasi format), `Hudson  ` (Hudson Soft game discs like
+///   `Bomberman.hdf`), or another vendor — we log a warning rather
+///   than reject so users with rarer SASI donors aren't blocked.
 ///
 /// **License footprint**: the returned bytes flow user → user — they
 /// originated in `donor_path` (which the user provided), and they end
-/// up in the user's output HDD. Sharp's boot bytes never live in the
-/// rusty-backup repo or shipping binaries. Same legal pattern as
-/// `--system-disk` (you provide a Human68k floppy, we extract files
-/// from it) or as running Sharp's own `SWITCH.X /HD` from inside
-/// Human68k (which writes the same bytes from the inside).
+/// up in the user's output HDD. Sharp's / Hudson's boot bytes never
+/// live in the rusty-backup repo or shipping binaries. Same legal
+/// pattern as `--system-disk` (you provide a Human68k floppy, we
+/// extract files from it) or as running Sharp's own `SWITCH.X /HD`
+/// from inside Human68k (which writes the same bytes from the inside).
 pub fn extract_partition_boot_sector(
     donor_path: &Path,
     variant: HddVariant,
 ) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        matches!(variant, HddVariant::Scsi),
-        "boot-sector-donor extraction is SCSI only today. For SASI output, \
-         omit --boot-sector-donor and use the SWITCH.X /HD workflow on \
-         first boot (see module docs for the rationale)."
-    );
-
     let donor_bytes = std::fs::read(donor_path)
         .map_err(|e| anyhow::anyhow!("read boot-sector donor {}: {e}", donor_path.display()))?;
+
+    let (table_offset, sector_size, expected_min_bytes, sig_hint) = match variant {
+        HddVariant::Scsi => (0x800u64, 1024u64, 0x9000, "X68SCSI1"),
+        HddVariant::Sasi => (0x400u64, 256u64, 0x2000, "\\x82w68000W or BRA.S (0x60)"),
+    };
     anyhow::ensure!(
-        donor_bytes.len() >= 0x9000,
-        "donor {} is too small ({} bytes) — expected at least 36 KiB to \
-         cover the SCSI signature header + table + first partition sector",
+        donor_bytes.len() >= expected_min_bytes,
+        "donor {} is too small ({} bytes) — expected at least {} to cover \
+         the signature header, X68K table at byte 0x{:x}, and the first \
+         partition sector",
         donor_path.display(),
         donor_bytes.len(),
+        expected_min_bytes,
+        table_offset,
     );
 
-    // Validate the SCSI signature at byte 0 — guards against extracting
-    // garbage from a non-X68000 file the user pointed us at by mistake.
-    anyhow::ensure!(
-        &donor_bytes[0..8] == b"X68SCSI1",
-        "donor {} does not start with `X68SCSI1` magic — is it really a \
-         Sharp X68000 SCSI HDD? (well-known donor: hd0.hds, ~100 MB)",
-        donor_path.display(),
-    );
+    // Validate the byte-0 signature. SCSI is strict (X68SCSI1 only).
+    // SASI accepts either Sharp's empty-marker (`\x82w68000W`) or a
+    // self-bootable IPL stub (byte 0 = `0x60` BRA.S, no fixed magic).
+    match variant {
+        HddVariant::Scsi => {
+            anyhow::ensure!(
+                &donor_bytes[0..8] == b"X68SCSI1",
+                "donor {} does not start with `X68SCSI1` magic — is it really a \
+                 Sharp X68000 SCSI HDD? (well-known donor: hd0.hds, ~100 MB)",
+                donor_path.display(),
+            );
+        }
+        HddVariant::Sasi => {
+            let sasi_sig = donor_bytes[0..8] == [0x82, b'w', b'6', b'8', b'0', b'0', b'0', b'W'];
+            let bra_ipl = donor_bytes[0] == 0x60;
+            anyhow::ensure!(
+                sasi_sig || bra_ipl,
+                "donor {} doesn't look like a SASI X68000 HDD: byte 0 = 0x{:02x}, \
+                 expected {} (well-known sig) or 0x60 (self-bootable IPL stub)",
+                donor_path.display(),
+                donor_bytes[0],
+                sig_hint,
+            );
+        }
+    }
 
     // Parse the X68K partition table and find the first Human68k slot.
     let mut cursor = Cursor::new(&donor_bytes);
-    let table = X68kPartitionTable::detect_at(&mut cursor, 0x800)
-        .map_err(|e| anyhow::anyhow!("parse X68K table at 0x800 in {}: {e}", donor_path.display()))?
+    let table = X68kPartitionTable::detect_at(&mut cursor, table_offset)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "parse X68K table at byte 0x{:x} in {}: {e}",
+                table_offset,
+                donor_path.display()
+            )
+        })?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "no X68K partition table found at byte 0x800 in {}",
+                "no X68K partition table found at byte 0x{:x} in {}",
+                table_offset,
                 donor_path.display()
             )
         })?;
@@ -483,40 +537,67 @@ pub fn extract_partition_boot_sector(
             )
         })?;
 
-    // SCSI sector size is 1024 bytes; the partition's first sector is at
-    // start_sector * 1024 within the donor.
-    let sector_size = variant.sector_size() as usize;
-    let part_byte_offset = human68k_entry.start_sector as usize * sector_size;
+    // Partition's first sector is at start_sector * sector_size within
+    // the donor (sector size = 256 for SASI, 1024 for SCSI).
+    let sector_size_usize = sector_size as usize;
+    let part_byte_offset = human68k_entry.start_sector as usize * sector_size_usize;
     anyhow::ensure!(
-        part_byte_offset + sector_size <= donor_bytes.len(),
+        part_byte_offset + sector_size_usize <= donor_bytes.len(),
         "Human68k partition at sector {} would read past end of donor {} ({} bytes)",
         human68k_entry.start_sector,
         donor_path.display(),
         donor_bytes.len(),
     );
 
-    let mut sector = vec![0u8; sector_size];
-    sector.copy_from_slice(&donor_bytes[part_byte_offset..part_byte_offset + sector_size]);
+    let mut sector = vec![0u8; sector_size_usize];
+    sector.copy_from_slice(&donor_bytes[part_byte_offset..part_byte_offset + sector_size_usize]);
 
-    // Sanity-check the extracted sector: byte 0 should be 0x60 (Sharp's
-    // BRA.S over the BPB), and offset 0x02 should be the SHARP/KG OEM
-    // marker. Catches "user pointed us at a non-Human68k partition" cases.
+    // Sanity-check the extracted sector: byte 0 should be 0x60 (BRA.S
+    // over the BPB, both Sharp/KG and Hudson formats use this).
     anyhow::ensure!(
         sector[0] == 0x60,
         "donor partition boot sector at byte 0x{:x} of {} doesn't start \
-         with 0x60 (BRA.S) — expected Sharp/KG Human68k boot sector. Is \
-         this partition formatted Human68k?",
+         with 0x60 (BRA.S) — expected a Human68k boot sector. Is this \
+         partition formatted Human68k?",
         part_byte_offset,
         donor_path.display(),
     );
-    anyhow::ensure!(
-        &sector[0x02..0x0E] == b"SHARP/KG    ",
-        "donor partition boot sector at byte 0x{:x} of {} doesn't have \
-         the Sharp/KG OEM marker at offset 0x02 — extracted bytes 0..14: {:?}",
-        part_byte_offset,
-        donor_path.display(),
-        &sector[..14],
-    );
+
+    // OEM marker check. For SCSI we expect Sharp/KG (strict). For SASI
+    // we accept Sharp/KG or Hudson — Hudson game discs (e.g. Bomberman)
+    // use a `Hudson soft 2.00`-style OEM. Anything else logs a warning
+    // and proceeds rather than failing — rarer SASI donors might use
+    // other vendor strings we haven't catalogued.
+    let oem = &sector[0x02..0x0E];
+    match variant {
+        HddVariant::Scsi => {
+            anyhow::ensure!(
+                oem == b"SHARP/KG    ",
+                "donor partition boot sector at byte 0x{:x} of {} doesn't have \
+                 the Sharp/KG OEM marker at offset 0x02 — extracted bytes 0..14: {:?}",
+                part_byte_offset,
+                donor_path.display(),
+                &sector[..14],
+            );
+        }
+        HddVariant::Sasi => {
+            let is_sharp_kg = oem == b"SHARP/KG    ";
+            let is_hudson = oem.starts_with(b"Hudson");
+            if !is_sharp_kg && !is_hudson {
+                // Don't fail — log via eprintln so the user sees it even
+                // when this is called from a CLI that hides info logs.
+                eprintln!(
+                    "warning: donor partition at byte 0x{:x} of {} has unfamiliar \
+                     OEM marker {:?} (expected `SHARP/KG    ` or `Hudson...`). \
+                     Proceeding — the boot sector will be overlaid as-is. If the \
+                     output HDD doesn't boot, that's the first thing to check.",
+                    part_byte_offset,
+                    donor_path.display(),
+                    std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
+                );
+            }
+        }
+    }
 
     Ok(sector)
 }
@@ -886,23 +967,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_partition_boot_sector_refuses_non_scsi_donor() {
-        // A SASI-tagged variant should be rejected at the API surface
-        // even before we look at the donor — the early error tells the
-        // user to use SWITCH.X instead.
-        let tmp = NamedTempFile::new().unwrap();
-        let err = extract_partition_boot_sector(tmp.path(), HddVariant::Sasi).unwrap_err();
-        assert!(err.to_string().contains("SCSI only"));
-    }
-
-    #[test]
-    fn extract_partition_boot_sector_validates_magic() {
-        // A file without `X68SCSI1` at byte 0 should be rejected with a
-        // clear "is this really a Sharp X68000 SCSI HDD?" error.
+    fn extract_partition_boot_sector_validates_scsi_magic() {
+        // A file without `X68SCSI1` at byte 0 should be rejected for SCSI
+        // with a clear "is this really a Sharp X68000 SCSI HDD?" error.
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), vec![0u8; 0x10000]).unwrap();
         let err = extract_partition_boot_sector(tmp.path(), HddVariant::Scsi).unwrap_err();
         assert!(err.to_string().contains("X68SCSI1"));
+    }
+
+    #[test]
+    fn extract_partition_boot_sector_validates_sasi_signature_or_bra() {
+        // SASI accepts either the Sharp empty-marker (`\x82w68000W`) at
+        // byte 0 or a BRA opcode (`0x60`) for self-bootable IPL discs.
+        // A file with neither should be rejected.
+        let tmp = NamedTempFile::new().unwrap();
+        let bad = vec![0u8; 0x4000];
+        std::fs::write(tmp.path(), &bad).unwrap();
+        let err = extract_partition_boot_sector(tmp.path(), HddVariant::Sasi).unwrap_err();
+        assert!(err.to_string().contains("0x00"));
+        assert!(err.to_string().contains("BRA.S"));
     }
 
     #[test]
