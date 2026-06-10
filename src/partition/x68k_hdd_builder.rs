@@ -43,24 +43,29 @@
 //! At build time, [`extract_partition_boot_sector`] opens the donor,
 //! locates the first Human68k partition via the X68K table at byte
 //! `0x800` (SCSI convention), and reads the donor's first partition
-//! sector (1024 bytes for SCSI). Those bytes are then written verbatim
-//! over the first sector of the generated output partition.
+//! sector (1024 bytes for SCSI). Sharp's boot CODE (bytes `0x00..0x12`
+//! BRA.S + OEM marker and bytes `0x22..end`, including the strings and
+//! the actual 68000 instructions) is written verbatim over the first
+//! sector of the generated output partition. The Sharp/KG **BPB region**
+//! at offsets `0x12..0x22` is rewritten by
+//! [`patch_sharp_kg_bpb_from_pc_bpb`] with the geometry of *our*
+//! freshly-formatted partition — so the donor's boot code reads the
+//! right FAT/root/data sectors regardless of how the donor was sized.
 //!
 //! License footprint: the boot-sector bytes flow user → user — they
 //! never live in the rusty-backup repo or shipping binaries. The user
 //! already owns their donor HDD; the builder just orchestrates the
-//! transfer. Same legal pattern as `--system-disk` (you provide a
-//! Human68k floppy, we extract files from it) or as running Sharp's
-//! own `SWITCH.X` tool (which writes the same bytes from inside
-//! Human68k).
+//! transfer (and patches it to match our partition's geometry). Same
+//! legal pattern as `--system-disk` (you provide a Human68k floppy, we
+//! extract files from it) or as running Sharp's own `SWITCH.X` tool
+//! (which writes the same bytes from inside Human68k).
 //!
-//! **Size constraint**: the donor's boot sector carries the donor's
-//! BPB (FAT geometry — `total_sectors`, `sectors_per_FAT`, etc.).
-//! For the boot to succeed, the output partition needs to be the same
-//! size as the donor's. With `hd0.hds` that means **`--size 100M`** and
-//! `--variant scsi`. Other sizes typically result in a hung boot
-//! (donor's BPB reads past the partition end while walking the FAT).
-//! Pick `--size` to match your donor's partition size.
+//! **No size constraint**: the BPB-patch step decouples our output
+//! partition's size from the donor's. `--size 32M` with the 100 MB
+//! `hd0.hds` donor works exactly the same as `--size 100M` — the
+//! donor's boot code reads our partition's actual BPB. The only
+//! limit is the Sharp/KG BPB's u8 `sectors_per_fat` field (offset
+//! `0x1D`), which caps the partition at roughly 512 MiB for FAT16.
 //!
 //! **SCSI only today**: SASI donors (256-byte sectors) aren't supported
 //! here yet — the validated SASI Human68k HDD donors in the wild are
@@ -82,7 +87,7 @@ use std::path::Path;
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::fs::entry::{EntryType, FileEntry};
-use crate::fs::fat::create_blank_fat;
+use crate::fs::fat::create_blank_fat_with_sector_size;
 use crate::fs::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
 };
@@ -260,8 +265,27 @@ pub fn build_x68k_hdd(
         } else {
             Some(label_buf.as_str())
         };
-        let mut body = create_blank_fat(per_partition_bytes, label)
-            .map_err(|e| anyhow::anyhow!("create_blank_fat on partition {} body: {e}", idx + 1))?;
+        // When we'll overlay a SCSI `--boot-sector-donor`, the donor's
+        // Sharp/KG BPB expects 1024-byte FAT sectors (real Sharp SCSI
+        // HDDs use 1024-B BPB sectors). Force the FAT layout to match
+        // so the donor's boot code reads our FAT at the right byte
+        // offsets after the BPB-patch step. Otherwise stick with the
+        // default 512-byte FAT BPB — it interops cleanly with the
+        // X68000 IPL ROM on any sector size, and our existing tests
+        // assume it.
+        let fat_bps: u32 =
+            if matches!(variant, HddVariant::Scsi) && boot_sector_donor.is_some() && idx == 0 {
+                1024
+            } else {
+                512
+            };
+        let mut body = create_blank_fat_with_sector_size(per_partition_bytes, fat_bps, label)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "create_blank_fat on partition {} body (bps={fat_bps}): {e}",
+                    idx + 1
+                )
+            })?;
         if idx == 0 {
             let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
                 .map_err(|e| anyhow::anyhow!("open partition 0 as Human68k: {e}"))?;
@@ -293,8 +317,15 @@ pub fn build_x68k_hdd(
     // sector onto partition 0's first sector. Other partitions keep our
     // own generated BPB (the donor's boot code is single-partition by
     // design, so multi-partition layouts only use the donor on slot 0).
+    //
+    // Critical: the donor's boot CODE survives intact, but the donor's
+    // Sharp/KG BPB at offset 0x12..0x26 is REPLACED by our partition's
+    // actual FAT geometry so the boot code reads the right FAT/root/data
+    // sectors. Without this patch the donor's BPB (configured for its
+    // own size, e.g. 100 MB for hd0.hds) would silently steer the boot
+    // code at our smaller / different-shaped partition — non-bootable.
     let boot_sector_donor_applied = if let Some(donor_path) = boot_sector_donor {
-        let donor_sector = extract_partition_boot_sector(donor_path, variant)?;
+        let mut donor_sector = extract_partition_boot_sector(donor_path, variant)?;
         anyhow::ensure!(
             donor_sector.len() as u64 == sector_size,
             "donor partition boot sector is {} bytes but variant {} expects {}",
@@ -302,12 +333,16 @@ pub fn build_x68k_hdd(
             variant.name(),
             sector_size,
         );
-        let p0 = &mut partition_bodies[0];
+        let p0 = &partition_bodies[0];
         anyhow::ensure!(
             (p0.len() as u64) >= sector_size,
             "partition 0 is smaller than one sector — can't overlay boot sector",
         );
-        p0[..donor_sector.len()].copy_from_slice(&donor_sector);
+        // Read our generated FAT BPB (standard PC layout, little-endian
+        // at offsets 0x0B..0x24) and re-encode the same fields into the
+        // donor's Sharp/KG layout (big-endian at offsets 0x12..0x22).
+        patch_sharp_kg_bpb_from_pc_bpb(&mut donor_sector, p0)?;
+        partition_bodies[0][..donor_sector.len()].copy_from_slice(&donor_sector);
         true
     } else {
         false
@@ -484,6 +519,120 @@ pub fn extract_partition_boot_sector(
     );
 
     Ok(sector)
+}
+
+/// Patch a donor partition boot sector's Sharp/KG BPB (big-endian fields
+/// at offsets `0x12..0x22`) with the FAT geometry of an output partition
+/// generated by [`crate::fs::fat::create_blank_fat_with_sector_size`].
+/// This is the bridge that lets a real Sharp `hd0.hds`-style boot sector
+/// boot from any size/shape partition we produce — without the patch,
+/// donor's boot code would walk its own embedded BPB and step off the
+/// end of a smaller partition.
+///
+/// `donor_sector` is the donor's boot sector (length = disk sector size,
+/// e.g. 1024 for SCSI). Bytes `0x00..0x12` (BRA.S + OEM marker) and
+/// `0x22..end` (boot code + strings) are left unchanged. Only the BPB
+/// field region at offsets `0x12..0x22` is rewritten.
+///
+/// `partition_body` is our generated FAT partition. Its first sector
+/// carries a standard PC FAT BPB (little-endian at offsets `0x0B..0x24`).
+/// We read those fields and re-encode them into Sharp/KG big-endian
+/// format at the canonical offsets.
+///
+/// Returns an error if our partition's `sectors_per_fat` exceeds 255
+/// (Sharp/KG stores it in a single byte at offset `0x1D`). That cap
+/// covers any vintage X68000 setup — a FAT16 partition with 1024-byte
+/// sectors hits the limit around ~512 MiB, which is past the practical
+/// usable HDD size on the Sharp IPL ROM.
+fn patch_sharp_kg_bpb_from_pc_bpb(
+    donor_sector: &mut [u8],
+    partition_body: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        donor_sector.len() >= 0x22,
+        "donor sector too small ({} bytes) to hold a Sharp/KG BPB",
+        donor_sector.len(),
+    );
+    anyhow::ensure!(
+        partition_body.len() >= 0x40,
+        "partition body too small ({} bytes) to hold a PC FAT BPB",
+        partition_body.len(),
+    );
+
+    // ---- Read our generated PC BPB (little-endian) ----
+    // Standard FAT BPB layout (see `src/fs/fat.rs::write_fat_boot_sector`):
+    //   0x0B (u16 LE)  bytes_per_sector
+    //   0x0D (u8)      sectors_per_cluster
+    //   0x0E (u16 LE)  reserved_sectors
+    //   0x10 (u8)      num_fats
+    //   0x11 (u16 LE)  root_entries
+    //   0x13 (u16 LE)  total_sectors_16 (zero if 32-bit form used)
+    //   0x15 (u8)      media_descriptor
+    //   0x16 (u16 LE)  sectors_per_fat
+    //   0x20 (u32 LE)  total_sectors_32 (zero if 16-bit form used)
+    let bps = u16::from_le_bytes([partition_body[0x0B], partition_body[0x0C]]);
+    let spc = partition_body[0x0D];
+    let reserved = u16::from_le_bytes([partition_body[0x0E], partition_body[0x0F]]);
+    let num_fats = partition_body[0x10];
+    let root_entries = u16::from_le_bytes([partition_body[0x11], partition_body[0x12]]);
+    let total_sectors_16 = u16::from_le_bytes([partition_body[0x13], partition_body[0x14]]);
+    let media = partition_body[0x15];
+    let sectors_per_fat_16 = u16::from_le_bytes([partition_body[0x16], partition_body[0x17]]);
+    let total_sectors_32 = u32::from_le_bytes([
+        partition_body[0x20],
+        partition_body[0x21],
+        partition_body[0x22],
+        partition_body[0x23],
+    ]);
+    let total_sectors = if total_sectors_16 != 0 {
+        total_sectors_16 as u32
+    } else {
+        total_sectors_32
+    };
+
+    anyhow::ensure!(
+        sectors_per_fat_16 <= u8::MAX as u16,
+        "partition's sectors_per_fat ({sectors_per_fat_16}) exceeds Sharp/KG \
+         BPB's u8 field at offset 0x1D — pick a smaller partition or larger \
+         sectors_per_cluster",
+    );
+    anyhow::ensure!(
+        sectors_per_fat_16 > 0,
+        "partition has zero sectors_per_fat — refusing to write a degenerate BPB",
+    );
+
+    // ---- Write the Sharp/KG BPB (big-endian) ----
+    // Layout (see `src/fs/human68k.rs::parse_sharp_kg`):
+    //   0x12 (u16 BE)  bytes_per_sector
+    //   0x14 (u8)      sectors_per_cluster
+    //   0x15 (u8)      num_fats
+    //   0x16 (u16 BE)  reserved_sectors
+    //   0x18 (u16 BE)  root_entries
+    //   0x1A (u16 BE)  total_sectors_16 (zero when 32-bit form used)
+    //   0x1C (u8)      media_descriptor
+    //   0x1D (u8)      sectors_per_fat
+    //   0x1E (u32 BE)  total_sectors_32
+    donor_sector[0x12..0x14].copy_from_slice(&bps.to_be_bytes());
+    donor_sector[0x14] = spc;
+    donor_sector[0x15] = num_fats;
+    donor_sector[0x16..0x18].copy_from_slice(&reserved.to_be_bytes());
+    donor_sector[0x18..0x1A].copy_from_slice(&root_entries.to_be_bytes());
+    // Sharp/KG uses the 16-bit total_sectors slot when it fits, 32-bit
+    // otherwise. The unused slot is zeroed — same convention `hd0.hds`
+    // itself follows (donor disk: 0x1A-0x1B = 0x0000, 0x1E-0x21 carries
+    // the full 32-bit count). Mirroring this guards against boot code
+    // that picks the wrong slot when both are non-zero.
+    let (total_16, total_32) = if total_sectors <= u16::MAX as u32 {
+        (total_sectors as u16, 0u32)
+    } else {
+        (0u16, total_sectors)
+    };
+    donor_sector[0x1A..0x1C].copy_from_slice(&total_16.to_be_bytes());
+    donor_sector[0x1C] = media;
+    donor_sector[0x1D] = sectors_per_fat_16 as u8;
+    donor_sector[0x1E..0x22].copy_from_slice(&total_32.to_be_bytes());
+
+    Ok(())
 }
 
 /// File or directory captured from a donor floppy, ready to replay onto
@@ -812,6 +961,105 @@ mod tests {
             assert_eq!(start, 64 + (slot as u32) * per_part);
             assert_eq!(length, per_part);
         }
+    }
+
+    #[test]
+    fn bpb_patcher_translates_pc_le_to_sharp_kg_be() {
+        // Build a minimal donor sector: just a 1024-byte zeroed buffer
+        // with the `0x60 0x24` BRA.S marker at byte 0 + SHARP/KG OEM —
+        // enough for the patcher to write the BPB region at 0x12..0x22
+        // without touching the surrounding code/strings.
+        let mut donor = vec![0u8; 1024];
+        donor[0] = 0x60;
+        donor[1] = 0x24;
+        donor[0x02..0x0E].copy_from_slice(b"SHARP/KG    ");
+        // Sentinel bytes after the BPB region — the patcher must NOT touch them.
+        donor[0x22..0x30].fill(0xAB);
+
+        // Build a synthetic PC FAT partition body with known BPB values.
+        let mut body = vec![0u8; 0x40];
+        // 0x0B-0x0C: bps = 1024 (LE)
+        body[0x0B..0x0D].copy_from_slice(&1024u16.to_le_bytes());
+        body[0x0D] = 8; // spc
+        body[0x0E..0x10].copy_from_slice(&1u16.to_le_bytes()); // reserved
+        body[0x10] = 2; // num_fats
+        body[0x11..0x13].copy_from_slice(&224u16.to_le_bytes()); // root_entries
+        body[0x13..0x15].copy_from_slice(&32704u16.to_le_bytes()); // total_sectors_16
+        body[0x15] = 0xF8; // media
+        body[0x16..0x18].copy_from_slice(&6u16.to_le_bytes()); // sectors_per_fat
+
+        patch_sharp_kg_bpb_from_pc_bpb(&mut donor, &body).unwrap();
+
+        // Verify Sharp/KG BPB fields are now in big-endian at the right offsets.
+        assert_eq!(u16::from_be_bytes([donor[0x12], donor[0x13]]), 1024);
+        assert_eq!(donor[0x14], 8);
+        assert_eq!(donor[0x15], 2);
+        assert_eq!(u16::from_be_bytes([donor[0x16], donor[0x17]]), 1);
+        assert_eq!(u16::from_be_bytes([donor[0x18], donor[0x19]]), 224);
+        assert_eq!(u16::from_be_bytes([donor[0x1A], donor[0x1B]]), 32704);
+        assert_eq!(donor[0x1C], 0xF8);
+        assert_eq!(donor[0x1D], 6);
+        // 32-bit slot zeroed because 16-bit slot is live (mirrors hd0.hds convention).
+        assert_eq!(
+            u32::from_be_bytes([donor[0x1E], donor[0x1F], donor[0x20], donor[0x21]]),
+            0
+        );
+
+        // Sentinels untouched — the patch is strictly 0x12..0x22.
+        assert!(donor[0x22..0x30].iter().all(|&b| b == 0xAB));
+        // BRA.S + OEM untouched.
+        assert_eq!(donor[0], 0x60);
+        assert_eq!(donor[1], 0x24);
+        assert_eq!(&donor[0x02..0x0E], b"SHARP/KG    ");
+    }
+
+    #[test]
+    fn bpb_patcher_uses_32bit_slot_for_large_partitions() {
+        // total_sectors > u16::MAX should land in the 32-bit slot with the
+        // 16-bit slot zeroed.
+        let mut donor = vec![0u8; 1024];
+        donor[0] = 0x60;
+        donor[1] = 0x24;
+        donor[0x02..0x0E].copy_from_slice(b"SHARP/KG    ");
+
+        let mut body = vec![0u8; 0x40];
+        body[0x0B..0x0D].copy_from_slice(&1024u16.to_le_bytes());
+        body[0x0D] = 4;
+        body[0x0E..0x10].copy_from_slice(&1u16.to_le_bytes());
+        body[0x10] = 2;
+        body[0x11..0x13].copy_from_slice(&512u16.to_le_bytes());
+        body[0x13..0x15].copy_from_slice(&0u16.to_le_bytes()); // small_total = 0
+        body[0x15] = 0xF8;
+        body[0x16..0x18].copy_from_slice(&50u16.to_le_bytes());
+        // Large total via 32-bit slot
+        body[0x20..0x24].copy_from_slice(&200_000u32.to_le_bytes());
+
+        patch_sharp_kg_bpb_from_pc_bpb(&mut donor, &body).unwrap();
+
+        assert_eq!(u16::from_be_bytes([donor[0x1A], donor[0x1B]]), 0);
+        assert_eq!(
+            u32::from_be_bytes([donor[0x1E], donor[0x1F], donor[0x20], donor[0x21]]),
+            200_000
+        );
+    }
+
+    #[test]
+    fn bpb_patcher_refuses_oversized_sectors_per_fat() {
+        // sectors_per_fat > 255 doesn't fit in the Sharp/KG u8 slot at 0x1D.
+        let mut donor = vec![0u8; 1024];
+        let mut body = vec![0u8; 0x40];
+        body[0x0B..0x0D].copy_from_slice(&1024u16.to_le_bytes());
+        body[0x0D] = 1;
+        body[0x0E..0x10].copy_from_slice(&1u16.to_le_bytes());
+        body[0x10] = 2;
+        body[0x11..0x13].copy_from_slice(&512u16.to_le_bytes());
+        body[0x13..0x15].copy_from_slice(&0u16.to_le_bytes());
+        body[0x15] = 0xF8;
+        body[0x16..0x18].copy_from_slice(&256u16.to_le_bytes()); // > 255
+        body[0x20..0x24].copy_from_slice(&500_000u32.to_le_bytes());
+
+        let err = patch_sharp_kg_bpb_from_pc_bpb(&mut donor, &body).unwrap_err();
+        assert!(err.to_string().contains("exceeds Sharp/KG"));
     }
 
     #[test]

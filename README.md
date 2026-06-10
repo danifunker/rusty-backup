@@ -50,7 +50,7 @@ rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
 rb-cli restore ./backups/my-backup ./restored.img
 rb-cli batch script.json --dry-run
 rb-cli new-x68k-hdd hdd.hdf --size 16M --system-disk human68k.dim
-rb-cli new-x68k-hdd c.hdf --size 100M --variant scsi --system-disk human68k.dim \
+rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --boot-sector-donor hd0.hds   # zero manual steps
 ```
 
@@ -185,9 +185,13 @@ The app has five tabs:
     Add `--boot-sector-donor hd0.hds` (the well-known 100 MB
     Sharp/Keisoku Giken SCSI HDD image, file size 104,857,600 bytes,
     widely mirrored on retro-archive sites under that exact filename)
-    plus `--size 100M --variant scsi` to overlay the donor's Sharp
-    partition boot sector — the HDD then self-boots straight to `C:>`
-    on every power-on with no manual `SWITCH.X` step.
+    plus `--variant scsi` to overlay the donor's Sharp partition boot
+    sector — the HDD then self-boots straight to `C:>` on every
+    power-on with no manual `SWITCH.X` step. Any `--size` from 1 MiB
+    to ~512 MiB works: the builder patches the donor's embedded BPB
+    with the output partition's actual FAT geometry, so the donor
+    boots from your sized HDD regardless of how the donor itself was
+    sized.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /

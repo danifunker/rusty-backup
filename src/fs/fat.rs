@@ -3674,14 +3674,36 @@ impl FatBlankLayout {
 
 /// Compute the layout that [`create_blank_fat`] would use for `size_bytes`.
 pub fn compute_fat_blank_layout(size_bytes: u64) -> Result<FatBlankLayout> {
+    compute_fat_blank_layout_with_sector_size(size_bytes, 512)
+}
+
+/// Like [`compute_fat_blank_layout`], but lets the caller choose the
+/// logical sector size. Needed for X68000 SCSI HDDs (1024-byte sectors)
+/// and SASI HDDs (256-byte sectors) so the generated FAT BPB matches
+/// the donor partition boot sector's sector-size assumption when
+/// [`crate::partition::x68k_hdd_builder::extract_partition_boot_sector`]
+/// overlays a real Sharp `hd0.hds`-style boot block.
+///
+/// `bytes_per_sector` must be one of `256`, `512`, `1024`, `2048`. For
+/// anything other than `512` the FAT12/16 cutoff thresholds stay the
+/// same in *byte* terms — the cluster-count budget for FAT12 (≤ 4084)
+/// drives the sectors-per-cluster picker.
+pub fn compute_fat_blank_layout_with_sector_size(
+    size_bytes: u64,
+    bytes_per_sector: u32,
+) -> Result<FatBlankLayout> {
     if size_bytes < 64 * 1024 {
         return Err(anyhow::anyhow!(
             "FAT volume must be at least 64 KiB, got {size_bytes}"
         ));
     }
+    if !matches!(bytes_per_sector, 256 | 512 | 1024 | 2048) {
+        return Err(anyhow::anyhow!(
+            "bytes_per_sector must be 256/512/1024/2048, got {bytes_per_sector}"
+        ));
+    }
 
-    const BYTES_PER_SECTOR: u32 = 512;
-    let total_sectors_u64 = size_bytes / BYTES_PER_SECTOR as u64;
+    let total_sectors_u64 = size_bytes / bytes_per_sector as u64;
     if total_sectors_u64 > u32::MAX as u64 {
         return Err(anyhow::anyhow!(
             "FAT volume size {size_bytes} exceeds u32 sector range"
@@ -3718,7 +3740,7 @@ pub fn compute_fat_blank_layout(size_bytes: u64) -> Result<FatBlankLayout> {
         FatType::Fat32 => (32, 1, 6),
     };
     let num_fats: u8 = 2;
-    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(BYTES_PER_SECTOR);
+    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector);
 
     let mut sectors_per_fat: u32 = 1;
     loop {
@@ -3736,7 +3758,7 @@ pub fn compute_fat_blank_layout(size_bytes: u64) -> Result<FatBlankLayout> {
             FatType::Fat16 => (total_clusters + 2) * 2,
             FatType::Fat32 => (total_clusters + 2) * 4,
         };
-        let needed_spf = fat_bytes_needed.div_ceil(BYTES_PER_SECTOR);
+        let needed_spf = fat_bytes_needed.div_ceil(bytes_per_sector);
         if needed_spf <= sectors_per_fat {
             break;
         }
@@ -3745,7 +3767,7 @@ pub fn compute_fat_blank_layout(size_bytes: u64) -> Result<FatBlankLayout> {
 
     Ok(FatBlankLayout {
         fat_type,
-        bytes_per_sector: BYTES_PER_SECTOR,
+        bytes_per_sector,
         sectors_per_cluster,
         reserved_sectors,
         num_fats,
@@ -3865,7 +3887,21 @@ pub fn write_blank_fat_metadata_to_sink<W: std::io::Write + std::io::Seek>(
 }
 
 pub fn create_blank_fat(size_bytes: u64, label: Option<&str>) -> Result<Vec<u8>> {
-    let layout = compute_fat_blank_layout(size_bytes)?;
+    create_blank_fat_with_sector_size(size_bytes, 512, label)
+}
+
+/// Like [`create_blank_fat`], but lets the caller choose the logical
+/// sector size. Used by the X68000 HDD builder
+/// ([`crate::partition::x68k_hdd_builder`]) to emit 1024-byte-sector
+/// FAT for SCSI variants so an overlaid `hd0.hds`-style Sharp partition
+/// boot sector's BPB matches our actual FAT layout. See
+/// [`compute_fat_blank_layout_with_sector_size`] for the constraints.
+pub fn create_blank_fat_with_sector_size(
+    size_bytes: u64,
+    bytes_per_sector: u32,
+    label: Option<&str>,
+) -> Result<Vec<u8>> {
+    let layout = compute_fat_blank_layout_with_sector_size(size_bytes, bytes_per_sector)?;
     let image_size = layout.image_size() as usize;
     let mut img = vec![0u8; image_size];
     let mut cur = std::io::Cursor::new(&mut img);

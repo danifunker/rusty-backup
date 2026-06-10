@@ -736,32 +736,53 @@ no hand-waving.
      PATH.DIM]` at GUI/CLI parity (per CLAUDE.md). Both surfaces
      share the same `build_x68k_hdd` entry point.
 
-   **Phase D.2 — `--boot-sector-donor` (shipped 2026-06-10):** for
-   users with a real Sharp X68000 SCSI HDD donor (typically the
-   well-known `hd0.hds`, 100 MB, file size 104,857,600 bytes,
-   Sharp/Keisoku Giken), the `extract_partition_boot_sector` helper
-   reads the donor's Human68k partition boot sector (Sharp IPL
-   Copyright 1990 SHARP at byte `0x8000`) and overlays it onto the
-   generated partition's first sector at build time. Result: HDD
-   self-boots straight to `C:>` on every power-on; no `SWITCH.X /HD`
-   step needed. Size constraint: `--size` must match the donor's
-   partition size (`--size 100M --variant scsi` for `hd0.hds`).
-   License footprint: the boot-sector bytes flow user → user (your
-   donor file → your output file) — they never live in the
-   rusty-backup repo or shipping binaries. Same legal pattern as
-   `--system-disk` or as running `SWITCH.X` manually. SCSI only
-   today; SASI donors are rare and unvalidated.
+   **Phase D.2 — `--boot-sector-donor` (shipped 2026-06-10, BPB-patch
+   fix shipped same day):** for users with a real Sharp X68000 SCSI HDD
+   donor (typically the well-known `hd0.hds`, 100 MB, file size
+   104,857,600 bytes, Sharp/Keisoku Giken), the
+   `extract_partition_boot_sector` helper reads the donor's Human68k
+   partition boot sector (Sharp IPL Copyright 1990 SHARP at byte
+   `0x8000`) and overlays it onto the generated partition's first
+   sector at build time. The Sharp boot CODE survives intact; the
+   embedded Sharp/KG BPB region (offsets `0x12..0x22`) is rewritten by
+   `patch_sharp_kg_bpb_from_pc_bpb` with the output partition's actual
+   FAT geometry. Result: HDD self-boots straight to `C:>` on every
+   power-on; no `SWITCH.X /HD` step needed; **no size constraint** —
+   any `--size` from 1 MiB up to the ~512 MiB cap of the Sharp/KG
+   u8 `sectors_per_fat` field. Output partitions are formatted with
+   1024-byte FAT sectors (via the new
+   `create_blank_fat_with_sector_size`) to match the SCSI logical
+   sector size the donor's boot code reads at. License footprint: the
+   boot-sector bytes flow user → user (your donor file → your output
+   file) — they never live in the rusty-backup repo or shipping
+   binaries. Same legal pattern as `--system-disk` or as running
+   `SWITCH.X` manually. SCSI only today; SASI donors are rare and
+   unvalidated.
+
+   **First-cut bug + fix.** The initial Phase D.2 commit (`f7e3fe6`)
+   was likely non-functional: it overlaid the donor sector verbatim
+   while leaving our partition with `create_blank_fat`'s default
+   512-byte-sector FAT. The donor's BPB then steered its boot code at
+   the wrong byte offsets (its BPB said "1024-B sectors at byte 0x400"
+   but our actual FAT was at byte 0x200 with 512-B sectors). The
+   BPB-patch fix this commit ships parameterizes the FAT creation
+   sector size and patches the donor's BPB with our partition's
+   geometry, so the boot code reads the correct sectors regardless of
+   output `--size`. MAME-byte-level evidence: the Drv3 activity
+   overlay on `mame x68030 -hard rb_phaseD2_fixed.hdf` matches the
+   original `hd0.hds` donor's boot pattern exactly, distinct from the
+   stalled single-Drv0 pattern of the broken first-cut HDD.
 
    **Honesty note on verification:** MAME headless (`mame x68030 -hard
-   out.hdf`) accepts the boot-sector-overlaid HDD without crashing and
-   runs to completion at ~230% real-time, but doesn't render the
-   emulated X68000 text screen to its AVI capture (the original
-   `hd0.hds` exhibits the same headless-render artifact). End-to-end
-   "boots to C:> with visible prompt" verification needs an
-   interactive MAME session — not available in our headless test
-   harness today. Byte-level correctness (Sharp boot sector byte-
-   identical with donor) + IPL ROM acceptance are the strongest
-   signals shipped.
+   out.hdf`) doesn't render the emulated X68000 text screen to its AVI
+   capture (the original `hd0.hds` exhibits the same headless-render
+   artifact). End-to-end "boots to `C:>` with visible prompt"
+   verification needs an interactive MAME session — not available in
+   our headless test harness today. Strongest signals shipped: BPB
+   patcher is unit-tested for byte-correct big-endian Sharp/KG layout;
+   MAME accepts the HDD at ~230% real-time without crashing; SCSI
+   drive activity overlay (Drv3 ●●) matches the donor's exact boot
+   I/O pattern, distinct from a hung boot.
 
    **The original Phase D workaround still ships:** without
    `--boot-sector-donor` (e.g. users without a real Sharp HDD donor),

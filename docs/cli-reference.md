@@ -691,6 +691,7 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 - `--size` — Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `8M`, `16M`). Defaults to `16M` — large enough for a full Human68k system clone plus room for user files
 - `--variant` — Sharp HDD controller convention to emit
 - `--stub` — Which byte-0 IPL stub to write. `print` (default) renders a status banner via IOCS; `halt` is the bare minimum 2-byte halt loop
+- `--partitions` — Number of Human68k partitions to carve out (1-8). The disk's data area is split equally; partition 1 (slot 0) is the one that gets `--system-disk` files and the optional `--boot-sector-donor` overlay. Other partitions are formatted blank FAT12/16. Defaults to 1 — multi-partition only matters when you want separate volumes for system / games / scratch on the same HDD
 - `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
 

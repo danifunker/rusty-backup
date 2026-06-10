@@ -116,12 +116,11 @@ pub struct NewX68kHddArgs {
     /// Search for the literal filename `hd0.hds` on retro-archive
     /// sites.
     ///
-    /// **Size constraint**: the donor's boot sector carries its own
-    /// BPB (FAT geometry). For the boot to succeed, set `--size` to
-    /// match the donor's partition size — for `hd0.hds` that means
-    /// **`--size 100M`** plus `--variant scsi`. Other sizes typically
-    /// hang the boot (donor's BPB reads past the end of the smaller
-    /// partition).
+    /// **No size constraint**: the builder reads the donor's boot
+    /// CODE verbatim but rewrites the embedded Sharp/KG BPB with the
+    /// output partition's actual FAT geometry, so any `--size` between
+    /// 1 MiB and ~512 MiB works (the upper bound is the Sharp/KG BPB's
+    /// u8 `sectors_per_fat` field at offset `0x1D`).
     ///
     /// SCSI only today. SASI output should omit this flag and use
     /// the `SWITCH.X` workflow instead (see `--system-disk`).
