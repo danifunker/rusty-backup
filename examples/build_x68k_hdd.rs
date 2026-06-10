@@ -36,8 +36,11 @@ use std::io::Cursor;
 
 use byteorder::{BigEndian, ByteOrder};
 
+use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::fat::create_blank_fat;
-use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+use rusty_backup::fs::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem,
+};
 use rusty_backup::fs::human68k::Human68kFilesystem;
 use rusty_backup::partition::x68k::{
     X68K_ENTRY_SIZE, X68K_FIRST_PARTITION_SECTOR, X68K_MAGIC, X68K_MAX_PARTITIONS,
@@ -47,6 +50,7 @@ use rusty_backup::partition::x68k_ipl::{
     build_sasi_boot_block, build_scsi_boot_block, IplStub, SASI_BOOT_BLOCK_BYTES,
     SCSI_BOOT_BLOCK_BYTES,
 };
+use rusty_backup::rbformats::containers::decode_floppy_container_file;
 
 /// SASI logical sector size (matches real Sharp / Hudson SASI HDDs +
 /// `Bomberman.hdf` reference).
@@ -84,17 +88,137 @@ impl Variant {
     }
 }
 
+/// Recursively walk a donor Human68k filesystem and collect every file +
+/// directory as `(relative_path, kind)` pairs in DFS pre-order. Files
+/// come with their full byte contents — donors are typically 1-2 MiB
+/// (Human68k 3.x system floppy) so eager-loading is fine.
+fn collect_donor_tree(
+    donor: &mut Human68kFilesystem<Cursor<&[u8]>>,
+) -> Result<Vec<DonorEntry>, String> {
+    fn walk(
+        fs: &mut Human68kFilesystem<Cursor<&[u8]>>,
+        dir: &FileEntry,
+        prefix: &[String],
+        out: &mut Vec<DonorEntry>,
+    ) -> Result<(), String> {
+        let entries = fs.list_directory(dir).map_err(|e| format!("list: {e}"))?;
+        for entry in entries {
+            // Human68k surfaces "." and ".." on subdir listings; skip them.
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let mut path = prefix.to_vec();
+            path.push(entry.name.clone());
+            match entry.entry_type {
+                EntryType::Directory => {
+                    out.push(DonorEntry {
+                        path: path.clone(),
+                        kind: DonorKind::Directory,
+                    });
+                    walk(fs, &entry, &path, out)?;
+                }
+                EntryType::File => {
+                    let bytes = fs
+                        .read_file(&entry, usize::MAX)
+                        .map_err(|e| format!("read {}: {e}", entry.name))?;
+                    out.push(DonorEntry {
+                        path,
+                        kind: DonorKind::File(bytes),
+                    });
+                }
+                _ => { /* symlinks / specials don't exist on Human68k FAT */ }
+            }
+        }
+        Ok(())
+    }
+    let root = donor.root().map_err(|e| format!("root: {e}"))?;
+    let mut out = Vec::new();
+    walk(donor, &root, &[], &mut out)?;
+    Ok(out)
+}
+
+struct DonorEntry {
+    /// Path components, e.g. `["BIN", "SWITCH.X"]` for `/BIN/SWITCH.X`.
+    path: Vec<String>,
+    kind: DonorKind,
+}
+
+enum DonorKind {
+    File(Vec<u8>),
+    Directory,
+}
+
+/// Apply a previously-collected donor tree to the output partition's
+/// Human68k filesystem, creating directories before the files inside them.
+/// Returns `(files_written, dirs_written)`.
+fn apply_donor_tree<W: std::io::Read + std::io::Write + std::io::Seek + Send>(
+    out_fs: &mut Human68kFilesystem<W>,
+    tree: &[DonorEntry],
+) -> Result<(usize, usize), String> {
+    let mut files = 0;
+    let mut dirs = 0;
+    // Walk DonorEntry list — DFS pre-order so each entry's parent has
+    // already been created by the time we get to it.
+    for entry in tree {
+        // split_last returns (last_element, rest_slice) — the last
+        // component is the new entry's name, everything before it is the
+        // parent directory chain we need to walk.
+        let (name, parent_components) = match entry.path.split_last() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Resolve the parent FileEntry by walking from root.
+        let mut parent = out_fs.root().map_err(|e| format!("root: {e}"))?;
+        for comp in parent_components {
+            let children = out_fs
+                .list_directory(&parent)
+                .map_err(|e| format!("list {comp}: {e}"))?;
+            parent = children
+                .into_iter()
+                .find(|c| &c.name == comp && c.entry_type == EntryType::Directory)
+                .ok_or_else(|| format!("intermediate dir {comp} missing"))?;
+        }
+        match &entry.kind {
+            DonorKind::Directory => {
+                out_fs
+                    .create_directory(&parent, name, &CreateDirectoryOptions::default())
+                    .map_err(|e| format!("mkdir {name}: {e}"))?;
+                dirs += 1;
+            }
+            DonorKind::File(bytes) => {
+                let mut reader: &[u8] = bytes;
+                out_fs
+                    .create_file(
+                        &parent,
+                        name,
+                        &mut reader,
+                        bytes.len() as u64,
+                        &CreateFileOptions::default(),
+                    )
+                    .map_err(|e| format!("create {name}: {e}"))?;
+                files += 1;
+            }
+        }
+    }
+    Ok((files, dirs))
+}
+
 fn main() {
     let mut out_path: Option<String> = None;
     let mut size_mib: u64 = 8;
     let mut variant = Variant::Sasi;
     let mut stub = IplStub::Print;
-    for arg in env::args().skip(1) {
+    let mut system_disk: Option<String> = None;
+    let mut args_iter = env::args().skip(1);
+    while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "--scsi" => variant = Variant::Scsi,
             "--sasi" => variant = Variant::Sasi,
             "--halt-stub" => stub = IplStub::Halt,
             "--print-stub" => stub = IplStub::Print,
+            "--system-disk" => {
+                system_disk = Some(args_iter.next().expect("--system-disk needs a path"));
+            }
             other => {
                 if out_path.is_none() {
                     out_path = Some(other.to_string());
@@ -106,8 +230,10 @@ fn main() {
             }
         }
     }
-    let out_path = out_path
-        .expect("usage: build_x68k_hdd <out.hdf> [size_mib] [--scsi] [--halt-stub|--print-stub]");
+    let out_path = out_path.expect(
+        "usage: build_x68k_hdd <out.hdf> [size_mib] [--scsi] [--halt-stub|--print-stub] \
+         [--system-disk PATH.DIM]",
+    );
 
     let sector_size = variant.sector_size();
     let boot_block_bytes = variant.boot_block_bytes();
@@ -126,42 +252,88 @@ fn main() {
     let mut body =
         create_blank_fat(part_bytes_target, label).expect("create_blank_fat on partition body");
 
-    // Seed a few text files inside it via the Human68k engine so the
-    // user can see them once a Human68k system floppy boots and mounts C:.
+    // If a donor system disk was provided, pre-read its tree so we can
+    // close it before opening the output filesystem (avoids double-borrow
+    // of the partition body).
+    let donor_tree: Option<Vec<DonorEntry>> = system_disk.as_deref().map(|path| {
+        // Donors are typically .dim / .D88 / .xdf / .hdm floppy containers
+        // — decode via the container layer to get a flat FAT stream. Fall
+        // back to raw bytes if the file isn't a recognised container (so a
+        // pre-flat .img works too).
+        let donor_bytes = match decode_floppy_container_file(std::path::Path::new(path)) {
+            Ok((kind, flat)) => {
+                println!(
+                    "  donor: decoded {} container ({} bytes flat)",
+                    kind.display_name(),
+                    flat.len()
+                );
+                flat
+            }
+            Err(_) => {
+                let raw = fs::read(path).unwrap_or_else(|e| panic!("read donor {path}: {e}"));
+                println!("  donor: using raw bytes ({} bytes)", raw.len());
+                raw
+            }
+        };
+        let donor_slice: &[u8] = &donor_bytes;
+        let mut donor_fs = Human68kFilesystem::open(Cursor::new(donor_slice), 0)
+            .unwrap_or_else(|e| panic!("open donor as Human68k: {e}"));
+        let tree = collect_donor_tree(&mut donor_fs).unwrap_or_else(|e| panic!("walk donor: {e}"));
+        println!(
+            "  read donor {path}: {} files + {} dirs",
+            tree.iter()
+                .filter(|e| matches!(e.kind, DonorKind::File(_)))
+                .count(),
+            tree.iter()
+                .filter(|e| matches!(e.kind, DonorKind::Directory))
+                .count(),
+        );
+        tree
+    });
+
+    // Populate the partition: either a couple of seed text files (the
+    // engine-validation case) or a full clone of the donor system disk
+    // (Phase D — `--system-disk` was passed).
     {
         let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
             .expect("open blank partition as Human68k");
-        let root = fs.root().expect("root");
-        let seeds: &[(&str, &[u8])] = &[
-            (
-                "HELLO.TXT",
-                b"hello from rusty-backup\r\n\
-                  This file lives on the self-bootable X68000 HDD that\r\n\
-                  rusty-backup's examples/build_x68k_hdd built.\r\n",
-            ),
-            (
-                "MISTER.TXT",
-                b"rusty-backup MiSTer X68000 verification fixture\r\n",
-            ),
-            (
-                "README.TXT",
-                b"To verify in MAME or on real / MiSTer hardware:\r\n\
-                  1. Boot Human68k from FDD0 (BLANK_disk_X68000.D88).\r\n\
-                  2. At the A> prompt, type: dir C:\r\n\
-                  3. You should see HELLO.TXT, MISTER.TXT, README.TXT.\r\n\
-                  4. Type: type C:HELLO.TXT\r\n",
-            ),
-        ];
-        for (name, data) in seeds {
-            let mut reader: &[u8] = data;
-            fs.create_file(
-                &root,
-                name,
-                &mut reader,
-                data.len() as u64,
-                &CreateFileOptions::default(),
-            )
-            .unwrap_or_else(|e| panic!("create_file {name}: {e}"));
+        if let Some(tree) = donor_tree {
+            let (files, dirs) =
+                apply_donor_tree(&mut fs, &tree).expect("apply donor tree to output partition");
+            println!("  wrote donor: {files} files + {dirs} dirs into Human partition");
+        } else {
+            let root = fs.root().expect("root");
+            let seeds: &[(&str, &[u8])] = &[
+                (
+                    "HELLO.TXT",
+                    b"hello from rusty-backup\r\n\
+                      This file lives on the self-bootable X68000 HDD that\r\n\
+                      rusty-backup's examples/build_x68k_hdd built.\r\n",
+                ),
+                (
+                    "MISTER.TXT",
+                    b"rusty-backup MiSTer X68000 verification fixture\r\n",
+                ),
+                (
+                    "README.TXT",
+                    b"To verify in MAME or on real / MiSTer hardware:\r\n\
+                      1. Boot Human68k from FDD0 (BLANK_disk_X68000.D88).\r\n\
+                      2. At the A> prompt, type: dir C:\r\n\
+                      3. You should see HELLO.TXT, MISTER.TXT, README.TXT.\r\n\
+                      4. Type: type C:HELLO.TXT\r\n",
+                ),
+            ];
+            for (name, data) in seeds {
+                let mut reader: &[u8] = data;
+                fs.create_file(
+                    &root,
+                    name,
+                    &mut reader,
+                    data.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap_or_else(|e| panic!("create_file {name}: {e}"));
+            }
         }
         fs.sync_metadata().expect("sync");
     }
@@ -217,7 +389,13 @@ fn main() {
         part_sectors,
         body.len() / (1024 * 1024),
     );
-    println!("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
+    if system_disk.is_some() {
+        println!("  -> Boot from FDD0 with the same donor floppy once, then run");
+        println!("     `A:\\BIN\\SWITCH.X /HD` to install the HDD boot sector.");
+        println!("     After that, the HDD self-boots straight to C:>.");
+    } else {
+        println!("  seeded: HELLO.TXT, MISTER.TXT, README.TXT");
+    }
     println!();
     println!("To verify in MAME (WSL):");
     match variant {
