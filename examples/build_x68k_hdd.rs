@@ -27,7 +27,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use rusty_backup::partition::x68k_hdd_builder::{build_x68k_hdd, HddVariant};
+use rusty_backup::partition::x68k_hdd_builder::{build_x68k_hdd, BootSectorSource, HddVariant};
 use rusty_backup::partition::x68k_ipl::IplStub;
 
 fn main() {
@@ -37,6 +37,7 @@ fn main() {
     let mut stub = IplStub::Print;
     let mut system_disk: Option<String> = None;
     let mut boot_sector_donor: Option<String> = None;
+    let mut builtin_boot_sector = false;
     let mut partitions: usize = 1;
     let mut args_iter = env::args().skip(1);
     while let Some(arg) = args_iter.next() {
@@ -52,6 +53,7 @@ fn main() {
                 boot_sector_donor =
                     Some(args_iter.next().expect("--boot-sector-donor needs a path"));
             }
+            "--builtin-boot-sector" => builtin_boot_sector = true,
             "--partitions" => {
                 partitions = args_iter
                     .next()
@@ -76,6 +78,15 @@ fn main() {
     );
     let out_path = PathBuf::from(out_path);
 
+    let donor_path = boot_sector_donor.as_deref().map(std::path::Path::new);
+    let boot_sector_source = match (donor_path, builtin_boot_sector) {
+        (Some(p), false) => BootSectorSource::Donor(p),
+        (None, true) => BootSectorSource::BuiltIn,
+        (None, false) => BootSectorSource::None,
+        (Some(_), true) => {
+            panic!("--boot-sector-donor and --builtin-boot-sector are mutually exclusive")
+        }
+    };
     let summary = build_x68k_hdd(
         &out_path,
         size_mib,
@@ -83,7 +94,7 @@ fn main() {
         stub,
         partitions,
         system_disk.as_deref().map(std::path::Path::new),
-        boot_sector_donor.as_deref().map(std::path::Path::new),
+        boot_sector_source,
     )
     .unwrap_or_else(|e| panic!("build failed: {e}"));
 

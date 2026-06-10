@@ -694,6 +694,7 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 - `--partitions` — Number of Human68k partitions to carve out (1-8). The disk's data area is split equally; partition 1 (slot 0) is the one that gets `--system-disk` files and the optional `--boot-sector-donor` overlay. Other partitions are formatted blank FAT12/16. Defaults to 1 — multi-partition only matters when you want separate volumes for system / games / scratch on the same HDD
 - `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
+- `--builtin-boot-sector` — Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only
 
 ### `optical`
 

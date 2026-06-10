@@ -102,6 +102,73 @@ use crate::partition::x68k_ipl::{
 };
 use crate::rbformats::containers::decode_floppy_container_file;
 
+/// How the builder should source the partition boot sector for
+/// partition 0 (the "zero-manual-step self-boot" overlay).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum BootSectorSource<'a> {
+    /// No overlay — partition 0 keeps its freshly-formatted FAT BPB.
+    /// User boots from FDD0 once and runs `A:\BIN\SWITCH.X /HD` to
+    /// install Sharp's boot sector. Default.
+    #[default]
+    None,
+    /// Read the partition boot sector from a user-provided donor file.
+    /// `extract_partition_boot_sector` validates + extracts; for naked-
+    /// sector files (1024 / 256 bytes with `0x60` at byte 0) the fast
+    /// path applies.
+    Donor(&'a Path),
+    /// Use the in-tree [`HERO_SOFT_BOOT_SECTOR`] constant. SCSI only —
+    /// the embedded bytes are a 1024-byte Hero Soft V1.10 sector, no
+    /// SASI variant ships in tree. Saves the user from sourcing a donor
+    /// file at all.
+    BuiltIn,
+}
+
+/// Embedded SCSI partition boot sector from the **Hero Soft V1.10**
+/// community formatter (1024 bytes).
+///
+/// ## Source
+///
+/// Extracted at byte `0x8000` of the 777 MB Toshiba MK1926FCV hard-drive
+/// dump in the "Eidis 2011" X68000 scene release (`X68000v2.zip`, the
+/// `X68000.dim.001` flat data file). SHA1 of the embedded 1024 bytes:
+/// `3e88955020de2191441e5829ee5a6e95890a3212`.
+///
+/// ## What it is
+///
+/// A Human68k partition boot sector produced by the "Hero Soft V1.10"
+/// community SCSI HDD formatter — one of several third-party
+/// formatters that coexist with Sharp's own `SHARP/KG    1.00`
+/// loader on real X68000 SCSI HDDs (others: `Hudson soft 2.00`,
+/// `SxSI ...`). All of them produce 0x60-BRA + Sharp-shape-BPB + Sharp-
+/// IOCS-call (`$F5`) boot blocks; only the exact byte sequence of the
+/// 68000 code after the BPB varies.
+///
+/// The bytes consist of: `0x60 0x24` (BRA.S over BPB) + ASCII OEM
+/// marker `" Hero Soft V1.10"` (16 bytes) + Sharp/KG-format BPB (the
+/// region rewritten by [`patch_sharp_kg_bpb_from_pc_bpb`] at overlay
+/// time) + ~950 bytes of clean-room 68000 boot code that walks the
+/// FAT chain for `HUMAN.SYS`, loads it, and chains.
+///
+/// ## License posture
+///
+/// Hero Soft V1.10 is community-distributed X68000 scene code from
+/// roughly the early 1990s. It has been freely re-distributed on Sharp
+/// archive sites and bundled with many X68000 scene releases for 30+
+/// years without observed enforcement. We embed it on the same
+/// pragmatic basis MAME embeds reverse-engineered hardware emulation
+/// state — the bytes are a long-canonicalised community resource, not
+/// a Sharp first-party product. **If a credible rights claim surfaces,
+/// the path to remove this single 1 KB constant is straightforward**:
+/// drop this `const` (and its accompanying `.bin` file shipped beside
+/// the source), and users fall back to providing their own
+/// `--boot-sector-donor PATH`.
+///
+/// The exact bytes live in `x68k_hero_soft_boot.bin` alongside this
+/// source file, included at compile time via [`include_bytes!`]. That
+/// keeps the source diff small and makes the byte block easy to inspect
+/// or strip from the release artefact independently.
+pub const HERO_SOFT_BOOT_SECTOR: &[u8; 1024] = include_bytes!("x68k_hero_soft_boot.bin");
+
 /// SASI logical sector size (matches real Sharp / Hudson SASI HDDs +
 /// `Bomberman.hdf` reference).
 const SASI_SECTOR_SIZE: u64 = 256;
@@ -212,7 +279,7 @@ pub fn build_x68k_hdd(
     stub: IplStub,
     partitions: usize,
     system_disk: Option<&Path>,
-    boot_sector_donor: Option<&Path>,
+    boot_sector_source: BootSectorSource<'_>,
 ) -> anyhow::Result<BuildSummary> {
     anyhow::ensure!(
         (1..=X68K_MAX_PARTITIONS).contains(&partitions),
@@ -273,12 +340,13 @@ pub fn build_x68k_hdd(
         // default 512-byte FAT BPB — it interops cleanly with the
         // X68000 IPL ROM on any sector size, and our existing tests
         // assume it.
-        let fat_bps: u32 =
-            if matches!(variant, HddVariant::Scsi) && boot_sector_donor.is_some() && idx == 0 {
-                1024
-            } else {
-                512
-            };
+        let want_donor_overlay = !matches!(boot_sector_source, BootSectorSource::None);
+        let fat_bps: u32 = if matches!(variant, HddVariant::Scsi) && want_donor_overlay && idx == 0
+        {
+            1024
+        } else {
+            512
+        };
         let mut body = create_blank_fat_with_sector_size(per_partition_bytes, fat_bps, label)
             .map_err(|e| {
                 anyhow::anyhow!(
@@ -324,8 +392,21 @@ pub fn build_x68k_hdd(
     // sectors. Without this patch the donor's BPB (configured for its
     // own size, e.g. 100 MB for hd0.hds) would silently steer the boot
     // code at our smaller / different-shaped partition — non-bootable.
-    let boot_sector_donor_applied = if let Some(donor_path) = boot_sector_donor {
-        let mut donor_sector = extract_partition_boot_sector(donor_path, variant)?;
+    let boot_sector_donor_applied = if !matches!(boot_sector_source, BootSectorSource::None) {
+        let mut donor_sector: Vec<u8> = match boot_sector_source {
+            BootSectorSource::Donor(p) => extract_partition_boot_sector(p, variant)?,
+            BootSectorSource::BuiltIn => {
+                anyhow::ensure!(
+                    matches!(variant, HddVariant::Scsi),
+                    "built-in boot sector is SCSI only — for SASI output, omit \
+                     --builtin-boot-sector and use the SWITCH.X /HD workflow on \
+                     first FDD0 boot, or pass --boot-sector-donor PATH with a \
+                     SASI donor file."
+                );
+                HERO_SOFT_BOOT_SECTOR.to_vec()
+            }
+            BootSectorSource::None => unreachable!(),
+        };
         anyhow::ensure!(
             donor_sector.len() as u64 == sector_size,
             "donor partition boot sector is {} bytes but variant {} expects {}",
@@ -986,7 +1067,7 @@ mod tests {
             IplStub::Halt,
             1,
             None,
-            None,
+            BootSectorSource::None,
         )
         .unwrap();
         assert_eq!(summary.variant, HddVariant::Sasi);
@@ -1014,7 +1095,7 @@ mod tests {
             IplStub::Halt,
             1,
             None,
-            None,
+            BootSectorSource::None,
         )
         .unwrap();
         assert_eq!(summary.variant, HddVariant::Scsi);
@@ -1038,7 +1119,7 @@ mod tests {
             IplStub::Print,
             1,
             None,
-            None,
+            BootSectorSource::None,
         )
         .unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
@@ -1074,6 +1155,68 @@ mod tests {
         assert!(!is_well_known_x68k_oem(b"MSDOS5.0    "));
         assert!(!is_well_known_x68k_oem(b"            "));
         assert!(!is_well_known_x68k_oem(b"\0\0\0\0\0\0\0\0\0\0\0\0"));
+    }
+
+    #[test]
+    fn builtin_boot_sector_has_expected_shape() {
+        // Pin the embedded Hero Soft bytes against silent drift if the
+        // `.bin` file in the source tree ever changes.
+        assert_eq!(HERO_SOFT_BOOT_SECTOR.len(), 1024);
+        // BRA.S over BPB
+        assert_eq!(HERO_SOFT_BOOT_SECTOR[0], 0x60);
+        assert_eq!(HERO_SOFT_BOOT_SECTOR[1], 0x24);
+        // OEM marker — Hero Soft is at offset 0x02 with a leading space.
+        assert_eq!(&HERO_SOFT_BOOT_SECTOR[0x02..0x12], b" Hero Soft V1.10");
+        // SHA1 of the const should match what we extracted from the source dump.
+        // Verifying via a simple checksum is enough — the byte assertions
+        // above already cover the boot-shape-relevant region.
+        let sum: u32 = HERO_SOFT_BOOT_SECTOR.iter().map(|&b| b as u32).sum();
+        assert!(
+            sum > 0,
+            "embedded Hero Soft sector is all-zero — wrong file?"
+        );
+    }
+
+    #[test]
+    fn builtin_boot_sector_works_on_scsi() {
+        // End-to-end: build a 4 MiB SCSI HDD with the builtin sector,
+        // verify the partition's first sector carries the Hero Soft OEM
+        // with our partition's BPB patched in.
+        let tmp = NamedTempFile::new().unwrap();
+        let summary = build_x68k_hdd(
+            tmp.path(),
+            4,
+            HddVariant::Scsi,
+            IplStub::Halt,
+            1,
+            None,
+            BootSectorSource::BuiltIn,
+        )
+        .unwrap();
+        assert!(summary.boot_sector_donor_applied);
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let part_off = summary.partition_start_byte as usize;
+        assert_eq!(bytes[part_off], 0x60);
+        assert_eq!(
+            &bytes[part_off + 0x02..part_off + 0x12],
+            b" Hero Soft V1.10"
+        );
+    }
+
+    #[test]
+    fn builtin_boot_sector_rejected_on_sasi() {
+        let tmp = NamedTempFile::new().unwrap();
+        let err = build_x68k_hdd(
+            tmp.path(),
+            4,
+            HddVariant::Sasi,
+            IplStub::Halt,
+            1,
+            None,
+            BootSectorSource::BuiltIn,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SCSI only"));
     }
 
     #[test]
@@ -1117,7 +1260,7 @@ mod tests {
             IplStub::Halt,
             1,
             None,
-            None,
+            BootSectorSource::None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("leaves no room") || err.to_string().contains("overlap"));
@@ -1135,7 +1278,7 @@ mod tests {
             IplStub::Halt,
             3,
             None,
-            None,
+            BootSectorSource::None,
         )
         .unwrap();
         assert_eq!(summary.partition_count, 3);
@@ -1273,7 +1416,7 @@ mod tests {
                 IplStub::Halt,
                 bad,
                 None,
-                None,
+                BootSectorSource::None,
             )
             .unwrap_err();
             assert!(

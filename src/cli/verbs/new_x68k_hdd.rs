@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
-use crate::partition::x68k_hdd_builder::{build_x68k_hdd, HddVariant};
+use crate::partition::x68k_hdd_builder::{build_x68k_hdd, BootSectorSource, HddVariant};
 use crate::partition::x68k_ipl::IplStub;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -152,8 +152,27 @@ pub struct NewX68kHddArgs {
     /// Sharp's boot-sector bytes never live in the rusty-backup repo
     /// — they flow from the user's donor file into the user's output
     /// file at build time. Same license footprint as `--system-disk`.
-    #[arg(long = "boot-sector-donor")]
+    #[arg(long = "boot-sector-donor", conflicts_with = "builtin_boot_sector")]
     pub boot_sector_donor: Option<PathBuf>,
+
+    /// Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes,
+    /// SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of
+    /// requiring `--boot-sector-donor PATH`. SCSI only.
+    ///
+    /// Convenience for users who don't have any X68000 HDD donor on
+    /// hand — `--system-disk donor.dim --builtin-boot-sector
+    /// --variant scsi` produces a fully self-bootable HDD with no
+    /// SWITCH.X step and no donor file beyond the Human68k system
+    /// floppy. The embedded bytes were extracted from the "Eidis 2011"
+    /// X68000 scene release; see the
+    /// `partition::x68k_hdd_builder::HERO_SOFT_BOOT_SECTOR` docs for
+    /// source + license posture.
+    #[arg(
+        long = "builtin-boot-sector",
+        conflicts_with = "boot_sector_donor",
+        default_value = "false"
+    )]
+    pub builtin_boot_sector: bool,
 }
 
 pub fn run(args: NewX68kHddArgs) -> Result<()> {
@@ -168,6 +187,17 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         "--size must be an exact multiple of 1 MiB (got {size_bytes} bytes)"
     );
 
+    let boot_sector_source = match (&args.boot_sector_donor, args.builtin_boot_sector) {
+        (Some(p), false) => BootSectorSource::Donor(p.as_path()),
+        (None, true) => BootSectorSource::BuiltIn,
+        (None, false) => BootSectorSource::None,
+        // clap's `conflicts_with` should make this unreachable, but be
+        // defensive — surface a clear error rather than silently picking
+        // one if the guard ever drifts.
+        (Some(_), true) => {
+            anyhow::bail!("--boot-sector-donor and --builtin-boot-sector are mutually exclusive")
+        }
+    };
     let summary = build_x68k_hdd(
         &args.image,
         size_mib,
@@ -175,7 +205,7 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         args.stub.into(),
         args.partitions,
         args.system_disk.as_deref(),
-        args.boot_sector_donor.as_deref(),
+        boot_sector_source,
     )?;
 
     log_stderr(format!(

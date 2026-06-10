@@ -51,7 +51,9 @@ rb-cli restore ./backups/my-backup ./restored.img
 rb-cli batch script.json --dry-run
 rb-cli new-x68k-hdd hdd.hdf --size 16M --system-disk human68k.dim
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
-                          --boot-sector-donor hd0.hds   # zero manual steps
+                          --boot-sector-donor hd0.hds      # zero manual steps, your donor
+rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
+                          --builtin-boot-sector            # zero manual steps, no donor needed
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
