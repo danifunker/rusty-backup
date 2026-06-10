@@ -648,12 +648,13 @@ no hand-waving.
 
 **Concrete code gaps (in dependency order):**
 
-1. **`partition/detect_superfloppy`** (`src/partition/mod.rs:139`)
-   accepts FAT VBR JMP byte `0xEB` / `0xE9` only. X68000 floppies
-   start with `0x60` (68000 BSR.S). Result: `rb-cli inspect/ls` on a
-   raw X68000 `.D88` decode fails detection even though the BPB is
-   valid (integration tests pass because they call the engine
-   directly).
+1. **[RESOLVED]** `partition/detect_superfloppy` now accepts the
+   X68000 `0x60` (68000 BRA.S) jump byte in addition to the FAT VBR
+   `0xEB` / `0xE9` (see `src/partition/mod.rs:196-202`). Raw X68000
+   `.D88` decodes that surface a Human68k BPB at byte 0 (either the
+   standard little-endian floppy layout or the Sharp/KG big-endian
+   one at offset 0x12) dispatch as `"human68k"` end-to-end. Resolved
+   pre-2026-06-10; the doc here was stale.
 
 2. **[RESOLVED for SCSI read]** `partition/x68k.rs` hardcoded 512-byte
    sectors when computing `partition_offset = start_lba *
@@ -707,24 +708,50 @@ no hand-waving.
    standard boot sector (`FS_REPLACE_SECTOR0` / `fake_bootsect`); we
    parse the real on-disk BPB instead.
 
-5. **No self-bootable IPL builder** in `examples/build_x68k_hdd.rs` —
-   the example produces a partition-table-only HDD that requires
-   booting from FDD0. Real-world workflow is HDD-bootable. The IPL
-   menu pattern (Bomberman: BSR.W → ANSI-positioned menu → boot
-   selected partition) is short — ~200 bytes of 68000 assembly.
+5. **[CLOSED 2026-06-10]** Self-bootable IPL builder shipped as the
+   five-phase A-E plan (see commits 9fafd99, 70c7cd8, 3d978ac, eb5cf4c
+   on `main`). `src/partition/x68k_hdd_builder.rs` is the shared engine,
+   and `rb-cli new-x68k-hdd` is the user-facing CLI verb at parity with
+   the `examples/build_x68k_hdd` scaffold. Coverage:
+   - **Phase A** (SASI IPL stub) — byte-0 `BRA.S self` halt-loop stub
+     satisfies the Sharp IPL ROM's "byte 0 == $60" check; MAME
+     `x68000 -sasi` chains into it cleanly.
+   - **Phase B** (printed banner) — clean-room 100-byte 68k stub
+     calls IOCS `B_PRINT` (function $21, TRAP #15) to clear screen +
+     print "Rusty Backup X68000 HDD — Boot Human68k from FDD0 to
+     mount as C:", then halts.
+   - **Phase C** (SCSI variant) — byte-0 `X68SCSI1` + 8-byte geometry
+     descriptor + 40-byte Keisoku Giken string, IPL at byte 0x400,
+     table at byte 0x800, 1024-B sectors. MAME `x68030 -hard` boots
+     it; byte-identical to the `SCSI_NetBSD.hds` reference for bytes
+     0..0x40.
+   - **Phase D** (`--system-disk`) — recursive clone of an entire
+     Human68k donor floppy (flat or `.dim`/`.D88`/`.xdf`/`.hdm` via
+     the floppy-container layer) into the output partition: 100 files
+     + 6 dirs from `Human 68k v3.02 (Sharp - Hudson).dim` land
+     byte-exact, including `HUMAN.SYS`, `COMMAND.X`, `BIN/SWITCH.X`,
+     `BIN/FORMAT.X`.
+   - **Phase E** (CLI verb) — `rb-cli new-x68k-hdd IMG --size 16M
+     [--variant sasi|scsi] [--stub print|halt] [--system-disk
+     PATH.DIM]` at GUI/CLI parity (per CLAUDE.md). Both surfaces
+     share the same `build_x68k_hdd` entry point.
 
-**Implementation estimate**: ~500 LOC + tests against `hd0.hds` and
-`Bomberman.HDF` as committed anchors. Phases: (a) signature detector +
-sector-size derivation in `partition/x68k.rs`; (b) extended-OEM BPB
-parser in `fs/human68k.rs`; (c) `examples/build_x68k_hdd.rs` upgrade
-to emit a SCSI-format bootable HDD with IPL menu; (d) `rb-cli put`
-round-trip against an injected `hd0.hds` clone on a MiSTer with
-Human68k v3.02 system disk.
+   **Deferred (Phase D.2 — explicitly out of scope today):** the
+   partition's Human68k boot sector. Writing a clean-room HDD boot
+   loader needs either reverse-engineering Sharp's `SWITCH.X` or
+   porting the `dis68k` libfat-human68k FAT12 reader into a tight 68k
+   stub; neither has a public clean-room reference. The Phase D
+   workaround that ships with `--system-disk`: boot the same donor
+   floppy from FDD0 once, run `A:\BIN\SWITCH.X /HD`, then the HDD
+   self-boots straight to `C:>` (the user's `SWITCH.X` from the
+   donor writes the proper boot sector). One manual step.
 
-**What's blocked behind this**: closing the X68000 row's `[!] ref` +
-`[!] write-verified` user-side parks via real-hardware MiSTer
-verification. Today the engine-level surface is proven; the
-in-emulator surface needs the SCSI/SASI format work above.
+   **Still open for §7.NH closure:** the MiSTer X68000 manual-verify
+   on real hardware. Today MAME `x68000 -sasi` / `x68030 -hard` both
+   chain into our IPL cleanly; verification on the actual MiSTer
+   X68000 core requires the user to source a Human68k system disk
+   with SCSI driver in `CONFIG.SYS` (or use `--system-disk` + the
+   one-step SWITCH.X workflow above).
 
 ### 8a. Full read/write support — progress + remaining plan (2026-06-07)
 

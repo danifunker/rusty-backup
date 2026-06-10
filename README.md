@@ -49,6 +49,7 @@ rb-cli inspect disk.hda
 rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
 rb-cli restore ./backups/my-backup ./restored.img
 rb-cli batch script.json --dry-run
+rb-cli new-x68k-hdd hdd.hdf --size 16M --system-disk human68k.dim
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
@@ -173,6 +174,12 @@ The app has five tabs:
   - **Defragment…** on Human68k (X68000) partitions: repack the volume so
     files are stored contiguously, reclaiming holes left by deleted files
     (also `rb-cli repack`).
+  - **Build a Sharp X68000 HDD from scratch** via the shell:
+    `rb-cli new-x68k-hdd out.hdf --size 16M --system-disk donor.dim`
+    (SASI default, `--variant scsi` available) — emits a self-bootable
+    HDD with the Sharp IPL signature, X68K partition table, and a full
+    Human68k system clone from a donor `.dim` / `.D88` / `.xdf` /
+    `.hdm` floppy. Boots clean in MAME `x68000 -sasi` / `x68030 -hard`.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
@@ -396,7 +403,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
 | **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
 | **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
-| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion + in-place add/delete/mkdir), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract + add/delete/mkdir + in-place grow/shrink + defragmenting repack, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images) |
+| **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion + in-place add/delete/mkdir), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract + add/delete/mkdir + in-place grow/shrink + defragmenting repack, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images). `rb-cli new-x68k-hdd` builds self-bootable HDDs from scratch (`--system-disk donor.dim` clones a Human68k system floppy into the partition; one `SWITCH.X /HD` on first FDD0 boot installs the partition boot sector and the HDD self-boots to C: thereafter). MAME-verified on x68000 SASI + x68030 SCSI. |
 | **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
 | **QL** (Sinclair)              | QDOS (QXL.WIN, read + write) | HDD (.win) |
 | **Amstrad CPC**                | AMSDOS + CP/M 2.2 / Plus (`amstrad_data` + `amstrad_sys` DPBs) | Floppy `.dsk` |
