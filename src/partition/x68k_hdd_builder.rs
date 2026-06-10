@@ -487,6 +487,14 @@ pub fn extract_partition_boot_sector(
         HddVariant::Scsi => (0x800u64, 1024u64, 0x9000, "X68SCSI1"),
         HddVariant::Sasi => (0x400u64, 256u64, 0x2000, "\\x82w68000W or BRA.S (0x60)"),
     };
+
+    // Fast path: caller pre-extracted just the partition boot sector
+    // (e.g. via `hero_soft_boot.bin` or similar). Detect by exact-size
+    // match + `0x60` BRA at byte 0, and skip the signature / table /
+    // partition lookup since the bytes ARE already the sector we want.
+    if donor_bytes.len() == sector_size as usize && donor_bytes[0] == 0x60 {
+        return validate_and_return_naked_sector(donor_bytes, donor_path, variant);
+    }
     anyhow::ensure!(
         donor_bytes.len() >= expected_min_bytes,
         "donor {} is too small ({} bytes) — expected at least {} to cover \
@@ -589,37 +597,93 @@ pub fn extract_partition_boot_sector(
     // use a `Hudson soft 2.00`-style OEM. Anything else logs a warning
     // and proceeds rather than failing — rarer SASI donors might use
     // other vendor strings we haven't catalogued.
+    // OEM marker policy: accept any vendor that produces a valid
+    // Human68k boot sector, log a warning for unfamiliar ones. The
+    // X68000 SCSI ecosystem has multiple formatter lineages — Sharp's
+    // own (`SHARP/KG    1.00`), Hero Soft V1.10, SxSI / scsiform,
+    // Hudson Soft (for SASI game discs), and likely others we haven't
+    // catalogued. All of them produce sectors with a `0x60` BRA at byte
+    // 0 (which we already checked) + a Sharp/KG-shape BPB at offset
+    // 0x12 + 68000 boot code via the same IOCS function call ($F5).
+    // Our BPB patcher rewrites the BPB region with our partition's
+    // geometry regardless of OEM, so the donor's boot code reads the
+    // right sectors as long as it's BPB-aware.
     let oem = &sector[0x02..0x0E];
-    match variant {
-        HddVariant::Scsi => {
-            anyhow::ensure!(
-                oem == b"SHARP/KG    ",
-                "donor partition boot sector at byte 0x{:x} of {} doesn't have \
-                 the Sharp/KG OEM marker at offset 0x02 — extracted bytes 0..14: {:?}",
-                part_byte_offset,
-                donor_path.display(),
-                &sector[..14],
-            );
-        }
-        HddVariant::Sasi => {
-            let is_sharp_kg = oem == b"SHARP/KG    ";
-            let is_hudson = oem.starts_with(b"Hudson");
-            if !is_sharp_kg && !is_hudson {
-                // Don't fail — log via eprintln so the user sees it even
-                // when this is called from a CLI that hides info logs.
-                eprintln!(
-                    "warning: donor partition at byte 0x{:x} of {} has unfamiliar \
-                     OEM marker {:?} (expected `SHARP/KG    ` or `Hudson...`). \
-                     Proceeding — the boot sector will be overlaid as-is. If the \
-                     output HDD doesn't boot, that's the first thing to check.",
-                    part_byte_offset,
-                    donor_path.display(),
-                    std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
-                );
-            }
-        }
+    if !is_well_known_x68k_oem(oem) {
+        eprintln!(
+            "warning: donor partition boot sector at byte 0x{:x} of {} has \
+             unfamiliar OEM marker {:?} (expected `SHARP/KG    `, ` Hudson...`, \
+             ` Hero...`, or `SxSI...`). Proceeding — the BPB will be patched \
+             with your partition geometry. If the output HDD doesn't boot, \
+             check that the donor's boot code is BPB-aware.",
+            part_byte_offset,
+            donor_path.display(),
+            std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
+        );
     }
 
+    Ok(sector)
+}
+
+/// True if the OEM marker at bytes 0x02..0x0E of an X68000 Human68k
+/// partition boot sector matches a known vendor's format.
+///
+/// Recognised vendors:
+/// - `SHARP/KG    1.00` — Sharp's own first-party tooling (`SWITCH.X /HD`,
+///   `FORMAT.X`). OEM lives at byte 0x02 with no leading space.
+/// - `Hudson soft 2.00` — Hudson Soft SASI game-disc IPL. OEM at byte
+///   0x03 with a leading 0x20 (space) at byte 0x02.
+/// - `Hero Soft V1.10` — third-party community SCSI formatter. Same
+///   leading-space convention as Hudson.
+/// - `SxSI ...` — community SxSI-driver formatters. Variable trailer.
+///
+/// Trimming the leading space normalises Hudson + Hero so a single
+/// `starts_with` check covers both layout conventions.
+fn is_well_known_x68k_oem(oem: &[u8]) -> bool {
+    let trimmed: &[u8] = if oem.first() == Some(&b' ') {
+        &oem[1..]
+    } else {
+        oem
+    };
+    oem == b"SHARP/KG    "
+        || trimmed.starts_with(b"Hudson")
+        || trimmed.starts_with(b"Hero")
+        || trimmed.starts_with(b"SxSI")
+}
+
+/// Validate + return a pre-extracted donor sector ("naked" mode).
+///
+/// Triggered by [`extract_partition_boot_sector`] when the donor file is
+/// exactly one sector long (1024 bytes for SCSI, 256 for SASI) and byte
+/// 0 is the canonical `0x60` BRA opcode. The user has done the
+/// extraction themselves (e.g. saved 1024 bytes of a donor HDD to
+/// `hero_soft_boot.bin`) so we skip the X68SCSI1 / X68K-table / sector
+/// lookup and just sanity-check + return the bytes.
+///
+/// Runs the same OEM-check policy as the full-donor path: well-known
+/// vendors (Sharp/KG, Hudson, Hero, SxSI) pass silently; unfamiliar
+/// markers log a warning but don't fail.
+fn validate_and_return_naked_sector(
+    sector: Vec<u8>,
+    donor_path: &Path,
+    _variant: HddVariant,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        sector.len() >= 0x0E,
+        "naked donor sector at {} is too short ({} bytes) to hold even an OEM marker",
+        donor_path.display(),
+        sector.len(),
+    );
+    let oem = &sector[0x02..0x0E];
+    if !is_well_known_x68k_oem(oem) {
+        eprintln!(
+            "warning: naked donor sector at {} has unfamiliar OEM marker {:?} \
+             (expected `SHARP/KG    `, ` Hudson...`, ` Hero...`, or `SxSI...`). \
+             Proceeding — the BPB will be patched with your partition geometry.",
+            donor_path.display(),
+            std::str::from_utf8(oem).unwrap_or("<non-utf8>"),
+        );
+    }
     Ok(sector)
 }
 
@@ -995,6 +1059,37 @@ mod tests {
         std::fs::write(tmp.path(), vec![0u8; 0x10000]).unwrap();
         let err = extract_partition_boot_sector(tmp.path(), HddVariant::Scsi).unwrap_err();
         assert!(err.to_string().contains("X68SCSI1"));
+    }
+
+    #[test]
+    fn oem_check_accepts_known_vendors_including_leading_space() {
+        assert!(is_well_known_x68k_oem(b"SHARP/KG    "));
+        assert!(is_well_known_x68k_oem(b" Hudson soft"));
+        assert!(is_well_known_x68k_oem(b" Hero Soft V"));
+        assert!(is_well_known_x68k_oem(b"SxSI driver "));
+        // No-space variants still match (forward-compat).
+        assert!(is_well_known_x68k_oem(b"Hudson soft "));
+        assert!(is_well_known_x68k_oem(b"Hero Soft V1"));
+        // Anything else returns false (logs warning, doesn't fail).
+        assert!(!is_well_known_x68k_oem(b"MSDOS5.0    "));
+        assert!(!is_well_known_x68k_oem(b"            "));
+        assert!(!is_well_known_x68k_oem(b"\0\0\0\0\0\0\0\0\0\0\0\0"));
+    }
+
+    #[test]
+    fn naked_sector_donor_accepted_when_size_matches_and_bra_at_byte_0() {
+        // Write a 1024-byte file with `0x60 BRA` at byte 0 + a known OEM.
+        // extract_partition_boot_sector should fast-path-accept it.
+        let mut sector = vec![0u8; 1024];
+        sector[0] = 0x60;
+        sector[1] = 0x24;
+        sector[0x02..0x0E].copy_from_slice(b"SHARP/KG    ");
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &sector).unwrap();
+        let extracted = extract_partition_boot_sector(tmp.path(), HddVariant::Scsi).unwrap();
+        assert_eq!(extracted.len(), 1024);
+        assert_eq!(extracted[0], 0x60);
+        assert_eq!(&extracted[0x02..0x0E], b"SHARP/KG    ");
     }
 
     #[test]

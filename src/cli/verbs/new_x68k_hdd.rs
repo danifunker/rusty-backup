@@ -122,9 +122,21 @@ pub struct NewX68kHddArgs {
     /// 1 MiB and ~512 MiB works (the upper bound is the Sharp/KG BPB's
     /// u8 `sectors_per_fat` field at offset `0x1D`).
     ///
-    /// **SCSI variant**: validated end-to-end against `hd0.hds`. The
-    /// donor's Sharp/KG BPB is patched with the output partition's
-    /// FAT geometry, so any `--size` works.
+    /// **SCSI variant**: validated end-to-end against `hd0.hds`
+    /// (Sharp/KG `1.00`) and `hero_soft_boot.bin` (community Hero Soft
+    /// V1.10). The donor's BPB is patched with the output partition's
+    /// FAT geometry, so any `--size` works regardless of donor size.
+    /// Well-known OEMs (`SHARP/KG    `, `Hudson...`, `Hero...`,
+    /// `SxSI...`) pass silently; unfamiliar OEMs log a warning and
+    /// proceed — most community SCSI formatters share the same Sharp/KG
+    /// BPB layout so they boot fine after patching.
+    ///
+    /// **Naked-sector mode**: passing a file that's exactly one sector
+    /// long (1024 bytes for SCSI, 256 for SASI) with `0x60` BRA at byte
+    /// 0 skips the X68SCSI1 signature + X68K table lookup and uses the
+    /// bytes verbatim. Useful for keeping a tiny portable donor
+    /// (`hero_soft_boot.bin` is 1 KB) instead of carrying around a
+    /// full 100+ MB HDD image.
     ///
     /// **SASI variant**: shipped experimental — accepts donors whose
     /// byte 0 carries either the `\x82w68000W` Sharp empty-marker or a
