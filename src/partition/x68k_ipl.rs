@@ -107,15 +107,64 @@ pub const IPL_HALT_STUB: &[u8] = &[0x60, 0xFE];
 /// for clear-screen (`ESC [ 2 J`) and cursor positioning (`ESC [ row ; col H`)
 /// are interpreted directly by the IPL ROM's console driver.
 pub fn build_print_ipl_stub() -> Vec<u8> {
+    build_print_ipl_stub_with_partitions(&[])
+}
+
+/// Build the Phase B print stub with a partition list baked into the
+/// banner text. Each entry in `partitions` is rendered as a row like
+/// `"  C: Human68k 99 MiB"` so users with multi-partition HDDs see the
+/// actual partition layout when they boot — distinct from a single-
+/// partition HDD's "boot from FDD0" footer.
+///
+/// `partitions` is `(drive_letter, size_mib)` pairs in slot order. Empty
+/// slice falls back to the single-partition banner (equivalent to
+/// [`build_print_ipl_stub`]).
+///
+/// The rendered text fits in the boot block (≤ ~900 bytes for SASI,
+/// ≤ ~2800 bytes for SCSI), so up to 8 partitions render cleanly.
+///
+/// 68k code stays the same shape as the single-partition variant — only
+/// the baked text changes. No runtime X68K table parsing in 68k, which
+/// keeps the verification footprint small (we'd need an interactive
+/// MAME oracle to safely debug 68k table-walking code, and we don't
+/// have one in headless CI).
+pub fn build_print_ipl_stub_with_partitions(partitions: &[(char, u64)]) -> Vec<u8> {
     // Message body — ANSI escape sequences are interpreted by the IPL
     // ROM's console driver, so we get clear-screen + cursor positioning
     // without writing any framebuffer code ourselves.
     let mut msg: Vec<u8> = Vec::new();
     msg.extend_from_slice(b"\x1B[2J"); // clear screen
-    msg.extend_from_slice(b"\x1B[10;28H"); // cursor row 10, col 28
+    msg.extend_from_slice(b"\x1B[3;28H"); // cursor row 3, col 28
     msg.extend_from_slice(b"Rusty Backup X68000 HDD\r\n");
-    msg.extend_from_slice(b"\x1B[12;26H"); // cursor row 12, col 26
-    msg.extend_from_slice(b"Boot Human68k from FDD0 to mount as C:\r\n");
+
+    if partitions.is_empty() {
+        // Single-partition / unspecified: legacy banner.
+        msg.extend_from_slice(b"\x1B[5;26H"); // cursor row 5, col 26
+        msg.extend_from_slice(b"Boot Human68k from FDD0 to mount as C:\r\n");
+    } else {
+        // Multi-partition: list each slot with its drive letter + size.
+        let line = format!(
+            "\x1B[5;28HX68K partition table -- {} slots:\r\n",
+            partitions.len()
+        );
+        msg.extend_from_slice(line.as_bytes());
+        for (i, (letter, size_mib)) in partitions.iter().enumerate() {
+            // Row 7 + i, col 30
+            let line = format!(
+                "\x1B[{};30H  {}: Human68k {} MiB\r\n",
+                7 + i,
+                letter,
+                size_mib,
+            );
+            msg.extend_from_slice(line.as_bytes());
+        }
+        let footer_row = 7 + partitions.len() + 2;
+        let line = format!(
+            "\x1B[{};26HBoot Human68k from FDD0 to mount as drives.\r\n",
+            footer_row,
+        );
+        msg.extend_from_slice(line.as_bytes());
+    }
     msg.push(0); // null terminator for B_PRINT
 
     // Code prelude — exactly 14 bytes so msg lands at byte 14, which makes
@@ -155,18 +204,21 @@ pub enum IplStub {
     /// ROM accepts. No visible output — used as the safe default and by
     /// Phase A.
     Halt,
-    /// Clear-screen + printed banner ("Rusty Backup X68000 HDD — Boot
-    /// Human68k from FDD0 to mount as C:") via IOCS B_PRINT, then halt.
-    /// Used by Phase B for visible chain-success confirmation.
+    /// Clear-screen + printed banner via IOCS B_PRINT, then halt.
+    /// The boot block builder renders a single-partition default
+    /// banner. For a per-partition list, use [`render_ipl_stub_bytes`]
+    /// directly with [`build_print_ipl_stub_with_partitions`].
     Print,
 }
 
-impl IplStub {
-    fn bytes(self) -> Vec<u8> {
-        match self {
-            Self::Halt => IPL_HALT_STUB.to_vec(),
-            Self::Print => build_print_ipl_stub(),
-        }
+/// Build the actual byte sequence for an IPL stub. Wrapper around the
+/// raw stub builders that lets the caller pass partition info for the
+/// Print variant — when `partitions` is empty, falls back to the
+/// generic single-partition banner.
+pub fn render_ipl_stub_bytes(stub: IplStub, partitions: &[(char, u64)]) -> Vec<u8> {
+    match stub {
+        IplStub::Halt => IPL_HALT_STUB.to_vec(),
+        IplStub::Print => build_print_ipl_stub_with_partitions(partitions),
     }
 }
 
@@ -181,17 +233,26 @@ pub fn build_sasi_boot_block(
     stub: IplStub,
     partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
 ) -> [u8; SASI_BOOT_BLOCK_BYTES] {
+    build_sasi_boot_block_with_stub_bytes(&render_ipl_stub_bytes(stub, &[]), partition_table_bytes)
+}
+
+/// Like [`build_sasi_boot_block`], but accepts a pre-rendered IPL stub
+/// byte sequence — lets the caller pass partition info into the Print
+/// stub via [`render_ipl_stub_bytes`].
+pub fn build_sasi_boot_block_with_stub_bytes(
+    stub_bytes: &[u8],
+    partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
+) -> [u8; SASI_BOOT_BLOCK_BYTES] {
     let mut block = [0u8; SASI_BOOT_BLOCK_BYTES];
     // Byte 0: IPL stub. The IPL ROM JSRs here after reading the boot
     // block; the chosen stub either halts or prints a banner + halts.
-    let stub_bytes = stub.bytes();
     assert!(
         stub_bytes.len() <= SASI_TABLE_OFFSET,
         "IPL stub ({} bytes) overlaps the SASI partition table at 0x{:x}",
         stub_bytes.len(),
         SASI_TABLE_OFFSET,
     );
-    block[..stub_bytes.len()].copy_from_slice(&stub_bytes);
+    block[..stub_bytes.len()].copy_from_slice(stub_bytes);
     // Byte 0x400: partition table (144 bytes, padded with zeros to the
     // end of the boot block).
     block[SASI_TABLE_OFFSET..SASI_TABLE_OFFSET + partition_table_bytes.len()]
@@ -211,6 +272,21 @@ pub fn build_scsi_boot_block(
     stub: IplStub,
     partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
 ) -> [u8; SCSI_BOOT_BLOCK_BYTES] {
+    build_scsi_boot_block_with_stub_bytes(
+        descriptor,
+        &render_ipl_stub_bytes(stub, &[]),
+        partition_table_bytes,
+    )
+}
+
+/// Like [`build_scsi_boot_block`], but accepts a pre-rendered IPL stub
+/// byte sequence — lets the caller pass partition info into the Print
+/// stub via [`render_ipl_stub_bytes`].
+pub fn build_scsi_boot_block_with_stub_bytes(
+    descriptor: &[u8; 8],
+    stub_bytes: &[u8],
+    partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
+) -> [u8; SCSI_BOOT_BLOCK_BYTES] {
     let mut block = [0u8; SCSI_BOOT_BLOCK_BYTES];
     // Bytes 0..8: X68SCSI1 magic.
     block[..8].copy_from_slice(X68K_SCSI_SIGNATURE);
@@ -222,7 +298,6 @@ pub fn build_scsi_boot_block(
     block[16..16 + ksg.len()].copy_from_slice(ksg);
     // Byte 0x400: IPL stub. The SCSI variant places the IPL after the
     // signature header rather than at byte 0.
-    let stub_bytes = stub.bytes();
     assert!(
         SCSI_IPL_OFFSET + stub_bytes.len() <= SCSI_TABLE_OFFSET,
         "IPL stub ({} bytes) at 0x{:x} overlaps the SCSI partition table at 0x{:x}",
@@ -230,7 +305,7 @@ pub fn build_scsi_boot_block(
         SCSI_IPL_OFFSET,
         SCSI_TABLE_OFFSET,
     );
-    block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + stub_bytes.len()].copy_from_slice(&stub_bytes);
+    block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + stub_bytes.len()].copy_from_slice(stub_bytes);
     // Byte 0x800: partition table.
     block[SCSI_TABLE_OFFSET..SCSI_TABLE_OFFSET + partition_table_bytes.len()]
         .copy_from_slice(partition_table_bytes);
@@ -284,6 +359,23 @@ mod tests {
         assert_eq!(&block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + 2], IPL_HALT_STUB);
         // Byte 0x800: partition table.
         assert_eq!(&block[SCSI_TABLE_OFFSET..SCSI_TABLE_OFFSET + 4], b"X68K");
+    }
+
+    #[test]
+    fn print_stub_with_partitions_renders_drive_letters_and_sizes() {
+        // Multi-partition build: each slot gets a drive letter + size.
+        let partitions = [('C', 16u64), ('D', 16), ('E', 16)];
+        let stub = build_print_ipl_stub_with_partitions(&partitions);
+        // Prelude is still 14 bytes (same shape as single-partition).
+        assert_eq!(&stub[..4], &[0x60, 0x02, b'R', b'B']);
+        // Banner header should mention X68000 HDD.
+        assert!(stub.windows(23).any(|w| w == b"Rusty Backup X68000 HDD"));
+        // Each drive letter + size combo should appear in the message.
+        assert!(stub.windows(15).any(|w| w == b"C: Human68k 16 "));
+        assert!(stub.windows(15).any(|w| w == b"D: Human68k 16 "));
+        assert!(stub.windows(15).any(|w| w == b"E: Human68k 16 "));
+        // The "3 slots:" header tells the user there are 3 partitions.
+        assert!(stub.windows(8).any(|w| w == b"3 slots:"));
     }
 
     #[test]

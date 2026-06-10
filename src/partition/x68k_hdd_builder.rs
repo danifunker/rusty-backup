@@ -97,8 +97,8 @@ use crate::partition::x68k::{
     X68K_MAX_PARTITIONS, X68K_TABLE_HEADER_SIZE,
 };
 use crate::partition::x68k_ipl::{
-    build_sasi_boot_block, build_scsi_boot_block, IplStub, SASI_BOOT_BLOCK_BYTES,
-    SCSI_BOOT_BLOCK_BYTES,
+    build_sasi_boot_block_with_stub_bytes, build_scsi_boot_block_with_stub_bytes,
+    render_ipl_stub_bytes, IplStub, SASI_BOOT_BLOCK_BYTES, SCSI_BOOT_BLOCK_BYTES,
 };
 use crate::rbformats::containers::decode_floppy_container_file;
 
@@ -388,11 +388,32 @@ pub fn build_x68k_hdd(
         );
     }
 
+    // Build the partition-list for the IPL stub. For multi-partition
+    // builds, each slot gets a drive letter (C, D, E, ...) + its size
+    // in MiB so the IPL stub's print banner renders a real partition
+    // map at boot time. Single-partition builds pass an empty list and
+    // fall back to the legacy single-partition banner.
+    let stub_partitions: Vec<(char, u64)> = if partitions > 1 {
+        (0..partitions)
+            .map(|i| {
+                (
+                    char::from(b'C' + i as u8),
+                    per_partition_bytes / (1024 * 1024),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let stub_bytes = render_ipl_stub_bytes(stub, &stub_partitions);
+
     // Assemble the disk: boot block + N partition bodies, contiguous.
     let mut disk = vec![0u8; total_bytes as usize];
     let boot_block: Vec<u8> = match variant {
-        HddVariant::Sasi => build_sasi_boot_block(stub, &table).to_vec(),
-        HddVariant::Scsi => build_scsi_boot_block(&SCSI_DESCRIPTOR, stub, &table).to_vec(),
+        HddVariant::Sasi => build_sasi_boot_block_with_stub_bytes(&stub_bytes, &table).to_vec(),
+        HddVariant::Scsi => {
+            build_scsi_boot_block_with_stub_bytes(&SCSI_DESCRIPTOR, &stub_bytes, &table).to_vec()
+        }
     };
     disk[..boot_block.len()].copy_from_slice(&boot_block);
     for (idx, body) in partition_bodies.iter().enumerate() {
