@@ -37,6 +37,7 @@ fn main() {
     let mut stub = IplStub::Print;
     let mut system_disk: Option<String> = None;
     let mut boot_sector_donor: Option<String> = None;
+    let mut partitions: usize = 1;
     let mut args_iter = env::args().skip(1);
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
@@ -50,6 +51,13 @@ fn main() {
             "--boot-sector-donor" => {
                 boot_sector_donor =
                     Some(args_iter.next().expect("--boot-sector-donor needs a path"));
+            }
+            "--partitions" => {
+                partitions = args_iter
+                    .next()
+                    .expect("--partitions needs a number")
+                    .parse()
+                    .expect("--partitions must be an integer");
             }
             other => {
                 if out_path.is_none() {
@@ -73,6 +81,7 @@ fn main() {
         size_mib,
         variant,
         stub,
+        partitions,
         system_disk.as_deref().map(std::path::Path::new),
         boot_sector_donor.as_deref().map(std::path::Path::new),
     )
@@ -92,7 +101,13 @@ fn main() {
         summary.boot_block_bytes,
     );
     println!(
-        "  1 Human partition @ sector {} (byte {}, {} sectors, {} MiB)",
+        "  {} Human partition{} starting @ sector {} (byte {}), {} sectors / {} MiB each",
+        summary.partition_count,
+        if summary.partition_count == 1 {
+            ""
+        } else {
+            "s"
+        },
         summary.partition_start_sector,
         summary.partition_start_byte,
         summary.partition_sectors,

@@ -79,6 +79,16 @@ pub struct NewX68kHddArgs {
     #[arg(long, value_enum, default_value = "print")]
     pub stub: CliStub,
 
+    /// Number of Human68k partitions to carve out (1-8). The disk's
+    /// data area is split equally; partition 1 (slot 0) is the one
+    /// that gets `--system-disk` files and the optional
+    /// `--boot-sector-donor` overlay. Other partitions are formatted
+    /// blank FAT12/16. Defaults to 1 — multi-partition only matters
+    /// when you want separate volumes for system / games / scratch on
+    /// the same HDD.
+    #[arg(long, default_value = "1")]
+    pub partitions: usize,
+
     /// Optional donor Human68k system floppy (flat `.img` or
     /// `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the
     /// builder recursively clones every file and subdirectory from the
@@ -140,6 +150,7 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         size_mib,
         args.variant.into(),
         args.stub.into(),
+        args.partitions,
         args.system_disk.as_deref(),
         args.boot_sector_donor.as_deref(),
     )?;
@@ -158,7 +169,13 @@ pub fn run(args: NewX68kHddArgs) -> Result<()> {
         summary.boot_block_bytes,
     ));
     log_stderr(format!(
-        "  1 Human partition @ sector {} (byte {}, {} sectors, {} MiB)",
+        "  {} Human partition{} starting @ sector {} (byte {}), {} sectors / {} MiB each",
+        summary.partition_count,
+        if summary.partition_count == 1 {
+            ""
+        } else {
+            "s"
+        },
         summary.partition_start_sector,
         summary.partition_start_byte,
         summary.partition_sectors,

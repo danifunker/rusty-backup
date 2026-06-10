@@ -158,9 +158,14 @@ pub struct BuildSummary {
     pub disk_sectors: u64,
     pub sector_size: u64,
     pub boot_block_bytes: usize,
+    /// Number of Human68k partitions carved out (1-8).
+    pub partition_count: usize,
     pub partition_start_sector: u64,
     pub partition_start_byte: u64,
+    /// Per-partition size in logical sectors (same for every partition;
+    /// disk's data area is split evenly).
     pub partition_sectors: u64,
+    /// Per-partition size in bytes (= [`Self::partition_sectors`] × [`Self::sector_size`]).
     pub partition_bytes: u64,
     /// Number of files written into the partition (3 for the seed-only
     /// path, however many the donor had otherwise).
@@ -180,26 +185,35 @@ pub struct BuildSummary {
 ///
 /// `size_mib` is the total disk size in MiB. `variant` chooses SASI vs.
 /// SCSI byte-0 / sector-size / table-offset conventions. `stub` selects
-/// the IPL code variant (halt loop vs. printed banner). If `system_disk`
-/// is `Some(p)`, the partition is populated by recursively cloning every
-/// file + directory from the donor at `p` (decoded through the floppy-
-/// container layer if it's `.dim`/`.D88`/`.xdf`/`.hdm`). Otherwise three
-/// seed text files land in the root.
+/// the IPL code variant (halt loop vs. printed banner). `partitions`
+/// is the number of Human68k partitions to carve out (1-8, default 1);
+/// they split the disk's data area into equal-size slots. If
+/// `system_disk` is `Some(p)`, partition 0 is populated by recursively
+/// cloning every file + directory from the donor at `p` (decoded
+/// through the floppy-container layer if it's `.dim`/`.D88`/`.xdf`/
+/// `.hdm`); other partitions stay blank. Without `system_disk`,
+/// partition 0 gets three seed text files for engine validation.
 ///
-/// If `boot_sector_donor` is `Some(p)`, the donor's partition boot sector
-/// (Sharp IPL Copyright 1990 SHARP) is extracted via
-/// [`extract_partition_boot_sector`] and overlaid onto the output
-/// partition's first sector, eliminating the post-build `SWITCH.X /HD`
-/// step. SCSI only; size must match the donor's partition size. See the
-/// module docs for the well-known `hd0.hds` donor pattern.
+/// If `boot_sector_donor` is `Some(p)`, the donor's partition boot
+/// sector (Sharp IPL Copyright 1990 SHARP) is extracted via
+/// [`extract_partition_boot_sector`] and overlaid onto partition 0's
+/// first sector, eliminating the post-build `SWITCH.X /HD` step. SCSI
+/// only; size must match the donor's partition size. See the module
+/// docs for the well-known `hd0.hds` donor pattern.
 pub fn build_x68k_hdd(
     out_path: &Path,
     size_mib: u64,
     variant: HddVariant,
     stub: IplStub,
+    partitions: usize,
     system_disk: Option<&Path>,
     boot_sector_donor: Option<&Path>,
 ) -> anyhow::Result<BuildSummary> {
+    anyhow::ensure!(
+        (1..=X68K_MAX_PARTITIONS).contains(&partitions),
+        "partitions must be between 1 and {} (got {partitions})",
+        X68K_MAX_PARTITIONS,
+    );
     let sector_size = variant.sector_size();
     let boot_block_bytes = variant.boot_block_bytes();
     let part_start_byte = u64::from(X68K_FIRST_PARTITION_SECTOR) * sector_size;
@@ -214,37 +228,71 @@ pub fn build_x68k_hdd(
         "size_mib={size_mib} leaves no room for the partition body \
          (boot block occupies {part_start_byte} bytes)",
     );
-    let part_bytes_target = total_bytes - part_start_byte;
 
-    let label = Some("RBHDD");
-    let mut body = create_blank_fat(part_bytes_target, label)
-        .map_err(|e| anyhow::anyhow!("create_blank_fat on partition body: {e}"))?;
+    let disk_sectors = total_bytes / sector_size;
+    let part_start_sector = u64::from(X68K_FIRST_PARTITION_SECTOR);
+    let data_sectors = disk_sectors - part_start_sector;
+    let per_partition_sectors = data_sectors / partitions as u64;
+    let per_partition_bytes = per_partition_sectors * sector_size;
+    anyhow::ensure!(
+        per_partition_bytes >= 64 * 1024,
+        "each of the {partitions} partitions would be only {per_partition_bytes} bytes \
+         — bump --size or reduce --partitions",
+    );
 
-    // Pre-read the donor tree (if any) before opening the output
-    // filesystem to avoid double-borrowing the partition body.
+    // Pre-read the donor tree (if any) before opening any output
+    // filesystem to avoid double-borrowing partition bodies.
     let donor_tree: Option<Vec<DonorEntry>> = system_disk.map(read_donor_tree).transpose()?;
     let from_donor = donor_tree.is_some();
 
-    let (files_written, dirs_written) = {
-        let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
-            .map_err(|e| anyhow::anyhow!("open blank partition as Human68k: {e}"))?;
-        let counts = if let Some(tree) = donor_tree {
-            apply_donor_tree(&mut fs, &tree)
-                .map_err(|e| anyhow::anyhow!("apply donor tree: {e}"))?
+    // Create + populate each partition body. Partition 0 gets the
+    // donor system tree (or seed files); partitions 1..N stay blank.
+    let mut partition_bodies: Vec<Vec<u8>> = Vec::with_capacity(partitions);
+    let mut total_files_written: usize = 0;
+    let mut total_dirs_written: usize = 0;
+    for idx in 0..partitions {
+        // Human68k volume labels are limited to 11 ASCII chars; tag
+        // each as RBHDD-N so the user can tell partitions apart in
+        // multi-partition layouts.
+        let label_buf = format!("RBHDD-{}", idx + 1);
+        let label = if partitions == 1 {
+            Some("RBHDD")
         } else {
-            seed_validation_files(&mut fs)
-                .map_err(|e| anyhow::anyhow!("seed validation files: {e}"))?;
-            (3, 0)
+            Some(label_buf.as_str())
         };
-        fs.sync_metadata()
-            .map_err(|e| anyhow::anyhow!("sync metadata: {e}"))?;
-        counts
-    };
+        let mut body = create_blank_fat(per_partition_bytes, label)
+            .map_err(|e| anyhow::anyhow!("create_blank_fat on partition {} body: {e}", idx + 1))?;
+        if idx == 0 {
+            let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
+                .map_err(|e| anyhow::anyhow!("open partition 0 as Human68k: {e}"))?;
+            let (files, dirs) = if let Some(tree) = &donor_tree {
+                apply_donor_tree(&mut fs, tree)
+                    .map_err(|e| anyhow::anyhow!("apply donor tree to partition 0: {e}"))?
+            } else {
+                seed_validation_files(&mut fs)
+                    .map_err(|e| anyhow::anyhow!("seed validation files in partition 0: {e}"))?;
+                (3, 0)
+            };
+            fs.sync_metadata()
+                .map_err(|e| anyhow::anyhow!("sync partition 0 metadata: {e}"))?;
+            total_files_written += files;
+            total_dirs_written += dirs;
+        } else {
+            // Partitions 1..N are formatted FAT12/16 but otherwise
+            // empty. We still open + sync to make sure the blank FS
+            // structures land correctly.
+            let mut fs = Human68kFilesystem::open(Cursor::new(&mut body), 0)
+                .map_err(|e| anyhow::anyhow!("open partition {} as Human68k: {e}", idx + 1))?;
+            fs.sync_metadata()
+                .map_err(|e| anyhow::anyhow!("sync partition {} metadata: {e}", idx + 1))?;
+        }
+        partition_bodies.push(body);
+    }
 
     // Optional Phase D.2: overlay the donor HDD's Sharp partition boot
-    // sector onto the output partition's first sector. This converts the
-    // HDD from "needs SWITCH.X /HD on first FDD0 boot" to "self-boots
-    // straight to C:>".
+    // sector onto partition 0's first sector. Other partitions keep our
+    // own generated BPB (the donor's boot code is single-partition by
+    // design, so multi-partition layouts only use the donor on slot 0).
     let boot_sector_donor_applied = if let Some(donor_path) = boot_sector_donor {
         let donor_sector = extract_partition_boot_sector(donor_path, variant)?;
         anyhow::ensure!(
@@ -254,40 +302,45 @@ pub fn build_x68k_hdd(
             variant.name(),
             sector_size,
         );
+        let p0 = &mut partition_bodies[0];
         anyhow::ensure!(
-            (body.len() as u64) >= sector_size,
-            "output partition is smaller than one sector — can't overlay boot sector",
+            (p0.len() as u64) >= sector_size,
+            "partition 0 is smaller than one sector — can't overlay boot sector",
         );
-        body[..donor_sector.len()].copy_from_slice(&donor_sector);
+        p0[..donor_sector.len()].copy_from_slice(&donor_sector);
         true
     } else {
         false
     };
 
-    let disk_sectors = total_bytes / sector_size;
-    let part_sectors = body.len() as u64 / sector_size;
-    let part_start_sector = u64::from(X68K_FIRST_PARTITION_SECTOR);
-
-    // Build the X68K partition table — slot 0 = Human68k, slots 1..7
-    // remain zero-filled (unused).
+    // Build the X68K partition table — populate `partitions` slots,
+    // each pointing at the right disk-relative start sector.
     let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
     BigEndian::write_u32(&mut table[0..4], X68K_MAGIC);
     BigEndian::write_u32(&mut table[4..8], disk_sectors as u32);
     BigEndian::write_u32(&mut table[8..12], disk_sectors as u32);
-    let e_off = X68K_TABLE_HEADER_SIZE;
-    table[e_off..e_off + 8].copy_from_slice(b"Human   ");
-    BigEndian::write_u32(&mut table[e_off + 8..e_off + 12], part_start_sector as u32);
-    BigEndian::write_u32(&mut table[e_off + 12..e_off + 16], part_sectors as u32);
+    for idx in 0..partitions {
+        let e_off = X68K_TABLE_HEADER_SIZE + idx * X68K_ENTRY_SIZE;
+        table[e_off..e_off + 8].copy_from_slice(b"Human   ");
+        let entry_start = part_start_sector + (idx as u64) * per_partition_sectors;
+        BigEndian::write_u32(&mut table[e_off + 8..e_off + 12], entry_start as u32);
+        BigEndian::write_u32(
+            &mut table[e_off + 12..e_off + 16],
+            per_partition_sectors as u32,
+        );
+    }
 
-    // Assemble the disk: boot block + zero padding + partition body.
+    // Assemble the disk: boot block + N partition bodies, contiguous.
     let mut disk = vec![0u8; total_bytes as usize];
     let boot_block: Vec<u8> = match variant {
         HddVariant::Sasi => build_sasi_boot_block(stub, &table).to_vec(),
         HddVariant::Scsi => build_scsi_boot_block(&SCSI_DESCRIPTOR, stub, &table).to_vec(),
     };
     disk[..boot_block.len()].copy_from_slice(&boot_block);
-    let part_off = part_start_byte as usize;
-    disk[part_off..part_off + body.len()].copy_from_slice(&body);
+    for (idx, body) in partition_bodies.iter().enumerate() {
+        let part_off = (part_start_byte + (idx as u64) * per_partition_bytes) as usize;
+        disk[part_off..part_off + body.len()].copy_from_slice(body);
+    }
 
     std::fs::write(out_path, &disk)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", out_path.display()))?;
@@ -298,12 +351,13 @@ pub fn build_x68k_hdd(
         disk_sectors,
         sector_size,
         boot_block_bytes,
+        partition_count: partitions,
         partition_start_sector: part_start_sector,
         partition_start_byte: part_start_byte,
-        partition_sectors: part_sectors,
-        partition_bytes: body.len() as u64,
-        files_written,
-        dirs_written,
+        partition_sectors: per_partition_sectors,
+        partition_bytes: per_partition_bytes,
+        files_written: total_files_written,
+        dirs_written: total_dirs_written,
         from_donor,
         boot_sector_donor_applied,
     })
@@ -610,8 +664,16 @@ mod tests {
     #[test]
     fn builds_sasi_image_with_seed_files() {
         let tmp = NamedTempFile::new().unwrap();
-        let summary =
-            build_x68k_hdd(tmp.path(), 4, HddVariant::Sasi, IplStub::Halt, None, None).unwrap();
+        let summary = build_x68k_hdd(
+            tmp.path(),
+            4,
+            HddVariant::Sasi,
+            IplStub::Halt,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(summary.variant, HddVariant::Sasi);
         assert_eq!(summary.sector_size, 256);
         assert_eq!(summary.partition_start_sector, 64);
@@ -630,8 +692,16 @@ mod tests {
     #[test]
     fn builds_scsi_image_with_seed_files() {
         let tmp = NamedTempFile::new().unwrap();
-        let summary =
-            build_x68k_hdd(tmp.path(), 4, HddVariant::Scsi, IplStub::Halt, None, None).unwrap();
+        let summary = build_x68k_hdd(
+            tmp.path(),
+            4,
+            HddVariant::Scsi,
+            IplStub::Halt,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(summary.variant, HddVariant::Scsi);
         assert_eq!(summary.sector_size, 1024);
         assert_eq!(summary.partition_start_sector, 64);
@@ -646,8 +716,16 @@ mod tests {
     #[test]
     fn print_stub_lands_in_built_image() {
         let tmp = NamedTempFile::new().unwrap();
-        let _ =
-            build_x68k_hdd(tmp.path(), 4, HddVariant::Sasi, IplStub::Print, None, None).unwrap();
+        let _ = build_x68k_hdd(
+            tmp.path(),
+            4,
+            HddVariant::Sasi,
+            IplStub::Print,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
         let bytes = std::fs::read(tmp.path()).unwrap();
         // The Print stub starts with 0x60 0x02 (BRA.S +2 = fall through)
         // rather than 0x60 0xFE.
@@ -683,8 +761,77 @@ mod tests {
         // SCSI boot block is 0xC00 (3072 bytes) = under 1 MiB but the
         // partition body would be 0 bytes — should fail clean.
         let tmp = NamedTempFile::new().unwrap();
-        let err =
-            build_x68k_hdd(tmp.path(), 0, HddVariant::Scsi, IplStub::Halt, None, None).unwrap_err();
+        let err = build_x68k_hdd(
+            tmp.path(),
+            0,
+            HddVariant::Scsi,
+            IplStub::Halt,
+            1,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("leaves no room") || err.to_string().contains("overlap"));
+    }
+
+    #[test]
+    fn builds_multi_partition_scsi_image() {
+        // 12 MiB / 3 partitions = ~4 MiB each. Verify the X68K table
+        // has 3 Human entries with monotonically increasing start LBAs.
+        let tmp = NamedTempFile::new().unwrap();
+        let summary = build_x68k_hdd(
+            tmp.path(),
+            12,
+            HddVariant::Scsi,
+            IplStub::Halt,
+            3,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.partition_count, 3);
+
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let table_off = 0x800;
+        assert_eq!(&bytes[table_off..table_off + 4], b"X68K");
+        for slot in 0..3 {
+            let e_off = table_off + 0x10 + slot * 0x10;
+            assert_eq!(&bytes[e_off..e_off + 8], b"Human   ", "slot {slot} name");
+        }
+        let slot3_off = table_off + 0x10 + 3 * 0x10;
+        assert!(
+            bytes[slot3_off..slot3_off + 16].iter().all(|&b| b == 0),
+            "slot 3 should be unused"
+        );
+
+        let per_part = summary.partition_sectors as u32;
+        for slot in 0..3 {
+            let e_off = table_off + 0x10 + slot * 0x10;
+            let start = u32::from_be_bytes(bytes[e_off + 8..e_off + 12].try_into().unwrap());
+            let length = u32::from_be_bytes(bytes[e_off + 12..e_off + 16].try_into().unwrap());
+            assert_eq!(start, 64 + (slot as u32) * per_part);
+            assert_eq!(length, per_part);
+        }
+    }
+
+    #[test]
+    fn rejects_partition_count_outside_1_to_8() {
+        let tmp = NamedTempFile::new().unwrap();
+        for bad in [0usize, 9, 10, 100] {
+            let err = build_x68k_hdd(
+                tmp.path(),
+                8,
+                HddVariant::Scsi,
+                IplStub::Halt,
+                bad,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("partitions must be between"),
+                "expected count-range error for {bad}, got: {err}"
+            );
+        }
     }
 }
