@@ -73,6 +73,66 @@ pub const SCSI_IPL_OFFSET: usize = 0x400;
 /// - `60 FE` — `BRA.S (PC - 2)` (i.e. branch back to this instruction)
 pub const IPL_HALT_STUB: &[u8] = &[0x60, 0xFE];
 
+/// Phase B IPL "print" stub — clears the screen, prints a status banner
+/// telling the user the HDD is from rusty-backup, then halts. The IPL ROM
+/// chains in, the user sees the banner and knows their HDD is recognised,
+/// then manually resets to FDD0 to boot Human68k.
+///
+/// Improves over [`IPL_HALT_STUB`] purely on the UX side — same "needs
+/// FDD0" outcome, but with visible confirmation that the chain worked.
+/// Phase D's `--system-disk` flag adds the actual self-boot.
+///
+/// 68000 assembly equivalent (clean-room — written from the public
+/// IOCS function reference at <https://gamesx.com/wiki/doku.php?id=x68000:trap_codes>,
+/// not transcribed from Sharp / Hudson IPL bytes):
+///
+/// ```text
+/// entry:                                        ; byte 0
+///     bra.s     fall_through                    ; 60 02 (satisfies IPL ROM's "byte 0 == $60" check)
+///     dc.b      "RB"                            ; 0x52 0x42 ("rusty-backup" tag)
+/// fall_through:                                 ; byte 4
+///     lea.l     msg(pc), a1                     ; 43 FA NN NN (PC-relative load of msg)
+///     moveq.l   #$21, d0                        ; 70 21  (IOCS B_PRINT function code)
+///     trap      #15                             ; 4E 4F  (IOCS dispatch)
+/// halt:                                         ; byte 12
+///     bra.s     halt                            ; 60 FE  (infinite loop)
+/// msg:                                          ; byte 14
+///     dc.b      "\x1B[2J\x1B[10;28HRusty Backup X68000 HDD\r\n"
+///     dc.b      "\x1B[12;26HBoot Human68k from FDD0 to mount as C:\r\n"
+///     dc.b      0
+/// ```
+///
+/// The IOCS B_PRINT call (function `$21`) takes a null-terminated string
+/// pointer in A1 and writes it to the text console; ANSI escape sequences
+/// for clear-screen (`ESC [ 2 J`) and cursor positioning (`ESC [ row ; col H`)
+/// are interpreted directly by the IPL ROM's console driver.
+pub fn build_print_ipl_stub() -> Vec<u8> {
+    // Message body — ANSI escape sequences are interpreted by the IPL
+    // ROM's console driver, so we get clear-screen + cursor positioning
+    // without writing any framebuffer code ourselves.
+    let mut msg: Vec<u8> = Vec::new();
+    msg.extend_from_slice(b"\x1B[2J"); // clear screen
+    msg.extend_from_slice(b"\x1B[10;28H"); // cursor row 10, col 28
+    msg.extend_from_slice(b"Rusty Backup X68000 HDD\r\n");
+    msg.extend_from_slice(b"\x1B[12;26H"); // cursor row 12, col 26
+    msg.extend_from_slice(b"Boot Human68k from FDD0 to mount as C:\r\n");
+    msg.push(0); // null terminator for B_PRINT
+
+    // Code prelude — exactly 14 bytes so msg lands at byte 14, which makes
+    // the LEA's PC-relative displacement = 14 - (4 + 2) = 8 (PC during the
+    // LEA's second word is at byte 6).
+    let mut code = vec![
+        0x60, 0x02, // bra.s fall_through (jump to byte 4)
+        b'R', b'B', // 2-byte "RB" tag (could be version / magic in future)
+        0x43, 0xFA, 0x00, 0x08, // lea msg(pc), a1 — disp=8, PC=6, target=14
+        0x70, 0x21, // moveq #$21, d0 — IOCS B_PRINT function code
+        0x4E, 0x4F, // trap #15 — IOCS dispatch
+        0x60, 0xFE, // bra.s halt (loop at byte 12)
+    ];
+    code.extend_from_slice(&msg);
+    code
+}
+
 /// 8-byte SASI HDD geometry descriptor for the `\x82w68000W` signature.
 /// Cribbed from `iplrom30.s:Lff09e8` (the IPL ROM's default empty-SASI
 /// descriptor template). Only relevant when emitting the "empty marker"
@@ -88,6 +148,28 @@ pub const IPL_HALT_STUB: &[u8] = &[0x60, 0xFE];
 /// ```
 pub const SASI_EMPTY_GEOMETRY_BYTES: [u8; 8] = [0x40, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x00, 0x00];
 
+/// Which IPL stub variant to write at byte 0 (SASI) / byte `0x400` (SCSI).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum IplStub {
+    /// 2-byte `BRA.S self` halt loop. Smallest possible stub that the IPL
+    /// ROM accepts. No visible output — used as the safe default and by
+    /// Phase A.
+    Halt,
+    /// Clear-screen + printed banner ("Rusty Backup X68000 HDD — Boot
+    /// Human68k from FDD0 to mount as C:") via IOCS B_PRINT, then halt.
+    /// Used by Phase B for visible chain-success confirmation.
+    Print,
+}
+
+impl IplStub {
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Halt => IPL_HALT_STUB.to_vec(),
+            Self::Print => build_print_ipl_stub(),
+        }
+    }
+}
+
 /// Build a SASI boot block: byte-0 IPL stub + zero padding + X68K
 /// partition table at byte `0x400`. The returned buffer is exactly
 /// [`SASI_BOOT_BLOCK_BYTES`] long and ready to be written at byte 0
@@ -96,12 +178,20 @@ pub const SASI_EMPTY_GEOMETRY_BYTES: [u8; 8] = [0x40, 0x00, 0x00, 0x00, 0xfc, 0x
 /// `partition_table_bytes` must be the 144-byte block produced by
 /// [`crate::partition::x68k::X68kPartitionTable::to_bytes`].
 pub fn build_sasi_boot_block(
+    stub: IplStub,
     partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
 ) -> [u8; SASI_BOOT_BLOCK_BYTES] {
     let mut block = [0u8; SASI_BOOT_BLOCK_BYTES];
-    // Byte 0: minimal IPL stub. The IPL ROM JMPs here after reading the
-    // boot block; we BRA.S to self and halt.
-    block[..IPL_HALT_STUB.len()].copy_from_slice(IPL_HALT_STUB);
+    // Byte 0: IPL stub. The IPL ROM JSRs here after reading the boot
+    // block; the chosen stub either halts or prints a banner + halts.
+    let stub_bytes = stub.bytes();
+    assert!(
+        stub_bytes.len() <= SASI_TABLE_OFFSET,
+        "IPL stub ({} bytes) overlaps the SASI partition table at 0x{:x}",
+        stub_bytes.len(),
+        SASI_TABLE_OFFSET,
+    );
+    block[..stub_bytes.len()].copy_from_slice(&stub_bytes);
     // Byte 0x400: partition table (144 bytes, padded with zeros to the
     // end of the boot block).
     block[SASI_TABLE_OFFSET..SASI_TABLE_OFFSET + partition_table_bytes.len()]
@@ -118,6 +208,7 @@ pub fn build_sasi_boot_block(
 /// byte 0x10 is filled in automatically.
 pub fn build_scsi_boot_block(
     descriptor: &[u8; 8],
+    stub: IplStub,
     partition_table_bytes: &[u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE],
 ) -> [u8; SCSI_BOOT_BLOCK_BYTES] {
     let mut block = [0u8; SCSI_BOOT_BLOCK_BYTES];
@@ -129,8 +220,17 @@ pub fn build_scsi_boot_block(
     // BlueSCSI, ZuluSCSI, NetBSD-prepared) all carry this exact text.
     let ksg = b"Human68K SCSI-DISK by Keisoku Giken\0\0\0\0\0";
     block[16..16 + ksg.len()].copy_from_slice(ksg);
-    // Byte 0x400: IPL stub. Same minimal halt-loop as SASI for Phase A.
-    block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + IPL_HALT_STUB.len()].copy_from_slice(IPL_HALT_STUB);
+    // Byte 0x400: IPL stub. The SCSI variant places the IPL after the
+    // signature header rather than at byte 0.
+    let stub_bytes = stub.bytes();
+    assert!(
+        SCSI_IPL_OFFSET + stub_bytes.len() <= SCSI_TABLE_OFFSET,
+        "IPL stub ({} bytes) at 0x{:x} overlaps the SCSI partition table at 0x{:x}",
+        stub_bytes.len(),
+        SCSI_IPL_OFFSET,
+        SCSI_TABLE_OFFSET,
+    );
+    block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + stub_bytes.len()].copy_from_slice(&stub_bytes);
     // Byte 0x800: partition table.
     block[SCSI_TABLE_OFFSET..SCSI_TABLE_OFFSET + partition_table_bytes.len()]
         .copy_from_slice(partition_table_bytes);
@@ -158,7 +258,7 @@ mod tests {
         table[1] = b'6';
         table[2] = b'8';
         table[3] = b'K';
-        let block = build_sasi_boot_block(&table);
+        let block = build_sasi_boot_block(IplStub::Halt, &table);
         assert_eq!(block.len(), SASI_BOOT_BLOCK_BYTES);
         assert_eq!(&block[0..2], IPL_HALT_STUB);
         // Padding between the IPL stub and the table is all zeros.
@@ -172,7 +272,7 @@ mod tests {
         let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
         table[0..4].copy_from_slice(b"X68K");
         let descriptor = [0x02, 0x00, 0x00, 0x1d, 0xaf, 0xff, 0x01, 0x00];
-        let block = build_scsi_boot_block(&descriptor, &table);
+        let block = build_scsi_boot_block(&descriptor, IplStub::Halt, &table);
         assert_eq!(block.len(), SCSI_BOOT_BLOCK_BYTES);
         // Byte 0: X68SCSI1 magic.
         assert_eq!(&block[0..8], X68K_SCSI_SIGNATURE);
@@ -183,6 +283,59 @@ mod tests {
         // Byte 0x400: IPL halt stub.
         assert_eq!(&block[SCSI_IPL_OFFSET..SCSI_IPL_OFFSET + 2], IPL_HALT_STUB);
         // Byte 0x800: partition table.
+        assert_eq!(&block[SCSI_TABLE_OFFSET..SCSI_TABLE_OFFSET + 4], b"X68K");
+    }
+
+    #[test]
+    fn print_stub_starts_with_bra_and_satisfies_ipl_check() {
+        let stub = build_print_ipl_stub();
+        // Byte 0 must be $60 (BRA opcode) — the Sharp IPL ROM checks
+        // `cmpi.b #$60, (a0)` at iplrom30.s:4181 before JSRing to our code.
+        assert_eq!(stub[0], 0x60);
+        // The BRA.S +2 lands at byte 4, where the LEA / MOVEQ / TRAP /
+        // BRA.S-halt sequence lives.
+        assert_eq!(stub[1], 0x02);
+        // LEA msg(pc), a1 at byte 4 with displacement 8 (msg lives at
+        // byte 14 = (4 + 2) + 8).
+        assert_eq!(&stub[4..8], &[0x43, 0xFA, 0x00, 0x08]);
+        // MOVEQ #$21, D0 = IOCS B_PRINT
+        assert_eq!(&stub[8..10], &[0x70, 0x21]);
+        // TRAP #15 = IOCS dispatch
+        assert_eq!(&stub[10..12], &[0x4E, 0x4F]);
+        // BRA.S self halt at byte 12
+        assert_eq!(&stub[12..14], &[0x60, 0xFE]);
+        // Message starts at byte 14 with ANSI clear-screen sequence
+        assert_eq!(&stub[14..18], b"\x1B[2J");
+        // Message ends with a null terminator (B_PRINT contract)
+        assert_eq!(*stub.last().unwrap(), 0);
+        // Recognisable banner text appears somewhere in the message body
+        assert!(stub.windows(23).any(|w| w == b"Rusty Backup X68000 HDD"));
+    }
+
+    #[test]
+    fn sasi_block_with_print_stub_keeps_table_at_0x400() {
+        // The print stub is ~100 bytes — much larger than the halt stub,
+        // but still well under the 0x400 table offset, so the SASI block
+        // layout stays sound.
+        let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
+        table[0..4].copy_from_slice(b"X68K");
+        let block = build_sasi_boot_block(IplStub::Print, &table);
+        assert_eq!(block.len(), SASI_BOOT_BLOCK_BYTES);
+        assert_eq!(block[0], 0x60); // BRA opcode
+        assert_eq!(&block[SASI_TABLE_OFFSET..SASI_TABLE_OFFSET + 4], b"X68K");
+    }
+
+    #[test]
+    fn scsi_block_with_print_stub_keeps_table_at_0x800() {
+        let mut table = [0u8; X68K_TABLE_HEADER_SIZE + X68K_MAX_PARTITIONS * X68K_ENTRY_SIZE];
+        table[0..4].copy_from_slice(b"X68K");
+        let descriptor = [0x02, 0x00, 0x00, 0x1d, 0xaf, 0xff, 0x01, 0x00];
+        let block = build_scsi_boot_block(&descriptor, IplStub::Print, &table);
+        // Byte 0 still the SCSI signature
+        assert_eq!(&block[0..8], X68K_SCSI_SIGNATURE);
+        // IPL at byte 0x400 starts with BRA opcode
+        assert_eq!(block[SCSI_IPL_OFFSET], 0x60);
+        // Table still at byte 0x800
         assert_eq!(&block[SCSI_TABLE_OFFSET..SCSI_TABLE_OFFSET + 4], b"X68K");
     }
 }

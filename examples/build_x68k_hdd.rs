@@ -44,7 +44,8 @@ use rusty_backup::partition::x68k::{
     X68K_TABLE_HEADER_SIZE,
 };
 use rusty_backup::partition::x68k_ipl::{
-    build_sasi_boot_block, build_scsi_boot_block, SASI_BOOT_BLOCK_BYTES, SCSI_BOOT_BLOCK_BYTES,
+    build_sasi_boot_block, build_scsi_boot_block, IplStub, SASI_BOOT_BLOCK_BYTES,
+    SCSI_BOOT_BLOCK_BYTES,
 };
 
 /// SASI logical sector size (matches real Sharp / Hudson SASI HDDs +
@@ -87,10 +88,13 @@ fn main() {
     let mut out_path: Option<String> = None;
     let mut size_mib: u64 = 8;
     let mut variant = Variant::Sasi;
+    let mut stub = IplStub::Print;
     for arg in env::args().skip(1) {
         match arg.as_str() {
             "--scsi" => variant = Variant::Scsi,
             "--sasi" => variant = Variant::Sasi,
+            "--halt-stub" => stub = IplStub::Halt,
+            "--print-stub" => stub = IplStub::Print,
             other => {
                 if out_path.is_none() {
                     out_path = Some(other.to_string());
@@ -102,7 +106,8 @@ fn main() {
             }
         }
     }
-    let out_path = out_path.expect("usage: build_x68k_hdd <out.hdf> [size_mib] [--scsi]");
+    let out_path = out_path
+        .expect("usage: build_x68k_hdd <out.hdf> [size_mib] [--scsi] [--halt-stub|--print-stub]");
 
     let sector_size = variant.sector_size();
     let boot_block_bytes = variant.boot_block_bytes();
@@ -180,8 +185,8 @@ fn main() {
     // Assemble the disk: boot block + zero padding + partition body.
     let mut disk = vec![0u8; total_bytes as usize];
     let boot_block: Vec<u8> = match variant {
-        Variant::Sasi => build_sasi_boot_block(&table).to_vec(),
-        Variant::Scsi => build_scsi_boot_block(&SCSI_DESCRIPTOR, &table).to_vec(),
+        Variant::Sasi => build_sasi_boot_block(stub, &table).to_vec(),
+        Variant::Scsi => build_scsi_boot_block(&SCSI_DESCRIPTOR, stub, &table).to_vec(),
     };
     disk[..boot_block.len()].copy_from_slice(&boot_block);
     let part_off = part_start_byte as usize;
