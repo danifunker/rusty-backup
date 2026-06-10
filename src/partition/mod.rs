@@ -8,6 +8,7 @@ pub mod rdb;
 pub mod resize;
 pub mod sgi;
 pub mod x68k;
+pub mod x68k_ipl;
 
 use std::io::{Read, Seek, SeekFrom};
 
