@@ -58,6 +58,12 @@ pub enum Command {
     /// D, partition-table-wrapped).
     New(verbs::new::NewArgs),
 
+    /// Build a self-bootable Sharp X68000 HDD image (SASI / SCSI) with
+    /// an X68K partition table + IPL stub + Human68k partition,
+    /// optionally pre-populated by cloning a Human68k donor floppy.
+    #[command(name = "new-x68k-hdd")]
+    NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
+
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
@@ -241,6 +247,7 @@ pub fn run(cli: Cli) -> Result<()> {
 pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
+        Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),

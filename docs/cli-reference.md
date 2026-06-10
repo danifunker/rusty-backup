@@ -674,6 +674,25 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 
+### `new-x68k-hdd`
+
+Build a self-bootable Sharp X68000 HDD image (SASI / SCSI) with an X68K partition table + IPL stub + Human68k partition, optionally pre-populated by cloning a Human68k donor floppy
+
+```
+Usage: new-x68k-hdd [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--size` — Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `8M`, `16M`). Defaults to `16M` — large enough for a full Human68k system clone plus room for user files
+- `--variant` — Sharp HDD controller convention to emit
+- `--stub` — Which byte-0 IPL stub to write. `print` (default) renders a status banner via IOCS; `halt` is the bare minimum 2-byte halt loop
+- `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
+
 ### `optical`
 
 Optical-media verbs (rip / convert / browse / extract)

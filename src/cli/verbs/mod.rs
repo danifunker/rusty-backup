@@ -26,6 +26,7 @@ pub mod locate;
 pub mod ls;
 pub mod mkdir;
 pub mod new;
+pub mod new_x68k_hdd;
 #[cfg(feature = "optical")]
 pub mod optical;
 pub mod partmap;
