@@ -47,6 +47,7 @@ pub mod qdos;
 pub mod qdos_mdv;
 pub mod reiserfs;
 pub mod resource_fork;
+pub mod rsdos;
 pub mod sfs;
 pub mod tree;
 pub mod ufs;
@@ -370,6 +371,14 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // the exact disk geometry + a plausible VTOC at sector 360.
     if atari_dos::looks_like_atari_dos(reader, partition_offset).is_some() {
         return "ataridos";
+    }
+
+    // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc, 35- or 40-track). No magic
+    // number; `looks_like_rsdos` gates on exact geometry AND a structurally
+    // consistent granule table + directory so OS-9 (same byte size) and
+    // random blobs are rejected.
+    if rsdos::looks_like_rsdos(reader, partition_offset).is_some() {
+        return "rsdos";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1264,6 +1273,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1575,6 +1588,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ataridos" => Ok(Box::new(atari_dos::AtariDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

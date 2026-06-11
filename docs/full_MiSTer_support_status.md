@@ -16,6 +16,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
   bidirectionally cross-validated against the `c1541` / Python `d64`
   reference), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
+  RS-DOS / CoCo Disk BASIC (read + write, raw 35- / 40-track `.dsk` / `.jvc`;
+  cross-validated against an independent clean-room reader/writer derived
+  from the toolshed `libdecb` semantics),
   ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
@@ -67,8 +70,8 @@ Legend for the **Support** column:
 | BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
 | AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |
-| CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **No** |
-| CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **No** |
+| CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **Partial** — `fs::rsdos` reads + writes RS-DOS / Disk BASIC (granule allocation table on track 17, 72-file directory, granule-chain files; raw 35- / 40-track `.dsk` / `.jvc`). Read/extract + add/delete bidirectionally cross-validated against an independent clean-room reader/writer derived from the toolshed `libdecb` semantics. DragonDOS and OS-9 RBF still pending. |
+| CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Partial** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2). OS-9 / NitrOS-9 RBF pending. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
 | Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |

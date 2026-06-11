@@ -21,7 +21,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82", "atr", "xfd",
+    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -145,6 +145,19 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing Atari disk extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn coco_disk_family_present() {
+        // CoCo Disk BASIC (RS-DOS) disk images (`src/fs/rsdos.rs`) for the
+        // CoCo2 / CoCo3 MiSTer cores. `.dsk` is the common raw dump; `.jvc`
+        // and `.vdk` are CoCo-specific container extensions.
+        for must in ["dsk", "jvc", "vdk"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing CoCo disk extension {must}"
             );
         }
     }

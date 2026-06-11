@@ -379,6 +379,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("Atari DOS".to_string());
     }
 
+    // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc). No magic; gated on exact
+    // geometry + a structurally consistent granule table + directory.
+    if crate::fs::rsdos::looks_like_rsdos(reader, 0).is_some() {
+        return Some("RS-DOS".to_string());
+    }
+
     None
 }
 
