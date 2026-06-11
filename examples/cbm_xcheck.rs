@@ -22,6 +22,8 @@ fn variant_from(s: &str) -> CbmVariant {
         "d64_40" => CbmVariant::D64_40,
         "d71" => CbmVariant::D71,
         "d81" => CbmVariant::D81,
+        "d80" => CbmVariant::D80,
+        "d82" => CbmVariant::D82,
         other => panic!("unknown variant {other}"),
     }
 }

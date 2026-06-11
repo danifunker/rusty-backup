@@ -302,7 +302,7 @@ readable.
 | Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
 | Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
-| Commodore disk | `.d64`, `.d71`, `.d81` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (cross-validated against the `c1541` / `d64` reference). |
+| Commodore disk | `.d64`, `.d71`, `.d81`, `.d80`, `.d82` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 + PET 8050 / 8250 (IEEE-488) flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (bidirectionally cross-validated against the `c1541` / Python `d64` reference). |
 | Commodore GCR  | `.g64`          | Yes (decode) | No        | Raw 1541 GCR track image (preservation-grade). Decoded to flat sectors so the CBM engine can read it; `.g71` (1571) detected but not yet decoded. |
 | Sharp D88      | `.d88`          | Yes            | Yes (convert + in-place edit) | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container. Add/delete/mkdir on the contained Human68k FAT volume persist back into the container (decode -> edit -> re-encode). |
 | X68000 XDF     | `.xdf`          | Yes            | Yes (convert + in-place edit) | Raw headerless X68000 floppy dump; geometry inferred from size. In-place file add/delete/edit supported. |
@@ -337,7 +337,7 @@ inspect-tab Edit Mode.
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. |
 | btrfs          | Yes    | No   | No              | —    | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes  | Yes             | —    | Apple II / IIgs |
-| CBM DOS (1541 / 1571 / 1581) | Yes | Yes | — (floppy, fixed geometry) | — | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81`. |
+| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Yes | Yes | — (floppy, fixed geometry) | — | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81` / `.d80` / `.d82`; `.g64` GCR decoded to sectors. |
 | Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | — | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. |
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
@@ -430,7 +430,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **MultiComp**                  | CP/M (`multicomp` DPB) | Floppy `.dsk` |
 | **C64 / C128**                 | CBM DOS (1541 / 1571 / 1581, read + write) | Floppy `.d64` / `.d71` / `.d81` |
 | **VIC20 / C16 / Plus-4**       | CBM DOS (1541, read + write) | Floppy `.d64` |
-| **PET / CBM-II**               | CBM DOS (1541, read + write; 8050/8250 `.d80`/`.d82` pending) | Floppy `.d64` |
+| **PET / CBM-II**               | CBM DOS (1541 + 8050/8250 IEEE-488, read + write) | Floppy `.d64` / `.d80` / `.d82` |
 
 For X68000 specifically, the floppy converter lets you take an image
 in any of the four formats Sharp tooling and MiSTer cores expect — XDF

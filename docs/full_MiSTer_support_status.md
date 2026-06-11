@@ -13,9 +13,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
   altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
-  CBM DOS (1541 / 1571 / 1581 read + write; cross-validated against the
-  `c1541` / Python `d64` reference), ANDOS (detect-only scaffold),
-  ISO9660 (optical browse).
+  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
+  bidirectionally cross-validated against the `c1541` / Python `d64`
+  reference), ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
@@ -62,7 +62,7 @@ Legend for the **Support** column:
 | C128 | Commodore 128 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` / `.d71` / `.d81`. |
 | C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
 | VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
-| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **Partial** — `.d64` (1541/2031/4040-compatible) read/write works; the 8050/8250 `.d80`/`.d82` IEEE-488 geometries are **not implemented** (they use a different multi-sector BAM layout + directory-on-track-39 — needs new geometry + BAM code in `fs::cbm`). |
+| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **Yes** — `fs::cbm` reads + writes the 8050 `.d80` (533248 B, 77 trk) and 8250 `.d82` (1066496 B, 154 trk) geometries: 29/27/25/23 zone map, BAM on track 38 (2–4 chained sectors, 5-byte/track entries), directory on track 39. Bidirectionally cross-validated against the Python `d64` reference (read + write byte-exact). `.d64` (1541/2031/4040) also works. |
 | BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
 | AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |

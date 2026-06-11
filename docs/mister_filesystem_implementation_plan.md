@@ -49,6 +49,24 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-11 (Wave 3 gap #1 — PET 8050/8250 `.d80`/`.d82`) — Extended
+  `fs::cbm` with `CbmVariant::{D80, D82}`: the PET/CBM IEEE-488 geometries
+  (8050 = 533248 B / 77 trk; 8250 = 1066496 B / 154 trk, side 2 mirrors
+  side 1). 29/27/25/23-sector zone map; the BAM lives on its own track
+  (38) as a 2–4-sector chain with 5-byte-per-track entries (free + 4
+  bitmap bytes, `bam_idx = (track-1)/50`); header + directory on track 39;
+  the header links to the BAM chain (which ends at the directory) rather
+  than the directory directly, so `dir_start` returns the fixed T39S1.
+  Dedicated `create_blank_pet` (layout ground-truthed byte-for-byte from
+  the Python `d64` reference). Detection (`looks_like_cbm`) keys on the
+  T39S0 'C' DOS version + "2C" DOS type + BAM-track link. **Bidirectional
+  oracle validation**: my engine reads the d64-lib-written D80/D82 files
+  byte-exact, and the oracle reads my engine's D80/D82 (incl. a 2000-byte
+  multi-block SEQ) byte-exact; blank free-block counts match the
+  documented 8050/8250 values (2052 / 4133 — note d64-lib itself is more
+  conservative). `.d80`/`.d82` added to DISK_IMAGE_EXTS; `rb-cli
+  inspect/ls` works. 1788 lib tests (+2 PET) green, zero warnings. **Next:**
+  `.g71` GCR (needs a real 1571 sample), or a fresh Wave-3 FS (Atari DOS).
 - 2026-06-11 (Wave 3 gap #2 — Commodore `.g64` GCR decoder) — Added
   `src/rbformats/containers/g64.rs`: a full GCR (Group Coded Recording)
   codec turning a 1541 raw-track `.g64` into a flat `.d64` the cbm engine
@@ -655,7 +673,7 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
-- [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **Remaining:** PET 8050/8250 `.d80`/`.d82` geometry (**not implemented** — different multi-sector BAM + dir-on-track-39; the `CbmVariant` enum is D64/D64_40/D71/D81 only); `.g71` GCR (1571 side-1 half-track mapping needs a real sample; `.g64` 1541 GCR **ships now** — decode + encode + cbm e2e, `src/rbformats/containers/g64.rs`).
+- [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **Remaining:** `.g71` GCR (1571 side-1 half-track mapping needs a real sample; `.g64` 1541 GCR **ships now** — decode + encode + cbm e2e, `src/rbformats/containers/g64.rs`). **PET 8050/8250 `.d80`/`.d82` now ship** (read + write, bidirectionally oracle-validated — see session log).
 - [~] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse the Wave-2 CP/M engine + DPB presets (all shipped: `amstrad_data`/`amstrad_sys`/`amstrad_pcw`/`einstein`/`svi328_cpm`/`multicomp`/`zx_plus3`). · [x] DPB presets (cpm_diskdefs.rs) · [x] **CLI dispatch now works for every floppy geometry** — `rb-cli {ls,get,put,rm} --fs-type cpm:<preset>` round-trips on the committed Amstrad fixture (184320 B). The blocker was that `PartitionTable::detect` hard-errored on flat CP/M discs whose size isn't a whitelisted "floppy size" (only Altair's 256256 B was), *before* the `--fs-type` override could apply; fixed by making detection failure non-fatal when `--fs-type` is forced (`cli::resolve::resolve_with_override`). Regression-pinned in tests/cli_cpm_floppy.rs. · [ ] per-core on-MiSTer boot verify (user-side §7). **Remaining:** EDSK-wrapped `.dsk` already decodes via source_reader; the per-core confirmation is just user-side core boots.
 - [ ] **Atari800** (Atari DOS) — full spine
 - [ ] **CoCo2/3** (RS-DOS/DragonDOS + OS-9 RBF — two FS) — full spine ×2

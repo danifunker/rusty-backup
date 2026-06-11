@@ -79,6 +79,10 @@ pub enum CbmVariant {
     D71,
     /// 1581 3.5", 80 tracks × 40 sectors (819200 bytes).
     D81,
+    /// 8050 (PET/CBM IEEE-488), single-sided, 77 tracks (533248 bytes).
+    D80,
+    /// 8250 (PET/CBM IEEE-488), double-sided, 154 tracks (1066496 bytes).
+    D82,
 }
 
 impl CbmVariant {
@@ -92,6 +96,8 @@ impl CbmVariant {
             196_608 | 197_376 => Some(CbmVariant::D64_40),
             349_696 | 351_062 => Some(CbmVariant::D71),
             819_200 => Some(CbmVariant::D81),
+            533_248 => Some(CbmVariant::D80),
+            1_066_496 => Some(CbmVariant::D82),
             _ => None,
         }
     }
@@ -103,6 +109,8 @@ impl CbmVariant {
             CbmVariant::D64_40 => 40,
             CbmVariant::D71 => 70,
             CbmVariant::D81 => 80,
+            CbmVariant::D80 => 77,
+            CbmVariant::D82 => 154,
         }
     }
 
@@ -110,6 +118,17 @@ impl CbmVariant {
     pub fn sectors_in_track(self, track: u8) -> u8 {
         match self {
             CbmVariant::D81 => 40,
+            CbmVariant::D80 | CbmVariant::D82 => {
+                // 8050/8250 zone map. The 8250 mirrors the 77-track side-1
+                // layout onto side 2 (tracks 78-154).
+                let t = if track > 77 { track - 77 } else { track };
+                match t {
+                    1..=39 => 29,
+                    40..=53 => 27,
+                    54..=64 => 25,
+                    _ => 23,
+                }
+            }
             CbmVariant::D64 | CbmVariant::D64_40 | CbmVariant::D71 => {
                 // 1541 zone map. The 1571 mirrors it onto side 2 (tracks
                 // 36–70); the 40-track 1541 just extends the outermost
@@ -133,8 +152,24 @@ impl CbmVariant {
     fn dir_track(self) -> u8 {
         match self {
             CbmVariant::D81 => 40,
+            CbmVariant::D80 | CbmVariant::D82 => 39,
             _ => 18,
         }
+    }
+
+    /// Track holding the BAM. Same as the directory track for the 1541 /
+    /// 1571 / 1581; the 8050/8250 keep the BAM on its own track (38).
+    fn bam_track(self) -> u8 {
+        match self {
+            CbmVariant::D80 | CbmVariant::D82 => 38,
+            _ => self.dir_track(),
+        }
+    }
+
+    /// Number of chained BAM sectors on [`bam_track`] for the 8050/8250
+    /// (50 track-entries per sector). Other variants don't use this.
+    fn num_bam_sectors(self) -> usize {
+        (self.tracks() as usize - 1) / 50 + 1
     }
 
     /// Total addressable sectors (= image length / 256).
@@ -160,6 +195,8 @@ impl CbmVariant {
             CbmVariant::D64 | CbmVariant::D64_40 => "CBM DOS (1541)",
             CbmVariant::D71 => "CBM DOS (1571)",
             CbmVariant::D81 => "CBM DOS (1581)",
+            CbmVariant::D80 => "CBM DOS (8050)",
+            CbmVariant::D82 => "CBM DOS (8250)",
         }
     }
 }
@@ -182,20 +219,34 @@ pub fn looks_like_cbm<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> 
     let mut buf = [0u8; SECTOR_BYTES];
     reader.read_exact(&mut buf).ok()?;
 
-    let dir_track = variant.dir_track();
-    // The header links to the first directory sector on the dir track.
-    if buf[0] != dir_track || buf[1] == 0 || buf[1] >= variant.sectors_in_track(dir_track) {
-        return None;
-    }
     let signature_ok = match variant {
         CbmVariant::D81 => {
+            // Header links to the first directory sector on the dir track.
             // DOS version 'D'; DOS-type "3D" at 0x19..0x1B.
-            buf[0x02] == b'D' && buf[0x19] == b'3' && buf[0x1A] == b'D'
+            buf[0] == variant.dir_track()
+                && buf[1] != 0
+                && buf[0x02] == b'D'
+                && buf[0x19] == b'3'
+                && buf[0x1A] == b'D'
+        }
+        CbmVariant::D80 | CbmVariant::D82 => {
+            // The 8050/8250 header (T39S0) links to the *BAM* track (38),
+            // not the directory. DOS version 'C'; DOS-type "2C" at 0x1B.
+            buf[0] == variant.bam_track()
+                && buf[0x02] == b'C'
+                && buf[0x1B] == b'2'
+                && buf[0x1C] == b'C'
         }
         _ => {
+            // Header links to the first directory sector on the dir track.
             // DOS version 'A'; DOS-type "2x" at 0xA5..0xA7 (1541 = "2A",
             // some 1571 variants "2C"/"2D").
-            buf[0x02] == b'A' && buf[0xA5] == b'2' && buf[0xA6].is_ascii_uppercase()
+            buf[0] == variant.dir_track()
+                && buf[1] != 0
+                && buf[1] < variant.sectors_in_track(variant.dir_track())
+                && buf[0x02] == b'A'
+                && buf[0xA5] == b'2'
+                && buf[0xA6].is_ascii_uppercase()
         }
     };
     signature_ok.then_some(variant)
@@ -442,6 +493,7 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
     fn load_header(&mut self) -> Result<(), FilesystemError> {
         let (name_off, id_off) = match self.variant {
             CbmVariant::D81 => (0x04usize, 0x16usize),
+            CbmVariant::D80 | CbmVariant::D82 => (0x06usize, 0x18usize),
             _ => (0x90usize, 0xA2usize),
         };
         let dir_track = self.variant.dir_track();
@@ -454,6 +506,12 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
     /// (track, sector) of the first directory entry sector.
     fn dir_start(&mut self) -> Result<(u8, u8), FilesystemError> {
         let dir_track = self.variant.dir_track();
+        // The 8050/8250 header links to the BAM chain (which ends at the
+        // directory), not to the directory directly — so the directory is
+        // at the fixed T39S1.
+        if matches!(self.variant, CbmVariant::D80 | CbmVariant::D82) {
+            return Ok((dir_track, 1));
+        }
         let hdr = self.read_sector(dir_track, 0)?;
         // Bytes 0-1 of the header link to the first directory sector.
         let (t, s) = (hdr[0], hdr[1]);
@@ -742,6 +800,22 @@ impl<R: Read + Write + Seek + Send> CbmFilesystem<R> {
                     bits[t as usize - 1][..5].copy_from_slice(&blk[o + 1..o + 6]);
                 }
             }
+            CbmVariant::D80 | CbmVariant::D82 => {
+                // Chained BAM sectors on track 38 (38/0, 38/3, [38/6, 38/9]).
+                // 50 track-entries per sector, 5 bytes each (free + 4 bitmap
+                // bytes) starting at offset 6.
+                let bam_blocks: Vec<[u8; SECTOR_BYTES]> = (0..variant.num_bam_sectors())
+                    .map(|i| self.read_sector(38, (i * 3) as u8))
+                    .collect::<Result<_, _>>()?;
+                for t in 1..=tracks {
+                    let idx = (t as usize - 1) / 50;
+                    let low = idx * 50 + 1;
+                    let o = 6 + (t as usize - low) * 5;
+                    let blk = &bam_blocks[idx];
+                    free[t as usize - 1] = blk[o];
+                    bits[t as usize - 1][..4].copy_from_slice(&blk[o + 1..o + 5]);
+                }
+            }
         }
         Ok(Bam {
             variant,
@@ -792,6 +866,22 @@ impl<R: Read + Write + Seek + Send> CbmFilesystem<R> {
                 }
                 self.write_sector(40, 1, &b1)?;
                 self.write_sector(40, 2, &b2)?;
+            }
+            CbmVariant::D80 | CbmVariant::D82 => {
+                let num = self.variant.num_bam_sectors();
+                let mut blocks: Vec<[u8; SECTOR_BYTES]> = (0..num)
+                    .map(|i| self.read_sector(38, (i * 3) as u8))
+                    .collect::<Result<_, _>>()?;
+                for t in 1..=self.variant.tracks() {
+                    let idx = (t as usize - 1) / 50;
+                    let low = idx * 50 + 1;
+                    let o = 6 + (t as usize - low) * 5;
+                    blocks[idx][o] = bam.free[t as usize - 1];
+                    blocks[idx][o + 1..o + 5].copy_from_slice(&bam.bits[t as usize - 1][..4]);
+                }
+                for (i, blk) in blocks.iter().enumerate() {
+                    self.write_sector(38, (i * 3) as u8, blk)?;
+                }
             }
         }
         Ok(())
@@ -1141,6 +1231,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
 /// This is the single source of truth for the on-disk format layout used
 /// by tests, the `rb-cli new` path, and external-oracle cross-checks.
 pub fn create_blank(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>, FilesystemError> {
+    if matches!(variant, CbmVariant::D80 | CbmVariant::D82) {
+        return create_blank_pet(variant, name, id);
+    }
     let total = variant.total_sectors() as usize * SECTOR_BYTES;
     let mut img = vec![0u8; total];
 
@@ -1270,8 +1363,102 @@ pub fn create_blank(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>
                 img[o + 1..o + 6].copy_from_slice(&bam.bits[t as usize - 1][..5]);
             }
         }
+        // The 8050/8250 take the dedicated `create_blank_pet` path above.
+        CbmVariant::D80 | CbmVariant::D82 => unreachable!(),
     }
 
+    Ok(img)
+}
+
+/// Build a blank 8050 (`.d80`) / 8250 (`.d82`) image. The PET/CBM IEEE-488
+/// drives keep the BAM on its own track (38, 2–4 chained sectors with
+/// 5-byte-per-track entries) and the header + directory on track 39; the
+/// header links to the BAM chain (which ends at the directory), not the
+/// directory directly. Layout verified byte-for-byte against the Python
+/// `d64` reference.
+fn create_blank_pet(variant: CbmVariant, name: &str, id: &str) -> Result<Vec<u8>, FilesystemError> {
+    let tracks = variant.tracks();
+    let total = variant.total_sectors() as usize * SECTOR_BYTES;
+    let mut img = vec![0u8; total];
+    let ts_off = |track: u8, sector: u8| -> usize {
+        let mut acc = 0usize;
+        for t in 1..track {
+            acc += variant.sectors_in_track(t) as usize * SECTOR_BYTES;
+        }
+        acc + sector as usize * SECTOR_BYTES
+    };
+
+    // Working BAM: all free, then reserve the structural sectors.
+    let mut bam = Bam {
+        variant,
+        free: (1..=tracks).map(|t| variant.sectors_in_track(t)).collect(),
+        bits: {
+            let mut v = vec![[0u8; 5]; tracks as usize];
+            for t in 1..=tracks {
+                let spt = variant.sectors_in_track(t);
+                for s in 0..spt {
+                    v[(t - 1) as usize][(s / 8) as usize] |= 1 << (s % 8);
+                }
+            }
+            v
+        },
+    };
+    let num_bam = variant.num_bam_sectors();
+    for i in 0..num_bam {
+        bam.set(38, (i * 3) as u8, false); // BAM blocks on track 38
+    }
+    bam.set(39, 0, false); // header
+    bam.set(39, 1, false); // first directory sector
+
+    // Header at 39/0: link to the first BAM block (not the directory).
+    let hdr = ts_off(39, 0);
+    img[hdr] = 38;
+    img[hdr + 1] = 0;
+    img[hdr + 0x02] = b'C';
+    let raw_name = encode_petscii_name(name)?;
+    let mut raw_id = [PAD; 2];
+    for (i, b) in id.bytes().take(2).enumerate() {
+        raw_id[i] = b;
+    }
+    img[hdr + 0x06..hdr + 0x06 + NAME_LEN].copy_from_slice(&raw_name);
+    img[hdr + 0x16] = PAD;
+    img[hdr + 0x17] = PAD;
+    img[hdr + 0x18] = raw_id[0];
+    img[hdr + 0x19] = raw_id[1];
+    img[hdr + 0x1A] = PAD;
+    img[hdr + 0x1B] = b'2';
+    img[hdr + 0x1C] = b'C';
+    for o in 0x1D..=0x20 {
+        img[hdr + o] = PAD;
+    }
+
+    // Empty first directory sector at 39/1.
+    let d0 = ts_off(39, 1);
+    img[d0] = 0x00;
+    img[d0 + 1] = 0xFF;
+
+    // BAM sectors on track 38, chained 38/0 -> 38/3 -> ... -> directory.
+    for i in 0..num_bam {
+        let base = ts_off(38, (i * 3) as u8);
+        let low = (i * 50 + 1) as u8;
+        let last = ((i + 1) * 50).min(tracks as usize) as u8;
+        if i + 1 < num_bam {
+            img[base] = 38;
+            img[base + 1] = ((i + 1) * 3) as u8;
+        } else {
+            img[base] = 39; // last BAM links to the directory
+            img[base + 1] = 1;
+        }
+        img[base + 0x02] = b'C';
+        img[base + 0x03] = 0x00;
+        img[base + 0x04] = low;
+        img[base + 0x05] = last + 2;
+        for t in low..=last {
+            let o = 6 + (t - low) as usize * 5;
+            img[base + o] = bam.free[t as usize - 1];
+            img[base + o + 1..base + o + 5].copy_from_slice(&bam.bits[t as usize - 1][..4]);
+        }
+    }
     Ok(img)
 }
 
@@ -1430,6 +1617,66 @@ mod tests {
                 payload,
                 "variant {variant:?}"
             );
+        }
+    }
+
+    #[test]
+    fn pet_geometry_and_blocks_free() {
+        assert_eq!(CbmVariant::D80.total_sectors(), 2083);
+        assert_eq!(CbmVariant::D82.total_sectors(), 4166);
+        assert_eq!(CbmVariant::from_image_len(533_248), Some(CbmVariant::D80));
+        assert_eq!(CbmVariant::from_image_len(1_066_496), Some(CbmVariant::D82));
+        // A freshly-formatted 8050 reports 2052 blocks free (2083 total,
+        // minus the 29-sector directory track 39 and the 2 BAM sectors on
+        // track 38).
+        let mut fs = open_mem(blank_image(CbmVariant::D80, "PET", "80"));
+        assert_eq!(fs.volume_label(), Some("PET"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert_eq!(fs.free_space().unwrap(), 2052 * SECTOR_BYTES as u64);
+        // 8250 blank: 4166 total - 29 (directory track 39) - 4 BAM sectors
+        // on track 38 = 4133 blocks free (the documented 8250 figure; the
+        // BAM + directory live only on side 1, side 2 is all data).
+        let mut fs2 = open_mem(blank_image(CbmVariant::D82, "PET2", "82"));
+        assert_eq!(fs2.free_space().unwrap(), 4133 * SECTOR_BYTES as u64);
+    }
+
+    #[test]
+    fn round_trip_d80_and_d82() {
+        for variant in [CbmVariant::D80, CbmVariant::D82] {
+            let mut fs = open_mem(blank_image(variant, "PETDISK", "PT"));
+            let root = fs.root().unwrap();
+            // A multi-block SEQ file plus a small PRG.
+            let big: Vec<u8> = (0..3000).map(|i| (i * 3 % 256) as u8).collect();
+            fs.create_file(
+                &root,
+                "BIGFILE",
+                &mut Cursor::new(big.clone()),
+                big.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let small = b"\x01\x04HI PET\r".to_vec();
+            fs.create_file(
+                &root,
+                "PROG",
+                &mut Cursor::new(small.clone()),
+                small.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let listing = fs.list_directory(&root).unwrap();
+            assert_eq!(listing.len(), 2, "variant {variant:?}");
+            let big_e = listing.iter().find(|e| e.name == "BIGFILE").unwrap();
+            assert_eq!(fs.read_file(big_e, usize::MAX).unwrap(), big, "{variant:?}");
+            let small_e = listing.iter().find(|e| e.name == "PROG").unwrap();
+            assert_eq!(fs.read_file(small_e, usize::MAX).unwrap(), small);
+
+            // Delete the big file; the small one survives and space recovers.
+            let free_before = fs.free_space().unwrap();
+            fs.delete_entry(&root, &big_e.clone()).unwrap();
+            assert_eq!(fs.list_directory(&root).unwrap().len(), 1);
+            assert!(fs.free_space().unwrap() > free_before);
         }
     }
 }

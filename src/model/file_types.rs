@@ -21,7 +21,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71",
+    "g71", "d80", "d82",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -129,7 +129,7 @@ mod tests {
         // C64/C128/C16/VIC-20/PET MiSTer cores. Pin the picker extensions
         // so a future cleanup of the disk-image list can't silently drop
         // them and break double-click open / the file picker filter.
-        for must in ["d64", "d71", "d81", "g64", "g71"] {
+        for must in ["d64", "d71", "d81", "g64", "g71", "d80", "d82"] {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing CBM disk extension {must}"
