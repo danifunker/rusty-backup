@@ -13,7 +13,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
   altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
-  ANDOS (detect-only scaffold), ISO9660 (optical browse).
+  CBM DOS (1541 / 1571 / 1581 read + write; cross-validated against the
+  `c1541` / Python `d64` reference), ANDOS (detect-only scaffold),
+  ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
@@ -56,11 +58,11 @@ Legend for the **Support** column:
 | SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **Partial** — CP/M side covered by `svi328_cpm` DPB; the MSX-DOS / FAT12 floppy variant routes through the existing FAT driver but no SV-specific BPB quirks have been validated. |
 | Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **Yes** — `fs::cpm` ships both `altair_8in` (8-inch floppy) and `altair_cf` (CompactFlash HDD) DPBs. |
 | MultiComp | Grant Searle MultiComp | Floppy | CP/M | **Yes** — `fs::cpm` `multicomp` DPB. |
-| C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **No** |
-| C128 | Commodore 128 | Floppy | CBM DOS | **No** |
-| C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **No** |
-| VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **No** |
-| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **No** |
+| C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **Yes** — `fs::cbm` reads + writes `.d64` (1541) / `.d71` (1571) / `.d81` (1581); add/delete cross-validated against `c1541` / Python `d64`. |
+| C128 | Commodore 128 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` / `.d71` / `.d81`. |
+| C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
+| VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
+| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **Partial** — `.d64` (1541/2031/4040-compatible) read/write works; the 8050/8250 `.d80`/`.d82` IEEE-488 geometries are **not implemented** (they use a different multi-sector BAM layout + directory-on-track-39 — needs new geometry + BAM code in `fs::cbm`). |
 | BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
 | AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |

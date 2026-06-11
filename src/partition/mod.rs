@@ -365,6 +365,14 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // Commodore CBM DOS (1541/1571/1581 .d64/.d71/.d81). Flat sector
+    // dumps with no partition table; `looks_like_cbm` gates on the exact
+    // geometry length AND the header-sector signature, so the same-size
+    // false-positive risk is negligible.
+    if crate::fs::cbm::looks_like_cbm(reader, 0).is_some() {
+        return Some("CBM DOS".to_string());
+    }
+
     None
 }
 

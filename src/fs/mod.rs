@@ -6,6 +6,7 @@ pub mod andos;
 pub mod apple_dos;
 pub mod binhex;
 pub mod btrfs;
+pub mod cbm;
 pub mod cpm;
 pub mod cpm_diskdefs;
 pub mod efs;
@@ -354,6 +355,14 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         {
             return "applesdos33";
         }
+    }
+
+    // Commodore CBM DOS (1541/1571/1581 .d64/.d71/.d81). Flat sector
+    // dumps with no partition table; `looks_like_cbm` gates on the exact
+    // geometry length AND the header-sector signature so we don't
+    // false-positive on a same-sized blob.
+    if cbm::looks_like_cbm(reader, partition_offset).is_some() {
+        return "cbmdos";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1240,6 +1249,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "cbmdos" => Ok(Box::new(cbm::CbmFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1543,6 +1556,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "applesdos33" => Ok(Box::new(apple_dos::AppleDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "cbmdos" => Ok(Box::new(cbm::CbmFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

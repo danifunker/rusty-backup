@@ -49,6 +49,31 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-11 (Wave 3 opens — Commodore CBM DOS read+write end-to-end) —
+  Built `src/fs/cbm.rs` ground-up (no `cbm`-crate port; the format is
+  small and fully specified — Schepers D64 / Immers-Neufeld). One unified
+  engine covers **1541 `.d64` (+40-track), 1571 `.d71`, 1581 `.d81`**:
+  per-track zone geometry, PETSCII 0xA0-padded names, the
+  bit-set-is-free BAM (per-variant: shared T18S0 for 1541, +T53S0 for
+  1571, dedicated T40S1/T40S2 for 1581), 32-byte directory entries, and
+  linked-sector files with exact last-byte length recovery. Full
+  `EditableFilesystem`: BAM allocation with 1541 interleave-10 + spiral
+  track order, directory-chain extension past the first 8 entries,
+  scratch-on-delete. Detection is `looks_like_cbm` (exact-geometry-size
+  gate AND header-sector signature: DOS version byte + dir-track link +
+  DOS-type marker) wired into both `detect_superfloppy` and
+  `detect_filesystem_type`; open dispatch + editable dispatch carry a
+  `"cbmdos"` arm. **Reference: bidirectional cross-validation against the
+  Python `d64` library** (an independent reference impl) — my engine
+  writes → oracle reads byte-exact, oracle writes → my engine reads
+  byte-exact, across D64/D71/D81 incl. a 5000-byte multi-block file; the
+  rb-cli `put`/`rm`-modified disk is re-read clean by the oracle. Picker
+  exts `.d64`/`.d71`/`.d81` + regression test; README + this doc synced.
+  1781 lib tests + 7 new cbm unit tests green; zero warnings. **Next:**
+  PET 8050/8250 `.d80`/`.d82` geometry (not implemented),
+  `.g64`/`.g71` GCR container, or the CP/M floppy-core verify sweep
+  (DPB presets already shipped from Wave 2 — Amstrad/PCW/Einstein/
+  SVI328/MultiComp/ZX+3 just need per-core confirmation).
 - 2026-06-05 (ADFS read+write end-to-end — closes Archie row to user-
   side parks) — Cracked the ADFS read-side puzzle via Linux kernel
   `fs/adfs/map.c` source-dive: `log2bpmb` (DR byte 0x05) is log2-bytes-
@@ -596,7 +621,8 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
-- [ ] **Commodore** (CBM: C64/128/16/VIC20/PET) — prereq [ ] GCR container; port `cbm` · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
+- [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **Remaining:** PET 8050/8250 `.d80`/`.d82` geometry (**not implemented** — different multi-sector BAM + dir-on-track-39; the `CbmVariant` enum is D64/D64_40/D71/D81 only); `.g64`/`.g71` GCR container (raw `.d6x` is the common case and ships now).
+- [ ] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse CP/M engine; per core: [ ] DPB preset · [ ] verify
 - [ ] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse CP/M engine; per core: [ ] DPB preset · [ ] verify
 - [ ] **Atari800** (Atari DOS) — full spine
 - [ ] **CoCo2/3** (RS-DOS/DragonDOS + OS-9 RBF — two FS) — full spine ×2
