@@ -356,7 +356,7 @@ inspect-tab Edit Mode.
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
-| None (superfloppy) | Yes (FAT / HFS / HFS+ at sector 0) | — | Standard floppy sizes are recognised even without a partition table. |
+| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
 images, partition table sidecars) for restore — see `docs/clonezilla.md`.
