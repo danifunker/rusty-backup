@@ -49,6 +49,30 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-11 (Wave 3 — Atari800 / Atari DOS 2 read+write) — Built
+  `src/fs/atari_dos.rs` ground-up for the 8-bit Atari800 core: VTOC at
+  sector 360 (bit-SET-is-free 90-byte bitmap), 64-file directory at
+  sectors 361-368 (16-byte 8.3 entries), linked-sector files (125 data +
+  3 link bytes per SD sector; `next = ((b0&3)<<8)|b1`, byte count in b2).
+  Geometry from body size (SD 92160 / ED 133120). Full `EditableFilesystem`
+  (alloc from the VTOC, scratch-on-delete with flag 0x80). `.atr` is wired
+  as an **editable container** (`src/rbformats/containers/atr.rs`: 16-byte
+  header strip on read, re-wrap on commit, via the existing
+  ContainerEditSession) — `.xfd` is headerless and routes through plain
+  superfloppy detection. Reference tooling friction: atrcopy 10.1 is
+  numpy-incompatible (np.alen / uint8 overflow) and building atari-tools
+  was sandbox-blocked, so validation used (a) the atrcopy-bundled **real**
+  DOS 2.0S system disk (DOS.SYS 4875 B / DUP.SYS 5126 B / AUTORUN.SYS 88 B
+  — my engine extracts all three byte-exact) and (b) an **independent
+  clean-room Python reader** I wrote from the spec; write side validated by
+  having that reader parse my engine's output byte-exact. Found+fixed a
+  `detect_container_kind` ordering bug (the loose D88 disk-name sniff
+  claimed ATR headers — moved the specific 0x0296 check ahead of it).
+  Picker exts `.atr`/`.xfd` + regression test; README + status doc + plan
+  synced; committed a 519-byte license-clean fixture (`test_atari_dos2.atr.zst`,
+  original content) + `tests/cli_atari800.rs`. 1796 lib tests green, zero
+  warnings. **Next:** double-density (256-byte) read + DOS 2.5 second VTOC,
+  or another Wave-3 FS (TRS-80 / Oric / CoCo).
 - 2026-06-11 (Wave 3 — `.g71` 1571 GCR, validated against real c1541) —
   Closed the last deferred CBM item. Installed VICE (`brew install vice`)
   for `c1541` — the authoritative G71 producer — and confirmed the format
@@ -694,7 +718,7 @@ A core is **done** only when every applicable stage is `[x]`.
 
 - [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **All CBM container/geometry gaps closed:** `.g64` (1541) **and** `.g71` (1571) GCR both decode (`src/rbformats/containers/g64.rs`; `.g71` side-1 mapping validated against a real VICE `c1541` image), and PET 8050/8250 `.d80`/`.d82` read+write ship (bidirectionally oracle-validated). The Commodore row is functionally complete on every format; only on-MiSTer/VICE boot parks remain (user-side §7).
 - [~] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse the Wave-2 CP/M engine + DPB presets (all shipped: `amstrad_data`/`amstrad_sys`/`amstrad_pcw`/`einstein`/`svi328_cpm`/`multicomp`/`zx_plus3`). · [x] DPB presets (cpm_diskdefs.rs) · [x] **CLI dispatch now works for every floppy geometry** — `rb-cli {ls,get,put,rm} --fs-type cpm:<preset>` round-trips on the committed Amstrad fixture (184320 B). The blocker was that `PartitionTable::detect` hard-errored on flat CP/M discs whose size isn't a whitelisted "floppy size" (only Altair's 256256 B was), *before* the `--fs-type` override could apply; fixed by making detection failure non-fatal when `--fs-type` is forced (`cli::resolve::resolve_with_override`). Regression-pinned in tests/cli_cpm_floppy.rs. · [ ] per-core on-MiSTer boot verify (user-side §7). **Remaining:** EDSK-wrapped `.dsk` already decodes via source_reader; the per-core confirmation is just user-side core boots.
-- [ ] **Atari800** (Atari DOS) — full spine
+- [x] **Atari800** (Atari DOS 2) — `src/fs/atari_dos.rs` (ground-up). · [x] inspect (VTOC@360 signature + exact geometry gate via `looks_like_atari_dos`, wired into detect_superfloppy + detect_filesystem_type) · [x] extract (linked-sector chain with per-sector byte count; SD 92160 + ED 133120) · [x] ref (**read** validated byte-exact against the atrcopy-bundled real DOS 2.0S system disk — DOS.SYS/DUP.SYS/AUTORUN.SYS — AND an independent clean-room Python reader; **write** validated the same way) · [x] add/del (full `EditableFilesystem`: VTOC bit-set-free alloc, 64-entry directory, scratch-on-delete) · [x] write-verified (clean-room oracle reads the rb-cli put/rm-modified disk byte-exact) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7) · [x] cli (tests/cli_atari800.rs + `.atr` edit round-trip through the ContainerEditSession) · [x] tests (engine unit + atr container unit + cli + committed fixture). **`.atr` is an editable container** (16-byte header strip/wrap via `src/rbformats/containers/atr.rs`); `.xfd` is headerless. **Remaining:** double-density (256-byte) read, DOS 2.5 second VTOC for sectors 720+, MyDOS/SpartaDOS.
 - [ ] **CoCo2/3** (RS-DOS/DragonDOS + OS-9 RBF — two FS) — full spine ×2
 - [ ] **Oric** (Sedoric) — full spine
 - [ ] **PC88** (N88-BASIC) — full spine

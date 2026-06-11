@@ -373,6 +373,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("CBM DOS".to_string());
     }
 
+    // Atari DOS 2 (.atr body / headerless .xfd). Gated on exact geometry
+    // size + a plausible VTOC at sector 360.
+    if crate::fs::atari_dos::looks_like_atari_dos(reader, 0).is_some() {
+        return Some("Atari DOS".to_string());
+    }
+
     None
 }
 

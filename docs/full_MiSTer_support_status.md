@@ -15,7 +15,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
   CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
   bidirectionally cross-validated against the `c1541` / Python `d64`
-  reference), ANDOS (detect-only scaffold), ISO9660 (optical browse).
+  reference), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
+  ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
@@ -69,7 +70,7 @@ Legend for the **Support** column:
 | CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **No** |
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **No** |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
-| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **No** |
+| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |

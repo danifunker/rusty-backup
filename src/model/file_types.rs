@@ -21,7 +21,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82",
+    "g71", "d80", "d82", "atr", "xfd",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -133,6 +133,18 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing CBM disk extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn atari_disk_family_present() {
+        // Atari 8-bit ATR / XFD disk images (`src/fs/atari_dos.rs`) for the
+        // Atari800 MiSTer core.
+        for must in ["atr", "xfd"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing Atari disk extension {must}"
             );
         }
     }

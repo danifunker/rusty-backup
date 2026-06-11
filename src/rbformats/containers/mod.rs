@@ -21,6 +21,7 @@
 //! plan.md`), all decoders are ported MIT source or hand-written; no new
 //! crate dependency.
 
+pub mod atr;
 pub mod d88;
 pub mod dim;
 pub mod edsk;
@@ -65,6 +66,9 @@ pub enum ContainerKind {
     /// both DIFC (signed `DIFC HEADER` at byte 0xAB) and generic
     /// `header + flat` variants; write path always emits DIFC.
     Dim,
+    /// Atari 8-bit ATR — a 16-byte header in front of the raw sector body.
+    /// The edit round-trip is a trivial strip / wrap (no geometry math).
+    Atr,
     /// Pass-through: the bytes are already a flat sector stream.
     Raw,
 }
@@ -79,6 +83,7 @@ impl ContainerKind {
             ContainerKind::Xdf => "X68000 XDF",
             ContainerKind::Hdm => "PC-98 HDM",
             ContainerKind::Dim => "DiskExplorer DIM",
+            ContainerKind::Atr => "Atari ATR",
             ContainerKind::Raw => "Raw",
         }
     }
@@ -106,6 +111,11 @@ pub fn detect_container_kind(head: &[u8], path: Option<&Path>) -> ContainerKind 
     }
     if edsk::looks_like_edsk_header(head) {
         return ContainerKind::Edsk;
+    }
+    // ATR's 0x0296 magic is specific; check it before the looser D88 disk-
+    // name sniff (which can otherwise claim an ATR header).
+    if atr::looks_like_atr_header(head) {
+        return ContainerKind::Atr;
     }
     if d88::looks_like_d88_header(head) {
         return ContainerKind::D88;
@@ -166,6 +176,10 @@ pub fn open_container_bytes(
         ContainerKind::Dim => {
             let (flat, _media) = dim::decode_dim_bytes(&bytes)?;
             Ok((ContainerKind::Dim, Box::new(Cursor::new(flat))))
+        }
+        ContainerKind::Atr => {
+            let flat = atr::decode_atr_bytes(&bytes)?;
+            Ok((ContainerKind::Atr, Box::new(Cursor::new(flat))))
         }
         ContainerKind::Raw => Ok((ContainerKind::Raw, Box::new(Cursor::new(bytes)))),
     }
@@ -301,6 +315,11 @@ pub fn decode_floppy_container_file(path: &Path) -> Result<(ContainerKind, Vec<u
     let bytes =
         std::fs::read(path).with_context(|| format!("reading container {}", path.display()))?;
     let kind = detect_container_kind(&bytes[..bytes.len().min(256)], Some(path));
+    // ATR's edit round-trip is a header strip / wrap, outside the PC-floppy
+    // geometry machinery the four-format set uses.
+    if kind == ContainerKind::Atr {
+        return Ok((kind, atr::decode_atr_bytes(&bytes)?));
+    }
     if !is_floppy_container(kind) {
         anyhow::bail!(
             "{} is not an editable floppy container (got {})",
@@ -322,6 +341,11 @@ pub fn decode_floppy_container_file(path: &Path) -> Result<(ContainerKind, Vec<u
 /// preserve copy-protection track quirks. The same is already true of
 /// [`convert_floppy_container`].
 pub fn encode_floppy_container(flat: &[u8], kind: ContainerKind) -> Result<Vec<u8>> {
+    // ATR: re-wrap the edited body with a fresh 16-byte header. Atari
+    // single/enhanced-density bodies are 128-byte-sectored.
+    if kind == ContainerKind::Atr {
+        return atr::encode_atr_bytes(flat, 128);
+    }
     if !is_floppy_container(kind) {
         anyhow::bail!(
             "{} is not a floppy container; cannot re-encode",

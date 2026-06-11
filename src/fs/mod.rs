@@ -4,6 +4,7 @@ pub mod affs_common;
 pub mod affs_fsck;
 pub mod andos;
 pub mod apple_dos;
+pub mod atari_dos;
 pub mod binhex;
 pub mod btrfs;
 pub mod cbm;
@@ -363,6 +364,12 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // false-positive on a same-sized blob.
     if cbm::looks_like_cbm(reader, partition_offset).is_some() {
         return "cbmdos";
+    }
+
+    // Atari DOS 2 (.atr stripped to its body, or headerless .xfd). Gated on
+    // the exact disk geometry + a plausible VTOC at sector 360.
+    if atari_dos::looks_like_atari_dos(reader, partition_offset).is_some() {
+        return "ataridos";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1253,6 +1260,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ataridos" => Ok(Box::new(atari_dos::AtariDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1560,6 +1571,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "cbmdos" => Ok(Box::new(cbm::CbmFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ataridos" => Ok(Box::new(atari_dos::AtariDosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
