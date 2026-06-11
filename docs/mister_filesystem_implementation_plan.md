@@ -49,6 +49,22 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-11 (Wave 3 gap #3 — CP/M floppy cores now scriptable via rb-cli)
+  — Closed the "CP/M floppy CLI" gap surfaced while shipping CBM. The
+  `--fs-type cpm:<preset>` flag + EDSK decoding already existed, but
+  `rb-cli ls/get/put/rm` failed on flat CP/M discs whose byte size isn't a
+  whitelisted "floppy size" in `partition::detect` (only Altair's 256256 B
+  was) — `PartitionTable::detect` hard-errored ("invalid MBR", `0xE5E5`)
+  *before* the override could apply. Fix: `cli::resolve::resolve_with_override`
+  makes a detection failure non-fatal when the user forces `--fs-type`,
+  falling back to a raw-FS-at-byte-0 context (the defining shape of a
+  signatureless flat CP/M floppy). Added `resolve_partition_{rw,streaming}_forced`
+  wrappers; wired ls/get/put/rm. Verified full ls/get/put/rm round-trip on
+  the committed Amstrad data fixture (184320 B) — `get HELLO.TXT` returns the
+  cpmtools-authored bytes, `put`/`rm` round-trip byte-exact. New
+  tests/cli_cpm_floppy.rs (3 tests incl. a negative "no --fs-type still
+  errors"). Altair CP/M test still green (success path unchanged). **Next:**
+  Wave 3 gap #2 (`.g64`/`.g71` GCR decoder), then gap #1 (PET `.d80`/`.d82`).
 - 2026-06-11 (Wave 3 opens — Commodore CBM DOS read+write end-to-end) —
   Built `src/fs/cbm.rs` ground-up (no `cbm`-crate port; the format is
   small and fully specified — Schepers D64 / Immers-Neufeld). One unified
@@ -622,8 +638,7 @@ A core is **done** only when every applicable stage is `[x]`.
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
 - [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **Remaining:** PET 8050/8250 `.d80`/`.d82` geometry (**not implemented** — different multi-sector BAM + dir-on-track-39; the `CbmVariant` enum is D64/D64_40/D71/D81 only); `.g64`/`.g71` GCR container (raw `.d6x` is the common case and ships now).
-- [ ] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse CP/M engine; per core: [ ] DPB preset · [ ] verify
-- [ ] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse CP/M engine; per core: [ ] DPB preset · [ ] verify
+- [~] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse the Wave-2 CP/M engine + DPB presets (all shipped: `amstrad_data`/`amstrad_sys`/`amstrad_pcw`/`einstein`/`svi328_cpm`/`multicomp`/`zx_plus3`). · [x] DPB presets (cpm_diskdefs.rs) · [x] **CLI dispatch now works for every floppy geometry** — `rb-cli {ls,get,put,rm} --fs-type cpm:<preset>` round-trips on the committed Amstrad fixture (184320 B). The blocker was that `PartitionTable::detect` hard-errored on flat CP/M discs whose size isn't a whitelisted "floppy size" (only Altair's 256256 B was), *before* the `--fs-type` override could apply; fixed by making detection failure non-fatal when `--fs-type` is forced (`cli::resolve::resolve_with_override`). Regression-pinned in tests/cli_cpm_floppy.rs. · [ ] per-core on-MiSTer boot verify (user-side §7). **Remaining:** EDSK-wrapped `.dsk` already decodes via source_reader; the per-core confirmation is just user-side core boots.
 - [ ] **Atari800** (Atari DOS) — full spine
 - [ ] **CoCo2/3** (RS-DOS/DragonDOS + OS-9 RBF — two FS) — full spine ×2
 - [ ] **Oric** (Sedoric) — full spine

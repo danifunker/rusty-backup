@@ -8,7 +8,7 @@ use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::parse::split_mac_path;
-use crate::cli::resolve::{resolve_partition_rw, FsDispatchOverride};
+use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
 
 #[derive(Debug, Args)]
 pub struct RmArgs {
@@ -42,7 +42,11 @@ pub struct RmArgs {
 }
 
 pub fn run(args: RmArgs) -> Result<()> {
-    let (file, mut ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
+    let (file, mut ctx, commit) = resolve_partition_rw_forced(
+        &args.image.path,
+        args.image.partition,
+        args.fs_override.fs_type.as_deref(),
+    )?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(

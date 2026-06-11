@@ -98,6 +98,18 @@ pub fn resolve_partition_rw(
     path: &std::path::Path,
     selector: Option<u32>,
 ) -> Result<(File, PartitionContext, RwCommit)> {
+    resolve_partition_rw_forced(path, selector, None)
+}
+
+/// As [`resolve_partition_rw`], but a `--fs-type` override (`fs_override`)
+/// makes a partition-table detection failure non-fatal — see
+/// [`resolve_with_override`]. Used by `put` / `rm`, which then call
+/// [`FsDispatchOverride::apply`] to install the override.
+pub fn resolve_partition_rw_forced(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    fs_override: Option<&str>,
+) -> Result<(File, PartitionContext, RwCommit)> {
     if source_reader::is_editable_container_path(path) {
         // Floppy container: decode to a temp flat, edit that, re-encode on
         // commit. open_image_rw on the temp gives the same File the raw path
@@ -105,7 +117,7 @@ pub fn resolve_partition_rw(
         let session = crate::model::container_edit::ContainerEditSession::open(path)
             .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
         let mut file = open_image_rw(session.flat_path())?;
-        let ctx = resolve(&mut file, selector)?;
+        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
         Ok((
             file,
             ctx,
@@ -115,7 +127,7 @@ pub fn resolve_partition_rw(
         ))
     } else {
         let mut file = open_image_rw(path)?;
-        let ctx = resolve(&mut file, selector)?;
+        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
         Ok((file, ctx, RwCommit { session: None }))
     }
 }
@@ -138,6 +150,19 @@ pub fn resolve_partition_streaming_with_password(
     selector: Option<u32>,
     password: Option<&[u8]>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
+    resolve_partition_streaming_forced(path, selector, password, None)
+}
+
+/// As [`resolve_partition_streaming_with_password`], but a `--fs-type`
+/// override (`fs_override`) makes a partition-table detection failure
+/// non-fatal — see [`resolve_with_override`]. Used by `ls` / `get`, which
+/// then call [`FsDispatchOverride::apply`] to install the override.
+pub fn resolve_partition_streaming_forced(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    password: Option<&[u8]>,
+    fs_override: Option<&str>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
     // Anything `source_reader::open_read_with_password` would unwrap (CHD /
     // GHO / IMZ streaming readers; MSA / EDSK / D88 / DIM / XDF / HDM /
     // Arculator-HDF / 140 KB Apple-II floppies) must NOT skip source_reader
@@ -147,19 +172,53 @@ pub fn resolve_partition_streaming_with_password(
     let is_streaming = source_reader::is_container_path(path);
     if is_streaming {
         let mut reader = source_reader::open_read_with_password(path, password)?;
-        let ctx = resolve(&mut reader, selector)?;
+        let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
         Ok((reader, ctx))
     } else {
         let mut file = open_image_ro(path)?;
-        let ctx = resolve(&mut file, selector)?;
+        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
         Ok((Box::new(std::io::BufReader::new(file)), ctx))
     }
 }
 
 fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<PartitionContext> {
+    resolve_with_override(reader, selector, None)
+}
+
+/// As [`resolve`], but `fs_override` (the `--fs-type` value, if any) makes
+/// a partition-table detection *failure* non-fatal: when the user has
+/// explicitly declared a filesystem, an image with neither a partition
+/// table nor an on-disk FS signature (the defining shape of a flat CP/M
+/// floppy — the BIOS holds the DPB out-of-band) is treated as a raw FS at
+/// byte 0. The override itself is applied by the caller afterwards via
+/// [`FsDispatchOverride::apply`].
+fn resolve_with_override<R: Read + Seek>(
+    reader: &mut R,
+    selector: Option<u32>,
+    fs_override: Option<&str>,
+) -> Result<PartitionContext> {
     let total = reader_size(reader)?;
-    let pt =
-        PartitionTable::detect(reader).map_err(|e| anyhow!("detecting partition table: {e}"))?;
+    let pt = match PartitionTable::detect(reader) {
+        Ok(pt) => pt,
+        Err(e) => {
+            if fs_override.is_some() {
+                if let Some(idx) = selector {
+                    bail!(
+                        "--partition / IMG@{idx} was given with --fs-type, but the image has no \
+                         partition table; drop the suffix to operate on the raw filesystem at byte 0"
+                    );
+                }
+                return Ok(PartitionContext {
+                    offset: 0,
+                    type_byte: 0x00,
+                    type_string: None,
+                    size: total,
+                    label: "Partition: raw filesystem @ byte 0 (forced via --fs-type)".to_string(),
+                });
+            }
+            return Err(anyhow!("detecting partition table: {e}"));
+        }
+    };
     let partitions = pt.partitions();
 
     // No partition table: treat as superfloppy / raw FS at byte 0.
