@@ -4,9 +4,12 @@
 //! data blocks, gaps — exactly what the read head sees. This is the
 //! preservation-grade format used for copy-protected discs.
 //!
-//! We decode `.g64` down to a flat `.d64` so the [`crate::fs::cbm`] engine
-//! (which speaks logical sectors) can read it. Decode is read-only: we do
-//! not re-encode GCR (an editor would round-trip through `.d64`).
+//! We decode `.g64` / `.g71` down to a flat `.d64` / `.d71` so the
+//! [`crate::fs::cbm`] engine (which speaks logical sectors) can read it.
+//! Decode is read-only: we do not re-encode GCR (an editor would
+//! round-trip through `.d64`/`.d71`). The `.g71` (1571) side-1 mapping —
+//! tracks 36-70 at half-track indices 84,86,..,152 — is validated against
+//! a real VICE `c1541`-produced image (see `tests/cbm_g71.rs`).
 //!
 //! ## Container framing (VICE G64 spec)
 //!
@@ -134,7 +137,13 @@ fn read_bytes(bits: &[bool], pos: &mut usize, n: usize) -> Option<Vec<u8>> {
 
 /// Decode all sectors found on one track's GCR bytes into a
 /// `sector -> 256 bytes` map.
-fn decode_track(track_gcr: &[u8], expected_track: u8) -> std::collections::HashMap<u8, Vec<u8>> {
+///
+/// The header's track byte is *not* used to place sectors — the offset
+/// table already isolates each (half-)track, so the caller's position is
+/// authoritative. This keeps the 1571 side-1 path robust regardless of
+/// whether the on-disk header numbers side-1 tracks logically (36-70) or
+/// physically (1-35).
+fn decode_track(track_gcr: &[u8]) -> std::collections::HashMap<u8, Vec<u8>> {
     let bits = bits_of(track_gcr);
     let n = bits.len();
     let mut sectors = std::collections::HashMap::new();
@@ -162,13 +171,11 @@ fn decode_track(track_gcr: &[u8], expected_track: u8) -> std::collections::HashM
         };
         match id[0] {
             0x08 => {
-                // Header: 7 more decoded bytes follow the ID.
+                // Header: 7 more decoded bytes follow the ID. rest[1] is the
+                // sector number (rest[2] is the track, which we ignore — see
+                // the function doc).
                 if let Some(rest) = read_bytes(&bits, &mut pos, 7) {
-                    let sector = rest[1];
-                    let track = rest[2];
-                    if track == expected_track {
-                        last_header_sector = Some(sector);
-                    }
+                    last_header_sector = Some(rest[1]);
                 }
             }
             0x07 => {
@@ -191,69 +198,78 @@ fn decode_track(track_gcr: &[u8], expected_track: u8) -> std::collections::HashM
     sectors
 }
 
-/// Decode a `.g64` image into a flat `.d64`. `.g71` (GCR-1571) is detected
-/// but not yet supported (the side-1 half-track mapping needs a real
-/// sample to validate against).
+/// Sectors on a 1-based D71 track: tracks 1-35 are side 0 (1541 zone map),
+/// tracks 36-70 are side 1 mirroring it.
+fn d71_sectors_in_track(track: u8) -> u8 {
+    sectors_in_track(if track > 35 { track - 35 } else { track })
+}
+
+/// Byte offset of (track, sector) in a flat D71.
+fn d71_offset(track: u8, sector: u8) -> usize {
+    let before: usize = (1..track).map(|t| d71_sectors_in_track(t) as usize).sum();
+    (before + sector as usize) * CBM_SECTOR
+}
+
+/// Return the decoded GCR byte slice for half-track index `ht`, or `None`
+/// when the entry is absent / empty / out of range.
+fn track_gcr_slice(bytes: &[u8], num_halftracks: usize, ht: usize) -> Option<&[u8]> {
+    if ht >= num_halftracks {
+        return None;
+    }
+    let o = 0x0C + ht * 4;
+    if o + 4 > bytes.len() {
+        return None;
+    }
+    let off = u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize;
+    if off == 0 || off + 2 > bytes.len() {
+        return None;
+    }
+    let len = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+    let start = off + 2;
+    let end = (start + len).min(bytes.len());
+    if start >= end {
+        return None;
+    }
+    Some(&bytes[start..end])
+}
+
+/// Decode a `.g64` (1541) or `.g71` (1571) image into the matching flat
+/// `.d64` / `.d71` sector image.
 pub fn decode_g64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < 12 {
         bail!("G64 too small ({} bytes)", bytes.len());
     }
-    if &bytes[0..8] == G71_SIGNATURE {
-        bail!("G71 (1571 GCR) images are not yet supported; convert to .d71 first");
-    }
-    if &bytes[0..8] != G64_SIGNATURE {
-        bail!("not a G64 image (bad signature)");
+    let is_g71 = &bytes[0..8] == G71_SIGNATURE;
+    if !is_g71 && &bytes[0..8] != G64_SIGNATURE {
+        bail!("not a G64/G71 image (bad signature)");
     }
     let num_halftracks = bytes[9] as usize;
     let max_track_size = u16::from_le_bytes([bytes[0x0A], bytes[0x0B]]) as usize;
     if max_track_size == 0 || max_track_size > 16384 {
         bail!("implausible G64 max track size {max_track_size}");
     }
+    if is_g71 {
+        decode_g71(bytes, num_halftracks)
+    } else {
+        decode_g64_1541(bytes, num_halftracks)
+    }
+}
 
-    let table_base = 0x0C;
-    let read_offset = |ht: usize| -> Option<u32> {
-        let o = table_base + ht * 4;
-        if o + 4 > bytes.len() {
-            return None;
-        }
-        Some(u32::from_le_bytes([
-            bytes[o],
-            bytes[o + 1],
-            bytes[o + 2],
-            bytes[o + 3],
-        ]))
-    };
-
-    // Decode whole tracks 1..=40 (D64 tops out at 40 tracks). Track T lives
-    // at half-track index (T-1)*2.
+/// 1541 path: whole tracks 1..=40 at half-track index (T-1)*2 -> flat D64.
+fn decode_g64_1541(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
     let mut decoded: Vec<(u8, std::collections::HashMap<u8, Vec<u8>>)> = Vec::new();
     let mut highest_track = 0u8;
     for track in 1..=40u8 {
         let ht = (track as usize - 1) * 2;
-        if ht >= num_halftracks {
-            break;
-        }
-        let Some(off) = read_offset(ht) else { break };
-        if off == 0 {
-            continue; // no data on this track
-        }
-        let off = off as usize;
-        if off + 2 > bytes.len() {
-            bail!("G64 track {track} offset {off} past EOF");
-        }
-        let len = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
-        let start = off + 2;
-        let end = (start + len).min(bytes.len());
-        if start >= end {
+        let Some(slice) = track_gcr_slice(bytes, num_halftracks, ht) else {
             continue;
-        }
-        let sectors = decode_track(&bytes[start..end], track);
+        };
+        let sectors = decode_track(slice);
         if !sectors.is_empty() {
             highest_track = track;
             decoded.push((track, sectors));
         }
     }
-
     if highest_track == 0 {
         bail!("G64 decoded no readable sectors");
     }
@@ -263,7 +279,6 @@ pub fn decode_g64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
         .map(|t| sectors_in_track(t) as usize)
         .sum();
     let mut d64 = vec![0u8; total_sectors * CBM_SECTOR];
-
     for (track, sectors) in decoded {
         if track > total_tracks {
             continue;
@@ -277,6 +292,42 @@ pub fn decode_g64_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(d64)
+}
+
+/// 1571 path: 70 D71 tracks. Side 0 (tracks 1-35) lives at half-track
+/// indices 0,2,..,68; side 1 (tracks 36-70) at 84,86,..,152 (VICE G71
+/// layout). Output is a flat 349200-byte D71.
+fn decode_g71(bytes: &[u8], num_halftracks: usize) -> Result<Vec<u8>> {
+    let total_sectors: usize = (1..=70u8).map(|t| d71_sectors_in_track(t) as usize).sum();
+    let mut d71 = vec![0u8; total_sectors * CBM_SECTOR];
+    let mut any = false;
+    for track in 1..=70u8 {
+        let ht = if track <= 35 {
+            (track as usize - 1) * 2
+        } else {
+            84 + (track as usize - 36) * 2
+        };
+        let Some(slice) = track_gcr_slice(bytes, num_halftracks, ht) else {
+            continue;
+        };
+        let sectors = decode_track(slice);
+        if sectors.is_empty() {
+            continue;
+        }
+        any = true;
+        let spt = d71_sectors_in_track(track);
+        for (sector, data) in sectors {
+            if sector >= spt {
+                continue;
+            }
+            let off = d71_offset(track, sector);
+            d71[off..off + CBM_SECTOR].copy_from_slice(&data);
+        }
+    }
+    if !any {
+        bail!("G71 decoded no readable sectors");
+    }
+    Ok(d71)
 }
 
 /// Convenience: read a file and decode it.
@@ -424,13 +475,29 @@ mod tests {
     }
 
     #[test]
-    fn g71_is_detected_but_unsupported() {
-        let mut bytes = vec![0u8; 32];
+    fn g71_empty_table_decodes_nothing() {
+        // A G71 header with an all-zero offset table has no readable
+        // sectors and surfaces a clear error (not a panic / bad image).
+        let mut bytes = vec![0u8; 0x0C + 168 * 4 * 2];
         bytes[..8].copy_from_slice(G71_SIGNATURE);
+        bytes[9] = 168;
         bytes[0x0A] = 0xF8;
         bytes[0x0B] = 0x1E;
         let err = decode_g64_bytes(&bytes).unwrap_err();
-        assert!(err.to_string().contains("G71"), "got: {err}");
+        assert!(
+            err.to_string().contains("no readable sectors"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn d71_geometry_helpers() {
+        // Side 1 mirrors side 0's zone map.
+        assert_eq!(d71_sectors_in_track(1), 21);
+        assert_eq!(d71_sectors_in_track(36), 21); // side-1 track 1
+        assert_eq!(d71_sectors_in_track(70), 17); // side-1 track 35
+        let total: usize = (1..=70u8).map(|t| d71_sectors_in_track(t) as usize).sum();
+        assert_eq!(total * CBM_SECTOR, 349_696);
     }
 
     /// Build a tiny synthetic D64 (header + a couple of files would need the
