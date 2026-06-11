@@ -25,6 +25,7 @@ pub mod d88;
 pub mod dim;
 pub mod edsk;
 pub mod floppy_geom;
+pub mod g64;
 pub mod hdf;
 pub mod hdm;
 pub mod msa;
