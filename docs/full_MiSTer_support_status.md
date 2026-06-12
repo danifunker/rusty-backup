@@ -22,6 +22,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   OS-9 / NitrOS-9 RBF (hierarchical Unix-like FS — read + write incl.
   subdirectories, raw `.dsk` / `.vdk`; cross-validated byte-exact against an
   independent clean-room RBF reader on real NitrOS-9 toolshed disks),
+  DragonDOS (Dragon 32/64 read + write, single- / double-sided 40-track
+  `.dsk`; cross-validated byte-exact against an independent clean-room
+  reader/writer and against real third-party DragonDOS disks),
   ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
@@ -73,7 +76,8 @@ Legend for the **Support** column:
 | BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
 | AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |
-| CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **Partial** — `fs::rsdos` reads + writes RS-DOS / Disk BASIC (granule allocation table on track 17, 72-file directory, granule-chain files; raw 35- / 40-track `.dsk` / `.jvc`), and `fs::os9` reads + writes OS-9 / NitrOS-9 RBF (hierarchical FS; `.dsk` / `.vdk`, byte-exact cross-validated against a clean-room RBF reader on real toolshed disks). Only the Dragon-specific DragonDOS variant is still pending. |
+| CoCo2 | Tandy CoCo 2 | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **Yes** — `fs::rsdos` reads + writes RS-DOS / Disk BASIC (granule allocation table on track 17, 72-file directory, granule-chain files; raw 35- / 40-track `.dsk` / `.jvc`), `fs::os9` reads + writes OS-9 / NitrOS-9 RBF (hierarchical FS; `.dsk` / `.vdk`, byte-exact cross-validated against a clean-room RBF reader on real toolshed disks), and `fs::dragondos` reads + writes DragonDOS (see Dragon row). |
+| Dragon | Dragon 32/64 | Floppy | DragonDOS, OS-9 (RBF) | **Yes** — `fs::dragondos` reads + writes DragonDOS (directory track 20 + backup track 16, one's-complement geometry signature, set-bit-free sector bitmap, 25-byte header/continuation directory entries; single- / double-sided 40-track `.dsk`). Byte-exact cross-validated against an independent clean-room reader/writer AND against real third-party DragonDOS disks (rolfmichelsen/dragontools' empty volume plus a populated 9-file AGD-suite disk, all files byte-identical across both readers). `fs::os9` covers OS-9 / NitrOS-9 RBF. |
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
 | Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |

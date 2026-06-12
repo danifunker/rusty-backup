@@ -10,6 +10,7 @@ pub mod btrfs;
 pub mod cbm;
 pub mod cpm;
 pub mod cpm_diskdefs;
+pub mod dragondos;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
@@ -372,6 +373,14 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // the exact disk geometry + a plausible VTOC at sector 360.
     if atari_dos::looks_like_atari_dos(reader, partition_offset).is_some() {
         return "ataridos";
+    }
+
+    // DragonDOS (flat .dsk, 40-track single- or double-sided). Same byte size
+    // as a 40-track RS-DOS disk, but its directory track carries a
+    // one's-complement geometry signature, so probe it first among the CoCo
+    // family — the signature is a confident discriminator.
+    if dragondos::looks_like_dragondos(reader, partition_offset).is_some() {
+        return "dragondos";
     }
 
     // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
@@ -1286,6 +1295,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "dragondos" => Ok(Box::new(dragondos::DragonDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "os9" => Ok(Box::new(os9::Os9Filesystem::open(
                     reader,
                     partition_offset,
@@ -1605,6 +1618,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "dragondos" => Ok(Box::new(dragondos::DragonDosFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

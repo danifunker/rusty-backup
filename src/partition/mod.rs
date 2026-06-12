@@ -379,6 +379,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("Atari DOS".to_string());
     }
 
+    // DragonDOS (flat .dsk). Same byte size as a 40-track RS-DOS disk, but the
+    // directory track carries a one's-complement geometry signature, so probe
+    // it first among the CoCo family.
+    if crate::fs::dragondos::looks_like_dragondos(reader, 0).is_some() {
+        return Some("DragonDOS".to_string());
+    }
+
     // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
     // RS-DOS disk, so probe it first: the LSN-0 identification sector plus a
     // directory root FD discriminate it cleanly.
