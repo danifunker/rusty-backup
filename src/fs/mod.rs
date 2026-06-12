@@ -38,6 +38,7 @@ pub mod layout_preserving;
 pub mod mac_alias;
 pub mod mfs;
 pub mod ntfs;
+pub mod os9;
 pub mod patch;
 pub mod pfs3;
 pub mod pfs3_clone;
@@ -371,6 +372,14 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // the exact disk geometry + a plausible VTOC at sector 360.
     if atari_dos::looks_like_atari_dos(reader, partition_offset).is_some() {
         return "ataridos";
+    }
+
+    // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
+    // RS-DOS disk, so it must be probed first: `looks_like_os9` validates the
+    // LSN-0 identification sector against the image length and confirms the
+    // root FD is a directory, which RS-DOS disks never satisfy.
+    if os9::looks_like_os9(reader, partition_offset).is_some() {
+        return "os9";
     }
 
     // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc, 35- or 40-track). No magic
@@ -1277,6 +1286,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "os9" => Ok(Box::new(os9::Os9Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1592,6 +1605,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "os9" => Ok(Box::new(os9::Os9Filesystem::open(
                     reader,
                     partition_offset,
                 )?)),

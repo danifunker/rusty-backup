@@ -379,6 +379,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("Atari DOS".to_string());
     }
 
+    // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
+    // RS-DOS disk, so probe it first: the LSN-0 identification sector plus a
+    // directory root FD discriminate it cleanly.
+    if crate::fs::os9::looks_like_os9(reader, 0).is_some() {
+        return Some("OS-9".to_string());
+    }
+
     // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc). No magic; gated on exact
     // geometry + a structurally consistent granule table + directory.
     if crate::fs::rsdos::looks_like_rsdos(reader, 0).is_some() {

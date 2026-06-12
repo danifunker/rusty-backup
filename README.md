@@ -305,7 +305,7 @@ readable.
 | Commodore disk | `.d64`, `.d71`, `.d81`, `.d80`, `.d82` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 + PET 8050 / 8250 (IEEE-488) flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (bidirectionally cross-validated against the `c1541` / Python `d64` reference). |
 | Commodore GCR  | `.g64`, `.g71`  | Yes (decode) | No        | Raw 1541 / 1571 GCR track images (preservation-grade). Decoded to flat sectors so the CBM engine can read them; the `.g71` side-1 mapping is validated against a real VICE `c1541` image. |
 | Atari disk     | `.atr`, `.xfd`  | Yes            | Yes (in-place edit) | 8-bit Atari (400/800/XL/XE) disk images for the Atari800 core. `.atr` = 16-byte header + sector body; `.xfd` headerless. Read/browse/extract + add/delete on the Atari DOS 2 volume. |
-| CoCo disk      | `.dsk`, `.jvc`  | Yes            | Yes (in-place edit) | Tandy Color Computer (CoCo2 / CoCo3 cores) raw 35- / 40-track sector dumps. Headerless flat body (length a multiple of 256). Read/browse/extract + add/delete on the RS-DOS / Disk BASIC volume. |
+| CoCo disk      | `.dsk`, `.jvc`, `.vdk` | Yes     | Yes (in-place edit) | Tandy Color Computer (CoCo2 / CoCo3 cores) raw 35- / 40-track sector dumps. Headerless flat body (length a multiple of 256). Auto-detects the volume's filesystem: RS-DOS / Disk BASIC (flat granule FS) or OS-9 / NitrOS-9 RBF (hierarchical). Read/browse/extract + add/delete on both. |
 | Sharp D88      | `.d88`          | Yes            | Yes (convert + in-place edit) | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container. Add/delete/mkdir on the contained Human68k FAT volume persist back into the container (decode -> edit -> re-encode). |
 | X68000 XDF     | `.xdf`          | Yes            | Yes (convert + in-place edit) | Raw headerless X68000 floppy dump; geometry inferred from size. In-place file add/delete/edit supported. |
 | X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize + defrag repack) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink + contiguous repack (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
@@ -342,6 +342,7 @@ inspect-tab Edit Mode.
 | CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Yes | Yes | — (floppy, fixed geometry) | — | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81` / `.d80` / `.d82`; `.g64` GCR decoded to sectors. |
 | Atari DOS 2 (2.0S / 2.5) | Yes | Yes | — (floppy, fixed geometry) | — | Atari 8-bit (Atari800 core). VTOC@360 (bit-set-is-free), 64-file directory, linked-sector files. Single + enhanced density `.atr` / `.xfd`. |
 | RS-DOS (CoCo Disk BASIC) | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores). Granule allocation table on track 17, 72-file directory, granule-chain files. Raw 35- / 40-track `.dsk` / `.jvc`. Read/extract + add/delete bidirectionally cross-validated against an independent clean-room reader/writer derived from the toolshed `libdecb` semantics. |
+| OS-9 / NitrOS-9 RBF | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores) and Dragon. Hierarchical Unix-like FS: LSN-0 identification sector, per-file/dir 256-byte file descriptors, segment-list extents, allocation bitmap (set-bit = allocated). Raw `.dsk` / `.vdk`. Read/extract + add/delete (incl. subdirectories) cross-validated byte-exact against an independent clean-room RBF reader on real NitrOS-9 toolshed disks. |
 | Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | — | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. |
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
@@ -358,7 +359,7 @@ inspect-tab Edit Mode.
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
-| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
+| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
 images, partition table sidecars) for restore — see `docs/clonezilla.md`.
@@ -436,7 +437,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **C64 / C128**                 | CBM DOS (1541 / 1571 / 1581, read + write) | Floppy `.d64` / `.d71` / `.d81` |
 | **VIC20 / C16 / Plus-4**       | CBM DOS (1541, read + write) | Floppy `.d64` |
 | **PET / CBM-II**               | CBM DOS (1541 + 8050/8250 IEEE-488, read + write) | Floppy `.d64` / `.d80` / `.d82` |
-| **CoCo2 / CoCo3** (Tandy)      | RS-DOS / Disk BASIC (read + write); DragonDOS + OS-9 RBF pending | Floppy `.dsk` / `.jvc` (35- / 40-track) |
+| **CoCo2 / CoCo3** (Tandy)      | RS-DOS / Disk BASIC + OS-9 / NitrOS-9 RBF (both read + write); DragonDOS pending | Floppy `.dsk` / `.jvc` / `.vdk` (35- / 40-track) |
 
 For X68000 specifically, the floppy converter lets you take an image
 in any of the four formats Sharp tooling and MiSTer cores expect — XDF
