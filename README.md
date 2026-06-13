@@ -54,6 +54,8 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --boot-sector-donor hd0.hds      # zero manual steps, your donor
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
+rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
+rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
@@ -194,6 +196,15 @@ The app has five tabs:
     with the output partition's actual FAT geometry, so the donor
     boots from your sized HDD regardless of how the donor itself was
     sized.
+  - **Make a classic-Mac SCSI disk bootable** via the shell:
+    `rb-cli mac-scsi-bless mac.hda` installs an Apple SCSI driver and a
+    valid Driver Descriptor Record into an APM disk so a Macintosh ROM
+    (e.g. Quadra 800) registers the drive over SCSI. Uses a bundled
+    known-good driver by default, or `--driver-from donor.hda` to copy a
+    donor disk's driver verbatim. Operates in place; partition data never
+    moves, and it is idempotent. (This registers the *driver* so the ROM
+    can read the disk — it does not change HFS boot-block behavior.)
+    Verified against the real Quadra 800 ROM in QEMU `-M q800`.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /

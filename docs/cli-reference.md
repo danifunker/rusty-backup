@@ -639,6 +639,25 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 
+### `mac-scsi-bless`
+
+Install an Apple SCSI driver + Driver Descriptor Record into an APM disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI. Operates in place; partition data is never moved. (This registers the driver so the ROM can read the disk — it does not change HFS boot-block behavior.)
+
+```
+Usage: mac-scsi-bless [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — APM disk image to make SCSI-bootable, in place
+
+**Options**
+
+- `--driver-from` — Extract the driver from a donor Apple-formatted disk's `Apple_Driver*` partition (most faithful — carries that disk's exact boot metadata)
+- `--driver` — Use a raw driver image file (advanced; `pmBootCksum` is unknown for an arbitrary driver, so it is written as 0 — see `--force-cksum-zero`)
+- `--builtin-driver` — Use the bundled known-good Apple SCSI driver (this is the default when no driver source is given)
+- `--force-cksum-zero` — Force `pmBootCksum = 0`. Some ROMs skip checksum verification then
+
 ### `mkdir`
 
 Create a directory inside a filesystem
@@ -1136,7 +1155,7 @@ Usage: fs-info [OPTIONS] <IMAGE>
 
 ### `show partmap`
 
-Print the partition table of a disk image (APM-only today)
+Print the partition table of a disk image (APM-only today), including the Driver Descriptor Record's driver map and each entry's boot fields
 
 ```
 Usage: partmap [OPTIONS] <IMAGE>

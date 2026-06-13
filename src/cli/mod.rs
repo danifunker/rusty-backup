@@ -64,6 +64,14 @@ pub enum Command {
     #[command(name = "new-x68k-hdd")]
     NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
 
+    /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
+    /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
+    /// Operates in place; partition data is never moved. (This registers the
+    /// driver so the ROM can read the disk — it does not change HFS
+    /// boot-block behavior.)
+    #[command(name = "mac-scsi-bless")]
+    MacScsiBless(verbs::mac_scsi_bless::MacScsiBlessArgs),
+
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
@@ -248,6 +256,7 @@ pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
+        Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),

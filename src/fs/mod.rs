@@ -38,6 +38,7 @@ pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
+pub mod mac_scsi_bless;
 pub mod mfs;
 pub mod ntfs;
 pub mod os9;
