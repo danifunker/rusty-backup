@@ -21,7 +21,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk",
+    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -147,6 +147,17 @@ mod tests {
                 "missing Atari disk extension {must}"
             );
         }
+    }
+
+    #[test]
+    fn acorn_dfs_family_present() {
+        // Acorn DFS single-sided floppy images (`src/fs/dfs.rs`) for the
+        // BBCMicro / AcornElectron MiSTer cores. `.ssd` is the flat
+        // single-sided dump.
+        assert!(
+            association_exts().contains(&"ssd".to_string()),
+            "missing Acorn DFS extension ssd"
+        );
     }
 
     #[test]

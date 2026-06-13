@@ -49,6 +49,35 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-13 (Wave 3 — BBCMicro / AcornElectron / Acorn DFS read+write) —
+  Built `src/fs/dfs.rs` ground-up for the BBC Micro / BBC Master / Acorn
+  Electron cores (the OPEN-WORK §5 reconciliation gap — DFS was "not in the
+  plan; only ADFS covered via Archie"). DFS is the flat-catalogue floppy FS:
+  two 256-byte catalogue sectors (0 + 1) hold a 12-char disc title, up to 31
+  files each with an 8-byte half-entry in *each* sector, files physically
+  contiguous and listed in **descending start-sector order**, single-character
+  directory namespaces (`$` default), 18-bit load/exec/length, 10-bit start
+  sector, lock bit, BCD cycle, *OPT boot option. No on-disk magic, so
+  `looks_like_dfs` gates on exact single-sided geometry (102400 = 40-track /
+  204800 = 80-track) AND a catalogue whose **declared sector count equals the
+  disk size** — the discriminator that separates a true single-sided `.ssd`
+  from a flat 40-track double-sided `.dsd` (whose side-0 catalogue declares
+  400 on an 800-sector file). Full read + edit (`EditableFilesystem`
+  add/delete; first-fit contiguous allocator, full-catalogue rebuild keeping
+  descending order, BCD cycle bump). Validated **bidirectionally** against an
+  independent clean-room Python DFS reader/writer (transcribed from the
+  BeebWiki Acorn DFS spec): the engine reads the oracle's disks byte-exact and
+  the oracle reads the engine's `put`/`rm` output byte-exact, across both
+  geometries, multi-sector files, locked files, non-`$` directories, and real
+  load/exec addresses. Wired into the 4 dispatch sites (`partition` display
+  name + `fs::mod` detect / open / open_editable) + `DISK_IMAGE_EXTS` (`.ssd`)
+  + regression test. 7 engine unit + 4 cli (tests/cli_bbcmicro.rs) tests + a
+  committed license-clean 463-byte fixture (`test_bbc_dfs.ssd.zst`, original
+  content). 1817 lib tests green, clippy clean. **This closes the OPEN-WORK §5
+  DFS gap for two cores.** BBCMicro / AcornElectron rows flip No -> Partial
+  (single-sided `.ssd`; double-sided `.dsd` track-interleaving + ADFS-on-floppy
+  remain). Next: `.dsd` deinterleave (unlocks double-sided BBC discs), Acorn
+  DFS Watford 62-file extension, or a fresh Wave-3 FS (Oric / PC88 / TRS-80).
 - 2026-06-11 (Wave 3 — Dragon / DragonDOS read+write) — Built
   `src/fs/dragondos.rs` ground-up for the Dragon Data Dragon 32/64 (and
   CoCo-via-DragonDOS-cart) MiSTer cores, the sister FS to RS-DOS. Format

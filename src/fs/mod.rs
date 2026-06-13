@@ -10,6 +10,7 @@ pub mod btrfs;
 pub mod cbm;
 pub mod cpm;
 pub mod cpm_diskdefs;
+pub mod dfs;
 pub mod dragondos;
 pub mod efs;
 pub mod efs_fsck;
@@ -381,6 +382,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // family — the signature is a confident discriminator.
     if dragondos::looks_like_dragondos(reader, partition_offset).is_some() {
         return "dragondos";
+    }
+
+    // Acorn DFS (flat single-sided .ssd, 40- or 80-track). No magic; gated on
+    // exact single-sided geometry AND a catalogue whose declared sector count
+    // matches the disk size, which separates a real .ssd from a flat .dsd.
+    if dfs::looks_like_dfs(reader, partition_offset).is_some() {
+        return "acorndfs";
     }
 
     // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
@@ -1299,6 +1307,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "acorndfs" => Ok(Box::new(dfs::DfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "os9" => Ok(Box::new(os9::Os9Filesystem::open(
                     reader,
                     partition_offset,
@@ -1622,6 +1634,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "dragondos" => Ok(Box::new(dragondos::DragonDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "acorndfs" => Ok(Box::new(dfs::DfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

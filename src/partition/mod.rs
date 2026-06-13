@@ -399,6 +399,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("RS-DOS".to_string());
     }
 
+    // Acorn DFS (flat single-sided .ssd, 40-/80-track). Gated on exact
+    // single-sided geometry and a catalogue whose declared sector count
+    // matches the disk size (separates a real .ssd from a flat .dsd).
+    if crate::fs::dfs::looks_like_dfs(reader, 0).is_some() {
+        return Some("Acorn DFS".to_string());
+    }
+
     None
 }
 

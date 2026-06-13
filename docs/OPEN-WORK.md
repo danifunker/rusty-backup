@@ -280,8 +280,11 @@ Treat as a single tracked initiative here; progress is on that doc's
 own per-format spine.
 
 Gaps to reconcile back into the plan when it gets picked up:
-- **BBCMicro / AcornElectron** — Acorn DFS (the flat catalog FS) not in
-  the plan; only ADFS is covered via Archie.
+- **BBCMicro / AcornElectron** — Acorn DFS — DONE (2026-06-13). `fs::dfs`
+  reads + writes the flat-catalogue DFS on single-sided `.ssd`
+  (40-track 100K / 80-track 200K), bidirectionally cross-validated
+  byte-exact against an independent clean-room reader/writer. Remaining:
+  double-sided `.dsd` (track-interleaved) and ADFS-on-floppy.
 - **AcornAtom** (Atom DOS) — niche, omitted from §1 + §5 of the plan.
 - **SAM-Coupe** (SAM DOS / MasterDOS) — omitted.
 - **ZX-Spectrum native FS** (TR-DOS / G+DOS) — only FAT + +3DOS are
