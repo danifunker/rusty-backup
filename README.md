@@ -363,6 +363,7 @@ inspect-tab Edit Mode.
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
+| Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
 
 ### Partition tables
 

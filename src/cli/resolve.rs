@@ -345,6 +345,13 @@ pub struct FsDispatchOverride {
     /// forwarded to the partition_type_string dispatch.
     #[arg(long = "fs-type", value_name = "TYPE")]
     pub fs_type: Option<String>,
+
+    /// Scan the **entire** image for recoverable text in the synthetic carve
+    /// view (used for disks with no recognized filesystem — e.g. custom
+    /// bootblock Amiga "NDOS" disks). By default the carve view only scans
+    /// the first 10 MB. No effect on disks with a real filesystem.
+    #[arg(long = "carve-full")]
+    pub carve_full: bool,
 }
 
 impl FsDispatchOverride {
@@ -354,7 +361,12 @@ impl FsDispatchOverride {
     /// The override replaces `ctx.type_string` and clears `ctx.type_byte`
     /// so the string-dispatch branch in `open_filesystem` wins. Updates
     /// `ctx.label` so the user can confirm the override is in effect.
+    ///
+    /// Also installs the process-wide carve scan policy from `--carve-full`
+    /// so a subsequent carve open scans the whole image instead of the
+    /// default first-10-MB window.
     pub fn apply(&self, ctx: &mut PartitionContext) {
+        crate::fs::carve::set_full_scan(self.carve_full);
         if let Some(t) = &self.fs_type {
             ctx.type_string = Some(t.clone());
             ctx.type_byte = 0; // Force string-dispatch

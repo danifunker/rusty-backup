@@ -7,6 +7,7 @@ pub mod apple_dos;
 pub mod atari_dos;
 pub mod binhex;
 pub mod btrfs;
+pub mod carve;
 pub mod cbm;
 pub mod cpm;
 pub mod cpm_diskdefs;
@@ -952,6 +953,9 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             "Apple_HFSX" => "HFSX",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            // Amiga boot block present, no AmigaDOS filesystem (custom
+            // bootblock / diagnostic disk). Browsable via the carve view.
+            "Amiga-NDOS" => "Amiga NDOS (no filesystem)",
             _ => "unknown",
         };
     }
@@ -1356,9 +1360,13 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "could not detect filesystem type on superfloppy".into(),
-                )),
+                // No filesystem recognized. Rather than erroring, fall back to
+                // the synthetic carve view so the user can still pull a raw
+                // copy and any recoverable text/JSON content off the image.
+                _ => Ok(Box::new(carve::CarveFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
             }
         }
         // FAT12
@@ -1905,6 +1913,15 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 ))),
             }
         }
+        // NDOS Amiga disk: a valid boot block (so the ROM runs its code) with
+        // no AmigaDOS root block — a custom bootblock disk (demo / diagnostic)
+        // that writes raw sectors instead of using a filesystem. There's
+        // nothing to mount, so fall back to the synthetic carve view, which
+        // surfaces the whole disk plus any recoverable text/JSON payloads.
+        "Amiga-NDOS" => Ok(Box::new(carve::CarveFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str
