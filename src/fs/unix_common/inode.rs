@@ -165,6 +165,7 @@ pub fn unix_entry_from_inode(
         amiga_protection: None,
         amiga_comment: None,
         amiga_date: None,
+        dos_attributes: None,
     }
 }
 

@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 pub mod api;
 pub mod config;
+pub mod copy_paths;
 pub mod device_safety;
 pub mod exit;
 pub mod glob;
@@ -86,6 +87,11 @@ pub enum Command {
     /// Extract a file, directory tree, or glob match from a filesystem
     /// to the host.
     Get(verbs::get::GetArgs),
+
+    /// Copy files / directory trees between two disk images without
+    /// staging through the host. SRC may be a glob; DST follows `cp`
+    /// semantics (into an existing directory, or rename to a target).
+    Cp(verbs::cp::CpArgs),
 
     /// Delete a file or directory from a filesystem.
     Rm(verbs::rm::RmArgs),
@@ -261,6 +267,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
+        Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),

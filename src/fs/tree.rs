@@ -166,6 +166,7 @@ mod tests {
                 amiga_protection: None,
                 amiga_comment: None,
                 amiga_date: None,
+                dos_attributes: None,
             })
         }
 
@@ -192,6 +193,7 @@ mod tests {
                         amiga_protection: None,
                         amiga_comment: None,
                         amiga_date: None,
+                        dos_attributes: None,
                     },
                     FileEntry {
                         name: "ReadMe".into(),
@@ -213,6 +215,7 @@ mod tests {
                         amiga_protection: None,
                         amiga_comment: None,
                         amiga_date: None,
+                        dos_attributes: None,
                     },
                 ]),
                 "/Documents" => Ok(vec![FileEntry {
@@ -235,6 +238,7 @@ mod tests {
                     amiga_protection: None,
                     amiga_comment: None,
                     amiga_date: None,
+                    dos_attributes: None,
                 }]),
                 _ => Ok(vec![]),
             }

@@ -434,6 +434,38 @@ Usage: convert [OPTIONS] <IN> <OUT>
 - `--bincue-multi-bin` — For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats
 - `--overwrite` — Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning
 
+### `cp`
+
+Copy files / directory trees between two disk images without staging through the host. SRC may be a glob; DST follows `cp` semantics (into an existing directory, or rename to a target)
+
+```
+Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
+```
+
+**Arguments**
+
+- `<SRC_IMAGE>` — Source image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Source path or glob inside the source filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and copy every match
+- `<DST_IMAGE>` — Destination image reference (`path` or `path@N`)
+- `<DST>` — Destination path inside the destination filesystem. Copying into an existing directory (or a path ending in `/`) keeps the source basename; otherwise the destination is the literal target name
+
+**Options**
+
+- `-r` / `--recursive` — Recursively copy directories. Without this, directory sources / matches are skipped with a warning
+- `--force` — Overwrite existing destination entries. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip when a destination entry already exists. Mutually exclusive with `--force`. Without either, an existing destination is an error
+- `--exclude` — Exclude source paths matching this glob. Repeatable. Exclude wins
+- `--ignore-case` — Match the source case-insensitively regardless of its native rule
+- `--case-sensitive` — Match the source case-sensitively regardless of its native rule
+- `--names` — Policy for source names the destination filesystem rejects (too long / illegal characters). Default: truncate
+- `--attrs` — Whether to carry FS-specific attributes (type/creator, Unix perms, DOS attribute bits, Amiga bits). Default: preserve
+- `--flatten` — Collapse a source tree into the destination directory when the destination filesystem has no subdirectories (CP/M, DFS, CBM, …)
+- `--parents` — Auto-create missing destination parent directories
+- `--password` — Password for an encrypted source container (currently: WinImage IMZ)
+- `--src-fs-type` — Force a specific filesystem dispatch for the SOURCE (e.g. `cpm:amstrad_data`). See `get --fs-type`
+- `--dst-fs-type` — Force a specific filesystem dispatch for the DESTINATION
+- `--carve-full` — Scan the entire source image for recoverable text in the synthetic carve view (NDOS disks). Source-side only
+
 ### `expand`
 
 Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images

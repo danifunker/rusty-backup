@@ -44,6 +44,7 @@ and automated build farms.
 rb-cli new disk.dsk --fs hfs --size 800K --name "My Disk"
 rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
 rb-cli ls  disk.dsk /System
+rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
 rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256

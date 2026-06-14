@@ -38,6 +38,7 @@ fn top_level_verbs_present() {
         "ls",
         "put",
         "get",
+        "cp",
         "rm",
         "mkdir",
         "fsck",

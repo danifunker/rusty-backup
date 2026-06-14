@@ -16,6 +16,7 @@ pub mod chmeta;
 pub mod completions;
 pub mod config;
 pub mod convert;
+pub mod cp;
 pub mod expand;
 pub mod floppy;
 pub mod fsck;

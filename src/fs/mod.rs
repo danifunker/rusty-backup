@@ -9,6 +9,7 @@ pub mod binhex;
 pub mod btrfs;
 pub mod carve;
 pub mod cbm;
+pub mod copy;
 pub mod cpm;
 pub mod cpm_diskdefs;
 pub mod dfs;

@@ -1130,6 +1130,7 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         })
     }
 
