@@ -51,6 +51,20 @@ pub mod attr {
     pub const FREE_PAGE: u16 = 9728;
     pub const HEADER: u16 = 9729;
     pub const DATA: u16 = 9730;
+
+    /// Classic Pilot (`PilotFileTypes`) page kinds, used by pre-Cedar volumes
+    /// (e.g. the 6085 Pilot 12.3 disks): label word 7 holds a `File.Type`, where
+    /// a free page is `tFreePage = 6` (vs the Cedar-nucleus `FREE_PAGE = 9728`).
+    /// Other classic types: VAM = 7, VFM = 8, normal data pages carry the file's
+    /// own type. See `PilotFileTypes.mesa`.
+    pub const FREE_PAGE_CLASSIC: u16 = 6;
+}
+
+/// True if a label `attributes`/`type` word marks a free page in either the
+/// Cedar-nucleus scheme ([`attr::FREE_PAGE`]) or the classic Pilot scheme
+/// ([`attr::FREE_PAGE_CLASSIC`]).
+fn is_free_page_attr(a: u16) -> bool {
+    a == attr::FREE_PAGE || a == attr::FREE_PAGE_CLASSIC
 }
 
 const VOLUME_LABEL_LEN: usize = 40;
@@ -181,14 +195,16 @@ pub fn pilot_checksum(words: &[u16]) -> u16 {
 }
 
 /// Compute the checksum over a page's words `[0..255)` and store it at word 255.
+///
+/// Note: real Pilot/Cedar **never computes** the physical/logical volume-root
+/// page checksum — the `checksum` field (word 255) is declared `_ 0` and left
+/// zero; volume validity is established by the seal + version alone (confirmed
+/// against the Dwarf 6085 disks, whose root-page word 255 is 0). We still stamp
+/// a checksum on the pages our own writer creates (it is a harmless reserved
+/// word that real Pilot ignores), but the reader does not verify it.
 fn set_page_checksum(data: &mut [u8]) {
     let words: Vec<u16> = (0..PAGE_WORDS - 1).map(|i| rdw(data, i)).collect();
     wrw(data, PAGE_WORDS - 1, pilot_checksum(&words));
-}
-/// Verify a page's stored checksum (word 255).
-fn page_checksum_ok(data: &[u8]) -> bool {
-    let words: Vec<u16> = (0..PAGE_WORDS - 1).map(|i| rdw(data, i)).collect();
-    pilot_checksum(&words) == rdw(data, PAGE_WORDS - 1)
 }
 
 /// Pack an ASCII string into a `PACKED ARRAY OF CHARACTER` starting at word
@@ -314,11 +330,8 @@ impl PhysicalRoot {
                 PR_SEAL
             )));
         }
-        if !page_checksum_ok(data) {
-            return Err(FilesystemError::Parse(
-                "Pilot: physical-root checksum mismatch".into(),
-            ));
-        }
+        // No checksum gate: the root-page checksum word is never computed by
+        // Pilot/Cedar (see `set_page_checksum`); the seal is the validity test.
         let label_len = rdw(data, 2) as usize;
         let mut pv_id = [0u16; 5];
         for (i, w) in pv_id.iter_mut().enumerate() {
@@ -355,11 +368,7 @@ impl LogicalRoot {
                 LR_SEAL
             )));
         }
-        if !page_checksum_ok(data) {
-            return Err(FilesystemError::Parse(
-                "Pilot: logical-root checksum mismatch".into(),
-            ));
-        }
+        // No checksum gate (see PhysicalRoot::parse): seal is the validity test.
         let mut v_id = [0u16; 5];
         for (i, w) in v_id.iter_mut().enumerate() {
             *w = rdw(data, 2 + i);
@@ -425,7 +434,7 @@ pub fn read_volume(disk: &Disk, generation: Generation) -> Result<PilotVolume, F
     for lp in 0..root_sv.n_pages as usize {
         let vda = root_sv.pv_page as usize + lp;
         if let Some(s) = disk.sector(vda) {
-            if Label::parse(&s.label).attributes == attr::FREE_PAGE {
+            if is_free_page_attr(Label::parse(&s.label).attributes) {
                 free_pages += 1;
             }
         }
@@ -1201,11 +1210,16 @@ mod tests {
     }
 
     #[test]
-    fn detects_corrupted_root_checksum() {
+    fn seal_is_the_root_validity_gate() {
         let geo = pilot_geometry(128);
         let mut disk = create_blank(geo, Generation::CedarNucleus, "X").expect("create");
-        // Corrupt a word in the physical root data; checksum must catch it.
+        assert!(read_volume(&disk, Generation::CedarNucleus).is_ok());
+        // Real Pilot never computes the root-page checksum word (it stays 0), so
+        // corrupting a non-seal data word must NOT fail the read...
         disk.sectors[0].data[10] ^= 0xff;
+        assert!(read_volume(&disk, Generation::CedarNucleus).is_ok());
+        // ...but a bad physical-root seal (word 0) must.
+        disk.sectors[0].data[0] ^= 0xff;
         assert!(read_volume(&disk, Generation::CedarNucleus).is_err());
     }
 }

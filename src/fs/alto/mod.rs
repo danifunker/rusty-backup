@@ -28,16 +28,20 @@ pub mod pdi;
 pub mod pilot;
 pub mod salto;
 pub mod write;
+pub mod zdisk;
 
 use super::filesystem::FilesystemError;
 
 /// Open a disk pack from raw bytes, auto-detecting the container: a PDI image
-/// (magic `PARCDISK`), a Salto emulator cooked `.dsk` image (recognized by its
-/// exact Diablo-31 size), or a period CopyDisk stream (`.bfs` / `.copydisk` /
-/// `.altodisk`).
+/// (magic `PARCDISK`), a Dwarf Draco 6085 `.zdisk` (a zlib stream inflating to
+/// the `0xDAAD` signature; a Pilot pack), a Salto emulator cooked `.dsk` image
+/// (recognized by its exact Diablo-31 size), or a period CopyDisk stream
+/// (`.bfs` / `.copydisk` / `.altodisk`).
 pub fn open_pack(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     if bytes.len() >= pdi::MAGIC.len() && &bytes[..pdi::MAGIC.len()] == pdi::MAGIC {
         pdi::read(bytes)
+    } else if zdisk::is_zdisk(bytes) {
+        zdisk::read(bytes)
     } else if salto::is_salto_image(bytes) {
         salto::read(bytes)
     } else {
