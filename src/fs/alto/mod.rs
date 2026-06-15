@@ -354,9 +354,25 @@ impl LabelCodec {
         l
     }
 
-    /// A free page's label: file id = the all-ones free-page marker.
-    pub fn free_label(&self, g: &Geometry) -> Vec<u8> {
-        self.make_label(g, None, None, 0, 0, EOF_DA, EOF_DA, EOF_DA)
+    /// A free page's label: chain links zeroed (the writer's free-page marker —
+    /// distinct from the `EOF_DA` used at file-chain ends) and the file id set to
+    /// the all-ones free marker. Matches the original BFS writer byte-for-byte.
+    pub fn free_label(&self, _g: &Geometry) -> Vec<u8> {
+        let mut l = vec![0u8; self.label_bytes()];
+        // version + serial = 0xFFFF,0xFFFF,0xFFFF; links left zero.
+        match self {
+            LabelCodec::Diablo => {
+                put_be16(&mut l, 5 * 2, 0xffff);
+                put_be16(&mut l, 6 * 2, 0xffff);
+                put_be16(&mut l, 7 * 2, 0xffff);
+            }
+            LabelCodec::Trident => {
+                put_be16(&mut l, 0, 0xffff);
+                put_be16(&mut l, 2, 0xffff);
+                put_be16(&mut l, 4, 0xffff);
+            }
+        }
+        l
     }
 }
 

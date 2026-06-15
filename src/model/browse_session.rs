@@ -158,9 +158,13 @@ impl BrowseSession {
         // (params block: length=7, type=3, diskType=10 AltoDiablo).
         // Salto cooked `.dsk` images carry no magic; recognize them by the exact
         // Diablo-31 image size (open_pack does the real validation).
-        let is_salto_dsk = std::fs::metadata(path)
-            .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
-            .unwrap_or(false);
+        let alto_size = std::fs::metadata(path).map(|m| m.len() as usize).ok();
+        let is_salto_dsk = alto_size == Some(crate::fs::alto::salto::IMAGE_BYTES);
+        // Trident (TFS) pack image: recognized by the exact T-80 / T-300 size.
+        let is_trident = matches!(
+            alto_size,
+            Some(crate::fs::alto::trident::T80_BYTES) | Some(crate::fs::alto::trident::T300_BYTES)
+        );
         // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
         // gate the full read on the zlib magic byte, then confirm by inflating
         // the prefix to the DAAD signature so we don't slurp unrelated files.
@@ -174,6 +178,7 @@ impl BrowseSession {
         if &magic == b"PARCDISK"
             || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
             || is_salto_dsk
+            || is_trident
             || zdisk_bytes.is_some()
         {
             let bytes = match zdisk_bytes {

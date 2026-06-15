@@ -21,10 +21,12 @@ use super::super::entry::FileEntry;
 use super::super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
-use super::{be16, Disk};
+use super::{be16, Disk, LabelCodec};
 
 /// `eofDA` (Disks.d): a `next`/`previous` link of this value terminates the
-/// chain. `BFSVirtualDA` also treats a stored real-DA of `0` as end-of-chain.
+/// chain (the [`LabelCodec`] handles this at runtime; this is used only by the
+/// hand-built test fixtures below).
+#[cfg(test)]
 const EOF_DA: u16 = 0xffff;
 
 /// SysDir's leader page is fixed at virtual disk address 1 (`BFSInit.bcpl`).
@@ -55,15 +57,6 @@ pub struct Bfs<'a> {
     disk: &'a Disk,
 }
 
-/// True when a label link terminates a page chain. A `next`/`previous` of
-/// `eofDA` (0xFFFF) **or 0** ends the chain: real BFS volumes terminate file
-/// chains with a link of 0, and the boot page at real disk address 0 is reached
-/// by the boot microcode directly (not by following a filesystem link), so a
-/// link of 0 always means end-of-file to the filesystem reader.
-fn is_eof_link(link: u16) -> bool {
-    link == EOF_DA || link == 0
-}
-
 impl<'a> Bfs<'a> {
     pub fn new(disk: &'a Disk) -> Self {
         Bfs { disk }
@@ -79,19 +72,20 @@ impl<'a> Bfs<'a> {
     /// Walk a file's data-page chain and return `(size_bytes, n_data_pages)`
     /// without copying the data.
     fn chain_stats(&self, leader_vda: usize) -> Result<(u64, u32), FilesystemError> {
+        let g = &self.disk.geometry;
+        let codec = LabelCodec::for_family(g.family);
         let leader = self.disk.sector(leader_vda).ok_or_else(|| {
             FilesystemError::InvalidData(format!("leader VDA {leader_vda} out of range"))
         })?;
-        let mut link = be16(&leader.label, 0); // LD.next -> first data page
+        let mut link = codec.next(g, &leader.label); // LD.next -> first data page
         let mut size = 0u64;
         let mut pages = 0u32;
-        let total = self.disk.geometry.total_sectors();
-        while !is_eof_link(link) {
-            let vda = self.disk.geometry.vda_from_da(link);
+        let total = g.total_sectors();
+        while let Some(vda) = link {
             let s = self.disk.sector(vda).ok_or_else(|| {
                 FilesystemError::InvalidData(format!("page VDA {vda} out of range"))
             })?;
-            let num_chars = be16(&s.label, 6) as usize; // DL.numChars
+            let num_chars = codec.num_chars(&s.label) as usize;
             size += num_chars.min(s.data.len()) as u64;
             pages += 1;
             if pages as usize > total {
@@ -99,7 +93,7 @@ impl<'a> Bfs<'a> {
                     "BFS page chain longer than the disk (loop?)".into(),
                 ));
             }
-            link = be16(&s.label, 0);
+            link = codec.next(g, &s.label);
         }
         Ok((size, pages))
     }
@@ -111,19 +105,23 @@ impl<'a> Bfs<'a> {
         leader_vda: usize,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
+        let g = &self.disk.geometry;
+        let codec = LabelCodec::for_family(g.family);
         let leader = self.disk.sector(leader_vda).ok_or_else(|| {
             FilesystemError::InvalidData(format!("leader VDA {leader_vda} out of range"))
         })?;
-        let mut link = be16(&leader.label, 0);
+        let mut link = codec.next(g, &leader.label);
         let mut out = Vec::new();
-        let total = self.disk.geometry.total_sectors();
+        let total = g.total_sectors();
         let mut pages = 0usize;
-        while !is_eof_link(link) && out.len() < max_bytes {
-            let vda = self.disk.geometry.vda_from_da(link);
+        while let Some(vda) = link {
+            if out.len() >= max_bytes {
+                break;
+            }
             let s = self.disk.sector(vda).ok_or_else(|| {
                 FilesystemError::InvalidData(format!("page VDA {vda} out of range"))
             })?;
-            let num_chars = (be16(&s.label, 6) as usize).min(s.data.len());
+            let num_chars = (codec.num_chars(&s.label) as usize).min(s.data.len());
             let want = (max_bytes - out.len()).min(num_chars);
             out.extend_from_slice(&s.data[..want]);
             pages += 1;
@@ -132,7 +130,7 @@ impl<'a> Bfs<'a> {
                     "BFS page chain longer than the disk (loop?)".into(),
                 ));
             }
-            link = be16(&s.label, 0);
+            link = codec.next(g, &s.label);
         }
         Ok(out)
     }

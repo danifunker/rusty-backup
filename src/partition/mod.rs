@@ -241,6 +241,15 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
                 return Some("Alto BFS".to_string());
             }
         }
+        // Trident (TFS) pack image (ContrAlto2/dorado layout): no magic,
+        // recognized by the exact T-80 / T-300 size. Browses as an Alto file
+        // system (the same logical FS on Trident hardware). open_pack validates.
+        if end as usize == crate::fs::alto::trident::T80_BYTES
+            || end as usize == crate::fs::alto::trident::T300_BYTES
+        {
+            let _ = reader.seek(SeekFrom::Start(0));
+            return Some("Alto BFS".to_string());
+        }
         let _ = reader.seek(SeekFrom::Start(0));
     }
 

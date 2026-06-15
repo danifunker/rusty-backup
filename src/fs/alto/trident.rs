@@ -96,9 +96,11 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     let (model, sectors_n) = match bytes.len() {
         T80_BYTES => (80u16, T80_SECTORS),
         T300_BYTES => (300u16, T300_SECTORS),
-        n => return Err(FilesystemError::Parse(format!(
+        n => {
+            return Err(FilesystemError::Parse(format!(
             "Trident pack: file is {n} bytes, expected {T80_BYTES} (T-80) or {T300_BYTES} (T-300)"
-        ))),
+        )))
+        }
     };
     let label_off = (DUMMY_WORDS + HEADER_WORDS) * 2; // 6
     let data_off = label_off + LABEL_BYTES; // 26

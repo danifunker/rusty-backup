@@ -18,7 +18,7 @@
 
 use super::super::filesystem::FilesystemError;
 use super::bfs::{parse_dir_entries, Bfs, SYSDIR_LEADER_VDA};
-use super::{be16, put_be16, Disk, Geometry, Sector};
+use super::{be16, put_be16, Disk, Geometry, LabelCodec, Sector};
 
 const EOF_DA: u16 = 0xffff;
 const DIR_BIT: u16 = 0x8000; // SN.word1 directory flag
@@ -28,9 +28,6 @@ const DV_TYPE_FREE: u16 = 0;
 const DV_TYPE_FILE: u16 = 1;
 const FPROP_DSHAPE: u16 = 1; // leader-page property type: disk shape
 
-const WORDS_PER_PAGE: usize = 256;
-const DATA_BYTES: usize = 512;
-const LABEL_BYTES: usize = 16;
 const LKDHEADER: usize = 16; // KDH words preceding the bit table
 const MAX_NAME_CHARS: usize = 39; // maxLengthFn in AltoFileSys.d
 const DV_HEADER_WORDS: usize = 6; // lDV: type/length word + 5-word file pointer
@@ -97,19 +94,19 @@ pub fn extract_files(disk: &Disk) -> Result<Vec<FileImage>, FilesystemError> {
         })?;
         let leader = leader_sec.data.clone();
         let mut pages = Vec::new();
-        let mut link = be16(&leader_sec.label, 0);
+        let codec = LabelCodec::for_family(geom.family);
+        let mut link = codec.next(geom, &leader_sec.label);
         let mut guard = 0usize;
-        while link != EOF_DA && link != 0 {
-            let vda = geom.vda_from_da(link);
+        while let Some(vda) = link {
             let s = disk.sector(vda).ok_or_else(|| {
                 FilesystemError::InvalidData(format!("page VDA {vda} out of range"))
             })?;
-            let num_chars = be16(&s.label, 6).min(DATA_BYTES as u16);
+            let num_chars = codec.num_chars(&s.label).min(geom.data_bytes);
             pages.push(DataPage {
                 data: s.data.clone(),
                 num_chars,
             });
-            link = be16(&s.label, 0);
+            link = codec.next(geom, &s.label);
             guard += 1;
             if guard > total {
                 return Err(FilesystemError::InvalidData(
@@ -164,10 +161,11 @@ pub fn add_file(source: &Disk, name: &str, data: &[u8]) -> Result<Disk, Filesyst
         .max()
         .unwrap_or(DD_SN as u32)
         + 1;
+    let dbytes = source.geometry.data_bytes as usize;
     let pages = data
-        .chunks(DATA_BYTES)
+        .chunks(dbytes)
         .map(|c| {
-            let mut d = vec![0u8; DATA_BYTES];
+            let mut d = vec![0u8; dbytes];
             d[..c.len()].copy_from_slice(c);
             DataPage {
                 data: d,
@@ -175,7 +173,7 @@ pub fn add_file(source: &Disk, name: &str, data: &[u8]) -> Result<Disk, Filesyst
             }
         })
         .collect();
-    let mut leader = vec![0u8; DATA_BYTES];
+    let mut leader = vec![0u8; dbytes];
     write_leader_name(&mut leader, &name);
     files.push(FileImage {
         name,
@@ -217,6 +215,12 @@ pub fn delete_file(source: &Disk, name: &str) -> Result<Disk, FilesystemError> {
 /// (e.g. backup -> restore), which keeps every page at its original VDA.
 pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, FilesystemError> {
     let total = geometry.total_sectors();
+    // Per-family parameters: the label shape and the page size are the only
+    // things that differ between Diablo/BFS and Trident/TFS — everything below
+    // (SysDir, leader, FP, bit table) is shared.
+    let codec = LabelCodec::for_family(geometry.family);
+    let data_bytes = geometry.data_bytes as usize;
+    let words_per_page = data_bytes / 2;
 
     // --- Pass 1: sizes + VDA layout ------------------------------------
     let mut dir_words = dv_words("SysDir.") + dv_words("DiskDescriptor.");
@@ -224,12 +228,12 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
         dir_words += dv_words(&f.name);
     }
     // page-align with at least one trailing free word
-    let sysdir_content_words = round_up_page(dir_words + 1);
-    let sysdir_data_pages = sysdir_content_words / WORDS_PER_PAGE;
+    let sysdir_content_words = round_up_page(dir_words + 1, words_per_page);
+    let sysdir_data_pages = sysdir_content_words / words_per_page;
 
     let disk_bt_size = ((total - 1) >> 4) + 1; // words in the bit table
     let dd_content_words = LKDHEADER + disk_bt_size;
-    let dd_data_pages = div_ceil(dd_content_words, WORDS_PER_PAGE);
+    let dd_data_pages = div_ceil(dd_content_words, words_per_page);
 
     let mut next = 0usize;
     let mut alloc = |n: usize| {
@@ -261,15 +265,18 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
     // --- Pass 2: write ---------------------------------------------------
     let mut sectors: Vec<Sector> = (0..total)
         .map(|_| Sector {
-            label: free_label(),
-            data: vec![0u8; DATA_BYTES],
+            label: codec.free_label(&geometry),
+            data: vec![0u8; data_bytes],
         })
         .collect();
+    // The leader's last-page hint stores a real disk address (advisory; the
+    // reader follows the label chain, not the hint). Diablo-packed; for Trident
+    // it is an approximation that no reader consults.
     let da = |v: usize| geometry.da_from_vda(v);
 
     // (a) user files
     for (f, lay) in files.iter().zip(&file_layouts) {
-        let first_data = lay.data.first().map(|&v| da(v)).unwrap_or(EOF_DA);
+        let first_data = lay.data.first().copied();
         let (last_da, last_page, last_chars) = match lay.data.last() {
             Some(&v) => (
                 da(v),
@@ -279,29 +286,28 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
             None => (EOF_DA, 0, 0),
         };
         let mut leader_data = f.leader.clone();
-        leader_data.resize(DATA_BYTES, 0);
+        leader_data.resize(data_bytes, 0);
         put_be16(&mut leader_data, LD_HINT_FA, last_da);
         put_be16(&mut leader_data, LD_HINT_FA + 2, last_page);
         put_be16(&mut leader_data, LD_HINT_FA + 4, last_chars);
         sectors[lay.leader] = Sector {
-            label: make_label(first_data, EOF_DA, 0, 0, f.version, f.sn_w1, f.sn_w2),
+            label: codec.make_label(
+                &geometry, first_data, None, 0, 0, f.version, f.sn_w1, f.sn_w2,
+            ),
             data: leader_data,
         };
         for (i, page) in f.pages.iter().enumerate() {
-            let prev = if i == 0 {
-                da(lay.leader)
-            } else {
-                da(lay.data[i - 1])
-            };
+            let prev = Some(if i == 0 { lay.leader } else { lay.data[i - 1] });
             let next = if i + 1 < lay.data.len() {
-                da(lay.data[i + 1])
+                Some(lay.data[i + 1])
             } else {
-                EOF_DA
+                None
             };
             let mut d = page.data.clone();
-            d.resize(DATA_BYTES, 0);
+            d.resize(data_bytes, 0);
             sectors[lay.data[i]] = Sector {
-                label: make_label(
+                label: codec.make_label(
+                    &geometry,
                     next,
                     prev,
                     page.num_chars,
@@ -349,10 +355,20 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
         "SysDir.",
         Some(&geometry),
         [DIR_BIT, SYSDIR_SN, 1, 0, sysdir_leader as u16],
-        (da(sysdir_last), sysdir_data_pages as u16, DATA_BYTES as u16),
+        (da(sysdir_last), sysdir_data_pages as u16, data_bytes as u16),
+        data_bytes,
     );
     sectors[sysdir_leader] = Sector {
-        label: make_label(da(sysdir_data), EOF_DA, 0, 0, 1, DIR_BIT, SYSDIR_SN),
+        label: codec.make_label(
+            &geometry,
+            Some(sysdir_data),
+            None,
+            0,
+            0,
+            1,
+            DIR_BIT,
+            SYSDIR_SN,
+        ),
         data: sysdir_leader_data,
     };
     write_data_pages(
@@ -412,15 +428,16 @@ pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, Files
     }
 
     let dd_last = dd_data + dd_data_pages - 1;
-    let dd_last_chars = (dd_content_words * 2 - (dd_data_pages - 1) * DATA_BYTES) as u16;
+    let dd_last_chars = (dd_content_words * 2 - (dd_data_pages - 1) * data_bytes) as u16;
     let dd_leader_data = build_leader(
         "DiskDescriptor.",
         None,
         [0, DD_SN, 1, 0, dd_leader as u16],
         (da(dd_last), dd_data_pages as u16, dd_last_chars),
+        data_bytes,
     );
     sectors[dd_leader] = Sector {
-        label: make_label(da(dd_data), EOF_DA, 0, 0, 1, 0, DD_SN),
+        label: codec.make_label(&geometry, Some(dd_data), None, 0, 0, 1, 0, DD_SN),
         data: dd_leader_data,
     };
     write_data_pages(
@@ -443,8 +460,8 @@ struct FileLayout {
     data: Vec<usize>,
 }
 
-fn round_up_page(words: usize) -> usize {
-    div_ceil(words, WORDS_PER_PAGE) * WORDS_PER_PAGE
+fn round_up_page(words: usize, words_per_page: usize) -> usize {
+    div_ceil(words, words_per_page) * words_per_page
 }
 
 /// Words occupied by one `DV` entry for `name` (header + name string).
@@ -459,31 +476,6 @@ fn name_words(name: &str) -> usize {
 fn push_be16(buf: &mut Vec<u8>, v: u16) {
     buf.push((v >> 8) as u8);
     buf.push(v as u8);
-}
-
-fn make_label(
-    next: u16,
-    prev: u16,
-    num_chars: u16,
-    page: u16,
-    version: u16,
-    sn_w1: u16,
-    sn_w2: u16,
-) -> Vec<u8> {
-    let mut l = vec![0u8; LABEL_BYTES];
-    put_be16(&mut l, 0, next);
-    put_be16(&mut l, 2, prev);
-    put_be16(&mut l, 6, num_chars);
-    put_be16(&mut l, 8, page);
-    put_be16(&mut l, 10, version);
-    put_be16(&mut l, 12, sn_w1);
-    put_be16(&mut l, 14, sn_w2);
-    l
-}
-
-/// A free page's label: fileId = `-1,-1,-1` (the free-page marker).
-fn free_label() -> Vec<u8> {
-    make_label(0, 0, 0, 0, 0xffff, 0xffff, 0xffff)
 }
 
 /// Append a `DV` directory entry: type/length word, 5-word file pointer, then
@@ -517,27 +509,25 @@ fn write_data_pages(
     sn_w1: u16,
     sn_w2: u16,
 ) {
-    let da = |v: usize| geom.da_from_vda(v);
+    let codec = LabelCodec::for_family(geom.family);
+    let data_bytes = geom.data_bytes as usize;
     for i in 0..n_pages {
         let vda = start + i;
-        let off = i * DATA_BYTES;
-        let end = (off + DATA_BYTES).min(content.len());
-        let mut d = vec![0u8; DATA_BYTES];
+        let off = i * data_bytes;
+        let end = (off + data_bytes).min(content.len());
+        let mut d = vec![0u8; data_bytes];
         if off < end {
             d[..end - off].copy_from_slice(&content[off..end]);
         }
-        let prev = if i == 0 {
-            da(leader_vda)
-        } else {
-            da(start + i - 1)
-        };
+        let prev = Some(if i == 0 { leader_vda } else { start + i - 1 });
         let next = if i + 1 < n_pages {
-            da(start + i + 1)
+            Some(start + i + 1)
         } else {
-            EOF_DA
+            None
         };
         sectors[vda] = Sector {
-            label: make_label(
+            label: codec.make_label(
+                geom,
                 next,
                 prev,
                 (end - off) as u16,
@@ -566,8 +556,9 @@ fn build_leader(
     dshape: Option<&Geometry>,
     dir_fp: [u16; 5],
     hint: (u16, u16, u16),
+    data_bytes: usize,
 ) -> Vec<u8> {
-    let mut d = vec![0u8; DATA_BYTES];
+    let mut d = vec![0u8; data_bytes];
     write_leader_name(&mut d, name);
     if let Some(g) = dshape {
         // FPROP word: (type << 8) | length; DSHAPE = 4 words, length = 5.
@@ -749,5 +740,69 @@ mod tests {
             clone_to(&src, tiny),
             Err(FilesystemError::DiskFull(_))
         ));
+    }
+
+    /// A small Trident geometry (real T-80 is 76 MB — too big for a unit test).
+    /// `build_disk` only needs enough pages, not the exact model size.
+    fn trident_small() -> Geometry {
+        Geometry {
+            family: FsFamily::Trident,
+            disk_model: 80,
+            n_disks: 1,
+            n_cylinders: 40,
+            n_heads: 5,
+            n_sectors: 9,
+            label_bytes: 20,
+            data_bytes: 2048,
+        }
+    }
+
+    #[test]
+    fn trident_create_add_read_delete() {
+        // The whole BFS write+read stack, parameterized for Trident: blank
+        // format, DiskDescriptor geometry, add a multi-page file (2048-byte
+        // pages, 10-word label, 2-word DH chain links), list by leader name,
+        // read back byte-identical, delete.
+        let blank = create_blank(trident_small()).unwrap();
+        assert_eq!(names(&blank), Vec::<String>::new());
+        let dd = Bfs::new(&blank).disk_descriptor().unwrap();
+        assert_eq!(dd.n_sectors, 9);
+        assert_eq!(dd.n_heads, 5);
+
+        let payload = b"Trident TFS round-trip payload. ".repeat(300); // ~9.6 KB -> 5 pages
+        let disk = add_file(&blank, "TFSFILE.BIN", &payload).unwrap();
+
+        let mut fs = BfsFilesystem::open(disk.clone());
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let e = entries
+            .iter()
+            .find(|e| e.name == "TFSFILE.BIN.")
+            .expect("Trident file is listed by its leader name");
+        assert_eq!(fs.read_file(e, usize::MAX).unwrap(), payload);
+
+        let after = delete_file(&disk, "TFSFILE.BIN").unwrap();
+        assert_eq!(names(&after), Vec::<String>::new());
+    }
+
+    #[test]
+    fn trident_pack_container_round_trip_with_files() {
+        use crate::fs::alto::trident;
+        // Build a real T-80 volume with a file, serialize to the Trident pack
+        // container, read it back, and confirm the file survives.
+        let blank = create_blank(trident::geometry(80)).unwrap();
+        let payload = b"pack round trip".repeat(500); // multi-page
+        let disk = add_file(&blank, "PACKED.DAT", &payload).unwrap();
+
+        let bytes = trident::write(&disk).expect("pack write");
+        assert_eq!(bytes.len(), trident::T80_BYTES);
+        let back = trident::read(&bytes).expect("pack read");
+
+        assert_eq!(
+            Bfs::new(&back)
+                .read_file_by_name("PACKED.DAT", usize::MAX)
+                .unwrap(),
+            payload
+        );
     }
 }
