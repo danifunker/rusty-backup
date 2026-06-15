@@ -433,7 +433,7 @@ uniform: rb-cli build → SCP → mount → in-core verify. Per-core notes:
 | Core | SD path | Format | Workflow |
 |---|---|---|---|
 | C64 / C128 / C16 / VIC20 | `/games/C64/` etc. | `.d64`/`.d71`/`.d81` (CBM DOS) | A + C; `c1541` for cross-check |
-| PET2001 | `/games/PET/` | `.d80`/`.d82` | A only (cbm crate doesn't write D80/D82) |
+| PET2001 | `/games/PET/` | `.d80`/`.d82` | A + C (`fs::cbm` reads + writes D80/D82; cross-check with Python `d64`) |
 | BBCMicro / AcornElectron | `/games/BBCMicro/` | `.ssd`/`.dsd` (Acorn DFS) | A + C |
 | AcornAtom | `/games/AcornAtom/` | `.atm` | A only |
 | CoCo2 / CoCo3 | `/games/CoCo2/` | `.dsk` (JV1; RS-DOS or OS-9 RBF) | A + C |

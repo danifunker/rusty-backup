@@ -2,7 +2,10 @@
 //!
 //! Subcommands:
 //! - `partmap IMG` — partition table summary (APM today; MBR / GPT
-//!   added in Phase B / C as the unified PT inspector lands).
+//!   added in Phase B / C as the unified PT inspector lands). Includes the
+//!   Driver Descriptor Record's driver map (`ddBlock`/`ddSize`/`ddType`) and
+//!   each entry's boot fields (`pmBootSize`/`pmBootCksum`/`pmProcessor`/
+//!   `pmPad`) — useful for auditing `mac-scsi-bless` output.
 //! - `fs-info IMG[@N]` — filesystem-level info (volume name, sizes,
 //!   counts). HFS today; widens through `open_filesystem` in Phase B.
 //! - `chd-info IMG` — CHD metadata (codecs, hunk size, compression,
@@ -21,10 +24,12 @@ use std::path::PathBuf;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::out_stdout;
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
+use crate::partition::apm::Apm;
 
 #[derive(Debug, Subcommand)]
 pub enum ShowCommand {
-    /// Print the partition table of a disk image (APM-only today).
+    /// Print the partition table of a disk image (APM-only today), including
+    /// the Driver Descriptor Record's driver map and each entry's boot fields.
     Partmap {
         image: PathBuf,
         /// Output format. `csv`/`tsv` produce one row per partition entry.
@@ -70,14 +75,16 @@ pub fn run(cmd: ShowCommand) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn show_partmap(image: PathBuf, format: OutputFormat) -> Result<()> {
-    if format == OutputFormat::Text {
-        return crate::cli::api::apm::cmd_info(image);
-    }
-    // Structured forms: re-parse so we can emit a programmatic shape.
     let mut file = crate::cli::io::open_image_ro(&image)?;
-    let apm = crate::partition::apm::Apm::parse(&mut file)
-        .map_err(|e| anyhow::anyhow!("parsing APM: {e}"))?;
+    let apm = Apm::parse(&mut file).map_err(|e| anyhow::anyhow!("parsing APM: {e}"))?;
     let bs = apm.ddr.block_size as u64;
+
+    if format == OutputFormat::Text {
+        print_partmap_text(&apm);
+        return Ok(());
+    }
+
+    // Structured forms: emit a programmatic shape.
     let rows: Vec<PartmapRow> = apm
         .entries
         .iter()
@@ -90,6 +97,13 @@ fn show_partmap(image: PathBuf, format: OutputFormat) -> Result<()> {
             block_count: e.block_count,
             size_bytes: e.size_bytes(bs as u16),
             status: e.status,
+            boot_start: e.boot_start,
+            boot_size: e.boot_size,
+            boot_load: e.boot_load,
+            boot_entry: e.boot_entry,
+            boot_checksum: e.boot_checksum,
+            processor: e.processor.clone(),
+            pad_present: e.pad.iter().any(|&b| b != 0),
         })
         .collect();
     match format {
@@ -97,7 +111,22 @@ fn show_partmap(image: PathBuf, format: OutputFormat) -> Result<()> {
             let payload = PartmapPayload {
                 kind: "apm".to_string(),
                 block_size: apm.ddr.block_size,
+                block_count: apm.ddr.block_count,
                 map_entry_count: apm.map_entry_count,
+                driver_count: apm.ddr.driver_count,
+                drivers: apm
+                    .ddr
+                    .driver_info
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| DriverRow {
+                        index: i,
+                        block: d.block,
+                        size_blocks: d.size,
+                        size_bytes: d.size as u64 * bs,
+                        kind: d.kind,
+                    })
+                    .collect(),
                 entries: rows,
             };
             emit_envelope(format, &Envelope::ok(payload))
@@ -107,12 +136,76 @@ fn show_partmap(image: PathBuf, format: OutputFormat) -> Result<()> {
     }
 }
 
+/// Render the APM as text: DDR + driver descriptor map, then one row per
+/// partition entry with boot metadata appended for driver partitions.
+fn print_partmap_text(apm: &Apm) {
+    let bs = apm.ddr.block_size as u64;
+    out_stdout(format!(
+        "DDR: block_size={} block_count={} drivers={}",
+        apm.ddr.block_size, apm.ddr.block_count, apm.ddr.driver_count
+    ));
+    for (i, d) in apm.ddr.driver_info.iter().enumerate() {
+        out_stdout(format!(
+            "  driver[{i}]: ddBlock={} ddSize={} blocks ({} bytes) ddType={}",
+            d.block,
+            d.size,
+            d.size as u64 * bs,
+            d.kind
+        ));
+    }
+    out_stdout(format!("Map entries: {}", apm.map_entry_count));
+    out_stdout(format!(
+        "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  status",
+        "idx", "type", "name", "start", "blocks", "bytes"
+    ));
+    for (i, e) in apm.entries.iter().enumerate() {
+        let mut line = format!(
+            "{:>3}  {:<24}  {:<24}  {:>10}  {:>10}  {:>10}  0x{:08x}",
+            i + 1,
+            e.partition_type,
+            e.name,
+            e.start_block,
+            e.block_count,
+            e.size_bytes(bs as u16),
+            e.status
+        );
+        // Boot fields are only meaningful for driver partitions; show them
+        // inline when present so normal rows stay terse.
+        if e.boot_size != 0 || e.boot_checksum != 0 || !e.processor.is_empty() {
+            line.push_str(&format!(
+                "  boot: size={} cksum=0x{:08x}",
+                e.boot_size, e.boot_checksum
+            ));
+            if !e.processor.is_empty() {
+                line.push_str(&format!(" proc={}", e.processor));
+            }
+            if e.pad.iter().any(|&b| b != 0) {
+                line.push_str(" pad");
+            }
+        }
+        out_stdout(line);
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PartmapPayload {
     kind: String,
     block_size: u16,
+    block_count: u32,
     map_entry_count: u32,
+    driver_count: u16,
+    drivers: Vec<DriverRow>,
     entries: Vec<PartmapRow>,
+}
+
+/// One DDR driver-descriptor-map entry.
+#[derive(Debug, Serialize)]
+struct DriverRow {
+    index: usize,
+    block: u32,
+    size_blocks: u16,
+    size_bytes: u64,
+    kind: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +218,13 @@ struct PartmapRow {
     block_count: u32,
     size_bytes: u64,
     status: u32,
+    boot_start: u32,
+    boot_size: u32,
+    boot_load: u64,
+    boot_entry: u64,
+    boot_checksum: u32,
+    processor: String,
+    pad_present: bool,
 }
 
 // ---------------------------------------------------------------------------

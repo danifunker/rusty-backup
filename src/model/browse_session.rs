@@ -300,7 +300,21 @@ impl BrowseSession {
             };
 
             set_phase("Opening filesystem...");
-            let mut fs = match session.open() {
+            // Feed the carve scanner's per-chunk progress into the shared
+            // status so a long full scan paints a determinate bar. Harmless
+            // for every other filesystem (their `open` never reports). The
+            // sink lives on this worker thread, where `session.open()` runs.
+            let progress_status = Arc::clone(&status_thread);
+            crate::fs::carve::set_scan_progress(Some(Box::new(move |done, total| {
+                if let Ok(mut g) = progress_status.lock() {
+                    g.phase = "Scanning image for recoverable data...".to_string();
+                    g.scan_done = done;
+                    g.scan_total = total;
+                }
+            })));
+            let opened = session.open();
+            crate::fs::carve::set_scan_progress(None);
+            let mut fs = match opened {
                 Ok(fs) => fs,
                 Err(e) => {
                     let msg = format!("{e}");
@@ -323,6 +337,13 @@ impl BrowseSession {
                     return;
                 }
             };
+
+            // Scan done — drop back to the plain spinner for the (instant)
+            // root read so the progress bar doesn't linger at 100%.
+            if let Ok(mut g) = status_thread.lock() {
+                g.scan_done = 0;
+                g.scan_total = 0;
+            }
 
             let fs_type = fs.fs_type().to_string();
             let volume_label = fs.volume_label().unwrap_or("").to_string();
@@ -471,6 +492,11 @@ impl ContainerEditCommit {
 /// because they go through `open_editable` and write back to disk.
 pub struct BrowseOpenStatus {
     pub phase: String,
+    /// Bytes scanned so far during a synthetic carve open. `scan_total == 0`
+    /// means "not a carve scan" (or not started) — the GUI then shows a plain
+    /// spinner; when `scan_total > 0` it paints a determinate progress bar.
+    pub scan_done: u64,
+    pub scan_total: u64,
     pub finished: bool,
     pub fs_type: String,
     pub volume_label: String,
@@ -490,6 +516,8 @@ impl BrowseOpenStatus {
     fn starting() -> Self {
         Self {
             phase: "Starting...".to_string(),
+            scan_done: 0,
+            scan_total: 0,
             finished: false,
             fs_type: String::new(),
             volume_label: String::new(),

@@ -18,9 +18,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::chd::ChdReader;
+use crate::rbformats::containers::atr::{decode_atr_bytes, looks_like_atr_header};
 use crate::rbformats::containers::d88::{decode_d88_bytes, looks_like_d88_header};
 use crate::rbformats::containers::dim::{decode_dim_bytes, looks_like_dim_header};
 use crate::rbformats::containers::edsk::{decode_edsk_bytes, looks_like_edsk_header};
+use crate::rbformats::containers::g64::{decode_g64_bytes, looks_like_g64_header};
 use crate::rbformats::containers::hdf::{decode_hdf_bytes, detect_hdf_offset};
 use crate::rbformats::containers::hdm::decode_hdm_bytes;
 use crate::rbformats::containers::msa::{decode_msa_bytes, MSA_MAGIC};
@@ -106,6 +108,43 @@ pub fn is_edsk_path(path: &Path) -> bool {
     };
     let mut head = [0u8; 34];
     matches!(f.read(&mut head), Ok(n) if n >= 22) && looks_like_edsk_header(&head)
+}
+
+/// Cheap sniff for an Atari `.atr` disk image: requires the `.atr`
+/// extension AND the 0x0296 magic.
+pub fn is_atr_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("atr"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 2];
+    matches!(f.read(&mut head), Ok(n) if n >= 2) && looks_like_atr_header(&head)
+}
+
+/// Cheap sniff for a Commodore G64 / G71 raw-GCR image: requires the
+/// `.g64` / `.g71` extension AND the `GCR-1541` / `GCR-1571` signature, so
+/// it never false-positives on a same-extension blob.
+pub fn is_g64_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("g64") || s.eq_ignore_ascii_case("g71"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8];
+    matches!(f.read(&mut head), Ok(n) if n >= 8) && looks_like_g64_header(&head)
 }
 
 /// Cheap sniff: returns true when `path` looks like a Sharp `.d88` floppy
@@ -278,6 +317,22 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let flat =
             decode_d88_bytes(&bytes).with_context(|| format!("decode D88 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_g64_path(path) {
+        // Commodore G64 raw-GCR floppy: decode the GCR bitstream down to a
+        // flat .d64 so the cbm engine (which speaks logical sectors) reads
+        // it. Read-only — we don't re-encode GCR.
+        let bytes = std::fs::read(path).with_context(|| format!("read G64 {}", path.display()))?;
+        let flat =
+            decode_g64_bytes(&bytes).with_context(|| format!("decode G64 {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_atr_path(path) {
+        // Atari .atr: strip the 16-byte header to expose the flat sector
+        // body the atari_dos engine reads. `.xfd` is headerless and falls
+        // through to the generic open-as-File path.
+        let bytes = std::fs::read(path).with_context(|| format!("read ATR {}", path.display()))?;
+        let flat =
+            decode_atr_bytes(&bytes).with_context(|| format!("decode ATR {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_dim_path(path) {
         // DiskExplorer .dim floppy (X68000 / PC-98): 256-byte header + flat
         // payload, decodes to ~1.2 MB. In-memory like EDSK / MSA / D88.
@@ -345,6 +400,8 @@ pub fn is_flat_floppy_container_path(path: &Path) -> bool {
     is_msa_path(path)
         || is_edsk_path(path)
         || is_d88_path(path)
+        || is_g64_path(path)
+        || is_atr_path(path)
         || is_dim_path(path)
         || is_xdf_path(path)
         || is_hdm_path(path)
@@ -352,14 +409,19 @@ pub fn is_flat_floppy_container_path(path: &Path) -> bool {
         || is_apple_ii_dsk_path(path)
 }
 
-/// The four floppy containers that support in-place editing via
-/// [`crate::model::container_edit`] (decode -> edit -> re-encode): XDF, HDM,
-/// DIM, D88. Subset of [`is_flat_floppy_container_path`] excluding the
-/// read-only-wrapped formats (MSA / EDSK / Apple-II / Arculator HDF) which
-/// have no re-encoder wired up — `containers::is_floppy_container` is the
-/// matching engine-side predicate.
+/// Containers that support in-place editing via
+/// [`crate::model::container_edit`] (decode -> edit -> re-encode): the four
+/// PC/Sharp floppy formats (XDF, HDM, DIM, D88) plus the Atari `.atr`
+/// (a trivial header strip / wrap). Subset of
+/// [`is_flat_floppy_container_path`] excluding the read-only-wrapped
+/// formats (MSA / EDSK / Apple-II / Arculator HDF) which have no
+/// re-encoder wired up.
 pub fn is_editable_container_path(path: &Path) -> bool {
-    is_xdf_path(path) || is_hdm_path(path) || is_dim_path(path) || is_d88_path(path)
+    is_xdf_path(path)
+        || is_hdm_path(path)
+        || is_dim_path(path)
+        || is_d88_path(path)
+        || is_atr_path(path)
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded

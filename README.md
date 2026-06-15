@@ -44,6 +44,7 @@ and automated build farms.
 rb-cli new disk.dsk --fs hfs --size 800K --name "My Disk"
 rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
 rb-cli ls  disk.dsk /System
+rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
 rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
@@ -54,6 +55,8 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --boot-sector-donor hd0.hds      # zero manual steps, your donor
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
+rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
+rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
@@ -194,6 +197,15 @@ The app has five tabs:
     with the output partition's actual FAT geometry, so the donor
     boots from your sized HDD regardless of how the donor itself was
     sized.
+  - **Make a classic-Mac SCSI disk bootable** via the shell:
+    `rb-cli mac-scsi-bless mac.hda` installs an Apple SCSI driver and a
+    valid Driver Descriptor Record into an APM disk so a Macintosh ROM
+    (e.g. Quadra 800) registers the drive over SCSI. Uses a bundled
+    known-good driver by default, or `--driver-from donor.hda` to copy a
+    donor disk's driver verbatim. Operates in place; partition data never
+    moves, and it is idempotent. (This registers the *driver* so the ROM
+    can read the disk — it does not change HFS boot-block behavior.)
+    Verified against the real Quadra 800 ROM in QEMU `-M q800`.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
@@ -302,6 +314,11 @@ readable.
 | Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
 | Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
+| Commodore disk | `.d64`, `.d71`, `.d81`, `.d80`, `.d82` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 + PET 8050 / 8250 (IEEE-488) flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (bidirectionally cross-validated against the `c1541` / Python `d64` reference). |
+| Commodore GCR  | `.g64`, `.g71`  | Yes (decode) | No        | Raw 1541 / 1571 GCR track images (preservation-grade). Decoded to flat sectors so the CBM engine can read them; the `.g71` side-1 mapping is validated against a real VICE `c1541` image. |
+| Atari disk     | `.atr`, `.xfd`  | Yes            | Yes (in-place edit) | 8-bit Atari (400/800/XL/XE) disk images for the Atari800 core. `.atr` = 16-byte header + sector body; `.xfd` headerless. Read/browse/extract + add/delete on the Atari DOS 2 volume. |
+| CoCo disk      | `.dsk`, `.jvc`, `.vdk` | Yes     | Yes (in-place edit) | Tandy Color Computer (CoCo2 / CoCo3 cores) raw 35- / 40-track sector dumps. Headerless flat body (length a multiple of 256). Auto-detects the volume's filesystem: RS-DOS / Disk BASIC (flat granule FS) or OS-9 / NitrOS-9 RBF (hierarchical). Read/browse/extract + add/delete on both. |
+| Acorn DFS disk | `.ssd`          | Yes            | Yes (in-place edit) | BBC Micro / BBC Master / Acorn Electron (MiSTer BBCMicro / AcornElectron cores) single-sided floppy. Flat 40-track (100K) / 80-track (200K) sector dump in logical order. Read/browse/extract + add/delete on the Acorn DFS catalogue. (Track-interleaved double-sided `.dsd` is a follow-up.) |
 | Sharp D88      | `.d88`          | Yes            | Yes (convert + in-place edit) | X68000 / PC-88 / PC-98 / MSX / FM-7 sparse track-table container. Add/delete/mkdir on the contained Human68k FAT volume persist back into the container (decode -> edit -> re-encode). |
 | X68000 XDF     | `.xdf`          | Yes            | Yes (convert + in-place edit) | Raw headerless X68000 floppy dump; geometry inferred from size. In-place file add/delete/edit supported. |
 | X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize + defrag repack) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink + contiguous repack (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
@@ -335,12 +352,19 @@ inspect-tab Edit Mode.
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. |
 | btrfs          | Yes    | No   | No              | —    | Modern Linux; read-only browse |
 | ProDOS         | Yes    | Yes  | Yes             | —    | Apple II / IIgs |
+| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Yes | Yes | — (floppy, fixed geometry) | — | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81` / `.d80` / `.d82`; `.g64` GCR decoded to sectors. |
+| Atari DOS 2 (2.0S / 2.5) | Yes | Yes | — (floppy, fixed geometry) | — | Atari 8-bit (Atari800 core). VTOC@360 (bit-set-is-free), 64-file directory, linked-sector files. Single + enhanced density `.atr` / `.xfd`. |
+| RS-DOS (CoCo Disk BASIC) | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores). Granule allocation table on track 17, 72-file directory, granule-chain files. Raw 35- / 40-track `.dsk` / `.jvc`. Read/extract + add/delete bidirectionally cross-validated against an independent clean-room reader/writer derived from the toolshed `libdecb` semantics. |
+| OS-9 / NitrOS-9 RBF | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores) and Dragon. Hierarchical Unix-like FS: LSN-0 identification sector, per-file/dir 256-byte file descriptors, segment-list extents, allocation bitmap (set-bit = allocated). Raw `.dsk` / `.vdk`. Read/extract + add/delete (incl. subdirectories) cross-validated byte-exact against an independent clean-room RBF reader on real NitrOS-9 toolshed disks. |
+| DragonDOS | Yes | Yes | — (floppy, fixed geometry) | — | Dragon Data Dragon 32/64 (and CoCo running DragonDOS), MiSTer Dragon core. Directory track 20 (backup on 16), one's-complement geometry signature, sector bitmap (set-bit = free), 25-byte directory entries with header + continuation extent blocks. Raw single- / double-sided 40-track `.dsk`. Read/extract + add/delete cross-validated byte-exact against an independent clean-room reader/writer and against real third-party DragonDOS disks (empty + a populated 9-file disk). |
+| Acorn DFS | Yes | Yes | — (floppy, fixed geometry) | — | BBC Micro / BBC Master / Acorn Electron (MiSTer BBCMicro / AcornElectron cores). Flat-catalogue FS in sectors 0–1: 12-char disc title, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length. Single-sided `.ssd` (40-/80-track). Read/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` directories, real load/exec addresses all round-trip). |
 | Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | — | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. |
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
+| Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
 
 ### Partition tables
 
@@ -351,7 +375,7 @@ inspect-tab Edit Mode.
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
-| None (superfloppy) | Yes (FAT / HFS / HFS+ at sector 0) | — | Standard floppy sizes are recognised even without a partition table. |
+| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
 images, partition table sidecars) for restore — see `docs/clonezilla.md`.
@@ -416,6 +440,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **MacPlus**                    | HFS | HDD (.hda / .hfv) — 400K MFS floppy outstanding |
 | **AtariST**                    | GEMDOS (FAT12 / FAT16), MSA containers | Floppy (`.st` / `.msa`); HDD pending AHDI write-side |
 | **Apple-II**                   | ProDOS + Apple DOS 3.3 | `.dsk` / `.do` / `.po` / `.2mg` / `.woz` (sector-order auto-detect) |
+| **Atari800**                   | Atari DOS 2 (2.0S / 2.5, read + write) | Floppy `.atr` / `.xfd` (single + enhanced density) |
 | **ZX-Spectrum**                | esxDOS FAT | DivMMC / esxDOS SD; native TR-DOS / +3DOS pending |
 | **X68000** (Sharp)             | Human68k (FAT-derived) | Floppy (`.d88` / `.xdf` / `.hdm` / `.dim` — any-to-any conversion + in-place add/delete/mkdir), SASI/SCSI HDD (`.hda` / `.hdf` / `.hds` — read/browse/extract + add/delete/mkdir + in-place grow/shrink + defragmenting repack, incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images). `rb-cli new-x68k-hdd` builds self-bootable HDDs from scratch (`--system-disk donor.dim` clones a Human68k system floppy into the partition; one `SWITCH.X /HD` on first FDD0 boot installs the partition boot sector and the HDD self-boots to C: thereafter). For users with the well-known `hd0.hds` donor (100 MB Sharp/Keisoku Giken SCSI HDD image, 104,857,600 bytes), `--boot-sector-donor hd0.hds --size 100M --variant scsi` overlays the donor's Sharp partition boot sector at build time — zero manual steps, self-boots to C:> on first power-on. MAME-verified on x68000 SASI + x68030 SCSI. |
 | **Archie** (Acorn Archimedes)  | ADFS / FileCore (read) | `.adf` floppy, bare + Arculator-wrapped `.hdf` HDD |
@@ -425,6 +450,12 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 | **TatungEinstein**             | Xtal-DOS / CP/M (`einstein` DPB) | Floppy `.dsk` |
 | **Altair8800**                 | CP/M (`altair_8in` 8-inch floppy + `altair_cf` CF/HDD DPBs) | Floppy + IDE/CF |
 | **MultiComp**                  | CP/M (`multicomp` DPB) | Floppy `.dsk` |
+| **C64 / C128**                 | CBM DOS (1541 / 1571 / 1581, read + write) | Floppy `.d64` / `.d71` / `.d81` |
+| **VIC20 / C16 / Plus-4**       | CBM DOS (1541, read + write) | Floppy `.d64` |
+| **PET / CBM-II**               | CBM DOS (1541 + 8050/8250 IEEE-488, read + write) | Floppy `.d64` / `.d80` / `.d82` |
+| **CoCo2 / CoCo3** (Tandy)      | RS-DOS / Disk BASIC + OS-9 / NitrOS-9 RBF (both read + write) | Floppy `.dsk` / `.jvc` / `.vdk` (35- / 40-track) |
+| **Dragon** (Dragon 32/64)      | DragonDOS + OS-9 / NitrOS-9 RBF (both read + write) | Floppy `.dsk` (single- / double-sided 40-track) |
+| **BBCMicro / AcornElectron**   | Acorn DFS (read + write) | Floppy `.ssd` (single-sided 40- / 80-track) |
 
 For X68000 specifically, the floppy converter lets you take an image
 in any of the four formats Sharp tooling and MiSTer cores expect — XDF

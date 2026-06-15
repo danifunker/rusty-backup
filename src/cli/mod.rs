@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 pub mod api;
 pub mod config;
+pub mod copy_paths;
 pub mod device_safety;
 pub mod exit;
 pub mod glob;
@@ -64,6 +65,14 @@ pub enum Command {
     #[command(name = "new-x68k-hdd")]
     NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
 
+    /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
+    /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
+    /// Operates in place; partition data is never moved. (This registers the
+    /// driver so the ROM can read the disk — it does not change HFS
+    /// boot-block behavior.)
+    #[command(name = "mac-scsi-bless")]
+    MacScsiBless(verbs::mac_scsi_bless::MacScsiBlessArgs),
+
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
@@ -78,6 +87,11 @@ pub enum Command {
     /// Extract a file, directory tree, or glob match from a filesystem
     /// to the host.
     Get(verbs::get::GetArgs),
+
+    /// Copy files / directory trees between two disk images without
+    /// staging through the host. SRC may be a glob; DST follows `cp`
+    /// semantics (into an existing directory, or rename to a target).
+    Cp(verbs::cp::CpArgs),
 
     /// Delete a file or directory from a filesystem.
     Rm(verbs::rm::RmArgs),
@@ -248,10 +262,12 @@ pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
+        Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
+        Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),
         Command::Fsck(args) => verbs::fsck::run(args),

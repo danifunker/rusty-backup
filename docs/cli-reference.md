@@ -434,6 +434,38 @@ Usage: convert [OPTIONS] <IN> <OUT>
 - `--bincue-multi-bin` — For BIN/CUE output, write one .bin per track instead of a single concatenated .bin. No effect for other formats
 - `--overwrite` — Overwrite destination files that already exist. Without this, existing outputs are skipped with a warning
 
+### `cp`
+
+Copy files / directory trees between two disk images without staging through the host. SRC may be a glob; DST follows `cp` semantics (into an existing directory, or rename to a target)
+
+```
+Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
+```
+
+**Arguments**
+
+- `<SRC_IMAGE>` — Source image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Source path or glob inside the source filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and copy every match
+- `<DST_IMAGE>` — Destination image reference (`path` or `path@N`)
+- `<DST>` — Destination path inside the destination filesystem. Copying into an existing directory (or a path ending in `/`) keeps the source basename; otherwise the destination is the literal target name
+
+**Options**
+
+- `-r` / `--recursive` — Recursively copy directories. Without this, directory sources / matches are skipped with a warning
+- `--force` — Overwrite existing destination entries. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip when a destination entry already exists. Mutually exclusive with `--force`. Without either, an existing destination is an error
+- `--exclude` — Exclude source paths matching this glob. Repeatable. Exclude wins
+- `--ignore-case` — Match the source case-insensitively regardless of its native rule
+- `--case-sensitive` — Match the source case-sensitively regardless of its native rule
+- `--names` — Policy for source names the destination filesystem rejects (too long / illegal characters). Default: truncate
+- `--attrs` — Whether to carry FS-specific attributes (type/creator, Unix perms, DOS attribute bits, Amiga bits). Default: preserve
+- `--flatten` — Collapse a source tree into the destination directory when the destination filesystem has no subdirectories (CP/M, DFS, CBM, …)
+- `--parents` — Auto-create missing destination parent directories
+- `--password` — Password for an encrypted source container (currently: WinImage IMZ)
+- `--src-fs-type` — Force a specific filesystem dispatch for the SOURCE (e.g. `cpm:amstrad_data`). See `get --fs-type`
+- `--dst-fs-type` — Force a specific filesystem dispatch for the DESTINATION
+- `--carve-full` — Scan the entire source image for recoverable text in the synthetic carve view (NDOS disks). Source-side only
+
 ### `expand`
 
 Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images
@@ -534,6 +566,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `get-binhex`
 
@@ -638,6 +671,26 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
+### `mac-scsi-bless`
+
+Install an Apple SCSI driver + Driver Descriptor Record into an APM disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI. Operates in place; partition data is never moved. (This registers the driver so the ROM can read the disk — it does not change HFS boot-block behavior.)
+
+```
+Usage: mac-scsi-bless [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — APM disk image to make SCSI-bootable, in place
+
+**Options**
+
+- `--driver-from` — Extract the driver from a donor Apple-formatted disk's `Apple_Driver*` partition (most faithful — carries that disk's exact boot metadata)
+- `--driver` — Use a raw driver image file (advanced; `pmBootCksum` is unknown for an arbitrary driver, so it is written as 0 — see `--force-cksum-zero`)
+- `--builtin-driver` — Use the bundled known-good Apple SCSI driver (this is the default when no driver source is given)
+- `--force-cksum-zero` — Force `pmBootCksum = 0`. Some ROMs skip checksum verification then
 
 ### `mkdir`
 
@@ -916,6 +969,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--force` — Overwrite an existing entry at the destination path
 - `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `put-binhex`
 
@@ -1050,6 +1104,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `setrsrc`
 
@@ -1136,7 +1191,7 @@ Usage: fs-info [OPTIONS] <IMAGE>
 
 ### `show partmap`
 
-Print the partition table of a disk image (APM-only today)
+Print the partition table of a disk image (APM-only today), including the Driver Descriptor Record's driver map and each entry's boot fields
 
 ```
 Usage: partmap [OPTIONS] <IMAGE>

@@ -13,6 +13,23 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
   altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
+  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
+  bidirectionally cross-validated against the `c1541` / Python `d64`
+  reference), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
+  RS-DOS / CoCo Disk BASIC (read + write, raw 35- / 40-track `.dsk` / `.jvc`;
+  cross-validated against an independent clean-room reader/writer derived
+  from the toolshed `libdecb` semantics),
+  OS-9 / NitrOS-9 RBF (hierarchical Unix-like FS — read + write incl.
+  subdirectories, raw `.dsk` / `.vdk`; cross-validated byte-exact against an
+  independent clean-room RBF reader on real NitrOS-9 toolshed disks),
+  DragonDOS (Dragon 32/64 read + write, single- / double-sided 40-track
+  `.dsk`; cross-validated byte-exact against an independent clean-room
+  reader/writer and against real third-party DragonDOS disks),
+  Acorn DFS (BBC Micro / BBC Master / Acorn Electron read + write,
+  single-sided `.ssd` 40-/80-track; flat catalogue in sectors 0–1,
+  contiguous files in descending start-sector order, single-character
+  directory namespaces; bidirectionally cross-validated byte-exact against
+  an independent clean-room DFS reader/writer),
   ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
@@ -56,18 +73,19 @@ Legend for the **Support** column:
 | SVI328 | Spectravideo SV-328 | Floppy | CP/M (MSX-DOS/FAT12 possible) | **Partial** — CP/M side covered by `svi328_cpm` DPB; the MSX-DOS / FAT12 floppy variant routes through the existing FAT driver but no SV-specific BPB quirks have been validated. |
 | Altair8800 | MITS Altair 8800 | Floppy, IDE/CF | CP/M | **Yes** — `fs::cpm` ships both `altair_8in` (8-inch floppy) and `altair_cf` (CompactFlash HDD) DPBs. |
 | MultiComp | Grant Searle MultiComp | Floppy | CP/M | **Yes** — `fs::cpm` `multicomp` DPB. |
-| C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **No** |
-| C128 | Commodore 128 | Floppy | CBM DOS | **No** |
-| C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **No** |
-| VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **No** |
-| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **No** |
-| BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **No** |
-| AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **No** |
+| C64 | Commodore 64/128 | Floppy | CBM DOS (flat track/sector) | **Yes** — `fs::cbm` reads + writes `.d64` (1541) / `.d71` (1571) / `.d81` (1581); add/delete cross-validated against `c1541` / Python `d64`. |
+| C128 | Commodore 128 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` / `.d71` / `.d81`. |
+| C16 | Commodore C16/Plus4 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
+| VIC20 | Commodore VIC-20 | Floppy | CBM DOS | **Yes** — `fs::cbm` `.d64` (1541). |
+| PET2001 | Commodore PET | Floppy (IEEE-488) | CBM DOS (D80/D82) | **Yes** — `fs::cbm` reads + writes the 8050 `.d80` (533248 B, 77 trk) and 8250 `.d82` (1066496 B, 154 trk) geometries: 29/27/25/23 zone map, BAM on track 38 (2–4 chained sectors, 5-byte/track entries), directory on track 39. Bidirectionally cross-validated against the Python `d64` reference (read + write byte-exact). `.d64` (1541/2031/4040) also works. |
+| BBCMicro | BBC Micro B/Master | Floppy | Acorn DFS / ADFS | **Partial** — `fs::dfs` reads + writes Acorn DFS single-sided `.ssd` (40-track 100K / 80-track 200K): flat catalogue in sectors 0–1, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length, lock bits. Read/browse/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` dirs, real load/exec all round-trip). Double-sided `.dsd` (track-interleaved) and ADFS-on-floppy outstanding. |
+| AcornElectron | Acorn Electron | Floppy | DFS / ADFS | **Partial** — same `fs::dfs` Acorn DFS read + write as BBCMicro (single-sided `.ssd`). Double-sided `.dsd` and ADFS outstanding. |
 | AcornAtom | Acorn Atom | Tape, Floppy | Atom DOS | **No** |
-| CoCo2 | Tandy CoCo 2 / Dragon | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **No** |
-| CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **No** |
+| CoCo2 | Tandy CoCo 2 | Floppy | RS-DOS / DragonDOS, OS-9 (RBF) | **Yes** — `fs::rsdos` reads + writes RS-DOS / Disk BASIC (granule allocation table on track 17, 72-file directory, granule-chain files; raw 35- / 40-track `.dsk` / `.jvc`), `fs::os9` reads + writes OS-9 / NitrOS-9 RBF (hierarchical FS; `.dsk` / `.vdk`, byte-exact cross-validated against a clean-room RBF reader on real toolshed disks), and `fs::dragondos` reads + writes DragonDOS (see Dragon row). |
+| Dragon | Dragon 32/64 | Floppy | DragonDOS, OS-9 (RBF) | **Yes** — `fs::dragondos` reads + writes DragonDOS (directory track 20 + backup track 16, one's-complement geometry signature, set-bit-free sector bitmap, 25-byte header/continuation directory entries; single- / double-sided 40-track `.dsk`). Byte-exact cross-validated against an independent clean-room reader/writer AND against real third-party DragonDOS disks (rolfmichelsen/dragontools' empty volume plus a populated 9-file AGD-suite disk, all files byte-identical across both readers). `fs::os9` covers OS-9 / NitrOS-9 RBF. |
+| CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
-| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **No** |
+| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |

@@ -137,6 +137,63 @@ fn is_floppy_size(size: u64) -> bool {
     )
 }
 
+/// Is there a real AmigaDOS root block on this volume?
+///
+/// Distinguishes a genuine AFFS/OFS/FFS floppy from a custom bootblock disk
+/// that merely carries the `DOS\x` magic. We do a deliberately lightweight
+/// *structural* check — the root block must be a `T_HEADER` (type long == 2)
+/// with `ST_ROOT` (secondary type long == 1). Full validation (checksum,
+/// hash-table size) stays in the AFFS parser; here we only need to tell
+/// "has a filesystem (maybe corrupt)" apart from "no filesystem at all".
+///
+/// Two candidate locations are probed: the boot block's root-block pointer
+/// (big-endian u32 at offset 8), and the conventional middle-of-volume block
+/// (`total_blocks / 2`), which is where AmigaDOS places the root on a standard
+/// floppy. The reader's position is restored before returning.
+fn amiga_root_block_present(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> bool {
+    const T_HEADER: u32 = 2;
+    const ST_ROOT: u32 = 1;
+
+    let resume = reader.stream_position().ok();
+    let result = (|| -> Option<bool> {
+        let end = reader.seek(SeekFrom::End(0)).ok()?;
+        let total_blocks = end / 512;
+
+        let boot_ptr = u32::from_be_bytes([
+            first_sector[8],
+            first_sector[9],
+            first_sector[10],
+            first_sector[11],
+        ]) as u64;
+        let mid = total_blocks / 2;
+
+        for &block in [boot_ptr, mid].iter() {
+            if block == 0 || block >= total_blocks {
+                continue;
+            }
+            if reader.seek(SeekFrom::Start(block * 512)).is_err() {
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            if reader.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            let type_long = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let sec_type = u32::from_be_bytes([buf[508], buf[509], buf[510], buf[511]]);
+            if type_long == T_HEADER && sec_type == ST_ROOT {
+                return Some(true);
+            }
+        }
+        Some(false)
+    })()
+    .unwrap_or(false);
+
+    if let Some(pos) = resume {
+        let _ = reader.seek(SeekFrom::Start(pos));
+    }
+    result
+}
+
 /// Detect whether a disk image is a superfloppy (no partition table, filesystem at sector 0).
 ///
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
@@ -229,9 +286,18 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // Intl, DirCache, Long Names). PFS / SFS use the same shape for their
     // RDB DosType but never appear on bare ADFs — those are RDB-partitioned
     // hard-disk images instead. Returning the DosType string here lets the
-    // dispatcher route to the AFFS driver.
+    // dispatcher route to the AFFS driver — but ONLY when a real AmigaDOS
+    // root block exists. Custom bootblock disks (demos, intros, diagnostics)
+    // carry the `DOS\x` magic so the Kickstart ROM checksums and runs their
+    // boot code, yet have no filesystem at all (the boot code reads/writes raw
+    // sectors directly). Routing those to AFFS face-plants in the root-block
+    // parser; classify them as `Amiga-NDOS` instead so they reach the carve
+    // view. AmigaDOS itself labels such disks "NDOS" (Not a DOS disk).
     if &first_sector[0..3] == b"DOS" && first_sector[3] <= 7 {
-        return Some(format!("DOS\\{}", first_sector[3]));
+        if amiga_root_block_present(first_sector, reader) {
+            return Some(format!("DOS\\{}", first_sector[3]));
+        }
+        return Some("Amiga-NDOS".to_string());
     }
 
     // Check for HFS / HFS+ / HFSX / ext / ProDOS at offset 1024.
@@ -363,6 +429,47 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
                 return Some("DOS 3.3".to_string());
             }
         }
+    }
+
+    // Commodore CBM DOS (1541/1571/1581 .d64/.d71/.d81). Flat sector
+    // dumps with no partition table; `looks_like_cbm` gates on the exact
+    // geometry length AND the header-sector signature, so the same-size
+    // false-positive risk is negligible.
+    if crate::fs::cbm::looks_like_cbm(reader, 0).is_some() {
+        return Some("CBM DOS".to_string());
+    }
+
+    // Atari DOS 2 (.atr body / headerless .xfd). Gated on exact geometry
+    // size + a plausible VTOC at sector 360.
+    if crate::fs::atari_dos::looks_like_atari_dos(reader, 0).is_some() {
+        return Some("Atari DOS".to_string());
+    }
+
+    // DragonDOS (flat .dsk). Same byte size as a 40-track RS-DOS disk, but the
+    // directory track carries a one's-complement geometry signature, so probe
+    // it first among the CoCo family.
+    if crate::fs::dragondos::looks_like_dragondos(reader, 0).is_some() {
+        return Some("DragonDOS".to_string());
+    }
+
+    // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
+    // RS-DOS disk, so probe it first: the LSN-0 identification sector plus a
+    // directory root FD discriminate it cleanly.
+    if crate::fs::os9::looks_like_os9(reader, 0).is_some() {
+        return Some("OS-9".to_string());
+    }
+
+    // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc). No magic; gated on exact
+    // geometry + a structurally consistent granule table + directory.
+    if crate::fs::rsdos::looks_like_rsdos(reader, 0).is_some() {
+        return Some("RS-DOS".to_string());
+    }
+
+    // Acorn DFS (flat single-sided .ssd, 40-/80-track). Gated on exact
+    // single-sided geometry and a catalogue whose declared sector count
+    // matches the disk size (separates a real .ssd from a flat .dsd).
+    if crate::fs::dfs::looks_like_dfs(reader, 0).is_some() {
+        return Some("Acorn DFS".to_string());
     }
 
     None
@@ -839,12 +946,18 @@ impl PartitionTable {
                 // falls back to MBR type-byte detection.
                 let is_amiga_dos = fs_hint.starts_with("DOS\\") && fs_hint.len() == 5;
                 let is_human68k = fs_hint == "human68k";
+                // A custom bootblock Amiga disk with no filesystem. Route the
+                // hint through `partition_type_string` so the dispatcher opens
+                // the carve view instead of the AFFS parser.
+                let is_amiga_ndos = fs_hint == "Amiga-NDOS";
                 let display_name = if is_amiga_dos {
                     let variant = fs_hint.as_bytes()[4] - b'0';
                     let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
                     rdb::dos_type_display_name(raw)
                 } else if is_human68k {
                     "Human68k (FAT)".to_string()
+                } else if is_amiga_ndos {
+                    "Amiga NDOS (no filesystem)".to_string()
                 } else {
                     fs_hint.clone()
                 };
@@ -858,7 +971,7 @@ impl PartitionTable {
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: if is_amiga_dos || is_human68k {
+                    partition_type_string: if is_amiga_dos || is_human68k || is_amiga_ndos {
                         Some(fs_hint.clone())
                     } else {
                         None
@@ -1204,6 +1317,51 @@ mod tests {
         let parts = table.partitions();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].type_name, "HFS");
+    }
+
+    #[test]
+    fn test_amiga_ndos_classification() {
+        // A custom bootblock Amiga disk: valid `DOS\0` boot-block magic, a
+        // root-block pointer of 880 (standard 880K floppy), but the root
+        // block itself is all zeros — no AmigaDOS filesystem. Must classify
+        // as Amiga-NDOS, not DOS\0 (which would face-plant in the AFFS parser).
+        let mut data = vec![0u8; 901_120]; // 1760 blocks
+        data[0..4].copy_from_slice(b"DOS\0");
+        // boot-block root pointer (big-endian u32 at offset 8) = block 880
+        data[8..12].copy_from_slice(&880u32.to_be_bytes());
+        // block 880 left zero -> no T_HEADER/ST_ROOT.
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "Amiga NDOS (no filesystem)");
+        assert_eq!(
+            parts[0].partition_type_string.as_deref(),
+            Some("Amiga-NDOS")
+        );
+    }
+
+    #[test]
+    fn test_amiga_dos_with_valid_root_block_is_affs() {
+        // Same boot-block magic, but this time block 880 carries a real
+        // root block (T_HEADER + ST_ROOT). Must classify as DOS\0 so the
+        // AFFS driver gets dispatched — i.e. the NDOS path must NOT swallow
+        // genuine AmigaDOS floppies.
+        let mut data = vec![0u8; 901_120];
+        data[0..4].copy_from_slice(b"DOS\0");
+        data[8..12].copy_from_slice(&880u32.to_be_bytes());
+        let root = 880 * 512;
+        data[root..root + 4].copy_from_slice(&2u32.to_be_bytes()); // T_HEADER
+        data[root + 508..root + 512].copy_from_slice(&1u32.to_be_bytes()); // ST_ROOT
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).unwrap();
+        assert_eq!(table.type_name(), "None");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].partition_type_string.as_deref(), Some("DOS\\0"));
     }
 
     #[test]

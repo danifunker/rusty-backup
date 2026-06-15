@@ -516,6 +516,9 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         amiga_protection: None,
                         amiga_comment: None,
                         amiga_date: None,
+                        // exFAT FileAttributes share FAT's bit layout; carry
+                        // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
+                        dos_attributes: Some(file_attrs & 0x27),
                     }
                 } else {
                     FileEntry {
@@ -538,6 +541,9 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         amiga_protection: None,
                         amiga_comment: None,
                         amiga_date: None,
+                        // exFAT FileAttributes share FAT's bit layout; carry
+                        // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
+                        dos_attributes: Some(file_attrs & 0x27),
                     }
                 };
 
@@ -577,6 +583,7 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         })
     }
 
@@ -644,6 +651,10 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
 
     fn used_size(&self) -> u64 {
         self.used_bytes
+    }
+
+    fn allocation_unit(&self) -> Option<u64> {
+        Some(self.cluster_size)
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
@@ -1219,7 +1230,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         validate_exfat_name(name)?;
 
@@ -1276,8 +1287,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
             }
         }
 
-        // Build entry set and add to directory
-        let entry_bytes = Self::build_entry_set(name, 0x20, first_cluster, data_len); // 0x20 = Archive
+        // Build entry set and add to directory. Carry RO/HID/SYS/ARC from the
+        // caller (e.g. the cross-image copy engine) when provided; default to
+        // Archive for brand-new files.
+        let attrs = options.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20);
+        let entry_bytes = Self::build_entry_set(name, attrs, first_cluster, data_len);
         self.add_entry_to_directory(parent, &entry_bytes)?;
 
         let path = if parent.path == "/" {

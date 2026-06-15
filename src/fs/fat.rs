@@ -599,6 +599,10 @@ impl<R: Read + Seek> FatFilesystem<R> {
                 FileEntry::new_file(display_name, path, size, cluster as u64)
             };
             entry.modified = Some(modified);
+            // Carry RO/HID/SYS/ARC so the cross-image copy engine can
+            // preserve them on FAT/exFAT destinations (drop the directory /
+            // volume-id bits — those are structural, not user attributes).
+            entry.dos_attributes = Some((attr & 0x27) as u16);
             entries.push(entry);
         }
 
@@ -700,6 +704,10 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         // Rough estimate: total - (free clusters * cluster size)
         // For accuracy we'd need to scan the FAT, but this is a reasonable approximation
         self.total_size() / 2 // placeholder
+    }
+
+    fn allocation_unit(&self) -> Option<u64> {
+        Some(self.cluster_size())
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
@@ -1654,10 +1662,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
             }
         }
 
-        // Generate SFN and build directory entries
+        // Generate SFN and build directory entries. Carry RO/HID/SYS/ARC from
+        // the caller (the cross-image copy engine) when present; default to
+        // Archive for brand-new files. Mask off structural bits so a stray
+        // directory / volume-id bit can never be stamped onto a file.
         let sfn = Self::generate_short_name(name, &existing_sfns);
-        let entry_bytes =
-            Self::build_dir_entries(name, &sfn, ATTR_ARCHIVE, first_cluster, data_len as u32);
+        let attr = options
+            .dos_attributes
+            .map(|a| (a as u8) & 0x27)
+            .unwrap_or(ATTR_ARCHIVE);
+        let entry_bytes = Self::build_dir_entries(name, &sfn, attr, first_cluster, data_len as u32);
 
         self.add_to_directory(parent, &entry_bytes)?;
         if !options.skip_fsinfo_update {

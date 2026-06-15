@@ -11,7 +11,7 @@ use clap::Args;
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
-use crate::cli::resolve::{resolve_partition_streaming_with_password, FsDispatchOverride};
+use crate::cli::resolve::{resolve_partition_streaming_forced, FsDispatchOverride};
 use crate::fs::filesystem::Filesystem;
 
 #[derive(Debug, Args)]
@@ -49,10 +49,11 @@ pub struct LsArgs {
 
 pub fn run(args: LsArgs) -> Result<()> {
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
-    let (reader, mut ctx) = resolve_partition_streaming_with_password(
+    let (reader, mut ctx) = resolve_partition_streaming_forced(
         &args.image.path,
         args.image.partition,
         pw_bytes,
+        args.fs_override.fs_type.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);

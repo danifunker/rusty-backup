@@ -63,6 +63,11 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
+    /// "Full scan" toggle for the synthetic carve view: when off (default)
+    /// only the first `carve::DEFAULT_SCAN_LIMIT` bytes are scanned for
+    /// recoverable text; when on the whole image is scanned. Only shown for
+    /// carve filesystems. Flipping it re-opens the volume.
+    carve_full_scan: bool,
     volume_label: String,
     /// Optional prefix prepended to the volume label in the header (e.g. the
     /// Amiga drive name "DH0"). Set by the caller via `set_label_prefix`
@@ -367,6 +372,7 @@ impl Default for BrowseView {
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
+            carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
             volume_label: String::new(),
             label_prefix: String::new(),
             session: BrowseSession::new(),
@@ -790,6 +796,26 @@ impl BrowseView {
             }
             if let Some((_, ref name)) = self.blessed_folder {
                 ui.label(format!("Blessed: {}", name));
+            }
+
+            // Carve view: "Full scan" toggle. By default the synthetic carve
+            // view only scans the first 10 MB of an image for recoverable
+            // text (fast on large devices); turning this on scans the whole
+            // image. Flipping it re-opens the volume so the new policy applies.
+            if self.fs_type == "Raw carve (no filesystem)" {
+                ui.add_space(8.0);
+                let resp = ui.checkbox(&mut self.carve_full_scan, "Full scan");
+                let limit_mb = rusty_backup::fs::carve::DEFAULT_SCAN_LIMIT / (1024 * 1024);
+                resp.clone().on_hover_text(format!(
+                    "Off: scan only the first {limit_mb} MB for recoverable text (fast).\n\
+                     On: scan the entire image (slower on large disks).\n\
+                     'whole-disk.img' is always the full image regardless."
+                ));
+                if resp.changed() {
+                    rusty_backup::fs::carve::set_full_scan(self.carve_full_scan);
+                    self.error = None;
+                    self.pending_open = Some(self.session.spawn_open());
+                }
             }
 
             // Edit mode toggle
@@ -4834,6 +4860,22 @@ impl BrowseView {
             if let Ok(g) = arc.lock() {
                 if g.finished {
                     take_now = true;
+                } else if g.scan_total > 0 {
+                    // Synthetic carve scan in progress — determinate bar. A
+                    // full scan of a large device is the slow case the
+                    // "Full scan" toggle introduces; show real progress.
+                    let frac = (g.scan_done as f32 / g.scan_total as f32).clamp(0.0, 1.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(format!(
+                            "{} ({} / {})",
+                            g.phase,
+                            rusty_backup::partition::format_size(g.scan_done),
+                            rusty_backup::partition::format_size(g.scan_total),
+                        ));
+                    });
+                    ui.add(egui::ProgressBar::new(frac).show_percentage());
+                    ui.ctx().request_repaint();
                 } else {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());

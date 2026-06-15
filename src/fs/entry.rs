@@ -52,6 +52,14 @@ pub struct FileEntry {
     /// in `modified`. Only set for AmigaDOS / PFS3 / SFS entries;
     /// `None` outside that family.
     pub amiga_date: Option<(i32, i32, i32)>,
+    /// Standard DOS attribute bits (read-only `0x01`, hidden `0x02`,
+    /// system `0x04`, archive `0x20`; the volume-label `0x08` and
+    /// directory `0x10` bits are represented by `entry_type` and not
+    /// carried here). Populated for FAT (the on-disk `u8` widened) and
+    /// exFAT (the directory entry's `u16` FileAttributes). `None` for
+    /// filesystems that have no DOS attribute concept. The copy engine
+    /// carries this across FAT/exFAT destinations.
+    pub dos_attributes: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +95,7 @@ impl FileEntry {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl FileEntry {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         }
     }
 
@@ -135,6 +145,7 @@ impl FileEntry {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         }
     }
 
@@ -165,6 +176,7 @@ impl FileEntry {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         }
     }
 
@@ -194,6 +206,7 @@ impl FileEntry {
             amiga_protection: None,
             amiga_comment: None,
             amiga_date: None,
+            dos_attributes: None,
         }
     }
 

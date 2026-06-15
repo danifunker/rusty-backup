@@ -31,6 +31,16 @@ pub trait Filesystem: Send {
     /// Used space in bytes.
     fn used_size(&self) -> u64;
 
+    /// Allocation unit (cluster / block) size in bytes, when the
+    /// filesystem has a single fixed one. The cross-image copy preflight
+    /// uses this to project real on-disk consumption — many small files
+    /// each round up to one unit, so summing raw byte sizes badly
+    /// underestimates usage on large-cluster volumes. `None` means
+    /// "unknown"; the copy engine then falls back to a 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the minimum number of bytes from the partition start needed to
     /// capture all filesystem data **without moving any data on disk** — i.e.
     /// the position of the last allocated byte. Used for smart backup trimming.
@@ -254,6 +264,12 @@ pub struct CreateFileOptions {
     /// Caller must call `sync_metadata` when done to write a correct
     /// FSInfo sector.  Eliminates two full FAT-table reads per file.
     pub skip_fsinfo_update: bool,
+    /// Standard DOS attribute bits to stamp on the new file (read-only
+    /// `0x01`, hidden `0x02`, system `0x04`, archive `0x20`). Honored by
+    /// FAT and exFAT; ignored elsewhere. `None` lets the filesystem pick
+    /// its conventional default (FAT/exFAT use archive). See
+    /// [`crate::fs::entry::FileEntry::dos_attributes`].
+    pub dos_attributes: Option<u16>,
 }
 
 /// Options for creating a directory on an editable filesystem.

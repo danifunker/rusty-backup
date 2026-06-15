@@ -280,14 +280,18 @@ Treat as a single tracked initiative here; progress is on that doc's
 own per-format spine.
 
 Gaps to reconcile back into the plan when it gets picked up:
-- **BBCMicro / AcornElectron** — Acorn DFS (the flat catalog FS) not in
-  the plan; only ADFS is covered via Archie.
+- **BBCMicro / AcornElectron** — Acorn DFS — DONE (2026-06-13). `fs::dfs`
+  reads + writes the flat-catalogue DFS on single-sided `.ssd`
+  (40-track 100K / 80-track 200K), bidirectionally cross-validated
+  byte-exact against an independent clean-room reader/writer. Remaining:
+  double-sided `.dsd` (track-interleaved) and ADFS-on-floppy.
 - **AcornAtom** (Atom DOS) — niche, omitted from §1 + §5 of the plan.
 - **SAM-Coupe** (SAM DOS / MasterDOS) — omitted.
 - **ZX-Spectrum native FS** (TR-DOS / G+DOS) — only FAT + +3DOS are
   covered. The native floppy FS isn't in scope yet.
-- **PET2001 D80/D82** — included in CBM Wave 3 but the `cbm` crate
-  doesn't cover those formats; needs an extra slice.
+- **PET2001 D80/D82** — DONE (2026-06-11). `fs::cbm` reads + writes the
+  8050 `.d80` / 8250 `.d82` geometries from scratch (no `cbm` crate),
+  bidirectionally validated against the Python `d64` reference.
 - **§0 vs §4 reconciliation** — §0 says "Add/Delete is the target for
   every format" but §4 marks ~9 floppy cores as "write deferred". Decide
   which is right (only ColecoAdam EOS has a legitimate read-only reason

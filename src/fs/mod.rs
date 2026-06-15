@@ -4,10 +4,16 @@ pub mod affs_common;
 pub mod affs_fsck;
 pub mod andos;
 pub mod apple_dos;
+pub mod atari_dos;
 pub mod binhex;
 pub mod btrfs;
+pub mod carve;
+pub mod cbm;
+pub mod copy;
 pub mod cpm;
 pub mod cpm_diskdefs;
+pub mod dfs;
+pub mod dragondos;
 pub mod efs;
 pub mod efs_fsck;
 pub mod efs_resize;
@@ -34,8 +40,10 @@ pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
+pub mod mac_scsi_bless;
 pub mod mfs;
 pub mod ntfs;
+pub mod os9;
 pub mod patch;
 pub mod pfs3;
 pub mod pfs3_clone;
@@ -45,6 +53,7 @@ pub mod qdos;
 pub mod qdos_mdv;
 pub mod reiserfs;
 pub mod resource_fork;
+pub mod rsdos;
 pub mod sfs;
 pub mod tree;
 pub mod ufs;
@@ -354,6 +363,51 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         {
             return "applesdos33";
         }
+    }
+
+    // Commodore CBM DOS (1541/1571/1581 .d64/.d71/.d81). Flat sector
+    // dumps with no partition table; `looks_like_cbm` gates on the exact
+    // geometry length AND the header-sector signature so we don't
+    // false-positive on a same-sized blob.
+    if cbm::looks_like_cbm(reader, partition_offset).is_some() {
+        return "cbmdos";
+    }
+
+    // Atari DOS 2 (.atr stripped to its body, or headerless .xfd). Gated on
+    // the exact disk geometry + a plausible VTOC at sector 360.
+    if atari_dos::looks_like_atari_dos(reader, partition_offset).is_some() {
+        return "ataridos";
+    }
+
+    // DragonDOS (flat .dsk, 40-track single- or double-sided). Same byte size
+    // as a 40-track RS-DOS disk, but its directory track carries a
+    // one's-complement geometry signature, so probe it first among the CoCo
+    // family — the signature is a confident discriminator.
+    if dragondos::looks_like_dragondos(reader, partition_offset).is_some() {
+        return "dragondos";
+    }
+
+    // Acorn DFS (flat single-sided .ssd, 40- or 80-track). No magic; gated on
+    // exact single-sided geometry AND a catalogue whose declared sector count
+    // matches the disk size, which separates a real .ssd from a flat .dsd.
+    if dfs::looks_like_dfs(reader, partition_offset).is_some() {
+        return "acorndfs";
+    }
+
+    // OS-9 / NitrOS-9 RBF (flat .dsk/.vdk). Same byte size as a 35-track
+    // RS-DOS disk, so it must be probed first: `looks_like_os9` validates the
+    // LSN-0 identification sector against the image length and confirms the
+    // root FD is a directory, which RS-DOS disks never satisfy.
+    if os9::looks_like_os9(reader, partition_offset).is_some() {
+        return "os9";
+    }
+
+    // RS-DOS / CoCo Disk BASIC (flat .dsk/.jvc, 35- or 40-track). No magic
+    // number; `looks_like_rsdos` gates on exact geometry AND a structurally
+    // consistent granule table + directory so OS-9 (same byte size) and
+    // random blobs are rejected.
+    if rsdos::looks_like_rsdos(reader, partition_offset).is_some() {
+        return "rsdos";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -900,6 +954,9 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
             "Apple_HFSX" => "HFSX",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
+            // Amiga boot block present, no AmigaDOS filesystem (custom
+            // bootblock / diagnostic disk). Browsable via the carve view.
+            "Amiga-NDOS" => "Amiga NDOS (no filesystem)",
             _ => "unknown",
         };
     }
@@ -1240,6 +1297,30 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "cbmdos" => Ok(Box::new(cbm::CbmFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ataridos" => Ok(Box::new(atari_dos::AtariDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "dragondos" => Ok(Box::new(dragondos::DragonDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "acorndfs" => Ok(Box::new(dfs::DfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "os9" => Ok(Box::new(os9::Os9Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "adfs" => Ok(Box::new(adfs::AdfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1280,9 +1361,13 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                _ => Err(FilesystemError::Unsupported(
-                    "could not detect filesystem type on superfloppy".into(),
-                )),
+                // No filesystem recognized. Rather than erroring, fall back to
+                // the synthetic carve view so the user can still pull a raw
+                // copy and any recoverable text/JSON content off the image.
+                _ => Ok(Box::new(carve::CarveFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
             }
         }
         // FAT12
@@ -1546,6 +1631,30 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "cbmdos" => Ok(Box::new(cbm::CbmFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ataridos" => Ok(Box::new(atari_dos::AtariDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "rsdos" => Ok(Box::new(rsdos::RsdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "dragondos" => Ok(Box::new(dragondos::DragonDosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "acorndfs" => Ok(Box::new(dfs::DfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "os9" => Ok(Box::new(os9::Os9Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "efs" => Ok(Box::new(efs::EfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1805,6 +1914,15 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
                 ))),
             }
         }
+        // NDOS Amiga disk: a valid boot block (so the ROM runs its code) with
+        // no AmigaDOS root block — a custom bootblock disk (demo / diagnostic)
+        // that writes raw sectors instead of using a filesystem. There's
+        // nothing to mount, so fall back to the synthetic carve view, which
+        // surfaces the whole disk plus any recoverable text/JSON payloads.
+        "Amiga-NDOS" => Ok(Box::new(carve::CarveFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str

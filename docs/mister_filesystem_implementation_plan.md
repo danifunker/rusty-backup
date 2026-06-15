@@ -49,6 +49,220 @@ Amstrad / PCW / Einstein / SVI328 / MultiComp / ZX+3 floppy
 cores at zero per-core cost.
 
 **Session log** (newest first; one line per session — date, what moved, what's next):
+- 2026-06-13 (Wave 3 — BBCMicro / AcornElectron / Acorn DFS read+write) —
+  Built `src/fs/dfs.rs` ground-up for the BBC Micro / BBC Master / Acorn
+  Electron cores (the OPEN-WORK §5 reconciliation gap — DFS was "not in the
+  plan; only ADFS covered via Archie"). DFS is the flat-catalogue floppy FS:
+  two 256-byte catalogue sectors (0 + 1) hold a 12-char disc title, up to 31
+  files each with an 8-byte half-entry in *each* sector, files physically
+  contiguous and listed in **descending start-sector order**, single-character
+  directory namespaces (`$` default), 18-bit load/exec/length, 10-bit start
+  sector, lock bit, BCD cycle, *OPT boot option. No on-disk magic, so
+  `looks_like_dfs` gates on exact single-sided geometry (102400 = 40-track /
+  204800 = 80-track) AND a catalogue whose **declared sector count equals the
+  disk size** — the discriminator that separates a true single-sided `.ssd`
+  from a flat 40-track double-sided `.dsd` (whose side-0 catalogue declares
+  400 on an 800-sector file). Full read + edit (`EditableFilesystem`
+  add/delete; first-fit contiguous allocator, full-catalogue rebuild keeping
+  descending order, BCD cycle bump). Validated **bidirectionally** against an
+  independent clean-room Python DFS reader/writer (transcribed from the
+  BeebWiki Acorn DFS spec): the engine reads the oracle's disks byte-exact and
+  the oracle reads the engine's `put`/`rm` output byte-exact, across both
+  geometries, multi-sector files, locked files, non-`$` directories, and real
+  load/exec addresses. Wired into the 4 dispatch sites (`partition` display
+  name + `fs::mod` detect / open / open_editable) + `DISK_IMAGE_EXTS` (`.ssd`)
+  + regression test. 7 engine unit + 4 cli (tests/cli_bbcmicro.rs) tests + a
+  committed license-clean 463-byte fixture (`test_bbc_dfs.ssd.zst`, original
+  content). 1817 lib tests green, clippy clean. **This closes the OPEN-WORK §5
+  DFS gap for two cores.** BBCMicro / AcornElectron rows flip No -> Partial
+  (single-sided `.ssd`; double-sided `.dsd` track-interleaving + ADFS-on-floppy
+  remain). Next: `.dsd` deinterleave (unlocks double-sided BBC discs), Acorn
+  DFS Watford 62-file extension, or a fresh Wave-3 FS (Oric / PC88 / TRS-80).
+- 2026-06-11 (Wave 3 — Dragon / DragonDOS read+write) — Built
+  `src/fs/dragondos.rs` ground-up for the Dragon Data Dragon 32/64 (and
+  CoCo-via-DragonDOS-cart) MiSTer cores, the sister FS to RS-DOS. Format
+  transcribed from MAME `imgtool` `dgndos.cpp`: directory track 20 (backup
+  mirror on track 16), sector bitmap in track-20 sectors 1-2 (**set bit =
+  free**), one's-complement geometry bytes at 0xFC-0xFF as the signature,
+  25-byte directory entries (header block with 4 sector-allocation extents +
+  continuation blocks with 7 each, linked via the CONTINUED bit). Key
+  simplification: LSN is a flat linear sector index, so byte offset = `lsn *
+  256` for both single- and double-sided 40-track `.dsk`. Full read + edit
+  (`EditableFilesystem` add/delete; greedy contiguous allocator, extent
+  grouping capped at 254, backup-track mirroring). Validated three ways: (a)
+  an independent clean-room Python reader/writer (from the same spec) —
+  bidirectional byte-exact, and engine+oracle produce **byte-identical** 180K
+  disks; (b) a real third-party **empty** DragonDOS volume from
+  rolfmichelsen/dragontools (C#) — geometry/signature match exactly, engine
+  adds a file the oracle reads back byte-exact; (c) a real **populated**
+  9-file DragonDOS disk (AGD-suite) — all 9 files (incl. multi-sector `.BIN`,
+  tokenized `.BAS`) byte-identical across both independent readers. Wired
+  into the 4 `fs::mod` dispatch sites + `partition::detect_superfloppy`
+  display name, probed before OS-9/RS-DOS (its complement signature is a
+  confident discriminator). `.dsk`/`.vdk` already in `DISK_IMAGE_EXTS`. 6
+  engine unit + 4 cli (tests/cli_dragon.rs) tests + a committed license-clean
+  oracle-authored fixture (`test_dragon_dragondos.dsk.zst`). 1809 lib tests
+  green, clippy clean. **This closes the CoCo2/3 + Dragon spine row.** Next: a
+  fresh Wave-3 FS (Oric / PC88 / TRS-80) or the `.jvc`/`.vdk` container header
+  stripping follow-up.
+- 2026-06-11 (Wave 3 — CoCo2/3 / OS-9 RBF read+write) — Built
+  `src/fs/os9.rs` ground-up for the OS-9 / NitrOS-9 RBF filesystem (the
+  second CoCo FS family, hierarchical/Unix-like unlike flat RS-DOS): LSN-0
+  identification sector, per-file/dir 256-byte file descriptors (FD.ATT
+  dir-bit, FD.SIZ, 5-byte segment-list extents), high-bit-terminated 29-byte
+  directory names, allocation bitmap (set-bit = allocated, MSB-first).
+  `looks_like_os9` validates the ident sector against image length + a
+  directory root FD, so it cleanly separates from same-size RS-DOS disks
+  (probed first). Full read + edit incl. subdirectories (`create_file`,
+  `create_directory`, `delete_entry`; contiguous/coalesced segment alloc,
+  directory grow + slot reuse, non-empty-dir delete refusal). Fetched real
+  fixtures from the NitrOS-9 toolshed (`disks/os9l2_d1`, `disks/l2tools`)
+  and validated **byte-exact** against an independent clean-room Python RBF
+  reader: all 57 + 28 files extract identically, and after add/delete every
+  pre-existing file stays byte-exact while space reclaims exactly. Wired into
+  the 4 `fs::mod` dispatch sites + partition display name (`.dsk`/`.vdk`
+  already in `DISK_IMAGE_EXTS`). 2 engine unit + 3 lib (tests/os9_lib.rs) +
+  4 cli (tests/cli_coco_os9.rs) tests + committed `test_coco_os9l2.dsk.zst`
+  / `test_coco_os9_l2tools.dsk.zst` fixtures, all green. **Next:** DragonDOS
+  (the remaining Dragon-specific CoCo variant) or a fresh Wave-3 FS
+  (Oric / PC88 / TRS-80).
+- 2026-06-11 (Wave 3 — CoCo2/3 / RS-DOS Disk BASIC read+write) — Built
+  `src/fs/rsdos.rs` ground-up for the Tandy Color Computer cores: granule
+  allocation table at track 17 sector 2 (`0xFF` free, `<0xC0` chain pointer,
+  `0xC0|S` last granule), 72-file directory at track 17 sectors 3-11,
+  granule-chain files (2304-byte granules, the two dir granules skipped in
+  numbering). No on-disk magic, so `looks_like_rsdos` discriminates purely on
+  exact 35-/40-track geometry + a structurally consistent FAT + directory
+  (correctly rejects the same-size OS-9 `l2tools` disk). Full read + edit
+  (`EditableFilesystem`). Validated **bidirectionally** against an independent
+  clean-room Python reader/writer transcribed from toolshed `libdecb`: rb-cli
+  reads the Python-written disk byte-exact, the oracle reads rb-cli's
+  put/rm output byte-exact. Wired into the 4 `fs::mod` dispatch sites +
+  partition display name + `DISK_IMAGE_EXTS` (`.dsk`/`.jvc`/`.vdk`). 4 engine
+  unit tests + 4 cli (tests/cli_coco.rs) + committed `test_coco_rsdos.dsk.zst`
+  fixture, all green. **Next:** DragonDOS (sister FS) or OS-9 RBF (real
+  fixtures `os9l2_d1`/`l2tools` already on hand), or a fresh Wave-3 FS
+  (Oric / PC88 / TRS-80).
+- 2026-06-11 (Wave 3 — Atari800 / Atari DOS 2 read+write) — Built
+  `src/fs/atari_dos.rs` ground-up for the 8-bit Atari800 core: VTOC at
+  sector 360 (bit-SET-is-free 90-byte bitmap), 64-file directory at
+  sectors 361-368 (16-byte 8.3 entries), linked-sector files (125 data +
+  3 link bytes per SD sector; `next = ((b0&3)<<8)|b1`, byte count in b2).
+  Geometry from body size (SD 92160 / ED 133120). Full `EditableFilesystem`
+  (alloc from the VTOC, scratch-on-delete with flag 0x80). `.atr` is wired
+  as an **editable container** (`src/rbformats/containers/atr.rs`: 16-byte
+  header strip on read, re-wrap on commit, via the existing
+  ContainerEditSession) — `.xfd` is headerless and routes through plain
+  superfloppy detection. Reference tooling friction: atrcopy 10.1 is
+  numpy-incompatible (np.alen / uint8 overflow) and building atari-tools
+  was sandbox-blocked, so validation used (a) the atrcopy-bundled **real**
+  DOS 2.0S system disk (DOS.SYS 4875 B / DUP.SYS 5126 B / AUTORUN.SYS 88 B
+  — my engine extracts all three byte-exact) and (b) an **independent
+  clean-room Python reader** I wrote from the spec; write side validated by
+  having that reader parse my engine's output byte-exact. Found+fixed a
+  `detect_container_kind` ordering bug (the loose D88 disk-name sniff
+  claimed ATR headers — moved the specific 0x0296 check ahead of it).
+  Picker exts `.atr`/`.xfd` + regression test; README + status doc + plan
+  synced; committed a 519-byte license-clean fixture (`test_atari_dos2.atr.zst`,
+  original content) + `tests/cli_atari800.rs`. 1796 lib tests green, zero
+  warnings. **Next:** double-density (256-byte) read + DOS 2.5 second VTOC,
+  or another Wave-3 FS (TRS-80 / Oric / CoCo).
+- 2026-06-11 (Wave 3 — `.g71` 1571 GCR, validated against real c1541) —
+  Closed the last deferred CBM item. Installed VICE (`brew install vice`)
+  for `c1541` — the authoritative G71 producer — and confirmed the format
+  via the VICE doc + a real image: `GCR-1571` signature, byte $09 = 168
+  half-tracks, **side 0 = even indices 0..68 (tracks 1-35), side 1 = even
+  indices 84..152 (tracks 36-70)**. Generalized `decode_g64_bytes` to
+  dispatch g64→D64 / g71→D71 via a shared `track_gcr_slice` helper +
+  `decode_g71` (D71 zone map mirrored at track 35, `d71_offset`). Dropped
+  the per-track header-track filter in `decode_track` (the offset table
+  already isolates each half-track, so position is authoritative — makes
+  side-1 robust to either logical/physical track numbering). **Gold-
+  standard validation**: `c1541 -format g71 -write` a 1103-block file
+  (HUGE) that *cannot* fit on side 0's ~664 blocks → my decoder reads it
+  byte-exact, proving side-1 decode. Committed a 12 KB real-c1541 fixture
+  `tests/fixtures/test_cbm_1571.g71.zst` (README + a 180000-byte
+  side-spanning SIDEONE) + `tests/cbm_g71.rs`. `rb-cli ls/get` on `.g71`
+  works via the existing source_reader g64 branch. 1789 lib tests green,
+  zero warnings. **Next:** a fresh Wave-3 FS (Atari DOS) or user-side
+  on-core verification.
+- 2026-06-11 (Wave 3 gap #1 — PET 8050/8250 `.d80`/`.d82`) — Extended
+  `fs::cbm` with `CbmVariant::{D80, D82}`: the PET/CBM IEEE-488 geometries
+  (8050 = 533248 B / 77 trk; 8250 = 1066496 B / 154 trk, side 2 mirrors
+  side 1). 29/27/25/23-sector zone map; the BAM lives on its own track
+  (38) as a 2–4-sector chain with 5-byte-per-track entries (free + 4
+  bitmap bytes, `bam_idx = (track-1)/50`); header + directory on track 39;
+  the header links to the BAM chain (which ends at the directory) rather
+  than the directory directly, so `dir_start` returns the fixed T39S1.
+  Dedicated `create_blank_pet` (layout ground-truthed byte-for-byte from
+  the Python `d64` reference). Detection (`looks_like_cbm`) keys on the
+  T39S0 'C' DOS version + "2C" DOS type + BAM-track link. **Bidirectional
+  oracle validation**: my engine reads the d64-lib-written D80/D82 files
+  byte-exact, and the oracle reads my engine's D80/D82 (incl. a 2000-byte
+  multi-block SEQ) byte-exact; blank free-block counts match the
+  documented 8050/8250 values (2052 / 4133 — note d64-lib itself is more
+  conservative). `.d80`/`.d82` added to DISK_IMAGE_EXTS; `rb-cli
+  inspect/ls` works. 1788 lib tests (+2 PET) green, zero warnings. **Next:**
+  `.g71` GCR (needs a real 1571 sample), or a fresh Wave-3 FS (Atari DOS).
+- 2026-06-11 (Wave 3 gap #2 — Commodore `.g64` GCR decoder) — Added
+  `src/rbformats/containers/g64.rs`: a full GCR (Group Coded Recording)
+  codec turning a 1541 raw-track `.g64` into a flat `.d64` the cbm engine
+  reads. Implements the standard 4-bit→5-bit GCR table (unit-tested as
+  self-inverse against the published 1541-ROM codes), MSB-first bitstream
+  sync detection (≥10 one-bits), header/data block parsing with checksums,
+  and per-track sector reassembly via the 1541 zone map. Also a public
+  `encode_g64_from_d64` (symmetric writer — emits SYNC·header·gap·SYNC·
+  data·gap with correct GCR + checksums + the half-track offset table), so
+  the codec round-trips end-to-end without external `.g64` tooling. Wired
+  into `source_reader` (`is_g64_path` + decode-to-flat branch +
+  `is_flat_floppy_container_path`); `.g64`/`.g71` added to `DISK_IMAGE_EXTS`
+  + regression test. E2E (`tests/cbm_g64.rs`): cbm builds a .d64 with files
+  → encode .g64 → `rb-cli ls/get` decodes the GCR → reads files byte-exact.
+  `.g71` (1571) is detected and cleanly refused (side-1 half-track mapping
+  needs a real sample to validate, vs. risking a wrong decode). Found+fixed
+  a decode off-by-one (the peeked ID byte made the data read one byte long).
+  **Next:** Wave 3 gap #1 (PET `.d80`/`.d82` geometry + multi-sector BAM).
+- 2026-06-11 (Wave 3 gap #3 — CP/M floppy cores now scriptable via rb-cli)
+  — Closed the "CP/M floppy CLI" gap surfaced while shipping CBM. The
+  `--fs-type cpm:<preset>` flag + EDSK decoding already existed, but
+  `rb-cli ls/get/put/rm` failed on flat CP/M discs whose byte size isn't a
+  whitelisted "floppy size" in `partition::detect` (only Altair's 256256 B
+  was) — `PartitionTable::detect` hard-errored ("invalid MBR", `0xE5E5`)
+  *before* the override could apply. Fix: `cli::resolve::resolve_with_override`
+  makes a detection failure non-fatal when the user forces `--fs-type`,
+  falling back to a raw-FS-at-byte-0 context (the defining shape of a
+  signatureless flat CP/M floppy). Added `resolve_partition_{rw,streaming}_forced`
+  wrappers; wired ls/get/put/rm. Verified full ls/get/put/rm round-trip on
+  the committed Amstrad data fixture (184320 B) — `get HELLO.TXT` returns the
+  cpmtools-authored bytes, `put`/`rm` round-trip byte-exact. New
+  tests/cli_cpm_floppy.rs (3 tests incl. a negative "no --fs-type still
+  errors"). Altair CP/M test still green (success path unchanged). **Next:**
+  Wave 3 gap #2 (`.g64`/`.g71` GCR decoder), then gap #1 (PET `.d80`/`.d82`).
+- 2026-06-11 (Wave 3 opens — Commodore CBM DOS read+write end-to-end) —
+  Built `src/fs/cbm.rs` ground-up (no `cbm`-crate port; the format is
+  small and fully specified — Schepers D64 / Immers-Neufeld). One unified
+  engine covers **1541 `.d64` (+40-track), 1571 `.d71`, 1581 `.d81`**:
+  per-track zone geometry, PETSCII 0xA0-padded names, the
+  bit-set-is-free BAM (per-variant: shared T18S0 for 1541, +T53S0 for
+  1571, dedicated T40S1/T40S2 for 1581), 32-byte directory entries, and
+  linked-sector files with exact last-byte length recovery. Full
+  `EditableFilesystem`: BAM allocation with 1541 interleave-10 + spiral
+  track order, directory-chain extension past the first 8 entries,
+  scratch-on-delete. Detection is `looks_like_cbm` (exact-geometry-size
+  gate AND header-sector signature: DOS version byte + dir-track link +
+  DOS-type marker) wired into both `detect_superfloppy` and
+  `detect_filesystem_type`; open dispatch + editable dispatch carry a
+  `"cbmdos"` arm. **Reference: bidirectional cross-validation against the
+  Python `d64` library** (an independent reference impl) — my engine
+  writes → oracle reads byte-exact, oracle writes → my engine reads
+  byte-exact, across D64/D71/D81 incl. a 5000-byte multi-block file; the
+  rb-cli `put`/`rm`-modified disk is re-read clean by the oracle. Picker
+  exts `.d64`/`.d71`/`.d81` + regression test; README + this doc synced.
+  1781 lib tests + 7 new cbm unit tests green; zero warnings. **Next:**
+  PET 8050/8250 `.d80`/`.d82` geometry (not implemented),
+  `.g64`/`.g71` GCR container, or the CP/M floppy-core verify sweep
+  (DPB presets already shipped from Wave 2 — Amstrad/PCW/Einstein/
+  SVI328/MultiComp/ZX+3 just need per-core confirmation).
 - 2026-06-05 (ADFS read+write end-to-end — closes Archie row to user-
   side parks) — Cracked the ADFS read-side puzzle via Linux kernel
   `fs/adfs/map.c` source-dive: `log2bpmb` (DR byte 0x05) is log2-bytes-
@@ -576,7 +790,7 @@ A core is **done** only when every applicable stage is `[x]`.
 
 - [ ] §3.1 non-512 logical-sector accessor + `src/fs/README.md` note
 - [x] §3.2 container framework `src/rbformats/containers/` (`open_container` dispatch)
-- [~] §3.2 decoders: [x] MSA · [x] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [ ] GCR `.g64/.g71` · [ ] `.nib` · [x] `.d88` (Sharp; encode + decode + e2e tests + source_reader plumbing)
+- [x] §3.2 decoders: [x] MSA · [x] EDSK · [ ] TD0 (port) · [ ] IMD (port) · [x] GCR (`.g64` 1541 + `.g71` 1571 decode; encode + round-trip + cbm e2e + source_reader plumbing — `src/rbformats/containers/g64.rs`; `.g71` side-1 mapping validated against a real VICE `c1541` image, `tests/cbm_g71.rs`) · [ ] `.nib` · [x] `.d88` (Sharp; encode + decode + e2e tests + source_reader plumbing)
 - [x] §3.3 partitionless / extension-dispatch framework (detect_superfloppy + detect_filesystem_type cover Wave-2: FAT/HFS/HFS+/MFS/ext/btrfs/EFS/XFS/ADFS/ProDOS/DOS3.3/DFS/QDOS/ANDOS + AmigaDOS DosType string routing)
 - [ ] §3.4 convention docs (endianness, bitmap polarity, write-safety)
 
@@ -596,10 +810,10 @@ A core is **done** only when every applicable stage is `[x]`.
 
 ### Wave 3 — floppy-only long tail (full spine, no resize)
 
-- [ ] **Commodore** (CBM: C64/128/16/VIC20/PET) — prereq [ ] GCR container; port `cbm` · [ ] inspect · [ ] extract · [ ] ref · [ ] add/del · [ ] write-verified · [ ] gui · [ ] cli · [ ] tests
-- [ ] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse CP/M engine; per core: [ ] DPB preset · [ ] verify
-- [ ] **Atari800** (Atari DOS) — full spine
-- [ ] **CoCo2/3** (RS-DOS/DragonDOS + OS-9 RBF — two FS) — full spine ×2
+- [~] **Commodore** (CBM: C64/128/16/VIC20/PET) — hand-written `src/fs/cbm.rs` (ground-up, no `cbm` crate port — the format is small and well-specified). · [x] inspect (size + header-sig gated `looks_like_cbm` in detect_superfloppy + detect_filesystem_type) · [x] extract (D64/D71/D81 directory chain + linked-sector file read, exact last-byte length) · [x] ref (**bidirectional cross-validation against the Python `d64` library** — my engine writes → oracle reads, oracle writes → my engine reads, all byte-exact across D64/D71/D81 incl. multi-block files) · [x] add/del (full `EditableFilesystem`: BAM alloc with interleave + directory-chain extension past 8 files; oracle-confirmed CLI `put`/`rm` round-trip) · [x] write-verified (oracle reads CLI-modified disk byte-exact; on-MiSTer boot park is user-side §7) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7 polish) · [x] cli (tests/cli_cbm.rs + rb-cli inspect/ls/get/put/rm round-trip) · [x] tests (engine unit + oracle read fixture + cli). **All CBM container/geometry gaps closed:** `.g64` (1541) **and** `.g71` (1571) GCR both decode (`src/rbformats/containers/g64.rs`; `.g71` side-1 mapping validated against a real VICE `c1541` image), and PET 8050/8250 `.d80`/`.d82` read+write ship (bidirectionally oracle-validated). The Commodore row is functionally complete on every format; only on-MiSTer/VICE boot parks remain (user-side §7).
+- [~] **CP/M floppy cores** (Amstrad, PCW, Einstein, SVI328, MultiComp, ZX+3) — reuse the Wave-2 CP/M engine + DPB presets (all shipped: `amstrad_data`/`amstrad_sys`/`amstrad_pcw`/`einstein`/`svi328_cpm`/`multicomp`/`zx_plus3`). · [x] DPB presets (cpm_diskdefs.rs) · [x] **CLI dispatch now works for every floppy geometry** — `rb-cli {ls,get,put,rm} --fs-type cpm:<preset>` round-trips on the committed Amstrad fixture (184320 B). The blocker was that `PartitionTable::detect` hard-errored on flat CP/M discs whose size isn't a whitelisted "floppy size" (only Altair's 256256 B was), *before* the `--fs-type` override could apply; fixed by making detection failure non-fatal when `--fs-type` is forced (`cli::resolve::resolve_with_override`). Regression-pinned in tests/cli_cpm_floppy.rs. · [ ] per-core on-MiSTer boot verify (user-side §7). **Remaining:** EDSK-wrapped `.dsk` already decodes via source_reader; the per-core confirmation is just user-side core boots.
+- [x] **Atari800** (Atari DOS 2) — `src/fs/atari_dos.rs` (ground-up). · [x] inspect (VTOC@360 signature + exact geometry gate via `looks_like_atari_dos`, wired into detect_superfloppy + detect_filesystem_type) · [x] extract (linked-sector chain with per-sector byte count; SD 92160 + ED 133120) · [x] ref (**read** validated byte-exact against the atrcopy-bundled real DOS 2.0S system disk — DOS.SYS/DUP.SYS/AUTORUN.SYS — AND an independent clean-room Python reader; **write** validated the same way) · [x] add/del (full `EditableFilesystem`: VTOC bit-set-free alloc, 64-entry directory, scratch-on-delete) · [x] write-verified (clean-room oracle reads the rb-cli put/rm-modified disk byte-exact) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7) · [x] cli (tests/cli_atari800.rs + `.atr` edit round-trip through the ContainerEditSession) · [x] tests (engine unit + atr container unit + cli + committed fixture). **`.atr` is an editable container** (16-byte header strip/wrap via `src/rbformats/containers/atr.rs`); `.xfd` is headerless. **Remaining:** double-density (256-byte) read, DOS 2.5 second VTOC for sectors 720+, MyDOS/SpartaDOS.
+- [x] **CoCo2/3 + Dragon** (RS-DOS + DragonDOS + OS-9 RBF — three FS) — `src/fs/rsdos.rs` + `src/fs/dragondos.rs` + `src/fs/os9.rs` (all ground-up). **RS-DOS / Disk BASIC:** · [x] inspect (no magic; `looks_like_rsdos` gates on exact 35-/40-track geometry AND a structurally consistent granule table + directory, so OS-9 same-size disks and random blobs are rejected) · [x] extract (granule-chain walk on the track-17 FAT, exact last-sector byte count) · [x] ref (**bidirectional cross-validation against an independent clean-room Python reader/writer** derived from the toolshed `libdecb` semantics — rb-cli reads the Python-written disk byte-exact, the oracle reads rb-cli's put/rm output byte-exact) · [x] add/del (full `EditableFilesystem`: granule alloc/free in the FAT, 72-entry directory, last-granule sector/byte bookkeeping) · [x] write-verified · [x] cli (tests/cli_coco.rs) · [x] tests (engine + `test_coco_rsdos.dsk.zst`). **OS-9 / NitrOS-9 RBF:** · [x] inspect (`looks_like_os9` validates the LSN-0 ident sector against image length + a directory root FD; probed before RS-DOS) · [x] extract (FD segment-list extents, high-bit-terminated names, recursive subdir walk) · [x] ref (**byte-exact** vs an independent clean-room Python RBF reader on the real toolshed `os9l2_d1` (57 files) + `l2tools` (28 files) disks) · [x] add/del incl. subdirectories (`create_file`/`create_directory`/`delete_entry`; bitmap set-bit=allocated alloc/free, coalesced segments, dir grow + slot reuse, non-empty-dir delete refusal) · [x] write-verified (after add/delete every pre-existing file stays byte-exact per oracle; space reclaims exactly) · [x] cli (tests/cli_coco_os9.rs — inspect/ls incl. subdir/get-nested/put/rm) · [x] tests (engine + lib tests/os9_lib.rs + committed `test_coco_os9l2.dsk.zst` / `test_coco_os9_l2tools.dsk.zst`) · — resize (N/A floppy-only) · [!] gui (shared dispatch path; parked §7). **DragonDOS** (`src/fs/dragondos.rs`): · [x] inspect (`looks_like_dragondos` reads the directory-track geometry bytes + one's-complement signature, probed before OS-9/RS-DOS; single- and double-sided 40-track) · [x] extract (header + continuation extent chain, LSN = flat sector index so offset = `lsn*256`, exact last-sector byte count) · [x] ref (**three-way:** independent clean-room Python reader/writer — bidirectional byte-exact and engine+oracle produce byte-identical disks; a real empty DragonDOS volume from rolfmichelsen/dragontools; and a real populated 9-file AGD-suite disk, all files byte-identical across both readers) · [x] add/del (full `EditableFilesystem`: set-bit-free bitmap alloc, contiguous-greedy extent grouping, header/continuation dirent linking, backup-track mirroring) · [x] write-verified · [x] cli (tests/cli_dragon.rs) · [x] tests (6 engine unit + cli + committed `test_dragon_dragondos.dsk.zst`). **Remaining (all three FS):** `.jvc`-header (non-256-multiple) and `.vdk` container header stripping.
 - [ ] **Oric** (Sedoric) — full spine
 - [ ] **PC88** (N88-BASIC) — full spine
 - [ ] **TRS-80** (TRSDOS/LDOS) — full spine

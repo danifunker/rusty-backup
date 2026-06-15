@@ -20,7 +20,8 @@
 pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
-    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima",
+    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
+    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -118,6 +119,56 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing floppy-container extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn cbm_disk_family_present() {
+        // Commodore CBM DOS floppy images (`src/fs/cbm.rs`) for the
+        // C64/C128/C16/VIC-20/PET MiSTer cores. Pin the picker extensions
+        // so a future cleanup of the disk-image list can't silently drop
+        // them and break double-click open / the file picker filter.
+        for must in ["d64", "d71", "d81", "g64", "g71", "d80", "d82"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing CBM disk extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn atari_disk_family_present() {
+        // Atari 8-bit ATR / XFD disk images (`src/fs/atari_dos.rs`) for the
+        // Atari800 MiSTer core.
+        for must in ["atr", "xfd"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing Atari disk extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn acorn_dfs_family_present() {
+        // Acorn DFS single-sided floppy images (`src/fs/dfs.rs`) for the
+        // BBCMicro / AcornElectron MiSTer cores. `.ssd` is the flat
+        // single-sided dump.
+        assert!(
+            association_exts().contains(&"ssd".to_string()),
+            "missing Acorn DFS extension ssd"
+        );
+    }
+
+    #[test]
+    fn coco_disk_family_present() {
+        // CoCo Disk BASIC (RS-DOS) disk images (`src/fs/rsdos.rs`) for the
+        // CoCo2 / CoCo3 MiSTer cores. `.dsk` is the common raw dump; `.jvc`
+        // and `.vdk` are CoCo-specific container extensions.
+        for must in ["dsk", "jvc", "vdk"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing CoCo disk extension {must}"
             );
         }
     }
