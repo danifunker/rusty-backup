@@ -144,7 +144,12 @@ fn main() {
     let mut fs = PilotFilesystem::open(disk, Generation::OriginalPilot).expect("open fs");
     let root = fs.root().expect("root");
     let entries = fs.list_directory(&root).expect("list");
-    println!("  total files listed: {}", entries.len());
+    let named = entries.iter().filter(|e| !e.name.starts_with("LV")).count();
+    println!(
+        "  total files listed: {} ({named} with leader names, {} synthetic)",
+        entries.len(),
+        entries.len() - named
+    );
     let mut by_size: Vec<_> = entries.iter().collect();
     by_size.sort_by_key(|e| std::cmp::Reverse(e.size));
     for e in by_size.iter().take(8) {

@@ -772,15 +772,87 @@ fn type_label(a: u16) -> String {
     }
 }
 
-/// One file discovered by a page-label scan: its identity, the data pages that
-/// carry it (absolute VDA, sorted by logical page), and a synthesized name (the
-/// Pilot nucleus has no name directory — human names live in the PFS layer).
+/// Trim a NUL-terminated run of printable ASCII out of `b`.
+fn ascii_clean(b: &[u8]) -> String {
+    b.iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as char)
+        .filter(|&c| (' '..='~').contains(&c))
+        .collect()
+}
+
+/// Try to read a human file name from a file's **leader page** (logical page 0).
+/// The Pilot nucleus has no name directory, but files created through the
+/// FileStream/FileTool carry their name in page 0. We handle the two leader
+/// layouts seen on real Pilot 12.3 / XDE volumes (verified against the Dwarf
+/// disks) plus the documented Cedar `fsLP`/`fullLP`, validating the result is a
+/// sane printable string; returns `None` for raw nucleus files (no leader).
+fn leader_name(data: &[u8]) -> Option<String> {
+    if data.len() < 80 {
+        return None;
+    }
+    let w = |wi: usize| be16(data, wi * 2);
+    let validate = |s: String| -> Option<String> {
+        let t = s.trim().to_string();
+        (1..=60).contains(&t.len()).then_some(t)
+    };
+    // XDE descriptive leader: word0 = 0x1061, word1 = length (chars), string at
+    // byte 4, of the form "(dir)name( date )" — keep "(dir)name", drop the date.
+    if w(0) == 0x1061 {
+        let n = (w(1) as usize).min(76);
+        let s = ascii_clean(&data[4..4 + n]);
+        // Drop a trailing "( <date> HH:MM:SS ... )" group (the last parenthesized
+        // group containing a time colon); keep the "(dir)name" part.
+        let s = match s.rfind('(') {
+            Some(p) if s[p..].contains(':') => s[..p].trim_end().to_string(),
+            _ => s,
+        };
+        return validate(s);
+    }
+    // XDE FileTool leader: word0 = 0x1b83, name length at byte 28, chars at 30.
+    if w(0) == 0x1b83 {
+        let n = data[28] as usize;
+        if (1..=40).contains(&n) && 30 + n <= data.len() {
+            return validate(ascii_clean(&data[30..30 + n]));
+        }
+    }
+    // Cedar FileStream leader (fsLP): versionID 01240B @word0, nameLength @word10,
+    // name (packed chars) @word11.
+    if w(0) == 0o1240 {
+        let n = (w(10) as usize).min(40);
+        return validate(ascii_clean(&data[22..22 + n]));
+    }
+    // Cedar directory leader (fullLP): magic 25280 @word64, property list from
+    // word65 (LPEntry{type,len,value}); file name = tFileName(6) StringBody.
+    if w(64) == 25280 {
+        let mut wi = 65usize;
+        while wi + 4 < 250 {
+            let ptype = w(wi);
+            if ptype == 0xffff {
+                break;
+            }
+            let plen = w(wi + 1) as usize;
+            if ptype == 6 {
+                let slen = (w(wi + 2) as usize).min(40);
+                return validate(ascii_clean(&data[(wi + 4) * 2..(wi + 4) * 2 + slen]));
+            }
+            wi += plen + 2;
+        }
+    }
+    None
+}
+
+/// One file discovered by a page-label scan: its identity, the pages that carry
+/// it (absolute VDA, sorted by logical page), whether logical page 0 is a leader
+/// page (name/metadata, excluded from content), and a display name.
 struct PilotFile {
     name: String,
     #[allow(dead_code)]
     file_id: [u16; 5],
     /// `(logical page, absolute VDA)`, sorted by logical page.
     pages: Vec<(u32, usize)>,
+    /// True if `pages[0]` is a leader page (logical page 0) to skip when reading.
+    has_leader: bool,
     size: u64,
 }
 
@@ -849,23 +921,48 @@ fn build_files(disk: &Disk, volume: &PilotVolume) -> Vec<PilotFile> {
         }
         for (id, (type_word, mut pages)) in by_id {
             pages.sort_by_key(|&(fp, _)| fp);
-            let size = pages.len() as u64 * PAGE_BYTES as u64;
-            let name = format!(
+            // Logical page 0, if present, may be a leader page carrying the file
+            // name (and is then metadata, not content).
+            let synthetic = format!(
                 "LV{svidx}_{:04X}{:04X}_{}",
                 id[0],
                 id[1],
                 type_label(type_word)
             );
+            let (name, has_leader) = match pages.first() {
+                Some(&(0, vda)) => match disk.sector(vda).and_then(|s| leader_name(&s.data)) {
+                    Some(n) => (n, true),
+                    None => (synthetic, false),
+                },
+                _ => (synthetic, false),
+            };
+            let content_pages = pages.len() - has_leader as usize;
             files.push(PilotFile {
                 name,
                 file_id: id,
                 pages,
-                size,
+                has_leader,
+                size: content_pages as u64 * PAGE_BYTES as u64,
             });
         }
     }
     files.sort_by(|a, b| a.name.cmp(&b.name));
+    dedup_names(&mut files);
     files
+}
+
+/// Make display names unique by appending " (N)" to repeats (preserves the
+/// first occurrence). Browse views key navigation on the path, so duplicate
+/// names would otherwise collide.
+fn dedup_names(files: &mut [PilotFile]) {
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for f in files.iter_mut() {
+        let count = seen.entry(f.name.clone()).or_insert(0);
+        if *count > 0 {
+            f.name = format!("{} ({})", f.name, *count + 1);
+        }
+        *count += 1;
+    }
 }
 
 impl Filesystem for PilotFilesystem {
@@ -890,9 +987,11 @@ impl Filesystem for PilotFilesystem {
             .get(entry.location as usize)
             .ok_or_else(|| FilesystemError::Parse("Pilot: bad file index".into()))?;
         // The label scan already ordered the data pages by logical page and
-        // resolved fragmentation, so concatenating them yields the file.
+        // resolved fragmentation, so concatenating them yields the file. Skip a
+        // leader page (logical page 0) — it holds the name/metadata, not content.
         let mut out = Vec::new();
-        for &(_logical, vda) in &file.pages {
+        let skip = file.has_leader as usize;
+        for &(_logical, vda) in file.pages.iter().skip(skip) {
             if out.len() >= max_bytes {
                 break;
             }
