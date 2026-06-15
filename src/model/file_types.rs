@@ -21,7 +21,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd",
+    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -91,6 +91,20 @@ mod tests {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing X68000 HDD extension {must}"
+            );
+        }
+    }
+
+    #[test]
+    fn alto_pack_extensions_present() {
+        // Xerox Alto disk packs: the PARC Disk Image (`.pdi`) and the period
+        // CopyDisk stream containers (`.bfs` / `.copydisk` / `.altodisk`). The
+        // BrowseSession Alto branch opens all four; pin them so the picker
+        // keeps surfacing Alto packs.
+        for must in ["pdi", "bfs", "copydisk", "altodisk"] {
+            assert!(
+                association_exts().contains(&must.to_string()),
+                "missing Alto pack extension {must}"
             );
         }
     }

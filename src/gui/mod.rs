@@ -1,3 +1,4 @@
+mod alto_resize_dialog;
 mod archives_tab;
 mod backup_tab;
 mod browse_view;

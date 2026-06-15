@@ -324,6 +324,7 @@ readable.
 | X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize + defrag repack) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink + contiguous repack (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
 | PC-98 HDM      | `.hdm`          | Yes            | Yes (convert + in-place edit) | DiskExplorer raw headerless floppy dump (byte-identical to XDF). In-place file add/delete/edit supported. |
 | DiskExplorer DIM | `.dim`        | Yes            | Yes (convert + in-place edit, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read. Add/delete/edit persist back into the container. |
+| Xerox Alto pack | `.pdi`, `.bfs`, `.copydisk`, `.altodisk` | Yes | No | Diablo 31/44 disk packs for the Xerox Alto. `.pdi` = **PARC Disk Image** (a flat, self-describing, label-inclusive container designed as the recommended emulator format); `.bfs` / `.copydisk` / `.altodisk` = period CopyDisk streams, imported transparently. Detected by magic and surfaced as a single browsable `Alto BFS` volume. Browse + extract; read-only (write/PDI-export planned). |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 "Yes (convert)" means the format isn't a backup wrapper but is fully
@@ -364,6 +365,7 @@ inspect-tab Edit Mode.
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
+| Alto BFS | Yes | No | — | — | Xerox Alto Basic File System (the same on-disk format as the Alto OS file primitives and TFS, on Diablo 31/44 packs). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` packs. Read-only for now; write / TFS (Trident) support planned. Validated against every CopyDisk pack in the CHM Xerox PARC archive. |
 | Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
 
 ### Partition tables
@@ -375,7 +377,7 @@ inspect-tab Edit Mode.
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
-| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
+| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / Alto BFS / …) | — | Standard floppy / disk sizes are recognised even without a partition table. Xerox Alto packs (`.pdi` / `.bfs` / CopyDisk) are detected by magic and presented as a single `Alto BFS` volume. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
 images, partition table sidecars) for restore — see `docs/clonezilla.md`.

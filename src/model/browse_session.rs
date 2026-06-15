@@ -149,6 +149,19 @@ impl BrowseSession {
             let _ = f.read(&mut magic);
         }
 
+        // Xerox Alto disk packs (PARC Disk Image, or a CopyDisk stream). These
+        // are label-bearing disks that can't be represented as a flat sector
+        // stream the way every other source here can, so they bypass
+        // open_filesystem: read the whole pack, decode it into an in-memory
+        // Disk, and hand back a BFS filesystem view. PDI starts with the magic
+        // "PARCDISK"; a CopyDisk stream opens with bytes 00 07 00 03 00 0a
+        // (params block: length=7, type=3, diskType=10 AltoDiablo).
+        if &magic == b"PARCDISK" || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
+            let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
+            let disk = crate::fs::alto::open_pack(&bytes)?;
+            return Ok(Box::new(crate::fs::alto::bfs::BfsFilesystem::open(disk)));
+        }
+
         // CHD — 8-byte magic "MComprHD" at offset 0.
         if &magic == b"MComprHD" {
             let chd_reader = ChdReader::open(path)
@@ -347,6 +360,8 @@ impl BrowseSession {
 
             let fs_type = fs.fs_type().to_string();
             let volume_label = fs.volume_label().unwrap_or("").to_string();
+            let total_size = fs.total_size();
+            let used_size = fs.used_size();
             let blessed_folder = fs.blessed_system_folder();
 
             set_phase("Reading root directory...");
@@ -366,6 +381,8 @@ impl BrowseSession {
                 g.phase = "Done".to_string();
                 g.fs_type = fs_type;
                 g.volume_label = volume_label;
+                g.total_size = total_size;
+                g.used_size = used_size;
                 g.blessed_folder = blessed_folder;
                 g.root = root;
                 g.root_entries = root_entries;
@@ -412,6 +429,26 @@ impl BrowseSession {
             .source_path
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
+
+        // Xerox Alto packs: read the whole pack, decode to an in-memory Disk,
+        // and hand back an editable BFS view. Edits rebuild the volume and
+        // sync writes it back as a PDI (the no-op container commit applies).
+        // PDI magic "PARCDISK"; CopyDisk params block 00 07 00 03 00 0a.
+        {
+            let mut magic = [0u8; 8];
+            if let Ok(mut f) = File::open(path) {
+                let _ = f.read(&mut magic);
+            }
+            if &magic == b"PARCDISK" || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
+                let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
+                let disk = crate::fs::alto::open_pack(&bytes)?;
+                let efs = Box::new(crate::fs::alto::bfs::BfsFilesystem::open_editable(
+                    disk,
+                    path.clone(),
+                ));
+                return Ok((efs, ContainerEditCommit { session: None }));
+            }
+        }
 
         // Floppy container: edit a decoded temp flat, re-encode on commit.
         if crate::model::source_reader::is_editable_container_path(path) {
@@ -500,6 +537,9 @@ pub struct BrowseOpenStatus {
     pub finished: bool,
     pub fs_type: String,
     pub volume_label: String,
+    /// Total filesystem size and used bytes, for the browser's free-space line.
+    pub total_size: u64,
+    pub used_size: u64,
     pub blessed_folder: Option<(u64, String)>,
     pub root: Option<FileEntry>,
     pub root_entries: Option<Vec<FileEntry>>,
@@ -521,6 +561,8 @@ impl BrowseOpenStatus {
             finished: false,
             fs_type: String::new(),
             volume_label: String::new(),
+            total_size: 0,
+            used_size: 0,
             blessed_folder: None,
             root: None,
             root_entries: None,
@@ -620,5 +662,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.name == "R.TXT"));
+    }
+
+    /// A Xerox Alto pack (here a PARC Disk Image) must route through the Alto
+    /// branch of `open()` and come back as a BFS filesystem view — this is the
+    /// exact path the GUI browse view takes when a user opens a `.pdi`/`.bfs`.
+    #[test]
+    fn open_routes_alto_pdi_to_bfs_filesystem() {
+        use crate::fs::alto::{Disk, FsFamily, Geometry, Sector};
+        use std::io::Write as _;
+
+        let geometry = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 1,
+            n_heads: 1,
+            n_sectors: 4,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let total = geometry.total_sectors();
+        let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
+        let pdi = crate::fs::alto::pdi::write(&Disk { geometry, sectors });
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&pdi).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open an Alto PDI pack");
+        assert_eq!(fs.fs_type(), "Alto BFS");
     }
 }

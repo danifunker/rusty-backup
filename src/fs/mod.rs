@@ -2,6 +2,7 @@ pub mod adfs;
 pub mod affs;
 pub mod affs_common;
 pub mod affs_fsck;
+pub mod alto;
 pub mod andos;
 pub mod apple_dos;
 pub mod atari_dos;

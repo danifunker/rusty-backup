@@ -200,6 +200,18 @@ fn amiga_root_block_present(first_sector: &[u8; 512], reader: &mut (impl Read + 
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // Xerox Alto disk packs are label-bearing disks held in one of two
+    // whole-file containers, neither of which is a flat sector image: a PARC
+    // Disk Image (magic "PARCDISK") or a CopyDisk stream (which opens with a
+    // 7-word params block: length=7, type=3 "hereAreDiskParams", diskType=10
+    // "AltoDiablo" -> bytes 00 07 00 03 00 0a). They route through the
+    // BrowseSession Alto branch, which reads the whole file and opens a BFS.
+    if &first_sector[0..8] == b"PARCDISK"
+        || first_sector[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+    {
+        return Some("Alto BFS".to_string());
+    }
+
     // Check for FAT VBR: JMP instruction + valid BPB fields.
     // We validate multiple BPB fields to reliably distinguish a FAT boot sector
     // from an MBR. The partition table area (offsets 446-509) of a FAT VBR

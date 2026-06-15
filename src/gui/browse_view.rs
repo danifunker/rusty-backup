@@ -63,6 +63,10 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
+    /// Volume total / used bytes (cached at open) for the header free-space
+    /// line. `volume_total == 0` means "unknown / not loaded".
+    volume_total: u64,
+    volume_used: u64,
     /// "Full scan" toggle for the synthetic carve view: when off (default)
     /// only the first `carve::DEFAULT_SCAN_LIMIT` bytes are scanned for
     /// recoverable text; when on the whole image is scanned. Only shown for
@@ -372,6 +376,8 @@ impl Default for BrowseView {
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
+            volume_total: 0,
+            volume_used: 0,
             carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
             volume_label: String::new(),
             label_prefix: String::new(),
@@ -598,6 +604,8 @@ impl BrowseView {
         self.error = None;
         self.active = false;
         self.fs_type.clear();
+        self.volume_total = 0;
+        self.volume_used = 0;
         self.volume_label.clear();
         self.label_prefix.clear();
         self.session = BrowseSession::new();
@@ -785,6 +793,16 @@ impl BrowseView {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Filesystem Browser").strong());
             ui.label(format!("[{}]", self.fs_type));
+            if self.volume_total > 0 {
+                let free = self.volume_total.saturating_sub(self.volume_used);
+                ui.label(format!(
+                    "{} used / {} ({} free)",
+                    partition::format_size(self.volume_used),
+                    partition::format_size(self.volume_total),
+                    partition::format_size(free),
+                ))
+                .on_hover_text("Volume space: used / total (free)");
+            }
             let display_label = match (self.label_prefix.is_empty(), self.volume_label.is_empty()) {
                 (false, false) => format!("{} - {}", self.label_prefix, self.volume_label),
                 (false, true) => self.label_prefix.clone(),
@@ -2034,6 +2052,8 @@ impl BrowseView {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                        self.volume_total = fs.total_size();
+                        self.volume_used = fs.used_size();
                         self.blessed_folder = fs.blessed_system_folder();
                         if let Ok(root) = fs.root() {
                             self.root = Some(root);
@@ -2063,6 +2083,8 @@ impl BrowseView {
                     Ok(mut fs) => {
                         self.fs_type = fs.fs_type().to_string();
                         self.volume_label = fs.volume_label().unwrap_or("").to_string();
+                        self.volume_total = fs.total_size();
+                        self.volume_used = fs.used_size();
                         self.blessed_folder = fs.blessed_system_folder();
                         if let Ok(root) = fs.root() {
                             self.root = Some(root);
@@ -2323,7 +2345,8 @@ impl BrowseView {
                 self.add_file_dialog();
             }
 
-            if ui.button("New Folder...").clicked() {
+            // Alto BFS has a flat namespace — no subdirectories to create.
+            if self.fs_type != "Alto BFS" && ui.button("New Folder...").clicked() {
                 self.new_folder_name.clear();
                 self.show_new_folder_dialog = true;
             }
@@ -3118,6 +3141,8 @@ impl BrowseView {
         self.invalidate_cached_fs();
         if let Some(mut fs) = self.take_or_open_fs() {
             self.blessed_folder = fs.blessed_system_folder();
+            self.volume_total = fs.total_size();
+            self.volume_used = fs.used_size();
             self.return_fs(fs);
         }
     }
@@ -4894,6 +4919,8 @@ impl BrowseView {
                 if let Ok(mut g) = arc.lock() {
                     self.fs_type = std::mem::take(&mut g.fs_type);
                     self.volume_label = std::mem::take(&mut g.volume_label);
+                    self.volume_total = g.total_size;
+                    self.volume_used = g.used_size;
                     self.blessed_folder = g.blessed_folder.take();
                     if let Some(root) = g.root.take() {
                         if let Some(entries) = g.root_entries.take() {

@@ -23,6 +23,7 @@ use rusty_backup::rbformats::export::ExportFormat;
 
 use super::chd_options_ui::ChdOptionsControl;
 
+use super::alto_resize_dialog::AltoResizeDialog;
 use super::browse_view::BrowseView;
 use super::context::TabContext;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
@@ -183,6 +184,8 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
+    /// "Resize Alto Disk…" dialog (Alto BFS only).
+    alto_resize_dialog: Option<AltoResizeDialog>,
     /// "Convert Floppy Container..." dialog (XDF/HDM/DIM/D88).
     floppy_convert_dialog: Option<FloppyConvertDialog>,
     /// Pending Human68k defragment awaiting confirmation: (partition byte
@@ -261,6 +264,7 @@ impl Default for InspectTab {
             repair_report: None,
             repair_context: None,
             expand_hfs_dialog: None,
+            alto_resize_dialog: None,
             floppy_convert_dialog: None,
             pending_repack: None,
             repack_status: None,
@@ -3422,6 +3426,8 @@ impl InspectTab {
         let mut defrag_request: Option<(u64, String)> = None;
         // "Calc min" button click: partition index to compute minimum size for.
         let mut min_size_calc_request: Option<usize> = None;
+        // "Resize…" click on an Alto BFS row.
+        let mut resize_request = false;
 
         // The in-place Human68k defragment worker rewrites the partition
         // region of the underlying file, so it's offered for image-file
@@ -3673,6 +3679,21 @@ impl InspectTab {
                             {
                                 defrag_request = Some((part.byte_offset(), part.type_name.clone()));
                             }
+                            // Resize an Alto BFS volume onto a new geometry.
+                            // Reads the image and writes a brand-new PDI, so it's
+                            // offered for image-file sources only.
+                            if part.type_name == "Alto BFS"
+                                && is_image_source
+                                && ui
+                                    .small_button("Resize…")
+                                    .on_hover_text(
+                                        "Re-lay this Alto volume onto a different disk geometry \
+                                         (Diablo 31 / 44, grow or shrink) and save it as a PDI.",
+                                    )
+                                    .clicked()
+                            {
+                                resize_request = true;
+                            }
                         } else {
                             ui.label("");
                         }
@@ -3698,6 +3719,17 @@ impl InspectTab {
             self.open_expand_hfs(offset, partition_size, ctx);
         }
 
+        // Handle Alto resize request: open the dialog on the loaded image.
+        if resize_request {
+            match self.image_file_path.clone() {
+                Some(path) => match AltoResizeDialog::new(path) {
+                    Ok(dlg) => self.alto_resize_dialog = Some(dlg),
+                    Err(e) => ctx.log.error(format!("Cannot open resize dialog: {e}")),
+                },
+                None => ctx.log.error("Resize: no image file loaded"),
+            }
+        }
+
         // Handle defragment request: stash it for the confirmation modal
         // (the worker rewrites the partition in place).
         if let Some((offset, label)) = defrag_request {
@@ -3720,6 +3752,14 @@ impl InspectTab {
             let still_open = dlg.show(ui.ctx(), ctx.log);
             if !still_open {
                 self.expand_hfs_dialog = None;
+            }
+        }
+
+        // Resize-Alto dialog
+        if let Some(dlg) = &mut self.alto_resize_dialog {
+            let still_open = dlg.show(ui.ctx(), ctx.log);
+            if !still_open {
+                self.alto_resize_dialog = None;
             }
         }
 
@@ -5073,7 +5113,17 @@ fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
     }
     matches!(
         type_name,
-        "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "XFS" | "ext" | "btrfs" | "Unknown"
+        "FAT"
+            | "HFS"
+            | "HFS+"
+            | "NTFS"
+            | "exFAT"
+            | "ProDOS"
+            | "XFS"
+            | "ext"
+            | "btrfs"
+            | "Alto BFS"
+            | "Unknown"
     )
 }
 
