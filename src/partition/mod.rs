@@ -206,10 +206,36 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // 7-word params block: length=7, type=3 "hereAreDiskParams", diskType=10
     // "AltoDiablo" -> bytes 00 07 00 03 00 0a). They route through the
     // BrowseSession Alto branch, which reads the whole file and opens a BFS.
-    if &first_sector[0..8] == b"PARCDISK"
-        || first_sector[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
-    {
+    if &first_sector[0..8] == b"PARCDISK" {
+        // PDI header: fsFamily is a big-endian word at byte 10
+        // (0 = Alto/Diablo, 1 = Alto/Trident, 2 = Pilot/Cedar).
+        let fs_family = u16::from_be_bytes([first_sector[10], first_sector[11]]);
+        return Some(if fs_family == 2 {
+            "Pilot/Cedar".to_string()
+        } else {
+            "Alto BFS".to_string()
+        });
+    }
+    if first_sector[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
         return Some("Alto BFS".to_string());
+    }
+    // Salto Alto-emulator cooked `.dsk`: no magic, recognized by the exact
+    // Diablo-31 image size plus a page-number prefix on record 1 that reads as
+    // its VDA (1 big-endian, or 0x0100 little-endian — Salto images come in
+    // both byte orders). open_pack does the full validation.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        if end as usize == crate::fs::alto::salto::IMAGE_BYTES {
+            let mut p = [0u8; 2];
+            let rec1 = crate::fs::alto::salto::RECORD_BYTES as u64;
+            let ok = reader.seek(SeekFrom::Start(rec1)).is_ok()
+                && reader.read_exact(&mut p).is_ok()
+                && matches!(u16::from_be_bytes(p), 1 | 0x0100);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if ok {
+                return Some("Alto BFS".to_string());
+            }
+        }
+        let _ = reader.seek(SeekFrom::Start(0));
     }
 
     // Check for FAT VBR: JMP instruction + valid BPB fields.

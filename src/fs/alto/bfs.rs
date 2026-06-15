@@ -55,7 +55,11 @@ pub struct Bfs<'a> {
     disk: &'a Disk,
 }
 
-/// True when a label link terminates a page chain.
+/// True when a label link terminates a page chain. A `next`/`previous` of
+/// `eofDA` (0xFFFF) **or 0** ends the chain: real BFS volumes terminate file
+/// chains with a link of 0, and the boot page at real disk address 0 is reached
+/// by the boot microcode directly (not by following a filesystem link), so a
+/// link of 0 always means end-of-file to the filesystem reader.
 fn is_eof_link(link: u16) -> bool {
     link == EOF_DA || link == 0
 }

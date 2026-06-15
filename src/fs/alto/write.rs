@@ -201,9 +201,20 @@ pub fn delete_file(source: &Disk, name: &str) -> Result<Disk, FilesystemError> {
 }
 
 /// Build a complete BFS volume from a set of user files. Lays out, in order:
-/// the boot page (VDA 0), SysDir (leader at VDA 1 + data), DiskDescriptor
-/// (leader + KDH/bit-table data), then each file (leader + data), packed
-/// contiguously.
+/// the boot page (VDA 0, reserved free); SysDir (leader at the fixed VDA 1 plus
+/// data); DiskDescriptor (leader plus KDH/bit-table data); then each file
+/// (leader plus data), packed contiguously.
+///
+/// **This is a defragmenting rebuild and does NOT preserve bootability.** Per
+/// `InOutLd.asm`, the Alto OS's `OutLd` writes the running OS *memory image*
+/// into the boot file's own pages, and that image embeds absolute disk
+/// addresses of the live filesystem state (e.g. the `LastLdCB` disk command
+/// block plus in-core file addresses). `Sys.Boot` is therefore a snapshot tied
+/// to the disk's exact physical layout. Verified in the Salto emulator: a
+/// rebuilt disk's boot chain loads a byte-for-byte identical image and the
+/// loader still `JMP @0`s into it, but the resumed OS reads a stale (moved)
+/// address and hangs. Bootability is preserved only by a *verbatim* copy
+/// (e.g. backup -> restore), which keeps every page at its original VDA.
 pub fn build_disk(geometry: Geometry, files: &[FileImage]) -> Result<Disk, FilesystemError> {
     let total = geometry.total_sectors();
 

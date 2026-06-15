@@ -22,6 +22,9 @@ pub const FORMAT_VERSION: u16 = 1;
 
 const FLAG_LABELS_PRESENT: u16 = 0x0001;
 const FLAG_HEADERS_PRESENT: u16 = 0x0002;
+/// Pilot file-ID is 80-bit (original Pilot) rather than 32-bit (Cedar nucleus).
+/// Meaningful only when `fsFamily = Pilot`.
+pub const FLAG_PILOT_80BIT: u16 = 0x0004;
 
 /// Parsed PDI header.
 #[derive(Debug, Clone)]
@@ -42,6 +45,12 @@ impl PdiHeader {
 
 /// Serialize a [`Disk`] to canonical PDI bytes (`headerBytes = 0`).
 pub fn write(disk: &Disk) -> Vec<u8> {
+    write_with_flags(disk, 0)
+}
+
+/// As [`write`], but OR `extra_flags` into the header `flags` word — e.g.
+/// [`FLAG_PILOT_80BIT`] to record the original-Pilot file-ID generation.
+pub fn write_with_flags(disk: &Disk, extra_flags: u16) -> Vec<u8> {
     let g = &disk.geometry;
     let label_bytes = g.label_bytes as usize;
     let data_bytes = g.data_bytes as usize;
@@ -60,7 +69,7 @@ pub fn write(disk: &Disk) -> Vec<u8> {
     put_be16(&mut out, 22, 0); // headerBytes (canonical: none stored)
     put_be16(&mut out, 24, g.label_bytes);
     put_be16(&mut out, 26, g.data_bytes);
-    put_be16(&mut out, 28, FLAG_LABELS_PRESENT);
+    put_be16(&mut out, 28, FLAG_LABELS_PRESENT | extra_flags);
     put_be16(&mut out, 30, 0); // fsNumber
                                // bytes 32.. (volumeLabel, reserved) left zero
 

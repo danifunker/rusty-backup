@@ -48,7 +48,11 @@ fn sha256_hex(b: &[u8]) -> String {
 
 fn is_pack(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.ends_with(".pdi") || n.contains(".bfs") || n.contains(".copydisk") || n.contains(".altodisk")
+    n.ends_with(".pdi")
+        || n.ends_with(".dsk")
+        || n.contains(".bfs")
+        || n.contains(".copydisk")
+        || n.contains(".altodisk")
 }
 
 fn collect_packs(path: &Path, out: &mut Vec<PathBuf>) {
@@ -259,6 +263,107 @@ fn main() {
         return;
     }
 
+    // Export a pack as a Salto cooked .dsk via our writer — to boot in Salto.
+    //   --write-salto <out.dsk> <pack>     pure sector round-trip (preserves boot)
+    //   --salto-rebuild <out.dsk> <pack>   defragmenting rebuild (build_disk)
+    if args[0] == "--write-salto" || args[0] == "--salto-rebuild" {
+        if args.len() != 3 {
+            eprintln!("usage: parc_probe {} <out.dsk> <pack>", args[0]);
+            std::process::exit(2);
+        }
+        let bytes = fs::read(&args[2]).expect("read pack");
+        let src = open_pack(&bytes).expect("open pack");
+        let disk = if args[0] == "--salto-rebuild" {
+            write::clone_to(&src, src.geometry.clone()).expect("rebuild")
+        } else {
+            src
+        };
+        let dsk = rusty_backup::fs::alto::salto::write(&disk).expect("salto write");
+        fs::write(&args[1], &dsk).expect("write dsk");
+        println!(
+            "wrote {} ({} bytes, {} sectors)",
+            args[1],
+            dsk.len(),
+            disk.geometry.total_sectors()
+        );
+        return;
+    }
+
+    if args[0] == "bootchain" && args.len() == 2 {
+        // Follow the chain the boot microcode follows: start at real DA 0, read
+        // the page, follow its label `next` link, until eofDA/0. Report the page
+        // count and a hash of the loaded image (the OutLd memory snapshot).
+        let bytes = fs::read(&args[1]).expect("read");
+        let disk = open_pack(&bytes).expect("open");
+        let g = &disk.geometry;
+        let mut vda = 0usize;
+        let mut image: Vec<u8> = Vec::new();
+        let mut pages = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(vda) {
+                println!("  LOOP at vda {vda}");
+                break;
+            }
+            let Some(s) = disk.sector(vda) else { break };
+            let w = |i: usize| u16::from_be_bytes([s.label[i], s.label[i + 1]]);
+            let (next, _prev, nc, page, _v, s1, s2) = (w(0), w(2), w(6), w(8), w(10), w(12), w(14));
+            if pages < 3 {
+                println!("  vda{vda}: page={page} numChars={nc} next={next:#06x}(vda {}) sn=({s1:#x},{s2:#x})", g.vda_from_da(next));
+            }
+            image.extend_from_slice(&s.data[..(nc as usize).min(s.data.len())]);
+            pages += 1;
+            if next == 0xffff || next == 0 || pages > g.total_sectors() {
+                break;
+            }
+            vda = g.vda_from_da(next);
+        }
+        println!(
+            "BOOTCHAIN {} : {pages} pages, {} bytes, sha {}",
+            args[1],
+            image.len(),
+            sha256_hex(&image)
+        );
+        return;
+    }
+
+    if args[0] == "dbg" && args.len() == 3 {
+        // dbg <pack> <name>: dump a file's leader + first chain pages.
+        let bytes = fs::read(&args[1]).expect("read pack");
+        let disk = open_pack(&bytes).expect("open");
+        let want = args[2].trim_end_matches('.');
+        let g = &disk.geometry;
+        let lbl = |vda: usize| {
+            let s = disk.sector(vda).unwrap();
+            let w = |i: usize| u16::from_be_bytes([s.label[i], s.label[i + 1]]);
+            (w(0), w(2), w(6), w(8), w(10), w(12), w(14)) // next prev numChars page ver sn1 sn2
+        };
+        for f in Bfs::new(&disk).list_files().expect("list") {
+            if f.name.trim_end_matches('.').eq_ignore_ascii_case(want) {
+                println!(
+                    "FILE {} serial={:#x} v{} leader_vda={} size={} pages={}",
+                    f.name, f.serial, f.version, f.leader_vda, f.size, f.n_pages
+                );
+                let (nx, pv, nc, pg, ver, s1, s2) = lbl(f.leader_vda);
+                println!("  leader@{}: next={:#06x}(vda {}) prev={:#06x} numChars={} page={} ver={} sn=({:#x},{:#x})",
+                    f.leader_vda, nx, g.vda_from_da(nx), pv, nc, pg, ver, s1, s2);
+                let mut link = nx;
+                for _ in 0..4 {
+                    if link == 0xffff {
+                        println!("  -> eofDA");
+                        break;
+                    }
+                    let vda = g.vda_from_da(link);
+                    let (nx, pv, nc, pg, _v, s1, s2) = lbl(vda);
+                    println!("  page@vda{}: next={:#06x}(vda {}) prev={:#06x} numChars={} page={} sn=({:#x},{:#x})",
+                        vda, nx, g.vda_from_da(nx), pv, nc, pg, s1, s2);
+                    link = nx;
+                }
+            }
+        }
+        return;
+    }
+
     if args[0] == "rebuild-check" {
         // Validate the writer against real data: rebuild every user file into a
         // fresh volume of the same geometry and confirm the file set + every
@@ -296,6 +401,29 @@ fn main() {
                     a.len(),
                     b.len()
                 );
+                // Name the first few files that differ (missing, or size/content).
+                let mut shown = 0;
+                for (name, av) in &a {
+                    match b.get(name) {
+                        Some(bv) if bv == av => {}
+                        Some(bv) => {
+                            println!("     ~ {name}: src {} B, rebuilt {} B", av.len(), bv.len());
+                            shown += 1;
+                        }
+                        None => {
+                            println!("     - {name}: missing in rebuilt (src {} B)", av.len());
+                            shown += 1;
+                        }
+                    }
+                    if shown >= 5 {
+                        break;
+                    }
+                }
+                for name in b.keys() {
+                    if !a.contains_key(name) {
+                        println!("     + {name}: only in rebuilt");
+                    }
+                }
             }
         }
         println!("=== {ok}/{} packs rebuilt byte-identical ===", packs.len());

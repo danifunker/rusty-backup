@@ -836,8 +836,8 @@ impl BrowseView {
                 }
             }
 
-            // Edit mode toggle
-            if self.edit_supported {
+            // Edit mode toggle (Pilot/Cedar volumes are read-only for now)
+            if self.edit_supported && self.fs_type != "Pilot/Cedar" {
                 let busy = self.extraction_progress.is_some()
                     || self.archive_edit_progress.is_some()
                     || self.chd_flatten_progress.is_some();

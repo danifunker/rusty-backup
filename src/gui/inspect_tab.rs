@@ -5123,6 +5123,7 @@ fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "ext"
             | "btrfs"
             | "Alto BFS"
+            | "Pilot/Cedar"
             | "Unknown"
     )
 }

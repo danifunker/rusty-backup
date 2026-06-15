@@ -156,9 +156,27 @@ impl BrowseSession {
         // Disk, and hand back a BFS filesystem view. PDI starts with the magic
         // "PARCDISK"; a CopyDisk stream opens with bytes 00 07 00 03 00 0a
         // (params block: length=7, type=3, diskType=10 AltoDiablo).
-        if &magic == b"PARCDISK" || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
+        // Salto cooked `.dsk` images carry no magic; recognize them by the exact
+        // Diablo-31 image size (open_pack does the real validation).
+        let is_salto_dsk = std::fs::metadata(path)
+            .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
+            .unwrap_or(false);
+        if &magic == b"PARCDISK"
+            || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+            || is_salto_dsk
+        {
             let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
             let disk = crate::fs::alto::open_pack(&bytes)?;
+            // A PDI with fsFamily=2 is a Pilot/Cedar volume (structurally
+            // unrelated to BFS); everything else is an Alto BFS pack.
+            if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
+                use crate::fs::alto::pilot::{Generation, PilotFilesystem};
+                // File-ID generation comes from PDI flags bit 2.
+                let generation = crate::fs::alto::pdi::read_header(&bytes)
+                    .map(|h| Generation::from_pdi_flag_bit2(h.flags & 0x0004 != 0))
+                    .unwrap_or(Generation::CedarNucleus);
+                return Ok(Box::new(PilotFilesystem::open(disk, generation)?));
+            }
             return Ok(Box::new(crate::fs::alto::bfs::BfsFilesystem::open(disk)));
         }
 
@@ -439,9 +457,21 @@ impl BrowseSession {
             if let Ok(mut f) = File::open(path) {
                 let _ = f.read(&mut magic);
             }
-            if &magic == b"PARCDISK" || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
+            let is_salto_dsk = std::fs::metadata(path)
+                .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
+                .unwrap_or(false);
+            if &magic == b"PARCDISK"
+                || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+                || is_salto_dsk
+            {
                 let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
                 let disk = crate::fs::alto::open_pack(&bytes)?;
+                // Pilot/Cedar volumes (fsFamily=2) are read-only for now.
+                if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
+                    return Err(FilesystemError::Unsupported(
+                        "Pilot/Cedar volumes are read-only".into(),
+                    ));
+                }
                 let efs = Box::new(crate::fs::alto::bfs::BfsFilesystem::open_editable(
                     disk,
                     path.clone(),
@@ -695,5 +725,69 @@ mod tests {
             .open()
             .expect("BrowseSession should open an Alto PDI pack");
         assert_eq!(fs.fs_type(), "Alto BFS");
+    }
+
+    #[test]
+    fn open_routes_salto_dsk_to_bfs_filesystem() {
+        use crate::fs::alto::{salto, Disk, FsFamily, Geometry, Sector};
+        use std::io::Write as _;
+
+        // A blank Salto-shaped Diablo-31 pack written in Salto's .dsk container.
+        let geometry = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 203,
+            n_heads: 2,
+            n_sectors: 12,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let total = geometry.total_sectors();
+        let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
+        let dsk = salto::write(&Disk { geometry, sectors }).expect("salto write");
+        assert_eq!(dsk.len(), salto::IMAGE_BYTES);
+
+        let mut tmp = tempfile::Builder::new().suffix(".dsk").tempfile().unwrap();
+        tmp.write_all(&dsk).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open a Salto .dsk pack");
+        assert_eq!(fs.fs_type(), "Alto BFS");
+    }
+
+    #[test]
+    fn open_routes_pilot_pdi_to_pilot_filesystem() {
+        use crate::fs::alto::pilot::{self, Generation};
+        use std::io::Write as _;
+
+        // A blank Cedar-nucleus Pilot volume, written as a PDI (fsFamily=2).
+        let disk = pilot::create_blank(
+            pilot::pilot_geometry(128),
+            Generation::CedarNucleus,
+            "RouteTest",
+        )
+        .expect("create blank pilot volume");
+        let pdi = crate::fs::alto::pdi::write(&disk);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&pdi).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let mut fs = session
+            .open()
+            .expect("BrowseSession should open a Pilot PDI volume");
+        assert_eq!(fs.fs_type(), "Pilot/Cedar");
+        assert_eq!(fs.volume_label(), Some("RouteTest"));
+        // Blank volume: browsable root, zero files.
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("list").is_empty());
+
+        // Editing a Pilot volume is refused (read-only).
+        assert!(session.open_editable().is_err());
     }
 }
