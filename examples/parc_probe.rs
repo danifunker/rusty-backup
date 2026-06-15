@@ -50,6 +50,9 @@ fn is_pack(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.ends_with(".pdi")
         || n.ends_with(".dsk")
+        || n.ends_with(".dsk44") // ContrAlto Diablo-44
+        || n.ends_with(".dsk80") // ContrAlto Trident T-80
+        || n.ends_with(".dsk300") // ContrAlto Trident T-300
         || n.contains(".bfs")
         || n.contains(".copydisk")
         || n.contains(".altodisk")

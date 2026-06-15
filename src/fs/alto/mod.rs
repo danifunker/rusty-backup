@@ -296,7 +296,8 @@ impl LabelCodec {
     pub fn file_id(&self, label: &[u8]) -> (u16, u16, u16) {
         match self {
             LabelCodec::Diablo => (be16(label, 5 * 2), be16(label, 6 * 2), be16(label, 7 * 2)),
-            LabelCodec::Trident => (be16(label, 0), be16(label, 2), be16(label, 4)),
+            // Trident: serialNumber (words 0,1) then version (word 2).
+            LabelCodec::Trident => (be16(label, 4), be16(label, 0), be16(label, 2)),
         }
     }
 
@@ -341,9 +342,12 @@ impl LabelCodec {
                 put_be16(&mut l, 7 * 2, sn_w2);
             }
             LabelCodec::Trident => {
-                put_be16(&mut l, 0, version);
-                put_be16(&mut l, 2, sn_w1);
-                put_be16(&mut l, 4, sn_w2);
+                // fileId is serialNumber (2 words) then version — confirmed
+                // against the real Spruce T-300 pack (SysDir = 8000 0064 0001 =
+                // dir-bit/100/v1), the opposite order from Diablo.
+                put_be16(&mut l, 0, sn_w1);
+                put_be16(&mut l, 2, sn_w2);
+                put_be16(&mut l, 4, version);
                 // word 3 = packID (left 0)
                 put_be16(&mut l, 4 * 2, num_chars);
                 put_be16(&mut l, 5 * 2, page);

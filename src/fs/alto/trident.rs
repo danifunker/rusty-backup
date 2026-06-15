@@ -92,6 +92,15 @@ fn swap_words(buf: &mut [u8]) {
 
 /// Parse a Trident pack image into an in-memory [`Disk`] (`family = Trident`),
 /// normalizing the little-endian pack words to big-endian.
+///
+/// Real Trident packs are written with a physical **sector interleave**, so a
+/// sector's position in the file is *not* its virtual disk address. Each sector
+/// carries its true disk address in its 2-word **header**, so we place every
+/// sector at the VDA decoded from its own header ([`Geometry::trident_vda_from_dh`])
+/// rather than by file order. (Images our own writer produces have header ==
+/// file position, so this de-skews to the identity.) Sectors whose header
+/// doesn't resolve to an in-range VDA (unformatted/spare) are dropped; gaps stay
+/// zeroed.
 pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     let (model, sectors_n) = match bytes.len() {
         T80_BYTES => (80u16, T80_SECTORS),
@@ -102,19 +111,28 @@ pub fn read(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         )))
         }
     };
+    let geom = geometry(model);
+    let header_off = DUMMY_WORDS * 2; // 2 — skip the dummy word
     let label_off = (DUMMY_WORDS + HEADER_WORDS) * 2; // 6
     let data_off = label_off + LABEL_BYTES; // 26
-    let mut sectors = Vec::with_capacity(sectors_n);
+    let mut sectors = vec![Sector::zeroed(LABEL_BYTES, DATA_BYTES); sectors_n];
     for i in 0..sectors_n {
         let rec = i * SECTOR_BYTES;
+        // The 2-word header (little-endian) is the sector's own disk address.
+        let h0 = (bytes[rec + header_off] as u16) | ((bytes[rec + header_off + 1] as u16) << 8);
+        let h1 = (bytes[rec + header_off + 2] as u16) | ((bytes[rec + header_off + 3] as u16) << 8);
+        let vda = geom.trident_vda_from_dh(h0, h1);
+        if vda >= sectors_n {
+            continue;
+        }
         let mut label = bytes[rec + label_off..rec + label_off + LABEL_BYTES].to_vec();
         let mut data = bytes[rec + data_off..rec + data_off + DATA_BYTES].to_vec();
         swap_words(&mut label);
         swap_words(&mut data);
-        sectors.push(Sector { label, data });
+        sectors[vda] = Sector { label, data };
     }
     Ok(Disk {
-        geometry: geometry(model),
+        geometry: geom,
         sectors,
     })
 }
