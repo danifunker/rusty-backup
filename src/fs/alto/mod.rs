@@ -27,6 +27,7 @@ pub mod copydisk;
 pub mod pdi;
 pub mod pilot;
 pub mod salto;
+pub mod trident;
 pub mod write;
 pub mod zdisk;
 
@@ -44,6 +45,8 @@ pub fn open_pack(bytes: &[u8]) -> Result<Disk, FilesystemError> {
         zdisk::read(bytes)
     } else if salto::is_salto_image(bytes) {
         salto::read(bytes)
+    } else if trident::is_trident_image(bytes) {
+        trident::read(bytes)
     } else {
         copydisk::read(bytes)
     }
@@ -163,6 +166,197 @@ impl Geometry {
             | ((track as u16) << 3)
             | ((head as u16) << 2)
             | ((disk as u16) << 1)
+    }
+
+    /// Trident 2-word disk header (`DH`) from a VDA: word 0 = cylinder, word 1 =
+    /// `(head << 8) | sector` (`Tfs.d` `DA` / `TfsA.asm:TFSRealDA`). Single file
+    /// system (`firstVTrack = 0`); the T-300 multi-FS split is not modeled here.
+    pub fn trident_dh_from_vda(&self, vda: usize) -> [u16; 2] {
+        let n_sectors = self.n_sectors as usize;
+        let n_heads = self.n_heads as usize;
+        let sector = vda % n_sectors;
+        let t = vda / n_sectors;
+        let head = t % n_heads;
+        let cyl = t / n_heads;
+        [
+            cyl as u16,
+            (((head as u16) & 0xff) << 8) | ((sector as u16) & 0xff),
+        ]
+    }
+
+    /// Inverse of [`Geometry::trident_dh_from_vda`].
+    pub fn trident_vda_from_dh(&self, w0: u16, w1: u16) -> usize {
+        let cyl = w0 as usize;
+        let head = (w1 >> 8) as usize & 0xff;
+        let sector = (w1 & 0xff) as usize;
+        (cyl * self.n_heads as usize + head) * self.n_sectors as usize + sector
+    }
+}
+
+/// `eofDA`: a chain link of this value (or 0) terminates a page chain.
+pub(crate) const EOF_DA: u16 = 0xffff;
+
+/// Encodes/decodes the per-sector **label** for the Alto file system, which is
+/// the *same logical filesystem* on Diablo (BFS) and Trident (TFS) but with a
+/// different on-disk label shape. Both carry the same fields — chain links
+/// (`next`/`prev`), `numChars`, `pageNumber`, and the file id (`version` +
+/// 2-word serial) — so the directory, leader pages, file pointers, and
+/// free-page bitmap above this layer are identical; only the label byte layout
+/// and the disk-address width differ.
+///
+/// | | Diablo (8 words) | Trident (10 words) |
+/// |---|---|---|
+/// | next | word 0 (1-word DA) | words 8-9 (2-word DH) |
+/// | prev | word 1 (1-word DA) | words 6-7 (2-word DH) |
+/// | numChars | word 3 | word 4 |
+/// | pageNumber | word 4 | word 5 |
+/// | fileId (version, sn1, sn2) | words 5,6,7 | words 0,1,2 |
+/// | packID | — | word 3 |
+///
+/// Sources: `BFS.d` (Diablo `DL`), `Tfs.d` (Trident `DL` + `DA`/`DH`),
+/// `BFSBase.bcpl` / `TfsA.asm` (the DA↔VDA mappings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelCodec {
+    Diablo,
+    Trident,
+}
+
+/// A decoded chain link: a VDA, or `None` at end-of-file.
+pub(crate) type Link = Option<usize>;
+
+impl LabelCodec {
+    pub fn for_family(family: FsFamily) -> Self {
+        match family {
+            FsFamily::Trident => LabelCodec::Trident,
+            _ => LabelCodec::Diablo,
+        }
+    }
+
+    /// Label size in bytes.
+    pub fn label_bytes(&self) -> usize {
+        match self {
+            LabelCodec::Diablo => 16,  // 8 words
+            LabelCodec::Trident => 20, // 10 words
+        }
+    }
+
+    fn decode_link(&self, g: &Geometry, label: &[u8], word: usize) -> Link {
+        match self {
+            LabelCodec::Diablo => {
+                let da = be16(label, word * 2);
+                if da == EOF_DA || da == 0 {
+                    None
+                } else {
+                    Some(g.vda_from_da(da))
+                }
+            }
+            LabelCodec::Trident => {
+                let w0 = be16(label, word * 2);
+                let w1 = be16(label, word * 2 + 2);
+                if (w0 == EOF_DA && w1 == EOF_DA) || (w0 == 0 && w1 == 0) {
+                    None
+                } else {
+                    Some(g.trident_vda_from_dh(w0, w1))
+                }
+            }
+        }
+    }
+
+    /// The `next` chain link (to the following page), or `None` at EOF.
+    pub fn next(&self, g: &Geometry, label: &[u8]) -> Link {
+        match self {
+            LabelCodec::Diablo => self.decode_link(g, label, 0),
+            LabelCodec::Trident => self.decode_link(g, label, 8),
+        }
+    }
+
+    /// The `prev` chain link (to the preceding page), or `None` at the start.
+    pub fn prev(&self, g: &Geometry, label: &[u8]) -> Link {
+        match self {
+            LabelCodec::Diablo => self.decode_link(g, label, 1),
+            LabelCodec::Trident => self.decode_link(g, label, 6),
+        }
+    }
+
+    pub fn num_chars(&self, label: &[u8]) -> u16 {
+        match self {
+            LabelCodec::Diablo => be16(label, 3 * 2),
+            LabelCodec::Trident => be16(label, 4 * 2),
+        }
+    }
+
+    pub fn page_number(&self, label: &[u8]) -> u16 {
+        match self {
+            LabelCodec::Diablo => be16(label, 4 * 2),
+            LabelCodec::Trident => be16(label, 5 * 2),
+        }
+    }
+
+    /// `(version, serial_word1, serial_word2)`.
+    pub fn file_id(&self, label: &[u8]) -> (u16, u16, u16) {
+        match self {
+            LabelCodec::Diablo => (be16(label, 5 * 2), be16(label, 6 * 2), be16(label, 7 * 2)),
+            LabelCodec::Trident => (be16(label, 0), be16(label, 2), be16(label, 4)),
+        }
+    }
+
+    fn encode_link(&self, g: &Geometry, label: &mut [u8], word: usize, link: Link) {
+        match self {
+            LabelCodec::Diablo => {
+                let da = link.map(|v| g.da_from_vda(v)).unwrap_or(EOF_DA);
+                put_be16(label, word * 2, da);
+            }
+            LabelCodec::Trident => {
+                let [w0, w1] = link
+                    .map(|v| g.trident_dh_from_vda(v))
+                    .unwrap_or([EOF_DA, EOF_DA]);
+                put_be16(label, word * 2, w0);
+                put_be16(label, word * 2 + 2, w1);
+            }
+        }
+    }
+
+    /// Build a label from decoded fields. `next`/`prev` are VDAs (`None` = EOF).
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_label(
+        &self,
+        g: &Geometry,
+        next: Link,
+        prev: Link,
+        num_chars: u16,
+        page: u16,
+        version: u16,
+        sn_w1: u16,
+        sn_w2: u16,
+    ) -> Vec<u8> {
+        let mut l = vec![0u8; self.label_bytes()];
+        match self {
+            LabelCodec::Diablo => {
+                self.encode_link(g, &mut l, 0, next);
+                self.encode_link(g, &mut l, 1, prev);
+                put_be16(&mut l, 3 * 2, num_chars);
+                put_be16(&mut l, 4 * 2, page);
+                put_be16(&mut l, 5 * 2, version);
+                put_be16(&mut l, 6 * 2, sn_w1);
+                put_be16(&mut l, 7 * 2, sn_w2);
+            }
+            LabelCodec::Trident => {
+                put_be16(&mut l, 0, version);
+                put_be16(&mut l, 2, sn_w1);
+                put_be16(&mut l, 4, sn_w2);
+                // word 3 = packID (left 0)
+                put_be16(&mut l, 4 * 2, num_chars);
+                put_be16(&mut l, 5 * 2, page);
+                self.encode_link(g, &mut l, 6, prev);
+                self.encode_link(g, &mut l, 8, next);
+            }
+        }
+        l
+    }
+
+    /// A free page's label: file id = the all-ones free-page marker.
+    pub fn free_label(&self, g: &Geometry) -> Vec<u8> {
+        self.make_label(g, None, None, 0, 0, EOF_DA, EOF_DA, EOF_DA)
     }
 }
 
