@@ -22,7 +22,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
     "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta",
+    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44",
 ];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
@@ -103,7 +103,9 @@ mod tests {
         // the Dwarf Draco 6085 Pilot image (`.zdisk` / `.zdelta`). The
         // BrowseSession Alto branch opens all of them; pin them so the picker
         // keeps surfacing Alto / Pilot packs.
-        for must in ["pdi", "bfs", "copydisk", "altodisk", "zdisk", "zdelta"] {
+        for must in [
+            "pdi", "bfs", "copydisk", "altodisk", "zdisk", "zdelta", "dsk300", "dsk80", "dsk44",
+        ] {
             assert!(
                 association_exts().contains(&must.to_string()),
                 "missing Alto/Pilot pack extension {must}"
