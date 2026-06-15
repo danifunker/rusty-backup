@@ -794,15 +794,28 @@ fn leader_name(data: &[u8]) -> Option<String> {
     let w = |wi: usize| be16(data, wi * 2);
     let validate = |s: String| -> Option<String> {
         let t = s.trim().to_string();
-        (1..=60).contains(&t.len()).then_some(t)
+        (1..=72).contains(&t.len()).then_some(t)
     };
-    // XDE descriptive leader: word0 = 0x1061, word1 = length (chars), string at
-    // byte 4, of the form "(dir)name( date )" — keep "(dir)name", drop the date.
-    if w(0) == 0x1061 {
-        let n = (w(1) as usize).min(76);
-        let s = ascii_clean(&data[4..4 + n]);
+    // XDE / ViewPoint descriptive leader, of the form "(dir)name( date )":
+    // word1 = length (chars), string at byte 4. word0 = 0x1061 stores it as
+    // 8-bit ASCII (XDE); word0 = 0x1062 as 16-bit XCCS characters with the ASCII
+    // in each word's low byte (ViewPoint). We keep "(dir)name" and drop the
+    // trailing time-stamped group. (ViewPoint *client* files have no leader name
+    // and no Pilot central directory — clientRootFile is 0 — so their names live
+    // in the desktop / NS-Filing layer, not on this disk; they surface by ID.)
+    if w(0) == 0x1061 || w(0) == 0x1062 {
+        let n = (w(1) as usize).min(72);
+        let s: String = if w(0) == 0x1061 {
+            ascii_clean(&data[4..4 + n])
+        } else {
+            (0..n)
+                .map(|i| data[(2 + i) * 2 + 1] as char)
+                .take_while(|&c| c != '\0')
+                .filter(|&c| (' '..='~').contains(&c))
+                .collect()
+        };
         // Drop a trailing "( <date> HH:MM:SS ... )" group (the last parenthesized
-        // group containing a time colon); keep the "(dir)name" part.
+        // group containing a time colon).
         let s = match s.rfind('(') {
             Some(p) if s[p..].contains(':') => s[..p].trim_end().to_string(),
             _ => s,
