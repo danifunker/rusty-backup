@@ -231,13 +231,21 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // both byte orders). open_pack does the full validation.
     if let Ok(end) = reader.seek(SeekFrom::End(0)) {
         if end as usize == crate::fs::alto::salto::IMAGE_BYTES {
-            let mut p = [0u8; 2];
             let rec1 = crate::fs::alto::salto::RECORD_BYTES as u64;
-            let ok = reader.seek(SeekFrom::Start(rec1)).is_ok()
+            // Salto: record 1's leading word is its VDA (1 big-endian / 0x0100 LE).
+            let mut p = [0u8; 2];
+            let salto_ok = reader.seek(SeekFrom::Start(rec1)).is_ok()
                 && reader.read_exact(&mut p).is_ok()
                 && matches!(u16::from_be_bytes(p), 1 | 0x0100);
+            // ContrAlto2 Diablo .dsk (same size): record 1's 2-word header (after
+            // a zero dummy word) is the packed disk address; the SysDir leader's
+            // is the Diablo-31 DA of VDA 1 (0x1000).
+            let mut h = [0u8; 2];
+            let contralto_ok = reader.seek(SeekFrom::Start(rec1 + 4)).is_ok()
+                && reader.read_exact(&mut h).is_ok()
+                && u16::from_le_bytes(h) == 0x1000;
             let _ = reader.seek(SeekFrom::Start(0));
-            if ok {
+            if salto_ok || contralto_ok {
                 return Some("Alto BFS".to_string());
             }
         }

@@ -22,13 +22,20 @@
 //! as [`super::salto`] does for its `.dsk`.
 //!
 //! Geometry: **T-80** = 815 × 5 × 9 (~75 MB), **T-300** = 815 × 19 × 9
-//! (~285 MB) (`TfsInit.bcpl`, dorado `disk.c`). For a single-file-system pack
-//! the linear CHS index equals the TFS virtual disk address; the T-300 split
-//! into ≤3 file systems (`fsNumber`, ≤383 tracks each) is not modeled here.
+//! (~285 MB) (`TfsInit.bcpl`, dorado `disk.c`). Real packs are written with a
+//! physical sector interleave, so [`read`] places each sector at the VDA in its
+//! own header rather than by file position. The T-300 split into ≤3 file systems
+//! (`fsNumber`, ≤383 tracks each) is not modeled — we browse the first.
 //!
-//! Note: no real Trident pack survives in any public archive, so this path is
-//! validated by synthetic round-trip and against the dorado constants, not real
-//! data.
+//! Validated against the real **Spruce print-server T-300** pack shipped with
+//! ContrAlto2 (`spruce-server-t300.zip`).
+//!
+//! This module also reads the sibling **ContrAlto2 Diablo `.dsk`** ([`read_diablo`]):
+//! the same `[dummy][header][label][data]` framing but Diablo geometry (8-word
+//! label, 512-byte data → 534 B/sector, the same size as a Salto `.dsk`).
+//! ContrAlto's first word is a zero dummy and the disk address is in the 2-word
+//! header, whereas Salto's first word is the page number — so a Salto read is
+//! tried first and this is the fallback.
 
 use super::super::filesystem::FilesystemError;
 use super::{Disk, FsFamily, Geometry, Sector};
@@ -58,6 +65,21 @@ pub const T300_SECTORS: usize = T300_CYLINDERS as usize * T300_HEADS as usize * 
 pub const T80_BYTES: usize = T80_SECTORS * SECTOR_BYTES;
 /// Byte size of a T-300 pack image.
 pub const T300_BYTES: usize = T300_SECTORS * SECTOR_BYTES;
+
+// --- ContrAlto2 Diablo pack (same framing, Diablo geometry) ---
+const DIABLO_LABEL_BYTES: usize = 16; // 8 words
+const DIABLO_DATA_BYTES: usize = 512; // 256 words
+/// `[dummy 1w][header 2w][label 8w][data 256w]` = 534 bytes.
+const DIABLO_SECTOR_BYTES: usize = 2 + 4 + DIABLO_LABEL_BYTES + DIABLO_DATA_BYTES;
+const DIABLO31_CYLINDERS: u16 = 203;
+const DIABLO31_HEADS: u16 = 2;
+const DIABLO31_SECTORS_PT: u16 = 12;
+/// Sectors in a Diablo-31 pack (203 × 2 × 12 = 4872).
+pub const DIABLO31_SECTORS: usize =
+    DIABLO31_CYLINDERS as usize * DIABLO31_HEADS as usize * DIABLO31_SECTORS_PT as usize;
+/// Byte size of a ContrAlto2 Diablo-31 pack (== a Salto `.dsk`; disambiguated by
+/// content — see [`read_diablo`]).
+pub const DIABLO_IMAGE_BYTES: usize = DIABLO31_SECTORS * DIABLO_SECTOR_BYTES;
 
 /// Trident geometry for the given model (80 or 300).
 pub fn geometry(model: u16) -> Geometry {
@@ -168,6 +190,61 @@ pub fn write(disk: &Disk) -> Result<Vec<u8>, FilesystemError> {
     Ok(out)
 }
 
+fn diablo31_geometry() -> Geometry {
+    Geometry {
+        family: FsFamily::Diablo,
+        disk_model: 31,
+        n_disks: 1,
+        n_cylinders: DIABLO31_CYLINDERS,
+        n_heads: DIABLO31_HEADS,
+        n_sectors: DIABLO31_SECTORS_PT,
+        label_bytes: DIABLO_LABEL_BYTES as u16,
+        data_bytes: DIABLO_DATA_BYTES as u16,
+    }
+}
+
+/// Could this be a ContrAlto2 Diablo `.dsk`? (Same size as a Salto `.dsk`; the
+/// caller should try Salto first and fall back to [`read_diablo`].)
+pub fn is_diablo_image(bytes: &[u8]) -> bool {
+    bytes.len() == DIABLO_IMAGE_BYTES
+}
+
+/// Read a ContrAlto2 / Bitsavers **Diablo** pack into a [`Disk`]. Per sector:
+/// `[dummy 1w][header 2w][label 8w][data 256w]`, little-endian. The header's
+/// second word is the packed Diablo disk address; each sector is placed at the
+/// VDA from [`Geometry::vda_from_da`] (handling the physical sector interleave),
+/// and the words are normalized to big-endian. Diablo-31 only.
+pub fn read_diablo(bytes: &[u8]) -> Result<Disk, FilesystemError> {
+    if bytes.len() != DIABLO_IMAGE_BYTES {
+        return Err(FilesystemError::Parse(format!(
+            "ContrAlto Diablo pack: file is {} bytes, expected {DIABLO_IMAGE_BYTES}",
+            bytes.len()
+        )));
+    }
+    let geom = diablo31_geometry();
+    let label_off = 6; // 2 dummy + 4 header
+    let data_off = label_off + DIABLO_LABEL_BYTES; // 22
+    let mut sectors = vec![Sector::zeroed(DIABLO_LABEL_BYTES, DIABLO_DATA_BYTES); DIABLO31_SECTORS];
+    for i in 0..DIABLO31_SECTORS {
+        let rec = i * DIABLO_SECTOR_BYTES;
+        // header word 1 (little-endian) = the packed Diablo disk address.
+        let da = (bytes[rec + 4] as u16) | ((bytes[rec + 5] as u16) << 8);
+        let vda = geom.vda_from_da(da);
+        if vda >= DIABLO31_SECTORS {
+            continue;
+        }
+        let mut label = bytes[rec + label_off..rec + label_off + DIABLO_LABEL_BYTES].to_vec();
+        let mut data = bytes[rec + data_off..rec + data_off + DIABLO_DATA_BYTES].to_vec();
+        swap_words(&mut label);
+        swap_words(&mut data);
+        sectors[vda] = Sector { label, data };
+    }
+    Ok(Disk {
+        geometry: geom,
+        sectors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +274,32 @@ mod tests {
             let [w0, w1] = g.trident_dh_from_vda(vda);
             assert_eq!(g.trident_vda_from_dh(w0, w1), vda, "vda {vda}");
         }
+    }
+
+    #[test]
+    fn diablo_pack_reads_back_a_blank_volume() {
+        use crate::fs::alto::bfs::Bfs;
+        use crate::fs::alto::write;
+        // Format a blank Diablo-31 volume, serialize it into the ContrAlto Diablo
+        // pack framing (dummy + DA header + label + data, little-endian, placed by
+        // disk address), and confirm read_diablo reconstructs a walkable BFS.
+        let disk = write::create_blank(diablo31_geometry()).expect("blank");
+        let mut bytes = vec![0u8; DIABLO_IMAGE_BYTES];
+        for (vda, s) in disk.sectors.iter().enumerate() {
+            let rec = vda * DIABLO_SECTOR_BYTES;
+            // dummy word 0; header word 0 = 0, word 1 = packed Diablo DA.
+            put_be16(&mut bytes, rec + 4, disk.geometry.da_from_vda(vda));
+            bytes[rec + 6..rec + 6 + DIABLO_LABEL_BYTES].copy_from_slice(&s.label);
+            bytes[rec + 22..rec + 22 + DIABLO_DATA_BYTES].copy_from_slice(&s.data);
+            swap_words(&mut bytes[rec..rec + DIABLO_SECTOR_BYTES]); // -> little-endian
+        }
+        assert!(is_diablo_image(&bytes));
+        let back = read_diablo(&bytes).expect("read_diablo");
+        assert_eq!(back.geometry.family, FsFamily::Diablo);
+        let files = Bfs::new(&back).list_files().expect("list");
+        assert!(files
+            .iter()
+            .any(|f| f.name.trim_end_matches('.').eq_ignore_ascii_case("SysDir")));
     }
 
     fn sample_pack(model: u16) -> Disk {

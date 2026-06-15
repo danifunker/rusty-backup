@@ -44,7 +44,10 @@ pub fn open_pack(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     } else if zdisk::is_zdisk(bytes) {
         zdisk::read(bytes)
     } else if salto::is_salto_image(bytes) {
-        salto::read(bytes)
+        // A Salto `.dsk` and a ContrAlto2 Diablo `.dsk` are the same size; try
+        // Salto first (its leading word is the page number), then fall back to
+        // the ContrAlto Diablo framing (leading dummy + disk-address header).
+        salto::read(bytes).or_else(|_| trident::read_diablo(bytes))
     } else if trident::is_trident_image(bytes) {
         trident::read(bytes)
     } else {
