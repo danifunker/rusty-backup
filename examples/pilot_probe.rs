@@ -13,7 +13,7 @@
 
 use std::fs;
 
-use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem};
+use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
 use rusty_backup::fs::alto::{open_pack, pdi};
 use rusty_backup::fs::filesystem::Filesystem;
 
@@ -123,6 +123,90 @@ fn main() {
                 args[1]
             );
         }
+        Some("install-boot") if args.len() == 4 => {
+            // install-boot <pdi> <germ|bootfile|microcode> <hostfile>
+            let slot = PvBootFile::parse(&args[2]).unwrap_or_else(|| {
+                eprintln!("unknown boot slot {:?} (germ|bootfile|microcode)", args[2]);
+                std::process::exit(2);
+            });
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let payload = fs::read(&args[3]).expect("read host file");
+            let disk =
+                pilot::install_boot_file(&disk, gen, slot, &payload).expect("install_boot_file");
+            fs::write(&args[1], pilot::write_pdi(&disk, gen)).expect("write pdi");
+            // Verify the chain reads back byte-identical (page-padded).
+            let back = open_pack(&fs::read(&args[1]).unwrap()).unwrap();
+            let got = pilot::read_boot_file(&back, slot)
+                .unwrap()
+                .expect("present");
+            let ok = got.len() >= payload.len() && got[..payload.len()] == payload[..];
+            println!(
+                "Installed {} boot file {} ({} bytes, {} pages) into {} -- chain verify {}",
+                slot.label(),
+                args[3],
+                payload.len(),
+                payload.len().div_ceil(512),
+                args[1],
+                if ok { "OK" } else { "FAILED" }
+            );
+        }
+        Some("extract-boot") if args.len() == 4 => {
+            // extract-boot <pdi> <germ|bootfile|microcode> <out>
+            let slot = PvBootFile::parse(&args[2]).unwrap_or_else(|| {
+                eprintln!("unknown boot slot {:?} (germ|bootfile|microcode)", args[2]);
+                std::process::exit(2);
+            });
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            match pilot::read_boot_file(&disk, slot).expect("read_boot_file") {
+                Some(data) => {
+                    fs::write(&args[3], &data).expect("write out");
+                    println!(
+                        "Extracted {} boot file ({} pages, {} bytes) -> {}",
+                        slot.label(),
+                        data.len() / 512,
+                        data.len(),
+                        args[3]
+                    );
+                }
+                None => {
+                    eprintln!("slot {} is empty", slot.label());
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("boot-info") if args.len() == 2 => {
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            println!("BOOT  {}", args[1]);
+            for slot in [
+                PvBootFile::Microcode,
+                PvBootFile::Germ,
+                PvBootFile::BootFile,
+                PvBootFile::Checkpoint,
+            ] {
+                let entry = pilot::boot_file_entry(&disk, slot).expect("boot_file_entry");
+                if !entry.is_present() {
+                    println!("  {:<11}: (empty)", slot.label());
+                    continue;
+                }
+                match pilot::read_boot_file(&disk, slot) {
+                    Ok(Some(data)) => println!(
+                        "  {:<11}: fileID {:04X}{:04X} firstPage {} firstLink(VDA) {} -> {} pages, chain OK",
+                        slot.label(),
+                        entry.file_id[0],
+                        entry.file_id[1],
+                        entry.first_page,
+                        entry.first_link,
+                        data.len() / 512
+                    ),
+                    Ok(None) => println!("  {:<11}: (empty)", slot.label()),
+                    Err(e) => println!("  {:<11}: present but chain INVALID: {e}", slot.label()),
+                }
+            }
+        }
         Some("roundtrip") if args.len() == 4 => {
             let pages: u16 = args[1].parse().expect("pages");
             let gen = parse_gen(&args[2]);
@@ -140,6 +224,9 @@ fn main() {
             eprintln!("  pilot_probe probe <file.pdi>");
             eprintln!("  pilot_probe add <file.pdi> <hostfile>");
             eprintln!("  pilot_probe del <file.pdi> <fileID-decimal>");
+            eprintln!("  pilot_probe install-boot <file.pdi> <germ|bootfile|microcode> <hostfile>");
+            eprintln!("  pilot_probe extract-boot <file.pdi> <germ|bootfile|microcode> <out>");
+            eprintln!("  pilot_probe boot-info <file.pdi>");
             eprintln!("  pilot_probe roundtrip <pages> <cedar|pilot> <name>");
             std::process::exit(2);
         }

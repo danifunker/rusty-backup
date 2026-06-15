@@ -1185,6 +1185,284 @@ pub fn delete_file(disk: &Disk, fid: u32) -> Result<Disk, FilesystemError> {
     Ok(disk)
 }
 
+// ---- bootingInfo: installing a disk-resident germ / boot file ----
+//
+// A disk-germ Cedar boot reads its software off the physical volume itself (per
+// `DoradoBooting.tioga` §1.3: Cedar microcode boot-loads the installed germ,
+// which in turn loads the installed physical-volume boot file). The microcode
+// finds those files through the physical-volume root's `bootingInfo` array, and
+// reads each one by following a per-run **boot chain** threaded through the
+// sector labels' `dontCare` field — the boot path cannot use the file system
+// yet, so the chain, not the run table, locates the pages.
+//
+// This is the install side. The germ + boot-file *content* is a real Mesa VM
+// memory image (from `MakeBoot`; unclonable without a source — we have the real
+// `Dorado.germ` / `BasicCedarDorado.boot`), but its *placement* is free: the
+// image embeds no disk address (confirmed against `BootChannelDisk.mesa` /
+// `DiskBootSoft.mc` — the germ reads the boot file's location from `bootingInfo`
+// at run time, unlike the Alto `Sys.Boot` snapshot, which is verbatim-only). So
+// an installer may lay each file at any free run and record where it went.
+//
+// Sources: `VolumeFormat.mesa` (`PhysicalRoot.bootingInfo(10B)`), `BootFile.mesa`
+// (`DiskFileID`), `File.mesa` (`VolumeFile` ordinals), `DiskBootTransfer.mc`
+// (the per-run `bootChainLink`, end-of-file `[-1,-1]`), `BootChannelDisk.mesa`.
+
+/// Word offset of `bootingInfo` in the physical-volume root (`10B`), an
+/// `ARRAY File.VolumeFile[checkpoint..bootFile] OF BootFile.DiskFileID`.
+const BOOTING_INFO_BASE: usize = 8;
+/// Words per `BootFile.DiskFileID`: `fID`(5) + `firstPage`(INT, 2) +
+/// `firstLink`(`DiskFace.DontCare`/`DiskAddress`, 2).
+const DISK_FILE_ID_WORDS: usize = 9;
+/// `bootChainLink` end-of-file sentinel (`[-1, -1]`, `DiskBootTransfer.mc`).
+const BOOT_CHAIN_EOF: [u16; 2] = [0xffff, 0xffff];
+
+/// A boot-file slot in the PV-root `bootingInfo` array (`File.VolumeFile`
+/// ordinals; the disk-boot microcode reads only the PV root's copy). A disk-germ
+/// Cedar boot follows [`Germ`](PvBootFile::Germ) then
+/// [`BootFile`](PvBootFile::BootFile); [`Microcode`](PvBootFile::Microcode) is
+/// the optional soft-microcode slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PvBootFile {
+    Checkpoint,
+    Microcode,
+    Germ,
+    BootFile,
+}
+
+impl PvBootFile {
+    fn ordinal(self) -> usize {
+        match self {
+            PvBootFile::Checkpoint => 0,
+            PvBootFile::Microcode => 1,
+            PvBootFile::Germ => 2,
+            PvBootFile::BootFile => 3,
+        }
+    }
+    /// Word offset of this slot's `DiskFileID` in the PV root.
+    fn root_word(self) -> usize {
+        BOOTING_INFO_BASE + self.ordinal() * DISK_FILE_ID_WORDS
+    }
+    /// Parse a slot name (`germ` / `bootfile` / `microcode` / `checkpoint`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "germ" => Some(PvBootFile::Germ),
+            "bootfile" | "boot" | "pilot" => Some(PvBootFile::BootFile),
+            "microcode" | "mc" | "ucode" => Some(PvBootFile::Microcode),
+            "checkpoint" => Some(PvBootFile::Checkpoint),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            PvBootFile::Checkpoint => "checkpoint",
+            PvBootFile::Microcode => "microcode",
+            PvBootFile::Germ => "germ",
+            PvBootFile::BootFile => "bootFile",
+        }
+    }
+}
+
+/// Encode a flat virtual disk address (VDA) as a 2-word `DiskFace.DontCare` /
+/// `DiskAddress`, low word first. In the PDI logical-sector model the disk
+/// address *is* the VDA; a geometry-accurate consumer maps VDA <-> (cylinder,
+/// head, sector) for its pack, exactly as it regenerates ECC (PDI stores logical
+/// sectors, not physical geometry). Used for both the `bootChainLink` and the
+/// `bootingInfo` `firstLink`.
+fn da_words(vda: u32) -> [u16; 2] {
+    [(vda & 0xffff) as u16, (vda >> 16) as u16]
+}
+fn da_from_words(w: [u16; 2]) -> u32 {
+    (w[0] as u32) | ((w[1] as u32) << 16)
+}
+
+/// A parsed PV-root `bootingInfo` slot (`BootFile.DiskFileID`).
+#[derive(Debug, Clone)]
+pub struct BootFileEntry {
+    pub slot: PvBootFile,
+    pub file_id: [u16; 5],
+    pub first_page: u32,
+    /// VDA of the boot file's first page (the initial boot-chain link).
+    pub first_link: u32,
+}
+
+impl BootFileEntry {
+    /// True if the slot is populated (a non-null `fID`).
+    pub fn is_present(&self) -> bool {
+        self.file_id != [0; 5]
+    }
+}
+
+/// Read a PV-root `bootingInfo` slot's `DiskFileID`.
+pub fn boot_file_entry(disk: &Disk, slot: PvBootFile) -> Result<BootFileEntry, FilesystemError> {
+    let d = disk
+        .sector(0)
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no physical-volume root page".into()))?
+        .data
+        .as_slice();
+    if rdw(d, 0) != PR_SEAL {
+        return Err(FilesystemError::Parse(
+            "Pilot: bad physical-root seal".into(),
+        ));
+    }
+    let w = slot.root_word();
+    let mut file_id = [0u16; 5];
+    for (k, fw) in file_id.iter_mut().enumerate() {
+        *fw = rdw(d, w + k);
+    }
+    Ok(BootFileEntry {
+        slot,
+        file_id,
+        first_page: rdlong(d, w + 5),
+        first_link: da_from_words([rdw(d, w + 7), rdw(d, w + 8)]),
+    })
+}
+
+/// Install `bytes` as the disk-resident boot file for `slot`: allocate free
+/// logical pages, write them as a **label-chained Pilot boot file** (`fileID` +
+/// ascending `filePage`, `attributes = data`, the per-run `bootChainLink`
+/// threaded through `dontCare` and `[-1,-1]` at end of file), record the
+/// `DiskFileID` in the PV-root `bootingInfo` slot, and mark the VAM. Returns the
+/// updated disk.
+///
+/// The germ and the physical-volume boot file are the two a disk-germ Cedar boot
+/// follows. Content is stored verbatim (page-granular, zero-padded to a page);
+/// the boot path locates pages by the chain, so no run-table header is emitted
+/// (the boot file's own page 0 is its `BootFile.Header`, i.e. `firstPage = 0`).
+pub fn install_boot_file(
+    disk: &Disk,
+    generation: Generation,
+    slot: PvBootFile,
+    bytes: &[u8],
+) -> Result<Disk, FilesystemError> {
+    let vol = read_volume(disk, generation)?;
+    let sv = vol
+        .physical_root
+        .sub_volumes
+        .iter()
+        .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+        .cloned()
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
+    let pv_page = sv.pv_page as usize;
+    let n_pages = sv.n_pages as usize;
+    let n = bytes.len().div_ceil(PAGE_BYTES).max(1);
+
+    // Free logical pages (logical 0 is the LV root). First-fit, ascending; a
+    // fresh volume yields one contiguous run, but a fragmented free list is fine
+    // — the boot chain records run breaks.
+    let free: Vec<u32> = (1..n_pages)
+        .filter(|&lp| {
+            disk.sector(pv_page + lp)
+                .map(|s| Label::parse(&s.label).attributes == attr::FREE_PAGE)
+                .unwrap_or(false)
+        })
+        .map(|lp| lp as u32)
+        .collect();
+    if free.len() < n {
+        return Err(FilesystemError::DiskFull(format!(
+            "Pilot: need {n} free pages to install the {} boot file ({} bytes), have {}",
+            slot.label(),
+            bytes.len(),
+            free.len()
+        )));
+    }
+    let pages = &free[..n];
+    let vdas: Vec<u32> = pages.iter().map(|&lp| pv_page as u32 + lp).collect();
+
+    let mut disk = disk.clone();
+
+    // Allocate a FileID for the boot file (advance the LV-root counter).
+    let lv_root_vda = pv_page;
+    let fid = rdlong(&disk.sectors[lv_root_vda].data, 253).wrapping_add(1);
+    let file_id = make_file_id(generation, fid);
+
+    // Lay the pages and thread the boot chain through the labels' `dontCare`.
+    for (i, (&lp, &vda)) in pages.iter().zip(&vdas).enumerate() {
+        let dont_care = if i + 1 == n {
+            BOOT_CHAIN_EOF // last page of the file
+        } else if vdas[i + 1] != vda + 1 {
+            da_words(vdas[i + 1]) // run break: point at the next run's first page
+        } else {
+            [0, 0] // interior of a contiguous run (link unused)
+        };
+        let s = &mut disk.sectors[pv_page + lp as usize];
+        let mut label = Label::new(file_id, i as u32, attr::DATA);
+        label.dont_care = dont_care;
+        s.label = label.bytes();
+        let off = i * PAGE_BYTES;
+        let end = (off + PAGE_BYTES).min(bytes.len());
+        let chunk = &bytes[off..end];
+        for b in s.data.iter_mut() {
+            *b = 0;
+        }
+        s.data[..chunk.len()].copy_from_slice(chunk);
+    }
+
+    // Record the DiskFileID in the PV-root bootingInfo slot.
+    {
+        let d = &mut disk.sectors[0].data;
+        let w = slot.root_word();
+        for (k, &v) in file_id.iter().enumerate() {
+            wrw(d, w + k, v);
+        }
+        wrlong(d, w + 5, 0); // firstPage
+        let first = da_words(vdas[0]);
+        wrw(d, w + 7, first[0]);
+        wrw(d, w + 8, first[1]);
+        set_page_checksum(d);
+    }
+
+    // Persist the advanced FileID, re-checksum the LV root, refresh the VAM.
+    wrlong(&mut disk.sectors[lv_root_vda].data, 253, fid);
+    set_page_checksum(&mut disk.sectors[lv_root_vda].data);
+    rebuild_vam(&mut disk, &sv);
+    Ok(disk)
+}
+
+/// Follow a boot file's per-run `bootChainLink` chain from its `bootingInfo`
+/// slot, returning the concatenated page bytes (page-granular), or `None` if the
+/// slot is empty. Validates each page's label `fileID` + `filePage` and stops at
+/// the `[-1, -1]` end-of-file sentinel — the same walk the boot microcode does,
+/// so a successful read is the structural proof that the install is well-formed.
+pub fn read_boot_file(disk: &Disk, slot: PvBootFile) -> Result<Option<Vec<u8>>, FilesystemError> {
+    let entry = boot_file_entry(disk, slot)?;
+    if !entry.is_present() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    let mut vda = entry.first_link;
+    let limit = disk.geometry.total_sectors() as u32 + 1;
+    for i in 0..limit {
+        let expected_page = entry.first_page + i;
+        let s = disk.sector(vda as usize).ok_or_else(|| {
+            FilesystemError::Parse(format!("Pilot: boot chain page {vda} out of range"))
+        })?;
+        let l = Label::parse(&s.label);
+        if l.file_id != entry.file_id {
+            return Err(FilesystemError::Parse(format!(
+                "Pilot: boot chain page {vda} fileID mismatch"
+            )));
+        }
+        if l.file_page != expected_page {
+            return Err(FilesystemError::Parse(format!(
+                "Pilot: boot chain page {vda} filePage {} != expected {expected_page}",
+                l.file_page
+            )));
+        }
+        out.extend_from_slice(&s.data);
+        if l.dont_care == BOOT_CHAIN_EOF {
+            return Ok(Some(out));
+        }
+        vda = if l.dont_care == [0, 0] {
+            vda + 1
+        } else {
+            da_from_words(l.dont_care)
+        };
+    }
+    Err(FilesystemError::Parse(
+        "Pilot: boot chain exceeds disk size (missing [-1,-1] terminator?)".into(),
+    ))
+}
+
 /// A Pilot-shaped geometry of `total_pages` 512-byte pages (single spindle).
 /// Geometry is bookkeeping for PDI; any factorization works for tooling.
 pub fn pilot_geometry(total_pages: u16) -> Geometry {
@@ -1391,5 +1669,116 @@ mod tests {
         // ...but a bad physical-root seal (word 0) must.
         disk.sectors[0].data[0] ^= 0xff;
         assert!(read_volume(&disk, Generation::CedarNucleus).is_err());
+    }
+
+    #[test]
+    fn install_boot_file_round_trips_via_chain() {
+        use super::super::pdi;
+
+        let geo = pilot_geometry(256);
+        let blank = create_blank(geo, Generation::CedarNucleus, "Boot").expect("create");
+
+        // A ~6-page "germ" with non-trivial content.
+        let germ: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let disk = install_boot_file(&blank, Generation::CedarNucleus, PvBootFile::Germ, &germ)
+            .expect("install germ");
+
+        // bootingInfo[germ] is populated; firstPage is 0; firstLink lands inside
+        // the subvolume's logical pages.
+        let entry = boot_file_entry(&disk, PvBootFile::Germ).unwrap();
+        assert!(entry.is_present());
+        assert_eq!(entry.first_page, 0);
+        let sv = &read_volume(&disk, Generation::CedarNucleus)
+            .unwrap()
+            .physical_root
+            .sub_volumes[0];
+        assert!(entry.first_link >= sv.pv_page && entry.first_link < sv.pv_page + sv.n_pages);
+
+        // Following the chain (the boot microcode's own walk) recovers the bytes,
+        // zero-padded to a page boundary.
+        let got = read_boot_file(&disk, PvBootFile::Germ)
+            .unwrap()
+            .expect("germ present");
+        let padded = germ.len().div_ceil(PAGE_BYTES) * PAGE_BYTES;
+        assert_eq!(got.len(), padded);
+        assert_eq!(&got[..germ.len()], &germ[..]);
+        assert!(got[germ.len()..].iter().all(|&b| b == 0));
+
+        // An un-installed slot reads back as empty.
+        assert!(read_boot_file(&disk, PvBootFile::BootFile)
+            .unwrap()
+            .is_none());
+
+        // Installing a second slot leaves the first intact, and both survive a
+        // PDI round trip byte-for-byte through the chain.
+        let boot: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(7) % 256) as u8)
+            .collect();
+        let disk = install_boot_file(&disk, Generation::CedarNucleus, PvBootFile::BootFile, &boot)
+            .expect("install bootFile");
+        let bytes = write_pdi(&disk, Generation::CedarNucleus);
+        let back = pdi::read(&bytes).expect("pdi read");
+        assert_eq!(
+            read_boot_file(&back, PvBootFile::Germ).unwrap().unwrap(),
+            got
+        );
+        let boot_back = read_boot_file(&back, PvBootFile::BootFile)
+            .unwrap()
+            .expect("bootFile present");
+        assert_eq!(&boot_back[..boot.len()], &boot[..]);
+        // The volume still parses and the VAM agrees with the labels.
+        let vol = read_volume(&back, Generation::CedarNucleus).unwrap();
+        assert_eq!(vol.vam_free_pages, Some(vol.free_pages));
+    }
+
+    #[test]
+    fn boot_chain_follows_run_breaks() {
+        // Force a fragmented free list so the installed boot file spans a run
+        // break, exercising the non-trivial `bootChainLink` path.
+        let geo = pilot_geometry(160);
+        let blank = create_blank(geo, Generation::CedarNucleus, "Frag").expect("create");
+
+        // Three single-page files (each = header + data = 2 pages), then delete
+        // the middle one to leave a hole between B's pages and the later free run.
+        let (d1, _fa) = add_file(&blank, Generation::CedarNucleus, &[0xAA; 50]).unwrap();
+        let (d2, fb) = add_file(&d1, Generation::CedarNucleus, &[0xBB; 50]).unwrap();
+        let (d3, _fc) = add_file(&d2, Generation::CedarNucleus, &[0xCC; 50]).unwrap();
+        let d4 = delete_file(&d3, fb).unwrap();
+
+        // A 4-page boot file must now reuse the freed hole plus later free pages,
+        // i.e. a multi-run allocation with a real chain link.
+        let payload: Vec<u8> = (0..(4 * PAGE_BYTES) as u32 - 7)
+            .map(|i| (i % 249) as u8)
+            .collect();
+        let disk = install_boot_file(&d4, Generation::CedarNucleus, PvBootFile::Germ, &payload)
+            .expect("install");
+
+        // The chain follower reconstructs the bytes across the run break.
+        let got = read_boot_file(&disk, PvBootFile::Germ)
+            .unwrap()
+            .expect("present");
+        assert_eq!(&got[..payload.len()], &payload[..]);
+
+        // Confirm at least one page actually carried a forward link (not just the
+        // [-1,-1] terminator) — i.e. the run break was exercised.
+        let entry = boot_file_entry(&disk, PvBootFile::Germ).unwrap();
+        let mut vda = entry.first_link;
+        let mut saw_link = false;
+        loop {
+            let l = Label::parse(&disk.sector(vda as usize).unwrap().label);
+            if l.dont_care == BOOT_CHAIN_EOF {
+                break;
+            }
+            if l.dont_care != [0, 0] {
+                saw_link = true;
+                vda = da_from_words(l.dont_care);
+            } else {
+                vda += 1;
+            }
+        }
+        assert!(
+            saw_link,
+            "expected a non-trivial bootChainLink across the hole"
+        );
     }
 }
