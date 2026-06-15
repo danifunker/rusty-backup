@@ -161,20 +161,37 @@ impl BrowseSession {
         let is_salto_dsk = std::fs::metadata(path)
             .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
             .unwrap_or(false);
+        // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
+        // gate the full read on the zlib magic byte, then confirm by inflating
+        // the prefix to the DAAD signature so we don't slurp unrelated files.
+        let zdisk_bytes = if magic[0] == 0x78 {
+            std::fs::read(path)
+                .ok()
+                .filter(|b| crate::fs::alto::zdisk::is_zdisk(b))
+        } else {
+            None
+        };
         if &magic == b"PARCDISK"
             || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
             || is_salto_dsk
+            || zdisk_bytes.is_some()
         {
-            let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
+            let bytes = match zdisk_bytes {
+                Some(b) => b,
+                None => std::fs::read(path).map_err(FilesystemError::Io)?,
+            };
             let disk = crate::fs::alto::open_pack(&bytes)?;
-            // A PDI with fsFamily=2 is a Pilot/Cedar volume (structurally
-            // unrelated to BFS); everything else is an Alto BFS pack.
+            // A PDI with fsFamily=2 (or any .zdisk) is a Pilot/Cedar volume
+            // (structurally unrelated to BFS); everything else is an Alto BFS pack.
             if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
                 use crate::fs::alto::pilot::{Generation, PilotFilesystem};
-                // File-ID generation comes from PDI flags bit 2.
+                // File-ID generation comes from PDI flags bit 2; a 6085 .zdisk
+                // carries no flags, so default to the original-Pilot generation
+                // (these are classic Pilot 12.3 volumes). Generation does not
+                // affect the read path, only how a written ID is interpreted.
                 let generation = crate::fs::alto::pdi::read_header(&bytes)
                     .map(|h| Generation::from_pdi_flag_bit2(h.flags & 0x0004 != 0))
-                    .unwrap_or(Generation::CedarNucleus);
+                    .unwrap_or(Generation::OriginalPilot);
                 return Ok(Box::new(PilotFilesystem::open(disk, generation)?));
             }
             return Ok(Box::new(crate::fs::alto::bfs::BfsFilesystem::open(disk)));
@@ -460,13 +477,20 @@ impl BrowseSession {
             let is_salto_dsk = std::fs::metadata(path)
                 .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
                 .unwrap_or(false);
+            // Dwarf Draco 6085 ".zdisk" (a Pilot pack); see open() for the gating.
+            let is_zdisk = magic[0] == 0x78
+                && std::fs::read(path)
+                    .map(|b| crate::fs::alto::zdisk::is_zdisk(&b))
+                    .unwrap_or(false);
             if &magic == b"PARCDISK"
                 || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
                 || is_salto_dsk
+                || is_zdisk
             {
                 let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
                 let disk = crate::fs::alto::open_pack(&bytes)?;
-                // Pilot/Cedar volumes (fsFamily=2) are read-only for now.
+                // Pilot/Cedar volumes (fsFamily=2, and every .zdisk) are
+                // read-only for now.
                 if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
                     return Err(FilesystemError::Unsupported(
                         "Pilot/Cedar volumes are read-only".into(),
@@ -788,6 +812,46 @@ mod tests {
         assert!(fs.list_directory(&root).expect("list").is_empty());
 
         // Editing a Pilot volume is refused (read-only).
+        assert!(session.open_editable().is_err());
+    }
+
+    #[test]
+    fn open_routes_zdisk_to_pilot_filesystem() {
+        use crate::fs::alto::pilot::{self, Generation};
+        use crate::fs::alto::{zdisk, FsFamily, Geometry};
+        use std::io::Write as _;
+
+        // A blank original-Pilot volume on a 6085-shaped geometry (16
+        // sectors/track), serialized to the Dwarf Draco `.zdisk` container.
+        let geo = Geometry {
+            family: FsFamily::Pilot,
+            disk_model: 0,
+            n_disks: 1,
+            n_cylinders: 40,
+            n_heads: 1,
+            n_sectors: 16,
+            label_bytes: 20,
+            data_bytes: 512,
+        };
+        let disk = pilot::create_blank(geo, Generation::OriginalPilot, "ZDiskVol")
+            .expect("create blank pilot volume");
+        let zbytes = zdisk::write(&disk).expect("zdisk write");
+
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".zdisk")
+            .tempfile()
+            .unwrap();
+        tmp.write_all(&zbytes).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open a Dwarf .zdisk Pilot volume");
+        assert_eq!(fs.fs_type(), "Pilot/Cedar");
+        assert_eq!(fs.volume_label(), Some("ZDiskVol"));
+
+        // A .zdisk Pilot volume is read-only.
         assert!(session.open_editable().is_err());
     }
 }

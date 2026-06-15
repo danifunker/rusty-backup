@@ -23,6 +23,8 @@
 //! Sources: `VolumeFormat.mesa`, `DiskFace.mesa`, `File.mesa`, `Checksum.mesa`,
 //! `PilotDiskDefs.mc`, and the Othello `PhysicalVolumeScavenger` (placement).
 
+use std::collections::HashMap;
+
 use super::super::entry::FileEntry;
 use super::super::filesystem::{Filesystem, FilesystemError};
 use super::{be16, put_be16, Disk, FsFamily, Geometry, Sector};
@@ -736,72 +738,134 @@ impl RunTable {
         }
         RunTable { header_pages, runs }
     }
+}
 
-    fn total_pages(&self) -> u64 {
-        self.runs.iter().map(|&(_, n)| n as u64).sum()
+/// Logical page number from a label, masking the classic page-0 flag bits
+/// (`immutable`/`temporary`/`zeroSize`, word 6 bits 13-15; `filePageHi` is 7
+/// bits). For the Cedar scheme the page number is small, so the mask is a no-op.
+fn file_page_number(l: &Label) -> u32 {
+    let lo = l.file_page & 0xffff;
+    let hi = (l.file_page >> 16) & 0x7f;
+    (hi << 16) | lo
+}
+
+/// True if a page's label `attributes`/`type` word marks it as a **user-file
+/// data page** — i.e. not free, not a volume-structure page (physicalRoot..
+/// scavengerLog = 0..9), and not a Cedar run-table `header` (9729) or `freePage`
+/// (9728). This admits Cedar `data` (9730) and classic file types (`tempFileList`
+/// 10, `vmBackingFile` 12, `anonymousFile` 15, client types >= 256, ...).
+fn is_user_data_page(a: u16) -> bool {
+    a != attr::FREE_PAGE && a != attr::HEADER && !matches!(a, 0..=9)
+}
+
+/// Short label for a page `File.Type`/attribute, used in synthesized names.
+fn type_label(a: u16) -> String {
+    match a {
+        10 => "temp".into(),
+        11 => "txnState".into(),
+        12 => "vmBacking".into(),
+        15 => "anon".into(),
+        16 => "txnLog".into(),
+        attr::DATA => "data".into(),
+        t if t >= 256 => "client".into(),
+        t => format!("t{t}"),
     }
 }
 
-/// Read-only [`Filesystem`] view of a Pilot/Cedar volume. File enumeration is by
-/// `header`-attribute page scan (the Cedar nucleus has no name directory in the
-/// nucleus, so files surface by file ID); reads follow the run table.
+/// One file discovered by a page-label scan: its identity, the data pages that
+/// carry it (absolute VDA, sorted by logical page), and a synthesized name (the
+/// Pilot nucleus has no name directory — human names live in the PFS layer).
+struct PilotFile {
+    name: String,
+    #[allow(dead_code)]
+    file_id: [u16; 5],
+    /// `(logical page, absolute VDA)`, sorted by logical page.
+    pages: Vec<(u32, usize)>,
+    size: u64,
+}
+
+/// Read-only [`Filesystem`] view of a Pilot/Cedar volume.
+///
+/// Files are enumerated by a **page-label scan** (the scavenger's authoritative
+/// source) across every subvolume, grouping data pages by `fileID`. This handles
+/// both the Cedar-nucleus scheme (our own writer: `header` run-table + `data`
+/// pages) and the classic Pilot scheme (e.g. 6085 Pilot 12.3: pages carry the
+/// file's `File.Type`), and reconstructs fragmented files from the labels alone.
+/// Files surface by file ID; the nucleus has no name directory, so names are
+/// synthesized (the PFS name layer is a separate, future concern).
 pub struct PilotFilesystem {
     disk: Disk,
     #[allow(dead_code)]
     generation: Generation,
     volume: PilotVolume,
+    files: Vec<PilotFile>,
 }
 
 impl PilotFilesystem {
     pub fn open(disk: Disk, generation: Generation) -> Result<Self, FilesystemError> {
         let volume = read_volume(&disk, generation)?;
+        let files = build_files(&disk, &volume);
         Ok(Self {
             disk,
             generation,
             volume,
+            files,
         })
     }
 
-    /// The single subvolume that holds the logical volume root.
-    fn root_subvolume(&self) -> &SubVolumeDesc {
-        // read_volume verified this exists.
-        self.volume
-            .physical_root
-            .sub_volumes
-            .iter()
-            .find(|sv| sv.lv_page == ROOT_PAGE_NUMBER)
-            .expect("root subvolume present (validated at open)")
-    }
-
     fn enumerate(&self) -> Vec<FileEntry> {
-        let sv = self.root_subvolume();
-        let mut out = Vec::new();
-        for lp in 0..sv.n_pages as usize {
-            let vda = sv.pv_page as usize + lp;
-            let Some(sector) = self.disk.sector(vda) else {
-                continue;
-            };
-            let label = Label::parse(&sector.label);
-            if label.attributes != attr::HEADER {
-                continue;
-            }
-            // The VAM is a (header) file too, but it's volume metadata, not a
-            // user file — keep it out of the browse listing.
-            if label.file_id == VAM_FILE_ID {
-                continue;
-            }
-            let run = RunTable::parse(&sector.data);
-            let size = run.total_pages() * PAGE_BYTES as u64;
-            let name = format!("File-{:04X}{:04X}", label.file_id[0], label.file_id[1]);
-            out.push(FileEntry::new_file(
-                name.clone(),
-                format!("/{name}"),
-                size,
-                vda as u64,
-            ));
-        }
-        out
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                FileEntry::new_file(f.name.clone(), format!("/{}", f.name), f.size, i as u64)
+            })
+            .collect()
     }
+}
+
+/// Scan every subvolume's page labels and group user-file data pages by `fileID`
+/// into a sorted, deduplicated file table.
+fn build_files(disk: &Disk, volume: &PilotVolume) -> Vec<PilotFile> {
+    // Per file ID: its type word plus its `(logical page, absolute VDA)` pages.
+    type FileGroup = (u16, Vec<(u32, usize)>);
+    let mut files: Vec<PilotFile> = Vec::new();
+    for (svidx, sv) in volume.physical_root.sub_volumes.iter().enumerate() {
+        let pv = sv.pv_page as usize;
+        let mut by_id: HashMap<[u16; 5], FileGroup> = HashMap::new();
+        for lp in 0..sv.n_pages as usize {
+            let vda = pv + lp;
+            let Some(s) = disk.sector(vda) else { continue };
+            let l = Label::parse(&s.label);
+            if !is_user_data_page(l.attributes)
+                || l.file_id == VAM_FILE_ID
+                || l.file_id == [0; 5]
+                || l.file_id == [0xffff; 5]
+            {
+                continue;
+            }
+            let entry = by_id.entry(l.file_id).or_insert((l.attributes, Vec::new()));
+            entry.1.push((file_page_number(&l), vda));
+        }
+        for (id, (type_word, mut pages)) in by_id {
+            pages.sort_by_key(|&(fp, _)| fp);
+            let size = pages.len() as u64 * PAGE_BYTES as u64;
+            let name = format!(
+                "LV{svidx}_{:04X}{:04X}_{}",
+                id[0],
+                id[1],
+                type_label(type_word)
+            );
+            files.push(PilotFile {
+                name,
+                file_id: id,
+                pages,
+                size,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    files
 }
 
 impl Filesystem for PilotFilesystem {
@@ -821,28 +885,22 @@ impl Filesystem for PilotFilesystem {
         entry: &FileEntry,
         max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        let sv = self.root_subvolume();
-        let header_vda = entry.location as usize;
-        let header = self
-            .disk
-            .sector(header_vda)
-            .ok_or_else(|| FilesystemError::Parse("Pilot: file header page out of range".into()))?;
-        let run = RunTable::parse(&header.data);
-
+        let file = self
+            .files
+            .get(entry.location as usize)
+            .ok_or_else(|| FilesystemError::Parse("Pilot: bad file index".into()))?;
+        // The label scan already ordered the data pages by logical page and
+        // resolved fragmentation, so concatenating them yields the file.
         let mut out = Vec::new();
-        'runs: for (first, count) in run.runs {
-            for p in 0..count {
-                let logical = first + p;
-                let vda = sv.pv_page + logical;
-                let Some(sector) = self.disk.sector(vda as usize) else {
-                    break 'runs;
-                };
-                let take = (max_bytes - out.len()).min(PAGE_BYTES);
-                out.extend_from_slice(&sector.data[..take]);
-                if out.len() >= max_bytes {
-                    break 'runs;
-                }
+        for &(_logical, vda) in &file.pages {
+            if out.len() >= max_bytes {
+                break;
             }
+            let Some(sector) = self.disk.sector(vda) else {
+                break;
+            };
+            let take = (max_bytes - out.len()).min(PAGE_BYTES);
+            out.extend_from_slice(&sector.data[..take]);
         }
         Ok(out)
     }

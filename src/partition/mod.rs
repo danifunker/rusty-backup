@@ -219,6 +219,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if first_sector[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
         return Some("Alto BFS".to_string());
     }
+    // Dwarf Draco 6085 ".zdisk"/".zdelta": a zlib stream (magic byte 0x78) that
+    // inflates to the 0xDAAD signature. A Pilot/Cedar pack; routes through the
+    // BrowseSession Alto branch (which reads the whole file and opens Pilot).
+    if first_sector[0] == 0x78 && crate::fs::alto::zdisk::is_zdisk(first_sector) {
+        return Some("Pilot/Cedar".to_string());
+    }
     // Salto Alto-emulator cooked `.dsk`: no magic, recognized by the exact
     // Diablo-31 image size plus a page-number prefix on record 1 that reads as
     // its VDA (1 big-endian, or 0x0100 little-endian — Salto images come in
