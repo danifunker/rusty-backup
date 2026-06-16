@@ -892,14 +892,18 @@ pub(crate) fn open_device_for_inspect(path: &Path) -> Result<File> {
         }
 
         let err = std::io::Error::last_os_error();
-        let raw = err.raw_os_error().unwrap_or(0);
-
-        if raw == libc::EPERM || raw == libc::EACCES {
-            return authopen_device(&raw_device, libc::O_RDWR)
-                .with_context(|| format!("cannot open {} for inspection", raw_device));
-        }
-
-        Err(anyhow::anyhow!(err).context(format!("cannot open {} for reading", raw_device)))
+        // The unprivileged open failed. Escalate via authopen (the native admin
+        // prompt, opening as root) for ANY errno — not just EPERM/EACCES. A
+        // still-mounted or DiskArbitration-claimed disk returns EBUSY here,
+        // which the old EPERM/EACCES-only gate let fall straight through to the
+        // error below with no prompt at all (the reported symptom). Inspect is
+        // read-only, so request O_RDONLY: root can open a mounted disk's raw
+        // device read-only even when an O_RDWR open would be refused with EBUSY.
+        // (Device *writes* go through open_target_for_writing, which unmounts
+        // and opens O_RDWR separately.)
+        log::warn!("direct open of {raw_device} failed ({err}); escalating via authopen");
+        authopen_device(&raw_device, libc::O_RDONLY)
+            .with_context(|| format!("cannot open {raw_device} for reading"))
     } else {
         File::open(path).with_context(|| format!("cannot open {}", path.display()))
     }
