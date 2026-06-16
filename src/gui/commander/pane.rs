@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
@@ -33,6 +35,16 @@ use super::Side;
 const ROW_H: f32 = 20.0;
 const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
 const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+
+/// What a pane reports back to [`super::CommanderMode`] after a frame.
+#[derive(Default)]
+pub(crate) struct PaneResponse {
+    /// A status line for the overlay's bottom bar, if anything happened.
+    pub status: Option<String>,
+    /// The user asked (via the row menu) to copy this pane's selection to the
+    /// other pane; `CommanderMode` performs the cross-pane copy.
+    pub copy_to_other: bool,
+}
 
 pub(crate) struct CommanderPane {
     side: Side,
@@ -85,13 +97,13 @@ impl CommanderPane {
         }
     }
 
-    /// Render the pane. Returns a status line when the user did something worth
-    /// surfacing in the overlay's bottom bar.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    /// Render the pane. Returns status + any cross-pane request for the overlay.
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> PaneResponse {
         let mut status = self.poll_open(ui.ctx());
         if let Some(s) = self.poll_apply(ui.ctx()) {
             status = Some(s);
         }
+        let mut copy_to_other = false;
 
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
@@ -122,16 +134,61 @@ impl CommanderPane {
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
         } else if self.listing.is_loaded() {
             self.render_header(ui);
-            if let Some(s) = self.render_rows(ui) {
-                status = Some(s);
+            let (s, copy) = self.render_rows(ui);
+            if s.is_some() {
+                status = s;
             }
+            copy_to_other = copy;
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
             });
         }
 
-        status
+        PaneResponse {
+            status,
+            copy_to_other,
+        }
+    }
+
+    // --- accessors used by CommanderMode for cross-pane copy ---------------
+
+    /// True when a volume is open and the pane isn't mid-operation.
+    pub(crate) fn can_receive(&self) -> bool {
+        self.listing.is_loaded() && self.pending_apply.is_none() && self.pending_open.is_none()
+    }
+
+    /// True when at least one row is selected.
+    pub(crate) fn has_selection(&self) -> bool {
+        !self.listing.selection().is_empty()
+    }
+
+    /// The selected entries (owned clones) in the current directory.
+    pub(crate) fn selected_entries(&self) -> Vec<FileEntry> {
+        self.listing
+            .selected_entries()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The current directory entry (copy destination parent).
+    pub(crate) fn cwd_entry(&self) -> Option<FileEntry> {
+        self.listing.cwd().cloned()
+    }
+
+    /// Mutable access to the open filesystem (to extract files for a copy).
+    pub(crate) fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
+        self.listing.fs_mut()
+    }
+
+    /// Push staged edits onto this pane's queue; returns how many.
+    pub(crate) fn stage_edits(&mut self, edits: Vec<StagedEdit>) -> usize {
+        let n = edits.len();
+        for e in edits {
+            self.queue.push(e);
+        }
+        n
     }
 
     // --- source bar --------------------------------------------------------
@@ -485,7 +542,7 @@ impl CommanderPane {
         }
     }
 
-    fn render_rows(&mut self, ui: &mut egui::Ui) -> Option<String> {
+    fn render_rows(&mut self, ui: &mut egui::Ui) -> (Option<String>, bool) {
         let rows = self.build_display_rows();
         let busy = self.pending_apply.is_some();
 
@@ -495,6 +552,7 @@ impl CommanderPane {
         let mut bg_deselect = false;
         let mut ctx_rclick: Option<String> = None;
         let mut m_delete = false;
+        let mut m_copy = false;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -539,6 +597,14 @@ impl CommanderPane {
                     // Right-click a data row for the staging menu.
                     if !row.is_parent() && !busy {
                         let menu = resp.context_menu(|ui| {
+                            // Copy applies to real / pending-delete rows, not a
+                            // not-yet-applied staged add.
+                            if !matches!(row.kind, RowKind::PendingAdd)
+                                && ui.button("Copy to other pane").clicked()
+                            {
+                                m_copy = true;
+                                ui.close();
+                            }
                             let label = match row.kind {
                                 RowKind::PendingDelete => "Undelete",
                                 RowKind::PendingAdd => "Remove from staging",
@@ -548,7 +614,6 @@ impl CommanderPane {
                                 m_delete = true;
                                 ui.close();
                             }
-                            ui.add_enabled(false, egui::Button::new("Copy to other pane (M3b)"));
                         });
                         if menu.is_some() {
                             ctx_rclick = Some(row.name.clone());
@@ -602,7 +667,7 @@ impl CommanderPane {
                 names.len()
             ));
         }
-        status
+        (status, m_copy)
     }
 }
 
