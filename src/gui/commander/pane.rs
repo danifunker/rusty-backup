@@ -16,6 +16,7 @@
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -101,6 +102,13 @@ pub(crate) struct CommanderPane {
     pending_host_delete: Option<Vec<String>>,
     /// The open "Rename..." dialog, if any (single entry at a time).
     rename_dialog: Option<RenameDialog>,
+    /// Tree view toggled on: the pane shows a folder tree (navigation) beside
+    /// the flat grid (the working set) instead of just the grid.
+    tree_mode: bool,
+    /// Lazily-listed child *directories* per directory path, for the tree.
+    tree_cache: HashMap<String, Vec<FileEntry>>,
+    /// Directory paths the user has expanded in the tree.
+    tree_expanded: HashSet<String>,
 }
 
 /// State for the modal "Rename..." dialog.
@@ -141,7 +149,16 @@ impl CommanderPane {
             pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
+            tree_mode: false,
+            tree_cache: HashMap::new(),
+            tree_expanded: HashSet::new(),
         }
+    }
+
+    /// Drop the cached tree so it re-lists against a freshly-(re)opened source.
+    fn reset_tree(&mut self) {
+        self.tree_cache.clear();
+        self.tree_expanded.clear();
     }
 
     /// Number of staged (unapplied) edits on this pane.
@@ -192,8 +209,37 @@ impl CommanderPane {
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
         } else if self.listing.is_loaded() {
-            self.render_header(ui);
-            let actions = self.render_rows(ui);
+            let mut actions = RowActions::default();
+            if self.tree_mode {
+                // Split: folder tree on the left (navigation), flat grid on the
+                // right (the working set the selection / copy / delete act on).
+                let avail = ui.available_size();
+                let tree_w = (avail.x * 0.38).clamp(140.0, 280.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(tree_w, avail.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("commander_tree", self.side.idx()))
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| self.render_tree(ui));
+                        },
+                    );
+                    ui.separator();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2((avail.x - tree_w - 12.0).max(120.0), avail.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_header(ui);
+                            actions = self.render_rows(ui);
+                        },
+                    );
+                });
+            } else {
+                self.render_header(ui);
+                actions = self.render_rows(ui);
+            }
             if actions.status.is_some() {
                 status = actions.status;
             }
@@ -470,6 +516,9 @@ impl CommanderPane {
     /// Re-read the current directory listing (after an immediate host write).
     pub(crate) fn reload_listing(&mut self) {
         let _ = self.listing.reload();
+        // A host write may have added / removed directories; drop the tree
+        // cache so it re-lists.
+        self.reset_tree();
     }
 
     /// True when at least one row is selected.
@@ -580,6 +629,11 @@ impl CommanderPane {
                 });
             }
 
+            // Tree toggle: show the folder tree (navigation) beside the grid.
+            if self.listing.is_loaded() && ui.selectable_label(self.tree_mode, "Tree").clicked() {
+                self.tree_mode = !self.tree_mode;
+            }
+
             // Right-aligned volume label + free space.
             if self.listing.is_loaded() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -665,6 +719,7 @@ impl CommanderPane {
         self.pending_open = None;
         self.pending_apply = None;
         self.queue.clear();
+        self.reset_tree();
         self.error = None;
         self.volume_label.clear();
         self.fs_type.clear();
@@ -690,6 +745,7 @@ impl CommanderPane {
 
     /// Begin an async open of partition `idx`.
     fn open_partition(&mut self, idx: usize) -> String {
+        self.reset_tree();
         let Some(path) = self.source.clone() else {
             return String::new();
         };
@@ -1136,6 +1192,88 @@ impl CommanderPane {
             copy: m_copy,
             export: m_export,
             checksums: m_checksums,
+        }
+    }
+
+    // --- tree view ---------------------------------------------------------
+
+    /// Render the lazy folder tree (directories only). Clicking a folder sets
+    /// the flat grid's current directory; the grid stays the working set the
+    /// selection / copy / delete / rename / checksum actions operate on.
+    fn render_tree(&mut self, ui: &mut egui::Ui) {
+        let Some(root) = self.listing.root_entry() else {
+            return;
+        };
+        let mut nav: Option<String> = None;
+        self.render_tree_node(ui, &root, true, &mut nav);
+        if let Some(path) = nav {
+            if let Err(e) = self.listing.navigate_to(&path) {
+                self.error = Some(format!("Cannot open '{path}': {e}"));
+            }
+        }
+    }
+
+    /// One tree node (a directory). Lazily lists its child directories on first
+    /// expansion (cached in `tree_cache`); recurses into expanded children. The
+    /// `nav` out-param carries a click target back up to [`render_tree`].
+    fn render_tree_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        entry: &FileEntry,
+        is_root: bool,
+        nav: &mut Option<String>,
+    ) {
+        let path = entry.path.clone();
+        // Side-keyed id so the two panes' trees never share CollapsingState.
+        let id = ui.make_persistent_id(("commander_tree_node", self.side.idx(), &path));
+        let mut state =
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
+        let is_cwd = self.listing.cwd_path() == path;
+        let label = if is_root && entry.name.is_empty() {
+            "/".to_string()
+        } else {
+            entry.name.clone()
+        };
+
+        let header = ui.horizontal(|ui| {
+            state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+            if ui.selectable_label(is_cwd, &label).clicked() {
+                *nav = Some(path.clone());
+            }
+        });
+
+        state.show_body_indented(&header.response, ui, |ui| {
+            match self.tree_cache.get(&path).cloned() {
+                Some(children) if children.is_empty() => {
+                    ui.weak("(no subfolders)");
+                }
+                Some(children) => {
+                    for child in &children {
+                        self.render_tree_node(ui, child, false, nav);
+                    }
+                }
+                None => {
+                    ui.weak("...");
+                }
+            }
+        });
+
+        // Lazily list child directories on first expansion.
+        if state.is_open() {
+            if !self.tree_cache.contains_key(&path) {
+                let mut dirs: Vec<FileEntry> = self
+                    .listing
+                    .list_dir(entry)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.is_directory())
+                    .collect();
+                dirs.sort_by_key(|e| e.name.to_lowercase());
+                self.tree_cache.insert(path.clone(), dirs);
+            }
+            self.tree_expanded.insert(path.clone());
+        } else {
+            self.tree_expanded.remove(&path);
         }
     }
 }

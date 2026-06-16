@@ -237,6 +237,41 @@ impl DirListing {
         Ok(())
     }
 
+    /// The volume / folder root frame's directory entry (the tree-view root),
+    /// or `None` before a source loads.
+    pub fn root_entry(&self) -> Option<FileEntry> {
+        self.stack.first().map(|f| f.dir.clone())
+    }
+
+    /// List `dir`'s children from the current source (public wrapper used by
+    /// the tree view to lazily populate a node). Independent of the navigation
+    /// stack — does not change the current directory.
+    pub fn list_dir(&mut self, dir: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        self.list_children(dir)
+    }
+
+    /// Jump the current directory to `path` (used by the tree view, which can
+    /// select any descendant of the root). Rebuilds the navigation stack from
+    /// the root down so `up()` still works afterwards. `path` must be the root
+    /// itself or a descendant of it.
+    pub fn navigate_to(&mut self, path: &str) -> Result<(), FilesystemError> {
+        if self.stack.is_empty() {
+            return Ok(());
+        }
+        let root_path = self.stack[0].dir.path.clone();
+        self.stack.truncate(1);
+        self.sort_current();
+        self.clear_selection();
+        if path == root_path {
+            return Ok(());
+        }
+        let rel = path.strip_prefix(&root_path).unwrap_or(path);
+        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+            self.enter(comp)?;
+        }
+        Ok(())
+    }
+
     /// List the children of `dir` from the current source.
     fn list_children(&mut self, dir: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
         match &mut self.source {
@@ -729,6 +764,35 @@ mod tests {
         let parent = base.path().parent().unwrap().to_string_lossy().to_string();
         l.up();
         assert_eq!(l.cwd_path(), parent);
+    }
+
+    #[test]
+    fn navigate_to_jumps_to_a_descendant_and_back() {
+        // base/a/b/f.txt
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("a").join("b")).unwrap();
+        std::fs::write(base.path().join("a").join("b").join("f.txt"), b"x").unwrap();
+
+        let mut l = DirListing::new();
+        l.load_host_root(base.path().to_path_buf()).unwrap();
+
+        let target = base
+            .path()
+            .join("a")
+            .join("b")
+            .to_string_lossy()
+            .to_string();
+        l.navigate_to(&target).unwrap();
+        assert_eq!(l.cwd_path(), target);
+        assert!(row_names(&l).iter().any(|n| n == "f.txt"));
+        // The rebuilt stack still supports `up()`.
+        l.up();
+        assert_eq!(l.cwd_path(), base.path().join("a").to_string_lossy());
+
+        // Jump straight back to the root.
+        let root = base.path().to_string_lossy().to_string();
+        l.navigate_to(&root).unwrap();
+        assert_eq!(l.cwd_path(), root);
     }
 
     #[test]

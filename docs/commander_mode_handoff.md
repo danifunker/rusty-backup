@@ -14,17 +14,21 @@ Last updated: 2026-06-16
   overlay. Full design in [`commander_mode.md`](commander_mode.md); tracked in
   [`OPEN-WORK.md`](OPEN-WORK.md) §6.1.
 - **Where it's at:** plan + mock + wired shell + a **working two-pane file
-  manager** (M2-lite + M3 + host panes): each pane opens a **disk image** (pick a
-  partition) or a **host folder**, with a sortable multi-select listing and `..` /
-  double-click nav. Image panes stage delete + copy-in (Apply/Discard writes
-  through, virtual overlay, unsaved guards); host panes write immediately
-  (delete behind a confirm). The middle column copies a selection between the
-  panes in **all four** combos (image↔image, host→image, image→host, host→host).
-- **Next concrete step (M6 — requested batch):** add right-click **Rename**,
-  **Calculate Checksums** (CRC32/MD5/SHA1/SHA256 window), and **Export to hard
-  drive**, plus a per-pane **Tree** toggle. A wildcard **Find/Search** is
-  deferred (M7). Full design in [`commander_mode.md`](commander_mode.md) §15; the
-  task breakdown is in "Next step" below.
+  manager** (M2-lite + M3 + host panes + **the whole M6 batch**): each pane opens
+  a **disk image** (pick a partition) or a **host folder**, with a sortable
+  multi-select listing and `..` / double-click nav. Image panes stage delete +
+  copy-in + rename (Apply/Discard writes through, virtual overlay, unsaved
+  guards); host panes write immediately (delete / rename behind a confirm). The
+  middle column copies a selection between the panes in **all four** combos
+  (image↔image, host→image, image→host, host→host). Right-click also offers
+  **Export to hard drive**, **Calculate checksums** (CRC32/MD5/SHA1/SHA256), and
+  **Rename** (FAT in-place); each pane has a **Tree** toggle.
+- **Next concrete step:** the M6 batch (Export, Checksums, Rename, Tree) is done.
+  Remaining: extend `EditableFilesystem::rename` to exFAT / HFS / HFS+ / ext (FAT
+  only today; gated by `fs::supports_rename`); the §3.3 **R4** tree-model dedup
+  (share the lazy tree between Commander and `browse_view`); and the deferred
+  wildcard **Find/Search** (M7, §15.5). Full design in
+  [`commander_mode.md`](commander_mode.md) §15.
 
 ## Commits on this branch
 
@@ -137,6 +141,20 @@ the H2 commit lands with this doc update.)
   progress, writer==reader). View: right-click "Calculate checksums..." opens
   `CommanderMode::checksums` — an `egui::Window` with a per-file 4-row grid
   (monospace value + Copy button) and a live spinner/progress bar while hashing.
+- **M6.4 Per-pane Tree view** — a "Tree" toggle on each pane's source bar splits
+  the pane into a lazy folder tree (left, navigation) + the flat grid (right, the
+  working set). "Tree navigates, grid is the working set" — clicking a tree folder
+  calls `DirListing::navigate_to(path)` to set the grid's cwd, so the existing
+  selection / copy / delete / rename / checksum model is untouched. New on
+  `DirListing`: `root_entry()`, `list_dir(dir)` (public lister, off-stack),
+  `navigate_to(path)` (rebuilds the stack from root). The tree state
+  (`tree_cache: HashMap<path, child-dirs>` + `tree_expanded`) lives on the pane and
+  is dropped on every source/partition switch + host re-list; nodes lazily list
+  child directories on first expansion (the browse_view `CollapsingState` pattern),
+  side-keyed `id_salt` per node. 1 model test (`navigate_to` jump + up + back).
+  NOTE: this is the *contained* version — it does **not** do the §3.3 R4 refactor
+  (lifting browse_view onto the shared tree); browse_view still has its own
+  `directory_cache`/`expanded_paths`. R4 dedup is a follow-up.
 
 ## How to run it
 
@@ -174,12 +192,11 @@ suggested order is smallest-win-first:
    **Remaining:** exFAT / HFS / HFS+ / ext `rename` overrides (each flips its core's
    cell to enabled once added — no GUI change needed beyond extending
    `fs::supports_rename`).
-4. **Per-pane Tree view** (§15.4) — *largest; a shared-model refactor.* A "Tree"
-   toggle on the source bar switches the pane to a lazy folder tree. Lift
-   `browse_view`'s `directory_cache` + `expanded_paths` + `render_tree_entry`
-   (egui `CollapsingState`) into the model (the §3.3 **R4** share) keyed by the same
-   `ListingSource`; both browse view and Commander render over it. Side-keyed
-   `id_salt` per `CollapsingState` (two-pane id gotcha). Can land last.
+4. **Per-pane Tree view** (§15.4) — *DONE (contained).* A "Tree" toggle splits the
+   pane into a lazy folder tree (navigation) + grid (working set);
+   `DirListing::navigate_to` drives cwd from tree clicks. The §3.3 **R4** dedup
+   (lifting `browse_view`'s `directory_cache`/`expanded_paths`/`render_tree_entry`
+   onto the shared tree so both views render over it) is **not** done — follow-up.
 
 **Deferred — M7 find/search** (§15.5): a per-pane wildcard (`*`/`?`) name search —
 `model::find::search(source, root, pattern, progress)` recursive walk + a results
