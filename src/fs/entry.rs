@@ -60,6 +60,12 @@ pub struct FileEntry {
     /// filesystems that have no DOS attribute concept. The copy engine
     /// carries this across FAT/exFAT destinations.
     pub dos_attributes: Option<u16>,
+    /// HFS/HFS+/MFS raw catalog dates `(create, modify, backup)` in Mac-epoch
+    /// seconds (since 1904-01-01 UTC). Kept raw so the detail pane can both
+    /// display them (via `hfs_common::format_mac_date`) and stage an in-place
+    /// edit (`StagedEdit::SetDates`). The `modify` value is also surfaced as a
+    /// formatted string in `modified`. `None` outside the HFS family.
+    pub mac_dates: Option<(u32, u32, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -96,6 +102,7 @@ impl FileEntry {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         }
     }
 
@@ -121,6 +128,7 @@ impl FileEntry {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         }
     }
 
@@ -146,6 +154,7 @@ impl FileEntry {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         }
     }
 
@@ -177,6 +186,7 @@ impl FileEntry {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         }
     }
 
@@ -207,6 +217,7 @@ impl FileEntry {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         }
     }
 

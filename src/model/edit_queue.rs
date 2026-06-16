@@ -87,6 +87,22 @@ pub enum StagedEdit {
         type_code: [u8; 4],
         creator_code: [u8; 4],
     },
+    /// Set Unix permission bits (`st_mode`) on an existing entry. Applied via
+    /// [`EditableFilesystem::set_permissions`]; ext-only today (other Unix
+    /// filesystems return `Unsupported`).
+    SetPermissions {
+        entry: FileEntry,
+        mode: u32,
+    },
+    /// Set HFS/HFS+ creation/modification/backup dates on an existing entry.
+    /// Values are Mac epoch seconds (since 1904-01-01 UTC); applied via
+    /// [`EditableFilesystem::set_dates`].
+    SetDates {
+        entry: FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
+    },
 }
 
 /// Walk an editable filesystem from the root to the directory at `path`,
@@ -222,6 +238,13 @@ pub fn apply_edit(
             &String::from_utf8_lossy(type_code),
             &String::from_utf8_lossy(creator_code),
         ),
+        StagedEdit::SetPermissions { entry, mode } => efs.set_permissions(entry, *mode),
+        StagedEdit::SetDates {
+            entry,
+            create,
+            modify,
+            backup,
+        } => efs.set_dates(entry, *create, *modify, *backup),
     }
 }
 
@@ -584,6 +607,58 @@ impl EditQueue {
             creator_code,
         });
     }
+
+    /// Push a `SetPermissions` edit, replacing any prior one targeting the
+    /// same on-disk path.
+    pub fn replace_set_permissions(&mut self, entry: &FileEntry, mode: u32) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetPermissions { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetPermissions {
+            entry: entry.clone(),
+            mode,
+        });
+    }
+
+    /// Return the permission bits the user has staged for `entry_path`, if any.
+    pub fn pending_permissions_for(&self, entry_path: &str) -> Option<u32> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetPermissions { entry, mode } if entry.path == entry_path => Some(*mode),
+            _ => None,
+        })
+    }
+
+    /// Push a `SetDates` edit, replacing any prior one targeting the same
+    /// on-disk path. Dates are Mac epoch seconds.
+    pub fn replace_set_dates(&mut self, entry: &FileEntry, create: u32, modify: u32, backup: u32) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetDates { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetDates {
+            entry: entry.clone(),
+            create,
+            modify,
+            backup,
+        });
+    }
+
+    /// Return the (create, modify, backup) Mac-epoch dates the user has staged
+    /// for `entry_path`, if any.
+    pub fn pending_dates_for(&self, entry_path: &str) -> Option<(u32, u32, u32)> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetDates {
+                entry,
+                create,
+                modify,
+                backup,
+            } if entry.path == entry_path => Some((*create, *modify, *backup)),
+            _ => None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -699,5 +774,39 @@ mod tests {
         assert_eq!(&disk[OFFSET..OFFSET + 2], &[0x4C, 0x4B]);
         // ...and the leading DDR / partition-map region is pristine.
         assert!(disk[..OFFSET].iter().all(|&b| b == 0xAB));
+    }
+
+    /// `replace_set_permissions` keeps a single staged edit per on-disk path
+    /// (the latest value wins) and `pending_permissions_for` reports it back.
+    #[test]
+    fn replace_set_permissions_dedups_and_reports() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+        let b = FileEntry::new_file("b".into(), "/b".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_permissions(&a, 0o644);
+        q.replace_set_permissions(&b, 0o600);
+        // Restaging the same path replaces, not appends.
+        q.replace_set_permissions(&a, 0o755);
+
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pending_permissions_for("/a"), Some(0o755));
+        assert_eq!(q.pending_permissions_for("/b"), Some(0o600));
+        assert_eq!(q.pending_permissions_for("/c"), None);
+    }
+
+    /// `replace_set_dates` keeps a single staged edit per on-disk path and
+    /// `pending_dates_for` reports the (create, modify, backup) triple back.
+    #[test]
+    fn replace_set_dates_dedups_and_reports() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_dates(&a, 100, 200, 300);
+        q.replace_set_dates(&a, 111, 222, 333);
+
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.pending_dates_for("/a"), Some((111, 222, 333)));
+        assert_eq!(q.pending_dates_for("/missing"), None);
     }
 }

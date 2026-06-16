@@ -51,6 +51,9 @@ pub(crate) struct PaneResponse {
     /// The user asked (via the row menu) to calculate checksums for this pane's
     /// selection; `CommanderMode` opens the threaded checksum window.
     pub checksums: bool,
+    /// The user double-clicked a file or chose "File Info..."; carries the
+    /// entry name. `CommanderMode` opens the floating File Info window over it.
+    pub detail: Option<String>,
 }
 
 /// Per-frame outcome of the listing grid (which row action, if any, fired).
@@ -63,6 +66,8 @@ struct RowActions {
     export: bool,
     /// Calculate checksums for the selection.
     checksums: bool,
+    /// Open the File Info window for this entry (by name).
+    detail: Option<String>,
 }
 
 pub(crate) struct CommanderPane {
@@ -126,6 +131,8 @@ enum PendingSwitch {
     Source(PathBuf),
     HostRoot(PathBuf),
     Partition(usize),
+    /// Close (unload) the pane entirely.
+    Close,
 }
 
 impl CommanderPane {
@@ -180,6 +187,7 @@ impl CommanderPane {
         let mut copy_to_other = false;
         let mut export_to_host = false;
         let mut checksums = false;
+        let mut detail = None;
 
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
@@ -246,6 +254,7 @@ impl CommanderPane {
             copy_to_other = actions.copy;
             export_to_host = actions.export;
             checksums = actions.checksums;
+            detail = actions.detail;
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -267,6 +276,7 @@ impl CommanderPane {
             copy_to_other,
             export_to_host,
             checksums,
+            detail,
         }
     }
 
@@ -472,6 +482,7 @@ impl CommanderPane {
                 PendingSwitch::Source(path) => self.load_source(path),
                 PendingSwitch::HostRoot(path) => self.load_host(path),
                 PendingSwitch::Partition(idx) => self.open_partition(idx),
+                PendingSwitch::Close => self.close_source(),
             });
         }
         if cancel {
@@ -533,6 +544,45 @@ impl CommanderPane {
         self.listing.fs_mut()
     }
 
+    /// Mutable access to this pane's staged-edit queue (so the File Info window
+    /// can stage metadata edits onto it).
+    pub(crate) fn queue_mut(&mut self) -> &mut EditQueue {
+        &mut self.queue
+    }
+
+    /// The current filesystem type string (e.g. "HFS", "ProDOS", "ext4"); empty
+    /// for a host pane or before a source is opened.
+    pub(crate) fn fs_type(&self) -> &str {
+        &self.fs_type
+    }
+
+    /// Look up an entry by name in the current directory and read up to `max`
+    /// bytes of its data for the File Info preview. Returns the entry plus its
+    /// bytes (`None` for a directory or on read error). Drives `open_detail`.
+    pub(crate) fn detail_payload(
+        &mut self,
+        name: &str,
+        max: usize,
+    ) -> Option<(FileEntry, Option<Vec<u8>>)> {
+        let entry = self
+            .listing
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()?;
+        if !entry.is_file() {
+            return Some((entry, None));
+        }
+        let data = if self.listing.is_host() {
+            read_host_file_capped(&entry.path, max)
+        } else {
+            self.listing
+                .fs_mut()
+                .and_then(|fs| fs.read_file(&entry, max).ok())
+        };
+        Some((entry, data))
+    }
+
     /// Push staged edits onto this pane's queue; returns how many.
     pub(crate) fn stage_edits(&mut self, edits: Vec<StagedEdit>) -> usize {
         let n = edits.len();
@@ -546,56 +596,74 @@ impl CommanderPane {
 
     fn source_bar(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let mut status = None;
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open...").clicked() {
-                if let Some(path) = super::super::file_dialog()
-                    .add_filter(
-                        "Disk Images",
-                        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                    )
-                    .add_filter("All Files", &["*"])
-                    .pick_file()
-                {
-                    if self.queue.is_empty() {
-                        status = Some(self.load_source(path));
-                    } else {
-                        self.pending_switch = Some(PendingSwitch::Source(path));
+
+        // Row 1: source selection + pane lifecycle (Close / Apply / Discard).
+        // Kept on its own line so the partition switcher (row 2) never gets
+        // squeezed into per-character wrapping on a narrow pane.
+        ui.horizontal(|ui| {
+            // Shared source picker (R1): the same ComboBox widget the Inspect
+            // tab uses, here offering an image file or a host folder. Image
+            // opens are not materialized (BrowseSession peels the container).
+            let current_label = if self.listing.is_host() {
+                "Local folder".to_string()
+            } else if let Some(p) = &self.source {
+                format!(
+                    "Image: {}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                )
+            } else {
+                "Open image or folder...".to_string()
+            };
+            let cfg = super::super::source_picker::PickerConfig {
+                show_devices: false,
+                show_image: true,
+                show_host_folder: true,
+                show_backup_folder: false,
+                materialize_image: false,
+                width: 200.0,
+            };
+            let state = super::super::source_picker::PickerState {
+                selected_device_idx: None,
+                image_active: self.source.is_some() && !self.listing.is_host(),
+                host_active: self.listing.is_host(),
+                backup_active: false,
+                devices: &[],
+            };
+            let id = format!("commander_source_{}", self.side.idx());
+            if let Some(ev) =
+                super::super::source_picker::show(ui, &id, &cfg, &current_label, &state)
+            {
+                use super::super::source_picker::SourceEvent;
+                match ev {
+                    SourceEvent::Image { path, .. } => {
+                        if self.queue.is_empty() {
+                            status = Some(self.load_source(path));
+                        } else {
+                            self.pending_switch = Some(PendingSwitch::Source(path));
+                        }
                     }
-                }
-            }
-            if ui.button("Open Folder...").clicked() {
-                if let Some(dir) = super::super::file_dialog().pick_folder() {
-                    if self.queue.is_empty() {
-                        status = Some(self.load_host(dir));
-                    } else {
-                        self.pending_switch = Some(PendingSwitch::HostRoot(dir));
+                    SourceEvent::HostFolder(dir) => {
+                        if self.queue.is_empty() {
+                            status = Some(self.load_host(dir));
+                        } else {
+                            self.pending_switch = Some(PendingSwitch::HostRoot(dir));
+                        }
                     }
+                    SourceEvent::Device(_) | SourceEvent::BackupFolder(_) => {}
                 }
             }
 
-            // Partition dropdown (image panes only; host folders have none).
-            if !self.listing.is_host() {
-                let current = self
-                    .selected_part
-                    .and_then(|i| self.partitions.get(i))
-                    .map(partition_label)
-                    .unwrap_or_else(|| "(no partitions)".to_string());
-                let mut chosen = self.selected_part;
-                egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (i, p) in self.partitions.iter().enumerate() {
-                            ui.selectable_value(&mut chosen, Some(i), partition_label(p));
-                        }
-                    });
-                if chosen != self.selected_part {
-                    if let Some(i) = chosen {
-                        if self.queue.is_empty() {
-                            status = Some(self.open_partition(i));
-                        } else {
-                            self.pending_switch = Some(PendingSwitch::Partition(i));
-                        }
-                    }
+            // Close (unload) this pane — guarded by unsaved staged edits.
+            if (self.source.is_some() || self.listing.is_loaded())
+                && ui
+                    .button("Close")
+                    .on_hover_text("Unload this pane")
+                    .clicked()
+            {
+                if self.queue.is_empty() {
+                    status = Some(self.close_source());
+                } else {
+                    self.pending_switch = Some(PendingSwitch::Close);
                 }
             }
 
@@ -616,17 +684,55 @@ impl CommanderPane {
                     }
                 });
             }
+        });
 
-            // Tree toggle: show the folder tree (navigation) beside the grid.
-            if self.listing.is_loaded() && ui.selectable_label(self.tree_mode, "Tree").clicked() {
-                self.tree_mode = !self.tree_mode;
-            }
+        // Row 2: partition switcher + view toggle + volume readout.
+        if self.listing.is_loaded() {
+            ui.horizontal(|ui| {
+                // Partition dropdown (image panes only; host folders have none).
+                if !self.listing.is_host() {
+                    let current = self
+                        .selected_part
+                        .and_then(|i| self.partitions.get(i))
+                        .map(partition_label)
+                        .unwrap_or_else(|| "(no partitions)".to_string());
+                    let mut chosen = self.selected_part;
+                    egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for (i, p) in self.partitions.iter().enumerate() {
+                                ui.selectable_value(&mut chosen, Some(i), partition_label(p));
+                            }
+                        });
+                    if chosen != self.selected_part {
+                        if let Some(i) = chosen {
+                            if self.queue.is_empty() {
+                                status = Some(self.open_partition(i));
+                            } else {
+                                self.pending_switch = Some(PendingSwitch::Partition(i));
+                            }
+                        }
+                    }
+                }
 
-            // Right-aligned volume label + free space.
-            if self.listing.is_loaded() {
+                // View toggle, rendered as an obvious button (List <-> Tree).
+                let tree_label = if self.tree_mode {
+                    "List view"
+                } else {
+                    "Tree view"
+                };
+                if ui
+                    .button(tree_label)
+                    .on_hover_text("Toggle folder-tree navigation")
+                    .clicked()
+                {
+                    self.tree_mode = !self.tree_mode;
+                }
+
+                // Right-aligned volume label + free space.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.listing.is_host() {
-                        ui.strong("host folder");
+                        ui.strong("local folder");
                     } else {
                         let free = self.total_size.saturating_sub(self.used_size);
                         ui.label(format!("free: {}", format_size(free)));
@@ -639,9 +745,33 @@ impl CommanderPane {
                         ui.strong(label);
                     }
                 });
-            }
-        });
+            });
+        }
         status
+    }
+
+    /// Unload the pane back to the empty state (the "Close" button). The caller
+    /// guards this behind the unsaved-edits check; here we just reset.
+    fn close_source(&mut self) -> String {
+        self.source = None;
+        self.partitions.clear();
+        self.selected_part = None;
+        self.listing = DirListing::new();
+        self.session = None;
+        self.queue.clear();
+        self.pending_open = None;
+        self.pending_apply = None;
+        self.open_phase.clear();
+        self.volume_label.clear();
+        self.fs_type.clear();
+        self.total_size = 0;
+        self.used_size = 0;
+        self.error = None;
+        self.pending_host_delete = None;
+        self.rename_dialog = None;
+        self.tree_mode = false;
+        self.reset_tree();
+        format!("[{}] closed.", self.side.label())
     }
 
     fn path_line(&mut self, ui: &mut egui::Ui) {
@@ -987,6 +1117,7 @@ impl CommanderPane {
         let mut m_checksums = false;
         let mut m_rename: Option<String> = None;
         let mut m_cancel_rename: Option<String> = None;
+        let mut m_info: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -1019,6 +1150,9 @@ impl CommanderPane {
                             to_up = true;
                         } else if row.is_dir {
                             to_enter = Some(row.name.clone());
+                        } else {
+                            // Double-click a file -> open its File Info window.
+                            m_info = Some(row.name.clone());
                         }
                     } else if resp.clicked() {
                         if row.is_parent() {
@@ -1055,6 +1189,15 @@ impl CommanderPane {
                                 && ui.button("Calculate checksums...").clicked()
                             {
                                 m_checksums = true;
+                                ui.close();
+                            }
+                            // File Info / Details: metadata + preview, with the
+                            // editable-metadata subset on image panes. Needs
+                            // real data, so a not-yet-applied add is excluded.
+                            if !matches!(row.kind, RowKind::PendingAdd)
+                                && ui.button("File Info / Details...").clicked()
+                            {
+                                m_info = Some(row.name.clone());
                                 ui.close();
                             }
                             // Rename a single entry in place. A row with a
@@ -1177,6 +1320,7 @@ impl CommanderPane {
             copy: m_copy,
             export: m_export,
             checksums: m_checksums,
+            detail: m_info,
         }
     }
 
@@ -1261,6 +1405,16 @@ impl CommanderPane {
             self.tree_expanded.remove(&path);
         }
     }
+}
+
+/// Read up to `max` bytes from a host file for the File Info preview.
+/// Returns `None` on any I/O error (the window then shows metadata only).
+fn read_host_file_capped(path: &str, max: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(max as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// How a row participates in the staged-edit overlay.

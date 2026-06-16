@@ -176,8 +176,10 @@ fn main() -> eframe::Result {
 
     let make_options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 700.0])
-            .with_min_inner_size([600.0, 400.0])
+            // Roomy default so the two-pane Commander Mode overlay (two
+            // listings + the middle action column) fits without clipping.
+            .with_inner_size([1200.0, 800.0])
+            .with_min_inner_size([700.0, 460.0])
             .with_icon(icon_data.clone())
             // app_id must match the .desktop file name so Wayland
             // compositors can look up the installed icon instead of

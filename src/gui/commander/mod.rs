@@ -21,19 +21,51 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus};
 use rusty_backup::partition::format_size;
 
+use super::file_detail::{self, FileContent};
+use super::metadata_editor::{
+    self, ExtPermsEditorState, HfsDatesEditorState, HfsTypeEditorState, ProdosTypeEditorState,
+};
+
 mod pane;
 
 use pane::CommanderPane;
+
+/// Upper bound on bytes read off a volume to preview the selected file in the
+/// File Info window (matches the classic browse view's cap).
+const MAX_PREVIEW_SIZE: usize = 1024 * 1024;
 
 /// An open "Calculate Checksums" window: its title and the worker status it
 /// polls each frame.
 struct ChecksumWindow {
     title: String,
     status: Arc<Mutex<ChecksumStatus>>,
+}
+
+/// An open "File Info" window: the entry it describes, its decoded preview, and
+/// the per-editor scratch state for the editable-metadata subset. Edits stage
+/// onto the owning pane's queue (resolved by `side`); host panes are read-only.
+struct DetailWindow {
+    /// Which pane owns the entry (and the queue edits stage onto).
+    side: Side,
+    entry: FileEntry,
+    /// True when the owning pane lists a host folder (read-only display).
+    is_host: bool,
+    /// The owning pane's filesystem type, gating which editors appear.
+    fs_type: String,
+    /// Decoded preview content (text or binary), or `None` for a directory /
+    /// unreadable file.
+    content: Option<FileContent>,
+    hfs_editor: Option<HfsTypeEditorState>,
+    prodos_editor: Option<ProdosTypeEditorState>,
+    dates_editor: Option<HfsDatesEditorState>,
+    perms_editor: Option<ExtPermsEditorState>,
+    /// Last staging status, shown in the window.
+    result: Option<String>,
 }
 
 /// Which pane is which. Kept tiny and `Copy` so it can key per-pane widget ids
@@ -85,6 +117,8 @@ pub struct CommanderMode {
     pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
     /// The open "Calculate Checksums" window, if any (one at a time).
     checksums: Option<ChecksumWindow>,
+    /// The open "File Info" window, if any (one at a time).
+    detail: Option<DetailWindow>,
 }
 
 impl Default for CommanderMode {
@@ -105,6 +139,7 @@ impl CommanderMode {
             unsaved_close: false,
             pending_host_copy: None,
             checksums: None,
+            detail: None,
         }
     }
 
@@ -164,6 +199,9 @@ impl CommanderMode {
                         if resp.checksums {
                             self.status = self.start_checksums(Side::Left);
                         }
+                        if let Some(name) = resp.detail {
+                            self.status = self.open_detail(Side::Left, name);
+                        }
                     },
                 );
                 ui.separator();
@@ -194,12 +232,16 @@ impl CommanderMode {
                         if resp.checksums {
                             self.status = self.start_checksums(Side::Right);
                         }
+                        if let Some(name) = resp.detail {
+                            self.status = self.open_detail(Side::Right, name);
+                        }
                     },
                 );
             });
         });
 
         self.render_checksum_window(ui.ctx());
+        self.render_detail_window(ui.ctx());
 
         if self.unsaved_close {
             let n = self.left.staged_count() + self.right.staged_count();
@@ -245,26 +287,27 @@ impl CommanderMode {
         let r_can = idle && self.right.has_selection() && self.left.can_receive();
 
         if ui
-            .add_enabled(l_can, egui::Button::new("Copy L -> R").min_size(w))
+            .add_enabled(l_can, egui::Button::new("Copy >>").min_size(w))
+            .on_hover_text("Copy the left pane's selection into the right pane")
             .clicked()
         {
             status = Some(self.copy(Side::Left));
         }
         ui.add_space(6.0);
         if ui
-            .add_enabled(r_can, egui::Button::new("Copy R -> L").min_size(w))
+            .add_enabled(r_can, egui::Button::new("Copy <<").min_size(w))
+            .on_hover_text("Copy the right pane's selection into the left pane")
             .clicked()
         {
             status = Some(self.copy(Side::Right));
         }
         ui.add_space(12.0);
         // Delete is staged per-pane via right-click; Compare is deferred.
-        ui.add_enabled(false, egui::Button::new("Delete\n(row menu)").min_size(w));
+        ui.add_enabled(false, egui::Button::new("Delete").min_size(w))
+            .on_hover_text("Use the row right-click menu to delete");
         ui.add_space(12.0);
-        ui.add_enabled(
-            false,
-            egui::Button::new("Compare\n(later)").min_size(egui::vec2(116.0, 30.0)),
-        );
+        ui.add_enabled(false, egui::Button::new("Compare").min_size(w))
+            .on_hover_text("Not implemented yet");
         status
     }
 
@@ -554,6 +597,159 @@ impl CommanderMode {
         }
         if !open {
             self.checksums = None;
+        }
+    }
+
+    /// Open the File Info window over the named entry in the `from` pane (§9).
+    /// Reads up to 1 MiB for the preview and snapshots the pane's fs type so the
+    /// window can offer the right editable-metadata subset. Replaces any window
+    /// already open.
+    fn open_detail(&mut self, from: Side, name: String) -> String {
+        let pane = match from {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        };
+        let is_host = pane.is_host_pane();
+        let fs_type = pane.fs_type().to_string();
+        let Some((entry, bytes)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
+            return format!("[{}] could not open File Info for '{name}'.", from.label());
+        };
+        let content = bytes.map(|data| file_detail::detect_content_type(&entry, &data));
+        let title = entry.name.clone();
+        self.detail = Some(DetailWindow {
+            side: from,
+            entry,
+            is_host,
+            fs_type,
+            content,
+            hfs_editor: None,
+            prodos_editor: None,
+            dates_editor: None,
+            perms_editor: None,
+            result: None,
+        });
+        format!("File Info: {title}")
+    }
+
+    /// Render the open File Info window (if any): read-only metadata rows + a
+    /// text/hex preview, plus the editable-metadata subset (HFS type/creator +
+    /// dates, ProDOS type, ext permissions) on image panes. Edits stage onto the
+    /// owning pane's queue; host panes are read-only.
+    fn render_detail_window(&mut self, ctx: &egui::Context) {
+        // Disjoint borrows: the window scratch and the owning pane's queue.
+        let CommanderMode {
+            detail,
+            left,
+            right,
+            ..
+        } = self;
+        let Some(win) = detail.as_mut() else {
+            return;
+        };
+        let pane = match win.side {
+            Side::Left => left,
+            Side::Right => right,
+        };
+
+        let fs = win.fs_type.as_str();
+        let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
+        let is_classic_hfs = fs == "HFS";
+        let is_prodos = fs == "ProDOS";
+        let is_ext = fs.starts_with("ext");
+        // Image panes get the editors; host panes are read-only display.
+        let edit_mode = !win.is_host;
+
+        let mut open = true;
+        egui::Window::new(format!("File Info: {}", win.entry.name))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                // Read-only metadata rows (HFS/ProDOS suppress inline type/creator
+                // — they render it in a dedicated editor row below).
+                file_detail::render_metadata_rows(ui, &win.entry, is_hfs || is_prodos);
+
+                let queue = pane.queue_mut();
+                if is_hfs && win.entry.is_file() {
+                    ui.separator();
+                    metadata_editor::render_hfs_type_row(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        queue,
+                        &mut win.hfs_editor,
+                        &mut win.result,
+                    );
+                }
+                if is_classic_hfs {
+                    metadata_editor::render_hfs_dates_row(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        queue,
+                        &mut win.dates_editor,
+                        &mut win.result,
+                    );
+                }
+                if is_prodos && win.entry.is_file() {
+                    ui.separator();
+                    metadata_editor::render_prodos_type_row(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        queue,
+                        &mut win.prodos_editor,
+                        &mut win.result,
+                    );
+                }
+                if is_ext {
+                    ui.separator();
+                    metadata_editor::render_ext_permissions_row(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        queue,
+                        &mut win.perms_editor,
+                        &mut win.result,
+                    );
+                }
+
+                if let Some(msg) = &win.result {
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), msg);
+                }
+
+                // Preview (read-only).
+                ui.separator();
+                match &win.content {
+                    Some(FileContent::Text(text)) => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("commander_detail_preview")
+                            .max_height(280.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut text.as_str())
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                            });
+                    }
+                    Some(FileContent::Binary(data)) => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("commander_detail_preview")
+                            .max_height(280.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                file_detail::render_hex_view(ui, data);
+                            });
+                    }
+                    None => {}
+                }
+            });
+
+        if !open {
+            self.detail = None;
         }
     }
 }

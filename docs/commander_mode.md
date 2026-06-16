@@ -1,12 +1,17 @@
 # Commander Mode — Design & Implementation Plan
 
-Status: **Shipped: M2-lite browsing + M3 staged writes + host panes.** Both
-panes browse disk images and host folders; staged delete + copy-in on image
-panes, immediate writes on host panes, all four copy combos, Apply/Discard,
-virtual overlay, unsaved guards. **Planned next:** the right-click action batch
-(Rename / Calculate Checksums / Export to hard drive), a per-pane tree view, and
-a wildcard find — all specced in §15. Then M1 widget extraction + the M4 File
-Info window.
+Status: **Shipped: M2-lite browsing + M3 staged writes + host panes + the M6
+right-click batch (Rename / Checksums / Export / Tree) + M1 widget extraction
+(R0+R1) + the M4 File Info window.** Both panes browse disk images and host
+folders; staged delete + copy-in on image panes, immediate writes on host
+panes, all four copy combos, Apply/Discard, virtual overlay, unsaved guards. A
+floating File Info window (double-click a file or right-click → "File Info /
+Details…") shows metadata + a text/hex preview and stages the editable subset
+(HFS type/creator + dates, ProDOS type, ext permissions) onto the owning pane's
+queue. The source bar (Inspect tab + both Commander panes) is the shared
+`source_picker` widget. **Planned next:** the deferred wildcard **Find/Search**
+(M7, §15.5); the R4 tree-model dedup with the browse view (§3.3); M5+ Compare +
+the broader metadata-setter backlog (§10.2).
 Last updated: 2026-06-16
 Owner: TBD
 
@@ -172,13 +177,17 @@ because the classic browse view must look/behave identically afterward.
 
 ### 3.3 Refactor sequencing
 
-- **R0** — Extract `file_detail` + `metadata_editor` + size/date helpers (pure moves).
-  Browse view keeps working identically. *Ship, verify, then continue.*
-- **R1** — Extract `source_picker` from `inspect_tab`; Inspect tab adopts it.
-- **R2** — Add `DirListing` (new model) + the async listing worker.
-- **R3** — Build `CommanderPane` / `CommanderMode` on R0–R2.
+- **R0** (**done**) — Extracted `file_detail` (metadata rows, content-type classify,
+  hex preview) + `metadata_editor` (HFS type/creator, ProDOS type, plus new HFS-dates
+  and ext-permissions rows). Browse view behaves identically.
+- **R1** (**done**) — Extracted `source_picker` from `inspect_tab`; the Inspect tab and
+  both Commander pane source bars now render the same ComboBox widget and share the
+  `pick_image_file` open/filter/materialize logic.
+- **R2** (**done**) — `DirListing` model + the async listing worker.
+- **R3** (**done**) — `CommanderPane` / `CommanderMode` on R0–R2.
 - **R4** — (optional, later) migrate `browse_view`'s tree to share `DirListing` for
-  its lazy children, retiring duplicate `directory_cache` logic.
+  its lazy children, retiring duplicate `directory_cache` logic. Commander's own tree
+  (§15.4) shipped self-contained; this is the cross-view dedup.
 
 ---
 
@@ -481,15 +490,17 @@ needs a new setter.
 
 ### 10.2 Concrete to-do checklist
 
-v1 (needed for the detail-pane editing we promised):
+v1 (needed for the detail-pane editing we promised) — **done**:
 
-- [ ] Add `StagedEdit::SetPermissions { path, mode }` + `apply_edit` arm (calls
-      `set_permissions`). Wire ext.
-- [ ] Add `StagedEdit::SetDates { path, create, modify, backup }` + `apply_edit` arm
-      (calls `set_dates`). Wire HFS.
-- [ ] Surface HFS create/modify/backup dates so the detail pane can show + edit them
-      (either extend `FileEntry` with optional `created`/`backup` strings, or a
-      `file_detail`-only HFS date fetch). Pick one in R0.
+- [x] Added `StagedEdit::SetPermissions { entry, mode }` + `apply_edit` arm (calls
+      `set_permissions`). Wired ext via the `metadata_editor` permissions row.
+- [x] Added `StagedEdit::SetDates { entry, create, modify, backup }` + `apply_edit`
+      arm (calls `set_dates`). Wired HFS via the `metadata_editor` dates row.
+- [x] Surfaced HFS create/modify/backup dates on `FileEntry::mac_dates` (raw Mac-epoch
+      triple), decoded from the catalog in `hfs.rs`; `hfs_common::{format_mac_date,
+      parse_mac_date}` convert to/from the `YYYY-MM-DD HH:MM:SS` display/edit string.
+      (Chose the `FileEntry` field over a `file_detail`-only fetch — it serves both
+      display and round-trip editing.)
 
 Future phases (each unchecked = one driver-spanning task):
 
@@ -535,20 +546,26 @@ per-row diff status. Re-spec when we get there.
 ## 13. Milestones
 
 1. **M0 — mock** (done): `examples/commander_mock.rs`, layout & interaction agreed.
-2. **M1 — refactor R0/R1**: extract `file_detail`, `metadata_editor`, `source_picker`;
-   browse view + Inspect adopt them unchanged. *(not started)*
+2. **M1 — refactor R0/R1** (**done**): extracted `file_detail` + `metadata_editor`
+   (R0) and `source_picker` (R1, §3.2); the browse view, the Inspect tab, and both
+   Commander panes adopt them. R4 (browse-view tree dedup) is still deferred.
 3. **M2 — read-only Commander** (**done**, M2-lite): overlay, two panes, source open
-   (picker), `DirListing`, columns, sort, `..` nav. (Drag-load + detail window pending.)
+   (picker), `DirListing`, columns, sort, `..` nav.
 4. **M3 — staged writes** (**done**): per-pane `EditQueue`, copy (image↔image staged),
    delete, Apply/Discard, unsaved guard, virtual overlay.
 5. **Host panes** (**done**): host-folder source, all four copy combos (host→image staged;
    image→host / host→host immediate threaded), immediate host delete.
-6. **M4 — editable subset**: detail-pane editing for HFS/ProDOS/ext (+ the two new
-   `StagedEdit` variants from §10.2).
-7. **M6 — right-click action batch** (§15): **Rename** (§15.1), **Calculate Checksums**
-   (§15.2), **Export to hard drive** (§15.3), and the **per-pane tree view** (§15.4).
+6. **M4 — editable subset** (**done**): the floating File Info window (§9) — metadata
+   rows + text/hex preview + the editable subset (HFS type/creator via the extracted
+   widget; HFS dates and ext permissions via the new `SetDates` / `SetPermissions`
+   queue variants; ProDOS type), staged onto the owning pane's queue. HFS catalog
+   dates are surfaced on `FileEntry::mac_dates`.
+7. **M6 — right-click action batch** (§15, **done**): **Rename** (§15.1), **Calculate
+   Checksums** (§15.2), **Export to hard drive** (§15.3), and the **per-pane tree view**
+   (§15.4).
 8. **M7 — find / search** (§15.5, deferrable): wildcard name search per pane.
-9. **M5+** — Compare; the broad metadata-setter backlog from §10.2.
+9. **M5+** — Compare; the R4 tree-model dedup (§3.3); the broad metadata-setter
+   backlog from §10.2.
 
 ---
 

@@ -40,6 +40,14 @@ use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 const MAX_FLOPPY_CONTAINER_BYTES: u64 = 2 * 1024 * 1024;
 
 /// State for the Inspect tab.
+/// A source change (open or close) deferred behind the unsaved-edits confirm,
+/// so the live source is never mutated — and a new disk never partially loads —
+/// until the user resolves the prompt.
+enum PendingSourceChange {
+    Open(super::source_picker::SourceEvent),
+    Close,
+}
+
 pub struct InspectTab {
     /// Index into the device list, or None if "Open Image File..." is selected
     selected_device_idx: Option<usize>,
@@ -84,6 +92,9 @@ pub struct InspectTab {
     prev_device_idx: Option<usize>,
     prev_image_path: Option<PathBuf>,
     prev_backup_path: Option<PathBuf>,
+    /// A source open/close held until the user resolves the unsaved-edits
+    /// prompt (deferred-switch guard). `None` when nothing is pending.
+    pending_source_change: Option<PendingSourceChange>,
     /// Filesystem browser
     browse_view: BrowseView,
     /// Export: true if the export popup is open
@@ -225,6 +236,7 @@ impl Default for InspectTab {
             prev_device_idx: None,
             prev_image_path: None,
             prev_backup_path: None,
+            pending_source_change: None,
             browse_view: BrowseView::default(),
             export_popup: false,
             export_whole_disk: true,
@@ -417,73 +429,36 @@ impl InspectTab {
                 "Select a device or image...".into()
             };
 
-            egui::ComboBox::from_id_salt("inspect_source")
-                .selected_text(&current_label)
-                .width(400.0)
-                .height(400.0) // Allow more items to be visible without scrolling
-                .show_ui(ui, |ui| {
-                    for (i, device) in ctx.devices.iter().enumerate() {
-                        let label = device.display_name();
-                        if ui
-                            .selectable_value(&mut self.selected_device_idx, Some(i), &label)
-                            .clicked()
-                        {
-                            self.image_file_path = None;
-                            self.amiga_tempdir = None;
-                            self.backup_folder_path = None;
-                            self.clear_results();
-                        }
-                    }
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open File...")
-                        .clicked()
-                    {
-                        if let Some(path) = super::file_dialog()
-                            .add_filter(
-                                "Disk Images",
-                                rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                            )
-                            .add_filter(
-                                "Mac archives",
-                                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-                            )
-                            .add_filter("All Files", &["*"])
-                            .pick_file()
-                        {
-                            self.selected_device_idx = None;
-                            self.backup_folder_path = None;
-                            // Transparently decompress .adz / .hdz so the
-                            // rest of the pipeline (PartitionTable::detect,
-                            // backup, browse) sees a raw image. Floppy
-                            // containers (.d88/.xdf/.hdm/.dim) are NOT decoded
-                            // here (false) — they open directly so edits
-                            // persist back into the container via the browse
-                            // view's ContainerEditSession writeback.
-                            match super::prepare_disk_image_path(&path, false) {
-                                Ok((materialized, guard)) => {
-                                    self.image_file_path = Some(materialized);
-                                    self.amiga_tempdir = guard;
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to decompress {}: {}", path.display(), e);
-                                    self.image_file_path = Some(path);
-                                    self.amiga_tempdir = None;
-                                }
-                            }
-                            self.clear_results();
-                        }
-                    }
-                    if ui
-                        .selectable_label(
-                            self.backup_folder_path.is_some(),
-                            "Open Backup Folder...",
-                        )
-                        .clicked()
-                    {
-                        self.pick_backup_folder();
-                    }
-                });
+            // Shared source picker (R1): same ComboBox widget the Commander
+            // panes use. It owns the rfd dialogs + image filter/materialize and
+            // emits a SourceEvent; we map that onto our source state here.
+            let cfg = super::source_picker::PickerConfig {
+                show_devices: true,
+                show_image: true,
+                show_host_folder: false,
+                show_backup_folder: true,
+                materialize_image: true,
+                width: 400.0,
+            };
+            let state = super::source_picker::PickerState {
+                selected_device_idx: self.selected_device_idx,
+                image_active: self.image_file_path.is_some(),
+                host_active: false,
+                backup_active: self.backup_folder_path.is_some(),
+                devices: ctx.devices,
+            };
+            if let Some(ev) =
+                super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
+            {
+                // Gate the switch on unsaved browse edits: defer it behind the
+                // confirm prompt so the live source is untouched (and no new
+                // disk partially loads) until the user resolves it.
+                if self.browse_view.has_unsaved_edits() {
+                    self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                } else {
+                    self.apply_source_event(ev);
+                }
+            }
         });
 
         ui.add_space(4.0);
@@ -494,30 +469,29 @@ impl InspectTab {
             || self.backup_folder_path != self.prev_backup_path;
 
         if selection_changed {
-            if self.browse_view.is_active() && !self.browse_view.close_or_prompt() {
-                // Unsaved-edits dialog shown; revert the selection until the
-                // user resolves it. They can re-pick the new source after.
-                self.selected_device_idx = self.prev_device_idx;
-                self.image_file_path = self.prev_image_path.clone();
-                self.backup_folder_path = self.prev_backup_path.clone();
-            } else {
-                self.prev_device_idx = self.selected_device_idx;
-                self.prev_image_path = self.image_file_path.clone();
-                self.prev_backup_path = self.backup_folder_path.clone();
-                // Re-sniff floppy-ness on every source change so the
-                // "Convert Floppy Container..." button tracks the source.
-                self.source_is_floppy = self
-                    .image_file_path
-                    .as_deref()
-                    .map(Self::detect_source_is_floppy)
-                    .unwrap_or(false);
-                if self.backup_folder_path.is_some() {
-                    self.load_backup_metadata(ctx);
-                } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
-                    self.run_inspect(ctx);
-                }
+            // The source only ever changes through `apply_source_event` /
+            // `do_close` (both gated upstream on unsaved edits), so by here the
+            // switch is committed — just record it and load.
+            self.prev_device_idx = self.selected_device_idx;
+            self.prev_image_path = self.image_file_path.clone();
+            self.prev_backup_path = self.backup_folder_path.clone();
+            // Re-sniff floppy-ness on every source change so the
+            // "Convert Floppy Container..." button tracks the source.
+            self.source_is_floppy = self
+                .image_file_path
+                .as_deref()
+                .map(Self::detect_source_is_floppy)
+                .unwrap_or(false);
+            if self.backup_folder_path.is_some() {
+                self.load_backup_metadata(ctx);
+            } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
+                self.run_inspect(ctx);
             }
         }
+
+        // Deferred source-switch confirm (shown when a switch/close was
+        // requested while the browse view had unsaved staged edits).
+        self.render_source_switch_guard(ui, ctx);
 
         // Poll background inspect (physical device)
         self.poll_inspect_status(ctx);
@@ -740,44 +714,17 @@ impl InspectTab {
                 }
             }
 
-            // Close button — releases the device/image and clears results
-            if self.selected_device_idx.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Device").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.selected_device_idx = None;
-                self.prev_device_idx = None;
-                ctx.log.info("Device closed and remounted.");
-            }
-            if self.image_file_path.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Image").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.image_file_path = None;
-                self.amiga_tempdir = None;
-                self.prev_image_path = None;
-                ctx.log.info("Image file closed.");
-            }
-            if self.backup_folder_path.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Backup").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.backup_folder_path = None;
-                self.prev_backup_path = None;
-                // Signal to gui::mod that the cross-tab `loaded_backup_folder`
-                // should be cleared too — otherwise its auto-reopen fallback
-                // re-loads the backup on the very next frame.
-                self.close_backup_requested = true;
-                ctx.log.info("Backup folder closed.");
+            // One consolidated Close button: clears whatever source is open
+            // (device / image / backup). Guarded by unsaved browse edits.
+            let any_source = self.selected_device_idx.is_some()
+                || self.image_file_path.is_some()
+                || self.backup_folder_path.is_some();
+            if any_source && !inspect_running && !export_running && ui.button("Close").clicked() {
+                if self.browse_view.has_unsaved_edits() {
+                    self.pending_source_change = Some(PendingSourceChange::Close);
+                } else {
+                    self.do_close(ctx);
+                }
             }
 
             if export_running && ui.button("Cancel Export").clicked() {
@@ -2520,12 +2467,93 @@ impl InspectTab {
         }
     }
 
-    fn pick_backup_folder(&mut self) {
-        if let Some(path) = super::file_dialog().pick_folder() {
-            self.backup_folder_path = Some(path);
-            self.selected_device_idx = None;
-            self.image_file_path = None;
-            self.clear_results();
+    /// Apply a picked source: close any open browse view, set the source
+    /// fields, and clear stale results. The subsequent `selection_changed`
+    /// pass loads the new source. Unsaved-edit gating happens at the call site.
+    fn apply_source_event(&mut self, ev: super::source_picker::SourceEvent) {
+        use super::source_picker::SourceEvent;
+        self.browse_view.close();
+        match ev {
+            SourceEvent::Device(i) => {
+                self.selected_device_idx = Some(i);
+                self.image_file_path = None;
+                self.amiga_tempdir = None;
+                self.backup_folder_path = None;
+                self.clear_results();
+            }
+            SourceEvent::Image { path, tempdir } => {
+                self.selected_device_idx = None;
+                self.backup_folder_path = None;
+                self.image_file_path = Some(path);
+                self.amiga_tempdir = tempdir;
+                self.clear_results();
+            }
+            SourceEvent::BackupFolder(path) => {
+                self.backup_folder_path = Some(path);
+                self.selected_device_idx = None;
+                self.image_file_path = None;
+                self.clear_results();
+            }
+            // Inspect's picker doesn't offer a host folder.
+            SourceEvent::HostFolder(_) => {}
+        }
+    }
+
+    /// Close whatever source is open (the consolidated Close button). Unsaved
+    /// edits are gated at the call site.
+    fn do_close(&mut self, ctx: &mut TabContext) {
+        let was_backup = self.backup_folder_path.is_some();
+        self.browse_view.close();
+        self.clear_results();
+        self.selected_device_idx = None;
+        self.prev_device_idx = None;
+        self.image_file_path = None;
+        self.amiga_tempdir = None;
+        self.prev_image_path = None;
+        self.backup_folder_path = None;
+        self.prev_backup_path = None;
+        if was_backup {
+            // Otherwise gui::mod's auto-reopen fallback re-loads the backup.
+            self.close_backup_requested = true;
+        }
+        ctx.log.info("Source closed.");
+    }
+
+    /// Modal shown when a source open/close was requested while the browse view
+    /// had unsaved staged edits: discard and proceed, or cancel and keep the
+    /// current source fully intact (it was never touched).
+    fn render_source_switch_guard(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        if self.pending_source_change.is_none() {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Discard unsaved edits?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("The open volume has unapplied staged edits.");
+                ui.label("Switching or closing the source will discard them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard & continue").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.browse_view.close();
+            match self.pending_source_change.take() {
+                Some(PendingSourceChange::Open(ev)) => self.apply_source_event(ev),
+                Some(PendingSourceChange::Close) => self.do_close(ctx),
+                None => {}
+            }
+        } else if cancel {
+            self.pending_source_change = None;
         }
     }
 

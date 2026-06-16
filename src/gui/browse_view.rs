@@ -27,6 +27,9 @@ use rusty_backup::rbformats::chd_edit::{
     self, is_compressed_chd, make_backup_copy, ChdEditSession,
 };
 
+use super::file_detail::{self, FileContent};
+use super::metadata_editor::{self, HfsTypeEditorState, ProdosTypeEditorState};
+
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
 /// Upper bound on bytes read off the disk image to sniff whether the
@@ -152,8 +155,7 @@ pub struct BrowseView {
     show_unsaved_dialog: bool,
     /// When true, a successful Discard/Apply from the unsaved dialog should
     /// fully close the browse view rather than just leaving edit mode. Set by
-    /// `close_or_prompt()` when the caller wants to dismiss the view but
-    /// staged edits force the dialog first.
+    /// the in-view Close intercept when staged edits force the dialog first.
     pending_close: bool,
     /// Inline ProDOS type/aux editor state, keyed by entry path. Reset when
     /// the selection changes.
@@ -310,34 +312,6 @@ struct PendingExtraction {
     dest: PathBuf,
     /// Path(s) at `dest` that already exist and would be replaced.
     conflicts: Vec<PathBuf>,
-}
-
-/// Transient state for the "Set ProDOS Type…" dialog.
-#[derive(Debug, Clone)]
-/// Inline editor state for an HFS/HFS+ file's type and creator codes.
-struct HfsTypeEditorState {
-    /// Path of the entry being edited — invalidates when selection changes.
-    entry_path: String,
-    /// 4-char freeform input for the type code (clamped on every frame).
-    type_input: String,
-    /// 4-char freeform input for the creator code.
-    creator_input: String,
-}
-
-/// Inline editor state for a ProDOS file's type byte and aux type.
-struct ProdosTypeEditorState {
-    /// Path of the entry being edited — invalidates when selection changes.
-    entry_path: String,
-    /// 2-char hex input for the type byte.
-    type_input: String,
-    /// 4-char hex input for the aux type.
-    aux_input: String,
-}
-
-#[derive(Debug, Clone)]
-enum FileContent {
-    Binary(Vec<u8>),
-    Text(String),
 }
 
 /// How to encode ProDOS file type/aux when extracting files to a host
@@ -665,20 +639,12 @@ impl BrowseView {
         self.active
     }
 
-    /// Close the browse view, prompting first if there are unsaved staged
-    /// edits. Returns true if the view is now closed; false if the unsaved
-    /// dialog was shown and the caller should retry on a later frame.
-    pub fn close_or_prompt(&mut self) -> bool {
-        if !self.active {
-            return true;
-        }
-        if self.edit_mode && !self.staged_edits.is_empty() {
-            self.show_unsaved_dialog = true;
-            self.pending_close = true;
-            return false;
-        }
-        self.close();
-        true
+    /// True when the view is open in edit mode with unapplied staged edits —
+    /// i.e. closing / switching the source would lose work. Lets a caller gate
+    /// a source switch behind its own confirm dialog (see Inspect's deferred
+    /// source-switch guard) before calling [`close`](Self::close).
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.active && self.edit_mode && !self.staged_edits.is_empty()
     }
 
     /// Returns true if the current filesystem is HFS or HFS+.
@@ -1376,7 +1342,7 @@ impl BrowseView {
                 green
             }
         } else if self.is_prodos_type() && entry.is_file() {
-            let (t, _) = self.resolved_prodos_type(entry);
+            let (t, _) = metadata_editor::resolved_prodos_type(&self.staged_edits, entry);
             if !rusty_backup::fs::prodos_types::is_known_type(t) {
                 blue
             } else {
@@ -1501,7 +1467,7 @@ impl BrowseView {
         if let Some(mut fs) = self.take_or_open_fs() {
             match fs.read_file(entry, MAX_PREVIEW_SIZE) {
                 Ok(data) => {
-                    self.content = Some(detect_content_type(entry, &data));
+                    self.content = Some(file_detail::detect_content_type(entry, &data));
                 }
                 Err(e) => {
                     self.error = Some(format!("Failed to read file: {e}"));
@@ -1547,56 +1513,36 @@ impl BrowseView {
             }
             Some(entry) => {
                 let entry = entry.clone();
-                // File info header
-                ui.label(egui::RichText::new(&entry.name).strong());
-                ui.horizontal(|ui| {
-                    ui.label(format!("Size: {}", entry.size_string()));
-                    if let Some(modified) = &entry.modified {
-                        if !modified.is_empty() {
-                            ui.label(format!("Modified: {modified}"));
-                        }
-                    }
-                    // HFS/HFS+ and ProDOS render Type/Creator (or Type/Aux)
-                    // below in a dedicated editor row. For other filesystems
-                    // there's nothing extra to show, so this block is empty.
-                    if !self.is_hfs_type() && !self.is_prodos_type() {
-                        if let Some(ref tc) = entry.type_code {
-                            ui.label(format!("Type: {tc}"));
-                        }
-                        if let Some(ref cc) = entry.creator_code {
-                            ui.label(format!("Creator: {cc}"));
-                        }
-                    }
-                    if let Some(ref rsrc) = entry.resource_fork_size {
-                        if *rsrc > 0 {
-                            ui.label(format!("Rsrc: {}", partition::format_size(*rsrc)));
-                        }
-                    }
-                    if let Some(mode_str) = entry.mode_string() {
-                        ui.label(format!("Permissions: {mode_str}"));
-                    }
-                    if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
-                        ui.label(format!("Owner: {uid}:{gid}"));
-                    }
-                    if let Some(ref target) = entry.symlink_target {
-                        ui.label(format!("Target: {target}"));
-                    }
-                    if let Some(ref stype) = entry.special_type {
-                        ui.label(format!("Type: {stype}"));
-                    }
-                    ui.label(format!("Path: {}", entry.path));
-                });
+                // Read-only metadata rows (name header + size/modified/type/...).
+                // HFS/HFS+ and ProDOS suppress the inline Type/Creator labels —
+                // they render those in a dedicated editor row below.
+                let suppress_type_creator = self.is_hfs_type() || self.is_prodos_type();
+                file_detail::render_metadata_rows(ui, &entry, suppress_type_creator);
 
                 // HFS/HFS+ type/creator row — read-only labels normally, full
                 // editor (text fields + dictionary pulldown) when in edit mode.
                 if self.is_hfs_type() && entry.is_file() {
-                    self.render_hfs_type_row(ui, &entry);
+                    metadata_editor::render_hfs_type_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        &mut self.staged_edits,
+                        &mut self.hfs_type_editor,
+                        &mut self.edit_result,
+                    );
                 }
 
                 // ProDOS type/aux row — read-only normally, type pulldown + hex
                 // inputs when in edit mode.
                 if self.is_prodos_type() && entry.is_file() {
-                    self.render_prodos_type_row(ui, &entry);
+                    metadata_editor::render_prodos_type_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        &mut self.staged_edits,
+                        &mut self.prodos_type_editor,
+                        &mut self.edit_result,
+                    );
                 }
 
                 // ProDOS/GS-OS leaves $CB..$EE unassigned in the official
@@ -1813,7 +1759,7 @@ impl BrowseView {
                             .max_height(content_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                render_hex_view(ui, data);
+                                file_detail::render_hex_view(ui, data);
                             });
                     }
                 }
@@ -3269,335 +3215,6 @@ impl BrowseView {
                 self.root = Some(root);
             }
             self.return_fs(fs);
-        }
-    }
-
-    /// Render the HFS/HFS+ type/creator row beneath the file-info header.
-    /// Read-only when not in edit mode; full editor (text + pulldown + Set
-    /// button) when edit mode is on. For directories, no-op.
-    fn render_hfs_type_row(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        let (cur_t, cur_c) = self.staged_edits.resolved_hfs_type_creator(entry);
-        let cur_t_str = String::from_utf8_lossy(&cur_t).to_string();
-        let cur_c_str = String::from_utf8_lossy(&cur_c).to_string();
-        let cur_desc = rusty_backup::fs::hfs_common::describe_type_creator(&cur_t, &cur_c);
-
-        if !self.edit_mode {
-            ui.horizontal(|ui| {
-                if cur_t != [0; 4] || cur_c != [0; 4] {
-                    let label = match cur_desc {
-                        Some(d) => format!("Type: {cur_t_str}  Creator: {cur_c_str}  ({d})"),
-                        None => format!("Type: {cur_t_str}  Creator: {cur_c_str}"),
-                    };
-                    ui.label(label);
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(120, 160, 220),
-                        "Type: (none)  Creator: (none)",
-                    );
-                }
-            });
-            return;
-        }
-
-        // Edit mode — seed editor state if it's a different entry.
-        let needs_seed = self
-            .hfs_type_editor
-            .as_ref()
-            .map(|s| s.entry_path != entry.path)
-            .unwrap_or(true);
-        if needs_seed {
-            self.hfs_type_editor = Some(HfsTypeEditorState {
-                entry_path: entry.path.clone(),
-                type_input: cur_t_str.clone(),
-                creator_input: cur_c_str.clone(),
-            });
-        }
-
-        let mut stage_action: Option<([u8; 4], [u8; 4])> = None;
-        let mut reset_action = false;
-
-        // Borrow editor mutably inside one ui.horizontal closure.
-        if let Some(state) = self.hfs_type_editor.as_mut() {
-            ui.horizontal(|ui| {
-                ui.label("Type:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.type_input)
-                        .desired_width(48.0)
-                        .char_limit(4)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.label("Creator:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.creator_input)
-                        .desired_width(48.0)
-                        .char_limit(4)
-                        .font(egui::TextStyle::Monospace),
-                );
-
-                // Pulldown with current FInfo first, then dictionary by name.
-                let combo_label = match cur_desc {
-                    Some(d) => format!("(current) {cur_t_str}/{cur_c_str} — {d}"),
-                    None if cur_t != [0; 4] || cur_c != [0; 4] => {
-                        format!("(current) {cur_t_str}/{cur_c_str}")
-                    }
-                    None => "Pick from dictionary…".to_string(),
-                };
-                let mut picked: Option<([u8; 4], [u8; 4])> = None;
-                egui::ComboBox::from_id_salt(("hfs_tc_dict", &entry.path))
-                    .selected_text(combo_label)
-                    .width(280.0)
-                    .show_ui(ui, |ui| {
-                        if cur_t != [0; 4] || cur_c != [0; 4] {
-                            let label = match cur_desc {
-                                Some(d) => {
-                                    format!("(current) {cur_t_str}/{cur_c_str} — {d}")
-                                }
-                                None => format!("(current) {cur_t_str}/{cur_c_str}"),
-                            };
-                            if ui.selectable_label(false, label).clicked() {
-                                picked = Some((cur_t, cur_c));
-                            }
-                            ui.separator();
-                        }
-                        for e in rusty_backup::fs::hfs_common::known_type_creators() {
-                            let label =
-                                format!("{}/{} — {}", e.type_str(), e.creator_str(), e.description);
-                            if ui.selectable_label(false, label).clicked() {
-                                picked = Some((e.type_code, e.creator_code));
-                            }
-                        }
-                    });
-                if let Some((t, c)) = picked {
-                    state.type_input = String::from_utf8_lossy(&t).to_string();
-                    state.creator_input = String::from_utf8_lossy(&c).to_string();
-                }
-
-                // Encode current text into 4-byte arrays (space-padded).
-                let typed_t = rusty_backup::fs::hfs_common::encode_fourcc(&state.type_input);
-                let typed_c = rusty_backup::fs::hfs_common::encode_fourcc(&state.creator_input);
-                let changed = typed_t != cur_t || typed_c != cur_c;
-
-                if ui
-                    .add_enabled(changed, egui::Button::new("Set"))
-                    .on_hover_text("Stage type/creator change")
-                    .clicked()
-                {
-                    stage_action = Some((typed_t, typed_c));
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("Revert editor to current values")
-                    .clicked()
-                {
-                    reset_action = true;
-                }
-            });
-        }
-
-        if reset_action {
-            if let Some(state) = self.hfs_type_editor.as_mut() {
-                state.type_input = cur_t_str;
-                state.creator_input = cur_c_str;
-            }
-        }
-
-        if let Some((t, c)) = stage_action {
-            if self
-                .staged_edits
-                .set_pending_hfs_override(&entry.path, t, c)
-            {
-                self.edit_result = Some(format!(
-                    "Updated pending '{}' to {}/{}",
-                    entry.name,
-                    String::from_utf8_lossy(&t),
-                    String::from_utf8_lossy(&c),
-                ));
-            } else {
-                self.staged_edits.replace_set_type_creator(entry, t, c);
-                self.edit_result = Some(format!(
-                    "Staged type/creator {}/{} on '{}'",
-                    String::from_utf8_lossy(&t),
-                    String::from_utf8_lossy(&c),
-                    entry.name,
-                ));
-            }
-        }
-    }
-
-    /// Resolve the effective ProDOS (type_byte, aux_type) for an entry,
-    /// considering any pending `AddFile` overrides. Returns `(0x00, 0x0000)`
-    /// when nothing is known.
-    fn resolved_prodos_type(&self, entry: &FileEntry) -> (u8, u16) {
-        // 1) Pending AddFile override
-        for edit in self.staged_edits.iter() {
-            if let StagedEdit::AddFile {
-                parent,
-                name,
-                prodos_type,
-                prodos_aux,
-                ..
-            } = edit
-            {
-                let path = if parent.path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{}/{name}", parent.path)
-                };
-                if path != entry.path {
-                    continue;
-                }
-                let t = prodos_type.unwrap_or(0);
-                let a = prodos_aux.unwrap_or(0);
-                return (t, a);
-            }
-        }
-        // 2) On-disk catalog values: parse "$XX ABC" out of entry.type_code
-        let t = entry
-            .type_code
-            .as_deref()
-            .and_then(|tc| {
-                tc.split_whitespace()
-                    .next()
-                    .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-            })
-            .unwrap_or(0);
-        let a = entry.aux_type.unwrap_or(0);
-        (t, a)
-    }
-
-    /// Render the ProDOS type/aux row beneath the file-info header. Read-only
-    /// when not in edit mode; full editor (type pulldown + 2-char/4-char hex
-    /// inputs + Set/Reset) when edit mode is on.
-    fn render_prodos_type_row(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
-        use rusty_backup::fs::prodos_types as pt;
-
-        let (cur_t, cur_a) = self.resolved_prodos_type(entry);
-        let cur_known = pt::is_known_type(cur_t);
-        let cur_abbr = pt::type_abbr(cur_t);
-        let cur_desc = pt::type_description(cur_t);
-
-        if !self.edit_mode {
-            ui.horizontal(|ui| {
-                let label =
-                    format!("Type: ${cur_t:02X} {cur_abbr}  Aux: ${cur_a:04X}  ({cur_desc})");
-                if cur_known {
-                    ui.label(label);
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(120, 160, 220), label);
-                }
-            });
-            return;
-        }
-
-        // Edit mode — seed editor state if it's a different entry.
-        let needs_seed = self
-            .prodos_type_editor
-            .as_ref()
-            .map(|s| s.entry_path != entry.path)
-            .unwrap_or(true);
-        if needs_seed {
-            self.prodos_type_editor = Some(ProdosTypeEditorState {
-                entry_path: entry.path.clone(),
-                type_input: format!("{cur_t:02X}"),
-                aux_input: format!("{cur_a:04X}"),
-            });
-        }
-
-        let mut stage_action: Option<(u8, u16)> = None;
-        let mut reset_action = false;
-
-        if let Some(state) = self.prodos_type_editor.as_mut() {
-            ui.horizontal(|ui| {
-                ui.label("Type pulldown:");
-                let combo_label = format!("${cur_t:02X} {cur_abbr} — {cur_desc}");
-                let mut picked: Option<u8> = None;
-                egui::ComboBox::from_id_salt(("prodos_type_combo", &entry.path))
-                    .selected_text(combo_label)
-                    .width(320.0)
-                    .show_ui(ui, |ui| {
-                        for (byte, info) in &pt::all_types() {
-                            let label =
-                                format!("${:02X} {} — {}", byte, info.abbr, info.description);
-                            if ui.selectable_label(*byte == cur_t, label).clicked() {
-                                picked = Some(*byte);
-                            }
-                        }
-                    });
-                if let Some(b) = picked {
-                    state.type_input = format!("{b:02X}");
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Type ($):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.type_input)
-                        .desired_width(40.0)
-                        .char_limit(2)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.label("Aux ($):");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.aux_input)
-                        .desired_width(60.0)
-                        .char_limit(4)
-                        .font(egui::TextStyle::Monospace),
-                );
-
-                let parsed_t = u8::from_str_radix(state.type_input.trim(), 16).ok();
-                let parsed_a = u16::from_str_radix(state.aux_input.trim(), 16).ok();
-                let valid = parsed_t.is_some() && parsed_a.is_some();
-                let changed = match (parsed_t, parsed_a) {
-                    (Some(t), Some(a)) => t != cur_t || a != cur_a,
-                    _ => false,
-                };
-
-                if ui
-                    .add_enabled(valid && changed, egui::Button::new("Set"))
-                    .on_hover_text("Stage type/aux change")
-                    .clicked()
-                {
-                    if let (Some(t), Some(a)) = (parsed_t, parsed_a) {
-                        stage_action = Some((t, a));
-                    }
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("Revert editor to current values")
-                    .clicked()
-                {
-                    reset_action = true;
-                }
-                if !valid {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 120, 120),
-                        "Type must be 2 hex digits, Aux must be 4",
-                    );
-                }
-            });
-        }
-
-        if reset_action {
-            if let Some(state) = self.prodos_type_editor.as_mut() {
-                state.type_input = format!("{cur_t:02X}");
-                state.aux_input = format!("{cur_a:04X}");
-            }
-        }
-
-        if let Some((t, a)) = stage_action {
-            if self
-                .staged_edits
-                .set_pending_prodos_override(&entry.path, t, a)
-            {
-                self.edit_result = Some(format!(
-                    "Updated pending '{}' to ${t:02X}/${a:04X}",
-                    entry.name,
-                ));
-            } else {
-                self.staged_edits.replace_set_prodos_type(entry, t, a);
-                self.edit_result =
-                    Some(format!("Staged type ${t:02X}/${a:04X} on '{}'", entry.name,));
-            }
         }
     }
 
@@ -5451,158 +5068,6 @@ fn fourcc_bytes(s: &str) -> [u8; 4] {
         result[i] = b;
     }
     result
-}
-
-/// Detect whether data is text or binary and return appropriate content.
-/// HFS/HFS+ file type classification from assets/hfs_file_types.json, embedded at compile time.
-mod hfs_file_types {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-
-    #[derive(serde::Deserialize)]
-    struct TypeInfo {
-        category: String,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct HfsFileTypes {
-        types: HashMap<String, TypeInfo>,
-    }
-
-    static HFS_TYPES: OnceLock<HashMap<String, bool>> = OnceLock::new();
-    const HFS_FILE_TYPES_JSON: &str = include_str!("../../assets/hfs_file_types.json");
-
-    fn get() -> &'static HashMap<String, bool> {
-        HFS_TYPES.get_or_init(|| {
-            let ft: HfsFileTypes =
-                serde_json::from_str(HFS_FILE_TYPES_JSON).unwrap_or(HfsFileTypes {
-                    types: HashMap::new(),
-                });
-            ft.types
-                .into_iter()
-                .map(|(k, v)| (k, v.category == "text"))
-                .collect()
-        })
-    }
-
-    /// Returns Some(true) for known text type, Some(false) for known binary, None for unknown.
-    pub fn classify(type_code: &str) -> Option<bool> {
-        get().get(type_code).copied()
-    }
-}
-
-fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
-    if data.is_empty() {
-        return FileContent::Text(String::new());
-    }
-
-    // Check HFS type code first (if present)
-    if let Some(ref type_code) = entry.type_code {
-        if let Some(is_text) = hfs_file_types::classify(type_code) {
-            if !is_text {
-                return FileContent::Binary(data.to_vec());
-            }
-            // Known text type — decode as text (Mac files may not be UTF-8)
-            if let Ok(text) = std::str::from_utf8(data) {
-                return FileContent::Text(text.to_string());
-            }
-            // Not valid UTF-8 but known text type — show as lossy text
-            let text = data
-                .iter()
-                .map(|&b| {
-                    if b.is_ascii_graphic() || b.is_ascii_whitespace() {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-            return FileContent::Text(text);
-        }
-    }
-
-    // Fall back to content heuristics
-    // Try UTF-8 first
-    if let Ok(text) = std::str::from_utf8(data) {
-        let non_printable = text
-            .chars()
-            .filter(|c| !c.is_ascii_graphic() && !c.is_ascii_whitespace())
-            .count();
-        if non_printable * 10 < text.len() {
-            return FileContent::Text(text.to_string());
-        }
-    }
-
-    // Check if mostly printable bytes
-    let printable = data
-        .iter()
-        .filter(|&&b| b.is_ascii_graphic() || b.is_ascii_whitespace())
-        .count();
-    if printable * 10 >= data.len() * 8 {
-        // 80% printable
-        let text = data
-            .iter()
-            .map(|&b| {
-                if b.is_ascii_graphic() || b.is_ascii_whitespace() {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        return FileContent::Text(text);
-    }
-
-    FileContent::Binary(data.to_vec())
-}
-
-/// Render a hex dump view of binary data.
-fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
-    let bytes_per_line = 16;
-    let lines = data.len().div_ceil(bytes_per_line);
-    let max_lines = 256; // Limit display to ~4KB
-
-    let display_lines = lines.min(max_lines);
-    let mut hex_text = String::new();
-
-    for i in 0..display_lines {
-        let offset = i * bytes_per_line;
-        hex_text.push_str(&format!("{offset:08X}  "));
-
-        for j in 0..bytes_per_line {
-            if offset + j < data.len() {
-                hex_text.push_str(&format!("{:02X} ", data[offset + j]));
-            } else {
-                hex_text.push_str("   ");
-            }
-            if j == 7 {
-                hex_text.push(' ');
-            }
-        }
-
-        hex_text.push_str(" |");
-        for j in 0..bytes_per_line {
-            if offset + j < data.len() {
-                let b = data[offset + j];
-                hex_text.push(if b.is_ascii_graphic() || b == b' ' {
-                    b as char
-                } else {
-                    '.'
-                });
-            }
-        }
-        hex_text.push_str("|\n");
-    }
-
-    if lines > max_lines {
-        hex_text.push_str(&format!("... ({} more lines)\n", lines - max_lines));
-    }
-
-    ui.add(
-        egui::TextEdit::multiline(&mut hex_text.as_str())
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
 }
 
 /// Compact byte-count formatter for the Workflow E archive viewer

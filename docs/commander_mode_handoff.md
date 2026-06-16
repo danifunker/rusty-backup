@@ -14,21 +14,25 @@ Last updated: 2026-06-16
   overlay. Full design in [`commander_mode.md`](commander_mode.md); tracked in
   [`OPEN-WORK.md`](OPEN-WORK.md) §6.1.
 - **Where it's at:** plan + mock + wired shell + a **working two-pane file
-  manager** (M2-lite + M3 + host panes + **the whole M6 batch**): each pane opens
-  a **disk image** (pick a partition) or a **host folder**, with a sortable
-  multi-select listing and `..` / double-click nav. Image panes stage delete +
-  copy-in + rename (Apply/Discard writes through, virtual overlay, unsaved
-  guards); host panes write immediately (delete / rename behind a confirm). The
-  middle column copies a selection between the panes in **all four** combos
-  (image↔image, host→image, image→host, host→host). Right-click also offers
-  **Export to hard drive**, **Calculate checksums** (CRC32/MD5/SHA1/SHA256), and
-  **Rename** (FAT in-place); each pane has a **Tree** toggle.
-- **Next concrete step:** the M6 batch (Export, Checksums, Rename, Tree) is done,
-  and `EditableFilesystem::rename` is now implemented for all 26 editable
-  filesystems. Remaining: the §3.3 **R4** tree-model dedup (share the lazy tree
-  between Commander and `browse_view`); a possible `rb-cli` rename verb; and the
-  deferred wildcard **Find/Search** (M7, §15.5). Full design in
-  [`commander_mode.md`](commander_mode.md) §15.
+  manager** (M2-lite + M3 + host panes + **the whole M6 batch** + **M1 widget
+  extraction** + **the M4 File Info window**): each pane opens a **disk image**
+  (pick a partition) or a **host folder**, with a sortable multi-select listing
+  and `..` / double-click nav. Image panes stage delete + copy-in + rename
+  (Apply/Discard writes through, virtual overlay, unsaved guards); host panes
+  write immediately (delete / rename behind a confirm). The middle column copies
+  a selection between the panes in **all four** combos (image↔image, host→image,
+  image→host, host→host). Right-click also offers **Export to hard drive**,
+  **Calculate checksums** (CRC32/MD5/SHA1/SHA256), **Rename** (in-place on all 26
+  editable filesystems), and **File Info / Details**; each pane has a **Tree**
+  toggle. **Double-clicking a file** (or right-click → File Info) opens a floating
+  window with metadata rows + a text/hex preview and an editable subset (HFS
+  type/creator + dates, ProDOS type, ext permissions) staged onto the pane queue.
+- **Next concrete step:** M1 (R0 `file_detail`/`metadata_editor` + R1
+  `source_picker`) and M4 (File Info window + `SetDates`/`SetPermissions` queue
+  variants + HFS `mac_dates`) are done. Remaining: the §3.3 **R4** tree-model
+  dedup (share the lazy tree between Commander and `browse_view`); a possible
+  `rb-cli` rename verb; M5+ Compare; and the deferred wildcard **Find/Search**
+  (M7, §15.5). Full design in [`commander_mode.md`](commander_mode.md) §15.
 
 ## Commits on this branch
 

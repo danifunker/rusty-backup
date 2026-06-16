@@ -398,6 +398,8 @@ enum CatalogRecord {
         dir_id: u32,
         name: String,
         parent_id: u32,
+        /// Catalog dates `(create, modify, backup)` in Mac-epoch seconds.
+        dates: (u32, u32, u32),
     },
     File {
         file_id: u32,
@@ -411,6 +413,8 @@ enum CatalogRecord {
         creator_code: String,
         /// Finder flags (FInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
         finder_flags: u16,
+        /// Catalog dates `(create, modify, backup)` in Mac-epoch seconds.
+        dates: (u32, u32, u32),
     },
 }
 
@@ -547,10 +551,18 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         }
                         let dir_id =
                             BigEndian::read_u32(&node[rec_data_offset + 6..rec_data_offset + 10]);
+                        // Dir record dates: crDate@10, mdDate@14, bkDate@18.
+                        let dir = &node[rec_data_offset..];
+                        let dates = (
+                            BigEndian::read_u32(&dir[10..14]),
+                            BigEndian::read_u32(&dir[14..18]),
+                            BigEndian::read_u32(&dir[18..22]),
+                        );
                         results.push(CatalogRecord::Directory {
                             dir_id,
                             name,
                             parent_id: rec_parent_id,
+                            dates,
                         });
                     }
                     CATALOG_FILE => {
@@ -582,6 +594,12 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         for j in 0..3 {
                             rsrc_extents[j] = HfsExtDescriptor::parse(&rec[86 + j * 4..90 + j * 4]);
                         }
+                        // File record dates: crDate@44, mdDate@48, bkDate@52.
+                        let dates = (
+                            BigEndian::read_u32(&rec[44..48]),
+                            BigEndian::read_u32(&rec[48..52]),
+                            BigEndian::read_u32(&rec[52..56]),
+                        );
                         results.push(CatalogRecord::File {
                             file_id,
                             name,
@@ -593,6 +611,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             type_code,
                             creator_code,
                             finder_flags,
+                            dates,
                         });
                     }
                     _ => {}
@@ -2571,6 +2590,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -2581,13 +2601,21 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         let mut entries = Vec::new();
         for child in children {
             match child {
-                CatalogRecord::Directory { dir_id, name, .. } => {
+                CatalogRecord::Directory {
+                    dir_id,
+                    name,
+                    dates,
+                    ..
+                } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    entries.push(FileEntry::new_directory(name, path, dir_id as u64));
+                    let mut fe = FileEntry::new_directory(name, path, dir_id as u64);
+                    fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.mac_dates = Some(dates);
+                    entries.push(fe);
                 }
                 CatalogRecord::File {
                     file_id,
@@ -2598,6 +2626,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     type_code,
                     creator_code,
                     finder_flags,
+                    dates,
                     ..
                 } => {
                     let path = if entry.path == "/" {
@@ -2608,6 +2637,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);
                     }
@@ -4305,6 +4336,53 @@ mod tests {
         // Read back
         let read_back = fs.read_file(&fe, 1024).unwrap();
         assert_eq!(&read_back, test_data);
+    }
+
+    /// Catalog dates surface on `FileEntry::mac_dates` (and the modify value on
+    /// `modified`), and an in-place `set_dates` round-trips through sync +
+    /// reopen. Exercises the M4 read path (catalog decode) plus the write path
+    /// (`set_dates`, the setter `StagedEdit::SetDates` dispatches to).
+    #[test]
+    fn test_hfs_catalog_dates_round_trip() {
+        let img = make_editable_hfs_image();
+        let mut buf = img.clone();
+
+        // create_file stamps create/modify to "now" (non-zero); backup is 0.
+        {
+            let mut fs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            let root = fs.root().unwrap();
+            let data = b"x";
+            let fe = fs
+                .create_file(
+                    &root,
+                    "dated.txt",
+                    &mut Cursor::new(data.as_slice()),
+                    1,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            fs.sync_metadata().unwrap();
+
+            let listed = fs.list_directory(&root).unwrap();
+            let f = listed.iter().find(|e| e.name == "dated.txt").unwrap();
+            let (c, m, b) = f.mac_dates.expect("HFS file should carry mac_dates");
+            assert!(c != 0 && m != 0, "create/modify stamped by create_file");
+            assert_eq!(b, 0, "backup date defaults to 0");
+
+            // Stage specific dates via the in-place setter and persist.
+            let target = (0x10000000u32, 0x20000000u32, 0x30000000u32);
+            fs.set_dates(&fe, target.0, target.1, target.2).unwrap();
+            fs.sync_metadata().unwrap();
+        }
+
+        // Reopen and confirm the dates decoded back, including the formatted
+        // string surfaced in `modified`.
+        let mut fs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let f = listed.iter().find(|e| e.name == "dated.txt").unwrap();
+        assert_eq!(f.mac_dates, Some((0x10000000, 0x20000000, 0x30000000)));
+        assert_eq!(f.modified, hfs_common::format_mac_date(0x20000000));
     }
 
     #[test]

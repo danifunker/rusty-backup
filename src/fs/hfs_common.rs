@@ -118,6 +118,36 @@ pub fn hfs_now() -> u32 {
     (unix_secs + MAC_EPOCH_DELTA) as u32
 }
 
+/// Format an HFS/HFS+ Mac-epoch timestamp (seconds since 1904-01-01 UTC) as a
+/// human-readable `YYYY-MM-DD HH:MM:SS` string. Returns `None` for a zero
+/// timestamp ("no date set" on disk). Dates before the Unix epoch clamp to
+/// 1970-01-01 — vintage Mac files are 1984+, so this is harmless in practice.
+pub fn format_mac_date(mac_secs: u32) -> Option<String> {
+    if mac_secs == 0 {
+        return None;
+    }
+    let unix = mac_secs as i64 - MAC_EPOCH_DELTA as i64;
+    Some(super::unix_common::inode::format_unix_timestamp(unix))
+}
+
+/// Parse a `YYYY-MM-DD HH:MM:SS` string (interpreted as UTC) into Mac-epoch
+/// seconds. The inverse of [`format_mac_date`]; returns `None` when the string
+/// doesn't parse or falls outside the representable range. An empty string (or
+/// the literal `0`) maps to `0` ("no date set"), so a cleared field round-trips.
+pub fn parse_mac_date(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || s == "0" {
+        return Some(0);
+    }
+    let ndt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()?;
+    let mac = ndt.and_utc().timestamp() + MAC_EPOCH_DELTA as i64;
+    if (0..=u32::MAX as i64).contains(&mac) {
+        Some(mac as u32)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Type/creator lookup from hfs_file_types.json
 // ---------------------------------------------------------------------------
@@ -1651,6 +1681,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_mac_date() {
+        // Zero == "no date set".
+        assert_eq!(format_mac_date(0), None);
+        // The Unix epoch in Mac-epoch seconds is MAC_EPOCH_DELTA.
+        assert_eq!(
+            format_mac_date(MAC_EPOCH_DELTA as u32).as_deref(),
+            Some("1970-01-01 00:00:00")
+        );
+        // A real vintage Mac timestamp: 2000-01-01 00:00:00 UTC.
+        assert_eq!(
+            format_mac_date((MAC_EPOCH_DELTA + 946_684_800) as u32).as_deref(),
+            Some("2000-01-01 00:00:00")
+        );
+    }
+
+    #[test]
+    fn test_parse_mac_date_round_trips() {
+        // Empty / "0" map to the "no date" sentinel.
+        assert_eq!(parse_mac_date(""), Some(0));
+        assert_eq!(parse_mac_date("0"), Some(0));
+        // Round-trips a real timestamp through format -> parse.
+        let mac = (MAC_EPOCH_DELTA + 946_684_800) as u32; // 2000-01-01
+        let s = format_mac_date(mac).unwrap();
+        assert_eq!(parse_mac_date(&s), Some(mac));
+        // Garbage is rejected.
+        assert_eq!(parse_mac_date("not a date"), None);
+    }
 
     // -- Bitmap tests --
 
