@@ -266,7 +266,15 @@ impl DirListing {
             return Ok(());
         }
         let rel = path.strip_prefix(&root_path).unwrap_or(path);
-        for comp in rel.split('/').filter(|c| !c.is_empty()) {
+        // Image-fs paths always use '/'. Host paths use the OS separator, which
+        // is '\' on Windows — split on both for host panes so a descendant path
+        // like `<root>\a\b` decomposes into components (image filenames may
+        // legitimately contain a backslash, so only host panes split on it).
+        let is_host = self.is_host();
+        for comp in rel
+            .split(|c| c == '/' || (is_host && c == std::path::MAIN_SEPARATOR))
+            .filter(|c| !c.is_empty())
+        {
             self.enter(comp)?;
         }
         Ok(())
