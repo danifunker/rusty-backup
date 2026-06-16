@@ -275,6 +275,56 @@ impl EditQueue {
         self.edits.len()
     }
 
+    /// One plain-language line per staged edit, in apply order — for a
+    /// "pending edits" review list (the GUI shows these before Apply).
+    pub fn describe(&self) -> Vec<String> {
+        self.edits
+            .iter()
+            .map(|e| match e {
+                StagedEdit::AddFile { parent, name, .. } => {
+                    format!("Add file: {}", Self::pending_path(&parent.path, name))
+                }
+                StagedEdit::CreateDirectory { parent, name } => {
+                    format!("New folder: {}", Self::pending_path(&parent.path, name))
+                }
+                StagedEdit::DeleteEntry { entry, .. } => format!("Delete: {}", entry.path),
+                StagedEdit::DeleteRecursive { entry, .. } => {
+                    format!("Delete (recursive): {}", entry.path)
+                }
+                StagedEdit::Rename {
+                    entry, new_name, ..
+                } => format!("Rename: {} -> {}", entry.path, new_name),
+                StagedEdit::SetProdosType {
+                    entry,
+                    type_byte,
+                    aux_type,
+                } => format!(
+                    "ProDOS type: {} -> ${type_byte:02X}/${aux_type:04X}",
+                    entry.path
+                ),
+                StagedEdit::SetProdosAccess { entry, access } => {
+                    format!("ProDOS access: {} -> ${access:02X}", entry.path)
+                }
+                StagedEdit::BlessFolder { entry } => format!("Bless folder: {}", entry.path),
+                StagedEdit::WriteBootBlocks { .. } => "Write boot blocks".to_string(),
+                StagedEdit::SetTypeCreator {
+                    entry,
+                    type_code,
+                    creator_code,
+                } => format!(
+                    "Type/Creator: {} -> {}/{}",
+                    entry.path,
+                    String::from_utf8_lossy(type_code),
+                    String::from_utf8_lossy(creator_code),
+                ),
+                StagedEdit::SetPermissions { entry, mode } => {
+                    format!("Permissions: {} -> {:o}", entry.path, mode & 0o7777)
+                }
+                StagedEdit::SetDates { entry, .. } => format!("Dates: {}", entry.path),
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.edits.is_empty()
     }
@@ -320,6 +370,20 @@ impl EditQueue {
             | StagedEdit::CreateDirectory { parent, name, .. } => {
                 Self::pending_path(&parent.path, name) == entry_path
             }
+            _ => false,
+        })
+    }
+
+    /// True when a metadata edit (type/creator, ProDOS type/access, dates, or
+    /// permissions) is staged for `entry_path` — drives the "changed" row tint
+    /// so the user sees which existing files have pending metadata edits.
+    pub fn has_pending_metadata(&self, entry_path: &str) -> bool {
+        self.edits.iter().any(|edit| match edit {
+            StagedEdit::SetTypeCreator { entry, .. }
+            | StagedEdit::SetProdosType { entry, .. }
+            | StagedEdit::SetProdosAccess { entry, .. }
+            | StagedEdit::SetDates { entry, .. }
+            | StagedEdit::SetPermissions { entry, .. } => entry.path == entry_path,
             _ => false,
         })
     }
@@ -479,6 +543,18 @@ impl EditQueue {
                     .unwrap_or([0; 4]);
                 return (t, c);
             }
+        }
+        // A staged SetTypeCreator on an existing file wins over the on-disk
+        // value, so the editor/detail rows reflect the pending change.
+        if let Some((t, c)) = self.edits.iter().rev().find_map(|e| match e {
+            StagedEdit::SetTypeCreator {
+                entry: e2,
+                type_code,
+                creator_code,
+            } if e2.path == entry.path => Some((*type_code, *creator_code)),
+            _ => None,
+        }) {
+            return (t, c);
         }
         let t = entry
             .type_code
@@ -808,5 +884,63 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q.pending_dates_for("/a"), Some((111, 222, 333)));
         assert_eq!(q.pending_dates_for("/missing"), None);
+    }
+
+    /// `has_pending_metadata` flags exactly the entries with a staged metadata
+    /// edit — drives the blue "changed" row tint.
+    #[test]
+    fn has_pending_metadata_flags_metadata_edits() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+        let b = FileEntry::new_file("b".into(), "/b".into(), 0, 0);
+        let dir = FileEntry::new_directory("d".into(), "/d".into(), 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_dates(&a, 1, 2, 3);
+        q.replace_set_permissions(&b, 0o644);
+        // A delete is not a metadata edit.
+        q.push(StagedEdit::DeleteEntry {
+            parent: dir.clone(),
+            entry: FileEntry::new_file("c".into(), "/d/c".into(), 0, 0),
+        });
+
+        assert!(q.has_pending_metadata("/a"));
+        assert!(q.has_pending_metadata("/b"));
+        assert!(!q.has_pending_metadata("/d/c")); // staged delete, not metadata
+        assert!(!q.has_pending_metadata("/missing"));
+    }
+
+    /// A staged `SetTypeCreator` on an existing file is reflected by
+    /// `resolved_hfs_type_creator` (so the editor/detail rows show the change).
+    #[test]
+    fn resolved_hfs_type_creator_reflects_staged_set() {
+        let mut e = FileEntry::new_file("doc".into(), "/doc".into(), 0, 0);
+        e.type_code = Some("TEXT".into());
+        e.creator_code = Some("ttxt".into());
+
+        let mut q = EditQueue::new();
+        // Before staging: the on-disk values.
+        assert_eq!(q.resolved_hfs_type_creator(&e), (*b"TEXT", *b"ttxt"));
+
+        q.replace_set_type_creator(&e, *b"PICT", *b"8BIM");
+        assert_eq!(q.resolved_hfs_type_creator(&e), (*b"PICT", *b"8BIM"));
+    }
+
+    /// `describe` renders one plain-language line per staged edit, in order.
+    #[test]
+    fn describe_lists_edits_in_order() {
+        let dir = FileEntry::new_directory("d".into(), "/d".into(), 0);
+        let f = FileEntry::new_file("f".into(), "/d/f".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_permissions(&f, 0o600);
+        q.push(StagedEdit::DeleteEntry {
+            parent: dir,
+            entry: f.clone(),
+        });
+
+        let lines = q.describe();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
+        assert!(lines[1].starts_with("Delete: /d/f"));
     }
 }

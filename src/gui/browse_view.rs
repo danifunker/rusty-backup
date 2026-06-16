@@ -1277,7 +1277,16 @@ impl BrowseView {
                     } else {
                         format!("{}  ({})", entry.name, size_str)
                     };
-                    let resp = ui.selectable_label(is_selected, &label);
+                    // Tint files with staged metadata edits (type/dates/perms)
+                    // blue so the user sees what they've changed before Apply.
+                    let meta_changed =
+                        self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
+                    let rich = if meta_changed {
+                        egui::RichText::new(&label).color(egui::Color32::from_rgb(150, 190, 255))
+                    } else {
+                        egui::RichText::new(&label)
+                    };
+                    let resp = ui.selectable_label(is_selected, rich);
                     let resp = if let Some(h) = hover_text {
                         resp.on_hover_text(h)
                     } else {

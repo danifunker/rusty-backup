@@ -36,6 +36,8 @@ use super::Side;
 const ROW_H: f32 = 20.0;
 const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
 const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+/// Tint for an existing entry with staged metadata edits (type/dates/perms).
+const META_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 190, 255);
 
 /// What a pane reports back to [`super::CommanderMode`] after a frame.
 #[derive(Default)]
@@ -107,6 +109,8 @@ pub(crate) struct CommanderPane {
     pending_host_delete: Option<Vec<String>>,
     /// The open "Rename..." dialog, if any (single entry at a time).
     rename_dialog: Option<RenameDialog>,
+    /// Whether the "Pending edits" review popup is open for this pane.
+    show_edits_popup: bool,
     /// Tree view toggled on: the pane shows a folder tree (navigation) beside
     /// the flat grid (the working set) instead of just the grid.
     tree_mode: bool,
@@ -156,6 +160,7 @@ impl CommanderPane {
             pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
+            show_edits_popup: false,
             tree_mode: false,
             tree_cache: HashMap::new(),
             tree_expanded: HashSet::new(),
@@ -270,6 +275,7 @@ impl CommanderPane {
         if let Some(s) = self.render_rename_dialog(ui.ctx()) {
             status = Some(s);
         }
+        self.render_edits_popup(ui.ctx());
 
         PaneResponse {
             status,
@@ -683,6 +689,14 @@ impl CommanderPane {
                         status = Some(format!("[{}] discarded staged edits.", self.side.label()));
                     }
                 });
+                if n > 0
+                    && ui
+                        .button(format!("Edits ({n})"))
+                        .on_hover_text("Review the pending staged edits")
+                        .clicked()
+                {
+                    self.show_edits_popup = !self.show_edits_popup;
+                }
             }
         });
 
@@ -772,6 +786,40 @@ impl CommanderPane {
         self.tree_mode = false;
         self.reset_tree();
         format!("[{}] closed.", self.side.label())
+    }
+
+    /// The "Pending edits" review popup: a plain-language list of every staged
+    /// edit on this pane, in apply order. Opened by the "Edits (N)" button.
+    fn render_edits_popup(&mut self, ctx: &egui::Context) {
+        if !self.show_edits_popup {
+            return;
+        }
+        // Auto-close once the queue empties (Apply / Discard).
+        if self.queue.is_empty() {
+            self.show_edits_popup = false;
+            return;
+        }
+        let mut open = true;
+        let lines = self.queue.describe();
+        egui::Window::new(format!("Pending edits ({})", self.side.label()))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label("Staged for this pane (applied in order on Apply):");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        for (i, line) in lines.iter().enumerate() {
+                            ui.label(format!("{}. {line}", i + 1));
+                        }
+                    });
+            });
+        if !open {
+            self.show_edits_popup = false;
+        }
     }
 
     fn path_line(&mut self, ui: &mut egui::Ui) {
@@ -1438,6 +1486,9 @@ struct DisplayRow {
     kind: RowKind,
     /// For a `PendingRename` row, the staged new name (shown as `old -> new`).
     rename_to: Option<String>,
+    /// A metadata edit (type/creator, dates, permissions, ...) is staged for
+    /// this existing entry — tints the row blue.
+    meta_changed: bool,
 }
 
 impl DisplayRow {
@@ -1465,6 +1516,7 @@ impl CommanderPane {
                     type_tag: String::new(),
                     kind: RowKind::Parent,
                     rename_to: None,
+                    meta_changed: false,
                 },
                 Row::Entry(e) => {
                     let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
@@ -1483,6 +1535,7 @@ impl CommanderPane {
                         type_tag: type_tag(e),
                         kind,
                         rename_to,
+                        meta_changed: self.queue.has_pending_metadata(&e.path),
                     }
                 }
             })
@@ -1497,6 +1550,7 @@ impl CommanderPane {
                 type_tag: type_tag(&e),
                 kind: RowKind::PendingAdd,
                 rename_to: None,
+                meta_changed: false,
             });
         }
         rows
@@ -1557,6 +1611,7 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
         RowKind::PendingAdd => ADD_COLOR,
         RowKind::PendingRename => ADD_COLOR,
         RowKind::PendingDelete => DEL_COLOR,
+        RowKind::Normal if row.meta_changed => META_COLOR,
         RowKind::Normal if row.is_dir => egui::Color32::from_rgb(120, 160, 255),
         RowKind::Normal => base,
     };

@@ -217,7 +217,18 @@ pub fn resolved_prodos_type(queue: &EditQueue, entry: &FileEntry) -> (u8, u16) {
             return (t, a);
         }
     }
-    // 2) On-disk catalog values: parse "$XX ABC" out of entry.type_code
+    // 2) A staged SetProdosType on an existing file wins over the on-disk value.
+    if let Some((t, a)) = queue.iter().rev().find_map(|e| match e {
+        StagedEdit::SetProdosType {
+            entry: e2,
+            type_byte,
+            aux_type,
+        } if e2.path == entry.path => Some((*type_byte, *aux_type)),
+        _ => None,
+    }) {
+        return (t, a);
+    }
+    // 3) On-disk catalog values: parse "$XX ABC" out of entry.type_code
     let t = entry
         .type_code
         .as_deref()
@@ -389,7 +400,7 @@ pub fn render_hfs_dates_row(
     editor: &mut Option<HfsDatesEditorState>,
     result: &mut Option<String>,
 ) {
-    use rusty_backup::fs::hfs_common::{format_mac_date, parse_mac_date};
+    use rusty_backup::fs::hfs_common::{format_mac_date, parse_mac_date_checked};
 
     // Effective current dates: a staged edit wins over the on-disk values.
     let (cur_c, cur_m, cur_b) = queue
@@ -447,12 +458,16 @@ pub fn render_hfs_dates_row(
                 }
             });
 
-        let parsed_c = parse_mac_date(&state.create);
-        let parsed_m = parse_mac_date(&state.modify);
-        let parsed_b = parse_mac_date(&state.backup);
-        let valid = parsed_c.is_some() && parsed_m.is_some() && parsed_b.is_some();
-        let changed = match (parsed_c, parsed_m, parsed_b) {
-            (Some(c), Some(m), Some(b)) => (c, m, b) != (cur_c, cur_m, cur_b),
+        let r_c = parse_mac_date_checked(&state.create);
+        let r_m = parse_mac_date_checked(&state.modify);
+        let r_b = parse_mac_date_checked(&state.backup);
+        // First failing field, labelled so the user knows which date is wrong.
+        let field_err = [("Created", &r_c), ("Modified", &r_m), ("Backup", &r_b)]
+            .iter()
+            .find_map(|(label, r)| r.as_ref().err().map(|e| format!("{label}: {e}")));
+        let valid = field_err.is_none();
+        let changed = match (&r_c, &r_m, &r_b) {
+            (Ok(c), Ok(m), Ok(b)) => (*c, *m, *b) != (cur_c, cur_m, cur_b),
             _ => false,
         };
 
@@ -462,20 +477,17 @@ pub fn render_hfs_dates_row(
                 .on_hover_text("Stage create/modify/backup date change")
                 .clicked()
             {
-                if let (Some(c), Some(m), Some(b)) = (parsed_c, parsed_m, parsed_b) {
-                    stage_action = Some((c, m, b));
+                if let (Ok(c), Ok(m), Ok(b)) = (&r_c, &r_m, &r_b) {
+                    stage_action = Some((*c, *m, *b));
                 }
             }
             if ui.button("Reset").clicked() {
                 reset_action = true;
             }
-            if !valid {
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 120, 120),
-                    "Use YYYY-MM-DD HH:MM:SS or leave blank",
-                );
-            }
         });
+        if let Some(msg) = &field_err {
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), msg);
+        }
     }
 
     if reset_action {
