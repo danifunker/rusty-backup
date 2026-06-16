@@ -316,17 +316,21 @@ Build order follows the CONTRIBUTING playbook (engine -> model -> thin view) and
 - **model/** — reuse `BrowseSession` (open / list / `open_editable` / commit),
   `EditQueue` + `StagedEdit` + `edit_queue::apply_edit`, `model::file_types`.
   New: `model::dir_listing::DirListing` (cwd + sorted listing + multi-selection;
-  pure, unit-tested) — the one genuinely new model object.
+  pure, unit-tested) and `model::commander_source` (partition probe +
+  per-pane `BrowseSession` builder).
 - **gui/** — thin view in `src/gui/commander/`. Holds the model objects + small
   UI scratch only; no orchestration, no background spawns (route through a
   model runner / `BrowseSession::spawn_open`). Extract shared widgets the
   browse view already has (`file_detail` hex/metadata, type/creator editor rows,
   a source picker) instead of duplicating them.
 
-Status (2026-06-15): plan doc + runnable layout mock landed; the overlay
-entry-point shell (`src/gui/commander/`, launched from the tab bar) is wired and
-compiles. Next: `DirListing` model (engine/model-first) + real per-pane listing
-over `BrowseSession`. Milestones M1-M5 in the plan doc.
+Status (2026-06-16): plan + mock + entry-point shell landed; **read-only browser
+(M2-lite) working** — `DirListing` + `commander_source` models (unit-tested) and
+the `CommanderPane` binding render a real per-pane listing over `BrowseSession`
+(open + partition picker + sortable grid + multi-select + `..`/double-click nav).
+Next: **M3 staged writes** (per-pane `EditQueue`, copy/delete, Apply/Discard,
+virtual overlay, unsaved guard); then M1 widget extraction for the M4 detail
+window. Milestones M1-M5 in the plan doc.
 
 
 ---

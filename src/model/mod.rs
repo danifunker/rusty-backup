@@ -9,7 +9,9 @@ pub mod browse_session;
 pub mod bulk_convert_runner;
 #[cfg(feature = "chd")]
 pub mod chd_expand_runner;
+pub mod commander_source;
 pub mod container_edit;
+pub mod dir_listing;
 pub mod edit_queue;
 pub mod export_runner;
 pub mod file_types;

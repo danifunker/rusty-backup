@@ -1,9 +1,12 @@
 //! Commander Mode -- full-page two-pane file explorer overlay.
 //!
-//! This is the entry-point shell wired into [`crate::gui::RustyBackupApp`] as
-//! `Option<CommanderMode>`: `Some` means the overlay is open and takes over the
-//! whole frame (the tab strip is not drawn). The directory-listing, copy, and
-//! staging engine lands in later milestones -- see `docs/commander_mode.md`.
+//! This is wired into [`crate::gui::RustyBackupApp`] as `Option<CommanderMode>`:
+//! `Some` means the overlay is open and takes over the whole frame (the tab
+//! strip is not drawn). Each pane can open a disk image / container and browse
+//! it read-only (listing, sort, multi-select, `..` / double-click navigation),
+//! backed by the [`DirListing`](rusty_backup::model::dir_listing::DirListing)
+//! model. The copy / delete / staging engine in the middle column lands in a
+//! later milestone -- see `docs/commander_mode.md`.
 //!
 //! NOTE: this crate uses a patched eframe whose panels are
 //! `egui::Panel::*::show_inside` rather than the stock `TopBottomPanel`. The
@@ -58,7 +61,8 @@ impl CommanderMode {
         Self {
             left: CommanderPane::new(Side::Left),
             right: CommanderPane::new(Side::Right),
-            status: "Commander Mode -- open a source in each pane. (Listing engine: in progress.)"
+            status: "Commander Mode -- open a disk image in each pane to browse it. \
+                     (Copy / staging: coming next.)"
                 .into(),
         }
     }
@@ -129,8 +133,8 @@ impl CommanderMode {
 }
 
 /// Middle action column. The copy/delete controls are disabled until the
-/// listing + staging engine lands (next milestone); this fixes their place in
-/// the layout so the shell already reads like the final UI.
+/// staging engine lands (next milestone); this fixes their place in the layout
+/// so the shell already reads like the final UI.
 fn render_middle(ui: &mut egui::Ui) {
     ui.add_space(60.0);
     let w = egui::vec2(116.0, 26.0);
