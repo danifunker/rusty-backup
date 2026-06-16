@@ -1805,6 +1805,60 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
         Ok(())
     }
 
+    /// Rename an entry in place: the file/dir keeps its start cluster, size,
+    /// and attributes (only its directory entry's name changes), so no data is
+    /// copied and a directory's `.`/`..` and contents are untouched. New LFN +
+    /// SFN entries are added for `new_name`, then the old entries removed —
+    /// add-then-remove so a failure mid-way never orphans the file's data.
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_fat_name(new_name)?;
+
+        let dir_data = if parent.path == "/" && self.fat_type != FatType::Fat32 {
+            self.read_root_directory()?
+        } else {
+            self.read_cluster_chain(parent.location as u32)?
+        };
+        // Reject a collision with a *different* entry; a case-only rename
+        // (e.g. "readme" -> "README") still resolves to the same entry, so
+        // allow it when the names match case-insensitively.
+        if !new_name.eq_ignore_ascii_case(&entry.name)
+            && self.name_exists_in_dir(&dir_data, new_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Preserve the entry's identity: same start cluster + size, and its
+        // attribute byte (forcing the directory bit for a directory).
+        let cluster = entry.location as u32;
+        let size = entry.size as u32;
+        let attr = if entry.is_directory() {
+            ATTR_DIRECTORY
+        } else {
+            entry
+                .dos_attributes
+                .map(|a| (a as u8) & 0x27)
+                .unwrap_or(ATTR_ARCHIVE)
+        };
+
+        let existing_sfns = self.collect_existing_sfns(&dir_data);
+        let sfn = Self::generate_short_name(new_name, &existing_sfns);
+        let entry_bytes = Self::build_dir_entries(new_name, &sfn, attr, cluster, size);
+
+        // Add the new name first, then remove the old (matched by old name +
+        // cluster, so the just-added new entry is never the one removed).
+        self.add_to_directory(parent, &entry_bytes)?;
+        self.remove_dir_entries(parent, entry)?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.update_fsinfo()?;
         self.reader.flush()?;
@@ -4265,6 +4319,99 @@ mod tests {
         // List the new directory — should be empty
         let sub_entries = fs.list_directory(&entries[0]).unwrap();
         assert!(sub_entries.is_empty());
+    }
+
+    #[test]
+    fn test_fat_rename_file_preserves_data() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let data = b"rename me please";
+        let mut reader = std::io::Cursor::new(data.to_vec());
+        fs.create_file(
+            &root,
+            "OLDNAME.TXT",
+            &mut reader,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let entry = fs.list_directory(&root).unwrap().pop().unwrap();
+        let original_cluster = entry.location;
+
+        // Rename to a long (LFN-requiring) name.
+        fs.rename(&root, &entry, "A Renamed File.txt").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one entry after rename: {entries:?}"
+        );
+        let renamed = &entries[0];
+        assert_eq!(renamed.name, "A Renamed File.txt");
+        // Identity preserved: same start cluster, same size, same content.
+        assert_eq!(renamed.location, original_cluster);
+        assert_eq!(renamed.size, data.len() as u64);
+        assert_eq!(&fs.read_file(renamed, usize::MAX).unwrap(), data);
+    }
+
+    #[test]
+    fn test_fat_rename_rejects_collision() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        for name in ["A.TXT", "B.TXT"] {
+            let mut r = std::io::Cursor::new(b"x".to_vec());
+            fs.create_file(&root, name, &mut r, 1, &CreateFileOptions::default())
+                .unwrap();
+        }
+        let a = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "A.TXT")
+            .unwrap();
+        // Renaming A.TXT onto the existing B.TXT must fail and leave both intact.
+        assert!(matches!(
+            fs.rename(&root, &a, "B.TXT"),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "A.TXT"), "{names:?}");
+        assert!(names.iter().any(|n| n == "B.TXT"), "{names:?}");
+    }
+
+    #[test]
+    fn test_fat_rename_directory_keeps_contents() {
+        let mut img = create_test_fat16_image();
+        let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        fs.create_directory(&root, "OLDDIR", &CreateDirectoryOptions::default())
+            .unwrap();
+        let dir = fs.list_directory(&root).unwrap().pop().unwrap();
+        let mut r = std::io::Cursor::new(b"inside".to_vec());
+        fs.create_file(&dir, "INNER.TXT", &mut r, 6, &CreateFileOptions::default())
+            .unwrap();
+
+        fs.rename(&root, &dir, "NewDir").unwrap();
+
+        let renamed = fs.list_directory(&root).unwrap().pop().unwrap();
+        assert_eq!(renamed.name, "NewDir");
+        assert!(renamed.is_directory());
+        // The directory's contents survive the parent-entry rewrite.
+        let children = fs.list_directory(&renamed).unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "INNER.TXT");
+        assert_eq!(&fs.read_file(&children[0], usize::MAX).unwrap(), b"inside");
     }
 
     #[test]

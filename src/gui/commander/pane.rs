@@ -99,6 +99,18 @@ pub(crate) struct CommanderPane {
     /// Host-pane only: entry names the user asked to delete, held until they
     /// confirm the (immediate, irreversible) host removal.
     pending_host_delete: Option<Vec<String>>,
+    /// The open "Rename..." dialog, if any (single entry at a time).
+    rename_dialog: Option<RenameDialog>,
+}
+
+/// State for the modal "Rename..." dialog.
+struct RenameDialog {
+    /// The live entry being renamed.
+    entry: FileEntry,
+    /// The editable new-name buffer (seeded with the current name).
+    input: String,
+    /// Last validation error, shown inline; cleared as the user types.
+    error: Option<String>,
 }
 
 /// A deferred source change awaiting the unsaved-edits confirmation.
@@ -128,6 +140,7 @@ impl CommanderPane {
             error: None,
             pending_switch: None,
             pending_host_delete: None,
+            rename_dialog: None,
         }
     }
 
@@ -197,6 +210,9 @@ impl CommanderPane {
             status = Some(s);
         }
         if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
+            status = Some(s);
+        }
+        if let Some(s) = self.render_rename_dialog(ui.ctx()) {
             status = Some(s);
         }
 
@@ -275,6 +291,116 @@ impl CommanderPane {
                 "[{}] deleted {removed} item(s) from the host folder.",
                 self.side.label()
             )
+        }
+    }
+
+    /// Whether in-place rename is available for this pane: always for a host
+    /// folder (`std::fs::rename`), otherwise gated on the open volume's
+    /// filesystem via [`fs::supports_rename`](rusty_backup::fs::supports_rename).
+    fn supports_rename(&self) -> bool {
+        if self.listing.is_host() {
+            return true;
+        }
+        self.session.as_ref().is_some_and(|s| {
+            rusty_backup::fs::supports_rename(s.partition_type, s.partition_type_string.as_deref())
+        })
+    }
+
+    /// The modal "Rename..." dialog. Image panes stage a `Rename` edit (applied
+    /// on Apply); host panes rename immediately via `std::fs::rename`. No-op
+    /// when nothing is pending.
+    fn render_rename_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
+        self.rename_dialog.as_ref()?;
+        let side = self.side;
+        let mut do_rename = false;
+        let mut cancel = false;
+        {
+            let d = self.rename_dialog.as_mut().unwrap();
+            let old_name = d.entry.name.clone();
+            let input = &mut d.input;
+            let err = d.error.clone();
+            egui::Window::new(format!("Rename ({})", side.label()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Rename \"{old_name}\" to:"));
+                    let resp = ui.text_edit_singleline(input);
+                    if let Some(e) = &err {
+                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                    }
+                    let valid = !input.trim().is_empty() && *input != old_name;
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(valid, egui::Button::new("Rename")).clicked() {
+                            do_rename = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    // Enter confirms when the name is valid.
+                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_rename = true;
+                    }
+                });
+        }
+
+        if cancel {
+            self.rename_dialog = None;
+            return None;
+        }
+        if do_rename {
+            let new_name = self
+                .rename_dialog
+                .as_ref()
+                .unwrap()
+                .input
+                .trim()
+                .to_string();
+            // Validate against the filesystem's name rules (image panes only;
+            // host names are validated by the OS at rename time).
+            if let Some(Err(e)) = self.listing.fs_mut().map(|fs| fs.validate_name(&new_name)) {
+                if let Some(d) = self.rename_dialog.as_mut() {
+                    d.error = Some(format!("{e}"));
+                }
+                return None;
+            }
+            let entry = self.rename_dialog.take().unwrap().entry;
+            return Some(self.perform_rename(entry, new_name));
+        }
+        None
+    }
+
+    /// Carry out a confirmed rename: stage it (image pane) or apply it now
+    /// (host pane), then refresh.
+    fn perform_rename(&mut self, entry: FileEntry, new_name: String) -> String {
+        let side = self.side.label();
+        if self.listing.is_host() {
+            let old_path = PathBuf::from(&entry.path);
+            let new_path = old_path.with_file_name(&new_name);
+            if new_path.exists() {
+                return format!("[{side}] '{new_name}' already exists.");
+            }
+            match std::fs::rename(&old_path, &new_path) {
+                Ok(()) => {
+                    self.reload_listing();
+                    format!("[{side}] renamed to '{new_name}'.")
+                }
+                Err(e) => format!("[{side}] rename failed: {e}"),
+            }
+        } else {
+            let Some(cwd) = self.listing.cwd().cloned() else {
+                return format!("[{side}] no directory to rename in.");
+            };
+            // Replace any prior staged rename of the same entry.
+            self.queue.remove_pending_rename(&entry.path);
+            self.queue.push(StagedEdit::Rename {
+                parent: cwd,
+                entry,
+                new_name: new_name.clone(),
+            });
+            format!("[{side}] staged rename to '{new_name}'. Apply to write.")
         }
     }
 
@@ -704,16 +830,21 @@ impl CommanderPane {
             };
             if self.queue.is_pending_delete(&entry.path) {
                 self.queue.remove_pending_delete(&entry.path);
-            } else if entry.is_directory() {
-                self.queue.push(StagedEdit::DeleteRecursive {
-                    parent: cwd.clone(),
-                    entry,
-                });
             } else {
-                self.queue.push(StagedEdit::DeleteEntry {
-                    parent: cwd.clone(),
-                    entry,
-                });
+                // Deleting supersedes a staged rename of the same entry (else
+                // apply would rename it, then fail to delete the old name).
+                self.queue.remove_pending_rename(&entry.path);
+                if entry.is_directory() {
+                    self.queue.push(StagedEdit::DeleteRecursive {
+                        parent: cwd.clone(),
+                        entry,
+                    });
+                } else {
+                    self.queue.push(StagedEdit::DeleteEntry {
+                        parent: cwd.clone(),
+                        entry,
+                    });
+                }
             }
         }
     }
@@ -799,6 +930,7 @@ impl CommanderPane {
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.listing.is_host();
+        let can_rename = self.supports_rename();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
@@ -810,6 +942,8 @@ impl CommanderPane {
         let mut m_copy = false;
         let mut m_export = false;
         let mut m_checksums = false;
+        let mut m_rename: Option<String> = None;
+        let mut m_cancel_rename: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -878,6 +1012,21 @@ impl CommanderPane {
                                 && ui.button("Calculate checksums...").clicked()
                             {
                                 m_checksums = true;
+                                ui.close();
+                            }
+                            // Rename a single entry in place. A row with a
+                            // rename already staged offers to cancel it instead.
+                            if matches!(row.kind, RowKind::PendingRename)
+                                && ui.button("Cancel rename").clicked()
+                            {
+                                m_cancel_rename = Some(row.name.clone());
+                                ui.close();
+                            } else if matches!(row.kind, RowKind::Normal)
+                                && ui
+                                    .add_enabled(can_rename, egui::Button::new("Rename..."))
+                                    .clicked()
+                            {
+                                m_rename = Some(row.name.clone());
                                 ui.close();
                             }
                             if host_pane {
@@ -955,6 +1104,33 @@ impl CommanderPane {
                 self.pending_host_delete = Some(names);
             }
         }
+        if let Some(name) = m_rename {
+            if let Some(entry) = self
+                .listing
+                .entries()
+                .iter()
+                .find(|e| e.name == name)
+                .cloned()
+            {
+                self.rename_dialog = Some(RenameDialog {
+                    input: entry.name.clone(),
+                    entry,
+                    error: None,
+                });
+            }
+        }
+        if let Some(name) = m_cancel_rename {
+            if let Some(path) = self
+                .listing
+                .entries()
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.path.clone())
+            {
+                self.queue.remove_pending_rename(&path);
+                status = Some(format!("[{}] cancelled staged rename.", self.side.label()));
+            }
+        }
         RowActions {
             status,
             copy: m_copy,
@@ -971,6 +1147,7 @@ enum RowKind {
     Normal,
     PendingDelete,
     PendingAdd,
+    PendingRename,
 }
 
 /// Owned per-frame row snapshot, so the row loop can mutate the listing / queue
@@ -982,6 +1159,8 @@ struct DisplayRow {
     modified: String,
     type_tag: String,
     kind: RowKind,
+    /// For a `PendingRename` row, the staged new name (shown as `old -> new`).
+    rename_to: Option<String>,
 }
 
 impl DisplayRow {
@@ -1008,10 +1187,14 @@ impl CommanderPane {
                     modified: String::new(),
                     type_tag: String::new(),
                     kind: RowKind::Parent,
+                    rename_to: None,
                 },
                 Row::Entry(e) => {
+                    let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
                     let kind = if self.queue.is_pending_delete(&e.path) {
                         RowKind::PendingDelete
+                    } else if rename_to.is_some() {
+                        RowKind::PendingRename
                     } else {
                         RowKind::Normal
                     };
@@ -1022,6 +1205,7 @@ impl CommanderPane {
                         modified: e.modified.clone().unwrap_or_default(),
                         type_tag: type_tag(e),
                         kind,
+                        rename_to,
                     }
                 }
             })
@@ -1035,6 +1219,7 @@ impl CommanderPane {
                 modified: String::new(),
                 type_tag: type_tag(&e),
                 kind: RowKind::PendingAdd,
+                rename_to: None,
             });
         }
         rows
@@ -1093,16 +1278,21 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     let color = match row.kind {
         RowKind::Parent => ui.visuals().weak_text_color(),
         RowKind::PendingAdd => ADD_COLOR,
+        RowKind::PendingRename => ADD_COLOR,
         RowKind::PendingDelete => DEL_COLOR,
         RowKind::Normal if row.is_dir => egui::Color32::from_rgb(120, 160, 255),
         RowKind::Normal => base,
     };
 
     // ASCII overlay markers (no Unicode glyphs): "+ " pending add, "- " pending
-    // delete, trailing "/" for directories.
+    // delete, "old -> new" pending rename, trailing "/" for directories.
     let display_name = match row.kind {
         RowKind::PendingAdd => format!("+ {}", row.name),
         RowKind::PendingDelete => format!("- {}", row.name),
+        RowKind::PendingRename => match &row.rename_to {
+            Some(new) => format!("{} -> {}", row.name, new),
+            None => row.name.clone(),
+        },
         _ if row.is_dir && !row.is_parent() => format!("{}/", row.name),
         _ => row.name.clone(),
     };

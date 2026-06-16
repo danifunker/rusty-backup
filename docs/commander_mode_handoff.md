@@ -114,6 +114,20 @@ the H2 commit lands with this doc update.)
   export` builds the job, and `pending_host_copy`'s destination side is now
   `Option<Side>` (`None` = export, so `poll_host_copy` skips the re-list). Excluded
   on not-yet-applied staged-add rows (no real data yet).
+- **M6.3 Rename** — new engine method `EditableFilesystem::rename(parent, entry,
+  new_name)` (default `Unsupported`), implemented in place for **FAT 12/16/32**
+  (`fat.rs`): same start cluster / size / attrs, add new LFN+SFN then remove old
+  (add-then-remove so a failure never orphans data); case-only renames allowed,
+  real collisions rejected. `fs::supports_rename(part_type, type_string)` gates the
+  GUI (FAT today; everything else stays grayed out). Model: `StagedEdit::Rename` +
+  `apply_edit` arm + `EditQueue::{pending_rename_for, remove_pending_rename}`. View:
+  right-click "Rename..." (single entry) opens a name dialog validating via
+  `Filesystem::validate_name`; image panes stage it (overlay shows `old -> new`,
+  right-click "Cancel rename"), host panes rename immediately via `std::fs::rename`
+  (existence-checked). Staging a delete drops any staged rename on the same entry.
+  Tests: 3 FAT-engine (file/dir/collision) + 1 staged-apply. **Follow-up:** exFAT /
+  HFS / HFS+ / ext `rename` (and a possible `rb-cli` rename verb reusing the trait
+  method).
 - **M6.2 Calculate Checksums** — new `model::checksum` (added the `sha1` crate):
   `ChecksumHasher` (a `std::io::Write` sink feeding crc32fast + md-5 + sha1 + sha2),
   `hash_reader(reader, progress) -> ChecksumSet { crc32, md5, sha1, sha256 }` with
@@ -154,13 +168,12 @@ suggested order is smallest-win-first:
 2. **Calculate Checksums** (§15.2) — *DONE.* `model::checksum` streams once into
    CRC32 / MD5 / SHA1 / SHA256; threaded `spawn(ChecksumJob)`; right-click window
    with a per-file grid + Copy buttons. Added the `sha1` crate.
-3. **Rename** (§15.1) — needs an engine gap filled.
-   - **Engine:** `EditableFilesystem::rename(parent, entry, new_name)` (per-FS;
-     start FAT/exFAT/HFS/HFS+/ext, others `Err(Unsupported)` so the item grays out).
-   - **Model:** `StagedEdit::Rename { parent, entry, new_name }` + `apply_edit` arm.
-   - **View:** a name dialog (reuse the New-Folder shape) validating via
-     `Filesystem::validate_name`. Image pane stages it; host pane does immediate
-     `std::fs::rename`. Single-selection only.
+3. **Rename** (§15.1) — *DONE for FAT.* `EditableFilesystem::rename` (default
+   `Unsupported`) + in-place FAT 12/16/32 impl; `fs::supports_rename` gates the GUI;
+   `StagedEdit::Rename` + dialog; image stages (overlay `old -> new`), host immediate.
+   **Remaining:** exFAT / HFS / HFS+ / ext `rename` overrides (each flips its core's
+   cell to enabled once added — no GUI change needed beyond extending
+   `fs::supports_rename`).
 4. **Per-pane Tree view** (§15.4) — *largest; a shared-model refactor.* A "Tree"
    toggle on the source bar switches the pane to a lazy folder tree. Lift
    `browse_view`'s `directory_cache` + `expanded_paths` + `render_tree_entry`

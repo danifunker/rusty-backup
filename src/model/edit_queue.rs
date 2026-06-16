@@ -52,6 +52,14 @@ pub enum StagedEdit {
         parent: FileEntry,
         entry: FileEntry,
     },
+    /// Rename an entry in place (keeps its identity / contents). Applied via
+    /// [`EditableFilesystem::rename`]; the filesystem must support it (gated in
+    /// the GUI by `fs::supports_rename`).
+    Rename {
+        parent: FileEntry,
+        entry: FileEntry,
+        new_name: String,
+    },
     SetProdosType {
         entry: FileEntry,
         type_byte: u8,
@@ -189,6 +197,14 @@ pub fn apply_edit(
         }
         StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
         StagedEdit::DeleteRecursive { parent, entry } => efs.delete_recursive(parent, entry),
+        StagedEdit::Rename {
+            parent,
+            entry,
+            new_name,
+        } => {
+            let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
+            efs.rename(&resolved_parent, entry, new_name)
+        }
         StagedEdit::SetProdosType {
             entry,
             type_byte,
@@ -296,6 +312,27 @@ impl EditQueue {
                     if entry.path == entry_path
             )
         });
+        self.edits.len() < before
+    }
+
+    /// New name of a pending `Rename` targeting `entry_path`, if any (the most
+    /// recently staged one wins).
+    pub fn pending_rename_for(&self, entry_path: &str) -> Option<&str> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::Rename {
+                entry, new_name, ..
+            } if entry.path == entry_path => Some(new_name.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Remove any pending `Rename` targeting `entry_path`. Returns `true` if a
+    /// matching edit was removed.
+    pub fn remove_pending_rename(&mut self, entry_path: &str) -> bool {
+        let before = self.edits.len();
+        self.edits.retain(
+            |edit| !matches!(edit, StagedEdit::Rename { entry, .. } if entry.path == entry_path),
+        );
         self.edits.len() < before
     }
 

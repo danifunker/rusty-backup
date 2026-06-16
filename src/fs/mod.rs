@@ -976,6 +976,23 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
     }
 }
 
+/// Whether [`EditableFilesystem::rename`](crate::fs::filesystem::EditableFilesystem::rename)
+/// is implemented (in-place) for the filesystem behind this partition type /
+/// type string. The GUI gates the "Rename..." action on this so it only offers
+/// rename where it will succeed, rather than failing at apply time.
+///
+/// FAT (12/16/32) is supported today; every other driver falls back to the
+/// trait's `Unsupported` default, so this returns false for them.
+pub fn supports_rename(partition_type: u8, partition_type_string: Option<&str>) -> bool {
+    if let Some(s) = partition_type_string {
+        return s.eq_ignore_ascii_case("fat");
+    }
+    matches!(
+        partition_type,
+        0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C
+    )
+}
+
 /// True if this filesystem's `CompactReader` returns a layout-preserving
 /// stream (allocated blocks at their original byte offsets, free blocks
 /// zeroed) rather than a packed stream (allocated blocks repacked at the

@@ -356,6 +356,25 @@ pub trait EditableFilesystem: Filesystem {
         self.delete_entry(parent, entry)
     }
 
+    /// Rename an entry within its parent directory, in place: the entry keeps
+    /// its identity and contents (start cluster / CNID / inode and file data
+    /// are untouched) — only the name in the parent's directory listing
+    /// changes. `new_name` must validate via [`Filesystem::validate_name`] and
+    /// must not already name another entry in `parent`.
+    ///
+    /// Default returns `Unsupported` so the GUI can gray out the action on
+    /// filesystems that haven't implemented it yet.
+    fn rename(
+        &mut self,
+        _parent: &FileEntry,
+        _entry: &FileEntry,
+        _new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "rename not supported for this filesystem".into(),
+        ))
+    }
+
     /// Set Unix permission bits on an entry. Override on Unix-style
     /// filesystems (ext); other filesystems return `Unsupported` so callers
     /// don't silently lose mode information.

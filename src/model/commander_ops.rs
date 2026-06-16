@@ -449,6 +449,74 @@ mod tests {
         assert!(!names.iter().any(|n| n == "GONE.TXT"), "{names:?}");
     }
 
+    /// A staged `Rename` applied through `apply_edits` renames the entry in
+    /// place on a real FAT image (the M6.3 staging path).
+    #[test]
+    fn apply_edits_renames_in_place_on_a_real_image() {
+        use crate::fs::filesystem::CreateFileOptions;
+        use std::fs::OpenOptions;
+        use std::io::Cursor;
+
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("REN")).unwrap();
+        let tmp = tempfile::Builder::new().suffix(".img").tempfile().unwrap();
+        std::fs::write(tmp.path(), &flat).unwrap();
+        {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(tmp.path())
+                .unwrap();
+            let mut efs = crate::fs::open_editable_filesystem(f, 0, 0x01, None).unwrap();
+            let root = efs.root().unwrap();
+            let mut data = Cursor::new(b"keep my bytes".to_vec());
+            efs.create_file(
+                &root,
+                "BEFORE.TXT",
+                &mut data,
+                13,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        let session = BrowseSession {
+            source_path: Some(tmp.path().to_path_buf()),
+            partition_type: 0x01,
+            ..Default::default()
+        };
+
+        let mut fs = session.open().unwrap();
+        let root = fs.root().unwrap();
+        let before = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "BEFORE.TXT")
+            .unwrap();
+        drop(fs);
+
+        let edits = vec![StagedEdit::Rename {
+            parent: FileEntry::root(),
+            entry: before,
+            new_name: "After File.txt".to_string(),
+        }];
+        apply_edits(&session, &edits).expect("apply rename");
+
+        let mut fs = session.open().unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "After File.txt")
+            .expect("renamed entry present");
+        assert!(!entries.iter().any(|e| e.name == "BEFORE.TXT"));
+        assert_eq!(
+            &fs.read_file(renamed, usize::MAX).unwrap(),
+            b"keep my bytes"
+        );
+    }
+
     /// Image -> image copy: stage a file and a directory subtree from one FAT
     /// volume, apply onto a blank one, and confirm the whole subtree lands.
     #[test]
