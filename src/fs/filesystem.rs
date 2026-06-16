@@ -448,6 +448,17 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// Stage the 1024-byte HFS boot-block region (sectors 0–1) for the
+    /// volume, written verbatim at `sync_metadata` time. Used to make a
+    /// classic-HFS volume bootable by copying a donor's boot blocks. Override
+    /// on HFS/HFS+ (the only filesystems with a Mac boot region); others
+    /// return `Unsupported` so the GUI can gate the action.
+    fn write_boot_blocks(&mut self, _blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "write_boot_blocks not supported for this filesystem".into(),
+        ))
+    }
+
     /// Rename the volume. Override on filesystems where the volume name is
     /// stored in metadata that the implementation can rewrite in place
     /// (HFS today; others return `Unsupported`).

@@ -67,6 +67,12 @@ pub enum StagedEdit {
     BlessFolder {
         entry: FileEntry,
     },
+    /// Write the 1024-byte HFS boot-block region (sectors 0–1) verbatim,
+    /// captured from a donor disk at staging time. Makes a classic-HFS
+    /// volume bootable; HFS/HFS+ only.
+    WriteBootBlocks {
+        blocks: Box<[u8; 1024]>,
+    },
     /// Set HFS/HFS+ type and creator codes on an existing on-disk file.
     SetTypeCreator {
         entry: FileEntry,
@@ -190,6 +196,7 @@ pub fn apply_edit(
         } => efs.set_prodos_type(entry, *type_byte, *aux_type),
         StagedEdit::SetProdosAccess { entry, access } => efs.set_prodos_access(entry, *access),
         StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
+        StagedEdit::WriteBootBlocks { blocks } => efs.write_boot_blocks(blocks),
         StagedEdit::SetTypeCreator {
             entry,
             type_code,
@@ -525,5 +532,90 @@ impl EditQueue {
             type_code,
             creator_code,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::filesystem::Filesystem;
+    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use std::io::Cursor;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The full GUI "Boot Blocks..." mechanism: a `WriteBootBlocks` staged
+    /// edit, dispatched through `apply_edit` + `sync_metadata`, lands the
+    /// 1024-byte region at sector 0 of a previously-bare HFS volume.
+    #[test]
+    fn write_boot_blocks_staged_edit_reaches_sector_zero() {
+        // A freshly-built HFS volume has zeroed boot blocks.
+        let img = create_blank_hfs(8 * MIB, 4096, "NoBoot").unwrap();
+        assert_eq!(&img[0..2], &[0x00, 0x00]);
+
+        let mut blocks = Box::new([0u8; 1024]);
+        blocks[0] = 0x4C; // 'L'
+        blocks[1] = 0x4B; // 'K'
+        blocks[2] = 0x60;
+
+        let mut buf = img.clone();
+        {
+            let mut efs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::WriteBootBlocks {
+                    blocks: blocks.clone(),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        // Sector 0 now carries the staged boot blocks, and the volume still
+        // opens as a valid HFS volume.
+        assert_eq!(&buf[0..3], &[0x4C, 0x4B, 0x60]);
+        let fs = HfsFilesystem::open(Cursor::new(buf), 0).unwrap();
+        assert_eq!(fs.fs_type(), "HFS");
+    }
+
+    /// Full-disk (partitioned) case: the same staged edit, applied to an HFS
+    /// volume opened at a NON-zero partition offset (as on an APM disk — e.g.
+    /// an infinite-mac "device image" with DDR + map + drivers ahead of the
+    /// Apple_HFS partition), writes the boot blocks at the partition's first
+    /// sector and leaves the preceding bytes (DDR / partition map / drivers)
+    /// untouched. This is what makes "Boot Blocks..." work on full disks, not
+    /// just flat HFVs.
+    #[test]
+    fn write_boot_blocks_honors_partition_offset() {
+        // 0xC000 = 49152, the HFS offset of infinite-mac's SCSI-4.3 device
+        // image header.
+        const OFFSET: usize = 0xC000;
+        let hfs = create_blank_hfs(8 * MIB, 4096, "InPart").unwrap();
+
+        // Sentinel-filled leading region stands in for DDR + APM + drivers;
+        // it must never be overwritten by a partition-scoped boot write.
+        let mut disk = vec![0xABu8; OFFSET];
+        disk.extend_from_slice(&hfs);
+
+        let mut blocks = Box::new([0u8; 1024]);
+        blocks[0] = 0x4C;
+        blocks[1] = 0x4B;
+
+        {
+            let mut efs = HfsFilesystem::open(Cursor::new(&mut disk), OFFSET as u64).unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::WriteBootBlocks {
+                    blocks: blocks.clone(),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        // Boot blocks landed at the partition offset...
+        assert_eq!(&disk[OFFSET..OFFSET + 2], &[0x4C, 0x4B]);
+        // ...and the leading DDR / partition-map region is pristine.
+        assert!(disk[..OFFSET].iter().all(|&b| b == 0xAB));
     }
 }

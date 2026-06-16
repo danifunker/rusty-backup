@@ -3789,6 +3789,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         }
         result
     }
+
+    fn write_boot_blocks(&mut self, blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        self.set_boot_blocks(blocks);
+        Ok(())
+    }
 }
 
 impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {

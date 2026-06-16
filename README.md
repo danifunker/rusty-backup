@@ -57,6 +57,8 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
+rb-cli make-bootable disk.dsk --boot-from "System 7.0 HD.dsk"  # auto: apply only what's missing to boot
+rb-cli make-bootable mac.hda --dry-run                     # preview: detect kind + missing pieces
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
@@ -206,6 +208,24 @@ The app has five tabs:
     moves, and it is idempotent. (This registers the *driver* so the ROM
     can read the disk — it does not change HFS boot-block behavior.)
     Verified against the real Quadra 800 ROM in QEMU `-M q800`.
+  - **Make a Mac disk bootable** — `rb-cli make-bootable disk.img
+    [--boot-from "System 7.5.3 HD.dsk"]` (or the Inspect tab's
+    **Make Bootable...** button) auto-detects what the disk is and applies only
+    what it's missing:
+    - a **flat `.hfv`/`.dsk`** (BasiliskII / SheepShaver / Mini vMac, e.g. a
+      customized [infinite-mac](https://infinitemac.org) disk) — boot blocks +
+      blessed System Folder, kept flat (no APM wrapper added);
+    - a **full APM disk** (an infinite-mac "device image" with DDR + map +
+      drivers, or any Mac SCSI disk image) — a SCSI driver + DDR (bundled, or
+      `--driver-from donor`) if absent, then boot blocks on the `Apple_HFS`
+      partition + bless, leaving the DDR / map / drivers untouched.
+
+    Boot blocks are never synthesized — they're copied verbatim from a
+    `--boot-from` donor that already boots that System, so they stay
+    version-matched. The operation is idempotent (`--dry-run` previews it). The
+    lower-level pieces are also available on their own: `rb-cli put IMG[@N]
+    --boot-from DONOR`, `rb-cli bless set`, and the browse-view
+    **Boot Blocks...** / **Bless Folder** buttons.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /

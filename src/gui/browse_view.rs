@@ -111,6 +111,11 @@ pub struct BrowseView {
     archive_temp_path: Option<PathBuf>,
     /// Blessed (bootable) system folder info (HFS/HFS+ only).
     blessed_folder: Option<(u64, String)>,
+    /// Whether the open HFS volume has boot blocks at sector 0 (`'LK'`).
+    /// `None` until computed (or when not file-backed); computed lazily in
+    /// edit mode where the backing bytes are raw. Drives the "Boot blocks:"
+    /// status line and the "Boot Blocks…" button's hint.
+    boot_blocks_present: Option<bool>,
     /// Last filesystem check result (for popup display).
     fsck_result: Option<rusty_backup::fs::FsckResult>,
     /// Whether to show the fsck results popup.
@@ -397,6 +402,7 @@ impl Default for BrowseView {
             archive_edit_progress: None,
             archive_temp_path: None,
             blessed_folder: None,
+            boot_blocks_present: None,
             fsck_result: None,
             show_fsck_popup: false,
             chd_info_text: None,
@@ -789,6 +795,13 @@ impl BrowseView {
         // Handle drag-and-drop from host OS
         self.handle_dropped_files(ui);
 
+        // Lazily compute boot-block presence for the status line + the
+        // "Boot Blocks..." button. Only read in edit mode, where the backing
+        // file holds the raw (decompressed) image bytes.
+        if self.edit_mode && self.is_hfs_type() && self.boot_blocks_present.is_none() {
+            self.boot_blocks_present = self.detect_boot_blocks_present();
+        }
+
         // Header
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Filesystem Browser").strong());
@@ -814,6 +827,29 @@ impl BrowseView {
             }
             if let Some((_, ref name)) = self.blessed_folder {
                 ui.label(format!("Blessed: {}", name));
+            }
+            // Boot-block status (edit mode, HFS volumes). A bootable volume
+            // needs both a blessed System Folder and boot blocks at sector 0.
+            if self.edit_mode && self.is_hfs_type() {
+                match self.boot_blocks_present {
+                    Some(true) => {
+                        ui.label("Boot blocks: present")
+                            .on_hover_text("The volume's first sector has the 'LK' boot loader.");
+                    }
+                    Some(false) => {
+                        ui.label(
+                            egui::RichText::new("Boot blocks: absent")
+                                .color(egui::Color32::from_rgb(0xCC, 0x88, 0x00)),
+                        )
+                        .on_hover_text(
+                            "This volume has no boot loader. Use 'Boot Blocks...' to copy \
+                             them from a bootable donor disk (e.g. a matching stock System \
+                             disk), then bless the System Folder. Works on a flat HFV and on \
+                             the HFS partition of a full (APM) disk alike.",
+                        );
+                    }
+                    None => {}
+                }
             }
 
             // Carve view: "Full scan" toggle. By default the synthetic carve
@@ -2408,6 +2444,11 @@ impl BrowseView {
                         .unwrap_or(false);
                 if ui
                     .add_enabled(can_bless, egui::Button::new("Bless Folder"))
+                    .on_hover_text(
+                        "Mark the selected folder as the bootable System Folder. For the \
+                         volume to actually boot it also needs boot blocks (see 'Boot \
+                         Blocks...').",
+                    )
                     .clicked()
                 {
                     if let Some(ref sel) = self.selected_entry.clone() {
@@ -2415,6 +2456,29 @@ impl BrowseView {
                             .push(StagedEdit::BlessFolder { entry: sel.clone() });
                         self.edit_result = Some(format!("Staged bless folder '{}'", sel.name));
                     }
+                }
+
+                // Boot Blocks... — copy the 1024-byte boot loader from a
+                // bootable donor disk into the volume's first sector
+                // (partition-scoped, so it works on the HFS partition of a
+                // full APM disk too, not just a flat HFV). Needed to make a
+                // bare HFS volume (e.g. an edited infinite-mac disk) boot.
+                let boot_hint = match self.boot_blocks_present {
+                    Some(true) => {
+                        "This volume already has boot blocks; copy a donor's to replace them."
+                    }
+                    _ => {
+                        "Copy boot blocks from a bootable donor disk (e.g. a matching stock \
+                          System disk) into this volume's first sector. Works on a flat HFV \
+                          and on the HFS partition of a full (APM) disk."
+                    }
+                };
+                if ui
+                    .button("Boot Blocks...")
+                    .on_hover_text(boot_hint)
+                    .clicked()
+                {
+                    self.boot_blocks_dialog();
                 }
             }
 
@@ -2501,6 +2565,39 @@ impl BrowseView {
 
         if let Some(paths) = files {
             self.add_host_paths(&paths);
+        }
+    }
+
+    /// Pick a bootable donor disk and stage copying its 1024-byte boot-block
+    /// region into sector 0 of the current volume. Together with "Bless
+    /// Folder" this makes a bare classic-HFS volume (e.g. an edited
+    /// infinite-mac data disk) bootable. The donor's HFS volume is
+    /// auto-located and its `'LK'` signature validated before staging.
+    fn boot_blocks_dialog(&mut self) {
+        let donor = match rfd::FileDialog::new()
+            .set_title("Select a bootable donor disk to copy boot blocks from")
+            .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
+            .pick_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+
+        match rusty_backup::fs::hfs_boot::read_donor_boot_blocks_from_image(&donor) {
+            Ok(d) => {
+                self.staged_edits
+                    .push(StagedEdit::WriteBootBlocks { blocks: d.blocks });
+                let donor_name = donor
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("donor");
+                self.edit_result = Some(format!(
+                    "Staged boot blocks from '{donor_name}'. Apply Edits to write them."
+                ));
+            }
+            Err(e) => {
+                self.edit_result = Some(format!("Boot blocks: {e}"));
+            }
         }
     }
 
@@ -4972,6 +5069,20 @@ impl BrowseView {
     /// (after sync_metadata, archive recompress, etc.).
     fn invalidate_cached_fs(&mut self) {
         self.cached_fs = None;
+        // Boot-block status is recomputed lazily from the (now possibly
+        // changed) backing bytes the next time the header renders.
+        self.boot_blocks_present = None;
+    }
+
+    /// Best-effort: does the open volume have HFS boot blocks at sector 0?
+    /// Reads two bytes from the backing file at the partition offset. Returns
+    /// `None` when unknown — no file-backed source (e.g. a CHD edit session),
+    /// or a read error. Only trustworthy in edit mode, where the backing file
+    /// holds the raw, decompressed image bytes.
+    fn detect_boot_blocks_present(&self) -> Option<bool> {
+        let path = self.session.source_path.as_ref()?;
+        let mut f = std::fs::File::open(path).ok()?;
+        rusty_backup::fs::hfs_boot::has_boot_blocks(&mut f, self.session.partition_offset).ok()
     }
 
     fn poll_extraction(&mut self, ui: &egui::Ui) {

@@ -692,6 +692,25 @@ Usage: mac-scsi-bless [OPTIONS] <IMAGE>
 - `--builtin-driver` — Use the bundled known-good Apple SCSI driver (this is the default when no driver source is given)
 - `--force-cksum-zero` — Force `pmBootCksum = 0`. Some ROMs skip checksum verification then
 
+### `make-bootable`
+
+Auto-detect what a Mac disk needs to boot and apply only the missing pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a `--boot-from` donor), and a blessed System Folder. Idempotent; a flat HFV is kept flat. Works on flat HFVs and full APM disks alike
+
+```
+Usage: make-bootable [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Disk image to make bootable, in place
+
+**Options**
+
+- `--boot-from` — Bootable donor disk to copy boot blocks from, if the target lacks them (its classic-HFS volume is auto-located and `'LK'`-validated). Without it, missing boot blocks are reported but not synthesized
+- `--driver-from` — For a full (APM) disk missing a SCSI driver: extract it from a donor Apple-formatted disk instead of using the bundled driver
+- `--bless` — Absolute Mac path of the folder to bless (e.g. `/System Folder`). Defaults to auto-blessing a root folder named "System Folder"
+- `--dry-run` — Report what would change without writing anything
+
 ### `mkdir`
 
 Create a directory inside a filesystem
@@ -964,6 +983,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
+- `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path

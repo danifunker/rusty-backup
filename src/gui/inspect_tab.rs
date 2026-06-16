@@ -689,6 +689,33 @@ impl InspectTab {
                 self.expand_image_add_mib = 0;
             }
 
+            // Make Bootable button — auto-detect what this Mac disk needs to
+            // boot (SCSI driver + DDR on a full APM disk, boot blocks, blessed
+            // System Folder) and apply only the missing pieces. A flat HFV is
+            // kept flat. See src/fs/make_bootable.rs.
+            let has_mac_hfs = self.partitions.iter().any(|p| {
+                is_classic_hfs(
+                    p.partition_type_byte,
+                    p.partition_type_string.as_deref(),
+                    &p.type_name,
+                )
+            });
+            if ui
+                .add_enabled(
+                    is_image_file && has_mac_hfs && !export_running && !chd_expand_running,
+                    egui::Button::new("Make Bootable..."),
+                )
+                .on_hover_text(
+                    "Auto-detect what this Mac disk needs to boot (SCSI driver + DDR on a \
+                     full APM disk, boot blocks, blessed System Folder) and apply only the \
+                     missing pieces. A flat HFV is kept flat; you'll be asked for a donor \
+                     disk only if boot blocks are missing.",
+                )
+                .clicked()
+            {
+                self.run_make_bootable(ctx);
+            }
+
             // Resize Partitions button — same conditions as Edit Partition Table
             let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
             if ui
@@ -1102,6 +1129,97 @@ impl InspectTab {
             fs_hint,
             has_partition_table,
         })
+    }
+
+    /// Auto-detect what the loaded Mac disk needs to boot and apply only the
+    /// missing pieces (driver + DDR on a full APM disk, boot blocks, blessed
+    /// System Folder). Prompts for a donor disk only when boot blocks are
+    /// absent. Runs synchronously — each step is a small metadata/sector write.
+    fn run_make_bootable(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::fs::make_bootable::{
+            assess_bootability, make_bootable, BootDiskKind, DriverSource, MakeBootableOptions,
+        };
+
+        let Some(path) = self.image_file_path.clone() else {
+            return;
+        };
+
+        let assessment = match assess_bootability(&path) {
+            Ok(a) => a,
+            Err(e) => {
+                ctx.log.error(format!("Make Bootable: {e}"));
+                return;
+            }
+        };
+        let kind = match assessment.kind {
+            BootDiskKind::FlatHfs => "flat HFS image (kept flat)",
+            BootDiskKind::ApmHfs => "full APM disk",
+        };
+        ctx.log.info(format!(
+            "Make Bootable: detected {kind} - boot blocks {}, System Folder {}",
+            if assessment.has_boot_blocks {
+                "present"
+            } else {
+                "absent"
+            },
+            match &assessment.blessed_folder {
+                Some(n) => format!("blessed ({n})"),
+                None => "not blessed".to_string(),
+            }
+        ));
+
+        if assessment.is_bootable() {
+            ctx.log
+                .info("Make Bootable: disk is already bootable; nothing to do.");
+            return;
+        }
+
+        // Boot blocks can't be synthesized — ask for a donor disk if missing.
+        // Cancelling the picker aborts without writing anything.
+        let mut donor = None;
+        if !assessment.has_boot_blocks {
+            match rfd::FileDialog::new()
+                .set_title("Boot blocks needed - pick a bootable donor disk")
+                .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
+                .pick_file()
+            {
+                Some(p) => donor = Some(p),
+                None => {
+                    ctx.log
+                        .info("Make Bootable: cancelled (boot blocks need a donor disk).");
+                    return;
+                }
+            }
+        }
+
+        let opts = MakeBootableOptions {
+            donor,
+            driver: DriverSource::Builtin,
+            bless_path: None,
+            dry_run: false,
+        };
+        match make_bootable(&path, &opts) {
+            Ok(report) => {
+                for s in &report.applied {
+                    ctx.log.info(format!("Make Bootable: {s}"));
+                }
+                for s in &report.skipped {
+                    ctx.log.info(format!("Make Bootable: skip - {s}"));
+                }
+                for s in &report.still_missing {
+                    ctx.log.warn(format!("Make Bootable: MISSING - {s}"));
+                }
+                if report.now_bootable {
+                    ctx.log.info("Make Bootable: disk is now bootable.");
+                } else {
+                    ctx.log
+                        .warn("Make Bootable: disk is not yet bootable (see MISSING above).");
+                }
+                // Force re-detection so the partition list / statuses refresh.
+                self.prev_image_path = None;
+            }
+            Err(e) => ctx.log.error(format!("Make Bootable failed: {e}")),
+        }
     }
 
     fn init_resize_popup(&mut self, ctx: &mut TabContext) {

@@ -3196,6 +3196,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         result
     }
 
+    fn write_boot_blocks(&mut self, blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        HfsFilesystem::set_boot_blocks(self, blocks);
+        Ok(())
+    }
+
     fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError> {
         HfsFilesystem::set_volume_name(self, new_name)
     }

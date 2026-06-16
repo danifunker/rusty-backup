@@ -73,6 +73,13 @@ pub enum Command {
     #[command(name = "mac-scsi-bless")]
     MacScsiBless(verbs::mac_scsi_bless::MacScsiBlessArgs),
 
+    /// Auto-detect what a Mac disk needs to boot and apply only the missing
+    /// pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a
+    /// `--boot-from` donor), and a blessed System Folder. Idempotent; a flat
+    /// HFV is kept flat. Works on flat HFVs and full APM disks alike.
+    #[command(name = "make-bootable")]
+    MakeBootable(verbs::make_bootable::MakeBootableArgs),
+
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
@@ -263,6 +270,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
+        Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
