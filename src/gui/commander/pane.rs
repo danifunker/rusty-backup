@@ -108,6 +108,8 @@ pub(crate) struct CommanderPane {
     pending_host_delete: Option<Vec<String>>,
     /// The open "Rename..." dialog, if any (single entry at a time).
     rename_dialog: Option<RenameDialog>,
+    /// The open "New Folder..." dialog, if any.
+    new_folder_dialog: Option<NewFolderDialog>,
     /// Whether the "Pending edits" review popup is open for this pane.
     show_edits_popup: bool,
 }
@@ -117,6 +119,14 @@ struct RenameDialog {
     /// The live entry being renamed.
     entry: FileEntry,
     /// The editable new-name buffer (seeded with the current name).
+    input: String,
+    /// Last validation error, shown inline; cleared as the user types.
+    error: Option<String>,
+}
+
+/// State for the modal "New Folder..." dialog.
+struct NewFolderDialog {
+    /// The editable folder-name buffer.
     input: String,
     /// Last validation error, shown inline; cleared as the user types.
     error: Option<String>,
@@ -152,6 +162,7 @@ impl CommanderPane {
             pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
+            new_folder_dialog: None,
             show_edits_popup: false,
         }
     }
@@ -224,6 +235,9 @@ impl CommanderPane {
             status = Some(s);
         }
         if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
+            status = Some(s);
+        }
+        if let Some(s) = self.render_new_folder_dialog(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.render_rename_dialog(ui.ctx()) {
@@ -405,6 +419,107 @@ impl CommanderPane {
                 new_name: new_name.clone(),
             });
             format!("[{side}] staged rename to '{new_name}'. Apply to write.")
+        }
+    }
+
+    /// The "New Folder..." modal: a name field staged as a CreateDirectory on
+    /// an image pane, or created immediately on a host pane.
+    fn render_new_folder_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
+        self.new_folder_dialog.as_ref()?;
+        let side = self.side;
+        let mut do_create = false;
+        let mut cancel = false;
+        {
+            let d = self.new_folder_dialog.as_mut().unwrap();
+            let input = &mut d.input;
+            let err = d.error.clone();
+            egui::Window::new(format!("New Folder ({})", side.label()))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Folder name:");
+                    let resp = ui.text_edit_singleline(input);
+                    if let Some(e) = &err {
+                        ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                    }
+                    let valid = !input.trim().is_empty();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(valid, egui::Button::new("Create")).clicked() {
+                            do_create = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                    if valid && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        do_create = true;
+                    }
+                });
+        }
+
+        if cancel {
+            self.new_folder_dialog = None;
+            return None;
+        }
+        if do_create {
+            let name = self
+                .new_folder_dialog
+                .as_ref()
+                .unwrap()
+                .input
+                .trim()
+                .to_string();
+            // Name validity (image panes; host names are validated by the OS).
+            if let Some(Err(e)) = self.listing.fs_mut().map(|fs| fs.validate_name(&name)) {
+                if let Some(d) = self.new_folder_dialog.as_mut() {
+                    d.error = Some(format!("{e}"));
+                }
+                return None;
+            }
+            // Reject a name already present (on disk or staged here).
+            let cwd_path = self.listing.cwd_path().to_string();
+            let dup = self.listing.entries().iter().any(|e| e.name == name)
+                || self
+                    .queue
+                    .pending_adds_for(&cwd_path)
+                    .iter()
+                    .any(|e| e.name == name);
+            if dup {
+                if let Some(d) = self.new_folder_dialog.as_mut() {
+                    d.error = Some(format!("'{name}' already exists here"));
+                }
+                return None;
+            }
+            self.new_folder_dialog = None;
+            return Some(self.perform_new_folder(name));
+        }
+        None
+    }
+
+    /// Create the folder: immediate `std::fs::create_dir` on a host pane, or a
+    /// staged `CreateDirectory` on an image pane.
+    fn perform_new_folder(&mut self, name: String) -> String {
+        let side = self.side.label();
+        if self.listing.is_host() {
+            let dir = PathBuf::from(self.listing.cwd_path()).join(&name);
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {
+                    self.reload_listing();
+                    format!("[{side}] created folder '{name}'.")
+                }
+                Err(e) => format!("[{side}] create folder failed: {e}"),
+            }
+        } else {
+            let Some(cwd) = self.listing.cwd().cloned() else {
+                return format!("[{side}] no directory open.");
+            };
+            self.queue.push(StagedEdit::CreateDirectory {
+                parent: cwd,
+                name: name.clone(),
+            });
+            format!("[{side}] staged new folder '{name}'. Apply to write.")
         }
     }
 
@@ -683,6 +798,21 @@ impl CommanderPane {
                             }
                         }
                     }
+                }
+
+                // New Folder: stages a CreateDirectory on an image pane;
+                // creates it immediately on a host pane.
+                let busy = self.pending_apply.is_some() || self.pending_open.is_some();
+                if !busy
+                    && ui
+                        .button("New Folder")
+                        .on_hover_text("Create a folder in the current directory")
+                        .clicked()
+                {
+                    self.new_folder_dialog = Some(NewFolderDialog {
+                        input: String::new(),
+                        error: None,
+                    });
                 }
 
                 // Right-aligned volume label + free space.
