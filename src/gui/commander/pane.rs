@@ -626,6 +626,7 @@ impl CommanderPane {
                 show_host_folder: true,
                 show_backup_folder: false,
                 materialize_image: false,
+                include_mac_archives: false,
                 width: 200.0,
             };
             let state = super::super::source_picker::PickerState {

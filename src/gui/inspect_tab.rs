@@ -438,6 +438,7 @@ impl InspectTab {
                 show_host_folder: false,
                 show_backup_folder: true,
                 materialize_image: true,
+                include_mac_archives: true,
                 width: 400.0,
             };
             let state = super::source_picker::PickerState {

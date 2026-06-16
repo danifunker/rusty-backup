@@ -50,6 +50,10 @@ pub struct PickerConfig {
     /// `prepare_disk_image_path`. Inspect sets this; Commander leaves it off
     /// and lets `BrowseSession` peel the container itself.
     pub materialize_image: bool,
+    /// Add the "Mac archives" (`.sit`/`.hqx`/…) filter group to the image file
+    /// dialog. Inspect can inspect those; the Commander panes (disk browsing
+    /// only) leave it off so non-disk archives don't clutter the picker.
+    pub include_mac_archives: bool,
     /// ComboBox width.
     pub width: f32,
 }
@@ -69,18 +73,21 @@ pub struct PickerState<'a> {
 /// to a tempfile via `prepare_disk_image_path` (the guard rides along in the
 /// returned tuple). Returns `None` if the user cancels. Shared by the picker's
 /// "Open File…" entry and Commander's "Open…" button.
-pub fn pick_image_file(materialize: bool) -> Option<(PathBuf, Option<tempfile::TempDir>)> {
-    let path = super::file_dialog()
-        .add_filter(
-            "Disk Images",
-            rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-        )
-        .add_filter(
+pub fn pick_image_file(
+    materialize: bool,
+    include_mac_archives: bool,
+) -> Option<(PathBuf, Option<tempfile::TempDir>)> {
+    let mut dialog = super::file_dialog().add_filter(
+        "Disk Images",
+        rusty_backup::model::file_types::DISK_IMAGE_EXTS,
+    );
+    if include_mac_archives {
+        dialog = dialog.add_filter(
             "Mac archives",
             rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-        )
-        .add_filter("All Files", &["*"])
-        .pick_file()?;
+        );
+    }
+    let path = dialog.add_filter("All Files", &["*"]).pick_file()?;
     if !materialize {
         return Some((path, None));
     }
@@ -131,7 +138,9 @@ pub fn show(
                     .selectable_label(state.image_active, "Open File...")
                     .clicked()
             {
-                if let Some((path, tempdir)) = pick_image_file(cfg.materialize_image) {
+                if let Some((path, tempdir)) =
+                    pick_image_file(cfg.materialize_image, cfg.include_mac_archives)
+                {
                     event = Some(SourceEvent::Image { path, tempdir });
                 }
             }
