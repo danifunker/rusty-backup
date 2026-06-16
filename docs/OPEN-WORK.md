@@ -303,7 +303,8 @@ Gaps to reconcile back into the plan when it gets picked up:
 
 ### 6.1 Commander Mode — two-pane file explorer
 
-Full design + runnable mock: [`commander_mode.md`](commander_mode.md). A
+Full design + runnable mock: [`commander_mode.md`](commander_mode.md); pick-up
+notes: [`commander_mode_handoff.md`](commander_mode_handoff.md). A
 full-page, Midnight-Commander-style overlay with two panes (each a disk-image
 partition or a host folder), staged copy/delete between them, multi-select,
 right-click menu, and export/archive-out. Locked decisions and the
