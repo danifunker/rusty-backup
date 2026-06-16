@@ -1,15 +1,18 @@
-//! One Commander pane: a source bar (open + partition picker), a path line, and
-//! a flat single-directory listing grid with sortable columns, multi-selection,
-//! and `..` / double-click navigation.
+//! One Commander pane: a source bar (open + partition picker + Apply/Discard), a
+//! path line, and a flat single-directory listing grid with sortable columns,
+//! multi-selection, `..` / double-click navigation, and a per-pane staged-edit
+//! queue (delete, with the staged adds shown in the virtual overlay).
 //!
 //! All listing state lives in the [`DirListing`] model
 //! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
 //! it. Opening a source is delegated to
 //! [`rusty_backup::model::commander_source`] (partition probe + `BrowseSession`)
 //! and runs off-thread via [`BrowseSession::spawn_open`], polled each frame.
+//! Applying staged edits runs off-thread via
+//! [`rusty_backup::model::commander_ops::spawn_apply`].
 //!
-//! Read-only for now: copy / delete / staging arrive with the middle-column
-//! engine in a later milestone (see `docs/commander_mode.md` §5, §7).
+//! Cross-pane copy (the middle column) and the unsaved-changes guard land in the
+//! next milestones (see `docs/commander_mode.md` §5, §7).
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
@@ -18,14 +21,18 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use rusty_backup::model::browse_session::BrowseOpenStatus;
+use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
+use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
+use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::partition::{format_size, PartitionInfo};
 
 use super::Side;
 
 const ROW_H: f32 = 20.0;
+const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
+const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 
 pub(crate) struct CommanderPane {
     side: Side,
@@ -37,8 +44,15 @@ pub(crate) struct CommanderPane {
     selected_part: Option<usize>,
     /// The directory-listing model this pane renders.
     listing: DirListing,
+    /// The session that opened the current partition, kept so Apply can
+    /// re-open it read-write. `None` until a partition is opened.
+    session: Option<BrowseSession>,
+    /// Staged edits (delete; copy lands in M3b) for this image pane.
+    queue: EditQueue,
     /// In-flight async open (spinner) from `BrowseSession::spawn_open`.
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
+    /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
+    pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
     /// Phase text shown next to the spinner while `pending_open` is live.
     open_phase: String,
     /// Volume metadata captured on open, for the source-bar readout.
@@ -46,7 +60,7 @@ pub(crate) struct CommanderPane {
     fs_type: String,
     total_size: u64,
     used_size: u64,
-    /// Last open / navigation error, shown in the pane body.
+    /// Last open / navigation / apply error, shown in the pane body.
     error: Option<String>,
 }
 
@@ -58,7 +72,10 @@ impl CommanderPane {
             partitions: Vec::new(),
             selected_part: None,
             listing: DirListing::new(),
+            session: None,
+            queue: EditQueue::new(),
             pending_open: None,
+            pending_apply: None,
             open_phase: String::new(),
             volume_label: String::new(),
             fs_type: String::new(),
@@ -72,6 +89,9 @@ impl CommanderPane {
     /// surfacing in the overlay's bottom bar.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let mut status = self.poll_open(ui.ctx());
+        if let Some(s) = self.poll_apply(ui.ctx()) {
+            status = Some(s);
+        }
 
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
@@ -79,7 +99,14 @@ impl CommanderPane {
         self.path_line(ui);
         ui.separator();
 
-        if self.pending_open.is_some() {
+        if self.pending_apply.is_some() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label("Applying staged edits...");
+            });
+        } else if self.pending_open.is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -144,6 +171,21 @@ impl CommanderPane {
                     status = Some(self.open_partition(i));
                 }
             }
+
+            // Per-pane staging controls.
+            let n = self.queue.len();
+            let busy = self.pending_apply.is_some() || self.pending_open.is_some();
+            ui.add_enabled_ui(n > 0 && !busy, |ui| {
+                if ui.button(format!("Apply ({n})")).clicked() {
+                    status = Some(self.apply());
+                }
+            });
+            ui.add_enabled_ui(n > 0 && !busy, |ui| {
+                if ui.button("Discard").clicked() {
+                    self.queue.clear();
+                    status = Some(format!("[{}] discarded staged edits.", self.side.label()));
+                }
+            });
 
             // Right-aligned volume label + free space.
             if self.listing.is_loaded() {
@@ -223,8 +265,10 @@ impl CommanderPane {
         self.selected_part = Some(idx);
         self.error = None;
         self.listing = DirListing::new();
+        self.queue.clear();
         let session = commander_source::session_for(&path, part);
         self.pending_open = Some(session.spawn_open());
+        self.session = Some(session);
         self.open_phase = "Opening...".to_string();
         format!(
             "[{}] opening {} ...",
@@ -277,6 +321,91 @@ impl CommanderPane {
             _ => {
                 self.error = Some("Filesystem opened but no root directory was returned.".into());
                 None
+            }
+        }
+    }
+
+    // --- staging -----------------------------------------------------------
+
+    /// Spawn an async apply of the staged queue against this pane's source.
+    fn apply(&mut self) -> String {
+        if self.queue.is_empty() {
+            return String::new();
+        }
+        let Some(session) = self.session.clone() else {
+            return format!("[{}] no source to apply to.", self.side.label());
+        };
+        let n = self.queue.len();
+        let edits: Vec<StagedEdit> = self.queue.iter().cloned().collect();
+        self.pending_apply = Some(commander_ops::spawn_apply(session, edits));
+        self.error = None;
+        format!("[{}] applying {n} edit(s)...", self.side.label())
+    }
+
+    /// Poll an in-flight apply; on success, re-open the source so the listing
+    /// reflects the write. Returns a status line on completion.
+    fn poll_apply(&mut self, ctx: &egui::Context) -> Option<String> {
+        let arc = self.pending_apply.clone()?;
+        ctx.request_repaint();
+        let mut guard = arc.lock().ok()?;
+        if !guard.finished {
+            return None;
+        }
+        self.pending_apply = None;
+        if let Some(err) = guard.error.take() {
+            drop(guard);
+            self.error = Some(format!("Apply failed: {err}"));
+            return Some(format!("[{}] apply failed.", self.side.label()));
+        }
+        drop(guard);
+        let n = self.queue.len();
+        self.queue.clear();
+        // Re-open the source: the cached read-only filesystem snapshotted its
+        // catalog before the write, so a plain reload would show stale data.
+        if let Some(i) = self.selected_part {
+            self.open_partition(i);
+        }
+        Some(format!("[{}] applied {n} edit(s).", self.side.label()))
+    }
+
+    /// Toggle the staged-delete state of `names` in the current directory:
+    /// stage a delete on a normal entry, undelete a pending delete, or un-stage
+    /// a pending copy / new folder.
+    fn toggle_delete(&mut self, names: &[String]) {
+        let Some(cwd) = self.listing.cwd().cloned() else {
+            return;
+        };
+        let pending_adds = self.queue.pending_adds_for(&cwd.path);
+        for name in names {
+            if let Some(add) = pending_adds.iter().find(|e| &e.name == name) {
+                if add.is_directory() {
+                    self.queue.remove_pending_subtree(&add.path);
+                } else {
+                    self.queue.remove_pending_add(&add.path);
+                }
+                continue;
+            }
+            let Some(entry) = self
+                .listing
+                .entries()
+                .iter()
+                .find(|e| &e.name == name)
+                .cloned()
+            else {
+                continue;
+            };
+            if self.queue.is_pending_delete(&entry.path) {
+                self.queue.remove_pending_delete(&entry.path);
+            } else if entry.is_directory() {
+                self.queue.push(StagedEdit::DeleteRecursive {
+                    parent: cwd.clone(),
+                    entry,
+                });
+            } else {
+                self.queue.push(StagedEdit::DeleteEntry {
+                    parent: cwd.clone(),
+                    entry,
+                });
             }
         }
     }
@@ -357,12 +486,15 @@ impl CommanderPane {
     }
 
     fn render_rows(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let rows = build_display_rows(&self.listing);
+        let rows = self.build_display_rows();
+        let busy = self.pending_apply.is_some();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
         let mut click: Option<(String, bool, bool)> = None;
         let mut bg_deselect = false;
+        let mut ctx_rclick: Option<String> = None;
+        let mut m_delete = false;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -374,7 +506,7 @@ impl CommanderPane {
                         egui::vec2(ui.available_width(), ROW_H),
                         egui::Sense::click(),
                     );
-                    let selected = !row.is_parent && self.listing.is_selected(&row.name);
+                    let selected = !row.is_parent() && self.listing.is_selected(&row.name);
                     if selected {
                         ui.painter().rect_filled(
                             rect,
@@ -391,16 +523,35 @@ impl CommanderPane {
                     paint_row(ui, rect, row);
 
                     if resp.double_clicked() {
-                        if row.is_parent {
+                        if row.is_parent() {
                             to_up = true;
                         } else if row.is_dir {
                             to_enter = Some(row.name.clone());
                         }
                     } else if resp.clicked() {
-                        if row.is_parent {
+                        if row.is_parent() {
                             to_up = true;
                         } else {
                             click = Some((row.name.clone(), mods.command, mods.shift));
+                        }
+                    }
+
+                    // Right-click a data row for the staging menu.
+                    if !row.is_parent() && !busy {
+                        let menu = resp.context_menu(|ui| {
+                            let label = match row.kind {
+                                RowKind::PendingDelete => "Undelete",
+                                RowKind::PendingAdd => "Remove from staging",
+                                _ => "Delete",
+                            };
+                            if ui.button(label).clicked() {
+                                m_delete = true;
+                                ui.close();
+                            }
+                            ui.add_enabled(false, egui::Button::new("Copy to other pane (M3b)"));
+                        });
+                        if menu.is_some() {
+                            ctx_rclick = Some(row.name.clone());
                         }
                     }
                 }
@@ -436,44 +587,100 @@ impl CommanderPane {
                 self.listing.click(&name);
             }
         }
+        // A right-click on an unselected row acts on just that row.
+        if let Some(name) = &ctx_rclick {
+            if !self.listing.is_selected(name) {
+                self.listing.click(name);
+            }
+        }
+        if m_delete {
+            let names: Vec<String> = self.listing.selection().to_vec();
+            self.toggle_delete(&names);
+            status = Some(format!(
+                "[{}] toggled delete on {} item(s).",
+                self.side.label(),
+                names.len()
+            ));
+        }
         status
     }
 }
 
-/// Owned per-frame row snapshot, so the row loop can mutate the listing freely
-/// after rendering without holding a borrow of it.
+/// How a row participates in the staged-edit overlay.
+#[derive(Clone, Copy, PartialEq)]
+enum RowKind {
+    Parent,
+    Normal,
+    PendingDelete,
+    PendingAdd,
+}
+
+/// Owned per-frame row snapshot, so the row loop can mutate the listing / queue
+/// freely after rendering without holding a borrow of them.
 struct DisplayRow {
     name: String,
     is_dir: bool,
-    is_parent: bool,
     size: u64,
     modified: String,
     type_tag: String,
+    kind: RowKind,
 }
 
-fn build_display_rows(listing: &DirListing) -> Vec<DisplayRow> {
-    listing
-        .current_rows()
-        .into_iter()
-        .map(|r| match r {
-            Row::Parent => DisplayRow {
-                name: "..".to_string(),
-                is_dir: true,
-                is_parent: true,
-                size: 0,
-                modified: String::new(),
-                type_tag: String::new(),
-            },
-            Row::Entry(e) => DisplayRow {
+impl DisplayRow {
+    fn is_parent(&self) -> bool {
+        self.kind == RowKind::Parent
+    }
+}
+
+impl CommanderPane {
+    /// Build the rendered rows, merging the staged-edit overlay: real entries
+    /// flagged pending-delete where the queue has a delete for them, and the
+    /// queue's pending adds for this directory appended as green rows.
+    fn build_display_rows(&self) -> Vec<DisplayRow> {
+        let cwd_path = self.listing.cwd_path().to_string();
+        let mut rows: Vec<DisplayRow> = self
+            .listing
+            .current_rows()
+            .into_iter()
+            .map(|r| match r {
+                Row::Parent => DisplayRow {
+                    name: "..".to_string(),
+                    is_dir: true,
+                    size: 0,
+                    modified: String::new(),
+                    type_tag: String::new(),
+                    kind: RowKind::Parent,
+                },
+                Row::Entry(e) => {
+                    let kind = if self.queue.is_pending_delete(&e.path) {
+                        RowKind::PendingDelete
+                    } else {
+                        RowKind::Normal
+                    };
+                    DisplayRow {
+                        name: e.name.clone(),
+                        is_dir: e.is_directory(),
+                        size: e.size,
+                        modified: e.modified.clone().unwrap_or_default(),
+                        type_tag: type_tag(e),
+                        kind,
+                    }
+                }
+            })
+            .collect();
+
+        for e in self.queue.pending_adds_for(&cwd_path) {
+            rows.push(DisplayRow {
                 name: e.name.clone(),
                 is_dir: e.is_directory(),
-                is_parent: false,
                 size: e.size,
-                modified: e.modified.clone().unwrap_or_default(),
-                type_tag: type_tag(e),
-            },
-        })
-        .collect()
+                modified: String::new(),
+                type_tag: type_tag(&e),
+                kind: RowKind::PendingAdd,
+            });
+        }
+        rows
+    }
 }
 
 /// Short label for a partition in the dropdown: `1: FAT16 (510.0 MiB)`.
@@ -525,18 +732,21 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     let mid = rect.center().y;
     let font = egui::FontId::proportional(13.0);
     let base = ui.visuals().text_color();
-    let color = if row.is_parent {
-        ui.visuals().weak_text_color()
-    } else if row.is_dir {
-        egui::Color32::from_rgb(120, 160, 255)
-    } else {
-        base
+    let color = match row.kind {
+        RowKind::Parent => ui.visuals().weak_text_color(),
+        RowKind::PendingAdd => ADD_COLOR,
+        RowKind::PendingDelete => DEL_COLOR,
+        RowKind::Normal if row.is_dir => egui::Color32::from_rgb(120, 160, 255),
+        RowKind::Normal => base,
     };
 
-    let display_name = if row.is_dir && !row.is_parent {
-        format!("{}/", row.name)
-    } else {
-        row.name.clone()
+    // ASCII overlay markers (no Unicode glyphs): "+ " pending add, "- " pending
+    // delete, trailing "/" for directories.
+    let display_name = match row.kind {
+        RowKind::PendingAdd => format!("+ {}", row.name),
+        RowKind::PendingDelete => format!("- {}", row.name),
+        _ if row.is_dir && !row.is_parent() => format!("{}/", row.name),
+        _ => row.name.clone(),
     };
 
     let name_cell = egui::Rect::from_min_max(
@@ -574,4 +784,12 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
         font,
         ui.visuals().weak_text_color(),
     );
+
+    // Strike through a pending delete's name.
+    if row.kind == RowKind::PendingDelete {
+        ui.painter().line_segment(
+            [egui::pos2(c.name_l, mid), egui::pos2(c.name_r, mid)],
+            egui::Stroke::new(1.0, color),
+        );
+    }
 }

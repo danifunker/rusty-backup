@@ -285,6 +285,20 @@ impl EditQueue {
         })
     }
 
+    /// Remove any `Delete*` edit targeting `entry_path` (the "undelete" action).
+    /// Returns `true` if a matching edit was removed.
+    pub fn remove_pending_delete(&mut self, entry_path: &str) -> bool {
+        let before = self.edits.len();
+        self.edits.retain(|edit| {
+            !matches!(
+                edit,
+                StagedEdit::DeleteEntry { entry, .. } | StagedEdit::DeleteRecursive { entry, .. }
+                    if entry.path == entry_path
+            )
+        });
+        self.edits.len() < before
+    }
+
     /// Synthesize `FileEntry`s for pending adds whose parent is `parent_path`.
     pub fn pending_adds_for(&self, parent_path: &str) -> Vec<FileEntry> {
         self.edits
@@ -543,6 +557,37 @@ mod tests {
     use std::io::Cursor;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// Commander's delete-toggle round trip: staging a delete makes the entry
+    /// pending, and `remove_pending_delete` (undelete) clears it without
+    /// disturbing an unrelated staged delete.
+    #[test]
+    fn remove_pending_delete_undeletes_one_entry() {
+        let parent = FileEntry::new_directory("dir".into(), "/dir".into(), 0);
+        let a = FileEntry::new_file("a.txt".into(), "/dir/a.txt".into(), 10, 0);
+        let b = FileEntry::new_directory("sub".into(), "/dir/sub".into(), 0);
+
+        let mut q = EditQueue::new();
+        q.push(StagedEdit::DeleteEntry {
+            parent: parent.clone(),
+            entry: a.clone(),
+        });
+        q.push(StagedEdit::DeleteRecursive {
+            parent: parent.clone(),
+            entry: b.clone(),
+        });
+        assert!(q.is_pending_delete("/dir/a.txt"));
+        assert!(q.is_pending_delete("/dir/sub"));
+
+        assert!(q.remove_pending_delete("/dir/a.txt"));
+        assert!(!q.is_pending_delete("/dir/a.txt"));
+        // The recursive delete of the sibling directory is untouched.
+        assert!(q.is_pending_delete("/dir/sub"));
+        assert_eq!(q.len(), 1);
+
+        // Removing a non-pending path is a no-op.
+        assert!(!q.remove_pending_delete("/dir/a.txt"));
+    }
 
     /// The full GUI "Boot Blocks..." mechanism: a `WriteBootBlocks` staged
     /// edit, dispatched through `apply_edit` + `sync_metadata`, lands the
