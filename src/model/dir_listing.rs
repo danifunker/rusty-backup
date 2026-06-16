@@ -1,23 +1,41 @@
 //! Flat single-directory listing model for Commander Mode.
 //!
 //! A [`DirListing`] is the per-pane model that Commander's two panes render
-//! over: it owns the open [`Filesystem`], a stack of directory frames (the
-//! current directory plus its ancestors, each with a cached, sorted child
-//! list), the active sort column, and the multi-selection. It is *pure* model
-//! state — no egui, no threading — so the selection / sort / navigation logic
-//! is unit-testable without a GUI (see the tests at the bottom of this file).
+//! over: it owns the listing source (an open [`Filesystem`] for a disk-image
+//! pane, or the host filesystem for a host-folder pane), a stack of directory
+//! frames (the current directory plus its ancestors, each with a cached, sorted
+//! child list), the active sort column, and the multi-selection. The selection
+//! / sort / navigation logic is unit-testable without a GUI (see the tests at
+//! the bottom of this file).
 //!
-//! The slow part of opening a source — reading the catalog and the root
-//! directory — is done off-thread by [`BrowseSession::spawn_open`]; the worker
-//! hands the opened `Filesystem` plus the root listing to [`load_root`]. After
-//! that, `enter` / `up` re-list directories synchronously against the held
-//! filesystem (these reads are fast once the catalog is resident).
+//! For an image pane, the slow part of opening — reading the catalog and the
+//! root directory — is done off-thread by [`BrowseSession::spawn_open`]; the
+//! worker hands the opened `Filesystem` plus the root listing to [`load_root`].
+//! A host pane is loaded synchronously with [`load_host_root`] (a `std::fs`
+//! directory read). After that, `enter` / `up` re-list directories against the
+//! current source.
 //!
 //! [`load_root`]: DirListing::load_root
+//! [`load_host_root`]: DirListing::load_host_root
 //! [`BrowseSession::spawn_open`]: crate::model::browse_session::BrowseSession::spawn_open
+
+use std::path::Path;
 
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::fs::filesystem::{Filesystem, FilesystemError};
+
+/// Where a [`DirListing`] reads its directory listings from.
+#[derive(Default)]
+enum ListingSource {
+    /// Nothing loaded (and the pure unit tests, which drive the stack directly).
+    #[default]
+    None,
+    /// A disk-image volume: listings come from the open filesystem.
+    Image(Box<dyn Filesystem>),
+    /// A real host-OS folder subtree: listings come from `std::fs`, keyed by the
+    /// absolute host path stored in each entry's `path`.
+    Host,
+}
 
 /// Sortable listing columns. Mirrors the Commander mock's column set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -53,11 +71,10 @@ pub enum Row<'a> {
 /// re-sort (which reorders rows but not names).
 #[derive(Default)]
 pub struct DirListing {
-    /// The opened, read-only filesystem. `None` before a source is loaded
-    /// (and in the pure unit tests, which drive the stack directly).
-    fs: Option<Box<dyn Filesystem>>,
+    /// Where listings come from (image filesystem, host folder, or nothing).
+    source: ListingSource,
     /// Ancestor stack; `stack[0]` is the volume root, `stack.last()` is the
-    /// current directory. Empty until [`load_root`](Self::load_root).
+    /// current directory. Empty until a source is loaded.
     stack: Vec<Frame>,
     /// Host-folder pane: `..` is always offered (a host pane may ascend above
     /// the folder it was opened at). Image panes hide `..` at the volume root.
@@ -76,9 +93,9 @@ impl DirListing {
         Self::default()
     }
 
-    /// Install a freshly-opened filesystem and its root directory listing,
-    /// resetting navigation and selection. `host_mode` true means a host
-    /// folder pane (parent navigation is always available).
+    /// Install a freshly-opened image filesystem and its root directory listing,
+    /// resetting navigation and selection. `host_mode` true means parent
+    /// navigation is always available (rare for an image; normally false).
     pub fn load_root(
         &mut self,
         fs: Box<dyn Filesystem>,
@@ -86,17 +103,39 @@ impl DirListing {
         entries: Vec<FileEntry>,
         host_mode: bool,
     ) {
-        self.fs = Some(fs);
+        self.reset(ListingSource::Image(fs), host_mode);
+        self.push_dir(root, entries);
+    }
+
+    /// Load a host-OS folder as the listing root (a `std::fs` read). The pane
+    /// can navigate below it, and `..` may ascend above it on the real tree.
+    pub fn load_host_root(&mut self, root: std::path::PathBuf) -> Result<(), FilesystemError> {
+        let path = root.to_string_lossy().to_string();
+        let entries = list_host_dir(&path)?;
+        let name = host_dir_name(&root, &path);
+        let dir = FileEntry::new_directory(name, path, 0);
+        self.reset(ListingSource::Host, true);
+        self.push_dir(dir, entries);
+        Ok(())
+    }
+
+    /// Reset to a fresh source, clearing the stack and selection.
+    fn reset(&mut self, source: ListingSource, host_mode: bool) {
+        self.source = source;
         self.host_mode = host_mode;
         self.stack.clear();
         self.selected.clear();
         self.anchor = None;
-        self.push_dir(root, entries);
     }
 
     /// True once a source has been loaded.
     pub fn is_loaded(&self) -> bool {
         !self.stack.is_empty()
+    }
+
+    /// True when this pane lists a host-OS folder rather than a disk image.
+    pub fn is_host(&self) -> bool {
+        matches!(self.source, ListingSource::Host)
     }
 
     /// The current directory entry, or `None` before a source loads.
@@ -152,8 +191,8 @@ impl DirListing {
     // --- navigation --------------------------------------------------------
 
     /// Enter the child directory named `name` in the current directory,
-    /// reading its listing from the held filesystem. Errors if the name is not
-    /// a directory here, or if no filesystem is loaded.
+    /// reading its listing from the current source. Errors if the name is not
+    /// a directory here, or if no source is loaded.
     pub fn enter(&mut self, name: &str) -> Result<(), FilesystemError> {
         let child = self
             .entries()
@@ -161,43 +200,72 @@ impl DirListing {
             .find(|e| e.is_directory() && e.name == name)
             .cloned()
             .ok_or_else(|| FilesystemError::NotFound(format!("directory '{name}'")))?;
-        let fs = self
-            .fs
-            .as_mut()
-            .ok_or_else(|| FilesystemError::Parse("no filesystem loaded".into()))?;
-        let entries = fs.list_directory(&child)?;
+        let entries = self.list_children(&child)?;
         self.push_dir(child, entries);
         self.clear_selection();
         Ok(())
     }
 
-    /// Navigate to the parent directory. No-op at the volume root (a host
-    /// pane's ascent above its opened root is handled by re-rooting the
-    /// listing, not here).
+    /// Navigate to the parent directory. For an image pane this pops the
+    /// ancestor stack (a no-op at the volume root). For a host pane at its
+    /// loaded root, it re-roots to the real parent folder so the user can
+    /// ascend above where the pane was opened.
     pub fn up(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
             self.clear_selection();
+            return;
+        }
+        if self.is_host() {
+            self.host_reroot_to_parent();
         }
     }
 
-    /// Re-read the current directory from the filesystem, preserving the cwd
-    /// but dropping the selection. Used after a source is mutated and re-opened.
+    /// Re-read the current directory from the source, preserving the cwd but
+    /// dropping the selection. Used after an image source is mutated and
+    /// re-opened, or to refresh a host listing.
     pub fn reload(&mut self) -> Result<(), FilesystemError> {
         let Some(dir) = self.cwd().cloned() else {
             return Ok(());
         };
-        let fs = self
-            .fs
-            .as_mut()
-            .ok_or_else(|| FilesystemError::Parse("no filesystem loaded".into()))?;
-        let entries = fs.list_directory(&dir)?;
+        let entries = self.list_children(&dir)?;
         if let Some(frame) = self.stack.last_mut() {
             frame.entries = entries;
         }
         self.sort_current();
         self.clear_selection();
         Ok(())
+    }
+
+    /// List the children of `dir` from the current source.
+    fn list_children(&mut self, dir: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        match &mut self.source {
+            ListingSource::Image(fs) => fs.list_directory(dir),
+            ListingSource::Host => list_host_dir(&dir.path),
+            ListingSource::None => Err(FilesystemError::Parse("no source loaded".into())),
+        }
+    }
+
+    /// Host-only: replace the single root frame with its parent directory on the
+    /// host tree. Silently no-ops if there is no parent or it can't be read.
+    fn host_reroot_to_parent(&mut self) {
+        let Some(cur) = self.cwd().map(|e| e.path.clone()) else {
+            return;
+        };
+        let path = Path::new(&cur);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if parent == path {
+            return;
+        }
+        let parent_path = parent.to_string_lossy().to_string();
+        if let Ok(entries) = list_host_dir(&parent_path) {
+            let name = host_dir_name(parent, &parent_path);
+            self.stack.clear();
+            self.push_dir(FileEntry::new_directory(name, parent_path, 0), entries);
+            self.clear_selection();
+        }
     }
 
     /// Push a new directory frame, sorting its children by the active sort.
@@ -300,11 +368,64 @@ impl DirListing {
             .collect()
     }
 
-    /// Borrow the open filesystem mutably (e.g. to read a file for preview or
-    /// copy). `None` before a source loads.
+    /// Borrow the open image filesystem mutably (e.g. to read a file for
+    /// preview or copy). `None` for a host pane or before a source loads.
     pub fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
-        self.fs.as_deref_mut()
+        match &mut self.source {
+            ListingSource::Image(fs) => Some(fs.as_mut()),
+            _ => None,
+        }
     }
+}
+
+/// Read a host directory into `FileEntry`s (one stack frame's worth). Each
+/// entry's `path` is the absolute host path so navigation can re-list it.
+fn list_host_dir(path: &str) -> Result<Vec<FileEntry>, FilesystemError> {
+    let mut out = Vec::new();
+    for dent in std::fs::read_dir(path).map_err(FilesystemError::Io)? {
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue, // skip unreadable entries rather than abort
+        };
+        let name = dent.file_name().to_string_lossy().to_string();
+        let full = dent.path().to_string_lossy().to_string();
+        // `symlink_metadata` so a symlink is reported as a symlink, not its
+        // target (and a dangling link still lists).
+        let meta = match dent.path().symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = meta.file_type();
+        let modified = meta.modified().ok().map(format_host_mtime);
+        let mut entry = if ft.is_dir() {
+            FileEntry::new_directory(name, full, 0)
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(dent.path())
+                .map(|t| t.to_string_lossy().to_string())
+                .unwrap_or_default();
+            FileEntry::new_symlink(name, full, meta.len(), 0, target)
+        } else {
+            FileEntry::new_file(name, full, meta.len(), 0)
+        };
+        entry.modified = modified;
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// Display name for a host directory: the final path component, or the whole
+/// path for a root like `/` or `C:\` that has no file name.
+fn host_dir_name(path: &Path, full: &str) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| full.to_string())
+}
+
+/// Format a host mtime as `YYYY-MM-DD HH:MM:SS` (local time), matching the
+/// string the image filesystems produce for the Modified column.
+fn format_host_mtime(t: std::time::SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Compare two entries by a single column (ascending). Folders-first grouping
@@ -573,6 +694,41 @@ mod tests {
         assert!(l.at_root());
         l.up();
         assert!(l.at_root());
+    }
+
+    #[test]
+    fn host_folder_listing_and_navigation() {
+        // base/
+        //   sub/inner.txt
+        //   top.txt
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("sub")).unwrap();
+        std::fs::write(base.path().join("sub").join("inner.txt"), b"hi").unwrap();
+        std::fs::write(base.path().join("top.txt"), b"top").unwrap();
+
+        let mut l = DirListing::new();
+        l.load_host_root(base.path().to_path_buf()).unwrap();
+        assert!(l.is_host());
+        // A host pane always offers `..`, even at the loaded root.
+        assert!(l.show_parent());
+        let names = row_names(&l);
+        assert!(names.iter().any(|n| n == ".."));
+        assert!(names.iter().any(|n| n == "sub"));
+        assert!(names.iter().any(|n| n == "top.txt"));
+
+        // Enter sub: inner.txt is listed; cwd is the real host path.
+        l.enter("sub").unwrap();
+        assert_eq!(l.cwd_path(), base.path().join("sub").to_string_lossy());
+        assert!(row_names(&l).iter().any(|n| n == "inner.txt"));
+
+        // Up returns to base.
+        l.up();
+        assert_eq!(l.cwd_path(), base.path().to_string_lossy());
+
+        // Up again ascends above the loaded root, onto the real parent tree.
+        let parent = base.path().parent().unwrap().to_string_lossy().to_string();
+        l.up();
+        assert_eq!(l.cwd_path(), parent);
     }
 
     #[test]

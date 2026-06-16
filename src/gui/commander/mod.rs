@@ -200,8 +200,12 @@ impl CommanderMode {
         ui.add_space(60.0);
         let w = egui::vec2(116.0, 26.0);
 
-        let l_can = self.left.has_selection() && self.right.can_receive();
-        let r_can = self.right.has_selection() && self.left.can_receive();
+        // H1: only image -> image copies are wired; a host pane on either end is
+        // handled by the host-write engine (H2).
+        let l_can =
+            self.left.has_selection() && !self.left.is_host_pane() && self.right.can_receive();
+        let r_can =
+            self.right.has_selection() && !self.right.is_host_pane() && self.left.can_receive();
 
         if ui
             .add_enabled(l_can, egui::Button::new("Copy L -> R").min_size(w))

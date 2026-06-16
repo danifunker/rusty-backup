@@ -1,18 +1,18 @@
-//! One Commander pane: a source bar (open + partition picker + Apply/Discard), a
-//! path line, and a flat single-directory listing grid with sortable columns,
-//! multi-selection, `..` / double-click navigation, and a per-pane staged-edit
-//! queue (delete, with the staged adds shown in the virtual overlay).
+//! One Commander pane: a source bar (open image / folder + partition picker +
+//! Apply/Discard), a path line, and a flat single-directory listing grid with
+//! sortable columns, multi-selection, `..` / double-click navigation, and a
+//! per-pane staged-edit queue (delete + copy-in, shown in the virtual overlay).
 //!
-//! All listing state lives in the [`DirListing`] model
+//! A pane lists either a **disk-image volume** (partition probe + `BrowseSession`,
+//! opened off-thread via [`BrowseSession::spawn_open`]) or a **host-OS folder**
+//! (`std::fs`). All listing state lives in the [`DirListing`] model
 //! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
-//! it. Opening a source is delegated to
-//! [`rusty_backup::model::commander_source`] (partition probe + `BrowseSession`)
-//! and runs off-thread via [`BrowseSession::spawn_open`], polled each frame.
-//! Applying staged edits runs off-thread via
+//! it. Applying staged edits runs off-thread via
 //! [`rusty_backup::model::commander_ops::spawn_apply`].
 //!
-//! Cross-pane copy (the middle column) and the unsaved-changes guard land in the
-//! next milestones (see `docs/commander_mode.md` §5, §7).
+//! Image panes stage edits (Apply writes through); host panes take immediate
+//! writes and never stage. The cross-pane copy itself lives in
+//! [`super::CommanderMode`] (it spans both panes).
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
@@ -59,7 +59,8 @@ pub(crate) struct CommanderPane {
     /// The session that opened the current partition, kept so Apply can
     /// re-open it read-write. `None` until a partition is opened.
     session: Option<BrowseSession>,
-    /// Staged edits (delete; copy lands in M3b) for this image pane.
+    /// Staged edits (delete + copy-in) for this image pane; empty for host
+    /// panes, which write immediately.
     queue: EditQueue,
     /// In-flight async open (spinner) from `BrowseSession::spawn_open`.
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
@@ -82,6 +83,7 @@ pub(crate) struct CommanderPane {
 /// A deferred source change awaiting the unsaved-edits confirmation.
 enum PendingSwitch {
     Source(PathBuf),
+    HostRoot(PathBuf),
     Partition(usize),
 }
 
@@ -207,6 +209,7 @@ impl CommanderPane {
             // `load_source` / `open_partition` reset the queue themselves.
             return self.pending_switch.take().map(|req| match req {
                 PendingSwitch::Source(path) => self.load_source(path),
+                PendingSwitch::HostRoot(path) => self.load_host(path),
                 PendingSwitch::Partition(idx) => self.open_partition(idx),
             });
         }
@@ -218,9 +221,19 @@ impl CommanderPane {
 
     // --- accessors used by CommanderMode for cross-pane copy ---------------
 
-    /// True when a volume is open and the pane isn't mid-operation.
+    /// True when this pane can receive a *staged* copy: an image volume that is
+    /// open and not mid-operation. Host panes take immediate writes instead and
+    /// are wired with the host-write engine (H2), so they return false for now.
     pub(crate) fn can_receive(&self) -> bool {
-        self.listing.is_loaded() && self.pending_apply.is_none() && self.pending_open.is_none()
+        self.listing.is_loaded()
+            && !self.listing.is_host()
+            && self.pending_apply.is_none()
+            && self.pending_open.is_none()
+    }
+
+    /// True when this pane lists a host-OS folder rather than a disk image.
+    pub(crate) fn is_host_pane(&self) -> bool {
+        self.listing.is_host()
     }
 
     /// True when at least one row is selected.
@@ -277,58 +290,76 @@ impl CommanderPane {
                     }
                 }
             }
-
-            // Partition dropdown (populated after a source is opened).
-            let current = self
-                .selected_part
-                .and_then(|i| self.partitions.get(i))
-                .map(partition_label)
-                .unwrap_or_else(|| "(no partitions)".to_string());
-            let mut chosen = self.selected_part;
-            egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for (i, p) in self.partitions.iter().enumerate() {
-                        ui.selectable_value(&mut chosen, Some(i), partition_label(p));
-                    }
-                });
-            if chosen != self.selected_part {
-                if let Some(i) = chosen {
+            if ui.button("Open Folder...").clicked() {
+                if let Some(dir) = super::super::file_dialog().pick_folder() {
                     if self.queue.is_empty() {
-                        status = Some(self.open_partition(i));
+                        status = Some(self.load_host(dir));
                     } else {
-                        self.pending_switch = Some(PendingSwitch::Partition(i));
+                        self.pending_switch = Some(PendingSwitch::HostRoot(dir));
                     }
                 }
             }
 
-            // Per-pane staging controls.
-            let n = self.queue.len();
-            let busy = self.pending_apply.is_some() || self.pending_open.is_some();
-            ui.add_enabled_ui(n > 0 && !busy, |ui| {
-                if ui.button(format!("Apply ({n})")).clicked() {
-                    status = Some(self.apply());
+            // Partition dropdown (image panes only; host folders have none).
+            if !self.listing.is_host() {
+                let current = self
+                    .selected_part
+                    .and_then(|i| self.partitions.get(i))
+                    .map(partition_label)
+                    .unwrap_or_else(|| "(no partitions)".to_string());
+                let mut chosen = self.selected_part;
+                egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (i, p) in self.partitions.iter().enumerate() {
+                            ui.selectable_value(&mut chosen, Some(i), partition_label(p));
+                        }
+                    });
+                if chosen != self.selected_part {
+                    if let Some(i) = chosen {
+                        if self.queue.is_empty() {
+                            status = Some(self.open_partition(i));
+                        } else {
+                            self.pending_switch = Some(PendingSwitch::Partition(i));
+                        }
+                    }
                 }
-            });
-            ui.add_enabled_ui(n > 0 && !busy, |ui| {
-                if ui.button("Discard").clicked() {
-                    self.queue.clear();
-                    status = Some(format!("[{}] discarded staged edits.", self.side.label()));
-                }
-            });
+            }
+
+            // Per-pane staging controls (image panes only; host writes are
+            // immediate and never staged).
+            if !self.listing.is_host() {
+                let n = self.queue.len();
+                let busy = self.pending_apply.is_some() || self.pending_open.is_some();
+                ui.add_enabled_ui(n > 0 && !busy, |ui| {
+                    if ui.button(format!("Apply ({n})")).clicked() {
+                        status = Some(self.apply());
+                    }
+                });
+                ui.add_enabled_ui(n > 0 && !busy, |ui| {
+                    if ui.button("Discard").clicked() {
+                        self.queue.clear();
+                        status = Some(format!("[{}] discarded staged edits.", self.side.label()));
+                    }
+                });
+            }
 
             // Right-aligned volume label + free space.
             if self.listing.is_loaded() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let free = self.total_size.saturating_sub(self.used_size);
-                    ui.label(format!("free: {}", format_size(free)));
-                    ui.separator();
-                    let label = if self.volume_label.is_empty() {
-                        self.fs_type.clone()
+                    if self.listing.is_host() {
+                        ui.strong("host folder");
                     } else {
-                        format!("{} ({})", self.volume_label, self.fs_type)
-                    };
-                    ui.strong(label);
+                        let free = self.total_size.saturating_sub(self.used_size);
+                        ui.label(format!("free: {}", format_size(free)));
+                        ui.separator();
+                        let label = if self.volume_label.is_empty() {
+                            self.fs_type.clone()
+                        } else {
+                            format!("{} ({})", self.volume_label, self.fs_type)
+                        };
+                        ui.strong(label);
+                    }
                 });
             }
         });
@@ -337,9 +368,13 @@ impl CommanderPane {
 
     fn path_line(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let prefix = match self.selected_part.and_then(|i| self.partitions.get(i)) {
-                Some(_) => format!("@{}", self.selected_part.map(|i| i + 1).unwrap_or(0)),
-                None => "-".to_string(),
+            let prefix = if self.listing.is_host() {
+                "host".to_string()
+            } else {
+                match self.selected_part {
+                    Some(i) => format!("@{}", i + 1),
+                    None => "-".to_string(),
+                }
             };
             ui.monospace(prefix);
             let path = self.listing.cwd_path();
@@ -380,6 +415,39 @@ impl CommanderPane {
                 self.partitions.clear();
                 self.error = Some(format!("Could not read partitions: {e:#}"));
                 format!("[{}] failed to open {}", self.side.label(), path.display())
+            }
+        }
+    }
+
+    /// Open a host-OS folder as this pane's source (synchronous `std::fs` read;
+    /// writes to a host pane are immediate, never staged).
+    fn load_host(&mut self, dir: PathBuf) -> String {
+        self.source = Some(dir.clone());
+        self.partitions.clear();
+        self.selected_part = None;
+        self.session = None;
+        self.pending_open = None;
+        self.pending_apply = None;
+        self.queue.clear();
+        self.error = None;
+        self.volume_label.clear();
+        self.fs_type.clear();
+
+        match self.listing.load_host_root(dir.clone()) {
+            Ok(()) => format!(
+                "[{}] opened host folder {} ({} item(s)).",
+                self.side.label(),
+                dir.display(),
+                self.listing.entries().len()
+            ),
+            Err(e) => {
+                self.listing = DirListing::new();
+                self.error = Some(format!("Could not read folder: {e}"));
+                format!(
+                    "[{}] failed to open folder {}",
+                    self.side.label(),
+                    dir.display()
+                )
             }
         }
     }
@@ -618,6 +686,11 @@ impl CommanderPane {
     fn render_rows(&mut self, ui: &mut egui::Ui) -> (Option<String>, bool) {
         let rows = self.build_display_rows();
         let busy = self.pending_apply.is_some();
+        // Host panes don't stage (writes are immediate); their right-click
+        // delete / copy land with the host-write engine (H2). Until then the
+        // staging menu is image-only so a host pane can't queue an edit that
+        // would never be applied.
+        let staging_menu = !self.listing.is_host();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
@@ -668,7 +741,7 @@ impl CommanderPane {
                     }
 
                     // Right-click a data row for the staging menu.
-                    if !row.is_parent() && !busy {
+                    if !row.is_parent() && !busy && staging_menu {
                         let menu = resp.context_menu(|ui| {
                             // Copy applies to real / pending-delete rows, not a
                             // not-yet-applied staged add.
