@@ -62,6 +62,9 @@ pub struct CommanderMode {
     /// alive until the destination queue is applied (or the overlay closes).
     /// Created lazily on the first copy.
     temp: Option<tempfile::TempDir>,
+    /// Whether the unsaved-edits confirmation is showing (Close was clicked
+    /// while a pane had staged edits).
+    unsaved_close: bool,
 }
 
 impl Default for CommanderMode {
@@ -79,6 +82,7 @@ impl CommanderMode {
                      use the middle Copy buttons or right-click to stage a copy."
                 .into(),
             temp: None,
+            unsaved_close: false,
         }
     }
 
@@ -93,7 +97,11 @@ impl CommanderMode {
                 ui.heading("Commander Mode");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
-                        close = true;
+                        if self.left.staged_count() + self.right.staged_count() > 0 {
+                            self.unsaved_close = true;
+                        } else {
+                            close = true;
+                        }
                     }
                 });
             });
@@ -154,6 +162,32 @@ impl CommanderMode {
                 );
             });
         });
+
+        if self.unsaved_close {
+            let n = self.left.staged_count() + self.right.staged_count();
+            egui::Window::new("Unsaved staged edits")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "{n} staged edit(s) across the panes have not been applied."
+                    ));
+                    ui.label("Apply them per-pane first, or discard.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Discard & Close").clicked() {
+                            self.left.discard_edits();
+                            self.right.discard_edits();
+                            self.unsaved_close = false;
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.unsaved_close = false;
+                        }
+                    });
+                });
+        }
 
         close
     }

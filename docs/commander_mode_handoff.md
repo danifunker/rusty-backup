@@ -13,29 +13,30 @@ Last updated: 2026-06-16
 - **What it is:** a full-page, Midnight-Commander-style two-pane file explorer
   overlay. Full design in [`commander_mode.md`](commander_mode.md); tracked in
   [`OPEN-WORK.md`](OPEN-WORK.md) §6.1.
-- **Where it's at:** plan + runnable mock + wired shell + a **working read-only
-  browser** (M2-lite): each pane opens a disk image, picks a partition, and
-  shows a sortable, multi-selectable listing with `..` / double-click
-  navigation. Copy / delete / **staging is not built yet** (middle column is
-  still disabled).
-- **Next concrete step:** M3 — the staged copy/delete engine in the middle
-  column (per-pane `EditQueue`, the four copy combos, Apply/Discard, virtual
-  overlay). See "Next step" below.
+- **Where it's at:** plan + mock + wired shell + a **working browser with staged
+  writes** (M2-lite + M3a/b/c): each pane opens a disk image, picks a partition,
+  and shows a sortable, multi-selectable listing with `..` / double-click
+  navigation; right-click stages delete/undelete; the middle column stages an
+  image→image copy onto the other pane; per-pane Apply/Discard writes through;
+  unsaved-changes guards on Close and source-switch.
+- **Next concrete step:** **host panes** (`PaneSource::Host`) to unlock the
+  remaining three copy combos (host→image / image→host / host→host), then **M4**
+  (the File Info detail window + editable type/creator) after the **M1** widget
+  extraction. See "Next step" below.
 
 ## Commits on this branch
 
 ```
+fea01aa  commander: cross-pane copy via the middle column (M3b)
+f72c69a  commander: per-pane staged delete + Apply/Discard (M3a)
+627e989  commander: read-only two-pane browser over DirListing (M2-lite)
 e7c3711  commander: add handoff/resume doc
 c055273  commander: wire entry-point shell (overlay + tab-bar button)
 57eb650  commander-mode: plan doc + runnable layout mock (no engine yet)
 ```
 
-(Run `git log --oneline upcoming-mister..commander-mode` to see just this work.)
-
-**Uncommitted in the working tree** (M2-lite read-only browser — green, ready to
-commit): `src/model/dir_listing.rs`, `src/model/commander_source.rs`, the
-`CommanderPane` binding in `src/gui/commander/pane.rs`, and the doc/status
-refresh in `src/gui/commander/mod.rs`.
+(Run `git log --oneline upcoming-mister..commander-mode` to see just this work;
+the M3c unsaved-guard commit lands with this doc update.)
 
 ## What's landed (done)
 
@@ -65,11 +66,30 @@ refresh in `src/gui/commander/mod.rs`.
   does) and returns the `Vec<PartitionInfo>`; `session_for(path, &PartitionInfo)`
   builds the pane's `BrowseSession` (offset via `byte_offset()`, FAT type-byte
   inference for superfloppies). Round-trip test on a real superfloppy.
-- **Read-only `CommanderPane` binding** — `src/gui/commander/pane.rs`. Source bar
-  (Open + partition dropdown + volume/free readout), path line, async open via
-  `BrowseSession::spawn_open` (spinner, polled each frame), and the listing grid
-  (sortable headers, multi-select with Ctrl/Cmd + Shift, `..` / double-click
-  navigation) lifted from the mock. Writes/copy/staging are still disabled.
+- **`CommanderPane` binding** — `src/gui/commander/pane.rs`. Source bar
+  (Open + partition dropdown + Apply/Discard + volume/free readout), path line,
+  async open via `BrowseSession::spawn_open` (spinner, polled each frame), and the
+  listing grid (sortable headers, multi-select with Ctrl/Cmd + Shift, `..` /
+  double-click navigation) lifted from the mock.
+- **`commander_ops` model** — `src/model/commander_ops.rs`. `apply_edits()` opens
+  the pane's source read-write, replays the `EditQueue` via `apply_edit`, syncs,
+  and commits; `spawn_apply()` threads it behind an `ApplyStatus`. `stage_copy()`
+  extracts selected entries (data + resource fork + HFS type/creator) to a temp
+  dir and returns the `AddFile`/`CreateDirectory` edits to recreate them on the
+  destination (directories recurse). 3 unit tests (apply delete+add, copy subtree).
+- **M3a staged delete + Apply/Discard** — right-click a row for Delete / Undelete
+  / Remove-from-staging on the selection; Apply (threaded) writes and re-opens the
+  source; Discard clears. Virtual overlay merges pending deletes (dimmed +
+  strikethrough, `- `) and pending adds (green, `+ `) in `build_display_rows`.
+  `EditQueue::remove_pending_delete` added (with test).
+- **M3b cross-pane copy** — middle `Copy L->R` / `R->L` (and a per-row "Copy to
+  other pane") stage an image→image copy onto the other pane's queue via
+  `stage_copy`; `CommanderMode` owns a lazy `temp` `TempDir` and the copy
+  direction; `CommanderPane::show` returns a `PaneResponse { status,
+  copy_to_other }`.
+- **M3c unsaved guard** — Close with staged edits opens a Discard&Close / Cancel
+  modal; switching a pane's source/partition with a non-empty queue opens a
+  per-pane Discard&switch / Cancel confirm.
 
 ## How to run it
 
@@ -88,37 +108,31 @@ cargo test --lib
 
 ## Next step (do this first when resuming)
 
-The read-only browser (M2-lite) is done. The next milestone is **M3 — staged
-writes** (plan §5, §7, §8). Build it model-first:
+M2-lite + M3 (staged delete, image→image copy, Apply/Discard, unsaved guards)
+are done. Pick the next milestone:
 
-1. **Per-pane `EditQueue`** — give `CommanderPane` a `queue: EditQueue` (reuse
-   `src/model/edit_queue.rs` as-is). The pane already owns a `BrowseSession`-
-   derived open via `commander_source::session_for`; keep that session around so
-   Apply can call `open_editable()`.
-2. **Copy (the four backend combos, plan §5)** — middle-column `Copy L->R` /
-   `R->L` act on the source pane's `listing.selected_entries()`:
-   - host->image / image->image stage `StagedEdit::AddFile` onto the **dest**
-     queue (image->image extracts data + resource fork + type/creator to
-     `CommanderMode::temp` first);
-   - image->host / host->host are immediate writes.
-3. **Delete (§8)** — middle-column toggle stages `DeleteEntry` /
-   `DeleteRecursive` (or un-stages a pending add); host deletes are immediate
-   behind a confirm.
-4. **Apply / Discard + virtual overlay (§7)** — lift `browse_view::
-   apply_staged_edits` into a shared helper (open_editable -> drain -> `apply_edit`
-   loop -> `sync_metadata` -> `commit`), then `listing.reload()`. Render pending
-   adds green `+` / pending deletes dimmed+strikethrough (the `DirListing` rows
-   need to merge in `queue.pending_adds_for(cwd)` and flag pending deletes — add
-   a thin overlay step in the pane's `build_display_rows`).
-5. **Unsaved-changes guard** — the Discard/Apply/Cancel modal on Close and on
-   switching a pane's source while its queue is non-empty.
+1. **Host panes (`PaneSource::Host`)** — the biggest unlock. Today a pane is
+   always an image (`commander_source` + `BrowseSession`). Add a host-folder
+   source (rfd `pick_folder`, `std::fs` listing into `DirListing` with
+   `host_mode = true`) so the remaining three copy combos light up:
+   - **host→image** — stage `AddFile { host_path = real file }` (no temp copy).
+   - **image→host** — extract straight to the host path (immediate, no staging).
+   - **host→host** — `std::fs::copy` (immediate).
+   `DirListing` already supports `host_mode`; the listing source is the new part.
+   Decide host-side delete (immediate `remove_*` behind a confirm) per §8.
+2. **M1 widget extraction + M4 detail window** — extract `file_detail`
+   (hex/metadata) and `metadata_editor` (type/creator rows) out of `browse_view`
+   into shared modules, then add the double-click File Info window (plan §9) with
+   the editable HFS/ProDOS/ext subset (the two new `StagedEdit` variants in §10.2).
+3. **Browsable-partition gate** — lift `is_browsable_type` & friends out of
+   `inspect_tab.rs` (private today) into a shared module so the partition dropdown
+   can gray out non-FS partitions instead of listing all and erroring on open.
 
-After M3, **M1 refactors** are still worth doing for the detail window (M4):
-extract `file_detail` (hex/metadata) + `metadata_editor` (type/creator) out of
-`browse_view`, and a shared `source_picker`. The browsable-partition gate
-(`is_browsable_type` & friends, currently private in `inspect_tab.rs`) should be
-lifted to a shared module too — the pane currently lists *all* partitions and
-surfaces an open error for non-FS ones instead of graying them out.
+Smaller follow-ups: drag-to-load (plan §6 — the OS drop signals are already in
+`gui/mod.rs`), New Folder (`CreateDirectory`) + Export (§9b), and Apply-and-close
+in the unsaved guard (currently Discard&Close / Cancel only — a combined apply
+needs to keep `CommanderMode::temp` alive until both applies finish, since copied
+blobs live there).
 
 ## Reuse map (do NOT reinvent these)
 
@@ -127,6 +141,7 @@ surfaces an open error for non-FS ones instead of graying them out.
 | open / list / `open_editable` / commit a source | `model::browse_session::BrowseSession` |
 | probe partitions + build a pane session | `model::commander_source::{probe_partitions, session_for}` (new) |
 | cwd / sorted rows / sort / multi-selection / nav | `model::dir_listing::DirListing` (new) |
+| apply a queue / stage an image→image copy | `model::commander_ops::{apply_edits, spawn_apply, stage_copy}` (new) |
 | staged copy/delete + apply | `model::edit_queue::{EditQueue, StagedEdit, apply_edit}` |
 | picker extensions | `model::file_types::DISK_IMAGE_EXTS` |
 | size / date formatting | `partition::format_size`, `FileEntry::size_string()` / `.modified` |
@@ -160,10 +175,11 @@ surfaces an open error for non-FS ones instead of graying them out.
 Point a fresh session at this file:
 
 > "Resume Commander Mode. Read `docs/commander_mode_handoff.md`, then
-> `docs/commander_mode.md`. We're on branch `commander-mode`. The read-only
-> browser (M2-lite) is done; continue with M3 staged writes (model-first per
-> CONTRIBUTING.md), reusing `EditQueue` and the `DirListing` /
-> `commander_source` models. Build with `cargo run` and click 'Commander Mode'."
+> `docs/commander_mode.md`. We're on branch `commander-mode`. M2-lite browsing +
+> M3 staged writes (delete, image→image copy, Apply/Discard, unsaved guards) are
+> done; continue with host panes (`PaneSource::Host`) to unlock the host copy
+> combos, model-first per CONTRIBUTING.md, reusing `DirListing` / `commander_ops`
+> / `EditQueue`. Build with `cargo run` and click 'Commander Mode'."
 
 Open questions still to settle are in `commander_mode.md` §14 (resource-fork
 handling on host↔image copies, function-key bar, persisting pane state, which

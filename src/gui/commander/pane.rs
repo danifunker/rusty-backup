@@ -74,6 +74,15 @@ pub(crate) struct CommanderPane {
     used_size: u64,
     /// Last open / navigation / apply error, shown in the pane body.
     error: Option<String>,
+    /// A source/partition switch the user requested while the queue was
+    /// non-empty; held until they confirm discarding the staged edits.
+    pending_switch: Option<PendingSwitch>,
+}
+
+/// A deferred source change awaiting the unsaved-edits confirmation.
+enum PendingSwitch {
+    Source(PathBuf),
+    Partition(usize),
 }
 
 impl CommanderPane {
@@ -94,7 +103,18 @@ impl CommanderPane {
             total_size: 0,
             used_size: 0,
             error: None,
+            pending_switch: None,
         }
+    }
+
+    /// Number of staged (unapplied) edits on this pane.
+    pub(crate) fn staged_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Discard all staged edits (used by the overlay's Close guard).
+    pub(crate) fn discard_edits(&mut self) {
+        self.queue.clear();
     }
 
     /// Render the pane. Returns status + any cross-pane request for the overlay.
@@ -145,10 +165,55 @@ impl CommanderPane {
             });
         }
 
+        if let Some(s) = self.render_switch_guard(ui.ctx()) {
+            status = Some(s);
+        }
+
         PaneResponse {
             status,
             copy_to_other,
         }
+    }
+
+    /// Confirm discarding staged edits before honoring a deferred source /
+    /// partition switch. No-op when nothing is pending.
+    fn render_switch_guard(&mut self, ctx: &egui::Context) -> Option<String> {
+        // Short-circuit when nothing is pending.
+        self.pending_switch.as_ref()?;
+        let n = self.queue.len();
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(format!("Discard staged edits? ({})", self.side.label()))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "The {} pane has {n} staged edit(s) that have not been applied.",
+                    self.side.label()
+                ));
+                ui.label("Switching the source will discard them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard & switch").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            // `load_source` / `open_partition` reset the queue themselves.
+            return self.pending_switch.take().map(|req| match req {
+                PendingSwitch::Source(path) => self.load_source(path),
+                PendingSwitch::Partition(idx) => self.open_partition(idx),
+            });
+        }
+        if cancel {
+            self.pending_switch = None;
+        }
+        None
     }
 
     // --- accessors used by CommanderMode for cross-pane copy ---------------
@@ -205,7 +270,11 @@ impl CommanderPane {
                     .add_filter("All Files", &["*"])
                     .pick_file()
                 {
-                    status = Some(self.load_source(path));
+                    if self.queue.is_empty() {
+                        status = Some(self.load_source(path));
+                    } else {
+                        self.pending_switch = Some(PendingSwitch::Source(path));
+                    }
                 }
             }
 
@@ -225,7 +294,11 @@ impl CommanderPane {
                 });
             if chosen != self.selected_part {
                 if let Some(i) = chosen {
-                    status = Some(self.open_partition(i));
+                    if self.queue.is_empty() {
+                        status = Some(self.open_partition(i));
+                    } else {
+                        self.pending_switch = Some(PendingSwitch::Partition(i));
+                    }
                 }
             }
 
