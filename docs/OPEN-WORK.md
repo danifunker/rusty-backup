@@ -301,8 +301,31 @@ Gaps to reconcile back into the plan when it gets picked up:
 
 ## 6. CLI / GUI
 
-(Section currently empty — Mac archives GUI polish closed 2026-06-02,
-see §10. Reopen when new CLI / GUI work surfaces.)
+### 6.1 Commander Mode — two-pane file explorer
+
+Full design + runnable mock: [`commander_mode.md`](commander_mode.md). A
+full-page, Midnight-Commander-style overlay with two panes (each a disk-image
+partition or a host folder), staged copy/delete between them, multi-select,
+right-click menu, and export/archive-out. Locked decisions and the
+editable-metadata + export-crate inventories live in the plan doc.
+
+Build order follows the CONTRIBUTING playbook (engine -> model -> thin view) and
+**reuses existing layers rather than reinventing**:
+
+- **model/** — reuse `BrowseSession` (open / list / `open_editable` / commit),
+  `EditQueue` + `StagedEdit` + `edit_queue::apply_edit`, `model::file_types`.
+  New: `model::dir_listing::DirListing` (cwd + sorted listing + multi-selection;
+  pure, unit-tested) — the one genuinely new model object.
+- **gui/** — thin view in `src/gui/commander/`. Holds the model objects + small
+  UI scratch only; no orchestration, no background spawns (route through a
+  model runner / `BrowseSession::spawn_open`). Extract shared widgets the
+  browse view already has (`file_detail` hex/metadata, type/creator editor rows,
+  a source picker) instead of duplicating them.
+
+Status (2026-06-15): plan doc + runnable layout mock landed; the overlay
+entry-point shell (`src/gui/commander/`, launched from the tab bar) is wired and
+compiles. Next: `DirListing` model (engine/model-first) + real per-pane listing
+over `BrowseSession`. Milestones M1-M5 in the plan doc.
 
 
 ---

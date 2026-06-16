@@ -4,6 +4,7 @@ mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
 mod chd_options_ui;
+mod commander;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
@@ -407,6 +408,9 @@ pub struct RustyBackupApp {
     /// Inspect tab, and the tab is switched to it. `None` for normal
     /// launches without a file argv.
     pending_initial_image: Option<PathBuf>,
+    /// Full-page Commander Mode overlay. `Some` while it is open; it then
+    /// takes over the whole frame and the tab strip is not drawn.
+    commander: Option<commander::CommanderMode>,
 }
 
 impl Default for RustyBackupApp {
@@ -492,6 +496,7 @@ impl Default for RustyBackupApp {
             bulk_convert_dialog: None,
             bulk_convert_status: None,
             pending_initial_image: None,
+            commander: None,
         }
     }
 }
@@ -753,6 +758,16 @@ impl eframe::App for RustyBackupApp {
     }
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Full-page Commander Mode overlay: when open it takes over the whole
+        // frame and the normal tab UI is not drawn.
+        if self.commander.is_some() {
+            let close = self.commander.as_mut().unwrap().show(ctx);
+            if close {
+                self.commander = None;
+            }
+            return;
+        }
+
         // Top panel: tab bar
         egui::Panel::top("tab_bar").show_inside(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -761,6 +776,10 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Inspect, "Inspect");
                 ui.selectable_value(&mut self.active_tab, Tab::Optical, "Optical");
                 ui.selectable_value(&mut self.active_tab, Tab::Archives, "Archives");
+                ui.separator();
+                if ui.button("Commander Mode").clicked() {
+                    self.commander = Some(commander::CommanderMode::new());
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Version display
