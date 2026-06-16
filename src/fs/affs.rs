@@ -134,9 +134,17 @@ pub struct AffsEntry {
 
 impl AffsEntry {
     fn parse(buf: &[u8; BSIZE], block_num: u32) -> Result<Self, FilesystemError> {
-        if read_i32(buf, 0) != T_HEADER {
+        // File header / user-dir / root blocks are T_HEADER; a file *extension*
+        // ("file list") block is T_LIST. Both carry the same ST_FILE data-block
+        // array parsed below, so accept either primary type — the secondary-type
+        // dispatch here and the callers' `sec_type` checks (e.g. the file
+        // extension-chain walk in stream_file_data) reject anything unexpected.
+        // Rejecting T_LIST here made every file larger than the 72-entry inline
+        // block array (~36 KB) unreadable.
+        let primary = read_i32(buf, 0);
+        if primary != T_HEADER && primary != T_LIST {
             return Err(parse_err(format!(
-                "entry block {block_num}: type != T_HEADER"
+                "entry block {block_num}: type {primary} is not T_HEADER/T_LIST"
             )));
         }
         if !verify_normal_checksum(buf, 5) {
@@ -2347,6 +2355,50 @@ mod tests {
         assert_eq!(readme.size, 13);
         let data = fs.read_file(readme, usize::MAX).expect("read");
         assert_eq!(&data, b"Hello, Amiga!");
+    }
+
+    /// A file larger than the 72-entry inline data-block array needs at least
+    /// one file-extension (T_LIST) block. Reading it back exercises the
+    /// extension-chain walk in `stream_file_data`, which previously rejected
+    /// the T_LIST block as "type != T_HEADER" — making every AFFS file over
+    /// ~36 KB unreadable. Uses OFS (variant 1) to match the disk that surfaced
+    /// the bug.
+    #[test]
+    fn read_file_spanning_extension_blocks_round_trips() {
+        use super::super::filesystem::CreateFileOptions;
+
+        let img = make_empty_floppy_image(1, "EXT");
+        let mut cur = Cursor::new(img);
+        // 100 KB > 72 OFS data blocks (488 B each), so several extension blocks.
+        let payload: Vec<u8> = (0..100_000usize)
+            .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
+            .collect();
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            let mut src = std::io::Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "big",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+            fs.sync_metadata().expect("sync");
+        }
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let children = fs.list_directory(&root).expect("list");
+        let big = children
+            .iter()
+            .find(|c| c.name == "big")
+            .expect("big present");
+        assert_eq!(big.size as usize, payload.len());
+        let data = fs
+            .read_file(big, usize::MAX)
+            .expect("read file spanning extension blocks");
+        assert_eq!(data, payload, "large OFS file round-trips via extensions");
     }
 
     #[test]
