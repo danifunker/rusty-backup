@@ -47,6 +47,21 @@ pub(crate) struct PaneResponse {
     /// The user asked (via the row menu) to export this pane's selection to a
     /// host folder they pick; `CommanderMode` runs the threaded host write.
     pub export_to_host: bool,
+    /// The user asked (via the row menu) to calculate checksums for this pane's
+    /// selection; `CommanderMode` opens the threaded checksum window.
+    pub checksums: bool,
+}
+
+/// Per-frame outcome of the listing grid (which row action, if any, fired).
+#[derive(Default)]
+struct RowActions {
+    status: Option<String>,
+    /// Copy the selection to the other pane.
+    copy: bool,
+    /// Export the selection to a picked host folder.
+    export: bool,
+    /// Calculate checksums for the selection.
+    checksums: bool,
 }
 
 pub(crate) struct CommanderPane {
@@ -134,6 +149,7 @@ impl CommanderPane {
         }
         let mut copy_to_other = false;
         let mut export_to_host = false;
+        let mut checksums = false;
 
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
@@ -164,12 +180,13 @@ impl CommanderPane {
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
         } else if self.listing.is_loaded() {
             self.render_header(ui);
-            let (s, copy, export) = self.render_rows(ui);
-            if s.is_some() {
-                status = s;
+            let actions = self.render_rows(ui);
+            if actions.status.is_some() {
+                status = actions.status;
             }
-            copy_to_other = copy;
-            export_to_host = export;
+            copy_to_other = actions.copy;
+            export_to_host = actions.export;
+            checksums = actions.checksums;
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -187,6 +204,7 @@ impl CommanderPane {
             status,
             copy_to_other,
             export_to_host,
+            checksums,
         }
     }
 
@@ -775,7 +793,7 @@ impl CommanderPane {
         }
     }
 
-    fn render_rows(&mut self, ui: &mut egui::Ui) -> (Option<String>, bool, bool) {
+    fn render_rows(&mut self, ui: &mut egui::Ui) -> RowActions {
         let rows = self.build_display_rows();
         let busy = self.pending_apply.is_some();
         // Host panes write immediately (Delete removes now); image panes stage
@@ -791,6 +809,7 @@ impl CommanderPane {
         let mut m_host_delete = false;
         let mut m_copy = false;
         let mut m_export = false;
+        let mut m_checksums = false;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -851,6 +870,14 @@ impl CommanderPane {
                                 && ui.button("Export to hard drive...").clicked()
                             {
                                 m_export = true;
+                                ui.close();
+                            }
+                            // Checksums need real data, so a not-yet-applied
+                            // staged add is excluded (same as Copy / Export).
+                            if !matches!(row.kind, RowKind::PendingAdd)
+                                && ui.button("Calculate checksums...").clicked()
+                            {
+                                m_checksums = true;
                                 ui.close();
                             }
                             if host_pane {
@@ -928,7 +955,12 @@ impl CommanderPane {
                 self.pending_host_delete = Some(names);
             }
         }
-        (status, m_copy, m_export)
+        RowActions {
+            status,
+            copy: m_copy,
+            export: m_export,
+            checksums: m_checksums,
+        }
     }
 }
 

@@ -21,11 +21,20 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus};
+use rusty_backup::partition::format_size;
 
 mod pane;
 
 use pane::CommanderPane;
+
+/// An open "Calculate Checksums" window: its title and the worker status it
+/// polls each frame.
+struct ChecksumWindow {
+    title: String,
+    status: Arc<Mutex<ChecksumStatus>>,
+}
 
 /// Which pane is which. Kept tiny and `Copy` so it can key per-pane widget ids
 /// (Commander draws two near-identical panes in one `Ui` tree, so every
@@ -74,6 +83,8 @@ pub struct CommanderMode {
     /// "Export to hard drive" write, whose destination is an external folder
     /// not shown in either pane (nothing to re-list).
     pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
+    /// The open "Calculate Checksums" window, if any (one at a time).
+    checksums: Option<ChecksumWindow>,
 }
 
 impl Default for CommanderMode {
@@ -93,6 +104,7 @@ impl CommanderMode {
             temp: None,
             unsaved_close: false,
             pending_host_copy: None,
+            checksums: None,
         }
     }
 
@@ -149,6 +161,9 @@ impl CommanderMode {
                         if resp.export_to_host {
                             self.status = self.export(Side::Left);
                         }
+                        if resp.checksums {
+                            self.status = self.start_checksums(Side::Left);
+                        }
                     },
                 );
                 ui.separator();
@@ -176,10 +191,15 @@ impl CommanderMode {
                         if resp.export_to_host {
                             self.status = self.export(Side::Right);
                         }
+                        if resp.checksums {
+                            self.status = self.start_checksums(Side::Right);
+                        }
                     },
                 );
             });
         });
+
+        self.render_checksum_window(ui.ctx());
 
         if self.unsaved_close {
             let n = self.left.staged_count() + self.right.staged_count();
@@ -404,5 +424,136 @@ impl CommanderMode {
             Some(e) => format!("Export to {where_to} failed: {e}"),
             None => format!("Copied {copied} file(s) to {where_to}."),
         };
+    }
+
+    /// Open a "Calculate Checksums" window over the `from` pane's selected files
+    /// (§15.2). Directories are skipped; an image source is re-opened on the
+    /// worker thread (same as export). Replaces any window already open.
+    fn start_checksums(&mut self, from: Side) -> String {
+        let src = match from {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        };
+        let entries = src.selected_entries();
+        let file_count = entries.iter().filter(|e| e.is_file()).count();
+        if file_count == 0 {
+            return format!(
+                "Select one or more files in the {} pane to checksum (directories are skipped).",
+                from.label()
+            );
+        }
+
+        let job = if src.is_host_pane() {
+            ChecksumJob::Host { entries }
+        } else {
+            let Some(session) = src.session() else {
+                return "Source volume is not open.".to_string();
+            };
+            ChecksumJob::Image { session, entries }
+        };
+        let title = if file_count == 1 {
+            "Checksums".to_string()
+        } else {
+            format!("Checksums ({file_count} files)")
+        };
+        self.checksums = Some(ChecksumWindow {
+            title,
+            status: checksum::spawn(job),
+        });
+        format!("Calculating checksums for {file_count} file(s)...")
+    }
+
+    /// Render the open checksum window (if any): a spinner + progress while the
+    /// worker runs, then a CRC32 / MD5 / SHA1 / SHA256 grid per file, each value
+    /// with a Copy button.
+    fn render_checksum_window(&mut self, ctx: &egui::Context) {
+        let Some(win) = &self.checksums else {
+            return;
+        };
+        let mut open = true;
+        let mut to_copy: Option<String> = None;
+        let mut running = false;
+        egui::Window::new(&win.title)
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let Ok(st) = win.status.lock() else {
+                    return;
+                };
+                running = !st.finished;
+                if let Some(err) = &st.error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
+                    return;
+                }
+                if running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Hashing {} ({}/{})",
+                            st.current_file,
+                            st.done_files + 1,
+                            st.total_files
+                        ));
+                    });
+                    if st.current_total > 0 {
+                        let frac = st.current_bytes as f32 / st.current_total as f32;
+                        ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
+                    }
+                    ui.add_space(4.0);
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (i, fc) in st.results.iter().enumerate() {
+                            if i > 0 {
+                                ui.add_space(6.0);
+                                ui.separator();
+                            }
+                            ui.strong(format!("{}  ({})", fc.name, format_size(fc.size)));
+                            if let Some(err) = &fc.error {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 120, 120),
+                                    format!("failed: {err}"),
+                                );
+                                continue;
+                            }
+                            let Some(set) = &fc.set else { continue };
+                            egui::Grid::new(("cksum_grid", i))
+                                .num_columns(3)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (algo, value) in [
+                                        ("CRC32", set.crc32_hex()),
+                                        ("MD5", set.md5_hex()),
+                                        ("SHA1", set.sha1_hex()),
+                                        ("SHA256", set.sha256_hex()),
+                                    ] {
+                                        ui.label(algo);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&value).monospace(),
+                                            )
+                                            .wrap(),
+                                        );
+                                        if ui.small_button("Copy").clicked() {
+                                            to_copy = Some(value);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    });
+            });
+
+        if let Some(text) = to_copy {
+            ctx.copy_text(text);
+        }
+        if running {
+            ctx.request_repaint();
+        }
+        if !open {
+            self.checksums = None;
+        }
     }
 }

@@ -114,6 +114,15 @@ the H2 commit lands with this doc update.)
   export` builds the job, and `pending_host_copy`'s destination side is now
   `Option<Side>` (`None` = export, so `poll_host_copy` skips the re-list). Excluded
   on not-yet-applied staged-add rows (no real data yet).
+- **M6.2 Calculate Checksums** — new `model::checksum` (added the `sha1` crate):
+  `ChecksumHasher` (a `std::io::Write` sink feeding crc32fast + md-5 + sha1 + sha2),
+  `hash_reader(reader, progress) -> ChecksumSet { crc32, md5, sha1, sha256 }` with
+  hex accessors, and `spawn(ChecksumJob)` threading a whole selection behind a
+  `ChecksumStatus` (re-opens an image source on the worker, same as host copy;
+  directories skipped). 4 unit tests (empty + "abc" known vectors, monotonic
+  progress, writer==reader). View: right-click "Calculate checksums..." opens
+  `CommanderMode::checksums` — an `egui::Window` with a per-file 4-row grid
+  (monospace value + Copy button) and a live spinner/progress bar while hashing.
 
 ## How to run it
 
@@ -142,14 +151,9 @@ suggested order is smallest-win-first:
    `commander_ops::spawn_host_copy` (`ImageToHost` / `HostToHost`) into it. No new
    engine — just a menu item + folder picker + the poll Commander already has. This
    is the §9b "Export → To host" item made first-class (loose files, not an archive).
-2. **Calculate Checksums** (§15.2) — new screen showing CRC32 / MD5 / SHA1 / SHA256.
-   - **Engine/model:** new `model::checksum` — `hash_reader(reader, progress) ->
-     ChecksumSet { crc32, md5, sha1, sha256 }`, streaming once into all four hashers.
-     `crc32fast` + `md-5` + `sha2` are vendored; **add the `sha1` crate** (tiny,
-     RustCrypto). Do NOT reuse `backup::verify::RunningHasher` (CRC32/SHA256 only,
-     backup-specific). Unit-test against known vectors. Thread it (Status pattern)
-     for big files; source bytes via `Filesystem::write_file_to` / `std::fs`.
-   - **View:** an `egui::Window` (4-row grid, monospace, per-row Copy button).
+2. **Calculate Checksums** (§15.2) — *DONE.* `model::checksum` streams once into
+   CRC32 / MD5 / SHA1 / SHA256; threaded `spawn(ChecksumJob)`; right-click window
+   with a per-file grid + Copy buttons. Added the `sha1` crate.
 3. **Rename** (§15.1) — needs an engine gap filled.
    - **Engine:** `EditableFilesystem::rename(parent, entry, new_name)` (per-FS;
      start FAT/exFAT/HFS/HFS+/ext, others `Err(Unsupported)` so the item grays out).
