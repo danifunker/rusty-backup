@@ -119,6 +119,10 @@ pub struct CommanderMode {
     checksums: Option<ChecksumWindow>,
     /// The open "File Info" window, if any (one at a time).
     detail: Option<DetailWindow>,
+    /// When set, an image->image copy reproduces each file's original
+    /// timestamps on the destination (HFS catalog dates / Amiga datestamp)
+    /// instead of stamping the current time. Defaults on.
+    keep_dates: bool,
 }
 
 impl Default for CommanderMode {
@@ -140,6 +144,7 @@ impl CommanderMode {
             pending_host_copy: None,
             checksums: None,
             detail: None,
+            keep_dates: true,
         }
     }
 
@@ -308,6 +313,13 @@ impl CommanderMode {
         ui.add_space(12.0);
         ui.add_enabled(false, egui::Button::new("Compare").min_size(w))
             .on_hover_text("Not implemented yet");
+        ui.add_space(12.0);
+        ui.checkbox(&mut self.keep_dates, "Keep original dates")
+            .on_hover_text(
+                "Reproduce each copied file's original timestamps on the \
+                 destination (HFS catalog dates / Amiga datestamp) instead of \
+                 stamping the current time. Image-to-image copies only.",
+            );
         status
     }
 
@@ -317,6 +329,7 @@ impl CommanderMode {
     ///   (Apply writes through);
     /// - image -> host / host -> host: an immediate threaded host write.
     fn copy(&mut self, from: Side) -> String {
+        let keep_dates = self.keep_dates;
         let (src, dest) = match from {
             Side::Left => (&mut self.left, &mut self.right),
             Side::Right => (&mut self.right, &mut self.left),
@@ -357,7 +370,13 @@ impl CommanderMode {
                 let Some(src_fs) = src.fs_mut() else {
                     return "Source volume is not open.".to_string();
                 };
-                match commander_ops::stage_copy(src_fs, &entries, &dest_parent, &temp_dir) {
+                match commander_ops::stage_copy(
+                    src_fs,
+                    &entries,
+                    &dest_parent,
+                    &temp_dir,
+                    keep_dates,
+                ) {
                     Ok(edits) => {
                         let n = dest.stage_edits(edits);
                         format!("Staged copy of {n} item(s) into the {other} pane. Apply to write.")

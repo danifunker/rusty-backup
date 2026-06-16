@@ -59,14 +59,25 @@ pub fn apply_edits(session: &BrowseSession, edits: &[StagedEdit]) -> Result<()> 
 /// The destination filesystem silently drops metadata it can't hold (e.g. a
 /// resource fork copied onto FAT) at apply time — `create_file` ignores
 /// unsupported options.
+/// When `keep_dates` is set, each copied file carries its source timestamps
+/// (HFS catalog dates / Amiga datestamp) so the destination reproduces them
+/// instead of stamping the current time.
 pub fn stage_copy(
     src_fs: &mut dyn Filesystem,
     entries: &[FileEntry],
     dest_parent: &FileEntry,
     temp_dir: &Path,
+    keep_dates: bool,
 ) -> Result<Vec<StagedEdit>> {
     let mut edits = Vec::new();
-    stage_copy_into(src_fs, entries, dest_parent, temp_dir, &mut edits)?;
+    stage_copy_into(
+        src_fs,
+        entries,
+        dest_parent,
+        temp_dir,
+        keep_dates,
+        &mut edits,
+    )?;
     Ok(edits)
 }
 
@@ -75,6 +86,7 @@ fn stage_copy_into(
     entries: &[FileEntry],
     dest_parent: &FileEntry,
     temp_dir: &Path,
+    keep_dates: bool,
     edits: &mut Vec<StagedEdit>,
 ) -> Result<()> {
     for entry in entries {
@@ -92,7 +104,14 @@ fn stage_copy_into(
                 let children = src_fs
                     .list_directory(entry)
                     .with_context(|| format!("listing '{}' to copy", entry.name))?;
-                stage_copy_into(src_fs, &children, &child_parent, temp_dir, edits)?;
+                stage_copy_into(
+                    src_fs,
+                    &children,
+                    &child_parent,
+                    temp_dir,
+                    keep_dates,
+                    edits,
+                )?;
             }
             EntryType::File => {
                 let (mut blob, blob_path) = tempfile::Builder::new()
@@ -129,6 +148,11 @@ fn stage_copy_into(
                     resource_fork,
                     hfs_type_override: entry.type_code.as_deref().map(encode_fourcc),
                     hfs_creator_override: entry.creator_code.as_deref().map(encode_fourcc),
+                    dates: if keep_dates {
+                        crate::model::edit_queue::PreservedDates::from_entry(entry)
+                    } else {
+                        None
+                    },
                 });
             }
             EntryType::Symlink | EntryType::Special => {
@@ -183,6 +207,8 @@ fn stage_host_into(entries: &[FileEntry], dest_parent: &FileEntry, edits: &mut V
                 resource_fork: None,
                 hfs_type_override: None,
                 hfs_creator_override: None,
+                // Host files carry no Amiga/HFS raw dates to preserve.
+                dates: None,
             });
         }
     }
@@ -431,6 +457,7 @@ mod tests {
                 resource_fork: None,
                 hfs_type_override: None,
                 hfs_creator_override: None,
+                dates: None,
             },
         ];
         apply_edits(&session, &edits).expect("apply");
@@ -582,8 +609,14 @@ mod tests {
         assert_eq!(to_copy.len(), 2);
 
         let temp = tempfile::tempdir().unwrap();
-        let edits =
-            stage_copy(src_fs.as_mut(), &to_copy, &FileEntry::root(), temp.path()).expect("stage");
+        let edits = stage_copy(
+            src_fs.as_mut(),
+            &to_copy,
+            &FileEntry::root(),
+            temp.path(),
+            false,
+        )
+        .expect("stage");
         drop(src_fs);
 
         apply_edits(&dst_session, &edits).expect("apply copy");

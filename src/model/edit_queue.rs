@@ -19,6 +19,34 @@ use crate::fs::filesystem::{
 };
 use crate::fs::resource_fork::{self, ImportedResourceFork};
 
+/// Original timestamps captured from a source file so a cross-image copy can
+/// reproduce them on the destination instead of stamping the current time.
+/// Each filesystem family uses its own date representation; the unused half is
+/// `None`. Amiga dates are applied via `CreateFileOptions::amiga_date` (honored
+/// by AFFS `create_file`); HFS dates via `set_dates` after creation.
+#[derive(Debug, Clone, Default)]
+pub struct PreservedDates {
+    /// AmigaDOS `(days, minutes, ticks)` since 1978-01-01.
+    pub amiga: Option<(i32, i32, i32)>,
+    /// HFS/HFS+ `(create, modify, backup)` in Mac-epoch seconds.
+    pub mac: Option<(u32, u32, u32)>,
+}
+
+impl PreservedDates {
+    /// Capture whatever raw dates a source `FileEntry` carries (HFS `mac_dates`
+    /// and/or Amiga `amiga_date`). Returns `None` when the entry has neither, so
+    /// the copy just stamps the current time.
+    pub fn from_entry(entry: &FileEntry) -> Option<Self> {
+        if entry.mac_dates.is_none() && entry.amiga_date.is_none() {
+            return None;
+        }
+        Some(Self {
+            amiga: entry.amiga_date,
+            mac: entry.mac_dates,
+        })
+    }
+}
+
 /// A single edit operation queued by the GUI, applied later against an
 /// editable filesystem in insertion order.
 #[derive(Debug, Clone)]
@@ -39,6 +67,10 @@ pub enum StagedEdit {
         /// resource_fork sidecar if any, else the extension dictionary).
         hfs_type_override: Option<[u8; 4]>,
         hfs_creator_override: Option<[u8; 4]>,
+        /// Original timestamps captured from the source file, applied to the
+        /// created copy so dates survive a cross-image copy (the "keep original
+        /// dates" option). `None` lets `create_file` stamp the current time.
+        dates: Option<PreservedDates>,
     },
     CreateDirectory {
         parent: FileEntry,
@@ -155,10 +187,14 @@ pub fn apply_edit(
             resource_fork: rsrc_import,
             hfs_type_override,
             hfs_creator_override,
+            dates,
         } => {
             let mut opts = CreateFileOptions {
                 type_code: prodos_type.map(|t| format!("${:02X}", t)),
                 aux_type: *prodos_aux,
+                // Amiga dates round-trip via create_file (AFFS honors this);
+                // HFS dates are applied with set_dates after creation below.
+                amiga_dates: dates.as_ref().and_then(|d| d.amiga),
                 ..Default::default()
             };
 
@@ -203,7 +239,13 @@ pub fn apply_edit(
 
             let mut file = File::open(host_path).map_err(FilesystemError::Io)?;
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-            efs.create_file(&resolved_parent, name, &mut file, *size, &opts)?;
+            let created = efs.create_file(&resolved_parent, name, &mut file, *size, &opts)?;
+            // HFS/HFS+ dates aren't a create_file option, so apply them after
+            // the fact. Best-effort: filesystems without set_dates return
+            // Unsupported, which we ignore (the copy keeps its create-time stamp).
+            if let Some((c, m, b)) = dates.as_ref().and_then(|d| d.mac) {
+                let _ = efs.set_dates(&created, c, m, b);
+            }
             Ok(())
         }
         StagedEdit::CreateDirectory { parent, name } => {
@@ -942,5 +984,61 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
         assert!(lines[1].starts_with("Delete: /d/f"));
+    }
+
+    /// "Keep original dates": an AddFile carrying a source Amiga datestamp
+    /// reproduces it on the destination (via CreateFileOptions::amiga_dates)
+    /// instead of stamping the current time — end to end through apply_edit.
+    #[test]
+    fn add_file_preserves_amiga_dates() {
+        use crate::fs::affs::{create_blank_affs, AffsFilesystem};
+        use crate::fs::filesystem::Filesystem;
+        use std::io::Cursor;
+
+        let img = create_blank_affs(880 * 1024, 1, "DATES").unwrap();
+        let mut buf = img.clone();
+
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"vintage payload").unwrap();
+        let target = (1234i32, 56i32, 78i32); // (days, mins, ticks) since 1978
+
+        {
+            let mut efs = AffsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            let root = efs.root().unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::AddFile {
+                    parent: root,
+                    name: "DATED".to_string(),
+                    host_path: host.path().to_path_buf(),
+                    size: 15,
+                    prodos_type: None,
+                    prodos_aux: None,
+                    resource_fork: None,
+                    hfs_type_override: None,
+                    hfs_creator_override: None,
+                    dates: Some(PreservedDates {
+                        amiga: Some(target),
+                        mac: None,
+                    }),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        let mut fs = AffsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DATED")
+            .expect("DATED present");
+        assert_eq!(
+            entry.amiga_date,
+            Some(target),
+            "copied file kept the source's Amiga datestamp"
+        );
     }
 }

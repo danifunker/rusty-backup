@@ -3114,6 +3114,7 @@ impl BrowseView {
             resource_fork: rsrc_import,
             hfs_type_override: None,
             hfs_creator_override: None,
+            dates: None,
         });
         Ok(())
     }

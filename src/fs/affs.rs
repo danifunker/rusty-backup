@@ -476,6 +476,8 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         extension: u32,
         access: u32,
         comment: &str,
+        // Datestamp to stamp; `None` uses the current time.
+        date: Option<(i32, i32, i32)>,
     ) -> Result<(), FilesystemError> {
         let mut buf = [0u8; BSIZE];
         buf[0..4].copy_from_slice(&T_HEADER.to_be_bytes());
@@ -504,7 +506,7 @@ impl<R: Read + Seek> AffsFilesystem<R> {
         if !comment.is_empty() {
             write_bstr(&mut buf, 0x148, MAX_COMMENT_LEN, comment)?;
         }
-        let (days, mins, ticks) = Self::now_datestamp();
+        let (days, mins, ticks) = date.unwrap_or_else(Self::now_datestamp);
         buf[0x1A4..0x1A8].copy_from_slice(&days.to_be_bytes());
         buf[0x1A8..0x1AC].copy_from_slice(&mins.to_be_bytes());
         buf[0x1AC..0x1B0].copy_from_slice(&ticks.to_be_bytes());
@@ -1255,6 +1257,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
             header_extension,
             access,
             comment_str,
+            options.amiga_dates,
         )?;
         self.hash_chain_insert(parent_block, header_block, name)?;
 
