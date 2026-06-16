@@ -20,9 +20,11 @@ Last updated: 2026-06-16
   through, virtual overlay, unsaved guards); host panes write immediately
   (delete behind a confirm). The middle column copies a selection between the
   panes in **all four** combos (image↔image, host→image, image→host, host→host).
-- **Next concrete step:** **M1 widget extraction + the M4 File Info window**
-  (double-click → detail + editable HFS/ProDOS/ext metadata), plus the
-  browsable-partition gate. See "Next step" below.
+- **Next concrete step (M6 — requested batch):** add right-click **Rename**,
+  **Calculate Checksums** (CRC32/MD5/SHA1/SHA256 window), and **Export to hard
+  drive**, plus a per-pane **Tree** toggle. A wildcard **Find/Search** is
+  deferred (M7). Full design in [`commander_mode.md`](commander_mode.md) §15; the
+  task breakdown is in "Next step" below.
 
 ## Commits on this branch
 
@@ -121,28 +123,50 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib
 ```
 
-## Next step (do this first when resuming)
+## Next step — M6 right-click / view-mode batch (do this first when resuming)
 
-M2-lite + M3 + host panes are done — both panes browse images **and** host
-folders, with all four copy combos, delete, and the unsaved guards. Pick the
-next milestone:
+M2-lite + M3 + host panes are done. The **requested next batch** (full design in
+[`commander_mode.md`](commander_mode.md) §15) adds these. Build each model-first
+(engine → model → thin view), unit-testing the model piece before the menu item;
+suggested order is smallest-win-first:
 
-1. **M1 widget extraction + M4 detail window** — extract `file_detail`
-   (hex/metadata) and `metadata_editor` (type/creator rows) out of `browse_view`
-   into shared modules, then add the double-click File Info window (plan §9) with
-   the editable HFS/ProDOS/ext subset (the two new `StagedEdit` variants in §10.2).
-2. **Browsable-partition gate** — lift `is_browsable_type` & friends out of
-   `inspect_tab.rs` (private today) into a shared module so the partition dropdown
-   can gray out non-FS partitions instead of listing all and erroring on open.
-3. **Drag-to-load** (plan §6) — the OS drop signals are already wired in
-   `gui/mod.rs`; route a dropped image/folder onto the pane under the pointer
-   (load as source) and dropped host files onto an image pane (stage host→image).
+1. **Export to hard drive** (§15.3) — *smallest; pure reuse.* A right-click
+   "Export to hard drive…" that `pick_folder`s a destination and runs the existing
+   `commander_ops::spawn_host_copy` (`ImageToHost` / `HostToHost`) into it. No new
+   engine — just a menu item + folder picker + the poll Commander already has. This
+   is the §9b "Export → To host" item made first-class (loose files, not an archive).
+2. **Calculate Checksums** (§15.2) — new screen showing CRC32 / MD5 / SHA1 / SHA256.
+   - **Engine/model:** new `model::checksum` — `hash_reader(reader, progress) ->
+     ChecksumSet { crc32, md5, sha1, sha256 }`, streaming once into all four hashers.
+     `crc32fast` + `md-5` + `sha2` are vendored; **add the `sha1` crate** (tiny,
+     RustCrypto). Do NOT reuse `backup::verify::RunningHasher` (CRC32/SHA256 only,
+     backup-specific). Unit-test against known vectors. Thread it (Status pattern)
+     for big files; source bytes via `Filesystem::write_file_to` / `std::fs`.
+   - **View:** an `egui::Window` (4-row grid, monospace, per-row Copy button).
+3. **Rename** (§15.1) — needs an engine gap filled.
+   - **Engine:** `EditableFilesystem::rename(parent, entry, new_name)` (per-FS;
+     start FAT/exFAT/HFS/HFS+/ext, others `Err(Unsupported)` so the item grays out).
+   - **Model:** `StagedEdit::Rename { parent, entry, new_name }` + `apply_edit` arm.
+   - **View:** a name dialog (reuse the New-Folder shape) validating via
+     `Filesystem::validate_name`. Image pane stages it; host pane does immediate
+     `std::fs::rename`. Single-selection only.
+4. **Per-pane Tree view** (§15.4) — *largest; a shared-model refactor.* A "Tree"
+   toggle on the source bar switches the pane to a lazy folder tree. Lift
+   `browse_view`'s `directory_cache` + `expanded_paths` + `render_tree_entry`
+   (egui `CollapsingState`) into the model (the §3.3 **R4** share) keyed by the same
+   `ListingSource`; both browse view and Commander render over it. Side-keyed
+   `id_salt` per `CollapsingState` (two-pane id gotcha). Can land last.
 
-Smaller follow-ups: New Folder (`CreateDirectory`) + Export (§9b); host→image
-resource forks (AppleDouble import); image→host fork sidecars; Apply-and-close in
-the unsaved guard (currently Discard&Close / Cancel only — a combined apply needs
-to keep `CommanderMode::temp` alive until both applies finish, since copied blobs
-live there); a copy-progress readout for large host writes.
+**Deferred — M7 find/search** (§15.5): a per-pane wildcard (`*`/`?`) name search —
+`model::find::search(source, root, pattern, progress)` recursive walk + a results
+grid mode. Not needed for the core loop; none of M6 depends on it.
+
+Other backlog (unchanged): M1 widget extraction + the M4 File Info window (plan §9);
+the browsable-partition gate (lift `is_browsable_type` out of `inspect_tab.rs`);
+drag-to-load (§6, OS drop signals already wired in `gui/mod.rs`); New Folder
+(`CreateDirectory`); archive Export (§9b); resource-fork sidecars on host copies;
+Apply-and-close in the unsaved guard (needs `CommanderMode::temp` kept alive until
+both applies finish).
 
 ## Reuse map (do NOT reinvent these)
 
@@ -185,12 +209,14 @@ live there); a copy-progress readout for large host writes.
 Point a fresh session at this file:
 
 > "Resume Commander Mode. Read `docs/commander_mode_handoff.md`, then
-> `docs/commander_mode.md`. We're on branch `commander-mode`. Browsing (image +
-> host panes), all four copy combos, delete, and the unsaved guards are done;
-> continue with the M1 widget extraction + the M4 File Info window (model-first
-> per CONTRIBUTING.md, reusing `DirListing` / `commander_ops` / `EditQueue`).
+> `docs/commander_mode.md` §15. We're on branch `commander-mode`. Browsing (image
+> + host panes), all four copy combos, delete, and the unsaved guards are done.
+> Build the M6 batch model-first per CONTRIBUTING.md (reusing `DirListing` /
+> `commander_ops` / `EditQueue`): Export to hard drive (§15.3), Calculate
+> Checksums (§15.2, add the `sha1` crate), Rename (§15.1, needs an
+> `EditableFilesystem::rename` trait method), then the per-pane Tree view (§15.4).
 > Build with `cargo run` and click 'Commander Mode'."
 
-Open questions still to settle are in `commander_mode.md` §14 (resource-fork
-handling on host↔image copies, function-key bar, persisting pane state, which
-archive formats ship in v1).
+Open questions still to settle are in `commander_mode.md` §14 (checksum set,
+rename scope, tree-view model, resource-fork sidecars on host copies, archive
+formats, function-key bar, persisting pane state).

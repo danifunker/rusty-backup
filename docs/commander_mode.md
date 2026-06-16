@@ -1,7 +1,13 @@
 # Commander Mode — Design & Implementation Plan
 
-Status: **Planning** (no code yet beyond the runnable mock)
-Last updated: 2026-06-15
+Status: **Shipped: M2-lite browsing + M3 staged writes + host panes.** Both
+panes browse disk images and host folders; staged delete + copy-in on image
+panes, immediate writes on host panes, all four copy combos, Apply/Discard,
+virtual overlay, unsaved guards. **Planned next:** the right-click action batch
+(Rename / Calculate Checksums / Export to hard drive), a per-pane tree view, and
+a wildcard find — all specced in §15. Then M1 widget extraction + the M4 File
+Info window.
+Last updated: 2026-06-16
 Owner: TBD
 
 A Midnight Commander–style, full-page, two-pane file explorer for Rusty Backup.
@@ -180,14 +186,17 @@ because the classic browse view must look/behave identically afterward.
 
 ### 4.1 Source bar (top of each pane)
 
-`[ Open... ]  [ partition v ]   <volume label>   free: <n>`
+`[ Open... ] [ Open Folder... ] [ partition v ] [ Tree ]   <volume label>   free: <n>`
 
-- **Open...** → shared `source_picker`: pick a physical device, a disk image, or a
-  host folder (rfd `pick_file` / `pick_folder`).
+- **Open...** → image / device picker (rfd `pick_file`); **Open Folder...** → host
+  folder (rfd `pick_folder`). (M1 will fold both into a shared `source_picker`.)
 - **partition dropdown** — populated after an image is opened (reuses Inspect's
   partition parse). Selecting one (re)opens the pane's `BrowseSession` at that
   partition's offset/type. Host panes hide the dropdown.
-- Right side shows volume label + free space (`free_space()` for editable images).
+- **Tree** toggle — switch this pane between the flat grid and a lazy folder tree
+  (planned; full design in §15.4).
+- Right side shows volume label + free space (`free_space()` for editable images);
+  host panes show "host folder".
 
 ### 4.2 Listing
 
@@ -377,11 +386,16 @@ These are settled from iterating on `examples/commander_mock.rs`:
   row again is *not* a de-select, because a fast second click registers as a double-click).
 - **Double-click** — a directory enters it; a file opens File Info (§9).
 - **Right-click → context menu** (not auto-open). The menu acts on the selection when the
-  clicked row is part of it, otherwise on just that row. Items:
-  - **Copy to {other} pane** (→ stage onto the other pane's queue, §5)
-  - **Delete** / **Undelete** / **Remove from staging** (the one toggle, below)
+  clicked row is part of it, otherwise on just that row. Items (those marked **[§15]**
+  are the planned batch, not yet built):
+  - **Copy to {other} pane** (→ stage onto the other pane's queue, §5) — *built*
+  - **Delete** / **Undelete** / **Remove from staging** (the one toggle, below) — *built*
+    (image panes stage; host panes delete immediately behind a confirm)
+  - **Rename…** **[§15.1]** — opens a name dialog; staged on image panes, immediate on host
+  - **Calculate Checksums…** **[§15.2]** — opens a window showing CRC32 / MD5 / SHA1 (+ SHA256)
+  - **Export to hard drive…** **[§15.3]** — pick a host folder; immediate extraction
   - **Info / Details** (§9)
-  - **Export…** submenu (§9b)
+  - **Export…** submenu (§9b — archive formats: zip / tgz / sit)
 - **Delete is a single toggle** (`toggle_delete`): on a normal entry it stages a delete;
   on an entry already staged for delete it **undeletes** (un-stages); on a staged copy /
   new folder it **drops it from the list**. This is the "undelete" behaviour — no separate
@@ -479,7 +493,7 @@ v1 (needed for the detail-pane editing we promised):
 
 Future phases (each unchecked = one driver-spanning task):
 
-- [ ] `rename` trait method + `StagedEdit::Rename`.
+- [ ] `rename` trait method + `StagedEdit::Rename` (full design in §15.1).
 - [ ] generic `set_modified_time`.
 - [ ] `set_dos_attributes` (FAT, exFAT) + queue variant + editor widget.
 - [ ] `set_amiga_protection` / `set_amiga_comment` / `set_amiga_dates` (AFFS, PFS3, SFS).
@@ -522,29 +536,153 @@ per-row diff status. Re-spec when we get there.
 
 1. **M0 — mock** (done): `examples/commander_mock.rs`, layout & interaction agreed.
 2. **M1 — refactor R0/R1**: extract `file_detail`, `metadata_editor`, `source_picker`;
-   browse view + Inspect adopt them unchanged.
-3. **M2 — read-only Commander**: overlay, two panes, source open (picker + drag-load),
-   `DirListing`, columns, sort, `..` nav, detail window (display only). No writes.
-4. **M3 — staged writes**: per-pane `EditQueue`, copy (all four backend combos),
-   delete, Apply/Discard, projected free space, unsaved guard, virtual overlay.
-5. **M4 — editable subset**: detail-pane editing for HFS/ProDOS/ext (+ the two new
+   browse view + Inspect adopt them unchanged. *(not started)*
+3. **M2 — read-only Commander** (**done**, M2-lite): overlay, two panes, source open
+   (picker), `DirListing`, columns, sort, `..` nav. (Drag-load + detail window pending.)
+4. **M3 — staged writes** (**done**): per-pane `EditQueue`, copy (image↔image staged),
+   delete, Apply/Discard, unsaved guard, virtual overlay.
+5. **Host panes** (**done**): host-folder source, all four copy combos (host→image staged;
+   image→host / host→host immediate threaded), immediate host delete.
+6. **M4 — editable subset**: detail-pane editing for HFS/ProDOS/ext (+ the two new
    `StagedEdit` variants from §10.2).
-6. **M5+** — Compare; the broad metadata-setter backlog from §10.2.
+7. **M6 — right-click action batch** (§15): **Rename** (§15.1), **Calculate Checksums**
+   (§15.2), **Export to hard drive** (§15.3), and the **per-pane tree view** (§15.4).
+8. **M7 — find / search** (§15.5, deferrable): wildcard name search per pane.
+9. **M5+** — Compare; the broad metadata-setter backlog from §10.2.
 
 ---
 
 ## 14. Open questions
 
 - **Multi-select semantics** — *resolved* (§9a): Ctrl/Cmd-toggle + Shift-range via
-  `Modifiers::command`, lands in M2.
+  `Modifiers::command`. **Shipped.**
 - **Archive formats beyond zip / tgz / sit** — ship `.7z` (`sevenz-rust2`) and/or
-  `.tar.xz` (`xz2`) in v1, or defer until asked? (Inventory in §9b.)
+  `.tar.xz` (`xz2`), or defer until asked? (Inventory in §9b; archive export itself
+  is not built yet.)
 - **Host→image resource forks** — when a host file has an AppleDouble (`._name`) or a
   macOS named fork, do we import the resource fork? (Probably yes on macOS, via the
-  existing `ResourceForkSource`.) Decide in M3.
+  existing `ResourceForkSource`.) **Shipped data-fork-only; fork import still open.**
 - **Image→host resource forks** — write an AppleDouble sidecar, a macOS named fork, or
-  drop the fork with a warning? Decide in M3.
+  drop the fork with a warning? **Shipped drop-with-warning; sidecars still open**
+  (affects §15.3 Export to hard drive too).
+- **Rename scope** (§15.1) — single-selection only, or batch/templated rename later?
+- **Checksum set** (§15.2) — is CRC32 / MD5 / SHA1 / SHA256 the right default set, or
+  add BLAKE3? Do we offer per-file rows for a multi-selection, or a combined manifest?
+- **Tree view model** (§15.4) — fold the lazy tree into `DirListing`, or a sibling
+  `DirTree`? (Ties into the R4 browse-view share.)
 - **Function-key bar** — do we also want a classic MC F5/F6/F8 keyboard map, or are
-  the middle buttons enough for v1? (Mock uses buttons only.)
+  the middle buttons + right-click enough?
 - **Persisting pane state** — remember last-opened sources / column widths across
   sessions, or always start empty?
+
+---
+
+## 15. Right-click actions, tree view, and search (planned batch)
+
+This is the next batch of user-facing features (milestone M6, plus the deferrable
+M7 search). All build on the engine/model that already shipped — `DirListing`
+(image + host listing sources), `commander_ops` (apply / stage_copy /
+stage_host_to_image / spawn_host_copy), and the per-pane `EditQueue`. Build
+model-first per CONTRIBUTING (engine → model → thin view), unit-testing each new
+model piece before wiring the menu item.
+
+### 15.1 Rename
+
+Rename the selected entry. There is **no `rename` on `EditableFilesystem` today**
+(confirmed gap, §10), so this needs an engine-layer addition:
+
+- **Engine** — `EditableFilesystem::rename(parent, entry, new_name) -> Result<()>`,
+  with a per-FS implementation (in-place directory-entry rewrite; FAT rewrites the
+  SFN/LFN set, HFS/HFS+ re-keys the catalog record, ext rewrites the dirent, etc.).
+  Start with the filesystems users will hit first (FAT/exFAT/HFS/HFS+/ext); other
+  drivers return `Err(Unsupported)` so the menu item can gray out.
+- **Model** — `StagedEdit::Rename { parent, entry, new_name }` + an `apply_edit` arm
+  calling `efs.rename(...)`. The virtual overlay shows the row under its new name
+  (and the old name struck through, optional).
+- **View** — a "Rename…" name dialog (reuse the New-Folder dialog shape), validating
+  against `Filesystem::validate_name` and the destination's duplicate-name rule.
+  - **Image pane** → stage `Rename` (applied on Apply).
+  - **Host pane** → immediate `std::fs::rename` (no staging), then re-list.
+- **Interim fallback** (if the trait method is deferred): rename via copy-to-new-name
+  + delete-old on the *same* pane. Loses in-place semantics and is slower, so prefer
+  the real trait method; document the fallback only as a stopgap.
+
+Single-selection only (multi-rename / templated rename is out of scope).
+
+### 15.2 Calculate Checksums
+
+Open a small window ("Checksums: NAME") showing, for the selected file(s),
+**CRC32**, **MD5**, **SHA1**, and **SHA256** as hex, with a copy-to-clipboard
+button per row. For a multi-selection, show one row per file (and skip
+directories, or recurse with a per-file breakdown — pick per-file rows).
+
+- **Crates** — `crc32fast`, `md-5`, and `sha2` (SHA256) are **already vendored**;
+  **add the `sha1` crate** (tiny, RustCrypto, same family as `md-5`/`sha2`). The
+  existing `backup::verify::RunningHasher` only does CRC32/SHA256 and is
+  backup-specific — do **not** overload it.
+- **Model** — `model::checksum::hash_reader(reader, &dyn Fn(progress)) -> ChecksumSet`
+  that streams the data **once** (64 KiB–1 MiB chunks) feeding all four hashers in
+  parallel; `ChecksumSet { crc32, md5, sha1, sha256 }` with hex accessors. Source
+  data comes from `Filesystem::write_file_to` (image) or `std::fs::File` (host).
+  Unit-test against known vectors (e.g. the empty input and `"abc"`).
+- **Threading** — large files: run on a worker thread behind a `ChecksumStatus`
+  (the established Status pattern), polled each frame with a spinner / progress
+  bar. The window shows "computing…" until done.
+- **View** — `egui::Window` with a 4-row grid (algorithm → value), monospace values,
+  a Copy button each. Reachable from the right-click menu and (later) the File Info
+  window's detail rows.
+
+### 15.3 Export to hard drive
+
+A first-class "Export to hard drive…" menu action that writes the selection to a
+host folder the user picks (rfd `pick_folder`), regardless of what the *other*
+pane is pointing at. This is the §5 image→host (and host→host) export surfaced
+directly:
+
+- **Reuse** — exactly the H2 host-write engine: `commander_ops::spawn_host_copy`
+  with `HostCopyJob::ImageToHost { session, entries, dest_dir = picked }` for an
+  image source, or `HostToHost { entries, dest_dir }` for a host source. Threaded,
+  with the same `HostCopyStatus` poll + completion toast Commander already uses.
+- **Distinction from §9b** — §9b *archives* the selection into a single container
+  file (zip / tgz / sit). §15.3 writes the selection out as **plain files/folders**
+  into a chosen directory. Both are immediate host writes; the menu offers both
+  ("Export to hard drive…" = loose files; "Export…" submenu = archive).
+- **Forks** — data fork only for v1 (note metadata loss in the status line, as the
+  copy engine already does); AppleDouble/MacBinary sidecars are a later option
+  (open question, §14).
+
+### 15.4 Per-pane tree view
+
+A **tree toggle** button on each pane's source bar switches that pane between the
+flat single-directory grid (today) and a hierarchical, lazily-expanding folder
+tree — the classic file-manager left-tree navigation.
+
+- **Reuse** — the browse view already implements exactly this: `directory_cache:
+  HashMap<String, Vec<FileEntry>>` + `expanded_paths: HashSet<String>` +
+  `render_tree_entry` (egui `CollapsingState`) in `gui/browse_view.rs`. The tree
+  state belongs in the model, so this is the **R4** refactor from §3.3: lift the
+  lazy-tree cache into `DirListing` (or a sibling `DirTree` model) keyed by the same
+  `ListingSource`, and have both the browse view and Commander render over it. The
+  per-`CollapsingState` `id_salt` must be side-keyed (the two-pane id gotcha, §9a).
+- **Behaviour** — clicking a folder in the tree sets the flat grid's cwd (tree for
+  navigation, grid for the working set), or the tree fully replaces the grid while
+  toggled on — pick the "tree navigates, grid is the working set" split (matches MC
+  and keeps copy/delete acting on a single directory's selection).
+- **Scope note** — this is the largest item in the batch because of the shared-model
+  refactor; it can land after Rename/Checksums/Export if we want quicker wins first.
+
+### 15.5 Find / search (deferred — M7)
+
+A per-pane search box that finds files by name with shell wildcards (`*`, `?`,
+character classes). **Deferrable** — not needed for the core file-manager loop.
+
+- **Model** — `model::find::search(source, root, pattern, &dyn Fn(progress)) ->
+  Vec<FileEntry>`: a recursive walk over the listing source (image fs or host
+  `std::fs`) matching each name against a compiled glob. Use a small glob matcher
+  (the `globset` crate, or a hand-rolled `*`/`?` matcher — no new dep needed for the
+  simple two-wildcard case). Threaded for large trees (Status pattern), cancelable.
+- **View** — a search field in the source bar (or a Ctrl/Cmd-F popup); results show
+  in the grid as a flat list with their full paths, selectable for copy/delete/export
+  like any other selection. Double-click jumps to the containing directory.
+- **Why deferred** — it needs a results-list view mode distinct from the cwd grid,
+  and a recursive-walk worker; none of the M6 items depend on it.

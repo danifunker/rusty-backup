@@ -333,8 +333,12 @@ panes stage delete + copy-in onto per-pane `EditQueue`s (Apply/Discard, virtual
 overlay, unsaved guards); host panes write immediately (delete behind a confirm).
 The middle column copies a selection across the panes in all four combos
 (image↔image and host→image staged; image→host and host→host immediate/threaded).
-Next: M1 widget extraction + the M4 File Info detail window, the
-browsable-partition gate, and drag-to-load. Milestones M1-M5 in the plan doc.
+Next: the **M6 right-click / view batch** (plan §15) — Export to hard drive
+(§15.3, reuses `spawn_host_copy`), Calculate Checksums (§15.2, `model::checksum`
++ add the `sha1` crate), Rename (§15.1, new `EditableFilesystem::rename`), and a
+per-pane Tree view (§15.4, the R4 browse-view share); wildcard Find is deferred
+(M7, §15.5). Then M1 widget extraction + the M4 File Info window, the
+browsable-partition gate, and drag-to-load. Milestones in the plan doc §13.
 
 
 ---
