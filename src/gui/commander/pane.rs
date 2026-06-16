@@ -16,7 +16,6 @@
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -111,13 +110,6 @@ pub(crate) struct CommanderPane {
     rename_dialog: Option<RenameDialog>,
     /// Whether the "Pending edits" review popup is open for this pane.
     show_edits_popup: bool,
-    /// Tree view toggled on: the pane shows a folder tree (navigation) beside
-    /// the flat grid (the working set) instead of just the grid.
-    tree_mode: bool,
-    /// Lazily-listed child *directories* per directory path, for the tree.
-    tree_cache: HashMap<String, Vec<FileEntry>>,
-    /// Directory paths the user has expanded in the tree.
-    tree_expanded: HashSet<String>,
 }
 
 /// State for the modal "Rename..." dialog.
@@ -161,16 +153,7 @@ impl CommanderPane {
             pending_host_delete: None,
             rename_dialog: None,
             show_edits_popup: false,
-            tree_mode: false,
-            tree_cache: HashMap::new(),
-            tree_expanded: HashSet::new(),
         }
-    }
-
-    /// Drop the cached tree so it re-lists against a freshly-(re)opened source.
-    fn reset_tree(&mut self) {
-        self.tree_cache.clear();
-        self.tree_expanded.clear();
     }
 
     /// Number of staged (unapplied) edits on this pane.
@@ -222,37 +205,8 @@ impl CommanderPane {
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
         } else if self.listing.is_loaded() {
-            let mut actions = RowActions::default();
-            if self.tree_mode {
-                // Split: folder tree on the left (navigation), flat grid on the
-                // right (the working set the selection / copy / delete act on).
-                let avail = ui.available_size();
-                let tree_w = (avail.x * 0.38).clamp(140.0, 280.0);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(tree_w, avail.y),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt(("commander_tree", self.side.idx()))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| self.render_tree(ui));
-                        },
-                    );
-                    ui.separator();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2((avail.x - tree_w - 12.0).max(120.0), avail.y),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            self.render_header(ui);
-                            actions = self.render_rows(ui);
-                        },
-                    );
-                });
-            } else {
-                self.render_header(ui);
-                actions = self.render_rows(ui);
-            }
+            self.render_header(ui);
+            let actions = self.render_rows(ui);
             if actions.status.is_some() {
                 status = actions.status;
             }
@@ -521,9 +475,6 @@ impl CommanderPane {
     /// Re-read the current directory listing (after an immediate host write).
     pub(crate) fn reload_listing(&mut self) {
         let _ = self.listing.reload();
-        // A host write may have added / removed directories; drop the tree
-        // cache so it re-lists.
-        self.reset_tree();
     }
 
     /// True when at least one row is selected.
@@ -712,8 +663,12 @@ impl CommanderPane {
                         .map(partition_label)
                         .unwrap_or_else(|| "(no partitions)".to_string());
                     let mut chosen = self.selected_part;
+                    // Cap the width so a long partition label (e.g. a raw-carve
+                    // "Amiga NDOS (no filesystem)") can't overflow into the
+                    // volume readout on the right.
                     egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
                         .selected_text(current)
+                        .width(210.0)
                         .show_ui(ui, |ui| {
                             for (i, p) in self.partitions.iter().enumerate() {
                                 ui.selectable_value(&mut chosen, Some(i), partition_label(p));
@@ -728,20 +683,6 @@ impl CommanderPane {
                             }
                         }
                     }
-                }
-
-                // View toggle, rendered as an obvious button (List <-> Tree).
-                let tree_label = if self.tree_mode {
-                    "List view"
-                } else {
-                    "Tree view"
-                };
-                if ui
-                    .button(tree_label)
-                    .on_hover_text("Toggle folder-tree navigation")
-                    .clicked()
-                {
-                    self.tree_mode = !self.tree_mode;
                 }
 
                 // Right-aligned volume label + free space.
@@ -784,8 +725,6 @@ impl CommanderPane {
         self.error = None;
         self.pending_host_delete = None;
         self.rename_dialog = None;
-        self.tree_mode = false;
-        self.reset_tree();
         format!("[{}] closed.", self.side.label())
     }
 
@@ -886,7 +825,6 @@ impl CommanderPane {
         self.pending_open = None;
         self.pending_apply = None;
         self.queue.clear();
-        self.reset_tree();
         self.error = None;
         self.volume_label.clear();
         self.fs_type.clear();
@@ -912,7 +850,6 @@ impl CommanderPane {
 
     /// Begin an async open of partition `idx`.
     fn open_partition(&mut self, idx: usize) -> String {
-        self.reset_tree();
         let Some(path) = self.source.clone() else {
             return String::new();
         };
@@ -1204,9 +1141,11 @@ impl CommanderPane {
                             m_info = Some(row.name.clone());
                         }
                     } else if resp.clicked() {
-                        if row.is_parent() {
-                            to_up = true;
-                        } else {
+                        // A single click on ".." does nothing — navigate up on
+                        // double-click, consistent with folders (which enter on
+                        // double-click). A single click navigating immediately
+                        // also pre-empted any double-click on the row.
+                        if !row.is_parent() {
                             click = Some((row.name.clone(), mods.command, mods.shift));
                         }
                     }
@@ -1370,88 +1309,6 @@ impl CommanderPane {
             export: m_export,
             checksums: m_checksums,
             detail: m_info,
-        }
-    }
-
-    // --- tree view ---------------------------------------------------------
-
-    /// Render the lazy folder tree (directories only). Clicking a folder sets
-    /// the flat grid's current directory; the grid stays the working set the
-    /// selection / copy / delete / rename / checksum actions operate on.
-    fn render_tree(&mut self, ui: &mut egui::Ui) {
-        let Some(root) = self.listing.root_entry() else {
-            return;
-        };
-        let mut nav: Option<String> = None;
-        self.render_tree_node(ui, &root, true, &mut nav);
-        if let Some(path) = nav {
-            if let Err(e) = self.listing.navigate_to(&path) {
-                self.error = Some(format!("Cannot open '{path}': {e}"));
-            }
-        }
-    }
-
-    /// One tree node (a directory). Lazily lists its child directories on first
-    /// expansion (cached in `tree_cache`); recurses into expanded children. The
-    /// `nav` out-param carries a click target back up to [`render_tree`].
-    fn render_tree_node(
-        &mut self,
-        ui: &mut egui::Ui,
-        entry: &FileEntry,
-        is_root: bool,
-        nav: &mut Option<String>,
-    ) {
-        let path = entry.path.clone();
-        // Side-keyed id so the two panes' trees never share CollapsingState.
-        let id = ui.make_persistent_id(("commander_tree_node", self.side.idx(), &path));
-        let mut state =
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, is_root);
-        let is_cwd = self.listing.cwd_path() == path;
-        let label = if is_root && entry.name.is_empty() {
-            "/".to_string()
-        } else {
-            entry.name.clone()
-        };
-
-        let header = ui.horizontal(|ui| {
-            state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
-            if ui.selectable_label(is_cwd, &label).clicked() {
-                *nav = Some(path.clone());
-            }
-        });
-
-        state.show_body_indented(&header.response, ui, |ui| {
-            match self.tree_cache.get(&path).cloned() {
-                Some(children) if children.is_empty() => {
-                    ui.weak("(no subfolders)");
-                }
-                Some(children) => {
-                    for child in &children {
-                        self.render_tree_node(ui, child, false, nav);
-                    }
-                }
-                None => {
-                    ui.weak("...");
-                }
-            }
-        });
-
-        // Lazily list child directories on first expansion.
-        if state.is_open() {
-            if !self.tree_cache.contains_key(&path) {
-                let mut dirs: Vec<FileEntry> = self
-                    .listing
-                    .list_dir(entry)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|e| e.is_directory())
-                    .collect();
-                dirs.sort_by_key(|e| e.name.to_lowercase());
-                self.tree_cache.insert(path.clone(), dirs);
-            }
-            self.tree_expanded.insert(path.clone());
-        } else {
-            self.tree_expanded.remove(&path);
         }
     }
 }
@@ -1618,7 +1475,9 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
     };
 
     // ASCII overlay markers (no Unicode glyphs): "+ " pending add, "- " pending
-    // delete, "old -> new" pending rename, trailing "/" for directories.
+    // delete, "old -> new" pending rename, trailing "/" for directories, and a
+    // leading "* " for an entry with staged metadata edits (in addition to the
+    // blue tint, since blue alone reads too close to the folder color).
     let display_name = match row.kind {
         RowKind::PendingAdd => format!("+ {}", row.name),
         RowKind::PendingDelete => format!("- {}", row.name),
@@ -1626,8 +1485,18 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
             Some(new) => format!("{} -> {}", row.name, new),
             None => row.name.clone(),
         },
-        _ if row.is_dir && !row.is_parent() => format!("{}/", row.name),
-        _ => row.name.clone(),
+        _ => {
+            let base = if row.is_dir && !row.is_parent() {
+                format!("{}/", row.name)
+            } else {
+                row.name.clone()
+            };
+            if row.meta_changed {
+                format!("* {base}")
+            } else {
+                base
+            }
+        }
     };
 
     let name_cell = egui::Rect::from_min_max(
