@@ -23,11 +23,11 @@ Last updated: 2026-06-16
   (image↔image, host→image, image→host, host→host). Right-click also offers
   **Export to hard drive**, **Calculate checksums** (CRC32/MD5/SHA1/SHA256), and
   **Rename** (FAT in-place); each pane has a **Tree** toggle.
-- **Next concrete step:** the M6 batch (Export, Checksums, Rename, Tree) is done.
-  Remaining: extend `EditableFilesystem::rename` to exFAT / HFS / HFS+ / ext (FAT
-  only today; gated by `fs::supports_rename`); the §3.3 **R4** tree-model dedup
-  (share the lazy tree between Commander and `browse_view`); and the deferred
-  wildcard **Find/Search** (M7, §15.5). Full design in
+- **Next concrete step:** the M6 batch (Export, Checksums, Rename, Tree) is done,
+  and `EditableFilesystem::rename` is now implemented for all 26 editable
+  filesystems. Remaining: the §3.3 **R4** tree-model dedup (share the lazy tree
+  between Commander and `browse_view`); a possible `rb-cli` rename verb; and the
+  deferred wildcard **Find/Search** (M7, §15.5). Full design in
   [`commander_mode.md`](commander_mode.md) §15.
 
 ## Commits on this branch
@@ -119,19 +119,29 @@ the H2 commit lands with this doc update.)
   `Option<Side>` (`None` = export, so `poll_host_copy` skips the re-list). Excluded
   on not-yet-applied staged-add rows (no real data yet).
 - **M6.3 Rename** — new engine method `EditableFilesystem::rename(parent, entry,
-  new_name)` (default `Unsupported`), implemented in place for **FAT 12/16/32**
-  (`fat.rs`): same start cluster / size / attrs, add new LFN+SFN then remove old
-  (add-then-remove so a failure never orphans data); case-only renames allowed,
-  real collisions rejected. `fs::supports_rename(part_type, type_string)` gates the
-  GUI (FAT today; everything else stays grayed out). Model: `StagedEdit::Rename` +
-  `apply_edit` arm + `EditQueue::{pending_rename_for, remove_pending_rename}`. View:
-  right-click "Rename..." (single entry) opens a name dialog validating via
+  new_name)` (default `Unsupported`), now implemented **in place for every editable
+  filesystem (26)**: FAT, exFAT, NTFS, ext, UFS, EFS, HFS, HFS+, MFS, ProDOS,
+  Apple DOS 3.3, CBM, Atari DOS, RS-DOS, DragonDOS, Acorn DFS/ADFS, OS-9, QDOS,
+  Human68k, CP/M, AFFS, PFS3, SFS, XFS, Alto BFS. Each keeps the entry's identity
+  (start cluster / inode / CNID / objectnode) and data; only the parent listing's
+  name changes. Strategies vary by on-disk shape: fixed-field in-place overwrite
+  (CBM/Atari/ProDOS/OS-9/RS-DOS/DragonDOS/DFS/ADFS/Human68k/MFS…), remove+add for
+  variable-length dirents (exFAT/ext/UFS/EFS/PFS3/SFS), B-tree re-key + thread fix
+  (HFS in-place Str31, HFS+ rebuilt variable thread), NTFS dual-write (index $I30
+  re-key + child `$FILE_NAME` grown/shrunk in place, sequence number preserved),
+  AFFS hash-chain relink, XFS add-then-remove with matched `is_dir` so the parent
+  nlink ±1 cancels, BFS full-volume rebuild (DV entry + leader). Case-only renames
+  allowed, real collisions rejected; 36 unit tests (incl. XFS fsck-clean,
+  HFS+/NTFS persistence + grow/shrink). Model: `StagedEdit::Rename` + `apply_edit`
+  arm + `EditQueue::{pending_rename_for, remove_pending_rename}`. View: right-click
+  "Rename..." (single entry) opens a name dialog validating via
   `Filesystem::validate_name`; image panes stage it (overlay shows `old -> new`,
   right-click "Cancel rename"), host panes rename immediately via `std::fs::rename`
   (existence-checked). Staging a delete drops any staged rename on the same entry.
-  Tests: 3 FAT-engine (file/dir/collision) + 1 staged-apply. **Follow-up:** exFAT /
-  HFS / HFS+ / ext `rename` (and a possible `rb-cli` rename verb reusing the trait
-  method).
+  Rename is offered on any loaded pane (like Delete): browse-only filesystems
+  (e.g. btrfs) surface `Unsupported` at Apply rather than being pre-gated, so there
+  is no per-type `supports_rename` table to drift. **Follow-up:** a possible
+  `rb-cli` rename verb reusing the trait method.
 - **M6.2 Calculate Checksums** — new `model::checksum` (added the `sha1` crate):
   `ChecksumHasher` (a `std::io::Write` sink feeding crc32fast + md-5 + sha1 + sha2),
   `hash_reader(reader, progress) -> ChecksumSet { crc32, md5, sha1, sha256 }` with
@@ -186,12 +196,11 @@ suggested order is smallest-win-first:
 2. **Calculate Checksums** (§15.2) — *DONE.* `model::checksum` streams once into
    CRC32 / MD5 / SHA1 / SHA256; threaded `spawn(ChecksumJob)`; right-click window
    with a per-file grid + Copy buttons. Added the `sha1` crate.
-3. **Rename** (§15.1) — *DONE for FAT.* `EditableFilesystem::rename` (default
-   `Unsupported`) + in-place FAT 12/16/32 impl; `fs::supports_rename` gates the GUI;
-   `StagedEdit::Rename` + dialog; image stages (overlay `old -> new`), host immediate.
-   **Remaining:** exFAT / HFS / HFS+ / ext `rename` overrides (each flips its core's
-   cell to enabled once added — no GUI change needed beyond extending
-   `fs::supports_rename`).
+3. **Rename** (§15.1) — *DONE for all 26 editable filesystems.*
+   `EditableFilesystem::rename` (default `Unsupported`) implemented per-FS in place;
+   `StagedEdit::Rename` + dialog; image stages (overlay `old -> new`), host
+   immediate. Offered on any loaded pane (like Delete); browse-only filesystems
+   surface `Unsupported` at Apply.
 4. **Per-pane Tree view** (§15.4) — *DONE (contained).* A "Tree" toggle splits the
    pane into a lazy folder tree (navigation) + grid (working set);
    `DirListing::navigate_to` drives cwd from tree clicks. The §3.3 **R4** dedup

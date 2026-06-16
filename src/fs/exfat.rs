@@ -1372,6 +1372,62 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_exfat_name(new_name)?;
+
+        let parent_cluster = if parent.path == "/" {
+            self.root_cluster
+        } else {
+            parent.location as u32
+        };
+        let dir_data = self.read_cluster_chain(parent_cluster, None)?;
+
+        // Reject a collision with a *different* entry. exFAT names are
+        // case-insensitive, so a case-only self-rename ("readme" ->
+        // "README") resolves to the same entry and is allowed; only a
+        // genuinely different occupant of the name triggers the error.
+        let case_only = new_name.eq_ignore_ascii_case(&entry.name);
+        if !case_only && Self::name_exists_in_dir(&dir_data, new_name) {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Preserve identity: same FirstCluster + DataLength, and the
+        // attribute byte (forcing the directory bit for a directory).
+        // build_entry_set recomputes NameHash + SetChecksum from the new
+        // name, so we never hand-patch the entry-set bytes.
+        let attrs = if entry.is_directory() {
+            ATTR_DIRECTORY
+        } else {
+            entry.dos_attributes.map(|a| a & 0x27).unwrap_or(0x20)
+        };
+        let entry_bytes = Self::build_entry_set(new_name, attrs, entry.location as u32, entry.size);
+
+        // remove_entry_from_directory matches names case-insensitively
+        // and does not consult the cluster. For the normal case (names
+        // differ by more than case) we add the new entry first, then
+        // remove the old — the remove can only match the old name. For a
+        // case-only rename both entries would match case-insensitively,
+        // so we remove the old entry first; the file's identity (the
+        // start cluster) is shared between old and new entries, so this
+        // ordering never orphans data.
+        if case_only {
+            self.remove_entry_from_directory(parent, entry)?;
+            self.add_entry_to_directory(parent, &entry_bytes)?;
+        } else {
+            self.add_entry_to_directory(parent, &entry_bytes)?;
+            self.remove_entry_from_directory(parent, entry)?;
+        }
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.recalculate_boot_checksum()?;
         self.reader.flush()?;
@@ -2490,6 +2546,48 @@ mod tests {
             &CreateFileOptions::default(),
         );
         assert!(matches!(result, Err(FilesystemError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_exfat_rename_preserves_identity_and_content() {
+        let mut image = make_test_exfat_image();
+        let mut fs = open_test_exfat(&mut image);
+
+        let root = fs.root().unwrap();
+        let data = b"rename me please";
+        let mut cursor = std::io::Cursor::new(data.as_slice());
+        let file = fs
+            .create_file(
+                &root,
+                "old.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let original_cluster = file.location;
+
+        // Rename, then re-locate via the directory listing.
+        let root = fs.root().unwrap();
+        fs.rename(&root, &file, "new.txt").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "old.txt"),
+            "old name should be gone"
+        );
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "new.txt")
+            .expect("new name should be listed");
+
+        // Identity (FirstCluster) and size preserved.
+        assert_eq!(renamed.location, original_cluster);
+        assert_eq!(renamed.size, data.len() as u64);
+
+        // Content preserved.
+        let content = fs.read_file(renamed, data.len()).unwrap();
+        assert_eq!(&content[..data.len()], data);
     }
 
     #[test]

@@ -778,6 +778,49 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DragonDosFilesystem<R
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "DragonDOS is flat; only root files are renamable".into(),
+            ));
+        }
+        let index = entry.location as usize;
+        if index >= MAX_DIRENTS || !self.is_real_file(index) {
+            return Err(FilesystemError::NotFound(format!(
+                "'{}' is not a live DragonDOS file",
+                entry.name
+            )));
+        }
+        let raw_name = encode_name(new_name)?;
+
+        // Reject a collision with a *different* live header dirent. Names are
+        // folded to uppercase by the encoder, so byte-exact comparison of the
+        // encoded form covers case folding.
+        for i in 0..MAX_DIRENTS {
+            if i != index && self.is_real_file(i) && self.dirent(i)[1..12] == raw_name {
+                return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+            }
+        }
+
+        // Overwrite only the 11-byte name field of the header dirent; the flag
+        // byte (incl. protect), extents and continuation link are untouched, so
+        // the file keeps its identity and contents. Continuation dirents carry
+        // no name, so only the header slot changes.
+        let (s, _e) = Self::dirent_range(index);
+        self.dir_track[s + 1..s + 12].copy_from_slice(&raw_name);
+        self.flush_dir_track()?;
+        self.refresh()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -939,6 +982,78 @@ mod tests {
         assert_eq!(fs2.read_file(d2, usize::MAX).unwrap(), big);
         let x2 = l2.iter().find(|e| e.name == "EXACT").unwrap();
         assert_eq!(fs2.read_file(x2, usize::MAX).unwrap(), exact);
+    }
+
+    #[test]
+    fn rename_in_place_round_trip() {
+        let mut fs = open_mem(create_blank(40, 1));
+        let root = fs.root().unwrap();
+
+        let big: Vec<u8> = (0..700).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let d = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DATA.BIN")
+            .unwrap();
+        // Capture the first data LSN (identity) before the rename.
+        let (lsns_before, _) = fs.collect_extents(d.location as usize).unwrap();
+        let first_lsn = lsns_before[0].lsn;
+
+        fs.rename(&root, &d, "REPORT.TXT").unwrap();
+
+        // Re-open from bytes to prove persistence.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs2 = DragonDosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r2 = fs2.root().unwrap();
+        let l2 = fs2.list_directory(&r2).unwrap();
+        let names: Vec<&str> = l2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"REPORT.TXT"));
+        assert!(!names.contains(&"DATA.BIN"));
+
+        // Identity (first data LSN) + contents preserved.
+        let renamed = l2.iter().find(|e| e.name == "REPORT.TXT").unwrap();
+        let (lsns_after, _) = fs2.collect_extents(renamed.location as usize).unwrap();
+        assert_eq!(lsns_after[0].lsn, first_lsn);
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), big);
+    }
+
+    #[test]
+    fn rename_collision_rejected() {
+        let mut fs = open_mem(create_blank(40, 1));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "ONE",
+            &mut Cursor::new(vec![1u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "TWO",
+            &mut Cursor::new(vec![2u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let two = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TWO")
+            .unwrap();
+        let err = fs.rename(&root, &two, "ONE").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 
     #[test]

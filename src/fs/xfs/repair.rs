@@ -298,6 +298,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for XfsFilesystem<R> {
         self.do_delete_entry(parent.location, &entry.name, entry.location)
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        // Same-parent, in-place rename (short-form / single-block parents).
+        self.do_rename(parent.location, &entry.name, new_name, entry.location)
+    }
+
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
         // Order matters: R4 (secondary-superblock geometry) → R4b (AGF/AGI
         // summary counters) → R3 (inobt free-mask/freecount repair) → R5

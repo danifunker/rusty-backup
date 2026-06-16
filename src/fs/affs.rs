@@ -1351,6 +1351,50 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        self.validate_name(new_name)?;
+        let parent_block = if parent.location == 0 {
+            self.root_block
+        } else {
+            parent.location as u32
+        };
+        let block = entry.location as u32;
+
+        // Reject a collision with a *different* entry. AFFS folds case
+        // (intl vs non-intl), so a case-only self-rename ("readme" ->
+        // "README") still resolves to `block` — allow that.
+        if let Some(existing) = self.lookup_in_dir(parent_block, new_name)? {
+            if existing != block {
+                return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+            }
+        }
+
+        // Remove from the hash chain under the OLD name, rewrite the
+        // header's name (+ checksum) in place, then re-insert under the
+        // NEW name. The header block number (= the entry's identity) and
+        // all data-block pointers are untouched, so file contents and the
+        // entry's `next_same_hash`/`parent` linkage survive. Doing remove
+        // first means the chosen bucket reflects the new name even when it
+        // differs from the old one.
+        self.hash_chain_remove(parent_block, block, &entry.name)?;
+        let mut buf = self.read_block(block)?;
+        write_bstr(&mut buf, 0x1B0, MAX_NAME_LEN, new_name)?;
+        buf[0x14..0x18].copy_from_slice(&[0u8; 4]);
+        let sum = normal_checksum(&buf, 5);
+        buf[0x14..0x18].copy_from_slice(&sum.to_be_bytes());
+        self.write_block_cached(block, buf);
+        self.hash_chain_insert(parent_block, block, new_name)?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Write every dirty block to disk in block-number order — gives the
         // OS a clean forward sweep for the file system cache and makes the
@@ -2349,6 +2393,55 @@ mod tests {
         let root = fs.root().expect("root");
         let children = fs.list_directory(&root).expect("list");
         assert!(children.iter().all(|c| c.name != "big"));
+    }
+
+    /// Rename a file in place: the new name is listed, the old is gone, and
+    /// the entry keeps its header block (identity) plus its data contents.
+    #[test]
+    fn rename_file_round_trips() {
+        use super::super::filesystem::CreateFileOptions;
+
+        let img = make_empty_floppy_image(1, "REN");
+        let mut cur = Cursor::new(img);
+        let orig_block;
+        {
+            let mut fs = AffsFilesystem::open(&mut cur, 0).expect("open");
+            let root = fs.root().expect("root");
+            let payload = b"keep this content".to_vec();
+            let mut src = std::io::Cursor::new(payload.clone());
+            let fe = fs
+                .create_file(
+                    &root,
+                    "oldname",
+                    &mut src,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create_file");
+            orig_block = fe.location;
+            fs.sync_metadata().expect("sync");
+
+            let children = fs.list_directory(&root).expect("list");
+            let old = children
+                .iter()
+                .find(|c| c.name == "oldname")
+                .unwrap()
+                .clone();
+            fs.rename(&root, &old, "newname").expect("rename");
+            fs.sync_metadata().expect("sync");
+        }
+        // Reopen: new name present, old gone, identity + contents preserved.
+        let mut fs = AffsFilesystem::open(&mut cur, 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let children = fs.list_directory(&root).expect("list");
+        assert!(children.iter().all(|c| c.name != "oldname"), "old gone");
+        let renamed = children
+            .iter()
+            .find(|c| c.name == "newname")
+            .expect("new name listed");
+        assert_eq!(renamed.location, orig_block, "header block preserved");
+        let data = fs.read_file(renamed, usize::MAX).expect("read");
+        assert_eq!(data, b"keep this content", "contents preserved");
     }
 
     #[test]

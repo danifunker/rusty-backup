@@ -387,6 +387,25 @@ impl EditableFilesystem for BfsFilesystem {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        _parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        self.disk = super::write::rename_file(&self.disk, &entry.name, new_name)?;
+        self.refresh_free();
+        // Surface the rebuilt entry under its new (normalized, trailing-`.`)
+        // name; the FileEntry returned to the caller reflects the new state.
+        let bare = new_name.trim_end_matches('.');
+        self.entry_for(bare).map(|_| ()).ok_or_else(|| {
+            FilesystemError::InvalidData(format!("renamed file {new_name} not found"))
+        })
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         let path = self.save_path.as_ref().ok_or_else(|| {
             FilesystemError::Unsupported("Alto volume opened read-only (no save path)".into())
@@ -677,5 +696,80 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.name == "NOTE.TXT."));
+    }
+
+    /// create -> rename -> sync, then reload: new name listed, old gone,
+    /// content + serial (identity) preserved.
+    #[test]
+    fn editable_rename_persists_to_pdi() {
+        use super::super::write::create_blank;
+        use super::super::{pdi, FsFamily, Geometry};
+        use std::io::Write as _;
+
+        let geom = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 203,
+            n_heads: 2,
+            n_sectors: 12,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&pdi::write(&create_blank(geom).unwrap()))
+            .unwrap();
+        let path = tmp.path().to_path_buf();
+        let payload = b"renamed through the editable trait".to_vec();
+
+        // create OLD.TXT and capture its serial number for an identity check.
+        let serial_before;
+        {
+            let disk = pdi::read(&std::fs::read(&path).unwrap()).unwrap();
+            let mut efs = BfsFilesystem::open_editable(disk, path.clone());
+            let root = efs.root().unwrap();
+            let mut cur = std::io::Cursor::new(payload.clone());
+            efs.create_file(
+                &root,
+                "OLD.TXT",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+            serial_before = Bfs::new(&efs.disk).find_entry("OLD.TXT").unwrap().serial;
+        }
+
+        // rename OLD.TXT -> NEW.DAT and sync.
+        {
+            let disk = pdi::read(&std::fs::read(&path).unwrap()).unwrap();
+            let mut efs = BfsFilesystem::open_editable(disk, path.clone());
+            let root = efs.root().unwrap();
+            let old = efs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "OLD.TXT.")
+                .unwrap();
+            efs.rename(&root, &old, "NEW.DAT").unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        // reload: new name present, old name gone, bytes + serial intact.
+        let mut fs = BfsFilesystem::open(pdi::read(&std::fs::read(&path).unwrap()).unwrap());
+        let root = fs.root().unwrap();
+        let listing = fs.list_directory(&root).unwrap();
+        assert!(listing.iter().all(|e| e.name != "OLD.TXT."));
+        let new = listing
+            .iter()
+            .find(|e| e.name == "NEW.DAT.")
+            .expect("renamed file present");
+        assert_eq!(fs.read_file(new, usize::MAX).unwrap(), payload);
+        let serial_after = Bfs::new(&fs.disk).find_entry("NEW.DAT").unwrap().serial;
+        assert_eq!(
+            serial_after, serial_before,
+            "serial number (identity) must survive a rename"
+        );
     }
 }

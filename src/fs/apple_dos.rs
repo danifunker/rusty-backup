@@ -925,6 +925,100 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
         Ok(())
     }
 
+    /// Rename a file in place: only the 30-byte name field of the catalog
+    /// slot changes. The first-T/S pointer (byte 0x00/0x01), type byte
+    /// (0x02), and length-in-sectors (0x21/0x22) are untouched, so the file
+    /// keeps its identity, type, and data. DOS 3.3 stores names verbatim and
+    /// does not fold case, so the collision check is an exact byte match.
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "DOS 3.3 is flat; only files in the root are renamable".into(),
+            ));
+        }
+        if entry.entry_type != EntryType::File {
+            return Err(FilesystemError::InvalidData(
+                "DOS 3.3 only stores files".into(),
+            ));
+        }
+        // Validate / encode the new name to its 30-byte high-bit-set form.
+        let encoded = encode_apple_name(new_name)?;
+
+        // Reject a collision with a *different* live entry (exact match —
+        // DOS 3.3 does not fold case).
+        if self
+            .entries
+            .iter()
+            .any(|e| !e.is_unused() && !e.is_deleted() && e.name == new_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        let idx = entry.location as usize;
+        let de =
+            self.entries.get(idx).cloned().ok_or_else(|| {
+                FilesystemError::NotFound(format!("entry idx {idx} out of range"))
+            })?;
+        if de.is_unused() || de.is_deleted() {
+            return Err(FilesystemError::NotFound(
+                "entry already deleted or unallocated".into(),
+            ));
+        }
+
+        // Re-walk the catalog chain and match by name to find the slot,
+        // mirroring delete_entry.
+        let mut found = None;
+        let mut track = self.vtoc.first_catalog_track;
+        let mut sector = self.vtoc.first_catalog_sector;
+        let mut seen_cat = std::collections::HashSet::new();
+        'outer: for _ in 0..MAX_CATALOG_SECTORS {
+            if track == 0 {
+                break;
+            }
+            if !seen_cat.insert((track, sector)) {
+                break;
+            }
+            let cat = read_sector(&mut self.reader, self.partition_offset, track, sector)?;
+            for i in 0..7 {
+                let off = 0x0B + i * 35;
+                if cat[off] == 0 || cat[off] == 0xFF {
+                    continue;
+                }
+                let mut probe = [0u8; 35];
+                probe.copy_from_slice(&cat[off..off + 35]);
+                let parsed = AppleDosFileEntry::parse(&probe);
+                if parsed.name == de.name {
+                    found = Some((track, sector, i));
+                    break 'outer;
+                }
+            }
+            track = cat[0x01];
+            sector = cat[0x02];
+        }
+        let (ct, cs, slot) = found.ok_or_else(|| {
+            FilesystemError::NotFound(format!("catalog slot for '{}' not found", de.name))
+        })?;
+
+        let mut cat = read_sector(&mut self.reader, self.partition_offset, ct, cs)?;
+        let off = 0x0B + slot * 35;
+        // Name field: bytes off+0x03..off+0x21 (30 bytes). Overwrite only
+        // these; byte 0x00 (first T/S track), 0x02 (type), and 0x21/0x22
+        // (length) are preserved.
+        cat[off + 0x03..off + 0x21].copy_from_slice(&encoded);
+        self.write_sector(ct, cs, &cat)?;
+        self.reader.flush()?;
+        self.refresh_entries()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Every primitive flushes synchronously, so sync_metadata is a
         // no-op. The trait requires it, so we just bounce the reader.
@@ -1268,6 +1362,48 @@ mod tests {
         // HELLO used T/S list at T1S0 + data at T2S0 = 2 sectors.
         let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
         assert_eq!(after_free, before_free + 2 * APPLE_II_SECTOR_BYTES as u64);
+    }
+
+    #[test]
+    fn rename_keeps_identity_and_content() {
+        let mut fs = AppleDosFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let hello = entries.iter().find(|e| e.name == "HELLO").unwrap().clone();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+        let content_before = fs.read_file(&hello, usize::MAX).unwrap();
+        let type_before = hello.special_type.clone();
+
+        fs.rename(&root, &hello, "WORLD").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Re-open from the underlying bytes to confirm it round-trips.
+        let inner = fs.reader.clone();
+        let mut fs2 = AppleDosFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries2 = fs2.list_directory(&root2).unwrap();
+        assert!(
+            entries2.iter().all(|e| e.name != "HELLO"),
+            "old name should be gone"
+        );
+        let renamed = entries2
+            .iter()
+            .find(|e| e.name == "WORLD")
+            .expect("new name should be listed")
+            .clone();
+        // Identity preserved: same type (file kind unchanged), no data move.
+        assert_eq!(renamed.special_type, type_before);
+        let content_after = fs2.read_file(&renamed, usize::MAX).unwrap();
+        assert_eq!(content_after, content_before);
+        // No sectors allocated or freed — rename only touches the catalog.
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        assert_eq!(after_free, before_free);
+
+        // Rename to the same name is a no-op.
+        fs2.rename(&root2, &renamed, "WORLD").unwrap();
+        let root3 = fs2.root().unwrap();
+        let entries3 = fs2.list_directory(&root3).unwrap();
+        assert_eq!(entries3.iter().filter(|e| e.name == "WORLD").count(), 1);
     }
 
     #[test]

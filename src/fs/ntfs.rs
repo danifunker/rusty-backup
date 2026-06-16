@@ -1546,6 +1546,72 @@ fn build_resident_attr(attr_type: u32, data: &[u8]) -> Vec<u8> {
     attr
 }
 
+/// Replace a resident attribute's whole blob in place, shifting following
+/// attributes to accommodate a different length and updating the record's
+/// bytes-in-use. Unlike [`HfsFilesystem`]-style rebuilds this preserves the
+/// record header (sequence number, hard-link count, flags), so it is safe to
+/// use on records from a real volume. Returns `DiskFull` if the grown record
+/// would overflow `record`.
+fn replace_resident_attr(
+    record: &mut [u8],
+    target_type: u32,
+    new_attr: &[u8],
+) -> Result<(), FilesystemError> {
+    let attr_offset = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+    let used =
+        u32::from_le_bytes([record[0x18], record[0x19], record[0x1A], record[0x1B]]) as usize;
+    let mut pos = attr_offset;
+    while pos + 16 <= record.len() {
+        let attr_type = u32::from_le_bytes([
+            record[pos],
+            record[pos + 1],
+            record[pos + 2],
+            record[pos + 3],
+        ]);
+        if attr_type == ATTR_END || attr_type == 0 {
+            break;
+        }
+        let attr_len = u32::from_le_bytes([
+            record[pos + 4],
+            record[pos + 5],
+            record[pos + 6],
+            record[pos + 7],
+        ]) as usize;
+        if attr_len < 16 || pos + attr_len > record.len() {
+            break;
+        }
+        // Resident attribute of the requested type (residency flag at +8 == 0).
+        if attr_type == target_type && record[pos + 8] == 0 {
+            let tail_start = pos + attr_len;
+            if tail_start > used || used > record.len() {
+                return Err(FilesystemError::InvalidData(
+                    "corrupt MFT record during rename".into(),
+                ));
+            }
+            let tail: Vec<u8> = record[tail_start..used].to_vec();
+            let new_used = pos + new_attr.len() + tail.len();
+            if new_used > record.len() {
+                return Err(FilesystemError::DiskFull(
+                    "MFT record full after rename".into(),
+                ));
+            }
+            record[pos..pos + new_attr.len()].copy_from_slice(new_attr);
+            record[pos + new_attr.len()..new_used].copy_from_slice(&tail);
+            if new_used < used {
+                for b in &mut record[new_used..used] {
+                    *b = 0;
+                }
+            }
+            record[0x18..0x1C].copy_from_slice(&(new_used as u32).to_le_bytes());
+            return Ok(());
+        }
+        pos += attr_len;
+    }
+    Err(FilesystemError::NotFound(format!(
+        "resident attribute 0x{target_type:X} not found in record"
+    )))
+}
+
 /// Build a non-resident attribute header + data runs, padded to 8-byte alignment.
 fn build_nonresident_attr(attr_type: u32, runs: &[(u64, u64)], real_size: u64) -> Vec<u8> {
     let encoded = encode_data_runs(runs);
@@ -2730,6 +2796,56 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_ntfs_name(new_name)?;
+        let parent_record_num = if parent.path == "/" {
+            MFT_RECORD_ROOT
+        } else {
+            parent.location
+        };
+
+        // The index reports the entry's own (case-folded) name, so reject a
+        // collision only when the new name differs from the old one.
+        if !new_name.eq_ignore_ascii_case(&entry.name)
+            && self.name_exists_in_index(parent_record_num, new_name)?
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        let record_number = entry.location;
+        let is_dir = entry.is_directory();
+
+        // The new name lives in two places: the child record's $FILE_NAME
+        // attribute and the parent directory's $I30 index entry. Both carry a
+        // $FILE_NAME structure; build it once.
+        let new_fn_value = build_file_name_attr(parent_record_num, new_name, is_dir, entry.size);
+
+        // 1) Rewrite the child's $FILE_NAME in place (grow/shrink), preserving
+        //    the record's sequence number, link count, and every other attribute.
+        let mut record = self.read_mft_record(record_number)?;
+        let child_seq = u16::from_le_bytes([record[0x10], record[0x11]]);
+        let new_attr = build_resident_attr(ATTR_FILE_NAME, &new_fn_value);
+        replace_resident_attr(&mut record, ATTR_FILE_NAME, &new_attr)?;
+        self.write_mft_record(record_number, &mut record)?;
+
+        // 2) Re-key the parent index entry (remove old name, insert new). The
+        //    index entry's MFT reference must carry the child's real sequence
+        //    number, not a hardcoded 1.
+        self.remove_index_entry(parent_record_num, &entry.name)?;
+        let index_entry = build_index_entry(record_number, child_seq, &new_fn_value);
+        self.insert_index_entry(parent_record_num, &index_entry)?;
+
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -3601,6 +3717,72 @@ mod tests {
         // New directory should be empty
         let children = fs.list_directory(&dir).unwrap();
         assert!(children.is_empty());
+    }
+
+    #[test]
+    fn test_ntfs_rename_file() {
+        let mut image = load_fixture("test_ntfs.img.zst");
+        let mut fs = NtfsFilesystem::open(Cursor::new(&mut image), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let data = b"rename me, keep my bytes";
+        let mut cursor = Cursor::new(data.as_slice());
+        let file = fs
+            .create_file(
+                &root,
+                "old.txt",
+                &mut cursor,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let rec = file.location;
+
+        // Rename to a LONGER name — exercises the resident $FILE_NAME grow path
+        // (and re-keys the parent $I30 index).
+        fs.rename(&root, &file, "a considerably longer name.txt")
+            .unwrap();
+        let renamed = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "a considerably longer name.txt")
+            .expect("renamed entry listed");
+        assert!(!fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "old.txt"));
+        // Same MFT record (identity) and content preserved.
+        assert_eq!(renamed.location, rec);
+        assert_eq!(fs.read_file(&renamed, data.len()).unwrap(), data);
+
+        // Rename to a SHORTER name — the shrink path.
+        fs.rename(&root, &renamed, "x.txt").unwrap();
+        let short = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "x.txt")
+            .expect("short name listed");
+        assert_eq!(fs.read_file(&short, data.len()).unwrap(), data);
+
+        // A collision with a different entry is rejected.
+        let mut c2 = Cursor::new(b"y".as_slice());
+        fs.create_file(
+            &root,
+            "taken.txt",
+            &mut c2,
+            1,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            fs.rename(&root, &short, "taken.txt"),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
+
+        fs.sync_metadata().unwrap();
     }
 
     #[test]

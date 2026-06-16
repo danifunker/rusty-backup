@@ -186,6 +186,43 @@ pub fn add_file(source: &Disk, name: &str, data: &[u8]) -> Result<Disk, Filesyst
     build_disk(source.geometry.clone(), &files)
 }
 
+/// Rename a user file in place, returning the rebuilt volume. The file keeps
+/// its serial number, version, and page contents (its identity) — only the
+/// name in the SysDir `DV` entry and the leader page (offset [`LD_NAME`]) is
+/// rewritten. Reserved names (`SysDir` / `DiskDescriptor`) are refused, and a
+/// collision with a *different* existing user file errors.
+pub fn rename_file(source: &Disk, old: &str, new: &str) -> Result<Disk, FilesystemError> {
+    let new_name = normalize_name(new)?;
+    let new_bare = new_name.trim_end_matches('.');
+    if new_bare.eq_ignore_ascii_case("SysDir") || new_bare.eq_ignore_ascii_case("DiskDescriptor") {
+        return Err(FilesystemError::InvalidData(
+            "that name is reserved by the filesystem".into(),
+        ));
+    }
+    let old_bare = old.trim_end_matches('.');
+    let mut files = extract_files(source)?;
+    // Reject a collision with a *different* user file. BFS folds case (names
+    // compare case-insensitively), so a case-only self-rename never collides:
+    // it matches the file we're renaming, which we exclude here.
+    if !new_bare.eq_ignore_ascii_case(old_bare)
+        && files
+            .iter()
+            .any(|f| f.name.trim_end_matches('.').eq_ignore_ascii_case(new_bare))
+    {
+        return Err(FilesystemError::AlreadyExists(new_name));
+    }
+    let target = files
+        .iter_mut()
+        .find(|f| f.name.trim_end_matches('.').eq_ignore_ascii_case(old_bare))
+        .ok_or_else(|| FilesystemError::NotFound(old.to_string()))?;
+    // Identity (serial / version / pages) is untouched; only the name in the
+    // DV entry (via FileImage.name) and the leader page are rewritten.
+    target.name = new_name;
+    let name = target.name.clone();
+    write_leader_name(&mut target.leader, &name);
+    build_disk(source.geometry.clone(), &files)
+}
+
 /// Delete a file from a volume, returning the rebuilt volume.
 pub fn delete_file(source: &Disk, name: &str) -> Result<Disk, FilesystemError> {
     let mut files = extract_files(source)?;

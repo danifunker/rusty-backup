@@ -340,18 +340,6 @@ impl CommanderPane {
         }
     }
 
-    /// Whether in-place rename is available for this pane: always for a host
-    /// folder (`std::fs::rename`), otherwise gated on the open volume's
-    /// filesystem via [`fs::supports_rename`](rusty_backup::fs::supports_rename).
-    fn supports_rename(&self) -> bool {
-        if self.listing.is_host() {
-            return true;
-        }
-        self.session.as_ref().is_some_and(|s| {
-            rusty_backup::fs::supports_rename(s.partition_type, s.partition_type_string.as_deref())
-        })
-    }
-
     /// The modal "Rename..." dialog. Image panes stage a `Rename` edit (applied
     /// on Apply); host panes rename immediately via `std::fs::rename`. No-op
     /// when nothing is pending.
@@ -986,7 +974,6 @@ impl CommanderPane {
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.listing.is_host();
-        let can_rename = self.supports_rename();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
@@ -1078,9 +1065,7 @@ impl CommanderPane {
                                 m_cancel_rename = Some(row.name.clone());
                                 ui.close();
                             } else if matches!(row.kind, RowKind::Normal)
-                                && ui
-                                    .add_enabled(can_rename, egui::Button::new("Rename..."))
-                                    .clicked()
+                                && ui.button("Rename...").clicked()
                             {
                                 m_rename = Some(row.name.clone());
                                 ui.close();

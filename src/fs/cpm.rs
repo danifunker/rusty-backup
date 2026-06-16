@@ -767,6 +767,79 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "CP/M is flat; only files in the root are renameable".into(),
+            ));
+        }
+        if entry.entry_type != EntryType::File {
+            return Err(FilesystemError::InvalidData(
+                "CP/M only stores files".into(),
+            ));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let (new_n8, new_e3) = validate_cpm_name(new_name)?;
+
+        // Resolve the entry's current padded (name, ext) the same way
+        // delete_entry does, so we can match its directory extents.
+        let old = &entry.name;
+        let (old_n8, old_e3) = old
+            .rsplit_once('.')
+            .map(|(n, e)| {
+                (
+                    format!("{:<8}", n.to_ascii_uppercase()),
+                    format!("{:<3}", e.to_ascii_uppercase()),
+                )
+            })
+            .unwrap_or((
+                format!("{:<8}", old.to_ascii_uppercase()),
+                "   ".to_string(),
+            ));
+
+        // Reject a collision with a *different* file group. CP/M folds
+        // case (names are stored uppercase), so a case-only rename can
+        // never collide with another entry — it resolves to the same
+        // (name, ext) we're already on, so it's a no-op skip.
+        if (new_n8 != old_n8 || new_e3 != old_e3)
+            && self.collect_files().iter().any(|g| {
+                g.name.eq_ignore_ascii_case(&new_n8) && g.ext.eq_ignore_ascii_case(&new_e3)
+            })
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // A file occupies multiple directory entries (one per extent),
+        // all sharing (user, name, ext). Rewrite the name/ext on EVERY
+        // matching active extent, preserving the per-entry attribute bits
+        // (R/O, SYS, ARC) and all identity fields (extent #, block ptrs).
+        let mut hit = false;
+        for e in self.entries.iter_mut() {
+            if !e.is_active() {
+                continue;
+            }
+            if e.name.eq_ignore_ascii_case(&old_n8) && e.ext.eq_ignore_ascii_case(&old_e3) {
+                e.name = new_n8.clone();
+                e.ext = new_e3.clone();
+                hit = true;
+            }
+        }
+        if !hit {
+            return Err(FilesystemError::NotFound(format!(
+                "CP/M file '{old}' not in directory"
+            )));
+        }
+        self.dir_write_back()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.dir_write_back()?;
         self.reader.flush()?;
@@ -962,5 +1035,33 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    #[test]
+    fn rename_changes_name_preserves_content() {
+        let disk = build_amstrad_disk_with_one_file();
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(disk), 0, AMSTRAD_DATA).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let target = entries
+            .iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .unwrap()
+            .clone();
+        let original = fs.read_file(&target, 4096).unwrap();
+        fs.rename(&root, &target, "GREET.TXT").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Reopen the backing store; old name gone, new name present,
+        // contents byte-identical (same blocks).
+        let inner = fs.reader.clone();
+        let mut fs2 = CpmFilesystem::open_with_dpb(inner, 0, AMSTRAD_DATA).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert!(entries.iter().all(|e| e.name != "HELLO.TXT"));
+        let renamed = entries.iter().find(|e| e.name == "GREET.TXT").unwrap();
+        assert_eq!(renamed.size, target.size);
+        let got = fs2.read_file(renamed, 4096).unwrap();
+        assert_eq!(got, original);
     }
 }

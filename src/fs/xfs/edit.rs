@@ -1628,6 +1628,39 @@ impl<R: Read + Write + Seek + Send> XfsFilesystem<R> {
         Ok(())
     }
 
+    /// Rename `old_name` -> `new_name` within the same parent directory. The
+    /// child inode (and its data) is untouched; only the parent's directory
+    /// entry changes.
+    ///
+    /// Both directory primitives adjust the parent's `nlink` by ±1 when the
+    /// child is a directory (the `..` back-reference). For a same-parent rename
+    /// that must net to zero, so we pass the child's *real* `is_dir` to both the
+    /// insert and the remove. We add the new entry first, then remove the old,
+    /// so a mid-operation failure never leaves the child unreferenced.
+    pub(crate) fn do_rename(
+        &mut self,
+        parent_ino: u64,
+        old_name: &str,
+        new_name: &str,
+        child_ino: u64,
+    ) -> Result<(), FilesystemError> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        if new_name.is_empty() {
+            return Err(FilesystemError::InvalidData("name cannot be empty".into()));
+        }
+        let sb = self.superblock().clone();
+        let (cc, _cbuf) = self.read_inode_buf(child_ino)?;
+        let is_dir = cc.is_dir();
+        // Pre-flight (unique name, parent editable, fits) before any mutation.
+        self.dir_can_insert(&sb, parent_ino, new_name, is_dir)?;
+        self.dir_insert_entry(&sb, parent_ino, new_name, child_ino, is_dir)?;
+        self.dir_remove_entry(&sb, parent_ino, old_name, is_dir)?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
     // ----- format-aware directory insert (short-form OR single-block) --------
 
     /// Check, without writing, that `name` can be inserted into directory

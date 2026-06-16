@@ -896,6 +896,53 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let new_raw = encode_os9_name(new_name)?;
+        let dir_lsn = self.dir_fd_lsn(parent);
+
+        // Reject a collision with a *different* existing entry. OS-9 names are
+        // case-sensitive, so a plain equality check is the right fold here.
+        if self.entry_exists(dir_lsn, new_name)? {
+            return Err(FilesystemError::AlreadyExists(format!(
+                "OS-9 entry '{new_name}' already exists"
+            )));
+        }
+
+        // Find the directory slot whose name matches the old name, then rewrite
+        // only the 29-byte name field, preserving the 24-bit FD LSN (bytes
+        // 29..32) so the entry keeps its identity and contents.
+        let dir_fd = self.read_fd(dir_lsn)?;
+        let data = self.read_fd_data(&dir_fd)?;
+        let slots = data.len() / DIR_ENTRY_LEN;
+        for i in 0..slots {
+            let e = &data[i * DIR_ENTRY_LEN..(i + 1) * DIR_ENTRY_LEN];
+            if e[0] == 0x00 {
+                continue;
+            }
+            if decode_os9_name(&e[0..NAME_LEN]) == entry.name {
+                let mut slot = [0u8; DIR_ENTRY_LEN];
+                slot.copy_from_slice(e);
+                slot[0..NAME_LEN].copy_from_slice(&new_raw);
+                // bytes NAME_LEN..DIR_ENTRY_LEN (the FD LSN) left untouched.
+                self.write_dir_slot(&dir_fd, i, &slot)?;
+                self.reader.flush()?;
+                return Ok(());
+            }
+        }
+        Err(FilesystemError::NotFound(format!(
+            "'{}' not found in directory",
+            entry.name
+        )))
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -933,5 +980,80 @@ mod tests {
         for v in [0u64, 1, 255, 256, 567, 0x123456, 0xFFFFFF] {
             assert_eq!(u24_be(&put_u24_be(v)), v);
         }
+    }
+
+    /// Decompress the shared OS-9 fixture (a real 35-track NitrOS-9 L2 disk).
+    fn fixture_bytes() -> Vec<u8> {
+        use std::io::Read as _;
+        let compressed =
+            std::fs::read("tests/fixtures/test_coco_os9l2.dsk.zst").expect("read fixture");
+        let mut dec = zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))
+            .expect("zstd decoder");
+        let mut bytes = Vec::new();
+        dec.read_to_end(&mut bytes).expect("decompress");
+        bytes
+    }
+
+    #[test]
+    fn rename_in_place_round_trip() {
+        use std::io::Cursor;
+        let mut fs = Os9Filesystem::open(Cursor::new(fixture_bytes()), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // Create a fresh file at the root so the test owns it.
+        let payload: Vec<u8> = (0..900u32).map(|i| (i % 256) as u8).collect();
+        let created = fs
+            .create_file(
+                &root,
+                "BEFORE.B09",
+                &mut Cursor::new(payload.clone()),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let fd_lsn = created.location;
+
+        fs.rename(&root, &created, "AFTER.B09").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Re-open and confirm the new name lists, the old is gone, and the FD
+        // LSN (identity) plus contents are preserved.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs2 = Os9Filesystem::open(Cursor::new(bytes), 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let listing = fs2.list_directory(&root2).unwrap();
+        let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"AFTER.B09"));
+        assert!(!names.contains(&"BEFORE.B09"));
+
+        let renamed = listing.iter().find(|e| e.name == "AFTER.B09").unwrap();
+        assert_eq!(renamed.location, fd_lsn, "FD LSN (identity) changed");
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), payload);
+    }
+
+    #[test]
+    fn rename_collision_rejected() {
+        use std::io::Cursor;
+        let mut fs = Os9Filesystem::open(Cursor::new(fixture_bytes()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let one = fs
+            .create_file(
+                &root,
+                "ALPHA.X",
+                &mut Cursor::new(vec![1u8; 20]),
+                20,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        fs.create_file(
+            &root,
+            "BETA.X",
+            &mut Cursor::new(vec![2u8; 20]),
+            20,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let err = fs.rename(&root, &one, "BETA.X").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 }

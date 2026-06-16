@@ -1700,6 +1700,84 @@ mod tests {
         target_pointer_width = "32",
         ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
     )]
+    fn rename_preserves_inode_and_content_xfs() {
+        // Rename a file and a directory in place; identity (inode) and content
+        // are preserved, and the volume stays fsck-clean (which catches any
+        // parent-nlink drift from the directory rename).
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let child_ino;
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            let fe = fs
+                .create_file(
+                    &root,
+                    "before.bin",
+                    &mut data,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create_file");
+            child_ino = fe.location;
+            fs.create_directory(&root, "olddir", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            fs.sync_metadata().expect("sync");
+        }
+        // Reopen and rename both.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            let before = entries
+                .iter()
+                .find(|e| e.name == "before.bin")
+                .expect("file");
+            fs.rename(&root, before, "after.bin").expect("rename file");
+            let olddir = entries.iter().find(|e| e.name == "olddir").expect("dir");
+            fs.rename(&root, olddir, "newdir").expect("rename dir");
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let after = entries
+            .iter()
+            .find(|e| e.name == "after.bin")
+            .expect("renamed file present");
+        assert!(!entries.iter().any(|e| e.name == "before.bin"));
+        assert_eq!(after.location, child_ino, "inode identity preserved");
+        let got = fs.read_file(after, payload.len()).expect("read");
+        assert_eq!(got, payload, "content preserved");
+        let newdir = entries
+            .iter()
+            .find(|e| e.name == "newdir")
+            .expect("renamed dir present");
+        assert!(newdir.is_directory());
+        // Original fixture entry survives.
+        assert!(entries.iter().any(|e| e.name == "hello.txt"));
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "fsck errors after rename: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn block_dir_recompacts_to_shortform_on_shrink() {
         // §2.1 hole (B): grow root to block form by adding 20 files, then
         // delete them all. The block_remove_entry path is supposed to detect

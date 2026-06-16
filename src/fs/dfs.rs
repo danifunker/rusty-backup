@@ -626,6 +626,57 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DfsFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "DFS is flat; only root files are renamable".into(),
+            ));
+        }
+        let (new_dir, new_fname) = split_dir_name(new_name)?;
+
+        // Resolve the target by display name so a stale index can't rename the
+        // wrong file (matches delete_entry).
+        let idx = self
+            .find_entry(&entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(format!("'{}' not found", entry.name)))?;
+        if self.cat.entries[idx].locked {
+            return Err(FilesystemError::Unsupported(format!(
+                "'{}' is locked",
+                self.cat.entries[idx].display_name()
+            )));
+        }
+
+        // Reject a collision with a *different* entry. DFS folds case, so a
+        // case-only rename resolves to the same slot and is allowed.
+        if self
+            .cat
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != idx && e.same_file(new_dir, &new_fname))
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Overwrite only the dir/name; start_sector, length, addresses and the
+        // lock flag are untouched, so the file keeps its identity and contents.
+        self.cat.entries[idx].dir = new_dir;
+        self.cat.entries[idx].name = new_fname;
+        self.cat.cycle = bcd_increment(self.cat.cycle);
+        self.flush_catalogue()?;
+        self.reader.flush()?;
+        self.refresh()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -751,6 +802,80 @@ mod tests {
         let l2 = fs2.list_directory(&r2).unwrap();
         assert_eq!(l2.len(), 1);
         assert_eq!(fs2.read_file(&l2[0], usize::MAX).unwrap(), big);
+    }
+
+    #[test]
+    fn rename_in_place_round_trip() {
+        let mut fs = open_mem(create_blank_dfs(400, "TEST"));
+        let root = fs.root().unwrap();
+
+        let hello = b"HELLO BBC MICRO\r".to_vec();
+        fs.create_file(
+            &root,
+            "HELLO",
+            &mut Cursor::new(hello.clone()),
+            hello.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let h = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "HELLO")
+            .unwrap();
+        let start = fs.cat.entries[h.location as usize].start_sector;
+
+        // Rename into the 'B' directory with a new base name.
+        fs.rename(&root, &h, "B.GREET").unwrap();
+
+        // Re-open from bytes to prove persistence.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs2 = DfsFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r2 = fs2.root().unwrap();
+        let l2 = fs2.list_directory(&r2).unwrap();
+        let names: Vec<&str> = l2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"B.GREET"));
+        assert!(!names.contains(&"HELLO"));
+
+        // Identity (start sector) + contents preserved.
+        let renamed = l2.iter().find(|e| e.name == "B.GREET").unwrap();
+        assert_eq!(
+            fs2.cat.entries[renamed.location as usize].start_sector,
+            start
+        );
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), hello);
+    }
+
+    #[test]
+    fn rename_collision_rejected() {
+        let mut fs = open_mem(create_blank_dfs(400, "COL"));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "ONE",
+            &mut Cursor::new(vec![1u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "TWO",
+            &mut Cursor::new(vec![2u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let two = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TWO")
+            .unwrap();
+        // Case-insensitive collision with the *other* file.
+        let err = fs.rename(&root, &two, "one").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 
     #[test]

@@ -931,6 +931,46 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         )))
     }
 
+    /// Rename fallback used when the new name no longer fits in the
+    /// dirblock that holds the old entry. Removes the old dirent (which
+    /// preserves the child inum and compacts its block), then inserts the
+    /// new name pointing at the same inum — possibly allocating a fresh
+    /// dirblock. The child inode is never touched, so identity and data
+    /// are preserved. Mirrors create_file's staged-bitmap orchestration:
+    /// dir_insert may allocate and mutates the parent inode (extent
+    /// growth), so the parent inode is written back after.
+    pub(crate) fn rename_via_remove_insert(
+        &mut self,
+        parent_inum: u32,
+        old_name: &[u8],
+        new_name: &[u8],
+        child_inum: u32,
+    ) -> Result<(), FilesystemError> {
+        // dir_remove keeps the child inum and writes the (compacted)
+        // dirblock back immediately.
+        let parent_inode = self.read_inode(parent_inum)?;
+        let removed = self.dir_remove(&parent_inode, old_name)?;
+        if removed != child_inum {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS rename: removed dirent inum {removed} differs from entry inum {child_inum}"
+            )));
+        }
+
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+        let res = (|| -> Result<(), FilesystemError> {
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_inode, &mut bm, new_name, child_inum)?;
+            self.write_inode(&parent_inode)?;
+            self.sb_dirty = true;
+            Ok(())
+        })();
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
     /// Allocate disk space for `data_len` bytes via the in-memory
     /// bitmap, populate `inode.extents` / `numextents`, then stream
     /// `data` into the allocated blocks. The strategy starts with one
@@ -1371,6 +1411,83 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
 
         self.staged_bitmap = Some(bm);
         res
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let new_name_bytes = new_name.as_bytes();
+        validate_name(new_name_bytes)?;
+
+        let parent_inum = parent.location as u32;
+        let entry_inum = entry.location as u32;
+        let old_name_bytes = entry.name.as_bytes();
+
+        // EFS names are case-sensitive; any name differing from the old
+        // one is a distinct dirent. Reject only if it already exists.
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, new_name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+
+        // Preferred path: if the renamed entry stays within its current
+        // 512-byte dirblock (the common case — names are short and the
+        // inum is unchanged), re-serialize that one block in place. This
+        // allocates nothing, so no bitmap / superblock bookkeeping is
+        // needed. Walk the directory's extents to find the block holding
+        // the old name.
+        let mut extents: Vec<EfsExtent> = parent_inode
+            .extents
+            .iter()
+            .take(parent_inode.numextents as usize)
+            .copied()
+            .collect();
+        extents.sort_by_key(|e| e.offset);
+
+        for ext in &extents {
+            for i in 0..ext.length as u32 {
+                let bn = ext.bn + i;
+                let block = self.read_block(bn)?;
+                let mut entries = parse_dir_block(&block);
+                if let Some(slot) = entries.iter().position(|e| e.name == old_name_bytes) {
+                    // Confirm the dirent points at the entry we expect —
+                    // guards against a stale FileEntry.
+                    if entries[slot].inum != entry_inum {
+                        return Err(FilesystemError::InvalidData(format!(
+                            "EFS rename: dirent inum {} does not match entry inum {}",
+                            entries[slot].inum, entry_inum
+                        )));
+                    }
+                    entries[slot].name = new_name_bytes.to_vec();
+                    if let Some(new_block) = serialize_dir_block(&entries) {
+                        // Fits — commit the single-block rewrite.
+                        self.write_block(bn, &new_block)?;
+                        return Ok(());
+                    }
+                    // The longer name overflows this block. Fall back to
+                    // remove-then-insert below (the new entry may need a
+                    // fresh block). The child inum is preserved across
+                    // both operations, so identity / data are untouched.
+                    return self.rename_via_remove_insert(
+                        parent_inum,
+                        old_name_bytes,
+                        new_name_bytes,
+                        entry_inum,
+                    );
+                }
+            }
+        }
+
+        Err(FilesystemError::NotFound(entry.name.clone()))
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
@@ -3149,6 +3266,51 @@ mod tests {
             .find(|e| e.name == "greeting.txt")
             .expect("file present");
         let data = fs2.read_file(entry, usize::MAX).expect("read");
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn editable_rename_preserves_inode_and_content() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+
+        let root = fs.root().expect("root");
+        let payload = b"rename me on efs".to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        let created = fs
+            .create_file(
+                &root,
+                "old.txt",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        let original_inum = created.location;
+
+        fs.rename(&root, &created, "new.txt").expect("rename");
+        fs.sync_metadata().expect("sync");
+
+        // Re-open and verify.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().unwrap();
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "old.txt"),
+            "old name should be gone"
+        );
+        let renamed = kids
+            .iter()
+            .find(|e| e.name == "new.txt")
+            .expect("new name present");
+
+        // Identity (inode number) and content preserved.
+        assert_eq!(renamed.location, original_inum);
+        let data = fs2.read_file(renamed, usize::MAX).expect("read");
         assert_eq!(data, payload);
     }
 

@@ -3026,6 +3026,92 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         result
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let parent_id = parent.location as u32;
+        let cnid = entry.location as u32;
+        let new_name_raw = validate_hfs_create_name(new_name)?;
+        let old_name_raw = utf8_to_mac_roman(&entry.name)?;
+
+        let snap = self.snapshot();
+        let result = (|| -> Result<(), FilesystemError> {
+            // Locate the entry's catalog record by its current (parent, name) key.
+            let (node_idx, rec_idx, _key_abs) = self
+                .find_catalog_record_by_name(parent_id, &old_name_raw)
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!(
+                        "entry '{}' not found in catalog",
+                        entry.name
+                    ))
+                })?;
+
+            // Reject a collision only with a DIFFERENT record. HFS folds case, so
+            // a case-only rename resolves back to this same record (allowed).
+            if let Some((n2, r2, _)) = self.find_catalog_record_by_name(parent_id, &new_name_raw) {
+                if (n2, r2) != (node_idx, rec_idx) {
+                    return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+                }
+            }
+
+            // Extract the record's data body to re-emit it verbatim under the new
+            // key (the CNID and all fork/Finder data are unchanged).
+            let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
+            let node_off = node_idx as usize * node_size;
+            let node = &self.catalog_data[node_off..node_off + node_size];
+            let (rec_start, rec_end) = hfs_common::btree_record_range(node, node_size, rec_idx);
+            let key_len = node[rec_start] as usize;
+            let mut data_rel = 1 + key_len;
+            if !data_rel.is_multiple_of(2) {
+                data_rel += 1;
+            }
+            let data_bytes = node[rec_start + data_rel..rec_end].to_vec();
+
+            let mut new_record = Self::build_catalog_key(parent_id, &new_name_raw);
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+            new_record.extend_from_slice(&data_bytes);
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+
+            self.remove_catalog_record(node_idx, rec_idx);
+            self.insert_catalog_record(&new_record)?;
+
+            // Rewrite the thread record's `thdCName` (fixed Str31 at data +14, so
+            // the record footprint is unchanged — safe to patch in place).
+            // Directories always have a thread; files may not.
+            if let Some((_n, _r, t_key_abs)) = self.find_catalog_record_by_cnid(cnid) {
+                let t_key_len = self.catalog_data[t_key_abs] as usize;
+                let mut t_data_off = t_key_abs + 1 + t_key_len;
+                if !t_data_off.is_multiple_of(2) {
+                    t_data_off += 1;
+                }
+                if t_data_off + 15 + 31 <= self.catalog_data.len() {
+                    self.catalog_data[t_data_off + 14] = new_name_raw.len() as u8;
+                    for i in 0..31 {
+                        self.catalog_data[t_data_off + 15 + i] = 0;
+                    }
+                    self.catalog_data[t_data_off + 15..t_data_off + 15 + new_name_raw.len()]
+                        .copy_from_slice(&new_name_raw);
+                }
+            }
+            // A same-parent rename leaves parent valence and MDB counts unchanged.
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
     fn set_type_creator(
         &mut self,
         entry: &FileEntry,
@@ -4238,6 +4324,70 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.name == "NewDir" && e.is_directory()));
+    }
+
+    #[test]
+    fn test_hfs_editable_rename_file() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let data = b"keep my bytes across a rename";
+        let mut r = Cursor::new(data.as_slice());
+        let fe = fs
+            .create_file(
+                &root,
+                "Before",
+                &mut r,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let cnid = fe.location;
+
+        fs.rename(&root, &fe, "After Doc").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.iter().any(|e| e.name == "After Doc"), "{entries:?}");
+        assert!(!entries.iter().any(|e| e.name == "Before"), "{entries:?}");
+        let renamed = entries.iter().find(|e| e.name == "After Doc").unwrap();
+        // Identity (CNID) preserved and content intact (the catalog re-key keeps
+        // the fork data untouched).
+        assert_eq!(renamed.location, cnid);
+        assert_eq!(&fs.read_file(renamed, 1024).unwrap(), data);
+
+        // Renaming a directory keeps it browsable (its thread record name is
+        // updated in place).
+        fs.create_directory(&root, "OldDir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let old_dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OldDir")
+            .unwrap();
+        fs.rename(&root, &old_dir, "NewDir").unwrap();
+        let new_dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "NewDir")
+            .expect("renamed dir present");
+        assert!(fs.list_directory(&new_dir).is_ok());
+
+        // A collision with a different entry is rejected.
+        let after = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "After Doc")
+            .unwrap();
+        assert!(matches!(
+            fs.rename(&root, &after, "NewDir"),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
+
+        fs.sync_metadata().unwrap();
     }
 
     #[test]
