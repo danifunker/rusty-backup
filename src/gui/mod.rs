@@ -149,11 +149,14 @@ pub fn prepare_disk_image_path(
     // source_reader::open_read, and editing persists back into the container
     // through BrowseSession::open_editable's ContainerEditSession. Pre-decoding
     // to a throwaway tempfile would orphan edits and hide the real file name.
-    // The gzip-wrapped Amiga images (.adz/.hdz) are decoded regardless, since
-    // gzip isn't seekable and there's no container-aware reader for them.
+    // The gzip-wrapped Amiga images (.adz/.hdz) decode to flat sectors only for
+    // the Backup/Restore path (`decode_floppy_containers`); the browse/inspect/
+    // commander path leaves them as containers so `source_reader::open_read`
+    // peels the gzip and edits re-gzip back in place (BrowseSession's gzip
+    // ContainerEditSession), rather than orphaning edits in a throwaway .adf.
     let target_ext = match ext.as_deref() {
-        Some("adz") => "adf",
-        Some("hdz") => "hdf",
+        Some("adz") if decode_floppy_containers => "adf",
+        Some("hdz") if decode_floppy_containers => "hdf",
         Some("msa") if decode_floppy_containers => "st",
         Some("d88") if decode_floppy_containers => "img",
         Some("xdf") | Some("hdm") | Some("dim") if decode_floppy_containers => "img",

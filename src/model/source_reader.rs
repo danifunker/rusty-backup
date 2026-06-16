@@ -273,6 +273,46 @@ pub fn is_gho_path(path: &Path) -> bool {
     matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == GHO_MAGIC
 }
 
+/// `.adz` / `.hdz` — gzip-wrapped Amiga images (an `.adf` floppy or `.hdf`
+/// hard-disk image inside a gzip stream). Matched by extension + gzip magic so
+/// a mislabeled file isn't mistaken for one. Kept as the container (not
+/// materialized to a separate `.adf`/`.hdf`) so edits re-gzip back in place.
+pub fn is_gzip_image_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("adz") || e.eq_ignore_ascii_case("hdz"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == [0x1f, 0x8b]
+}
+
+/// A seekable reader over a gzip-decoded image held in a temp file, so a large
+/// `.hdz` isn't decompressed entirely into RAM. The temp file is removed when
+/// the reader is dropped.
+struct GzipTempReader {
+    file: File,
+    _temp: tempfile::TempPath,
+}
+
+impl std::io::Read for GzipTempReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Seek for GzipTempReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 /// Open `path` for reading, transparently wrapping CHD and SECTOR-mode
 /// GHO files in their respective streaming readers.
 ///
@@ -383,6 +423,24 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let flat = open_apple_ii_dsk(bytes, ext.as_deref())
             .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_gzip_image_path(path) {
+        // .adz/.hdz: gzip-wrapped Amiga image. Decode to a temp file (an .hdf
+        // can be large, so don't hold it all in RAM) and read from there.
+        let input =
+            File::open(path).with_context(|| format!("open gzip image {}", path.display()))?;
+        let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+        let mut temp = tempfile::Builder::new()
+            .prefix(".rb-gzip-image-")
+            .tempfile()
+            .context("create gzip-decode tempfile")?;
+        std::io::copy(&mut decoder, temp.as_file_mut())
+            .with_context(|| format!("decompress gzip image {}", path.display()))?;
+        let temp_path = temp.into_temp_path();
+        let file = File::open(&temp_path).context("reopen decoded gzip image")?;
+        Ok(Box::new(GzipTempReader {
+            file,
+            _temp: temp_path,
+        }))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
@@ -422,6 +480,7 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_dim_path(path)
         || is_d88_path(path)
         || is_atr_path(path)
+        || is_gzip_image_path(path)
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
@@ -434,6 +493,7 @@ pub fn is_container_path(path: &Path) -> bool {
     is_chd_path(path)
         || is_gho_path(path)
         || is_imz_path(path)
+        || is_gzip_image_path(path)
         || is_flat_floppy_container_path(path)
 }
 
@@ -687,5 +747,45 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, flat);
+    }
+
+    /// A gzip-wrapped `.adz` is recognized as a container and `open_read` peels
+    /// the gzip to the original flat image (so partition detection sees the
+    /// real bytes, not the gzip header — the "Invalid MBR: 0xE148" bug).
+    #[test]
+    fn open_read_decodes_gzip_adz() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.adz");
+        let payload: Vec<u8> = (0..8192usize)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
+        {
+            let f = File::create(&path).unwrap();
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+
+        assert!(is_gzip_image_path(&path));
+        assert!(is_container_path(&path));
+
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload, "gzip peeled to the original image");
+
+        // Seekable (random access into the decoded image).
+        r.seek(SeekFrom::Start(100)).unwrap();
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &payload[100..104]);
+
+        // A .adz without gzip magic is not treated as a gzip image.
+        let bogus = dir.path().join("bogus.adz");
+        std::fs::write(&bogus, b"NOTGZIP").unwrap();
+        assert!(!is_gzip_image_path(&bogus));
     }
 }

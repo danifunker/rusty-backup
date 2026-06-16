@@ -67,7 +67,7 @@ pub fn resolve_partition_ro(
 /// container format, atomically replacing the original. **Dropping without
 /// committing discards container edits**, so a verb that errors out before
 /// calling `commit` leaves the original container untouched.
-#[must_use = "call commit() to persist edits made to a floppy container"]
+#[must_use = "call commit() to persist edits made to a container"]
 pub struct RwCommit {
     session: Option<crate::model::container_edit::ContainerEditSession>,
 }
@@ -77,10 +77,10 @@ impl RwCommit {
     pub fn commit(self) -> Result<()> {
         match self.session {
             Some(session) => {
-                let kind = session.kind();
+                let fmt = session.format_name();
                 session
                     .commit()
-                    .map_err(|e| anyhow!("re-encoding {} container: {e:#}", kind.display_name()))
+                    .map_err(|e| anyhow!("re-encoding {fmt} container: {e:#}"))
             }
             None => Ok(()),
         }

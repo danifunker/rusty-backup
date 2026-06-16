@@ -245,6 +245,26 @@ impl BrowseSession {
             }
         }
 
+        // Gzip-wrapped Amiga images (.adz/.hdz) — magic 1f 8b. open_read peels
+        // the gzip to a temp flat image; the inner image may be a superfloppy
+        // (.adf, AFFS at offset 0) or RDB-partitioned (.hdf), so honor the
+        // partition offset just like a raw image (offset 0 for a superfloppy).
+        if magic[0] == 0x1f && magic[1] == 0x8b {
+            let reader = crate::model::source_reader::open_read(path)
+                .map_err(|e| FilesystemError::Parse(format!("failed to open gzip image: {e:#}")))?;
+            let effective_offset = if self.partition_type == 0 {
+                0
+            } else {
+                self.partition_offset
+            };
+            return fs::open_filesystem(
+                reader,
+                effective_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         // Flat floppy containers (MSA / EDSK / D88 / DIM / XDF / HDM /
         // Arculator HDF / 140 KB Apple-II). open_read sniffs the format and
         // decodes it into an in-memory flat sector stream; the decoded image
@@ -557,7 +577,7 @@ impl BrowseSession {
 /// the container and atomically replaces the original. Dropping without
 /// committing discards container edits (so a failed/aborted edit leaves the
 /// original container untouched).
-#[must_use = "call commit() to persist edits to a floppy container"]
+#[must_use = "call commit() to persist edits to a container"]
 pub struct ContainerEditCommit {
     session: Option<crate::model::container_edit::ContainerEditSession>,
 }
