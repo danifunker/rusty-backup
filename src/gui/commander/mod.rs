@@ -2,22 +2,26 @@
 //!
 //! This is wired into [`crate::gui::RustyBackupApp`] as `Option<CommanderMode>`:
 //! `Some` means the overlay is open and takes over the whole frame (the tab
-//! strip is not drawn). Each pane opens a disk image / container and browses it
-//! (listing, sort, multi-select, `..` / double-click navigation, per-pane staged
-//! delete), backed by the
+//! strip is not drawn). Each pane opens a disk image / container *or* a host-OS
+//! folder and browses it (listing, sort, multi-select, `..` / double-click
+//! navigation, delete), backed by the
 //! [`DirListing`](rusty_backup::model::dir_listing::DirListing) model. The middle
-//! column stages a cross-volume copy of one pane's selection onto the other
-//! pane's queue (image -> image, via
-//! [`commander_ops::stage_copy`](rusty_backup::model::commander_ops::stage_copy)).
+//! column copies one pane's selection onto the other in any combination:
+//! image->image and host->image are staged onto the destination's queue, while
+//! image->host and host->host are immediate threaded host writes
+//! (`commander_ops::{stage_copy, stage_host_to_image, spawn_host_copy}`).
 //!
 //! NOTE: this crate uses a patched eframe whose panels are
 //! `egui::Panel::*::show_inside` rather than the stock `TopBottomPanel`. The
 //! main app's `ui()` method hands us its `&mut egui::Ui`, so we build the
 //! overlay with `show_inside` against it, exactly like the rest of the GUI.
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use eframe::egui;
 
-use rusty_backup::model::commander_ops;
+use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus};
 
 mod pane;
 
@@ -65,6 +69,9 @@ pub struct CommanderMode {
     /// Whether the unsaved-edits confirmation is showing (Close was clicked
     /// while a pane had staged edits).
     unsaved_close: bool,
+    /// In-flight immediate host-write copy (image->host / host->host) and the
+    /// destination side to re-list when it finishes.
+    pending_host_copy: Option<(Side, Arc<Mutex<HostCopyStatus>>)>,
 }
 
 impl Default for CommanderMode {
@@ -83,6 +90,7 @@ impl CommanderMode {
                 .into(),
             temp: None,
             unsaved_close: false,
+            pending_host_copy: None,
         }
     }
 
@@ -90,6 +98,8 @@ impl CommanderMode {
     /// user asks to close it (the caller then drops the `CommanderMode`).
     pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
         let mut close = false;
+
+        self.poll_host_copy(ui.ctx());
 
         egui::Panel::top("commander_top").show_inside(ui, |ui| {
             ui.add_space(2.0);
@@ -192,20 +202,19 @@ impl CommanderMode {
         close
     }
 
-    /// Middle action column: stage a cross-volume copy of one pane's selection
-    /// onto the other. Delete is reachable per-pane (right-click); Compare is a
-    /// later milestone.
+    /// Middle action column: copy one pane's selection onto the other (any
+    /// image/host combination). Delete is reachable per-pane (right-click);
+    /// Compare is a later milestone.
     fn render_middle(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let mut status = None;
         ui.add_space(60.0);
         let w = egui::vec2(116.0, 26.0);
 
-        // H1: only image -> image copies are wired; a host pane on either end is
-        // handled by the host-write engine (H2).
-        let l_can =
-            self.left.has_selection() && !self.left.is_host_pane() && self.right.can_receive();
-        let r_can =
-            self.right.has_selection() && !self.right.is_host_pane() && self.left.can_receive();
+        // A copy needs a selection on the source and a ready destination, and no
+        // host-write already in flight.
+        let idle = self.pending_host_copy.is_none();
+        let l_can = idle && self.left.has_selection() && self.right.can_receive();
+        let r_can = idle && self.right.has_selection() && self.left.can_receive();
 
         if ui
             .add_enabled(l_can, egui::Button::new("Copy L -> R").min_size(w))
@@ -231,17 +240,12 @@ impl CommanderMode {
         status
     }
 
-    /// Stage a copy of the `from` pane's selection into the other pane's current
-    /// directory (image -> image). Files (with resource fork + type/creator) and
-    /// directory subtrees are extracted to `temp` and queued on the destination.
+    /// Copy the `from` pane's selection into the other pane's current directory.
+    /// Dispatches by source/destination kind:
+    /// - image -> image / host -> image: staged onto the destination's queue
+    ///   (Apply writes through);
+    /// - image -> host / host -> host: an immediate threaded host write.
     fn copy(&mut self, from: Side) -> String {
-        if self.temp.is_none() {
-            self.temp = tempfile::tempdir().ok();
-        }
-        let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
-            return "Could not create a temp directory for the copy.".to_string();
-        };
-
         let (src, dest) = match from {
             Side::Left => (&mut self.left, &mut self.right),
             Side::Right => (&mut self.right, &mut self.left),
@@ -253,26 +257,95 @@ impl CommanderMode {
         }
         if !dest.can_receive() {
             return format!(
-                "The {} pane can't receive a copy (open a volume there first).",
+                "The {} pane can't receive a copy (open a volume or folder there first).",
                 from.other().label()
             );
         }
         let Some(dest_parent) = dest.cwd_entry() else {
-            return "Open a destination volume first.".to_string();
+            return "Open a destination first.".to_string();
         };
-        let Some(src_fs) = src.fs_mut() else {
-            return "Source volume is not open.".to_string();
-        };
+        let src_host = src.is_host_pane();
+        let dest_host = dest.is_host_pane();
+        let other = from.other().label();
 
-        match commander_ops::stage_copy(src_fs, &entries, &dest_parent, &temp_dir) {
-            Ok(edits) => {
+        match (src_host, dest_host) {
+            // host -> image: stage real host paths (no temp extraction).
+            (true, false) => {
+                let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
                 let n = dest.stage_edits(edits);
-                format!(
-                    "Staged copy of {n} item(s) into the {} pane. Apply to write.",
-                    from.other().label()
-                )
+                format!("Staged copy of {n} host item(s) into the {other} pane. Apply to write.")
             }
-            Err(e) => format!("Copy failed: {e:#}"),
+            // image -> image: extract to temp, stage onto the destination queue.
+            (false, false) => {
+                if self.temp.is_none() {
+                    self.temp = tempfile::tempdir().ok();
+                }
+                let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
+                    return "Could not create a temp directory for the copy.".to_string();
+                };
+                let Some(src_fs) = src.fs_mut() else {
+                    return "Source volume is not open.".to_string();
+                };
+                match commander_ops::stage_copy(src_fs, &entries, &dest_parent, &temp_dir) {
+                    Ok(edits) => {
+                        let n = dest.stage_edits(edits);
+                        format!("Staged copy of {n} item(s) into the {other} pane. Apply to write.")
+                    }
+                    Err(e) => format!("Copy failed: {e:#}"),
+                }
+            }
+            // image -> host: immediate extraction on a worker thread.
+            (false, true) => {
+                let Some(session) = src.session() else {
+                    return "Source volume is not open.".to_string();
+                };
+                let dest_dir = PathBuf::from(&dest_parent.path);
+                let job = HostCopyJob::ImageToHost {
+                    session,
+                    entries,
+                    dest_dir,
+                };
+                self.pending_host_copy = Some((from.other(), commander_ops::spawn_host_copy(job)));
+                format!("Copying to the {other} folder...")
+            }
+            // host -> host: immediate filesystem copy on a worker thread.
+            (true, true) => {
+                let dest_dir = PathBuf::from(&dest_parent.path);
+                let job = HostCopyJob::HostToHost { entries, dest_dir };
+                self.pending_host_copy = Some((from.other(), commander_ops::spawn_host_copy(job)));
+                format!("Copying to the {other} folder...")
+            }
         }
+    }
+
+    /// Poll an in-flight immediate host copy; on completion, re-list the
+    /// destination pane and surface the result.
+    fn poll_host_copy(&mut self, ctx: &egui::Context) {
+        let Some((dest_side, arc)) = self.pending_host_copy.clone() else {
+            return;
+        };
+        ctx.request_repaint();
+        let Ok(mut guard) = arc.lock() else {
+            return;
+        };
+        if !guard.finished {
+            return;
+        }
+        self.pending_host_copy = None;
+        let err = guard.error.take();
+        let copied = guard.copied;
+        drop(guard);
+
+        match dest_side {
+            Side::Left => self.left.reload_listing(),
+            Side::Right => self.right.reload_listing(),
+        }
+        self.status = match err {
+            Some(e) => format!("Copy to the {} folder failed: {e}", dest_side.label()),
+            None => format!(
+                "Copied {copied} file(s) to the {} folder.",
+                dest_side.label()
+            ),
+        };
     }
 }

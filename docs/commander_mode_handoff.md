@@ -13,20 +13,23 @@ Last updated: 2026-06-16
 - **What it is:** a full-page, Midnight-Commander-style two-pane file explorer
   overlay. Full design in [`commander_mode.md`](commander_mode.md); tracked in
   [`OPEN-WORK.md`](OPEN-WORK.md) §6.1.
-- **Where it's at:** plan + mock + wired shell + a **working browser with staged
-  writes** (M2-lite + M3a/b/c): each pane opens a disk image, picks a partition,
-  and shows a sortable, multi-selectable listing with `..` / double-click
-  navigation; right-click stages delete/undelete; the middle column stages an
-  image→image copy onto the other pane; per-pane Apply/Discard writes through;
-  unsaved-changes guards on Close and source-switch.
-- **Next concrete step:** **host panes** (`PaneSource::Host`) to unlock the
-  remaining three copy combos (host→image / image→host / host→host), then **M4**
-  (the File Info detail window + editable type/creator) after the **M1** widget
-  extraction. See "Next step" below.
+- **Where it's at:** plan + mock + wired shell + a **working two-pane file
+  manager** (M2-lite + M3 + host panes): each pane opens a **disk image** (pick a
+  partition) or a **host folder**, with a sortable multi-select listing and `..` /
+  double-click nav. Image panes stage delete + copy-in (Apply/Discard writes
+  through, virtual overlay, unsaved guards); host panes write immediately
+  (delete behind a confirm). The middle column copies a selection between the
+  panes in **all four** combos (image↔image, host→image, image→host, host→host).
+- **Next concrete step:** **M1 widget extraction + the M4 File Info window**
+  (double-click → detail + editable HFS/ProDOS/ext metadata), plus the
+  browsable-partition gate. See "Next step" below.
 
 ## Commits on this branch
 
 ```
+<H2>     commander: host copy combos + host delete (H2)
+8d4773e  commander: host-folder panes (browse) — PaneSource::Host (H1)
+05664a4  commander: unsaved-changes guards on close / source switch (M3c)
 fea01aa  commander: cross-pane copy via the middle column (M3b)
 f72c69a  commander: per-pane staged delete + Apply/Discard (M3a)
 627e989  commander: read-only two-pane browser over DirListing (M2-lite)
@@ -36,7 +39,7 @@ c055273  commander: wire entry-point shell (overlay + tab-bar button)
 ```
 
 (Run `git log --oneline upcoming-mister..commander-mode` to see just this work;
-the M3c unsaved-guard commit lands with this doc update.)
+the H2 commit lands with this doc update.)
 
 ## What's landed (done)
 
@@ -90,6 +93,18 @@ the M3c unsaved-guard commit lands with this doc update.)
 - **M3c unsaved guard** — Close with staged edits opens a Discard&Close / Cancel
   modal; switching a pane's source/partition with a non-empty queue opens a
   per-pane Discard&switch / Cancel confirm.
+- **H1 host panes (browse)** — `DirListing` gains a `ListingSource`
+  (None / Image(fs) / Host); a host pane lists via `std::fs` (size +
+  chrono-formatted mtime), `load_host_root` opens a folder, `up()` re-roots a
+  host pane above its loaded root, `is_host()` exposes the kind. Pane gets an
+  "Open Folder..." button; partition dropdown / Apply / free-space are
+  image-only. Host-listing + nav unit-tested.
+- **H2 host copy combos + delete** — `commander_ops` adds `stage_host_to_image`
+  (host→image, real paths, no temp) and `spawn_host_copy` for the immediate
+  `image→host` / `host→host` writes (threaded, `HostCopyStatus`); `CommanderMode::
+  copy` dispatches on `(src_host, dest_host)` across all four combos and polls
+  `pending_host_copy`, re-listing the destination on completion. Host panes get a
+  right-click immediate Delete behind a confirm. 3 new copy unit tests.
 
 ## How to run it
 
@@ -108,31 +123,26 @@ cargo test --lib
 
 ## Next step (do this first when resuming)
 
-M2-lite + M3 (staged delete, image→image copy, Apply/Discard, unsaved guards)
-are done. Pick the next milestone:
+M2-lite + M3 + host panes are done — both panes browse images **and** host
+folders, with all four copy combos, delete, and the unsaved guards. Pick the
+next milestone:
 
-1. **Host panes (`PaneSource::Host`)** — the biggest unlock. Today a pane is
-   always an image (`commander_source` + `BrowseSession`). Add a host-folder
-   source (rfd `pick_folder`, `std::fs` listing into `DirListing` with
-   `host_mode = true`) so the remaining three copy combos light up:
-   - **host→image** — stage `AddFile { host_path = real file }` (no temp copy).
-   - **image→host** — extract straight to the host path (immediate, no staging).
-   - **host→host** — `std::fs::copy` (immediate).
-   `DirListing` already supports `host_mode`; the listing source is the new part.
-   Decide host-side delete (immediate `remove_*` behind a confirm) per §8.
-2. **M1 widget extraction + M4 detail window** — extract `file_detail`
+1. **M1 widget extraction + M4 detail window** — extract `file_detail`
    (hex/metadata) and `metadata_editor` (type/creator rows) out of `browse_view`
    into shared modules, then add the double-click File Info window (plan §9) with
    the editable HFS/ProDOS/ext subset (the two new `StagedEdit` variants in §10.2).
-3. **Browsable-partition gate** — lift `is_browsable_type` & friends out of
+2. **Browsable-partition gate** — lift `is_browsable_type` & friends out of
    `inspect_tab.rs` (private today) into a shared module so the partition dropdown
    can gray out non-FS partitions instead of listing all and erroring on open.
+3. **Drag-to-load** (plan §6) — the OS drop signals are already wired in
+   `gui/mod.rs`; route a dropped image/folder onto the pane under the pointer
+   (load as source) and dropped host files onto an image pane (stage host→image).
 
-Smaller follow-ups: drag-to-load (plan §6 — the OS drop signals are already in
-`gui/mod.rs`), New Folder (`CreateDirectory`) + Export (§9b), and Apply-and-close
-in the unsaved guard (currently Discard&Close / Cancel only — a combined apply
-needs to keep `CommanderMode::temp` alive until both applies finish, since copied
-blobs live there).
+Smaller follow-ups: New Folder (`CreateDirectory`) + Export (§9b); host→image
+resource forks (AppleDouble import); image→host fork sidecars; Apply-and-close in
+the unsaved guard (currently Discard&Close / Cancel only — a combined apply needs
+to keep `CommanderMode::temp` alive until both applies finish, since copied blobs
+live there); a copy-progress readout for large host writes.
 
 ## Reuse map (do NOT reinvent these)
 
@@ -141,7 +151,7 @@ blobs live there).
 | open / list / `open_editable` / commit a source | `model::browse_session::BrowseSession` |
 | probe partitions + build a pane session | `model::commander_source::{probe_partitions, session_for}` (new) |
 | cwd / sorted rows / sort / multi-selection / nav | `model::dir_listing::DirListing` (new) |
-| apply a queue / stage an image→image copy | `model::commander_ops::{apply_edits, spawn_apply, stage_copy}` (new) |
+| apply a queue / stage a copy / immediate host copy | `model::commander_ops::{apply_edits, spawn_apply, stage_copy, stage_host_to_image, spawn_host_copy}` (new) |
 | staged copy/delete + apply | `model::edit_queue::{EditQueue, StagedEdit, apply_edit}` |
 | picker extensions | `model::file_types::DISK_IMAGE_EXTS` |
 | size / date formatting | `partition::format_size`, `FileEntry::size_string()` / `.modified` |
@@ -175,11 +185,11 @@ blobs live there).
 Point a fresh session at this file:
 
 > "Resume Commander Mode. Read `docs/commander_mode_handoff.md`, then
-> `docs/commander_mode.md`. We're on branch `commander-mode`. M2-lite browsing +
-> M3 staged writes (delete, image→image copy, Apply/Discard, unsaved guards) are
-> done; continue with host panes (`PaneSource::Host`) to unlock the host copy
-> combos, model-first per CONTRIBUTING.md, reusing `DirListing` / `commander_ops`
-> / `EditQueue`. Build with `cargo run` and click 'Commander Mode'."
+> `docs/commander_mode.md`. We're on branch `commander-mode`. Browsing (image +
+> host panes), all four copy combos, delete, and the unsaved guards are done;
+> continue with the M1 widget extraction + the M4 File Info window (model-first
+> per CONTRIBUTING.md, reusing `DirListing` / `commander_ops` / `EditQueue`).
+> Build with `cargo run` and click 'Commander Mode'."
 
 Open questions still to settle are in `commander_mode.md` §14 (resource-fork
 handling on host↔image copies, function-key bar, persisting pane state, which

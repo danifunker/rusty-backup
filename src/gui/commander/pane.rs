@@ -78,6 +78,9 @@ pub(crate) struct CommanderPane {
     /// A source/partition switch the user requested while the queue was
     /// non-empty; held until they confirm discarding the staged edits.
     pending_switch: Option<PendingSwitch>,
+    /// Host-pane only: entry names the user asked to delete, held until they
+    /// confirm the (immediate, irreversible) host removal.
+    pending_host_delete: Option<Vec<String>>,
 }
 
 /// A deferred source change awaiting the unsaved-edits confirmation.
@@ -106,6 +109,7 @@ impl CommanderPane {
             used_size: 0,
             error: None,
             pending_switch: None,
+            pending_host_delete: None,
         }
     }
 
@@ -170,10 +174,83 @@ impl CommanderPane {
         if let Some(s) = self.render_switch_guard(ui.ctx()) {
             status = Some(s);
         }
+        if let Some(s) = self.render_host_delete_guard(ui.ctx()) {
+            status = Some(s);
+        }
 
         PaneResponse {
             status,
             copy_to_other,
+        }
+    }
+
+    /// Confirm (and perform) an immediate host delete. No-op when nothing is
+    /// pending. Host writes can't be staged/undone, so this is a hard confirm.
+    fn render_host_delete_guard(&mut self, ctx: &egui::Context) -> Option<String> {
+        let count = self.pending_host_delete.as_ref()?.len();
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new(format!("Delete from host folder? ({})", self.side.label()))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Permanently delete {count} item(s) from the host folder?"
+                ));
+                ui.label("This is immediate and cannot be undone.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            let names = self.pending_host_delete.take().unwrap_or_default();
+            return Some(self.delete_host_entries(&names));
+        }
+        if cancel {
+            self.pending_host_delete = None;
+        }
+        None
+    }
+
+    /// Immediately remove `names` from the host folder, then re-list.
+    fn delete_host_entries(&mut self, names: &[String]) -> String {
+        let targets: Vec<FileEntry> = self
+            .listing
+            .entries()
+            .iter()
+            .filter(|e| names.iter().any(|n| n == &e.name))
+            .cloned()
+            .collect();
+        let (mut removed, mut failed) = (0, 0);
+        for e in targets {
+            let res = if e.is_directory() {
+                std::fs::remove_dir_all(&e.path)
+            } else {
+                std::fs::remove_file(&e.path)
+            };
+            match res {
+                Ok(()) => removed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        self.reload_listing();
+        if failed > 0 {
+            format!(
+                "[{}] deleted {removed} item(s); {failed} could not be removed.",
+                self.side.label()
+            )
+        } else {
+            format!(
+                "[{}] deleted {removed} item(s) from the host folder.",
+                self.side.label()
+            )
         }
     }
 
@@ -221,19 +298,28 @@ impl CommanderPane {
 
     // --- accessors used by CommanderMode for cross-pane copy ---------------
 
-    /// True when this pane can receive a *staged* copy: an image volume that is
-    /// open and not mid-operation. Host panes take immediate writes instead and
-    /// are wired with the host-write engine (H2), so they return false for now.
+    /// True when this pane can receive a copy: a volume/folder is open and the
+    /// pane isn't mid-operation. (A host destination takes an immediate write;
+    /// an image destination takes a staged copy.)
     pub(crate) fn can_receive(&self) -> bool {
-        self.listing.is_loaded()
-            && !self.listing.is_host()
-            && self.pending_apply.is_none()
-            && self.pending_open.is_none()
+        self.listing.is_loaded() && self.pending_apply.is_none() && self.pending_open.is_none()
     }
 
     /// True when this pane lists a host-OS folder rather than a disk image.
     pub(crate) fn is_host_pane(&self) -> bool {
         self.listing.is_host()
+    }
+
+    /// A clone of the session that opened this image pane (to re-open the source
+    /// read-only on a worker thread for an image->host extraction). `None` for a
+    /// host pane or before a source is opened.
+    pub(crate) fn session(&self) -> Option<BrowseSession> {
+        self.session.clone()
+    }
+
+    /// Re-read the current directory listing (after an immediate host write).
+    pub(crate) fn reload_listing(&mut self) {
+        let _ = self.listing.reload();
     }
 
     /// True when at least one row is selected.
@@ -686,11 +772,9 @@ impl CommanderPane {
     fn render_rows(&mut self, ui: &mut egui::Ui) -> (Option<String>, bool) {
         let rows = self.build_display_rows();
         let busy = self.pending_apply.is_some();
-        // Host panes don't stage (writes are immediate); their right-click
-        // delete / copy land with the host-write engine (H2). Until then the
-        // staging menu is image-only so a host pane can't queue an edit that
-        // would never be applied.
-        let staging_menu = !self.listing.is_host();
+        // Host panes write immediately (Delete removes now); image panes stage
+        // (Delete / Undelete / Remove-from-staging go on the queue).
+        let host_pane = self.listing.is_host();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
@@ -698,6 +782,7 @@ impl CommanderPane {
         let mut bg_deselect = false;
         let mut ctx_rclick: Option<String> = None;
         let mut m_delete = false;
+        let mut m_host_delete = false;
         let mut m_copy = false;
 
         egui::ScrollArea::vertical()
@@ -740,8 +825,8 @@ impl CommanderPane {
                         }
                     }
 
-                    // Right-click a data row for the staging menu.
-                    if !row.is_parent() && !busy && staging_menu {
+                    // Right-click a data row for its actions.
+                    if !row.is_parent() && !busy {
                         let menu = resp.context_menu(|ui| {
                             // Copy applies to real / pending-delete rows, not a
                             // not-yet-applied staged add.
@@ -751,14 +836,21 @@ impl CommanderPane {
                                 m_copy = true;
                                 ui.close();
                             }
-                            let label = match row.kind {
-                                RowKind::PendingDelete => "Undelete",
-                                RowKind::PendingAdd => "Remove from staging",
-                                _ => "Delete",
-                            };
-                            if ui.button(label).clicked() {
-                                m_delete = true;
-                                ui.close();
+                            if host_pane {
+                                if ui.button("Delete (immediate)").clicked() {
+                                    m_host_delete = true;
+                                    ui.close();
+                                }
+                            } else {
+                                let label = match row.kind {
+                                    RowKind::PendingDelete => "Undelete",
+                                    RowKind::PendingAdd => "Remove from staging",
+                                    _ => "Delete",
+                                };
+                                if ui.button(label).clicked() {
+                                    m_delete = true;
+                                    ui.close();
+                                }
                             }
                         });
                         if menu.is_some() {
@@ -812,6 +904,12 @@ impl CommanderPane {
                 self.side.label(),
                 names.len()
             ));
+        }
+        if m_host_delete {
+            let names: Vec<String> = self.listing.selection().to_vec();
+            if !names.is_empty() {
+                self.pending_host_delete = Some(names);
+            }
         }
         (status, m_copy)
     }

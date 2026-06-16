@@ -324,15 +324,17 @@ Build order follows the CONTRIBUTING playbook (engine -> model -> thin view) and
   browse view already has (`file_detail` hex/metadata, type/creator editor rows,
   a source picker) instead of duplicating them.
 
-Status (2026-06-16): plan + mock + shell + **M2-lite browsing and M3 staged
-writes working**. Models (unit-tested): `dir_listing`, `commander_source`,
-`commander_ops` (`apply_edits`/`spawn_apply`/`stage_copy`). The two panes open
-images, browse (sortable grid + multi-select + `..`/double-click nav), stage
-delete (right-click) and image→image copy (middle column) onto per-pane
-`EditQueue`s, Apply/Discard through `commander_ops`, with a virtual overlay and
-unsaved-changes guards on Close / source-switch. Next: **host panes**
-(`PaneSource::Host`) to unlock the host↔image / host→host copy combos, then M1
-widget extraction + the M4 detail window. Milestones M1-M5 in the plan doc.
+Status (2026-06-16): plan + mock + shell + **a working two-pane file manager**.
+Models (unit-tested): `dir_listing` (image + host listing sources),
+`commander_source`, `commander_ops` (apply / stage_copy / stage_host_to_image /
+spawn_host_copy). Each pane browses a **disk image** (partition picker) or a
+**host folder** (sortable grid + multi-select + `..`/double-click nav). Image
+panes stage delete + copy-in onto per-pane `EditQueue`s (Apply/Discard, virtual
+overlay, unsaved guards); host panes write immediately (delete behind a confirm).
+The middle column copies a selection across the panes in all four combos
+(image↔image and host→image staged; image→host and host→host immediate/threaded).
+Next: M1 widget extraction + the M4 File Info detail window, the
+browsable-partition gate, and drag-to-load. Milestones M1-M5 in the plan doc.
 
 
 ---
