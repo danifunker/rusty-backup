@@ -70,8 +70,10 @@ pub struct CommanderMode {
     /// while a pane had staged edits).
     unsaved_close: bool,
     /// In-flight immediate host-write copy (image->host / host->host) and the
-    /// destination side to re-list when it finishes.
-    pending_host_copy: Option<(Side, Arc<Mutex<HostCopyStatus>>)>,
+    /// destination side to re-list when it finishes. The side is `None` for an
+    /// "Export to hard drive" write, whose destination is an external folder
+    /// not shown in either pane (nothing to re-list).
+    pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
 }
 
 impl Default for CommanderMode {
@@ -144,6 +146,9 @@ impl CommanderMode {
                         if resp.copy_to_other {
                             self.status = self.copy(Side::Left);
                         }
+                        if resp.export_to_host {
+                            self.status = self.export(Side::Left);
+                        }
                     },
                 );
                 ui.separator();
@@ -167,6 +172,9 @@ impl CommanderMode {
                         }
                         if resp.copy_to_other {
                             self.status = self.copy(Side::Right);
+                        }
+                        if resp.export_to_host {
+                            self.status = self.export(Side::Right);
                         }
                     },
                 );
@@ -305,21 +313,64 @@ impl CommanderMode {
                     entries,
                     dest_dir,
                 };
-                self.pending_host_copy = Some((from.other(), commander_ops::spawn_host_copy(job)));
+                self.pending_host_copy =
+                    Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
                 format!("Copying to the {other} folder...")
             }
             // host -> host: immediate filesystem copy on a worker thread.
             (true, true) => {
                 let dest_dir = PathBuf::from(&dest_parent.path);
                 let job = HostCopyJob::HostToHost { entries, dest_dir };
-                self.pending_host_copy = Some((from.other(), commander_ops::spawn_host_copy(job)));
+                self.pending_host_copy =
+                    Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
                 format!("Copying to the {other} folder...")
             }
         }
     }
 
+    /// Export the `from` pane's selection to a host folder the user picks
+    /// (loose files / folders, not an archive — §15.3). The destination is
+    /// independent of what the other pane shows; this is the immediate host
+    /// write engine ([`commander_ops::spawn_host_copy`]) with no re-list on
+    /// completion (the picked folder isn't a pane).
+    fn export(&mut self, from: Side) -> String {
+        if self.pending_host_copy.is_some() {
+            return "A copy is already in progress; wait for it to finish.".to_string();
+        }
+        let src = match from {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        };
+        let entries = src.selected_entries();
+        if entries.is_empty() {
+            return format!("Nothing selected in the {} pane to export.", from.label());
+        }
+        let Some(dest_dir) = super::file_dialog().pick_folder() else {
+            return "Export cancelled.".to_string();
+        };
+
+        let job = if src.is_host_pane() {
+            HostCopyJob::HostToHost { entries, dest_dir }
+        } else {
+            let Some(session) = src.session() else {
+                return "Source volume is not open.".to_string();
+            };
+            HostCopyJob::ImageToHost {
+                session,
+                entries,
+                dest_dir,
+            }
+        };
+        self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
+        format!(
+            "Exporting the {} pane selection to the host folder...",
+            from.label()
+        )
+    }
+
     /// Poll an in-flight immediate host copy; on completion, re-list the
-    /// destination pane and surface the result.
+    /// destination pane (when the destination is a pane, not an export target)
+    /// and surface the result.
     fn poll_host_copy(&mut self, ctx: &egui::Context) {
         let Some((dest_side, arc)) = self.pending_host_copy.clone() else {
             return;
@@ -336,16 +387,22 @@ impl CommanderMode {
         let copied = guard.copied;
         drop(guard);
 
-        match dest_side {
-            Side::Left => self.left.reload_listing(),
-            Side::Right => self.right.reload_listing(),
-        }
+        // Re-list the destination pane only for a cross-pane copy; an export
+        // writes to an external folder that isn't shown in either pane.
+        let where_to = match dest_side {
+            Some(Side::Left) => {
+                self.left.reload_listing();
+                "the L folder".to_string()
+            }
+            Some(Side::Right) => {
+                self.right.reload_listing();
+                "the R folder".to_string()
+            }
+            None => "the host folder".to_string(),
+        };
         self.status = match err {
-            Some(e) => format!("Copy to the {} folder failed: {e}", dest_side.label()),
-            None => format!(
-                "Copied {copied} file(s) to the {} folder.",
-                dest_side.label()
-            ),
+            Some(e) => format!("Export to {where_to} failed: {e}"),
+            None => format!("Copied {copied} file(s) to {where_to}."),
         };
     }
 }

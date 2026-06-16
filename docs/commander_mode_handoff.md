@@ -107,6 +107,13 @@ the H2 commit lands with this doc update.)
   copy` dispatches on `(src_host, dest_host)` across all four combos and polls
   `pending_host_copy`, re-listing the destination on completion. Host panes get a
   right-click immediate Delete behind a confirm. 3 new copy unit tests.
+- **M6.1 Export to hard drive** — a right-click "Export to hard drive..." action
+  on any data row (image or host pane) `pick_folder`s a destination and runs the
+  existing `spawn_host_copy` (`ImageToHost` for an image source, `HostToHost` for a
+  host source). Pure reuse: `PaneResponse` gains `export_to_host`, `CommanderMode::
+  export` builds the job, and `pending_host_copy`'s destination side is now
+  `Option<Side>` (`None` = export, so `poll_host_copy` skips the re-list). Excluded
+  on not-yet-applied staged-add rows (no real data yet).
 
 ## How to run it
 
@@ -130,8 +137,8 @@ M2-lite + M3 + host panes are done. The **requested next batch** (full design in
 (engine → model → thin view), unit-testing the model piece before the menu item;
 suggested order is smallest-win-first:
 
-1. **Export to hard drive** (§15.3) — *smallest; pure reuse.* A right-click
-   "Export to hard drive…" that `pick_folder`s a destination and runs the existing
+1. **Export to hard drive** (§15.3) — *DONE.* A right-click "Export to hard
+   drive…" that `pick_folder`s a destination and runs the existing
    `commander_ops::spawn_host_copy` (`ImageToHost` / `HostToHost`) into it. No new
    engine — just a menu item + folder picker + the poll Commander already has. This
    is the §9b "Export → To host" item made first-class (loose files, not an archive).
