@@ -11,14 +11,16 @@
 //! [`BrowseSession::open`] peels them, so the partition offsets this module
 //! reports line up with the offsets the session later opens at.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::BackupMetadata;
+use crate::clonezilla::block_cache::PartcloneBlockCache;
+use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::zstd_stream::ZstdStreamCache;
-use crate::model::backup_loader::infer_fat_type_byte;
+use crate::model::backup_loader::{self, infer_fat_type_byte, LoadOutcome};
 use crate::model::browse_session::BrowseSession;
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
@@ -159,6 +161,137 @@ pub fn session_for_backup_partition(
     Ok(session)
 }
 
+/// A backup folder resolved to its kind, partition list, and the context needed
+/// to open a partition for browsing. This is the **one** entry point a UI uses
+/// to open a backup, so Commander, the Inspect tab, and a future TUI share the
+/// native-vs-Clonezilla routing instead of each re-deriving it (the gap that
+/// left Commander unable to open Clonezilla images). Wraps
+/// [`backup_loader::load_backup`], which does the native-vs-Clonezilla detection.
+pub enum ResolvedBackup {
+    /// A native rusty-backup folder (`metadata.json`).
+    Native {
+        folder: PathBuf,
+        metadata: Box<BackupMetadata>,
+        partitions: Vec<PartitionInfo>,
+    },
+    /// A Clonezilla image folder (partclone + sfdisk).
+    Clonezilla {
+        folder: PathBuf,
+        image: Box<ClonezillaImage>,
+        partitions: Vec<PartitionInfo>,
+    },
+}
+
+/// How to open a resolved backup partition for browsing.
+pub enum BackupPartitionOpen {
+    /// A ready [`BrowseSession`] — `spawn_open` it like any image partition.
+    Session(BrowseSession),
+    /// A Clonezilla partition needs a partclone block cache before a session can
+    /// open it. A previous scan may already be on disk ([`load_partclone_cache`]);
+    /// otherwise the cache must be built by a scan (the cache runner) and then
+    /// turned into a session with [`session_for_partclone_cache`].
+    Clonezilla(ClonezillaOpen),
+}
+
+/// Everything needed to obtain a Clonezilla partition's block cache and then a
+/// browsing session.
+pub struct ClonezillaOpen {
+    /// Sorted partclone split files backing this partition.
+    pub partclone_files: Vec<PathBuf>,
+    /// MBR partition type byte (drives filesystem dispatch).
+    pub partition_type: u8,
+    /// Where a prior scan's metadata cache lives / will be written
+    /// (`_<device>.metadata.cache` in the image folder).
+    pub cache_path: PathBuf,
+}
+
+/// Resolve a backup folder: detect native rusty-backup vs Clonezilla and return
+/// its partition list + open context.
+pub fn resolve_backup(folder: &Path) -> Result<ResolvedBackup> {
+    match backup_loader::load_backup(folder)? {
+        LoadOutcome::Backup(o) => Ok(ResolvedBackup::Native {
+            folder: folder.to_path_buf(),
+            metadata: Box::new(o.metadata),
+            partitions: o.partitions,
+        }),
+        LoadOutcome::Clonezilla(o) => Ok(ResolvedBackup::Clonezilla {
+            folder: folder.to_path_buf(),
+            image: Box::new(o.image),
+            partitions: o.partitions,
+        }),
+    }
+}
+
+impl ResolvedBackup {
+    /// The partition list (drives the pane's partition dropdown).
+    pub fn partitions(&self) -> &[PartitionInfo] {
+        match self {
+            ResolvedBackup::Native { partitions, .. } => partitions,
+            ResolvedBackup::Clonezilla { partitions, .. } => partitions,
+        }
+    }
+
+    /// True for a Clonezilla image (vs. a native rusty-backup folder).
+    pub fn is_clonezilla(&self) -> bool {
+        matches!(self, ResolvedBackup::Clonezilla { .. })
+    }
+
+    /// Build the opener for the partition with index `part_index`.
+    pub fn open_partition(&self, part_index: usize) -> Result<BackupPartitionOpen> {
+        match self {
+            ResolvedBackup::Native {
+                folder, metadata, ..
+            } => Ok(BackupPartitionOpen::Session(session_for_backup_partition(
+                folder, metadata, part_index,
+            )?)),
+            ResolvedBackup::Clonezilla { folder, image, .. } => {
+                let cz = image
+                    .partitions
+                    .iter()
+                    .find(|p| p.index == part_index)
+                    .with_context(|| {
+                        format!("partition {part_index} not found in Clonezilla image")
+                    })?;
+                if cz.partclone_files.is_empty() {
+                    bail!("Clonezilla partition {part_index} has no partclone data files");
+                }
+                let cache_path = folder.join(format!("_{}.metadata.cache", cz.device_name));
+                Ok(BackupPartitionOpen::Clonezilla(ClonezillaOpen {
+                    partclone_files: cz.partclone_files.clone(),
+                    partition_type: cz.partition_type_byte,
+                    cache_path,
+                }))
+            }
+        }
+    }
+}
+
+/// Build a read-only [`BrowseSession`] over a ready partclone block cache (the
+/// reader short-circuits all disk access through the cache, so partition offset
+/// is 0).
+pub fn session_for_partclone_cache(
+    cache: Arc<Mutex<PartcloneBlockCache>>,
+    partition_type: u8,
+) -> BrowseSession {
+    BrowseSession {
+        partclone_cache: Some(cache),
+        partition_type,
+        partition_offset: 0,
+        ..Default::default()
+    }
+}
+
+/// Try to load a Clonezilla partition's block cache from a previous on-disk scan.
+/// Returns `None` when no cache file exists yet (a fresh scan is needed).
+pub fn load_partclone_cache(open: &ClonezillaOpen) -> Option<Arc<Mutex<PartcloneBlockCache>>> {
+    if !open.cache_path.exists() {
+        return None;
+    }
+    PartcloneBlockCache::load_from_file(&open.cache_path, open.partclone_files.clone())
+        .ok()
+        .map(|c| Arc::new(Mutex::new(c)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +419,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let meta = one_partition_meta("none", "partition-0.raw", 1024);
         assert!(session_for_backup_partition(dir.path(), &meta, 0).is_err());
+    }
+
+    /// `resolve_backup` on a native rusty-backup folder lists its partitions and
+    /// `open_partition` yields a ready browsing session.
+    #[test]
+    fn resolve_native_backup_lists_partitions_and_opens() {
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("RESV")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let compressed = zstd::encode_all(&flat[..], 3).unwrap();
+        std::fs::write(dir.path().join("partition-0.zst"), &compressed).unwrap();
+        let meta = one_partition_meta("zstd", "partition-0.zst", flat.len() as u64);
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+
+        let resolved = resolve_backup(dir.path()).expect("resolve");
+        assert!(!resolved.is_clonezilla());
+        assert_eq!(resolved.partitions().len(), 1);
+        match resolved.open_partition(0).expect("open") {
+            BackupPartitionOpen::Session(s) => {
+                let fs = s.open().expect("open volume");
+                assert_eq!(fs.volume_label(), Some("RESV"));
+            }
+            _ => panic!("a native backup partition should open as a Session"),
+        }
+    }
+
+    /// A Clonezilla partition resolves to a `Clonezilla` open carrying the right
+    /// partclone files + `_<device>.metadata.cache` path; with no cache on disk
+    /// yet, `load_partclone_cache` reports that a scan is needed.
+    #[test]
+    fn clonezilla_open_routes_to_cache_path() {
+        use crate::clonezilla::metadata::ClonezillaPartition;
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![dir.path().join("sda1.ext4-ptcl-img.gz.aa")];
+        let part = ClonezillaPartition {
+            index: 1,
+            device_name: "sda1".into(),
+            start_lba: 2048,
+            size_sectors: 1000,
+            partition_type_byte: 0x83,
+            filesystem_type: "ext4".into(),
+            is_extended: false,
+            is_logical: false,
+            bootable: false,
+            partclone_files: files.clone(),
+            type_guid: None,
+            unique_guid: None,
+            partition_name: None,
+        };
+        let image = ClonezillaImage {
+            disk_name: "sda".into(),
+            cylinders: 0,
+            heads: 0,
+            sectors_per_track: 0,
+            mbr_bytes: [0u8; 512],
+            hidden_data_after_mbr: vec![],
+            ebr_data: std::collections::HashMap::new(),
+            partitions: vec![part],
+            source_size_bytes: 0,
+            image_info: String::new(),
+            is_gpt: false,
+            gpt_primary_raw: None,
+            gpt_backup_raw: None,
+            gpt_disk_guid: None,
+            gpt_first_lba: None,
+            gpt_last_lba: None,
+        };
+        let resolved = ResolvedBackup::Clonezilla {
+            folder: dir.path().to_path_buf(),
+            image: Box::new(image),
+            partitions: vec![],
+        };
+        assert!(resolved.is_clonezilla());
+        let BackupPartitionOpen::Clonezilla(open) = resolved.open_partition(1).expect("open")
+        else {
+            panic!("a Clonezilla partition should yield a Clonezilla open");
+        };
+        assert_eq!(open.partition_type, 0x83);
+        assert_eq!(open.partclone_files, files);
+        assert_eq!(open.cache_path, dir.path().join("_sda1.metadata.cache"));
+        // No prior scan on disk -> a fresh scan is needed.
+        assert!(load_partclone_cache(&open).is_none());
     }
 }

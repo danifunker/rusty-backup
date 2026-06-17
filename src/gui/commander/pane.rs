@@ -5,10 +5,10 @@
 //!
 //! A pane lists one of three sources: a **disk-image volume** (partition probe +
 //! `BrowseSession`, opened off-thread via [`BrowseSession::spawn_open`]), a
-//! **host-OS folder** (`std::fs`), or a **native rusty-backup folder**
-//! (read-only — partitions come from the backup's `metadata.json`, opened
-//! per-compression via [`commander_source::session_for_backup_partition`]). All
-//! listing state lives in the [`DirListing`] model
+//! **host-OS folder** (`std::fs`), or a **backup folder** — native rusty-backup
+//! or Clonezilla (read-only; partitions + opener come from the shared
+//! [`commander_source::resolve_backup`] resolver). All listing state lives in
+//! the [`DirListing`] model
 //! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
 //! it. Applying staged edits runs off-thread via
 //! [`rusty_backup::model::commander_ops::spawn_apply`].
@@ -25,11 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
-use rusty_backup::model::backup_loader;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
@@ -94,11 +92,10 @@ pub(crate) struct CommanderPane {
     source: Option<PathBuf>,
     /// Partitions parsed from the source; drives the partition dropdown.
     partitions: Vec<PartitionInfo>,
-    /// When the source is a native rusty-backup folder, its parsed
-    /// `metadata.json`; `open_partition` then builds a backup-data session
-    /// (per-compression) instead of a raw-image one. `None` for an image /
-    /// host source.
-    backup_meta: Option<BackupMetadata>,
+    /// When the source is a backup folder (native rusty-backup *or* Clonezilla),
+    /// the resolved backup — `open_partition` routes through it to build the
+    /// right session. `None` for an image / host source.
+    resolved_backup: Option<commander_source::ResolvedBackup>,
     /// Index into `partitions` currently being browsed.
     selected_part: Option<usize>,
     /// The directory-listing model this pane renders.
@@ -174,7 +171,7 @@ impl CommanderPane {
             side,
             source: None,
             partitions: Vec::new(),
-            backup_meta: None,
+            resolved_backup: None,
             selected_part: None,
             listing: DirListing::new(),
             session: None,
@@ -618,7 +615,7 @@ impl CommanderPane {
         self.listing.is_loaded()
             && self.pending_apply.is_none()
             && self.pending_open.is_none()
-            && self.backup_meta.is_none()
+            && self.resolved_backup.is_none()
     }
 
     /// True when this pane lists a host-OS folder rather than a disk image.
@@ -626,12 +623,13 @@ impl CommanderPane {
         self.listing.is_host()
     }
 
-    /// True when this pane lists a (read-only) native backup folder's contents.
-    /// Backups can be browsed and copied *out of*, but not edited: writing to a
-    /// raw backup's partition file would silently desync its `metadata.json`
-    /// checksum, and zstd backups have no in-place editable session.
+    /// True when this pane lists a (read-only) backup folder's contents — native
+    /// rusty-backup or Clonezilla. Backups can be browsed and copied *out of*,
+    /// but not edited: writing to a raw backup's partition file would silently
+    /// desync its `metadata.json` checksum, zstd backups have no in-place
+    /// editable session, and Clonezilla images are read-through a block cache.
     pub(crate) fn is_backup_pane(&self) -> bool {
-        self.backup_meta.is_some()
+        self.resolved_backup.is_some()
     }
 
     /// A clone of the session that opened this image pane (to re-open the source
@@ -751,7 +749,7 @@ impl CommanderPane {
             // Shared source picker (R1): the same ComboBox widget the Inspect
             // tab uses, here offering an image file or a host folder. Image
             // opens are not materialized (BrowseSession peels the container).
-            let is_backup = self.backup_meta.is_some();
+            let is_backup = self.resolved_backup.is_some();
             let current_label = if self.listing.is_host() {
                 "Local folder".to_string()
             } else if is_backup {
@@ -833,7 +831,7 @@ impl CommanderPane {
 
             // Per-pane staging controls (writable image panes only; host writes
             // are immediate and never staged, and backups are read-only).
-            if !self.listing.is_host() && self.backup_meta.is_none() {
+            if !self.listing.is_host() && self.resolved_backup.is_none() {
                 let n = self.queue.len();
                 let busy = self.pending_apply.is_some() || self.pending_open.is_some();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
@@ -896,7 +894,7 @@ impl CommanderPane {
                 // read-only backup pane.
                 let busy = self.pending_apply.is_some() || self.pending_open.is_some();
                 if !busy
-                    && self.backup_meta.is_none()
+                    && self.resolved_backup.is_none()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
@@ -934,7 +932,7 @@ impl CommanderPane {
     fn close_source(&mut self) -> String {
         self.source = None;
         self.partitions.clear();
-        self.backup_meta = None;
+        self.resolved_backup = None;
         self.selected_part = None;
         self.listing = DirListing::new();
         self.session = None;
@@ -1023,7 +1021,7 @@ impl CommanderPane {
     fn load_source(&mut self, path: PathBuf) -> String {
         self.source = Some(path.clone());
         self.listing = DirListing::new();
-        self.backup_meta = None;
+        self.resolved_backup = None;
         self.pending_open = None;
         self.error = None;
         self.selected_part = None;
@@ -1052,15 +1050,14 @@ impl CommanderPane {
         }
     }
 
-    /// Open a native rusty-backup folder (`metadata.json` present) and start
-    /// browsing its first partition's data file. The partition dropdown lists
-    /// the backed-up partitions; `open_partition` builds a backup-data session
-    /// per compression (raw / zstd). Clonezilla images and CHD / WOZ backups
-    /// aren't browsable from a pane yet — those surface an error.
+    /// Open a backup folder — native rusty-backup *or* Clonezilla (the shared
+    /// resolver detects which) — and start browsing its first browsable
+    /// partition. The partition dropdown lists the backed-up partitions;
+    /// `open_partition` routes through the resolver to build the right session.
     fn load_backup_source(&mut self, folder: PathBuf) -> String {
         self.source = Some(folder.clone());
         self.listing = DirListing::new();
-        self.backup_meta = None;
+        self.resolved_backup = None;
         self.partitions.clear();
         self.session = None;
         self.pending_open = None;
@@ -1071,10 +1068,10 @@ impl CommanderPane {
         self.volume_label.clear();
         self.fs_type.clear();
 
-        match backup_loader::load_backup_metadata(&folder) {
-            Ok(outcome) => {
-                self.partitions = outcome.partitions;
-                self.backup_meta = Some(outcome.metadata);
+        match commander_source::resolve_backup(&folder) {
+            Ok(resolved) => {
+                self.partitions = resolved.partitions().to_vec();
+                self.resolved_backup = Some(resolved);
                 match self.first_browsable_partition() {
                     Some(i) => self.open_partition(i),
                     None => format!(
@@ -1098,7 +1095,7 @@ impl CommanderPane {
     /// writes to a host pane are immediate, never staged).
     fn load_host(&mut self, dir: PathBuf) -> String {
         self.source = Some(dir.clone());
-        self.backup_meta = None;
+        self.resolved_backup = None;
         self.partitions.clear();
         self.selected_part = None;
         self.session = None;
@@ -1156,15 +1153,35 @@ impl CommanderPane {
             return format!("[{}] {msg}", self.side.label());
         }
 
-        // Resolve the session first (the backup builder is fallible and borrows
-        // `backup_meta`); only then mutate the pane's open state.
-        let built = match &self.backup_meta {
-            Some(meta) => commander_source::session_for_backup_partition(&path, meta, part.index),
-            None => Ok(commander_source::session_for(&path, &part)),
-        };
-        let session = match built {
-            Ok(s) => s,
-            Err(e) => {
+        // Resolve the session. A backup folder routes through the shared
+        // resolver (native -> per-compression session; Clonezilla -> a partclone
+        // block cache from a prior scan); a plain image builds a raw session.
+        // `open_partition` returns owned data, so the `resolved_backup` borrow is
+        // released before we mutate the pane on the error paths below.
+        use commander_source::BackupPartitionOpen;
+        let open_result = self
+            .resolved_backup
+            .as_ref()
+            .map(|r| r.open_partition(part.index));
+        let session = match open_result {
+            Some(Ok(BackupPartitionOpen::Session(s))) => s,
+            Some(Ok(BackupPartitionOpen::Clonezilla(open))) => {
+                match commander_source::load_partclone_cache(&open) {
+                    Some(cache) => {
+                        commander_source::session_for_partclone_cache(cache, open.partition_type)
+                    }
+                    None => {
+                        // No on-disk scan yet — building it is the cache runner's
+                        // job (next phase). Point the user at Inspect for now.
+                        let msg = "Clonezilla metadata not built yet -- open this \
+                                   partition once in the Inspect tab to build the \
+                                   cache, then reopen it here.";
+                        self.error = Some(msg.to_string());
+                        return format!("[{}] {msg}", self.side.label());
+                    }
+                }
+            }
+            Some(Err(e)) => {
                 self.error = Some(format!("{e:#}"));
                 return format!(
                     "[{}] cannot browse {}: {e}",
@@ -1172,6 +1189,7 @@ impl CommanderPane {
                     partition_label(&part)
                 );
             }
+            None => commander_source::session_for(&path, &part),
         };
         self.pending_open = Some(session.spawn_open());
         self.session = Some(session);
@@ -1406,7 +1424,7 @@ impl CommanderPane {
         let host_pane = self.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
         // delete or rename (both would mutate the backup).
-        let read_only = self.backup_meta.is_some();
+        let read_only = self.resolved_backup.is_some();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
