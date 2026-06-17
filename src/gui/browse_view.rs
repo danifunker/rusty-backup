@@ -432,6 +432,22 @@ impl BrowseView {
     /// for all filesystem reads instead of re-opening `source_path`.  Pass
     /// `Some(file)` when browsing a raw device on macOS to avoid a second auth
     /// prompt; pass `None` for backup files / image files.
+    /// Open the browser from a fully-built [`BrowseSession`]. This is the
+    /// low-level seam every other opener funnels through: it clears prior
+    /// browse state, installs the session, and spawns the async open + initial
+    /// root listing on a worker thread (`show()` drains the result each frame).
+    ///
+    /// It deliberately does **not** decide edit policy — `edit_supported`, the
+    /// WOZ/zstd `archive_edit_ctx`, the CHD-edit flow, and the single-file-chd
+    /// backup folder are layered by the caller after this returns (see `open`,
+    /// and the Inspect tab's resolver-driven routing).
+    pub fn open_with_session(&mut self, session: BrowseSession) {
+        self.close();
+        self.session = session;
+        self.active = true;
+        self.pending_open = Some(self.session.spawn_open());
+    }
+
     pub fn open(
         &mut self,
         source_path: PathBuf,
@@ -440,13 +456,17 @@ impl BrowseView {
         partition_type_string: Option<String>,
         preopen_file: Option<File>,
     ) {
-        self.close();
-        self.session.source_path = Some(source_path.clone());
-        self.session.partition_offset = partition_offset;
-        self.session.partition_type = partition_type;
-        self.session.partition_type_string = partition_type_string;
-        self.session.preopen_file = preopen_file.map(std::sync::Arc::new);
-        // Editing is supported for regular files (not Clonezilla/streaming)
+        let session = BrowseSession {
+            source_path: Some(source_path.clone()),
+            partition_offset,
+            partition_type,
+            partition_type_string,
+            preopen_file: preopen_file.map(std::sync::Arc::new),
+            ..Default::default()
+        };
+        self.open_with_session(session);
+
+        // Editing is supported for regular files (not Clonezilla/streaming).
         self.edit_supported = true;
 
         // WOZ images still go through the decompress→edit→recompress
@@ -478,24 +498,16 @@ impl BrowseView {
                 checksum_type: String::new(),
             });
         }
-
-        // Open + initial root listing run on a worker thread so the UI can
-        // paint a spinner + phase while we wait. `show()` drains the result
-        // each frame.
-        self.active = true;
-        self.pending_open = Some(self.session.spawn_open());
     }
 
     /// Open the browser using a partclone block cache (for Clonezilla images).
     pub fn open_partclone(&mut self, cache: Arc<Mutex<PartcloneBlockCache>>, partition_type: u8) {
-        self.close();
-        self.session.partclone_cache = Some(cache);
-        self.session.partition_type = partition_type;
-        self.session.partition_offset = 0;
-        // Same async pattern as `open` / `open_streaming`: hand the open and
-        // initial root listing to a worker so the UI can paint a spinner.
-        self.active = true;
-        self.pending_open = Some(self.session.spawn_open());
+        self.open_with_session(BrowseSession {
+            partclone_cache: Some(cache),
+            partition_type,
+            partition_offset: 0,
+            ..Default::default()
+        });
     }
 
     /// Open the browser by streaming a native zstd-compressed partition image.
@@ -504,26 +516,24 @@ impl BrowseView {
     /// 256 MB in-memory buffer.  Call `upgrade_to_seekable_cache` once the
     /// background seekable cache is ready to enable full random access.
     pub fn open_streaming(&mut self, path: PathBuf, ptype: u8, ptype_str: Option<String>) {
-        self.close();
-        self.session.partition_type = ptype;
-        self.session.partition_type_string = ptype_str;
-        self.session.partition_offset = 0;
-
         let cache = match ZstdStreamCache::new(&path) {
             Ok(c) => Arc::new(Mutex::new(c)),
             Err(e) => {
+                self.close();
                 self.error = Some(format!("Cannot open zstd stream: {e}"));
                 self.active = true;
                 return;
             }
         };
-        self.session.zstd_cache = Some(cache);
-
         // Open + initial root listing on a worker thread so the UI can paint
         // a spinner while a slow first read (NAS, large HFS+ catalog) runs.
-        // `show()` drains the result each frame.
-        self.active = true;
-        self.pending_open = Some(self.session.spawn_open());
+        self.open_with_session(BrowseSession {
+            partition_type: ptype,
+            partition_type_string: ptype_str,
+            partition_offset: 0,
+            zstd_cache: Some(cache),
+            ..Default::default()
+        });
     }
 
     /// Set a label prefix shown alongside the volume label in the header.
