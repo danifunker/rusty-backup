@@ -15,8 +15,9 @@ use std::path::PathBuf;
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
+use crate::fs::efs::resolve_bytes_per_inode;
 use crate::partition::sgi_hdd_builder::{
-    build_sgi_efs_hdd, SgiHddOptions, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
+    write_sgi_efs_hdd, SgiHddOptions, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -58,6 +59,17 @@ pub struct NewSgiHddArgs {
     /// (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders).
     #[arg(long, default_value_t = DEFAULT_SECTORS_PER_TRACK)]
     pub sectors: u16,
+
+    /// Approximate total inode count for the EFS root. The formatter scales the
+    /// cylinder groups to hit roughly this many inodes. Mutually exclusive with
+    /// `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB.
+    #[arg(long, conflicts_with = "bytes_per_inode")]
+    pub inodes: Option<u64>,
+
+    /// EFS inode density, in bytes per inode (smaller = more inodes). Floored at
+    /// one inode per 512-byte block. Mutually exclusive with `--inodes`.
+    #[arg(long)]
+    pub bytes_per_inode: Option<u64>,
 }
 
 pub fn run(args: NewSgiHddArgs) -> Result<()> {
@@ -71,10 +83,19 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         name: args.name.clone(),
         heads: args.heads,
         sectors_per_track: args.sectors,
+        // Resolve the inode density against the EFS root size (the partition is
+        // most of the disk; this is the count the user cares about).
+        bytes_per_inode: resolve_bytes_per_inode(size_bytes, args.inodes, args.bytes_per_inode),
     };
-    let (image, layout) = build_sgi_efs_hdd(&opts)?;
-    std::fs::write(&args.image, &image)
+    // Stream directly to the output file: the volume header + EFS metadata are
+    // written and the rest stays sparse, so even multi-GB disks never
+    // materialize the whole image in memory.
+    let mut file = std::fs::File::create(&args.image)
+        .with_context(|| format!("creating {}", args.image.display()))?;
+    let layout = write_sgi_efs_hdd(&mut file, &opts)
         .with_context(|| format!("writing {}", args.image.display()))?;
+    file.set_len(layout.disk_bytes)
+        .with_context(|| format!("sizing {}", args.image.display()))?;
 
     log_stderr(format!(
         "wrote {} ({} bytes, {} MiB) - SGI volume header + EFS root",

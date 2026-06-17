@@ -70,9 +70,24 @@ pub struct NewArgs {
     /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
     #[arg(long = "affs-variant", default_value = "1")]
     pub affs_variant: u8,
+
+    /// EFS only: approximate total inode count. The formatter scales its
+    /// cylinder groups to hit roughly this many inodes. Mutually exclusive with
+    /// `--bytes-per-inode`; default density is ~1 inode/4 KiB.
+    #[arg(long, conflicts_with = "bytes_per_inode")]
+    pub inodes: Option<u64>,
+
+    /// EFS only: inode density in bytes per inode (smaller = more inodes),
+    /// floored at one inode per 512-byte block. Mutually exclusive with
+    /// `--inodes`.
+    #[arg(long)]
+    pub bytes_per_inode: Option<u64>,
 }
 
 pub fn run(args: NewArgs) -> Result<()> {
+    if (args.inodes.is_some() || args.bytes_per_inode.is_some()) && args.fs != FsKind::Efs {
+        anyhow::bail!("--inodes / --bytes-per-inode are only valid with --fs efs");
+    }
     match args.fs {
         FsKind::Hfs => {
             let catalog_bytes = args
@@ -109,9 +124,16 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Fat => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::fat::create_blank_fat(size, Some(name))
         }),
-        FsKind::Efs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
-            crate::fs::efs::create_blank_efs(size, name)
-        }),
+        FsKind::Efs => write_blank_efs_image(
+            &args.image,
+            &args.size,
+            &args.name,
+            crate::fs::efs::resolve_bytes_per_inode(
+                parse_size(&args.size).context("parsing --size")?,
+                args.inodes,
+                args.bytes_per_inode,
+            ),
+        ),
         FsKind::Affs => {
             let variant = args.affs_variant;
             format_and_write(&args.image, &args.size, &args.name, |size, name| {
@@ -134,6 +156,42 @@ fn format_and_write(
         "wrote {} ({} bytes, volume {:?})",
         image.display(),
         bytes.len(),
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare EFS superfloppy by streaming only its non-zero regions to the
+/// output file (the rest stays sparse), so large volumes never materialize the
+/// whole image in memory. `bytes_per_inode` sets the inode density.
+fn write_blank_efs_image(
+    image: &std::path::Path,
+    size_str: &str,
+    name: &str,
+    bytes_per_inode: u64,
+) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    if size < 32 * 1024 {
+        anyhow::bail!("EFS volume must be at least 32 KiB, got {size}");
+    }
+    let total_blocks_u64 = size / 512;
+    if total_blocks_u64 > u32::MAX as u64 {
+        anyhow::bail!("EFS volume size {size} exceeds u32 block range");
+    }
+    let total_blocks = total_blocks_u64 as u32;
+    let disk_bytes = total_blocks as u64 * 512;
+
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    crate::fs::efs::write_blank_efs(&mut file, 0, total_blocks, name, bytes_per_inode)
+        .with_context(|| format!("writing {}", image.display()))?;
+    // Ensure the file is exactly the requested size even though the trailing
+    // blocks past the replica superblock are sparse.
+    file.set_len(disk_bytes)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({disk_bytes} bytes, volume {:?})",
+        image.display(),
         name
     ));
     Ok(())

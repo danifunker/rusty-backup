@@ -17,9 +17,10 @@
 //! Swap (slot 1, RAW) is omitted — this is a non-bootable data disk. All
 //! geometry is big-endian; sectors are always 512 bytes.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 
-use crate::fs::efs::create_blank_efs;
+use crate::fs::efs::{write_blank_efs, EFS_DEFAULT_BYTES_PER_INODE};
 use crate::partition::sgi::{
     SgiDeviceParameters, SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
     SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
@@ -61,16 +62,20 @@ pub struct SgiHddOptions {
     pub heads: u16,
     /// Sectors per track (512-byte sectors).
     pub sectors_per_track: u16,
+    /// EFS inode density, in bytes per inode (the inode count scales as
+    /// `efs_bytes / bytes_per_inode`). Floored at one inode per 512-byte block.
+    pub bytes_per_inode: u64,
 }
 
 impl SgiHddOptions {
-    /// Options with the default 1 MiB-cylinder geometry.
+    /// Options with the default IRIS/SGI geometry and inode density.
     pub fn new(size_bytes: u64, name: impl Into<String>) -> Self {
         SgiHddOptions {
             size_bytes,
             name: name.into(),
             heads: DEFAULT_HEADS,
             sectors_per_track: DEFAULT_SECTORS_PER_TRACK,
+            bytes_per_inode: EFS_DEFAULT_BYTES_PER_INODE,
         }
     }
 }
@@ -92,13 +97,10 @@ pub struct SgiHddLayout {
     pub efs_sectors: u64,
 }
 
-/// Build a dvh-wrapped EFS hard-disk image in memory. Returns the full disk
-/// bytes (exactly `layout.disk_bytes`) plus the computed [`SgiHddLayout`].
-///
-/// The result is addressable by every partition-aware verb: `PartitionTable::
-/// detect` recognizes the volume header, `partitions()` exposes the EFS root as
-/// a `0xA1`-typed partition, and the EFS lives at `efs_first_sector × 512`.
-pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)> {
+/// Compute the disk geometry / partition layout for the given options without
+/// writing any bytes. Validates the geometry and that the EFS partition meets
+/// its minimum size.
+pub fn compute_sgi_layout(opts: &SgiHddOptions) -> Result<SgiHddLayout> {
     ensure!(opts.heads > 0, "heads must be > 0");
     ensure!(opts.sectors_per_track > 0, "sectors-per-track must be > 0");
 
@@ -136,7 +138,21 @@ pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)
         "EFS partition would be only {efs_bytes} bytes (< 32 KiB); increase --size"
     );
 
-    // --- Build the volume header ------------------------------------------
+    Ok(SgiHddLayout {
+        disk_sectors,
+        disk_bytes: disk_sectors * SECTOR_SIZE,
+        cylinders: disk_cyls as u32,
+        heads: opts.heads,
+        sectors_per_track: opts.sectors_per_track,
+        cylinder_sectors,
+        volhdr_sectors,
+        efs_first_sector,
+        efs_sectors,
+    })
+}
+
+/// Build the 512-byte SGI volume header (sector 0) for the given layout.
+fn build_volume_header(opts: &SgiHddOptions, layout: &SgiHddLayout) -> [u8; SECTOR_SIZE as usize] {
     let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
         .map(|_| SgiPartitionEntry {
             blocks: 0,
@@ -145,17 +161,17 @@ pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)
         })
         .collect();
     partitions[SLOT_EFS_ROOT] = SgiPartitionEntry {
-        blocks: efs_sectors as u32,
-        first: efs_first_sector as u32,
+        blocks: layout.efs_sectors as u32,
+        first: layout.efs_first_sector as u32,
         partition_type_raw: SgiPartitionType::Efs.as_u32(),
     };
     partitions[SLOT_VOLHDR] = SgiPartitionEntry {
-        blocks: volhdr_sectors as u32,
+        blocks: layout.volhdr_sectors as u32,
         first: 0,
         partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
     };
     partitions[SLOT_VOLUME] = SgiPartitionEntry {
-        blocks: disk_sectors as u32,
+        blocks: layout.disk_sectors as u32,
         first: 0,
         partition_type_raw: SgiPartitionType::Volume.as_u32(),
     };
@@ -173,7 +189,7 @@ pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)
         root_part_num: SLOT_EFS_ROOT as u16,
         swap_part_num: 0, // no separate swap partition on a data disk
         device_parameters: SgiDeviceParameters::for_geometry(
-            disk_cyls as u32,
+            layout.cylinders,
             opts.heads,
             opts.sectors_per_track,
         ),
@@ -183,29 +199,58 @@ pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)
         checksum: 0,
         checksum_valid: true,
     };
-    let sector0 = vh.to_bytes(); // 512 bytes, checksum zero-summed
+    vh.to_bytes() // 512 bytes, checksum zero-summed
+}
 
-    // --- Assemble the disk ------------------------------------------------
-    let mut image = vec![0u8; disk_sectors as usize * SECTOR_SIZE as usize];
-    image[..sector0.len()].copy_from_slice(&sector0);
+/// Stream a dvh-wrapped EFS hard disk directly into `sink`: the volume header at
+/// sector 0 and a freshly-formatted EFS root partition, writing only non-zero
+/// regions (the rest stays as sparse holes in a `set_len`'d file). Returns the
+/// computed [`SgiHddLayout`].
+///
+/// This is the memory-frugal path for large disks: peak memory is the EFS bitmap
+/// (~disk_size/4096) rather than the whole image. The CLI uses it to write disks
+/// of any size to a file without materializing them in RAM.
+pub fn write_sgi_efs_hdd<W: Write + Seek>(
+    sink: &mut W,
+    opts: &SgiHddOptions,
+) -> Result<SgiHddLayout> {
+    let layout = compute_sgi_layout(opts)?;
+    write_sgi_efs_hdd_into(sink, opts, &layout)?;
+    Ok(layout)
+}
 
-    let efs =
-        create_blank_efs(efs_bytes, &opts.name).context("formatting the EFS root partition")?;
-    debug_assert_eq!(efs.len() as u64, efs_bytes, "EFS image size mismatch");
-    let efs_off = efs_first_sector as usize * SECTOR_SIZE as usize;
-    image[efs_off..efs_off + efs.len()].copy_from_slice(&efs);
+/// Write the dvh + EFS into `sink` using a precomputed layout.
+fn write_sgi_efs_hdd_into<W: Write + Seek>(
+    sink: &mut W,
+    opts: &SgiHddOptions,
+    layout: &SgiHddLayout,
+) -> Result<()> {
+    let sector0 = build_volume_header(opts, layout);
+    sink.seek(SeekFrom::Start(0))?;
+    sink.write_all(&sector0)?;
 
-    let layout = SgiHddLayout {
-        disk_sectors,
-        disk_bytes: disk_sectors * SECTOR_SIZE,
-        cylinders: disk_cyls as u32,
-        heads: opts.heads,
-        sectors_per_track: opts.sectors_per_track,
-        cylinder_sectors,
-        volhdr_sectors,
-        efs_first_sector,
-        efs_sectors,
-    };
+    write_blank_efs(
+        sink,
+        layout.efs_first_sector * SECTOR_SIZE,
+        layout.efs_sectors as u32,
+        &opts.name,
+        opts.bytes_per_inode,
+    )?;
+    Ok(())
+}
+
+/// Build a dvh-wrapped EFS hard-disk image **in memory**. Returns the full disk
+/// bytes (exactly `layout.disk_bytes`) plus the computed [`SgiHddLayout`]. For
+/// large disks prefer [`write_sgi_efs_hdd`], which streams to a file without
+/// allocating the whole image.
+///
+/// The result is addressable by every partition-aware verb: `PartitionTable::
+/// detect` recognizes the volume header, `partitions()` exposes the EFS root as
+/// a `0xA1`-typed partition, and the EFS lives at `efs_first_sector × 512`.
+pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)> {
+    let layout = compute_sgi_layout(opts)?;
+    let mut image = vec![0u8; layout.disk_bytes as usize];
+    write_sgi_efs_hdd_into(&mut Cursor::new(&mut image[..]), opts, &layout)?;
     Ok((image, layout))
 }
 
@@ -319,5 +364,47 @@ mod tests {
         let (_img, layout) = build_sgi_efs_hdd(&SgiHddOptions::new(1024, "T")).unwrap();
         assert!(layout.efs_sectors >= MIN_EFS_SECTORS);
         assert_eq!(layout.disk_sectors % layout.cylinder_sectors, 0);
+    }
+
+    /// Streaming to a (sparse) file via `write_sgi_efs_hdd` produces bytes
+    /// identical to the in-memory `build_sgi_efs_hdd` — the untouched regions
+    /// must read back as zero, and the file must be exactly `disk_bytes`.
+    #[test]
+    fn streamed_file_matches_in_memory_image() {
+        use std::io::{Read, Seek, SeekFrom};
+        let opts = SgiHddOptions::new(40 * 1024 * 1024, "STREAM");
+        let (mem, layout) = build_sgi_efs_hdd(&opts).unwrap();
+
+        let mut file = tempfile::tempfile().expect("tempfile");
+        let streamed_layout = write_sgi_efs_hdd(&mut file, &opts).expect("stream");
+        file.set_len(streamed_layout.disk_bytes).unwrap();
+        assert_eq!(streamed_layout, layout);
+
+        let mut on_disk = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut on_disk).unwrap();
+        assert_eq!(on_disk.len() as u64, layout.disk_bytes, "exact size");
+        assert_eq!(on_disk, mem, "streamed bytes match the in-memory image");
+    }
+
+    /// Inode density scales the cylinder-group inode count: a smaller
+    /// bytes-per-inode yields more inodes for the same disk.
+    #[test]
+    fn bytes_per_inode_controls_inode_count() {
+        let mut sparse = SgiHddOptions::new(64 * 1024 * 1024, "INO");
+        sparse.bytes_per_inode = 16384; // ~1 inode / 16 KiB
+        let mut dense = sparse.clone();
+        dense.bytes_per_inode = 2048; // ~1 inode / 2 KiB
+
+        let inodes = |opts: &SgiHddOptions| {
+            let (img, layout) = build_sgi_efs_hdd(opts).unwrap();
+            let sb_off = (layout.efs_first_sector * 512 + 512) as usize;
+            let sb = crate::fs::efs::EfsSuperblock::parse(&img[sb_off..]).unwrap();
+            sb.ncg as u32 * sb.cgisize as u32 * 4
+        };
+        assert!(
+            inodes(&dense) > inodes(&sparse) * 3,
+            "denser inode setting must yield many more inodes"
+        );
     }
 }
