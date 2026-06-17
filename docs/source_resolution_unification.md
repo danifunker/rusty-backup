@@ -150,3 +150,65 @@ resolver path) once Phase 4 lands.
       no resolution code of its own.
 - [ ] CLI keeps `cli/resolve.rs` but re-uses the gates / `resolve_backup` /
       `cache_runner` for any browse-shaped feature it adds.
+
+## Resume prompt — Phase 4
+
+Point a fresh session at this:
+
+> **Resume: source-resolution unification, Phase 4 (Inspect adopts the resolver).**
+> Branch `commander-mode` in `/Users/dani/repos/rusty-backup` (tree clean). Read
+> `CONTRIBUTING.md` § "Presentation layers: one model, many UIs", then this whole
+> file (`docs/source_resolution_unification.md`) — it's the authoritative plan.
+>
+> **State:** Phases 1–3 are done + committed (capability gates → `fs/`; shared
+> backup resolver `commander_source::{resolve_backup, ResolvedBackup,
+> session_for_backup_partition}`; `model::cache_runner`), plus the CHD-backup fix
+> and a superfloppy-gate fix. Both originally-reported bugs are fixed and
+> user-verified in the GUI. Commander Mode opens images, native backups
+> (raw/zstd), CHD backups (single-file-chd), and Clonezilla — all through the
+> shared model. **The Inspect tab still has its own per-compression open routing**
+> in `gui/inspect_tab.rs::open_browse` (+ `open_browse_zstd`,
+> `open_browse_clonezilla`); Phase 4 unifies it onto the resolver + the shared
+> `BrowseSession`, then deletes the inline ladder.
+>
+> **Do, in order (each a separate commit):**
+> 1. Add `BrowseView::open_with_session(session: BrowseSession)` to
+>    `gui/browse_view.rs` — it already owns `session: BrowseSession`; `open()`
+>    just fills its fields + `spawn_open()`. This is the seam.
+> 2. Extend the resolver (`model/commander_source.rs`) to cover **every**
+>    compression Inspect handles, not just the read-only none/zstd subset:
+>    per-partition `woz`; the **zstd seekable-cache upgrade** (Inspect opens
+>    streaming via `open_browse_zstd`, then builds a background seekable cache and
+>    swaps — preserve it; the resolver only does streaming `ZstdStreamCache`
+>    today); per-partition `chd`/`chd-dvd` if any real backups use it (CHD backups
+>    are normally single-file-chd, already handled).
+> 3. Preserve Inspect's edit contexts layered on the session:
+>    `set_archive_edit_context` (zstd/woz), the `chd_edit` flow, and
+>    `single_file_chd_backup_folder` metadata refresh (Straggler D — converge on
+>    the resolver path).
+> 4. Lift the Clonezilla cache decision tree into the resolver/`cache_runner`
+>    (Straggler C): Inspect's `open_browse_clonezilla` holds the full "in-memory
+>    `block_caches` hit → persisted `_<device>.metadata.cache` load → else scan"
+>    logic; share it so Commander gains the in-memory reuse.
+> 5. Route `open_browse` through `resolve_backup` + `ResolvedBackup::open_partition`
+>    → `browse_view.open_with_session(...)`; delete the inline per-compression
+>    ladder. (Optional follow-on: Stragglers A/B — collapse the 3 image-probe
+>    copies + image session-building.)
+>
+> **Key files:** `gui/inspect_tab.rs` (`open_browse` + `open_browse_*`),
+> `gui/browse_view.rs` (`open` ~L435 / `open_partclone` ~L490, owns the session),
+> `model/commander_source.rs` (resolver), `model/browse_session.rs` (session
+> fields), `model/cache_runner.rs`.
+>
+> **CRITICAL:** this touches the working Inspect tab and is **not validatable in a
+> headless sandbox**. It's a faithful refactor — preserve Inspect behavior
+> exactly, keep changes incremental + reversible, commit per sub-step, and after
+> each step have the user GUI-validate that **every** backup compression still
+> **browses *and* edits**: raw/none, zstd (incl. the seekable upgrade), woz,
+> single-file-chd, Clonezilla, and a plain image — plus edit mode (archive-edit
+> decompress→recompress, `chd_edit`). Do not merge blind.
+>
+> **Per-commit gates:** `cargo build --all-targets` (zero warnings),
+> `cargo clippy --all-targets -- -D warnings`, `cargo test --lib` (1981+ green);
+> no Unicode glyphs in UI strings; the pre-commit hook runs fmt+check+clippy.
+> Done = the acceptance-criteria checklist above is satisfied.
