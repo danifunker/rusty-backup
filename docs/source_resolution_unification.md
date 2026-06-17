@@ -30,8 +30,9 @@ partially unified:
 | FS dispatch / partition parse / container peel | shared | shared | shared |
 | Capability gates (`fs::partition_is_browsable`) | — (doesn't gate) | ✅ | ✅ |
 | `BrowseSession` (async open primitive) | — (sync reader) | ✅ | ✅ |
-| Backup resolver (`commander_source::resolve_backup`) | — | ❌ **Phase 4** | ✅ |
+| Backup resolver (`commander_source::resolve_backup`) | — | ✅ (Phase 4) | ✅ |
 | Cache-scan runner (`model::cache_runner`) | — | ✅ | ✅ |
+| Clonezilla cache decision tree (`PartcloneCacheStore`) | — | ✅ (Straggler C) | ✅ (Straggler C) |
 | Resolution orchestration lives in | `cli/resolve.rs` | `inspect_tab::open_browse` (inline) | `model::commander_source` |
 
 The end-state collapses the two GUI columns into the Commander column (the
@@ -54,36 +55,55 @@ shared model) and leaves the CLI column as a deliberately leaner sibling.
 - **CHD backups** (`c1a7c2a`). `ResolvedBackup::open_partition` handles the
   single-file-chd layout (open the `.chd` container at the partition offset).
   **Fixes "partition 0 has no data files listed".**
+- **Phase 4 — Inspect adopts the resolver** (`8942090`, `43e89a5`, `fa17583`,
+  `473ac50`, `1eeb48c`, `24abc2c`). *Implemented; pending GUI validation.* The
+  steps below all landed:
+  1. `BrowseView::open_with_session(session)` — the seam `open` /
+     `open_streaming` / `open_partclone` now funnel through.
+  2. `session_for_backup_partition` builds a session for **every** per-partition
+     compression Inspect browses (none / chd / chd-dvd / woz on `source_path`;
+     zstd streaming). `single_data_file` shares the data-file lookup + split /
+     exists checks.
+  3. The compression→edit-flow mapping lives in `commander_source::backup_edit_for`
+     → `BackupEdit::{InPlace, Archive(ArchiveEditPlan), ReadOnly}`; Inspect's
+     `apply_backup_edit` applies it (raw/CHD `mark_edit_supported`; zstd/woz
+     `set_archive_edit_context`). The zstd seekable-cache upgrade stays in the
+     view (`open_browse_zstd`); single-file-chd still reaches `open_browse` via
+     the Case 1 image redirect (Straggler D converges it later).
+  4. `inspect_tab::open_browse`'s native-folder ladder + the hand-rolled
+     Clonezilla cache tree are gone — both go through the shared model.
+
+  Inspect routes through the shared **free functions** (`single_data_file`,
+  `session_for_backup_partition`, `backup_edit_for`) rather than storing a
+  `ResolvedBackup` like Commander, because it eagerly resolves the backup at
+  load time (and redirects single-file-chd to an image). Those free functions
+  are exactly what `ResolvedBackup::open_partition` calls, so the duplication is
+  gone; full `ResolvedBackup` adoption in Inspect is left to Stragglers B/D.
+- **Straggler C — shared Clonezilla cache decision tree** (`473ac50`, `1eeb48c`).
+  `commander_source::PartcloneCacheStore::resolve` owns the in-memory-hit →
+  on-disk-load → scan decision (and stale-cache removal); Inspect and Commander
+  both hold a store. Commander gained the in-memory reuse it lacked.
+
+## Validation checklist (Phase 4 — run in the GUI)
+
+Phase 4 is a faithful refactor of the working Inspect tab and **was not
+validatable in a headless sandbox**. Before considering it done, confirm in a
+running GUI that each source still **browses *and* edits**:
+
+- [ ] Native backup: **raw / none** (browse + add/delete a file).
+- [ ] Native backup: **zstd** (browse via streaming; re-open after the seekable
+      cache builds to exercise the upgrade + reuse; edit via decompress →
+      recompress).
+- [ ] Native backup: **woz** (browse + archive edit).
+- [ ] Native backup: **chd / chd-dvd** per-partition if available (browse +
+      `chd_edit`).
+- [ ] **single-file-chd** backup (Case 1 image redirect; browse + `chd_edit` +
+      metadata refresh on save).
+- [ ] **Clonezilla** backup (fresh scan, then re-open to exercise in-memory
+      reuse).
+- [ ] A plain **image** (unchanged Case 1).
 
 ## Remaining work
-
-### Phase 4 — Inspect adopts the resolver (the GUI unification)
-
-Inspect already shares the loader (`load_backup`), the gates (Phase 1), and the
-cache runner (Phase 3). The remaining duplication is the **per-partition open
-routing** in `inspect_tab::open_browse` (+ `open_browse_zstd` /
-`open_browse_clonezilla`). To unify without regressing Inspect, do all of:
-
-1. **`BrowseView::open_with_session(session: BrowseSession)`** — `BrowseView`
-   already owns a `BrowseSession` and `open()` just fills its fields + calls
-   `spawn_open()`; add the seam that takes a prebuilt session.
-2. **Extend the resolver to every compression** Inspect supports, not just the
-   read-only none/zstd subset: `chd` / `chd-dvd` (per-partition, if any still
-   exist) + `woz`, and the **zstd seekable-cache upgrade** (Inspect opens
-   streaming, then swaps to a background-built seekable cache — see
-   `open_browse_zstd`). Today `session_for_backup_partition` covers none/zstd
-   streaming only.
-3. **Preserve Inspect's edit contexts** layered on top of the session:
-   `set_archive_edit_context` (zstd/woz), the `chd_edit` flow, and
-   `single_file_chd_backup_folder` (metadata refresh).
-4. Route `open_browse` through `resolve_backup` + `ResolvedBackup::open_partition`
-   → `browse_view.open_with_session(...)`, then delete the inline per-compression
-   ladder.
-
-**Blocked on:** needs the running GUI to validate every backup compression type
-(none / zstd / chd / woz / single-file-chd) + Clonezilla still browse and edit
-correctly. Do it with that validation in hand. This is the step that makes
-Commander and Inspect *the same path*.
 
 ### Straggler A — unify image partition probing (3 copies → 1)
 
@@ -102,13 +122,15 @@ via `commander_source::session_for(path, part)`. Both produce a `BrowseSession`.
 Fold Inspect onto `session_for` + `BrowseView::open_with_session` (rides on
 Phase 4 / Straggler A).
 
-### Straggler C — unify the Clonezilla cache-lookup decision tree
+### Straggler C — unify the Clonezilla cache-lookup decision tree ✅ DONE
 
-Inspect's `open_browse_clonezilla` holds the full decision tree: an in-memory
-`block_caches: HashMap` hit, a persisted `_<device>.metadata.cache` load, then a
-scan. Commander's resolver has the simpler `load_partclone_cache` (disk-or-scan).
-Lift the whole "ready-in-memory? on-disk? else scan" decision into the resolver /
-`cache_runner` so both share it (and Commander gains the in-memory reuse).
+~~Inspect's `open_browse_clonezilla` holds the full decision tree~~ — done in
+`473ac50` + `1eeb48c`. `commander_source::PartcloneCacheStore::resolve` returns
+`PartcloneLookup::{Ready, NeedsScan}`, owning the in-memory-hit →
+on-disk-load (`_<device>.metadata.cache`) → scan decision plus stale-cache
+removal. Inspect and Commander each hold a store; both call `resolve` then hand
+a `NeedsScan` cache to `cache_runner::spawn_partclone_scan` and `insert` the
+result on completion. Commander gained the in-memory reuse it lacked.
 
 ### Straggler D — single-file-chd: converge the two approaches
 
@@ -140,18 +162,26 @@ resolver path) once Phase 4 lands.
 
 ## Acceptance criteria ("done")
 
-- [ ] Inspect and Commander open every source (device / image / native backup /
-      Clonezilla / single-file-chd) through **one** resolver + `BrowseSession`;
-      `inspect_tab::open_browse`'s per-compression ladder is gone (Phase 4 + B +
-      D).
+- [x] Inspect and Commander open every source (device / image / native backup /
+      Clonezilla / single-file-chd) through the **shared model** resolver
+      functions + `BrowseSession`; `inspect_tab::open_browse`'s per-compression
+      ladder is gone (Phase 4). *Inspect routes via the free functions, not a
+      stored `ResolvedBackup` — full adoption + single-file-chd convergence is
+      Stragglers B/D.* **Pending GUI validation** (see checklist above).
 - [ ] Image partition probing is one shared fn (Straggler A); CLI calls it too.
-- [ ] The Clonezilla cache decision tree is in the model, shared (Straggler C).
+- [x] The Clonezilla cache decision tree is in the model, shared (Straggler C —
+      `PartcloneCacheStore`).
 - [ ] A new `src/tui/` could list + open any source using only `model::` —
       no resolution code of its own.
 - [ ] CLI keeps `cli/resolve.rs` but re-uses the gates / `resolve_backup` /
       `cache_runner` for any browse-shaped feature it adds.
 
-## Resume prompt — Phase 4
+## Resume prompt — Phase 4 (EXECUTED — kept for history)
+
+> **Status:** Phase 4 was implemented across `8942090`..`24abc2c`; see the
+> **Done** + **Validation checklist** sections above. This prompt is retained as
+> the record of what was planned. The remaining open work is Stragglers A / B /
+> D and the GUI validation pass.
 
 Point a fresh session at this:
 
