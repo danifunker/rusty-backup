@@ -131,6 +131,13 @@ impl ArchivesTab {
         self.pending_inspect_open.take()
     }
 
+    /// Load `path` as the archive source (the next `show` reloads on the path
+    /// change). Used when the Inspect tab redirects a picked Mac-archive file
+    /// here instead of trying to parse it as a disk image.
+    pub fn open_path(&mut self, path: PathBuf) {
+        self.archive_path = Some(path);
+    }
+
     /// Spawn the background extractor. When `selected_only` is true,
     /// only entries whose checkbox is ticked are extracted via
     /// [`extract::extract_filtered`]; otherwise [`extract::extract_all`]

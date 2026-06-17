@@ -662,6 +662,54 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for RsdosFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "RS-DOS is flat; only root files are renamable".into(),
+            ));
+        }
+        let slot = entry.location as usize;
+        let de = self
+            .entries
+            .get(slot)
+            .cloned()
+            .ok_or_else(|| FilesystemError::NotFound(format!("slot {slot} out of range")))?;
+        if !de.is_live() {
+            return Err(FilesystemError::NotFound("already deleted".into()));
+        }
+        let raw_name = encode_name(new_name)?;
+
+        // Reject a collision with a *different* live slot. Names are folded to
+        // uppercase by the encoder, so byte-exact comparison covers case
+        // folding; the encoded first byte is always a valid letter/digit
+        // (never 0x00/0xFF), so the slot stays a live header.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.slot != slot && e.is_live() && e.raw_name == raw_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Overwrite only the 11-byte name field; file type, ASCII flag, first
+        // granule and last-sector size (bytes 0x0B..0x10) are preserved, so the
+        // file keeps its identity and contents.
+        let mut ebuf = self.read_at(self.geom.dir_offset(slot), ENTRY_LEN)?;
+        ebuf[0..11].copy_from_slice(&raw_name);
+        self.write_at(self.geom.dir_offset(slot), &ebuf)?;
+        self.reader.flush()?;
+        self.refresh()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -791,6 +839,78 @@ mod tests {
                 &CreateFileOptions::default(),
             )
             .unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn rename_in_place_round_trip() {
+        let mut fs = open_mem(create_blank(35));
+        let root = fs.root().unwrap();
+
+        let big: Vec<u8> = (0..2560).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let d = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DATA.BIN")
+            .unwrap();
+        let first_gran = fs.entries[d.location as usize].first_granule;
+
+        fs.rename(&root, &d, "REPORT.TXT").unwrap();
+
+        // Re-open from bytes to prove persistence.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs2 = RsdosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r2 = fs2.root().unwrap();
+        let l2 = fs2.list_directory(&r2).unwrap();
+        let names: Vec<&str> = l2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"REPORT.TXT"));
+        assert!(!names.contains(&"DATA.BIN"));
+
+        // Identity (first granule) + contents preserved.
+        let renamed = l2.iter().find(|e| e.name == "REPORT.TXT").unwrap();
+        assert_eq!(
+            fs2.entries[renamed.location as usize].first_granule,
+            first_gran
+        );
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), big);
+    }
+
+    #[test]
+    fn rename_collision_rejected() {
+        let mut fs = open_mem(create_blank(35));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "ONE",
+            &mut Cursor::new(vec![1u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "TWO",
+            &mut Cursor::new(vec![2u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let two = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TWO")
+            .unwrap();
+        let err = fs.rename(&root, &two, "ONE").unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 }

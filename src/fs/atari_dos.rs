@@ -653,6 +653,63 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "Atari DOS is flat; only root files are renamable".into(),
+            ));
+        }
+        let raw_name = encode_name(new_name)?;
+
+        let idx = entry.location as usize;
+        let de =
+            self.entries.get(idx).cloned().ok_or_else(|| {
+                FilesystemError::NotFound(format!("entry idx {idx} out of range"))
+            })?;
+        if !de.is_live() {
+            return Err(FilesystemError::NotFound("already deleted".into()));
+        }
+        if de.locked() {
+            return Err(FilesystemError::Unsupported(format!(
+                "'{}' is locked",
+                de.name
+            )));
+        }
+
+        // Reject a collision with a *different* live slot. Atari names are
+        // folded to uppercase by the encoder, so byte-exact comparison of the
+        // encoded form covers case folding; a case-only rename resolves back
+        // to the same slot and is allowed.
+        if self
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != idx && e.is_live() && e.raw_name == raw_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Overwrite only the 11-byte name field; flag, sector count and start
+        // sector are untouched, so the file keeps its identity and contents.
+        let dir_sector = DIR_FIRST_SECTOR + (de.slot / 8) as u16;
+        let mut dbuf = self.read_sector(dir_sector)?;
+        let eoff = (de.slot % 8) * ENTRY_LEN;
+        dbuf[eoff + 5..eoff + 16].copy_from_slice(&raw_name);
+        self.write_sector(dir_sector, &dbuf)?;
+
+        self.reader.flush()?;
+        self.refresh_entries()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -777,6 +834,72 @@ mod tests {
         let l2 = fs2.list_directory(&r2).unwrap();
         assert_eq!(l2.len(), 1);
         assert_eq!(fs2.read_file(&l2[0], usize::MAX).unwrap(), big);
+    }
+
+    #[test]
+    fn rename_in_place_round_trip() {
+        let mut fs = open_mem(create_blank_sd());
+        let root = fs.root().unwrap();
+
+        let hello = b"HELLO ATARI\x9b".to_vec();
+        fs.create_file(
+            &root,
+            "HELLO.TXT",
+            &mut Cursor::new(hello.clone()),
+            hello.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let listing = fs.list_directory(&root).unwrap();
+        let h = listing
+            .iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .unwrap()
+            .clone();
+        let start = fs.entries[h.location as usize].start_sector;
+
+        fs.rename(&root, &h, "GREET.TXT").unwrap();
+
+        // Re-open from bytes to prove persistence.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs2 = AtariDosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r2 = fs2.root().unwrap();
+        let l2 = fs2.list_directory(&r2).unwrap();
+        let names: Vec<&str> = l2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"GREET.TXT"));
+        assert!(!names.contains(&"HELLO.TXT"));
+
+        // Identity (start sector) + contents preserved.
+        let renamed = l2.iter().find(|e| e.name == "GREET.TXT").unwrap();
+        assert_eq!(fs2.entries[renamed.location as usize].start_sector, start);
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), hello);
+    }
+
+    #[test]
+    fn rename_collision_rejected() {
+        let mut fs = open_mem(create_blank_sd());
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "ONE",
+            &mut Cursor::new(vec![1u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "TWO",
+            &mut Cursor::new(vec![2u8; 10]),
+            10,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let listing = fs.list_directory(&root).unwrap();
+        let two = listing.iter().find(|e| e.name == "TWO").unwrap().clone();
+        let err = fs.rename(&root, &two, "ONE").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 
     #[test]

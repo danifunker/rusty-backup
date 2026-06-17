@@ -67,7 +67,7 @@ pub fn resolve_partition_ro(
 /// container format, atomically replacing the original. **Dropping without
 /// committing discards container edits**, so a verb that errors out before
 /// calling `commit` leaves the original container untouched.
-#[must_use = "call commit() to persist edits made to a floppy container"]
+#[must_use = "call commit() to persist edits made to a container"]
 pub struct RwCommit {
     session: Option<crate::model::container_edit::ContainerEditSession>,
 }
@@ -77,10 +77,10 @@ impl RwCommit {
     pub fn commit(self) -> Result<()> {
         match self.session {
             Some(session) => {
-                let kind = session.kind();
+                let fmt = session.format_name();
                 session
                     .commit()
-                    .map_err(|e| anyhow!("re-encoding {} container: {e:#}", kind.display_name()))
+                    .map_err(|e| anyhow!("re-encoding {fmt} container: {e:#}"))
             }
             None => Ok(()),
         }
@@ -163,22 +163,28 @@ pub fn resolve_partition_streaming_forced(
     password: Option<&[u8]>,
     fs_override: Option<&str>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
-    // Anything `source_reader::open_read_with_password` would unwrap (CHD /
-    // GHO / IMZ streaming readers; MSA / EDSK / D88 / DIM / XDF / HDM /
-    // Arculator-HDF / 140 KB Apple-II floppies) must NOT skip source_reader
-    // and go straight to `open_image_ro`, or the consumer would see the
-    // wrapped bytes instead of the decoded flat-sector stream.
-    // `is_container_path` is the single source of truth for that set.
-    let is_streaming = source_reader::is_container_path(path);
-    if is_streaming {
-        let mut reader = source_reader::open_read_with_password(path, password)?;
-        let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
-        Ok((reader, ctx))
-    } else {
-        let mut file = open_image_ro(path)?;
-        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((Box::new(std::io::BufReader::new(file)), ctx))
-    }
+    resolve_partition_streaming_forced_inside(path, selector, password, fs_override, None)
+}
+
+/// As [`resolve_partition_streaming_forced`], but `inside` names a specific
+/// entry to open when `path` is a `.zip` holding more than one disk image
+/// (the CLI `--inside` flag). Ignored for every non-zip source.
+pub fn resolve_partition_streaming_forced_inside(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    password: Option<&[u8]>,
+    fs_override: Option<&str>,
+    inside: Option<&str>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
+    // Peel any container *and* any image wrapper through the one shared
+    // primitive so the CLI probes a source identically to the GUI: CHD / GHO /
+    // IMZ / .zip-wrapped / flat-floppy containers decode to a flat stream, and
+    // VHD / 2MG / DMG / DiskCopy 4.2 wrappers are unwrapped (previously the CLI
+    // streaming path saw the wrapped bytes for those and mis-detected the
+    // partition table). A raw image falls through to a buffered file.
+    let mut reader = source_reader::open_peeled_read_with_entry(path, password, inside)?;
+    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    Ok((reader, ctx))
 }
 
 fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<PartitionContext> {

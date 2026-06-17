@@ -1844,6 +1844,43 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_ext_name(new_name)?;
+
+        let parent_inode = parent.location as u32;
+        // ext names are case-sensitive, so any name that differs from the
+        // old one (including a case-only change) is a genuinely distinct
+        // dirent — reject only if that exact name already occupies the
+        // directory.
+        if self.name_exists_in_dir(parent_inode, new_name)? {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // The name lives only in the dirent; the inode keeps its number
+        // and data. Match the file_type create uses for this kind.
+        let file_type = if entry.is_directory() {
+            FT_DIR
+        } else {
+            FT_REG_FILE
+        };
+
+        // Add the new dirent first (pointing at the same inode), then
+        // remove the old one (matched by old name), so a mid-failure
+        // never leaves the inode unreferenced. A same-parent rename does
+        // not change link counts, so we do not touch update_inode_links.
+        self.add_dir_entry(parent_inode, new_name, entry.location as u32, file_type)?;
+        self.remove_dir_entry(parent_inode, &entry.name)?;
+        Ok(())
+    }
+
     fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
         let inode_num = entry.location as u32;
         let inode = self.read_inode(inode_num)?;
@@ -5029,6 +5066,45 @@ mod tests {
 
         // Read file back
         let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&data[..test_data.len()], test_data);
+    }
+
+    #[test]
+    fn test_ext_rename_preserves_inode_and_content() {
+        let mut img = make_editable_ext2_image();
+        let mut fs = ExtFilesystem::open(&mut img, 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let test_data = b"rename me on ext2";
+        let mut reader = Cursor::new(test_data.to_vec());
+        let file = fs
+            .create_file(
+                &root,
+                "before.txt",
+                &mut reader,
+                test_data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let original_inode = file.location;
+
+        fs.rename(&root, &file, "after.txt").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.name == "before.txt"),
+            "old name should be gone"
+        );
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "after.txt")
+            .expect("new name should be listed");
+
+        // Identity (inode number) preserved.
+        assert_eq!(renamed.location, original_inode);
+
+        // Content preserved.
+        let data = fs.read_file(renamed, usize::MAX).unwrap();
         assert_eq!(&data[..test_data.len()], test_data);
     }
 

@@ -31,15 +31,26 @@ pub struct InspectArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
     pub format: OutputFormat,
 
-    /// Password for encrypted containers (currently: WinImage IMZ).
+    /// Password for encrypted containers (currently: WinImage IMZ, and
+    /// password-protected `.zip` disks).
     #[arg(long)]
     pub password: Option<String>,
+
+    /// For a `.zip` holding more than one disk image, the archive entry to
+    /// open (e.g. `--inside backup.img`). Matched by exact name, then case-
+    /// insensitively, then by basename. Ignored for non-zip sources.
+    #[arg(long = "inside", value_name = "NAME")]
+    pub inside: Option<String>,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
-    let mut reader = crate::model::source_reader::open_read_with_password(&args.image, pw_bytes)?;
+    let mut reader = crate::model::source_reader::open_read_with_password_and_entry(
+        &args.image,
+        pw_bytes,
+        args.inside.as_deref(),
+    )?;
     let pt = PartitionTable::detect(&mut reader)?;
     let partitions = pt.partitions();
     let ext = args
@@ -116,7 +127,43 @@ fn emit_text(
             flags.join(",")
         ));
     }
+    // For SGI disks the browsable list above filters out the disk-wide
+    // wrappers (VOLHDR / VOLUME) and swap/raw slots; dump the full 16-slot
+    // volume-header table + geometry so the complete dvh layout is visible.
+    if let PartitionTable::Sgi(vh) = pt {
+        emit_sgi_volume_header(vh);
+    }
     Ok(())
+}
+
+/// Print the full SGI volume-header slot table (all non-empty slots, including
+/// the VOLHDR / VOLUME wrappers) plus the disk geometry.
+fn emit_sgi_volume_header(vh: &crate::partition::sgi::SgiVolumeHeader) {
+    let dp = &vh.device_parameters;
+    out_stdout("");
+    out_stdout(format!(
+        "SGI volume header: {} cyls x {} heads x {} secs/trk x {} bytes/sec",
+        dp.cylinders(),
+        dp.trks0,
+        dp.secs,
+        dp.secbytes,
+    ));
+    out_stdout(format!(
+        "{:>4}  {:<8}  {:>12}  {:>12}",
+        "slot", "type", "first", "blocks"
+    ));
+    for (i, e) in vh.partitions.iter().enumerate() {
+        if e.is_empty() {
+            continue;
+        }
+        out_stdout(format!(
+            "{:>4}  {:<8}  {:>12}  {:>12}",
+            i,
+            e.partition_type().display_name(),
+            e.first,
+            e.blocks,
+        ));
+    }
 }
 
 fn emit_structured(

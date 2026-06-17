@@ -30,7 +30,8 @@ use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DIS
 use crate::rbformats::containers::xdf::decode_xdf_bytes;
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
-use crate::rbformats::ReadSeek;
+use crate::rbformats::zip_disk::{ZipDiskReader, ZIP_MAGIC};
+use crate::rbformats::{detect_image_format_with_path, wrap_image_reader, ImageFormat, ReadSeek};
 
 /// Cheap magic sniff: returns true when `path` starts with `MComprHD`.
 pub fn is_chd_path(path: &Path) -> bool {
@@ -60,6 +61,28 @@ pub fn is_imz_path(path: &Path) -> bool {
     };
     let mut magic = [0u8; 4];
     matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == IMZ_MAGIC
+}
+
+/// `.zip` holding a flat / raw disk image (a CF/SD card dump, hard-disk
+/// image, etc.). A bare `PK\x03\x04` would false-positive on every ZIP, so
+/// — like [`is_imz_path`] — we require the `.zip` extension AND the magic.
+/// `.imz` (handled by [`is_imz_path`]) carries a different extension, so the
+/// two openers never collide. The specific entry to open is resolved at
+/// open time by [`ZipDiskReader`].
+pub fn is_zip_image_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == ZIP_MAGIC
 }
 
 /// True when `path` is a 140 KB Apple-II disk image (`.do`, `.po`, or
@@ -273,6 +296,46 @@ pub fn is_gho_path(path: &Path) -> bool {
     matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == GHO_MAGIC
 }
 
+/// `.adz` / `.hdz` — gzip-wrapped Amiga images (an `.adf` floppy or `.hdf`
+/// hard-disk image inside a gzip stream). Matched by extension + gzip magic so
+/// a mislabeled file isn't mistaken for one. Kept as the container (not
+/// materialized to a separate `.adf`/`.hdf`) so edits re-gzip back in place.
+pub fn is_gzip_image_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("adz") || e.eq_ignore_ascii_case("hdz"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == [0x1f, 0x8b]
+}
+
+/// A seekable reader over a gzip-decoded image held in a temp file, so a large
+/// `.hdz` isn't decompressed entirely into RAM. The temp file is removed when
+/// the reader is dropped.
+struct GzipTempReader {
+    file: File,
+    _temp: tempfile::TempPath,
+}
+
+impl std::io::Read for GzipTempReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Seek for GzipTempReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 /// Open `path` for reading, transparently wrapping CHD and SECTOR-mode
 /// GHO files in their respective streaming readers.
 ///
@@ -284,13 +347,37 @@ pub fn is_gho_path(path: &Path) -> bool {
 /// `GhoReader::open` to error out; the caller can then fall back to the
 /// legacy `materialize_gho_to_temp` path which decodes to a tempfile.
 pub fn open_read(path: &Path) -> Result<Box<dyn ReadSeek>> {
-    open_read_with_password(path, None)
+    open_read_dispatch(path, None, None)
 }
 
 /// Variant of [`open_read`] that accepts an optional password for
-/// container formats that support encryption (IMZ and GHO; CHD's scheme is
-/// not wired here). Pass `None` to behave like [`open_read`].
+/// container formats that support encryption (IMZ, GHO, and password-
+/// protected `.zip` disks; CHD's scheme is not wired here). Pass `None` to
+/// behave like [`open_read`].
 pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn ReadSeek>> {
+    open_read_dispatch(path, password, None)
+}
+
+/// As [`open_read_with_password`], but `inside` names a specific entry to
+/// open when `path` is a `.zip` holding more than one disk image (the CLI
+/// `--inside` flag). Ignored for every other source type.
+pub fn open_read_with_password_and_entry(
+    path: &Path,
+    password: Option<&[u8]>,
+    inside: Option<&str>,
+) -> Result<Box<dyn ReadSeek>> {
+    open_read_dispatch(path, password, inside)
+}
+
+/// The container-dispatch chain behind [`open_read`] /
+/// [`open_read_with_password`]. `inside` names the specific entry to open
+/// when `path` is a `.zip` holding more than one disk image (the CLI
+/// `--inside` flag); it is ignored for every other source type.
+fn open_read_dispatch(
+    path: &Path,
+    password: Option<&[u8]>,
+    inside: Option<&str>,
+) -> Result<Box<dyn ReadSeek>> {
     if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
@@ -383,9 +470,79 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
         let flat = open_apple_ii_dsk(bytes, ext.as_deref())
             .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_gzip_image_path(path) {
+        // .adz/.hdz: gzip-wrapped Amiga image. Decode to a temp file (an .hdf
+        // can be large, so don't hold it all in RAM) and read from there.
+        let input =
+            File::open(path).with_context(|| format!("open gzip image {}", path.display()))?;
+        let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+        let mut temp = tempfile::Builder::new()
+            .prefix(".rb-gzip-image-")
+            .tempfile()
+            .context("create gzip-decode tempfile")?;
+        std::io::copy(&mut decoder, temp.as_file_mut())
+            .with_context(|| format!("decompress gzip image {}", path.display()))?;
+        let temp_path = temp.into_temp_path();
+        let file = File::open(&temp_path).context("reopen decoded gzip image")?;
+        Ok(Box::new(GzipTempReader {
+            file,
+            _temp: temp_path,
+        }))
+    } else if is_zip_image_path(path) {
+        // A plain .zip holding a RAW disk image. Pick the disk entry (or the
+        // `--inside`-named one) and inflate it to a temp file; disk images
+        // can be large, so we never hold the whole thing in RAM.
+        let zip = ZipDiskReader::open_with(path, password, inside)
+            .with_context(|| format!("open ZIP disk image {}", path.display()))?;
+        Ok(Box::new(zip))
     } else {
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
+    }
+}
+
+/// Open `path` as a flat, seekable disk-image stream with **any** container or
+/// image wrapper peeled off — the single "peel a picked source into a readable
+/// disk image" primitive every front end's partition probe shares.
+///
+/// - CHD / GHO / IMZ / flat-floppy containers ([`is_container_path`]) decode
+///   through [`open_read_with_password`].
+/// - VHD / 2MG / DMG / DiskCopy 4.2 (and any other) image wrapper is unwrapped
+///   via the format pipeline ([`detect_image_format_with_path`] +
+///   [`wrap_image_reader`]).
+/// - A raw image falls through to a plain buffered file.
+///
+/// The partition offsets a caller reads after this line up with the offsets a
+/// later [`crate::model::browse_session::BrowseSession`] open produces, since
+/// the browse session peels the same wrappers. Keep this the one place the peel
+/// set is defined so CHD / GHO / IMZ / VHD / … probe identically everywhere.
+pub fn open_peeled_read(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn ReadSeek>> {
+    open_peeled_read_with_entry(path, password, None)
+}
+
+/// As [`open_peeled_read`], but `inside` names a specific entry to open when
+/// `path` is a `.zip` holding more than one disk image (the CLI `--inside`
+/// flag). Ignored for every non-zip source.
+pub fn open_peeled_read_with_entry(
+    path: &Path,
+    password: Option<&[u8]>,
+    inside: Option<&str>,
+) -> Result<Box<dyn ReadSeek>> {
+    if is_container_path(path) {
+        return open_read_dispatch(path, password, inside);
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    match detect_image_format_with_path(file, Some(path)) {
+        Ok(format) if !matches!(format, ImageFormat::Raw) => {
+            let file2 = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let (reader, _size) = wrap_image_reader(file2, format)
+                .with_context(|| format!("unwrap image {}", path.display()))?;
+            Ok(reader)
+        }
+        _ => {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            Ok(Box::new(BufReader::new(file)))
+        }
     }
 }
 
@@ -422,6 +579,7 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_dim_path(path)
         || is_d88_path(path)
         || is_atr_path(path)
+        || is_gzip_image_path(path)
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
@@ -434,6 +592,8 @@ pub fn is_container_path(path: &Path) -> bool {
     is_chd_path(path)
         || is_gho_path(path)
         || is_imz_path(path)
+        || is_zip_image_path(path)
+        || is_gzip_image_path(path)
         || is_flat_floppy_container_path(path)
 }
 
@@ -687,5 +847,134 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, flat);
+    }
+
+    /// A gzip-wrapped `.adz` is recognized as a container and `open_read` peels
+    /// the gzip to the original flat image (so partition detection sees the
+    /// real bytes, not the gzip header — the "Invalid MBR: 0xE148" bug).
+    #[test]
+    fn open_read_decodes_gzip_adz() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.adz");
+        let payload: Vec<u8> = (0..8192usize)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
+        {
+            let f = File::create(&path).unwrap();
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+
+        assert!(is_gzip_image_path(&path));
+        assert!(is_container_path(&path));
+
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload, "gzip peeled to the original image");
+
+        // Seekable (random access into the decoded image).
+        r.seek(SeekFrom::Start(100)).unwrap();
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &payload[100..104]);
+
+        // A .adz without gzip magic is not treated as a gzip image.
+        let bogus = dir.path().join("bogus.adz");
+        std::fs::write(&bogus, b"NOTGZIP").unwrap();
+        assert!(!is_gzip_image_path(&bogus));
+    }
+
+    #[test]
+    fn is_zip_image_path_requires_both_extension_and_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        // Right magic, wrong extension (a non-disk ZIP stays unhandled).
+        let other = dir.path().join("archive.tar");
+        std::fs::write(&other, b"PK\x03\x04rest").unwrap();
+        assert!(
+            !is_zip_image_path(&other),
+            "PK magic without .zip extension"
+        );
+
+        // Right extension, wrong magic.
+        let wrong_magic = dir.path().join("fake.zip");
+        std::fs::write(&wrong_magic, b"NOPE").unwrap();
+        assert!(!is_zip_image_path(&wrong_magic), ".zip without PK magic");
+
+        // Both.
+        let real = dir.path().join("real.zip");
+        std::fs::write(&real, b"PK\x03\x04rest").unwrap();
+        assert!(is_zip_image_path(&real));
+        assert!(is_container_path(&real));
+        // And an .imz is NOT treated as a .zip disk (different opener).
+        let imz = dir.path().join("disk.imz");
+        std::fs::write(&imz, b"PK\x03\x04rest").unwrap();
+        assert!(!is_zip_image_path(&imz));
+    }
+
+    /// A `.zip` holding a raw FAT superfloppy routes through `open_read`, which
+    /// inflates the inner image so partition detection sees the real bytes
+    /// (not the ZIP local-file header) — the same contract as the gzip path.
+    #[test]
+    fn open_read_routes_zip_disk_and_partition_detect_finds_fat() {
+        use crate::partition::PartitionTable;
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("ZIPD")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.zip");
+        {
+            let f = File::create(&path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            zw.start_file(
+                "backup.img",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            zw.write_all(&flat).unwrap();
+            zw.finish().unwrap();
+        }
+
+        assert!(is_zip_image_path(&path));
+        assert!(is_container_path(&path));
+
+        let mut reader = open_read(&path).unwrap();
+        let table = PartitionTable::detect(&mut reader).unwrap();
+        assert_eq!(table.type_name(), "None"); // superfloppy, no partition table
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].type_name, "FAT");
+        assert_eq!(parts[0].size_bytes, flat.len() as u64);
+
+        // open_peeled_read (the CLI's resolve primitive) peels it identically.
+        let mut peeled = open_peeled_read(&path, None).unwrap();
+        let table2 = PartitionTable::detect(&mut peeled).unwrap();
+        assert_eq!(table2.partitions()[0].type_name, "FAT");
+    }
+
+    /// A raw (non-container, non-wrapped) image passes through `open_peeled_read`
+    /// byte-for-byte — the contract the CLI's raw path relies on.
+    #[test]
+    fn open_peeled_read_passes_raw_image_through() {
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("PEEL")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::write(&img, &flat).unwrap();
+
+        let mut r = open_peeled_read(&img, None).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, flat, "raw image read back unchanged");
+
+        // Seekable random access into the (un-peeled) image.
+        r.seek(SeekFrom::Start(512)).unwrap();
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &flat[512..516]);
     }
 }

@@ -65,6 +65,20 @@ pub enum Command {
     #[command(name = "new-x68k-hdd")]
     NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
 
+    /// Build a dvh-wrapped IRIX hard-disk image: an SGI volume header +
+    /// partition table wrapping a formatted EFS root partition, mountable
+    /// by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM
+    /// superfloppy). Populate it with `put IMG@1 host/file /file`.
+    #[command(name = "new-sgi-hdd")]
+    NewSgiHdd(verbs::new_sgi_hdd::NewSgiHddArgs),
+
+    /// Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the
+    /// EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD
+    /// geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with
+    /// `put IMG@1 host/file /file`.
+    #[command(name = "new-sgi-cdrom")]
+    NewSgiCdrom(verbs::new_sgi_cdrom::NewSgiCdromArgs),
+
     /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
     /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
     /// Operates in place; partition data is never moved. (This registers the
@@ -72,6 +86,13 @@ pub enum Command {
     /// boot-block behavior.)
     #[command(name = "mac-scsi-bless")]
     MacScsiBless(verbs::mac_scsi_bless::MacScsiBlessArgs),
+
+    /// Auto-detect what a Mac disk needs to boot and apply only the missing
+    /// pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a
+    /// `--boot-from` donor), and a blessed System Folder. Idempotent; a flat
+    /// HFV is kept flat. Works on flat HFVs and full APM disks alike.
+    #[command(name = "make-bootable")]
+    MakeBootable(verbs::make_bootable::MakeBootableArgs),
 
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
@@ -87,6 +108,18 @@ pub enum Command {
     /// Extract a file, directory tree, or glob match from a filesystem
     /// to the host.
     Get(verbs::get::GetArgs),
+
+    /// Archive a filesystem (or a subtree) to a single `.tar.gz` /
+    /// `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real
+    /// symlinks, so extracting on a case-insensitive host won't clobber
+    /// files that differ only in case.
+    Tar(verbs::tar::TarArgs),
+
+    /// Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a
+    /// filesystem in an image (the inverse of `tar`). Recreates the tree,
+    /// streams files in, and recreates symlinks where the target FS
+    /// supports them.
+    Untar(verbs::untar::UntarArgs),
 
     /// Copy files / directory trees between two disk images without
     /// staging through the host. SRC may be a glob; DST follows `cp`
@@ -262,11 +295,16 @@ pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
+        Command::NewSgiHdd(args) => verbs::new_sgi_hdd::run(args),
+        Command::NewSgiCdrom(args) => verbs::new_sgi_cdrom::run(args),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
+        Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
+        Command::Tar(args) => verbs::tar::run(args),
+        Command::Untar(args) => verbs::untar::run(args),
         Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),

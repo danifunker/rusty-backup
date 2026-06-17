@@ -2,6 +2,7 @@ pub mod adfs;
 pub mod affs;
 pub mod affs_common;
 pub mod affs_fsck;
+pub mod alto;
 pub mod andos;
 pub mod apple_dos;
 pub mod atari_dos;
@@ -24,6 +25,7 @@ pub mod fat;
 pub mod filesystem;
 pub mod fsck;
 pub mod hfs;
+pub mod hfs_boot;
 pub mod hfs_clone;
 pub mod hfs_common;
 pub mod hfs_fsck;
@@ -41,6 +43,7 @@ pub mod jfs_fsck;
 pub mod layout_preserving;
 pub mod mac_alias;
 pub mod mac_scsi_bless;
+pub mod make_bootable;
 pub mod mfs;
 pub mod ntfs;
 pub mod os9;
@@ -55,6 +58,8 @@ pub mod reiserfs;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
+pub mod tar_export;
+pub mod tar_import;
 pub mod tree;
 pub mod ufs;
 pub mod ufs_fsck;
@@ -2048,6 +2053,163 @@ pub fn is_amiga_sfs_type(s: &str) -> bool {
     matches!(s, "SFS\\0" | "SFS\\2")
 }
 
+// --- partition-capability gates --------------------------------------------
+// Pure `(type byte / type string / hint name) -> bool` predicates that every
+// presentation layer (the Inspect tab, Commander Mode panes, the CLI, a future
+// TUI) uses to decide which actions a partition row supports. They live here in
+// the engine — not in any one view — so all UIs share one source of truth.
+// `partition_is_browsable` is the combined gate the partition grids actually
+// call; the others gate the more specific Check / Expand actions.
+
+/// True for an MBR partition type byte whose filesystem the browser can open.
+pub fn is_browsable_type(ptype: u8) -> bool {
+    matches!(
+        ptype,
+        0x01 | 0x04
+            | 0x06
+            | 0x07
+            | 0x0B
+            | 0x0C
+            | 0x0E
+            | 0x11
+            | 0x14
+            | 0x16
+            | 0x1B
+            | 0x1C
+            | 0x1E
+            | 0x83
+            | 0xA0
+            | 0xA1
+            | 0xA8
+            | 0xAF
+    )
+}
+
+/// True for an APM/GPT partition type *string* whose filesystem the browser can
+/// open (AmigaDOS/PFS3/SFS DosType tags, the Apple_* APM types, the GPT Linux
+/// GUID, and the synthetic `Amiga-NDOS` carve view). Notably excludes APM
+/// driver/partition-map entries like `Apple_Driver_IOKit`, which carry no
+/// filesystem.
+pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
+    let Some(s) = type_str else {
+        return false;
+    };
+    if is_amiga_dos_type(s) || is_amiga_pfs3_type(s) || is_amiga_sfs_type(s) {
+        return true;
+    }
+    matches!(
+        s,
+        "Apple_HFS"
+            | "Apple_HFSX"
+            | "Apple_HFS+"
+            | "Apple_UNIX_SVR2"
+            | "Apple_UNIX_SRVR2"
+            | "Apple_PRODOS"
+            | "Apple_ProDOS"
+            // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
+            | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+            // Custom bootblock Amiga disk with no filesystem — browsable via
+            // the synthetic carve view (whole-disk + recoverable text/JSON).
+            | "Amiga-NDOS"
+    )
+}
+
+/// True for a partition-less (superfloppy, type byte 0) image whose detected
+/// filesystem hint name is browsable.
+///
+/// This MUST cover every `fs_hint` that `partition::detect_superfloppy` can
+/// emit: a superfloppy opens with type byte 0, which makes `open_filesystem`
+/// auto-detect the filesystem from the superblock — so *any* hint
+/// `detect_superfloppy` produces is one the browser can open. Keep this in sync
+/// with that function; an omission silently makes the GUI refuse a filesystem
+/// the engine handles (e.g. EFS / MFS / QDOS / human68k / ADFS CD-ROms and
+/// floppies). `"Unknown"` covers the partition-table-present-but-unrecognized
+/// case.
+pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
+    if ptype != 0 {
+        return false;
+    }
+    matches!(
+        type_name,
+        "FAT"
+            | "HFS"
+            | "HFS+"
+            | "NTFS"
+            | "exFAT"
+            | "ProDOS"
+            // Apple DOS 3.3 (the `detect_superfloppy` hint for a 140 KB Apple II
+            // floppy / WOZ); open_filesystem auto-detects it as `applesdos33`.
+            | "DOS 3.3"
+            | "XFS"
+            | "ext"
+            | "btrfs"
+            | "EFS"
+            | "MFS"
+            | "ADFS"
+            | "ANDOS"
+            | "QDOS"
+            | "human68k"
+            | "Amiga-NDOS"
+            | "Alto BFS"
+            | "Pilot/Cedar"
+            | "Unknown"
+    )
+}
+
+/// Fallback: detect FAT from the human-readable type name (older backups that
+/// didn't store a `partition_type_byte`).
+fn is_fat_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("fat")
+}
+
+/// The combined "can this partition be opened in the browser?" gate — the OR of
+/// the type-byte, type-string, FAT-name fallback, and superfloppy-hint checks.
+/// This is the single predicate the Inspect grid and the Commander pane both
+/// call to decide whether to offer Browse (and, for Commander, whether to
+/// auto-open a partition at all).
+pub fn partition_is_browsable(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
+    is_browsable_type(ptype)
+        || is_fat_name(type_name)
+        || is_browsable_type_string(type_string)
+        || is_browsable_superfloppy(ptype, type_name)
+}
+
+/// True when a partition row is a classic-HFS **superfloppy** — a flat,
+/// partition-less HFS volume at LBA 0 (a BasiliskII `.hfv`), carrying
+/// `partition_type_byte == 0` with `type_name == "HFS"` because no partition
+/// table assigned a type byte. The classic-HFS fsck / edit / expand paths are
+/// offset-driven and work at offset 0, but the `0xAF` / APM `Apple_HFS` gates
+/// skip these rows — this lets callers OR them back in.
+pub fn is_superfloppy_hfs(ptype: u8, type_name: &str) -> bool {
+    ptype == 0 && type_name == "HFS"
+}
+
+/// Heuristic: is this partition classic HFS (not HFS+/HFSX)? Gates the
+/// "Expand HFS Volume…" action, which only handles classic HFS. APM rows that
+/// `probe_apple_hfs_type` flagged HFS+/HFSX carry a `type_name` tag like
+/// `Apple_HFS (HFS+)`; those are excluded.
+pub fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
+    let apm_hfs = type_string
+        .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
+        .unwrap_or(false);
+    let mbr_hfs = ptype == 0xAF;
+    // A partition-less HFS superfloppy (a BasiliskII .hfv) is classic HFS too.
+    let superfloppy = is_superfloppy_hfs(ptype, type_name);
+    if !(apm_hfs || mbr_hfs || superfloppy) {
+        return false;
+    }
+    !(type_name.contains("HFS+") || type_name.contains("HFSX"))
+}
+
+/// True for a partition type that supports filesystem checking (fsck): classic
+/// HFS (`0xAF` or APM `Apple_HFS`) and the AmigaDOS OFS/FFS variants.
+pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
+    if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
+        return true;
+    }
+    type_str.map(is_amiga_dos_type).unwrap_or(false)
+}
+
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
 ///
 /// Returns `(fs_type, hfsplus_offset)` where `fs_type` is `"hfs"`, `"hfsplus"`,
@@ -2313,6 +2475,83 @@ pub fn probe_apple_hfs_type<R: Read + Seek>(reader: &mut R, partition_offset: u6
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn browsable_gate_excludes_apm_driver_partitions() {
+        // The bug Commander hit: an APM driver / partition-map entry carries no
+        // filesystem and must NOT be browsable.
+        assert!(!partition_is_browsable(0, Some("Apple_Driver_IOKit"), ""));
+        assert!(!partition_is_browsable(0, Some("Apple_Driver_ATA"), ""));
+        assert!(!partition_is_browsable(0, Some("Apple_partition_map"), ""));
+        assert!(!is_browsable_type_string(Some("Apple_Driver_IOKit")));
+    }
+
+    #[test]
+    fn browsable_gate_accepts_real_filesystems() {
+        assert!(partition_is_browsable(0x0B, None, "FAT32")); // FAT32 type byte
+        assert!(partition_is_browsable(0xAF, None, "HFS")); // MBR HFS
+        assert!(partition_is_browsable(0, Some("Apple_HFS"), "Apple_HFS")); // APM HFS
+        assert!(partition_is_browsable(0, Some("DOS\\1"), "")); // AmigaDOS FFS
+        assert!(partition_is_browsable(0, None, "HFS")); // HFS superfloppy
+        assert!(partition_is_browsable(0, None, "exFAT")); // superfloppy hint
+                                                           // FAT-name fallback for older backups with no type byte.
+        assert!(partition_is_browsable(0x00, None, "FAT16 (no type byte)"));
+    }
+
+    #[test]
+    fn browsable_superfloppy_covers_every_detect_hint() {
+        // Regression guard: every fs_hint `partition::detect_superfloppy` emits
+        // must be browsable (a type-byte-0 superfloppy auto-detects + opens).
+        // These were silently refused by Commander after the gate moved to fs/
+        // — notably the SGI EFS CD-ROM case the user reported.
+        for hint in [
+            "FAT",
+            "HFS",
+            "HFS+",
+            "NTFS",
+            "exFAT",
+            "ext",
+            "btrfs",
+            "XFS",
+            "ProDOS",
+            "DOS 3.3",
+            "EFS",
+            "MFS",
+            "ADFS",
+            "ANDOS",
+            "QDOS",
+            "human68k",
+            "Amiga-NDOS",
+            "Alto BFS",
+            "Pilot/Cedar",
+        ] {
+            assert!(
+                is_browsable_superfloppy(0, hint),
+                "superfloppy hint {hint:?} must be browsable"
+            );
+            assert!(partition_is_browsable(0, None, hint), "hint {hint:?}");
+        }
+    }
+
+    #[test]
+    fn classic_hfs_excludes_hfs_plus() {
+        assert!(is_classic_hfs(0xAF, None, "HFS"));
+        assert!(is_classic_hfs(0, Some("Apple_HFS"), "Apple_HFS"));
+        assert!(is_classic_hfs(0, None, "HFS")); // .hfv superfloppy
+                                                 // HFS+/HFSX (incl. APM rows tagged by probe_apple_hfs_type) are excluded.
+        assert!(!is_classic_hfs(0, Some("Apple_HFS"), "Apple_HFS (HFS+)"));
+        assert!(!is_classic_hfs(0xAF, None, "HFSX"));
+        assert!(!is_classic_hfs(0x0B, None, "FAT32"));
+    }
+
+    #[test]
+    fn checkable_covers_classic_hfs_and_amiga_dos() {
+        assert!(is_checkable_type(0xAF, None));
+        assert!(is_checkable_type(0, Some("Apple_HFS")));
+        assert!(is_checkable_type(0, Some("DOS\\3")));
+        assert!(!is_checkable_type(0x0B, None)); // FAT not checkable
+        assert!(!is_checkable_type(0, Some("Apple_Driver_IOKit")));
+    }
 
     /// Build a 4 KiB buffer whose first 4 bytes are the XFS superblock magic.
     /// Enough to exercise `detect_filesystem_type` without needing a valid

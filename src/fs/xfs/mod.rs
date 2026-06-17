@@ -436,6 +436,7 @@ impl<R: Read + Seek + Send> XfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -783,6 +784,7 @@ impl<R: Read + Seek + Send> Filesystem for XfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -1063,7 +1065,12 @@ mod tests {
     /// slice (rather than a fresh Vec per call) keeps the cargo-test thread pool
     /// from holding N independent copies at once, which would exhaust a 32-bit
     /// address space (the i686 Windows CI leg). Tests that need to mutate the
-    /// image take an owned `.to_vec()` copy.
+    /// image take an owned `.to_vec()` copy; the leaked static plus that owned
+    /// copy is ~1 GiB, and once the heap fragments a contiguous 512 MiB block
+    /// can no longer be carved on i686 — so every test that takes the owned
+    /// copy is `#[cfg_attr(target_pointer_width = "32", ignore = ...)]` and
+    /// runs on 64-bit targets only. Read-only tests share the static and run
+    /// everywhere.
     fn load_sgi_fixture(name: &str) -> &'static [u8] {
         use std::sync::{Mutex, OnceLock};
         static CACHE: OnceLock<Mutex<std::collections::HashMap<String, &'static [u8]>>> =
@@ -1171,6 +1178,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn fsck_tolerates_null_rootino_in_secondary_superblock() {
         // Real mkfs.xfs leaves rootino/rbmino/rsumino as NULLFSINO in the
         // secondary superblocks (verified via `xfs_db -c 'sb 2'`). The
@@ -1190,6 +1201,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn fsck_detects_unaccounted_blocks() {
         // Shrink AG 0's bnobt first free record's blockcount so the freed
         // blocks vanish from the free list while staying unclaimed -> leaked.
@@ -1210,6 +1225,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn fsck_detects_free_block_also_claimed_by_inode() {
         // Patch AG 0's bnobt so a free extent overlaps the root inode chunk
         // (agbno 8..12, marked S_INO). Read bno_root from the AGF (byte
@@ -1230,6 +1249,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn fsck_detects_corrupted_ag_superblock_replica() {
         // Corrupt AG 1's superblock replica: flip its dblocks field so it
         // disagrees with the primary. AG 1 starts at agblocks*blocksize =
@@ -1249,6 +1272,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn fsck_detects_agf_freeblks_mismatch() {
         // Corrupt AG 0's AGF freeblks summary so it disagrees with the
         // free-space btree walk. AGF is sector 1 (byte 512); freeblks is at
@@ -1266,6 +1293,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r4b_rewrites_agf_agi_summaries() {
         // R4b round-trip: corrupt AG 0's AGF freeblks (byte 512+52) and AGI
         // count/freecount (byte 1024+16, 1024+28), run repair(), confirm the
@@ -1314,6 +1345,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r4_rewrites_corrupted_secondary_superblock() {
         // R4 round-trip: corrupt AG 1's secondary superblock geometry
         // (agblocks @ 84..88 and dblocks @ 8..16), run repair(), then confirm
@@ -1357,6 +1392,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r5_recomputes_inode_nblocks() {
         // R5 round-trip: hello.txt (inode 131) is an inline-extents regular
         // file. Corrupt its di_nblocks (core offset 64) to a bogus value, run
@@ -1414,6 +1453,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r7_reconnects_orphan_into_lost_found() {
         // Create a file, then orphan it by dropping the root's last short-form
         // entry (decrement count + di_size in the inode bytes) while leaving the
@@ -1510,6 +1553,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn shortform_to_block_dir_conversion() {
         // Add enough files to overflow the inline root directory, forcing a
         // short-form -> single-block conversion (exercises the dir2 block
@@ -1572,6 +1619,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn delete_entry_frees_inode_and_blocks() {
         // Create a file + an empty dir, then delete both; the volume returns to
         // a clean state with the entries gone and free space recovered.
@@ -1647,6 +1698,88 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
+    fn rename_preserves_inode_and_content_xfs() {
+        // Rename a file and a directory in place; identity (inode) and content
+        // are preserved, and the volume stays fsck-clean (which catches any
+        // parent-nlink drift from the directory rename).
+        use crate::fs::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        use std::io::Cursor as IoCursor;
+        let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+
+        let img = load_fixture().to_vec();
+        let mut cursor = Cursor::new(img);
+        let child_ino;
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("open editable");
+            let root = fs.root().expect("root");
+            let mut data = IoCursor::new(payload.clone());
+            let fe = fs
+                .create_file(
+                    &root,
+                    "before.bin",
+                    &mut data,
+                    payload.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create_file");
+            child_ino = fe.location;
+            fs.create_directory(&root, "olddir", &CreateDirectoryOptions::default())
+                .expect("mkdir");
+            fs.sync_metadata().expect("sync");
+        }
+        // Reopen and rename both.
+        {
+            let mut fs = XfsFilesystem::open(&mut cursor, 0).expect("reopen editable");
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            let before = entries
+                .iter()
+                .find(|e| e.name == "before.bin")
+                .expect("file");
+            fs.rename(&root, before, "after.bin").expect("rename file");
+            let olddir = entries.iter().find(|e| e.name == "olddir").expect("dir");
+            fs.rename(&root, olddir, "newdir").expect("rename dir");
+            fs.sync_metadata().expect("sync");
+        }
+
+        let repaired = cursor.into_inner();
+        let mut fs = XfsFilesystem::open(Cursor::new(repaired), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let after = entries
+            .iter()
+            .find(|e| e.name == "after.bin")
+            .expect("renamed file present");
+        assert!(!entries.iter().any(|e| e.name == "before.bin"));
+        assert_eq!(after.location, child_ino, "inode identity preserved");
+        let got = fs.read_file(after, payload.len()).expect("read");
+        assert_eq!(got, payload, "content preserved");
+        let newdir = entries
+            .iter()
+            .find(|e| e.name == "newdir")
+            .expect("renamed dir present");
+        assert!(newdir.is_directory());
+        // Original fixture entry survives.
+        assert!(entries.iter().any(|e| e.name == "hello.txt"));
+        let res = fs.run_fsck().expect("fsck");
+        assert!(
+            res.errors.is_empty(),
+            "fsck errors after rename: {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn block_dir_recompacts_to_shortform_on_shrink() {
         // §2.1 hole (B): grow root to block form by adding 20 files, then
         // delete them all. The block_remove_entry path is supposed to detect
@@ -1759,6 +1892,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn dir_overflow_converts_block_to_leaf_form() {
         // §2.1 hole (C): when a single-block directory would overflow on the
         // next insert, convert it to leaf form — two XD2D data blocks plus an
@@ -1865,6 +2002,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn create_file_writes_bmbt_format_when_extents_exceed_inline_cap() {
         // §2.1 hole (D): when an allocation produces more extent records than
         // fit the inline data fork (`max_inline = (inodesize - fork_offset) /
@@ -2033,6 +2174,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn create_file_in_shortform_root_roundtrips_data() {
         // Allocate an inode + data blocks + insert: create /payload.bin with a
         // known pattern, then read it back byte-for-byte and confirm the volume
@@ -2082,6 +2227,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn create_directory_in_shortform_root() {
         // Allocate an inode + insert a short-form entry: create /made_dir under
         // the root, then confirm it lists, is an empty directory, the root link
@@ -2136,6 +2285,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r7_recomputes_inode_nlink() {
         // R7 link-count half: corrupt the root directory's nlink (v2 inodes ->
         // di_nlink at core offset 16), repair(), and confirm R7 recomputes it
@@ -2313,6 +2466,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn repair_r6_drops_dangling_shortform_entry() {
         // R6 round-trip: free hello.txt (inode 131) by zeroing its mode, then
         // repair(). R3 frees it in the inobt, R2 reclaims its blocks, and R6
@@ -3084,6 +3241,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn alloc_new_inode_chunk_extends_inobt_and_keeps_volume_clean() {
         // §2.1 hole (A): when every existing inobt chunk is full,
         // alloc_new_inode_chunk should carve fresh aligned blocks, write 64
@@ -3632,6 +3793,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn alloc_new_inode_chunk_promotes_full_leaf_to_multi_level() {
         // §2.1 hole (A) follow-up: when the AG's only inobt leaf is full
         // (numrecs == max_leaf), alloc_new_inode_chunk must switch from the
@@ -3910,6 +4075,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_pointer_width = "32",
+        ignore = "512 MiB SGI fixture (.to_vec) exhausts the 32-bit address space; runs on 64-bit targets only"
+    )]
     fn dir1_dispatch_uses_dir1_shortform_parser() {
         // Patch the fixture's versionnum to clear the DIRV2 bit, then assert
         // the dir1 dispatch path is taken. The fixture's root inode is dir2

@@ -149,6 +149,59 @@ impl BrowseSession {
             let _ = f.read(&mut magic);
         }
 
+        // Xerox Alto disk packs (PARC Disk Image, or a CopyDisk stream). These
+        // are label-bearing disks that can't be represented as a flat sector
+        // stream the way every other source here can, so they bypass
+        // open_filesystem: read the whole pack, decode it into an in-memory
+        // Disk, and hand back a BFS filesystem view. PDI starts with the magic
+        // "PARCDISK"; a CopyDisk stream opens with bytes 00 07 00 03 00 0a
+        // (params block: length=7, type=3, diskType=10 AltoDiablo).
+        // Salto cooked `.dsk` images carry no magic; recognize them by the exact
+        // Diablo-31 image size (open_pack does the real validation).
+        let alto_size = std::fs::metadata(path).map(|m| m.len() as usize).ok();
+        let is_salto_dsk = alto_size == Some(crate::fs::alto::salto::IMAGE_BYTES);
+        // Trident (TFS) pack image: recognized by the exact T-80 / T-300 size.
+        let is_trident = matches!(
+            alto_size,
+            Some(crate::fs::alto::trident::T80_BYTES) | Some(crate::fs::alto::trident::T300_BYTES)
+        );
+        // Dwarf Draco 6085 ".zdisk"/".zdelta" is a zlib stream (a Pilot pack);
+        // gate the full read on the zlib magic byte, then confirm by inflating
+        // the prefix to the DAAD signature so we don't slurp unrelated files.
+        let zdisk_bytes = if magic[0] == 0x78 {
+            std::fs::read(path)
+                .ok()
+                .filter(|b| crate::fs::alto::zdisk::is_zdisk(b))
+        } else {
+            None
+        };
+        if &magic == b"PARCDISK"
+            || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+            || is_salto_dsk
+            || is_trident
+            || zdisk_bytes.is_some()
+        {
+            let bytes = match zdisk_bytes {
+                Some(b) => b,
+                None => std::fs::read(path).map_err(FilesystemError::Io)?,
+            };
+            let disk = crate::fs::alto::open_pack(&bytes)?;
+            // A PDI with fsFamily=2 (or any .zdisk) is a Pilot/Cedar volume
+            // (structurally unrelated to BFS); everything else is an Alto BFS pack.
+            if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
+                use crate::fs::alto::pilot::{Generation, PilotFilesystem};
+                // File-ID generation comes from PDI flags bit 2; a 6085 .zdisk
+                // carries no flags, so default to the original-Pilot generation
+                // (these are classic Pilot 12.3 volumes). Generation does not
+                // affect the read path, only how a written ID is interpreted.
+                let generation = crate::fs::alto::pdi::read_header(&bytes)
+                    .map(|h| Generation::from_pdi_flag_bit2(h.flags & 0x0004 != 0))
+                    .unwrap_or(Generation::OriginalPilot);
+                return Ok(Box::new(PilotFilesystem::open(disk, generation)?));
+            }
+            return Ok(Box::new(crate::fs::alto::bfs::BfsFilesystem::open(disk)));
+        }
+
         // CHD — 8-byte magic "MComprHD" at offset 0.
         if &magic == b"MComprHD" {
             let chd_reader = ChdReader::open(path)
@@ -176,7 +229,7 @@ impl BrowseSession {
             );
         }
 
-        // IMZ — 4-byte magic "PK\x03\x04" (ZIP local file header).
+        // IMZ / .zip — 4-byte magic "PK\x03\x04" (ZIP local file header).
         if &magic[..4] == b"PK\x03\x04" {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("imz") {
@@ -189,7 +242,50 @@ impl BrowseSession {
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );
+            } else if ext.eq_ignore_ascii_case("zip") {
+                // A plain .zip holding a RAW disk image. open_read inflates the
+                // chosen entry to a temp flat image; the inner image may be a
+                // superfloppy (offset 0) or a partitioned disk, so honor
+                // partition_offset exactly like a raw image. The GUI auto-picks
+                // the disk entry (no `--inside`); an ambiguous archive surfaces
+                // the multi-image error.
+                let pw = self.password.as_deref().map(|s| s.as_bytes());
+                let reader = crate::model::source_reader::open_read_with_password(path, pw)
+                    .map_err(|e| {
+                        FilesystemError::Parse(format!("failed to open ZIP disk: {e:#}"))
+                    })?;
+                let effective_offset = if self.partition_type == 0 {
+                    0
+                } else {
+                    self.partition_offset
+                };
+                return fs::open_filesystem(
+                    reader,
+                    effective_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
             }
+        }
+
+        // Gzip-wrapped Amiga images (.adz/.hdz) — magic 1f 8b. open_read peels
+        // the gzip to a temp flat image; the inner image may be a superfloppy
+        // (.adf, AFFS at offset 0) or RDB-partitioned (.hdf), so honor the
+        // partition offset just like a raw image (offset 0 for a superfloppy).
+        if magic[0] == 0x1f && magic[1] == 0x8b {
+            let reader = crate::model::source_reader::open_read(path)
+                .map_err(|e| FilesystemError::Parse(format!("failed to open gzip image: {e:#}")))?;
+            let effective_offset = if self.partition_type == 0 {
+                0
+            } else {
+                self.partition_offset
+            };
+            return fs::open_filesystem(
+                reader,
+                effective_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
         }
 
         // Flat floppy containers (MSA / EDSK / D88 / DIM / XDF / HDM /
@@ -347,6 +443,8 @@ impl BrowseSession {
 
             let fs_type = fs.fs_type().to_string();
             let volume_label = fs.volume_label().unwrap_or("").to_string();
+            let total_size = fs.total_size();
+            let used_size = fs.used_size();
             let blessed_folder = fs.blessed_system_folder();
 
             set_phase("Reading root directory...");
@@ -366,6 +464,8 @@ impl BrowseSession {
                 g.phase = "Done".to_string();
                 g.fs_type = fs_type;
                 g.volume_label = volume_label;
+                g.total_size = total_size;
+                g.used_size = used_size;
                 g.blessed_folder = blessed_folder;
                 g.root = root;
                 g.root_entries = root_entries;
@@ -412,6 +512,45 @@ impl BrowseSession {
             .source_path
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no source path set".into()))?;
+
+        // Xerox Alto packs: read the whole pack, decode to an in-memory Disk,
+        // and hand back an editable BFS view. Edits rebuild the volume and
+        // sync writes it back as a PDI (the no-op container commit applies).
+        // PDI magic "PARCDISK"; CopyDisk params block 00 07 00 03 00 0a.
+        {
+            let mut magic = [0u8; 8];
+            if let Ok(mut f) = File::open(path) {
+                let _ = f.read(&mut magic);
+            }
+            let is_salto_dsk = std::fs::metadata(path)
+                .map(|m| m.len() as usize == crate::fs::alto::salto::IMAGE_BYTES)
+                .unwrap_or(false);
+            // Dwarf Draco 6085 ".zdisk" (a Pilot pack); see open() for the gating.
+            let is_zdisk = magic[0] == 0x78
+                && std::fs::read(path)
+                    .map(|b| crate::fs::alto::zdisk::is_zdisk(&b))
+                    .unwrap_or(false);
+            if &magic == b"PARCDISK"
+                || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+                || is_salto_dsk
+                || is_zdisk
+            {
+                let bytes = std::fs::read(path).map_err(FilesystemError::Io)?;
+                let disk = crate::fs::alto::open_pack(&bytes)?;
+                // Pilot/Cedar volumes (fsFamily=2, and every .zdisk) are
+                // read-only for now.
+                if disk.geometry.family == crate::fs::alto::FsFamily::Pilot {
+                    return Err(FilesystemError::Unsupported(
+                        "Pilot/Cedar volumes are read-only".into(),
+                    ));
+                }
+                let efs = Box::new(crate::fs::alto::bfs::BfsFilesystem::open_editable(
+                    disk,
+                    path.clone(),
+                ));
+                return Ok((efs, ContainerEditCommit { session: None }));
+            }
+        }
 
         // Floppy container: edit a decoded temp flat, re-encode on commit.
         if crate::model::source_reader::is_editable_container_path(path) {
@@ -461,7 +600,7 @@ impl BrowseSession {
 /// the container and atomically replaces the original. Dropping without
 /// committing discards container edits (so a failed/aborted edit leaves the
 /// original container untouched).
-#[must_use = "call commit() to persist edits to a floppy container"]
+#[must_use = "call commit() to persist edits to a container"]
 pub struct ContainerEditCommit {
     session: Option<crate::model::container_edit::ContainerEditSession>,
 }
@@ -500,6 +639,9 @@ pub struct BrowseOpenStatus {
     pub finished: bool,
     pub fs_type: String,
     pub volume_label: String,
+    /// Total filesystem size and used bytes, for the browser's free-space line.
+    pub total_size: u64,
+    pub used_size: u64,
     pub blessed_folder: Option<(u64, String)>,
     pub root: Option<FileEntry>,
     pub root_entries: Option<Vec<FileEntry>>,
@@ -521,6 +663,8 @@ impl BrowseOpenStatus {
             finished: false,
             fs_type: String::new(),
             volume_label: String::new(),
+            total_size: 0,
+            used_size: 0,
             blessed_folder: None,
             root: None,
             root_entries: None,
@@ -620,5 +764,142 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.name == "R.TXT"));
+    }
+
+    /// A Xerox Alto pack (here a PARC Disk Image) must route through the Alto
+    /// branch of `open()` and come back as a BFS filesystem view — this is the
+    /// exact path the GUI browse view takes when a user opens a `.pdi`/`.bfs`.
+    #[test]
+    fn open_routes_alto_pdi_to_bfs_filesystem() {
+        use crate::fs::alto::{Disk, FsFamily, Geometry, Sector};
+        use std::io::Write as _;
+
+        let geometry = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 1,
+            n_heads: 1,
+            n_sectors: 4,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let total = geometry.total_sectors();
+        let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
+        let pdi = crate::fs::alto::pdi::write(&Disk { geometry, sectors });
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&pdi).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open an Alto PDI pack");
+        assert_eq!(fs.fs_type(), "Alto BFS");
+    }
+
+    #[test]
+    fn open_routes_salto_dsk_to_bfs_filesystem() {
+        use crate::fs::alto::{salto, Disk, FsFamily, Geometry, Sector};
+        use std::io::Write as _;
+
+        // A blank Salto-shaped Diablo-31 pack written in Salto's .dsk container.
+        let geometry = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 203,
+            n_heads: 2,
+            n_sectors: 12,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let total = geometry.total_sectors();
+        let sectors = (0..total).map(|_| Sector::zeroed(16, 512)).collect();
+        let dsk = salto::write(&Disk { geometry, sectors }).expect("salto write");
+        assert_eq!(dsk.len(), salto::IMAGE_BYTES);
+
+        let mut tmp = tempfile::Builder::new().suffix(".dsk").tempfile().unwrap();
+        tmp.write_all(&dsk).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open a Salto .dsk pack");
+        assert_eq!(fs.fs_type(), "Alto BFS");
+    }
+
+    #[test]
+    fn open_routes_pilot_pdi_to_pilot_filesystem() {
+        use crate::fs::alto::pilot::{self, Generation};
+        use std::io::Write as _;
+
+        // A blank Cedar-nucleus Pilot volume, written as a PDI (fsFamily=2).
+        let disk = pilot::create_blank(
+            pilot::pilot_geometry(128),
+            Generation::CedarNucleus,
+            "RouteTest",
+        )
+        .expect("create blank pilot volume");
+        let pdi = crate::fs::alto::pdi::write(&disk);
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&pdi).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let mut fs = session
+            .open()
+            .expect("BrowseSession should open a Pilot PDI volume");
+        assert_eq!(fs.fs_type(), "Pilot/Cedar");
+        assert_eq!(fs.volume_label(), Some("RouteTest"));
+        // Blank volume: browsable root, zero files.
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("list").is_empty());
+
+        // Editing a Pilot volume is refused (read-only).
+        assert!(session.open_editable().is_err());
+    }
+
+    #[test]
+    fn open_routes_zdisk_to_pilot_filesystem() {
+        use crate::fs::alto::pilot::{self, Generation};
+        use crate::fs::alto::{zdisk, FsFamily, Geometry};
+        use std::io::Write as _;
+
+        // A blank original-Pilot volume on a 6085-shaped geometry (16
+        // sectors/track), serialized to the Dwarf Draco `.zdisk` container.
+        let geo = Geometry {
+            family: FsFamily::Pilot,
+            disk_model: 0,
+            n_disks: 1,
+            n_cylinders: 40,
+            n_heads: 1,
+            n_sectors: 16,
+            label_bytes: 20,
+            data_bytes: 512,
+        };
+        let disk = pilot::create_blank(geo, Generation::OriginalPilot, "ZDiskVol")
+            .expect("create blank pilot volume");
+        let zbytes = zdisk::write(&disk).expect("zdisk write");
+
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".zdisk")
+            .tempfile()
+            .unwrap();
+        tmp.write_all(&zbytes).unwrap();
+
+        let mut session = BrowseSession::new();
+        session.source_path = Some(tmp.path().to_path_buf());
+        let fs = session
+            .open()
+            .expect("BrowseSession should open a Dwarf .zdisk Pilot volume");
+        assert_eq!(fs.fs_type(), "Pilot/Cedar");
+        assert_eq!(fs.volume_label(), Some("ZDiskVol"));
+
+        // A .zdisk Pilot volume is read-only.
+        assert!(session.open_editable().is_err());
     }
 }

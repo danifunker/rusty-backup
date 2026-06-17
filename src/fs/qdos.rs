@@ -775,6 +775,67 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "QDOS subdir rename deferred — only root supported".into(),
+            ));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_qdos_name(new_name)?;
+        // QDOS names are case-sensitive on disk (we mirror sQLux's literal
+        // comparison), so any name distinct from the current one that
+        // already exists is a real collision with a different entry.
+        if self.find_dir_slot_by_name(new_name).is_ok() {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+
+        // Locate this file's directory slot and rewrite the WHOLE 64-byte
+        // slot so a shorter name zeroes the old tail. The name+length live
+        // at 0x0E (length, BE u16) and 0x10.. (body). All other fields
+        // (file_length, access_keys, file_type, first_block) are preserved
+        // verbatim, keeping the file's identity and contents untouched.
+        let slot_index = self.find_dir_slot_by_name(&entry.name)?;
+        let slot_off = self.dir_slot_byte_offset(slot_index)?;
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        let mut slot = [0u8; DIR_ENTRY_SIZE];
+        self.reader.read_exact(&mut slot)?;
+        // Clear the old name region (length + 36-byte body) then stamp new.
+        BigEndian::write_u16(&mut slot[0x0E..0x10], new_name.len() as u16);
+        for b in &mut slot[0x10..0x10 + 36] {
+            *b = 0;
+        }
+        slot[0x10..0x10 + new_name.len()].copy_from_slice(new_name.as_bytes());
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        self.reader.write_all(&slot)?;
+
+        // The name+length are ALSO mirrored in the 64-byte file header at
+        // the start of the file's first cluster (create_file writes both).
+        // Rewrite the same offsets there so the two copies stay in sync.
+        let first_cluster = entry.location as u16;
+        if first_cluster != 0 {
+            let hdr_off = self.cluster_byte_offset(first_cluster);
+            self.reader.seek(SeekFrom::Start(hdr_off))?;
+            let mut hdr = [0u8; FILE_HEADER_BYTES];
+            self.reader.read_exact(&mut hdr)?;
+            BigEndian::write_u16(&mut hdr[0x0E..0x10], new_name.len() as u16);
+            for b in &mut hdr[0x10..0x10 + 36] {
+                *b = 0;
+            }
+            hdr[0x10..0x10 + new_name.len()].copy_from_slice(new_name.as_bytes());
+            self.reader.seek(SeekFrom::Start(hdr_off))?;
+            self.reader.write_all(&hdr)?;
+        }
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -1284,6 +1345,50 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn rename_changes_name_in_slot_and_header() {
+        let disk = build_synthetic_qxlwin();
+        let cur = Cursor::new(disk);
+        let mut fs = QdosFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let payload = b"qdos rename content";
+        let created = fs
+            .create_file(
+                &root,
+                "OLDNAME",
+                &mut payload.as_slice(),
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let cluster = created.location;
+        fs.rename(&root, &created, "RENAMED_QL").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Re-open from the backing buffer to confirm the slot + file-header
+        // mirror both carry the new name.
+        let raw = fs.reader.into_inner();
+        let mut fs2 = QdosFilesystem::open(Cursor::new(raw), 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let post = fs2.list_directory(&root2).unwrap();
+        assert!(post.iter().all(|e| e.name != "OLDNAME"));
+        let renamed = post.iter().find(|e| e.name == "RENAMED_QL").unwrap();
+        // Identity preserved: same first cluster, same user-visible size.
+        assert_eq!(renamed.location, cluster);
+        assert_eq!(renamed.size, payload.len() as u64);
+        // Contents intact.
+        let got = fs2.read_file(renamed, 1024).unwrap();
+        assert_eq!(&got, payload);
+
+        // File-header mirror at the first cluster carries the new name too.
+        let hdr = fs2
+            .read_chain_bytes(renamed.location as u16, FILE_HEADER_BYTES)
+            .unwrap();
+        let hdr_name_len = BigEndian::read_u16(&hdr[0x0E..0x10]) as usize;
+        assert_eq!(hdr_name_len, "RENAMED_QL".len());
+        assert_eq!(&hdr[0x10..0x10 + hdr_name_len], b"RENAMED_QL");
     }
 
     #[test]

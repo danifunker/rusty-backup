@@ -19,6 +19,34 @@ use crate::fs::filesystem::{
 };
 use crate::fs::resource_fork::{self, ImportedResourceFork};
 
+/// Original timestamps captured from a source file so a cross-image copy can
+/// reproduce them on the destination instead of stamping the current time.
+/// Each filesystem family uses its own date representation; the unused half is
+/// `None`. Amiga dates are applied via `CreateFileOptions::amiga_date` (honored
+/// by AFFS `create_file`); HFS dates via `set_dates` after creation.
+#[derive(Debug, Clone, Default)]
+pub struct PreservedDates {
+    /// AmigaDOS `(days, minutes, ticks)` since 1978-01-01.
+    pub amiga: Option<(i32, i32, i32)>,
+    /// HFS/HFS+ `(create, modify, backup)` in Mac-epoch seconds.
+    pub mac: Option<(u32, u32, u32)>,
+}
+
+impl PreservedDates {
+    /// Capture whatever raw dates a source `FileEntry` carries (HFS `mac_dates`
+    /// and/or Amiga `amiga_date`). Returns `None` when the entry has neither, so
+    /// the copy just stamps the current time.
+    pub fn from_entry(entry: &FileEntry) -> Option<Self> {
+        if entry.mac_dates.is_none() && entry.amiga_date.is_none() {
+            return None;
+        }
+        Some(Self {
+            amiga: entry.amiga_date,
+            mac: entry.mac_dates,
+        })
+    }
+}
+
 /// A single edit operation queued by the GUI, applied later against an
 /// editable filesystem in insertion order.
 #[derive(Debug, Clone)]
@@ -39,6 +67,10 @@ pub enum StagedEdit {
         /// resource_fork sidecar if any, else the extension dictionary).
         hfs_type_override: Option<[u8; 4]>,
         hfs_creator_override: Option<[u8; 4]>,
+        /// Original timestamps captured from the source file, applied to the
+        /// created copy so dates survive a cross-image copy (the "keep original
+        /// dates" option). `None` lets `create_file` stamp the current time.
+        dates: Option<PreservedDates>,
     },
     CreateDirectory {
         parent: FileEntry,
@@ -51,6 +83,14 @@ pub enum StagedEdit {
     DeleteRecursive {
         parent: FileEntry,
         entry: FileEntry,
+    },
+    /// Rename an entry in place (keeps its identity / contents). Applied via
+    /// [`EditableFilesystem::rename`]; the filesystem must support it (gated in
+    /// the GUI by `fs::supports_rename`).
+    Rename {
+        parent: FileEntry,
+        entry: FileEntry,
+        new_name: String,
     },
     SetProdosType {
         entry: FileEntry,
@@ -67,11 +107,33 @@ pub enum StagedEdit {
     BlessFolder {
         entry: FileEntry,
     },
+    /// Write the 1024-byte HFS boot-block region (sectors 0–1) verbatim,
+    /// captured from a donor disk at staging time. Makes a classic-HFS
+    /// volume bootable; HFS/HFS+ only.
+    WriteBootBlocks {
+        blocks: Box<[u8; 1024]>,
+    },
     /// Set HFS/HFS+ type and creator codes on an existing on-disk file.
     SetTypeCreator {
         entry: FileEntry,
         type_code: [u8; 4],
         creator_code: [u8; 4],
+    },
+    /// Set Unix permission bits (`st_mode`) on an existing entry. Applied via
+    /// [`EditableFilesystem::set_permissions`]; ext-only today (other Unix
+    /// filesystems return `Unsupported`).
+    SetPermissions {
+        entry: FileEntry,
+        mode: u32,
+    },
+    /// Set HFS/HFS+ creation/modification/backup dates on an existing entry.
+    /// Values are Mac epoch seconds (since 1904-01-01 UTC); applied via
+    /// [`EditableFilesystem::set_dates`].
+    SetDates {
+        entry: FileEntry,
+        create: u32,
+        modify: u32,
+        backup: u32,
     },
 }
 
@@ -125,10 +187,14 @@ pub fn apply_edit(
             resource_fork: rsrc_import,
             hfs_type_override,
             hfs_creator_override,
+            dates,
         } => {
             let mut opts = CreateFileOptions {
                 type_code: prodos_type.map(|t| format!("${:02X}", t)),
                 aux_type: *prodos_aux,
+                // Amiga dates round-trip via create_file (AFFS honors this);
+                // HFS dates are applied with set_dates after creation below.
+                amiga_dates: dates.as_ref().and_then(|d| d.amiga),
                 ..Default::default()
             };
 
@@ -173,7 +239,13 @@ pub fn apply_edit(
 
             let mut file = File::open(host_path).map_err(FilesystemError::Io)?;
             let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
-            efs.create_file(&resolved_parent, name, &mut file, *size, &opts)?;
+            let created = efs.create_file(&resolved_parent, name, &mut file, *size, &opts)?;
+            // HFS/HFS+ dates aren't a create_file option, so apply them after
+            // the fact. Best-effort: filesystems without set_dates return
+            // Unsupported, which we ignore (the copy keeps its create-time stamp).
+            if let Some((c, m, b)) = dates.as_ref().and_then(|d| d.mac) {
+                let _ = efs.set_dates(&created, c, m, b);
+            }
             Ok(())
         }
         StagedEdit::CreateDirectory { parent, name } => {
@@ -183,6 +255,14 @@ pub fn apply_edit(
         }
         StagedEdit::DeleteEntry { parent, entry } => efs.delete_entry(parent, entry),
         StagedEdit::DeleteRecursive { parent, entry } => efs.delete_recursive(parent, entry),
+        StagedEdit::Rename {
+            parent,
+            entry,
+            new_name,
+        } => {
+            let resolved_parent = resolve_dir_by_path(efs, &parent.path)?;
+            efs.rename(&resolved_parent, entry, new_name)
+        }
         StagedEdit::SetProdosType {
             entry,
             type_byte,
@@ -190,6 +270,7 @@ pub fn apply_edit(
         } => efs.set_prodos_type(entry, *type_byte, *aux_type),
         StagedEdit::SetProdosAccess { entry, access } => efs.set_prodos_access(entry, *access),
         StagedEdit::BlessFolder { entry } => efs.set_blessed_folder(entry),
+        StagedEdit::WriteBootBlocks { blocks } => efs.write_boot_blocks(blocks),
         StagedEdit::SetTypeCreator {
             entry,
             type_code,
@@ -199,6 +280,13 @@ pub fn apply_edit(
             &String::from_utf8_lossy(type_code),
             &String::from_utf8_lossy(creator_code),
         ),
+        StagedEdit::SetPermissions { entry, mode } => efs.set_permissions(entry, *mode),
+        StagedEdit::SetDates {
+            entry,
+            create,
+            modify,
+            backup,
+        } => efs.set_dates(entry, *create, *modify, *backup),
     }
 }
 
@@ -227,6 +315,56 @@ impl EditQueue {
 
     pub fn len(&self) -> usize {
         self.edits.len()
+    }
+
+    /// One plain-language line per staged edit, in apply order — for a
+    /// "pending edits" review list (the GUI shows these before Apply).
+    pub fn describe(&self) -> Vec<String> {
+        self.edits
+            .iter()
+            .map(|e| match e {
+                StagedEdit::AddFile { parent, name, .. } => {
+                    format!("Add file: {}", Self::pending_path(&parent.path, name))
+                }
+                StagedEdit::CreateDirectory { parent, name } => {
+                    format!("New folder: {}", Self::pending_path(&parent.path, name))
+                }
+                StagedEdit::DeleteEntry { entry, .. } => format!("Delete: {}", entry.path),
+                StagedEdit::DeleteRecursive { entry, .. } => {
+                    format!("Delete (recursive): {}", entry.path)
+                }
+                StagedEdit::Rename {
+                    entry, new_name, ..
+                } => format!("Rename: {} -> {}", entry.path, new_name),
+                StagedEdit::SetProdosType {
+                    entry,
+                    type_byte,
+                    aux_type,
+                } => format!(
+                    "ProDOS type: {} -> ${type_byte:02X}/${aux_type:04X}",
+                    entry.path
+                ),
+                StagedEdit::SetProdosAccess { entry, access } => {
+                    format!("ProDOS access: {} -> ${access:02X}", entry.path)
+                }
+                StagedEdit::BlessFolder { entry } => format!("Bless folder: {}", entry.path),
+                StagedEdit::WriteBootBlocks { .. } => "Write boot blocks".to_string(),
+                StagedEdit::SetTypeCreator {
+                    entry,
+                    type_code,
+                    creator_code,
+                } => format!(
+                    "Type/Creator: {} -> {}/{}",
+                    entry.path,
+                    String::from_utf8_lossy(type_code),
+                    String::from_utf8_lossy(creator_code),
+                ),
+                StagedEdit::SetPermissions { entry, mode } => {
+                    format!("Permissions: {} -> {:o}", entry.path, mode & 0o7777)
+                }
+                StagedEdit::SetDates { entry, .. } => format!("Dates: {}", entry.path),
+            })
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -276,6 +414,55 @@ impl EditQueue {
             }
             _ => false,
         })
+    }
+
+    /// True when a metadata edit (type/creator, ProDOS type/access, dates, or
+    /// permissions) is staged for `entry_path` — drives the "changed" row tint
+    /// so the user sees which existing files have pending metadata edits.
+    pub fn has_pending_metadata(&self, entry_path: &str) -> bool {
+        self.edits.iter().any(|edit| match edit {
+            StagedEdit::SetTypeCreator { entry, .. }
+            | StagedEdit::SetProdosType { entry, .. }
+            | StagedEdit::SetProdosAccess { entry, .. }
+            | StagedEdit::SetDates { entry, .. }
+            | StagedEdit::SetPermissions { entry, .. } => entry.path == entry_path,
+            _ => false,
+        })
+    }
+
+    /// Remove any `Delete*` edit targeting `entry_path` (the "undelete" action).
+    /// Returns `true` if a matching edit was removed.
+    pub fn remove_pending_delete(&mut self, entry_path: &str) -> bool {
+        let before = self.edits.len();
+        self.edits.retain(|edit| {
+            !matches!(
+                edit,
+                StagedEdit::DeleteEntry { entry, .. } | StagedEdit::DeleteRecursive { entry, .. }
+                    if entry.path == entry_path
+            )
+        });
+        self.edits.len() < before
+    }
+
+    /// New name of a pending `Rename` targeting `entry_path`, if any (the most
+    /// recently staged one wins).
+    pub fn pending_rename_for(&self, entry_path: &str) -> Option<&str> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::Rename {
+                entry, new_name, ..
+            } if entry.path == entry_path => Some(new_name.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Remove any pending `Rename` targeting `entry_path`. Returns `true` if a
+    /// matching edit was removed.
+    pub fn remove_pending_rename(&mut self, entry_path: &str) -> bool {
+        let before = self.edits.len();
+        self.edits.retain(
+            |edit| !matches!(edit, StagedEdit::Rename { entry, .. } if entry.path == entry_path),
+        );
+        self.edits.len() < before
     }
 
     /// Synthesize `FileEntry`s for pending adds whose parent is `parent_path`.
@@ -398,6 +585,18 @@ impl EditQueue {
                     .unwrap_or([0; 4]);
                 return (t, c);
             }
+        }
+        // A staged SetTypeCreator on an existing file wins over the on-disk
+        // value, so the editor/detail rows reflect the pending change.
+        if let Some((t, c)) = self.edits.iter().rev().find_map(|e| match e {
+            StagedEdit::SetTypeCreator {
+                entry: e2,
+                type_code,
+                creator_code,
+            } if e2.path == entry.path => Some((*type_code, *creator_code)),
+            _ => None,
+        }) {
+            return (t, c);
         }
         let t = entry
             .type_code
@@ -525,5 +724,321 @@ impl EditQueue {
             type_code,
             creator_code,
         });
+    }
+
+    /// Push a `SetPermissions` edit, replacing any prior one targeting the
+    /// same on-disk path.
+    pub fn replace_set_permissions(&mut self, entry: &FileEntry, mode: u32) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetPermissions { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetPermissions {
+            entry: entry.clone(),
+            mode,
+        });
+    }
+
+    /// Return the permission bits the user has staged for `entry_path`, if any.
+    pub fn pending_permissions_for(&self, entry_path: &str) -> Option<u32> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetPermissions { entry, mode } if entry.path == entry_path => Some(*mode),
+            _ => None,
+        })
+    }
+
+    /// Push a `SetDates` edit, replacing any prior one targeting the same
+    /// on-disk path. Dates are Mac epoch seconds.
+    pub fn replace_set_dates(&mut self, entry: &FileEntry, create: u32, modify: u32, backup: u32) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetDates { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetDates {
+            entry: entry.clone(),
+            create,
+            modify,
+            backup,
+        });
+    }
+
+    /// Return the (create, modify, backup) Mac-epoch dates the user has staged
+    /// for `entry_path`, if any.
+    pub fn pending_dates_for(&self, entry_path: &str) -> Option<(u32, u32, u32)> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetDates {
+                entry,
+                create,
+                modify,
+                backup,
+            } if entry.path == entry_path => Some((*create, *modify, *backup)),
+            _ => None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::filesystem::Filesystem;
+    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use std::io::Cursor;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Commander's delete-toggle round trip: staging a delete makes the entry
+    /// pending, and `remove_pending_delete` (undelete) clears it without
+    /// disturbing an unrelated staged delete.
+    #[test]
+    fn remove_pending_delete_undeletes_one_entry() {
+        let parent = FileEntry::new_directory("dir".into(), "/dir".into(), 0);
+        let a = FileEntry::new_file("a.txt".into(), "/dir/a.txt".into(), 10, 0);
+        let b = FileEntry::new_directory("sub".into(), "/dir/sub".into(), 0);
+
+        let mut q = EditQueue::new();
+        q.push(StagedEdit::DeleteEntry {
+            parent: parent.clone(),
+            entry: a.clone(),
+        });
+        q.push(StagedEdit::DeleteRecursive {
+            parent: parent.clone(),
+            entry: b.clone(),
+        });
+        assert!(q.is_pending_delete("/dir/a.txt"));
+        assert!(q.is_pending_delete("/dir/sub"));
+
+        assert!(q.remove_pending_delete("/dir/a.txt"));
+        assert!(!q.is_pending_delete("/dir/a.txt"));
+        // The recursive delete of the sibling directory is untouched.
+        assert!(q.is_pending_delete("/dir/sub"));
+        assert_eq!(q.len(), 1);
+
+        // Removing a non-pending path is a no-op.
+        assert!(!q.remove_pending_delete("/dir/a.txt"));
+    }
+
+    /// The full GUI "Boot Blocks..." mechanism: a `WriteBootBlocks` staged
+    /// edit, dispatched through `apply_edit` + `sync_metadata`, lands the
+    /// 1024-byte region at sector 0 of a previously-bare HFS volume.
+    #[test]
+    fn write_boot_blocks_staged_edit_reaches_sector_zero() {
+        // A freshly-built HFS volume has zeroed boot blocks.
+        let img = create_blank_hfs(8 * MIB, 4096, "NoBoot").unwrap();
+        assert_eq!(&img[0..2], &[0x00, 0x00]);
+
+        let mut blocks = Box::new([0u8; 1024]);
+        blocks[0] = 0x4C; // 'L'
+        blocks[1] = 0x4B; // 'K'
+        blocks[2] = 0x60;
+
+        let mut buf = img.clone();
+        {
+            let mut efs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::WriteBootBlocks {
+                    blocks: blocks.clone(),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        // Sector 0 now carries the staged boot blocks, and the volume still
+        // opens as a valid HFS volume.
+        assert_eq!(&buf[0..3], &[0x4C, 0x4B, 0x60]);
+        let fs = HfsFilesystem::open(Cursor::new(buf), 0).unwrap();
+        assert_eq!(fs.fs_type(), "HFS");
+    }
+
+    /// Full-disk (partitioned) case: the same staged edit, applied to an HFS
+    /// volume opened at a NON-zero partition offset (as on an APM disk — e.g.
+    /// an infinite-mac "device image" with DDR + map + drivers ahead of the
+    /// Apple_HFS partition), writes the boot blocks at the partition's first
+    /// sector and leaves the preceding bytes (DDR / partition map / drivers)
+    /// untouched. This is what makes "Boot Blocks..." work on full disks, not
+    /// just flat HFVs.
+    #[test]
+    fn write_boot_blocks_honors_partition_offset() {
+        // 0xC000 = 49152, the HFS offset of infinite-mac's SCSI-4.3 device
+        // image header.
+        const OFFSET: usize = 0xC000;
+        let hfs = create_blank_hfs(8 * MIB, 4096, "InPart").unwrap();
+
+        // Sentinel-filled leading region stands in for DDR + APM + drivers;
+        // it must never be overwritten by a partition-scoped boot write.
+        let mut disk = vec![0xABu8; OFFSET];
+        disk.extend_from_slice(&hfs);
+
+        let mut blocks = Box::new([0u8; 1024]);
+        blocks[0] = 0x4C;
+        blocks[1] = 0x4B;
+
+        {
+            let mut efs = HfsFilesystem::open(Cursor::new(&mut disk), OFFSET as u64).unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::WriteBootBlocks {
+                    blocks: blocks.clone(),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        // Boot blocks landed at the partition offset...
+        assert_eq!(&disk[OFFSET..OFFSET + 2], &[0x4C, 0x4B]);
+        // ...and the leading DDR / partition-map region is pristine.
+        assert!(disk[..OFFSET].iter().all(|&b| b == 0xAB));
+    }
+
+    /// `replace_set_permissions` keeps a single staged edit per on-disk path
+    /// (the latest value wins) and `pending_permissions_for` reports it back.
+    #[test]
+    fn replace_set_permissions_dedups_and_reports() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+        let b = FileEntry::new_file("b".into(), "/b".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_permissions(&a, 0o644);
+        q.replace_set_permissions(&b, 0o600);
+        // Restaging the same path replaces, not appends.
+        q.replace_set_permissions(&a, 0o755);
+
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pending_permissions_for("/a"), Some(0o755));
+        assert_eq!(q.pending_permissions_for("/b"), Some(0o600));
+        assert_eq!(q.pending_permissions_for("/c"), None);
+    }
+
+    /// `replace_set_dates` keeps a single staged edit per on-disk path and
+    /// `pending_dates_for` reports the (create, modify, backup) triple back.
+    #[test]
+    fn replace_set_dates_dedups_and_reports() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_dates(&a, 100, 200, 300);
+        q.replace_set_dates(&a, 111, 222, 333);
+
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.pending_dates_for("/a"), Some((111, 222, 333)));
+        assert_eq!(q.pending_dates_for("/missing"), None);
+    }
+
+    /// `has_pending_metadata` flags exactly the entries with a staged metadata
+    /// edit — drives the blue "changed" row tint.
+    #[test]
+    fn has_pending_metadata_flags_metadata_edits() {
+        let a = FileEntry::new_file("a".into(), "/a".into(), 0, 0);
+        let b = FileEntry::new_file("b".into(), "/b".into(), 0, 0);
+        let dir = FileEntry::new_directory("d".into(), "/d".into(), 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_dates(&a, 1, 2, 3);
+        q.replace_set_permissions(&b, 0o644);
+        // A delete is not a metadata edit.
+        q.push(StagedEdit::DeleteEntry {
+            parent: dir.clone(),
+            entry: FileEntry::new_file("c".into(), "/d/c".into(), 0, 0),
+        });
+
+        assert!(q.has_pending_metadata("/a"));
+        assert!(q.has_pending_metadata("/b"));
+        assert!(!q.has_pending_metadata("/d/c")); // staged delete, not metadata
+        assert!(!q.has_pending_metadata("/missing"));
+    }
+
+    /// A staged `SetTypeCreator` on an existing file is reflected by
+    /// `resolved_hfs_type_creator` (so the editor/detail rows show the change).
+    #[test]
+    fn resolved_hfs_type_creator_reflects_staged_set() {
+        let mut e = FileEntry::new_file("doc".into(), "/doc".into(), 0, 0);
+        e.type_code = Some("TEXT".into());
+        e.creator_code = Some("ttxt".into());
+
+        let mut q = EditQueue::new();
+        // Before staging: the on-disk values.
+        assert_eq!(q.resolved_hfs_type_creator(&e), (*b"TEXT", *b"ttxt"));
+
+        q.replace_set_type_creator(&e, *b"PICT", *b"8BIM");
+        assert_eq!(q.resolved_hfs_type_creator(&e), (*b"PICT", *b"8BIM"));
+    }
+
+    /// `describe` renders one plain-language line per staged edit, in order.
+    #[test]
+    fn describe_lists_edits_in_order() {
+        let dir = FileEntry::new_directory("d".into(), "/d".into(), 0);
+        let f = FileEntry::new_file("f".into(), "/d/f".into(), 0, 0);
+
+        let mut q = EditQueue::new();
+        q.replace_set_permissions(&f, 0o600);
+        q.push(StagedEdit::DeleteEntry {
+            parent: dir,
+            entry: f.clone(),
+        });
+
+        let lines = q.describe();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("Permissions: /d/f -> 600"));
+        assert!(lines[1].starts_with("Delete: /d/f"));
+    }
+
+    /// "Keep original dates": an AddFile carrying a source Amiga datestamp
+    /// reproduces it on the destination (via CreateFileOptions::amiga_dates)
+    /// instead of stamping the current time — end to end through apply_edit.
+    #[test]
+    fn add_file_preserves_amiga_dates() {
+        use crate::fs::affs::{create_blank_affs, AffsFilesystem};
+        use crate::fs::filesystem::Filesystem;
+        use std::io::Cursor;
+
+        let img = create_blank_affs(880 * 1024, 1, "DATES").unwrap();
+        let mut buf = img.clone();
+
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), b"vintage payload").unwrap();
+        let target = (1234i32, 56i32, 78i32); // (days, mins, ticks) since 1978
+
+        {
+            let mut efs = AffsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            let root = efs.root().unwrap();
+            apply_edit(
+                &mut efs,
+                &StagedEdit::AddFile {
+                    parent: root,
+                    name: "DATED".to_string(),
+                    host_path: host.path().to_path_buf(),
+                    size: 15,
+                    prodos_type: None,
+                    prodos_aux: None,
+                    resource_fork: None,
+                    hfs_type_override: None,
+                    hfs_creator_override: None,
+                    dates: Some(PreservedDates {
+                        amiga: Some(target),
+                        mac: None,
+                    }),
+                },
+            )
+            .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        let mut fs = AffsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DATED")
+            .expect("DATED present");
+        assert_eq!(
+            entry.amiga_date,
+            Some(target),
+            "copied file kept the source's Amiga datestamp"
+        );
     }
 }

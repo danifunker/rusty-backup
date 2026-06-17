@@ -356,6 +356,25 @@ pub trait EditableFilesystem: Filesystem {
         self.delete_entry(parent, entry)
     }
 
+    /// Rename an entry within its parent directory, in place: the entry keeps
+    /// its identity and contents (start cluster / CNID / inode and file data
+    /// are untouched) — only the name in the parent's directory listing
+    /// changes. `new_name` must validate via [`Filesystem::validate_name`] and
+    /// must not already name another entry in `parent`.
+    ///
+    /// Default returns `Unsupported` so the GUI can gray out the action on
+    /// filesystems that haven't implemented it yet.
+    fn rename(
+        &mut self,
+        _parent: &FileEntry,
+        _entry: &FileEntry,
+        _new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "rename not supported for this filesystem".into(),
+        ))
+    }
+
     /// Set Unix permission bits on an entry. Override on Unix-style
     /// filesystems (ext); other filesystems return `Unsupported` so callers
     /// don't silently lose mode information.
@@ -448,6 +467,17 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// Stage the 1024-byte HFS boot-block region (sectors 0–1) for the
+    /// volume, written verbatim at `sync_metadata` time. Used to make a
+    /// classic-HFS volume bootable by copying a donor's boot blocks. Override
+    /// on HFS/HFS+ (the only filesystems with a Mac boot region); others
+    /// return `Unsupported` so the GUI can gate the action.
+    fn write_boot_blocks(&mut self, _blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "write_boot_blocks not supported for this filesystem".into(),
+        ))
+    }
+
     /// Rename the volume. Override on filesystems where the volume name is
     /// stored in metadata that the implementation can rewrite in place
     /// (HFS today; others return `Unsupported`).
@@ -485,6 +515,15 @@ pub trait EditableFilesystem: Filesystem {
         Err(FilesystemError::Unsupported(
             "set_dates not supported for this filesystem".into(),
         ))
+    }
+
+    /// Whether this filesystem can store symbolic links (i.e.
+    /// [`Self::create_symlink`] is actually implemented). Default `false`;
+    /// override to `true` alongside `create_symlink`. Lets callers (e.g. the
+    /// tar-import preflight) warn *before* a lossy import that symlinks will
+    /// be dropped, rather than discovering it entry-by-entry.
+    fn supports_symlinks(&self) -> bool {
+        false
     }
 
     /// Create a symbolic link in `parent` pointing at `target` (a path

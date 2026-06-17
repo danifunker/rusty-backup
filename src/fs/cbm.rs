@@ -1211,6 +1211,54 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "CBM DOS is flat; only root files are renamable".into(),
+            ));
+        }
+        let raw_name = encode_petscii_name(new_name)?;
+
+        let idx = entry.location as usize;
+        let de =
+            self.entries.get(idx).cloned().ok_or_else(|| {
+                FilesystemError::NotFound(format!("entry idx {idx} out of range"))
+            })?;
+
+        // Reject a collision with a *different* slot. CBM compares byte-exact
+        // raw names (case folded to uppercase by the encoder), so a case-only
+        // rename resolves back to the same slot and is allowed.
+        if self
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(i, e)| i != idx && e.raw_name == raw_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Overwrite only the 16-byte name field of the slot; the type byte,
+        // first-block link, REL/GEOS bytes and block count are untouched, so
+        // the file keeps its identity and contents.
+        let (dt, ds, slot) = de.slot;
+        let mut dir = self.read_sector(dt, ds)?;
+        let off = slot * 32;
+        dir[off + 0x05..off + 0x05 + NAME_LEN].copy_from_slice(&raw_name);
+        self.write_sector(dt, ds, &dir)?;
+
+        self.reader.flush()?;
+        self.refresh_entries()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -1557,6 +1605,64 @@ mod tests {
         let data = &listing[0].clone();
         assert_eq!(fs.read_file(data, usize::MAX).unwrap(), big);
         assert!(fs.free_space().unwrap() > free_before);
+    }
+
+    #[test]
+    fn rename_in_place_d64() {
+        let img = blank_image(CbmVariant::D64, "TESTDISK", "XY");
+        let mut fs = open_mem(img);
+        let root = fs.root().unwrap();
+
+        let payload = b"\x01\x08HELLO WORLD\r".to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            "HELLO",
+            &mut cur,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        let listing = fs.list_directory(&root).unwrap();
+        let hello = listing.iter().find(|e| e.name == "HELLO").unwrap().clone();
+        let first_block = fs.entries[hello.location as usize].first_track;
+
+        fs.rename(&root, &hello, "GREETING").unwrap();
+
+        // Re-open from the underlying bytes to prove the rename persisted.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = open_mem(bytes);
+        let root2 = fs2.root().unwrap();
+        let listing2 = fs2.list_directory(&root2).unwrap();
+        let names: Vec<&str> = listing2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"GREETING"));
+        assert!(!names.contains(&"HELLO"));
+
+        // Identity + contents preserved.
+        let renamed = listing2.iter().find(|e| e.name == "GREETING").unwrap();
+        assert_eq!(
+            fs2.entries[renamed.location as usize].first_track,
+            first_block
+        );
+        assert_eq!(fs2.read_file(renamed, usize::MAX).unwrap(), payload);
+    }
+
+    #[test]
+    fn rename_collision_rejected_d64() {
+        let img = blank_image(CbmVariant::D64, "DISK", "01");
+        let mut fs = open_mem(img);
+        let root = fs.root().unwrap();
+        let mut a = Cursor::new(vec![1u8; 10]);
+        fs.create_file(&root, "ONE", &mut a, 10, &CreateFileOptions::default())
+            .unwrap();
+        let mut b = Cursor::new(vec![2u8; 10]);
+        fs.create_file(&root, "TWO", &mut b, 10, &CreateFileOptions::default())
+            .unwrap();
+        let listing = fs.list_directory(&root).unwrap();
+        let two = listing.iter().find(|e| e.name == "TWO").unwrap().clone();
+        let err = fs.rename(&root, &two, "ONE").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 
     #[test]

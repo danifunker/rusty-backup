@@ -1,15 +1,19 @@
+mod alto_resize_dialog;
 mod archives_tab;
 mod backup_tab;
 mod browse_view;
 mod bulk_convert_dialog;
 mod chd_options_ui;
+mod commander;
 mod context;
 mod elevation_dialog;
 mod expand_hfs_dialog;
+mod file_detail;
 mod floppy_convert_dialog;
 pub mod fonts;
 mod inspect_tab;
 mod journal_view;
+mod metadata_editor;
 mod optical_tab;
 mod partition_bar;
 mod physical_disk_export;
@@ -18,6 +22,7 @@ mod resize_popup;
 mod restore_tab;
 mod settings_dialog;
 mod size_mode_row;
+mod source_picker;
 pub mod ui_logger;
 
 use archives_tab::ArchivesTab;
@@ -144,11 +149,14 @@ pub fn prepare_disk_image_path(
     // source_reader::open_read, and editing persists back into the container
     // through BrowseSession::open_editable's ContainerEditSession. Pre-decoding
     // to a throwaway tempfile would orphan edits and hide the real file name.
-    // The gzip-wrapped Amiga images (.adz/.hdz) are decoded regardless, since
-    // gzip isn't seekable and there's no container-aware reader for them.
+    // The gzip-wrapped Amiga images (.adz/.hdz) decode to flat sectors only for
+    // the Backup/Restore path (`decode_floppy_containers`); the browse/inspect/
+    // commander path leaves them as containers so `source_reader::open_read`
+    // peels the gzip and edits re-gzip back in place (BrowseSession's gzip
+    // ContainerEditSession), rather than orphaning edits in a throwaway .adf.
     let target_ext = match ext.as_deref() {
-        Some("adz") => "adf",
-        Some("hdz") => "hdf",
+        Some("adz") if decode_floppy_containers => "adf",
+        Some("hdz") if decode_floppy_containers => "hdf",
         Some("msa") if decode_floppy_containers => "st",
         Some("d88") if decode_floppy_containers => "img",
         Some("xdf") | Some("hdm") | Some("dim") if decode_floppy_containers => "img",
@@ -406,6 +414,9 @@ pub struct RustyBackupApp {
     /// Inspect tab, and the tab is switched to it. `None` for normal
     /// launches without a file argv.
     pending_initial_image: Option<PathBuf>,
+    /// Full-page Commander Mode overlay. `Some` while it is open; it then
+    /// takes over the whole frame and the tab strip is not drawn.
+    commander: Option<commander::CommanderMode>,
 }
 
 impl Default for RustyBackupApp {
@@ -491,6 +502,7 @@ impl Default for RustyBackupApp {
             bulk_convert_dialog: None,
             bulk_convert_status: None,
             pending_initial_image: None,
+            commander: None,
         }
     }
 }
@@ -752,6 +764,16 @@ impl eframe::App for RustyBackupApp {
     }
 
     fn ui(&mut self, ctx: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Full-page Commander Mode overlay: when open it takes over the whole
+        // frame and the normal tab UI is not drawn.
+        if self.commander.is_some() {
+            let close = self.commander.as_mut().unwrap().show(ctx);
+            if close {
+                self.commander = None;
+            }
+            return;
+        }
+
         // Top panel: tab bar
         egui::Panel::top("tab_bar").show_inside(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -760,6 +782,10 @@ impl eframe::App for RustyBackupApp {
                 ui.selectable_value(&mut self.active_tab, Tab::Inspect, "Inspect");
                 ui.selectable_value(&mut self.active_tab, Tab::Optical, "Optical");
                 ui.selectable_value(&mut self.active_tab, Tab::Archives, "Archives");
+                ui.separator();
+                if ui.button("Commander Mode").clicked() {
+                    self.commander = Some(commander::CommanderMode::new());
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Version display
@@ -1076,6 +1102,13 @@ impl eframe::App for RustyBackupApp {
             self.inspect_tab
                 .load_image_with_tempdir(open.path, Some(open.guard));
             self.active_tab = Tab::Inspect;
+        }
+
+        // The reverse: a Mac archive picked in the Inspect source dropdown isn't
+        // a disk image, so hand it to the Archives tab and switch there.
+        if let Some(path) = self.inspect_tab.take_open_archive_request() {
+            self.archives_tab.open_path(path);
+            self.active_tab = Tab::Archives;
         }
 
         // Show settings dialog if open

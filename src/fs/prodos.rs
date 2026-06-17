@@ -65,6 +65,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -1056,6 +1057,57 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         // / ProDOS technical reference; helper constants in `prodos_types`
         // also expose the bit-flag layout for the GUI label.
         entry_bytes[30] = access;
+        self.write_dir_entry(block_num, slot, &entry_bytes)?;
+        Ok(())
+    }
+
+    /// Rename an entry in place: only the name field of the parent's pointer
+    /// entry changes. The storage_type nibble, key block, blocks_used, EOF,
+    /// type/aux, dates, and access byte are all preserved — so the file keeps
+    /// its identity and data. (ProDOS subdirectories also carry a self-name in
+    /// their own header block; the FST treats the parent's pointer entry as
+    /// authoritative, so we leave the header self-name stale, matching real
+    /// ProDOS behavior.)
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        // Uppercases and validates (length / first-letter / allowed chars).
+        let validated = validate_prodos_name(new_name)?;
+        let dir_key_block = parent.location as u16;
+
+        // Reject a collision with a *different* entry. ProDOS folds case, so a
+        // case-only rename ("file" -> "FILE") resolves to the same entry and is
+        // allowed; only error when the name already names some other entry.
+        if !validated.eq_ignore_ascii_case(&entry.name)
+            && self.find_dir_entry(dir_key_block, &validated)?.is_some()
+        {
+            return Err(FilesystemError::AlreadyExists(validated));
+        }
+
+        let (block_num, slot) = self
+            .find_dir_entry(dir_key_block, &entry.name)?
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+
+        let block = self.read_block(block_num)?;
+        let eo = 4 + slot * 39;
+        let mut entry_bytes = [0u8; 39];
+        entry_bytes.copy_from_slice(&block[eo..eo + 39]);
+
+        // Byte 0 = (storage_type << 4) | name_len. Preserve the high nibble
+        // (storage type / identity) and stamp the new length in the low nibble.
+        let storage_type = entry_bytes[0] >> 4;
+        let name_bytes = validated.as_bytes();
+        entry_bytes[0] = (storage_type << 4) | (name_bytes.len() as u8 & 0x0F);
+        // Name occupies bytes 1..16 (15 reserved); rewrite and zero the rest.
+        entry_bytes[1..16].fill(0);
+        entry_bytes[1..1 + name_bytes.len()].copy_from_slice(name_bytes);
+
         self.write_dir_entry(block_num, slot, &entry_bytes)?;
         Ok(())
     }
@@ -2119,6 +2171,45 @@ mod tests {
         let root = fs.root().unwrap();
         let entries = fs.list_directory(&root).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_rename_file_preserves_identity() {
+        let mut fs = make_editable_fs();
+        let root = fs.root().unwrap();
+        let data = b"rename me please";
+        let opts = CreateFileOptions {
+            type_code: Some("$04".into()),
+            ..Default::default()
+        };
+        let entry = fs
+            .create_file(&root, "OLDNAME", &mut &data[..], data.len() as u64, &opts)
+            .unwrap();
+        let key_ptr = entry.location;
+        let size = entry.size;
+
+        let root = fs.root().unwrap();
+        fs.rename(&root, &entry, "NEWNAME").unwrap();
+
+        // New name listed, old gone.
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "NEWNAME");
+        // Identity preserved: same key block + size.
+        assert_eq!(entries[0].location, key_ptr);
+        assert_eq!(entries[0].size, size);
+
+        // Content preserved.
+        let read_back = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&read_back, data);
+
+        // Renaming to the existing name is a no-op (case-only self-rename ok).
+        let cur = entries[0].clone();
+        fs.rename(&root, &cur, "newname").unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

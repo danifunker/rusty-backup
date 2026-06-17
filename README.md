@@ -45,6 +45,9 @@ rb-cli new disk.dsk --fs hfs --size 800K --name "My Disk"
 rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
 rb-cli ls  disk.dsk /System
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
+rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
+rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
+rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
 rb-cli backup /dev/disk3 ./backups --format chd --checksum sha256
@@ -55,8 +58,13 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --boot-sector-donor hd0.hds      # zero manual steps, your donor
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
+rb-cli new-sgi-hdd irix.img --size 50M                     # IRIX SGI dvh + EFS root HDD
+rb-cli new-sgi-cdrom irix.iso --size 600M                  # IRIX EFS CD-ROM (slot-7 SYSV, mount -t efs)
+rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
+rb-cli make-bootable disk.dsk --boot-from "System 7.0 HD.dsk"  # auto: apply only what's missing to boot
+rb-cli make-bootable mac.hda --dry-run                     # preview: detect kind + missing pieces
 ```
 
 Shell completions for bash / zsh / fish / PowerShell:
@@ -114,8 +122,8 @@ of every release; grab it from the
 you don't want to set up the cross toolchain locally.
 
 What's in the MiSTer build:
-- Every filesystem operation (`ls`, `put`, `get`, `rm`, `mkdir`,
-  `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
+- Every filesystem operation (`ls`, `put`, `get`, `tar`, `untar`, `rm`,
+  `mkdir`, `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
   exFAT, HFS, HFS+, ext, AFFS, PFS3, SFS, ProDOS, Human68k, ADFS, etc.
 - `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, the
   four floppy container formats, **and CHD**.
@@ -206,6 +214,24 @@ The app has five tabs:
     moves, and it is idempotent. (This registers the *driver* so the ROM
     can read the disk — it does not change HFS boot-block behavior.)
     Verified against the real Quadra 800 ROM in QEMU `-M q800`.
+  - **Make a Mac disk bootable** — `rb-cli make-bootable disk.img
+    [--boot-from "System 7.5.3 HD.dsk"]` (or the Inspect tab's
+    **Make Bootable...** button) auto-detects what the disk is and applies only
+    what it's missing:
+    - a **flat `.hfv`/`.dsk`** (BasiliskII / SheepShaver / Mini vMac, e.g. a
+      customized [infinite-mac](https://infinitemac.org) disk) — boot blocks +
+      blessed System Folder, kept flat (no APM wrapper added);
+    - a **full APM disk** (an infinite-mac "device image" with DDR + map +
+      drivers, or any Mac SCSI disk image) — a SCSI driver + DDR (bundled, or
+      `--driver-from donor`) if absent, then boot blocks on the `Apple_HFS`
+      partition + bless, leaving the DDR / map / drivers untouched.
+
+    Boot blocks are never synthesized — they're copied verbatim from a
+    `--boot-from` donor that already boots that System, so they stay
+    version-matched. The operation is idempotent (`--dry-run` previews it). The
+    lower-level pieces are also available on their own: `rb-cli put IMG[@N]
+    --boot-from DONOR`, `rb-cli bless set`, and the browse-view
+    **Boot Blocks...** / **Bless Folder** buttons.
   - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
@@ -304,6 +330,7 @@ readable.
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
+| ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
@@ -324,6 +351,12 @@ readable.
 | X68000 HDD     | `.hda`, `.hdf`, `.hds`, `.ima` | Yes | Yes (in-place edit + resize + defrag repack) | Sharp SASI/SCSI hard-disk images; X68k partition table + Human68k FAT12/16. Read/browse/extract + add/delete/mkdir + in-place FS grow/shrink + contiguous repack (SHARP/KG big-endian BPB & FAT). Geometry auto-detected: SCSI `X68SCSI1` (table @ 0x800, 1024-byte sectors) and SASI (table @ 0x400, 256-byte sectors, incl. custom-IPL game disks). |
 | PC-98 HDM      | `.hdm`          | Yes            | Yes (convert + in-place edit) | DiskExplorer raw headerless floppy dump (byte-identical to XDF). In-place file add/delete/edit supported. |
 | DiskExplorer DIM | `.dim`        | Yes            | Yes (convert + in-place edit, DIFC) | DIFC 256-byte header + payload; generic 256-byte-header fallback for IBM XDF DIM on read. Add/delete/edit persist back into the container. |
+| Xerox Alto pack | `.pdi`, `.bfs`, `.copydisk`, `.altodisk` | Yes | Yes | Diablo 31/44 disk packs for the Xerox Alto. `.pdi` = **PARC Disk Image** (a flat, self-describing, label-inclusive container designed as the recommended emulator format); `.bfs` / `.copydisk` / `.altodisk` = period CopyDisk streams, imported transparently. Detected by magic, surfaced as a single browsable `Alto BFS` volume. Browse + extract + add/delete + resize; edits save as PDI. |
+| Salto disk | `.dsk` | Yes | Yes | Salto Alto-II emulator "cooked" Diablo-31 image (`[pageno][header][label][data]` per sector). Byte order auto-detected (Salto-native little-endian or big-endian); export writes Salto-native little-endian so the result loads in the emulator. Same `Alto BFS` content as the other Alto packs. |
+| ContrAlto2 Diablo | `.dsk` | Yes | No | ContrAlto2 / Bitsavers Diablo-31 pack (`[dummy][header][label][data]`, little-endian, sector-interleaved) — same size as a Salto `.dsk` but distinguished by content; sectors placed by their header disk address. Read as an `Alto BFS` volume. |
+| Trident pack | — (raw, size-detected) | Yes | Yes | Trident T-80 / T-300 pack image (ContrAlto2 / dorado layout: `[dummy][header][label 10w][data 1024w]` per sector, little-endian, 2048-byte pages, physical sector interleave). The same Alto file system (TFS) on Trident hardware; recognized by the exact T-80 (~76 MB) / T-300 (~285 MB) size, surfaced as an `Alto BFS` volume. Validated against ContrAlto2's real Spruce print-server T-300 pack. |
+| Xerox Pilot/Cedar volume | `.pdi` (`fsFamily=2`) | Yes | Yes (create / add file) | D-machine Pilot/Cedar filesystem in a PARC Disk Image. Physical/logical volume roots, subvolume table, VAM, run-table files; both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot via `flags` bit 2). Surfaced as a read-only `Pilot/Cedar` volume in the GUI; blank-volume + add-file via `pilot_probe`. See `docs/` PARC specs. |
+| Dwarf 6085 disk | `.zdisk`, `.zdelta` | Yes | No | Dwarf "Draco" 6085/Daybreak emulator rigid-disk image — a zlib stream of label-inclusive Pilot sectors (10-word label + 256-word data; the 6085/IOP stores labels byte-swapped, normalized on read). Opens as a read-only `Pilot/Cedar` volume; lists and extracts files. The disks shipped with Dwarf (ViewPoint 2.0, XDE 5.0) are the real Pilot volumes our reader was validated against. |
 | Raw physical disk | —            | Yes            | Yes (restore target) | CF/SD/USB/HDD/SSD — see below |
 
 "Yes (convert)" means the format isn't a backup wrapper but is fully
@@ -364,6 +397,8 @@ inspect-tab Edit Mode.
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
+| Alto BFS / TFS | Yes | Yes | Yes (resize) | — | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). |
+| Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so names are recovered from each file's leader page where present — XDE volumes name ~90% of files this way, ViewPoint names its boot/system files — and otherwise synthesized from the file ID); blank-volume creation + add/delete files via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |
 | Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
 
 ### Partition tables
@@ -374,8 +409,8 @@ inspect-tab Edit Mode.
 | GPT    | Yes   | Yes  | Primary + backup header rewritten with refreshed CRCs on every edit. |
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
-| SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
-| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / …) | — | Standard floppy / disk sizes are recognised even without a partition table. |
+| SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write; geometry (`vh_dp`) preserved across edits. `rb-cli new-sgi-hdd` synthesizes a dvh + EFS-root hard disk from scratch (IRIX 5.3-6.5). |
+| None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / Alto BFS / Pilot/Cedar / …) | — | Standard floppy / disk sizes are recognised even without a partition table. Xerox Alto packs (`.pdi` / `.bfs` / CopyDisk / Salto `.dsk`), Pilot/Cedar PDIs (`fsFamily=2`), and Dwarf 6085 `.zdisk` images are detected by magic and presented as a single `Alto BFS` or `Pilot/Cedar` volume. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
 images, partition table sidecars) for restore — see `docs/clonezilla.md`.

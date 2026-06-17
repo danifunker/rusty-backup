@@ -148,6 +148,17 @@ impl EfsSuperblock {
         BigEndian::write_u32(&mut buf[88..92], self.checksum);
     }
 
+    /// Set `self.checksum` to the value IRIX expects for the current field
+    /// values. Serializes into a scratch buffer (so `fs_spare` and the
+    /// alignment pad are zeroed) and runs [`efs_superblock_checksum`] over
+    /// it. Call after every other field is final.
+    pub fn recompute_checksum(&mut self) {
+        let mut tmp = [0u8; EFS_SUPERBLOCK_SIZE];
+        self.checksum = 0;
+        self.write_into(&mut tmp);
+        self.checksum = efs_superblock_checksum(&tmp);
+    }
+
     fn label(&self) -> String {
         let n = trim_ascii(&self.fname);
         let p = trim_ascii(&self.fpack);
@@ -161,6 +172,33 @@ impl EfsSuperblock {
             format!("{n}:{p}")
         }
     }
+}
+
+/// Compute the EFS superblock checksum (IRIX 3.3+ "new" algorithm, used by
+/// both old-magic and new-magic volumes). XOR each big-endian 16-bit word of
+/// the superblock from offset 0 up to — but not including — the checksum field
+/// at offset 88 into a 32-bit accumulator, rotating the accumulator left by one
+/// bit after each word.
+///
+/// Verified byte-exact against a real IRIX-formatted SCSI disk
+/// (`fs_checksum = 0xfa73610a` reproduced from the on-disk superblock; see
+/// `docs/sgi_efs_hdd_irix_debug.md`). The Linux efs driver never checks this
+/// field, but IRIX's own mount / `fsck -t efs` validate it — a zero checksum is
+/// why our synthesized disks were rejected.
+pub(crate) fn efs_superblock_checksum(sb: &[u8]) -> u32 {
+    debug_assert!(
+        sb.len() >= 88,
+        "superblock buffer must cover offsets 0..88 for the checksum"
+    );
+    let mut c: u32 = 0;
+    let mut i = 0;
+    while i < 88 {
+        let word = ((sb[i] as u32) << 8) | sb[i + 1] as u32;
+        c ^= word;
+        c = c.rotate_left(1);
+        i += 2;
+    }
+    c
 }
 
 /// A single on-disk extent (8 bytes, big-endian).
@@ -931,6 +969,46 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         )))
     }
 
+    /// Rename fallback used when the new name no longer fits in the
+    /// dirblock that holds the old entry. Removes the old dirent (which
+    /// preserves the child inum and compacts its block), then inserts the
+    /// new name pointing at the same inum — possibly allocating a fresh
+    /// dirblock. The child inode is never touched, so identity and data
+    /// are preserved. Mirrors create_file's staged-bitmap orchestration:
+    /// dir_insert may allocate and mutates the parent inode (extent
+    /// growth), so the parent inode is written back after.
+    pub(crate) fn rename_via_remove_insert(
+        &mut self,
+        parent_inum: u32,
+        old_name: &[u8],
+        new_name: &[u8],
+        child_inum: u32,
+    ) -> Result<(), FilesystemError> {
+        // dir_remove keeps the child inum and writes the (compacted)
+        // dirblock back immediately.
+        let parent_inode = self.read_inode(parent_inum)?;
+        let removed = self.dir_remove(&parent_inode, old_name)?;
+        if removed != child_inum {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS rename: removed dirent inum {removed} differs from entry inum {child_inum}"
+            )));
+        }
+
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+        let res = (|| -> Result<(), FilesystemError> {
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_inode, &mut bm, new_name, child_inum)?;
+            self.write_inode(&parent_inode)?;
+            self.sb_dirty = true;
+            Ok(())
+        })();
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
     /// Allocate disk space for `data_len` bytes via the in-memory
     /// bitmap, populate `inode.extents` / `numextents`, then stream
     /// `data` into the allocated blocks. The strategy starts with one
@@ -1096,6 +1174,11 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// The primary write is the commit point — callers should
     /// sequence: data → inodes → bitmap → replica → primary.
     pub(crate) fn write_superblock_pair(&mut self) -> Result<(), FilesystemError> {
+        // Stamp the IRIX superblock checksum from the now-final fields. Any
+        // mutation path (edit-sync, resize) routes through here, so this keeps
+        // every disk we write self-validating for IRIX mount / fsck.
+        self.sb.recompute_checksum();
+
         let mut primary_sector = [0u8; EFS_BLOCKSIZE as usize];
         // Re-read the primary sector first so any pad/spare bytes the
         // sector held outside our serializer's coverage are preserved.
@@ -1151,6 +1234,7 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         amiga_comment: None,
         amiga_date: None,
         dos_attributes: None,
+        mac_dates: None,
     }
 }
 
@@ -1373,6 +1457,83 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
         res
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let new_name_bytes = new_name.as_bytes();
+        validate_name(new_name_bytes)?;
+
+        let parent_inum = parent.location as u32;
+        let entry_inum = entry.location as u32;
+        let old_name_bytes = entry.name.as_bytes();
+
+        // EFS names are case-sensitive; any name differing from the old
+        // one is a distinct dirent. Reject only if it already exists.
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, new_name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+
+        // Preferred path: if the renamed entry stays within its current
+        // 512-byte dirblock (the common case — names are short and the
+        // inum is unchanged), re-serialize that one block in place. This
+        // allocates nothing, so no bitmap / superblock bookkeeping is
+        // needed. Walk the directory's extents to find the block holding
+        // the old name.
+        let mut extents: Vec<EfsExtent> = parent_inode
+            .extents
+            .iter()
+            .take(parent_inode.numextents as usize)
+            .copied()
+            .collect();
+        extents.sort_by_key(|e| e.offset);
+
+        for ext in &extents {
+            for i in 0..ext.length as u32 {
+                let bn = ext.bn + i;
+                let block = self.read_block(bn)?;
+                let mut entries = parse_dir_block(&block);
+                if let Some(slot) = entries.iter().position(|e| e.name == old_name_bytes) {
+                    // Confirm the dirent points at the entry we expect —
+                    // guards against a stale FileEntry.
+                    if entries[slot].inum != entry_inum {
+                        return Err(FilesystemError::InvalidData(format!(
+                            "EFS rename: dirent inum {} does not match entry inum {}",
+                            entries[slot].inum, entry_inum
+                        )));
+                    }
+                    entries[slot].name = new_name_bytes.to_vec();
+                    if let Some(new_block) = serialize_dir_block(&entries) {
+                        // Fits — commit the single-block rewrite.
+                        self.write_block(bn, &new_block)?;
+                        return Ok(());
+                    }
+                    // The longer name overflows this block. Fall back to
+                    // remove-then-insert below (the new entry may need a
+                    // fresh block). The child inum is preserved across
+                    // both operations, so identity / data are untouched.
+                    return self.rename_via_remove_insert(
+                        parent_inum,
+                        old_name_bytes,
+                        new_name_bytes,
+                        entry_inum,
+                    );
+                }
+            }
+        }
+
+        Err(FilesystemError::NotFound(entry.name.clone()))
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.do_sync_metadata()
     }
@@ -1532,6 +1693,7 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                mac_dates: None,
             };
             let lf = fs.create_directory(
                 &root_entry,
@@ -1737,6 +1899,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -1832,6 +1995,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
                                 amiga_comment: None,
                                 amiga_date: None,
                                 dos_attributes: None,
+                                mac_dates: None,
                             };
                             if matches!(e.entry_type, EntryType::Directory) {
                                 e.size = 0;
@@ -2169,17 +2333,50 @@ fn trim_ascii(b: &[u8]) -> String {
 
 /// Build a freshly-formatted EFS volume in memory.
 ///
-/// Produces a single-cylinder-group EFS volume that `EfsFilesystem::open`
-/// can read and write. The root inode (inum 2) is a directory with one
-/// allocated 512-byte dirblock — empty, so the volume mounts as a clean
-/// `/` with no entries.
+/// Produces a multi-cylinder-group EFS volume (the IRIX `mkfs_efs` shape) that
+/// `EfsFilesystem::open` can read and write and that mounts on real IRIX. The
+/// number of cylinder groups and the inode count scale with `size_bytes` (≈ one
+/// inode per 4 KiB), so large volumes are not capped at a single group's worth
+/// of inodes. The root inode (inum 2) is a directory with one allocated 512-byte
+/// dirblock holding `.`/`..` — empty, so the volume mounts as a clean `/`.
 ///
-/// `size_bytes` must be at least 32 KiB. `name` is the 6-byte
-/// `fname`/`fpack` short label (padded with spaces; characters beyond 6
-/// bytes are truncated).
+/// `size_bytes` must be at least 32 KiB. `name` is the 6-byte `fname`/`fpack`
+/// short label (padded with spaces; characters beyond 6 bytes are truncated).
 pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
-    use byteorder::{BigEndian, ByteOrder};
+    create_blank_efs_with_inodes(size_bytes, name, EFS_DEFAULT_BYTES_PER_INODE)
+}
 
+/// Default inode density: ~one inode per 4 KiB of volume.
+pub const EFS_DEFAULT_BYTES_PER_INODE: u64 = 4096;
+/// Target size of each cylinder group (~16 MiB). Keeps `cgisize` well inside
+/// its u16 field at any volume size while staying close to `mkfs_efs`'s scale.
+const EFS_CG_TARGET_BLOCKS: u32 = 32 * 1024;
+
+/// Resolve an explicit inode count or bytes-per-inode request (e.g. from CLI
+/// `--inodes` / `--bytes-per-inode`) into a bytes-per-inode density for
+/// [`write_blank_efs`]. `--inodes` wins if both are given. The result is
+/// floored at one inode per 512-byte block (the densest sane layout).
+pub fn resolve_bytes_per_inode(
+    size_bytes: u64,
+    target_inodes: Option<u64>,
+    bytes_per_inode: Option<u64>,
+) -> u64 {
+    let nbpi = if let Some(t) = target_inodes {
+        size_bytes / t.max(1)
+    } else {
+        bytes_per_inode.unwrap_or(EFS_DEFAULT_BYTES_PER_INODE)
+    };
+    nbpi.max(EFS_BLOCKSIZE)
+}
+
+/// Like [`create_blank_efs`] but with a caller-chosen inode density. Builds the
+/// whole image in memory; for large volumes prefer [`write_blank_efs`], which
+/// streams only the non-zero regions to a sink and leaves the rest sparse.
+pub fn create_blank_efs_with_inodes(
+    size_bytes: u64,
+    name: &str,
+    bytes_per_inode: u64,
+) -> anyhow::Result<Vec<u8>> {
     if size_bytes < 32 * 1024 {
         return Err(anyhow::anyhow!(
             "EFS volume must be at least 32 KiB, got {size_bytes}"
@@ -2192,41 +2389,96 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
         ));
     }
     let total_blocks = total_blocks_u64 as u32;
-
-    // Single cylinder group layout. `firstcg` = 18 mirrors classic IRIX
-    // (boot + sb + bitmap + reserved space up to the inode region).
-    let firstcg: u32 = 18;
-    // Inode region size in blocks. 4 inodes per block (128-byte inodes).
-    //   ≤ 4 MiB:    8 blocks (32 inodes)
-    //   ≤ 64 MiB:   32 blocks (128 inodes)
-    //   ≤ 512 MiB:  128 blocks (512 inodes)
-    //   larger:     512 blocks (2048 inodes)
-    let cgisize: u16 = match size_bytes {
-        0..=4_194_304 => 8,
-        4_194_305..=67_108_864 => 32,
-        67_108_865..=536_870_912 => 128,
-        _ => 512,
-    };
-    // Single CG covers the entire data region past the inode table.
-    let cgfsize: u32 = total_blocks - firstcg;
-    if cgfsize <= cgisize as u32 + 4 {
-        return Err(anyhow::anyhow!(
-            "EFS volume too small to fit inode region + a root dirblock"
-        ));
-    }
-    // Bitmap byte size: 1 bit per block, packed.
-    let bmsize: u32 = (total_blocks as usize + 7) as u32 / 8;
-    let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
-    if bm_sectors > (firstcg - 2) {
-        return Err(anyhow::anyhow!(
-            "EFS bitmap too large for the reserved region (firstcg=18 sectors)"
-        ));
-    }
-    // Root dirblock: first block in the data region past the inode table.
-    let root_dirblock: u32 = firstcg + cgisize as u32;
-    let replsb: u32 = total_blocks - 1;
-
     let mut img = vec![0u8; total_blocks as usize * EFS_BLOCKSIZE as usize];
+    write_blank_efs(
+        &mut std::io::Cursor::new(&mut img[..]),
+        0,
+        total_blocks,
+        name,
+        bytes_per_inode,
+    )?;
+    Ok(img)
+}
+
+/// Format a blank multi-cylinder-group EFS volume of `total_blocks` 512-byte
+/// blocks directly into `sink`, at byte offset `part_off`, writing ONLY the
+/// non-zero regions: the primary superblock, the free-space bitmap, cylinder
+/// group 0's first inode block (the root inode), the root dirblock, and the
+/// replicated superblock. Everything else (empty CG inode tables, all data
+/// blocks, the trailing zone) is left untouched.
+///
+/// When `sink` is a freshly-`set_len`'d file the untouched regions stay sparse
+/// holes, so peak memory is the bitmap (~`total_blocks/8` bytes) rather than the
+/// whole image — the path large disks take. `sink` must be (or be able to grow
+/// to) at least `part_off + total_blocks*512` bytes; writing the replica
+/// superblock at the last block also extends a file to that size.
+///
+/// Layout (partition-relative 512-byte blocks):
+/// ```text
+///   0              reserved (boot / unused)
+///   1              primary superblock
+///   2 .. firstcg   free-space bitmap (set bit = free)
+///   firstcg ..     `ncg` UNIFORM cylinder groups, each `cgfsize` blocks:
+///                  `cgisize` inode-table blocks then `cgfsize-cgisize` data
+///   fs_size .. V   trailing zone; holds the replicated superblock at V-1
+/// ```
+/// `cgisize` is chosen so each CG holds ~one inode per `bytes_per_inode` bytes,
+/// and `ncg` so each group stays ~`EFS_CG_TARGET_BLOCKS`; the inode count thus
+/// scales with the volume. The reader, fsck, and in-place resize all assume
+/// uniform groups, so every CG is exactly `cgfsize` blocks and
+/// `fs_size == firstcg + ncg*cgfsize`.
+pub fn write_blank_efs<W: Write + Seek>(
+    sink: &mut W,
+    part_off: u64,
+    total_blocks: u32,
+    name: &str,
+    bytes_per_inode: u64,
+) -> anyhow::Result<()> {
+    let nbpi = bytes_per_inode.max(EFS_BLOCKSIZE);
+
+    // Bitmap spans the whole volume; 1 bit per block, packed. Sized first
+    // because the bitmap region (blocks 2..firstcg) precedes the first CG.
+    let bmsize: u32 = total_blocks.div_ceil(8);
+    let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
+    let firstcg: u32 = 2 + bm_sectors;
+
+    // Data area = everything after the bitmap, less one trailing block reserved
+    // for the replicated superblock (kept outside the CGs so `fs_size` can be an
+    // exact `ncg * cgfsize` multiple).
+    let usable = total_blocks
+        .checked_sub(firstcg + 1)
+        .filter(|u| *u >= 4)
+        .ok_or_else(|| {
+            anyhow::anyhow!("EFS volume too small for a superblock + bitmap + data region")
+        })?;
+    let ncg: u32 = usable
+        .div_ceil(EFS_CG_TARGET_BLOCKS)
+        .clamp(1, u16::MAX as u32);
+    let cgfsize: u32 = usable / ncg; // floor -> uniform CGs, tiny trailing remainder
+                                     // Inode-table blocks per CG from the density target; at least one, and the
+                                     // group must keep at least one data block.
+    let cgisize: u16 = ((cgfsize as u64 * EFS_BLOCKSIZE) / (nbpi * EFS_INODES_PER_BLOCK))
+        .clamp(1, u16::MAX as u64) as u16;
+    if cgfsize <= cgisize as u32 + 1 {
+        return Err(anyhow::anyhow!(
+            "EFS inode density too high for this volume: each cylinder group needs an inode \
+             region plus at least one data block (use a larger --bytes-per-inode / fewer --inodes)"
+        ));
+    }
+    let fs_size: u32 = firstcg + ncg * cgfsize; // data-area end (<= total_blocks - 1)
+    let replsb: u32 = total_blocks - 1;
+    // Root dirblock: first data block of CG 0 (right after its inode table).
+    let root_dirblock: u32 = firstcg + cgisize as u32;
+
+    // Free counts (advisory — IRIX uses these for `df`, not for mounting, but a
+    // wrong count makes `fsck -t efs` "fix" the volume on first boot). Free data
+    // blocks = every CG's data region minus the one root dirblock we allocate.
+    let data_blocks_per_cg = cgfsize - cgisize as u32;
+    let tfree = (ncg * data_blocks_per_cg).saturating_sub(1);
+    // Inodes: `ncg * cgisize * 4`. Inodes 0 and 1 are reserved and inode 2 is
+    // the root directory, so three are unavailable.
+    let total_inodes = ncg * cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
+    let tinode = total_inodes.saturating_sub(3);
 
     let mut fname = [b' '; 6];
     let nb = name.as_bytes();
@@ -2234,64 +2486,75 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     fname[..n].copy_from_slice(&nb[..n]);
     let fpack = fname;
 
-    let sb = EfsSuperblock {
-        fs_size: total_blocks,
+    let mut sb = EfsSuperblock {
+        fs_size,
         firstcg,
         cgfsize,
         cgisize,
         sectors: 63,
         heads: 1,
-        ncg: 1,
+        ncg: ncg as u16,
         dirty: 0,
         fs_time: 0,
         magic: EFS_MAGIC_OLD,
         fname,
         fpack,
         bmsize,
-        tfree: 0, // not maintained by our reader; fsck recomputes if needed
-        tinode: 0,
-        bmblock: 2,
+        tfree,
+        tinode,
+        // Old-magic convention: bitmap location is computed (it lives at block
+        // 2, right after the primary superblock), so the field is left 0 — this
+        // matches real IRIX-formatted disks. `effective_bmblock()` resolves it.
+        bmblock: 0,
         replsb,
         lastialloc: 2, // last allocated inode = root
         checksum: 0,
     };
-    let sb_off = EFS_BLOCKSIZE as usize;
-    sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
-    // Replica superblock at last block.
-    let rep_off = replsb as usize * EFS_BLOCKSIZE as usize;
-    sb.write_into(&mut img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]);
+    // Stamp the IRIX superblock checksum now that every other field is final.
+    // Without this IRIX rejects the volume on mount / fsck.
+    sb.recompute_checksum();
 
-    // Bitmap convention: set bit = free, clear bit = in-use.
-    let bm_off = 2 * EFS_BLOCKSIZE as usize;
-    for i in 0..bmsize as usize {
-        img[bm_off + i] = 0xFF;
-    }
-    // Clear bits for blocks that are in-use:
-    //   - boot (0)
-    //   - primary sb (1)
-    //   - bitmap blocks (2..2+bm_sectors)
-    //   - inode region (firstcg .. firstcg+cgisize)
-    //   - root dirblock
-    //   - last block (replica sb)
-    let mut in_use: Vec<u32> = Vec::new();
-    in_use.push(0);
-    in_use.push(1);
-    for b in 2..2 + bm_sectors {
-        in_use.push(b);
-    }
-    for b in firstcg..firstcg + cgisize as u32 {
-        in_use.push(b);
-    }
-    in_use.push(root_dirblock);
-    in_use.push(replsb);
-    for b in in_use {
-        let by = (b / 8) as usize;
-        let bit = 7 - (b % 8) as usize;
-        img[bm_off + by] &= !(1u8 << bit);
-    }
+    // Primary superblock (block 1) and its replica (last block) — full sectors
+    // so the bytes past the 92-byte struct are explicitly zeroed.
+    let mut sb_sector = [0u8; EFS_BLOCKSIZE as usize];
+    sb.write_into(&mut sb_sector);
+    write_sector_at(sink, part_off, 1, &sb_sector)?;
+    write_sector_at(sink, part_off, replsb, &sb_sector)?;
 
-    // Root inode (inum 2) at firstcg*BLOCKSIZE + 2*128.
-    let root_inode_off = firstcg as usize * EFS_BLOCKSIZE as usize + 2 * EFS_INODESIZE as usize;
+    // Free-space bitmap at block 2 (set bit = free). Start all-free, then clear
+    // bits for in-use blocks: boot (0), primary sb (1), the bitmap itself
+    // (2..firstcg), every cylinder group's inode table, the root dirblock, and
+    // the trailing zone (fs_size..V, which holds the replica superblock).
+    let mut bitmap = vec![0xFFu8; bmsize as usize];
+    {
+        let mut mark_in_use = |blk: u32| {
+            let by = (blk / 8) as usize;
+            let bit = 7 - (blk % 8) as u8;
+            bitmap[by] &= !(1u8 << bit);
+        };
+        mark_in_use(0);
+        mark_in_use(1);
+        for b in 2..firstcg {
+            mark_in_use(b);
+        }
+        for cg in 0..ncg {
+            let cg_start = firstcg + cg * cgfsize;
+            for b in cg_start..cg_start + cgisize as u32 {
+                mark_in_use(b);
+            }
+        }
+        mark_in_use(root_dirblock);
+        for b in fs_size..total_blocks {
+            mark_in_use(b);
+        }
+    }
+    sink.seek(SeekFrom::Start(part_off + 2 * EFS_BLOCKSIZE))?;
+    sink.write_all(&bitmap)?;
+
+    // CG 0's first inode block, carrying the root inode (inum 2) at slot 2
+    // (offset 2*128). Inodes 0, 1, 3 stay zero (free); the rest of the inode
+    // table — including every other CG's — stays sparse-zero (mode 0 = free).
+    let mut inode_block = [0u8; EFS_BLOCKSIZE as usize];
     let mut root = EfsInode::empty(2);
     root.mode = 0o040755; // directory, rwxr-xr-x
     root.nlink = 2; // . and ..
@@ -2303,17 +2566,42 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
         length: 1,
         offset: 0,
     };
-    let mut slot = [0u8; EFS_INODESIZE as usize];
-    root.write_into(&mut slot);
-    img[root_inode_off..root_inode_off + EFS_INODESIZE as usize].copy_from_slice(&slot);
+    let mut root_slot = [0u8; EFS_INODESIZE as usize];
+    root.write_into(&mut root_slot);
+    let slot = 2 * EFS_INODESIZE as usize;
+    inode_block[slot..slot + EFS_INODESIZE as usize].copy_from_slice(&root_slot);
+    write_sector_at(sink, part_off, firstcg, &inode_block)?;
 
-    // Root dirblock: just the EFS_DIRBLK header. No entries.
-    let dirblk_off = root_dirblock as usize * EFS_BLOCKSIZE as usize;
-    BigEndian::write_u16(&mut img[dirblk_off..dirblk_off + 2], EFS_DIRBLK_MAGIC);
-    img[dirblk_off + 2] = 0; // slot count
-    img[dirblk_off + 3] = 0; // first free byte
+    // Root dirblock: the mandatory "." and ".." entries, both pointing at the
+    // root inode (CNID 2 — the root's parent is itself). Real IRIX EFS requires
+    // every directory to begin with these; a root missing them mounts but shows
+    // up empty on IRIX (our own reader is lenient and filters them from
+    // listings, which is why round-trips looked fine).
+    let root_dir = serialize_dir_block(&[
+        DirEntry {
+            inum: EFS_ROOT_INODE,
+            name: b".".to_vec(),
+        },
+        DirEntry {
+            inum: EFS_ROOT_INODE,
+            name: b"..".to_vec(),
+        },
+    ])
+    .expect("root . and .. always fit in one dirblock");
+    write_sector_at(sink, part_off, root_dirblock, &root_dir)?;
 
-    Ok(img)
+    Ok(())
+}
+
+/// Write a sector-sized buffer at partition-relative block `block`.
+fn write_sector_at<W: Write + Seek>(
+    sink: &mut W,
+    part_off: u64,
+    block: u32,
+    data: &[u8],
+) -> std::io::Result<()> {
+    sink.seek(SeekFrom::Start(part_off + block as u64 * EFS_BLOCKSIZE))?;
+    sink.write_all(data)
 }
 
 #[cfg(test)]
@@ -2448,6 +2736,33 @@ mod tests {
         // Wait — inblock = (4 % 9840) / 4 = 1. byte_in_block = (4 % 4) * 128 = 0.
         // byte = (1830 + 1) * 512 = 937472 = 0xE4E00.
         assert_eq!(fs.inode_byte_offset(4), 0xE4E00);
+    }
+
+    /// A freshly formatted EFS root directory begins with "." and ".." (both
+    /// pointing at the root inode). Regression guard: without them IRIX mounts
+    /// the volume but shows an empty root. Subdirectories already got them via
+    /// `create_directory`; this covers `create_blank_efs`'s root.
+    #[test]
+    fn blank_efs_root_has_dot_and_dotdot() {
+        let img = create_blank_efs(8 * 1024 * 1024, "T").expect("format");
+        // Superblock at block 1 (byte 512); firstcg at sb offset 4.
+        let firstcg = u32::from_be_bytes(img[516..520].try_into().unwrap()) as usize;
+        // Root inode 2 at firstcg*512 + 2*128; its first extent (8 bytes,
+        // packed magic|bn|len|off at +32) gives the root dirblock number.
+        let ino = firstcg * 512 + 2 * 128;
+        let ex = &img[ino + 32..ino + 40];
+        let bn = ((ex[1] as usize) << 16) | ((ex[2] as usize) << 8) | ex[3] as usize;
+        let db: [u8; EFS_BLOCKSIZE as usize] = img[bn * 512..bn * 512 + EFS_BLOCKSIZE as usize]
+            .try_into()
+            .unwrap();
+        let entries = parse_dir_block(&db);
+        assert!(entries.iter().any(|e| e.name == b"."), "root has '.'");
+        assert!(entries.iter().any(|e| e.name == b".."), "root has '..'");
+        for e in &entries {
+            if e.name == b"." || e.name == b".." {
+                assert_eq!(e.inum, EFS_ROOT_INODE, "{:?} points at root inode", e.name);
+            }
+        }
     }
 
     #[test]
@@ -2914,6 +3229,127 @@ mod tests {
         assert!(entries.is_empty(), "fresh EFS must have an empty root");
     }
 
+    /// Pins the EFS superblock checksum algorithm to a real IRIX-formatted SCSI
+    /// disk. The on-disk `fs_checksum` was `0xfa73610a` for these field values;
+    /// see `docs/sgi_efs_hdd_irix_debug.md`. If this breaks, IRIX will reject
+    /// every disk we synthesize.
+    #[test]
+    fn efs_checksum_matches_real_irix_disk() {
+        let mut sb = EfsSuperblock {
+            fs_size: 2_092_584,
+            firstcg: 513,
+            cgfsize: 41_021,
+            cgisize: 1_051,
+            sectors: 63,
+            heads: 10,
+            ncg: 51,
+            dirty: 0,
+            fs_time: 0x6a32_cc51,
+            magic: EFS_MAGIC_OLD,
+            fname: *b"noname",
+            fpack: *b"nopack",
+            bmsize: 261_573,
+            tfree: 2_038_446,
+            tinode: 214_397,
+            bmblock: 0,
+            replsb: 2_092_607,
+            lastialloc: 28,
+            checksum: 0,
+        };
+        sb.recompute_checksum();
+        assert_eq!(sb.checksum, 0xfa73_610a);
+    }
+
+    /// A freshly formatted volume stamps a checksum that validates, leaves
+    /// `bmblock` at the old-magic computed sentinel (0), and replicates both in
+    /// the trailing superblock.
+    #[test]
+    fn create_blank_efs_has_valid_checksum_and_bmblock() {
+        let img = create_blank_efs(8 * 1024 * 1024, "TEST").expect("format 8M EFS");
+        let sb = EfsSuperblock::parse(&img[512..512 + EFS_SUPERBLOCK_SIZE]).expect("parse sb");
+        assert_eq!(sb.bmblock, 0, "old-magic EFS leaves bmblock computed");
+        assert_ne!(sb.checksum, 0, "checksum must be stamped");
+
+        let stored = sb.checksum;
+        let mut probe = sb.clone();
+        probe.recompute_checksum();
+        assert_eq!(
+            probe.checksum, stored,
+            "stamped checksum must self-validate"
+        );
+
+        let rep_off = sb.replsb as usize * EFS_BLOCKSIZE as usize;
+        let rep =
+            EfsSuperblock::parse(&img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]).expect("parse repl");
+        assert_eq!(rep.checksum, stored, "replica carries the same checksum");
+        assert_eq!(rep.bmblock, 0);
+    }
+
+    /// A volume past the per-CG target spans multiple uniform cylinder groups,
+    /// scales its inode count with size (no single-CG cap), keeps the layout
+    /// invariants (`fs_size == firstcg + ncg*cgfsize`, data area before the
+    /// replica SB), and round-trips a file through the editable API.
+    #[test]
+    fn create_blank_efs_multi_cg_scales_and_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_efs(64 * 1024 * 1024, "BIGVOL").expect("format 64M EFS");
+        let total_blocks = (img.len() / EFS_BLOCKSIZE as usize) as u32;
+
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let sb = fs.sb.clone();
+        assert!(
+            sb.ncg > 1,
+            "a 64 MiB volume must span multiple cylinder groups, got ncg={}",
+            sb.ncg
+        );
+        // Inode count scales far past the old single-CG cap (was 128 at 64 MiB).
+        let total_inodes = sb.ncg as u32 * sb.cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
+        assert!(
+            total_inodes > 10_000,
+            "inode count should scale with size, got {total_inodes}"
+        );
+        // Layout invariants.
+        assert_eq!(sb.fs_size, sb.firstcg + sb.ncg as u32 * sb.cgfsize);
+        assert!(
+            sb.fs_size < total_blocks,
+            "data area precedes the trailing zone"
+        );
+        assert_eq!(sb.replsb, total_blocks - 1);
+        assert_eq!(sb.bmblock, 0);
+
+        // Fresh root is empty.
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("list").is_empty());
+
+        // A file written into the multi-CG volume reads back byte-identical.
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        let mut cur = Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            "data.bin",
+            &mut cur,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        fs.sync_metadata().expect("sync");
+
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let entry = fs2
+            .list_directory(&root2)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "data.bin")
+            .expect("data.bin present");
+        let read_back = fs2.read_file(&entry, usize::MAX).expect("read");
+        assert_eq!(
+            read_back, payload,
+            "multi-CG file round-trips byte-identical"
+        );
+    }
+
     #[test]
     fn allocate_inode_returns_disk_full_when_all_used() {
         let img = build_synthetic_for_bitmap_tests();
@@ -3149,6 +3585,51 @@ mod tests {
             .find(|e| e.name == "greeting.txt")
             .expect("file present");
         let data = fs2.read_file(entry, usize::MAX).expect("read");
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn editable_rename_preserves_inode_and_content() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = build_synthetic_with_root_dir();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        fs.sb.tfree = 200;
+        fs.sb.tinode = 8;
+
+        let root = fs.root().expect("root");
+        let payload = b"rename me on efs".to_vec();
+        let mut cur = Cursor::new(payload.clone());
+        let created = fs
+            .create_file(
+                &root,
+                "old.txt",
+                &mut cur,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        let original_inum = created.location;
+
+        fs.rename(&root, &created, "new.txt").expect("rename");
+        fs.sync_metadata().expect("sync");
+
+        // Re-open and verify.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().unwrap();
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "old.txt"),
+            "old name should be gone"
+        );
+        let renamed = kids
+            .iter()
+            .find(|e| e.name == "new.txt")
+            .expect("new name present");
+
+        // Identity (inode number) and content preserved.
+        assert_eq!(renamed.location, original_inum);
+        let data = fs2.read_file(renamed, usize::MAX).expect("read");
         assert_eq!(data, payload);
     }
 

@@ -55,6 +55,14 @@ path = "example/generate_cli_html_help.rs"
 name = "decrypt_real_imz"
 path = "example/decrypt_real_imz.rs"
 
+# Throwaway visual mock for the planned Commander Mode UI (docs/commander_mode.md).
+# Needs eframe/egui, so it is gated behind `mock_gui` to keep the default
+# `cargo build --examples` (no GUI deps) from trying to compile it.
+[[example]]
+name = "commander_mock"
+path = "examples/commander_mock.rs"
+required-features = ["mock_gui"]
+
 [features]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
@@ -62,6 +70,9 @@ path = "example/decrypt_real_imz.rs"
 default = ["gui", "chd", "optical"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client.
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+# eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
+# layout mock: `cargo run --example commander_mock --features mock_gui`.
+mock_gui = ["dep:eframe", "dep:egui"]
 # MAME CHD core. Prebuilt binary not available for armv7-linux — leave this
 # off for MiSTer cross-compiles. ADFS / QXL.WIN / .d88 / .adf / .hdf / .vhd /
 # .img / .zst all still work without it.
@@ -99,6 +110,7 @@ zstd = "0.13"
 zeekstd = "0.6"
 sha2 = "0.11"
 md-5 = "0.11"
+sha1 = "0.11"
 aes = "0.9"
 cbc = "0.2"
 crc32c = "0.6"
@@ -109,6 +121,7 @@ image = "0.25"
 dirs = "6"
 unicode-normalization = "0.1"
 flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
+tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"

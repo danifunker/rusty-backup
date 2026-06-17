@@ -61,9 +61,40 @@ pub fn load_backup(folder: &Path) -> Result<LoadOutcome> {
         if is_clonezilla_image(folder) {
             return load_clonezilla(folder).map(LoadOutcome::Clonezilla);
         }
-        anyhow::bail!("no metadata.json found in {}", folder.display());
+        anyhow::bail!("{}", no_metadata_message(folder));
     }
     load_backup_metadata(folder).map(LoadOutcome::Backup)
+}
+
+/// The "no metadata.json" error, distinguishing a folder that already holds
+/// backup artifacts (per-partition data files or a partition-table sidecar) but
+/// no `metadata.json` — the signature of a backup interrupted before it
+/// finished, since `metadata.json` and the per-partition checksums are written
+/// last — from a folder that simply isn't a rusty-backup at all.
+fn no_metadata_message(folder: &Path) -> String {
+    let looks_like_backup = std::fs::read_dir(folder)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("partition-")
+                    || matches!(
+                        name.as_ref(),
+                        "apm.json" | "apm.bin" | "mbr.json" | "mbr.bin" | "gpt.json"
+                    )
+            })
+        })
+        .unwrap_or(false);
+    if looks_like_backup {
+        format!(
+            "no metadata.json in {} - this looks like an incomplete backup \
+             (partition data is present, but metadata.json, which is written when \
+             a backup finishes, is missing). The backup was probably interrupted.",
+            folder.display()
+        )
+    } else {
+        format!("no metadata.json found in {}", folder.display())
+    }
 }
 
 /// Parse a rusty-backup folder: `metadata.json` (required) + `mbr.bin`
@@ -365,5 +396,39 @@ pub fn infer_fat_type_byte(name: &str) -> u8 {
         0xAF
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder with partition data but no metadata.json (an interrupted
+    /// backup) reports the incomplete-backup hint, not a bare "not found".
+    #[test]
+    fn incomplete_backup_folder_reports_helpful_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("apm.json"), b"{}").unwrap();
+        std::fs::write(dir.path().join("partition-11.zst"), b"\x28\xb5\x2f\xfd").unwrap();
+
+        // load_backup bails (no metadata.json, not a Clonezilla image) with the
+        // incomplete-backup wording.
+        let err = load_backup(dir.path()).err().unwrap().to_string();
+        assert!(
+            err.contains("incomplete backup"),
+            "expected incomplete-backup hint, got: {err}"
+        );
+        assert!(!err.contains("not found"), "should not be the bare message");
+    }
+
+    /// A folder with no backup artifacts at all gets the plain "not found".
+    #[test]
+    fn empty_folder_reports_plain_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_backup(dir.path()).err().unwrap().to_string();
+        assert!(
+            err.contains("no metadata.json found"),
+            "expected the plain message, got: {err}"
+        );
     }
 }

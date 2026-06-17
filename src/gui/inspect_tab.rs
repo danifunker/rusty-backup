@@ -7,8 +7,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 
 use rusty_backup::backup::metadata::BackupMetadata;
-use rusty_backup::clonezilla;
+// Partition-capability gates — shared across all UIs, defined in the engine.
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
+use rusty_backup::fs::{
+    is_checkable_type, is_classic_hfs, is_superfloppy_hfs, partition_is_browsable,
+};
+use rusty_backup::model::cache_runner;
+use rusty_backup::model::commander_source::{self, ClonezillaOpen, PartcloneLookup};
 use rusty_backup::model::export_runner::{
     self, ExportStatus, PartitionExportConfig, PerPartitionInputs,
 };
@@ -23,6 +28,7 @@ use rusty_backup::rbformats::export::ExportFormat;
 
 use super::chd_options_ui::ChdOptionsControl;
 
+use super::alto_resize_dialog::AltoResizeDialog;
 use super::browse_view::BrowseView;
 use super::context::TabContext;
 use super::expand_hfs_dialog::{summarize_source as summarize_hfs_source, ExpandHfsDialog};
@@ -39,6 +45,27 @@ use super::physical_disk_export::{PhysicalDiskExport, PhysicalDiskExportSource};
 const MAX_FLOPPY_CONTAINER_BYTES: u64 = 2 * 1024 * 1024;
 
 /// State for the Inspect tab.
+/// A source change (open or close) deferred behind the unsaved-edits confirm,
+/// so the live source is never mutated — and a new disk never partially loads —
+/// until the user resolves the prompt.
+enum PendingSourceChange {
+    Open(super::source_picker::SourceEvent),
+    Close,
+}
+
+/// True when `path` is a classic Mac archive (StuffIt / BinHex / Compact Pro)
+/// by extension — those route to the Archives tab, not disk inspection.
+fn is_mac_archive_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false)
+}
+
 pub struct InspectTab {
     /// Index into the device list, or None if "Open Image File..." is selected
     selected_device_idx: Option<usize>,
@@ -83,6 +110,13 @@ pub struct InspectTab {
     prev_device_idx: Option<usize>,
     prev_image_path: Option<PathBuf>,
     prev_backup_path: Option<PathBuf>,
+    /// A source open/close held until the user resolves the unsaved-edits
+    /// prompt (deferred-switch guard). `None` when nothing is pending.
+    pending_source_change: Option<PendingSourceChange>,
+    /// A Mac-archive file the user picked in the source dropdown — the app
+    /// consumes this to switch to the Archives tab instead of inspecting it as
+    /// a disk image. `None` when nothing is pending.
+    pending_open_archive: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
     /// Export: true if the export popup is open
@@ -132,8 +166,10 @@ pub struct InspectTab {
         HashMap<usize, Arc<Mutex<rusty_backup::model::volume_label_runner::VolumeLabelStatus>>>,
     /// Clonezilla image metadata (when backup is a Clonezilla image)
     clonezilla_image: Option<ClonezillaImage>,
-    /// Block caches per Clonezilla partition (for browse support)
-    block_caches: HashMap<usize, Arc<Mutex<clonezilla::block_cache::PartcloneBlockCache>>>,
+    /// Scanned Clonezilla block caches reused across opens, plus the
+    /// in-memory/on-disk/scan decision tree — the same shared store Commander
+    /// uses (see `commander_source::PartcloneCacheStore`).
+    cache_store: commander_source::PartcloneCacheStore,
     /// Background block cache scan status
     block_cache_scan: Option<Arc<Mutex<BlockCacheScan>>>,
     /// Seekable zstd cache files for native zstd backups
@@ -183,6 +219,8 @@ pub struct InspectTab {
     repair_context: Option<(u64, u8, Option<String>)>,
     /// "Expand HFS Volume…" dialog (classic HFS only).
     expand_hfs_dialog: Option<ExpandHfsDialog>,
+    /// "Resize Alto Disk…" dialog (Alto BFS only).
+    alto_resize_dialog: Option<AltoResizeDialog>,
     /// "Convert Floppy Container..." dialog (XDF/HDM/DIM/D88).
     floppy_convert_dialog: Option<FloppyConvertDialog>,
     /// Pending Human68k defragment awaiting confirmation: (partition byte
@@ -222,6 +260,8 @@ impl Default for InspectTab {
             prev_device_idx: None,
             prev_image_path: None,
             prev_backup_path: None,
+            pending_source_change: None,
+            pending_open_archive: None,
             browse_view: BrowseView::default(),
             export_popup: false,
             export_whole_disk: true,
@@ -239,7 +279,7 @@ impl Default for InspectTab {
             last_logged_min_size_phase: HashMap::new(),
             pending_volume_label_probes: HashMap::new(),
             clonezilla_image: None,
-            block_caches: HashMap::new(),
+            cache_store: commander_source::PartcloneCacheStore::new(),
             block_cache_scan: None,
             seekable_cache_files: HashMap::new(),
             cache_status: None,
@@ -261,6 +301,7 @@ impl Default for InspectTab {
             repair_report: None,
             repair_context: None,
             expand_hfs_dialog: None,
+            alto_resize_dialog: None,
             floppy_convert_dialog: None,
             pending_repack: None,
             repack_status: None,
@@ -299,6 +340,13 @@ impl InspectTab {
     /// the auto-load fallback in `gui::mod::update`).
     pub fn take_close_backup_request(&mut self) -> bool {
         std::mem::take(&mut self.close_backup_requested)
+    }
+
+    /// Returns and clears a Mac-archive file the user picked in the source
+    /// dropdown. The app routes it to the Archives tab (a `.sit`/`.hqx` isn't a
+    /// disk image, so inspecting it would just fail).
+    pub fn take_open_archive_request(&mut self) -> Option<PathBuf> {
+        self.pending_open_archive.take()
     }
 
     pub fn load_backup(&mut self, path: &PathBuf) {
@@ -375,7 +423,7 @@ impl InspectTab {
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
-        self.block_caches.clear();
+        self.cache_store.clear();
         self.block_cache_scan = None;
         self.seekable_cache_files.clear();
         self.cache_status = None;
@@ -413,73 +461,37 @@ impl InspectTab {
                 "Select a device or image...".into()
             };
 
-            egui::ComboBox::from_id_salt("inspect_source")
-                .selected_text(&current_label)
-                .width(400.0)
-                .height(400.0) // Allow more items to be visible without scrolling
-                .show_ui(ui, |ui| {
-                    for (i, device) in ctx.devices.iter().enumerate() {
-                        let label = device.display_name();
-                        if ui
-                            .selectable_value(&mut self.selected_device_idx, Some(i), &label)
-                            .clicked()
-                        {
-                            self.image_file_path = None;
-                            self.amiga_tempdir = None;
-                            self.backup_folder_path = None;
-                            self.clear_results();
-                        }
-                    }
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.image_file_path.is_some(), "Open File...")
-                        .clicked()
-                    {
-                        if let Some(path) = super::file_dialog()
-                            .add_filter(
-                                "Disk Images",
-                                rusty_backup::model::file_types::DISK_IMAGE_EXTS,
-                            )
-                            .add_filter(
-                                "Mac archives",
-                                rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
-                            )
-                            .add_filter("All Files", &["*"])
-                            .pick_file()
-                        {
-                            self.selected_device_idx = None;
-                            self.backup_folder_path = None;
-                            // Transparently decompress .adz / .hdz so the
-                            // rest of the pipeline (PartitionTable::detect,
-                            // backup, browse) sees a raw image. Floppy
-                            // containers (.d88/.xdf/.hdm/.dim) are NOT decoded
-                            // here (false) — they open directly so edits
-                            // persist back into the container via the browse
-                            // view's ContainerEditSession writeback.
-                            match super::prepare_disk_image_path(&path, false) {
-                                Ok((materialized, guard)) => {
-                                    self.image_file_path = Some(materialized);
-                                    self.amiga_tempdir = guard;
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to decompress {}: {}", path.display(), e);
-                                    self.image_file_path = Some(path);
-                                    self.amiga_tempdir = None;
-                                }
-                            }
-                            self.clear_results();
-                        }
-                    }
-                    if ui
-                        .selectable_label(
-                            self.backup_folder_path.is_some(),
-                            "Open Backup Folder...",
-                        )
-                        .clicked()
-                    {
-                        self.pick_backup_folder();
-                    }
-                });
+            // Shared source picker (R1): same ComboBox widget the Commander
+            // panes use. It owns the rfd dialogs + image filter/materialize and
+            // emits a SourceEvent; we map that onto our source state here.
+            let cfg = super::source_picker::PickerConfig {
+                show_devices: true,
+                show_image: true,
+                show_host_folder: false,
+                show_backup_folder: true,
+                materialize_image: true,
+                include_mac_archives: true,
+                width: 400.0,
+            };
+            let state = super::source_picker::PickerState {
+                selected_device_idx: self.selected_device_idx,
+                image_active: self.image_file_path.is_some(),
+                host_active: false,
+                backup_active: self.backup_folder_path.is_some(),
+                devices: ctx.devices,
+            };
+            if let Some(ev) =
+                super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
+            {
+                // Gate the switch on unsaved browse edits: defer it behind the
+                // confirm prompt so the live source is untouched (and no new
+                // disk partially loads) until the user resolves it.
+                if self.browse_view.has_unsaved_edits() {
+                    self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                } else {
+                    self.apply_source_event(ev);
+                }
+            }
         });
 
         ui.add_space(4.0);
@@ -490,30 +502,29 @@ impl InspectTab {
             || self.backup_folder_path != self.prev_backup_path;
 
         if selection_changed {
-            if self.browse_view.is_active() && !self.browse_view.close_or_prompt() {
-                // Unsaved-edits dialog shown; revert the selection until the
-                // user resolves it. They can re-pick the new source after.
-                self.selected_device_idx = self.prev_device_idx;
-                self.image_file_path = self.prev_image_path.clone();
-                self.backup_folder_path = self.prev_backup_path.clone();
-            } else {
-                self.prev_device_idx = self.selected_device_idx;
-                self.prev_image_path = self.image_file_path.clone();
-                self.prev_backup_path = self.backup_folder_path.clone();
-                // Re-sniff floppy-ness on every source change so the
-                // "Convert Floppy Container..." button tracks the source.
-                self.source_is_floppy = self
-                    .image_file_path
-                    .as_deref()
-                    .map(Self::detect_source_is_floppy)
-                    .unwrap_or(false);
-                if self.backup_folder_path.is_some() {
-                    self.load_backup_metadata(ctx);
-                } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
-                    self.run_inspect(ctx);
-                }
+            // The source only ever changes through `apply_source_event` /
+            // `do_close` (both gated upstream on unsaved edits), so by here the
+            // switch is committed — just record it and load.
+            self.prev_device_idx = self.selected_device_idx;
+            self.prev_image_path = self.image_file_path.clone();
+            self.prev_backup_path = self.backup_folder_path.clone();
+            // Re-sniff floppy-ness on every source change so the
+            // "Convert Floppy Container..." button tracks the source.
+            self.source_is_floppy = self
+                .image_file_path
+                .as_deref()
+                .map(Self::detect_source_is_floppy)
+                .unwrap_or(false);
+            if self.backup_folder_path.is_some() {
+                self.load_backup_metadata(ctx);
+            } else if self.selected_device_idx.is_some() || self.image_file_path.is_some() {
+                self.run_inspect(ctx);
             }
         }
+
+        // Deferred source-switch confirm (shown when a switch/close was
+        // requested while the browse view had unsaved staged edits).
+        self.render_source_switch_guard(ui, ctx);
 
         // Poll background inspect (physical device)
         self.poll_inspect_status(ctx);
@@ -685,6 +696,33 @@ impl InspectTab {
                 self.expand_image_add_mib = 0;
             }
 
+            // Make Bootable button — auto-detect what this Mac disk needs to
+            // boot (SCSI driver + DDR on a full APM disk, boot blocks, blessed
+            // System Folder) and apply only the missing pieces. A flat HFV is
+            // kept flat. See src/fs/make_bootable.rs.
+            let has_mac_hfs = self.partitions.iter().any(|p| {
+                is_classic_hfs(
+                    p.partition_type_byte,
+                    p.partition_type_string.as_deref(),
+                    &p.type_name,
+                )
+            });
+            if ui
+                .add_enabled(
+                    is_image_file && has_mac_hfs && !export_running && !chd_expand_running,
+                    egui::Button::new("Make Bootable..."),
+                )
+                .on_hover_text(
+                    "Auto-detect what this Mac disk needs to boot (SCSI driver + DDR on a \
+                     full APM disk, boot blocks, blessed System Folder) and apply only the \
+                     missing pieces. A flat HFV is kept flat; you'll be asked for a donor \
+                     disk only if boot blocks are missing.",
+                )
+                .clicked()
+            {
+                self.run_make_bootable(ctx);
+            }
+
             // Resize Partitions button — same conditions as Edit Partition Table
             let resize_running = self.resize_popup.as_ref().is_some_and(|p| p.is_running());
             if ui
@@ -709,44 +747,17 @@ impl InspectTab {
                 }
             }
 
-            // Close button — releases the device/image and clears results
-            if self.selected_device_idx.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Device").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.selected_device_idx = None;
-                self.prev_device_idx = None;
-                ctx.log.info("Device closed and remounted.");
-            }
-            if self.image_file_path.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Image").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.image_file_path = None;
-                self.amiga_tempdir = None;
-                self.prev_image_path = None;
-                ctx.log.info("Image file closed.");
-            }
-            if self.backup_folder_path.is_some()
-                && !inspect_running
-                && !export_running
-                && ui.button("Close Backup").clicked()
-            {
-                self.browse_view.close();
-                self.clear_results();
-                self.backup_folder_path = None;
-                self.prev_backup_path = None;
-                // Signal to gui::mod that the cross-tab `loaded_backup_folder`
-                // should be cleared too — otherwise its auto-reopen fallback
-                // re-loads the backup on the very next frame.
-                self.close_backup_requested = true;
-                ctx.log.info("Backup folder closed.");
+            // One consolidated Close button: clears whatever source is open
+            // (device / image / backup). Guarded by unsaved browse edits.
+            let any_source = self.selected_device_idx.is_some()
+                || self.image_file_path.is_some()
+                || self.backup_folder_path.is_some();
+            if any_source && !inspect_running && !export_running && ui.button("Close").clicked() {
+                if self.browse_view.has_unsaved_edits() {
+                    self.pending_source_change = Some(PendingSourceChange::Close);
+                } else {
+                    self.do_close(ctx);
+                }
             }
 
             if export_running && ui.button("Cancel Export").clicked() {
@@ -1098,6 +1109,97 @@ impl InspectTab {
             fs_hint,
             has_partition_table,
         })
+    }
+
+    /// Auto-detect what the loaded Mac disk needs to boot and apply only the
+    /// missing pieces (driver + DDR on a full APM disk, boot blocks, blessed
+    /// System Folder). Prompts for a donor disk only when boot blocks are
+    /// absent. Runs synchronously — each step is a small metadata/sector write.
+    fn run_make_bootable(&mut self, ctx: &mut TabContext) {
+        use rusty_backup::fs::make_bootable::{
+            assess_bootability, make_bootable, BootDiskKind, DriverSource, MakeBootableOptions,
+        };
+
+        let Some(path) = self.image_file_path.clone() else {
+            return;
+        };
+
+        let assessment = match assess_bootability(&path) {
+            Ok(a) => a,
+            Err(e) => {
+                ctx.log.error(format!("Make Bootable: {e}"));
+                return;
+            }
+        };
+        let kind = match assessment.kind {
+            BootDiskKind::FlatHfs => "flat HFS image (kept flat)",
+            BootDiskKind::ApmHfs => "full APM disk",
+        };
+        ctx.log.info(format!(
+            "Make Bootable: detected {kind} - boot blocks {}, System Folder {}",
+            if assessment.has_boot_blocks {
+                "present"
+            } else {
+                "absent"
+            },
+            match &assessment.blessed_folder {
+                Some(n) => format!("blessed ({n})"),
+                None => "not blessed".to_string(),
+            }
+        ));
+
+        if assessment.is_bootable() {
+            ctx.log
+                .info("Make Bootable: disk is already bootable; nothing to do.");
+            return;
+        }
+
+        // Boot blocks can't be synthesized — ask for a donor disk if missing.
+        // Cancelling the picker aborts without writing anything.
+        let mut donor = None;
+        if !assessment.has_boot_blocks {
+            match rfd::FileDialog::new()
+                .set_title("Boot blocks needed - pick a bootable donor disk")
+                .add_filter("Disk images", &["dsk", "hfv", "img", "hda", "raw"])
+                .pick_file()
+            {
+                Some(p) => donor = Some(p),
+                None => {
+                    ctx.log
+                        .info("Make Bootable: cancelled (boot blocks need a donor disk).");
+                    return;
+                }
+            }
+        }
+
+        let opts = MakeBootableOptions {
+            donor,
+            driver: DriverSource::Builtin,
+            bless_path: None,
+            dry_run: false,
+        };
+        match make_bootable(&path, &opts) {
+            Ok(report) => {
+                for s in &report.applied {
+                    ctx.log.info(format!("Make Bootable: {s}"));
+                }
+                for s in &report.skipped {
+                    ctx.log.info(format!("Make Bootable: skip - {s}"));
+                }
+                for s in &report.still_missing {
+                    ctx.log.warn(format!("Make Bootable: MISSING - {s}"));
+                }
+                if report.now_bootable {
+                    ctx.log.info("Make Bootable: disk is now bootable.");
+                } else {
+                    ctx.log
+                        .warn("Make Bootable: disk is not yet bootable (see MISSING above).");
+                }
+                // Force re-detection so the partition list / statuses refresh.
+                self.prev_image_path = None;
+            }
+            Err(e) => ctx.log.error(format!("Make Bootable failed: {e}")),
+        }
     }
 
     fn init_resize_popup(&mut self, ctx: &mut TabContext) {
@@ -2398,12 +2500,99 @@ impl InspectTab {
         }
     }
 
-    fn pick_backup_folder(&mut self) {
-        if let Some(path) = super::file_dialog().pick_folder() {
-            self.backup_folder_path = Some(path);
-            self.selected_device_idx = None;
-            self.image_file_path = None;
-            self.clear_results();
+    /// Apply a picked source: close any open browse view, set the source
+    /// fields, and clear stale results. The subsequent `selection_changed`
+    /// pass loads the new source. Unsaved-edit gating happens at the call site.
+    fn apply_source_event(&mut self, ev: super::source_picker::SourceEvent) {
+        use super::source_picker::SourceEvent;
+        self.browse_view.close();
+        match ev {
+            SourceEvent::Device(i) => {
+                self.selected_device_idx = Some(i);
+                self.image_file_path = None;
+                self.amiga_tempdir = None;
+                self.backup_folder_path = None;
+                self.clear_results();
+            }
+            SourceEvent::Image { path, tempdir } => {
+                // A Mac archive (.sit/.hqx/...) isn't a disk image — hand it to
+                // the Archives tab instead of failing to parse a partition table.
+                if is_mac_archive_path(&path) {
+                    self.pending_open_archive = Some(path);
+                    return;
+                }
+                self.selected_device_idx = None;
+                self.backup_folder_path = None;
+                self.image_file_path = Some(path);
+                self.amiga_tempdir = tempdir;
+                self.clear_results();
+            }
+            SourceEvent::BackupFolder(path) => {
+                self.backup_folder_path = Some(path);
+                self.selected_device_idx = None;
+                self.image_file_path = None;
+                self.clear_results();
+            }
+            // Inspect's picker doesn't offer a host folder.
+            SourceEvent::HostFolder(_) => {}
+        }
+    }
+
+    /// Close whatever source is open (the consolidated Close button). Unsaved
+    /// edits are gated at the call site.
+    fn do_close(&mut self, ctx: &mut TabContext) {
+        let was_backup = self.backup_folder_path.is_some();
+        self.browse_view.close();
+        self.clear_results();
+        self.selected_device_idx = None;
+        self.prev_device_idx = None;
+        self.image_file_path = None;
+        self.amiga_tempdir = None;
+        self.prev_image_path = None;
+        self.backup_folder_path = None;
+        self.prev_backup_path = None;
+        if was_backup {
+            // Otherwise gui::mod's auto-reopen fallback re-loads the backup.
+            self.close_backup_requested = true;
+        }
+        ctx.log.info("Source closed.");
+    }
+
+    /// Modal shown when a source open/close was requested while the browse view
+    /// had unsaved staged edits: discard and proceed, or cancel and keep the
+    /// current source fully intact (it was never touched).
+    fn render_source_switch_guard(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
+        if self.pending_source_change.is_none() {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        egui::Window::new("Discard unsaved edits?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label("The open volume has unapplied staged edits.");
+                ui.label("Switching or closing the source will discard them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Discard & continue").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirm {
+            self.browse_view.close();
+            match self.pending_source_change.take() {
+                Some(PendingSourceChange::Open(ev)) => self.apply_source_event(ev),
+                Some(PendingSourceChange::Close) => self.do_close(ctx),
+                None => {}
+            }
+        } else if cancel {
+            self.pending_source_change = None;
         }
     }
 
@@ -2422,7 +2611,7 @@ impl InspectTab {
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
-        self.block_caches.clear();
+        self.cache_store.clear();
         self.block_cache_scan = None;
         self.seekable_cache_files.clear();
         self.cache_status = None;
@@ -3422,6 +3611,8 @@ impl InspectTab {
         let mut defrag_request: Option<(u64, String)> = None;
         // "Calc min" button click: partition index to compute minimum size for.
         let mut min_size_calc_request: Option<usize> = None;
+        // "Resize…" click on an Alto BFS row.
+        let mut resize_request = false;
 
         // The in-place Human68k defragment worker rewrites the partition
         // region of the underlying file, so it's offered for image-file
@@ -3612,11 +3803,11 @@ impl InspectTab {
                             ui.label("");
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if is_browsable_type(part.partition_type_byte)
-                            || is_fat_name(&part.type_name)
-                            || is_browsable_type_string(part.partition_type_string.as_deref())
-                            || is_browsable_superfloppy(part.partition_type_byte, &part.type_name)
-                        {
+                        if partition_is_browsable(
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                            &part.type_name,
+                        ) {
                             let ptype = if part.partition_type_byte != 0 {
                                 part.partition_type_byte
                             } else {
@@ -3673,6 +3864,21 @@ impl InspectTab {
                             {
                                 defrag_request = Some((part.byte_offset(), part.type_name.clone()));
                             }
+                            // Resize an Alto BFS volume onto a new geometry.
+                            // Reads the image and writes a brand-new PDI, so it's
+                            // offered for image-file sources only.
+                            if part.type_name == "Alto BFS"
+                                && is_image_source
+                                && ui
+                                    .small_button("Resize…")
+                                    .on_hover_text(
+                                        "Re-lay this Alto volume onto a different disk geometry \
+                                         (Diablo 31 / 44, grow or shrink) and save it as a PDI.",
+                                    )
+                                    .clicked()
+                            {
+                                resize_request = true;
+                            }
                         } else {
                             ui.label("");
                         }
@@ -3698,6 +3904,17 @@ impl InspectTab {
             self.open_expand_hfs(offset, partition_size, ctx);
         }
 
+        // Handle Alto resize request: open the dialog on the loaded image.
+        if resize_request {
+            match self.image_file_path.clone() {
+                Some(path) => match AltoResizeDialog::new(path) {
+                    Ok(dlg) => self.alto_resize_dialog = Some(dlg),
+                    Err(e) => ctx.log.error(format!("Cannot open resize dialog: {e}")),
+                },
+                None => ctx.log.error("Resize: no image file loaded"),
+            }
+        }
+
         // Handle defragment request: stash it for the confirmation modal
         // (the worker rewrites the partition in place).
         if let Some((offset, label)) = defrag_request {
@@ -3720,6 +3937,14 @@ impl InspectTab {
             let still_open = dlg.show(ui.ctx(), ctx.log);
             if !still_open {
                 self.expand_hfs_dialog = None;
+            }
+        }
+
+        // Resize-Alto dialog
+        if let Some(dlg) = &mut self.alto_resize_dialog {
+            let still_open = dlg.show(ui.ctx(), ctx.log);
+            if !still_open {
+                self.alto_resize_dialog = None;
             }
         }
 
@@ -4488,7 +4713,11 @@ impl InspectTab {
             return;
         }
 
-        // Case 2: native backup folder — find the partition's data file
+        // Case 2: native backup folder. Source resolution (data-file lookup,
+        // split/exists checks, the per-compression reader) and the edit-context
+        // mapping live in the shared model (commander_source) — the same path
+        // Commander uses — instead of an inline per-compression ladder. The view
+        // keeps only the zstd seekable-cache upgrade and the unsupported message.
         let (folder, meta) = match (&self.backup_folder_path, &self.backup_metadata) {
             (Some(f), Some(m)) => (f.clone(), m.clone()),
             _ => {
@@ -4500,139 +4729,81 @@ impl InspectTab {
             }
         };
 
-        // Look up partition metadata
-        let part_meta = match meta.partitions.iter().find(|p| p.index == part_index) {
-            Some(pm) => pm,
-            None => {
-                ctx.log.error(format!(
-                    "partition-{}: not found in backup metadata",
-                    part_index,
-                ));
-                return;
-            }
-        };
-
-        if part_meta.compressed_files.is_empty() {
-            ctx.log.error(format!(
-                "partition-{}: no data files listed in backup metadata",
+        // zstd opens streaming immediately, then upgrades to a background-built
+        // seekable cache (and reuses one already built this session). That
+        // machinery stays in the view; the model supplies only the validated
+        // data file and the archive-edit context.
+        if meta.compression_type == "zstd" {
+            let data_path = match commander_source::single_data_file(&folder, &meta, part_index) {
+                Ok(p) => p,
+                Err(e) => {
+                    ctx.log.error(format!("partition-{part_index}: {e:#}"));
+                    return;
+                }
+            };
+            self.open_browse_zstd(
                 part_index,
-            ));
+                ptype,
+                partition_type_string,
+                &data_path,
+                &folder,
+                &format!("partition-{part_index}"),
+                ctx,
+            );
+            self.apply_backup_edit(&folder, &meta, part_index);
             return;
         }
 
-        // Split files not supported for browsing
-        if part_meta.compressed_files.len() > 1 {
-            ctx.log.warn(format!(
-                "partition-{}: browsing split backup files is not supported (files: {})",
-                part_index,
-                part_meta.compressed_files.join(", "),
-            ));
-            return;
-        }
-
-        let data_file = &part_meta.compressed_files[0];
-        let data_path = folder.join(data_file);
-
-        if !data_path.exists() {
-            ctx.log.error(format!(
-                "partition-{}: data file not found: {}",
-                part_index,
-                data_path.display(),
-            ));
-            return;
-        }
-
-        let metadata_path = folder.join("metadata.json");
-        let compression_type_str = meta.compression_type.clone();
-        let checksum_type = meta.checksum_type.clone();
-
-        match meta.compression_type.as_str() {
-            "none" => {
-                // Raw file — partition data starts at offset 0
+        // Every other per-partition compression resolves to a ready session.
+        match commander_source::session_for_backup_partition(&folder, &meta, part_index) {
+            Ok(session) => {
                 ctx.log.info(format!(
-                    "Browsing partition {} from {}",
-                    part_index, data_file,
+                    "Browsing partition {part_index} from {} backup",
+                    meta.compression_type
                 ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                // Raw backups support direct editing (no decompress needed)
+                self.browse_view.open_with_session(session);
+                // Layer edit support from the model's compression -> flow
+                // mapping (raw edits directly, CHD via chd_edit; the edit-mode
+                // toggle picks the mechanism by sniffing the source).
+                self.apply_backup_edit(&folder, &meta, part_index);
             }
-            "zstd" => {
-                // Zstd-compressed backup — open streaming immediately while
-                // seekable cache builds in the background
-                self.open_browse_zstd(
-                    part_index,
-                    ptype,
-                    partition_type_string,
-                    &data_path,
-                    &folder,
-                    &format!("partition-{}", part_index),
-                    ctx,
-                );
-                // Set archive edit context for decompress→edit→recompress flow
+            // none / chd / chd-dvd / woz only fail on a real error (missing or
+            // split data file); any other compression isn't browsable yet.
+            Err(e) => match meta.compression_type.as_str() {
+                "none" | "chd" | "chd-dvd" | "woz" => {
+                    ctx.log.error(format!("partition-{part_index}: {e:#}"));
+                }
+                other => {
+                    ctx.log.warn(format!(
+                        "partition-{part_index}: browsing {other} compressed backups \
+                         is not yet supported"
+                    ));
+                }
+            },
+        }
+    }
+
+    /// Layer edit support onto the just-opened backup partition from the shared
+    /// compression -> edit-flow mapping ([`commander_source::backup_edit_for`]):
+    /// raw / CHD edit in place; zstd / woz go through the
+    /// decompress -> edit -> recompress archive flow; anything else stays
+    /// read-only.
+    fn apply_backup_edit(&mut self, folder: &Path, meta: &BackupMetadata, part_index: usize) {
+        match commander_source::backup_edit_for(folder, meta, part_index) {
+            Ok(commander_source::BackupEdit::InPlace) => self.browse_view.mark_edit_supported(),
+            Ok(commander_source::BackupEdit::Archive(plan)) => {
                 self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
+                    plan.archive_path,
+                    plan.compression_type,
+                    plan.original_size,
+                    plan.compacted,
+                    plan.metadata_path,
+                    plan.partition_index,
+                    plan.checksum_type,
                 );
             }
-            "chd" | "chd-dvd" => {
-                // CHD-compressed backup — open directly via ChdReader (on-demand
-                // decompression). Editing flows through `chd_edit::ChdEditSession`
-                // (diff-against-parent for compressed, in-place for uncompressed),
-                // so no `archive_edit_ctx` is set here. NOTE: backup metadata.json
-                // checksum / compressed_files entries are NOT auto-updated after
-                // a CHD edit yet — that lives on the Phase 2 follow-up TODO.
-                ctx.log.info(format!(
-                    "Browsing partition {} from CHD: {}",
-                    part_index, data_file,
-                ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                let _ = (metadata_path, checksum_type, compression_type_str);
-            }
-            "woz" => {
-                ctx.log.info(format!(
-                    "Browsing partition {} from WOZ: {}",
-                    part_index, data_file,
-                ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
-                );
-            }
-            other => {
-                ctx.log.warn(format!(
-                    "partition-{}: browsing {} compressed backups is not yet supported (file: {})",
-                    part_index, other, data_file,
-                ));
-            }
+            Ok(commander_source::BackupEdit::ReadOnly) => {}
+            Err(e) => log::warn!("no edit context for partition {part_index}: {e:#}"),
         }
     }
 
@@ -4664,89 +4835,41 @@ impl InspectTab {
             return;
         }
 
-        // Check if block cache already exists in memory
-        if let Some(cache) = self.block_caches.get(&part_index) {
-            if let Ok(c) = cache.lock() {
-                if c.state == clonezilla::block_cache::CacheState::Ready {
-                    drop(c);
-                    ctx.log.info(format!(
-                        "Browsing partition {} from block cache",
-                        part_index
-                    ));
-                    self.browse_view.open_partclone(Arc::clone(cache), ptype);
-                    return;
-                }
-            }
-        }
-
-        // Check if a scan is already running
-        if self.block_cache_scan.is_some() {
-            ctx.log
-                .warn("A metadata scan is already in progress. Please wait.");
-            return;
-        }
-
-        // Try to load persisted cache from disk
-        let cache_path = folder.join(format!("_{}.metadata.cache", cz_part.device_name));
-        if cache_path.exists() {
-            match clonezilla::block_cache::PartcloneBlockCache::load_from_file(
-                &cache_path,
-                cz_part.partclone_files.clone(),
-            ) {
-                Ok(loaded) => {
-                    ctx.log.info(format!(
-                        "Loaded cached metadata for partition {} ({} blocks)",
-                        part_index,
-                        loaded.cached_block_count(),
-                    ));
-                    let cache = Arc::new(Mutex::new(loaded));
-                    self.block_caches.insert(part_index, Arc::clone(&cache));
-                    self.browse_view.open_partclone(cache, ptype);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("Failed to load metadata cache: {e}, will re-scan");
-                    let _ = std::fs::remove_file(&cache_path);
-                }
-            }
-        }
-
-        // Start background metadata scan
-        ctx.log.info(format!(
-            "Scanning metadata for partition {} ({})...",
-            part_index,
-            partition::format_size(cz_part.size_bytes()),
-        ));
-
-        let cache = Arc::new(Mutex::new(
-            clonezilla::block_cache::PartcloneBlockCache::new(cz_part.partclone_files.clone()),
-        ));
-
-        let scan = Arc::new(Mutex::new(BlockCacheScan {
-            finished: false,
-            error: None,
-            partition_index: part_index,
+        // Shared decision tree (same store Commander uses): a cache scanned
+        // earlier this session is reused in memory, else a prior on-disk scan
+        // loads, else a background scan builds one. `poll_block_cache_scan`
+        // memoizes the result and opens it.
+        let open = ClonezillaOpen {
+            partclone_files: cz_part.partclone_files.clone(),
             partition_type: ptype,
-            cache: Arc::clone(&cache),
-        }));
-        self.block_cache_scan = Some(Arc::clone(&scan));
-
-        let cache_for_thread = Arc::clone(&cache);
-        std::thread::spawn(move || {
-            let _wake =
-                rusty_backup::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
-            let result = clonezilla::metadata_scan::scan_metadata(
-                &cache_for_thread,
-                ptype,
-                Some(&cache_path),
-            );
-            if let Ok(mut s) = scan.lock() {
-                s.finished = true;
-                if let Err(e) = result {
-                    s.error = Some(format!("{e:#}"));
-                }
+            cache_path: folder.join(format!("_{}.metadata.cache", cz_part.device_name)),
+        };
+        match self.cache_store.resolve(part_index, &open) {
+            PartcloneLookup::Ready(cache) => {
+                ctx.log.info(format!(
+                    "Browsing partition {} from cached metadata",
+                    part_index
+                ));
+                self.browse_view.open_partclone(cache, ptype);
             }
-        });
+            PartcloneLookup::NeedsScan { cache, cache_path } => {
+                if self.block_cache_scan.is_some() {
+                    ctx.log
+                        .warn("A metadata scan is already in progress. Please wait.");
+                    return;
+                }
+                ctx.log.info(format!(
+                    "Scanning metadata for partition {} ({})...",
+                    part_index,
+                    partition::format_size(cz_part.size_bytes()),
+                ));
+                // The scan runs on a worker thread; the spawn lives in the
+                // shared model runner so Commander Mode uses the same path.
+                self.block_cache_scan = Some(cache_runner::spawn_partclone_scan(
+                    cache, part_index, ptype, cache_path,
+                ));
+            }
+        }
     }
 
     /// Open browse for a native zstd-compressed backup.
@@ -4860,7 +4983,8 @@ impl InspectTab {
                 ));
                 let cache = Arc::clone(&scan.cache);
                 drop(scan);
-                self.block_caches.insert(part_index, Arc::clone(&cache));
+                // Memoize so a later open of this partition reuses it in memory.
+                self.cache_store.insert(part_index, Arc::clone(&cache));
                 self.block_cache_scan = None;
 
                 // Auto-open the browser
@@ -4991,112 +5115,6 @@ fn create_seekable_cache_from_zstd(
     Ok(())
 }
 
-/// Check if a partition type byte corresponds to a browsable filesystem.
-fn is_browsable_type(ptype: u8) -> bool {
-    matches!(
-        ptype,
-        0x01 | 0x04
-            | 0x06
-            | 0x07
-            | 0x0B
-            | 0x0C
-            | 0x0E
-            | 0x11
-            | 0x14
-            | 0x16
-            | 0x1B
-            | 0x1C
-            | 0x1E
-            | 0x83
-            | 0xA0
-            | 0xA1
-            | 0xA8
-            | 0xAF
-    )
-}
-
-/// Heuristic: is this partition classic HFS (not HFS+/HFSX)?
-/// Used to gate the "Expand HFS Volume…" action, which only handles classic
-/// HFS. APM rows where `probe_apple_hfs_type` flagged HFS+/HFSX get a tag in
-/// `type_name` like `Apple_HFS (HFS+)`; those are excluded here.
-fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
-    let apm_hfs = type_string
-        .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
-        .unwrap_or(false);
-    let mbr_hfs = ptype == 0xAF;
-    // A partition-less HFS superfloppy (a BasiliskII .hfv) is classic HFS too;
-    // the expand dialog can re-floor it or convert it (incl. to a flat HFV).
-    let superfloppy = is_superfloppy_hfs(ptype, type_name);
-    if !(apm_hfs || mbr_hfs || superfloppy) {
-        return false;
-    }
-    !(type_name.contains("HFS+") || type_name.contains("HFSX"))
-}
-
-/// Check if an APM partition type string corresponds to a browsable filesystem.
-fn is_browsable_type_string(type_str: Option<&str>) -> bool {
-    let Some(s) = type_str else {
-        return false;
-    };
-    // AmigaDOS DosType tags (DOS\0..DOS\7) — RDB-partitioned hard drives and
-    // single-partition HDFs / ADFs both route through this string.
-    if rusty_backup::fs::is_amiga_dos_type(s) {
-        return true;
-    }
-    if rusty_backup::fs::is_amiga_pfs3_type(s) {
-        return true;
-    }
-    if rusty_backup::fs::is_amiga_sfs_type(s) {
-        return true;
-    }
-    matches!(
-        s,
-        "Apple_HFS"
-            | "Apple_HFSX"
-            | "Apple_HFS+"
-            | "Apple_UNIX_SVR2"
-            | "Apple_UNIX_SRVR2"
-            | "Apple_PRODOS"
-            | "Apple_ProDOS"
-            // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
-            | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-            // Custom bootblock Amiga disk with no filesystem — browsable via
-            // the synthetic carve view (whole-disk + recoverable text/JSON).
-            | "Amiga-NDOS"
-    )
-}
-
-/// Check if a superfloppy (type byte 0) has a browsable filesystem hint.
-fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
-    if ptype != 0 {
-        return false;
-    }
-    matches!(
-        type_name,
-        "FAT" | "HFS" | "HFS+" | "NTFS" | "exFAT" | "ProDOS" | "XFS" | "ext" | "btrfs" | "Unknown"
-    )
-}
-
-/// Check if a partition row is a classic-HFS **superfloppy** (a flat,
-/// partition-less HFS volume at LBA 0, i.e. a BasiliskII `.hfv`). These rows
-/// carry `partition_type_byte == 0` with `type_name == "HFS"` because no
-/// partition table assigned them a type byte. The classic-HFS fsck, edit, and
-/// expand paths are all offset-driven and work at offset 0, but the gating
-/// helpers keyed to `0xAF` / APM `Apple_HFS` skip these rows — this helper lets
-/// callers OR them back in.
-fn is_superfloppy_hfs(ptype: u8, type_name: &str) -> bool {
-    ptype == 0 && type_name == "HFS"
-}
-
-/// Fallback check: detect FAT from the human-readable type name string.
-/// Used for older backups where `partition_type_byte` was not stored.
-fn is_fat_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("fat")
-}
-
-/// Infer an MBR partition type byte from the human-readable type name.
-/// Used for older backups that didn't store `partition_type_byte`.
 /// Format a byte count using base-1000 (SI) units, matching how storage
 /// media is marketed (e.g. "8 GB" on an SD card = 8,000,000,000 bytes).
 fn format_size_decimal(bytes: u64) -> String {
@@ -5108,17 +5126,6 @@ fn format_size_decimal(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", b / MB)
     }
-}
-
-/// Check if a partition type supports filesystem checking (fsck).
-/// Classic HFS (0xAF or APM "Apple_HFS") and AmigaDOS OFS/FFS variants.
-fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
-    if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
-        return true;
-    }
-    type_str
-        .map(rusty_backup::fs::is_amiga_dos_type)
-        .unwrap_or(false)
 }
 
 /// Format an HFS allocation block size as "N KiB" when it's a whole

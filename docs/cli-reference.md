@@ -564,7 +564,8 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -617,7 +618,8 @@ Usage: inspect [OPTIONS] <IMAGE>
 **Options**
 
 - `--format` — Output format
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 
 ### `install-completions`
 
@@ -669,7 +671,8 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / a positional path
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -691,6 +694,25 @@ Usage: mac-scsi-bless [OPTIONS] <IMAGE>
 - `--driver` — Use a raw driver image file (advanced; `pmBootCksum` is unknown for an arbitrary driver, so it is written as 0 — see `--force-cksum-zero`)
 - `--builtin-driver` — Use the bundled known-good Apple SCSI driver (this is the default when no driver source is given)
 - `--force-cksum-zero` — Force `pmBootCksum = 0`. Some ROMs skip checksum verification then
+
+### `make-bootable`
+
+Auto-detect what a Mac disk needs to boot and apply only the missing pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a `--boot-from` donor), and a blessed System Folder. Idempotent; a flat HFV is kept flat. Works on flat HFVs and full APM disks alike
+
+```
+Usage: make-bootable [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Disk image to make bootable, in place
+
+**Options**
+
+- `--boot-from` — Bootable donor disk to copy boot blocks from, if the target lacks them (its classic-HFS volume is auto-located and `'LK'`-validated). Without it, missing boot blocks are reported but not synthesized
+- `--driver-from` — For a full (APM) disk missing a SCSI driver: extract it from a donor Apple-formatted disk instead of using the bundled driver
+- `--bless` — Absolute Mac path of the folder to bless (e.g. `/System Folder`). Defaults to auto-blessing a root folder named "System Folder"
+- `--dry-run` — Report what would change without writing anything
 
 ### `mkdir`
 
@@ -726,6 +748,49 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
+- `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
+- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+
+### `new-sgi-cdrom`
+
+Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with `put IMG@1 host/file /file`
+
+```
+Usage: new-sgi-cdrom [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
+- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+
+### `new-sgi-hdd`
+
+Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM superfloppy). Populate it with `put IMG@1 host/file /file`
+
+```
+Usage: new-sgi-hdd [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`). Rounded up to a whole cylinder. Defaults to 50M
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--fs` — Root filesystem to format. Only `efs` is supported today
+- `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
+- `--sectors` — Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)
+- `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
+- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
 ### `new-x68k-hdd`
 
@@ -964,6 +1029,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
+- `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path
@@ -1272,6 +1338,34 @@ Usage: list <ARCHIVE>
 
 - `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
 
+### `tar`
+
+Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case
+
+```
+Usage: tar [OPTIONS] <IMAGE> <SRC> <OUT>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Source path inside the filesystem to archive — a directory (archived recursively) or a single file. Use `/` for the whole volume
+- `<OUT>` — Output archive path. Compression is inferred from the extension (`.tar` = none, `.tar.zst` = zstd, otherwise gzip) unless one of `--gzip` / `--zstd` / `--no-compress` is given
+
+**Options**
+
+- `--exclude` — Exclude entries whose path matches this glob (a directory match prunes its whole subtree). Repeatable
+- `--gzip` — Force gzip (`.tar.gz`)
+- `--zstd` — Force zstd (`.tar.zst`)
+- `--no-compress` — Force no compression (`.tar`)
+- `--force` — Overwrite OUT if it already exists
+- `--ignore-case` — Match `--exclude` globs case-insensitively (default follows the filesystem's native rule)
+- `--case-sensitive` — Match `--exclude` globs case-sensitively (default follows the filesystem's native rule)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Ignored for non-zip sources
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `terminal`
 
 Open an interactive rb-cli shell (rustyline-based REPL)
@@ -1279,6 +1373,29 @@ Open an interactive rb-cli shell (rustyline-based REPL)
 ```
 Usage: terminal
 ```
+
+### `untar`
+
+Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them
+
+```
+Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<ARCHIVE>` — Host archive to import (`.tar.gz` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)
+- `<DEST>` — Destination directory inside the filesystem. Defaults to the root
+
+**Options**
+
+- `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
+- `--no-permissions` — Do not apply archived Unix permission bits (mode) to imported files
+- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `write`
 

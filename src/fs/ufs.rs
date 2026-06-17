@@ -2166,6 +2166,51 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let new_name_bytes = new_name.as_bytes();
+        validate_name(new_name_bytes)?;
+
+        let parent_inum = parent.location as u32;
+        let entry_inum = entry.location as u32;
+
+        // UFS names are case-sensitive, so any name differing from the old
+        // one is a distinct dirent. Reject only if that name already
+        // occupies the directory.
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, new_name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+
+        // The name lives only in the dirent; the inode keeps its number
+        // and data. Derive d_type from the child inode's mode, mirroring
+        // create_file.
+        let child = self.read_inode(entry_inum)?;
+        let d_type = mode_to_dirent_type(child.mode);
+
+        // Insert the new dirent (pointing at the same inum) first, then
+        // remove the old (matched by old name), so a mid-failure never
+        // leaves the inode unreferenced. dir_insert mutates the parent
+        // inode (size / blocks may grow), so write it back before
+        // dir_remove resolves the parent's dir data again. A same-parent
+        // rename does not change link counts.
+        let mut parent_inode = self.read_inode(parent_inum)?;
+        self.dir_insert(&mut parent_inode, new_name_bytes, entry_inum, d_type)?;
+        self.write_inode(parent_inum, &parent_inode)?;
+        self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Every primitive write flushes synchronously — bitmaps, cs
         // counters, inodes, and frag data all land at the moment they're
@@ -2416,6 +2461,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                mac_dates: None,
             };
             let children =
                 (fs as &mut dyn super::filesystem::Filesystem).list_directory(&root_entry)?;
@@ -2451,6 +2497,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                mac_dates: None,
             };
             let lf = fs.create_directory(
                 &root_entry,
@@ -4028,6 +4075,57 @@ mod tests {
         assert!(
             result.is_clean(),
             "fsck reported errors after create_file: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// Rename keeps the inode number and file contents, drops the old
+    /// name, exposes the new one, and leaves the volume fsck-clean.
+    #[test]
+    fn rename_preserves_inode_and_content_against_ufs1_fixture() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"rename me on ufs".to_vec();
+        let mut src = payload.as_slice();
+        let created = fs
+            .create_file(
+                &root,
+                "old_ufs.txt",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        let original_inum = created.location;
+
+        fs.rename(&root, &created, "new_ufs.txt").expect("rename");
+
+        // Re-open to confirm everything landed on disk.
+        let mut fs2 = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root2 = fs2.root().expect("root2");
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(
+            !kids.iter().any(|e| e.name == "old_ufs.txt"),
+            "old name should be gone"
+        );
+        let renamed = kids
+            .iter()
+            .find(|e| e.name == "new_ufs.txt")
+            .expect("new name present");
+
+        // Identity (inode number) and content preserved.
+        assert_eq!(renamed.location, original_inum);
+        let bytes = fs2.read_file(renamed, 1024).expect("read");
+        assert_eq!(bytes, payload);
+
+        // fsck must stay clean after the rename.
+        let result = fs2.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors after rename: {:?}",
             result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
     }

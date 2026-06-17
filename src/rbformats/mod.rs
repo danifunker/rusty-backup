@@ -184,6 +184,7 @@ pub mod vmdk;
 pub mod vmdk_sparse;
 pub mod woz;
 pub mod woz_write;
+pub mod zip_disk;
 pub mod zstd;
 
 use std::fs::{self, File};

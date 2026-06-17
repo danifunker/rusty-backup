@@ -398,6 +398,8 @@ enum CatalogRecord {
         dir_id: u32,
         name: String,
         parent_id: u32,
+        /// Catalog dates `(create, modify, backup)` in Mac-epoch seconds.
+        dates: (u32, u32, u32),
     },
     File {
         file_id: u32,
@@ -411,6 +413,8 @@ enum CatalogRecord {
         creator_code: String,
         /// Finder flags (FInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
         finder_flags: u16,
+        /// Catalog dates `(create, modify, backup)` in Mac-epoch seconds.
+        dates: (u32, u32, u32),
     },
 }
 
@@ -547,10 +551,18 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         }
                         let dir_id =
                             BigEndian::read_u32(&node[rec_data_offset + 6..rec_data_offset + 10]);
+                        // Dir record dates: crDate@10, mdDate@14, bkDate@18.
+                        let dir = &node[rec_data_offset..];
+                        let dates = (
+                            BigEndian::read_u32(&dir[10..14]),
+                            BigEndian::read_u32(&dir[14..18]),
+                            BigEndian::read_u32(&dir[18..22]),
+                        );
                         results.push(CatalogRecord::Directory {
                             dir_id,
                             name,
                             parent_id: rec_parent_id,
+                            dates,
                         });
                     }
                     CATALOG_FILE => {
@@ -582,6 +594,12 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         for j in 0..3 {
                             rsrc_extents[j] = HfsExtDescriptor::parse(&rec[86 + j * 4..90 + j * 4]);
                         }
+                        // File record dates: crDate@44, mdDate@48, bkDate@52.
+                        let dates = (
+                            BigEndian::read_u32(&rec[44..48]),
+                            BigEndian::read_u32(&rec[48..52]),
+                            BigEndian::read_u32(&rec[52..56]),
+                        );
                         results.push(CatalogRecord::File {
                             file_id,
                             name,
@@ -593,6 +611,7 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                             type_code,
                             creator_code,
                             finder_flags,
+                            dates,
                         });
                     }
                     _ => {}
@@ -2571,6 +2590,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -2581,13 +2601,21 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         let mut entries = Vec::new();
         for child in children {
             match child {
-                CatalogRecord::Directory { dir_id, name, .. } => {
+                CatalogRecord::Directory {
+                    dir_id,
+                    name,
+                    dates,
+                    ..
+                } => {
                     let path = if entry.path == "/" {
                         format!("/{name}")
                     } else {
                         format!("{}/{name}", entry.path)
                     };
-                    entries.push(FileEntry::new_directory(name, path, dir_id as u64));
+                    let mut fe = FileEntry::new_directory(name, path, dir_id as u64);
+                    fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.mac_dates = Some(dates);
+                    entries.push(fe);
                 }
                 CatalogRecord::File {
                     file_id,
@@ -2598,6 +2626,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     type_code,
                     creator_code,
                     finder_flags,
+                    dates,
                     ..
                 } => {
                     let path = if entry.path == "/" {
@@ -2608,6 +2637,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.modified = hfs_common::format_mac_date(dates.1);
+                    fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
                         fe.resource_fork_size = Some(rsrc_size as u64);
                     }
@@ -3026,6 +3057,92 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
         result
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let parent_id = parent.location as u32;
+        let cnid = entry.location as u32;
+        let new_name_raw = validate_hfs_create_name(new_name)?;
+        let old_name_raw = utf8_to_mac_roman(&entry.name)?;
+
+        let snap = self.snapshot();
+        let result = (|| -> Result<(), FilesystemError> {
+            // Locate the entry's catalog record by its current (parent, name) key.
+            let (node_idx, rec_idx, _key_abs) = self
+                .find_catalog_record_by_name(parent_id, &old_name_raw)
+                .ok_or_else(|| {
+                    FilesystemError::NotFound(format!(
+                        "entry '{}' not found in catalog",
+                        entry.name
+                    ))
+                })?;
+
+            // Reject a collision only with a DIFFERENT record. HFS folds case, so
+            // a case-only rename resolves back to this same record (allowed).
+            if let Some((n2, r2, _)) = self.find_catalog_record_by_name(parent_id, &new_name_raw) {
+                if (n2, r2) != (node_idx, rec_idx) {
+                    return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+                }
+            }
+
+            // Extract the record's data body to re-emit it verbatim under the new
+            // key (the CNID and all fork/Finder data are unchanged).
+            let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
+            let node_off = node_idx as usize * node_size;
+            let node = &self.catalog_data[node_off..node_off + node_size];
+            let (rec_start, rec_end) = hfs_common::btree_record_range(node, node_size, rec_idx);
+            let key_len = node[rec_start] as usize;
+            let mut data_rel = 1 + key_len;
+            if !data_rel.is_multiple_of(2) {
+                data_rel += 1;
+            }
+            let data_bytes = node[rec_start + data_rel..rec_end].to_vec();
+
+            let mut new_record = Self::build_catalog_key(parent_id, &new_name_raw);
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+            new_record.extend_from_slice(&data_bytes);
+            if !new_record.len().is_multiple_of(2) {
+                new_record.push(0);
+            }
+
+            self.remove_catalog_record(node_idx, rec_idx);
+            self.insert_catalog_record(&new_record)?;
+
+            // Rewrite the thread record's `thdCName` (fixed Str31 at data +14, so
+            // the record footprint is unchanged — safe to patch in place).
+            // Directories always have a thread; files may not.
+            if let Some((_n, _r, t_key_abs)) = self.find_catalog_record_by_cnid(cnid) {
+                let t_key_len = self.catalog_data[t_key_abs] as usize;
+                let mut t_data_off = t_key_abs + 1 + t_key_len;
+                if !t_data_off.is_multiple_of(2) {
+                    t_data_off += 1;
+                }
+                if t_data_off + 15 + 31 <= self.catalog_data.len() {
+                    self.catalog_data[t_data_off + 14] = new_name_raw.len() as u8;
+                    for i in 0..31 {
+                        self.catalog_data[t_data_off + 15 + i] = 0;
+                    }
+                    self.catalog_data[t_data_off + 15..t_data_off + 15 + new_name_raw.len()]
+                        .copy_from_slice(&new_name_raw);
+                }
+            }
+            // A same-parent rename leaves parent valence and MDB counts unchanged.
+            Ok(())
+        })();
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
     fn set_type_creator(
         &mut self,
         entry: &FileEntry,
@@ -3194,6 +3311,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             self.restore_snapshot(snap);
         }
         result
+    }
+
+    fn write_boot_blocks(&mut self, blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        HfsFilesystem::set_boot_blocks(self, blocks);
+        Ok(())
     }
 
     fn set_volume_name(&mut self, new_name: &str) -> Result<(), FilesystemError> {
@@ -4216,6 +4338,53 @@ mod tests {
         assert_eq!(&read_back, test_data);
     }
 
+    /// Catalog dates surface on `FileEntry::mac_dates` (and the modify value on
+    /// `modified`), and an in-place `set_dates` round-trips through sync +
+    /// reopen. Exercises the M4 read path (catalog decode) plus the write path
+    /// (`set_dates`, the setter `StagedEdit::SetDates` dispatches to).
+    #[test]
+    fn test_hfs_catalog_dates_round_trip() {
+        let img = make_editable_hfs_image();
+        let mut buf = img.clone();
+
+        // create_file stamps create/modify to "now" (non-zero); backup is 0.
+        {
+            let mut fs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+            let root = fs.root().unwrap();
+            let data = b"x";
+            let fe = fs
+                .create_file(
+                    &root,
+                    "dated.txt",
+                    &mut Cursor::new(data.as_slice()),
+                    1,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            fs.sync_metadata().unwrap();
+
+            let listed = fs.list_directory(&root).unwrap();
+            let f = listed.iter().find(|e| e.name == "dated.txt").unwrap();
+            let (c, m, b) = f.mac_dates.expect("HFS file should carry mac_dates");
+            assert!(c != 0 && m != 0, "create/modify stamped by create_file");
+            assert_eq!(b, 0, "backup date defaults to 0");
+
+            // Stage specific dates via the in-place setter and persist.
+            let target = (0x10000000u32, 0x20000000u32, 0x30000000u32);
+            fs.set_dates(&fe, target.0, target.1, target.2).unwrap();
+            fs.sync_metadata().unwrap();
+        }
+
+        // Reopen and confirm the dates decoded back, including the formatted
+        // string surfaced in `modified`.
+        let mut fs = HfsFilesystem::open(Cursor::new(&mut buf), 0).unwrap();
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let f = listed.iter().find(|e| e.name == "dated.txt").unwrap();
+        assert_eq!(f.mac_dates, Some((0x10000000, 0x20000000, 0x30000000)));
+        assert_eq!(f.modified, hfs_common::format_mac_date(0x20000000));
+    }
+
     #[test]
     fn test_hfs_editable_create_directory() {
         let img = make_editable_hfs_image();
@@ -4233,6 +4402,70 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.name == "NewDir" && e.is_directory()));
+    }
+
+    #[test]
+    fn test_hfs_editable_rename_file() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        let data = b"keep my bytes across a rename";
+        let mut r = Cursor::new(data.as_slice());
+        let fe = fs
+            .create_file(
+                &root,
+                "Before",
+                &mut r,
+                data.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let cnid = fe.location;
+
+        fs.rename(&root, &fe, "After Doc").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(entries.iter().any(|e| e.name == "After Doc"), "{entries:?}");
+        assert!(!entries.iter().any(|e| e.name == "Before"), "{entries:?}");
+        let renamed = entries.iter().find(|e| e.name == "After Doc").unwrap();
+        // Identity (CNID) preserved and content intact (the catalog re-key keeps
+        // the fork data untouched).
+        assert_eq!(renamed.location, cnid);
+        assert_eq!(&fs.read_file(renamed, 1024).unwrap(), data);
+
+        // Renaming a directory keeps it browsable (its thread record name is
+        // updated in place).
+        fs.create_directory(&root, "OldDir", &CreateDirectoryOptions::default())
+            .unwrap();
+        let old_dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "OldDir")
+            .unwrap();
+        fs.rename(&root, &old_dir, "NewDir").unwrap();
+        let new_dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "NewDir")
+            .expect("renamed dir present");
+        assert!(fs.list_directory(&new_dir).is_ok());
+
+        // A collision with a different entry is rejected.
+        let after = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "After Doc")
+            .unwrap();
+        assert!(matches!(
+            fs.rename(&root, &after, "NewDir"),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
+
+        fs.sync_metadata().unwrap();
     }
 
     #[test]

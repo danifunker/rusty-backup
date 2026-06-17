@@ -1,0 +1,502 @@
+//! Synthesize a complete SGI/IRIX hard-disk image from scratch: a 512-byte SGI
+//! volume header (dvh) + partition table at sector 0 wrapping a freshly
+//! formatted EFS root partition, mountable by IRIX 5.3–6.5 as a SCSI HDD.
+//!
+//! `rb-cli new --fs efs` produces a *bare* EFS superfloppy (fine for an EFS
+//! CD-ROM that IRIX reads with `mount -t efs`), but a real IRIX hard disk needs
+//! the volume header at sector 0 so `fx` / `prtvtoc` and the disk driver see a
+//! partition table. This module writes that header — mirroring the field
+//! layout / big-endianness of [`crate::partition::sgi`], the parser used as the
+//! source of truth — and lays an EFS filesystem in partition 0.
+//!
+//! Layout (IRIX convention, verified against `tests/fixtures/sgi/irix_volhdr.bin`):
+//! - slot 8 VOLHDR (type 0): first=0, blocks = volume-header region.
+//! - slot 10 VOLUME (type 6): first=0, blocks = entire disk.
+//! - slot 0 EFS (type 7): first = after VOLHDR (cylinder-aligned), blocks = remainder; an EFS filesystem lives here.
+//!
+//! Swap (slot 1, RAW) is omitted — this is a non-bootable data disk. All
+//! geometry is big-endian; sectors are always 512 bytes.
+
+use anyhow::{ensure, Result};
+use std::io::{Cursor, Seek, SeekFrom, Write};
+
+use crate::fs::efs::{write_blank_efs, EFS_DEFAULT_BYTES_PER_INODE};
+use crate::partition::sgi::{
+    SgiDeviceParameters, SgiPartitionEntry, SgiPartitionType, SgiVolumeDirEntry, SgiVolumeHeader,
+    SGI_NUM_PARTITIONS, SGI_NUM_VOL_DIR, SGI_VOLHDR_MAGIC,
+};
+
+const SECTOR_SIZE: u64 = 512;
+
+/// Default heads (tracks per cylinder). Must match the geometry the target
+/// drive reports via SCSI MODE SENSE — the IRIS emulator (and typical SGI SCSI
+/// HDDs) synthesize 16 heads (`iris/src/scsi.rs`).
+pub const DEFAULT_HEADS: u16 = 16;
+/// Default sectors per track (512-byte sectors). **Must** match the drive's
+/// reported geometry: IRIX `fx` compares the volume header's `device_parameters`
+/// against the geometry the drive reports and rejects the sgilabel ("disagrees
+/// with existing volume header parameters") if they differ — which keeps the
+/// disk from mounting at all. The IRIS emulator reports 63 sectors/track with
+/// 16 heads, so a cylinder is 16 × 63 = 1008 sectors (504 KiB). Verified against
+/// a real IRIX-formatted disk; see `docs/sgi_efs_hdd_irix_debug.md`.
+pub const DEFAULT_SECTORS_PER_TRACK: u16 = 63;
+/// Fixed volume-header region size (slot 8, VOLHDR), rounded up to a whole
+/// cylinder. 2 MiB matches the real IRIX fixture's volhdr region.
+const VOLHDR_REGION_BYTES: u64 = 2 * 1024 * 1024;
+/// EFS minimum volume size (the `create_blank_efs` floor), in sectors.
+const MIN_EFS_SECTORS: u64 = (32 * 1024) / SECTOR_SIZE;
+
+/// CD-ROM geometry: IRIX EFS CDs report 1 head × 32 sectors/track (cylinder =
+/// 32 sectors = 16 KiB). Verified against real IRIX 5.3 / 6.5 distribution CDs.
+/// A 32-sector cylinder is also a whole number of 2048-byte CD sectors.
+pub const CDROM_HEADS: u16 = 1;
+pub const CDROM_SECTORS_PER_TRACK: u16 = 32;
+/// CD-ROM volume-header region (slot 8): 64 sectors (32 KiB, two cylinders),
+/// matching the IRIX 6.5 Applications CD — just the header, no boot miniroot.
+const CDROM_VOLHDR_SECTORS: u64 = 64;
+
+// SGI partition slot indices (IRIX convention).
+const SLOT_EFS_ROOT: usize = 0;
+/// EFS CDs put the filesystem in slot 7 (mounted `mount -t efs … s7`).
+const SLOT_EFS_CDROM: usize = 7;
+const SLOT_VOLHDR: usize = 8;
+const SLOT_VOLUME: usize = 10;
+
+/// Target medium — selects the partition shape IRIX expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SgiMedia {
+    /// A hard disk: EFS root in slot 0 (type EFS), a 2 MiB volume header.
+    #[default]
+    HardDisk,
+    /// An EFS CD-ROM image (`.iso`): the EFS filesystem in slot 7 typed SYSV
+    /// (the IRIX EFS-CD convention — `IS_EFS()` accepts SYSV), with a tiny
+    /// 64-sector volume header. Mounted on IRIX with `mount -t efs … s7`.
+    CdRom,
+}
+
+/// Inputs for [`build_sgi_efs_hdd`].
+#[derive(Debug, Clone)]
+pub struct SgiHddOptions {
+    /// Requested disk size in bytes. Rounded **up** to a whole cylinder.
+    pub size_bytes: u64,
+    /// EFS volume label (up to 6 bytes; longer is truncated by the formatter).
+    pub name: String,
+    /// Heads / tracks per cylinder.
+    pub heads: u16,
+    /// Sectors per track (512-byte sectors).
+    pub sectors_per_track: u16,
+    /// EFS inode density, in bytes per inode (the inode count scales as
+    /// `efs_bytes / bytes_per_inode`). Floored at one inode per 512-byte block.
+    pub bytes_per_inode: u64,
+    /// Target medium — hard disk (EFS in slot 0) or CD-ROM (EFS in slot 7,
+    /// typed SYSV). [`new`](Self::new) defaults to hard disk.
+    pub media: SgiMedia,
+}
+
+impl SgiHddOptions {
+    /// Hard-disk options with the default IRIS/SGI geometry and inode density.
+    pub fn new(size_bytes: u64, name: impl Into<String>) -> Self {
+        SgiHddOptions {
+            size_bytes,
+            name: name.into(),
+            heads: DEFAULT_HEADS,
+            sectors_per_track: DEFAULT_SECTORS_PER_TRACK,
+            bytes_per_inode: EFS_DEFAULT_BYTES_PER_INODE,
+            media: SgiMedia::HardDisk,
+        }
+    }
+
+    /// EFS CD-ROM options: 1 × 32 CD geometry and the slot-7/SYSV EFS layout.
+    pub fn new_cdrom(size_bytes: u64, name: impl Into<String>) -> Self {
+        SgiHddOptions {
+            size_bytes,
+            name: name.into(),
+            heads: CDROM_HEADS,
+            sectors_per_track: CDROM_SECTORS_PER_TRACK,
+            bytes_per_inode: EFS_DEFAULT_BYTES_PER_INODE,
+            media: SgiMedia::CdRom,
+        }
+    }
+}
+
+/// The computed disk layout, for the CLI to print and tests to assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SgiHddLayout {
+    pub disk_sectors: u64,
+    pub disk_bytes: u64,
+    pub cylinders: u32,
+    pub heads: u16,
+    pub sectors_per_track: u16,
+    pub cylinder_sectors: u64,
+    /// VOLHDR region length (slot 8), in 512-byte sectors.
+    pub volhdr_sectors: u64,
+    /// First sector of the EFS root partition (slot 0).
+    pub efs_first_sector: u64,
+    /// EFS root partition length, in 512-byte sectors.
+    pub efs_sectors: u64,
+}
+
+/// Compute the disk geometry / partition layout for the given options without
+/// writing any bytes. Validates the geometry and that the EFS partition meets
+/// its minimum size.
+pub fn compute_sgi_layout(opts: &SgiHddOptions) -> Result<SgiHddLayout> {
+    ensure!(opts.heads > 0, "heads must be > 0");
+    ensure!(opts.sectors_per_track > 0, "sectors-per-track must be > 0");
+
+    let cylinder_sectors = opts.heads as u64 * opts.sectors_per_track as u64;
+    let cylinder_bytes = cylinder_sectors * SECTOR_SIZE;
+
+    // VOLHDR region (slot 8). A hard disk reserves 2 MiB (rounded up to a whole
+    // cylinder); an EFS CD reserves a tiny 64-sector header, matching real IRIX
+    // EFS CDs. Both must be cylinder-aligned so the EFS partition that follows
+    // starts on a cylinder boundary.
+    let volhdr_sectors = match opts.media {
+        SgiMedia::HardDisk => VOLHDR_REGION_BYTES.div_ceil(cylinder_bytes) * cylinder_sectors,
+        SgiMedia::CdRom => CDROM_VOLHDR_SECTORS.div_ceil(cylinder_sectors) * cylinder_sectors,
+    };
+
+    // Total disk rounded up to a whole cylinder, and at least big enough for
+    // the VOLHDR region plus a minimum EFS partition.
+    let requested_sectors = opts.size_bytes.div_ceil(SECTOR_SIZE);
+    let min_disk_sectors = volhdr_sectors + MIN_EFS_SECTORS;
+    let disk_cyls = requested_sectors
+        .max(min_disk_sectors)
+        .div_ceil(cylinder_sectors);
+    let disk_sectors = disk_cyls * cylinder_sectors;
+
+    ensure!(
+        disk_sectors <= u32::MAX as u64,
+        "disk too large for an SGI volume header: {disk_sectors} sectors exceeds the 32-bit \
+         block range (max ~2 TiB)"
+    );
+    ensure!(
+        disk_cyls <= 0x00FF_FFFF,
+        "cylinder count {disk_cyls} exceeds the 24-bit cylinder range; use a larger \
+         --heads / --sectors geometry"
+    );
+
+    let efs_first_sector = volhdr_sectors;
+    let efs_sectors = disk_sectors - volhdr_sectors;
+    let efs_bytes = efs_sectors * SECTOR_SIZE;
+    ensure!(
+        efs_sectors >= MIN_EFS_SECTORS,
+        "EFS partition would be only {efs_bytes} bytes (< 32 KiB); increase --size"
+    );
+
+    Ok(SgiHddLayout {
+        disk_sectors,
+        disk_bytes: disk_sectors * SECTOR_SIZE,
+        cylinders: disk_cyls as u32,
+        heads: opts.heads,
+        sectors_per_track: opts.sectors_per_track,
+        cylinder_sectors,
+        volhdr_sectors,
+        efs_first_sector,
+        efs_sectors,
+    })
+}
+
+/// Build the 512-byte SGI volume header (sector 0) for the given layout.
+fn build_volume_header(opts: &SgiHddOptions, layout: &SgiHddLayout) -> [u8; SECTOR_SIZE as usize] {
+    let mut partitions: Vec<SgiPartitionEntry> = (0..SGI_NUM_PARTITIONS)
+        .map(|_| SgiPartitionEntry {
+            blocks: 0,
+            first: 0,
+            partition_type_raw: 0,
+        })
+        .collect();
+    // Hard disks put the EFS root in slot 0 typed EFS; EFS CDs put it in slot 7
+    // typed SYSV (the IRIX EFS-CD convention, mounted `… s7`).
+    let (efs_slot, efs_type) = match opts.media {
+        SgiMedia::HardDisk => (SLOT_EFS_ROOT, SgiPartitionType::Efs),
+        SgiMedia::CdRom => (SLOT_EFS_CDROM, SgiPartitionType::SysV),
+    };
+    partitions[efs_slot] = SgiPartitionEntry {
+        blocks: layout.efs_sectors as u32,
+        first: layout.efs_first_sector as u32,
+        partition_type_raw: efs_type.as_u32(),
+    };
+    partitions[SLOT_VOLHDR] = SgiPartitionEntry {
+        blocks: layout.volhdr_sectors as u32,
+        first: 0,
+        partition_type_raw: SgiPartitionType::VolHdr.as_u32(),
+    };
+    partitions[SLOT_VOLUME] = SgiPartitionEntry {
+        blocks: layout.disk_sectors as u32,
+        first: 0,
+        partition_type_raw: SgiPartitionType::Volume.as_u32(),
+    };
+
+    let volume_directory: Vec<SgiVolumeDirEntry> = (0..SGI_NUM_VOL_DIR)
+        .map(|_| SgiVolumeDirEntry {
+            name: String::new(),
+            block_num: 0,
+            bytes: 0,
+        })
+        .collect();
+
+    let vh = SgiVolumeHeader {
+        magic: SGI_VOLHDR_MAGIC,
+        root_part_num: efs_slot as u16,
+        swap_part_num: 0, // no separate swap partition on a data disk
+        device_parameters: SgiDeviceParameters::for_geometry(
+            layout.cylinders,
+            opts.heads,
+            opts.sectors_per_track,
+        ),
+        bootfile: "/unix".to_string(),
+        volume_directory,
+        partitions,
+        checksum: 0,
+        checksum_valid: true,
+    };
+    vh.to_bytes() // 512 bytes, checksum zero-summed
+}
+
+/// Stream a dvh-wrapped EFS hard disk directly into `sink`: the volume header at
+/// sector 0 and a freshly-formatted EFS root partition, writing only non-zero
+/// regions (the rest stays as sparse holes in a `set_len`'d file). Returns the
+/// computed [`SgiHddLayout`].
+///
+/// This is the memory-frugal path for large disks: peak memory is the EFS bitmap
+/// (~disk_size/4096) rather than the whole image. The CLI uses it to write disks
+/// of any size to a file without materializing them in RAM.
+pub fn write_sgi_efs_hdd<W: Write + Seek>(
+    sink: &mut W,
+    opts: &SgiHddOptions,
+) -> Result<SgiHddLayout> {
+    let layout = compute_sgi_layout(opts)?;
+    write_sgi_efs_hdd_into(sink, opts, &layout)?;
+    Ok(layout)
+}
+
+/// Write the dvh + EFS into `sink` using a precomputed layout.
+fn write_sgi_efs_hdd_into<W: Write + Seek>(
+    sink: &mut W,
+    opts: &SgiHddOptions,
+    layout: &SgiHddLayout,
+) -> Result<()> {
+    let sector0 = build_volume_header(opts, layout);
+    sink.seek(SeekFrom::Start(0))?;
+    sink.write_all(&sector0)?;
+
+    write_blank_efs(
+        sink,
+        layout.efs_first_sector * SECTOR_SIZE,
+        layout.efs_sectors as u32,
+        &opts.name,
+        opts.bytes_per_inode,
+    )?;
+    Ok(())
+}
+
+/// Build a dvh-wrapped EFS hard-disk image **in memory**. Returns the full disk
+/// bytes (exactly `layout.disk_bytes`) plus the computed [`SgiHddLayout`]. For
+/// large disks prefer [`write_sgi_efs_hdd`], which streams to a file without
+/// allocating the whole image.
+///
+/// The result is addressable by every partition-aware verb: `PartitionTable::
+/// detect` recognizes the volume header, `partitions()` exposes the EFS root as
+/// a `0xA1`-typed partition, and the EFS lives at `efs_first_sector × 512`.
+pub fn build_sgi_efs_hdd(opts: &SgiHddOptions) -> Result<(Vec<u8>, SgiHddLayout)> {
+    let layout = compute_sgi_layout(opts)?;
+    let mut image = vec![0u8; layout.disk_bytes as usize];
+    write_sgi_efs_hdd_into(&mut Cursor::new(&mut image[..]), opts, &layout)?;
+    Ok((image, layout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition::sgi::SGI_TYPE_BYTE_EFS;
+    use crate::partition::PartitionTable;
+    use std::io::Cursor;
+
+    /// Default IRIS/SGI geometry: 16 heads × 63 sectors = 1008-sector (504 KiB)
+    /// cylinders. A 50 MiB request rounds up to a whole number of cylinders, the
+    /// VOLHDR region rounds 2 MiB up to whole cylinders, and EFS fills the rest.
+    #[test]
+    fn builds_expected_layout() {
+        let (img, layout) =
+            build_sgi_efs_hdd(&SgiHddOptions::new(50 * 1024 * 1024, "IRIX")).unwrap();
+        assert_eq!(layout.heads, 16);
+        assert_eq!(layout.sectors_per_track, 63);
+        assert_eq!(layout.cylinder_sectors, 1008); // 16 × 63 = 504 KiB
+                                                   // 50 MiB = 102400 sectors -> ceil(102400 / 1008) = 102 cylinders.
+        assert_eq!(layout.cylinders, 102);
+        assert_eq!(layout.disk_sectors, 102 * 1008);
+        assert_eq!(layout.disk_bytes, 102 * 1008 * 512);
+        assert_eq!(img.len() as u64, layout.disk_bytes);
+        // VOLHDR region: 2 MiB rounds up to 5 cylinders (5040 sectors).
+        assert_eq!(layout.volhdr_sectors, 5040);
+        assert_eq!(layout.efs_first_sector, 5040);
+        assert_eq!(layout.efs_sectors, 102 * 1008 - 5040);
+        // Rounded up to at least the request, and a whole-cylinder multiple.
+        assert!(layout.disk_bytes >= 50 * 1024 * 1024);
+        assert_eq!(layout.disk_sectors % layout.cylinder_sectors, 0);
+    }
+
+    /// The synthesized sector 0 parses through our own SGI parser, checksums to
+    /// zero, and matches the fixture's slot convention (8 VOLHDR @0, 10 VOLUME @0
+    /// spanning the disk, 0 EFS after VOLHDR), with sane geometry.
+    #[test]
+    fn header_round_trips_and_matches_fixture_structure() {
+        let (img, layout) =
+            build_sgi_efs_hdd(&SgiHddOptions::new(20 * 1024 * 1024, "ROOT")).unwrap();
+        let vh = SgiVolumeHeader::parse(&img[..512]).expect("synthesized header parses");
+        assert_eq!(vh.magic, SGI_VOLHDR_MAGIC);
+        assert!(vh.checksum_valid, "checksum must zero-sum");
+        assert_eq!(vh.root_part_num, 0);
+
+        // Geometry sane: 512-byte sectors, the cylinder count we computed.
+        assert_eq!(vh.device_parameters.secbytes, 512);
+        assert_eq!(vh.device_parameters.trks0, layout.heads);
+        assert_eq!(vh.device_parameters.secs, layout.sectors_per_track);
+        assert_eq!(vh.device_parameters.cylinders(), layout.cylinders);
+
+        // Slot convention.
+        let p0 = &vh.partitions[0];
+        assert_eq!(p0.partition_type(), SgiPartitionType::Efs);
+        assert_eq!(p0.first as u64, layout.efs_first_sector);
+        assert_eq!(p0.blocks as u64, layout.efs_sectors);
+
+        let p8 = &vh.partitions[8];
+        assert_eq!(p8.partition_type(), SgiPartitionType::VolHdr);
+        assert_eq!(p8.first, 0);
+        assert_eq!(p8.blocks as u64, layout.volhdr_sectors);
+
+        let p10 = &vh.partitions[10];
+        assert_eq!(p10.partition_type(), SgiPartitionType::Volume);
+        assert_eq!(p10.first, 0);
+        assert_eq!(p10.blocks as u64, layout.disk_sectors);
+    }
+
+    /// `PartitionTable::detect` recognizes the disk as SGI, surfaces the EFS
+    /// root at the right offset (wrappers filtered), and the EFS filesystem at
+    /// that offset opens with a readable, empty root directory.
+    #[test]
+    fn detects_and_opens_the_efs_partition() {
+        let (img, layout) =
+            build_sgi_efs_hdd(&SgiHddOptions::new(16 * 1024 * 1024, "DATA")).unwrap();
+
+        let table = PartitionTable::detect(&mut Cursor::new(&img[..])).expect("SGI detected");
+        assert_eq!(table.type_name(), "SGI");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1, "only the EFS partition is browsable");
+        let efs = &parts[0];
+        assert_eq!(efs.partition_type_byte, SGI_TYPE_BYTE_EFS);
+        assert_eq!(efs.start_lba, layout.efs_first_sector);
+
+        let offset = efs.start_lba * 512;
+        let mut fs = crate::fs::open_filesystem(
+            Cursor::new(img.clone()),
+            offset,
+            efs.partition_type_byte,
+            None,
+        )
+        .expect("open EFS at partition offset");
+        let root = fs.root().expect("root");
+        assert!(
+            fs.list_directory(&root).expect("list root").is_empty(),
+            "a freshly formatted EFS root is empty"
+        );
+        // EFS reports the label as `fname:fpack`; both were set from the name.
+        assert!(
+            fs.volume_label().unwrap_or_default().contains("DATA"),
+            "volume label carries the name"
+        );
+    }
+
+    /// A disk too small to hold the VOLHDR region plus a minimum EFS partition
+    /// is still rounded up to something valid (we floor the disk, not error),
+    /// and the EFS partition meets the 32 KiB minimum.
+    #[test]
+    fn tiny_request_is_floored_to_a_valid_disk() {
+        let (_img, layout) = build_sgi_efs_hdd(&SgiHddOptions::new(1024, "T")).unwrap();
+        assert!(layout.efs_sectors >= MIN_EFS_SECTORS);
+        assert_eq!(layout.disk_sectors % layout.cylinder_sectors, 0);
+    }
+
+    /// An EFS CD-ROM has the IRIX shape: 1×32 CD geometry, the EFS filesystem in
+    /// slot 7 typed SYSV (which `PartitionTable` surfaces as EFS and opens), and
+    /// a tiny cylinder-aligned volume header. Matches real IRIX 5.3/6.5 CDs.
+    #[test]
+    fn cdrom_layout_matches_irix_efs_cd_shape() {
+        let (img, layout) =
+            build_sgi_efs_hdd(&SgiHddOptions::new_cdrom(64 * 1024 * 1024, "CDVOL")).unwrap();
+        assert_eq!(layout.heads, 1);
+        assert_eq!(layout.sectors_per_track, 32);
+        assert_eq!(layout.cylinder_sectors, 32);
+        assert_eq!(layout.disk_sectors % 4, 0, "whole 2048-byte CD sectors");
+
+        let vh = SgiVolumeHeader::parse(&img[..512]).expect("parses");
+        assert!(vh.checksum_valid);
+        assert_eq!(vh.root_part_num, 7);
+        // Slot 7 is the EFS partition, typed SYSV per the IRIX EFS-CD convention.
+        assert_eq!(vh.partitions[7].partition_type(), SgiPartitionType::SysV);
+        assert_eq!(vh.partitions[7].first as u64, layout.efs_first_sector);
+        assert!(vh.partitions[7].partition_type().is_efs());
+        assert_eq!(vh.partitions[8].partition_type(), SgiPartitionType::VolHdr);
+        assert_eq!(vh.partitions[10].partition_type(), SgiPartitionType::Volume);
+        assert!(vh.partitions[0].is_empty(), "no slot-0 root on a CD");
+
+        // PartitionTable surfaces the SYSV partition as EFS and opens it.
+        let table = PartitionTable::detect(&mut Cursor::new(&img[..])).expect("SGI");
+        let parts = table.partitions();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].index, 7);
+        assert_eq!(parts[0].partition_type_byte, SGI_TYPE_BYTE_EFS);
+        assert!(parts[0].type_name.contains("EFS"));
+        let mut fs = crate::fs::open_filesystem(
+            Cursor::new(img.clone()),
+            parts[0].start_lba * 512,
+            parts[0].partition_type_byte,
+            None,
+        )
+        .expect("open EFS at slot 7");
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("list").is_empty());
+    }
+
+    /// Streaming to a (sparse) file via `write_sgi_efs_hdd` produces bytes
+    /// identical to the in-memory `build_sgi_efs_hdd` — the untouched regions
+    /// must read back as zero, and the file must be exactly `disk_bytes`.
+    #[test]
+    fn streamed_file_matches_in_memory_image() {
+        use std::io::{Read, Seek, SeekFrom};
+        let opts = SgiHddOptions::new(40 * 1024 * 1024, "STREAM");
+        let (mem, layout) = build_sgi_efs_hdd(&opts).unwrap();
+
+        let mut file = tempfile::tempfile().expect("tempfile");
+        let streamed_layout = write_sgi_efs_hdd(&mut file, &opts).expect("stream");
+        file.set_len(streamed_layout.disk_bytes).unwrap();
+        assert_eq!(streamed_layout, layout);
+
+        let mut on_disk = Vec::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_end(&mut on_disk).unwrap();
+        assert_eq!(on_disk.len() as u64, layout.disk_bytes, "exact size");
+        assert_eq!(on_disk, mem, "streamed bytes match the in-memory image");
+    }
+
+    /// Inode density scales the cylinder-group inode count: a smaller
+    /// bytes-per-inode yields more inodes for the same disk.
+    #[test]
+    fn bytes_per_inode_controls_inode_count() {
+        let mut sparse = SgiHddOptions::new(64 * 1024 * 1024, "INO");
+        sparse.bytes_per_inode = 16384; // ~1 inode / 16 KiB
+        let mut dense = sparse.clone();
+        dense.bytes_per_inode = 2048; // ~1 inode / 2 KiB
+
+        let inodes = |opts: &SgiHddOptions| {
+            let (img, layout) = build_sgi_efs_hdd(opts).unwrap();
+            let sb_off = (layout.efs_first_sector * 512 + 512) as usize;
+            let sb = crate::fs::efs::EfsSuperblock::parse(&img[sb_off..]).unwrap();
+            sb.ncg as u32 * sb.cgisize as u32 * 4
+        };
+        assert!(
+            inodes(&dense) > inodes(&sparse) * 3,
+            "denser inode setting must yield many more inodes"
+        );
+    }
+}

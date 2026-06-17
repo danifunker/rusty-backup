@@ -2019,6 +2019,7 @@ fn test_pfs3_staged_edits_round_trip() {
             resource_fork: None,
             hfs_type_override: None,
             hfs_creator_override: None,
+            dates: None,
         },
     ];
     for edit in &edits {
@@ -2179,6 +2180,7 @@ fn test_affs_staged_edits_round_trip() {
             resource_fork: None,
             hfs_type_override: None,
             hfs_creator_override: None,
+            dates: None,
         },
     ];
     for edit in &edits {
@@ -2276,6 +2278,7 @@ fn test_sfs_staged_edits_round_trip() {
             resource_fork: None,
             hfs_type_override: None,
             hfs_creator_override: None,
+            dates: None,
         },
     ];
     for edit in &edits {

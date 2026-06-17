@@ -2784,6 +2784,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            mac_dates: None,
         })
     }
 
@@ -3745,6 +3746,24 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
         result
     }
 
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        validate_hfsplus_create_name(new_name)?;
+        let snap = self.snapshot();
+        let result = self.rename_inner(parent, entry, new_name);
+        if result.is_err() {
+            self.restore_snapshot(snap);
+        }
+        result
+    }
+
     fn set_type_creator(
         &mut self,
         entry: &FileEntry,
@@ -3788,6 +3807,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> 
             self.restore_snapshot(snap);
         }
         result
+    }
+
+    fn write_boot_blocks(&mut self, blocks: &[u8; 1024]) -> Result<(), FilesystemError> {
+        self.set_boot_blocks(blocks);
+        Ok(())
     }
 }
 
@@ -4569,6 +4593,75 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             self.vh.file_count = self.vh.file_count.saturating_sub(1);
         }
 
+        Ok(())
+    }
+
+    fn rename_inner(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        let parent_cnid = parent.location as u32;
+        let cnid = entry.location as u32;
+
+        // Locate the entry's catalog record by its current (parent, name) key.
+        let (node_idx, rec_idx, _abs) = self
+            .find_catalog_record(parent_cnid, &entry.name)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("entry '{}' not found in catalog", entry.name))
+            })?;
+
+        // Reject a collision only with a DIFFERENT record. On a case-insensitive
+        // volume a case-only rename folds back to this same record (allowed).
+        if let Some((n2, r2, _)) = self.find_catalog_record(parent_cnid, new_name) {
+            if (n2, r2) != (node_idx, rec_idx) {
+                return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+            }
+        }
+
+        // Extract the record's data body to re-emit it verbatim under the new
+        // key (CNID, forks, Finder info, BSD info all preserved).
+        let node_size = self.catalog_node_size();
+        let node_off = node_idx as usize * node_size;
+        let node = &self.catalog_data[node_off..node_off + node_size];
+        let (rec_start, rec_end) = super::hfs_common::btree_record_range(node, node_size, rec_idx);
+        let key_len = BigEndian::read_u16(&node[rec_start..rec_start + 2]) as usize;
+        let mut data_rel = 2 + key_len;
+        if !data_rel.is_multiple_of(2) {
+            data_rel += 1;
+        }
+        let data_bytes = node[rec_start + data_rel..rec_end].to_vec();
+
+        let mut new_record = Self::build_catalog_key(parent_cnid, new_name);
+        if new_record.len() % 2 != 0 {
+            new_record.push(0);
+        }
+        new_record.extend_from_slice(&data_bytes);
+
+        self.remove_catalog_record(node_idx, rec_idx);
+        self.insert_catalog_record(&new_record)?;
+
+        // The thread record's name is a variable-length UTF-16 string, so its
+        // footprint changes with the new name — rebuild it (remove + reinsert)
+        // rather than patching in place. Folders always have a thread; files
+        // generally do.
+        if let Some((t_node, t_rec, _)) = self.find_catalog_record_by_cnid(cnid) {
+            self.remove_catalog_record(t_node, t_rec);
+            let thread_type = if entry.is_directory() {
+                CATALOG_FOLDER_THREAD
+            } else {
+                CATALOG_FILE_THREAD
+            };
+            let (_k, thread_data) = Self::build_thread_record(thread_type, parent_cnid, new_name);
+            let mut thread_record = Self::build_catalog_key(cnid, "");
+            if thread_record.len() % 2 != 0 {
+                thread_record.push(0);
+            }
+            thread_record.extend_from_slice(&thread_data);
+            self.insert_catalog_record(&thread_record)?;
+        }
+        // A same-parent rename leaves parent valence and VH counts unchanged.
         Ok(())
     }
 
@@ -6408,6 +6501,85 @@ mod tests {
         assert_eq!(entries[0].name, "hello.txt");
         let got = fs2.read_file(&entries[0], 1024).unwrap();
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn test_hfsplus_rename_round_trips() {
+        let img = create_blank_hfsplus(32 * 1024 * 1024, 4096, "Work", false);
+        let mut fs = HfsPlusFilesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+
+        let payload = b"keep my bytes across a rename".to_vec();
+        let mut data = std::io::Cursor::new(payload.clone());
+        let fe = fs
+            .create_file(
+                &root,
+                "before.txt",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let cnid = fe.location;
+        fs.create_directory(&root, "olddir", &CreateDirectoryOptions::default())
+            .unwrap();
+
+        // File rename to a longer name — exercises the variable-length thread
+        // record rebuild (not an in-place patch).
+        fs.rename(&root, &fe, "a much longer renamed file.txt")
+            .unwrap();
+        // Directory rename — its thread record is rebuilt too.
+        let old_dir = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "olddir")
+            .unwrap();
+        fs.rename(&root, &old_dir, "newdir").unwrap();
+
+        // A collision with a different entry is rejected.
+        let mut t = std::io::Cursor::new(b"x".as_slice());
+        fs.create_file(&root, "taken.txt", &mut t, 1, &CreateFileOptions::default())
+            .unwrap();
+        let renamed_now = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "a much longer renamed file.txt")
+            .unwrap();
+        assert!(matches!(
+            fs.rename(&root, &renamed_now, "taken.txt"),
+            Err(FilesystemError::AlreadyExists(_))
+        ));
+
+        // Persist and reopen: the renames survive a round-trip to disk.
+        fs.sync_metadata().unwrap();
+        let img2 = fs.reader.into_inner();
+        let mut c2 = std::io::Cursor::new(img2);
+        let mut fs2 = HfsPlusFilesystem::open(&mut c2, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "a much longer renamed file.txt"),
+            "{entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.name == "before.txt"),
+            "{entries:?}"
+        );
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "a much longer renamed file.txt")
+            .unwrap();
+        // CNID and content preserved through the catalog re-key.
+        assert_eq!(renamed.location, cnid);
+        assert_eq!(fs2.read_file(renamed, 4096).unwrap(), payload);
+        // The renamed directory is still browsable.
+        let newdir = entries.iter().find(|e| e.name == "newdir").unwrap();
+        assert!(fs2.list_directory(newdir).is_ok());
     }
 
     #[test]

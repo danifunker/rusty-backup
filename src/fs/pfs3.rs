@@ -2254,6 +2254,92 @@ impl<R: Read + Write + Seek + Send> Pfs3Filesystem<R> {
         Ok(fe)
     }
 
+    fn do_rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        let parent_anode = parent.location as u32;
+        let entry_anode = entry.location as u32;
+
+        // Locate the existing direntry and parse all of its fields so we
+        // can faithfully reconstruct it with only the name changed. The
+        // anode (= the entry's identity) and the file data it references
+        // are never touched.
+        let (db_sec, off) =
+            find_direntry_in_dir(self, parent_anode, entry_anode)?.ok_or_else(|| {
+                parse_err(format!(
+                    "rename: anode {entry_anode} not found in dir {parent_anode}"
+                ))
+            })?;
+        let blk = self.read_reserved_block(db_sec)?.to_vec();
+        let total = blk[off] as usize;
+        let nlen = blk[off + 17] as usize;
+        let de = parse_direntry(&blk[off..off + total], 0, self.largefile)
+            .ok_or_else(|| parse_err("rename: failed to re-parse existing direntry"))?;
+
+        let new_bytes = new_name.as_bytes();
+        if new_bytes == de.name.as_bytes() {
+            return Ok(());
+        }
+        // Validate via the encoder by building a throwaway direntry; this
+        // surfaces empty / oversized / illegal names before we mutate.
+        build_direntry(
+            de.ttype,
+            entry_anode,
+            de.fsize,
+            new_name,
+            &de.comment,
+            de.protection,
+            Some((de.cd as i32, de.cm as i32, de.ct as i32)),
+            (de.extrafields_link != 0).then_some(de.extrafields_link),
+        )?;
+
+        // Reject a collision with a *different* entry. PFS3 is
+        // case-insensitive, so a case-only self-rename matches `entry`
+        // itself — allow it (handled by the same-name early return for an
+        // exact match, and here by checking the resolved anode).
+        {
+            use super::filesystem::Filesystem;
+            let kids = self.list_directory(parent)?;
+            if kids
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(new_name) && c.location != entry.location)
+            {
+                return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+            }
+        }
+
+        if new_bytes.len() == nlen {
+            // Same length — overwrite the name bytes in place. Everything
+            // else (anode, size, dates, protection, comment, extrafields,
+            // total length) stays byte-for-byte identical.
+            self.ensure_reserved_dirty(db_sec)?;
+            let db = self.dirty_reserved.get_mut(&db_sec).unwrap();
+            db[off + 18..off + 18 + nlen].copy_from_slice(new_bytes);
+            return Ok(());
+        }
+
+        // Different length — remove the old direntry, then re-add it with
+        // the SAME anode so identity (and the data it points at) is
+        // preserved while all metadata fields carry over verbatim.
+        remove_direntry_from_dir(self, parent_anode, entry_anode)?;
+        add_direntry_to_dir(
+            self,
+            parent_anode,
+            de.ttype,
+            entry_anode,
+            de.fsize,
+            new_name,
+            &de.comment,
+            de.protection,
+            Some((de.cd as i32, de.cm as i32, de.ct as i32)),
+            (de.extrafields_link != 0).then_some(de.extrafields_link),
+        )?;
+        Ok(())
+    }
+
     fn do_delete_entry(
         &mut self,
         parent: &FileEntry,
@@ -2761,6 +2847,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
         }
     }
 
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
     fn create_symlink(
         &mut self,
         parent: &FileEntry,
@@ -2808,6 +2898,25 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
         match self.do_delete_entry(parent, entry) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.restore_snapshot(snap);
+                Err(e)
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let snap = self.snapshot();
+        match self.do_rename(parent, entry, new_name) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.restore_snapshot(snap);
@@ -4271,5 +4380,46 @@ mod tests {
         assert_eq!(fe.amiga_protection, Some(0xF0));
         assert_eq!(fe.amiga_comment.as_deref(), Some("dir note"));
         assert_eq!(fe.amiga_date, Some((100, 200, 300)));
+    }
+
+    /// `rename` round-trips: the new name is listed, the old is gone, and
+    /// the entry keeps its anode (identity) plus its file contents. Uses a
+    /// different-length new name to exercise the remove+re-add path.
+    #[test]
+    fn rename_file_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "Ren").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = Pfs3Filesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let payload = b"keep this content".to_vec();
+        let mut src = std::io::Cursor::new(payload.clone());
+        let created = fs
+            .create_file(
+                &root,
+                "old",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        let orig_anode = created.location;
+        fs.rename(&root, &created, "much-longer-name")
+            .expect("rename");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = Pfs3Filesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(kids.iter().all(|c| c.name != "old"), "old name gone");
+        let renamed = kids
+            .iter()
+            .find(|c| c.name == "much-longer-name")
+            .expect("new name listed");
+        assert_eq!(renamed.location, orig_anode, "anode preserved");
+        let data = fs2.read_file(renamed, usize::MAX).expect("read");
+        assert_eq!(data, b"keep this content", "contents preserved");
     }
 }

@@ -1782,6 +1782,150 @@ impl<R: Read + Write + Seek + Send> SfsFilesystem<R> {
         ))
     }
 
+    fn do_rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        let parent_node = parent.location as u32;
+        let entry_node = entry.location as u32;
+
+        // Locate the entry's fsObject within its OBJC chain block and
+        // parse all of its fields so we can reconstruct it with only the
+        // name changed. The objectnode (= identity), the data/extent
+        // pointers, and the file data are all left untouched.
+        let chain_blk = self.lookup_object_block(entry_node)?;
+        let cur = self.read_block(chain_blk)?.to_vec();
+        let mut off = 24usize;
+        let mut found: Option<(usize, SfsObject, usize)> = None;
+        while off < cur.len() {
+            match parse_object(&cur, off) {
+                Some((obj, consumed)) => {
+                    if obj.objectnode == entry_node {
+                        found = Some((off, obj, consumed));
+                        break;
+                    }
+                    off += consumed;
+                }
+                None => break,
+            }
+        }
+        let (obj_off, obj, consumed) = found.ok_or_else(|| {
+            parse_err(format!(
+                "rename: object {} not found in block {}",
+                entry_node, chain_blk
+            ))
+        })?;
+
+        if new_name.as_bytes() == obj.name.as_bytes() {
+            return Ok(());
+        }
+
+        // Reject a collision with a *different* entry. SFS folds case, so a
+        // case-only self-rename matches `entry` itself — allow that.
+        {
+            let kids = self.list_directory(parent)?;
+            if kids
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(new_name) && c.location != entry.location)
+            {
+                return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+            }
+        }
+
+        // Build the replacement object bytes (validates the name 1..30).
+        let new_bytes = build_object(
+            obj.objectnode,
+            obj.protection,
+            obj.data_or_hashtable,
+            obj.size_or_firstdirblock,
+            obj.datemodified,
+            obj.bits,
+            new_name,
+            &obj.comment,
+        )?;
+
+        if new_bytes.len() == consumed {
+            // Same encoded length — overwrite the object bytes in place.
+            // ensure_dirty so the checksum is re-stamped at flush time.
+            self.ensure_dirty(chain_blk)?;
+            let buf = self.dirty.get_mut(&chain_blk).unwrap();
+            buf[obj_off..obj_off + consumed].copy_from_slice(&new_bytes);
+            return Ok(());
+        }
+
+        // Different length — splice the old object out of its block, then
+        // place the rebuilt object. Try the same block first; if it no
+        // longer has room, grow the parent's OBJC chain like create does.
+        self.ensure_dirty(chain_blk)?;
+        let buf = self.dirty.get_mut(&chain_blk).unwrap();
+        let end = buf.len();
+        buf.copy_within(obj_off + consumed..end, obj_off);
+        let new_tail = end - consumed;
+        for b in &mut buf[new_tail..end] {
+            *b = 0;
+        }
+
+        match self.splice_object_into_block(chain_blk, &new_bytes) {
+            Ok(()) => Ok(()),
+            Err(FilesystemError::DiskFull(_)) => {
+                // Old block can't fit the longer object; place it in a
+                // block in the parent's chain with room (allocating a new
+                // OBJC if needed) and re-home the objectnode mapping.
+                let (parent_dir_blk, parent_dir_obj_off) = self.locate_dir_object(parent_node)?;
+                let target_blk = self.ensure_dir_chain_room(
+                    parent_dir_blk,
+                    parent_dir_obj_off,
+                    parent_node,
+                    new_bytes.len(),
+                )?;
+                self.splice_object_into_block(target_blk, &new_bytes)?;
+                // Repoint the objectnode's NodeContainer entry at the new
+                // OBJC block so future lookups find it.
+                self.repoint_object_node(entry_node, target_blk)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Update the leaf NodeContainer entry for `objectnode` so its
+    /// `fsObjectNode.data` points at `new_obj_blk`. Mirrors
+    /// `alloc_object_node`'s slot math.
+    fn repoint_object_node(
+        &mut self,
+        objectnode: u32,
+        new_obj_blk: u32,
+    ) -> Result<(), FilesystemError> {
+        let nc_blk = self.root.objectnoderoot;
+        self.ensure_dirty(nc_blk)?;
+        let buf = self.dirty.get_mut(&nc_blk).unwrap();
+        let nodenumber = rd_u32(buf, 12);
+        let nodes = rd_u32(buf, 16);
+        if nodes != 1 {
+            return Err(parse_err(
+                "repoint_object_node: only leaf NodeContainer supported",
+            ));
+        }
+        if objectnode < nodenumber {
+            return Err(parse_err(format!(
+                "repoint_object_node: {} below nodenumber {}",
+                objectnode, nodenumber
+            )));
+        }
+        let slot = (objectnode - nodenumber) as usize;
+        let o = 20 + slot * FS_OBJECTNODE_SIZE;
+        if o + 4 > buf.len() {
+            return Err(parse_err(format!(
+                "repoint_object_node: slot {} out of range",
+                slot
+            )));
+        }
+        buf[o..o + 4].copy_from_slice(&new_obj_blk.to_be_bytes());
+        Ok(())
+    }
+
     fn do_delete_entry(
         &mut self,
         parent: &FileEntry,
@@ -2048,6 +2192,25 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Sf
     ) -> Result<(), FilesystemError> {
         let snap = self.snapshot();
         match self.do_delete_entry(parent, entry) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.restore_snapshot(snap);
+                Err(e)
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let snap = self.snapshot();
+        match self.do_rename(parent, entry, new_name) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.restore_snapshot(snap);
@@ -2891,6 +3054,48 @@ mod tests {
         let d = kids.iter().find(|c| c.name == "MyDir").unwrap();
         let sub_kids = fs2.list_directory(d).expect("list dir");
         assert!(sub_kids.is_empty());
+    }
+
+    /// `rename` round-trips: the new name is listed, the old is gone, and
+    /// the entry keeps its objectnode (identity) plus its file contents. A
+    /// different-length new name exercises the splice-out + re-place path.
+    #[test]
+    fn sfs_rename_file_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_sfs(8192, "Ren").expect("format");
+        let cur = std::io::Cursor::new(img);
+        let mut fs = SfsFilesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+
+        let payload: &[u8] = b"keep this content";
+        let mut p = std::io::Cursor::new(payload);
+        let file_fe = fs
+            .create_file(
+                &root,
+                "old.txt",
+                &mut p,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create_file");
+        let orig_node = file_fe.location;
+        fs.rename(&root, &file_fe, "much-longer-name.txt")
+            .expect("rename");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        let img2 = fs.reader.into_inner();
+        let cur2 = std::io::Cursor::new(img2);
+        let mut fs2 = SfsFilesystem::open(cur2, 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let kids = fs2.list_directory(&root2).expect("list");
+        assert!(kids.iter().all(|c| c.name != "old.txt"), "old name gone");
+        let renamed = kids
+            .iter()
+            .find(|c| c.name == "much-longer-name.txt")
+            .expect("new name listed");
+        assert_eq!(renamed.location, orig_node, "objectnode preserved");
+        let data = fs2.read_file(renamed, payload.len() * 2).expect("read");
+        assert_eq!(data, payload, "contents preserved");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod mbr;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod sgi_hdd_builder;
 pub mod x68k;
 pub mod x68k_hdd_builder;
 pub mod x68k_ipl;
@@ -200,6 +201,67 @@ fn amiga_root_block_present(first_sector: &[u8; 512], reader: &mut (impl Read + 
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // Xerox Alto disk packs are label-bearing disks held in one of two
+    // whole-file containers, neither of which is a flat sector image: a PARC
+    // Disk Image (magic "PARCDISK") or a CopyDisk stream (which opens with a
+    // 7-word params block: length=7, type=3 "hereAreDiskParams", diskType=10
+    // "AltoDiablo" -> bytes 00 07 00 03 00 0a). They route through the
+    // BrowseSession Alto branch, which reads the whole file and opens a BFS.
+    if &first_sector[0..8] == b"PARCDISK" {
+        // PDI header: fsFamily is a big-endian word at byte 10
+        // (0 = Alto/Diablo, 1 = Alto/Trident, 2 = Pilot/Cedar).
+        let fs_family = u16::from_be_bytes([first_sector[10], first_sector[11]]);
+        return Some(if fs_family == 2 {
+            "Pilot/Cedar".to_string()
+        } else {
+            "Alto BFS".to_string()
+        });
+    }
+    if first_sector[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a] {
+        return Some("Alto BFS".to_string());
+    }
+    // Dwarf Draco 6085 ".zdisk"/".zdelta": a zlib stream (magic byte 0x78) that
+    // inflates to the 0xDAAD signature. A Pilot/Cedar pack; routes through the
+    // BrowseSession Alto branch (which reads the whole file and opens Pilot).
+    if first_sector[0] == 0x78 && crate::fs::alto::zdisk::is_zdisk(first_sector) {
+        return Some("Pilot/Cedar".to_string());
+    }
+    // Salto Alto-emulator cooked `.dsk`: no magic, recognized by the exact
+    // Diablo-31 image size plus a page-number prefix on record 1 that reads as
+    // its VDA (1 big-endian, or 0x0100 little-endian — Salto images come in
+    // both byte orders). open_pack does the full validation.
+    if let Ok(end) = reader.seek(SeekFrom::End(0)) {
+        if end as usize == crate::fs::alto::salto::IMAGE_BYTES {
+            let rec1 = crate::fs::alto::salto::RECORD_BYTES as u64;
+            // Salto: record 1's leading word is its VDA (1 big-endian / 0x0100 LE).
+            let mut p = [0u8; 2];
+            let salto_ok = reader.seek(SeekFrom::Start(rec1)).is_ok()
+                && reader.read_exact(&mut p).is_ok()
+                && matches!(u16::from_be_bytes(p), 1 | 0x0100);
+            // ContrAlto2 Diablo .dsk (same size): record 1's 2-word header (after
+            // a zero dummy word) is the packed disk address; the SysDir leader's
+            // is the Diablo-31 DA of VDA 1 (0x1000).
+            let mut h = [0u8; 2];
+            let contralto_ok = reader.seek(SeekFrom::Start(rec1 + 4)).is_ok()
+                && reader.read_exact(&mut h).is_ok()
+                && u16::from_le_bytes(h) == 0x1000;
+            let _ = reader.seek(SeekFrom::Start(0));
+            if salto_ok || contralto_ok {
+                return Some("Alto BFS".to_string());
+            }
+        }
+        // Trident (TFS) pack image (ContrAlto2/dorado layout): no magic,
+        // recognized by the exact T-80 / T-300 size. Browses as an Alto file
+        // system (the same logical FS on Trident hardware). open_pack validates.
+        if end as usize == crate::fs::alto::trident::T80_BYTES
+            || end as usize == crate::fs::alto::trident::T300_BYTES
+        {
+            let _ = reader.seek(SeekFrom::Start(0));
+            return Some("Alto BFS".to_string());
+        }
+        let _ = reader.seek(SeekFrom::Start(0));
+    }
+
     // Check for FAT VBR: JMP instruction + valid BPB fields.
     // We validate multiple BPB fields to reliably distinguish a FAT boot sector
     // from an MBR. The partition table area (offsets 446-509) of a FAT VBR
@@ -777,15 +839,21 @@ impl PartitionTable {
                         if ptype.is_skipped_from_browse() {
                             return None;
                         }
-                        let partition_type_byte = match ptype {
-                            sgi::SgiPartitionType::Xfs => SGI_TYPE_BYTE_XFS,
-                            sgi::SgiPartitionType::Efs => SGI_TYPE_BYTE_EFS,
-                            _ => 0,
+                        let partition_type_byte = if ptype.is_efs() {
+                            SGI_TYPE_BYTE_EFS
+                        } else if ptype == sgi::SgiPartitionType::Xfs {
+                            SGI_TYPE_BYTE_XFS
+                        } else {
+                            0
                         };
-                        let type_name = match ptype {
-                            sgi::SgiPartitionType::Xfs => "SGI XFS".to_string(),
-                            sgi::SgiPartitionType::Efs => "SGI EFS".to_string(),
-                            other => format!("SGI {}", other.display_name()),
+                        // SYSV-typed partitions are EFS CD-ROM filesystems; show
+                        // them as EFS rather than their raw "SYSV" type name.
+                        let type_name = if ptype.is_efs() {
+                            "SGI EFS".to_string()
+                        } else if ptype == sgi::SgiPartitionType::Xfs {
+                            "SGI XFS".to_string()
+                        } else {
+                            format!("SGI {}", ptype.display_name())
                         };
                         Some(PartitionInfo {
                             index: i,

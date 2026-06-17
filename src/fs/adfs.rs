@@ -1693,6 +1693,117 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         Ok(())
     }
 
+    /// Rename an entry in place: only the 10-byte name field of the parent's
+    /// directory slot is rewritten (CR-terminated when < 10 chars, mirroring
+    /// `insert_dir_entry`). The load/exec/length/indaddr (bytes 10..25) and
+    /// attribute byte (25) are preserved, so the file keeps its identity,
+    /// data fragment, and attributes. ADFS folds case on lookup, so a
+    /// case-only rename resolves to the same slot and is allowed.
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if self.fsm.is_none() {
+            return Err(FilesystemError::Unsupported(
+                "D-format ADFS write not supported".into(),
+            ));
+        }
+        // Name guard mirroring `parse_dir_entry`: <= 10 ASCII chars, no CR /
+        // control bytes / spaces (which the parser treats as terminators).
+        if new_name.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "ADFS filename is empty".into(),
+            ));
+        }
+        if new_name.len() > 10 {
+            return Err(FilesystemError::InvalidData(format!(
+                "ADFS filename '{new_name}' exceeds 10 characters"
+            )));
+        }
+        for c in new_name.chars() {
+            let b = c as u32;
+            if !c.is_ascii() || !(0x21..=0x7E).contains(&b) {
+                return Err(FilesystemError::InvalidData(format!(
+                    "ADFS filename '{new_name}' contains an unsupported character '{c}' \
+                     (use printable ASCII, no spaces)"
+                )));
+            }
+        }
+
+        let parent_indaddr = if parent.path == "/" {
+            self.disc_record.root
+        } else {
+            parent.location as u32
+        };
+
+        let mut block = self.read_dir_block(parent_indaddr)?;
+
+        // Reject a collision with a *different* entry (case-insensitive —
+        // ADFS folds case). A case-only self-rename is allowed.
+        if !new_name.eq_ignore_ascii_case(&entry.name) {
+            let mut off = DIR_SMALL_HEADER;
+            while off + DIR_ENTRY_SIZE <= block.len() - DIR_SMALL_HEADER {
+                let slot: [u8; DIR_ENTRY_SIZE] =
+                    block[off..off + DIR_ENTRY_SIZE].try_into().expect("size");
+                match parse_dir_entry(&slot) {
+                    Some(e) => {
+                        if e.name.eq_ignore_ascii_case(new_name) {
+                            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+                        }
+                        off += DIR_ENTRY_SIZE;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // Locate the slot matching the entry's current name.
+        let mut target: Option<usize> = None;
+        let mut off = DIR_SMALL_HEADER;
+        while off + DIR_ENTRY_SIZE <= block.len() - DIR_SMALL_HEADER {
+            let slot: [u8; DIR_ENTRY_SIZE] =
+                block[off..off + DIR_ENTRY_SIZE].try_into().expect("size");
+            match parse_dir_entry(&slot) {
+                Some(e) => {
+                    if e.name == entry.name {
+                        target = Some(off);
+                        break;
+                    }
+                    off += DIR_ENTRY_SIZE;
+                }
+                None => break,
+            }
+        }
+        let off = target.ok_or_else(|| {
+            FilesystemError::NotFound(format!("ADFS: dir entry '{}' not found", entry.name))
+        })?;
+
+        // Rewrite bytes 0..10 with the new name; preserve bytes 10..25
+        // (load/exec/length/indaddr) and byte 25 (attrs).
+        let nb = new_name.as_bytes();
+        let nlen = nb.len().min(9);
+        // Clear the 10-byte name field, then stamp the new name.
+        for b in &mut block[off..off + 10] {
+            *b = 0;
+        }
+        block[off..off + nlen].copy_from_slice(&nb[..nlen]);
+        if nlen < 10 {
+            // CR-terminate so the kernel-style parser stops here.
+            block[off + nlen] = 0x0D;
+        }
+
+        // Bump the cycle counter at the tail, like insert/remove.
+        let last = block.len() - 1;
+        block[last] = block[last].wrapping_add(1);
+        self.write_dir_block(parent_indaddr, &block)?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         // Every primitive flushes synchronously — nothing to do here.
         Ok(())
@@ -2010,6 +2121,55 @@ mod tests {
             free_before,
             free_after,
         );
+    }
+
+    #[test]
+    fn rename_keeps_indaddr_and_content() {
+        let disk = build_eformat_with_one_file();
+        let cur = Cursor::new(disk);
+        let mut fs = AdfsFilesystem::open(cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        // Create a file so we control its name + content.
+        let payload = b"rename my fragment";
+        let mut src = std::io::Cursor::new(payload.to_vec());
+        let opts = CreateFileOptions::default();
+        let made = fs
+            .create_file(&root, "OLDFILE", &mut src, payload.len() as u64, &opts)
+            .unwrap();
+        let indaddr_before = made.location;
+        let size_before = made.size;
+        let free_before = fs.fsm.as_ref().unwrap().free_bytes();
+
+        fs.rename(&root, &made, "NEWFILE").unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(
+            entries.iter().all(|e| e.name != "OLDFILE"),
+            "old name should be gone"
+        );
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "NEWFILE")
+            .expect("new name should be listed")
+            .clone();
+        // Identity preserved: same indirect disc address + size, same data.
+        assert_eq!(renamed.location, indaddr_before);
+        assert_eq!(renamed.size, size_before);
+        let data = fs.read_file(&renamed, payload.len() * 2).unwrap();
+        assert_eq!(&data, payload);
+        // Rename touches only the dir block — no fragment alloc/free.
+        let free_after = fs.fsm.as_ref().unwrap().free_bytes();
+        assert_eq!(free_after, free_before);
+
+        // Rename to the same name is a no-op.
+        fs.rename(&root, &renamed, "NEWFILE").unwrap();
+        let count = fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "NEWFILE")
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -109,11 +109,19 @@ impl SgiPartitionType {
         }
     }
 
-    /// True if this partition is browseable as a filesystem in our GUI. Step
-    /// 2 surfaces only EFS and XFS; other types (VOLHDR, VOLUME, container
-    /// types, swap/raw, log) are listed but not opened.
+    /// True if this partition holds an EFS filesystem. IRIX types EFS CD-ROM
+    /// partitions as **SYSV (5)** rather than EFS (7) — the kernel's `IS_EFS()`
+    /// accepts both (`efs_vh.h`: "partition type sysv is used for EFS format
+    /// CD-ROM partitions"). We mirror that so EFS CDs route to the EFS reader.
+    pub fn is_efs(self) -> bool {
+        matches!(self, Self::Efs | Self::SysV)
+    }
+
+    /// True if this partition is browseable as a filesystem. Surfaces EFS
+    /// (incl. the SYSV-typed CD-ROM variant) and XFS; other types (VOLHDR,
+    /// VOLUME, container types, swap/raw, log) are listed but not opened.
     pub fn is_browsable(self) -> bool {
-        matches!(self, Self::Efs | Self::Xfs)
+        self.is_efs() || matches!(self, Self::Xfs)
     }
 
     /// True if the partition is a wrapper around the entire disk or a
@@ -218,12 +226,139 @@ impl SgiPartitionEntry {
     }
 }
 
+/// `struct device_parameters` (48 bytes) at offset 0x18 of the volume header —
+/// the disk's CHS-ish geometry plus drive timing fields that IRIX `fx` /
+/// `prtvtoc` and the disk driver read. Every multi-byte field is big-endian.
+///
+/// We model every field so `parse` → `to_bytes` is byte-exact (an existing
+/// disk's geometry survives a partition-table edit), and so synthesis can set a
+/// sane geometry with [`for_geometry`](Self::for_geometry). Only the geometry
+/// fields (`cyls`/`cylshi`/`trks0`/`secs`/`secbytes`) carry meaning for our
+/// uses; the rest round-trip untouched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SgiDeviceParameters {
+    pub skew: u8,
+    pub gap1: u8,
+    pub gap2: u8,
+    pub spares_cyl: u8,
+    /// Low 16 bits of the usable cylinder count (high 8 in `cylshi`).
+    pub cyls: u16,
+    pub shd0: u16,
+    /// Usable tracks (heads) for volume 0.
+    pub trks0: u16,
+    pub ctq_depth: u8,
+    /// High 8 bits of the cylinder count.
+    pub cylshi: u8,
+    pub unused: u16,
+    /// Usable sectors per track.
+    pub secs: u16,
+    /// Bytes per sector (always 512 for the disks we synthesize).
+    pub secbytes: u16,
+    pub interleave: u16,
+    pub flags: i32,
+    pub datarate: i32,
+    pub nretries: i32,
+    pub mspw: i32,
+    pub xgap1: u16,
+    pub xsync: u16,
+    pub xrdly: u16,
+    pub xgap2: u16,
+    pub xrgate: u16,
+    pub xwcont: u16,
+}
+
+/// Byte length of `struct device_parameters` on disk.
+pub const SGI_DEVICE_PARAMETERS_SIZE: usize = 48;
+/// Offset of `vh_dp` within the 512-byte volume header.
+pub const SGI_DEVICE_PARAMETERS_OFFSET: usize = 0x18;
+
+impl SgiDeviceParameters {
+    fn parse(buf: &[u8; SGI_DEVICE_PARAMETERS_SIZE]) -> Self {
+        SgiDeviceParameters {
+            skew: buf[0],
+            gap1: buf[1],
+            gap2: buf[2],
+            spares_cyl: buf[3],
+            cyls: BigEndian::read_u16(&buf[4..6]),
+            shd0: BigEndian::read_u16(&buf[6..8]),
+            trks0: BigEndian::read_u16(&buf[8..10]),
+            ctq_depth: buf[10],
+            cylshi: buf[11],
+            unused: BigEndian::read_u16(&buf[12..14]),
+            secs: BigEndian::read_u16(&buf[14..16]),
+            secbytes: BigEndian::read_u16(&buf[16..18]),
+            interleave: BigEndian::read_u16(&buf[18..20]),
+            flags: BigEndian::read_i32(&buf[20..24]),
+            datarate: BigEndian::read_i32(&buf[24..28]),
+            nretries: BigEndian::read_i32(&buf[28..32]),
+            mspw: BigEndian::read_i32(&buf[32..36]),
+            xgap1: BigEndian::read_u16(&buf[36..38]),
+            xsync: BigEndian::read_u16(&buf[38..40]),
+            xrdly: BigEndian::read_u16(&buf[40..42]),
+            xgap2: BigEndian::read_u16(&buf[42..44]),
+            xrgate: BigEndian::read_u16(&buf[44..46]),
+            xwcont: BigEndian::read_u16(&buf[46..48]),
+        }
+    }
+
+    fn to_bytes(&self) -> [u8; SGI_DEVICE_PARAMETERS_SIZE] {
+        let mut out = [0u8; SGI_DEVICE_PARAMETERS_SIZE];
+        out[0] = self.skew;
+        out[1] = self.gap1;
+        out[2] = self.gap2;
+        out[3] = self.spares_cyl;
+        BigEndian::write_u16(&mut out[4..6], self.cyls);
+        BigEndian::write_u16(&mut out[6..8], self.shd0);
+        BigEndian::write_u16(&mut out[8..10], self.trks0);
+        out[10] = self.ctq_depth;
+        out[11] = self.cylshi;
+        BigEndian::write_u16(&mut out[12..14], self.unused);
+        BigEndian::write_u16(&mut out[14..16], self.secs);
+        BigEndian::write_u16(&mut out[16..18], self.secbytes);
+        BigEndian::write_u16(&mut out[18..20], self.interleave);
+        BigEndian::write_i32(&mut out[20..24], self.flags);
+        BigEndian::write_i32(&mut out[24..28], self.datarate);
+        BigEndian::write_i32(&mut out[28..32], self.nretries);
+        BigEndian::write_i32(&mut out[32..36], self.mspw);
+        BigEndian::write_u16(&mut out[36..38], self.xgap1);
+        BigEndian::write_u16(&mut out[38..40], self.xsync);
+        BigEndian::write_u16(&mut out[40..42], self.xrdly);
+        BigEndian::write_u16(&mut out[42..44], self.xgap2);
+        BigEndian::write_u16(&mut out[44..46], self.xrgate);
+        BigEndian::write_u16(&mut out[46..48], self.xwcont);
+        out
+    }
+
+    /// Build a geometry with the given cylinder/head/sector counts and the
+    /// fixed 512-byte sector size; all other fields zero. Cylinders > 65535
+    /// spill into `cylshi`.
+    pub fn for_geometry(cylinders: u32, heads: u16, sectors_per_track: u16) -> Self {
+        SgiDeviceParameters {
+            cyls: (cylinders & 0xFFFF) as u16,
+            cylshi: (cylinders >> 16) as u8,
+            trks0: heads,
+            secs: sectors_per_track,
+            secbytes: 512,
+            ..Default::default()
+        }
+    }
+
+    /// Full cylinder count (`cylshi` high byte + `cyls`).
+    pub fn cylinders(&self) -> u32 {
+        ((self.cylshi as u32) << 16) | self.cyls as u32
+    }
+}
+
 /// Parsed SGI Volume Header (sector 0 of an SGI disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SgiVolumeHeader {
     pub magic: u32,
     pub root_part_num: u16,
     pub swap_part_num: u16,
+    /// Disk geometry (`vh_dp`). Defaulted when absent from older `sgi.json`
+    /// sidecars; populated from the on-disk bytes on parse.
+    #[serde(default)]
+    pub device_parameters: SgiDeviceParameters,
     /// Null-terminated bootfile path (e.g. `/unix`).
     pub bootfile: String,
     pub volume_directory: Vec<SgiVolumeDirEntry>,
@@ -261,6 +396,14 @@ impl SgiVolumeHeader {
         let swap_part_num = BigEndian::read_u16(&buf[6..8]);
         let bootfile = parse_fixed_ascii(&buf[8..24]);
 
+        // Device parameters (geometry): 48 bytes at 0x18..0x48.
+        let device_parameters = SgiDeviceParameters::parse(
+            buf[SGI_DEVICE_PARAMETERS_OFFSET
+                ..SGI_DEVICE_PARAMETERS_OFFSET + SGI_DEVICE_PARAMETERS_SIZE]
+                .try_into()
+                .expect("48-byte slice"),
+        );
+
         // Volume directory: 15 × 16-byte entries at 0x048..0x138.
         let mut volume_directory = Vec::with_capacity(SGI_NUM_VOL_DIR);
         for i in 0..SGI_NUM_VOL_DIR {
@@ -296,6 +439,7 @@ impl SgiVolumeHeader {
             magic,
             root_part_num,
             swap_part_num,
+            device_parameters,
             bootfile,
             volume_directory,
             partitions,
@@ -313,6 +457,13 @@ impl SgiVolumeHeader {
         BigEndian::write_u16(&mut buf[4..6], self.root_part_num);
         BigEndian::write_u16(&mut buf[6..8], self.swap_part_num);
         write_fixed_ascii(&mut buf[8..24], &self.bootfile);
+
+        // Device parameters (geometry) at 0x18..0x48. Previously zeroed —
+        // round-tripping it preserves an existing disk's geometry across a
+        // partition-table edit and lets synthesis set it.
+        buf[SGI_DEVICE_PARAMETERS_OFFSET
+            ..SGI_DEVICE_PARAMETERS_OFFSET + SGI_DEVICE_PARAMETERS_SIZE]
+            .copy_from_slice(&self.device_parameters.to_bytes());
 
         for (i, entry) in self.volume_directory.iter().enumerate() {
             if i >= SGI_NUM_VOL_DIR {
@@ -413,6 +564,28 @@ mod tests {
         assert_eq!(p8.partition_type(), SgiPartitionType::VolHdr);
     }
 
+    /// The fixture's `device_parameters` region (0x18..0x48) survives a
+    /// `parse` -> `to_bytes` round-trip byte-for-byte — i.e. editing an SGI
+    /// disk's partition table no longer wipes its geometry (the old behavior,
+    /// when `to_bytes` zeroed this region).
+    #[test]
+    fn device_parameters_round_trip_byte_exact() {
+        let buf = load_irix_volhdr_fixture();
+        let vh = SgiVolumeHeader::parse(&buf).expect("valid SGI volhdr");
+        // secbytes anchors the layout; the fixture is a 512-byte/sector disk.
+        assert_eq!(vh.device_parameters.secbytes, 512);
+        assert_eq!(vh.device_parameters.trks0, 16);
+
+        let out = vh.to_bytes();
+        let dp_range =
+            SGI_DEVICE_PARAMETERS_OFFSET..SGI_DEVICE_PARAMETERS_OFFSET + SGI_DEVICE_PARAMETERS_SIZE;
+        assert_eq!(
+            &out[dp_range.clone()],
+            &buf[dp_range],
+            "device_parameters bytes must round-trip unchanged"
+        );
+    }
+
     #[test]
     fn rejects_wrong_magic() {
         let mut buf = vec![0u8; SGI_VOLHDR_SIZE];
@@ -453,6 +626,7 @@ mod tests {
             magic: SGI_VOLHDR_MAGIC,
             root_part_num: 0,
             swap_part_num: 1,
+            device_parameters: SgiDeviceParameters::for_geometry(403, 16, 63),
             bootfile: "/unix".to_string(),
             volume_directory: vec![SgiVolumeDirEntry {
                 name: "sash".to_string(),
@@ -493,6 +667,11 @@ mod tests {
         assert_eq!(round.root_part_num, vh.root_part_num);
         assert_eq!(round.swap_part_num, vh.swap_part_num);
         assert_eq!(round.bootfile, vh.bootfile);
+        // Geometry round-trips through to_bytes/parse.
+        assert_eq!(round.device_parameters.cylinders(), 403);
+        assert_eq!(round.device_parameters.trks0, 16);
+        assert_eq!(round.device_parameters.secs, 63);
+        assert_eq!(round.device_parameters.secbytes, 512);
         assert!(round.checksum_valid);
         assert_eq!(round.partitions[0].first, 0x0004_1000);
         assert_eq!(round.partitions[0].blocks, 0x0BB3_F000);

@@ -1113,6 +1113,62 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
         Ok(())
     }
 
+    /// Rename an entry in place: only the three name regions of its 32-byte
+    /// directory slot are rewritten ([0..8] n8, [8..11] e3 extension,
+    /// [12..22] ne10). The attribute byte (11) and the time/date/cluster/size
+    /// tail (22..32) are preserved, so the file keeps its identity, contents,
+    /// and first cluster. Human68k folds ASCII case on lookup, so a case-only
+    /// rename resolves to the same slot and is allowed.
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let (parent_cluster, _) = Self::parent_cluster_and_path(parent);
+        // Validate / encode the new name into its three on-disk regions.
+        let (n8, ne10, e3) = encode_human68k_name(new_name)?;
+
+        // Reject a collision with a *different* entry. Lookup folds ASCII
+        // case, so a case-only self-rename ("doc.txt" -> "DOC.TXT") still
+        // resolves to this entry and is allowed.
+        if !new_name.eq_ignore_ascii_case(&entry.name)
+            && self
+                .find_entry_slot_in_dir(parent_cluster, new_name)?
+                .is_some()
+        {
+            return Err(FilesystemError::AlreadyExists(format!(
+                "Human68k entry '{new_name}' already exists"
+            )));
+        }
+
+        let slot_off = self
+            .find_entry_slot_in_dir(parent_cluster, &entry.name)?
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!(
+                    "Human68k entry '{}' not found in '{}'",
+                    entry.name, parent.path
+                ))
+            })?;
+
+        // Read the 32-byte slot, overwrite only the name regions, write back.
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        let mut slot = [0u8; DIR_ENTRY_SIZE];
+        self.reader.read_exact(&mut slot)?;
+        slot[0..8].copy_from_slice(&n8);
+        slot[8..11].copy_from_slice(&e3);
+        // byte 11 (attr) preserved
+        slot[12..22].copy_from_slice(&ne10);
+        // bytes 22..32 (time/date/cluster/size) preserved
+        self.reader.seek(SeekFrom::Start(slot_off))?;
+        self.reader.write_all(&slot)?;
+        self.reader.flush()?;
+        Ok(())
+    }
+
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
         self.reader.flush()?;
         Ok(())
@@ -1998,6 +2054,59 @@ mod tests {
             .create_file(&root, "DOC.TXT", &mut src, 1, &CreateFileOptions::default())
             .unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn rename_keeps_cluster_and_content() {
+        let disk = build_fat12_synthetic();
+        let mut fs = Human68kFilesystem::open(Cursor::new(disk), 0).unwrap();
+        let root = fs.root().unwrap();
+        let doc = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DOC.TXT")
+            .unwrap();
+        let cluster_before = doc.location;
+        let size_before = doc.size;
+        let content_before = fs.read_file(&doc, 4096).unwrap();
+        let before_free = EditableFilesystem::free_space(&mut fs).unwrap();
+
+        fs.rename(&root, &doc, "RENAMED.TX").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Round-trip via a fresh open.
+        let inner = fs.reader.clone();
+        let mut fs2 = Human68kFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries = fs2.list_directory(&root2).unwrap();
+        assert!(
+            entries.iter().all(|e| e.name != "DOC.TXT"),
+            "old name should be gone"
+        );
+        let renamed = entries
+            .iter()
+            .find(|e| e.name == "RENAMED.TX")
+            .expect("new name should be listed")
+            .clone();
+        // Identity preserved: same first cluster + size, same data.
+        assert_eq!(renamed.location, cluster_before);
+        assert_eq!(renamed.size, size_before);
+        assert_eq!(fs2.read_file(&renamed, 4096).unwrap(), content_before);
+        // No clusters allocated or freed by a rename.
+        let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
+        assert_eq!(after_free, before_free);
+
+        // Case-only self-rename is a no-op (still one entry).
+        fs2.rename(&root2, &renamed, "renamed.tx").unwrap();
+        let root3 = fs2.root().unwrap();
+        let count = fs2
+            .list_directory(&root3)
+            .unwrap()
+            .iter()
+            .filter(|e| e.name.eq_ignore_ascii_case("RENAMED.TX"))
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -962,6 +962,52 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         de.finder_info[4..8].copy_from_slice(creator_code.as_bytes());
         Ok(())
     }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if parent.path != "/" {
+            return Err(FilesystemError::Unsupported(
+                "MFS is flat; only files in the root are renamable".into(),
+            ));
+        }
+        if entry.entry_type != EntryType::File {
+            return Err(FilesystemError::InvalidData(
+                "MFS only stores files; cannot rename a directory".into(),
+            ));
+        }
+        let _ = validate_mfs_name(new_name)?;
+
+        let fnum = entry.location as u32;
+        // Reject a collision with a *different* in-use entry. MFS names are
+        // case-sensitive on disk, so plain equality is the right comparison.
+        if self
+            .entries
+            .iter()
+            .any(|e| e.is_in_use() && e.file_number != fnum && e.name == new_name)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.to_string()));
+        }
+
+        // Overwrite only the name; flags, Finder info, file number, fork heads,
+        // lengths and dates are untouched, so the file keeps its identity and
+        // contents. Persistence happens via sync_metadata -> dir_write_back.
+        let de = self
+            .entries
+            .iter_mut()
+            .find(|e| e.is_in_use() && e.file_number == fnum)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("file number {fnum} not in directory"))
+            })?;
+        de.name = new_name.to_string();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1293,6 +1339,45 @@ mod tests {
         // "Doc" used 2 blocks (data fork + resource fork) at 1024 B each.
         let after_free = EditableFilesystem::free_space(&mut fs2).unwrap();
         assert_eq!(after_free, before_free + 2 * 1024);
+    }
+
+    #[test]
+    fn rename_in_place_round_trips_through_sync() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+        let fnum = doc.location;
+
+        fs.rename(&root, &doc, "Report").unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Reopen and prove the rename persisted with identity + contents intact.
+        let inner = fs.reader.clone();
+        let mut fs2 = MfsFilesystem::open(inner, 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let entries2 = fs2.list_directory(&root2).unwrap();
+        let names: Vec<&str> = entries2.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Report"));
+        assert!(!names.contains(&"Doc"));
+
+        let renamed = entries2.iter().find(|e| e.name == "Report").unwrap();
+        // Same file number (identity); both forks + resource size preserved.
+        assert_eq!(renamed.location, fnum);
+        assert_eq!(renamed.resource_fork_size, Some(4));
+        assert_eq!(fs2.read_file(renamed, 1024).unwrap(), b"first line\n");
+        assert_eq!(fs2.read_resource_fork(renamed).unwrap(), b"RSRC");
+    }
+
+    #[test]
+    fn rename_rejects_collision() {
+        let mut fs = MfsFilesystem::open(edit_fixture(), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+        // "Hello" already exists; renaming "Doc" onto it must be rejected.
+        let err = fs.rename(&root, &doc, "Hello").unwrap_err();
+        assert!(matches!(err, FilesystemError::AlreadyExists(_)));
     }
 
     #[test]
