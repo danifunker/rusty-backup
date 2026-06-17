@@ -465,6 +465,26 @@ mod tests {
         );
     }
 
+    /// A large (> 32 MiB) volume — where `create_blank_efs` grows `firstcg`
+    /// past the classic 18 so the bigger bitmap fits — is still fsck-clean.
+    /// Regression guard for the firstcg-scaling change that lets EFS back a
+    /// real SGI hard disk.
+    #[test]
+    fn fsck_clean_on_large_scaled_firstcg_volume() {
+        let img = super::super::efs::create_blank_efs(48 * 1024 * 1024, "BIGVOL").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let result = fsck_efs(&mut fs).expect("fsck");
+        assert!(
+            result.errors.is_empty(),
+            "expected no errors on a large volume, got: {:?}",
+            result
+                .errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn fsck_flags_replica_mismatch() {
         let mut img = build_clean_volume();

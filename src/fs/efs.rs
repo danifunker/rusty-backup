@@ -2314,9 +2314,6 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // Single cylinder group layout. `firstcg` = 18 mirrors classic IRIX
-    // (boot + sb + bitmap + reserved space up to the inode region).
-    let firstcg: u32 = 18;
     // Inode region size in blocks. 4 inodes per block (128-byte inodes).
     //   ≤ 4 MiB:    8 blocks (32 inodes)
     //   ≤ 64 MiB:   32 blocks (128 inodes)
@@ -2328,19 +2325,23 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
         67_108_865..=536_870_912 => 128,
         _ => 512,
     };
+    // Bitmap byte size: 1 bit per block, packed. Sized first because the
+    // bitmap region (blocks 2..2+bm_sectors) must fit *before* the inode
+    // region at `firstcg`.
+    let bmsize: u32 = (total_blocks as usize + 7) as u32 / 8;
+    let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
+    // Single cylinder group layout. `firstcg` reserves boot(1) + sb(1) +
+    // the bitmap before the inode region. A floor of 18 keeps the classic
+    // IRIX layout for small volumes (bitmap ≤ 16 blocks → firstcg stays 18,
+    // byte-identical to before); larger volumes grow firstcg so the bitmap
+    // fits. The reader/fsck read `firstcg` from the superblock, so any value
+    // is honored.
+    let firstcg: u32 = (2 + bm_sectors).max(18);
     // Single CG covers the entire data region past the inode table.
     let cgfsize: u32 = total_blocks - firstcg;
     if cgfsize <= cgisize as u32 + 4 {
         return Err(anyhow::anyhow!(
             "EFS volume too small to fit inode region + a root dirblock"
-        ));
-    }
-    // Bitmap byte size: 1 bit per block, packed.
-    let bmsize: u32 = (total_blocks as usize + 7) as u32 / 8;
-    let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
-    if bm_sectors > (firstcg - 2) {
-        return Err(anyhow::anyhow!(
-            "EFS bitmap too large for the reserved region (firstcg=18 sectors)"
         ));
     }
     // Root dirblock: first block in the data region past the inode table.

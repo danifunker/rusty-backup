@@ -7,6 +7,7 @@ pub mod mbr;
 pub mod rdb;
 pub mod resize;
 pub mod sgi;
+pub mod sgi_hdd_builder;
 pub mod x68k;
 pub mod x68k_hdd_builder;
 pub mod x68k_ipl;

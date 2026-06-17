@@ -981,6 +981,9 @@ mod tests {
             magic: SGI_VOLHDR_MAGIC,
             root_part_num: 0,
             swap_part_num: 1,
+            device_parameters: crate::partition::sgi::SgiDeviceParameters::for_geometry(
+                403, 16, 63,
+            ),
             bootfile: "/unix".to_string(),
             volume_directory: Vec::new(),
             partitions: Vec::new(),
