@@ -2333,14 +2333,15 @@ fn trim_ascii(b: &[u8]) -> String {
 
 /// Build a freshly-formatted EFS volume in memory.
 ///
-/// Produces a single-cylinder-group EFS volume that `EfsFilesystem::open`
-/// can read and write. The root inode (inum 2) is a directory with one
-/// allocated 512-byte dirblock — empty, so the volume mounts as a clean
-/// `/` with no entries.
+/// Produces a multi-cylinder-group EFS volume (the IRIX `mkfs_efs` shape) that
+/// `EfsFilesystem::open` can read and write and that mounts on real IRIX. The
+/// number of cylinder groups and the inode count scale with `size_bytes` (≈ one
+/// inode per 4 KiB), so large volumes are not capped at a single group's worth
+/// of inodes. The root inode (inum 2) is a directory with one allocated 512-byte
+/// dirblock holding `.`/`..` — empty, so the volume mounts as a clean `/`.
 ///
-/// `size_bytes` must be at least 32 KiB. `name` is the 6-byte
-/// `fname`/`fpack` short label (padded with spaces; characters beyond 6
-/// bytes are truncated).
+/// `size_bytes` must be at least 32 KiB. `name` is the 6-byte `fname`/`fpack`
+/// short label (padded with spaces; characters beyond 6 bytes are truncated).
 pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
     if size_bytes < 32 * 1024 {
         return Err(anyhow::anyhow!(
@@ -2355,51 +2356,68 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     }
     let total_blocks = total_blocks_u64 as u32;
 
-    // Inode region size in blocks. 4 inodes per block (128-byte inodes).
-    //   ≤ 4 MiB:    8 blocks (32 inodes)
-    //   ≤ 64 MiB:   32 blocks (128 inodes)
-    //   ≤ 512 MiB:  128 blocks (512 inodes)
-    //   larger:     512 blocks (2048 inodes)
-    let cgisize: u16 = match size_bytes {
-        0..=4_194_304 => 8,
-        4_194_305..=67_108_864 => 32,
-        67_108_865..=536_870_912 => 128,
-        _ => 512,
-    };
-    // Bitmap byte size: 1 bit per block, packed. Sized first because the
-    // bitmap region (blocks 2..2+bm_sectors) must fit *before* the inode
-    // region at `firstcg`.
-    let bmsize: u32 = (total_blocks as usize + 7) as u32 / 8;
+    // --- Multi-cylinder-group layout (the IRIX mkfs_efs shape) -------------
+    //
+    // Volume layout, in partition-relative 512-byte blocks:
+    //   0              reserved (boot / unused)
+    //   1              primary superblock
+    //   2 .. firstcg   free-space bitmap (set bit = free)
+    //   firstcg ..     `ncg` UNIFORM cylinder groups, each `cgfsize` blocks:
+    //                  `cgisize` inode-table blocks then `cgfsize-cgisize` data
+    //   fs_size .. V   trailing zone; holds the replicated superblock at V-1
+    //
+    // The inode count scales with the volume instead of being capped by a
+    // single group: `cgisize` blocks of inodes per CG (4 inodes / 512-byte
+    // block) target one inode per `EFS_BYTES_PER_INODE` bytes, and `ncg` is
+    // chosen so each group stays ~`EFS_CG_TARGET_BLOCKS` (which keeps `cgisize`
+    // well inside its u16 field at any volume size). The reader, fsck, and
+    // in-place resize all assume uniform groups, so every CG is exactly
+    // `cgfsize` blocks and `fs_size == firstcg + ncg*cgfsize`.
+    const EFS_BYTES_PER_INODE: u64 = 4096;
+    const EFS_CG_TARGET_BLOCKS: u32 = 32 * 1024; // ~16 MiB per cylinder group
+
+    // Bitmap spans the whole volume; 1 bit per block, packed. Sized first
+    // because the bitmap region (blocks 2..firstcg) precedes the first CG.
+    let bmsize: u32 = total_blocks.div_ceil(8);
     let bm_sectors = bmsize.div_ceil(EFS_BLOCKSIZE as u32);
-    // Single cylinder group layout. `firstcg` reserves boot(1) + sb(1) +
-    // the bitmap before the inode region. A floor of 18 keeps the classic
-    // IRIX layout for small volumes (bitmap ≤ 16 blocks → firstcg stays 18,
-    // byte-identical to before); larger volumes grow firstcg so the bitmap
-    // fits. The reader/fsck read `firstcg` from the superblock, so any value
-    // is honored.
-    let firstcg: u32 = (2 + bm_sectors).max(18);
-    // Single CG covers the entire data region past the inode table.
-    let cgfsize: u32 = total_blocks - firstcg;
-    if cgfsize <= cgisize as u32 + 4 {
+    let firstcg: u32 = 2 + bm_sectors;
+
+    // Data area = everything after the bitmap, less one trailing block reserved
+    // for the replicated superblock (kept outside the CGs so `fs_size` can be an
+    // exact `ncg * cgfsize` multiple).
+    let usable = total_blocks
+        .checked_sub(firstcg + 1)
+        .filter(|u| *u >= 4)
+        .ok_or_else(|| {
+            anyhow::anyhow!("EFS volume too small for a superblock + bitmap + data region")
+        })?;
+    let ncg: u32 = usable
+        .div_ceil(EFS_CG_TARGET_BLOCKS)
+        .clamp(1, u16::MAX as u32);
+    let cgfsize: u32 = usable / ncg; // floor -> uniform CGs, tiny trailing remainder
+                                     // Inode-table blocks per CG from the density target; at least one, and the
+                                     // group must keep at least one data block.
+    let cgisize: u16 = ((cgfsize as u64 * EFS_BLOCKSIZE)
+        / (EFS_BYTES_PER_INODE * EFS_INODES_PER_BLOCK))
+        .clamp(1, u16::MAX as u64) as u16;
+    if cgfsize <= cgisize as u32 + 1 {
         return Err(anyhow::anyhow!(
-            "EFS volume too small to fit inode region + a root dirblock"
+            "EFS volume too small to fit an inode region + a data block per cylinder group"
         ));
     }
-    // Root dirblock: first block in the data region past the inode table.
-    let root_dirblock: u32 = firstcg + cgisize as u32;
+    let fs_size: u32 = firstcg + ncg * cgfsize; // data-area end (<= total_blocks - 1)
     let replsb: u32 = total_blocks - 1;
+    // Root dirblock: first data block of CG 0 (right after its inode table).
+    let root_dirblock: u32 = firstcg + cgisize as u32;
 
-    // Free counts (advisory — IRIX uses these for `df`, not for mounting, but
-    // a wrong count makes `fsck -t efs` "fix" the volume on first boot). The
-    // single cylinder group's data region is `cgfsize - cgisize` blocks; we
-    // pre-allocate exactly two of them (the root dirblock and the trailing
-    // replica superblock, which lives at `replsb` inside the data region).
-    let data_blocks = cgfsize - cgisize as u32;
-    let tfree = data_blocks.saturating_sub(2);
-    // Inodes: `cgisize * 4` per cylinder group (128-byte inodes). Inodes 0 and
-    // 1 are reserved and inode 2 is the root directory we just wrote, so three
-    // are unavailable.
-    let total_inodes = cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
+    // Free counts (advisory — IRIX uses these for `df`, not for mounting, but a
+    // wrong count makes `fsck -t efs` "fix" the volume on first boot). Free data
+    // blocks = every CG's data region minus the one root dirblock we allocate.
+    let data_blocks_per_cg = cgfsize - cgisize as u32;
+    let tfree = (ncg * data_blocks_per_cg).saturating_sub(1);
+    // Inodes: `ncg * cgisize * 4`. Inodes 0 and 1 are reserved and inode 2 is
+    // the root directory, so three are unavailable.
+    let total_inodes = ncg * cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
     let tinode = total_inodes.saturating_sub(3);
 
     let mut img = vec![0u8; total_blocks as usize * EFS_BLOCKSIZE as usize];
@@ -2411,13 +2429,13 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     let fpack = fname;
 
     let mut sb = EfsSuperblock {
-        fs_size: total_blocks,
+        fs_size,
         firstcg,
         cgfsize,
         cgisize,
         sectors: 63,
         heads: 1,
-        ncg: 1,
+        ncg: ncg as u16,
         dirty: 0,
         fs_time: 0,
         magic: EFS_MAGIC_OLD,
@@ -2443,33 +2461,36 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     let rep_off = replsb as usize * EFS_BLOCKSIZE as usize;
     sb.write_into(&mut img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]);
 
-    // Bitmap convention: set bit = free, clear bit = in-use.
+    // Free-space bitmap at block 2 (set bit = free). Start all-free, then clear
+    // bits for in-use blocks: boot (0), primary sb (1), the bitmap itself
+    // (2..firstcg), every cylinder group's inode table, the root dirblock, and
+    // the trailing zone (fs_size..V, which holds the replica superblock).
     let bm_off = 2 * EFS_BLOCKSIZE as usize;
-    for i in 0..bmsize as usize {
-        img[bm_off + i] = 0xFF;
+    for b in &mut img[bm_off..bm_off + bmsize as usize] {
+        *b = 0xFF;
     }
-    // Clear bits for blocks that are in-use:
-    //   - boot (0)
-    //   - primary sb (1)
-    //   - bitmap blocks (2..2+bm_sectors)
-    //   - inode region (firstcg .. firstcg+cgisize)
-    //   - root dirblock
-    //   - last block (replica sb)
-    let mut in_use: Vec<u32> = Vec::new();
-    in_use.push(0);
-    in_use.push(1);
-    for b in 2..2 + bm_sectors {
-        in_use.push(b);
-    }
-    for b in firstcg..firstcg + cgisize as u32 {
-        in_use.push(b);
-    }
-    in_use.push(root_dirblock);
-    in_use.push(replsb);
-    for b in in_use {
-        let by = (b / 8) as usize;
-        let bit = 7 - (b % 8) as usize;
-        img[bm_off + by] &= !(1u8 << bit);
+    {
+        let bm = &mut img[bm_off..bm_off + bmsize as usize];
+        let mut mark_in_use = |blk: u32| {
+            let by = (blk / 8) as usize;
+            let bit = 7 - (blk % 8) as u8;
+            bm[by] &= !(1u8 << bit);
+        };
+        mark_in_use(0);
+        mark_in_use(1);
+        for b in 2..firstcg {
+            mark_in_use(b);
+        }
+        for cg in 0..ncg {
+            let cg_start = firstcg + cg * cgfsize;
+            for b in cg_start..cg_start + cgisize as u32 {
+                mark_in_use(b);
+            }
+        }
+        mark_in_use(root_dirblock);
+        for b in fs_size..total_blocks {
+            mark_in_use(b);
+        }
     }
 
     // Root inode (inum 2) at firstcg*BLOCKSIZE + 2*128.
@@ -3191,6 +3212,71 @@ mod tests {
             EfsSuperblock::parse(&img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]).expect("parse repl");
         assert_eq!(rep.checksum, stored, "replica carries the same checksum");
         assert_eq!(rep.bmblock, 0);
+    }
+
+    /// A volume past the per-CG target spans multiple uniform cylinder groups,
+    /// scales its inode count with size (no single-CG cap), keeps the layout
+    /// invariants (`fs_size == firstcg + ncg*cgfsize`, data area before the
+    /// replica SB), and round-trips a file through the editable API.
+    #[test]
+    fn create_blank_efs_multi_cg_scales_and_round_trips() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_efs(64 * 1024 * 1024, "BIGVOL").expect("format 64M EFS");
+        let total_blocks = (img.len() / EFS_BLOCKSIZE as usize) as u32;
+
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let sb = fs.sb.clone();
+        assert!(
+            sb.ncg > 1,
+            "a 64 MiB volume must span multiple cylinder groups, got ncg={}",
+            sb.ncg
+        );
+        // Inode count scales far past the old single-CG cap (was 128 at 64 MiB).
+        let total_inodes = sb.ncg as u32 * sb.cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
+        assert!(
+            total_inodes > 10_000,
+            "inode count should scale with size, got {total_inodes}"
+        );
+        // Layout invariants.
+        assert_eq!(sb.fs_size, sb.firstcg + sb.ncg as u32 * sb.cgfsize);
+        assert!(
+            sb.fs_size < total_blocks,
+            "data area precedes the trailing zone"
+        );
+        assert_eq!(sb.replsb, total_blocks - 1);
+        assert_eq!(sb.bmblock, 0);
+
+        // Fresh root is empty.
+        let root = fs.root().expect("root");
+        assert!(fs.list_directory(&root).expect("list").is_empty());
+
+        // A file written into the multi-CG volume reads back byte-identical.
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
+        let mut cur = Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            "data.bin",
+            &mut cur,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        fs.sync_metadata().expect("sync");
+
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let root2 = fs2.root().expect("root");
+        let entry = fs2
+            .list_directory(&root2)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "data.bin")
+            .expect("data.bin present");
+        let read_back = fs2.read_file(&entry, usize::MAX).expect("read");
+        assert_eq!(
+            read_back, payload,
+            "multi-CG file round-trips byte-identical"
+        );
     }
 
     #[test]

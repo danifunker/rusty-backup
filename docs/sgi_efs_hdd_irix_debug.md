@@ -190,19 +190,28 @@ everything needed to replicate. Find where the emulator stores its disk files
 and dump it with the script below. Fallback: `prtvtoc /dev/rdsk/dks0d3vh` on the
 formatted blank prints the drive's cylinders/heads/sectors.
 
-## Remaining: single-CG vs multi-CG
+## Multi-CG formatter — DONE (2026-06-17)
 
-We still emit **one cylinder group** (`ncg=1`); IRIX `mkfs_efs` emits many
-(ncg=51 for 1 GB). ncg=1 is a *legal* EFS layout (mkfs produces it for small
-volumes) and our reader/IRIX address inodes the same way regardless of ncg, so
-a single-CG volume *should* mount. The practical downside is **inode count**:
-single-CG caps inodes at `cgisize*4` (e.g. 512 inodes on a 100 MB disk, vs
-~214k on the oracle), so a user can't create many files. If the real-IRIX test
-shows single-CG won't mount (or the inode cap matters), replicate the multi-CG
-layout: reverse-engineer `mkfs_efs`'s CG sizing (`firstcg`/`cgfsize`/`cgisize`/
-`ncg` as a function of size + geometry) from `~/scsi3.raw` (+ the `efs_small.img`
-fixture as a second data point) and emit it from `create_blank_efs`. Our EFS
-reader + resize already handle multi-CG, so only the *formatter* needs it.
+`create_blank_efs` now emits a **uniform multi-cylinder-group** layout (the
+`mkfs_efs` shape) instead of a single CG, so the inode count scales with the
+volume instead of being capped at one group's worth (~512 on a 100 MB disk).
+Design:
+
+- One inode per `EFS_BYTES_PER_INODE` (4 KiB): `cgisize = cgfsize*512/(NBPI*4)`,
+  which makes total inodes `= data_bytes / 4096` independent of `ncg`.
+- `ncg = ceil(usable / EFS_CG_TARGET_BLOCKS)` with a ~16 MiB target CG, so each
+  `cgfsize ≤ target` and `cgisize` stays well inside its u16 field at any size.
+- Uniform CGs: `fs_size = firstcg + ncg*cgfsize`; bitmap spans the whole volume
+  at block 2; the replica SB lives in the trailing zone at block V-1; root dir
+  is the first data block of CG 0.
+
+Verified: a 100 MB disk → ncg=7, 25 060 inodes (was 512); 64 MB unit test
+round-trips a file across CGs; the 48 MB fsck test now exercises 3 CGs and stays
+clean. Applies to both `new-sgi-hdd` and bare `new --fs efs`. Reader + in-place
+resize already handled uniform multi-CG, so only the formatter changed.
+
+Future option (not needed for mounting): a `--bytes-per-inode` / `--inodes` CLI
+knob to tune density per disk.
 
 ## Validation done (rb-cli side, no emulator)
 
