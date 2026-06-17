@@ -55,6 +55,9 @@ pub(crate) struct PaneResponse {
     /// The user double-clicked a file or chose "File Info..."; carries the
     /// entry name. `CommanderMode` opens the floating File Info window over it.
     pub detail: Option<String>,
+    /// The user interacted with (clicked in) this pane this frame, so it becomes
+    /// the "active" pane the middle-column Delete acts on.
+    pub focused: bool,
 }
 
 /// Per-frame outcome of the listing grid (which row action, if any, fired).
@@ -69,6 +72,8 @@ struct RowActions {
     checksums: bool,
     /// Open the File Info window for this entry (by name).
     detail: Option<String>,
+    /// A row in this pane was clicked/navigated this frame (focus signal).
+    focused: bool,
 }
 
 pub(crate) struct CommanderPane {
@@ -187,6 +192,7 @@ impl CommanderPane {
         let mut export_to_host = false;
         let mut checksums = false;
         let mut detail = None;
+        let mut focused = false;
 
         if let Some(s) = self.source_bar(ui) {
             status = Some(s);
@@ -225,6 +231,7 @@ impl CommanderPane {
             export_to_host = actions.export;
             checksums = actions.checksums;
             detail = actions.detail;
+            focused = actions.focused;
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -251,6 +258,7 @@ impl CommanderPane {
             export_to_host,
             checksums,
             detail,
+            focused,
         }
     }
 
@@ -590,6 +598,24 @@ impl CommanderPane {
     /// Re-read the current directory listing (after an immediate host write).
     pub(crate) fn reload_listing(&mut self) {
         let _ = self.listing.reload();
+    }
+
+    /// Delete this pane's current selection — the middle-column Delete acting on
+    /// the active pane. Mirrors the row right-click delete: an image pane toggles
+    /// a staged delete (Apply writes through); a host pane queues a confirm.
+    pub(crate) fn delete_selection(&mut self) -> String {
+        let names: Vec<String> = self.listing.selection().to_vec();
+        if names.is_empty() {
+            return format!("[{}] nothing selected to delete.", self.side.label());
+        }
+        if self.listing.is_host() {
+            self.pending_host_delete = Some(names);
+            format!("[{}] confirm host delete...", self.side.label())
+        } else {
+            let n = names.len();
+            self.toggle_delete(&names);
+            format!("[{}] toggled delete on {n} item(s).", self.side.label())
+        }
     }
 
     /// True when at least one row is selected.
@@ -1364,6 +1390,10 @@ impl CommanderPane {
                 }
             });
 
+        // Any row interaction marks this pane "active" for the middle Delete.
+        let focused =
+            click.is_some() || ctx_rclick.is_some() || to_enter.is_some() || to_up || bg_deselect;
+
         let mut status = None;
         if to_up {
             self.listing.up();
@@ -1439,6 +1469,7 @@ impl CommanderPane {
             export: m_export,
             checksums: m_checksums,
             detail: m_info,
+            focused,
         }
     }
 }

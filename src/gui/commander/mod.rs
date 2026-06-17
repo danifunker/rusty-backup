@@ -123,6 +123,9 @@ pub struct CommanderMode {
     /// timestamps on the destination (HFS catalog dates / Amiga datestamp)
     /// instead of stamping the current time. Defaults on.
     keep_dates: bool,
+    /// The pane the user last interacted with — the middle-column Delete acts
+    /// on it. Updated from each pane's `focused` response.
+    active: Side,
 }
 
 impl Default for CommanderMode {
@@ -145,6 +148,7 @@ impl CommanderMode {
             checksums: None,
             detail: None,
             keep_dates: true,
+            active: Side::Left,
         }
     }
 
@@ -207,6 +211,9 @@ impl CommanderMode {
                         if let Some(name) = resp.detail {
                             self.status = self.open_detail(Side::Left, name);
                         }
+                        if resp.focused {
+                            self.active = Side::Left;
+                        }
                     },
                 );
                 ui.separator();
@@ -239,6 +246,9 @@ impl CommanderMode {
                         }
                         if let Some(name) = resp.detail {
                             self.status = self.open_detail(Side::Right, name);
+                        }
+                        if resp.focused {
+                            self.active = Side::Right;
                         }
                     },
                 );
@@ -318,14 +328,20 @@ impl CommanderMode {
             status = Some(self.copy(Side::Right));
         }
         ui.add_space(12.0);
-        // Delete is staged per-pane via right-click; Compare is deferred.
-        icon_button(
-            ui,
-            sz,
-            false,
-            "Use the row right-click menu to delete",
-            draw_delete_icon,
-        );
+        // Delete acts on the active pane (the one last clicked in).
+        let active = self.active;
+        let del_enabled = idle
+            && match active {
+                Side::Left => self.left.has_selection(),
+                Side::Right => self.right.has_selection(),
+            };
+        let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
+        if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
+            status = Some(match active {
+                Side::Left => self.left.delete_selection(),
+                Side::Right => self.right.delete_selection(),
+            });
+        }
         ui.add_space(12.0);
         icon_button(
             ui,
