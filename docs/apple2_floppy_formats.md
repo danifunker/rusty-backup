@@ -236,6 +236,16 @@ on every seek.
 
 ### Known Limitations (acceptable for v1)
 
+- **TODO: DOS 3.3 WOZ superfloppies aren't browsable yet.** A 5.25" WOZ holding
+  a bare Apple DOS 3.3 filesystem (e.g. `Copy Commando - Disk 1, Side A.woz`)
+  inspects fine — `partition::detect_superfloppy` returns `fs_hint = "DOS 3.3"`
+  and Inspect synthesizes a single-partition view — but the **Browse** button is
+  gated off because `fs::is_browsable_superfloppy` (`src/fs/mod.rs`) whitelists
+  `"ProDOS"` but not `"DOS 3.3"`. The engine already opens it (`open_filesystem`
+  auto-detects `applesdos33` → `AppleDosFilesystem`), so the fix is to add
+  `"DOS 3.3"` to that whitelist (same omission class as the EFS/MFS/QDOS gate
+  fix). Validate against a real DOS 3.3 WOZ after adding it; editing DOS 3.3 may
+  still be unsupported (browse-only is fine for now).
 - **Read-only** — no writing back to WOZ format (WOZ writing requires
   nibblization, which is the reverse process and significantly more complex)
 - **No copy-protection support** — we decode standard GCR encoding only.
