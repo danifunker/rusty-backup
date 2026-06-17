@@ -109,6 +109,12 @@ pub enum Command {
     /// to the host.
     Get(verbs::get::GetArgs),
 
+    /// Archive a filesystem (or a subtree) to a single `.tar.gz` /
+    /// `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real
+    /// symlinks, so extracting on a case-insensitive host won't clobber
+    /// files that differ only in case.
+    Tar(verbs::tar::TarArgs),
+
     /// Copy files / directory trees between two disk images without
     /// staging through the host. SRC may be a glob; DST follows `cp`
     /// semantics (into an existing directory, or rename to a target).
@@ -291,6 +297,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
+        Command::Tar(args) => verbs::tar::run(args),
         Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),

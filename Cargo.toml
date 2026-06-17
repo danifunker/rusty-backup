@@ -121,6 +121,7 @@ image = "0.25"
 dirs = "6"
 unicode-normalization = "0.1"
 flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
+tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
 base64 = "0.22"

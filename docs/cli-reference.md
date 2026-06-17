@@ -1338,6 +1338,34 @@ Usage: list <ARCHIVE>
 
 - `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
 
+### `tar`
+
+Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case
+
+```
+Usage: tar [OPTIONS] <IMAGE> <SRC> <OUT>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<SRC>` — Source path inside the filesystem to archive — a directory (archived recursively) or a single file. Use `/` for the whole volume
+- `<OUT>` — Output archive path. Compression is inferred from the extension (`.tar` = none, `.tar.zst` = zstd, otherwise gzip) unless one of `--gzip` / `--zstd` / `--no-compress` is given
+
+**Options**
+
+- `--exclude` — Exclude entries whose path matches this glob (a directory match prunes its whole subtree). Repeatable
+- `--gzip` — Force gzip (`.tar.gz`)
+- `--zstd` — Force zstd (`.tar.zst`)
+- `--no-compress` — Force no compression (`.tar`)
+- `--force` — Overwrite OUT if it already exists
+- `--ignore-case` — Match `--exclude` globs case-insensitively (default follows the filesystem's native rule)
+- `--case-sensitive` — Match `--exclude` globs case-sensitively (default follows the filesystem's native rule)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Ignored for non-zip sources
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `terminal`
 
 Open an interactive rb-cli shell (rustyline-based REPL)

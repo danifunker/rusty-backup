@@ -58,6 +58,7 @@ pub mod reiserfs;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
+pub mod tar_export;
 pub mod tree;
 pub mod ufs;
 pub mod ufs_fsck;

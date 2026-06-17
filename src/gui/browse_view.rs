@@ -181,6 +181,8 @@ pub struct BrowseView {
     /// Background flatten progress (compressed CHD apply): merges the diff
     /// into a fresh compressed CHD that overwrites the parent.
     chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
+    /// Background tar export progress ("Export to .tar.gz...").
+    tar_export_progress: Option<Arc<Mutex<TarExportProgress>>>,
     /// When the CHD being edited is the body of a single-file-chd backup,
     /// this carries the backup folder path so that on flatten-success we
     /// can refresh `metadata.json` (per-partition checksums + container
@@ -305,6 +307,18 @@ struct ChdFlattenProgress {
     cancel_requested: bool,
 }
 
+/// Background progress for "Export to .tar.gz..." — archiving the whole
+/// volume to a tar stream on a worker thread.
+struct TarExportProgress {
+    files: u64,
+    dirs: u64,
+    symlinks: u64,
+    bytes: u64,
+    finished: bool,
+    error: Option<String>,
+    out_path: std::path::PathBuf,
+}
+
 /// Captured state from `start_extraction` so the extraction can resume after
 /// the user answers the overwrite confirmation dialog.
 struct PendingExtraction {
@@ -398,6 +412,7 @@ impl Default for BrowseView {
             pending_extraction: None,
             chd_edit: None,
             chd_flatten_progress: None,
+            tar_export_progress: None,
             single_file_chd_backup_folder: None,
             pending_open: None,
             needs_password: false,
@@ -653,6 +668,7 @@ impl BrowseView {
         // CHD is left untouched; user's `.chd_backup` is preserved.
         self.discard_chd_edit_session();
         self.chd_flatten_progress = None;
+        self.tar_export_progress = None;
         self.single_file_chd_backup_folder = None;
     }
 
@@ -932,6 +948,23 @@ impl BrowseView {
                 }
             }
 
+            // Export the whole volume to a tar archive (.tar.gz / .tar.zst /
+            // .tar). Preserves case-sensitive names + real symlinks (data
+            // fork only) so a case-insensitive host won't clobber files that
+            // differ only in case. Runs on a worker thread.
+            if !self.edit_mode && self.tar_export_progress.is_none() {
+                let btn = ui.button("Export to .tar.gz...");
+                if btn.hovered() {
+                    btn.clone().on_hover_text(
+                        "Archive the whole volume to .tar.gz / .tar.zst / .tar \
+                         (preserves case + symlinks; choose the extension in the save dialog)",
+                    );
+                }
+                if btn.clicked() {
+                    self.start_tar_export();
+                }
+            }
+
             // Check filesystem button (HFS only for now)
             if self.fs_type == "HFS" && ui.button("Check").clicked() {
                 match self.take_or_open_fs() {
@@ -1053,6 +1086,9 @@ impl BrowseView {
                 ui.ctx().request_repaint();
             }
         }
+
+        // Background tar-export progress (Export to .tar.gz...).
+        self.poll_tar_export(ui);
 
         // CHD flatten progress bar (compressed CHD edit-apply)
         self.poll_chd_flatten(ui);
@@ -2335,6 +2371,123 @@ impl BrowseView {
             }
         }
         self.edit_result = Some(result_msg);
+    }
+
+    /// Spawn a background job that archives the whole volume to a
+    /// `.tar.gz` / `.tar.zst` / `.tar` chosen via a save dialog. Compression
+    /// is inferred from the chosen extension. Real symlinks and
+    /// case-sensitive names are preserved (data fork only). Progress is
+    /// polled by [`Self::poll_tar_export`].
+    fn start_tar_export(&mut self) {
+        let default_name = {
+            let base = self
+                .session
+                .source_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .unwrap_or("volume");
+            format!("{base}.tar.gz")
+        };
+        let path = match super::file_dialog()
+            .set_title("Export volume to tar archive")
+            .set_file_name(&default_name)
+            .save_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        let compression = rusty_backup::fs::tar_export::TarCompression::infer_from_path(&path);
+        let session = self.session.clone();
+        let progress = Arc::new(Mutex::new(TarExportProgress {
+            files: 0,
+            dirs: 0,
+            symlinks: 0,
+            bytes: 0,
+            finished: false,
+            error: None,
+            out_path: path.clone(),
+        }));
+        let progress_thread = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: tar export");
+            let result = (|| -> anyhow::Result<()> {
+                let mut fs = session
+                    .open()
+                    .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+                let root = fs
+                    .root()
+                    .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
+                let file = std::fs::File::create(&path)
+                    .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
+                let out = std::io::BufWriter::new(file);
+                let opts = rusty_backup::fs::tar_export::TarExportOptions::default();
+                let cb = |s: &rusty_backup::fs::tar_export::TarExportStats| {
+                    if let Ok(mut p) = progress_thread.lock() {
+                        p.files = s.files;
+                        p.dirs = s.dirs;
+                        p.symlinks = s.symlinks;
+                        p.bytes = s.total_bytes;
+                    }
+                };
+                rusty_backup::fs::tar_export::export_tar(
+                    &mut *fs,
+                    &root,
+                    "",
+                    out,
+                    compression,
+                    &opts,
+                    &cb,
+                )?;
+                Ok(())
+            })();
+            if let Ok(mut p) = progress_thread.lock() {
+                p.finished = true;
+                if let Err(e) = result {
+                    p.error = Some(format!("{e:#}"));
+                }
+            }
+        });
+        self.tar_export_progress = Some(progress);
+    }
+
+    /// Poll the background tar-export worker: show a spinner while running,
+    /// and surface the result when it finishes.
+    fn poll_tar_export(&mut self, ui: &mut egui::Ui) {
+        let arc = match &self.tar_export_progress {
+            Some(p) => Arc::clone(p),
+            None => return,
+        };
+        let Ok(p) = arc.lock() else { return };
+        if !p.finished {
+            ui.ctx().request_repaint();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!(
+                    "Exporting archive... {} files, {} dirs, {} symlinks",
+                    p.files, p.dirs, p.symlinks
+                ));
+            });
+            return;
+        }
+        let error = p.error.clone();
+        let (files, dirs, symlinks, bytes) = (p.files, p.dirs, p.symlinks, p.bytes);
+        let out = p.out_path.clone();
+        drop(p);
+        self.tar_export_progress = None;
+        match error {
+            Some(e) => self.error = Some(format!("Tar export failed: {e}")),
+            None => {
+                self.edit_result = Some(format!(
+                    "Wrote {} ({} files, {} dirs, {} symlinks, {})",
+                    out.display(),
+                    files,
+                    dirs,
+                    symlinks,
+                    partition::format_size(bytes),
+                ));
+            }
+        }
     }
 
     /// Render the edit mode toolbar with action buttons and free space.

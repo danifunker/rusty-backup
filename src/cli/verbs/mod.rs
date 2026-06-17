@@ -47,5 +47,6 @@ pub mod setvolname;
 pub mod show;
 pub mod shrink;
 pub mod sit;
+pub mod tar;
 pub mod terminal;
 pub mod write;
