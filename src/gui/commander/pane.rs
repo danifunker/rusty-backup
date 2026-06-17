@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
@@ -117,6 +116,10 @@ pub(crate) struct CommanderPane {
     /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
     /// partclone-cache session and hands off to `pending_open`.
     pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
+    /// Scanned Clonezilla block caches reused across opens this session. The
+    /// shared store also holds the in-memory/on-disk/scan decision tree so this
+    /// pane and the Inspect tab agree (see `commander_source::PartcloneCacheStore`).
+    cache_store: commander_source::PartcloneCacheStore,
     /// Phase text shown next to the spinner while `pending_open` is live.
     open_phase: String,
     /// Volume metadata captured on open, for the source-bar readout.
@@ -186,6 +189,7 @@ impl CommanderPane {
             pending_open: None,
             pending_apply: None,
             pending_scan: None,
+            cache_store: commander_source::PartcloneCacheStore::new(),
             open_phase: String::new(),
             volume_label: String::new(),
             fs_type: String::new(),
@@ -955,6 +959,7 @@ impl CommanderPane {
         self.source = None;
         self.partitions.clear();
         self.resolved_backup = None;
+        self.cache_store.clear();
         self.selected_part = None;
         self.listing = DirListing::new();
         self.session = None;
@@ -1045,6 +1050,7 @@ impl CommanderPane {
         self.source = Some(path.clone());
         self.listing = DirListing::new();
         self.resolved_backup = None;
+        self.cache_store.clear();
         self.pending_open = None;
         self.error = None;
         self.selected_part = None;
@@ -1081,6 +1087,7 @@ impl CommanderPane {
         self.source = Some(folder.clone());
         self.listing = DirListing::new();
         self.resolved_backup = None;
+        self.cache_store.clear();
         self.partitions.clear();
         self.session = None;
         self.pending_open = None;
@@ -1119,6 +1126,7 @@ impl CommanderPane {
     fn load_host(&mut self, dir: PathBuf) -> String {
         self.source = Some(dir.clone());
         self.resolved_backup = None;
+        self.cache_store.clear();
         self.partitions.clear();
         self.selected_part = None;
         self.session = None;
@@ -1190,21 +1198,19 @@ impl CommanderPane {
         let session = match open_result {
             Some(Ok(BackupPartitionOpen::Session(s))) => s,
             Some(Ok(BackupPartitionOpen::Clonezilla(open))) => {
-                match commander_source::load_partclone_cache(&open) {
-                    // A prior scan is on disk — browse it immediately.
-                    Some(cache) => {
+                // Shared decision tree: a cache scanned earlier this session is
+                // reused in memory; else a prior on-disk scan loads; else a
+                // background scan builds one (`poll_scan` memoizes + opens it).
+                match self.cache_store.resolve(part.index, &open) {
+                    commander_source::PartcloneLookup::Ready(cache) => {
                         commander_source::session_for_partclone_cache(cache, open.partition_type)
                     }
-                    // No scan yet — build the partclone block cache on a worker
-                    // thread (shared runner); `poll_scan` opens it when ready.
-                    None => {
-                        let cache =
-                            Arc::new(Mutex::new(PartcloneBlockCache::new(open.partclone_files)));
+                    commander_source::PartcloneLookup::NeedsScan { cache, cache_path } => {
                         self.pending_scan = Some(cache_runner::spawn_partclone_scan(
                             cache,
                             part.index,
                             open.partition_type,
-                            open.cache_path,
+                            cache_path,
                         ));
                         self.open_phase = "Scanning Clonezilla metadata...".to_string();
                         return format!(
@@ -1253,7 +1259,11 @@ impl CommanderPane {
         }
         let cache = Arc::clone(&guard.cache);
         let partition_type = guard.partition_type;
+        let part_index = guard.partition_index;
         drop(guard);
+        // Memoize the freshly-scanned cache so re-opening this partition reuses
+        // it in memory instead of re-loading the persisted scan from disk.
+        self.cache_store.insert(part_index, Arc::clone(&cache));
         let session = commander_source::session_for_partclone_cache(cache, partition_type);
         self.open_phase = "Opening...".to_string();
         self.pending_open = Some(session.spawn_open());

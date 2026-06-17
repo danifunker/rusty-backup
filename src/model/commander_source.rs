@@ -11,13 +11,14 @@
 //! [`BrowseSession::open`] peels them, so the partition offsets this module
 //! reports line up with the offsets the session later opens at.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
 use crate::backup::metadata::{BackupLayout, BackupMetadata};
-use crate::clonezilla::block_cache::PartcloneBlockCache;
+use crate::clonezilla::block_cache::{CacheState, PartcloneBlockCache};
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::zstd_stream::ZstdStreamCache;
 use crate::model::backup_loader::{self, infer_fat_type_byte, LoadOutcome};
@@ -400,6 +401,100 @@ pub fn load_partclone_cache(open: &ClonezillaOpen) -> Option<Arc<Mutex<Partclone
         .map(|c| Arc::new(Mutex::new(c)))
 }
 
+/// In-memory store of scanned partclone block caches (keyed by partition index)
+/// plus the lookup decision both GUI front ends share. Browsing a Clonezilla
+/// partition needs a scanned [`PartcloneBlockCache`]; the cheapest source is a
+/// cache already scanned this session, then a prior scan persisted to disk
+/// (`_<device>.metadata.cache`), and only failing both does a background scan
+/// run. The Inspect tab inlined this whole tree; lifting it here (Straggler C
+/// of the source-resolution unification) lets Commander reuse in-memory caches
+/// too instead of re-loading from disk on every open.
+#[derive(Default)]
+pub struct PartcloneCacheStore {
+    caches: HashMap<usize, Arc<Mutex<PartcloneBlockCache>>>,
+}
+
+/// Outcome of [`PartcloneCacheStore::resolve`].
+pub enum PartcloneLookup {
+    /// A ready, scanned cache — open a browsing session immediately with
+    /// [`session_for_partclone_cache`].
+    Ready(Arc<Mutex<PartcloneBlockCache>>),
+    /// No cache available yet. Hand `cache` to [`cache_runner::spawn_partclone_scan`]
+    /// with `cache_path`; when the scan finishes, call [`PartcloneCacheStore::insert`]
+    /// to memoize it so the next open reuses it in memory.
+    ///
+    /// [`cache_runner::spawn_partclone_scan`]: crate::model::cache_runner::spawn_partclone_scan
+    NeedsScan {
+        cache: Arc<Mutex<PartcloneBlockCache>>,
+        cache_path: PathBuf,
+    },
+}
+
+impl PartcloneCacheStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decide how to obtain partition `part_index`'s block cache: reuse a ready
+    /// in-memory cache, load a prior on-disk scan (memoizing it), or report that
+    /// a fresh scan is needed. A corrupt on-disk cache is removed so the scan
+    /// rewrites it.
+    pub fn resolve(&mut self, part_index: usize, open: &ClonezillaOpen) -> PartcloneLookup {
+        // 1. A cache scanned earlier this session — reuse it directly.
+        if let Some(cache) = self.caches.get(&part_index) {
+            let ready = cache
+                .lock()
+                .map(|c| c.state == CacheState::Ready)
+                .unwrap_or(false);
+            if ready {
+                return PartcloneLookup::Ready(Arc::clone(cache));
+            }
+        }
+
+        // 2. A prior scan persisted to disk — load + memoize it. A cache file
+        //    that fails to load is stale; drop it so the scan below rewrites it.
+        if open.cache_path.exists() {
+            match PartcloneBlockCache::load_from_file(
+                &open.cache_path,
+                open.partclone_files.clone(),
+            ) {
+                Ok(loaded) => {
+                    let cache = Arc::new(Mutex::new(loaded));
+                    self.caches.insert(part_index, Arc::clone(&cache));
+                    return PartcloneLookup::Ready(cache);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to load metadata cache {}: {e}; will re-scan",
+                        open.cache_path.display()
+                    );
+                    let _ = std::fs::remove_file(&open.cache_path);
+                }
+            }
+        }
+
+        // 3. Nothing cached yet — the caller must run a background scan.
+        let cache = Arc::new(Mutex::new(PartcloneBlockCache::new(
+            open.partclone_files.clone(),
+        )));
+        PartcloneLookup::NeedsScan {
+            cache,
+            cache_path: open.cache_path.clone(),
+        }
+    }
+
+    /// Memoize a freshly-scanned cache (called when the scan runner finishes) so
+    /// a later open of the same partition reuses it in memory.
+    pub fn insert(&mut self, part_index: usize, cache: Arc<Mutex<PartcloneBlockCache>>) {
+        self.caches.insert(part_index, cache);
+    }
+
+    /// Drop all cached scans (e.g. when the pane's source folder changes).
+    pub fn clear(&mut self) {
+        self.caches.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +756,61 @@ mod tests {
             }
             _ => panic!("single-file-chd should open as a Session over the container"),
         }
+    }
+
+    /// Build a minimal `ClonezillaOpen` over a temp folder for store tests.
+    fn dummy_open(dir: &Path) -> ClonezillaOpen {
+        ClonezillaOpen {
+            partclone_files: vec![dir.join("sda1.ext4-ptcl-img.gz.aa")],
+            partition_type: 0x83,
+            cache_path: dir.join("_sda1.metadata.cache"),
+        }
+    }
+
+    /// With nothing cached in memory and no scan on disk, the store reports a
+    /// scan is needed and hands back the path it should be persisted to.
+    #[test]
+    fn partclone_store_needs_scan_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = dummy_open(dir.path());
+        let mut store = PartcloneCacheStore::new();
+        match store.resolve(1, &open) {
+            PartcloneLookup::NeedsScan { cache_path, .. } => {
+                assert_eq!(cache_path, open.cache_path);
+            }
+            _ => panic!("no cache anywhere -> NeedsScan"),
+        }
+    }
+
+    /// A cache scanned earlier this session is reused in memory (no disk read);
+    /// a still-scanning cache is not reused, so the store falls back to a scan.
+    #[test]
+    fn partclone_store_reuses_ready_in_memory_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = dummy_open(dir.path());
+
+        let mut store = PartcloneCacheStore::new();
+        let ready = Arc::new(Mutex::new(PartcloneBlockCache::new(
+            open.partclone_files.clone(),
+        )));
+        ready.lock().unwrap().state = CacheState::Ready;
+        store.insert(1, Arc::clone(&ready));
+        match store.resolve(1, &open) {
+            PartcloneLookup::Ready(c) => assert!(Arc::ptr_eq(&c, &ready)),
+            _ => panic!("a ready in-memory cache should be reused"),
+        }
+
+        // A not-yet-ready (still Scanning) cache is ignored; with no disk cache
+        // the store asks for a fresh scan.
+        store.clear();
+        let scanning = Arc::new(Mutex::new(PartcloneBlockCache::new(
+            open.partclone_files.clone(),
+        )));
+        store.insert(1, scanning);
+        assert!(matches!(
+            store.resolve(1, &open),
+            PartcloneLookup::NeedsScan { .. }
+        ));
     }
 
     /// A Clonezilla partition resolves to a `Clonezilla` open carrying the right
