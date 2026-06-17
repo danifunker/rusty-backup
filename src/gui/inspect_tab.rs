@@ -4713,7 +4713,11 @@ impl InspectTab {
             return;
         }
 
-        // Case 2: native backup folder — find the partition's data file
+        // Case 2: native backup folder. Source resolution (data-file lookup,
+        // split/exists checks, the per-compression reader) and the edit-context
+        // mapping live in the shared model (commander_source) — the same path
+        // Commander uses — instead of an inline per-compression ladder. The view
+        // keeps only the zstd seekable-cache upgrade and the unsupported message.
         let (folder, meta) = match (&self.backup_folder_path, &self.backup_metadata) {
             (Some(f), Some(m)) => (f.clone(), m.clone()),
             _ => {
@@ -4725,139 +4729,81 @@ impl InspectTab {
             }
         };
 
-        // Look up partition metadata
-        let part_meta = match meta.partitions.iter().find(|p| p.index == part_index) {
-            Some(pm) => pm,
-            None => {
-                ctx.log.error(format!(
-                    "partition-{}: not found in backup metadata",
-                    part_index,
-                ));
-                return;
-            }
-        };
-
-        if part_meta.compressed_files.is_empty() {
-            ctx.log.error(format!(
-                "partition-{}: no data files listed in backup metadata",
+        // zstd opens streaming immediately, then upgrades to a background-built
+        // seekable cache (and reuses one already built this session). That
+        // machinery stays in the view; the model supplies only the validated
+        // data file and the archive-edit context.
+        if meta.compression_type == "zstd" {
+            let data_path = match commander_source::single_data_file(&folder, &meta, part_index) {
+                Ok(p) => p,
+                Err(e) => {
+                    ctx.log.error(format!("partition-{part_index}: {e:#}"));
+                    return;
+                }
+            };
+            self.open_browse_zstd(
                 part_index,
-            ));
+                ptype,
+                partition_type_string,
+                &data_path,
+                &folder,
+                &format!("partition-{part_index}"),
+                ctx,
+            );
+            self.apply_backup_edit(&folder, &meta, part_index);
             return;
         }
 
-        // Split files not supported for browsing
-        if part_meta.compressed_files.len() > 1 {
-            ctx.log.warn(format!(
-                "partition-{}: browsing split backup files is not supported (files: {})",
-                part_index,
-                part_meta.compressed_files.join(", "),
-            ));
-            return;
-        }
-
-        let data_file = &part_meta.compressed_files[0];
-        let data_path = folder.join(data_file);
-
-        if !data_path.exists() {
-            ctx.log.error(format!(
-                "partition-{}: data file not found: {}",
-                part_index,
-                data_path.display(),
-            ));
-            return;
-        }
-
-        let metadata_path = folder.join("metadata.json");
-        let compression_type_str = meta.compression_type.clone();
-        let checksum_type = meta.checksum_type.clone();
-
-        match meta.compression_type.as_str() {
-            "none" => {
-                // Raw file — partition data starts at offset 0
+        // Every other per-partition compression resolves to a ready session.
+        match commander_source::session_for_backup_partition(&folder, &meta, part_index) {
+            Ok(session) => {
                 ctx.log.info(format!(
-                    "Browsing partition {} from {}",
-                    part_index, data_file,
+                    "Browsing partition {part_index} from {} backup",
+                    meta.compression_type
                 ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                // Raw backups support direct editing (no decompress needed)
+                self.browse_view.open_with_session(session);
+                // Layer edit support from the model's compression -> flow
+                // mapping (raw edits directly, CHD via chd_edit; the edit-mode
+                // toggle picks the mechanism by sniffing the source).
+                self.apply_backup_edit(&folder, &meta, part_index);
             }
-            "zstd" => {
-                // Zstd-compressed backup — open streaming immediately while
-                // seekable cache builds in the background
-                self.open_browse_zstd(
-                    part_index,
-                    ptype,
-                    partition_type_string,
-                    &data_path,
-                    &folder,
-                    &format!("partition-{}", part_index),
-                    ctx,
-                );
-                // Set archive edit context for decompress→edit→recompress flow
+            // none / chd / chd-dvd / woz only fail on a real error (missing or
+            // split data file); any other compression isn't browsable yet.
+            Err(e) => match meta.compression_type.as_str() {
+                "none" | "chd" | "chd-dvd" | "woz" => {
+                    ctx.log.error(format!("partition-{part_index}: {e:#}"));
+                }
+                other => {
+                    ctx.log.warn(format!(
+                        "partition-{part_index}: browsing {other} compressed backups \
+                         is not yet supported"
+                    ));
+                }
+            },
+        }
+    }
+
+    /// Layer edit support onto the just-opened backup partition from the shared
+    /// compression -> edit-flow mapping ([`commander_source::backup_edit_for`]):
+    /// raw / CHD edit in place; zstd / woz go through the
+    /// decompress -> edit -> recompress archive flow; anything else stays
+    /// read-only.
+    fn apply_backup_edit(&mut self, folder: &Path, meta: &BackupMetadata, part_index: usize) {
+        match commander_source::backup_edit_for(folder, meta, part_index) {
+            Ok(commander_source::BackupEdit::InPlace) => self.browse_view.mark_edit_supported(),
+            Ok(commander_source::BackupEdit::Archive(plan)) => {
                 self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
+                    plan.archive_path,
+                    plan.compression_type,
+                    plan.original_size,
+                    plan.compacted,
+                    plan.metadata_path,
+                    plan.partition_index,
+                    plan.checksum_type,
                 );
             }
-            "chd" | "chd-dvd" => {
-                // CHD-compressed backup — open directly via ChdReader (on-demand
-                // decompression). Editing flows through `chd_edit::ChdEditSession`
-                // (diff-against-parent for compressed, in-place for uncompressed),
-                // so no `archive_edit_ctx` is set here. NOTE: backup metadata.json
-                // checksum / compressed_files entries are NOT auto-updated after
-                // a CHD edit yet — that lives on the Phase 2 follow-up TODO.
-                ctx.log.info(format!(
-                    "Browsing partition {} from CHD: {}",
-                    part_index, data_file,
-                ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                let _ = (metadata_path, checksum_type, compression_type_str);
-            }
-            "woz" => {
-                ctx.log.info(format!(
-                    "Browsing partition {} from WOZ: {}",
-                    part_index, data_file,
-                ));
-                self.browse_view.open(
-                    data_path.clone(),
-                    0,
-                    ptype,
-                    partition_type_string.clone(),
-                    None,
-                );
-                self.browse_view.set_archive_edit_context(
-                    data_path,
-                    compression_type_str,
-                    part_meta.original_size_bytes,
-                    part_meta.compacted,
-                    metadata_path,
-                    part_index,
-                    checksum_type,
-                );
-            }
-            other => {
-                ctx.log.warn(format!(
-                    "partition-{}: browsing {} compressed backups is not yet supported (file: {})",
-                    part_index, other, data_file,
-                ));
-            }
+            Ok(commander_source::BackupEdit::ReadOnly) => {}
+            Err(e) => log::warn!("no edit context for partition {part_index}: {e:#}"),
         }
     }
 

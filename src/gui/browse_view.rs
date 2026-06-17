@@ -544,6 +544,17 @@ impl BrowseView {
         self.label_prefix = prefix;
     }
 
+    /// Mark the open source as editable in place (no archive decompress flow).
+    /// `open` sets this for image/device sources; a resolver-built session
+    /// opened via [`open_with_session`](Self::open_with_session) starts
+    /// read-only, so the caller flips it on for raw / CHD backup partitions
+    /// (the edit-mode toggle then picks direct vs `chd_edit` by sniffing the
+    /// source). Compressed (zstd / woz) backups use
+    /// [`set_archive_edit_context`](Self::set_archive_edit_context) instead.
+    pub fn mark_edit_supported(&mut self) {
+        self.edit_supported = true;
+    }
+
     /// Set up archive edit context so that toggling edit mode triggers
     /// decompress → edit → recompress flow instead of direct editing.
     pub fn set_archive_edit_context(

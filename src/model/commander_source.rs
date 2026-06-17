@@ -106,17 +106,21 @@ pub fn session_for(path: &Path, part: &PartitionInfo) -> BrowseSession {
 /// (one container holding the whole disk) and is routed by
 /// [`ResolvedBackup::open_partition`] before reaching here; Clonezilla images
 /// go through the partclone block cache.
-pub fn session_for_backup_partition(
+/// The single data file backing partition `part_index` of a native backup,
+/// validated to exist and not be split across multiple files. Shared by
+/// [`session_for_backup_partition`] and the Inspect tab's zstd opener (which
+/// builds its reader separately, for the streaming + seekable-cache upgrade) so
+/// both reject missing / split backups with the same checks.
+pub fn single_data_file(
     folder: &Path,
     metadata: &BackupMetadata,
     part_index: usize,
-) -> Result<BrowseSession> {
+) -> Result<PathBuf> {
     let part = metadata
         .partitions
         .iter()
         .find(|p| p.index == part_index)
         .with_context(|| format!("partition {part_index} not found in backup metadata"))?;
-
     if part.compressed_files.is_empty() {
         bail!("partition {part_index} has no data files listed in the backup");
     }
@@ -131,6 +135,20 @@ pub fn session_for_backup_partition(
     if !data_path.exists() {
         bail!("backup data file not found: {}", data_path.display());
     }
+    Ok(data_path)
+}
+
+pub fn session_for_backup_partition(
+    folder: &Path,
+    metadata: &BackupMetadata,
+    part_index: usize,
+) -> Result<BrowseSession> {
+    let data_path = single_data_file(folder, metadata, part_index)?;
+    let part = metadata
+        .partitions
+        .iter()
+        .find(|p| p.index == part_index)
+        .with_context(|| format!("partition {part_index} not found in backup metadata"))?;
 
     let partition_type = if part.partition_type_byte != 0 {
         part.partition_type_byte
