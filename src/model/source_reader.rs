@@ -30,7 +30,7 @@ use crate::rbformats::containers::sector_order::{open_apple_ii_dsk, APPLE_II_DIS
 use crate::rbformats::containers::xdf::decode_xdf_bytes;
 use crate::rbformats::gho::{GhoReader, GHO_MAGIC};
 use crate::rbformats::imz::{ImzReader, IMZ_MAGIC};
-use crate::rbformats::ReadSeek;
+use crate::rbformats::{detect_image_format_with_path, wrap_image_reader, ImageFormat, ReadSeek};
 
 /// Cheap magic sniff: returns true when `path` starts with `MComprHD`.
 pub fn is_chd_path(path: &Path) -> bool {
@@ -447,6 +447,40 @@ pub fn open_read_with_password(path: &Path, password: Option<&[u8]>) -> Result<B
     }
 }
 
+/// Open `path` as a flat, seekable disk-image stream with **any** container or
+/// image wrapper peeled off — the single "peel a picked source into a readable
+/// disk image" primitive every front end's partition probe shares.
+///
+/// - CHD / GHO / IMZ / flat-floppy containers ([`is_container_path`]) decode
+///   through [`open_read_with_password`].
+/// - VHD / 2MG / DMG / DiskCopy 4.2 (and any other) image wrapper is unwrapped
+///   via the format pipeline ([`detect_image_format_with_path`] +
+///   [`wrap_image_reader`]).
+/// - A raw image falls through to a plain buffered file.
+///
+/// The partition offsets a caller reads after this line up with the offsets a
+/// later [`crate::model::browse_session::BrowseSession`] open produces, since
+/// the browse session peels the same wrappers. Keep this the one place the peel
+/// set is defined so CHD / GHO / IMZ / VHD / … probe identically everywhere.
+pub fn open_peeled_read(path: &Path, password: Option<&[u8]>) -> Result<Box<dyn ReadSeek>> {
+    if is_container_path(path) {
+        return open_read_with_password(path, password);
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    match detect_image_format_with_path(file, Some(path)) {
+        Ok(format) if !matches!(format, ImageFormat::Raw) => {
+            let file2 = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let (reader, _size) = wrap_image_reader(file2, format)
+                .with_context(|| format!("unwrap image {}", path.display()))?;
+            Ok(reader)
+        }
+        _ => {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            Ok(Box::new(BufReader::new(file)))
+        }
+    }
+}
+
 /// Subset of [`is_container_path`] that [`open_read`] decodes fully into an
 /// in-memory flat-sector `Cursor` (no streaming, no password): the floppy
 /// wrappers MSA / EDSK / D88 / DIM / XDF / HDM / Arculator-HDF and the
@@ -787,5 +821,26 @@ mod tests {
         let bogus = dir.path().join("bogus.adz");
         std::fs::write(&bogus, b"NOTGZIP").unwrap();
         assert!(!is_gzip_image_path(&bogus));
+    }
+
+    /// A raw (non-container, non-wrapped) image passes through `open_peeled_read`
+    /// byte-for-byte — the contract the CLI's raw path relies on.
+    #[test]
+    fn open_peeled_read_passes_raw_image_through() {
+        let flat = crate::fs::fat::create_blank_fat(737280, Some("PEEL")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::write(&img, &flat).unwrap();
+
+        let mut r = open_peeled_read(&img, None).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, flat, "raw image read back unchanged");
+
+        // Seekable random access into the (un-peeled) image.
+        r.seek(SeekFrom::Start(512)).unwrap();
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).unwrap();
+        assert_eq!(&b, &flat[512..516]);
     }
 }

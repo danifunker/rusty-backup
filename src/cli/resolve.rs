@@ -163,22 +163,15 @@ pub fn resolve_partition_streaming_forced(
     password: Option<&[u8]>,
     fs_override: Option<&str>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
-    // Anything `source_reader::open_read_with_password` would unwrap (CHD /
-    // GHO / IMZ streaming readers; MSA / EDSK / D88 / DIM / XDF / HDM /
-    // Arculator-HDF / 140 KB Apple-II floppies) must NOT skip source_reader
-    // and go straight to `open_image_ro`, or the consumer would see the
-    // wrapped bytes instead of the decoded flat-sector stream.
-    // `is_container_path` is the single source of truth for that set.
-    let is_streaming = source_reader::is_container_path(path);
-    if is_streaming {
-        let mut reader = source_reader::open_read_with_password(path, password)?;
-        let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
-        Ok((reader, ctx))
-    } else {
-        let mut file = open_image_ro(path)?;
-        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((Box::new(std::io::BufReader::new(file)), ctx))
-    }
+    // Peel any container *and* any image wrapper through the one shared
+    // primitive so the CLI probes a source identically to the GUI: CHD / GHO /
+    // IMZ / flat-floppy containers decode to a flat stream, and VHD / 2MG / DMG
+    // / DiskCopy 4.2 wrappers are unwrapped (previously the CLI streaming path
+    // saw the wrapped bytes for those and mis-detected the partition table). A
+    // raw image falls through to a buffered file.
+    let mut reader = source_reader::open_peeled_read(path, password)?;
+    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    Ok((reader, ctx))
 }
 
 fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<PartitionContext> {

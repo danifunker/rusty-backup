@@ -25,41 +25,17 @@ use crate::model::backup_loader::{self, infer_fat_type_byte, LoadOutcome};
 use crate::model::browse_session::BrowseSession;
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
-use crate::rbformats::{self, BoxReadSeek, ImageFormat};
-
-/// Open a reader over `path` with any container wrapper peeled off, matching
-/// [`BrowseSession::open`]'s own peeling so partition offsets are consistent.
-fn open_probe_reader(path: &Path) -> Result<BoxReadSeek> {
-    // CHD / GHO / IMZ and the flat floppy wrappers decode to a flat sector
-    // stream via the shared container reader.
-    if source_reader::is_container_path(path) {
-        return source_reader::open_read(path);
-    }
-
-    // Otherwise peel an image wrapper (VHD / 2MG / DMG / DiskCopy 4.2 / ...);
-    // a Raw image falls through to a plain buffered file.
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    match rbformats::detect_image_format_with_path(file, Some(path)) {
-        Ok(format) if !matches!(format, ImageFormat::Raw) => {
-            let file2 =
-                std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let (reader, _size) = rbformats::wrap_image_reader(file2, format)
-                .with_context(|| format!("unwrap image {}", path.display()))?;
-            Ok(reader)
-        }
-        _ => {
-            let file =
-                std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            Ok(Box::new(std::io::BufReader::new(file)))
-        }
-    }
-}
 
 /// Parse the partition table of the image/container at `path` and return its
 /// partition list. A partition-less (superfloppy) image yields a single
 /// offset-0 entry whose `type_name` carries the detected filesystem hint.
+///
+/// Container / image-wrapper peeling goes through the shared
+/// [`source_reader::open_peeled_read`] primitive, so the offsets reported here
+/// match the offsets [`BrowseSession::open`] later opens at and every front end
+/// probes CHD / GHO / IMZ / VHD / … identically.
 pub fn probe_partitions(path: &Path) -> Result<Vec<PartitionInfo>> {
-    let mut reader = open_probe_reader(path)?;
+    let mut reader = source_reader::open_peeled_read(path, None)?;
     let table = PartitionTable::detect(&mut reader)
         .with_context(|| format!("parsing partition table of {}", path.display()))?;
     Ok(table.partitions())
