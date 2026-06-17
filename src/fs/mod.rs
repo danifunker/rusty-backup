@@ -2114,6 +2114,15 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
 
 /// True for a partition-less (superfloppy, type byte 0) image whose detected
 /// filesystem hint name is browsable.
+///
+/// This MUST cover every `fs_hint` that `partition::detect_superfloppy` can
+/// emit: a superfloppy opens with type byte 0, which makes `open_filesystem`
+/// auto-detect the filesystem from the superblock — so *any* hint
+/// `detect_superfloppy` produces is one the browser can open. Keep this in sync
+/// with that function; an omission silently makes the GUI refuse a filesystem
+/// the engine handles (e.g. EFS / MFS / QDOS / human68k / ADFS CD-ROms and
+/// floppies). `"Unknown"` covers the partition-table-present-but-unrecognized
+/// case.
 pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
     if ptype != 0 {
         return false;
@@ -2129,6 +2138,13 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "XFS"
             | "ext"
             | "btrfs"
+            | "EFS"
+            | "MFS"
+            | "ADFS"
+            | "ANDOS"
+            | "QDOS"
+            | "human68k"
+            | "Amiga-NDOS"
             | "Alto BFS"
             | "Pilot/Cedar"
             | "Unknown"
@@ -2475,6 +2491,40 @@ mod tests {
         assert!(partition_is_browsable(0, None, "exFAT")); // superfloppy hint
                                                            // FAT-name fallback for older backups with no type byte.
         assert!(partition_is_browsable(0x00, None, "FAT16 (no type byte)"));
+    }
+
+    #[test]
+    fn browsable_superfloppy_covers_every_detect_hint() {
+        // Regression guard: every fs_hint `partition::detect_superfloppy` emits
+        // must be browsable (a type-byte-0 superfloppy auto-detects + opens).
+        // These were silently refused by Commander after the gate moved to fs/
+        // — notably the SGI EFS CD-ROM case the user reported.
+        for hint in [
+            "FAT",
+            "HFS",
+            "HFS+",
+            "NTFS",
+            "exFAT",
+            "ext",
+            "btrfs",
+            "XFS",
+            "ProDOS",
+            "EFS",
+            "MFS",
+            "ADFS",
+            "ANDOS",
+            "QDOS",
+            "human68k",
+            "Amiga-NDOS",
+            "Alto BFS",
+            "Pilot/Cedar",
+        ] {
+            assert!(
+                is_browsable_superfloppy(0, hint),
+                "superfloppy hint {hint:?} must be browsable"
+            );
+            assert!(partition_is_browsable(0, None, hint), "hint {hint:?}");
+        }
     }
 
     #[test]
