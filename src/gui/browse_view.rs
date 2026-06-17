@@ -975,7 +975,7 @@ impl BrowseView {
                     );
                 }
                 if btn.clicked() {
-                    self.start_tar_export();
+                    self.start_tar_export(&FileEntry::root());
                 }
             }
 
@@ -1717,6 +1717,26 @@ impl BrowseView {
                             self.start_extraction(&entry);
                         }
 
+                        // Archive the selected folder/file to a tar.gz instead
+                        // of laying it out on the host — preserves case +
+                        // symlinks (handy for case-sensitive volumes).
+                        let tgz_label = if entry.is_directory() {
+                            "Export Folder to .tgz..."
+                        } else {
+                            "Export File to .tgz..."
+                        };
+                        if ui
+                            .button(tgz_label)
+                            .on_hover_text(
+                                "Save the selection as a single .tar.gz / .tar.zst / .tar \
+                                 (preserves exact case + symlinks; pick the extension in \
+                                 the save dialog)",
+                            )
+                            .clicked()
+                        {
+                            self.start_tar_export(&entry);
+                        }
+
                         // Workflow C: the selection already sniffed as a
                         // Mac archive (see show_archive_actions), so pop
                         // the C modal (Save as-is vs Decode-and-save).
@@ -2395,8 +2415,13 @@ impl BrowseView {
     /// is inferred from the chosen extension. Real symlinks and
     /// case-sensitive names are preserved (data fork only). Progress is
     /// polled by [`Self::poll_tar_export`].
-    fn start_tar_export(&mut self) {
-        let default_name = {
+    /// Archive `target` (the whole volume when its path is `/`, otherwise the
+    /// selected folder or file) to a `.tar.gz` / `.tar.zst` / `.tar` chosen
+    /// via a save dialog. A subtree is rooted under its own basename in the
+    /// archive (like `tar`); a single file becomes a one-entry archive.
+    fn start_tar_export(&mut self, target: &FileEntry) {
+        let whole_volume = target.path == "/";
+        let default_name = if whole_volume {
             let base = self
                 .session
                 .source_path
@@ -2405,15 +2430,30 @@ impl BrowseView {
                 .and_then(|s| s.to_str())
                 .unwrap_or("volume");
             format!("{base}.tar.gz")
+        } else {
+            format!("{}.tar.gz", target.name)
+        };
+        let title = if target.is_directory() {
+            "Export folder to tar archive"
+        } else {
+            "Export file to tar archive"
         };
         let path = match super::file_dialog()
-            .set_title("Export volume to tar archive")
+            .set_title(title)
             .set_file_name(&default_name)
             .save_file()
         {
             Some(p) => p,
             None => return,
         };
+        // A subtree roots its entries under its own name; the whole volume
+        // and single files sit at the archive top level.
+        let archive_prefix = if target.is_directory() && !whole_volume {
+            target.name.clone()
+        } else {
+            String::new()
+        };
+        let target = target.clone();
         let compression = rusty_backup::fs::tar_export::TarCompression::infer_from_path(&path);
         let session = self.session.clone();
         let progress = Arc::new(Mutex::new(TarExportProgress {
@@ -2432,9 +2472,15 @@ impl BrowseView {
                 let mut fs = session
                     .open()
                     .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
-                let root = fs
-                    .root()
-                    .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
+                // Re-fetch the root fresh on the worker's own fs instance; a
+                // subtree/file uses the selected entry directly (its on-disk
+                // identity is stable across fs instances of the same image).
+                let root = if whole_volume {
+                    fs.root()
+                        .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
+                } else {
+                    target
+                };
                 let file = std::fs::File::create(&path)
                     .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
                 let out = std::io::BufWriter::new(file);
@@ -2450,7 +2496,7 @@ impl BrowseView {
                 rusty_backup::fs::tar_export::export_tar(
                     &mut *fs,
                     &root,
-                    "",
+                    &archive_prefix,
                     out,
                     compression,
                     &opts,
