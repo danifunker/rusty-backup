@@ -29,6 +29,7 @@ pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod mkdir;
 pub mod new;
+pub mod new_sgi_hdd;
 pub mod new_x68k_hdd;
 #[cfg(feature = "optical")]
 pub mod optical;

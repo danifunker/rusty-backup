@@ -768,6 +768,28 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
 - `--builtin-boot-sector` — Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only
 
+### `new-sgi-hdd`
+
+Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table at sector 0 wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 as a SCSI HDD. Unlike `new --fs efs` (a *bare* EFS superfloppy / CD-ROM), this is a real hard disk that `fx`/`prtvtoc` recognize. Populate it with the ordinary verbs: `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`.
+
+The volume header places slot 8 VOLHDR (first=0, the volume-header region), slot 10 VOLUME (first=0, the whole disk), and slot 0 EFS (the root partition, after the cylinder-aligned VOLHDR region). Geometry is derived from `--size` and cylinder-aligned. The on-disk header round-trips through rb-cli's own SGI parser; real-IRIX `fx`/`prtvtoc`/`mount -t efs` validation is a manual check (needs hardware/emulator).
+
+```
+Usage: new-sgi-hdd [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--size` — Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `50M`). Rounded up to a whole cylinder. Defaults to `50M`
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--fs` — Root filesystem to format. Only `efs` is supported today (IRIX 5.3-6.5)
+- `--heads` — Heads (tracks per cylinder). Defaults to 16. Governs cylinder alignment + the geometry `fx`/`prtvtoc` report; EFS uses its own layout
+- `--sectors` — Sectors per track (512-byte sectors). Defaults to 128, which with 16 heads gives clean 1 MiB cylinders
+
 ### `optical`
 
 Optical-media verbs (rip / convert / browse / extract)

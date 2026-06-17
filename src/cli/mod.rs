@@ -65,6 +65,13 @@ pub enum Command {
     #[command(name = "new-x68k-hdd")]
     NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
 
+    /// Build a dvh-wrapped IRIX hard-disk image: an SGI volume header +
+    /// partition table wrapping a formatted EFS root partition, mountable
+    /// by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM
+    /// superfloppy). Populate it with `put IMG@1 host/file /file`.
+    #[command(name = "new-sgi-hdd")]
+    NewSgiHdd(verbs::new_sgi_hdd::NewSgiHddArgs),
+
     /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
     /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
     /// Operates in place; partition data is never moved. (This registers the
@@ -269,6 +276,7 @@ pub fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
+        Command::NewSgiHdd(args) => verbs::new_sgi_hdd::run(args),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),

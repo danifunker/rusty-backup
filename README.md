@@ -55,6 +55,8 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --boot-sector-donor hd0.hds      # zero manual steps, your donor
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
+rb-cli new-sgi-hdd irix.img --size 50M                     # IRIX SGI dvh + EFS root HDD
+rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim
 rb-cli make-bootable disk.dsk --boot-from "System 7.0 HD.dsk"  # auto: apply only what's missing to boot
@@ -402,7 +404,7 @@ inspect-tab Edit Mode.
 | GPT    | Yes   | Yes  | Primary + backup header rewritten with refreshed CRCs on every edit. |
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
-| SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write. |
+| SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write; geometry (`vh_dp`) preserved across edits. `rb-cli new-sgi-hdd` synthesizes a dvh + EFS-root hard disk from scratch (IRIX 5.3-6.5). |
 | None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / QDOS / Human68k / Alto BFS / Pilot/Cedar / …) | — | Standard floppy / disk sizes are recognised even without a partition table. Xerox Alto packs (`.pdi` / `.bfs` / CopyDisk / Salto `.dsk`), Pilot/Cedar PDIs (`fsFamily=2`), and Dwarf 6085 `.zdisk` images are detected by magic and presented as a single `Alto BFS` or `Pilot/Cedar` volume. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
