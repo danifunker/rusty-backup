@@ -2135,6 +2135,9 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "NTFS"
             | "exFAT"
             | "ProDOS"
+            // Apple DOS 3.3 (the `detect_superfloppy` hint for a 140 KB Apple II
+            // floppy / WOZ); open_filesystem auto-detects it as `applesdos33`.
+            | "DOS 3.3"
             | "XFS"
             | "ext"
             | "btrfs"
@@ -2509,6 +2512,7 @@ mod tests {
             "btrfs",
             "XFS",
             "ProDOS",
+            "DOS 3.3",
             "EFS",
             "MFS",
             "ADFS",
