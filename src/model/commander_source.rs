@@ -170,6 +170,82 @@ pub fn session_for_backup_partition(
     Ok(session)
 }
 
+/// The editing flow a native-backup partition supports once its
+/// [`BrowseSession`] is open, derived from the backup's compression. The view
+/// layers this onto the open session — the Inspect tab applies it today;
+/// Commander backup panes stay read-only and ignore it. Keeping the
+/// compression→flow mapping here (not inside a view) means every front end
+/// applies the same one, per CONTRIBUTING "one model, many UIs".
+pub enum BackupEdit {
+    /// Edit in place: a raw (`none`) partition image edits directly; a
+    /// per-partition CHD edits through the `chd_edit` diff/in-place flow.
+    /// Either way the view marks editing supported and lets its edit-mode
+    /// toggle pick the mechanism by sniffing the source.
+    InPlace,
+    /// Decompress → edit → recompress archive flow (`zstd` / `woz`). Carries
+    /// the parameters the view's archive-edit context needs to recompress and
+    /// refresh the backup's `metadata.json` after a save.
+    Archive(ArchiveEditPlan),
+    /// Not editable from a backup pane (a compression we can browse but not yet
+    /// write back).
+    ReadOnly,
+}
+
+/// Parameters for the decompress→edit→recompress flow of a compressed backup
+/// partition. Mirrors the Inspect view's `ArchiveEditContext` field-for-field
+/// so the view can install it directly.
+pub struct ArchiveEditPlan {
+    /// Compressed data file to decompress for editing and recompress on save.
+    pub archive_path: PathBuf,
+    /// Backup compression (`"zstd"` / `"woz"`); selects the recompression codec.
+    pub compression_type: String,
+    /// Uncompressed partition size (free-space projection + zero-fill).
+    pub original_size: u64,
+    /// Whether the partition was compacted (imaged size < original size).
+    pub compacted: bool,
+    /// The backup's `metadata.json`, rewritten with the new checksum on save.
+    pub metadata_path: PathBuf,
+    /// Index of this partition within the backup.
+    pub partition_index: usize,
+    /// Checksum algorithm recorded in the backup (`"sha256"` / `"crc32"`).
+    pub checksum_type: String,
+}
+
+/// The editing flow for partition `part_index` of a native backup, derived from
+/// its compression (see [`BackupEdit`]). The companion of
+/// [`session_for_backup_partition`]: that builds the read session, this tells
+/// the view how to enable editing on top of it.
+pub fn backup_edit_for(
+    folder: &Path,
+    metadata: &BackupMetadata,
+    part_index: usize,
+) -> Result<BackupEdit> {
+    let part = metadata
+        .partitions
+        .iter()
+        .find(|p| p.index == part_index)
+        .with_context(|| format!("partition {part_index} not found in backup metadata"))?;
+    Ok(match metadata.compression_type.as_str() {
+        "none" | "chd" | "chd-dvd" => BackupEdit::InPlace,
+        compression @ ("zstd" | "woz") => {
+            let data_file = part
+                .compressed_files
+                .first()
+                .with_context(|| format!("partition {part_index} has no data file listed"))?;
+            BackupEdit::Archive(ArchiveEditPlan {
+                archive_path: folder.join(data_file),
+                compression_type: compression.to_string(),
+                original_size: part.original_size_bytes,
+                compacted: part.compacted,
+                metadata_path: folder.join("metadata.json"),
+                partition_index: part_index,
+                checksum_type: metadata.checksum_type.clone(),
+            })
+        }
+        _ => BackupEdit::ReadOnly,
+    })
+}
+
 /// A backup folder resolved to its kind, partition list, and the context needed
 /// to open a partition for browsing. This is the **one** entry point a UI uses
 /// to open a backup, so Commander, the Inspect tab, and a future TUI share the
@@ -456,6 +532,48 @@ mod tests {
             assert_eq!(session.partition_offset, 0);
             assert!(session.zstd_cache.is_none());
         }
+    }
+
+    /// The edit-flow mapping: raw + CHD edit in place; zstd + woz go through the
+    /// archive (decompress→edit→recompress) flow with the right parameters; an
+    /// unhandled compression is read-only.
+    #[test]
+    fn backup_edit_for_maps_compression_to_flow() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for in_place in ["none", "chd", "chd-dvd"] {
+            let meta = one_partition_meta(in_place, "partition-0.bin", 4096);
+            assert!(
+                matches!(
+                    backup_edit_for(dir.path(), &meta, 0).unwrap(),
+                    BackupEdit::InPlace
+                ),
+                "{in_place} edits in place"
+            );
+        }
+
+        for archive in ["zstd", "woz"] {
+            let data_file = format!("partition-0.{archive}");
+            let mut meta = one_partition_meta(archive, &data_file, 4096);
+            meta.checksum_type = "crc32".into();
+            meta.partitions[0].compacted = true;
+            let BackupEdit::Archive(plan) = backup_edit_for(dir.path(), &meta, 0).unwrap() else {
+                panic!("{archive} should use the archive edit flow");
+            };
+            assert_eq!(plan.archive_path, dir.path().join(&data_file));
+            assert_eq!(plan.compression_type, archive);
+            assert_eq!(plan.original_size, 4096);
+            assert!(plan.compacted);
+            assert_eq!(plan.metadata_path, dir.path().join("metadata.json"));
+            assert_eq!(plan.partition_index, 0);
+            assert_eq!(plan.checksum_type, "crc32");
+        }
+
+        let meta = one_partition_meta("xz", "partition-0.xz", 4096);
+        assert!(matches!(
+            backup_edit_for(dir.path(), &meta, 0).unwrap(),
+            BackupEdit::ReadOnly
+        ));
     }
 
     /// A compression we don't yet open from a Commander pane errors cleanly
