@@ -517,6 +517,15 @@ pub trait EditableFilesystem: Filesystem {
         ))
     }
 
+    /// Whether this filesystem can store symbolic links (i.e.
+    /// [`Self::create_symlink`] is actually implemented). Default `false`;
+    /// override to `true` alongside `create_symlink`. Lets callers (e.g. the
+    /// tar-import preflight) warn *before* a lossy import that symlinks will
+    /// be dropped, rather than discovering it entry-by-entry.
+    fn supports_symlinks(&self) -> bool {
+        false
+    }
+
     /// Create a symbolic link in `parent` pointing at `target` (a path
     /// string interpreted by the filesystem's own resolver semantics).
     /// Returns the new symlink's entry. Default returns `Unsupported` —

@@ -1374,6 +1374,29 @@ Open an interactive rb-cli shell (rustyline-based REPL)
 Usage: terminal
 ```
 
+### `untar`
+
+Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them
+
+```
+Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<ARCHIVE>` — Host archive to import (`.tar.gz` / `.tar.zst` / `.tar`; the compression is detected from the file's contents, not its name)
+- `<DEST>` — Destination directory inside the filesystem. Defaults to the root
+
+**Options**
+
+- `--force` — Overwrite entries that already exist at the destination. Mutually exclusive with `--skip-existing`
+- `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
+- `--no-permissions` — Do not apply archived Unix permission bits (mode) to imported files
+- `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `write`
 
 Stream an image file onto a block device

@@ -46,6 +46,7 @@ rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
 rb-cli ls  disk.dsk /System
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
+rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)
 rb-cli get backup.zip /unix ./unix --inside disk.img   # extract from a RAW disk inside a .zip
 rb-cli fsck disk.dsk --checkonly
 rb-cli inspect disk.hda
@@ -121,8 +122,8 @@ of every release; grab it from the
 you don't want to set up the cross toolchain locally.
 
 What's in the MiSTer build:
-- Every filesystem operation (`ls`, `put`, `get`, `tar`, `rm`, `mkdir`,
-  `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
+- Every filesystem operation (`ls`, `put`, `get`, `tar`, `untar`, `rm`,
+  `mkdir`, `fsck`, `resize`, `expand`, `chmeta`, `bless`, …) on FAT, NTFS,
   exFAT, HFS, HFS+, ext, AFFS, PFS3, SFS, ProDOS, Human68k, ADFS, etc.
 - `inspect`, `backup`, `restore` for Raw, VHD, QCOW2, VMDK, Zstd, the
   four floppy container formats, **and CHD**.

@@ -115,6 +115,12 @@ pub enum Command {
     /// files that differ only in case.
     Tar(verbs::tar::TarArgs),
 
+    /// Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a
+    /// filesystem in an image (the inverse of `tar`). Recreates the tree,
+    /// streams files in, and recreates symlinks where the target FS
+    /// supports them.
+    Untar(verbs::untar::UntarArgs),
+
     /// Copy files / directory trees between two disk images without
     /// staging through the host. SRC may be a glob; DST follows `cp`
     /// semantics (into an existing directory, or rename to a target).
@@ -298,6 +304,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
         Command::Tar(args) => verbs::tar::run(args),
+        Command::Untar(args) => verbs::untar::run(args),
         Command::Cp(args) => verbs::cp::run(args),
         Command::Rm(args) => verbs::rm::run(args),
         Command::Mkdir(args) => verbs::mkdir::run(args),

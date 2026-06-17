@@ -49,4 +49,5 @@ pub mod shrink;
 pub mod sit;
 pub mod tar;
 pub mod terminal;
+pub mod untar;
 pub mod write;

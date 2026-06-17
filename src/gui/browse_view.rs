@@ -183,6 +183,9 @@ pub struct BrowseView {
     chd_flatten_progress: Option<Arc<Mutex<ChdFlattenProgress>>>,
     /// Background tar export progress ("Export to .tar.gz...").
     tar_export_progress: Option<Arc<Mutex<TarExportProgress>>>,
+    /// A tar import awaiting the user's confirmation (preflight found
+    /// content this filesystem can't represent).
+    pending_tar_import: Option<PendingTarImport>,
     /// When the CHD being edited is the body of a single-file-chd backup,
     /// this carries the backup folder path so that on flatten-success we
     /// can refresh `metadata.json` (per-partition checksums + container
@@ -319,6 +322,15 @@ struct TarExportProgress {
     out_path: std::path::PathBuf,
 }
 
+/// A tar import awaiting user confirmation because the preflight found
+/// content the target filesystem can't represent (dropped symlinks, invalid
+/// names, …). Cleared when the user confirms or cancels the modal.
+#[derive(Clone)]
+struct PendingTarImport {
+    archive_path: std::path::PathBuf,
+    preflight: rusty_backup::fs::tar_import::TarImportPreflight,
+}
+
 /// Captured state from `start_extraction` so the extraction can resume after
 /// the user answers the overwrite confirmation dialog.
 struct PendingExtraction {
@@ -413,6 +425,7 @@ impl Default for BrowseView {
             chd_edit: None,
             chd_flatten_progress: None,
             tar_export_progress: None,
+            pending_tar_import: None,
             single_file_chd_backup_folder: None,
             pending_open: None,
             needs_password: false,
@@ -669,6 +682,7 @@ impl BrowseView {
         self.discard_chd_edit_session();
         self.chd_flatten_progress = None;
         self.tar_export_progress = None;
+        self.pending_tar_import = None;
         self.single_file_chd_backup_folder = None;
     }
 
@@ -1147,6 +1161,9 @@ impl BrowseView {
 
         // New folder dialog
         self.render_new_folder_dialog(ui);
+
+        // Tar import confirmation (preflight found unrepresentable content)
+        self.render_tar_import_dialog(ui);
 
         // ProDOS "Set Type…" dialog
 
@@ -2490,6 +2507,190 @@ impl BrowseView {
         }
     }
 
+    /// Pick a host `.tar.gz` / `.tar.zst` / `.tar` and preflight it against
+    /// the current volume. If the import would lose content (dropped
+    /// symlinks, names this FS can't store), stash it for a confirmation
+    /// modal; otherwise import straight away. Imports into the directory the
+    /// user is currently editing.
+    fn start_tar_import_dialog(&mut self) {
+        let path = match rfd::FileDialog::new()
+            .set_title("Import a tar archive into this volume")
+            .add_filter("tar archive", &["gz", "tgz", "tar", "zst"])
+            .pick_file()
+        {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Preflight read-only: open editable (for capability + name checks),
+        // scan, then drop without committing.
+        let preflight = {
+            let (efs, _commit) = match self.session.open_editable() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.edit_result = Some(format!("Error opening filesystem: {e}"));
+                    return;
+                }
+            };
+            let opts = rusty_backup::fs::tar_import::TarImportOptions {
+                conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
+                ..Default::default()
+            };
+            match rusty_backup::fs::tar_import::preflight_tar_from_path(&*efs, &path, &opts) {
+                Ok(pf) => pf,
+                Err(e) => {
+                    self.edit_result = Some(format!("Could not read archive: {e:#}"));
+                    return;
+                }
+            }
+        };
+
+        if preflight.has_warnings() {
+            self.pending_tar_import = Some(PendingTarImport {
+                archive_path: path,
+                preflight,
+            });
+        } else {
+            self.run_tar_import(&path);
+        }
+    }
+
+    /// Import `archive` into the current directory. Existing names are
+    /// skipped (not overwritten); macOS `._*` sidecars are dropped. Writes
+    /// immediately (not staged), then reloads the view.
+    fn run_tar_import(&mut self, archive: &std::path::Path) {
+        let dest = self.current_parent_entry();
+        let (mut efs, commit) = match self.session.open_editable() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.edit_result = Some(format!("Error opening filesystem: {e}"));
+                return;
+            }
+        };
+        let opts = rusty_backup::fs::tar_import::TarImportOptions {
+            conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
+            ..Default::default()
+        };
+        let stats = match rusty_backup::fs::tar_import::import_tar_from_path(
+            &mut *efs,
+            &dest,
+            archive,
+            &opts,
+            &|_| {},
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.edit_result = Some(format!("Import failed: {e:#}"));
+                return;
+            }
+        };
+        if let Err(e) = efs.sync_metadata() {
+            self.edit_result = Some(format!("Error saving to disk: {e}"));
+            return;
+        }
+        drop(efs);
+        if let Err(e) = commit.commit() {
+            self.edit_result = Some(format!("Error writing container: {e}"));
+            return;
+        }
+
+        let mut msg = format!(
+            "Imported {} files, {} dirs, {} symlinks into /{}",
+            stats.files,
+            stats.dirs_created,
+            stats.symlinks,
+            if dest.path == "/" {
+                String::new()
+            } else {
+                dest.name.clone()
+            }
+        );
+        if stats.symlinks_skipped > 0 {
+            msg.push_str(&format!("; {} symlink(s) skipped", stats.symlinks_skipped));
+        }
+        if stats.appledouble_skipped > 0 {
+            msg.push_str(&format!(
+                "; {} ._ sidecar(s) skipped",
+                stats.appledouble_skipped
+            ));
+        }
+        if stats.invalid_names_skipped > 0 {
+            msg.push_str(&format!(
+                "; {} bad-name entr(ies) skipped",
+                stats.invalid_names_skipped
+            ));
+        }
+        if stats.skipped_existing > 0 {
+            msg.push_str(&format!("; {} already existed", stats.skipped_existing));
+        }
+        self.edit_result = Some(msg);
+        self.invalidate_all_caches();
+        self.invalidate_cached_fs();
+    }
+
+    /// Modal shown when a tar import's preflight found content the target
+    /// filesystem can't represent. Continue runs the (lossy) import; Cancel
+    /// abandons it.
+    fn render_tar_import_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = self.pending_tar_import.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut decision: Option<bool> = None; // Some(true)=continue, Some(false)=cancel
+        egui::Window::new("Import archive - some content can't be kept")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(520.0)
+            .show(ui.ctx(), |ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 180, 90),
+                    format!(
+                        "This [{}] volume can't store everything in the archive:",
+                        self.fs_type
+                    ),
+                );
+                ui.add_space(4.0);
+                for w in pending.preflight.warnings() {
+                    ui.label(format!("- {w}"));
+                }
+                if pending.preflight.appledouble > 0 {
+                    ui.label(format!(
+                        "- {} macOS ._ sidecar(s) will be skipped.",
+                        pending.preflight.appledouble
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} file(s) and {} dir(s) will be imported. Existing names are skipped.",
+                    pending.preflight.files, pending.preflight.dirs
+                ));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Continue").clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if !open {
+            decision = Some(false);
+        }
+        match decision {
+            Some(true) => {
+                self.pending_tar_import = None;
+                self.run_tar_import(&pending.archive_path);
+            }
+            Some(false) => {
+                self.pending_tar_import = None;
+                self.edit_result = Some("Archive import cancelled.".to_string());
+            }
+            None => {}
+        }
+    }
+
     /// Render the edit mode toolbar with action buttons and free space.
     fn render_edit_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -2508,6 +2709,13 @@ impl BrowseView {
 
             if ui.button("Add File...").clicked() {
                 self.add_file_dialog();
+            }
+
+            // Import a host .tar.gz / .tar.zst / .tar into the current
+            // directory. Runs a preflight first and prompts if the target
+            // filesystem can't represent some of the archive's content.
+            if ui.button("Import Archive...").clicked() {
+                self.start_tar_import_dialog();
             }
 
             // Alto BFS has a flat namespace — no subdirectories to create.

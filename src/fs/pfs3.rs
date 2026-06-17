@@ -2847,6 +2847,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
         }
     }
 
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
     fn create_symlink(
         &mut self,
         parent: &FileEntry,
