@@ -96,12 +96,15 @@ pub fn session_for(path: &Path, part: &PartitionInfo) -> BrowseSession {
 /// the backup's own `PartitionMetadata`, with the same FAT-from-name inference
 /// [`session_for`] uses for a zero type byte.
 ///
-/// Handles the **per-partition** compressions `none` (raw, opened via
-/// `source_path`) and `zstd` (streamed through a [`ZstdStreamCache`]); per-
-/// partition `woz` still returns an error. The other backup shapes are routed by
-/// [`ResolvedBackup::open_partition`] before reaching here: a CHD backup is the
-/// single-file-chd layout (opened as a CHD image), and Clonezilla images go
-/// through the partclone block cache.
+/// Handles every **per-partition** compression the Inspect tab browses:
+/// `none` (raw), `chd` / `chd-dvd` (per-partition CHD), and `woz` all open via
+/// `source_path` — the data file *is* the partition and [`BrowseSession::open`]
+/// sniffs its magic to pick the reader (plain raw, `ChdReader` for `MComprHD`,
+/// `WozReader` for the WOZ signature); `zstd` is streamed through a
+/// [`ZstdStreamCache`]. A *single-file-chd* CHD backup is a different shape
+/// (one container holding the whole disk) and is routed by
+/// [`ResolvedBackup::open_partition`] before reaching here; Clonezilla images
+/// go through the partclone block cache.
 pub fn session_for_backup_partition(
     folder: &Path,
     metadata: &BackupMetadata,
@@ -141,8 +144,12 @@ pub fn session_for_backup_partition(
     };
 
     match metadata.compression_type.as_str() {
-        // Raw partition image — data starts at byte 0 of the file.
-        "none" => {
+        // Raw / CHD / WOZ partition images: the data file *is* the partition
+        // (data at byte 0). `BrowseSession::open` sniffs the file's magic to
+        // pick the right reader — plain buffered file for raw, `ChdReader` for
+        // a `MComprHD` CHD, `WozReader` for the WOZ signature — so all three
+        // are the same session shape.
+        "none" | "chd" | "chd-dvd" | "woz" => {
             session.source_path = Some(data_path);
         }
         // Streamed zstd: decompress forward-only into a shared in-memory cache,
@@ -428,13 +435,36 @@ mod tests {
         assert_eq!(fs.volume_label(), Some("BKZSTD"));
     }
 
+    /// Per-partition `chd` / `chd-dvd` / `woz` backups open via `source_path`
+    /// at offset 0 (the data file *is* the partition); `BrowseSession::open`
+    /// sniffs the magic to pick the reader. We only check the session shape
+    /// here — decoding the container is covered by the format readers' tests.
+    #[test]
+    fn backup_session_opens_chd_and_woz_via_source_path() {
+        for compression in ["chd", "chd-dvd", "woz"] {
+            let dir = tempfile::tempdir().unwrap();
+            let data_file = format!("partition-0.{compression}");
+            std::fs::write(dir.path().join(&data_file), b"placeholder").unwrap();
+            let meta = one_partition_meta(compression, &data_file, 11);
+            let session =
+                session_for_backup_partition(dir.path(), &meta, 0).expect("session built");
+            assert_eq!(
+                session.source_path,
+                Some(dir.path().join(&data_file)),
+                "{compression} opens via source_path"
+            );
+            assert_eq!(session.partition_offset, 0);
+            assert!(session.zstd_cache.is_none());
+        }
+    }
+
     /// A compression we don't yet open from a Commander pane errors cleanly
     /// rather than producing a broken session.
     #[test]
     fn backup_session_rejects_unsupported_compression() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("partition-0.chd"), b"x").unwrap();
-        let meta = one_partition_meta("chd", "partition-0.chd", 1);
+        std::fs::write(dir.path().join("partition-0.xz"), b"x").unwrap();
+        let meta = one_partition_meta("xz", "partition-0.xz", 1);
         assert!(session_for_backup_partition(dir.path(), &meta, 0).is_err());
     }
 
