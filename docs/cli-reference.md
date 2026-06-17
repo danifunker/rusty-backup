@@ -564,7 +564,8 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -617,7 +618,8 @@ Usage: inspect [OPTIONS] <IMAGE>
 **Options**
 
 - `--format` — Output format
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 
 ### `install-completions`
 
@@ -669,7 +671,8 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / a positional path
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
@@ -745,8 +748,49 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
-- `--inodes` — EFS only: approximate total inode count (the formatter scales its cylinder groups to hit roughly this many). Mutually exclusive with `--bytes-per-inode`
-- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Default is ~4 KiB/inode. Mutually exclusive with `--inodes`. (`new --fs efs` is also streamed to the output file, so large bare EFS volumes don't materialize in memory.)
+- `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
+- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+
+### `new-sgi-cdrom`
+
+Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with `put IMG@1 host/file /file`
+
+```
+Usage: new-sgi-cdrom [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
+- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+
+### `new-sgi-hdd`
+
+Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM superfloppy). Populate it with `put IMG@1 host/file /file`
+
+```
+Usage: new-sgi-hdd [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--size` — Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`). Rounded up to a whole cylinder. Defaults to 50M
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--fs` — Root filesystem to format. Only `efs` is supported today
+- `--heads` — Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise
+- `--sectors` — Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)
+- `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
+- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
 ### `new-x68k-hdd`
 
@@ -769,51 +813,6 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 - `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
 - `--builtin-boot-sector` — Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only
-
-### `new-sgi-hdd`
-
-Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table at sector 0 wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 as a SCSI HDD. Unlike `new --fs efs` (a *bare* EFS superfloppy / CD-ROM), this is a real hard disk that `fx`/`prtvtoc` recognize. Populate it with the ordinary verbs: `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`. Confirmed to mount and read on real IRIX 5.3.
-
-The volume header places slot 8 VOLHDR (first=0, the volume-header region), slot 10 VOLUME (first=0, the whole disk), and slot 0 EFS (the root partition, after the cylinder-aligned VOLHDR region). The EFS root is a multi-cylinder-group volume whose inode count scales with size. The image is streamed directly to the output file (only non-zero regions are written; the rest stays sparse), so disks of any size are created without materializing them in memory.
-
-```
-Usage: new-sgi-hdd [OPTIONS] <IMAGE>
-```
-
-**Arguments**
-
-- `<IMAGE>` — Image file to create. Overwritten if it already exists
-
-**Options**
-
-- `--size` — Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `50M`). Rounded up to a whole cylinder. Defaults to `50M`
-- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
-- `--fs` — Root filesystem to format. Only `efs` is supported today (IRIX 5.3-6.5)
-- `--heads` — Heads (tracks per cylinder). Defaults to 16. **Must match the geometry the target drive reports** — IRIX `fx` rejects the volume header otherwise (the disk then won't mount)
-- `--sectors` — Sectors per track (512-byte sectors). Defaults to 63 (the IRIS emulator's / typical SGI SCSI value; 16 × 63 = 1008-sector cylinders). Like `--heads`, must match the drive's geometry
-- `--inodes` — Approximate total inode count for the EFS root (the formatter scales its cylinder groups to hit roughly this many). Mutually exclusive with `--bytes-per-inode`
-- `--bytes-per-inode` — EFS inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Default is ~4 KiB/inode. Mutually exclusive with `--inodes`
-
-### `new-sgi-cdrom`
-
-Build an IRIX EFS CD-ROM image (conventionally `.iso`): an SGI volume header at sector 0 with the EFS filesystem in **slot 7 typed SYSV** — the IRIX EFS-CD convention (the kernel's `IS_EFS()` accepts SYSV as well as EFS) — using CD geometry (1 head × 32 sectors). This matches the byte-structure of real IRIX 5.3 / 6.5 distribution CDs. Mounts on IRIX with `mount -t efs -o ro /dev/dsk/dks0d<N>s7 /CDROM`. Populate it before burning with `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`. The image is streamed to the file (only non-zero regions written; the rest stays sparse), so even a full CD never materializes in memory.
-
-Unlike `new-sgi-hdd` (EFS in slot 0, hard-disk geometry) or `new --fs efs` (a bare headerless EFS), this is the shape IRIX expects on optical media.
-
-```
-Usage: new-sgi-cdrom [OPTIONS] <IMAGE>
-```
-
-**Arguments**
-
-- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it already exists
-
-**Options**
-
-- `--size` — Disc size (`K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to `600M`; keep it at or below your target media (~650-700 MiB)
-- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
-- `--inodes` — Approximate total inode count. Mutually exclusive with `--bytes-per-inode`. (Real IRIX CDs are sparse — ~32 KiB/inode — so for a few large files pass a larger `--bytes-per-inode` / fewer `--inodes`)
-- `--bytes-per-inode` — EFS inode density in bytes per inode, floored at one inode per 512-byte block. Default ~4 KiB/inode. Mutually exclusive with `--inodes`
 
 ### `optical`
 

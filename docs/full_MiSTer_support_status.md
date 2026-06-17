@@ -33,10 +33,11 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   ANDOS (detect-only scaffold), ISO9660 (optical browse).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
-  DC42, HFV, IMZ (encrypted ZIP), GHO/GHS (Ghost SECTOR mode), MSA
-  (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein / etc.), `.d88`
-  (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Acorn `.hdf` (bare +
-  Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
+  DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
+  ZIP, inflated sparsely; `--inside` picks among multiple), GHO/GHS (Ghost
+  SECTOR mode), MSA (Atari ST), EDSK/DSK (Amstrad CPC / PCW / Einstein /
+  etc.), `.d88` (Sharp X68000 / PC-88 / PC-98 / MSX / FM-7), Acorn `.hdf`
+  (bare + Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
   gzip-wrapped Amiga `.adz` / `.hdz`.
 - **Raw / superfloppy** (partitionless) images are handled.
 

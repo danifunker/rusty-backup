@@ -35,7 +35,7 @@ use crate::cli::copy_paths::{base_name_of, compute_glob_root, has_glob_chars, st
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
-use crate::cli::resolve::{resolve_partition_streaming_forced, FsDispatchOverride};
+use crate::cli::resolve::{resolve_partition_streaming_forced_inside, FsDispatchOverride};
 use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::Filesystem;
 
@@ -82,9 +82,16 @@ pub struct GetArgs {
     #[arg(long = "skip-existing", conflicts_with = "force")]
     pub skip_existing: bool,
 
-    /// Password for encrypted containers (currently: WinImage IMZ).
+    /// Password for encrypted containers (currently: WinImage IMZ, and
+    /// password-protected `.zip` disks).
     #[arg(long)]
     pub password: Option<String>,
+
+    /// For a `.zip` holding more than one disk image, the archive entry to
+    /// open (e.g. `--inside backup.img`). Matched by exact name, then case-
+    /// insensitively, then by basename. Ignored for non-zip sources.
+    #[arg(long = "inside", value_name = "NAME")]
+    pub inside: Option<String>,
 
     #[command(flatten)]
     pub fs_override: FsDispatchOverride,
@@ -110,11 +117,12 @@ impl ConflictMode {
 
 pub fn run(args: GetArgs) -> Result<()> {
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
-    let (reader, mut ctx) = resolve_partition_streaming_forced(
+    let (reader, mut ctx) = resolve_partition_streaming_forced_inside(
         &args.image.path,
         args.image.partition,
         pw_bytes,
         args.fs_override.fs_type.as_deref(),
+        args.inside.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);

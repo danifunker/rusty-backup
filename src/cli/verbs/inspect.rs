@@ -31,15 +31,26 @@ pub struct InspectArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
     pub format: OutputFormat,
 
-    /// Password for encrypted containers (currently: WinImage IMZ).
+    /// Password for encrypted containers (currently: WinImage IMZ, and
+    /// password-protected `.zip` disks).
     #[arg(long)]
     pub password: Option<String>,
+
+    /// For a `.zip` holding more than one disk image, the archive entry to
+    /// open (e.g. `--inside backup.img`). Matched by exact name, then case-
+    /// insensitively, then by basename. Ignored for non-zip sources.
+    #[arg(long = "inside", value_name = "NAME")]
+    pub inside: Option<String>,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
-    let mut reader = crate::model::source_reader::open_read_with_password(&args.image, pw_bytes)?;
+    let mut reader = crate::model::source_reader::open_read_with_password_and_entry(
+        &args.image,
+        pw_bytes,
+        args.inside.as_deref(),
+    )?;
     let pt = PartitionTable::detect(&mut reader)?;
     let partitions = pt.partitions();
     let ext = args

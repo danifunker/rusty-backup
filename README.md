@@ -327,6 +327,7 @@ readable.
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
+| ZIP (raw disk) | `.zip`          | Yes            | No              | A RAW disk image inside a plain ZIP. Auto-picks the disk entry (`--inside NAME` to choose one of several); inflated sparsely to a temp file at open, so a mostly-empty multi-GB image only uses its real content. Picker-visible but not OS-associated |
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |

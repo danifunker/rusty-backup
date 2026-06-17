@@ -229,7 +229,7 @@ impl BrowseSession {
             );
         }
 
-        // IMZ — 4-byte magic "PK\x03\x04" (ZIP local file header).
+        // IMZ / .zip — 4-byte magic "PK\x03\x04" (ZIP local file header).
         if &magic[..4] == b"PK\x03\x04" {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext.eq_ignore_ascii_case("imz") {
@@ -239,6 +239,29 @@ impl BrowseSession {
                 return fs::open_filesystem(
                     imz_reader,
                     self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            } else if ext.eq_ignore_ascii_case("zip") {
+                // A plain .zip holding a RAW disk image. open_read inflates the
+                // chosen entry to a temp flat image; the inner image may be a
+                // superfloppy (offset 0) or a partitioned disk, so honor
+                // partition_offset exactly like a raw image. The GUI auto-picks
+                // the disk entry (no `--inside`); an ambiguous archive surfaces
+                // the multi-image error.
+                let pw = self.password.as_deref().map(|s| s.as_bytes());
+                let reader = crate::model::source_reader::open_read_with_password(path, pw)
+                    .map_err(|e| {
+                        FilesystemError::Parse(format!("failed to open ZIP disk: {e:#}"))
+                    })?;
+                let effective_offset = if self.partition_type == 0 {
+                    0
+                } else {
+                    self.partition_offset
+                };
+                return fs::open_filesystem(
+                    reader,
+                    effective_offset,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
                 );

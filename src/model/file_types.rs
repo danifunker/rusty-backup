@@ -22,8 +22,16 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
     "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44",
+    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip",
 ];
+
+/// Extensions that appear in the GUI file-picker dropdown (so a user can
+/// browse to one) but are intentionally NOT registered as OS file
+/// associations. `.zip` is the canonical case: Rusty Backup can open a
+/// `.zip` holding a RAW disk image, but it must not become the system
+/// handler for *every* `.zip` the user double-clicks. Filtered out of
+/// [`association_exts`].
+pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip"];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
 pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
@@ -46,6 +54,9 @@ pub fn association_exts() -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(DISK_IMAGE_EXTS.len());
     for ext in DISK_IMAGE_EXTS {
         let lower = ext.to_ascii_lowercase();
+        if NON_ASSOCIATED_EXTS.contains(&lower.as_str()) {
+            continue;
+        }
         if !out.contains(&lower) {
             out.push(lower);
         }
@@ -71,6 +82,22 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), exts.len());
+    }
+
+    #[test]
+    fn zip_is_picker_only_not_associated() {
+        // `.zip` is openable (a RAW disk image inside a zip), so it must
+        // appear in the picker dropdown — but Rusty Backup must NOT register
+        // as the OS handler for every .zip the user double-clicks. So it
+        // lives in DISK_IMAGE_EXTS yet is filtered out of association_exts().
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"zip"),
+            "zip must be in the picker list"
+        );
+        assert!(
+            !association_exts().contains(&"zip".to_string()),
+            "zip must NOT be registered as an OS file association"
+        );
     }
 
     #[test]

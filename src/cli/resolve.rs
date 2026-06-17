@@ -163,13 +163,26 @@ pub fn resolve_partition_streaming_forced(
     password: Option<&[u8]>,
     fs_override: Option<&str>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
+    resolve_partition_streaming_forced_inside(path, selector, password, fs_override, None)
+}
+
+/// As [`resolve_partition_streaming_forced`], but `inside` names a specific
+/// entry to open when `path` is a `.zip` holding more than one disk image
+/// (the CLI `--inside` flag). Ignored for every non-zip source.
+pub fn resolve_partition_streaming_forced_inside(
+    path: &std::path::Path,
+    selector: Option<u32>,
+    password: Option<&[u8]>,
+    fs_override: Option<&str>,
+    inside: Option<&str>,
+) -> Result<(BoxReadSeek, PartitionContext)> {
     // Peel any container *and* any image wrapper through the one shared
     // primitive so the CLI probes a source identically to the GUI: CHD / GHO /
-    // IMZ / flat-floppy containers decode to a flat stream, and VHD / 2MG / DMG
-    // / DiskCopy 4.2 wrappers are unwrapped (previously the CLI streaming path
-    // saw the wrapped bytes for those and mis-detected the partition table). A
-    // raw image falls through to a buffered file.
-    let mut reader = source_reader::open_peeled_read(path, password)?;
+    // IMZ / .zip-wrapped / flat-floppy containers decode to a flat stream, and
+    // VHD / 2MG / DMG / DiskCopy 4.2 wrappers are unwrapped (previously the CLI
+    // streaming path saw the wrapped bytes for those and mis-detected the
+    // partition table). A raw image falls through to a buffered file.
+    let mut reader = source_reader::open_peeled_read_with_entry(path, password, inside)?;
     let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
     Ok((reader, ctx))
 }
