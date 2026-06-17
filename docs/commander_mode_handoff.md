@@ -75,8 +75,13 @@ Last updated: 2026-06-16
     handle `SourceEvent::Device` via an elevated open + probe + preopen
     `BrowseSession`. **Untestable in sandbox; gated on the hardware verify above.**
   - [ ] **R4** — replace the removed Commander tree with the browse view's tree (§3.3).
-  - [ ] **Per-filesystem editable-metadata matrix** — which `EditableFilesystem`
-    setters each FS supports vs. returns `Unsupported`.
+  - [x] **Per-filesystem editable-metadata matrix** — documented in
+    [`editable_metadata_matrix.md`](editable_metadata_matrix.md): which optional
+    `EditableFilesystem` setter each of the 26 editable FS implements vs. returns
+    `Unsupported` (rename is universal; type/creator + dates + finder-info +
+    rsrc-fork + bless + volume-name on HFS, a subset on HFS+/MFS, ProDOS
+    type/access, ext permissions, PFS3 sym/hardlinks), plus the Commander File
+    Info current-vs-available editor backlog.
   - [ ] **HDZ "no files found"** — needs a real `.hdz` fixture; likely RDB parsing
     of the inner `.hdf` after the gzip peel (`commander_source::probe_partitions`).
   - [ ] M7 Find/Search; M5 Compare; broad metadata-setter backlog (§10.2).
