@@ -48,13 +48,16 @@ struct ChecksumWindow {
 
 /// An open "File Info" window: the entry it describes, its decoded preview, and
 /// the per-editor scratch state for the editable-metadata subset. Edits stage
-/// onto the owning pane's queue (resolved by `side`); host panes are read-only.
+/// onto the owning pane's queue (resolved by `side`); host folders and read-only
+/// backups show the metadata without the editors.
 struct DetailWindow {
     /// Which pane owns the entry (and the queue edits stage onto).
     side: Side,
     entry: FileEntry,
-    /// True when the owning pane lists a host folder (read-only display).
-    is_host: bool,
+    /// True when the owning pane accepts metadata edits (a writable image
+    /// volume). False for host folders and read-only backups, which display the
+    /// metadata without the editor rows.
+    editable: bool,
     /// The owning pane's filesystem type, gating which editors appear.
     fs_type: String,
     /// Decoded preview content (text or binary), or `None` for a directory /
@@ -368,13 +371,14 @@ impl CommanderMode {
             status = Some(self.copy(Side::Right));
         }
         ui.add_space(12.0);
-        // Delete acts on the active pane (the one last clicked in).
+        // Delete acts on the active pane (the one last clicked in). Disabled
+        // when that pane is a read-only backup.
         let active = self.active;
-        let del_enabled = idle
-            && match active {
-                Side::Left => self.left.has_selection(),
-                Side::Right => self.right.has_selection(),
-            };
+        let (active_has_sel, active_backup) = match active {
+            Side::Left => (self.left.has_selection(), self.left.is_backup_pane()),
+            Side::Right => (self.right.has_selection(), self.right.is_backup_pane()),
+        };
+        let del_enabled = idle && active_has_sel && !active_backup;
         let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
         if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
             status = Some(match active {
@@ -706,7 +710,9 @@ impl CommanderMode {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         };
-        let is_host = pane.is_host_pane();
+        // A writable image volume gets the metadata editors; host folders and
+        // read-only backups show the metadata without them.
+        let editable = !pane.is_host_pane() && !pane.is_backup_pane();
         let fs_type = pane.fs_type().to_string();
         let Some((entry, bytes)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
             return format!("[{}] could not open File Info for '{name}'.", from.label());
@@ -716,7 +722,7 @@ impl CommanderMode {
         self.detail = Some(DetailWindow {
             side: from,
             entry,
-            is_host,
+            editable,
             fs_type,
             content,
             hfs_editor: None,
@@ -753,8 +759,9 @@ impl CommanderMode {
         let is_classic_hfs = fs == "HFS";
         let is_prodos = fs == "ProDOS";
         let is_ext = fs.starts_with("ext");
-        // Image panes get the editors; host panes are read-only display.
-        let edit_mode = !win.is_host;
+        // Writable image panes get the editors; host folders and backups are
+        // read-only display.
+        let edit_mode = win.editable;
 
         let mut open = true;
         egui::Window::new(format!("File Info: {}", win.entry.name))

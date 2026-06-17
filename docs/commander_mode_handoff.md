@@ -54,11 +54,22 @@ Last updated: 2026-06-16
     `record_log`.
   - [ ] **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`)
     once seen in the app.
-  - [ ] **Phase 2 — "Open Backup…" in a pane:** lift Inspect's per-compression
-    backup-open (`inspect_tab.rs open_browse` case 2 + `open_browse_zstd` /
-    `open_browse_clonezilla`, ~line 4670+) into a shared `model` fn returning a
-    configured `BrowseSession`; set `show_backup_folder: true` + handle
-    `SourceEvent::BackupFolder`.
+  - [x] **Phase 2 — "Open Backup…" in a pane** — a pane's source picker now
+    offers `show_backup_folder: true`; `SourceEvent::BackupFolder` calls
+    `CommanderPane::load_backup_source`, which parses the folder via
+    `backup_loader::load_backup_metadata` (partition dropdown from the backup's
+    partitions, `backup_meta` stored on the pane). `open_partition` branches to
+    the new shared `commander_source::session_for_backup_partition(folder, meta,
+    index)`, which mirrors Inspect's per-compression open into a `BrowseSession`
+    (raw `none` via `source_path`; `zstd` via a streaming `ZstdStreamCache`).
+    **Backup panes are read-only** (a raw backup's `source_path` open_editable
+    would write the partition file in place and desync `metadata.json`'s
+    checksum; zstd has no in-place editable session) — Apply/Discard/Edits, New
+    Folder, Delete, Rename, copy-INTO, and the File Info metadata editors are all
+    gated off; browse + copy-OUT (Copy-to-other / Export / Checksums / read-only
+    File Info) remain. 4 model tests. **Still deferred:** CHD / WOZ backups and
+    **Clonezilla** images (need the block-cache/scan machinery) — those surface a
+    clean "not supported from a pane yet (use Inspect)" error.
   - [ ] **Phase 2 — device parity:** thread `&[DiskDevice]` (`gui/mod.rs self.devices`)
     into `CommanderMode::show` → `pane.show` → `source_bar`; `show_devices: true`;
     handle `SourceEvent::Device` via an elevated open + probe + preopen

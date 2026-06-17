@@ -3,16 +3,20 @@
 //! sortable columns, multi-selection, `..` / double-click navigation, and a
 //! per-pane staged-edit queue (delete + copy-in, shown in the virtual overlay).
 //!
-//! A pane lists either a **disk-image volume** (partition probe + `BrowseSession`,
-//! opened off-thread via [`BrowseSession::spawn_open`]) or a **host-OS folder**
-//! (`std::fs`). All listing state lives in the [`DirListing`] model
+//! A pane lists one of three sources: a **disk-image volume** (partition probe +
+//! `BrowseSession`, opened off-thread via [`BrowseSession::spawn_open`]), a
+//! **host-OS folder** (`std::fs`), or a **native rusty-backup folder**
+//! (read-only — partitions come from the backup's `metadata.json`, opened
+//! per-compression via [`commander_source::session_for_backup_partition`]). All
+//! listing state lives in the [`DirListing`] model
 //! (`rusty_backup::model::dir_listing`); the pane is the thin egui renderer over
 //! it. Applying staged edits runs off-thread via
 //! [`rusty_backup::model::commander_ops::spawn_apply`].
 //!
 //! Image panes stage edits (Apply writes through); host panes take immediate
-//! writes and never stage. The cross-pane copy itself lives in
-//! [`super::CommanderMode`] (it spans both panes).
+//! writes and never stage; backup panes are read-only (browse + copy-out only).
+//! The cross-pane copy itself lives in [`super::CommanderMode`] (it spans both
+//! panes).
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
@@ -21,8 +25,10 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::filesystem::Filesystem;
+use rusty_backup::model::backup_loader;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
@@ -87,6 +93,11 @@ pub(crate) struct CommanderPane {
     source: Option<PathBuf>,
     /// Partitions parsed from the source; drives the partition dropdown.
     partitions: Vec<PartitionInfo>,
+    /// When the source is a native rusty-backup folder, its parsed
+    /// `metadata.json`; `open_partition` then builds a backup-data session
+    /// (per-compression) instead of a raw-image one. `None` for an image /
+    /// host source.
+    backup_meta: Option<BackupMetadata>,
     /// Index into `partitions` currently being browsed.
     selected_part: Option<usize>,
     /// The directory-listing model this pane renders.
@@ -149,6 +160,8 @@ struct NewFolderDialog {
 enum PendingSwitch {
     Source(PathBuf),
     HostRoot(PathBuf),
+    /// Open a native rusty-backup folder as the source.
+    Backup(PathBuf),
     Partition(usize),
     /// Close (unload) the pane entirely.
     Close,
@@ -160,6 +173,7 @@ impl CommanderPane {
             side,
             source: None,
             partitions: Vec::new(),
+            backup_meta: None,
             selected_part: None,
             listing: DirListing::new(),
             session: None,
@@ -582,6 +596,7 @@ impl CommanderPane {
             return self.pending_switch.take().map(|req| match req {
                 PendingSwitch::Source(path) => self.load_source(path),
                 PendingSwitch::HostRoot(path) => self.load_host(path),
+                PendingSwitch::Backup(path) => self.load_backup_source(path),
                 PendingSwitch::Partition(idx) => self.open_partition(idx),
                 PendingSwitch::Close => self.close_source(),
             });
@@ -596,14 +611,26 @@ impl CommanderPane {
 
     /// True when this pane can receive a copy: a volume/folder is open and the
     /// pane isn't mid-operation. (A host destination takes an immediate write;
-    /// an image destination takes a staged copy.)
+    /// an image destination takes a staged copy.) A read-only backup pane can
+    /// never receive a copy.
     pub(crate) fn can_receive(&self) -> bool {
-        self.listing.is_loaded() && self.pending_apply.is_none() && self.pending_open.is_none()
+        self.listing.is_loaded()
+            && self.pending_apply.is_none()
+            && self.pending_open.is_none()
+            && self.backup_meta.is_none()
     }
 
     /// True when this pane lists a host-OS folder rather than a disk image.
     pub(crate) fn is_host_pane(&self) -> bool {
         self.listing.is_host()
+    }
+
+    /// True when this pane lists a (read-only) native backup folder's contents.
+    /// Backups can be browsed and copied *out of*, but not edited: writing to a
+    /// raw backup's partition file would silently desync its `metadata.json`
+    /// checksum, and zstd backups have no in-place editable session.
+    pub(crate) fn is_backup_pane(&self) -> bool {
+        self.backup_meta.is_some()
     }
 
     /// A clone of the session that opened this image pane (to re-open the source
@@ -622,6 +649,9 @@ impl CommanderPane {
     /// the active pane. Mirrors the row right-click delete: an image pane toggles
     /// a staged delete (Apply writes through); a host pane queues a confirm.
     pub(crate) fn delete_selection(&mut self) -> String {
+        if self.is_backup_pane() {
+            return format!("[{}] backup panes are read-only.", self.side.label());
+        }
         let names: Vec<String> = self.listing.selection().to_vec();
         if names.is_empty() {
             return format!("[{}] nothing selected to delete.", self.side.label());
@@ -720,30 +750,39 @@ impl CommanderPane {
             // Shared source picker (R1): the same ComboBox widget the Inspect
             // tab uses, here offering an image file or a host folder. Image
             // opens are not materialized (BrowseSession peels the container).
+            let is_backup = self.backup_meta.is_some();
             let current_label = if self.listing.is_host() {
                 "Local folder".to_string()
+            } else if is_backup {
+                match &self.source {
+                    Some(p) => format!(
+                        "Backup: {}",
+                        p.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                    None => "Backup folder".to_string(),
+                }
             } else if let Some(p) = &self.source {
                 format!(
                     "Image: {}",
                     p.file_name().unwrap_or_default().to_string_lossy()
                 )
             } else {
-                "Open image or folder...".to_string()
+                "Open image, backup, or folder...".to_string()
             };
             let cfg = super::super::source_picker::PickerConfig {
                 show_devices: false,
                 show_image: true,
                 show_host_folder: true,
-                show_backup_folder: false,
+                show_backup_folder: true,
                 materialize_image: false,
                 include_mac_archives: false,
                 width: 200.0,
             };
             let state = super::super::source_picker::PickerState {
                 selected_device_idx: None,
-                image_active: self.source.is_some() && !self.listing.is_host(),
+                image_active: self.source.is_some() && !self.listing.is_host() && !is_backup,
                 host_active: self.listing.is_host(),
-                backup_active: false,
+                backup_active: is_backup,
                 devices: &[],
             };
             let id = format!("commander_source_{}", self.side.idx());
@@ -766,7 +805,14 @@ impl CommanderPane {
                             self.pending_switch = Some(PendingSwitch::HostRoot(dir));
                         }
                     }
-                    SourceEvent::Device(_) | SourceEvent::BackupFolder(_) => {}
+                    SourceEvent::BackupFolder(folder) => {
+                        if self.queue.is_empty() {
+                            status = Some(self.load_backup_source(folder));
+                        } else {
+                            self.pending_switch = Some(PendingSwitch::Backup(folder));
+                        }
+                    }
+                    SourceEvent::Device(_) => {}
                 }
             }
 
@@ -784,9 +830,9 @@ impl CommanderPane {
                 }
             }
 
-            // Per-pane staging controls (image panes only; host writes are
-            // immediate and never staged).
-            if !self.listing.is_host() {
+            // Per-pane staging controls (writable image panes only; host writes
+            // are immediate and never staged, and backups are read-only).
+            if !self.listing.is_host() && self.backup_meta.is_none() {
                 let n = self.queue.len();
                 let busy = self.pending_apply.is_some() || self.pending_open.is_some();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
@@ -845,9 +891,11 @@ impl CommanderPane {
                 }
 
                 // New Folder: stages a CreateDirectory on an image pane;
-                // creates it immediately on a host pane.
+                // creates it immediately on a host pane. Not offered on a
+                // read-only backup pane.
                 let busy = self.pending_apply.is_some() || self.pending_open.is_some();
                 if !busy
+                    && self.backup_meta.is_none()
                     && ui
                         .button("New Folder")
                         .on_hover_text("Create a folder in the current directory")
@@ -885,6 +933,7 @@ impl CommanderPane {
     fn close_source(&mut self) -> String {
         self.source = None;
         self.partitions.clear();
+        self.backup_meta = None;
         self.selected_part = None;
         self.listing = DirListing::new();
         self.session = None;
@@ -958,6 +1007,7 @@ impl CommanderPane {
     fn load_source(&mut self, path: PathBuf) -> String {
         self.source = Some(path.clone());
         self.listing = DirListing::new();
+        self.backup_meta = None;
         self.pending_open = None;
         self.error = None;
         self.selected_part = None;
@@ -989,10 +1039,57 @@ impl CommanderPane {
         }
     }
 
+    /// Open a native rusty-backup folder (`metadata.json` present) and start
+    /// browsing its first partition's data file. The partition dropdown lists
+    /// the backed-up partitions; `open_partition` builds a backup-data session
+    /// per compression (raw / zstd). Clonezilla images and CHD / WOZ backups
+    /// aren't browsable from a pane yet — those surface an error.
+    fn load_backup_source(&mut self, folder: PathBuf) -> String {
+        self.source = Some(folder.clone());
+        self.listing = DirListing::new();
+        self.backup_meta = None;
+        self.partitions.clear();
+        self.session = None;
+        self.pending_open = None;
+        self.pending_apply = None;
+        self.queue.clear();
+        self.error = None;
+        self.selected_part = None;
+        self.volume_label.clear();
+        self.fs_type.clear();
+
+        match backup_loader::load_backup_metadata(&folder) {
+            Ok(outcome) => {
+                self.partitions = outcome.partitions;
+                self.backup_meta = Some(outcome.metadata);
+                let first = self
+                    .partitions
+                    .iter()
+                    .position(|p| !p.is_extended_container);
+                match first {
+                    Some(i) => self.open_partition(i),
+                    None => format!(
+                        "[{}] backup has no browsable partitions.",
+                        self.side.label()
+                    ),
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Could not read backup: {e:#}"));
+                format!(
+                    "[{}] failed to open backup {}",
+                    self.side.label(),
+                    folder.display()
+                )
+            }
+        }
+    }
+
     /// Open a host-OS folder as this pane's source (synchronous `std::fs` read;
     /// writes to a host pane are immediate, never staged).
     fn load_host(&mut self, dir: PathBuf) -> String {
         self.source = Some(dir.clone());
+        self.backup_meta = None;
         self.partitions.clear();
         self.selected_part = None;
         self.session = None;
@@ -1022,26 +1119,45 @@ impl CommanderPane {
         }
     }
 
-    /// Begin an async open of partition `idx`.
+    /// Begin an async open of partition `idx`. Builds a backup-data session
+    /// (per compression) when the source is a backup folder, otherwise a
+    /// raw-image session.
     fn open_partition(&mut self, idx: usize) -> String {
         let Some(path) = self.source.clone() else {
             return String::new();
         };
-        let Some(part) = self.partitions.get(idx) else {
+        let Some(part) = self.partitions.get(idx).cloned() else {
             return String::new();
         };
         self.selected_part = Some(idx);
         self.error = None;
         self.listing = DirListing::new();
         self.queue.clear();
-        let session = commander_source::session_for(&path, part);
+
+        // Resolve the session first (the backup builder is fallible and borrows
+        // `backup_meta`); only then mutate the pane's open state.
+        let built = match &self.backup_meta {
+            Some(meta) => commander_source::session_for_backup_partition(&path, meta, part.index),
+            None => Ok(commander_source::session_for(&path, &part)),
+        };
+        let session = match built {
+            Ok(s) => s,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                return format!(
+                    "[{}] cannot browse {}: {e}",
+                    self.side.label(),
+                    partition_label(&part)
+                );
+            }
+        };
         self.pending_open = Some(session.spawn_open());
         self.session = Some(session);
         self.open_phase = "Opening...".to_string();
         format!(
             "[{}] opening {} ...",
             self.side.label(),
-            partition_label(part)
+            partition_label(&part)
         )
     }
 
@@ -1266,6 +1382,9 @@ impl CommanderPane {
         // Host panes write immediately (Delete removes now); image panes stage
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.listing.is_host();
+        // A read-only backup pane offers browse / copy-out actions only — no
+        // delete or rename (both would mutate the backup).
+        let read_only = self.backup_meta.is_some();
 
         let mut to_enter: Option<String> = None;
         let mut to_up = false;
@@ -1366,18 +1485,25 @@ impl CommanderPane {
                             }
                             // Rename a single entry in place. A row with a
                             // rename already staged offers to cancel it instead.
-                            if matches!(row.kind, RowKind::PendingRename)
-                                && ui.button("Cancel rename").clicked()
-                            {
-                                m_cancel_rename = Some(row.name.clone());
-                                ui.close();
-                            } else if matches!(row.kind, RowKind::Normal)
-                                && ui.button("Rename...").clicked()
-                            {
-                                m_rename = Some(row.name.clone());
-                                ui.close();
+                            // Suppressed on a read-only backup pane.
+                            if !read_only {
+                                if matches!(row.kind, RowKind::PendingRename)
+                                    && ui.button("Cancel rename").clicked()
+                                {
+                                    m_cancel_rename = Some(row.name.clone());
+                                    ui.close();
+                                } else if matches!(row.kind, RowKind::Normal)
+                                    && ui.button("Rename...").clicked()
+                                {
+                                    m_rename = Some(row.name.clone());
+                                    ui.close();
+                                }
                             }
-                            if host_pane {
+                            // Delete (immediate on host, staged on image).
+                            // Suppressed on a read-only backup pane.
+                            if read_only {
+                                // browse / copy-out only
+                            } else if host_pane {
                                 if ui.button("Delete (immediate)").clicked() {
                                     m_host_delete = true;
                                     ui.close();
