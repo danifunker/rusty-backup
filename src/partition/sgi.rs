@@ -109,11 +109,19 @@ impl SgiPartitionType {
         }
     }
 
-    /// True if this partition is browseable as a filesystem in our GUI. Step
-    /// 2 surfaces only EFS and XFS; other types (VOLHDR, VOLUME, container
-    /// types, swap/raw, log) are listed but not opened.
+    /// True if this partition holds an EFS filesystem. IRIX types EFS CD-ROM
+    /// partitions as **SYSV (5)** rather than EFS (7) — the kernel's `IS_EFS()`
+    /// accepts both (`efs_vh.h`: "partition type sysv is used for EFS format
+    /// CD-ROM partitions"). We mirror that so EFS CDs route to the EFS reader.
+    pub fn is_efs(self) -> bool {
+        matches!(self, Self::Efs | Self::SysV)
+    }
+
+    /// True if this partition is browseable as a filesystem. Surfaces EFS
+    /// (incl. the SYSV-typed CD-ROM variant) and XFS; other types (VOLHDR,
+    /// VOLUME, container types, swap/raw, log) are listed but not opened.
     pub fn is_browsable(self) -> bool {
-        matches!(self, Self::Efs | Self::Xfs)
+        self.is_efs() || matches!(self, Self::Xfs)
     }
 
     /// True if the partition is a wrapper around the entire disk or a

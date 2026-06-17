@@ -56,6 +56,7 @@ rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
 rb-cli new-x68k-hdd c.hdf --size 32M --variant scsi --system-disk human68k.dim \
                           --builtin-boot-sector            # zero manual steps, no donor needed
 rb-cli new-sgi-hdd irix.img --size 50M                     # IRIX SGI dvh + EFS root HDD
+rb-cli new-sgi-cdrom irix.iso --size 600M                  # IRIX EFS CD-ROM (slot-7 SYSV, mount -t efs)
 rb-cli put irix.img@1 ./bstoolbox /bstoolbox               # populate its EFS root partition
 rb-cli mac-scsi-bless mac.hda                              # install Apple SCSI driver + DDR
 rb-cli mac-scsi-bless mac.hda --driver-from donor.hda      # use a donor disk's driver verbatim

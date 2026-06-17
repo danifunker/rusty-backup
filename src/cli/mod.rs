@@ -72,6 +72,13 @@ pub enum Command {
     #[command(name = "new-sgi-hdd")]
     NewSgiHdd(verbs::new_sgi_hdd::NewSgiHddArgs),
 
+    /// Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the
+    /// EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD
+    /// geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with
+    /// `put IMG@1 host/file /file`.
+    #[command(name = "new-sgi-cdrom")]
+    NewSgiCdrom(verbs::new_sgi_cdrom::NewSgiCdromArgs),
+
     /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
     /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
     /// Operates in place; partition data is never moved. (This registers the
@@ -277,6 +284,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::New(args) => verbs::new::run(args),
         Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
         Command::NewSgiHdd(args) => verbs::new_sgi_hdd::run(args),
+        Command::NewSgiCdrom(args) => verbs::new_sgi_cdrom::run(args),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),

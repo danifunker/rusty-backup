@@ -17,7 +17,7 @@ use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::fs::efs::resolve_bytes_per_inode;
 use crate::partition::sgi_hdd_builder::{
-    write_sgi_efs_hdd, SgiHddOptions, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
+    write_sgi_efs_hdd, SgiHddOptions, SgiMedia, DEFAULT_HEADS, DEFAULT_SECTORS_PER_TRACK,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -86,6 +86,7 @@ pub fn run(args: NewSgiHddArgs) -> Result<()> {
         // Resolve the inode density against the EFS root size (the partition is
         // most of the disk; this is the count the user cares about).
         bytes_per_inode: resolve_bytes_per_inode(size_bytes, args.inodes, args.bytes_per_inode),
+        media: SgiMedia::HardDisk,
     };
     // Stream directly to the output file: the volume header + EFS metadata are
     // written and the rest stays sparse, so even multi-GB disks never

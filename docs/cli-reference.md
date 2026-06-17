@@ -794,6 +794,27 @@ Usage: new-sgi-hdd [OPTIONS] <IMAGE>
 - `--inodes` — Approximate total inode count for the EFS root (the formatter scales its cylinder groups to hit roughly this many). Mutually exclusive with `--bytes-per-inode`
 - `--bytes-per-inode` — EFS inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Default is ~4 KiB/inode. Mutually exclusive with `--inodes`
 
+### `new-sgi-cdrom`
+
+Build an IRIX EFS CD-ROM image (conventionally `.iso`): an SGI volume header at sector 0 with the EFS filesystem in **slot 7 typed SYSV** — the IRIX EFS-CD convention (the kernel's `IS_EFS()` accepts SYSV as well as EFS) — using CD geometry (1 head × 32 sectors). This matches the byte-structure of real IRIX 5.3 / 6.5 distribution CDs. Mounts on IRIX with `mount -t efs -o ro /dev/dsk/dks0d<N>s7 /CDROM`. Populate it before burning with `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`. The image is streamed to the file (only non-zero regions written; the rest stays sparse), so even a full CD never materializes in memory.
+
+Unlike `new-sgi-hdd` (EFS in slot 0, hard-disk geometry) or `new --fs efs` (a bare headerless EFS), this is the shape IRIX expects on optical media.
+
+```
+Usage: new-sgi-cdrom [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it already exists
+
+**Options**
+
+- `--size` — Disc size (`K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to `600M`; keep it at or below your target media (~650-700 MiB)
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--inodes` — Approximate total inode count. Mutually exclusive with `--bytes-per-inode`. (Real IRIX CDs are sparse — ~32 KiB/inode — so for a few large files pass a larger `--bytes-per-inode` / fewer `--inodes`)
+- `--bytes-per-inode` — EFS inode density in bytes per inode, floored at one inode per 512-byte block. Default ~4 KiB/inode. Mutually exclusive with `--inodes`
+
 ### `optical`
 
 Optical-media verbs (rip / convert / browse / extract)

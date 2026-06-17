@@ -839,15 +839,21 @@ impl PartitionTable {
                         if ptype.is_skipped_from_browse() {
                             return None;
                         }
-                        let partition_type_byte = match ptype {
-                            sgi::SgiPartitionType::Xfs => SGI_TYPE_BYTE_XFS,
-                            sgi::SgiPartitionType::Efs => SGI_TYPE_BYTE_EFS,
-                            _ => 0,
+                        let partition_type_byte = if ptype.is_efs() {
+                            SGI_TYPE_BYTE_EFS
+                        } else if ptype == sgi::SgiPartitionType::Xfs {
+                            SGI_TYPE_BYTE_XFS
+                        } else {
+                            0
                         };
-                        let type_name = match ptype {
-                            sgi::SgiPartitionType::Xfs => "SGI XFS".to_string(),
-                            sgi::SgiPartitionType::Efs => "SGI EFS".to_string(),
-                            other => format!("SGI {}", other.display_name()),
+                        // SYSV-typed partitions are EFS CD-ROM filesystems; show
+                        // them as EFS rather than their raw "SYSV" type name.
+                        let type_name = if ptype.is_efs() {
+                            "SGI EFS".to_string()
+                        } else if ptype == sgi::SgiPartitionType::Xfs {
+                            "SGI XFS".to_string()
+                        } else {
+                            format!("SGI {}", ptype.display_name())
                         };
                         Some(PartitionInfo {
                             index: i,

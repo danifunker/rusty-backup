@@ -83,3 +83,45 @@ fn sgi_efs_hdd_create_put_fsck_get_roundtrip() {
     let got = std::fs::read(&out).expect("read get output");
     assert_eq!(got, payload, "EFS round-trip is byte-identical");
 }
+
+#[test]
+fn sgi_efs_cdrom_create_put_get_roundtrip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let iso = dir.path().join("irix.iso");
+    let iso_s = iso.to_str().unwrap();
+    let at1 = format!("{iso_s}@1");
+
+    // EFS CD-ROM: dvh + slot-7 SYSV EFS + 1x32 CD geometry (the IRIX EFS-CD
+    // shape). 64 MiB keeps the test quick; the image is sparse on disk.
+    run(&["new-sgi-cdrom", iso_s, "--size", "64M", "--name", "IRIXCD"]);
+    let len = std::fs::metadata(&iso).unwrap().len();
+    assert_eq!(
+        len % 2048,
+        0,
+        "CD image is a whole number of 2048-byte sectors"
+    );
+
+    // inspect shows the EFS in slot 7 (surfaced as EFS even though it's SYSV).
+    let inspect = run(&["inspect", iso_s]);
+    let s = String::from_utf8_lossy(&inspect.stdout);
+    assert!(s.contains("Partition table: SGI"), "inspect:\n{s}");
+    assert!(s.contains("SGI EFS"), "slot-7 SYSV surfaces as EFS:\n{s}");
+
+    // put / ls / fsck / get round-trip on the CD's EFS.
+    let payload: Vec<u8> = (0..12_345u32)
+        .map(|i| (i.wrapping_mul(40_503) >> 11) as u8)
+        .collect();
+    let src = dir.path().join("data");
+    std::fs::write(&src, &payload).expect("write payload");
+    run(&["put", &at1, src.to_str().unwrap(), "/DATA"]);
+    assert!(String::from_utf8_lossy(&run(&["ls", &at1]).stdout).contains("DATA"));
+    run(&["fsck", &at1]);
+
+    let out = dir.path().join("out.bin");
+    run(&["get", &at1, "/DATA", out.to_str().unwrap()]);
+    assert_eq!(
+        std::fs::read(&out).expect("read get output"),
+        payload,
+        "EFS CD round-trip is byte-identical"
+    );
+}
