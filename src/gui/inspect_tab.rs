@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 
 use rusty_backup::backup::metadata::BackupMetadata;
-use rusty_backup::clonezilla;
 // Partition-capability gates — shared across all UIs, defined in the engine.
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::fs::{
     is_checkable_type, is_classic_hfs, is_superfloppy_hfs, partition_is_browsable,
 };
+use rusty_backup::model::cache_runner;
+use rusty_backup::model::commander_source::{self, ClonezillaOpen, PartcloneLookup};
 use rusty_backup::model::export_runner::{
     self, ExportStatus, PartitionExportConfig, PerPartitionInputs,
 };
@@ -165,8 +166,10 @@ pub struct InspectTab {
         HashMap<usize, Arc<Mutex<rusty_backup::model::volume_label_runner::VolumeLabelStatus>>>,
     /// Clonezilla image metadata (when backup is a Clonezilla image)
     clonezilla_image: Option<ClonezillaImage>,
-    /// Block caches per Clonezilla partition (for browse support)
-    block_caches: HashMap<usize, Arc<Mutex<clonezilla::block_cache::PartcloneBlockCache>>>,
+    /// Scanned Clonezilla block caches reused across opens, plus the
+    /// in-memory/on-disk/scan decision tree — the same shared store Commander
+    /// uses (see `commander_source::PartcloneCacheStore`).
+    cache_store: commander_source::PartcloneCacheStore,
     /// Background block cache scan status
     block_cache_scan: Option<Arc<Mutex<BlockCacheScan>>>,
     /// Seekable zstd cache files for native zstd backups
@@ -276,7 +279,7 @@ impl Default for InspectTab {
             last_logged_min_size_phase: HashMap::new(),
             pending_volume_label_probes: HashMap::new(),
             clonezilla_image: None,
-            block_caches: HashMap::new(),
+            cache_store: commander_source::PartcloneCacheStore::new(),
             block_cache_scan: None,
             seekable_cache_files: HashMap::new(),
             cache_status: None,
@@ -420,7 +423,7 @@ impl InspectTab {
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
-        self.block_caches.clear();
+        self.cache_store.clear();
         self.block_cache_scan = None;
         self.seekable_cache_files.clear();
         self.cache_status = None;
@@ -2608,7 +2611,7 @@ impl InspectTab {
         self.pending_min_size_calcs.clear();
         self.pending_volume_label_probes.clear();
         self.clonezilla_image = None;
-        self.block_caches.clear();
+        self.cache_store.clear();
         self.block_cache_scan = None;
         self.seekable_cache_files.clear();
         self.cache_status = None;
@@ -4886,68 +4889,41 @@ impl InspectTab {
             return;
         }
 
-        // Check if block cache already exists in memory
-        if let Some(cache) = self.block_caches.get(&part_index) {
-            if let Ok(c) = cache.lock() {
-                if c.state == clonezilla::block_cache::CacheState::Ready {
-                    drop(c);
-                    ctx.log.info(format!(
-                        "Browsing partition {} from block cache",
-                        part_index
-                    ));
-                    self.browse_view.open_partclone(Arc::clone(cache), ptype);
+        // Shared decision tree (same store Commander uses): a cache scanned
+        // earlier this session is reused in memory, else a prior on-disk scan
+        // loads, else a background scan builds one. `poll_block_cache_scan`
+        // memoizes the result and opens it.
+        let open = ClonezillaOpen {
+            partclone_files: cz_part.partclone_files.clone(),
+            partition_type: ptype,
+            cache_path: folder.join(format!("_{}.metadata.cache", cz_part.device_name)),
+        };
+        match self.cache_store.resolve(part_index, &open) {
+            PartcloneLookup::Ready(cache) => {
+                ctx.log.info(format!(
+                    "Browsing partition {} from cached metadata",
+                    part_index
+                ));
+                self.browse_view.open_partclone(cache, ptype);
+            }
+            PartcloneLookup::NeedsScan { cache, cache_path } => {
+                if self.block_cache_scan.is_some() {
+                    ctx.log
+                        .warn("A metadata scan is already in progress. Please wait.");
                     return;
                 }
+                ctx.log.info(format!(
+                    "Scanning metadata for partition {} ({})...",
+                    part_index,
+                    partition::format_size(cz_part.size_bytes()),
+                ));
+                // The scan runs on a worker thread; the spawn lives in the
+                // shared model runner so Commander Mode uses the same path.
+                self.block_cache_scan = Some(cache_runner::spawn_partclone_scan(
+                    cache, part_index, ptype, cache_path,
+                ));
             }
         }
-
-        // Check if a scan is already running
-        if self.block_cache_scan.is_some() {
-            ctx.log
-                .warn("A metadata scan is already in progress. Please wait.");
-            return;
-        }
-
-        // Try to load persisted cache from disk
-        let cache_path = folder.join(format!("_{}.metadata.cache", cz_part.device_name));
-        if cache_path.exists() {
-            match clonezilla::block_cache::PartcloneBlockCache::load_from_file(
-                &cache_path,
-                cz_part.partclone_files.clone(),
-            ) {
-                Ok(loaded) => {
-                    ctx.log.info(format!(
-                        "Loaded cached metadata for partition {} ({} blocks)",
-                        part_index,
-                        loaded.cached_block_count(),
-                    ));
-                    let cache = Arc::new(Mutex::new(loaded));
-                    self.block_caches.insert(part_index, Arc::clone(&cache));
-                    self.browse_view.open_partclone(cache, ptype);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("Failed to load metadata cache: {e}, will re-scan");
-                    let _ = std::fs::remove_file(&cache_path);
-                }
-            }
-        }
-
-        // Start background metadata scan
-        ctx.log.info(format!(
-            "Scanning metadata for partition {} ({})...",
-            part_index,
-            partition::format_size(cz_part.size_bytes()),
-        ));
-
-        // The scan runs on a worker thread; the spawn lives in the shared model
-        // runner so Commander Mode uses the same code path.
-        let cache = Arc::new(Mutex::new(
-            clonezilla::block_cache::PartcloneBlockCache::new(cz_part.partclone_files.clone()),
-        ));
-        self.block_cache_scan = Some(rusty_backup::model::cache_runner::spawn_partclone_scan(
-            cache, part_index, ptype, cache_path,
-        ));
     }
 
     /// Open browse for a native zstd-compressed backup.
@@ -5061,7 +5037,8 @@ impl InspectTab {
                 ));
                 let cache = Arc::clone(&scan.cache);
                 drop(scan);
-                self.block_caches.insert(part_index, Arc::clone(&cache));
+                // Memoize so a later open of this partition reuses it in memory.
+                self.cache_store.insert(part_index, Arc::clone(&cache));
                 self.block_cache_scan = None;
 
                 // Auto-open the browser
