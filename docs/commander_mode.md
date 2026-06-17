@@ -1,17 +1,28 @@
 # Commander Mode — Design & Implementation Plan
 
-Status: **Shipped: M2-lite browsing + M3 staged writes + host panes + the M6
-right-click batch (Rename / Checksums / Export / Tree) + M1 widget extraction
-(R0+R1) + the M4 File Info window.** Both panes browse disk images and host
-folders; staged delete + copy-in on image panes, immediate writes on host
-panes, all four copy combos, Apply/Discard, virtual overlay, unsaved guards. A
-floating File Info window (double-click a file or right-click → "File Info /
-Details…") shows metadata + a text/hex preview and stages the editable subset
-(HFS type/creator + dates, ProDOS type, ext permissions) onto the owning pane's
-queue. The source bar (Inspect tab + both Commander panes) is the shared
-`source_picker` widget. **Planned next:** the deferred wildcard **Find/Search**
-(M7, §15.5); the R4 tree-model dedup with the browse view (§3.3); M5+ Compare +
-the broader metadata-setter backlog (§10.2).
+Status: **Shipped: M2-lite + M3 staged writes + host panes + the M6 right-click
+batch + M1 widget extraction (R0+R1) + the M4 File Info window + Phase 3
+(.adz/.hdz editable gzip containers) + two rounds of hands-on-test fixes.** Both
+panes browse disk images / containers and host folders; staged delete + copy-in
++ rename + New Folder on image panes, immediate writes on host panes, all four
+copy combos, Apply/Discard, virtual overlay, unsaved guards. A floating File
+Info window (double-click a file or right-click → "File Info / Details…") shows
+metadata + a text/hex preview and stages the editable subset (HFS type/creator +
+dates, ProDOS type, ext permissions) onto the owning pane's queue, reflecting the
+staged value back and tinting changed rows (blue + a `* ` marker). The source bar
+(Inspect tab + both Commander panes) is the shared `source_picker` widget; the
+middle column uses procedurally-painted icon buttons. Image-to-image copy
+preserves data + resource fork + type/creator + (optionally) original dates.
+
+`.adz`/`.hdz` open as gzip containers (peeled for reading, re-gzipped on edit) —
+never materialized to a separate `.adf`/`.hdf`. The old per-pane tree toggle was
+removed (a future R4 pass reuses the browse view's tree instead).
+
+**Round-3 / next (see `commander_mode_handoff.md` for the live punch-list):**
+functional center Delete (active-pane), `.sit`→Archives redirect, a rolling
+applied-ops log, **Phase 2** "Open Backup…" + physical-device parity in panes,
+the R4 tree dedup (§3.3), a per-FS editable-metadata matrix, and the deferred
+wildcard Find/Search (M7, §15.5).
 Last updated: 2026-06-16
 Owner: TBD
 
@@ -561,11 +572,23 @@ per-row diff status. Re-spec when we get there.
    queue variants; ProDOS type), staged onto the owning pane's queue. HFS catalog
    dates are surfaced on `FileEntry::mac_dates`.
 7. **M6 — right-click action batch** (§15, **done**): **Rename** (§15.1), **Calculate
-   Checksums** (§15.2), **Export to hard drive** (§15.3), and the **per-pane tree view**
-   (§15.4).
-8. **M7 — find / search** (§15.5, deferrable): wildcard name search per pane.
-9. **M5+** — Compare; the R4 tree-model dedup (§3.3); the broad metadata-setter
-   backlog from §10.2.
+   Checksums** (§15.2), **Export to hard drive** (§15.3). The per-pane tree (§15.4)
+   shipped then was **removed** as low-value; R4 will reuse the browse view's tree.
+8. **Phase 3 — `.adz`/`.hdz` editable gzip containers** (**done**): `.adz`/`.hdz`
+   open as gzip containers (peeled for reading via `source_reader::is_gzip_image_path`
+   + `open_read`; re-gzipped on edit via `container_edit`'s `EditFormat::Gzip`), no
+   longer materialized to a throwaway `.adf`/`.hdf`.
+9. **Round-1 / round-2 hands-on-test fixes** (**done**): New Folder (both panes);
+   "Keep original dates" on copy (`PreservedDates` — Amiga + HFS); staged-metadata
+   shown blue + `* ` and reflected in the editor; specific date-validation errors;
+   pending-edits list; macOS device elevation (`open_device_for_inspect`); AFFS
+   large-file read (`T_LIST`); icon middle-buttons; `.sit` dropped from the Commander
+   picker; deferred-switch unsaved guard + consolidated Close in Inspect.
+10. **M7 — find / search** (§15.5, deferrable): wildcard name search per pane.
+11. **M5+ / round-3** — functional center Delete (active-pane); `.sit`→Archives
+    redirect; rolling applied-ops log; **Phase 2** "Open Backup…" + physical-device
+    parity in Commander panes; the R4 tree dedup (§3.3); a per-FS editable-metadata
+    matrix; Compare; the broad metadata-setter backlog (§10.2).
 
 ---
 

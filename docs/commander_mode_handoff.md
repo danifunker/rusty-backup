@@ -13,30 +13,71 @@ Last updated: 2026-06-16
 - **What it is:** a full-page, Midnight-Commander-style two-pane file explorer
   overlay. Full design in [`commander_mode.md`](commander_mode.md); tracked in
   [`OPEN-WORK.md`](OPEN-WORK.md) §6.1.
-- **Where it's at:** plan + mock + wired shell + a **working two-pane file
-  manager** (M2-lite + M3 + host panes + **the whole M6 batch** + **M1 widget
-  extraction** + **the M4 File Info window**): each pane opens a **disk image**
-  (pick a partition) or a **host folder**, with a sortable multi-select listing
-  and `..` / double-click nav. Image panes stage delete + copy-in + rename
-  (Apply/Discard writes through, virtual overlay, unsaved guards); host panes
-  write immediately (delete / rename behind a confirm). The middle column copies
-  a selection between the panes in **all four** combos (image↔image, host→image,
-  image→host, host→host). Right-click also offers **Export to hard drive**,
-  **Calculate checksums** (CRC32/MD5/SHA1/SHA256), **Rename** (in-place on all 26
-  editable filesystems), and **File Info / Details**; each pane has a **Tree**
-  toggle. **Double-clicking a file** (or right-click → File Info) opens a floating
-  window with metadata rows + a text/hex preview and an editable subset (HFS
-  type/creator + dates, ProDOS type, ext permissions) staged onto the pane queue.
-- **Next concrete step:** M1 (R0 `file_detail`/`metadata_editor` + R1
-  `source_picker`) and M4 (File Info window + `SetDates`/`SetPermissions` queue
-  variants + HFS `mac_dates`) are done. Remaining: the §3.3 **R4** tree-model
-  dedup (share the lazy tree between Commander and `browse_view`); a possible
-  `rb-cli` rename verb; M5+ Compare; and the deferred wildcard **Find/Search**
-  (M7, §15.5). Full design in [`commander_mode.md`](commander_mode.md) §15.
+- **Where it's at:** a **working two-pane file manager** (M2-lite + M3 + host
+  panes + the **M6 batch** + **M1 widget extraction** + **M4 File Info window** +
+  **Phase 3 .adz/.hdz gzip containers** + two rounds of hands-on-test fixes).
+  Each pane opens a **disk image / container** (pick a partition) or a **host
+  folder**, with a sortable multi-select listing and `..` (double-click) / folder
+  (double-click) nav. Image panes stage delete + copy-in + rename + **New Folder**
+  (Apply/Discard, virtual overlay, unsaved guards + a per-pane **Close**); host
+  panes write immediately. The middle column has **icon buttons** (painted floppy
+  glyphs) for copy in **all four** combos, with a **"Keep original dates"** toggle
+  (Amiga + HFS). Right-click also offers **Export to hard drive**, **Calculate
+  checksums**, **Rename** (all 26 editable FS), and **File Info / Details**.
+  Double-clicking a file (or right-click → File Info) opens a floating window
+  with metadata + text/hex preview + an editable subset (HFS type/creator +
+  dates, ProDOS type, ext permissions) staged onto the pane queue, with staged
+  changes reflected and changed rows marked (blue + `* `). `.adz`/`.hdz` open as
+  gzip containers (peeled to read, re-gzipped on edit). The per-pane tree was
+  removed (R4 will reuse the browse view's tree).
+- **Branch state:** `commander-mode`, tree clean, **~10 unpushed commits** past
+  the CI-green nav fix `45a108c` (M1/M4/R1 → icon buttons). Only `45a108c` is on
+  the remote / has run CI.
+- **Verify on hardware (untested in the dev sandbox):** the macOS device
+  elevation fix (`os/macos.rs open_device_for_inspect`, commit `ff36fa3`) — open
+  a real `/dev/diskN` in Inspect, confirm the `authopen` admin prompt + read.
+- **Round-3 punch-list (next, in order):**
+  1. **Functional center Delete button** — needs an "active pane" concept (add
+     `focused` to `PaneResponse`/`RowActions`, track `active: Side` on
+     `CommanderMode`); the middle Delete acts on it (row right-click delete
+     already works).
+  2. **`.sit` → Archives redirect** — opening a Mac archive via Inspect's source
+     picker routes to the Archives tab instead of failing as a disk.
+  3. **Rolling "applied operations" log** for the Commander session (mirror
+     `EditQueue::describe`, but for completed applies via `commander_ops::apply_edits`).
+  4. **Right pane slightly cut off** — tweak `pane_w`/`mid_w` in `CommanderMode::show`.
+  5. **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`).
+  6. **Phase 2 — "Open Backup…" in a pane:** lift Inspect's per-compression
+     backup-open (`inspect_tab.rs open_browse` case 2 + `open_browse_zstd` /
+     `open_browse_clonezilla`, ~line 4670+) into a shared `model` fn returning a
+     configured `BrowseSession`; set `show_backup_folder: true` + handle
+     `SourceEvent::BackupFolder`.
+  7. **Phase 2 — device parity:** thread `&[DiskDevice]` (`gui/mod.rs self.devices`)
+     into `CommanderMode::show` → `pane.show` → `source_bar`; `show_devices: true`;
+     handle `SourceEvent::Device` via an elevated open + probe + preopen
+     `BrowseSession`. **Untestable in sandbox; gated on the hardware verify above.**
+  8. **R4** — replace the removed Commander tree with the browse view's tree (§3.3).
+  9. **Per-filesystem editable-metadata matrix** — which `EditableFilesystem`
+     setters each FS supports vs. returns `Unsupported`.
+  10. **HDZ "no files found"** — needs a real `.hdz` fixture; likely RDB parsing
+      of the inner `.hdf` after the gzip peel (`commander_source::probe_partitions`).
+  11. M7 Find/Search; M5 Compare; broad metadata-setter backlog (§10.2).
 
 ## Commits on this branch
 
 ```
+522af44  commander: pictured icon buttons in the middle column
+6eccbb8  commander: New Folder in both panes
+2fba0bd  commander: round-2 UI fixes (collision, drop tree, dbl-click .., meta marker)
+ff36fa3  os/macos: prompt for elevation on any device-open failure (read-only)
+c1fb387  commander: "Keep original dates" on image-to-image copy
+b55bc46  fs/affs: read files that span extension (T_LIST) blocks
+07bd014  commander: Phase 3 — .adz/.hdz as editable gzip containers
+7353247  commander/inspect: make the Mac-archives picker filter opt-in
+2f8dfb1  commander: Phase 5 — metadata-edit UX (staged values, blue tint, edits list, dates)
+2e41a11  commander: M1 widget extraction + M4 File Info window + R1 source picker + round-1
+45a108c  commander: fix navigate_to path split on Windows host panes (CI-green; pushed)
+--- earlier ---
 <H2>     commander: host copy combos + host delete (H2)
 8d4773e  commander: host-folder panes (browse) — PaneSource::Host (H1)
 05664a4  commander: unsaved-changes guards on close / source switch (M3c)
@@ -185,42 +226,20 @@ cargo clippy --all-targets -- -D warnings
 cargo test --lib
 ```
 
-## Next step — M6 right-click / view-mode batch (do this first when resuming)
+## Next step
 
-M2-lite + M3 + host panes are done. The **requested next batch** (full design in
-[`commander_mode.md`](commander_mode.md) §15) adds these. Build each model-first
-(engine → model → thin view), unit-testing the model piece before the menu item;
-suggested order is smallest-win-first:
+The live, ordered punch-list is the **round-3** list in the TL;DR above. M6
+(Export / Checksums / Rename-all-26-FS / the now-removed Tree), M1, M4, and
+Phase 3 are all done. Build each remaining item model-first (engine → model →
+thin view), unit-testing the model piece before the view.
 
-1. **Export to hard drive** (§15.3) — *DONE.* A right-click "Export to hard
-   drive…" that `pick_folder`s a destination and runs the existing
-   `commander_ops::spawn_host_copy` (`ImageToHost` / `HostToHost`) into it. No new
-   engine — just a menu item + folder picker + the poll Commander already has. This
-   is the §9b "Export → To host" item made first-class (loose files, not an archive).
-2. **Calculate Checksums** (§15.2) — *DONE.* `model::checksum` streams once into
-   CRC32 / MD5 / SHA1 / SHA256; threaded `spawn(ChecksumJob)`; right-click window
-   with a per-file grid + Copy buttons. Added the `sha1` crate.
-3. **Rename** (§15.1) — *DONE for all 26 editable filesystems.*
-   `EditableFilesystem::rename` (default `Unsupported`) implemented per-FS in place;
-   `StagedEdit::Rename` + dialog; image stages (overlay `old -> new`), host
-   immediate. Offered on any loaded pane (like Delete); browse-only filesystems
-   surface `Unsupported` at Apply.
-4. **Per-pane Tree view** (§15.4) — *DONE (contained).* A "Tree" toggle splits the
-   pane into a lazy folder tree (navigation) + grid (working set);
-   `DirListing::navigate_to` drives cwd from tree clicks. The §3.3 **R4** dedup
-   (lifting `browse_view`'s `directory_cache`/`expanded_paths`/`render_tree_entry`
-   onto the shared tree so both views render over it) is **not** done — follow-up.
-
-**Deferred — M7 find/search** (§15.5): a per-pane wildcard (`*`/`?`) name search —
-`model::find::search(source, root, pattern, progress)` recursive walk + a results
-grid mode. Not needed for the core loop; none of M6 depends on it.
-
-Other backlog (unchanged): M1 widget extraction + the M4 File Info window (plan §9);
-the browsable-partition gate (lift `is_browsable_type` out of `inspect_tab.rs`);
-drag-to-load (§6, OS drop signals already wired in `gui/mod.rs`); New Folder
-(`CreateDirectory`); archive Export (§9b); resource-fork sidecars on host copies;
-Apply-and-close in the unsaved guard (needs `CommanderMode::temp` kept alive until
-both applies finish).
+**Still-open backlog beyond the round-3 list** (lower priority): the
+browsable-partition gate (lift `is_browsable_type` out of `inspect_tab.rs`);
+drag-to-load (§6, OS drop signals already wired in `gui/mod.rs`); archive Export
+(§9b — zip/tgz/sit); resource-fork sidecars on host copies; Apply-and-close in
+the unsaved guard (needs `CommanderMode::temp` alive until both applies finish);
+a possible `rb-cli` rename verb; **M7 find/search** (§15.5 —
+`model::find::search` recursive wildcard walk + a results grid mode).
 
 ## Reuse map (do NOT reinvent these)
 
