@@ -30,42 +30,47 @@ Last updated: 2026-06-16
   changes reflected and changed rows marked (blue + `* `). `.adz`/`.hdz` open as
   gzip containers (peeled to read, re-gzipped on edit). The per-pane tree was
   removed (R4 will reuse the browse view's tree).
-- **Branch state:** `commander-mode`, tree clean, **~10 unpushed commits** past
-  the CI-green nav fix `45a108c` (M1/M4/R1 → icon buttons). Only `45a108c` is on
-  the remote / has run CI.
+- **Branch state:** `commander-mode`, tree clean, **~14 unpushed commits** past
+  the CI-green nav fix `45a108c` (M1/M4/R1 → round-3 A1/A2/A4). Only `45a108c` is
+  on the remote / has run CI.
 - **Verify on hardware (untested in the dev sandbox):** the macOS device
   elevation fix (`os/macos.rs open_device_for_inspect`, commit `ff36fa3`) — open
   a real `/dev/diskN` in Inspect, confirm the `authopen` admin prompt + read.
-- **Round-3 punch-list (next, in order):**
-  1. **Functional center Delete button** — needs an "active pane" concept (add
-     `focused` to `PaneResponse`/`RowActions`, track `active: Side` on
-     `CommanderMode`); the middle Delete acts on it (row right-click delete
-     already works).
-  2. **`.sit` → Archives redirect** — opening a Mac archive via Inspect's source
-     picker routes to the Archives tab instead of failing as a disk.
-  3. **Rolling "applied operations" log** for the Commander session (mirror
-     `EditQueue::describe`, but for completed applies via `commander_ops::apply_edits`).
-  4. **Right pane slightly cut off** — tweak `pane_w`/`mid_w` in `CommanderMode::show`.
-  5. **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`).
-  6. **Phase 2 — "Open Backup…" in a pane:** lift Inspect's per-compression
-     backup-open (`inspect_tab.rs open_browse` case 2 + `open_browse_zstd` /
-     `open_browse_clonezilla`, ~line 4670+) into a shared `model` fn returning a
-     configured `BrowseSession`; set `show_backup_folder: true` + handle
-     `SourceEvent::BackupFolder`.
-  7. **Phase 2 — device parity:** thread `&[DiskDevice]` (`gui/mod.rs self.devices`)
-     into `CommanderMode::show` → `pane.show` → `source_bar`; `show_devices: true`;
-     handle `SourceEvent::Device` via an elevated open + probe + preopen
-     `BrowseSession`. **Untestable in sandbox; gated on the hardware verify above.**
-  8. **R4** — replace the removed Commander tree with the browse view's tree (§3.3).
-  9. **Per-filesystem editable-metadata matrix** — which `EditableFilesystem`
-     setters each FS supports vs. returns `Unsupported`.
-  10. **HDZ "no files found"** — needs a real `.hdz` fixture; likely RDB parsing
-      of the inner `.hdf` after the gzip peel (`commander_source::probe_partitions`).
-  11. M7 Find/Search; M5 Compare; broad metadata-setter backlog (§10.2).
+- **Round-3 punch-list:**
+  - [x] **Center Delete button** (`eee8070`) — "active pane" via `focused` on
+    `PaneResponse`/`RowActions` + `CommanderMode::active`; `pane.delete_selection()`.
+  - [x] **`.sit` → Archives redirect** (`3dc0895`) — `InspectTab` signals
+    `pending_open_archive`; the app calls `ArchivesTab::open_path` + switches tabs.
+  - [x] **Right pane cutoff** (`02926d5`) — reserve separator/spacing width in
+    `CommanderMode::show`'s `pane_w`.
+  - [ ] **Rolling "applied operations" log** for the Commander session (mirror
+    `EditQueue::describe`, but for completed applies via `commander_ops::apply_edits`).
+    *Not started* — was the next item when this handoff was written.
+  - [ ] **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`)
+    once seen in the app.
+  - [ ] **Phase 2 — "Open Backup…" in a pane:** lift Inspect's per-compression
+    backup-open (`inspect_tab.rs open_browse` case 2 + `open_browse_zstd` /
+    `open_browse_clonezilla`, ~line 4670+) into a shared `model` fn returning a
+    configured `BrowseSession`; set `show_backup_folder: true` + handle
+    `SourceEvent::BackupFolder`.
+  - [ ] **Phase 2 — device parity:** thread `&[DiskDevice]` (`gui/mod.rs self.devices`)
+    into `CommanderMode::show` → `pane.show` → `source_bar`; `show_devices: true`;
+    handle `SourceEvent::Device` via an elevated open + probe + preopen
+    `BrowseSession`. **Untestable in sandbox; gated on the hardware verify above.**
+  - [ ] **R4** — replace the removed Commander tree with the browse view's tree (§3.3).
+  - [ ] **Per-filesystem editable-metadata matrix** — which `EditableFilesystem`
+    setters each FS supports vs. returns `Unsupported`.
+  - [ ] **HDZ "no files found"** — needs a real `.hdz` fixture; likely RDB parsing
+    of the inner `.hdf` after the gzip peel (`commander_source::probe_partitions`).
+  - [ ] M7 Find/Search; M5 Compare; broad metadata-setter backlog (§10.2).
 
 ## Commits on this branch
 
 ```
+02926d5  commander: stop the right pane clipping off-edge (round-3 A4)
+3dc0895  inspect: route a picked Mac archive to the Archives tab (round-3 A2)
+eee8070  commander: functional center Delete via active-pane tracking (round-3 A1)
+0b58bde  docs: refresh Commander Mode plan + handoff to current state
 522af44  commander: pictured icon buttons in the middle column
 6eccbb8  commander: New Folder in both panes
 2fba0bd  commander: round-2 UI fixes (collision, drop tree, dbl-click .., meta marker)
