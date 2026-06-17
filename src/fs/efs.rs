@@ -2299,8 +2299,6 @@ fn trim_ascii(b: &[u8]) -> String {
 /// `fname`/`fpack` short label (padded with spaces; characters beyond 6
 /// bytes are truncated).
 pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
-    use byteorder::{BigEndian, ByteOrder};
-
     if size_bytes < 32 * 1024 {
         return Err(anyhow::anyhow!(
             "EFS volume must be at least 32 KiB, got {size_bytes}"
@@ -2429,11 +2427,25 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     root.write_into(&mut slot);
     img[root_inode_off..root_inode_off + EFS_INODESIZE as usize].copy_from_slice(&slot);
 
-    // Root dirblock: just the EFS_DIRBLK header. No entries.
+    // Root dirblock: the mandatory "." and ".." entries, both pointing at the
+    // root inode (CNID 2 — the root's parent is itself). Real IRIX EFS requires
+    // every directory to begin with these; a root missing them mounts but shows
+    // up empty on IRIX (our own reader is lenient and filters them from
+    // listings, which is why round-trips looked fine). `create_directory`
+    // already emits them for subdirectories; this brings the root in line.
     let dirblk_off = root_dirblock as usize * EFS_BLOCKSIZE as usize;
-    BigEndian::write_u16(&mut img[dirblk_off..dirblk_off + 2], EFS_DIRBLK_MAGIC);
-    img[dirblk_off + 2] = 0; // slot count
-    img[dirblk_off + 3] = 0; // first free byte
+    let root_dir = serialize_dir_block(&[
+        DirEntry {
+            inum: EFS_ROOT_INODE,
+            name: b".".to_vec(),
+        },
+        DirEntry {
+            inum: EFS_ROOT_INODE,
+            name: b"..".to_vec(),
+        },
+    ])
+    .expect("root . and .. always fit in one dirblock");
+    img[dirblk_off..dirblk_off + EFS_BLOCKSIZE as usize].copy_from_slice(&root_dir);
 
     Ok(img)
 }
@@ -2570,6 +2582,33 @@ mod tests {
         // Wait — inblock = (4 % 9840) / 4 = 1. byte_in_block = (4 % 4) * 128 = 0.
         // byte = (1830 + 1) * 512 = 937472 = 0xE4E00.
         assert_eq!(fs.inode_byte_offset(4), 0xE4E00);
+    }
+
+    /// A freshly formatted EFS root directory begins with "." and ".." (both
+    /// pointing at the root inode). Regression guard: without them IRIX mounts
+    /// the volume but shows an empty root. Subdirectories already got them via
+    /// `create_directory`; this covers `create_blank_efs`'s root.
+    #[test]
+    fn blank_efs_root_has_dot_and_dotdot() {
+        let img = create_blank_efs(8 * 1024 * 1024, "T").expect("format");
+        // Superblock at block 1 (byte 512); firstcg at sb offset 4.
+        let firstcg = u32::from_be_bytes(img[516..520].try_into().unwrap()) as usize;
+        // Root inode 2 at firstcg*512 + 2*128; its first extent (8 bytes,
+        // packed magic|bn|len|off at +32) gives the root dirblock number.
+        let ino = firstcg * 512 + 2 * 128;
+        let ex = &img[ino + 32..ino + 40];
+        let bn = ((ex[1] as usize) << 16) | ((ex[2] as usize) << 8) | ex[3] as usize;
+        let db: [u8; EFS_BLOCKSIZE as usize] = img[bn * 512..bn * 512 + EFS_BLOCKSIZE as usize]
+            .try_into()
+            .unwrap();
+        let entries = parse_dir_block(&db);
+        assert!(entries.iter().any(|e| e.name == b"."), "root has '.'");
+        assert!(entries.iter().any(|e| e.name == b".."), "root has '..'");
+        for e in &entries {
+            if e.name == b"." || e.name == b".." {
+                assert_eq!(e.inum, EFS_ROOT_INODE, "{:?} points at root inode", e.name);
+            }
+        }
     }
 
     #[test]
