@@ -114,42 +114,21 @@ verify** (commit `ff36fa3`): until that's confirmed on real hardware, building
 the Commander device path would only add untestable code on top of an unverified
 elevation path. Verify the elevation first, then build device parity.
 
-## Source-resolution de-duplication (Inspect ⇄ Commander)
+## Source-resolution unification (Inspect ⇄ Commander ⇄ CLI ⇄ TUI)
 
 Triggered by two bugs (Commander couldn't open a Clonezilla backup; it auto-
-opened an APM `Apple_Driver_IOKit` driver partition and errored) that were both
-symptoms of source-resolution logic trapped in the Inspect view. Phased fix
-(see CONTRIBUTING "Presentation layers: one model, many UIs"):
+opened an APM `Apple_Driver_IOKit` driver partition and errored), both symptoms
+of source-resolution logic trapped in the Inspect view. **The full plan —
+phases, stragglers, the `.GHO` note, the CLI stance, and acceptance criteria —
+lives in [`source_resolution_unification.md`](source_resolution_unification.md).**
 
-- **Phase 1 — capability gates → engine (done, `3a4c208`).** `is_browsable_type*`
-  / `is_checkable_type` / `is_classic_hfs` / `is_superfloppy_hfs` moved from
-  `gui/inspect_tab.rs` into `fs/`, plus a combined `fs::partition_is_browsable`.
-  Inspect + Commander call it; Commander skips non-filesystem partitions. Fixes
-  the APM-driver bug. Unit-tested.
-- **Phase 5 doc — layering rule (done, `e188812`).** CONTRIBUTING "one model,
-  many UIs" section (litmus test + where-it-goes table + checklist), written
-  before the big refactor so the TUI can't re-leak.
-- **Phase 2 — shared backup resolver (done, `60548a2`).** `commander_source::
-  resolve_backup` → `ResolvedBackup` (Native | Clonezilla) via
-  `backup_loader::load_backup`. Commander uses it; fixes the Clonezilla
-  "no metadata.json" bug. 3 model tests.
-- **Phase 3 — cache-scan runner (done, `3e5fc5a`).** `model::cache_runner::
-  spawn_partclone_scan` extracted from the Inspect view; Inspect *and* Commander
-  share it. Commander now browses a Clonezilla partition end-to-end (scan on
-  first open, persisted cache after).
-- **Phase 4 — Inspect adopts the resolver (DEFERRED — needs GUI validation +
-  resolver expansion).** Inspect already shares the loader (`load_backup`), the
-  gates (Phase 1), and the cache runner (Phase 3); the remaining duplication is
-  the *per-compression open routing* in `inspect_tab::open_browse`. Forcing
-  Inspect onto `session_for_backup_partition` would **regress** its chd / woz /
-  single-file-chd browsing and its zstd **seekable-cache** upgrade + archive-edit
-  context — the resolver only covers the read-only none/zstd subset. The clean
-  path (a follow-up, GUI-validated): add `BrowseView::open_with_session(session)`
-  (BrowseView already owns a `BrowseSession`), extend the resolver to all five
-  compressions + the single-file-chd case, then route Inspect's `open_browse`
-  through it and layer the edit contexts on top. Until then, per CONTRIBUTING's
-  "don't unify genuinely-different shapes" rule, the richer Inspect open path and
-  the read-only Commander subset stay separate over the shared `BrowseSession`.
+Status in brief: Phase 1 (gates → `fs/`, `3a4c208`), Phase 2 (shared backup
+resolver, `60548a2`), Phase 3 (cache-scan runner, `3e5fc5a`), the CHD-backup fix
+(`c1a7c2a`), and the CONTRIBUTING layering rule (`e188812`) are **done** — both
+reported bugs are fixed. **Phase 4** (Inspect adopting the resolver — the GUI
+unification) plus stragglers A–D (image probing, session building, the Clonezilla
+cache decision tree, single-file-chd convergence) remain; all need the running
+GUI to validate. See the plan doc.
 
 ## Hands-on test checklist (round-4 — run in `cargo run`)
 
