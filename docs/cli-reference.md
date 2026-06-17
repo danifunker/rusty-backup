@@ -745,6 +745,8 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
+- `--inodes` — EFS only: approximate total inode count (the formatter scales its cylinder groups to hit roughly this many). Mutually exclusive with `--bytes-per-inode`
+- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Default is ~4 KiB/inode. Mutually exclusive with `--inodes`. (`new --fs efs` is also streamed to the output file, so large bare EFS volumes don't materialize in memory.)
 
 ### `new-x68k-hdd`
 
@@ -770,9 +772,9 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 
 ### `new-sgi-hdd`
 
-Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table at sector 0 wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 as a SCSI HDD. Unlike `new --fs efs` (a *bare* EFS superfloppy / CD-ROM), this is a real hard disk that `fx`/`prtvtoc` recognize. Populate it with the ordinary verbs: `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`.
+Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table at sector 0 wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 as a SCSI HDD. Unlike `new --fs efs` (a *bare* EFS superfloppy / CD-ROM), this is a real hard disk that `fx`/`prtvtoc` recognize. Populate it with the ordinary verbs: `put IMG@1 host/file /file`, then `ls` / `get` / `fsck`. Confirmed to mount and read on real IRIX 5.3.
 
-The volume header places slot 8 VOLHDR (first=0, the volume-header region), slot 10 VOLUME (first=0, the whole disk), and slot 0 EFS (the root partition, after the cylinder-aligned VOLHDR region). Geometry is derived from `--size` and cylinder-aligned. The on-disk header round-trips through rb-cli's own SGI parser; real-IRIX `fx`/`prtvtoc`/`mount -t efs` validation is a manual check (needs hardware/emulator).
+The volume header places slot 8 VOLHDR (first=0, the volume-header region), slot 10 VOLUME (first=0, the whole disk), and slot 0 EFS (the root partition, after the cylinder-aligned VOLHDR region). The EFS root is a multi-cylinder-group volume whose inode count scales with size. The image is streamed directly to the output file (only non-zero regions are written; the rest stays sparse), so disks of any size are created without materializing them in memory.
 
 ```
 Usage: new-sgi-hdd [OPTIONS] <IMAGE>
@@ -787,8 +789,10 @@ Usage: new-sgi-hdd [OPTIONS] <IMAGE>
 - `--size` — Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `50M`). Rounded up to a whole cylinder. Defaults to `50M`
 - `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
 - `--fs` — Root filesystem to format. Only `efs` is supported today (IRIX 5.3-6.5)
-- `--heads` — Heads (tracks per cylinder). Defaults to 16. Governs cylinder alignment + the geometry `fx`/`prtvtoc` report; EFS uses its own layout
-- `--sectors` — Sectors per track (512-byte sectors). Defaults to 128, which with 16 heads gives clean 1 MiB cylinders
+- `--heads` — Heads (tracks per cylinder). Defaults to 16. **Must match the geometry the target drive reports** — IRIX `fx` rejects the volume header otherwise (the disk then won't mount)
+- `--sectors` — Sectors per track (512-byte sectors). Defaults to 63 (the IRIS emulator's / typical SGI SCSI value; 16 × 63 = 1008-sector cylinders). Like `--heads`, must match the drive's geometry
+- `--inodes` — Approximate total inode count for the EFS root (the formatter scales its cylinder groups to hit roughly this many). Mutually exclusive with `--bytes-per-inode`
+- `--bytes-per-inode` — EFS inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Default is ~4 KiB/inode. Mutually exclusive with `--inodes`
 
 ### `optical`
 
