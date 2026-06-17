@@ -105,22 +105,35 @@ running GUI that each source still **browses *and* edits**:
 
 ## Remaining work
 
-### Straggler A — unify image partition probing (3 copies → 1)
+### Straggler A — unify image partition probing ✅ DONE
 
-"Peel container → detect table → list partitions" is implemented three times:
-`commander_source::probe_partitions`, `inspect_tab` (inline `PartitionTable::
-detect` with image-wrapper handling, ~`inspect_tab.rs:2860`), and `cli/resolve.rs`
-(inline `PartitionTable::detect`, ~`:201`). Promote one shared model fn (extend
-`commander_source::probe_partitions`, or a `model::source` probe) that all three
-call. This is what makes **every image container — CHD, GHO, IMZ, VHD, … —
-probe identically everywhere** (see the `.GHO` note below).
+~~"Peel container → detect table → list partitions" three times~~ — done in
+`56760e7`. The peel step is now one shared primitive,
+`source_reader::open_peeled_read(path, password)`: CHD / GHO / IMZ / flat-floppy
+containers decode via `open_read`; VHD / 2MG / DMG / DiskCopy 4.2 wrappers unwrap
+via the format pipeline; a raw image falls through to a buffered file.
+`commander_source::probe_partitions` and the CLI's streaming resolver
+(`cli/resolve.rs`) both call it, so a `.vhd` / `.chd` / … probes identically in
+the GUI and the CLI (the CLI streaming path previously read image wrappers raw
+and mis-detected their table). **Inspect's `run_inspect` keeps its own
+device-aware pipeline** — it needs the elevated device handle for the downstream
+per-partition probes (HFS-variant, block size, minimum size) and special-cases
+CD-CHD cooked sectors, neither of which the path-based primitive models — so it
+is intentionally not folded onto it; its file-peeling uses the same detect+wrap
+logic by construction.
 
-### Straggler B — unify image per-partition session building
+### Straggler B — unify image per-partition session building — WON'T DO (documented)
 
-Inspect builds the open via `browse_view.open(path, offset, type, …)`; Commander
-via `commander_source::session_for(path, part)`. Both produce a `BrowseSession`.
-Fold Inspect onto `session_for` + `BrowseView::open_with_session` (rides on
-Phase 4 / Straggler A).
+Considered and declined. Inspect builds the image/device open via
+`browse_view.open(path, offset, type, …)`; Commander via
+`commander_source::session_for(path, part)`. They look similar but Inspect's
+`open()` additionally carries things `session_for` does not and should not model:
+the macOS pre-opened (elevated) device fd, `/dev` device paths, the edit policy
+(`edit_supported` + the WOZ archive-edit context), and the Amiga drive-name
+label. The only genuinely duplicated logic is the 4-line "use the partition type
+byte, or infer it from the type name when zero" rule (in the Inspect grid and
+both resolver session builders) — too small to justify restructuring the most-
+used (device-inclusive, hardware-validated) browse path. Left as-is by decision.
 
 ### Straggler C — unify the Clonezilla cache-lookup decision tree ✅ DONE
 
@@ -132,12 +145,22 @@ removal. Inspect and Commander each hold a store; both call `resolve` then hand
 a `NeedsScan` cache to `cache_runner::spawn_partclone_scan` and `insert` the
 result on completion. Commander gained the in-memory reuse it lacked.
 
-### Straggler D — single-file-chd: converge the two approaches
+### Straggler D — single-file-chd: converge the two approaches ✅ DONE
 
-Inspect redirects the whole source to `<folder>/<container>` and inspects the
-`.chd` as an image (`single_file_chd_backup_folder`); Commander opens the
-container per-partition in `ResolvedBackup::open_partition`. Pick one (the
-resolver path) once Phase 4 lands.
+Converged on **Inspect's "it's a CHD image" model**, not the resolver's
+metadata-driven one. A single-file-chd backup is a CHD disk image that happens to
+live in a backup folder, so the ground truth is the container's own on-disk
+partition table. Inspect already opened the `.chd` as an image and parsed that
+table; Commander instead trusted `metadata.json`'s stored partition list.
+
+`resolve_backup` now (commit pending) probes the real `.chd` table via
+`probe_partitions(folder/container)` for a single-file-chd backup (falling back
+to the metadata list if the probe fails), so Commander's partition dropdown and
+`open_partition` use the same ground-truth table Inspect does — and the same path
+a plain `.chd` file takes. Inspect is unaffected (it doesn't use `resolve_backup`;
+it keeps its `single_file_chd_backup_folder` image redirect, which already parses
+the real table). The two front ends now treat single-file-chd identically: as a
+CHD image.
 
 ## Not a straggler / out of scope
 
@@ -166,15 +189,19 @@ resolver path) once Phase 4 lands.
       Clonezilla / single-file-chd) through the **shared model** resolver
       functions + `BrowseSession`; `inspect_tab::open_browse`'s per-compression
       ladder is gone (Phase 4). *Inspect routes via the free functions, not a
-      stored `ResolvedBackup` — full adoption + single-file-chd convergence is
-      Stragglers B/D.* **Pending GUI validation** (see checklist above).
-- [ ] Image partition probing is one shared fn (Straggler A); CLI calls it too.
+      stored `ResolvedBackup` (Straggler B — won't-do, documented). single-file-
+      chd converged on Inspect's "CHD image" model (Straggler D).* GUI-validated.
+- [x] Image partition probing is one shared peel primitive
+      (`source_reader::open_peeled_read`); Commander + CLI call it (Straggler A).
+      Inspect's device-aware `run_inspect` intentionally keeps its own pipeline.
 - [x] The Clonezilla cache decision tree is in the model, shared (Straggler C —
       `PartcloneCacheStore`).
 - [ ] A new `src/tui/` could list + open any source using only `model::` —
-      no resolution code of its own.
+      no resolution code of its own. *(Untested — no TUI exists yet, but the
+      resolver + `BrowseSession` + cache store are all egui-free.)*
 - [ ] CLI keeps `cli/resolve.rs` but re-uses the gates / `resolve_backup` /
-      `cache_runner` for any browse-shaped feature it adds.
+      `cache_runner` for any browse-shaped feature it adds. *(CLI now shares the
+      peel primitive; a `rb-cli browse <clonezilla>` verb would reuse the rest.)*
 
 ## Resume prompt — Phase 4 (EXECUTED — kept for history)
 

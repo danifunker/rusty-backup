@@ -289,11 +289,31 @@ pub struct ClonezillaOpen {
 /// its partition list + open context.
 pub fn resolve_backup(folder: &Path) -> Result<ResolvedBackup> {
     match backup_loader::load_backup(folder)? {
-        LoadOutcome::Backup(o) => Ok(ResolvedBackup::Native {
-            folder: folder.to_path_buf(),
-            metadata: Box::new(o.metadata),
-            partitions: o.partitions,
-        }),
+        LoadOutcome::Backup(o) => {
+            // A single-file-chd backup *is* a CHD disk image that happens to
+            // live in a backup folder. Treat it the way the Inspect tab does —
+            // and the way a plain `.chd` file opens — by probing the container's
+            // real on-disk partition table instead of trusting the stored
+            // metadata list, so Commander's partition dropdown and the per-
+            // partition open agree with the ground truth. If the probe fails
+            // for any reason, fall back to the metadata partitions.
+            let chd_container = if o.metadata.layout == BackupLayout::SingleFileChd {
+                o.metadata.container.clone()
+            } else {
+                None
+            };
+            let partitions = match chd_container {
+                Some(container) => {
+                    probe_partitions(&folder.join(container)).unwrap_or(o.partitions)
+                }
+                None => o.partitions,
+            };
+            Ok(ResolvedBackup::Native {
+                folder: folder.to_path_buf(),
+                metadata: Box::new(o.metadata),
+                partitions,
+            })
+        }
         LoadOutcome::Clonezilla(o) => Ok(ResolvedBackup::Clonezilla {
             folder: folder.to_path_buf(),
             image: Box::new(o.image),
