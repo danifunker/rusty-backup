@@ -189,7 +189,10 @@ impl CommanderMode {
             let full_h = ui.available_height();
             let full_w = ui.available_width();
             let mid_w = 132.0;
-            let pane_w = ((full_w - mid_w) / 2.0 - 8.0).max(200.0);
+            // Reserve room for the two separators + the item spacing between the
+            // five horizontal items, so the right pane isn't clipped off-edge.
+            let gaps = ui.spacing().item_spacing.x * 4.0 + 16.0;
+            let pane_w = ((full_w - mid_w - gaps) / 2.0).max(180.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(pane_w, full_h),
