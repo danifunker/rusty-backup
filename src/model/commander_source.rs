@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
-use crate::backup::metadata::BackupMetadata;
+use crate::backup::metadata::{BackupLayout, BackupMetadata};
 use crate::clonezilla::block_cache::PartcloneBlockCache;
 use crate::clonezilla::metadata::ClonezillaImage;
 use crate::fs::zstd_stream::ZstdStreamCache;
@@ -96,10 +96,12 @@ pub fn session_for(path: &Path, part: &PartitionInfo) -> BrowseSession {
 /// the backup's own `PartitionMetadata`, with the same FAT-from-name inference
 /// [`session_for`] uses for a zero type byte.
 ///
-/// Supported compressions: `none` (raw, opened via `source_path`) and `zstd`
-/// (streamed through a [`ZstdStreamCache`]). CHD / WOZ / Clonezilla backups need
-/// the heavier reader/cache machinery the Inspect tab carries and are not yet
-/// browsable from a Commander pane — those return an error the pane surfaces.
+/// Handles the **per-partition** compressions `none` (raw, opened via
+/// `source_path`) and `zstd` (streamed through a [`ZstdStreamCache`]); per-
+/// partition `woz` still returns an error. The other backup shapes are routed by
+/// [`ResolvedBackup::open_partition`] before reaching here: a CHD backup is the
+/// single-file-chd layout (opened as a CHD image), and Clonezilla images go
+/// through the partclone block cache.
 pub fn session_for_backup_partition(
     folder: &Path,
     metadata: &BackupMetadata,
@@ -240,10 +242,33 @@ impl ResolvedBackup {
     pub fn open_partition(&self, part_index: usize) -> Result<BackupPartitionOpen> {
         match self {
             ResolvedBackup::Native {
-                folder, metadata, ..
-            } => Ok(BackupPartitionOpen::Session(session_for_backup_partition(
-                folder, metadata, part_index,
-            )?)),
+                folder,
+                metadata,
+                partitions,
+            } => {
+                // A CHD backup uses the single-file-chd layout: one `.chd`
+                // container holding the whole disk (partition table at sector 0,
+                // partitions at their declared offsets), with no per-partition
+                // data files. Browse it like a CHD *image* — open the container
+                // at the partition's offset, the same redirect the Inspect tab
+                // performs.
+                if metadata.layout == BackupLayout::SingleFileChd {
+                    let container = metadata
+                        .container
+                        .as_deref()
+                        .context("single-file-chd backup is missing its container filename")?;
+                    let chd_path = folder.join(container);
+                    let part = partitions
+                        .iter()
+                        .find(|p| p.index == part_index)
+                        .with_context(|| format!("partition {part_index} not found in backup"))?;
+                    Ok(BackupPartitionOpen::Session(session_for(&chd_path, part)))
+                } else {
+                    Ok(BackupPartitionOpen::Session(session_for_backup_partition(
+                        folder, metadata, part_index,
+                    )?))
+                }
+            }
             ResolvedBackup::Clonezilla { folder, image, .. } => {
                 let cz = image
                     .partitions
@@ -445,6 +470,48 @@ mod tests {
                 assert_eq!(fs.volume_label(), Some("RESV"));
             }
             _ => panic!("a native backup partition should open as a Session"),
+        }
+    }
+
+    /// A single-file-chd backup (a CHD backup — the only CHD layout) opens its
+    /// `.chd` container as an image at the partition's byte offset, not via
+    /// per-partition data files (which it doesn't have). Regression guard for
+    /// the "partition N has no data files listed" bug on CHD backups.
+    #[test]
+    fn single_file_chd_backup_opens_container_at_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut meta = one_partition_meta("chd", "", 4096);
+        meta.layout = BackupLayout::SingleFileChd;
+        meta.container = Some("disk.chd".into());
+        meta.partitions[0].start_lba = 2048;
+        meta.partitions[0].compressed_files = vec![]; // single-file-chd has none
+        let part = PartitionInfo {
+            index: 0,
+            type_name: "Apple_HFS".into(),
+            partition_type_byte: 0,
+            start_lba: 2048,
+            start_byte: None,
+            size_bytes: 4096,
+            bootable: false,
+            is_logical: false,
+            is_extended_container: false,
+            partition_type_string: Some("Apple_HFS".into()),
+            hfs_block_size: None,
+            rdb_part_block: None,
+            drv_name: None,
+        };
+        let resolved = ResolvedBackup::Native {
+            folder: dir.path().to_path_buf(),
+            metadata: Box::new(meta),
+            partitions: vec![part],
+        };
+        match resolved.open_partition(0).expect("open") {
+            BackupPartitionOpen::Session(s) => {
+                assert_eq!(s.source_path, Some(dir.path().join("disk.chd")));
+                assert_eq!(s.partition_offset, 2048 * 512);
+                assert_eq!(s.partition_type_string.as_deref(), Some("Apple_HFS"));
+            }
+            _ => panic!("single-file-chd should open as a Session over the container"),
         }
     }
 
