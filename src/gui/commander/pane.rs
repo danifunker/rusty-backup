@@ -25,14 +25,17 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
+use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
+use rusty_backup::model::status::BlockCacheScan;
 use rusty_backup::partition::{format_size, PartitionInfo};
 
 use super::Side;
@@ -110,6 +113,10 @@ pub(crate) struct CommanderPane {
     pending_open: Option<Arc<Mutex<BrowseOpenStatus>>>,
     /// In-flight async apply (spinner) from `commander_ops::spawn_apply`.
     pending_apply: Option<Arc<Mutex<ApplyStatus>>>,
+    /// In-flight Clonezilla metadata scan (spinner) from
+    /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
+    /// partclone-cache session and hands off to `pending_open`.
+    pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
     /// Phase text shown next to the spinner while `pending_open` is live.
     open_phase: String,
     /// Volume metadata captured on open, for the source-bar readout.
@@ -178,6 +185,7 @@ impl CommanderPane {
             queue: EditQueue::new(),
             pending_open: None,
             pending_apply: None,
+            pending_scan: None,
             open_phase: String::new(),
             volume_label: String::new(),
             fs_type: String::new(),
@@ -209,6 +217,9 @@ impl CommanderPane {
         if let Some(s) = self.poll_apply(ui.ctx()) {
             status = Some(s);
         }
+        if let Some(s) = self.poll_scan(ui.ctx()) {
+            status = Some(s);
+        }
         let mut copy_to_other = false;
         let mut export_to_host = false;
         let mut checksums = false;
@@ -227,6 +238,13 @@ impl CommanderPane {
                 ui.add_space(8.0);
                 ui.spinner();
                 ui.label("Applying staged edits...");
+            });
+        } else if self.pending_scan.is_some() {
+            ui.add_space(20.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label("Scanning Clonezilla metadata (first open of this partition)...");
             });
         } else if self.pending_open.is_some() {
             ui.add_space(20.0);
@@ -833,7 +851,9 @@ impl CommanderPane {
             // are immediate and never staged, and backups are read-only).
             if !self.listing.is_host() && self.resolved_backup.is_none() {
                 let n = self.queue.len();
-                let busy = self.pending_apply.is_some() || self.pending_open.is_some();
+                let busy = self.pending_apply.is_some()
+                    || self.pending_open.is_some()
+                    || self.pending_scan.is_some();
                 ui.add_enabled_ui(n > 0 && !busy, |ui| {
                     if ui.button(format!("Apply ({n})")).clicked() {
                         status = Some(self.apply());
@@ -892,7 +912,9 @@ impl CommanderPane {
                 // New Folder: stages a CreateDirectory on an image pane;
                 // creates it immediately on a host pane. Not offered on a
                 // read-only backup pane.
-                let busy = self.pending_apply.is_some() || self.pending_open.is_some();
+                let busy = self.pending_apply.is_some()
+                    || self.pending_open.is_some()
+                    || self.pending_scan.is_some();
                 if !busy
                     && self.resolved_backup.is_none()
                     && ui
@@ -939,6 +961,7 @@ impl CommanderPane {
         self.queue.clear();
         self.pending_open = None;
         self.pending_apply = None;
+        self.pending_scan = None;
         self.open_phase.clear();
         self.volume_label.clear();
         self.fs_type.clear();
@@ -1139,6 +1162,7 @@ impl CommanderPane {
         self.error = None;
         self.listing = DirListing::new();
         self.queue.clear();
+        self.pending_scan = None;
 
         // Non-filesystem partitions (APM driver / partition-map entries, EFI,
         // ...) can't be browsed — surface a clear message instead of letting
@@ -1167,17 +1191,27 @@ impl CommanderPane {
             Some(Ok(BackupPartitionOpen::Session(s))) => s,
             Some(Ok(BackupPartitionOpen::Clonezilla(open))) => {
                 match commander_source::load_partclone_cache(&open) {
+                    // A prior scan is on disk — browse it immediately.
                     Some(cache) => {
                         commander_source::session_for_partclone_cache(cache, open.partition_type)
                     }
+                    // No scan yet — build the partclone block cache on a worker
+                    // thread (shared runner); `poll_scan` opens it when ready.
                     None => {
-                        // No on-disk scan yet — building it is the cache runner's
-                        // job (next phase). Point the user at Inspect for now.
-                        let msg = "Clonezilla metadata not built yet -- open this \
-                                   partition once in the Inspect tab to build the \
-                                   cache, then reopen it here.";
-                        self.error = Some(msg.to_string());
-                        return format!("[{}] {msg}", self.side.label());
+                        let cache =
+                            Arc::new(Mutex::new(PartcloneBlockCache::new(open.partclone_files)));
+                        self.pending_scan = Some(cache_runner::spawn_partclone_scan(
+                            cache,
+                            part.index,
+                            open.partition_type,
+                            open.cache_path,
+                        ));
+                        self.open_phase = "Scanning Clonezilla metadata...".to_string();
+                        return format!(
+                            "[{}] scanning Clonezilla metadata for {} ...",
+                            self.side.label(),
+                            partition_label(&part)
+                        );
                     }
                 }
             }
@@ -1199,6 +1233,35 @@ impl CommanderPane {
             self.side.label(),
             partition_label(&part)
         )
+    }
+
+    /// Poll an in-flight Clonezilla metadata scan; on completion, build a
+    /// partclone-cache session and hand off to the normal async-open path (so
+    /// `poll_open` loads the root listing). Returns a status line on completion.
+    fn poll_scan(&mut self, ctx: &egui::Context) -> Option<String> {
+        let arc = self.pending_scan.clone()?;
+        ctx.request_repaint();
+        let mut guard = arc.lock().ok()?;
+        if !guard.finished {
+            return None;
+        }
+        self.pending_scan = None;
+        if let Some(err) = guard.error.take() {
+            drop(guard);
+            self.error = Some(format!("Clonezilla metadata scan failed: {err}"));
+            return Some(format!("[{}] Clonezilla scan failed.", self.side.label()));
+        }
+        let cache = Arc::clone(&guard.cache);
+        let partition_type = guard.partition_type;
+        drop(guard);
+        let session = commander_source::session_for_partclone_cache(cache, partition_type);
+        self.open_phase = "Opening...".to_string();
+        self.pending_open = Some(session.spawn_open());
+        self.session = Some(session);
+        Some(format!(
+            "[{}] metadata ready; opening...",
+            self.side.label()
+        ))
     }
 
     /// Poll an in-flight open; on completion, hand the filesystem + root listing

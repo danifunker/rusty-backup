@@ -4940,35 +4940,14 @@ impl InspectTab {
             partition::format_size(cz_part.size_bytes()),
         ));
 
+        // The scan runs on a worker thread; the spawn lives in the shared model
+        // runner so Commander Mode uses the same code path.
         let cache = Arc::new(Mutex::new(
             clonezilla::block_cache::PartcloneBlockCache::new(cz_part.partclone_files.clone()),
         ));
-
-        let scan = Arc::new(Mutex::new(BlockCacheScan {
-            finished: false,
-            error: None,
-            partition_index: part_index,
-            partition_type: ptype,
-            cache: Arc::clone(&cache),
-        }));
-        self.block_cache_scan = Some(Arc::clone(&scan));
-
-        let cache_for_thread = Arc::clone(&cache);
-        std::thread::spawn(move || {
-            let _wake =
-                rusty_backup::os::wakelock::acquire("Rusty Backup: Clonezilla metadata scan");
-            let result = clonezilla::metadata_scan::scan_metadata(
-                &cache_for_thread,
-                ptype,
-                Some(&cache_path),
-            );
-            if let Ok(mut s) = scan.lock() {
-                s.finished = true;
-                if let Err(e) = result {
-                    s.error = Some(format!("{e:#}"));
-                }
-            }
-        });
+        self.block_cache_scan = Some(rusty_backup::model::cache_runner::spawn_partclone_scan(
+            cache, part_index, ptype, cache_path,
+        ));
     }
 
     /// Open browse for a native zstd-compressed backup.
