@@ -283,7 +283,7 @@ impl CommanderMode {
     fn render_middle(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let mut status = None;
         ui.add_space(60.0);
-        let w = egui::vec2(116.0, 26.0);
+        let sz = egui::vec2(100.0, 48.0);
 
         // A copy needs a selection on the source and a ready destination, and no
         // host-write already in flight.
@@ -291,28 +291,49 @@ impl CommanderMode {
         let l_can = idle && self.left.has_selection() && self.right.can_receive();
         let r_can = idle && self.right.has_selection() && self.left.can_receive();
 
-        if ui
-            .add_enabled(l_can, egui::Button::new("Copy >>").min_size(w))
-            .on_hover_text("Copy the left pane's selection into the right pane")
-            .clicked()
+        // Pictured buttons (procedurally painted — no font glyphs, no assets):
+        // stacked floppies + arrow for copy, a floppy with a red X for delete,
+        // and "101=011?" for the (disabled) compare.
+        if icon_button(
+            ui,
+            sz,
+            l_can,
+            "Copy the left pane's selection into the right pane",
+            |p, r, c| draw_copy_icon(p, r, c, true),
+        )
+        .clicked()
         {
             status = Some(self.copy(Side::Left));
         }
         ui.add_space(6.0);
-        if ui
-            .add_enabled(r_can, egui::Button::new("Copy <<").min_size(w))
-            .on_hover_text("Copy the right pane's selection into the left pane")
-            .clicked()
+        if icon_button(
+            ui,
+            sz,
+            r_can,
+            "Copy the right pane's selection into the left pane",
+            |p, r, c| draw_copy_icon(p, r, c, false),
+        )
+        .clicked()
         {
             status = Some(self.copy(Side::Right));
         }
         ui.add_space(12.0);
         // Delete is staged per-pane via right-click; Compare is deferred.
-        ui.add_enabled(false, egui::Button::new("Delete").min_size(w))
-            .on_hover_text("Use the row right-click menu to delete");
+        icon_button(
+            ui,
+            sz,
+            false,
+            "Use the row right-click menu to delete",
+            draw_delete_icon,
+        );
         ui.add_space(12.0);
-        ui.add_enabled(false, egui::Button::new("Compare").min_size(w))
-            .on_hover_text("Not implemented yet");
+        icon_button(
+            ui,
+            sz,
+            false,
+            "Compare — not implemented yet",
+            draw_compare_icon,
+        );
         ui.add_space(12.0);
         ui.checkbox(&mut self.keep_dates, "Keep original dates")
             .on_hover_text(
@@ -771,4 +792,107 @@ impl CommanderMode {
             self.detail = None;
         }
     }
+}
+
+// --- procedural button icons -----------------------------------------------
+// Painted with the egui Painter (rects/lines/text) rather than a font glyph
+// (the default font has no symbols) or bundled image assets (no image-loader
+// pipeline is wired). A first cut — easy to refine the proportions later.
+
+/// A clickable, button-shaped rect with a custom-painted icon instead of a text
+/// label. Mimics an egui button's fill + hover/disabled styling. `draw` paints
+/// the icon into the inset rect with the given foreground color.
+fn icon_button(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    enabled: bool,
+    hover: &str,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let wv = if enabled {
+        *ui.style().interact(&resp)
+    } else {
+        ui.visuals().widgets.noninteractive
+    };
+    let icon_color = if enabled {
+        wv.fg_stroke.color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let bg = wv.weak_bg_fill;
+    let cr = wv.corner_radius;
+    let painter = ui.painter();
+    painter.rect_filled(rect, cr, bg);
+    draw(painter, rect.shrink(8.0), icon_color);
+    resp.on_hover_text(hover)
+}
+
+/// A classic 3.5" floppy: a square body with a darker shutter near the top and
+/// a lighter label across the bottom.
+fn draw_floppy(p: &egui::Painter, center: egui::Pos2, side: f32, color: egui::Color32) {
+    let body = egui::Rect::from_center_size(center, egui::vec2(side, side));
+    p.rect_filled(body, 1.0, color);
+    let shutter = egui::Rect::from_min_size(
+        egui::pos2(center.x - side * 0.18, body.top() + side * 0.12),
+        egui::vec2(side * 0.5, side * 0.28),
+    );
+    p.rect_filled(shutter, 0.0, egui::Color32::from_black_alpha(130));
+    let label = egui::Rect::from_min_size(
+        egui::pos2(body.left() + side * 0.16, center.y + side * 0.04),
+        egui::vec2(side * 0.68, side * 0.34),
+    );
+    p.rect_filled(label, 0.0, egui::Color32::from_white_alpha(120));
+}
+
+/// Two stacked floppies on the left and an arrow on the right (pointing right
+/// for L->R, left for R->L).
+fn draw_copy_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32, rightward: bool) {
+    let side = (r.height() * 0.7).min(22.0);
+    let cy = r.center().y;
+    let fx = r.left() + side * 0.7;
+    draw_floppy(p, egui::pos2(fx - 3.0, cy - 3.0), side, color); // back
+    draw_floppy(p, egui::pos2(fx + 3.0, cy + 3.0), side, color); // front
+    let stroke = egui::Stroke::new(2.5, color);
+    let ax0 = r.center().x + 8.0;
+    let ax1 = r.right() - 2.0;
+    let (tail, head) = if rightward { (ax0, ax1) } else { (ax1, ax0) };
+    p.line_segment([egui::pos2(tail, cy), egui::pos2(head, cy)], stroke);
+    let d = if rightward { -1.0 } else { 1.0 };
+    p.line_segment(
+        [egui::pos2(head, cy), egui::pos2(head + d * 5.0, cy - 4.0)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(head, cy), egui::pos2(head + d * 5.0, cy + 4.0)],
+        stroke,
+    );
+}
+
+/// A floppy with a bold red X over it.
+fn draw_delete_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let side = (r.height() * 0.8).min(26.0);
+    draw_floppy(p, egui::pos2(r.center().x - 5.0, r.center().y), side, color);
+    let red = egui::Color32::from_rgb(220, 70, 70);
+    let stroke = egui::Stroke::new(3.0, red);
+    let h = side * 0.55;
+    let xc = egui::pos2(r.center().x + 8.0, r.center().y);
+    p.line_segment([xc + egui::vec2(-h, -h), xc + egui::vec2(h, h)], stroke);
+    p.line_segment([xc + egui::vec2(-h, h), xc + egui::vec2(h, -h)], stroke);
+}
+
+/// "101=011?" — two binary numbers compared, with a question mark.
+fn draw_compare_icon(p: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        "101=011?",
+        egui::FontId::monospace(12.0),
+        color,
+    );
 }
