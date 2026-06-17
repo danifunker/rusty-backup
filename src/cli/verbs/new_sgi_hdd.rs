@@ -45,13 +45,17 @@ pub struct NewSgiHddArgs {
     #[arg(long, value_enum, default_value = "efs")]
     pub fs: SgiFs,
 
-    /// Heads (tracks per cylinder). Geometry only governs cylinder alignment
-    /// and the values `fx`/`prtvtoc` report; EFS uses its own layout.
+    /// Heads (tracks per cylinder). Must match the geometry the target drive
+    /// reports over SCSI: IRIX `fx` rejects the volume header if its geometry
+    /// disagrees with the drive, which stops the disk from mounting. The IRIS
+    /// emulator and typical SGI SCSI HDDs report 16 heads; change this only for
+    /// a drive you know reports otherwise.
     #[arg(long, default_value_t = DEFAULT_HEADS)]
     pub heads: u16,
 
-    /// Sectors per track (512-byte sectors). Default 128, which with 16 heads
-    /// gives clean 1 MiB cylinders.
+    /// Sectors per track (512-byte sectors). Like `--heads`, must match the
+    /// drive's reported geometry or IRIX `fx` rejects the label. Default 63
+    /// (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders).
     #[arg(long, default_value_t = DEFAULT_SECTORS_PER_TRACK)]
     pub sectors: u16,
 }

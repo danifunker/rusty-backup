@@ -37,13 +37,17 @@ fn sgi_efs_hdd_create_put_fsck_get_roundtrip() {
     let img_s = img.to_str().unwrap();
     let at1 = format!("{img_s}@1");
 
-    // 1. Synthesize a 50 MiB SGI/EFS hard disk. 50 MiB → a 48 MiB EFS root,
+    // 1. Synthesize a 50 MiB SGI/EFS hard disk. 50 MiB → a ~48 MiB EFS root,
     //    which exercises the scaled-firstcg path (> 32 MiB).
     run(&["new-sgi-hdd", img_s, "--size", "50M", "--name", "TOOLBOX"]);
-    // The image is exactly the rounded disk size (50 MiB, whole cylinders).
+    // The image is rounded up to a whole number of 1008-sector (504 KiB)
+    // cylinders — at least the request, and an exact cylinder multiple.
+    let disk_len = std::fs::metadata(&img).unwrap().len();
+    let cylinder_bytes = 16 * 63 * 512; // heads × sectors × 512
+    assert!(disk_len >= 50 * 1024 * 1024, "disk is at least the request");
     assert_eq!(
-        std::fs::metadata(&img).unwrap().len(),
-        50 * 1024 * 1024,
+        disk_len % cylinder_bytes,
+        0,
         "disk is a whole-cylinder size"
     );
 

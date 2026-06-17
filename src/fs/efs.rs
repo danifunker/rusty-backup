@@ -148,6 +148,17 @@ impl EfsSuperblock {
         BigEndian::write_u32(&mut buf[88..92], self.checksum);
     }
 
+    /// Set `self.checksum` to the value IRIX expects for the current field
+    /// values. Serializes into a scratch buffer (so `fs_spare` and the
+    /// alignment pad are zeroed) and runs [`efs_superblock_checksum`] over
+    /// it. Call after every other field is final.
+    pub fn recompute_checksum(&mut self) {
+        let mut tmp = [0u8; EFS_SUPERBLOCK_SIZE];
+        self.checksum = 0;
+        self.write_into(&mut tmp);
+        self.checksum = efs_superblock_checksum(&tmp);
+    }
+
     fn label(&self) -> String {
         let n = trim_ascii(&self.fname);
         let p = trim_ascii(&self.fpack);
@@ -161,6 +172,33 @@ impl EfsSuperblock {
             format!("{n}:{p}")
         }
     }
+}
+
+/// Compute the EFS superblock checksum (IRIX 3.3+ "new" algorithm, used by
+/// both old-magic and new-magic volumes). XOR each big-endian 16-bit word of
+/// the superblock from offset 0 up to — but not including — the checksum field
+/// at offset 88 into a 32-bit accumulator, rotating the accumulator left by one
+/// bit after each word.
+///
+/// Verified byte-exact against a real IRIX-formatted SCSI disk
+/// (`fs_checksum = 0xfa73610a` reproduced from the on-disk superblock; see
+/// `docs/sgi_efs_hdd_irix_debug.md`). The Linux efs driver never checks this
+/// field, but IRIX's own mount / `fsck -t efs` validate it — a zero checksum is
+/// why our synthesized disks were rejected.
+pub(crate) fn efs_superblock_checksum(sb: &[u8]) -> u32 {
+    debug_assert!(
+        sb.len() >= 88,
+        "superblock buffer must cover offsets 0..88 for the checksum"
+    );
+    let mut c: u32 = 0;
+    let mut i = 0;
+    while i < 88 {
+        let word = ((sb[i] as u32) << 8) | sb[i + 1] as u32;
+        c ^= word;
+        c = c.rotate_left(1);
+        i += 2;
+    }
+    c
 }
 
 /// A single on-disk extent (8 bytes, big-endian).
@@ -1136,6 +1174,11 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// The primary write is the commit point — callers should
     /// sequence: data → inodes → bitmap → replica → primary.
     pub(crate) fn write_superblock_pair(&mut self) -> Result<(), FilesystemError> {
+        // Stamp the IRIX superblock checksum from the now-final fields. Any
+        // mutation path (edit-sync, resize) routes through here, so this keeps
+        // every disk we write self-validating for IRIX mount / fsck.
+        self.sb.recompute_checksum();
+
         let mut primary_sector = [0u8; EFS_BLOCKSIZE as usize];
         // Re-read the primary sector first so any pad/spare bytes the
         // sector held outside our serializer's coverage are preserved.
@@ -2346,6 +2389,19 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     let root_dirblock: u32 = firstcg + cgisize as u32;
     let replsb: u32 = total_blocks - 1;
 
+    // Free counts (advisory — IRIX uses these for `df`, not for mounting, but
+    // a wrong count makes `fsck -t efs` "fix" the volume on first boot). The
+    // single cylinder group's data region is `cgfsize - cgisize` blocks; we
+    // pre-allocate exactly two of them (the root dirblock and the trailing
+    // replica superblock, which lives at `replsb` inside the data region).
+    let data_blocks = cgfsize - cgisize as u32;
+    let tfree = data_blocks.saturating_sub(2);
+    // Inodes: `cgisize * 4` per cylinder group (128-byte inodes). Inodes 0 and
+    // 1 are reserved and inode 2 is the root directory we just wrote, so three
+    // are unavailable.
+    let total_inodes = cgisize as u32 * EFS_INODES_PER_BLOCK as u32;
+    let tinode = total_inodes.saturating_sub(3);
+
     let mut img = vec![0u8; total_blocks as usize * EFS_BLOCKSIZE as usize];
 
     let mut fname = [b' '; 6];
@@ -2354,7 +2410,7 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
     fname[..n].copy_from_slice(&nb[..n]);
     let fpack = fname;
 
-    let sb = EfsSuperblock {
+    let mut sb = EfsSuperblock {
         fs_size: total_blocks,
         firstcg,
         cgfsize,
@@ -2368,13 +2424,19 @@ pub fn create_blank_efs(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> 
         fname,
         fpack,
         bmsize,
-        tfree: 0, // not maintained by our reader; fsck recomputes if needed
-        tinode: 0,
-        bmblock: 2,
+        tfree,
+        tinode,
+        // Old-magic convention: bitmap location is computed (it lives at block
+        // 2, right after the primary superblock), so the field is left 0 — this
+        // matches real IRIX-formatted disks. `effective_bmblock()` resolves it.
+        bmblock: 0,
         replsb,
         lastialloc: 2, // last allocated inode = root
         checksum: 0,
     };
+    // Stamp the IRIX superblock checksum now that every other field is final.
+    // Without this IRIX rejects the volume on mount / fsck.
+    sb.recompute_checksum();
     let sb_off = EFS_BLOCKSIZE as usize;
     sb.write_into(&mut img[sb_off..sb_off + EFS_SUPERBLOCK_SIZE]);
     // Replica superblock at last block.
@@ -3073,6 +3135,62 @@ mod tests {
         assert!(root.is_directory());
         let entries = fs.list_directory(&root).expect("list root");
         assert!(entries.is_empty(), "fresh EFS must have an empty root");
+    }
+
+    /// Pins the EFS superblock checksum algorithm to a real IRIX-formatted SCSI
+    /// disk. The on-disk `fs_checksum` was `0xfa73610a` for these field values;
+    /// see `docs/sgi_efs_hdd_irix_debug.md`. If this breaks, IRIX will reject
+    /// every disk we synthesize.
+    #[test]
+    fn efs_checksum_matches_real_irix_disk() {
+        let mut sb = EfsSuperblock {
+            fs_size: 2_092_584,
+            firstcg: 513,
+            cgfsize: 41_021,
+            cgisize: 1_051,
+            sectors: 63,
+            heads: 10,
+            ncg: 51,
+            dirty: 0,
+            fs_time: 0x6a32_cc51,
+            magic: EFS_MAGIC_OLD,
+            fname: *b"noname",
+            fpack: *b"nopack",
+            bmsize: 261_573,
+            tfree: 2_038_446,
+            tinode: 214_397,
+            bmblock: 0,
+            replsb: 2_092_607,
+            lastialloc: 28,
+            checksum: 0,
+        };
+        sb.recompute_checksum();
+        assert_eq!(sb.checksum, 0xfa73_610a);
+    }
+
+    /// A freshly formatted volume stamps a checksum that validates, leaves
+    /// `bmblock` at the old-magic computed sentinel (0), and replicates both in
+    /// the trailing superblock.
+    #[test]
+    fn create_blank_efs_has_valid_checksum_and_bmblock() {
+        let img = create_blank_efs(8 * 1024 * 1024, "TEST").expect("format 8M EFS");
+        let sb = EfsSuperblock::parse(&img[512..512 + EFS_SUPERBLOCK_SIZE]).expect("parse sb");
+        assert_eq!(sb.bmblock, 0, "old-magic EFS leaves bmblock computed");
+        assert_ne!(sb.checksum, 0, "checksum must be stamped");
+
+        let stored = sb.checksum;
+        let mut probe = sb.clone();
+        probe.recompute_checksum();
+        assert_eq!(
+            probe.checksum, stored,
+            "stamped checksum must self-validate"
+        );
+
+        let rep_off = sb.replsb as usize * EFS_BLOCKSIZE as usize;
+        let rep =
+            EfsSuperblock::parse(&img[rep_off..rep_off + EFS_SUPERBLOCK_SIZE]).expect("parse repl");
+        assert_eq!(rep.checksum, stored, "replica carries the same checksum");
+        assert_eq!(rep.bmblock, 0);
     }
 
     #[test]

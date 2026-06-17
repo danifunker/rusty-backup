@@ -27,11 +27,18 @@ use crate::partition::sgi::{
 
 const SECTOR_SIZE: u64 = 512;
 
-/// Default heads (tracks per cylinder).
+/// Default heads (tracks per cylinder). Must match the geometry the target
+/// drive reports via SCSI MODE SENSE — the IRIS emulator (and typical SGI SCSI
+/// HDDs) synthesize 16 heads (`iris/src/scsi.rs`).
 pub const DEFAULT_HEADS: u16 = 16;
-/// Default sectors per track. With 512-byte sectors and 16 heads this gives a
-/// clean 1 MiB cylinder (16 × 128 × 512).
-pub const DEFAULT_SECTORS_PER_TRACK: u16 = 128;
+/// Default sectors per track (512-byte sectors). **Must** match the drive's
+/// reported geometry: IRIX `fx` compares the volume header's `device_parameters`
+/// against the geometry the drive reports and rejects the sgilabel ("disagrees
+/// with existing volume header parameters") if they differ — which keeps the
+/// disk from mounting at all. The IRIS emulator reports 63 sectors/track with
+/// 16 heads, so a cylinder is 16 × 63 = 1008 sectors (504 KiB). Verified against
+/// a real IRIX-formatted disk; see `docs/sgi_efs_hdd_irix_debug.md`.
+pub const DEFAULT_SECTORS_PER_TRACK: u16 = 63;
 /// Fixed volume-header region size (slot 8, VOLHDR), rounded up to a whole
 /// cylinder. 2 MiB matches the real IRIX fixture's volhdr region.
 const VOLHDR_REGION_BYTES: u64 = 2 * 1024 * 1024;
@@ -209,24 +216,27 @@ mod tests {
     use crate::partition::PartitionTable;
     use std::io::Cursor;
 
-    /// Default-geometry layout for a 50 MiB disk: 1 MiB cylinders, a 2 MiB
-    /// (2-cylinder) VOLHDR region, EFS filling the rest, all cylinder-aligned.
+    /// Default IRIS/SGI geometry: 16 heads × 63 sectors = 1008-sector (504 KiB)
+    /// cylinders. A 50 MiB request rounds up to a whole number of cylinders, the
+    /// VOLHDR region rounds 2 MiB up to whole cylinders, and EFS fills the rest.
     #[test]
     fn builds_expected_layout() {
         let (img, layout) =
             build_sgi_efs_hdd(&SgiHddOptions::new(50 * 1024 * 1024, "IRIX")).unwrap();
         assert_eq!(layout.heads, 16);
-        assert_eq!(layout.sectors_per_track, 128);
-        assert_eq!(layout.cylinder_sectors, 2048); // 1 MiB
-        assert_eq!(layout.cylinders, 50);
-        assert_eq!(layout.disk_sectors, 50 * 2048);
-        assert_eq!(layout.disk_bytes, 50 * 1024 * 1024);
+        assert_eq!(layout.sectors_per_track, 63);
+        assert_eq!(layout.cylinder_sectors, 1008); // 16 × 63 = 504 KiB
+                                                   // 50 MiB = 102400 sectors -> ceil(102400 / 1008) = 102 cylinders.
+        assert_eq!(layout.cylinders, 102);
+        assert_eq!(layout.disk_sectors, 102 * 1008);
+        assert_eq!(layout.disk_bytes, 102 * 1008 * 512);
         assert_eq!(img.len() as u64, layout.disk_bytes);
-        // VOLHDR = 2 MiB = 2 cylinders = 4096 sectors (matches the fixture).
-        assert_eq!(layout.volhdr_sectors, 4096);
-        assert_eq!(layout.efs_first_sector, 4096);
-        assert_eq!(layout.efs_sectors, 50 * 2048 - 4096);
-        // Disk size is a whole-cylinder multiple.
+        // VOLHDR region: 2 MiB rounds up to 5 cylinders (5040 sectors).
+        assert_eq!(layout.volhdr_sectors, 5040);
+        assert_eq!(layout.efs_first_sector, 5040);
+        assert_eq!(layout.efs_sectors, 102 * 1008 - 5040);
+        // Rounded up to at least the request, and a whole-cylinder multiple.
+        assert!(layout.disk_bytes >= 50 * 1024 * 1024);
         assert_eq!(layout.disk_sectors % layout.cylinder_sectors, 0);
     }
 

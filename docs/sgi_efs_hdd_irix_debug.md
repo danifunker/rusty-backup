@@ -1,10 +1,61 @@
-# SGI/IRIX EFS HDD synthesis — IRIX-mount debugging (resume)
+# SGI/IRIX EFS HDD synthesis — RESOLVED (real-IRIX validated)
 
-`rb-cli new-sgi-hdd` synthesizes a dvh-wrapped EFS IRIX hard disk. The rb-cli
-side is **done and validated** (create → inspect → put → fsck → get → cmp all
-pass, in CI). The **open problem** is the real-IRIX validation: a disk built by
-`new-sgi-hdd` does not yet visibly work when attached to the IRIS emulator. This
-doc is the handoff to continue that investigation.
+`rb-cli new-sgi-hdd` synthesizes a dvh-wrapped EFS IRIX hard disk.
+
+## RESOLVED 2026-06-17 — mounts + reads on real IRIX 5.3
+
+A disk built by the fixed `new-sgi-hdd` (`/Users/dani/irix-toolbox.img`,
+100 MiB) was attached to the IRIS emulator (IRIX 5.3, IP22) and **IRIX
+auto-mounted it** at `/disk2p0` — `ls -la /disk2p0` listed `HELLO.TXT` and
+`cat /disk2p0/HELLO.TXT` printed the file. Both blockers below are confirmed
+fixed end-to-end; `fx` accepted the sgilabel (no geometry complaint) and the
+single-cylinder-group EFS mounted fine, so the multi-CG work under "Remaining"
+turned out to be unnecessary for mounting. Everything from here down is the
+investigation record.
+
+## How it was cracked: both blockers, from the oracle disk
+
+The user supplied the oracle the prior handoff asked for — an IRIX-formatted
+1 GB SCSI disk at **`~/scsi3.raw`** (disk 0,3, mkfs_efs'd by IRIX, and it even
+contains IRIX's own writes: a `FromIRIX/` dir + `FromIrixText.txt`). Dumping it
+resolved **both** open unknowns, and the fixes are shipped on `commander-mode`:
+
+1. **dvh geometry (the blocker)** — the emulated SGI drive reports
+   **heads=16, sectors/track=63, cyls=ceil(total_sectors/1008)** via SCSI MODE
+   SENSE (source of truth: `~/repos/iris/src/scsi.rs:701-705`). We were writing
+   `secs=128`, so `fx` rejected the sgilabel ("disagrees with existing volume
+   header parameters") and IRIX never reached the EFS. **Fixed:**
+   `DEFAULT_SECTORS_PER_TRACK` 128 → **63** in `sgi_hdd_builder.rs`; cylinder is
+   now 16×63 = 1008 sectors. A generated disk's dvh geometry now equals the
+   drive's exactly (C×H×S == disk sectors).
+2. **EFS superblock `fs_checksum` (was the last unknown)** — **cracked** via
+   Aaru's `EFS/Checksum.cs` ("new"/IRIX-3.3+ algorithm) and validated byte-exact
+   against the oracle (`0xfa73610a`). Algorithm: XOR each **big-endian 16-bit**
+   word of the superblock over offsets `0..88` into a u32, **rotate-left-1**
+   after each word. Implemented as `efs::efs_superblock_checksum` +
+   `EfsSuperblock::recompute_checksum`; pinned by the
+   `efs_checksum_matches_real_irix_disk` unit test.
+3. Other superblock fixes from the oracle: **`fs_bmblock` 2 → 0** (old-magic
+   leaves it computed — bitmap is at block 2), and **`fs_tfree`/`fs_tinode`**
+   now computed (were 0). `write_superblock_pair` recomputes the checksum on
+   every mutation, so edited/resized EFS volumes stay valid too.
+
+**Our EFS reader was already correct** — it reads `~/scsi3.raw`'s real
+multi-cylinder-group volume (ncg=51) cleanly, listing `lost+found`, `FromIRIX`,
+`FromIrixText.txt`. The bug was purely on the synthesis side.
+
+**Caveat in the oracle:** `scsi3.raw`'s **dvh at sector 0 is zeroed** (the
+emulator never flushed the first ~4032 sectors to the backing file, though it
+flushed all the EFS data). So the oracle gave us the EFS layout + checksum but
+*not* the dvh bytes — the drive geometry came from the emulator source instead.
+
+**Confirmed working** on IRIX 5.3 (auto-mounted, file read — see RESOLVED block
+above). Single-CG (ncg=1) mounted fine, so the multi-CG work under "Remaining"
+is optional (only matters for inode count / authenticity, not mounting).
+
+---
+
+## (historical) original handoff follows
 
 ## What shipped (branch `commander-mode`)
 
@@ -42,19 +93,50 @@ there. Must confirm with an explicit manual mount before concluding anything.
   read the real fixture fine.
 - rb-cli round-trip (put/ls/fsck/get/cmp) is clean.
 
-## Known DIFFERENCES from the real fixture (suspects, not yet ruled in/out)
+## Known DIFFERENCES from the real fixture — now mostly RESOLVED
 
-Compared our superblock to `efs_small.img` (decompress: see script below):
+| field        | real         | ours (before) | status |
+|--------------|--------------|---------------|--------|
+| `fs_checksum`| computed     | `0`           | **FIXED** — algo cracked (see below), now stamped + validated |
+| `fs_tfree`   | real count   | `0`           | **FIXED** — computed in `create_blank_efs` |
+| `fs_tinode`  | real count   | `0`           | **FIXED** — computed (`cgisize*4*ncg - 3`) |
+| `fs_bmblock` | `0`          | `2`           | **FIXED** — now 0 (old-magic computed; bitmap stays at block 2) |
+| `ncg`/`heads`| 51 / 10      | 1 / 1         | **STILL single-CG** — legal EFS, but see "Remaining" |
 
-| field        | real fixture | ours        | note |
-|--------------|--------------|-------------|------|
-| `fs_checksum`| `0xde58a0b8` | `0`         | **couldn't reverse-engineer the algo** from the fixture alone (XOR/ADD × rotate × word-count brute force: no match). Linux efs driver does NOT validate it; IRIX *might*. |
-| `fs_tfree`   | real count   | `0`         | we never compute free blocks |
-| `fs_tinode`  | real count   | `0`         | we never compute free inodes |
-| `fs_bmblock` | `0`          | `2`         | `fs_bmblock` is "s2 only"; old-magic EFS (ours, `0x00072959`) computes the bitmap location, so real disks leave it 0 |
-| `ncg`/`heads`| 78 / 10      | 1 / 1       | ours is a single cylinder group, internally consistent but non-standard; IRIX EFS may assume the standard multi-CG layout |
+### The EFS superblock checksum algorithm (cracked + validated)
 
-`root nlink/size/numextents` also differ but are *correct* for our (tiny) content.
+From Aaru `Aaru.Filesystems/EFS/Checksum.cs` `ComputeChecksum` (the "new",
+IRIX-3.3+ variant, used by both old- and new-magic volumes). Validated against
+`~/scsi3.raw` (`0xfa73610a`):
+
+```
+c = 0u32
+for off in (0, 2, 4, ... 86):              # 44 big-endian 16-bit words, bytes 0..88
+    word = (sb[off] << 8) | sb[off+1]
+    c ^= word
+    c = c.rotate_left(1)                   # 32-bit rotate (carry = old bit 31)
+# c is fs_checksum; the field at 88..92 is excluded from the loop
+```
+
+(The "old"/pre-3.3 variant *shifts* instead of rotating — `c <<= 1` — and did
+**not** match our old-magic oracle. Use the rotate version.) Ours:
+`efs::efs_superblock_checksum` / `EfsSuperblock::recompute_checksum`.
+
+### The real EFS multi-CG layout (from `~/scsi3.raw`, a 1 GB disk)
+
+```
+fs_size=2092584 firstcg=513 cgfsize=41021 cgisize=1051
+sectors=63 heads=10 ncg=51 magic=0x00072959 bmblock=0
+bmsize=261573 tfree=2038446 tinode=214397 replsb=2092607 lastialloc=28
+```
+Layout (partition-relative blocks): block 0 reserved, block 1 = superblock,
+blocks 2..512 = bitmap (511 blocks), block 513 (`firstcg`) = CG0
+[inodes 1051 blocks, then data], CG1 at 513+41021, ... ×51; `fs_size` =
+`firstcg + ncg*cgfsize`. Root inode 2 @ block `firstcg`, off 256; root dirblock
+= `firstcg + cgisize` = 1564 (matches our single-CG `root_dirblock` formula).
+Inode addressing (Linux `efs/inode.c`, mirrored by our `inode_byte_offset`):
+`block = firstcg + cgfsize*(inode_index/cgisize) + inode_index%cgisize`,
+4 inodes/block.
 
 ## FINDINGS from IRIS (fx 5.3) — 2026-06-17
 
@@ -108,7 +190,41 @@ everything needed to replicate. Find where the emulator stores its disk files
 and dump it with the script below. Fallback: `prtvtoc /dev/rdsk/dks0d3vh` on the
 formatted blank prints the drive's cylinders/heads/sectors.
 
+## Remaining: single-CG vs multi-CG
+
+We still emit **one cylinder group** (`ncg=1`); IRIX `mkfs_efs` emits many
+(ncg=51 for 1 GB). ncg=1 is a *legal* EFS layout (mkfs produces it for small
+volumes) and our reader/IRIX address inodes the same way regardless of ncg, so
+a single-CG volume *should* mount. The practical downside is **inode count**:
+single-CG caps inodes at `cgisize*4` (e.g. 512 inodes on a 100 MB disk, vs
+~214k on the oracle), so a user can't create many files. If the real-IRIX test
+shows single-CG won't mount (or the inode cap matters), replicate the multi-CG
+layout: reverse-engineer `mkfs_efs`'s CG sizing (`firstcg`/`cgfsize`/`cgisize`/
+`ncg` as a function of size + geometry) from `~/scsi3.raw` (+ the `efs_small.img`
+fixture as a second data point) and emit it from `create_blank_efs`. Our EFS
+reader + resize already handle multi-CG, so only the *formatter* needs it.
+
+## Validation done (rb-cli side, no emulator)
+
+- `cargo test --lib` (1997 pass) incl. new `efs_checksum_matches_real_irix_disk`
+  and `create_blank_efs_has_valid_checksum_and_bmblock`; `cargo test --test
+  cli_sgi_hdd`; `cargo clippy --all-targets -D warnings` clean.
+- A generated 100M disk: dvh geometry 204c×16h×63s == disk sectors, dvh checksum
+  zero-sums, EFS checksum recomputes valid, `bmblock=0`, `firstcg+ncg*cgfsize ==
+  fs_size`. Our reader reads `~/scsi3.raw`'s real multi-CG EFS.
+- Bare `new --fs efs` still uses `firstcg=18` (layout guardrail) and now also
+  carries a valid checksum.
+
+To dump+check a freshly generated disk, see the validate script approach in this
+session's history, or reuse the superblock script below (`BASE = efs_first*512`).
+
 ## Next steps — in priority order
+
+### 0. Real-IRIX mount test (USER — the actual remaining work)
+Regenerate with the fixed binary, attach to IRIS, and confirm `fx` no longer
+reports "disagrees with existing volume header parameters" and `mount -t efs`
+shows the put file. If it mounts: done. If not, capture the `fx`/`mount`/`fsck`
+errors and proceed to the diagnostics below.
 
 ### 1. Confirm whether/where it actually mounts (do this FIRST)
 In the IRIX shell:
@@ -181,24 +297,28 @@ Decompress the real EFS oracle: `zstd -dkf tests/fixtures/sgi/efs_small.img.zst 
 - Test: `tests/cli_sgi_hdd.rs`. Build: `cargo build --bin rb-cli` → `target/debug/rb-cli`.
 - Fixtures (oracles): `tests/fixtures/sgi/irix_volhdr.bin` (real dvh),
   `tests/fixtures/sgi/efs_small.img.zst` (real EFS).
-- Disk under test: `/Users/dani/irix-toolbox.img` (100 MiB; EFS partition at sector 4096).
+- **Oracle disk**: `~/scsi3.raw` (1 GB IRIX-formatted SCSI 0,3; EFS partition at
+  sector 4032; dvh sector 0 is zeroed/unflushed; has IRIX's own writes).
+- External refs: drive geometry `~/repos/iris/src/scsi.rs` (`exec_mode_sense_6`,
+  heads=16/spt=63); EFS checksum `~/repos/Aaru/Aaru.Filesystems/EFS/Checksum.cs`;
+  EFS layout `~/efs-xfs-refs/efs-linux-5.15/efs/{super,inode}.c`.
+- Disk under test (user): `/Users/dani/irix-toolbox.img` — regenerate with the
+  fixed binary before re-testing (the old one had the wrong geometry/checksum).
 - Gates: `cargo clippy --all-targets -- -D warnings`, `cargo test --lib`, `cargo test --test cli_sgi_hdd`.
 
 ## Resume prompt (paste into a fresh session)
 
 > Resume: making `rb-cli new-sgi-hdd` (dvh + EFS IRIX hard disk) actually mount +
-> show files on the IRIS emulator / real IRIX. Read `docs/sgi_efs_hdd_irix_debug.md`
-> first — it's authoritative. The rb-cli side is done + committed (`4c41662`,
-> `8258ed0`, `5569c89`) and passes its own create→put→fsck→get→cmp e2e; the open
-> issue is that a synthesized disk doesn't visibly work under IRIX. Our EFS now
-> matches the real `efs_small.img` fixture's directory format byte-for-byte
-> (incl. `.`/`..`), so the remaining suspects are superblock fields IRIX may
-> validate: `fs_checksum`=0 (algorithm not yet reverse-engineered), `fs_tfree`/
-> `fs_tinode`=0, `fs_bmblock`=2 (should be 0 for old-magic EFS), and our
-> non-standard single-cylinder-group geometry. NEXT: use the IRIX diagnostics in
-> the doc (manual `mount -t efs`, `prtvtoc`, and especially IRIX's own
-> `fsck -t efs`) and/or capture IRIX's own writes by flushing the emulator to the
-> host image, then dump it (script in the doc) to read the authoritative format +
-> crack the checksum, and fix `create_blank_efs` / `sgi_hdd_builder` to match.
-> Don't regress the bare `new --fs efs` path (small EFS volumes must stay
-> byte-identical: `firstcg` stays 18). Disk under test: `/Users/dani/irix-toolbox.img`.
+> show files on the IRIS emulator. Read `docs/sgi_efs_hdd_irix_debug.md` first —
+> the "STATUS 2026-06-17 (cont)" block at the top is authoritative. Both prior
+> blockers are FIXED on `commander-mode`: the dvh geometry now matches the
+> emulated drive (heads=16, secs=63, cyls=ceil(N/1008), from `iris/src/scsi.rs`),
+> and the EFS `fs_checksum` algorithm was cracked (Aaru new-algo: XOR BE16 words
+> 0..88 + rotate-left-1) and validated against the oracle `~/scsi3.raw`
+> (`0xfa73610a`); we also set `bmblock=0` and compute `tfree`/`tinode`. Lib +
+> e2e + clippy all green; a generated disk's dvh/EFS structure validates. The
+> ONLY remaining work is the **real-IRIX mount test on the emulator** (regenerate,
+> attach, `fx` should accept the label, `mount -t efs` should show the file). If
+> it still won't mount, the prime suspect is our **single-cylinder-group** layout
+> vs IRIX's multi-CG — replicate `mkfs_efs`'s CG sizing from `~/scsi3.raw` (see
+> "Remaining"). Don't regress bare `new --fs efs` (`firstcg` stays 18 — verified).
