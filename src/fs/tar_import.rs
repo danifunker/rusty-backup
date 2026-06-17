@@ -61,6 +61,51 @@ fn is_appledouble(name: &str) -> bool {
     name.starts_with("._")
 }
 
+/// Cheap content sniff: does `path` look like a tar archive — plain, gzip-, or
+/// zstd-compressed? Only a small prefix is (de)compressed to check for the tar
+/// `ustar` magic at offset 257, so a gzip *disk image* (`.adz` / `.hdz`) is
+/// **not** mistaken for a tarball just because it's gzip. Used by the GUI to
+/// auto-route a dropped/added tar archive into the import flow.
+pub fn looks_like_tar_archive(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    let n = f.read(&mut magic).unwrap_or(0);
+    if f.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    // Need to see at least the first tar header (512 B) -> read ~600 of the
+    // (decompressed) stream so offset 257..262 is covered.
+    let prefix = if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        read_prefix(flate2::read::GzDecoder::new(f), 600)
+    } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
+        match zstd::Decoder::new(f) {
+            Ok(d) => read_prefix(d, 600),
+            Err(_) => return false,
+        }
+    } else {
+        read_prefix(f, 600)
+    };
+    // ustar magic: "ustar\0" (POSIX) or "ustar  " (GNU) — both start "ustar".
+    prefix.len() >= 262 && &prefix[257..262] == b"ustar"
+}
+
+fn read_prefix(mut r: impl Read, n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(k) => filled += k,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    buf.truncate(filled);
+    buf
+}
+
 /// Tally of what the import produced.
 #[derive(Default, Debug, Clone)]
 pub struct TarImportStats {
@@ -542,6 +587,89 @@ mod tests {
         let mut buf2 = Vec::new();
         fs.write_file_to(&inner, &mut buf2).unwrap();
         assert_eq!(buf2, b"nested file");
+    }
+
+    #[test]
+    fn looks_like_tar_detects_tar_and_rejects_gzip_image() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+
+        // A real .tar.gz built by exporting a tiny FAT volume.
+        let img = dir.path().join("s.img");
+        std::fs::write(
+            &img,
+            crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("S")).unwrap(),
+        )
+        .unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut efs = crate::fs::open_editable_filesystem(f, 0, 0, None).unwrap();
+            let root = efs.root().unwrap();
+            put_file(&mut *efs, &root, "A.TXT", b"hi");
+            efs.sync_metadata().unwrap();
+        }
+        let tgz = dir.path().join("a.tar.gz");
+        {
+            let f = std::fs::File::open(&img).unwrap();
+            let mut fs = crate::fs::open_filesystem(f, 0, 0, None).unwrap();
+            let root = fs.root().unwrap();
+            let out = std::fs::File::create(&tgz).unwrap();
+            export_tar(
+                &mut *fs,
+                &root,
+                "",
+                out,
+                TarCompression::Gzip,
+                &TarExportOptions::default(),
+                &|_| {},
+            )
+            .unwrap();
+        }
+        assert!(
+            looks_like_tar_archive(&tgz),
+            "real .tar.gz should be detected"
+        );
+
+        // A plain (uncompressed) tar.
+        let plain = dir.path().join("a.tar");
+        {
+            let f = std::fs::File::open(&img).unwrap();
+            let mut fs = crate::fs::open_filesystem(f, 0, 0, None).unwrap();
+            let root = fs.root().unwrap();
+            let out = std::fs::File::create(&plain).unwrap();
+            export_tar(
+                &mut *fs,
+                &root,
+                "",
+                out,
+                TarCompression::None,
+                &TarExportOptions::default(),
+                &|_| {},
+            )
+            .unwrap();
+        }
+        assert!(
+            looks_like_tar_archive(&plain),
+            "plain .tar should be detected"
+        );
+
+        // A gzip stream that is NOT a tar (stand-in for a .adz disk image) —
+        // must NOT be mistaken for a tarball.
+        let adz = dir.path().join("disk.adz");
+        {
+            let f = std::fs::File::create(&adz).unwrap();
+            let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            enc.write_all(&vec![0xE9u8; 4096]).unwrap(); // boot-sector-ish bytes
+            enc.finish().unwrap();
+        }
+        assert!(
+            !looks_like_tar_archive(&adz),
+            "gzip disk image must not look like tar"
+        );
     }
 
     #[test]

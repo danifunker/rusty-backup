@@ -186,6 +186,9 @@ pub struct BrowseView {
     /// A tar import awaiting the user's confirmation (preflight found
     /// content this filesystem can't represent).
     pending_tar_import: Option<PendingTarImport>,
+    /// A tar archive dropped/added as a host file, awaiting the user's
+    /// choice: import its contents, or add the archive as a plain file.
+    pending_tar_add: Option<PathBuf>,
     /// When the CHD being edited is the body of a single-file-chd backup,
     /// this carries the backup folder path so that on flatten-success we
     /// can refresh `metadata.json` (per-partition checksums + container
@@ -426,6 +429,7 @@ impl Default for BrowseView {
             chd_flatten_progress: None,
             tar_export_progress: None,
             pending_tar_import: None,
+            pending_tar_add: None,
             single_file_chd_backup_folder: None,
             pending_open: None,
             needs_password: false,
@@ -683,6 +687,7 @@ impl BrowseView {
         self.chd_flatten_progress = None;
         self.tar_export_progress = None;
         self.pending_tar_import = None;
+        self.pending_tar_add = None;
         self.single_file_chd_backup_folder = None;
     }
 
@@ -1161,6 +1166,9 @@ impl BrowseView {
 
         // New folder dialog
         self.render_new_folder_dialog(ui);
+
+        // Tar archive added/dropped: import contents vs add as file
+        self.render_tar_add_dialog(ui);
 
         // Tar import confirmation (preflight found unrepresentable content)
         self.render_tar_import_dialog(ui);
@@ -2567,7 +2575,14 @@ impl BrowseView {
             Some(p) => p,
             None => return,
         };
+        self.begin_tar_import_from_path(&path);
+    }
 
+    /// Preflight `path` against the current volume and either import it
+    /// straight away (lossless) or stash it for the confirmation modal
+    /// (`render_tar_import_dialog`) when content would be skipped/dropped.
+    /// Shared by the "Import Archive..." button and the add/drop auto-route.
+    fn begin_tar_import_from_path(&mut self, path: &std::path::Path) {
         // Preflight read-only: open editable (for capability + name checks),
         // scan, then drop without committing.
         let preflight = {
@@ -2582,7 +2597,7 @@ impl BrowseView {
                 conflict: rusty_backup::fs::tar_import::ImportConflict::Skip,
                 ..Default::default()
             };
-            match rusty_backup::fs::tar_import::preflight_tar_from_path(&*efs, &path, &opts) {
+            match rusty_backup::fs::tar_import::preflight_tar_from_path(&*efs, path, &opts) {
                 Ok(pf) => pf,
                 Err(e) => {
                     self.edit_result = Some(format!("Could not read archive: {e:#}"));
@@ -2593,11 +2608,11 @@ impl BrowseView {
 
         if preflight.has_warnings() {
             self.pending_tar_import = Some(PendingTarImport {
-                archive_path: path,
+                archive_path: path.to_path_buf(),
                 preflight,
             });
         } else {
-            self.run_tar_import(&path);
+            self.run_tar_import(path);
         }
     }
 
@@ -2672,6 +2687,66 @@ impl BrowseView {
         self.edit_result = Some(msg);
         self.invalidate_all_caches();
         self.invalidate_cached_fs();
+    }
+
+    /// Modal shown when a tar archive is added/dropped as a host file: import
+    /// its contents into the current folder, or add the archive as a plain
+    /// file. Mirrors the Mac-archive add flow.
+    fn render_tar_add_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(path) = self.pending_tar_add.clone() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("archive")
+            .to_string();
+        let mut open = true;
+        let mut decision: Option<u8> = None; // 0=import, 1=add-as-file, 2=cancel
+        egui::Window::new("Tar archive")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("\"{name}\" is a tar archive."));
+                ui.add_space(4.0);
+                ui.label(
+                    "Import its contents into the current folder, or add the \
+                     archive itself as a file?",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Import contents").clicked() {
+                        decision = Some(0);
+                    }
+                    if ui.button("Add as file").clicked() {
+                        decision = Some(1);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(2);
+                    }
+                });
+            });
+        if !open {
+            decision = Some(2);
+        }
+        match decision {
+            Some(0) => {
+                self.pending_tar_add = None;
+                self.begin_tar_import_from_path(&path);
+            }
+            Some(1) => {
+                self.pending_tar_add = None;
+                let parent = self.current_parent_entry();
+                match self.add_host_file(&path, &parent) {
+                    Ok(()) => self.edit_result = Some(format!("Staged \"{name}\" as a file")),
+                    Err(e) => self.edit_result = Some(format!("Could not add \"{name}\": {e}")),
+                }
+            }
+            Some(_) => self.pending_tar_add = None, // cancel / window closed
+            None => {}
+        }
     }
 
     /// Modal shown when a tar import's preflight found content the target
@@ -3023,6 +3098,15 @@ impl BrowseView {
         parent: &FileEntry,
         errors: &mut Vec<(PathBuf, String)>,
     ) -> usize {
+        // Tar archives (.tar / .tar.gz / .tar.zst), content-sniffed so a gzip
+        // disk image isn't mistaken for one: intercept before staging and let
+        // the modal ask whether to import the contents into the image or add
+        // the archive as a plain file. Works on any editable filesystem.
+        if rusty_backup::fs::tar_import::looks_like_tar_archive(host_path) {
+            self.pending_tar_add = Some(host_path.to_path_buf());
+            return 1;
+        }
+
         // Workflow A: if the target FS is HFS/HFS+ and the file's bytes
         // sniff as a Mac archive, intercept before staging — the modal
         // asks the user whether to convert/expand the archive or add it
