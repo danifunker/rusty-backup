@@ -56,6 +56,58 @@ Compared our superblock to `efs_small.img` (decompress: see script below):
 
 `root nlink/size/numextents` also differ but are *correct* for our (tiny) content.
 
+## FINDINGS from IRIS (fx 5.3) — 2026-06-17
+
+Tested on the IRIS emulator (drive identifies as `SGI / IRIS EMUL DISK / 1.0`,
+`fx version 5.3, Oct 18 1994` → IRIX 5.3 era). Disk attached as SCSI 0,2.
+
+`fx` on our disk (dksc(0,2)):
+```
+Scsi drive type == SGI    IRIS EMUL DISK  1.0
+            warning: disagrees with existing volume header parameters
+fx: Warning: no sgilabel on disk
+fx: Warning: can't read sgilabel on disk
+creating new sgilabel
+fx: Error: Invalid argument: can't set volume header in driver
+```
+Disk Manager shows our disk as "104 MB / IRIX Disk / Inactive" but "This disk is
+not recognized or is part of a logical volume" (only **Initialize** offered).
+
+**Root cause: the dvh `device_parameters` geometry disagrees with the geometry
+the emulated drive reports, so `fx` rejects our sgilabel — IRIX never reaches the
+EFS.** This is the blocker. (The "can't set volume header in driver: Invalid
+argument" is a *secondary* effect of trying to re-`fx` our wrong-geometry label;
+on a truly blank disk `fx` says "invalid label, ignored" and proceeds fine.)
+
+Reference: `mkfs_efs` log from IRIX formatting a blank ~1 GB emulator disk (0,3):
+```
+blocks=2092608 inodes=214404
+sectors=63 cgfsize=41021
+cgalign=1 ialign=1 ncg=51
+firstcg=513 cgisize=1051
+bitmap blocks=511
+```
+So: drive uses **sectors/track = 63** (we use 128 in the dvh dp); IRIX EFS is
+**multi-cylinder-group** (ncg=51 for 1 GB; ours is ncg=1, a single CG). Both must
+match. Note `firstcg=513`, `cgisize=1051` per CG — very different from our
+single-CG `firstcg=51`.
+
+### Two layered fixes needed
+1. **dvh geometry** (blocker): `device_parameters` must match the emulated
+   drive's real CHS (the drive reports sectors=63; need its heads/cyls too).
+   Until then `fx` rejects the sgilabel and the disk is "not recognized".
+2. **EFS multi-CG layout** (next): replicate IRIX's `mkfs_efs` cylinder-group
+   layout (ncg>1, firstcg/cgfsize/cgisize per the formula) instead of our
+   single-CG hack. `create_blank_efs` + the EFS reader's CG addressing.
+
+### The oracle to get
+An **IRIX-formatted disk's host image** (the blank 0,3 IRIX just formatted to
+1.02 GB EFS, or the system disk 0,1). It reveals the exact dvh geometry the
+emulator wants, the dvh checksum algorithm, AND IRIX's EFS multi-CG layout —
+everything needed to replicate. Find where the emulator stores its disk files
+and dump it with the script below. Fallback: `prtvtoc /dev/rdsk/dks0d3vh` on the
+formatted blank prints the drive's cylinders/heads/sectors.
+
 ## Next steps — in priority order
 
 ### 1. Confirm whether/where it actually mounts (do this FIRST)
