@@ -43,9 +43,15 @@ Last updated: 2026-06-16
     `pending_open_archive`; the app calls `ArchivesTab::open_path` + switches tabs.
   - [x] **Right pane cutoff** (`02926d5`) — reserve separator/spacing width in
     `CommanderMode::show`'s `pane_w`.
-  - [ ] **Rolling "applied operations" log** for the Commander session (mirror
-    `EditQueue::describe`, but for completed applies via `commander_ops::apply_edits`).
-    *Not started* — was the next item when this handoff was written.
+  - [x] **Rolling "applied operations" log** for the Commander session — a
+    timestamped `session_log: Vec<String>` on `CommanderMode` (capped at 200,
+    rolling) with a top-bar **Log (N)** toggle opening a "Session log" window
+    (Copy-all / Clear, sticks to bottom). Records: a pane's staged queue applied
+    (`CommanderPane::poll_apply` success), host copies / exports
+    (`CommanderMode::poll_host_copy`), and the immediate host writes (delete /
+    rename / new folder). Panes surface completions via a new
+    `PaneResponse::log_events: Vec<String>`, which `CommanderMode` timestamps via
+    `record_log`.
   - [ ] **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`)
     once seen in the app.
   - [ ] **Phase 2 — "Open Backup…" in a pane:** lift Inspect's per-compression

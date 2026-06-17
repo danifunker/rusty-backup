@@ -126,6 +126,13 @@ pub struct CommanderMode {
     /// The pane the user last interacted with — the middle-column Delete acts
     /// on it. Updated from each pane's `focused` response.
     active: Side,
+    /// Rolling history of data-changing operations completed this Commander
+    /// session (applies, host copies / exports, immediate host deletes /
+    /// renames / new folders), each timestamped. Capped at the most recent
+    /// [`Self::MAX_LOG`] entries. Shown in the "Log" window.
+    session_log: Vec<String>,
+    /// Whether the session-log window is open.
+    show_log: bool,
 }
 
 impl Default for CommanderMode {
@@ -149,6 +156,22 @@ impl CommanderMode {
             detail: None,
             keep_dates: true,
             active: Side::Left,
+            session_log: Vec::new(),
+            show_log: false,
+        }
+    }
+
+    /// Upper bound on retained session-log entries (rolling; oldest drop first).
+    const MAX_LOG: usize = 200;
+
+    /// Timestamp a completed-operation message and append it to the rolling
+    /// session log, dropping the oldest entries past [`Self::MAX_LOG`].
+    fn record_log(&mut self, msg: String) {
+        self.session_log
+            .push(format!("[{}] {msg}", log_timestamp()));
+        if self.session_log.len() > Self::MAX_LOG {
+            let excess = self.session_log.len() - Self::MAX_LOG;
+            self.session_log.drain(0..excess);
         }
     }
 
@@ -170,6 +193,13 @@ impl CommanderMode {
                         } else {
                             close = true;
                         }
+                    }
+                    if ui
+                        .button(format!("Log ({})", self.session_log.len()))
+                        .on_hover_text("Operations completed this Commander session")
+                        .clicked()
+                    {
+                        self.show_log = !self.show_log;
                     }
                 });
             });
@@ -199,6 +229,9 @@ impl CommanderMode {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let resp = self.left.show(ui);
+                        for ev in resp.log_events {
+                            self.record_log(ev);
+                        }
                         if let Some(msg) = resp.status {
                             self.status = msg;
                         }
@@ -235,6 +268,9 @@ impl CommanderMode {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let resp = self.right.show(ui);
+                        for ev in resp.log_events {
+                            self.record_log(ev);
+                        }
                         if let Some(msg) = resp.status {
                             self.status = msg;
                         }
@@ -260,6 +296,7 @@ impl CommanderMode {
 
         self.render_checksum_window(ui.ctx());
         self.render_detail_window(ui.ctx());
+        self.render_log_window(ui.ctx());
 
         if self.unsaved_close {
             let n = self.left.staged_count() + self.right.staged_count();
@@ -526,6 +563,7 @@ impl CommanderMode {
             Some(e) => format!("Export to {where_to} failed: {e}"),
             None => format!("Copied {copied} file(s) to {where_to}."),
         };
+        self.record_log(self.status.clone());
     }
 
     /// Open a "Calculate Checksums" window over the `from` pane's selected files
@@ -811,6 +849,67 @@ impl CommanderMode {
             self.detail = None;
         }
     }
+
+    /// Render the session-log window (if open): the rolling list of completed
+    /// operations, newest at the bottom, with Copy-all / Clear controls.
+    fn render_log_window(&mut self, ctx: &egui::Context) {
+        if !self.show_log {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Session log")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} operation(s) this session.",
+                        self.session_log.len()
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Clear").clicked() {
+                            self.session_log.clear();
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.session_log.is_empty(),
+                                egui::Button::new("Copy all"),
+                            )
+                            .clicked()
+                        {
+                            ctx.copy_text(self.session_log.join("\n"));
+                        }
+                    });
+                });
+                ui.separator();
+                if self.session_log.is_empty() {
+                    ui.weak(
+                        "No operations yet. Applied edits, host copies / exports, and \
+                         immediate host deletes / renames / new folders are recorded here.",
+                    );
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("commander_session_log")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.session_log {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+        if !open {
+            self.show_log = false;
+        }
+    }
+}
+
+/// Local-time `HH:MM:SS` stamp prefixed to each session-log entry.
+fn log_timestamp() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 // --- procedural button icons -----------------------------------------------

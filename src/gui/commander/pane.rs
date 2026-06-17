@@ -58,6 +58,11 @@ pub(crate) struct PaneResponse {
     /// The user interacted with (clicked in) this pane this frame, so it becomes
     /// the "active" pane the middle-column Delete acts on.
     pub focused: bool,
+    /// Data-changing operations that completed on this pane this frame (a staged
+    /// queue applied, or an immediate host delete / rename / new folder), in the
+    /// order they happened. `CommanderMode` timestamps each and appends it to the
+    /// rolling session log.
+    pub log_events: Vec<String>,
 }
 
 /// Per-frame outcome of the listing grid (which row action, if any, fired).
@@ -117,6 +122,9 @@ pub(crate) struct CommanderPane {
     new_folder_dialog: Option<NewFolderDialog>,
     /// Whether the "Pending edits" review popup is open for this pane.
     show_edits_popup: bool,
+    /// Data-changing operations completed this frame, drained into the
+    /// `PaneResponse` at the end of `show()` for the session log.
+    log_events: Vec<String>,
 }
 
 /// State for the modal "Rename..." dialog.
@@ -169,6 +177,7 @@ impl CommanderPane {
             rename_dialog: None,
             new_folder_dialog: None,
             show_edits_popup: false,
+            log_events: Vec::new(),
         }
     }
 
@@ -259,6 +268,7 @@ impl CommanderPane {
             checksums,
             detail,
             focused,
+            log_events: std::mem::take(&mut self.log_events),
         }
     }
 
@@ -319,7 +329,7 @@ impl CommanderPane {
             }
         }
         self.reload_listing();
-        if failed > 0 {
+        let msg = if failed > 0 {
             format!(
                 "[{}] deleted {removed} item(s); {failed} could not be removed.",
                 self.side.label()
@@ -329,7 +339,11 @@ impl CommanderPane {
                 "[{}] deleted {removed} item(s) from the host folder.",
                 self.side.label()
             )
+        };
+        if removed > 0 {
+            self.log_events.push(msg.clone());
         }
+        msg
     }
 
     /// The modal "Rename..." dialog. Image panes stage a `Rename` edit (applied
@@ -411,7 +425,9 @@ impl CommanderPane {
             match std::fs::rename(&old_path, &new_path) {
                 Ok(()) => {
                     self.reload_listing();
-                    format!("[{side}] renamed to '{new_name}'.")
+                    let msg = format!("[{side}] renamed '{}' to '{new_name}'.", entry.name);
+                    self.log_events.push(msg.clone());
+                    msg
                 }
                 Err(e) => format!("[{side}] rename failed: {e}"),
             }
@@ -515,7 +531,9 @@ impl CommanderPane {
             match std::fs::create_dir(&dir) {
                 Ok(()) => {
                     self.reload_listing();
-                    format!("[{side}] created folder '{name}'.")
+                    let msg = format!("[{side}] created folder '{name}'.");
+                    self.log_events.push(msg.clone());
+                    msg
                 }
                 Err(e) => format!("[{side}] create folder failed: {e}"),
             }
@@ -1115,7 +1133,9 @@ impl CommanderPane {
         if let Some(i) = self.selected_part {
             self.open_partition(i);
         }
-        Some(format!("[{}] applied {n} edit(s).", self.side.label()))
+        let msg = format!("[{}] applied {n} edit(s).", self.side.label());
+        self.log_events.push(msg.clone());
+        Some(msg)
     }
 
     /// Toggle the staged-delete state of `names` in the current directory:
