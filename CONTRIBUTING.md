@@ -97,6 +97,58 @@ Always upward — never sideways within a layer or downward.
 
 ---
 
+## Presentation layers: one model, many UIs (CLI, GUI, and a future TUI)
+
+This project has **more than one front end over the same core**, and is adding
+more. Today: `src/gui/` (egui) and `src/cli/` (40+ verbs over `model/` with no
+egui). A **TUI** (`src/tui/`, crossterm) is planned. They are all *thin adapters*
+over the same `model/` + engine. The CLI is the proof the pattern works — it
+drives backup, inspect, browse-view editing, fsck, resize, etc. without a single
+GUI type.
+
+**The rule that keeps it that way — the litmus test:**
+
+> **Could the CLI (or a headless test, or a TUI) call this without egui /
+> crossterm / rfd?** If yes, it belongs in `model/` or the engine — *not* in
+> `gui/` (or `tui/`). A pure predicate, a partition probe, a "resolve this picked
+> source into openable partitions" routine, a thread-spawn that reports progress
+> — all pass the test, so none of them may live in a view.
+
+When a view needs logic that fails the test only because it's *currently written*
+inside a view (a private `fn` in `gui/inspect_tab.rs`, say), the fix is to **move
+it down**, not to copy it into the second UI. Copying is how you get two
+divergent implementations that drift — exactly the trap that left Commander Mode
+unable to open Clonezilla backups or to gate out non-filesystem partitions,
+because the source-resolution + `is_browsable_type*` gates were trapped in the
+Inspect view. (The gates now live in `fs/`; source resolution is being lifted
+into `model/`.)
+
+**Where each kind of shared logic goes:**
+
+| Kind of logic | Home | Example |
+|---------------|------|---------|
+| Pure capability predicate (`(type byte/string) -> bool`) | engine (`fs/`, `partition/`) | `fs::partition_is_browsable`, `fs::is_checkable_type` |
+| "Resolve a picked source → openable partitions" | `model/` | `model::commander_source` / the source resolver |
+| Background work with progress | `model/*_runner.rs` (callbacks at the leaf, `Status` at the runner) | `model::export_runner`, the cache-scan runner |
+| Pure query/transform the view calls inline | `model/` pure fn or engine | `EditQueue` helpers, `partition::format_size` |
+| Rendering, widget state, dialog open/closed flags | the view (`gui/`, later `tui/`) | egui panels, `ScrollArea` state |
+
+**Checklist when adding a user-facing feature (extends the playbook below):**
+
+- [ ] Is any of this logic something a *second* UI would need? If yes, it goes in
+      `model/`/engine now — even if only one UI consumes it today.
+- [ ] Does the GUI button handler contain a predicate, a probe, a resolve, or a
+      spawn? Move it down; the handler should be ~10–20 lines of dispatch.
+- [ ] Could I write a unit test for this logic without a GUI? If not, it's in the
+      wrong layer.
+- [ ] Would the CLI (and the future TUI) call the *same function*, or would each
+      re-derive it? It must be the same function.
+
+When in doubt, look at how an existing `cli/verbs/*.rs` calls into `model/` for
+the same capability and mirror it — the CLI is the reference adapter.
+
+---
+
 ## Adding a feature: the playbook
 
 Follow this order. Every step makes the next one easier.
