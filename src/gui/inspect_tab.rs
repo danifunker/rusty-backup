@@ -8,7 +8,11 @@ use anyhow::Context;
 
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::clonezilla;
+// Partition-capability gates — shared across all UIs, defined in the engine.
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
+use rusty_backup::fs::{
+    is_checkable_type, is_classic_hfs, is_superfloppy_hfs, partition_is_browsable,
+};
 use rusty_backup::model::export_runner::{
     self, ExportStatus, PartitionExportConfig, PerPartitionInputs,
 };
@@ -3796,11 +3800,11 @@ impl InspectTab {
                             ui.label("");
                         }
                         ui.label(if part.bootable { "Yes" } else { "" });
-                        if is_browsable_type(part.partition_type_byte)
-                            || is_fat_name(&part.type_name)
-                            || is_browsable_type_string(part.partition_type_string.as_deref())
-                            || is_browsable_superfloppy(part.partition_type_byte, &part.type_name)
-                        {
+                        if partition_is_browsable(
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                            &part.type_name,
+                        ) {
                             let ptype = if part.partition_type_byte != 0 {
                                 part.partition_type_byte
                             } else {
@@ -5209,123 +5213,6 @@ fn create_seekable_cache_from_zstd(
     Ok(())
 }
 
-/// Check if a partition type byte corresponds to a browsable filesystem.
-fn is_browsable_type(ptype: u8) -> bool {
-    matches!(
-        ptype,
-        0x01 | 0x04
-            | 0x06
-            | 0x07
-            | 0x0B
-            | 0x0C
-            | 0x0E
-            | 0x11
-            | 0x14
-            | 0x16
-            | 0x1B
-            | 0x1C
-            | 0x1E
-            | 0x83
-            | 0xA0
-            | 0xA1
-            | 0xA8
-            | 0xAF
-    )
-}
-
-/// Heuristic: is this partition classic HFS (not HFS+/HFSX)?
-/// Used to gate the "Expand HFS Volume…" action, which only handles classic
-/// HFS. APM rows where `probe_apple_hfs_type` flagged HFS+/HFSX get a tag in
-/// `type_name` like `Apple_HFS (HFS+)`; those are excluded here.
-fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
-    let apm_hfs = type_string
-        .map(|s| s.eq_ignore_ascii_case("Apple_HFS"))
-        .unwrap_or(false);
-    let mbr_hfs = ptype == 0xAF;
-    // A partition-less HFS superfloppy (a BasiliskII .hfv) is classic HFS too;
-    // the expand dialog can re-floor it or convert it (incl. to a flat HFV).
-    let superfloppy = is_superfloppy_hfs(ptype, type_name);
-    if !(apm_hfs || mbr_hfs || superfloppy) {
-        return false;
-    }
-    !(type_name.contains("HFS+") || type_name.contains("HFSX"))
-}
-
-/// Check if an APM partition type string corresponds to a browsable filesystem.
-fn is_browsable_type_string(type_str: Option<&str>) -> bool {
-    let Some(s) = type_str else {
-        return false;
-    };
-    // AmigaDOS DosType tags (DOS\0..DOS\7) — RDB-partitioned hard drives and
-    // single-partition HDFs / ADFs both route through this string.
-    if rusty_backup::fs::is_amiga_dos_type(s) {
-        return true;
-    }
-    if rusty_backup::fs::is_amiga_pfs3_type(s) {
-        return true;
-    }
-    if rusty_backup::fs::is_amiga_sfs_type(s) {
-        return true;
-    }
-    matches!(
-        s,
-        "Apple_HFS"
-            | "Apple_HFSX"
-            | "Apple_HFS+"
-            | "Apple_UNIX_SVR2"
-            | "Apple_UNIX_SRVR2"
-            | "Apple_PRODOS"
-            | "Apple_ProDOS"
-            // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
-            | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
-            // Custom bootblock Amiga disk with no filesystem — browsable via
-            // the synthetic carve view (whole-disk + recoverable text/JSON).
-            | "Amiga-NDOS"
-    )
-}
-
-/// Check if a superfloppy (type byte 0) has a browsable filesystem hint.
-fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
-    if ptype != 0 {
-        return false;
-    }
-    matches!(
-        type_name,
-        "FAT"
-            | "HFS"
-            | "HFS+"
-            | "NTFS"
-            | "exFAT"
-            | "ProDOS"
-            | "XFS"
-            | "ext"
-            | "btrfs"
-            | "Alto BFS"
-            | "Pilot/Cedar"
-            | "Unknown"
-    )
-}
-
-/// Check if a partition row is a classic-HFS **superfloppy** (a flat,
-/// partition-less HFS volume at LBA 0, i.e. a BasiliskII `.hfv`). These rows
-/// carry `partition_type_byte == 0` with `type_name == "HFS"` because no
-/// partition table assigned them a type byte. The classic-HFS fsck, edit, and
-/// expand paths are all offset-driven and work at offset 0, but the gating
-/// helpers keyed to `0xAF` / APM `Apple_HFS` skip these rows — this helper lets
-/// callers OR them back in.
-fn is_superfloppy_hfs(ptype: u8, type_name: &str) -> bool {
-    ptype == 0 && type_name == "HFS"
-}
-
-/// Fallback check: detect FAT from the human-readable type name string.
-/// Used for older backups where `partition_type_byte` was not stored.
-fn is_fat_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("fat")
-}
-
-/// Infer an MBR partition type byte from the human-readable type name.
-/// Used for older backups that didn't store `partition_type_byte`.
 /// Format a byte count using base-1000 (SI) units, matching how storage
 /// media is marketed (e.g. "8 GB" on an SD card = 8,000,000,000 bytes).
 fn format_size_decimal(bytes: u64) -> String {
@@ -5337,17 +5224,6 @@ fn format_size_decimal(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", b / MB)
     }
-}
-
-/// Check if a partition type supports filesystem checking (fsck).
-/// Classic HFS (0xAF or APM "Apple_HFS") and AmigaDOS OFS/FFS variants.
-fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
-    if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
-        return true;
-    }
-    type_str
-        .map(rusty_backup::fs::is_amiga_dos_type)
-        .unwrap_or(false)
 }
 
 /// Format an HFS allocation block size as "N KiB" when it's a whole

@@ -28,6 +28,7 @@ use eframe::egui;
 use rusty_backup::backup::metadata::BackupMetadata;
 use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::filesystem::Filesystem;
+use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::backup_loader;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
@@ -1003,6 +1004,21 @@ impl CommanderPane {
 
     // --- opening -----------------------------------------------------------
 
+    /// Index of the first partition the browser can actually open — skips
+    /// extended containers *and* non-filesystem partitions (APM driver /
+    /// partition-map entries, EFI system partitions, ...). Uses the shared
+    /// engine gate so Commander, the Inspect grid, and the CLI agree.
+    fn first_browsable_partition(&self) -> Option<usize> {
+        self.partitions.iter().position(|p| {
+            !p.is_extended_container
+                && partition_is_browsable(
+                    p.partition_type_byte,
+                    p.partition_type_string.as_deref(),
+                    &p.type_name,
+                )
+        })
+    }
+
     /// Probe a freshly-picked file and start browsing its first real partition.
     fn load_source(&mut self, path: PathBuf) -> String {
         self.source = Some(path.clone());
@@ -1017,12 +1033,9 @@ impl CommanderPane {
         match commander_source::probe_partitions(&path) {
             Ok(parts) => {
                 self.partitions = parts;
-                // Auto-open the first non-extended-container partition.
-                let first = self
-                    .partitions
-                    .iter()
-                    .position(|p| !p.is_extended_container);
-                match first {
+                // Auto-open the first *browsable* partition (skips APM driver /
+                // partition-map entries and other non-filesystem partitions).
+                match self.first_browsable_partition() {
                     Some(i) => self.open_partition(i),
                     None => format!(
                         "[{}] {} has no browsable partitions.",
@@ -1062,11 +1075,7 @@ impl CommanderPane {
             Ok(outcome) => {
                 self.partitions = outcome.partitions;
                 self.backup_meta = Some(outcome.metadata);
-                let first = self
-                    .partitions
-                    .iter()
-                    .position(|p| !p.is_extended_container);
-                match first {
+                match self.first_browsable_partition() {
                     Some(i) => self.open_partition(i),
                     None => format!(
                         "[{}] backup has no browsable partitions.",
@@ -1133,6 +1142,19 @@ impl CommanderPane {
         self.error = None;
         self.listing = DirListing::new();
         self.queue.clear();
+
+        // Non-filesystem partitions (APM driver / partition-map entries, EFI,
+        // ...) can't be browsed — surface a clear message instead of letting
+        // `open_filesystem` fail with a raw "unsupported partition type" error.
+        if !partition_is_browsable(
+            part.partition_type_byte,
+            part.partition_type_string.as_deref(),
+            &part.type_name,
+        ) {
+            let msg = format!("{} has no browsable filesystem.", part.type_name);
+            self.error = Some(msg.clone());
+            return format!("[{}] {msg}", self.side.label());
+        }
 
         // Resolve the session first (the backup builder is fallible and borrows
         // `backup_meta`); only then mutate the pane's open state.
