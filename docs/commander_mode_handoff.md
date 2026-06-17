@@ -29,10 +29,13 @@ Last updated: 2026-06-16
   dates, ProDOS type, ext permissions) staged onto the pane queue, with staged
   changes reflected and changed rows marked (blue + `* `). `.adz`/`.hdz` open as
   gzip containers (peeled to read, re-gzipped on edit). The per-pane tree was
-  removed (R4 will reuse the browse view's tree).
-- **Branch state:** `commander-mode`, tree clean, **~14 unpushed commits** past
-  the CI-green nav fix `45a108c` (M1/M4/R1 → round-3 A1/A2/A4). Only `45a108c` is
-  on the remote / has run CI.
+  removed (R4 will reuse the browse view's tree). **Round-4** added a **rolling
+  session log** (top-bar Log window), a **read-only "Open Backup folder" pane**
+  (browse / copy files out of a native rusty-backup folder), and the
+  **per-filesystem editable-metadata matrix** doc.
+- **Branch state:** `commander-mode`, tree clean, **~17 unpushed commits** past
+  the CI-green nav fix `45a108c` (M1/M4/R1 → round-3 A1/A2/A4 → round-4 log /
+  backup-open / metadata-matrix). Only `45a108c` is on the remote / has run CI.
 - **Verify on hardware (untested in the dev sandbox):** the macOS device
   elevation fix (`os/macos.rs open_device_for_inspect`, commit `ff36fa3`) — open
   a real `/dev/diskN` in Inspect, confirm the `authopen` admin prompt + read.
@@ -52,8 +55,9 @@ Last updated: 2026-06-16
     rename / new folder). Panes surface completions via a new
     `PaneResponse::log_events: Vec<String>`, which `CommanderMode` timestamps via
     `record_log`.
-  - [ ] **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`)
-    once seen in the app.
+  - [ ] **Refine icon proportions** (`commander/mod.rs draw_copy_icon`/`draw_floppy`/
+    `draw_delete_icon`) once seen in the app. **Blocked: needs the running GUI**
+    — pixel-level visual polish, can't be judged headless.
   - [x] **Phase 2 — "Open Backup…" in a pane** — a pane's source picker now
     offers `show_backup_folder: true`; `SourceEvent::BackupFolder` calls
     `CommanderPane::load_backup_source`, which parses the folder via
@@ -74,7 +78,10 @@ Last updated: 2026-06-16
     into `CommanderMode::show` → `pane.show` → `source_bar`; `show_devices: true`;
     handle `SourceEvent::Device` via an elevated open + probe + preopen
     `BrowseSession`. **Untestable in sandbox; gated on the hardware verify above.**
-  - [ ] **R4** — replace the removed Commander tree with the browse view's tree (§3.3).
+  - [ ] **R4** — replace the removed Commander tree with the browse view's tree
+    (§3.3). **Blocked: large GUI refactor** (lifts two working surfaces onto one
+    shared tree model) that needs the running GUI to validate both still render —
+    doable headless as compile+test only, but regression-prone without eyes on it.
   - [x] **Per-filesystem editable-metadata matrix** — documented in
     [`editable_metadata_matrix.md`](editable_metadata_matrix.md): which optional
     `EditableFilesystem` setter each of the 26 editable FS implements vs. returns
@@ -82,13 +89,67 @@ Last updated: 2026-06-16
     rsrc-fork + bless + volume-name on HFS, a subset on HFS+/MFS, ProDOS
     type/access, ext permissions, PFS3 sym/hardlinks), plus the Commander File
     Info current-vs-available editor backlog.
-  - [ ] **HDZ "no files found"** — needs a real `.hdz` fixture; likely RDB parsing
-    of the inner `.hdf` after the gzip peel (`commander_source::probe_partitions`).
+  - [ ] **HDZ "no files found"** — likely RDB parsing of the inner `.hdf` after
+    the gzip peel (`commander_source::probe_partitions`). **Blocked: needs a real
+    `.hdz` fixture** — no RDB *builder* exists in-tree (only `partition/rdb.rs`'s
+    parser), and a synthetic disk likely wouldn't reproduce the real-world RDB
+    layout (RDSK block, block size, geometry) that triggers the bug.
   - [ ] M7 Find/Search; M5 Compare; broad metadata-setter backlog (§10.2).
+
+## Deferred / blocked — what's actionable vs. what's waiting
+
+Everything in the round-3/round-4 punch-list that can be built and verified
+without the running GUI or hardware is **done**. The four remaining items are
+each blocked on a resource the dev sandbox doesn't have:
+
+| Item | Blocker | How to unblock |
+|------|---------|----------------|
+| **Phase 2 device parity** (#) | **Hardware** — needs a real `/dev/diskN` + the unverified macOS elevation path | Do the hardware verify below first; then thread `&[DiskDevice]` → `pane.show` → `source_bar` (`show_devices: true`) + handle `SourceEvent::Device`. |
+| **Refine icon proportions** | **Running GUI** — pixel polish | Run the app, eyeball the middle-column copy/delete/floppy glyphs, tweak `draw_*` offsets. |
+| **R4 tree dedup** | **Running GUI** — large refactor across two surfaces | Lift `browse_view`'s tree onto a shared model; validate both Commander and browse_view trees render. |
+| **HDZ "no files"** | **Fixture** — needs a real `.hdz` | Obtain a real Amiga `.hdz` (gzip-wrapped RDB `.hdf`); reproduce, then fix RDB detection in `probe_partitions`. |
+
+The **device-parity** item is gated behind the **macOS device-elevation hardware
+verify** (commit `ff36fa3`): until that's confirmed on real hardware, building
+the Commander device path would only add untestable code on top of an unverified
+elevation path. Verify the elevation first, then build device parity.
+
+## Hands-on test checklist (round-4 — run in `cargo run`)
+
+The round-4 work is browse/copy/log only (no destructive writes to backups), so
+it's safe to exercise against real images and backup folders:
+
+1. **Session log:** open Commander → top-bar shows **Log (0)**. Apply a staged
+   edit on an image pane, copy files to a host folder, delete/rename in a host
+   pane → each bumps the count; open **Log** and confirm timestamped lines,
+   newest at bottom; **Copy all** / **Clear** work.
+2. **Open a backup folder:** in a pane's source dropdown pick **Open Backup
+   folder…**, choose a native rusty-backup folder (a **zstd** one and a **none**/
+   raw one). Confirm the partition dropdown lists the backed-up partitions and
+   the volume browses (files visible).
+3. **Backup pane is read-only:** confirm **no** Apply/Discard/Edits buttons, **no**
+   New Folder, and the row right-click menu shows only Copy/Export/Checksums/File
+   Info (no Delete/Rename); File Info shows metadata + preview but **no** editor
+   rows.
+4. **Copy out of a backup:** select files in the backup pane → **Copy to other
+   pane** (onto a writable image → stages; onto a host pane → immediate) and
+   **Export to hard drive…**; both should land real bytes; the export bumps the
+   session log.
+5. **Unsupported backups:** open a **CHD** or **Clonezilla** backup folder →
+   expect a clean "not supported from a pane yet (use Inspect)" message, not a
+   crash or a bogus-MBR error.
+6. **Hardware (the long-standing gate):** in **Inspect**, open a real `/dev/diskN`
+   and confirm the `authopen` admin prompt appears and the device reads
+   (validates `os/macos.rs open_device_for_inspect`, commit `ff36fa3`). This is
+   the prerequisite for Commander device parity.
 
 ## Commits on this branch
 
 ```
+660a81c  docs: per-filesystem editable-metadata matrix (round-4)
+cfc76a1  commander: open a native backup folder in a pane, read-only (round-4)
+4983990  commander: rolling "applied operations" session log (round-4)
+c16022c  docs: handoff — mark round-3 A1/A2/A4 done, refresh punch-list + commits
 02926d5  commander: stop the right pane clipping off-edge (round-3 A4)
 3dc0895  inspect: route a picked Mac archive to the Archives tab (round-3 A2)
 eee8070  commander: functional center Delete via active-pane tracking (round-3 A1)
@@ -120,6 +181,30 @@ c055273  commander: wire entry-point shell (overlay + tab-bar button)
 the H2 commit lands with this doc update.)
 
 ## What's landed (done)
+
+**Round-4 (this session):**
+
+- **Rolling session log** — `CommanderMode::session_log` (rolling, capped 200) +
+  a top-bar **Log (N)** window (Copy-all / Clear, sticks to bottom). Panes report
+  completed data-changing ops via `PaneResponse::log_events`, drained per frame
+  and timestamped by `record_log`. Sources: staged-queue applies
+  (`poll_apply`), host copies / exports (`poll_host_copy`), immediate host
+  delete / rename / new-folder.
+- **Phase 2 "Open Backup folder" (read-only)** — a pane can open a native
+  rusty-backup folder. `commander_source::session_for_backup_partition(folder,
+  meta, idx)` (new, 4 model tests) mirrors Inspect's per-compression open into a
+  `BrowseSession` (raw `none` via `source_path`; `zstd` via a streaming
+  `ZstdStreamCache`). Pane stores `backup_meta`; `open_partition` branches on it.
+  **Backup panes are read-only** (a raw backup's `open_editable` would rewrite the
+  partition file in place and desync `metadata.json`'s checksum) — Apply/Discard/
+  Edits, New Folder, Delete, Rename, copy-INTO, and the File Info editors are
+  gated off; browse + copy-OUT remain. CHD/WOZ/Clonezilla report a clean "use
+  Inspect" error.
+- **Per-FS editable-metadata matrix** — `docs/editable_metadata_matrix.md`:
+  audited all 26 editable filesystems for which optional `EditableFilesystem`
+  setter each implements vs. `Unsupported`.
+
+**Earlier:**
 
 - **Plan doc** — `docs/commander_mode.md` (14 sections: locked decisions,
   architecture, reuse/refactor strategy, copy/staging semantics, drag-to-load,
@@ -255,10 +340,14 @@ cargo test --lib
 
 ## Next step
 
-The live, ordered punch-list is the **round-3** list in the TL;DR above. M6
-(Export / Checksums / Rename-all-26-FS / the now-removed Tree), M1, M4, and
-Phase 3 are all done. Build each remaining item model-first (engine → model →
-thin view), unit-testing the model piece before the view.
+The live, ordered punch-list is the **round-3/round-4** list in the TL;DR above;
+everything buildable+verifiable headless is **done**. The four still-open items
+are each blocked on a resource the dev sandbox lacks — see the **"Deferred /
+blocked"** table above for each blocker and its unblock path. The single highest-
+leverage move is the **macOS device-elevation hardware verify** (`ff36fa3`): it
+clears the gate on Phase 2 device parity and is the only item a non-GUI session
+can't even start. Build each remaining item model-first (engine → model → thin
+view), unit-testing the model piece before the view.
 
 **Still-open backlog beyond the round-3 list** (lower priority): the
 browsable-partition gate (lift `is_browsable_type` out of `inspect_tab.rs`);

@@ -474,6 +474,11 @@ This is the master list of "what can we edit, and what's missing." v1 ships the
 `EditableFilesystem` trait method (and usually a `StagedEdit` variant + `apply_edit`
 arm + a `metadata_editor` widget).
 
+> The authoritative per-filesystem capability map (which optional setter each of
+> the 26 editable filesystems implements vs. returns `Unsupported`) lives in
+> [`editable_metadata_matrix.md`](editable_metadata_matrix.md). Keep that in sync
+> when adding a setter.
+
 ### 10.1 Per-field status
 
 Legend: **R** = read/displayed today · **W** = in-place setter exists today · **gap** =
@@ -481,7 +486,7 @@ needs a new setter.
 
 | Metadata field | Filesystems that read it | In-place setter today | v1 editable? | Gap to add |
 |----------------|--------------------------|------------------------|--------------|------------|
-| name (rename) | all | — none | no | `rename(parent, entry, new_name)` trait method + `StagedEdit::Rename` |
+| name (rename) | all | `rename` ✓ (all 26 editable FS) | **yes** | — (`StagedEdit::Rename` exists) |
 | modified (mtime) | most | — (HFS via `set_dates` only) | HFS only | generic `set_modified_time(entry, t)` for FAT/exFAT/NTFS/ext/Amiga/... |
 | created date | (on disk for HFS, NTFS, exFAT) | HFS `set_dates` | HFS only | surface on `FileEntry` (not present today) + setters for NTFS/exFAT |
 | backup date | HFS | HFS `set_dates` | HFS only | surface on `FileEntry` (not present today) |
@@ -515,7 +520,8 @@ v1 (needed for the detail-pane editing we promised) — **done**:
 
 Future phases (each unchecked = one driver-spanning task):
 
-- [ ] `rename` trait method + `StagedEdit::Rename` (full design in §15.1).
+- [x] `rename` trait method + `StagedEdit::Rename` (full design in §15.1) —
+      shipped in place on **all 26** editable filesystems (M6.3).
 - [ ] generic `set_modified_time`.
 - [ ] `set_dos_attributes` (FAT, exFAT) + queue variant + editor widget.
 - [ ] `set_amiga_protection` / `set_amiga_comment` / `set_amiga_dates` (AFFS, PFS3, SFS).
@@ -585,10 +591,20 @@ per-row diff status. Re-spec when we get there.
    large-file read (`T_LIST`); icon middle-buttons; `.sit` dropped from the Commander
    picker; deferred-switch unsaved guard + consolidated Close in Inspect.
 10. **M7 — find / search** (§15.5, deferrable): wildcard name search per pane.
-11. **M5+ / round-3** — functional center Delete (active-pane); `.sit`→Archives
-    redirect; rolling applied-ops log; **Phase 2** "Open Backup…" + physical-device
-    parity in Commander panes; the R4 tree dedup (§3.3); a per-FS editable-metadata
-    matrix; Compare; the broad metadata-setter backlog (§10.2).
+11. **Round-3** (**done**): functional center Delete (active-pane); `.sit`→Archives
+    redirect; right-pane cutoff fix.
+12. **Round-4** (**done**): rolling applied-ops **session log** (top-bar Log window);
+    **Phase 2 "Open Backup…"** in a pane (read-only — browse / copy out of a native
+    rusty-backup folder, raw + zstd; CHD/WOZ/Clonezilla still go through Inspect);
+    the **per-FS editable-metadata matrix** ([`editable_metadata_matrix.md`](editable_metadata_matrix.md)).
+13. **Still deferred** — each blocked on a resource the dev sandbox lacks (see the
+    handoff's "Deferred / blocked" table for the unblock path):
+    - **Phase 2 physical-device parity** — *hardware* (gated behind the macOS
+      device-elevation verify, `ff36fa3`).
+    - **Icon-proportion refinement** — *running GUI* (pixel polish).
+    - **R4 tree dedup** (§3.3) — *running GUI* (large two-surface refactor).
+    - **HDZ "no files found"** — a *real `.hdz` fixture* (RDB-in-`.hdf`).
+    - **M5 Compare** (§11) and the broad **metadata-setter backlog** (§10.2).
 
 ---
 
