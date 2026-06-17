@@ -1104,6 +1104,13 @@ impl eframe::App for RustyBackupApp {
             self.active_tab = Tab::Inspect;
         }
 
+        // The reverse: a Mac archive picked in the Inspect source dropdown isn't
+        // a disk image, so hand it to the Archives tab and switch there.
+        if let Some(path) = self.inspect_tab.take_open_archive_request() {
+            self.archives_tab.open_path(path);
+            self.active_tab = Tab::Archives;
+        }
+
         // Show settings dialog if open
         self.settings_dialog.show(ctx);
     }

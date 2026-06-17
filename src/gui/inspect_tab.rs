@@ -48,6 +48,19 @@ enum PendingSourceChange {
     Close,
 }
 
+/// True when `path` is a classic Mac archive (StuffIt / BinHex / Compact Pro)
+/// by extension — those route to the Archives tab, not disk inspection.
+fn is_mac_archive_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            rusty_backup::model::file_types::MAC_ARCHIVE_EXTS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(ext))
+        })
+        .unwrap_or(false)
+}
+
 pub struct InspectTab {
     /// Index into the device list, or None if "Open Image File..." is selected
     selected_device_idx: Option<usize>,
@@ -95,6 +108,10 @@ pub struct InspectTab {
     /// A source open/close held until the user resolves the unsaved-edits
     /// prompt (deferred-switch guard). `None` when nothing is pending.
     pending_source_change: Option<PendingSourceChange>,
+    /// A Mac-archive file the user picked in the source dropdown — the app
+    /// consumes this to switch to the Archives tab instead of inspecting it as
+    /// a disk image. `None` when nothing is pending.
+    pending_open_archive: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
     /// Export: true if the export popup is open
@@ -237,6 +254,7 @@ impl Default for InspectTab {
             prev_image_path: None,
             prev_backup_path: None,
             pending_source_change: None,
+            pending_open_archive: None,
             browse_view: BrowseView::default(),
             export_popup: false,
             export_whole_disk: true,
@@ -315,6 +333,13 @@ impl InspectTab {
     /// the auto-load fallback in `gui::mod::update`).
     pub fn take_close_backup_request(&mut self) -> bool {
         std::mem::take(&mut self.close_backup_requested)
+    }
+
+    /// Returns and clears a Mac-archive file the user picked in the source
+    /// dropdown. The app routes it to the Archives tab (a `.sit`/`.hqx` isn't a
+    /// disk image, so inspecting it would just fail).
+    pub fn take_open_archive_request(&mut self) -> Option<PathBuf> {
+        self.pending_open_archive.take()
     }
 
     pub fn load_backup(&mut self, path: &PathBuf) {
@@ -2483,6 +2508,12 @@ impl InspectTab {
                 self.clear_results();
             }
             SourceEvent::Image { path, tempdir } => {
+                // A Mac archive (.sit/.hqx/...) isn't a disk image — hand it to
+                // the Archives tab instead of failing to parse a partition table.
+                if is_mac_archive_path(&path) {
+                    self.pending_open_archive = Some(path);
+                    return;
+                }
                 self.selected_device_idx = None;
                 self.backup_folder_path = None;
                 self.image_file_path = Some(path);
