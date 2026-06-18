@@ -1597,6 +1597,20 @@ pub type BoxReadSeek = Box<dyn ReadSeek>;
 pub trait ReadSeek: Read + Seek + Send {}
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
+/// A boxed handle that implements `Read + Write + Seek`. Used by the CLI's
+/// read-write partition resolver so a plain [`std::fs::File`] and a
+/// [`chd_edit::ChdEditSession`] can both flow through the same code path —
+/// the CHD session is a `Read + Write + Seek` adapter, not a `File`.
+pub type BoxRwSeek = Box<dyn ReadWriteSeek>;
+
+/// Trait alias for `Read + Write + Seek + Send`. The `Send` supertrait makes
+/// `dyn ReadWriteSeek` (and thus [`BoxRwSeek`]) satisfy the
+/// `R: Read + Write + Seek + Send + 'static` bound on
+/// [`crate::fs::open_editable_filesystem`], exactly as [`ReadSeek`] does for
+/// the read-only dispatch.
+pub trait ReadWriteSeek: Read + std::io::Write + Seek + Send {}
+impl<T: Read + std::io::Write + Seek + Send> ReadWriteSeek for T {}
+
 /// Wraps a file according to its detected image format, returning a reader
 /// positioned at the start of the disk data and the data length.
 ///

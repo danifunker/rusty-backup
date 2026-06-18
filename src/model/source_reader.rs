@@ -412,6 +412,17 @@ fn open_read_dispatch(
         let flat =
             decode_g64_bytes(&bytes).with_context(|| format!("decode G64 {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_woz_path(path) {
+        // WOZ 1/2 Apple/Mac floppy: decode the GCR bitstream to a flat sector
+        // buffer (≤ 800 KB) and hand off as Cursor, like G64. Read-only here;
+        // editing re-encodes via container_edit's EditFormat::Woz.
+        let mut reader = crate::rbformats::woz::WozReader::open(path)
+            .with_context(|| format!("decode WOZ {}", path.display()))?;
+        let mut flat = Vec::with_capacity(reader.len() as usize);
+        reader
+            .read_to_end(&mut flat)
+            .with_context(|| format!("read WOZ {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_atr_path(path) {
         // Atari .atr: strip the 16-byte header to expose the flat sector
         // body the atari_dos engine reads. `.xfd` is headerless and falls
@@ -566,13 +577,36 @@ pub fn is_flat_floppy_container_path(path: &Path) -> bool {
         || is_apple_ii_dsk_path(path)
 }
 
+/// True for a standalone WOZ 1/2 floppy image (`.woz` + WOZ magic). WOZ is an
+/// editable container: it decodes to a flat 140K / 400K / 800K sector buffer
+/// that [`crate::model::container_edit`] re-encodes via
+/// [`crate::rbformats::woz_write::sectors_to_woz`] on commit.
+pub fn is_woz_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("woz"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 12];
+    match f.read(&mut magic) {
+        Ok(n) if n >= 8 => crate::rbformats::woz::is_woz(&magic[..n]),
+        _ => false,
+    }
+}
+
 /// Containers that support in-place editing via
 /// [`crate::model::container_edit`] (decode -> edit -> re-encode): the four
-/// PC/Sharp floppy formats (XDF, HDM, DIM, D88) plus the Atari `.atr`
-/// (a trivial header strip / wrap). Subset of
-/// [`is_flat_floppy_container_path`] excluding the read-only-wrapped
-/// formats (MSA / EDSK / Apple-II / Arculator HDF) which have no
-/// re-encoder wired up.
+/// PC/Sharp floppy formats (XDF, HDM, DIM, D88), the Atari `.atr` (a trivial
+/// header strip / wrap), the gzip `.adz`/`.hdz`, and the WOZ floppy. Subset of
+/// [`is_flat_floppy_container_path`] (plus gzip + WOZ) excluding the
+/// read-only-wrapped formats (MSA / EDSK / Apple-II / Arculator HDF) which have
+/// no re-encoder wired up.
 pub fn is_editable_container_path(path: &Path) -> bool {
     is_xdf_path(path)
         || is_hdm_path(path)
@@ -580,6 +614,7 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_d88_path(path)
         || is_atr_path(path)
         || is_gzip_image_path(path)
+        || is_woz_path(path)
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
@@ -594,6 +629,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_imz_path(path)
         || is_zip_image_path(path)
         || is_gzip_image_path(path)
+        || is_woz_path(path)
         || is_flat_floppy_container_path(path)
 }
 

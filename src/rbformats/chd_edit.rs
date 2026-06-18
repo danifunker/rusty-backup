@@ -27,6 +27,7 @@ use libchdman_rs::hd::HdImage;
 
 use super::chd::compress_chd;
 use super::chd_options::ChdOptions;
+use super::output_path;
 
 /// Sector-buffered `Read + Write + Seek` view over a CHD.
 ///
@@ -368,6 +369,32 @@ impl Read for HdImageSequentialReader {
     }
 }
 
+/// Compute the `(compress_chd output base, produced .chd)` pair for a flatten.
+///
+/// The produced `.chd` is guaranteed to be a sibling of `parent_path` that is
+/// never equal to it, so [`flatten_to_parent`] can write the recompressed image
+/// to a staging file and only `rename` it over the parent on success — keeping
+/// the parent intact if the (multi-minute) recompress is interrupted.
+///
+/// The subtlety: `compress_chd` derives its output via `output_path`, which is
+/// `<base.file_stem()>.chd`. `file_stem()` strips the final extension, so a base
+/// of `<stem>.flattening` collapses to `<stem>.chd` — the parent itself. Basing
+/// the staging name on the parent's *full* file name plus a `.rbflatten`
+/// extension makes `file_stem()` yield the full parent file name, so the output
+/// is `<parent-file-name>.chd` — a distinct sibling for any parent name, with or
+/// without dots.
+fn flatten_staging_paths(parent_path: &Path) -> (PathBuf, PathBuf) {
+    let parent_dir = parent_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut staging_name = parent_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    staging_name.push(".rbflatten");
+    let staging_base = parent_dir.join(staging_name);
+    let staging_chd = output_path(&staging_base, "chd", false, 0);
+    (staging_base, staging_chd)
+}
+
 /// Merge the parent + diff into a fresh compressed CHD that replaces
 /// `parent_path`, then delete the diff. Geometry, sector size, and logical
 /// size are inherited from the parent; codecs/hunk size come from `opts`
@@ -388,18 +415,11 @@ pub fn flatten_to_parent(
     let session = ChdEditSession::reopen_with_diff(parent_path, diff_path)?;
     let logical_size = session.logical_size();
 
-    // compress_chd derives the output filename from `output_base.file_stem()`
-    // + ".chd". Use a sibling `<stem>.flattening` base so we get
-    // `<stem>.flattening.chd` and don't clobber the parent until the rename.
+    // Stage the recompressed CHD as a DISTINCT sibling of the parent, so the
+    // parent stays intact until the final atomic rename. See
+    // [`flatten_staging_paths`] for why the naming has to be careful.
     let parent_dir = parent_path.parent().unwrap_or(Path::new("."));
-    let parent_stem = parent_path
-        .file_stem()
-        .map(|s| s.to_os_string())
-        .unwrap_or_default();
-    let mut staging_stem = parent_stem;
-    staging_stem.push(".flattening");
-    let staging_base = parent_dir.join(staging_stem);
-    let staging_chd = staging_base.with_extension("chd");
+    let (staging_base, staging_chd) = flatten_staging_paths(parent_path);
 
     // Defensive: leftover staging file from a previous crashed flatten.
     if staging_chd.exists() {
@@ -426,6 +446,10 @@ pub fn flatten_to_parent(
     if scratch_path.exists() {
         let _ = fs::remove_file(&scratch_path);
     }
+    let logical_mb = logical_size / (1024 * 1024);
+    log_cb(&format!(
+        "staging merged image ({logical_mb} MB) before recompression"
+    ));
     {
         let mut reader = HdImageSequentialReader { session };
         let mut scratch = std::io::BufWriter::with_capacity(
@@ -437,12 +461,37 @@ pub fn flatten_to_parent(
                 )
             })?,
         );
-        std::io::copy(&mut reader, &mut scratch)
-            .context("failed to stage merged view for flatten")?;
+        // A manual copy loop (instead of std::io::copy) so this full-image read
+        // — previously silent and potentially many seconds for a multi-GB CHD
+        // — reports progress and honors cancellation.
+        let mut copy_buf = vec![0u8; 1024 * 1024];
+        let mut staged: u64 = 0;
+        let mut last_logged_mb: u64 = 0;
+        loop {
+            if cancel_check() {
+                anyhow::bail!("flatten cancelled while staging merged image");
+            }
+            let n = reader
+                .read(&mut copy_buf)
+                .context("failed to stage merged view for flatten")?;
+            if n == 0 {
+                break;
+            }
+            scratch
+                .write_all(&copy_buf[..n])
+                .context("failed to write flatten scratch file")?;
+            staged += n as u64;
+            let mb = staged / (1024 * 1024);
+            if mb >= last_logged_mb + 256 {
+                last_logged_mb = mb;
+                log_cb(&format!("staged {mb} / {logical_mb} MB"));
+            }
+        }
         std::io::Write::flush(&mut scratch).context("failed to flush flatten scratch file")?;
         // reader (and the wrapped session) drops here — close the read-side
         // libchdman handle BEFORE compress_chd opens its write-side one.
     }
+    log_cb("recompressing staged image into CHD");
 
     let mut scratch_reader = std::io::BufReader::with_capacity(
         1024 * 1024,
@@ -468,6 +517,7 @@ pub fn flatten_to_parent(
 
     match result {
         Ok(_files) => {
+            log_cb("replacing original CHD with the recompressed image");
             fs::rename(&staging_chd, parent_path).with_context(|| {
                 format!(
                     "failed to replace {} with {}",
@@ -476,6 +526,7 @@ pub fn flatten_to_parent(
                 )
             })?;
             let _ = fs::remove_file(diff_path);
+            log_cb("removed edit diff; CHD is up to date");
             Ok(())
         }
         Err(e) => {
@@ -491,6 +542,35 @@ mod tests {
     use libchdman_rs::hd::{create_from_reader, HdCreateOptions};
     use std::io::Cursor;
     use tempfile::TempDir;
+
+    #[test]
+    fn flatten_staging_never_equals_parent() {
+        // Regression: `<stem>.flattening` had its extension stripped by
+        // output_path's file_stem(), collapsing the staging file onto the
+        // parent and overwriting it in place (non-atomic). The staging .chd
+        // must be a distinct sibling for every shape of parent name.
+        for parent in [
+            "/tmp/disk.chd",
+            "/tmp/a.b.chd", // dotted stem
+            "/tmp/noext",   // no extension
+            "/x/ULTRA64_copy.chd",
+            "relative.chd", // no parent dir
+        ] {
+            let parent = Path::new(parent);
+            let (base, staging) = flatten_staging_paths(parent);
+            assert_ne!(
+                staging, parent,
+                "staging .chd collided with parent for {parent:?}"
+            );
+            assert_eq!(
+                staging.parent(),
+                parent.parent(),
+                "staging must be a sibling (same dir) for an atomic rename, {parent:?}"
+            );
+            // The base we hand compress_chd must itself derive to `staging`.
+            assert_eq!(output_path(&base, "chd", false, 0), staging);
+        }
+    }
 
     /// Build an uncompressed HD CHD (codecs all-zero). `data.len()` must be
     /// a multiple of 512.

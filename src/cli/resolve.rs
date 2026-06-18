@@ -15,7 +15,14 @@ use std::io::{Read, Seek};
 use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
-use crate::rbformats::BoxReadSeek;
+use crate::rbformats::{BoxReadSeek, BoxRwSeek};
+
+#[cfg(feature = "chd")]
+use crate::cli::logging::log_stderr;
+#[cfg(feature = "chd")]
+use crate::rbformats::chd_edit;
+#[cfg(feature = "chd")]
+use std::path::{Path, PathBuf};
 
 /// Resolved partition context — what to pass to
 /// [`crate::fs::open_filesystem`] / [`crate::fs::open_editable_filesystem`].
@@ -57,47 +64,112 @@ pub fn resolve_partition_ro(
     Ok((file, ctx))
 }
 
-/// Returned by [`resolve_partition_rw`] alongside the read+write file handle.
+/// Returned by [`resolve_partition_rw`] alongside the read+write handle.
 /// Call [`RwCommit::commit`] once a mutation has succeeded (after the
 /// `EditableFilesystem` has been synced) to persist it.
 ///
-/// For a raw image this is a no-op — writes already landed in the file. For a
-/// floppy container (.d88 / .xdf / .hdm / .dim) the file handle points at a
-/// decoded temp flat, and `commit` re-encodes that flat back into the
-/// container format, atomically replacing the original. **Dropping without
-/// committing discards container edits**, so a verb that errors out before
-/// calling `commit` leaves the original container untouched.
+/// Three shapes, matching how the GUI persists each source kind:
+/// - [`RwCommit::None`] — raw image / device: writes already landed; no-op.
+/// - [`RwCommit::Container`] — floppy (.d88 / .xdf / .hdm / .dim / .atr) or
+///   gzip (.adz / .hdz) container: the handle points at a decoded temp flat,
+///   and `commit` re-encodes it back into the container, atomically replacing
+///   the original (the same `ContainerEditSession` path the GUI uses).
+/// - [`RwCommit::Chd`] — a CHD edited via `chd_edit`: an uncompressed CHD was
+///   mutated in place (`diff: None`, no-op commit); a compressed CHD routed
+///   writes into a diff (`diff: Some`) that `commit` merges + recompresses
+///   back over the original, logging each step.
+///
+/// **Dropping without committing discards container / compressed-CHD edits**,
+/// so a verb that errors out before `commit` leaves the original untouched.
 #[must_use = "call commit() to persist edits made to a container"]
-pub struct RwCommit {
-    session: Option<crate::model::container_edit::ContainerEditSession>,
+pub enum RwCommit {
+    /// Raw image / device — writes already landed in place.
+    None,
+    /// Floppy or gzip container — re-encode the temp flat on commit.
+    Container(crate::model::container_edit::ContainerEditSession),
+    /// CHD edited through `chd_edit`. `diff: None` is an in-place
+    /// uncompressed edit (nothing to do on commit); `diff: Some(path)` is a
+    /// compressed-CHD diff that must be flattened back over `parent`.
+    #[cfg(feature = "chd")]
+    Chd {
+        parent: PathBuf,
+        diff: Option<PathBuf>,
+    },
 }
 
 impl RwCommit {
-    /// Persist the edit. No-op for raw images; re-encodes for containers.
+    /// Persist the edit. No-op for raw images / in-place CHDs; re-encodes for
+    /// containers; merges + recompresses for compressed CHDs.
     pub fn commit(self) -> Result<()> {
-        match self.session {
-            Some(session) => {
+        match self {
+            RwCommit::None => Ok(()),
+            RwCommit::Container(session) => {
                 let fmt = session.format_name();
                 session
                     .commit()
                     .map_err(|e| anyhow!("re-encoding {fmt} container: {e:#}"))
             }
-            None => Ok(()),
+            #[cfg(feature = "chd")]
+            RwCommit::Chd { diff: None, .. } => Ok(()),
+            #[cfg(feature = "chd")]
+            RwCommit::Chd {
+                parent,
+                diff: Some(diff),
+            } => flatten_chd_with_progress(&parent, &diff),
         }
     }
 }
 
-/// Same as [`resolve_partition_ro`] but the file handle is open
-/// read+write. Caller is responsible for ensuring the path resolves to
-/// a regular file (device-write safety lives in Phase C).
+/// Merge a compressed CHD's edit diff back over the original via
+/// [`chd_edit::flatten_to_parent`], surfacing each phase + recompression
+/// progress to stderr so a multi-GB flatten doesn't look hung. Mirrors the
+/// GUI's background flatten, minus the worker thread (the CLI is one-shot).
+#[cfg(feature = "chd")]
+fn flatten_chd_with_progress(parent: &Path, diff: &Path) -> Result<()> {
+    log_stderr("Saving CHD edits: merging diff and recompressing the image...");
+    let mut last_logged_mb: u64 = 0;
+    let mut progress_cb = |bytes: u64| {
+        let mb = bytes / (1024 * 1024);
+        if mb >= last_logged_mb + 256 {
+            last_logged_mb = mb;
+            log_stderr(format!("  recompressed {mb} MB so far..."));
+        }
+    };
+    let cancel = || false;
+    let mut log_cb = |msg: &str| log_stderr(format!("  {msg}"));
+    chd_edit::flatten_to_parent(parent, diff, None, &mut progress_cb, &cancel, &mut log_cb)
+        .map_err(|e| anyhow!("recompressing edited CHD: {e:#}"))?;
+    log_stderr("CHD edits saved.");
+    Ok(())
+}
+
+/// Sibling diff path for a compressed CHD edit: `<stem>.edit-diff.chd`.
+/// Matches the GUI's naming (`browse_view::diff_path_for`) so a diff left by
+/// an interrupted edit is recognizable.
+#[cfg(feature = "chd")]
+fn chd_diff_path(parent: &Path) -> PathBuf {
+    let mut name = parent
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    name.push(".edit-diff.chd");
+    parent.with_file_name(name)
+}
+
+/// Same as [`resolve_partition_ro`] but the handle is open read+write.
+/// Caller is responsible for ensuring the path resolves to a regular file
+/// (device-write safety lives in Phase C).
 ///
-/// Returns a [`RwCommit`] the caller must `commit()` after a successful
-/// mutation. For floppy containers the returned file handle is a decoded temp
-/// flat; `commit` re-encodes it back into the container. See [`RwCommit`].
+/// Returns a boxed `Read + Write + Seek` handle plus a [`RwCommit`] the
+/// caller must `commit()` after a successful mutation. The handle is boxed
+/// (rather than a bare [`File`]) so a CHD edit session — a `Read + Write +
+/// Seek` adapter, not a `File` — can flow through the same path. For a
+/// container or compressed CHD the handle is backed by a temp flat / diff and
+/// `commit` re-encodes / flattens. See [`RwCommit`].
 pub fn resolve_partition_rw(
     path: &std::path::Path,
     selector: Option<u32>,
-) -> Result<(File, PartitionContext, RwCommit)> {
+) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
     resolve_partition_rw_forced(path, selector, None)
 }
 
@@ -109,27 +181,96 @@ pub fn resolve_partition_rw_forced(
     path: &std::path::Path,
     selector: Option<u32>,
     fs_override: Option<&str>,
-) -> Result<(File, PartitionContext, RwCommit)> {
+) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
+    // CHD first: it's a compressed/streaming container with no flat
+    // re-encoder, so it rides `chd_edit` instead of the ContainerEditSession
+    // temp-flat path (returns None when `path` isn't a CHD, or when the binary
+    // was built without the `chd` feature — falls through to the branches
+    // below, same as a raw image).
+    if let Some(resolved) = try_resolve_chd_rw(path, selector, fs_override)? {
+        return Ok(resolved);
+    }
+
     if source_reader::is_editable_container_path(path) {
-        // Floppy container: decode to a temp flat, edit that, re-encode on
-        // commit. open_image_rw on the temp gives the same File the raw path
-        // would, so downstream dispatch is identical.
+        // Floppy / gzip container: decode to a temp flat, edit that, re-encode
+        // on commit. open_image_rw on the temp gives the same File the raw
+        // path would, so downstream dispatch is identical.
         let session = crate::model::container_edit::ContainerEditSession::open(path)
             .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
         let mut file = open_image_rw(session.flat_path())?;
         let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((
-            file,
-            ctx,
-            RwCommit {
-                session: Some(session),
-            },
-        ))
+        Ok((Box::new(file), ctx, RwCommit::Container(session)))
     } else {
         let mut file = open_image_rw(path)?;
         let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((file, ctx, RwCommit { session: None }))
+        Ok((Box::new(file), ctx, RwCommit::None))
     }
+}
+
+/// CHD read-write open for [`resolve_partition_rw_forced`]. `Ok(None)` when
+/// `path` is not a CHD (caller falls through to the container / raw branches);
+/// `Ok(Some(..))` with a `chd_edit`-backed handle when it is. The GUI edits
+/// CHDs the same way (`browse_view::enter_chd_edit_mode`): uncompressed CHDs
+/// are mutated in place, compressed CHDs route writes into a diff that is
+/// flattened back on commit.
+#[cfg(feature = "chd")]
+fn try_resolve_chd_rw(
+    path: &Path,
+    selector: Option<u32>,
+    fs_override: Option<&str>,
+) -> Result<Option<(BoxRwSeek, PartitionContext, RwCommit)>> {
+    if !source_reader::is_chd_path(path) {
+        return Ok(None);
+    }
+    let compressed = chd_edit::is_compressed_chd(path)
+        .map_err(|e| anyhow!("inspecting CHD {}: {e:#}", path.display()))?;
+    let (mut reader, commit): (BoxRwSeek, RwCommit) = if compressed {
+        let backup = chd_edit::make_backup_copy(path)
+            .map_err(|e| anyhow!("backing up CHD before edit: {e:#}"))?;
+        log_stderr(format!(
+            "Editing compressed CHD (original preserved at {})",
+            backup.display()
+        ));
+        let diff = chd_diff_path(path);
+        if diff.exists() {
+            // Leftover diff from an interrupted edit — the parent was never
+            // touched, so discard it and start clean.
+            let _ = std::fs::remove_file(&diff);
+        }
+        let session = chd_edit::ChdEditSession::open_with_diff(path, &diff)
+            .map_err(|e| anyhow!("opening CHD {} for edit: {e:#}", path.display()))?;
+        (
+            Box::new(session),
+            RwCommit::Chd {
+                parent: path.to_path_buf(),
+                diff: Some(diff),
+            },
+        )
+    } else {
+        let session = chd_edit::ChdEditSession::open_uncompressed(path)
+            .map_err(|e| anyhow!("opening CHD {} for edit: {e:#}", path.display()))?;
+        (
+            Box::new(session),
+            RwCommit::Chd {
+                parent: path.to_path_buf(),
+                diff: None,
+            },
+        )
+    };
+    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    Ok(Some((reader, ctx, commit)))
+}
+
+/// No-CHD-feature stub: a CHD path falls through to the raw branch (which then
+/// fails at partition detection, same as before — a binary without the `chd`
+/// feature can't read CHDs at all).
+#[cfg(not(feature = "chd"))]
+fn try_resolve_chd_rw(
+    _path: &std::path::Path,
+    _selector: Option<u32>,
+    _fs_override: Option<&str>,
+) -> Result<Option<(BoxRwSeek, PartitionContext, RwCommit)>> {
+    Ok(None)
 }
 
 /// Like [`resolve_partition_ro`] but returns a boxed `Read + Seek`,
