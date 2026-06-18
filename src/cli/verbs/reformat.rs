@@ -13,7 +13,6 @@ use clap::Args;
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::cli::img_at::ImageRef;
-use crate::cli::io::open_image_rw;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::cli::verbs::new::FsKind;
@@ -53,10 +52,11 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         bail!("reformat: only --fs hfs is supported today");
     }
 
-    // Resolve which partition we're targeting (offset + size) without
-    // opening a filesystem — the existing contents are about to be wiped.
-    let (_probe, ctx) =
-        crate::cli::resolve::resolve_partition_ro(&args.image.path, args.image.partition)?;
+    // Open the image read-write (decoding a CHD / container as needed) and
+    // resolve which partition we're targeting (offset + size). We don't open a
+    // filesystem — the existing contents are about to be wiped.
+    let (mut file, ctx, commit) =
+        crate::cli::resolve::resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
 
     if ctx.size < 1024 {
@@ -111,7 +111,6 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         );
     }
 
-    let mut file = open_image_rw(&args.image.path)?;
     file.seek(SeekFrom::Start(ctx.offset))
         .context("seeking to partition offset")?;
     file.write_all(&volume)
@@ -131,6 +130,11 @@ pub fn run(args: ReformatArgs) -> Result<()> {
         }
     }
     file.flush().ok();
+
+    // Persist: flatten/re-encode if the image was a CHD / container; no-op for
+    // a raw image (writes already landed).
+    drop(file);
+    commit.commit()?;
 
     log_stderr(format!(
         "reformatted partition @ offset {} ({} bytes) as HFS volume {:?} (block_size={})",

@@ -63,6 +63,15 @@ pub fn run(args: GrowArgs) -> Result<()> {
                  growing a .chd image requires the full build"
             )
         }
+    } else if crate::model::source_reader::is_editable_container_path(&args.image) {
+        // Floppy / gzip / WOZ containers are fixed-geometry wrappers; appending
+        // zero bytes to the container file would corrupt it (the bytes aren't
+        // raw image data). Refuse rather than mangle the file.
+        bail!(
+            "cannot grow {}: floppy / gzip / WOZ containers are fixed-geometry. \
+             Convert to a raw image first (`rb-cli convert ... --format raw`) if you need to resize.",
+            args.image.display()
+        );
     } else {
         let mut f = std::fs::OpenOptions::new()
             .read(true)

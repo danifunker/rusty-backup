@@ -16,7 +16,6 @@ use clap::Args;
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
 
-use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::cli::logging::log_stderr;
 use crate::fs::mac_scsi_bless::{bless_apm_disk, BlessOptions, MacScsiDriver};
 
@@ -47,7 +46,9 @@ pub struct MacScsiBlessArgs {
 
 pub fn run(args: MacScsiBlessArgs) -> Result<()> {
     let driver = if let Some(donor) = &args.driver_from {
-        let mut f = open_image_ro(donor)?;
+        // Read the donor read-only through the streaming resolver so a CHD /
+        // container donor is decoded before we look for its Apple_Driver.
+        let (mut f, _ctx) = crate::cli::resolve::resolve_partition_streaming(donor, None)?;
         MacScsiDriver::from_donor(&mut f)
             .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("extracting driver from {}", donor.display()))?
@@ -59,7 +60,9 @@ pub fn run(args: MacScsiBlessArgs) -> Result<()> {
         MacScsiDriver::builtin()
     };
 
-    let mut f = open_image_rw(&args.image)?;
+    // Open the target read-write (decoding a CHD / container as needed; commit
+    // flattens / re-encodes on success).
+    let (mut f, commit) = crate::cli::resolve::resolve_image_rw(&args.image)?;
     let disk_len = f.seek(SeekFrom::End(0))?;
     f.rewind()?;
 
@@ -68,6 +71,8 @@ pub fn run(args: MacScsiBlessArgs) -> Result<()> {
     };
     let report =
         bless_apm_disk(&mut f, disk_len, &driver, &opts).map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(f);
+    commit.commit()?;
 
     let verb = if report.was_already_present {
         "refreshed"

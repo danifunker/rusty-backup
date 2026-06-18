@@ -1,9 +1,10 @@
 //! In-place editing of standalone container files: the floppy wrappers
-//! (`.d88` / `.xdf` / `.hdm` / `.dim` / `.atr`) and the gzip-wrapped Amiga
-//! images (`.adz` / `.hdz`).
+//! (`.d88` / `.xdf` / `.hdm` / `.dim` / `.atr`), the gzip-wrapped Amiga
+//! images (`.adz` / `.hdz`), and WOZ floppies (`.woz`).
 //!
 //! These wrappers can't be edited byte-in-place — D88 has a sparse track
-//! table, DIM a 256-byte header, gzip is compressed. A [`ContainerEditSession`]
+//! table, DIM a 256-byte header, gzip is compressed, WOZ stores GCR
+//! bitstreams. A [`ContainerEditSession`]
 //! decodes the container into a temporary flat image, hands that path to the
 //! caller to mutate via the normal [`crate::fs::EditableFilesystem`] flow,
 //! then re-encodes the (mutated) flat back into the original container format
@@ -33,6 +34,10 @@ enum EditFormat {
     /// A gzip-wrapped image (`.adz` / `.hdz`). Re-gzipped on commit; the inner
     /// image may be any size, so no size check.
     Gzip,
+    /// A WOZ 1/2 floppy (`.woz`). Decoded from its GCR bitstream to a flat
+    /// sector buffer; re-encoded via `sectors_to_woz` on commit. Fixed
+    /// geometry, so the edited flat must keep the same length.
+    Woz,
 }
 
 /// A container opened for editing: decoded to a temp flat image that the caller
@@ -75,6 +80,24 @@ impl ContainerEditSession {
             });
         }
 
+        // WOZ floppy: decode the GCR bitstream into a flat sector buffer.
+        if crate::model::source_reader::is_woz_path(path) {
+            let mut reader = crate::rbformats::woz::WozReader::open(path)
+                .with_context(|| format!("decode WOZ {}", path.display()))?;
+            let flat_len = reader.len();
+            let mut out = std::fs::File::create(temp.path())
+                .with_context(|| format!("write decoded flat to {}", temp.path().display()))?;
+            std::io::copy(&mut reader, &mut out)
+                .with_context(|| format!("decode WOZ image {}", path.display()))?;
+            out.sync_all().ok();
+            return Ok(Self {
+                original_path: path.to_path_buf(),
+                format: EditFormat::Woz,
+                original_flat_len: flat_len,
+                temp,
+            });
+        }
+
         let (kind, flat) = decode_floppy_container_file(path)?;
         std::fs::write(temp.path(), &flat)
             .with_context(|| format!("write decoded flat to {}", temp.path().display()))?;
@@ -98,6 +121,7 @@ impl ContainerEditSession {
         match self.format {
             EditFormat::Floppy(kind) => kind.display_name(),
             EditFormat::Gzip => "gzip",
+            EditFormat::Woz => "woz",
         }
     }
 
@@ -132,6 +156,22 @@ impl ContainerEditSession {
                     flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 std::io::copy(&mut input, &mut encoder).context("re-gzip edited image")?;
                 encoder.finish().context("finish gzip stream")?
+            }
+            EditFormat::Woz => {
+                let flat = std::fs::read(self.temp.path())
+                    .with_context(|| format!("read edited flat {}", self.temp.path().display()))?;
+                // WOZ is a fixed-geometry floppy; FS edits must not change the
+                // size, and sectors_to_woz only accepts the exact 140K / 400K /
+                // 800K disk sizes.
+                if flat.len() as u64 != self.original_flat_len {
+                    anyhow::bail!(
+                        "edited image changed size ({} -> {} bytes); WOZ floppies are fixed-geometry",
+                        self.original_flat_len,
+                        flat.len()
+                    );
+                }
+                crate::rbformats::woz_write::sectors_to_woz(&flat)
+                    .context("re-encode WOZ container")?
             }
         };
 
@@ -276,6 +316,40 @@ mod tests {
         dec.read_to_end(&mut got).unwrap();
         assert_eq!(got.len(), 4096, "geometry preserved");
         assert_eq!(got[100], 0x22, "edit persisted into the .adz");
+    }
+
+    /// A `.woz` decodes from its GCR bitstream to a flat sector buffer; an edit
+    /// re-encodes via `sectors_to_woz` and the result is still a valid WOZ
+    /// carrying the edit (same fixed geometry).
+    #[test]
+    fn round_trip_edit_woz() {
+        use crate::rbformats::woz::WozReader;
+        use crate::rbformats::woz_write::write_woz;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.woz");
+        // 5.25" 140K flat; sentinel byte we'll flip via the session.
+        let mut flat = vec![0u8; 143_360];
+        flat[1024] = 0x11;
+        write_woz(&path, &flat).unwrap();
+
+        let session = ContainerEditSession::open(&path).unwrap();
+        assert_eq!(session.format_name(), "woz");
+        let flat_path = session.flat_path().to_path_buf();
+        let mut edited = std::fs::read(&flat_path).unwrap();
+        assert_eq!(edited.len(), 143_360, "WOZ decoded to the flat 140K image");
+        assert_eq!(edited[1024], 0x11, "sentinel survived GCR decode");
+        edited[1024] = 0x22;
+        std::fs::write(&flat_path, &edited).unwrap();
+        session.commit().unwrap();
+
+        // Re-decode the persisted .woz: the edit must be there, still valid WOZ.
+        let mut reader = WozReader::open(&path).unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got.len(), 143_360, "geometry preserved");
+        assert_eq!(got[1024], 0x22, "edit persisted into the .woz");
     }
 
     #[test]
