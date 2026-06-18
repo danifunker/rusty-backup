@@ -20,6 +20,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod api;
+pub mod backup_edit;
 pub mod config;
 pub mod copy_paths;
 pub mod device_safety;

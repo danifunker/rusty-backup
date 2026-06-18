@@ -15,7 +15,6 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::cli::io::open_image_rw;
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
 use crate::partition::editor::{apply_edits, validate_edits, PartitionTableEdit};
@@ -285,13 +284,16 @@ fn apply_batch(
     edits: Vec<PartitionTableEdit>,
     dry_run: bool,
 ) -> Result<()> {
-    let mut file = open_image_rw(image)?;
-    let table = PartitionTable::detect(&mut file)
+    use std::io::{Seek, Write};
+
+    // Probe the table + disk size read-only first (peels a CHD / container),
+    // so `--dry-run` never opens a write handle — which, for a compressed CHD,
+    // would make a backup copy + diff for nothing.
+    let (mut probe, _ctx) = crate::cli::resolve::resolve_partition_streaming(image, None)?;
+    let table = PartitionTable::detect(&mut probe)
         .map_err(|e| anyhow::anyhow!("detecting partition table: {e}"))?;
-    let disk_size = {
-        use std::io::Seek;
-        file.seek(std::io::SeekFrom::End(0))?
-    };
+    let disk_size = probe.seek(std::io::SeekFrom::End(0))?;
+    drop(probe);
 
     let warnings = validate_edits(&table, &edits, disk_size)
         .map_err(|e| anyhow::anyhow!("validate_edits: {e}"))?;
@@ -302,9 +304,16 @@ fn apply_batch(
         log_stderr(format!("dry-run: {} edit(s) would apply", edits.len()));
         return Ok(());
     }
+
+    // Apply for real on a read-write handle (decoding a CHD / container as
+    // needed; commit flattens / re-encodes on success).
+    let (mut file, commit) = crate::cli::resolve::resolve_image_rw(image)?;
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
     apply_edits(&mut file, &table, &edits, disk_size, &mut log_cb)
         .map_err(|e| anyhow::anyhow!("apply_edits: {e}"))?;
+    file.flush().ok();
+    drop(file);
+    commit.commit()?;
     log_stderr(format!(
         "applied {} edit(s) to {}",
         edits.len(),

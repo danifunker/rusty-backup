@@ -210,6 +210,84 @@ pub fn start_compress(
     progress
 }
 
+/// Synchronous decompress of `ctx.archive_path` into `temp_path` (zero-padded
+/// to `original_size` when the partition was compacted). The CLI one-shot path
+/// uses this directly; [`start_extract`] is the GUI's threaded wrapper around
+/// the same [`decompress_partition_to_file`] call.
+pub fn extract_partition_sync(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+) -> anyhow::Result<()> {
+    decompress_partition_to_file(
+        &ctx.archive_path,
+        &ctx.compression_type,
+        temp_path,
+        ctx.original_size,
+        ctx.compacted,
+        progress_cb,
+        cancel_check,
+    )
+}
+
+/// Synchronous recompress of `temp_path` back into `ctx.archive_path`, plus the
+/// `metadata.json` checksum + file-list update (skipped when
+/// `ctx.metadata_path` is empty). Mirrors the body of [`start_compress`] minus
+/// the worker thread, so the CLI and GUI share identical recompress + metadata
+/// semantics — the stored checksum is over the *decompressed* temp bytes, and
+/// only `checksum` + `compressed_files` are rewritten (compacted / imaged-size
+/// stay as-is; a full recompress simply makes the zero tail compress away).
+pub fn recompress_partition_sync(
+    ctx: &ArchiveEditContext,
+    temp_path: &Path,
+    progress_cb: &mut impl FnMut(u64),
+    cancel_check: &impl Fn() -> bool,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let checksum = compute_file_checksum(temp_path, &ctx.checksum_type)
+        .map_err(|e| anyhow::anyhow!("computing {} checksum: {e}", ctx.checksum_type))?;
+
+    let archive_base = ctx.archive_path.with_extension("");
+    let new_files = compress_file_to_archive(
+        temp_path,
+        &archive_base,
+        &ctx.compression_type,
+        None,
+        progress_cb,
+        cancel_check,
+        log_cb,
+    )
+    .context("recompressing edited partition")?;
+
+    // Remove the old archive if the codec changed the extension.
+    if ctx.archive_path.exists() {
+        if let Some(first) = new_files.first() {
+            let new_path = ctx
+                .archive_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(first);
+            if new_path != ctx.archive_path {
+                let _ = std::fs::remove_file(&ctx.archive_path);
+            }
+        }
+    }
+
+    if !ctx.metadata_path.as_os_str().is_empty() {
+        backup_metadata::update_partition_checksum(
+            &ctx.metadata_path,
+            ctx.partition_index,
+            &checksum,
+            Some(&new_files),
+        )
+        .context("updating metadata.json after recompress")?;
+    }
+    Ok(())
+}
+
 /// SHA-256 or CRC-32 checksum of a file, formatted as a lowercase hex string.
 pub fn compute_file_checksum(
     path: &Path,

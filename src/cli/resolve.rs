@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Result};
 use std::fs::File;
 use std::io::{Read, Seek};
 
+use crate::cli::backup_edit;
 use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
@@ -95,6 +96,10 @@ pub enum RwCommit {
         parent: PathBuf,
         diff: Option<PathBuf>,
     },
+    /// A partition inside a backup folder, edited via its decompressed temp
+    /// flat — recompressed back over the archive + `metadata.json` rewritten on
+    /// commit. See [`crate::cli::backup_edit`].
+    BackupArchive(crate::cli::backup_edit::BackupArchiveCommit),
 }
 
 impl RwCommit {
@@ -116,6 +121,7 @@ impl RwCommit {
                 parent,
                 diff: Some(diff),
             } => flatten_chd_with_progress(&parent, &diff),
+            RwCommit::BackupArchive(commit) => commit.commit(),
         }
     }
 }
@@ -182,49 +188,58 @@ pub fn resolve_partition_rw_forced(
     selector: Option<u32>,
     fs_override: Option<&str>,
 ) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
-    // CHD first: it's a compressed/streaming container with no flat
-    // re-encoder, so it rides `chd_edit` instead of the ContainerEditSession
-    // temp-flat path (returns None when `path` isn't a CHD, or when the binary
-    // was built without the `chd` feature — falls through to the branches
-    // below, same as a raw image).
-    if let Some(resolved) = try_resolve_chd_rw(path, selector, fs_override)? {
-        return Ok(resolved);
+    // A backup folder stores each partition as a compressed file governed by
+    // metadata.json, not as a partition inside one image — handle it before
+    // the whole-image path (which would try to detect a partition table).
+    if backup_edit::is_backup_folder(path) {
+        return backup_edit::open_backup_partition_rw(path, selector);
     }
 
+    // Open the whole image read-write (decoding CHD / container as needed),
+    // then resolve which partition inside it the caller wants.
+    let (mut reader, commit) = resolve_image_rw(path)?;
+    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    Ok((reader, ctx, commit))
+}
+
+/// Open `path` read-write as a boxed whole-image `Read + Write + Seek` handle,
+/// decoding a CHD or editable container to its editable backing (a `chd_edit`
+/// diff / in-place session, or a `ContainerEditSession` temp flat) with a
+/// [`RwCommit`] that flattens / re-encodes on commit. Unlike
+/// [`resolve_partition_rw`] this does NOT resolve a partition — the caller
+/// works in absolute image offsets. Used by whole-disk verbs (`partmap`,
+/// `mac_scsi_bless`) so they edit a CHD / container the same way `put` does.
+pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit)> {
+    if let Some(chd) = try_open_chd_rw(path)? {
+        return Ok(chd);
+    }
     if source_reader::is_editable_container_path(path) {
-        // Floppy / gzip container: decode to a temp flat, edit that, re-encode
-        // on commit. open_image_rw on the temp gives the same File the raw
-        // path would, so downstream dispatch is identical.
+        // Floppy / gzip / WOZ container: decode to a temp flat, edit that,
+        // re-encode on commit. open_image_rw on the temp gives the same File
+        // the raw path would, so downstream dispatch is identical.
         let session = crate::model::container_edit::ContainerEditSession::open(path)
             .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
-        let mut file = open_image_rw(session.flat_path())?;
-        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((Box::new(file), ctx, RwCommit::Container(session)))
+        let file = open_image_rw(session.flat_path())?;
+        Ok((Box::new(file), RwCommit::Container(session)))
     } else {
-        let mut file = open_image_rw(path)?;
-        let ctx = resolve_with_override(&mut file, selector, fs_override)?;
-        Ok((Box::new(file), ctx, RwCommit::None))
+        let file = open_image_rw(path)?;
+        Ok((Box::new(file), RwCommit::None))
     }
 }
 
-/// CHD read-write open for [`resolve_partition_rw_forced`]. `Ok(None)` when
-/// `path` is not a CHD (caller falls through to the container / raw branches);
-/// `Ok(Some(..))` with a `chd_edit`-backed handle when it is. The GUI edits
-/// CHDs the same way (`browse_view::enter_chd_edit_mode`): uncompressed CHDs
-/// are mutated in place, compressed CHDs route writes into a diff that is
-/// flattened back on commit.
+/// CHD read-write open: an uncompressed CHD is mutated in place; a compressed
+/// CHD is opened read-only with writes routed into a fresh diff that is
+/// flattened back over the original on commit. Mirrors the GUI
+/// (`browse_view::enter_chd_edit_mode`). `Ok(None)` when `path` is not a CHD
+/// (caller falls through to the container / raw branches).
 #[cfg(feature = "chd")]
-fn try_resolve_chd_rw(
-    path: &Path,
-    selector: Option<u32>,
-    fs_override: Option<&str>,
-) -> Result<Option<(BoxRwSeek, PartitionContext, RwCommit)>> {
+fn try_open_chd_rw(path: &Path) -> Result<Option<(BoxRwSeek, RwCommit)>> {
     if !source_reader::is_chd_path(path) {
         return Ok(None);
     }
     let compressed = chd_edit::is_compressed_chd(path)
         .map_err(|e| anyhow!("inspecting CHD {}: {e:#}", path.display()))?;
-    let (mut reader, commit): (BoxRwSeek, RwCommit) = if compressed {
+    let resolved: (BoxRwSeek, RwCommit) = if compressed {
         let backup = chd_edit::make_backup_copy(path)
             .map_err(|e| anyhow!("backing up CHD before edit: {e:#}"))?;
         log_stderr(format!(
@@ -257,19 +272,14 @@ fn try_resolve_chd_rw(
             },
         )
     };
-    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
-    Ok(Some((reader, ctx, commit)))
+    Ok(Some(resolved))
 }
 
 /// No-CHD-feature stub: a CHD path falls through to the raw branch (which then
 /// fails at partition detection, same as before — a binary without the `chd`
 /// feature can't read CHDs at all).
 #[cfg(not(feature = "chd"))]
-fn try_resolve_chd_rw(
-    _path: &std::path::Path,
-    _selector: Option<u32>,
-    _fs_override: Option<&str>,
-) -> Result<Option<(BoxRwSeek, PartitionContext, RwCommit)>> {
+fn try_open_chd_rw(_path: &std::path::Path) -> Result<Option<(BoxRwSeek, RwCommit)>> {
     Ok(None)
 }
 
@@ -317,6 +327,13 @@ pub fn resolve_partition_streaming_forced_inside(
     fs_override: Option<&str>,
     inside: Option<&str>,
 ) -> Result<(BoxReadSeek, PartitionContext)> {
+    // A backup folder stores each partition as a compressed file governed by
+    // metadata.json; decompress the selected one to a temp flat (read-only) so
+    // get / ls / inspect see it like any other raw partition.
+    if backup_edit::is_backup_folder(path) {
+        return backup_edit::open_backup_partition_ro(path, selector);
+    }
+
     // Peel any container *and* any image wrapper through the one shared
     // primitive so the CLI probes a source identically to the GUI: CHD / GHO /
     // IMZ / .zip-wrapped / flat-floppy containers decode to a flat stream, and
