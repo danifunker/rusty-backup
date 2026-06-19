@@ -80,7 +80,7 @@ pub fn looks_like_tar_archive(path: &Path) -> bool {
     let prefix = if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         read_prefix(flate2::read::GzDecoder::new(f), 600)
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        match zstd::Decoder::new(f) {
+        match crate::rbformats::zstd_compat::decoder(f) {
             Ok(d) => read_prefix(d, 600),
             Err(_) => return false,
         }
@@ -150,7 +150,7 @@ pub fn import_tar_from_path(
         let dec = flate2::read::GzDecoder::new(file);
         import_tar(efs, dest, dec, opts, progress)
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
-        let dec = zstd::Decoder::new(file).context("init zstd decoder")?;
+        let dec = crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?;
         import_tar(efs, dest, dec, opts, progress)
     } else {
         import_tar(efs, dest, file, opts, progress)
@@ -341,7 +341,7 @@ pub fn preflight_tar_from_path(
     } else if n >= 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
         preflight_tar(
             efs,
-            zstd::Decoder::new(file).context("init zstd decoder")?,
+            crate::rbformats::zstd_compat::decoder(file).context("init zstd decoder")?,
             opts,
         )
     } else {

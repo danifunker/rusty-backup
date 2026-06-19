@@ -40,9 +40,12 @@ newer. If your "retro Linux" box is a Pentium/P5/P55C, this is all you need.
 ```sh
 rustup target add i586-unknown-linux-gnu
 cargo build --release --bin rb-cli \
-  --no-default-features \
+  --no-default-features --features pure-zstd \
   --target i586-unknown-linux-gnu
 ```
+
+`--features pure-zstd` selects the pure-Rust zstd backend; with that plus the
+pure-Rust flate2 baseline, the build pulls **no C** at all.
 
 ### Tier 2 — i486 (true 486) — *custom target + nightly build-std*
 
@@ -60,7 +63,7 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 
 cargo +nightly build --release --bin rb-cli \
-  --no-default-features \
+  --no-default-features --features pure-zstd \
   -Z build-std=std,panic_abort \
   --target targets/i486-unknown-linux-gnu.json
 ```
@@ -123,31 +126,41 @@ The decoupling work is already in `Cargo.toml`. The slim build
 (eframe, egui, glow, winit, rfd/GTK, reqwest, tokio, libchdman, opticaldiscs).
 What remains is almost entirely pure Rust.
 
-**Native (C) libraries in the slim build — there are only two, and one is
-already handled:**
+**Native (C) libraries — both are now solved.** With `--no-default-features
+--features pure-zstd`, the slim build pulls **no C at all**:
 
 | C dep | Pulled by | Status for 486 |
 |---|---|---|
-| `libz-ng-sys` (zlib-ng) | `flate2` | **Solved.** flate2's baseline is now the pure-Rust `rust_backend` (miniz_oxide); the C `zlib-ng` is behind the desktop-only `native-zlib` feature, which the slim build doesn't enable. So flate2 is pure Rust here — and that's exactly the gzip path cb-dos/486 wants. |
-| `zstd-sys` (libzstd) | `zstd`, `zeekstd` | **Open follow-up** (see below). Cross-compiles fine as C, but isn't pure Rust. |
+| `libz-ng-sys` (zlib-ng) | `flate2` | **Solved.** flate2's baseline is the pure-Rust `rust_backend` (miniz_oxide); the C `zlib-ng` is behind the desktop-only `native-zlib` feature, which the slim build doesn't enable. |
+| `zstd-sys` (libzstd) | `zstd`, `zeekstd` | **Solved.** The zstd backend is feature-selected — `native-zstd` (default, C libzstd) vs `pure-zstd` (the pure-Rust, bit-exact `libzstd-bitexact-rs`). The slim build uses `pure-zstd`. |
 
 Everything else resolves to pure Rust: `bzip2` → `libbz2-rs-sys` (a Rust port),
 `dirs-sys`, `zlib-rs`, `miniz_oxide`, `image`, `rustyline`, `crossterm`, the
 RustCrypto hashes/ciphers, etc.
 
-### Follow-up: gate `zstd` behind a feature
+### The zstd backend split (how it works)
 
-To make the slim build **100% pure Rust** (no C cross-toolchain needed at all),
-`zstd` + `zeekstd` need to live behind a cargo feature so the 486 build can drop
-them. This is **not done yet**: `zstd`/`Zstd` is referenced across ~40 files and
-`CompressionType::Zstd` is an enum variant matched in ~10 exhaustive sites plus
-the `metadata.json` (de)serialization, so gating it cleanly (without breaking
-the "zero warnings / `cargo test --lib` green" rules) is its own focused change,
-not a one-liner. Tracked as a separate task.
+All production code routes zstd through `src/rbformats/zstd_compat.rs`, which
+`#[cfg]`-dispatches:
 
-Until then, the i586/i486 build still compiles `zstd-sys` from C source, which
-needs the cross **C** toolchain you already need for linking anyway — so this
-blocks *purity*, not *feasibility*.
+- **`native-zstd`** (desktop default) → the C `zstd` crate (fast, esp. encode).
+- **`pure-zstd`** (slim/cross) → `libzstd-bitexact-rs`, a pure-Rust
+  reimplementation with **bit-exact parity to libzstd 1.5.7**. Because the
+  output is byte-identical, a backup made by either backend is interchangeable,
+  and checksums hold across the desktop↔486 boundary.
+
+The compat module exposes a backend-neutral `decoder() -> Box<dyn Read + Send>`
+and a `ZstdEncoder<W>` (`Write` + `finish()`) that adapts the pure crate's
+push/pull `StreamEncoder` to the `Write`-style API. Both configs build, lint
+(`clippy -D warnings`), and pass a round-trip test; the full native suite stays
+green (2024 tests).
+
+**Seekable zstd caveat.** The seekable-zstd random-access reader (`zeekstd`) is
+C-only; it has no pure-Rust equivalent. The one production consumer (the browse
+`.seekable.zst` cache) falls back, under `pure-zstd`, to fully decompressing the
+cache to an anonymous tempfile (still `Read + Seek`, just not random-access). A
+seekable `.zst` file is a valid sequence of zstd frames plus a skippable
+seek-table frame, so the pure decoder reads it correctly.
 
 ---
 
@@ -195,7 +208,9 @@ a CF/SD or small disk), which is the main practical tradeoff vs the DOS path.
       `native-zlib` (desktop default only).
 - [x] `targets/i486-unknown-linux-gnu.json` committed (`cpu=i486`,
       `max-atomic-width=32`).
-- [ ] Gate `zstd`/`zeekstd` behind a feature (→ 100% pure-Rust slim build).
+- [x] zstd backend feature-split: `native-zstd` (C) vs `pure-zstd`
+      (`libzstd-bitexact-rs`). Slim build with `--features pure-zstd` is now
+      **100% pure Rust** — both backends build, lint, and round-trip.
 - [ ] Stand up an i586 cross-build in CI (stable, easiest tier).
 - [ ] Stand up the i486 nightly `build-std` cross-build + link `libatomic`.
 - [ ] Boot + smoke-test on real 486 (DX2/DX4) hardware.

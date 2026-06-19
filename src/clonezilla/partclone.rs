@@ -489,8 +489,8 @@ impl<R: Read> Read for PartcloneCompactReader<R> {
 /// Chain: MultiPartReader → zstd::Decoder → PartcloneExpandReader
 pub fn open_partclone_reader(files: &[PathBuf]) -> Result<(PartcloneHeader, impl Read)> {
     let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder =
-        zstd::Decoder::new(multi).context("failed to create zstd decoder for partclone")?;
+    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
+        .context("failed to create zstd decoder for partclone")?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -503,8 +503,8 @@ pub fn open_partclone_reader(files: &[PathBuf]) -> Result<(PartcloneHeader, impl
 /// (compacted, without expanding unused blocks to zeros).
 pub fn open_partclone_stream(files: &[PathBuf]) -> Result<(PartcloneHeader, impl Read)> {
     let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder =
-        zstd::Decoder::new(multi).context("failed to create zstd decoder for partclone stream")?;
+    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
+        .context("failed to create zstd decoder for partclone stream")?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -521,8 +521,8 @@ pub(crate) fn open_partclone_raw(
     files: &[PathBuf],
 ) -> Result<(PartcloneHeader, PartcloneBitmap, impl Read + Send)> {
     let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder =
-        zstd::Decoder::new(multi).context("failed to create zstd decoder for partclone raw")?;
+    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
+        .context("failed to create zstd decoder for partclone raw")?;
 
     let header = parse_header(&mut decoder)?;
     let bitmap = parse_bitmap(&mut decoder, &header)?;
@@ -534,8 +534,8 @@ pub(crate) fn open_partclone_raw(
 /// without reading the full bitmap or data. Used for quick metadata extraction.
 pub fn read_partclone_header(files: &[PathBuf]) -> Result<PartcloneHeader> {
     let multi = MultiPartReader::new(files.to_vec())?;
-    let mut decoder =
-        zstd::Decoder::new(multi).context("failed to create zstd decoder for header read")?;
+    let mut decoder = crate::rbformats::zstd_compat::decoder(multi)
+        .context("failed to create zstd decoder for header read")?;
     parse_header(&mut decoder)
 }
 

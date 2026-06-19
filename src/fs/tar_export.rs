@@ -132,7 +132,8 @@ pub fn export_tar<W: Write>(
         }
         TarCompression::Zstd => {
             // Level 0 = zstd's default (currently 3).
-            let enc = zstd::Encoder::new(out, 0).context("init zstd encoder")?;
+            let enc = crate::rbformats::zstd_compat::ZstdEncoder::new(out, 0)
+                .context("init zstd encoder")?;
             let mut builder = tar::Builder::new(enc);
             export_into(
                 fs,

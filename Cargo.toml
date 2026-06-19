@@ -67,7 +67,7 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "native-zlib"]
+default = ["gui", "chd", "optical", "native-zlib", "native-zstd"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client.
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
 # Fast C zlib (zlib-ng) for flate2. The always-on baseline is flate2's pure-Rust
@@ -75,6 +75,16 @@ gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
 # desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486
 # Linux, armv7/MiSTer) so flate2 stays pure Rust — no zlib-ng C cross-compile.
 native-zlib = ["flate2/zlib-ng"]
+# zstd backend selection (exactly one must be on; `native-zstd` is in `default`).
+# `native-zstd` = the C libzstd (zstd + zeekstd crates), fast, for the desktop.
+# `pure-zstd`   = the pure-Rust, bit-exact `libzstd-bitexact-rs` for slim/cross
+# builds (i586/i486 Linux, armv7/MiSTer) — no C zstd to cross-compile. Bit-exact
+# means a backup made by either backend is byte-identical, so the two are
+# interchangeable. Slim build: `--no-default-features --features pure-zstd`.
+# The seekable-zstd cache (zeekstd) is C-only; the pure path full-decompresses
+# such caches to a tempfile instead of seeking. See docs/linux_486_build.md.
+native-zstd = ["dep:zstd", "dep:zeekstd"]
+pure-zstd = ["dep:libzstd-bitexact-rs"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -111,8 +121,11 @@ byteorder = "1"
 encoding_rs = "0.8"
 log = "0.4"
 env_logger = "0.11"
-zstd = "0.13"
-zeekstd = "0.6"
+# zstd backend — exactly one of native-zstd / pure-zstd selects these. See the
+# [features] section. C libzstd (fast, desktop) vs pure-Rust bit-exact (cross).
+zstd = { version = "0.13", optional = true }
+zeekstd = { version = "0.6", optional = true }
+libzstd-bitexact-rs = { version = "0.157", optional = true }
 sha2 = "0.11"
 md-5 = "0.11"
 sha1 = "0.11"

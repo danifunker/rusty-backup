@@ -321,22 +321,50 @@ impl BrowseSession {
                 .unwrap_or(false);
 
         if is_seekable_zst {
-            let file = File::open(path).map_err(FilesystemError::Io)?;
-            let decoder = match zeekstd::Decoder::new(file) {
-                Ok(d) => d,
-                Err(e) => {
+            // Native (C) zstd has a seekable random-access decoder (zeekstd).
+            #[cfg(feature = "native-zstd")]
+            {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let decoder = match zeekstd::Decoder::new(file) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(path);
+                        return Err(FilesystemError::Parse(format!(
+                            "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
+                        )));
+                    }
+                };
+                return fs::open_filesystem(
+                    decoder,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
+            // Pure-Rust zstd has no seekable reader; a seekable-zstd file is
+            // still a valid sequence of zstd frames (+ a skippable seek-table
+            // frame), so fully decompress it to an anonymous tempfile that
+            // gives Read + Seek. Correct, just not random-access.
+            #[cfg(not(feature = "native-zstd"))]
+            {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let mut dec = libzstd_bitexact_rs::StreamDecoder::new(file);
+                let mut tmp = tempfile::tempfile().map_err(FilesystemError::Io)?;
+                if let Err(e) = std::io::copy(&mut dec, &mut tmp) {
                     let _ = std::fs::remove_file(path);
                     return Err(FilesystemError::Parse(format!(
                         "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
                     )));
                 }
-            };
-            return fs::open_filesystem(
-                decoder,
-                self.partition_offset,
-                self.partition_type,
-                self.partition_type_string.as_deref(),
-            );
+                std::io::Seek::seek(&mut tmp, std::io::SeekFrom::Start(0))
+                    .map_err(FilesystemError::Io)?;
+                return fs::open_filesystem(
+                    tmp,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
         }
 
         // For all other formats (raw images, VHD, 2MG, DiskCopy 4.2,

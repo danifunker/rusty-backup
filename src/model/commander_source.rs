@@ -608,7 +608,7 @@ mod tests {
     fn backup_session_opens_zstd_partition() {
         let flat = crate::fs::fat::create_blank_fat(737280, Some("BKZSTD")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let compressed = zstd::encode_all(&flat[..], 3).unwrap();
+        let compressed = crate::rbformats::zstd_compat::encode_all(&flat[..], 3).unwrap();
         std::fs::write(dir.path().join("partition-0.zst"), &compressed).unwrap();
 
         let meta = one_partition_meta("zstd", "partition-0.zst", flat.len() as u64);
@@ -709,7 +709,7 @@ mod tests {
     fn resolve_native_backup_lists_partitions_and_opens() {
         let flat = crate::fs::fat::create_blank_fat(737280, Some("RESV")).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let compressed = zstd::encode_all(&flat[..], 3).unwrap();
+        let compressed = crate::rbformats::zstd_compat::encode_all(&flat[..], 3).unwrap();
         std::fs::write(dir.path().join("partition-0.zst"), &compressed).unwrap();
         let meta = one_partition_meta("zstd", "partition-0.zst", flat.len() as u64);
         std::fs::write(

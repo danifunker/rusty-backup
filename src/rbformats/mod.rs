@@ -186,6 +186,7 @@ pub mod woz;
 pub mod woz_write;
 pub mod zip_disk;
 pub mod zstd;
+pub(crate) mod zstd_compat;
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};

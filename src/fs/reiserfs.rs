@@ -2063,7 +2063,7 @@ mod tests {
         let path = format!("tests/fixtures/{name}");
         let compressed =
             std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"));
-        let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(compressed))
+        let mut decoder = crate::rbformats::zstd_compat::decoder(Cursor::new(compressed))
             .unwrap_or_else(|e| panic!("Failed to create zstd decoder for {path}: {e}"));
         let mut output = Vec::new();
         std::io::Read::read_to_end(&mut decoder, &mut output)

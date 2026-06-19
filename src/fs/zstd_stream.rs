@@ -22,26 +22,20 @@ use std::sync::{Arc, Mutex};
 pub struct ZstdStreamCache {
     /// Accumulated decompressed bytes.
     data: Vec<u8>,
-    /// Streaming decoder.  Dropped once `exhausted` is `true`.
-    /// `zstd::Decoder::new(file)` wraps `File` in a `BufReader` internally,
-    /// yielding `Decoder<'static, BufReader<File>>`.
-    decoder: Option<zstd::Decoder<'static, std::io::BufReader<File>>>,
+    /// Streaming decoder (backend-agnostic, boxed). Dropped once
+    /// `exhausted` is `true`. The concrete decoder is chosen by the zstd
+    /// backend feature; see `rbformats::zstd_compat`.
+    decoder: Option<Box<dyn Read + Send>>,
     /// `true` when the decoder has reached EOF of the compressed stream.
     exhausted: bool,
 }
-
-// SAFETY: `zstd::Decoder` holds raw C pointers internally, but all access goes
-// through the `Mutex` in `Arc<Mutex<ZstdStreamCache>>`, which serialises
-// access.  Sending the cache to another thread is therefore safe.
-unsafe impl Send for ZstdStreamCache {}
 
 impl ZstdStreamCache {
     /// Open `path` and prepare for streaming decompression.
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        // `Decoder::new` wraps `file` in a `BufReader` itself → Decoder<'static, BufReader<File>>
-        let decoder =
-            zstd::Decoder::new(file).map_err(|e| io::Error::other(format!("zstd decoder: {e}")))?;
+        let decoder = crate::rbformats::zstd_compat::decoder(file)
+            .map_err(|e| io::Error::other(format!("zstd decoder: {e}")))?;
         Ok(Self {
             data: Vec::new(),
             decoder: Some(decoder),
