@@ -187,6 +187,51 @@ linker = "i586-linux-gnu-gcc"   # or "gcc" with -m32 via the spec's pre-link-arg
 
 ---
 
+## Dockerized cross-build (verified)
+
+The cross-link needs a Linux 32-bit-x86 sysroot, so the build belongs in a
+container rather than on a macOS/dev box. `docker/cross-i586.Dockerfile` does it
+and **works from any host arch, including Apple-Silicon arm64**: `rustc` runs
+natively and emits i586 code; the `i686-linux-gnu` cross-gcc does the 32-bit
+link, so there's no emulation in the build path.
+
+```sh
+# 1. Build the toolchain image (empty context; the Dockerfile copies nothing).
+docker build -t rb-cross-i586 - < docker/cross-i586.Dockerfile
+
+# 2. Cross-build rb-cli (binary lands in ./target-cross/, which is gitignored).
+docker run --rm -v "$PWD":/src -w /src rb-cross-i586 \
+  cargo build --release --bin rb-cli \
+    --no-default-features --features pure-zstd \
+    --target i586-unknown-linux-gnu --target-dir /src/target-cross
+
+# 3. (optional) Run the 32-bit binary under Docker's linux/386 platform.
+docker run --rm --platform linux/386 -v "$PWD":/src i386/debian:bookworm-slim \
+  /src/target-cross/i586-unknown-linux-gnu/release/rb-cli --version
+```
+
+**Verified result** (arm64 host): full slim tree compiles in ~50 s; the artifact
+is `ELF 32-bit LSB pie executable, Intel 80386`; its only `NEEDED` libraries are
+`libc.so.6`, `libgcc_s.so.1`, `ld-linux.so.2` — **no libzstd, no libz**, proving
+the pure-Rust slim build links zero C libraries. It runs under `linux/386`
+(`rb-cli 0.1.0`, exit 0).
+
+**Caveat — this binary is Pentium+, not a true 486.** Debian's 32-bit glibc is
+i686-baseline (uses `CMOV` etc.), so a `*-linux-gnu` binary won't run on a real
+486. For a true-486 runtime, link against an **i486 sysroot** instead:
+
+- **musl** is the easiest path — a static `i586`/`i486`-musl binary has no glibc
+  dependency and musl is built generic. (Needs a custom musl target spec +
+  `-Z build-std`, same as Tier 2; dockerizable the same way.)
+- **Buildroot** for a board-specific glibc sysroot built with `-march=i486`.
+
+The Dockerfile already installs `libc6-dev-i386-cross` + `libatomic`, so the
+Tier-2 (i486) variant is the same image plus `--features pure-zstd`,
+`-Z build-std=std,panic_abort`, `--target targets/i486-unknown-linux-gnu.json`,
+and `-C link-arg=-latomic`.
+
+---
+
 ## The target distro
 
 Modern mainstream distros dropped i486 (Debian is i686-only). Realistic bases
@@ -211,6 +256,9 @@ a CF/SD or small disk), which is the main practical tradeoff vs the DOS path.
 - [x] zstd backend feature-split: `native-zstd` (C) vs `pure-zstd`
       (`libzstd-bitexact-rs`). Slim build with `--features pure-zstd` is now
       **100% pure Rust** — both backends build, lint, and round-trip.
-- [ ] Stand up an i586 cross-build in CI (stable, easiest tier).
-- [ ] Stand up the i486 nightly `build-std` cross-build + link `libatomic`.
+- [x] i586 cross-build works + verified: `docker/cross-i586.Dockerfile` produces
+      a runnable `Intel 80386` ELF with no C library deps (Pentium+ glibc). Wiring
+      it into GitHub Actions CI is the remaining step.
+- [ ] i486 nightly `build-std` cross-build + link `libatomic` (same image).
+- [ ] True-486 runtime: musl or Buildroot i486 sysroot (Debian glibc is i686).
 - [ ] Boot + smoke-test on real 486 (DX2/DX4) hardware.
