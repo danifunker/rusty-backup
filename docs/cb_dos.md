@@ -413,15 +413,23 @@ attribute round-trip, boot protection, and swap-file exclusion).
 
 ## 8. Phased plan
 
-- [ ] **Phase 0a — Toolchain + UI size POC.** Install DJGPP cross-compiler +
+- [~] **Phase 0a — Toolchain + UI size POC.** Install DJGPP cross-compiler +
       DOSBox-X/86Box. Build a minimal **text-UI POC** (`conio`: screen draw +
       `int 16h` keys + bottom function-key action bar + dummy disk list) and
       **measure the `.exe`** to confirm the floppy budget. Establish
       engine/front-end project layout (core C lib + TUI + CLI stubs).
-- [ ] **Phase 0b — Disk spike.** "hello disk": enumerate BIOS drives, `int 13h`
+      *DJGPP + DOSBox-X installed; POC built (~108 KB / 55 KB UPX), measured, and
+      now run under DOSBox-X. Remaining: core-C-lib / CLI-stub project layout.*
+- [~] **Phase 0b — Disk spike.** "hello disk": enumerate BIOS drives, `int 13h`
       ext read with CHS fallback, dump MBR, parse FAT/NTFS BPB + read the
       allocation bitmap, write a long-named file via the LFN API. Prove on real
       486 + emulator.
+      *Done & DOSBox-X-verified for FAT12/16/32 **and NTFS** (`disk_spike.c`) on
+      both a superfloppy and an MBR-partitioned disk; FAT cluster usage and NTFS
+      `$Bitmap` allocated-cluster counts both **bit-exact vs a host scan**; LFN
+      write/detect proven (`lfn_test.c`). NTFS path reads MFT record 6, applies
+      the fixup, decodes the `$DATA` runs, and counts set bits. Remaining:
+      real-**486 hardware**, a **booted-FreeDOS** run, and (stretch) **exFAT**.*
 - [ ] **Phase 1 — Desktop `Gzip` codec.** Add `CompressionType::Gzip` (+
       `compress.rs` compress/decompress). Verify the desktop can back up *and*
       restore a FAT disk with gzip, incl. resize-to-different-size. Freeze the
@@ -498,3 +506,44 @@ attribute round-trip, boot protection, and swap-file exclusion).
   SHSUCDX; USB = fragile/optional, mostly moot on real 486 hw). **Boot-disk
   design deferred** — engine work is independent of boot media, so it's settled
   later. No v1 destination matrix chosen yet.
+- 2026-06-19 — **Phase 0a POC run (gap closed) + Phase 0b disk spike done,
+  emulator-verified.** Installed/located **DOSBox-X 2026.05.02**
+  (`/Applications/dosbox-x.app`); the previously-unrun `tui_poc.exe` now boots
+  and renders correctly under it. Wrote **`crusty-backup/src/disk_spike.c`** — the
+  "hello disk" spike: enumerate BIOS drives (`int 13h AH=08h`), LBA-extensions
+  check (`AH=41h`), sector read with **ext (`AH=42h`) + CHS (`AH=02h`) fallback**
+  via a DPMI DOS-memory transfer buffer, sector-0 **MBR-vs-FAT-boot-sector**
+  classification, partition-table dump, **FAT12/16/32 BPB parse**, and a full
+  **FAT walk counting used/free/bad clusters** (the allocation-bitmap proxy).
+  Verified two ways in DOSBox-X (headless `-exit`, results written to
+  `C:\SPIKE.LOG` on the host mount): (1) the bare **FAT16 superfloppy** fixture
+  (`tests/fixtures/test_fat16.img`) — clusters 8167 / used 3 / free 8164,
+  **bit-exact** against an independent host-side Python FAT scan; (2) a
+  **host-built MBR-partitioned** FAT16 disk (type 0x06 @ LBA 63) — partition
+  table dumped and the nested boot sector parsed *through* the partition offset.
+  Also wrote **`crusty-backup/src/lfn_test.c`**: raw **LFN API** create
+  (`int 21h AX=716Ch`) + volume-info (`71A0h`). It correctly **detects LFN
+  absence** — DOSBox-X integrated DOS reports DOS 5.0, so LFN is off (`AX=0x7100`)
+  and the spike refuses rather than 8.3-mangling; with `-set "dos lfn=true"` the
+  long name **"Crusty Backup Long Name partition-1.gz"** round-trips verbatim to
+  the host FS with correct content. **Still pending:** prove all three on **real
+  486 hardware**, and a **booted-FreeDOS** run (with/without `doslfn`) to validate
+  the actual deployment environment — DOSBox-X integrated DOS only proves the API.
+  Test disks live under the gitignored `crusty-backup/build/disks/`; run harness
+  is `crusty-backup/run-dosbox.sh` + the headless `dosbox-x -exit -c …` pattern.
+- 2026-06-19 — **Phase 0b: NTFS added to the spike.** `disk_spike.c` now detects
+  the NTFS VBR (OEM `NTFS    `), parses its BPB (bytes/sec, sec/clus, total
+  sectors, MFT LCN, MFT-record size from the signed `clusters_per_mft` byte),
+  reads **MFT record 6 (`$Bitmap`)** — applying the update-sequence **fixup** —
+  walks attributes to the `$DATA` (0x80) attribute, **decodes its data runs**
+  (resident + non-resident), and reads the bitmap counting set bits (set =
+  allocated). Ported the minimal subset of `src/fs/ntfs.rs` (same offsets/fixup/
+  run-decode logic). MBR routing now also picks **type 0x07** partitions
+  (`is_imageable_part_type`); exFAT (OEM `EXFAT`) is detected and skipped.
+  Verified on a host-built MBR disk wrapping `tests/fixtures/test_ntfs.img`
+  (type 0x07 @ LBA 63): **511 clusters / 189 allocated / 322 free**, bit-exact
+  against an independent host-side Python `$Bitmap` decode. (DOSBox-X `IMGMOUNT`
+  rejected the bare 2 MiB image's auto-geometry / `-t hdd` left it "not active",
+  so the NTFS test disk is wrapped to ~16 MiB like the FAT one — the small-image
+  `IMGMOUNT` quirk is worth remembering.) Remaining 0b work unchanged: real-486,
+  booted-FreeDOS, exFAT (stretch).
