@@ -67,9 +67,14 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical"]
+default = ["gui", "chd", "optical", "native-zlib"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client.
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+# Fast C zlib (zlib-ng) for flate2. The always-on baseline is flate2's pure-Rust
+# `rust_backend` (miniz_oxide); this feature overrides it with the C backend for
+# desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486
+# Linux, armv7/MiSTer) so flate2 stays pure Rust — no zlib-ng C cross-compile.
+native-zlib = ["flate2/zlib-ng"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -120,7 +125,10 @@ tempfile = "3"
 image = "0.25"
 dirs = "6"
 unicode-normalization = "0.1"
-flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
+# Baseline is the pure-Rust backend (miniz_oxide) so the slim/cross builds need
+# no C zlib. The desktop `native-zlib` feature adds `flate2/zlib-ng`, which
+# flate2 prioritizes over the Rust backend when both are enabled.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }
