@@ -507,6 +507,121 @@ static void report_ntfs(const drive_info_t *di, int drive, uint64_t vol_lba,
     ntfs_count_bitmap(di, drive, vol_lba, &b);
 }
 
+/* ----- exFAT (allocation-bitmap directory entry) ------------------- */
+
+typedef struct {
+    unsigned bytes_per_sec;             /* 1 << BytesPerSectorShift */
+    unsigned sec_per_clus;              /* 1 << SectorsPerClusterShift */
+    unsigned bps_ratio;                 /* bytes_per_sec / 512 (BIOS sectors) */
+    uint64_t volume_length;             /* in exFAT sectors */
+    uint32_t cluster_heap_offset;       /* in exFAT sectors */
+    uint32_t cluster_count;
+    uint32_t root_cluster;
+    uint64_t cluster_size;              /* bytes */
+} exfat_bpb_t;
+
+static int parse_exfat_bpb(const uint8_t *s, exfat_bpb_t *b) {
+    memset(b, 0, sizeof *b);
+    unsigned bss = s[0x6C], scs = s[0x6D];
+    if (bss < 9 || bss > 12 || scs > 25) return -1;
+    b->bytes_per_sec = 1u << bss;
+    b->sec_per_clus  = 1u << scs;
+    b->bps_ratio     = b->bytes_per_sec / 512;
+    b->volume_length       = rd64(s + 0x48);
+    b->cluster_heap_offset = rd32(s + 0x58);
+    b->cluster_count       = rd32(s + 0x5C);
+    b->root_cluster        = rd32(s + 0x60);
+    b->cluster_size = (uint64_t)b->bytes_per_sec * b->sec_per_clus;
+    if (b->sec_per_clus == 0 || b->cluster_count == 0 || b->bps_ratio == 0)
+        return -1;
+    return 0;
+}
+
+/* BIOS LBA of an exFAT data cluster (clusters are 2-based). */
+static uint64_t exfat_cluster_lba(uint64_t vol_lba, const exfat_bpb_t *b,
+                                  uint32_t clus) {
+    uint64_t exfat_sec = (uint64_t)b->cluster_heap_offset +
+                         (uint64_t)(clus - 2) * b->sec_per_clus;
+    return vol_lba + exfat_sec * b->bps_ratio;
+}
+
+static void report_exfat(const drive_info_t *di, int drive, uint64_t vol_lba,
+                         const uint8_t *vbr) {
+    exfat_bpb_t b;
+    if (parse_exfat_bpb(vbr, &b) != 0) {
+        slog("  exFAT BPB failed sanity checks\n");
+        return;
+    }
+    slog("  exFAT  OEM '%.8s'  bytes/sec %u  sec/clus %u  cluster %lu B\n",
+         vbr + 3, b.bytes_per_sec, b.sec_per_clus,
+         (unsigned long)b.cluster_size);
+    slog("  volume %lu sec (%.1f MiB)  clusters %lu  heap @ sec %lu  root clus %lu\n",
+         (unsigned long)b.volume_length,
+         b.volume_length * (double)b.bytes_per_sec / (1024.0 * 1024.0),
+         (unsigned long)b.cluster_count,
+         (unsigned long)b.cluster_heap_offset, (unsigned long)b.root_cluster);
+
+    /* Scan the start of the root directory for the allocation-bitmap entry
+     * (type 0x81). It is a primary critical entry, always near the start. */
+    uint8_t buf[XFER_BYTES];
+    uint64_t root_lba = exfat_cluster_lba(vol_lba, &b, b.root_cluster);
+    int rsecs = (int)((uint64_t)b.sec_per_clus * b.bps_ratio);
+    if (rsecs > XFER_SECTORS) rsecs = XFER_SECTORS;
+    if (rsecs < 1) rsecs = 1;
+    if (read_lba(di, drive, root_lba, rsecs, buf) != 0) {
+        slog("  could not read exFAT root directory\n");
+        return;
+    }
+    uint32_t bm_clus = 0;
+    uint64_t bm_size = 0;
+    for (int off = 0; off + 32 <= rsecs * 512; off += 32) {
+        uint8_t et = buf[off];
+        if (et == 0x00) break;          /* end of directory */
+        if (et == 0x81) {               /* allocation bitmap */
+            bm_clus = rd32(buf + off + 20);
+            bm_size = rd64(buf + off + 24);
+            break;
+        }
+    }
+    if (bm_clus == 0) {
+        slog("  exFAT: allocation-bitmap entry (0x81) not found in root\n");
+        return;
+    }
+
+    /* Read the bitmap contiguously (matches how the desktop reads it) and
+     * count set bits = allocated clusters. */
+    uint64_t need = ((uint64_t)b.cluster_count + 7) / 8;
+    if (bm_size && bm_size < need) need = bm_size;
+    uint64_t bm_lba = exfat_cluster_lba(vol_lba, &b, bm_clus);
+    uint64_t bits_to_count = b.cluster_count, counted = 0, allocated = 0, done = 0;
+    while (done < need && counted < bits_to_count) {
+        uint64_t want = need - done;
+        int secs = (int)((want + 511) / 512);
+        if (secs > XFER_SECTORS) secs = XFER_SECTORS;
+        if (read_lba(di, drive, bm_lba + done / 512, secs, buf) != 0) {
+            slog("  exFAT bitmap read error\n");
+            return;
+        }
+        int got = secs * 512;
+        for (int byi = 0; byi < got && counted < bits_to_count; byi++) {
+            uint8_t v = buf[byi];
+            for (int bit = 0; bit < 8 && counted < bits_to_count; bit++) {
+                if (v & (1 << bit)) allocated++;
+                counted++;
+            }
+        }
+        done += got;
+    }
+
+    uint64_t freecl = b.cluster_count > allocated ? b.cluster_count - allocated : 0;
+    double cl_kib = b.cluster_size / 1024.0;
+    slog("  clusters: %lu total, %lu allocated, %lu free\n",
+         (unsigned long)b.cluster_count, (unsigned long)allocated,
+         (unsigned long)freecl);
+    slog("  allocated %.1f MiB, free %.1f MiB (cluster = %.1f KiB)\n",
+         allocated * cl_kib / 1024.0, freecl * cl_kib / 1024.0, cl_kib);
+}
+
 /* Read the volume boot sector at `vol_lba`, parse + report its BPB. */
 static void report_volume(const drive_info_t *di, int drive, uint64_t vol_lba) {
     uint8_t sec[512];
@@ -520,7 +635,7 @@ static void report_volume(const drive_info_t *di, int drive, uint64_t vol_lba) {
         return;
     }
     if (memcmp(sec + 3, "EXFAT   ", 8) == 0) {
-        slog("  exFAT volume (OEM 'EXFAT') -- not parsed by this spike\n");
+        report_exfat(di, drive, vol_lba, sec);
         return;
     }
     if (!looks_like_fat_boot(sec)) {

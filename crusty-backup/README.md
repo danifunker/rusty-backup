@@ -21,11 +21,12 @@ Current artifacts:
   - **FAT12/16/32** — parses the BPB and walks the FAT counting used/free/bad
     clusters.
   - **NTFS** — parses the BPB, reads MFT record 6 (`$Bitmap`) with fixup,
-    decodes the `$DATA` runs, and counts allocated clusters. (exFAT detected,
-    not parsed.)
+    decodes the `$DATA` runs, and counts allocated clusters.
+  - **exFAT** — parses the BPB, scans the root directory for the allocation-
+    bitmap entry (type 0x81), and counts the bitmap's allocated clusters.
   Writes findings to both the screen and `C:\SPIKE.LOG`. Cluster counts are
-  bit-exact vs an independent host scan for both a superfloppy and an
-  MBR-partitioned disk (FAT16 and NTFS).
+  bit-exact vs an independent host scan for FAT16, NTFS, and exFAT (on both a
+  superfloppy and an MBR-partitioned disk).
 - `src/lfn_test.c` — Phase 0b LFN write spike. Queries LFN support
   (`int 21h AX=71A0h`) and creates a long-named file via the raw LFN API
   (`AX=716Ch`). Correctly detects LFN *absence* (refuses rather than mangling);

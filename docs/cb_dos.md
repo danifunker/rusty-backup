@@ -426,10 +426,11 @@ attribute round-trip, boot protection, and swap-file exclusion).
       486 + emulator.
       *Done & DOSBox-X-verified for FAT12/16/32 **and NTFS** (`disk_spike.c`) on
       both a superfloppy and an MBR-partitioned disk; FAT cluster usage and NTFS
-      `$Bitmap` allocated-cluster counts both **bit-exact vs a host scan**; LFN
-      write/detect proven (`lfn_test.c`). NTFS path reads MFT record 6, applies
-      the fixup, decodes the `$DATA` runs, and counts set bits. Remaining:
-      real-**486 hardware**, a **booted-FreeDOS** run, and (stretch) **exFAT**.*
+      `$Bitmap` and **exFAT** allocation-bitmap counts all **bit-exact vs a host
+      scan**; LFN write/detect proven (`lfn_test.c`). NTFS reads MFT record 6 +
+      fixup + `$DATA` runs; exFAT scans the root for the 0x81 bitmap entry and
+      counts the contiguous bitmap. Remaining: real-**486 hardware** and a
+      **booted-FreeDOS** run.*
 - [ ] **Phase 1 — Desktop `Gzip` codec.** Add `CompressionType::Gzip` (+
       `compress.rs` compress/decompress). Verify the desktop can back up *and*
       restore a FAT disk with gzip, incl. resize-to-different-size. Freeze the
@@ -547,3 +548,16 @@ attribute round-trip, boot protection, and swap-file exclusion).
   so the NTFS test disk is wrapped to ~16 MiB like the FAT one — the small-image
   `IMGMOUNT` quirk is worth remembering.) Remaining 0b work unchanged: real-486,
   booted-FreeDOS, exFAT (stretch).
+- 2026-06-19 — **Phase 0b: exFAT added to the spike.** `disk_spike.c` now parses
+  the exFAT VBR/BPB (BytesPerSectorShift/SectorsPerClusterShift at 0x6C/0x6D,
+  cluster-heap offset, cluster count, root cluster), reads the start of the root
+  directory, finds the **allocation-bitmap directory entry (type 0x81)** (start
+  cluster @+20, size @+24), and reads the bitmap **contiguously** counting set
+  bits (set = allocated) — matching `src/fs/exfat.rs`. Handles non-512-byte
+  logical sectors via a `bytes_per_sec/512` BIOS-LBA ratio. The MBR type-0x07
+  path already routed here; `report_volume` distinguishes NTFS vs exFAT by OEM
+  string. Verified on a host-built MBR disk wrapping `tests/fixtures/
+  test_exfat.img` (type 0x07 @ LBA 63): **992 clusters / 9 allocated / 983
+  free**, bit-exact vs an independent host decode. **Phase 0b filesystem
+  coverage is now complete (FAT12/16/32 + NTFS + exFAT).** Remaining 0b:
+  real-486 hardware + booted-FreeDOS.
