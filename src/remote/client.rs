@@ -183,6 +183,68 @@ impl RemoteSession {
         self.expect_ok("StageMkdir")
     }
 
+    /// Stage an **on-device** copy: the daemon reads `src_path` from
+    /// `src_image` (a path on its serve root) into the session's destination
+    /// image. The file data never leaves the daemon — the client sends only the
+    /// command.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_copy_local(
+        &mut self,
+        session: u64,
+        src_image: &str,
+        src_partition: Option<u32>,
+        src_path: &str,
+        dest_parent: &str,
+        name: &str,
+        force: bool,
+    ) -> Result<()> {
+        write_control(
+            &mut self.writer,
+            &Request::StageCopyLocal {
+                session,
+                src_image: src_image.to_string(),
+                src_partition,
+                src_path: src_path.to_string(),
+                dest_parent: dest_parent.to_string(),
+                name: name.to_string(),
+                force,
+            },
+        )?;
+        self.expect_ok("StageCopyLocal")
+    }
+
+    // --- host-FS browse (Phase 2) ---
+
+    /// Classify a host path on the daemon: `(exists, is_dir)`.
+    pub fn host_stat(&mut self, path: &str) -> Result<(bool, bool)> {
+        write_control(
+            &mut self.writer,
+            &Request::HostStat {
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::HostKind { exists, is_dir } => Ok((exists, is_dir)),
+            Response::Error { message } => bail!("stat {path}: {message}"),
+            other => bail!("unexpected reply to HostStat: {other:?}"),
+        }
+    }
+
+    /// List a directory on the daemon's host filesystem.
+    pub fn list_host_dir(&mut self, path: &str) -> Result<Vec<WireEntry>> {
+        write_control(
+            &mut self.writer,
+            &Request::ListHostDir {
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::Dir { entries } => Ok(entries),
+            Response::Error { message } => bail!("list host dir {path}: {message}"),
+            other => bail!("unexpected reply to ListHostDir: {other:?}"),
+        }
+    }
+
     /// Replay the session's staged edits onto the image; returns the count.
     pub fn apply(&mut self, session: u64) -> Result<u64> {
         write_control(&mut self.writer, &Request::Apply { session })?;

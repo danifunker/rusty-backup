@@ -131,14 +131,32 @@ pub fn run(args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Remote directory listing over an `rb://` reference (Phase 0: literal paths
-/// only — globbing would need server-side volume walking, deferred).
+/// Remote directory listing over an `rb://` reference. Lists either the
+/// daemon's host filesystem (`rb://host/` or a host directory) or the contents
+/// of an image on it (`rb://host/img@N`), auto-detected. Literal paths only —
+/// globbing would need server-side volume walking, deferred.
 #[cfg(feature = "remote")]
 fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str) -> Result<()> {
     if has_glob_chars(path) {
-        bail!("glob patterns aren't supported over rb:// yet (Phase 0 lists literal paths)");
+        bail!("glob patterns aren't supported over rb:// yet (literal paths only)");
     }
     let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
+
+    // With no `@N` the rb:// path could be a host directory to browse or a
+    // (superfloppy) image file to open — ask the daemon which it is.
+    if partition.is_none() {
+        let (exists, is_dir) = session.host_stat(&rref.path)?;
+        if !exists {
+            bail!("no such path on the remote: {}", rref.path);
+        }
+        if is_dir {
+            for entry in session.list_host_dir(&rref.path)? {
+                print_wire_entry(&entry);
+            }
+            return Ok(());
+        }
+    }
+
     let (handle, label) = session.open_image(&rref.path, partition)?;
     log_stderr(label);
     for entry in session.list_dir(handle, path)? {

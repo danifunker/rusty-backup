@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
+    read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry, WireKind,
     CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
@@ -278,6 +278,48 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 write_control(&mut writer, &Response::Ok)?;
             }
 
+            // --- host-FS browse + on-device copy (Phase 2) ---
+            Request::ListHostDir { path } => match list_host_dir(root, &path) {
+                Ok(entries) => write_control(&mut writer, &Response::Dir { entries })?,
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+            },
+
+            Request::HostStat { path } => match host_stat(root, &path) {
+                Ok((exists, is_dir)) => {
+                    write_control(&mut writer, &Response::HostKind { exists, is_dir })?
+                }
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+            },
+
+            Request::StageCopyLocal {
+                session,
+                src_image,
+                src_partition,
+                src_path,
+                dest_parent,
+                name,
+                force,
+            } => match sessions.get_mut(&session) {
+                Some(sess) => {
+                    match stage_copy_local(root, &src_image, src_partition, &src_path, sess) {
+                        Ok((blob, size, type_code, creator_code)) => {
+                            sess.edits.push(StagedEdit::AddFile {
+                                dest_parent,
+                                name,
+                                blob,
+                                size,
+                                force,
+                                type_code,
+                                creator_code,
+                            });
+                            write_control(&mut writer, &Response::Ok)?;
+                        }
+                        Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                    }
+                }
+                None => reply_err(&mut writer, format!("no such session {session}"))?,
+            },
+
             Request::Bye => return Ok(()),
         }
     }
@@ -423,6 +465,116 @@ fn apply_session(sess: &Session) -> Result<u64> {
     drop(fs);
     commit.commit()?;
     Ok(count)
+}
+
+/// Stage an on-device copy: extract `src_path` from the source image into a
+/// staging blob in the session's staging dir, returning the blob + the source
+/// file's size and type/creator (preserved for HFS-style filesystems). The blob
+/// lives on the daemon, so nothing round-trips through the desktop.
+fn stage_copy_local(
+    root: &Path,
+    src_rel: &str,
+    src_partition: Option<u32>,
+    src_path: &str,
+    sess: &mut Session,
+) -> Result<(PathBuf, u64, Option<String>, Option<String>)> {
+    let (mut src_fs, _label) = open_image(root, src_rel, src_partition)?;
+    let entry = resolve_path(&mut *src_fs, src_path)?;
+    if entry.is_directory() {
+        bail!("{src_path} is a directory (recursive copy over rb:// isn't supported yet)");
+    }
+    let blob = sess.staging.path().join(format!("blob-{}", sess.blob_seq));
+    sess.blob_seq += 1;
+    let mut f = std::fs::File::create(&blob)
+        .with_context(|| format!("creating staging blob {}", blob.display()))?;
+    src_fs
+        .write_file_to(&entry, &mut f)
+        .map_err(|e| anyhow!("reading {src_path}: {e}"))?;
+    Ok((
+        blob,
+        entry.size,
+        entry.type_code.clone(),
+        entry.creator_code.clone(),
+    ))
+}
+
+/// List a directory on the host filesystem (sandboxed to the serve root).
+fn list_host_dir(root: &Path, rel: &str) -> Result<Vec<WireEntry>> {
+    let dir = sandbox_dir(root, rel)?;
+    if !dir.is_dir() {
+        bail!("{rel} is not a directory");
+    }
+    let rel_disp = rel.trim_end_matches('/');
+    let mut out = Vec::new();
+    for ent in
+        std::fs::read_dir(&dir).with_context(|| format!("reading host dir {}", dir.display()))?
+    {
+        let ent = ent?;
+        let name = ent.file_name().to_string_lossy().to_string();
+        let ft = ent.file_type()?;
+        let kind = if ft.is_dir() {
+            WireKind::Dir
+        } else if ft.is_symlink() {
+            WireKind::Symlink
+        } else {
+            WireKind::File
+        };
+        let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
+        let path = if rel_disp.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("{rel_disp}/{name}")
+        };
+        out.push(WireEntry {
+            name,
+            path,
+            kind,
+            size,
+            type_code: None,
+            creator_code: None,
+            symlink_target: None,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Classify a host path: `(exists, is_dir)`. A path that escapes the serve root
+/// is an error; a missing path is `(false, false)`.
+fn host_stat(root: &Path, rel: &str) -> Result<(bool, bool)> {
+    let rel = rel.trim_start_matches('/');
+    let joined = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    match joined.canonicalize() {
+        Ok(canon) => {
+            if !canon.starts_with(root) {
+                bail!("path {rel:?} escapes the serve root");
+            }
+            Ok((true, canon.is_dir()))
+        }
+        Err(_) => Ok((false, false)),
+    }
+}
+
+/// Like `sandbox_join` but allows the root itself (empty `rel`) — for browsing
+/// host directories rather than opening an image file.
+fn sandbox_dir(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = rel.trim_start_matches('/');
+    let joined = if rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    let canon = joined
+        .canonicalize()
+        .with_context(|| format!("resolving host path {rel:?} under serve root"))?;
+    if !canon.starts_with(root) {
+        bail!("path {rel:?} escapes the serve root");
+    }
+    Ok(canon)
 }
 
 /// Resolve a wire path under the serve root and refuse anything that escapes

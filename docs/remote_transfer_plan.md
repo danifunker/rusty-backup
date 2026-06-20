@@ -617,8 +617,17 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   (no atomic-batch / recoverable queue yet — plan §6/§13.2); sessions are per-connection (no idle-timeout
   reuse); `put --zero` / `--boot`, `rm` (`StageDelete`), and `StageCopyLocal` (on-device remote→remote)
   come with Phase 2.
-- **Phase 2 — host-FS browse + remote→remote (Family F).** `ListHostDir`/sandbox-to-root; `StageCopyLocal`
-  on-device copy. *Gate:* on-device image→image copy with no desktop data round-trip; `ls rb://host/`.
+- **Phase 2 — host-FS browse + remote→remote (Family F). — DONE (loopback-validated).** `ListHostDir` +
+  `HostStat` (sandboxed to root) let `rb-cli ls rb://host/` browse the daemon's host filesystem; `ls`
+  auto-detects (via `HostStat`) whether a no-`@N` path is a host directory to browse or a superfloppy
+  image to open. `StageCopyLocal` does an **on-device** copy — the daemon reads the source file from one
+  image into a session staging blob and queues it as an AddFile into the destination image, so the data
+  never round-trips through the desktop; wired into `rb-cli cp rb://host/src@N SRC rb://host/dst@M DST`
+  when both refs are on the same daemon. *Gate met:* `ls rb://host/` + subdir + file-auto-detect; on-device
+  `cp` of a 40 KB file between two images (pulled back **byte-exact**); cp-into-dir (trailing slash keeps
+  basename); mixed-local/remote and cross-host `cp` rejected cleanly; local `ls` confirms the daemon
+  committed real changes. **Deferred:** mixed local↔remote `cp` (round-trips; use `get`+`put`), globs /
+  recursive over `rb://`, `HostMkdir`/`HostDelete`.
 - **Phase 3 — GUI Commander remote pane (Family F).** Connect dialog, saved connections, remote source
   kind, copy arms, progress UI. *Gate:* drag a file from a remote image into a local image in the GUI.
 - **Phase 4 — MiSTer packaging & service.** `service install` + `user-startup.sh`, downloader DB,

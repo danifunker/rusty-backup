@@ -103,6 +103,26 @@ pub enum Request {
     /// Discard a session and its staging blobs (also serves as abort).
     CloseSession { session: u64 },
 
+    // --- host-FS browse + on-device copy (Phase 2) ---
+    /// List a directory on the daemon's host filesystem (sandboxed to root).
+    ListHostDir { path: String },
+    /// Classify a host path — does it exist, and is it a directory? Lets the
+    /// client distinguish a host directory to browse from an image file to
+    /// open when no `@N` partition was given.
+    HostStat { path: String },
+    /// Stage an **on-device** copy: the daemon reads `src_path` from `src_image`
+    /// (relative to the serve root, partition `src_partition`) and queues it as
+    /// an AddFile into the session's destination image — no desktop round-trip.
+    StageCopyLocal {
+        session: u64,
+        src_image: String,
+        src_partition: Option<u32>,
+        src_path: String,
+        dest_parent: String,
+        name: String,
+        force: bool,
+    },
+
     /// Polite disconnect.
     Bye,
 }
@@ -126,6 +146,8 @@ pub enum Response {
     SessionOpened { session: u64 },
     /// `Apply` finished; `count` staged edits were replayed.
     Applied { count: u64 },
+    /// `HostStat` result: whether the path exists and is a directory.
+    HostKind { exists: bool, is_dir: bool },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.
