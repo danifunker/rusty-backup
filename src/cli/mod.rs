@@ -32,6 +32,7 @@ pub mod logging;
 pub mod output;
 pub mod parse;
 pub mod resolve;
+pub mod tui;
 pub mod verbs;
 
 #[derive(Parser, Debug)]
@@ -206,6 +207,10 @@ pub enum Command {
     /// Restore a backup folder to a target image or device.
     Restore(verbs::restore::RestoreArgs),
 
+    /// Interactive backup/restore menu (the appliance UI): pick a disk, then
+    /// Inspect / Backup / Restore. Needs an interactive terminal.
+    Menu(verbs::menu::MenuArgs),
+
     /// Stream an image file onto a block device.
     Write(verbs::write::WriteArgs),
 
@@ -326,6 +331,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Inspect(args) => verbs::inspect::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
+        Command::Menu(args) => verbs::menu::run(args),
         Command::Write(args) => verbs::write::run(args),
         Command::Convert(args) => verbs::convert::run(args),
         Command::Batch(args) => verbs::batch::run(args),

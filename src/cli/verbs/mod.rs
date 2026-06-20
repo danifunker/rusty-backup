@@ -27,6 +27,7 @@ pub mod locate;
 pub mod ls;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
+pub mod menu;
 pub mod mkdir;
 pub mod new;
 pub mod new_sgi_cdrom;
