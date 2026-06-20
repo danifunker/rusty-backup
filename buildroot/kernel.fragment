@@ -1,0 +1,25 @@
+# Extra kernel options merged into qemu_x86's config so the appliance can see
+# the disks it backs up/restores and the medium it writes to.
+# rb-cli reads RAW block devices and parses FAT/NTFS/etc. itself, so the kernel
+# needs block-device drivers + the DESTINATION filesystems, not the source ones.
+
+# IDE / SATA / SCSI disks (real 486/Pentium = IDE; qemu = PIIX/AHCI).
+CONFIG_ATA=y
+CONFIG_ATA_PIIX=y
+CONFIG_ATA_GENERIC=y
+CONFIG_SATA_AHCI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_MSDOS_PARTITION=y
+
+# USB mass storage (a USB stick as backup destination).
+CONFIG_USB=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_UHCI_HCD=y
+CONFIG_USB_OHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+
+# Destination filesystems (where backups land).
+CONFIG_VFAT_FS=y
+CONFIG_EXT4_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y

@@ -40,3 +40,6 @@ flatpak/bin/
 tests/fixtures/*.img
 outputs/
 /target-cross
+/buildroot/output
+/buildroot/dl
+/buildroot/overlay/usr/bin/rb-cli
