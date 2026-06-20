@@ -6,6 +6,16 @@ its **disk-state / resume / change-detection** model. This is the companion to
 to §6 / Phase 7 and left "incremental-ish" state tracking unspecified. This file
 captures the design discussion that fleshed both out.
 
+> **Unified-daemon note (2026-06-20):** the networked transport here is now
+> **Family B** of the single `rb-cli serve` daemon described in the umbrella plan
+> [`remote_transfer_plan.md`](remote_transfer_plan.md). The host listener is
+> `rb-cli serve` (not a separate `net-serve` verb); cb-dos reaches it as a
+> JSON-free Family-B client over a shared binary `Hello` handshake, and the same
+> chunk-stream now also serves **desktop-pulls-remote-disk** and **restore-over-
+> the-wire** (producer/consumer symmetry — see the umbrella §0, §7). The chunk
+> container, resume map, fingerprint, and manifest specced below are unchanged and
+> remain the source of truth for Family B's internals.
+
 Two intertwined subjects live here:
 
 1. **Transport** — how cb-dos moves the native backup folder to/from the modern
@@ -34,7 +44,7 @@ From the scoping discussion (2026-06-03):
 | Transport family | **TCP/IP over a packet driver** — *not* raw L2 Ethernet, *not* serial/parallel |
 | Why TCP (not raw L2 or UDP) | Reliable in-order stream → **no hand-rolled ACK/retransmit**; testable with stock tools (`nc`, Wireshark, loopback sockets); host becomes a **plain unprivileged socket** (no pcap/Npcap/BPF/root) |
 | Stack on DOS | A small TCP/IP stack over the **Crynwr packet-driver API** (INT 60h). Reference / candidate-to-borrow: **mTCP** (GPLv3, AGPL-compatible) |
-| Host listener home | **`rb-cli net-serve` subcommand** — reuses format + restore code, scriptable, cross-platform |
+| Host listener home | **`rb-cli serve` daemon, Family B** (unified — was `net-serve`) — reuses format + restore code, scriptable, cross-platform |
 | On-disk artifact | A **single chunked container** (`.cbk`), not a folder-of-files on the wire. Container doubles as the resume log; folder is materialized at finalize for the desktop restore path |
 | Resume model | **ddrescue-style transfer map** of committed chunks; fsync-before-record ordering; truncate-to-last-committed on resume |
 | Chunk unit | One **independently-compressed gzip member** covering a fixed span of *uncompressed source data* (~1–4 MB). Self-verifying (gzip CRC trailer); producer resumes by source-offset seek, never recompresses |
@@ -507,7 +517,7 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 - [ ] **7a — Frame/socket hello-world.** DOS: bind packet driver, bring up
       IP/ARP (borrowed or minimal), open a TCP socket to the host, exchange a
-      greeting. Host: `rb-cli net-serve` accepts a plain socket, prints peer.
+      greeting. Host: `rb-cli serve` (Family B) accepts a plain socket, prints peer.
       Resolve the mTCP borrow-vs-port question here. Test in 86Box (SLiRP +
       port-forward).
 - [ ] **7b — Chunk protocol + container.** Define `.cbk` chunk header + index;
@@ -536,7 +546,8 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
   the Crynwr packet driver** (not raw L2 / serial / parallel) — chosen for TCP's
   free reliability + a **plain-socket, unprivileged, SLiRP-friendly host** (vs.
   pcap/Npcap/BPF/root for raw L2). **mTCP** (GPLv3, AGPL-OK) is the reference /
-  borrow candidate; borrow-vs-port-to-DJGPP is open. Host = **`rb-cli net-serve`**.
+  borrow candidate; borrow-vs-port-to-DJGPP is open. Host = **`rb-cli serve`**
+  (Family B of the unified daemon; was `net-serve`).
   Designed the **chunked `.cbk` container** (wire framing = on-disk artifact =
   ddrescue-style resume log) with chunks = **independent source-keyed gzip
   members** (`MultiGzDecoder` on the desktop; producer resumes by source seek, no
