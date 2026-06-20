@@ -363,8 +363,11 @@ impl BrowseSession {
             // Pure-Rust zstd has no seekable reader; a seekable-zstd file is
             // still a valid sequence of zstd frames (+ a skippable seek-table
             // frame), so fully decompress it to an anonymous tempfile that
-            // gives Read + Seek. Correct, just not random-access.
-            #[cfg(not(feature = "native-zstd"))]
+            // gives Read + Seek. Correct, just not random-access. Gate on
+            // pure-zstd actually being on (matching zstd_compat.rs) — plain
+            // `not(native-zstd)` also matched a no-backend build, where the
+            // `libzstd_bitexact_rs` crate isn't linked.
+            #[cfg(all(not(feature = "native-zstd"), feature = "pure-zstd"))]
             {
                 let file = File::open(path).map_err(FilesystemError::Io)?;
                 let mut dec = libzstd_bitexact_rs::StreamDecoder::new(file);

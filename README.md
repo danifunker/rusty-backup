@@ -91,14 +91,16 @@ checker's reqwest client — but **keeps CHD support** via the upstream
 device.
 
 The desktop release builds use the full feature set; only the MiSTer
-artifact runs `--no-default-features --features chd`.
+artifact runs `--no-default-features --features chd,pure-zstd` (CHD via the
+C prebuilt; zstd via the pure-Rust bit-exact backend, since a cross build
+won't link C libzstd).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features --features chd
+            --no-default-features --features chd,pure-zstd
 
 # Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
 # do the local rename here too so the on-MiSTer filename matches the

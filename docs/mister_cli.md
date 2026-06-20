@@ -222,7 +222,7 @@ cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --target armv7-unknown-linux-gnueabihf \
             --bin rb-cli \
             --release \
-            --no-default-features --features chd
+            --no-default-features --features chd,pure-zstd
 
 # Output: target/armv7-unknown-linux-gnueabihf/release/rb-cli
 file target/armv7-unknown-linux-gnueabihf/release/rb-cli
@@ -351,9 +351,11 @@ Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
   / GCC 5.4 / glibc 2.23 — too old to have the C++11 `std::thread`
   polymorphic-`_State` symbols the prebuilt depends on, so we pin to
   a digest of the `:main` rolling tag rather than `v0.2.5`.
-- The MiSTer job now builds with `--no-default-features --features chd`
-  so the artifact includes CHD support via the libchdman-rs prebuilt —
-  the GUI and optical stacks stay out, but `.chd` is in. The job is
+- The MiSTer job now builds with `--no-default-features --features chd,pure-zstd`
+  so the artifact includes CHD support via the libchdman-rs prebuilt (plus the
+  pure-Rust zstd backend — exactly one zstd backend is required, and a cross
+  build can't link C libzstd) — the GUI and optical stacks stay out, but `.chd`
+  is in. The job is
   marked `continue-on-error: true` and is intentionally OUT of the
   `release` job's `needs:` list, so a transient cross-compile failure
   (or the timing window while upstream libchdman-rs armv7 prebuilt is
