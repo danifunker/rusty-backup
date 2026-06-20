@@ -43,6 +43,8 @@ pub mod repack;
 pub mod resize;
 pub mod restore;
 pub mod rm;
+#[cfg(feature = "remote")]
+pub mod serve;
 pub mod setrsrc;
 pub mod setvolname;
 pub mod show;

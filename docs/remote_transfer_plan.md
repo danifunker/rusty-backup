@@ -593,9 +593,17 @@ Each phase ends at a validation gate. **Family F and Family B interleave** — F
 removable-media round-trip proving the native format first (cb-dos Phases 2–4). The unified daemon's
 *shared transport* is the join point.
 
-- **Phase 0 — read-only spike (de-risk latency/caching, Family F).** `rb-cli serve` with binary `Hello` +
-  Family-F browse/`ReadFile` + the client `RemoteBackend` read path. *Gate:* `rb-cli ls`/`get` against an
-  image hosted on another machine. **Make-or-break; do first.**
+- **Phase 0 — read-only spike (de-risk latency/caching, Family F). — DONE (loopback-validated).**
+  Landed in `src/remote/` behind the `remote` cargo feature (pure `std::net` + `serde_json`, no new dep):
+  `rb-cli serve --bind --root` daemon (thread-per-connection, handle table), the `Hello` / `OpenImage` /
+  `ListDir` / `ReadFile` verbs, and a client `RemoteSession` wired into `rb-cli ls` / `get` via
+  `rb://host:port/img@N` refs (`RemoteRef`). The daemon runs the *same* local pipeline
+  (`resolve_partition_streaming_forced_inside` → `open_filesystem` → `list_directory` / `write_file_to`),
+  so remote == local. *Gate met:* over loopback, `ls` matched the local listing and `get` returned a
+  20 KB file byte-exact; path-escape / missing-file / file-as-dir all error cleanly. **Simplification vs
+  the spec:** the `Hello` is JSON here (Family F only); the **binary** `Hello` for the JSON-free cb-dos
+  client is introduced additively in Phase 5a (the magic+version fields are already in place). Not yet
+  done: client read-ahead caching and a real two-machine latency measurement (loopback hides RTT).
 - **Phase 1 — Family F write path (stage→apply).** Sessions, SD staging, `StageUpload`/`Apply`, the
   relocated `EditQueue`. *Gate:* copy a file into a remote image, pull the SD, confirm a core mounts it.
 - **Phase 2 — host-FS browse + remote→remote (Family F).** `ListHostDir`/sandbox-to-root; `StageCopyLocal`

@@ -714,6 +714,14 @@ Usage: make-bootable [OPTIONS] <IMAGE>
 - `--bless` — Absolute Mac path of the folder to bless (e.g. `/System Folder`). Defaults to auto-blessing a root folder named "System Folder"
 - `--dry-run` — Report what would change without writing anything
 
+### `menu`
+
+Interactive backup/restore menu (the appliance UI): pick a disk, then Inspect / Backup / Restore. Needs an interactive terminal
+
+```
+Usage: menu
+```
+
 ### `mkdir`
 
 Create a directory inside a filesystem
@@ -1171,6 +1179,19 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
+### `serve`
+
+Run the network daemon so a remote `rb-cli` can browse and read files inside images this host holds (`rb://host:port/img@N`). Family F read-only (Phase 0). See docs/remote_transfer_plan.md
+
+```
+Usage: serve [OPTIONS]
+```
+
+**Options**
+
+- `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341)
+- `--root` — Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory
 
 ### `setrsrc`
 

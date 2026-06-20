@@ -55,6 +55,13 @@ pub struct LsArgs {
 }
 
 pub fn run(args: LsArgs) -> Result<()> {
+    // Remote source: `rb-cli ls rb://host:port/img@N /path`. The daemon parses
+    // the filesystem and returns the listing; we never pull raw blocks.
+    #[cfg(feature = "remote")]
+    if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
+        return remote_ls(&rref, args.image.partition, &args.path);
+    }
+
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
     let (reader, mut ctx) = resolve_partition_streaming_forced_inside(
         &args.image.path,
@@ -122,6 +129,34 @@ pub fn run(args: LsArgs) -> Result<()> {
         print_entry(&c, &c.name);
     }
     Ok(())
+}
+
+/// Remote directory listing over an `rb://` reference (Phase 0: literal paths
+/// only — globbing would need server-side volume walking, deferred).
+#[cfg(feature = "remote")]
+fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str) -> Result<()> {
+    if has_glob_chars(path) {
+        bail!("glob patterns aren't supported over rb:// yet (Phase 0 lists literal paths)");
+    }
+    let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
+    let (handle, label) = session.open_image(&rref.path, partition)?;
+    log_stderr(label);
+    for entry in session.list_dir(handle, path)? {
+        print_wire_entry(&entry);
+    }
+    Ok(())
+}
+
+/// Mirror of [`print_entry`] for a [`crate::remote::protocol::WireEntry`].
+#[cfg(feature = "remote")]
+fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
+    let kind = if entry.is_dir() { "DIR " } else { "FILE" };
+    let t = entry.type_code.as_deref().unwrap_or("    ");
+    let cr = entry.creator_code.as_deref().unwrap_or("    ");
+    out_stdout(format!(
+        "{kind}  {:>10}  {t} {cr}  {}",
+        entry.size, entry.name
+    ));
 }
 
 fn print_entry(entry: &crate::fs::entry::FileEntry, display_name: &str) {
