@@ -7,12 +7,36 @@ set -e
 BR=/opt/buildroot
 WORK=/work
 OVERLAY="$WORK/buildroot/overlay"
-# Static rb-cli (musl) — runs regardless of the appliance's own libc.
-RBCLI="$WORK/target-cross/i586-unknown-linux-musl/release/rb-cli"
 OUT="$WORK/buildroot/output"
 
+# CPU baseline for the appliance kernel + BusyBox userland. The qemu_x86
+# defconfig uses Buildroot's *internal* toolchain (it sets no external one), so
+# retargeting is just a config flip — the toolchain rebuilds gcc/glibc for the
+# chosen arch. The static rb-cli baked in must match the floor:
+#   i686 (default) -> Pentium Pro+; bundles the i586 static rb-cli (runs on i686)
+#   i586           -> Pentium / 5x86 / Vortex86 (e.g. ITX-Llama) — the floor for
+#                     the Linux appliance. Covers everything except a literal 486.
+# A true 486 is NOT a Linux-appliance target: it ships as cb-dos (the DOS lane,
+# tiny + BIOS int 13h) instead — see docs/cb_dos.md. (A 486 Linux rb-cli is an
+# open toolchain item, docs/linux_486_build.md, but low-RAM 486s want cb-dos.)
+#
+# BR2_CPU sets the toolchain/userland arch; KCPU_FRAG sets the *kernel*'s
+# processor family (the qemu_x86 kernel config pins M686=i686, so without this
+# the kernel keeps emitting CMOV and faults on a real Pentium even when the
+# userland is retargeted).
+APPLIANCE_ARCH="${APPLIANCE_ARCH:-i686}"
+case "$APPLIANCE_ARCH" in
+    i686) RB_TRIPLE="i586-unknown-linux-musl"; BR2_CPU=""; KCPU_FRAG="" ;;   # defconfig default (M686)
+    i586) RB_TRIPLE="i586-unknown-linux-musl"; BR2_CPU="BR2_x86_i586"; KCPU_FRAG="$WORK/buildroot/kernel-i586.fragment" ;;
+    i486) echo "ERROR: a true 486 ships as cb-dos (the DOS lane), not a Linux appliance — see docs/cb_dos.md."; exit 1 ;;
+    *) echo "ERROR: APPLIANCE_ARCH must be i686 or i586 (got '$APPLIANCE_ARCH'); a 486 uses cb-dos"; exit 1 ;;
+esac
+echo "Building the appliance for CPU floor: $APPLIANCE_ARCH (rb-cli: $RB_TRIPLE)"
+
+# Static rb-cli (musl) — runs regardless of the appliance's own libc.
+RBCLI="$WORK/target-cross/$RB_TRIPLE/release/rb-cli"
 if [ ! -f "$RBCLI" ]; then
-    echo "ERROR: static rb-cli not found at $RBCLI"
+    echo "ERROR: static rb-cli for $APPLIANCE_ARCH not found at $RBCLI"
     echo "Build it first:  docker run --rm -v \"\$PWD\":/src rb-cross-i586-musl"
     exit 1
 fi
@@ -44,7 +68,7 @@ BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /usr/bin/appliance-menu"
 # configured yet (that delay made early boots look hung). Re-enable when the
 # network branch lands.
 BR2_SYSTEM_DHCP=""
-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$WORK/buildroot/kernel.fragment"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$WORK/buildroot/kernel.fragment $KCPU_FRAG"
 # Destination-medium tooling (a 2nd disk / USB the backup is written to).
 BR2_PACKAGE_DOSFSTOOLS=y
 BR2_PACKAGE_E2FSPROGS=y
@@ -61,6 +85,14 @@ BR2_TARGET_ROOTFS_ISO9660_ISOLINUX=y
 BR2_TARGET_ROOTFS_ISO9660_BOOT_MENU="$WORK/buildroot/isolinux.cfg"
 BR2_TARGET_ROOTFS_ISO9660_HYBRID=y
 EOF
+
+# Retarget the CPU floor when asked (i686 is the defconfig default, so no-op).
+if [ -n "$BR2_CPU" ]; then
+    cat >> .config <<EOF
+# BR2_x86_pentiumpro is not set
+$BR2_CPU=y
+EOF
+fi
 make olddefconfig
 make -j"$(nproc)"
 

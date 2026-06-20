@@ -105,16 +105,17 @@ Do **not** judge a boot by a `-vga std` screendump — it freezes its own pictur
   `mkmedia.sh`, uploads `cbdos-freedos-<ver>.img` + `cbdos-<ver>.iso`. Verified
   the full flow locally and that the produced CD boots to the cb-dos banner.
 
-## NOT STARTED (remaining pipeline)
-
-- **Cross-binary release assets (optional)** — ship the i586/i486 standalone
-  `rb-cli` binaries as their own downloads (the i586-musl one is already bundled
-  inside the appliance, so this is just convenience).
-- **Retarget to i586/i486** + matching `rb-cli`. Note this is also the prerequisite
-  for the **ITX-Llama / Vortex86EX** boards — they're Pentium-class (i586), so the
-  i686 kernel won't boot on them; their onboard **RDC R6040** NIC driver is already
-  in `kernel.fragment`, waiting on the i586 build.
-- **Networking** (separate branch); **real 486/Pentium hardware** boot.
+- **i586 retarget — DONE.** `APPLIANCE_ARCH=i586` (`build.sh`) + the kernel
+  `M586TSC` fragment + the i586-musl rb-cli; CI ships i586. Covers Pentium / 5x86
+  / Vortex86 (ITX-Llama, whose RDC R6040 NIC driver is in the fragment) and up.
+  **The 486 line is [`cb-dos`](cb_dos.md), by decision** — not a Linux appliance
+  (low-RAM 486s want DOS; the static i486 Linux rb-cli is an unbuilt toolchain
+  item, see linux_486_build.md).
+- **NEXT: networking** (the decisive win — remote backup destination over the
+  kernel's NIC + TCP, instead of a 2nd local disk). Separate branch.
+- **Cross-binary release assets (optional)** — ship the i586 standalone `rb-cli`
+  as its own download (already bundled inside the appliance; convenience only).
+- **Real hardware** boot: i586 appliance on a Pentium-class box; cb-dos on a 486.
 
 ## Mechanics to reuse
 

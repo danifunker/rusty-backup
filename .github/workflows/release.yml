@@ -848,10 +848,14 @@ jobs:
           docker run --rm -v "$PWD":/src rb-cross-i586-musl
           ls -lh target-cross/i586-unknown-linux-musl/release/rb-cli
 
-      - name: Build the Buildroot appliance (kernel + rootfs + hybrid ISO)
+      - name: Build the Buildroot appliance (i586 kernel + rootfs + hybrid ISO)
+        # i586 (Pentium / 5x86 / Vortex86) is the appliance floor — it runs on
+        # i586 *and* i686, so it covers the widest range of vintage hardware
+        # (a true 486 uses cb-dos instead). The bundled rb-cli is the i586 static
+        # musl build from the step above.
         run: |
           docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
-          docker run --rm -v "$PWD":/work rb-buildroot
+          docker run --rm -e APPLIANCE_ARCH=i586 -v "$PWD":/work rb-buildroot
           ls -lh buildroot/output/
 
       - name: Install media tooling (PXE initrd extract + GRUB floppy)

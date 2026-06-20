@@ -265,10 +265,15 @@ a CF/SD or small disk), which is the main practical tradeoff vs the DOS path.
 - [x] Confirmed `qemu-i386 -cpu 486` is a real 486-compat check: the i586 static
       binary **faults (illegal instruction)** on `-cpu 486` — proving i586 ≠ 486
       and that bare 486 needs i486 codegen.
-- [ ] Wire the Docker cross-builds into GitHub Actions CI.
-- [ ] True-486 runtime: i486 codegen (have it) **+ an i486 libc**. Build a
-      Buildroot i486 rootfs (`BR2_x86_i486`) to run the `cross-i486` binary, or a
-      hand-populated i486-musl `build-std` sysroot for a fully static true-486
-      binary. (The custom i486-musl + build-std path is finicky — Buildroot is the
-      more maintainable route, and the natural way to ship a bootable appliance.)
-- [ ] Boot + smoke-test on real 486 (DX2/DX4) hardware.
+- [x] Wire the i586-musl cross-build into CI — the appliance's `build-appliance`
+      job builds it (`rb-cross-i586-musl`) and ships it inside the i586 ISO.
+- [~] True-486 *Linux* runtime: **not pursued — the 486 lane is
+      [`cb-dos`](cb_dos.md)** (DOS, tiny, BIOS int 13h). A 486 Linux rb-cli still
+      needs an i486 libc, and confirmed empirically this session that the
+      static-musl + `-Z build-std` path can't borrow the glibc cross-gcc's runtime
+      (`cannot find crt*.o / -lc / -lunwind`): it needs a real i486 musl toolchain
+      (`musl-cross-make`, `-march=i486`) or a glibc-dynamic link against
+      Buildroot's own i486 sysroot. Since low-RAM 486s want cb-dos anyway, the
+      Linux appliance floor is **i586** and a literal 486 stays on cb-dos.
+- [ ] Boot + smoke-test on real 486 (DX2/DX4) hardware (cb-dos lane) / real
+      Pentium-class hardware (i586 appliance).

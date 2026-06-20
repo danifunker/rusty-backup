@@ -154,25 +154,33 @@ rb-cli restore /mnt/backup /dev/sdb  # …and restore it
 On real hardware the disk to back up is typically `/dev/hda`; write the image to
 CF/USB and boot it, or PXE-boot it for a diskless backup station.
 
-## CPU baseline — the one knob that needs care
+## CPU baseline — i586 is the appliance floor
 
-`qemu_x86_defconfig` targets **i686** (Pentium Pro+), so the first image is an
-i686 appliance — it boots in qemu and proves the whole flow, and the static
-`rb-cli` (i586) runs on it. To actually target **486/Pentium** hardware, two
-things must drop to the right baseline together:
+The appliance is built for **i586 (Pentium / 5x86 / Vortex86)** by default in CI.
+i586 runs on i586 **and** i686, so it covers the widest range of vintage hardware
+with one image; the static `i586-musl` `rb-cli` is the matching floor. Choose the
+target with `APPLIANCE_ARCH` (`build.sh`): `i586` (default in CI), or `i686`
+(`qemu_x86_defconfig`'s native target — slightly faster on a Pentium Pro+, but
+won't run on a plain Pentium).
 
-1. **The appliance** (kernel + BusyBox): set `BR2_x86_i586` (Pentium) or
-   `BR2_x86_i486` in the Buildroot config. i486 requires Buildroot's *internal*
-   toolchain (Bootlin's prebuilt x86 toolchains are i686-class), a longer build.
-2. **`rb-cli`**: the static `i586-musl` binary runs on Pentium+ but **faults on a
-   bare 486** (it uses `CMPXCHG8B`; verified under `qemu -cpu 486`). A true-486
-   appliance needs an i486 `rb-cli` — the i486 codegen story in
-   [`linux_486_build.md`](linux_486_build.md) (`cross-i486` gives the codegen; a
-   fully static i486 binary needs an i486 libc, i.e. this same Buildroot
-   toolchain).
+**A true 486 is *not* a Linux-appliance target — it ships as
+[`cb-dos`](cb_dos.md)** (the DOS lane: tiny, BIOS `int 13h`, fits where even a
+minimal Linux doesn't). The appliance's ~27 MB in-RAM rootfs plus the engine want
+≥~64 MB RAM, which most 486s don't have; and a static 486 `rb-cli` needs an i486
+libc/toolchain that isn't built (see [`linux_486_build.md`](linux_486_build.md)).
+So the 486 line is cb-dos, and i586 is the lowest Linux floor.
 
-So: **i586/Pentium is the practical sweet spot today** (static binary just
-works); **i486** is a config + toolchain step on top.
+### The kernel-CPU gotcha (learned the hard way)
+
+`BR2_x86_i586` only retargets the **toolchain + BusyBox userland**. The kernel
+keeps qemu_x86's *pinned* config (`board/qemu/x86/linux.config`, which selects
+`M686` = i686), so it still emits **CMOV** and dies **silently right after the
+bootloader** on a real Pentium (`qemu -cpu pentium`) — a generic "does it boot?"
+check on qemu's default CPU misses this. The fix is a per-arch kernel fragment
+(`buildroot/kernel-i586.fragment` → `CONFIG_M586TSC`, i.e. CMPXCHG8B + TSC, no
+CMOV) merged on top; `build.sh` selects it by `APPLIANCE_ARCH`. **Always
+boot-test a retargeted image on the strict CPU** (`-cpu pentium`), not the
+default.
 
 ## Networking (separate branch)
 
@@ -224,6 +232,8 @@ inittab fixups, so that file is authoritative.
       release workflow (`build-appliance` job).
 - [ ] cb-dos FreeDOS floppy + CD into CI (the DOS lane; see cb_dos.md) + decide
       vendor-vs-fetch for the FreeDOS base.
-- [ ] Retarget to `BR2_x86_i586` (Pentium) / `BR2_x86_i486` (true 486) + matching rb-cli.
+- [x] Retarget to **i586** (Pentium / 5x86 / Vortex86) — `APPLIANCE_ARCH=i586`,
+      kernel `M586TSC` fragment, i586-musl rb-cli; CI ships i586. (A true 486 is
+      cb-dos, not a Linux appliance — by design.)
 - [ ] Networking (separate branch) → remote destination.
 - [ ] Real 486/Pentium hardware boot.

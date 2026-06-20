@@ -160,10 +160,10 @@ Pentium-class or newer box and in qemu. Targeting an actual **486** or **Pentium
 independent of the CPU target — it applies whichever baseline you build.
 
 **Vortex86 boards (e.g. the ITX-Llama).** Modern retro boards built on a DM&P
-Vortex86EX system-on-module are **Pentium-class (i586)**, not i686 — the stock
-i686 kernel won't boot on them. They need the i586 retarget above. Their built-in
-NIC is the **RDC R6040** Fast Ethernet, whose driver (`CONFIG_R6040`) is in the
-fragment, so the onboard Ethernet is recognised once the i586 kernel is built.
+Vortex86EX system-on-module are **Pentium-class (i586)**, not i686. The default
+appliance build is **i586** (`APPLIANCE_ARCH=i586`), so it runs on them — an i686
+build would not. Their built-in NIC is the **RDC R6040** Fast Ethernet, whose
+driver (`CONFIG_R6040`) is in the fragment, so the onboard Ethernet is recognised.
 
 ---
 
