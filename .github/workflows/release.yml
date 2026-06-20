@@ -891,6 +891,14 @@ jobs:
           docker run --rm -e APPLIANCE_ARCH="${ARCH}" -v "$PWD":/work rb-buildroot
           ls -lh buildroot/output/
 
+      - name: Take ownership of the Buildroot output (Docker writes it root-owned)
+        # Buildroot runs as root in the container (-v "$PWD":/work), so everything
+        # under buildroot/output/ lands root-owned. The host-side packaging steps
+        # below (package-pxe, GRUB floppy, ISO naming) run as the unprivileged
+        # runner and must be able to create files there — chown the tree first,
+        # else they die with "cp: cannot create ... Permission denied".
+        run: sudo chown -R "$(id -u):$(id -g)" buildroot/output
+
       - name: Install media tooling (PXE initrd extract + GRUB floppy)
         run: |
           sudo apt-get update
