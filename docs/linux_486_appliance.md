@@ -67,8 +67,46 @@ docker run  --rm -v "$PWD":/src rb-cross-i586-musl
 # 2. the appliance image
 docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
 docker run  --rm -v "$PWD":/work rb-buildroot
-# -> buildroot/output/{bzImage, rootfs.ext2}
+# -> buildroot/output/{bzImage, rootfs.ext2, rusty-backup-appliance.iso}
 ```
+
+## Deployable artifacts — how the appliance ships
+
+The build emits raw pieces (`bzImage`, `rootfs.ext2`) plus bootable media. The
+shape, and which machine each suits:
+
+| Artifact | Boots on | Status |
+|---|---|---|
+| **`rusty-backup-appliance.iso`** (hybrid) | a CD-ROM **or** (dd'd to a stick/CF) a USB/CF | building |
+| **GRUB boot floppy** → loads the appliance off the **CD** | pre-El-Torito BIOSes that can't boot CDs | planned |
+| **PXE bundle** (`bzImage` + initramfs + `pxelinux.cfg` + README) | a diskless backup *station* over the network | planned |
+
+Notes:
+- The **hybrid ISO** is the workhorse: one file is both the "CD ISO" and the
+  "USB/CF `.img`" — `dd if=…​.iso of=/dev/sdX` makes a bootable stick. So we don't
+  need a separate genimage `.img` target.
+- **Linux can't ship on a floppy** — the kernel alone (~5 MB) overflows 1.44 MB.
+  For an old machine whose BIOS predates El Torito (can't boot a CD), the bridge
+  is a tiny **GRUB boot floppy** that does `root=(cd0); linux /boot/bzImage; …` —
+  GRUB fits on a floppy and reads ISO9660, so the floppy boots and pulls the
+  appliance off the CD. (The floppy *as a self-contained OS* is the cb-dos lane,
+  not this one — see [`cb_dos.md`](cb_dos.md).)
+- **PXE** isn't one boot file: it's a tarball of `bzImage` + the rootfs as an
+  initramfs + a sample `pxelinux.cfg` + a README, dropped onto a TFTP/dnsmasq
+  box. Good for a permanent backup station; overkill for a one-off.
+
+All of these (plus the cb-dos FreeDOS floppy + CD) get built in CI and attached
+to the GitHub release — see the release workflow.
+
+## Building bootable media with rusty-backup itself
+
+rb-cli already mints bootable disk images for X68000 / SGI / Mac (partition
+table + filesystem + boot setup), so assembling/writing the appliance media is
+in its wheelhouse: it partitions + formats + drops files into a CF/USB image,
+and **writes any artifact to physical media** (that's just "restore to a
+device"). Buildroot produces the kernel + rootfs and the ready-to-`dd` hybrid
+ISO, so the bootloader plumbing isn't reinvented; rb-cli is the natural tool for
+the final write-to-CF/USB step.
 
 ## Boot + use (qemu, then real hardware)
 
@@ -145,9 +183,13 @@ small backup/restore **menu** (boot straight into the tool, like an installer).
       works (backup `/dev/sdb`, restore to a blank `/dev/sdc`, partition
       reconstructed).
 - [x] Auto-login (no login prompt) — installer-CD style.
-- [ ] Replace the auto-root shell with a backup/restore text menu.
-- [ ] Retarget to `BR2_x86_i586` for genuine Pentium support (static rb-cli fits).
-- [ ] True 486: `BR2_x86_i486` internal toolchain + an i486 `rb-cli`.
-- [ ] A small text menu (backup / restore / shell) instead of a bare prompt.
+- [x] Backup/restore text menu (`rb-cli menu`) + folder-picker screens; appliance
+      auto-launches it.
+- [~] Bootable hybrid ISO (CD + USB) — building.
+- [ ] GRUB boot-floppy → loads the appliance off the CD (pre-El-Torito BIOSes).
+- [ ] PXE bundle (kernel + initramfs + pxelinux.cfg + README).
+- [ ] cb-dos FreeDOS floppy + CD (the DOS lane; see cb_dos.md).
+- [ ] Wire all deployables into the GitHub release workflow.
+- [ ] Retarget to `BR2_x86_i586` (Pentium) / `BR2_x86_i486` (true 486) + matching rb-cli.
 - [ ] Networking (separate branch) → remote destination.
 - [ ] Real 486/Pentium hardware boot.
