@@ -79,16 +79,34 @@ qemu-system-i386 -M pc -m 256 -cdrom …iso -boot d -vga cirrus
 ```
 Do **not** judge a boot by a `-vga std` screendump — it freezes its own picture.
 
+## DONE since the original handoff
+
+- **GRUB boot-floppy → CD bridge** — `buildroot/make-grub-floppy.sh` builds a
+  1.44 MB GRUB i386-pc floppy whose embedded config `search`es every drive for
+  `/boot/bzImage` and boots the appliance off the CD. **Key fix:** a pre-El-Torito
+  BIOS won't expose the CD over int 13h, so the floppy bundles GRUB's *native*
+  `ata`/`ahci`/`usbms` drivers (not just `biosdisk`) — verified in qemu booting
+  `-fda grub-floppy.img -cdrom appliance.iso -boot a` straight to the rb-cli menu
+  (GRUB read the CD as `(ata2)`). Don't use `menuentry { }` in the embedded
+  config (needs `normal` mode); plain `search`/`linux`/`initrd`/`boot` commands.
+- **PXE bundle** — `buildroot/package-pxe.sh` emits
+  `rusty-backup-appliance-pxe-<ver>.tar.gz` (bzImage + the initramfs + a sample
+  `pxelinux.cfg` + README). Verified the bundled kernel+initrd boot to the menu.
+- **Release CI (appliance)** — `build-appliance` job in `release.yml` builds the
+  cross `rb-cli` + the Buildroot ISO, then runs the two scripts above; uploads
+  the ISO + PXE tarball + GRUB floppy; wired into the `release` job's `needs:`,
+  the flatten glob (`.iso`/`.img`), and the downloads table. Gated to main +
+  `continue-on-error` like the MiSTer job.
+
 ## NOT STARTED (remaining pipeline)
 
-- **GRUB boot-floppy → CD bridge** for pre-El-Torito 486 BIOSes (GRUB on a floppy
-  does `root=(cd0); linux /boot/bzImage; initrd …`). Design in
-  `linux_486_appliance.md`.
-- **PXE bundle** — `bzImage` + rootfs-as-initramfs + sample `pxelinux.cfg` + README.
-- **Release CI** — wire every artifact into `.github/workflows/release.yml`:
-  cb-dos floppy + CD, the 4 cross-build binaries, the appliance ISO, (later) the
-  GRUB floppy + PXE bundle. Decide: **vendor the FreeDOS base floppy** vs fetch it
-  from the FreeDOS 1.4 release in CI (it's GPL/redistributable; ~1.4 MB).
+- **Release CI (cb-dos + cross binaries)** — the appliance is wired in; still to
+  do: a `build-cb-dos` job (decide **vendor the FreeDOS base floppy** vs fetch it
+  from the FreeDOS 1.4 release in CI — it's GPL/redistributable, ~1.4 MB) and,
+  optionally, shipping the i586/i486 cross `rb-cli` binaries as standalone
+  release assets (the i586-musl one is already bundled inside the appliance).
+- **Retarget to i586/i486** + matching `rb-cli`; **networking** (separate branch);
+  **real 486/Pentium hardware** boot.
 
 ## Mechanics to reuse
 

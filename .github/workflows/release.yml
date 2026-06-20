@@ -827,6 +827,60 @@ jobs:
           name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
 
+  build-appliance:
+    name: Build Linux appliance (ISO + PXE + GRUB floppy)
+    # A full Buildroot build is ~25-30 min, so only spend it on the branches
+    # that actually publish a release.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    needs: generate-version
+    runs-on: ubuntu-latest
+    # Like the MiSTer job: the release still gates on these artifacts existing,
+    # but a Buildroot hiccup stays non-fatal and lets the desktop release ship.
+    continue-on-error: true
+    env:
+      VER: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the static i586-musl rb-cli (baked into the appliance)
+        run: |
+          docker build -t rb-cross-i586-musl - < docker/cross-i586-musl.Dockerfile
+          docker run --rm -v "$PWD":/src rb-cross-i586-musl
+          ls -lh target-cross/i586-unknown-linux-musl/release/rb-cli
+
+      - name: Build the Buildroot appliance (kernel + rootfs + hybrid ISO)
+        run: |
+          docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
+          docker run --rm -v "$PWD":/work rb-buildroot
+          ls -lh buildroot/output/
+
+      - name: Install media tooling (PXE initrd extract + GRUB floppy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso grub-pc-bin mtools
+
+      - name: Package PXE network-boot bundle
+        run: sh buildroot/package-pxe.sh "${VER}"
+
+      - name: Build GRUB boot floppy (pre-El-Torito BIOS bridge)
+        run: |
+          sh buildroot/make-grub-floppy.sh
+          mv buildroot/output/rusty-backup-grub-floppy.img \
+             "buildroot/output/rusty-backup-grub-floppy-${VER}.img"
+
+      - name: Name the ISO for the release
+        run: cp buildroot/output/rusty-backup-appliance.iso \
+                "buildroot/output/rusty-backup-appliance-${VER}.iso"
+
+      - name: Upload appliance artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: rusty-backup-appliance-${{ needs.generate-version.outputs.version }}
+          path: |
+            buildroot/output/rusty-backup-appliance-${{ needs.generate-version.outputs.version }}.iso
+            buildroot/output/rusty-backup-appliance-pxe-${{ needs.generate-version.outputs.version }}.tar.gz
+            buildroot/output/rusty-backup-grub-floppy-${{ needs.generate-version.outputs.version }}.img
+
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
@@ -844,6 +898,7 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-rb-cli-mini-armv7
+      - build-appliance
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -857,7 +912,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release-files
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       # Build a download-picker table from the (fixed) build matrix. Links
@@ -883,7 +938,10 @@ jobs:
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
             "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
-            "rb-cli-mini-armv7-linux-${VER}.tar.gz"; do
+            "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
+            "rusty-backup-appliance-${VER}.iso" \
+            "rusty-backup-appliance-pxe-${VER}.tar.gz" \
+            "rusty-backup-grub-floppy-${VER}.img"; do
             [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
           done
 
@@ -903,6 +961,18 @@ jobs:
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
           <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+
+          ### Boot the vintage machine itself (Linux appliance)
+
+          For 486/Pentium-class boxes too old to run the desktop app — boot the rusty-backup backup/restore menu straight on the metal (VGA monitor or serial console), with a broad vintage NIC / SCSI / IDE driver set baked in.
+
+          | Artifact | Boots from | Notes |
+          |---|---|---|
+          | [**Appliance ISO**](${BASE}/rusty-backup-appliance-${VER}.iso) | CD-ROM **or** USB / CF (\`dd\` the same file on) | The workhorse hybrid image. |
+          | [**PXE bundle**](${BASE}/rusty-backup-appliance-pxe-${VER}.tar.gz) | the network (TFTP / PXE) | A diskless backup *station*. |
+          | [**GRUB boot floppy**](${BASE}/rusty-backup-grub-floppy-${VER}.img) | a floppy that then loads the appliance off the CD | For pre-El-Torito BIOSes that can't boot a CD directly. |
+
+          <sub>Which cards work and how to add more: [\`docs/appliance_hardware_support.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/appliance_hardware_support.md).</sub>
 
           ---
           EOF

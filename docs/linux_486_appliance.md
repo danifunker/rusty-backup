@@ -84,8 +84,14 @@ shape, and which machine each suits:
 | Artifact | Boots on | Status |
 |---|---|---|
 | **`rusty-backup-appliance.iso`** (hybrid) | a CD-ROM **or** (dd'd to a stick/CF) a USB/CF | **boots to the menu** (serial + VGA verified) |
-| **GRUB boot floppy** → loads the appliance off the **CD** | pre-El-Torito BIOSes that can't boot CDs | planned |
-| **PXE bundle** (`bzImage` + initramfs + `pxelinux.cfg` + README) | a diskless backup *station* over the network | planned |
+| **GRUB boot floppy** → loads the appliance off the **CD** | pre-El-Torito BIOSes that can't boot CDs | **built + verified** (`buildroot/make-grub-floppy.sh`) |
+| **PXE bundle** (`bzImage` + initramfs + `pxelinux.cfg` + README) | a diskless backup *station* over the network | **built + verified** (`buildroot/package-pxe.sh`) |
+
+The GRUB floppy is the bridge for BIOSes that can't boot a CD: it carries GRUB's
+*native* `ata`/`ahci`/`usbms` drivers (a pre-El-Torito BIOS won't expose the CD
+over int 13h), so GRUB reads `/boot/bzImage` off the CD itself and boots the
+appliance. All three artifacts are produced by the `build-appliance` job in the
+release workflow.
 
 The ISO boots with a **dual console** (`console=tty0 console=ttyS0,115200`, plus a
 `serial` line in [`../buildroot/isolinux.cfg`](../buildroot/isolinux.cfg)) and runs
@@ -210,10 +216,14 @@ inittab fixups, so that file is authoritative.
 - [x] Broad vintage-hardware kernel (ISA/PCI/PC-Card NICs, SCSI, VLB+PCI IDE,
       Multi-I/O serial/parallel, parallel ZIP, USB) + user guide
       [`appliance_hardware_support.md`](appliance_hardware_support.md).
-- [ ] GRUB boot-floppy → loads the appliance off the CD (pre-El-Torito BIOSes).
-- [ ] PXE bundle (kernel + initramfs + pxelinux.cfg + README).
-- [ ] cb-dos FreeDOS floppy + CD (the DOS lane; see cb_dos.md).
-- [ ] Wire all deployables into the GitHub release workflow.
+- [x] GRUB boot-floppy → loads the appliance off the CD (pre-El-Torito BIOSes) —
+      `buildroot/make-grub-floppy.sh`, native-ATA, qemu-verified.
+- [x] PXE bundle (kernel + initramfs + pxelinux.cfg + README) —
+      `buildroot/package-pxe.sh`, qemu-verified.
+- [x] Wire the appliance deployables (ISO + PXE + GRUB floppy) into the GitHub
+      release workflow (`build-appliance` job).
+- [ ] cb-dos FreeDOS floppy + CD into CI (the DOS lane; see cb_dos.md) + decide
+      vendor-vs-fetch for the FreeDOS base.
 - [ ] Retarget to `BR2_x86_i586` (Pentium) / `BR2_x86_i486` (true 486) + matching rb-cli.
 - [ ] Networking (separate branch) → remote destination.
 - [ ] Real 486/Pentium hardware boot.
