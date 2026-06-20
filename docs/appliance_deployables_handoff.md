@@ -98,15 +98,23 @@ Do **not** judge a boot by a `-vga std` screendump — it freezes its own pictur
   the flatten glob (`.iso`/`.img`), and the downloads table. Gated to main +
   `continue-on-error` like the MiSTer job.
 
+- **Release CI (cb-dos)** — `build-cb-dos` job in `release.yml`: builds the DOS
+  tools (DJGPP), **fetches** the FreeDOS 1.4 FloppyEdition boot floppy in CI
+  (freely redistributable; not vendored —
+  `.../distributions/1.4/FD14-FloppyEdition.zip`, inner `144m/x86BOOT.img`), runs
+  `mkmedia.sh`, uploads `cbdos-freedos-<ver>.img` + `cbdos-<ver>.iso`. Verified
+  the full flow locally and that the produced CD boots to the cb-dos banner.
+
 ## NOT STARTED (remaining pipeline)
 
-- **Release CI (cb-dos + cross binaries)** — the appliance is wired in; still to
-  do: a `build-cb-dos` job (decide **vendor the FreeDOS base floppy** vs fetch it
-  from the FreeDOS 1.4 release in CI — it's GPL/redistributable, ~1.4 MB) and,
-  optionally, shipping the i586/i486 cross `rb-cli` binaries as standalone
-  release assets (the i586-musl one is already bundled inside the appliance).
-- **Retarget to i586/i486** + matching `rb-cli`; **networking** (separate branch);
-  **real 486/Pentium hardware** boot.
+- **Cross-binary release assets (optional)** — ship the i586/i486 standalone
+  `rb-cli` binaries as their own downloads (the i586-musl one is already bundled
+  inside the appliance, so this is just convenience).
+- **Retarget to i586/i486** + matching `rb-cli`. Note this is also the prerequisite
+  for the **ITX-Llama / Vortex86EX** boards — they're Pentium-class (i586), so the
+  i686 kernel won't boot on them; their onboard **RDC R6040** NIC driver is already
+  in `kernel.fragment`, waiting on the i586 build.
+- **Networking** (separate branch); **real 486/Pentium hardware** boot.
 
 ## Mechanics to reuse
 

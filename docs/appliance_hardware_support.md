@@ -18,7 +18,7 @@ The driver list lives in [`../buildroot/kernel.fragment`](../buildroot/kernel.fr
 |---|---|---|
 | **IDE / PATA** | libata: PIIX, generic, AHCI/SATA, plus PCI chipsets (VIA, SiS, ALi, AMD, HPT, CMD64x, Promise, ServerWorks, SiL680, ITE, …) and the bare-486 / VL-Bus / ISA controllers (`pata_legacy`, QDI, Winbond-VLB, RZ1000, CMD640) | — |
 | **SCSI** | PCI HBAs: Adaptec aic7xxx/aic79xx, Symbios/NCR 53c8xx, BusLogic, AdvanSys, Initio, AMD 53c974, DC395x, QLogic 1280 | ISA HBAs: Adaptec aha152x/1542/1740, NCR5380 family, QLogic FAS, DTC3280, PAS16, T128, NCR53c406a; parallel-port ZIP/JAZ (`ppa`, `imm`) |
-| **Ethernet** | PCI NICs: NE2000-PCI, RTL8139/8169, AMD PCnet32, DEC Tulip & clones (DE2104x, dmfe, uli526x, Winbond-840), 3c59x/3c90x, Intel e100/e1000, VIA Rhine/Velocity, SiS900, NatSemi, SMC EPIC, Sundance/DL2k, Starfire, ThunderLAN, … | ISA NICs: NE2000 (`ne`), 3c509 (`3c509`), 3c515, SMC Ultra/WD80x3, AMD Lance/NI65, SMC9194, Cirrus CS89x0; PLIP (parallel-cable IP) |
+| **Ethernet** | PCI NICs: NE2000-PCI, RTL8139/8169, AMD PCnet32, DEC Tulip & clones (DE2104x, dmfe, uli526x, Winbond-840), 3c59x/3c90x, Intel e100/e1000, VIA Rhine/Velocity, SiS900, NatSemi, SMC EPIC, Sundance/DL2k, Starfire, ThunderLAN, **RDC R6040 (Vortex86 SoC / ITX-Llama)**, … | ISA NICs: NE2000 (`ne`), 3c509 (`3c509`), 3c515, SMC Ultra/WD80x3, AMD Lance/NI65, SMC9194, Cirrus CS89x0; PLIP (parallel-cable IP) |
 | **PCMCIA / CardBus** | bridges: Yenta (CardBus), i82365 / TCIC (ISA PCIC), PD6729, i82092 | PC-Card NICs (3c589, 3c574, pcnet_cs, axnet_cs, smc91c92, xirc2ps, nmclan, fmvj18x), PC-Card IDE (`pata_pcmcia`), PC-Card serial |
 | **USB storage** | UHCI + OHCI + EHCI host controllers, USB mass-storage (a stick/drive as a destination) | — |
 | **Serial / parallel (Multi-I/O)** | 8250/16550 up to 8 UARTs with IRQ auto-detect & shared-IRQ (the extra COM ports on a Multi-I/O card), PC parallel port | — |
@@ -158,6 +158,12 @@ Pentium-class or newer box and in qemu. Targeting an actual **486** or **Pentium
 "CPU baseline" section of [`linux_486_appliance.md`](linux_486_appliance.md) and
 [`linux_486_build.md`](linux_486_build.md). The driver set in this document is
 independent of the CPU target — it applies whichever baseline you build.
+
+**Vortex86 boards (e.g. the ITX-Llama).** Modern retro boards built on a DM&P
+Vortex86EX system-on-module are **Pentium-class (i586)**, not i686 — the stock
+i686 kernel won't boot on them. They need the i586 retarget above. Their built-in
+NIC is the **RDC R6040** Fast Ethernet, whose driver (`CONFIG_R6040`) is in the
+fragment, so the onboard Ethernet is recognised once the i586 kernel is built.
 
 ---
 
