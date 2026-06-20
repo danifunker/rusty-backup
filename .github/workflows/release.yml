@@ -829,12 +829,16 @@ jobs:
 
   build-appliance:
     name: Build Linux appliance (${{ matrix.arch }})
+    # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
+    # toolchain from scratch), so only spend it on release branches — or trigger
+    # it by hand (workflow_dispatch) to validate a change on a feature branch.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
-    # ship. Runs on every push (like the other build jobs); only `release` is
-    # gated to main, so a feature-branch push builds + uploads but doesn't publish.
+    # ship. Cap the runtime so a wedged build can't burn the 6 h default.
     continue-on-error: true
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -899,6 +903,8 @@ jobs:
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)
+    # Release branches or a manual run (it's quick, but it's a release artifact).
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP

@@ -98,6 +98,13 @@ make -j"$(nproc)"
 
 mkdir -p "$OUT"
 cp -v output/images/bzImage output/images/rootfs.ext2 "$OUT/"
+# The rootfs as an initramfs cpio. This IS the ISO's /boot/initrd and the PXE
+# bundle's initrd; copy it out so package-pxe.sh uses it directly instead of
+# digging it back out of the ISO (which needs a working isoinfo/bsdtar/xorriso
+# on the host and was the fragile part in CI).
+if [ -f output/images/rootfs.cpio ]; then
+    cp -v output/images/rootfs.cpio "$OUT/rootfs.cpio"
+fi
 # The bootable hybrid ISO (name it for humans).
 if [ -f output/images/rootfs.iso9660 ]; then
     cp -v output/images/rootfs.iso9660 "$OUT/rusty-backup-appliance.iso"

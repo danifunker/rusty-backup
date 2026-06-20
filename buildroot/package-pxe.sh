@@ -23,21 +23,32 @@ ISO="$OUT/rusty-backup-appliance.iso"
 # out of the ISO (works with isoinfo, bsdtar, or xorriso — whichever is present).
 INITRD="$OUT/initrd"
 if [ -f "$OUT/rootfs.cpio" ]; then
+    # Preferred path: build.sh copies the rootfs cpio out next to the ISO, so we
+    # never need an ISO-extraction tool on the host.
     cp "$OUT/rootfs.cpio" "$INITRD"
 elif [ -f "$ISO" ]; then
+    # Fallback: dig /boot/initrd out of the ISO. Try every tool we know in turn
+    # and accept the first that yields a non-empty file (tools/versions vary on
+    # which ISO path spelling they accept), instead of trusting one blindly.
+    rm -f "$INITRD"
     if command -v isoinfo >/dev/null 2>&1; then
-        isoinfo -i "$ISO" -x '/boot/initrd.;1' > "$INITRD"
-    elif command -v bsdtar >/dev/null 2>&1; then
-        bsdtar -xOf "$ISO" boot/initrd > "$INITRD"
-    elif command -v xorriso >/dev/null 2>&1; then
-        xorriso -osirrox on -indev "$ISO" -extract /boot/initrd "$INITRD" >/dev/null 2>&1
-    else
-        echo "ERROR: need isoinfo, bsdtar, or xorriso to extract the initrd from the ISO"; exit 1
+        isoinfo -i "$ISO" -x '/boot/initrd.;1' > "$INITRD" 2>/dev/null || true
+    fi
+    if [ ! -s "$INITRD" ] && command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xOf "$ISO" boot/initrd > "$INITRD" 2>/dev/null || true
+    fi
+    if [ ! -s "$INITRD" ] && command -v xorriso >/dev/null 2>&1; then
+        xorriso -osirrox on -indev "$ISO" -extract /boot/initrd "$INITRD" >/dev/null 2>&1 || true
+    fi
+    if [ ! -s "$INITRD" ]; then
+        echo "ERROR: could not extract /boot/initrd from $ISO (need isoinfo, bsdtar, or xorriso)."
+        echo "       Easiest fix: rebuild so build.sh emits buildroot/output/rootfs.cpio."
+        exit 1
     fi
 else
     echo "ERROR: no rootfs.cpio and no ISO to source the initramfs from"; exit 1
 fi
-[ -s "$INITRD" ] || { echo "ERROR: extracted initrd is empty"; exit 1; }
+[ -s "$INITRD" ] || { echo "ERROR: initrd is empty"; exit 1; }
 
 STAGE="$OUT/pxe-stage/rusty-backup-appliance-pxe-${VER}"
 rm -rf "$OUT/pxe-stage"
