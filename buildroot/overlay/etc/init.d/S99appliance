@@ -24,13 +24,15 @@ BANNER
       echo "   /dev/$name   ${mib} MiB"
     done
     echo
-    echo " Quick start:"
-    echo "   rb-cli inspect /dev/hda            # show the partition layout"
-    echo "   rb-cli backup  /dev/hda /mnt/bkp   # back up a disk"
-    echo "   rb-cli restore /mnt/bkp  /dev/hda  # restore a disk"
-    echo "   rb-cli --help                      # all verbs"
+    echo " Quick start (disks show as /dev/sdX here; bare-IDE 486 may use hdX):"
+    echo "   rb-cli inspect /dev/sdb                                # layout"
+    echo "   rb-cli backup  /dev/sdb /mnt/bkp --format zstd         # back up"
+    echo "   rb-cli restore /mnt/bkp/sdb-* /dev/sdb --device --yes  # restore"
+    echo "   rb-cli --help                                          # all verbs"
     echo
-    echo " (mount your destination on /mnt first, e.g. a 2nd disk or USB.)"
+    echo " Notes: image with --format zstd (CHD/VHD are desktop-only); writing"
+    echo " a device needs --device --yes. Mount your destination on /mnt first"
+    echo " (2nd disk or USB) until networking lands."
     echo
     ;;
   stop) : ;;

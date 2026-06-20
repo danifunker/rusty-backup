@@ -31,6 +31,10 @@ make qemu_x86_defconfig
 cat >> .config <<EOF
 BR2_ROOTFS_OVERLAY="$OVERLAY"
 BR2_TARGET_GENERIC_HOSTNAME="rusty-backup"
+# Auto-login like an installer CD: the console getty runs a root shell directly
+# (getty -n -l /bin/sh) instead of prompting for login. The S99appliance banner
+# (+ later, a backup/restore menu) is what greets the user.
+BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /bin/sh"
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$WORK/buildroot/kernel.fragment"
 # Destination-medium tooling (a 2nd disk / USB the backup is written to).
 BR2_PACKAGE_DOSFSTOOLS=y

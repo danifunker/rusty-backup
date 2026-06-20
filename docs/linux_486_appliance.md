@@ -5,10 +5,13 @@ on a vintage 486/Pentium-class machine — the Linux sibling of the DOS-native
 [`cb-dos`](cb_dos.md). You boot it on (or beside) the old box, and it images /
 restores the local disk through the full Rust filesystem engine.
 
-> **Status: investigation / first working image.** The scaffolding below builds
-> a bootable image with `rb-cli` baked in. Networking is intentionally deferred
-> to a separate branch (see "Networking", below). Nothing here has run on real
-> 486 hardware yet.
+> **Status: first working image — verified in qemu.** The scaffolding below
+> builds a bootable image with `rb-cli` baked in. It boots in
+> `qemu-system-i386`, detects the attached disks, and **`rb-cli inspect` +
+> `backup --format zstd` run on a real DOS disk** (`/dev/sdb` → MBR/FAT16 parsed,
+> backup folder written); restore writes a device with `--device --yes`.
+> Networking is intentionally deferred to a separate branch (see "Networking").
+> Nothing here has run on real 486 hardware yet.
 
 ## Why a Linux appliance (vs. cb-dos)
 
@@ -117,9 +120,32 @@ gains the kernel's NIC + TCP stack, and the backup *destination* becomes a remot
 host instead of a 2nd local disk — the decisive advantage over cb-dos. Until
 then the destination is a second disk or a USB stick.
 
+## Gotchas found while bringing it up
+
+- The slim `rb-cli` has **no CHD** (desktop-only), and `backup` defaults to CHD —
+  so the appliance must `backup --format zstd` (pure-Rust). The boot banner says so.
+- Writing a device needs `--device --yes` (an overwrite-safety gate — it correctly
+  refused a device restore without it).
+- qemu's PIIX IDE shows disks as `/dev/sdX` (libata), not `hdX`. A bare-IDE 486
+  may present `/dev/hdX`; the banner notes both.
+- The init waits ~15 s for `eth0` (no NIC yet — networking is the deferred branch);
+  harmless boot delay.
+
+## Auto-login (installer-CD style)
+
+The appliance boots **straight to a root shell — no login prompt** (the
+`S99appliance` banner is what greets you). `build.sh` sets
+`BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /bin/sh"`, so the console `getty` runs a
+shell directly instead of `login`. A future step replaces that bare shell with a
+small backup/restore **menu** (boot straight into the tool, like an installer).
+
 ## Open / next
 
-- [ ] First boot + backup/restore smoke test in qemu (in progress).
+- [x] First boot + **backup *and* restore** smoke test in qemu — full round-trip
+      works (backup `/dev/sdb`, restore to a blank `/dev/sdc`, partition
+      reconstructed).
+- [x] Auto-login (no login prompt) — installer-CD style.
+- [ ] Replace the auto-root shell with a backup/restore text menu.
 - [ ] Retarget to `BR2_x86_i586` for genuine Pentium support (static rb-cli fits).
 - [ ] True 486: `BR2_x86_i486` internal toolchain + an i486 `rb-cli`.
 - [ ] A small text menu (backup / restore / shell) instead of a bare prompt.
