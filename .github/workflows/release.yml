@@ -914,8 +914,12 @@ jobs:
              "buildroot/output/rusty-backup-grub-floppy-${ARCH}-${VER}.img"
 
       - name: Name the ISO for the release
-        run: cp buildroot/output/rusty-backup-appliance.iso \
-                "buildroot/output/rusty-backup-appliance-${ARCH}-${VER}.iso"
+        # Block scalar (run: |) so the `\` is a real shell line-continuation.
+        # As a plain scalar, YAML folds the newline to a space first, leaving
+        # bash a `\<space>` (escaped space) that corrupts the destination path.
+        run: |
+          cp buildroot/output/rusty-backup-appliance.iso \
+             "buildroot/output/rusty-backup-appliance-${ARCH}-${VER}.iso"
 
       - name: Upload appliance artifacts
         uses: actions/upload-artifact@v7
