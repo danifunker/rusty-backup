@@ -1,0 +1,135 @@
+name: Appliance media (manual)
+
+# Build ONLY the deployable media (the Linux appliance and/or cb-dos) on demand,
+# so you can iterate on the Buildroot / cb-dos pipeline without running the whole
+# Release workflow (desktop builds etc.). This never publishes a release — it
+# just uploads the artifacts to the run for download. Trigger it from the
+# Actions tab ("Run workflow") or:  gh workflow run "Appliance media (manual)"
+#
+# It shares the same scripts (buildroot/*, crusty-backup/mkmedia.sh) and the same
+# dl/ccache caches as the Release workflow, so a warm cache carries over.
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Linux appliance CPU floor to build"
+        type: choice
+        options: [i586, i686, both, none]
+        default: i586
+      cbdos:
+        description: "Also build cb-dos (FreeDOS floppy + CD)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.m.outputs.arches }}
+    steps:
+      - id: m
+        run: |
+          case "${{ inputs.arch }}" in
+            both) echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
+            none) echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
+            *)    echo 'arches=["${{ inputs.arch }}"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  appliance:
+    needs: setup
+    if: needs.setup.outputs.arches != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.setup.outputs.arches) }}
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -af || true
+          df -h /
+
+      - name: Cache Buildroot source downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: buildroot-dl-2024.02
+          restore-keys: buildroot-dl-
+
+      - name: Cache Buildroot ccache (${{ matrix.arch }})
+        uses: actions/cache@v4
+        with:
+          path: buildroot/ccache
+          key: buildroot-ccache-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: buildroot-ccache-${{ matrix.arch }}-
+
+      - name: Build the static i586-musl rb-cli
+        run: |
+          docker build -t rb-cross-i586-musl - < docker/cross-i586-musl.Dockerfile
+          docker run --rm -v "$PWD":/src rb-cross-i586-musl
+
+      - name: Build the Buildroot appliance (${{ matrix.arch }})
+        run: |
+          docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
+          docker run --rm -e APPLIANCE_ARCH="$ARCH" -v "$PWD":/work rb-buildroot
+
+      - name: Install media tooling
+        run: sudo apt-get update && sudo apt-get install -y xorriso grub-pc-bin mtools
+
+      - name: Package PXE bundle + GRUB floppy + name the ISO
+        run: |
+          sh buildroot/package-pxe.sh "$ARCH-manual"
+          sh buildroot/make-grub-floppy.sh
+          mv buildroot/output/rusty-backup-grub-floppy.img \
+             "buildroot/output/rusty-backup-grub-floppy-$ARCH-manual.img"
+          cp buildroot/output/rusty-backup-appliance.iso \
+             "buildroot/output/rusty-backup-appliance-$ARCH-manual.iso"
+
+      - name: Upload appliance artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: appliance-${{ matrix.arch }}
+          path: |
+            buildroot/output/rusty-backup-appliance-${{ matrix.arch }}-manual.iso
+            buildroot/output/rusty-backup-appliance-pxe-${{ matrix.arch }}-manual.tar.gz
+            buildroot/output/rusty-backup-grub-floppy-${{ matrix.arch }}-manual.img
+
+      - name: Make Buildroot caches readable for actions/cache
+        if: always()
+        run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
+
+  cbdos:
+    if: ${{ inputs.cbdos }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the cb-dos DOS tools (DJGPP)
+        run: |
+          docker build --platform linux/amd64 -t rb-cb-dos - < docker/cb-dos.Dockerfile
+          docker run --rm --platform linux/amd64 -v "$PWD":/src rb-cb-dos
+
+      - name: Fetch FreeDOS base + build cb-dos media
+        run: |
+          curl -fsSL -o /tmp/fd14-floppy.zip \
+            https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-FloppyEdition.zip
+          unzip -o -j /tmp/fd14-floppy.zip 144m/x86BOOT.img -d /tmp
+          FDBASE=/tmp/x86BOOT.img sh crusty-backup/mkmedia.sh
+
+      - name: Upload cb-dos artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cbdos
+          path: |
+            crusty-backup/dist/cbdos-freedos.img
+            crusty-backup/dist/cbdos.iso

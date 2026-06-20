@@ -44,12 +44,36 @@ docker run --rm \
         genisoimage -quiet -o /cbdos.iso -V CBDOS -b boot/cbdos.img -c boot/boot.cat /isoroot
         cp /cbdos.iso /fd.img.iso 2>/dev/null || true
     '
-# genisoimage wrote inside the container; redo the ISO with the dist mount bound.
-docker run --rm -v "$DIST":/out debian:bookworm-slim sh -c '
+# Stage a \NET directory for the CD (DOS networking via mTCP + your packet
+# driver), if mTCP has been fetched — `sh crusty-backup/net/fetch-mtcp.sh`. The
+# boot floppy is too small for it, so networking rides on the CD only. DOS text
+# files get CRLF line endings. See docs/cb_dos_networking.md.
+NETDIR="$HERE/net"
+NETSTAGE="$DIST/.netstage"
+rm -rf "$NETSTAGE"; mkdir -p "$NETSTAGE"
+if ls "$NETDIR"/mtcp/*.EXE >/dev/null 2>&1; then
+    mkdir -p "$NETSTAGE/DRIVERS"
+    cp "$NETDIR"/mtcp/*.EXE "$NETSTAGE/"
+    [ -f "$NETDIR/mtcp/COPYING.TXT" ] && cp "$NETDIR/mtcp/COPYING.TXT" "$NETSTAGE/"
+    for c in "$NETDIR"/drivers/*.COM; do [ -f "$c" ] && cp "$c" "$NETSTAGE/DRIVERS/"; done
+    sed 's/$/\r/' "$NETDIR/drivers/DRIVERS.TXT" > "$NETSTAGE/DRIVERS/DRIVERS.TXT"
+    sed 's/$/\r/' "$NETDIR/MTCP.CFG"            > "$NETSTAGE/MTCP.CFG"
+    sed 's/$/\r/' "$NETDIR/NET.BAT"             > "$NETSTAGE/NET.BAT"
+    drv=$(ls "$NETDIR"/drivers/*.COM 2>/dev/null | wc -l | tr -d ' ')
+    echo "Including \\NET on the CD: mTCP + ${drv} packet driver(s)"
+else
+    echo "No mTCP in net/mtcp/ — CD has no \\NET (run net/fetch-mtcp.sh to add DOS networking)."
+fi
+
+# genisoimage wrote inside the container; redo the ISO with the dist mount bound
+# (and the staged \NET dir, when present).
+docker run --rm -v "$DIST":/out -v "$NETSTAGE":/netstage:ro debian:bookworm-slim sh -c '
     apt-get update >/dev/null 2>&1; apt-get install -y genisoimage >/dev/null 2>&1
     mkdir -p /isoroot/boot && cp /out/cbdos-freedos.img /isoroot/boot/cbdos.img
+    [ -n "$(ls -A /netstage 2>/dev/null)" ] && cp -r /netstage /isoroot/NET
     genisoimage -quiet -o /out/cbdos.iso -V CBDOS -b boot/cbdos.img -c boot/boot.cat /isoroot
 '
+rm -rf "$NETSTAGE"
 
 echo "cb-dos media written to crusty-backup/dist/ :"
 ls -lh "$DIST"/cbdos-freedos.img "$DIST"/cbdos.iso

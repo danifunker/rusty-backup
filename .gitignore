@@ -42,5 +42,9 @@ outputs/
 /target-cross
 /buildroot/output
 /buildroot/dl
+/buildroot/ccache
 /buildroot/overlay/usr/bin/rb-cli
 /crusty-backup/dist
+/crusty-backup/net/dl
+/crusty-backup/net/mtcp
+/crusty-backup/net/drivers/*.COM

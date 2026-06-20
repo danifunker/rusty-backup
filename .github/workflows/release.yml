@@ -861,6 +861,23 @@ jobs:
           docker image prune -af || true
           df -h /
 
+      - name: Cache Buildroot source downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: buildroot-dl-2024.02
+          restore-keys: buildroot-dl-
+
+      - name: Cache Buildroot ccache (${{ matrix.arch }})
+        # run_id in the key makes every run save a fresh entry; restore-keys
+        # pulls the newest previous one — so the ccache keeps warming up. After
+        # the first ~1 h build, warm-cache rebuilds are much faster.
+        uses: actions/cache@v4
+        with:
+          path: buildroot/ccache
+          key: buildroot-ccache-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: buildroot-ccache-${{ matrix.arch }}-
+
       - name: Build the static i586-musl rb-cli (baked into the appliance)
         # The i586 static binary runs on both i586 and i686 appliances.
         run: |
@@ -900,6 +917,12 @@ jobs:
             buildroot/output/rusty-backup-appliance-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.iso
             buildroot/output/rusty-backup-appliance-pxe-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
             buildroot/output/rusty-backup-grub-floppy-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.img
+
+      - name: Make Buildroot caches readable for actions/cache
+        # Buildroot runs as root in the container, so dl/ccache land root-owned;
+        # let the runner user read them when the cache@v4 post-step saves.
+        if: always()
+        run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)

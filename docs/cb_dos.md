@@ -389,6 +389,14 @@ doc also covers the coupled **disk-state model** the transport needs (chunked
 `.cbk` resume container, the "same source?" fingerprint, the file manifest +
 attribute round-trip, boot protection, and swap-file exclusion).
 
+**Pragmatic interim (shipped):** the cb-dos **CD** can carry mTCP (GPLv3) + a
+packet driver so you image to a file and then **FTP it off the box** today — no
+cb-dos network code, no host listener, just a standard DOS TCP/IP stack. Setup,
+the packet-driver library, and the build wiring are in
+**[`cb_dos_networking.md`](cb_dos_networking.md)**. The integrated `net-serve`
+transport above is still the eventual goal; this just unblocks moving backups
+over the wire now.
+
 ---
 
 ## 7. Open risks / unknowns

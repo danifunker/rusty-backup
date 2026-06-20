@@ -49,13 +49,18 @@ chmod 644 "$OVERLAY/etc/inittab"
 cd "$BR"
 export FORCE_UNSAFE_CONFIGURE=1
 export DL_DIR="$WORK/buildroot/dl"     # cache downloads on the host across runs
-mkdir -p "$DL_DIR"
+mkdir -p "$DL_DIR" "$WORK/buildroot/ccache"
 
 # Start from the known-bootable qemu_x86 config, then layer our customisations.
 make qemu_x86_defconfig
 cat >> .config <<EOF
 BR2_ROOTFS_OVERLAY="$OVERLAY"
 BR2_TARGET_GENERIC_HOSTNAME="rusty-backup"
+# ccache the toolchain + package compiles into a bind-mounted dir so it persists
+# across runs (locally on the host, and in CI via actions/cache). The first
+# build still pays full price (~1 h); warm cache after that is much faster.
+BR2_CCACHE=y
+BR2_CCACHE_DIR="$WORK/buildroot/ccache"
 # Boot straight into the backup/restore menu, like an installer CD. The
 # authoritative getty setup is the overlay's /etc/inittab, which runs
 # /usr/bin/appliance-menu on BOTH the VGA console (tty1) and the serial port
