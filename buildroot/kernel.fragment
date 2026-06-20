@@ -181,6 +181,14 @@ CONFIG_WINBOND_840=y
 CONFIG_DM9102=y
 CONFIG_ULI526X=y
 
+# RDC R6040 — the on-SoC Fast Ethernet MAC in the DM&P Vortex86 family, i.e. the
+# built-in NIC on modern retro boards like the ITX-Llama (Vortex86EX). PCI MAC,
+# binds automatically. (Booting the appliance on a Vortex86EX board also needs
+# an i586 kernel — see the CPU-baseline note in docs/linux_486_appliance.md;
+# this driver is what makes its onboard Ethernet work once that lands.)
+CONFIG_NET_VENDOR_RDC=y
+CONFIG_R6040=y
+
 # VIA.
 CONFIG_NET_VENDOR_VIA=y
 CONFIG_VIA_RHINE=y
