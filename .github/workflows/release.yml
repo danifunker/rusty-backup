@@ -828,34 +828,46 @@ jobs:
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
 
   build-appliance:
-    name: Build Linux appliance (ISO + PXE + GRUB floppy)
-    # A full Buildroot build is ~25-30 min, so only spend it on the branches
-    # that actually publish a release.
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    name: Build Linux appliance (${{ matrix.arch }})
     needs: generate-version
     runs-on: ubuntu-latest
-    # Like the MiSTer job: the release still gates on these artifacts existing,
-    # but a Buildroot hiccup stays non-fatal and lets the desktop release ship.
+    # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
+    # ship. Runs on every push (like the other build jobs); only `release` is
+    # gated to main, so a feature-branch push builds + uploads but doesn't publish.
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # i586 = broadest reach (Pentium / 5x86 / Vortex86 / ITX-Llama and up);
+        # i686 = a touch faster on Pentium-Pro+ but won't run on a plain Pentium.
+        # (A true 486 is cb-dos, built by the separate build-cb-dos job.)
+        arch: [i586, i686]
     env:
       VER: ${{ needs.generate-version.outputs.version }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v6
 
+      - name: Free up disk space (Buildroot needs several GB)
+        run: |
+          # GitHub runners ship ~25 GB of preinstalled SDKs we don't use; drop the
+          # big ones so the Buildroot toolchain + image build has room.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -af || true
+          df -h /
+
       - name: Build the static i586-musl rb-cli (baked into the appliance)
+        # The i586 static binary runs on both i586 and i686 appliances.
         run: |
           docker build -t rb-cross-i586-musl - < docker/cross-i586-musl.Dockerfile
           docker run --rm -v "$PWD":/src rb-cross-i586-musl
           ls -lh target-cross/i586-unknown-linux-musl/release/rb-cli
 
-      - name: Build the Buildroot appliance (i586 kernel + rootfs + hybrid ISO)
-        # i586 (Pentium / 5x86 / Vortex86) is the appliance floor — it runs on
-        # i586 *and* i686, so it covers the widest range of vintage hardware
-        # (a true 486 uses cb-dos instead). The bundled rb-cli is the i586 static
-        # musl build from the step above.
+      - name: Build the Buildroot appliance (${{ matrix.arch }} kernel + rootfs + hybrid ISO)
         run: |
           docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
-          docker run --rm -e APPLIANCE_ARCH=i586 -v "$PWD":/work rb-buildroot
+          docker run --rm -e APPLIANCE_ARCH="${ARCH}" -v "$PWD":/work rb-buildroot
           ls -lh buildroot/output/
 
       - name: Install media tooling (PXE initrd extract + GRUB floppy)
@@ -864,30 +876,29 @@ jobs:
           sudo apt-get install -y xorriso grub-pc-bin mtools
 
       - name: Package PXE network-boot bundle
-        run: sh buildroot/package-pxe.sh "${VER}"
+        run: sh buildroot/package-pxe.sh "${ARCH}-${VER}"
 
       - name: Build GRUB boot floppy (pre-El-Torito BIOS bridge)
         run: |
           sh buildroot/make-grub-floppy.sh
           mv buildroot/output/rusty-backup-grub-floppy.img \
-             "buildroot/output/rusty-backup-grub-floppy-${VER}.img"
+             "buildroot/output/rusty-backup-grub-floppy-${ARCH}-${VER}.img"
 
       - name: Name the ISO for the release
         run: cp buildroot/output/rusty-backup-appliance.iso \
-                "buildroot/output/rusty-backup-appliance-${VER}.iso"
+                "buildroot/output/rusty-backup-appliance-${ARCH}-${VER}.iso"
 
       - name: Upload appliance artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: rusty-backup-appliance-${{ needs.generate-version.outputs.version }}
+          name: rusty-backup-appliance-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: |
-            buildroot/output/rusty-backup-appliance-${{ needs.generate-version.outputs.version }}.iso
-            buildroot/output/rusty-backup-appliance-pxe-${{ needs.generate-version.outputs.version }}.tar.gz
-            buildroot/output/rusty-backup-grub-floppy-${{ needs.generate-version.outputs.version }}.img
+            buildroot/output/rusty-backup-appliance-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.iso
+            buildroot/output/rusty-backup-appliance-pxe-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+            buildroot/output/rusty-backup-grub-floppy-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.img
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP
@@ -988,9 +999,9 @@ jobs:
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
             "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
             "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
-            "rusty-backup-appliance-${VER}.iso" \
-            "rusty-backup-appliance-pxe-${VER}.tar.gz" \
-            "rusty-backup-grub-floppy-${VER}.img" \
+            "rusty-backup-appliance-i586-${VER}.iso" "rusty-backup-appliance-i686-${VER}.iso" \
+            "rusty-backup-appliance-pxe-i586-${VER}.tar.gz" "rusty-backup-appliance-pxe-i686-${VER}.tar.gz" \
+            "rusty-backup-grub-floppy-i586-${VER}.img" "rusty-backup-grub-floppy-i686-${VER}.img" \
             "cbdos-freedos-${VER}.img" "cbdos-${VER}.iso"; do
             [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
           done
@@ -1016,12 +1027,14 @@ jobs:
 
           For 486/Pentium-class boxes too old to run the desktop app — boot the rusty-backup backup/restore menu straight on the metal (VGA monitor or serial console), with a broad vintage NIC / SCSI / IDE driver set baked in.
 
+          Pick **i586** unless you know your box is a Pentium Pro or newer: i586 runs on i586 *and* i686 (Pentium / MMX / K6 / Cyrix / 5x86 / Vortex86-ITX-Llama and up); i686 is a touch faster but needs a Pentium-Pro-class CPU. A true 486 uses **cb-dos**.
+
           | Artifact | Boots from | Notes |
           |---|---|---|
-          | [**Appliance ISO**](${BASE}/rusty-backup-appliance-${VER}.iso) | CD-ROM **or** USB / CF (\`dd\` the same file on) | The workhorse hybrid image. |
-          | [**PXE bundle**](${BASE}/rusty-backup-appliance-pxe-${VER}.tar.gz) | the network (TFTP / PXE) | A diskless backup *station*. |
-          | [**GRUB boot floppy**](${BASE}/rusty-backup-grub-floppy-${VER}.img) | a floppy that then loads the appliance off the CD | For pre-El-Torito BIOSes that can't boot a CD directly. |
-          | **cb-dos** ([floppy](${BASE}/cbdos-freedos-${VER}.img) · [CD](${BASE}/cbdos-${VER}.iso)) | a FreeDOS floppy or CD | The DOS-native lane (no Linux) for boxes where even a minimal Linux is too heavy. |
+          | **Appliance ISO** — [i586](${BASE}/rusty-backup-appliance-i586-${VER}.iso) · [i686](${BASE}/rusty-backup-appliance-i686-${VER}.iso) | CD-ROM **or** USB / CF (\`dd\` the same file on) | The workhorse hybrid image. |
+          | **PXE bundle** — [i586](${BASE}/rusty-backup-appliance-pxe-i586-${VER}.tar.gz) · [i686](${BASE}/rusty-backup-appliance-pxe-i686-${VER}.tar.gz) | the network (TFTP / PXE) | A diskless backup *station*. |
+          | **GRUB boot floppy** — [i586](${BASE}/rusty-backup-grub-floppy-i586-${VER}.img) · [i686](${BASE}/rusty-backup-grub-floppy-i686-${VER}.img) | a floppy that then loads the appliance off the CD | For pre-El-Torito BIOSes that can't boot a CD directly. |
+          | **cb-dos** ([floppy](${BASE}/cbdos-freedos-${VER}.img) · [CD](${BASE}/cbdos-${VER}.iso)) | a FreeDOS floppy or CD | The DOS-native lane (no Linux) for a true 486, or any box where even a minimal Linux is too heavy. |
 
           <sub>Which cards work and how to add more: [\`docs/appliance_hardware_support.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/appliance_hardware_support.md). cb-dos background: [\`docs/cb_dos.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/cb_dos.md).</sub>
 
