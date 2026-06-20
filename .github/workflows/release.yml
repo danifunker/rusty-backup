@@ -926,8 +926,8 @@ jobs:
 
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)
-    # Release branches or a manual run (it's quick, but it's a release artifact).
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    # Cheap (~2-3 min: DJGPP build + a FreeDOS fetch), so run it on every push
+    # like the desktop builds — no gate. Only `release` (main-only) publishes.
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP
