@@ -1,8 +1,8 @@
 #!/bin/sh
 # Run a cb-dos POC binary under DOSBox-X (macOS).
 #
-#   ./run-dosbox.sh                 # runs build/TUI_POC.EXE
-#   ./run-dosbox.sh TUI_POC.UPX.EXE # runs the UPX-compressed build
+#   ./run-dosbox.sh                 # runs build/CRUSTYBK.EXE
+#   ./run-dosbox.sh DISKSPK.EXE     # runs another POC binary
 #
 # Override the emulator path with: DOSBOXX=/path/to/dosbox-x ./run-dosbox.sh
 set -e
@@ -10,7 +10,7 @@ set -e
 DOSBOXX="${DOSBOXX:-/Applications/dosbox-x.app/Contents/MacOS/dosbox-x}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/build"
-EXE="${1:-TUI_POC.EXE}"
+EXE="${1:-CRUSTYBK.EXE}"
 
 if [ ! -x "$DOSBOXX" ]; then
     echo "dosbox-x not found at: $DOSBOXX" >&2

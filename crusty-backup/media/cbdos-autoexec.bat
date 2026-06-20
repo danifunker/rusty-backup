@@ -7,15 +7,13 @@ SET LANG=EN
 alias reboot=fdapm warmboot
 alias halt=fdapm poweroff
 cls
+REM Boot straight into the crusty-backup text UI.
+CRUSTYBK.EXE
 echo.
-echo   crusty-backup (cb-dos) -- DOS backup/restore tools
-echo   ==================================================
+echo   crusty-backup (cb-dos) -- the menu has exited.
+echo     CRUSTYBK   relaunch the backup/restore menu
+echo     DISKSPK    int13h disk dump (MBR + FAT/NTFS/exFAT) -- diagnostics
+echo     LFNTEST    long-filename write test -- diagnostics
 echo.
-echo   Tools on this disk (type the name at the A: prompt):
-echo     TUI_POC    text UI preview (Phase 0a)
-echo     DISKSPK    int13h disk spike: dump MBR + FAT/NTFS/exFAT
-echo     LFNTEST    long-filename write test
-echo.
-echo   cb-dos is in development - the backup engine is still being built.
 echo   See docs/cb_dos.md in the rusty-backup repo.
 echo.

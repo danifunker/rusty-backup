@@ -31,8 +31,9 @@ Current artifacts:
   (`int 21h AX=71A0h`) and creates a long-named file via the raw LFN API
   (`AX=716Ch`). Correctly detects LFN *absence* (refuses rather than mangling);
   with LFN on, a long name round-trips verbatim to the host filesystem.
-- `src/tui_poc.c` — lightweight keyboard-only text UI (conio + `int 16h`,
-  double-buffered via `ScreenUpdate` so there's no flicker). Features:
+- `src/crustybk.c` — lightweight keyboard-only text UI (conio + `int 16h`,
+  double-buffered via `ScreenUpdate` so there's no flicker). Builds to
+  `CRUSTYBK.EXE`, which the boot floppy auto-runs. Features:
   - scrollable disk/partition list with a bottom function-key action bar
   - multi-select: Space marks/unmarks (`[X]`), a marked disk covers its
     partitions (`[-]`); Enter executes on the marked set
@@ -46,7 +47,7 @@ Current artifacts:
 
 | Binary | Size | Notes |
 |--------|------|-------|
-| `tui_poc.exe` | **~115 KB** | full text-UI POC, stripped |
+| `crustybk.exe` | **~115 KB** | the text UI (auto-run on boot), stripped |
 | UPX'd (`upx --best`) | **~57 KB** | self-extracts into RAM at launch |
 | `disk_spike.exe` | **~106 KB** | Phase 0b disk spike, stripped |
 | `lfn_test.exe` | **~102 KB** | Phase 0b LFN write spike, stripped |
@@ -67,14 +68,14 @@ make clean
 make DJGPP=/path/to/djgpp
 ```
 
-To compress (optional, self-extracting): `upx --best build/tui_poc.exe`.
+To compress (optional, self-extracting): `upx --best build/crustybk.exe`.
 
 ## Run / test
 
 **Interactive (the TUI POC):**
 
 ```sh
-./run-dosbox.sh                 # mounts build/ as C: and runs TUI_POC.EXE
+./run-dosbox.sh                 # mounts build/ as C: and runs CRUSTYBK.EXE
 ```
 
 Arrow keys move the selection; `F2`/`F3`/`F5` are stub actions; `F10`/`Esc` quit.

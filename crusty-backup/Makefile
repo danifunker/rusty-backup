@@ -17,7 +17,7 @@ LDFLAGS ?= -s            # strip symbols (smaller .exe)
 
 BUILD := build
 
-POCS := $(BUILD)/tui_poc.exe $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe
+POCS := $(BUILD)/crustybk.exe $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe
 
 all: $(POCS)
 

@@ -19,16 +19,30 @@ BUILD="$HERE/build"
 DIST="$HERE/dist"
 AUTOEXEC="$HERE/media/cbdos-autoexec.bat"
 
-for e in tui_poc disk_spike lfn_test; do
+for e in crustybk disk_spike lfn_test; do
     [ -f "$BUILD/$e.exe" ] || { echo "missing $BUILD/$e.exe (run make / cb-dos.Dockerfile first)"; exit 1; }
 done
 
 mkdir -p "$DIST"
 cp "$FDBASE" "$DIST/cbdos-freedos.img"
 
+# DPMI host. The cb-dos tools are DJGPP (32-bit protected mode) and need a DPMI
+# provider at runtime. DOSBox-X has one built in, but a real FreeDOS boot disk
+# does not — without this they fail with "Load error: no DPMI". CWSDPMI is
+# freely redistributable, and the DJGPP stub auto-loads CWSDPMI.EXE from the
+# program's own directory (A:\), so just shipping it on the floppy is enough.
+DL="$HERE/dl"
+CSDPMI_URL="${CSDPMI_URL:-http://www.delorie.com/pub/djgpp/current/v2misc/csdpmi7b.zip}"
+mkdir -p "$DL"
+if [ ! -f "$DL/CWSDPMI.EXE" ]; then
+    curl -fsSL -o "$DL/csdpmi7b.zip" "$CSDPMI_URL"
+    ( cd "$DL" && unzip -o -j -q csdpmi7b.zip bin/CWSDPMI.EXE )
+fi
+
 docker run --rm \
     -v "$DIST/cbdos-freedos.img":/fd.img \
     -v "$BUILD":/exe:ro \
+    -v "$DL/CWSDPMI.EXE":/dpmi/CWSDPMI.EXE:ro \
     -v "$AUTOEXEC":/in/fdauto.bat:ro \
     debian:bookworm-slim sh -c '
         apt-get update >/dev/null 2>&1
@@ -36,9 +50,12 @@ docker run --rm \
         export MTOOLS_SKIP_CHECK=1
         sed "s/\$/\r/" /in/fdauto.bat > /tmp/fdauto.bat   # CRLF for DOS
         mcopy -o -i /fd.img /tmp/fdauto.bat     ::FDAUTO.BAT
-        mcopy -o -i /fd.img /exe/tui_poc.exe    ::TUI_POC.EXE
+        mcopy -o -i /fd.img /dpmi/CWSDPMI.EXE   ::CWSDPMI.EXE
+        mcopy -o -i /fd.img /exe/crustybk.exe   ::CRUSTYBK.EXE
         mcopy -o -i /fd.img /exe/disk_spike.exe ::DISKSPK.EXE
         mcopy -o -i /fd.img /exe/lfn_test.exe   ::LFNTEST.EXE
+        # Drop the FreeDOS installer (irrelevant to cb-dos, frees ~39 KB).
+        mdel -i /fd.img ::SETUP.BAT 2>/dev/null || true
         # El-Torito CD that boots the same floppy (floppy emulation).
         mkdir -p /isoroot/boot && cp /fd.img /isoroot/boot/cbdos.img
         genisoimage -quiet -o /cbdos.iso -V CBDOS -b boot/cbdos.img -c boot/boot.cat /isoroot

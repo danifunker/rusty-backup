@@ -242,7 +242,7 @@ parse, compact, gzip, metadata) with **two thin front-ends**.
 - **CLI** — scriptable flags mirroring the engine (backup / restore / inspect,
   partition selection, sizing). Same verbs as `rb-cli` where they overlap.
 
-**Size POC — DONE (2026-06-02).** `crusty-backup/src/tui_poc.c` (conio screen
+**Size POC — DONE (2026-06-02).** `crusty-backup/src/crustybk.c` (conio screen
 draw + `int 16h` keys + bottom function-key action bar + dummy disk list),
 built with `i586-pc-msdosdjgpp-gcc -Os -s`, measures **111,104 bytes (~108 KB)**.
 For reference a bare DJGPP hello-world is ~146 KB unstripped; stripping (`-s`)
@@ -485,6 +485,15 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-20 — **Boots into the TUI on real FreeDOS.** The cb-dos disk now
+  auto-launches the text UI at boot (FDAUTO.BAT runs `CRUSTYBK.EXE`, renamed from
+  `tui_poc`), and the FreeDOS installer's `SETUP.BAT` is stripped. **Key fix:**
+  DJGPP binaries need a DPMI host — DOSBox-X fakes one, but a real FreeDOS boot
+  disk has none (they failed with "Load error: no DPMI"). `mkmedia.sh` now ships
+  **CWSDPMI.EXE** (freely redistributable; the DJGPP stub auto-loads it from
+  `A:\`), so the tools run on actual FreeDOS for the first time — verified in
+  qemu booting straight into the disk/partition TUI. `DISKSPK.EXE` (int13h disk
+  dump) and `LFNTEST.EXE` (LFN write check) remain as diagnostics at the prompt.
 - 2026-06-02 — Due-diligence pass over all desktop formats. **Decision: reuse
   the native PerPartition backup format** (it already does per-partition +
   per-disk + resize-on-restore; foreign formats don't resize). Dropped `.RBK`
@@ -492,7 +501,7 @@ over the wire now.
   (decoder already in-tree via Ghost/IMZ). Chose **LFN-required** DOS (FreeDOS /
   `doslfn`) so cb-dos writes native filenames verbatim — zero desktop naming
   work. gzip-only, 486+. No code yet.
-- 2026-06-02 — **Phase 0a POC built + measured.** `crusty-backup/src/tui_poc.c`
+- 2026-06-02 — **Phase 0a POC built + measured.** `crusty-backup/src/crustybk.c`
   (conio text UI, bottom function-key bar, keyboard-only) compiles with DJGPP
   gcc 12.2.0 → **111,104 B (~108 KB)** stripped; **56,436 B (~55 KB)** after
   `upx --best`. DJGPP toolchain at `~/djgpp` (had to clear macOS quarantine —
@@ -517,7 +526,7 @@ over the wire now.
   later. No v1 destination matrix chosen yet.
 - 2026-06-19 — **Phase 0a POC run (gap closed) + Phase 0b disk spike done,
   emulator-verified.** Installed/located **DOSBox-X 2026.05.02**
-  (`/Applications/dosbox-x.app`); the previously-unrun `tui_poc.exe` now boots
+  (`/Applications/dosbox-x.app`); the previously-unrun `crustybk.exe` now boots
   and renders correctly under it. Wrote **`crusty-backup/src/disk_spike.c`** — the
   "hello disk" spike: enumerate BIOS drives (`int 13h AH=08h`), LBA-extensions
   check (`AH=41h`), sector read with **ext (`AH=42h`) + CHS (`AH=02h`) fallback**

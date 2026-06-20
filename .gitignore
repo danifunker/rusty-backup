@@ -45,6 +45,7 @@ outputs/
 /buildroot/ccache
 /buildroot/overlay/usr/bin/rb-cli
 /crusty-backup/dist
+/crusty-backup/dl
 /crusty-backup/net/dl
 /crusty-backup/net/mtcp
 /crusty-backup/net/drivers/*.COM
