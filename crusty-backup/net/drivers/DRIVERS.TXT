@@ -1,0 +1,41 @@
+===================================================================
+ cb-dos packet-driver library
+===================================================================
+DOS TCP/IP (mTCP) needs a PACKET DRIVER for your network card. A packet
+driver is a tiny TSR (.COM) specific to your NIC; it presents the card to
+mTCP on a software interrupt (we use 60h by convention).
+
+This directory is where you put the .COM packet driver(s) for the card(s)
+you use. Drop the file in, rebuild the media, and load it before NET.BAT:
+
+    \NET\DRIVERS\<driver> 0x60 [IRQ] [IO]
+
+------- Common cards -> driver (and where to get it) --------------
+Card / chipset            Packet driver   Typical load line
+------------------------- --------------- -------------------------
+NE2000 / RTL8019 (ISA)    NE2000.COM      NE2000 0x60 <irq> <io>
+   (also most ISA clones)                 e.g. NE2000 0x60 3 0x300
+3Com 3C509 (ISA)          3C5X9PD.COM     3C5X9PD 0x60   (self-config)
+3Com 3C905 (PCI)          3C90XPD.COM     3C90XPD 0x60
+AMD PCnet (ISA/PCI)       PCNTPK.COM      PCNTPK 0x60
+Intel EtherExpress Pro/100 E100BPKT.COM   E100BPKT 0x60
+DEC 21x4x "Tulip" (PCI)   DC21X4.COM      DC21X4 0x60
+Realtek RTL8139 (PCI)     RTSPKT.COM      RTSPKT 0x60
+Realtek RTL8169 (PCI)     R8169PD.COM     R8169PD 0x60
+SMC/WD 80x3 (ISA)         WD8003E.COM     WD8003E 0x60 <irq> <io>
+DM&P Vortex86 RDC R6040    (vendor DOS pkt driver from DM&P)
+PCI card, unsure          try the generic PCI drivers above, or the
+                          card vendor's DOS "packet driver" download
+
+------- Where to get drivers --------------------------------------
+* The card's original driver disk / vendor site (search "<card>
+  packet driver DOS").
+* The Crynwr packet driver collection (GPL) - the classic library of
+  ISA-era drivers; mirrored on several DOS archives and the Internet
+  Archive. Look for PKTD11.ZIP / the "Crynwr" set.
+* Georg Potthast's packet driver collection and the FreeDOS network
+  packages also bundle many of these.
+
+------- No network card? --------------------------------------
+mTCP can run TCP/IP over a SERIAL cable using SLIP (no NIC needed) - see
+docs/cb_dos_networking.md. Slow, but works on any machine with a COM port.
