@@ -22,7 +22,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
     "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip",
+    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -31,7 +31,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// `.zip` holding a RAW disk image, but it must not become the system
 /// handler for *every* `.zip` the user double-clicks. Filtered out of
 /// [`association_exts`].
-pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip"];
+pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz"];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
 pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
@@ -97,6 +97,22 @@ mod tests {
         assert!(
             !association_exts().contains(&"zip".to_string()),
             "zip must NOT be registered as an OS file association"
+        );
+    }
+
+    #[test]
+    fn gz_is_picker_only_not_associated() {
+        // `.gz` is openable (a gzip-wrapped disk image, e.g. a `.pdi.gz` Alto /
+        // Pilot pack or a gzipped raw image), so it must appear in the picker
+        // dropdown — but, exactly like `.zip`, Rusty Backup must NOT become the
+        // OS handler for every `.gz` (which is overwhelmingly `.tar.gz` etc.).
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"gz"),
+            "gz must be in the picker list so .pdi.gz is selectable"
+        );
+        assert!(
+            !association_exts().contains(&"gz".to_string()),
+            "gz must NOT be registered as an OS file association"
         );
     }
 

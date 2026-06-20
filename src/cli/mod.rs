@@ -24,6 +24,7 @@ pub mod backup_edit;
 pub mod config;
 pub mod copy_paths;
 pub mod device_safety;
+pub mod dir_picker;
 pub mod exit;
 pub mod glob;
 pub mod img_at;

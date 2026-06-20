@@ -309,11 +309,68 @@ pub fn is_gzip_image_path(path: &Path) -> bool {
     if !ext_ok {
         return false;
     }
+    has_gzip_magic(path)
+}
+
+/// True for any gzip-wrapped disk image we transparently decompress on open:
+/// the editable Amiga `.adz`/`.hdz` containers ([`is_gzip_image_path`]) plus a
+/// generically `.gz`-suffixed image — a gzipped raw disk or a `.pdi.gz` Alto /
+/// Pilot pack. Matched by extension + gzip magic so a mislabeled file isn't
+/// taken for one. Unlike `.adz`/`.hdz`, a bare `.gz` image is read-only (there
+/// is no re-gzip-on-commit path), so it is deliberately NOT part of
+/// [`is_editable_container_path`].
+pub fn is_gzip_wrapped_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            e.eq_ignore_ascii_case("adz")
+                || e.eq_ignore_ascii_case("hdz")
+                || e.eq_ignore_ascii_case("gz")
+        })
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    has_gzip_magic(path)
+}
+
+/// First two bytes equal the gzip magic `1f 8b`.
+fn has_gzip_magic(path: &Path) -> bool {
     let Ok(mut f) = File::open(path) else {
         return false;
     };
     let mut magic = [0u8; 2];
     matches!(f.read(&mut magic), Ok(n) if n == 2) && magic == [0x1f, 0x8b]
+}
+
+/// Fully decompress a gzip file into memory. Used for the small gzip-wrapped
+/// Alto / Pilot packs (`.pdi.gz`, gzipped CopyDisk) that must be parsed as a
+/// whole [`crate::fs::alto::Disk`] rather than streamed as flat sectors.
+pub fn gunzip_to_vec(path: &Path) -> std::io::Result<Vec<u8>> {
+    let input = File::open(path)?;
+    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Decompress just the first `n` bytes of a gzip file, for cheap magic sniffing
+/// without inflating the whole stream. Returns fewer than `n` bytes only if the
+/// decompressed stream is shorter.
+pub fn gunzip_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
+    let input = File::open(path)?;
+    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(input));
+    let mut out = vec![0u8; n];
+    let mut filled = 0;
+    while filled < n {
+        match decoder.read(&mut out[filled..])? {
+            0 => break,
+            k => filled += k,
+        }
+    }
+    out.truncate(filled);
+    Ok(out)
 }
 
 /// A seekable reader over a gzip-decoded image held in a temp file, so a large
@@ -481,8 +538,8 @@ fn open_read_dispatch(
         let flat = open_apple_ii_dsk(bytes, ext.as_deref())
             .with_context(|| format!("decode Apple-II disk {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
-    } else if is_gzip_image_path(path) {
-        // .adz/.hdz: gzip-wrapped Amiga image. Decode to a temp file (an .hdf
+    } else if is_gzip_wrapped_path(path) {
+        // .adz/.hdz/.gz: gzip-wrapped image. Decode to a temp file (an .hdf
         // can be large, so don't hold it all in RAM) and read from there.
         let input =
             File::open(path).with_context(|| format!("open gzip image {}", path.display()))?;
@@ -628,7 +685,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_gho_path(path)
         || is_imz_path(path)
         || is_zip_image_path(path)
-        || is_gzip_image_path(path)
+        || is_gzip_wrapped_path(path)
         || is_woz_path(path)
         || is_flat_floppy_container_path(path)
 }
@@ -923,6 +980,49 @@ mod tests {
         let bogus = dir.path().join("bogus.adz");
         std::fs::write(&bogus, b"NOTGZIP").unwrap();
         assert!(!is_gzip_image_path(&bogus));
+    }
+
+    #[test]
+    fn open_read_decodes_gzip_dot_gz_pack() {
+        // A `.pdi.gz` (gzip-wrapped Alto/Pilot pack) must peel like `.adz`/`.hdz`
+        // so inspect + browse see the inner container magic instead of parsing
+        // the raw gzip stream as a bogus MBR. `is_gzip_image_path` (the editable
+        // adz/hdz set) stays false; `is_gzip_wrapped_path` and the container/peel
+        // path pick it up.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CedarDorado-boot.pdi.gz");
+        let mut payload = b"PARCDISK".to_vec();
+        payload.extend((0..4096usize).map(|i| (i & 0xFF) as u8));
+        {
+            let f = File::create(&path).unwrap();
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(&payload).unwrap();
+            enc.finish().unwrap();
+        }
+
+        assert!(
+            !is_gzip_image_path(&path),
+            "a bare .gz is not the editable set"
+        );
+        assert!(is_gzip_wrapped_path(&path));
+        assert!(is_container_path(&path), "peeled through open_read");
+
+        let mut r = open_read(&path).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload, "gz peeled to the original pack");
+
+        // Prefix-sniff helper used by the browse-session Alto branch.
+        let head = gunzip_prefix(&path, 8).unwrap();
+        assert_eq!(&head, b"PARCDISK");
+
+        // A `.gz` without gzip magic is not treated as a wrapped image.
+        let bogus = dir.path().join("notes.gz");
+        std::fs::write(&bogus, b"NOTGZIP").unwrap();
+        assert!(!is_gzip_wrapped_path(&bogus));
     }
 
     #[test]

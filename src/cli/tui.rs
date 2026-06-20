@@ -67,6 +67,87 @@ pub fn ascii_rule(width: usize) -> String {
     "-".repeat(width.min(120))
 }
 
+/// Smallest list viewport we'll ever render, even on a tiny console.
+pub const MIN_VIEWPORT: usize = 3;
+
+/// A reusable list cursor + scroll window, decoupled from what's being listed.
+/// The owner stores the items; `ListNav` tracks the selection and which slice is
+/// visible. Re-point it at a new list with [`set_len`](ListNav::set_len) (used
+/// when the directory picker descends into a folder).
+#[derive(Debug, Clone)]
+pub struct ListNav {
+    len: usize,
+    sel: usize,
+    scroll: usize,
+    viewport: usize,
+}
+
+impl ListNav {
+    pub fn new(len: usize) -> Self {
+        ListNav {
+            len,
+            sel: 0,
+            scroll: 0,
+            viewport: MIN_VIEWPORT,
+        }
+    }
+
+    pub fn selected(&self) -> usize {
+        self.sel
+    }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Replace the item count (e.g. after navigating to a new folder), resetting
+    /// the cursor to the top.
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len;
+        self.sel = 0;
+        self.scroll = 0;
+    }
+
+    pub fn set_viewport(&mut self, rows: usize) {
+        self.viewport = rows.max(MIN_VIEWPORT);
+        self.clamp();
+    }
+
+    pub fn move_up(&mut self) {
+        if self.sel > 0 {
+            self.sel -= 1;
+            self.clamp();
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.sel + 1 < self.len {
+            self.sel += 1;
+            self.clamp();
+        }
+    }
+
+    /// Inclusive-exclusive range of item indices currently visible.
+    pub fn visible_range(&self) -> (usize, usize) {
+        let end = (self.scroll + self.viewport).min(self.len);
+        (self.scroll, end)
+    }
+
+    fn clamp(&mut self) {
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if self.sel >= self.scroll + self.viewport {
+            self.scroll = self.sel + 1 - self.viewport;
+        }
+        let max_scroll = self.len.saturating_sub(self.viewport);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +158,40 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
         assert_eq!(truncate("anything", 0), "");
         assert_eq!(truncate("anything", 2), "..");
+    }
+
+    #[test]
+    fn listnav_moves_and_clamps() {
+        let mut n = ListNav::new(3);
+        n.set_viewport(4);
+        n.move_up();
+        assert_eq!(n.selected(), 0);
+        n.move_down();
+        n.move_down();
+        n.move_down();
+        assert_eq!(n.selected(), 2);
+    }
+
+    #[test]
+    fn listnav_scroll_follows_selection() {
+        let mut n = ListNav::new(10);
+        n.set_viewport(4);
+        for _ in 0..6 {
+            n.move_down();
+        }
+        let (start, end) = n.visible_range();
+        assert!(start <= 6 && 6 < end);
+        assert_eq!(end - start, 4);
+    }
+
+    #[test]
+    fn listnav_set_len_resets() {
+        let mut n = ListNav::new(10);
+        n.set_viewport(4);
+        n.move_down();
+        n.move_down();
+        n.set_len(2);
+        assert_eq!(n.selected(), 0);
+        assert_eq!(n.len(), 2);
     }
 }

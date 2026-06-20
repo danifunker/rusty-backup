@@ -1208,11 +1208,12 @@ pub fn delete_file(disk: &Disk, fid: u32) -> Result<Disk, FilesystemError> {
 // (the per-run `bootChainLink`, end-of-file `[-1,-1]`), `BootChannelDisk.mesa`.
 
 /// Word offset of `bootingInfo` in the physical-volume root (`10B`), an
-/// `ARRAY File.VolumeFile[checkpoint..bootFile] OF BootFile.DiskFileID`.
-const BOOTING_INFO_BASE: usize = 8;
+/// `ARRAY File.VolumeFile[checkpoint..bootFile] OF BootFile.DiskFileID`. This is
+/// the fixed PV-root offset the disk-boot microcode reads each boot stage from.
+pub const BOOTING_INFO_BASE: usize = 8;
 /// Words per `BootFile.DiskFileID`: `fID`(5) + `firstPage`(INT, 2) +
 /// `firstLink`(`DiskFace.DontCare`/`DiskAddress`, 2).
-const DISK_FILE_ID_WORDS: usize = 9;
+pub const DISK_FILE_ID_WORDS: usize = 9;
 /// `bootChainLink` end-of-file sentinel (`[-1, -1]`, `DiskBootTransfer.mc`).
 const BOOT_CHAIN_EOF: [u16; 2] = [0xffff, 0xffff];
 

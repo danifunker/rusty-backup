@@ -338,7 +338,7 @@ readable.
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
 | Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. Arculator-wrapped `.hdf` (Acorn) auto-detected. |
-| Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
+| Gzip-wrapped    | `.adz`, `.hdz`, `.gz` | Yes      | `.adz`/`.hdz` only | Any gzip-wrapped disk image, transparently decompressed at open. `.adz`/`.hdz` are the editable Amiga floppy/HDD wrappers; a bare `.gz` (e.g. a `.pdi.gz` Alto/Pilot pack or a gzipped raw image) is read-only. |
 | Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
 | Commodore disk | `.d64`, `.d71`, `.d81`, `.d80`, `.d82` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 + PET 8050 / 8250 (IEEE-488) flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (bidirectionally cross-validated against the `c1541` / Python `d64` reference). |

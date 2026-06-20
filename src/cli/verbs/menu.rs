@@ -276,56 +276,61 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
             report(r, "inspect");
         }
         Action::Backup => {
-            let dest = prompt("Backup destination directory [default /mnt]: ")?;
-            let dest = if dest.is_empty() {
-                PathBuf::from("/mnt")
-            } else {
-                PathBuf::from(dest)
-            };
-            println!(
-                "Backing up {} -> {} (zstd) ...",
-                disk.path.display(),
-                dest.display()
-            );
-            let r = backup::run(BackupArgs {
-                source: disk.path.clone(),
-                dest,
-                name: None,
-                // The slim appliance build has no CHD; zstd is pure-Rust.
-                format: Some(BackupFormat::Zstd),
-                checksum: None,
-                sector_by_sector: false,
-                partitions: None,
-                split_size_mib: None,
-            });
-            report(r, "backup");
+            match pick_dir("Pick a folder to write the backup into", false)? {
+                None => println!("Backup cancelled."),
+                Some(dest) => {
+                    println!(
+                        "Backing up {} -> {} (zstd) ...",
+                        disk.path.display(),
+                        dest.display()
+                    );
+                    let r = backup::run(BackupArgs {
+                        source: disk.path.clone(),
+                        dest,
+                        name: None,
+                        // The slim appliance build has no CHD; zstd is pure-Rust.
+                        format: Some(BackupFormat::Zstd),
+                        checksum: None,
+                        sector_by_sector: false,
+                        partitions: None,
+                        split_size_mib: None,
+                    });
+                    report(r, "backup");
+                }
+            }
         }
         Action::Restore => {
-            let src = prompt("Backup folder to restore from (the dir with metadata.json): ")?;
-            if src.is_empty() {
-                println!("No path given; restore cancelled.");
-            } else {
-                println!(
-                    "This will OVERWRITE {} with the backup at {}.",
-                    disk.path.display(),
-                    src
-                );
-                let confirm = prompt("Type 'yes' to proceed: ")?;
-                if confirm == "yes" {
-                    let r = restore::run(RestoreArgs {
-                        backup_dir: PathBuf::from(src),
-                        target: disk.path.clone(),
-                        target_size: None,
-                        size: None,
-                        alignment: None,
-                        device: true,
-                        yes: true,
-                        write_to_system_disk: false,
-                        write_zeros_to_unused: false,
-                    });
-                    report(r, "restore");
-                } else {
-                    println!("Restore cancelled.");
+            match pick_dir(
+                "Pick the backup folder to restore from (marked [backup])",
+                true,
+            )? {
+                None => println!("Restore cancelled."),
+                Some(src) => {
+                    println!(
+                        "This will OVERWRITE {} with the backup at {}.",
+                        disk.path.display(),
+                        src.display()
+                    );
+                    let yes = matches!(
+                        prompt("Proceed? [y/N]: ")?.chars().next(),
+                        Some('y') | Some('Y')
+                    );
+                    if yes {
+                        let r = restore::run(RestoreArgs {
+                            backup_dir: src,
+                            target: disk.path.clone(),
+                            target_size: None,
+                            size: None,
+                            alignment: None,
+                            device: true,
+                            yes: true,
+                            write_to_system_disk: false,
+                            write_zeros_to_unused: false,
+                        });
+                        report(r, "restore");
+                    } else {
+                        println!("Restore cancelled.");
+                    }
                 }
             }
         }
@@ -339,6 +344,18 @@ fn report(r: Result<()>, what: &str) {
         Ok(()) => println!("\n{what}: done."),
         Err(e) => eprintln!("\n{what} failed: {e:#}"),
     }
+}
+
+/// Browse for a folder, starting at `/mnt` (the appliance's usual destination
+/// mount) when it exists, else `/`.
+fn pick_dir(title: &str, require_backup: bool) -> Result<Option<PathBuf>> {
+    let mnt = PathBuf::from("/mnt");
+    let start = if mnt.is_dir() {
+        mnt
+    } else {
+        PathBuf::from("/")
+    };
+    crate::cli::dir_picker::pick_directory(&start, title, require_backup)
 }
 
 /// Read one trimmed line from stdin (normal cooked mode — used between TUI

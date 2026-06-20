@@ -149,6 +149,22 @@ impl BrowseSession {
             let _ = f.read(&mut magic);
         }
 
+        // A gzip-wrapped Alto/Pilot pack (`.pdi.gz`, gzipped CopyDisk) shows gzip
+        // magic on the raw file. Sniff the *decompressed* prefix so the Alto
+        // branch below sees the real container magic; the pack itself is small,
+        // so it's decompressed in full only when that magic matches (further
+        // down). Flat gzip images (`.adz`/`.hdz`) keep streaming through the
+        // dedicated gzip branch later in this function.
+        let is_gzip = magic[0] == 0x1f && magic[1] == 0x8b;
+        let probe_magic: [u8; 8] = if is_gzip {
+            crate::model::source_reader::gunzip_prefix(path, 8)
+                .ok()
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .unwrap_or(magic)
+        } else {
+            magic
+        };
+
         // Xerox Alto disk packs (PARC Disk Image, or a CopyDisk stream). These
         // are label-bearing disks that can't be represented as a flat sector
         // stream the way every other source here can, so they bypass
@@ -175,14 +191,17 @@ impl BrowseSession {
         } else {
             None
         };
-        if &magic == b"PARCDISK"
-            || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+        if &probe_magic == b"PARCDISK"
+            || probe_magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
             || is_salto_dsk
             || is_trident
             || zdisk_bytes.is_some()
         {
             let bytes = match zdisk_bytes {
                 Some(b) => b,
+                None if is_gzip => {
+                    crate::model::source_reader::gunzip_to_vec(path).map_err(FilesystemError::Io)?
+                }
                 None => std::fs::read(path).map_err(FilesystemError::Io)?,
             };
             let disk = crate::fs::alto::open_pack(&bytes)?;
