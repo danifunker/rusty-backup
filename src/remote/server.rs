@@ -1,14 +1,25 @@
-//! The `rb-cli serve` daemon — Family F, read-only (Phase 0).
+//! The `rb-cli serve` daemon — Family F (Phase 0 read + Phase 1 write).
 //!
 //! Blocking, thread-per-connection (`std::net`, no async runtime — matches the
 //! repo's `std::thread` idiom and keeps the slim build lean). Each connection
-//! owns its own handle table, so no shared state / locking is needed.
+//! owns its own handle + session tables, so no shared state / locking is needed.
 //!
-//! The daemon runs **the exact same pipeline the local CLI runs** —
+//! The daemon runs **the exact same pipeline the local CLI runs** — for reads
 //! `resolve_partition_streaming_forced_inside` → `open_filesystem` →
-//! `list_directory` / `write_file_to` — so a remote browse behaves identically
-//! to a local one. The client never sees raw blocks; it asks for directory
-//! listings and file bytes at the operation level (plan §2.2).
+//! `list_directory` / `write_file_to`; for writes `resolve_partition_rw_forced`
+//! → `open_editable_filesystem` → `create_file` / `create_directory` →
+//! `sync_metadata` → commit — so a remote operation behaves identically to a
+//! local one. The client never sees raw blocks; it browses, reads, and stages
+//! edits at the operation level (plan §2.2 / §2.4).
+//!
+//! **Phase 1 stage→apply.** A write session (bound to a destination image)
+//! accumulates staged edits — uploaded host files land in a per-session staging
+//! dir, directory creations queue as records — and `Apply` opens the image
+//! editable **once** and replays them, mirroring Commander's `EditQueue` (plan
+//! §2.4 / §6). Staging blobs and the queue live for the session's lifetime and
+//! are dropped on `CloseSession` / disconnect. (Phase-1 caveat: `Apply` writes
+//! to the live image like the local CLI does — a true atomic batch / recoverable
+//! queue is a later refinement.)
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
@@ -17,10 +28,10 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 use crate::cli::verbs::ls::resolve_path;
-use crate::fs::filesystem::Filesystem;
+use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_control, write_control, ChunkWriter, Request, Response, WireEntry, CAP_FAMILY_F,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
+    CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// Daemon configuration (from the `serve` verb).
@@ -30,6 +41,37 @@ pub struct ServeConfig {
     /// Root directory images are served from; every opened path is sandboxed
     /// under it.
     pub root: PathBuf,
+    /// Where per-session upload staging blobs live. `None` uses the system temp
+    /// dir. On a MiSTer this should point at a roomy writable mount, never tmpfs
+    /// (plan §6) — multi-hundred-MB uploads would OOM `/tmp`.
+    pub staging_dir: Option<PathBuf>,
+}
+
+/// One staged edit awaiting `Apply` (the relocated `StagedEdit`, plan §2.4).
+enum StagedEdit {
+    AddFile {
+        dest_parent: String,
+        name: String,
+        blob: PathBuf,
+        size: u64,
+        force: bool,
+        type_code: Option<String>,
+        creator_code: Option<String>,
+    },
+    Mkdir {
+        parent: String,
+        name: String,
+    },
+}
+
+/// A write session: the destination image + a queue of staged edits + the
+/// staging dir holding uploaded blobs (cleaned when the session is dropped).
+struct Session {
+    image_path: PathBuf,
+    partition: Option<u32>,
+    staging: tempfile::TempDir,
+    edits: Vec<StagedEdit>,
+    blob_seq: u64,
 }
 
 /// Bind and run the accept loop forever (until the process is killed).
@@ -38,6 +80,7 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         .root
         .canonicalize()
         .with_context(|| format!("serve root {:?}", cfg.root))?;
+    let staging_dir = cfg.staging_dir.clone();
     let listener = TcpListener::bind(&cfg.bind).with_context(|| format!("binding {}", cfg.bind))?;
     let bound = listener
         .local_addr()
@@ -48,19 +91,20 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         "rb-cli serve: listening on {bound} (root {})",
         root.display()
     );
-    eprintln!("rb-cli serve: Family F read-only (Phase 0 spike). Ctrl-C to stop.");
+    eprintln!("rb-cli serve: Family F read+write (stage->apply). Ctrl-C to stop.");
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let root = root.clone();
+                let staging_dir = staging_dir.clone();
                 std::thread::spawn(move || {
                     let peer = stream
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
                     eprintln!("rb-cli serve: {peer} connected");
-                    match handle_conn(stream, &root) {
+                    match handle_conn(stream, &root, staging_dir.as_deref()) {
                         Ok(()) => eprintln!("rb-cli serve: {peer} disconnected"),
                         Err(e) => eprintln!("rb-cli serve: {peer} ended: {e:#}"),
                     }
@@ -73,12 +117,14 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
 }
 
 /// Serve one connection until the peer says `Bye` or hangs up.
-fn handle_conn(stream: TcpStream, root: &Path) -> Result<()> {
+fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream.try_clone().context("cloning socket")?);
     let mut writer = BufWriter::new(stream);
     let mut handles: HashMap<u64, Box<dyn Filesystem>> = HashMap::new();
     let mut next_handle: u64 = 1;
+    let mut sessions: HashMap<u64, Session> = HashMap::new();
+    let mut next_session: u64 = 1;
 
     loop {
         let req: Request = match read_control(&mut reader) {
@@ -91,13 +137,9 @@ fn handle_conn(stream: TcpStream, root: &Path) -> Result<()> {
         match req {
             Request::Hello { magic, version } => {
                 if magic != RB_HELLO_MAGIC || version < MIN_PROTOCOL_VERSION {
-                    write_control(
+                    reply_err(
                         &mut writer,
-                        &Response::Error {
-                            message: format!(
-                                "unsupported client (magic {magic:#x}, version {version})"
-                            ),
-                        },
+                        format!("unsupported client (magic {magic:#x}, version {version})"),
                     )?;
                     return Ok(());
                 }
@@ -118,52 +160,24 @@ fn handle_conn(stream: TcpStream, root: &Path) -> Result<()> {
                     handles.insert(handle, fs);
                     write_control(&mut writer, &Response::Opened { handle, label })?;
                 }
-                Err(e) => write_control(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("{e:#}"),
-                    },
-                )?,
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
             },
 
             Request::ListDir { handle, path } => match handles.get_mut(&handle) {
                 Some(fs) => match list_dir(&mut **fs, &path) {
                     Ok(entries) => write_control(&mut writer, &Response::Dir { entries })?,
-                    Err(e) => write_control(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("{e:#}"),
-                        },
-                    )?,
+                    Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                 },
-                None => write_control(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("no such handle {handle}"),
-                    },
-                )?,
+                None => reply_err(&mut writer, format!("no such handle {handle}"))?,
             },
 
             Request::ReadFile { handle, path } => match handles.get_mut(&handle) {
-                None => write_control(
-                    &mut writer,
-                    &Response::Error {
-                        message: format!("no such handle {handle}"),
-                    },
-                )?,
+                None => reply_err(&mut writer, format!("no such handle {handle}"))?,
                 Some(fs) => match resolve_path(&mut **fs, &path) {
-                    Err(e) => write_control(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("{e:#}"),
-                        },
-                    )?,
-                    Ok(entry) if entry.is_directory() => write_control(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("{path} is a directory"),
-                        },
-                    )?,
+                    Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                    Ok(entry) if entry.is_directory() => {
+                        reply_err(&mut writer, format!("{path} is a directory"))?
+                    }
                     Ok(entry) => {
                         // Commit to the chunk stream. Once FileBegin is on the
                         // wire the client is in chunk-read mode, so a mid-stream
@@ -185,13 +199,108 @@ fn handle_conn(stream: TcpStream, root: &Path) -> Result<()> {
                 write_control(&mut writer, &Response::Ok)?;
             }
 
+            // --- write path (Phase 1) ---
+            Request::OpenSession {
+                image_path,
+                partition,
+            } => match open_session(root, &image_path, partition, staging_dir) {
+                Ok(session) => {
+                    let id = next_session;
+                    next_session += 1;
+                    sessions.insert(id, session);
+                    write_control(&mut writer, &Response::SessionOpened { session: id })?;
+                }
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+            },
+
+            Request::StageUpload {
+                session,
+                dest_parent,
+                name,
+                size,
+                force,
+                type_code,
+                creator_code,
+            } => {
+                // The file body follows as a chunk stream and MUST be consumed
+                // regardless of session validity, or the framing desyncs.
+                match sessions.get_mut(&session) {
+                    Some(sess) => {
+                        let blob = sess.staging.path().join(format!("blob-{}", sess.blob_seq));
+                        sess.blob_seq += 1;
+                        match stage_blob(&mut reader, &blob) {
+                            Ok(()) => {
+                                sess.edits.push(StagedEdit::AddFile {
+                                    dest_parent,
+                                    name,
+                                    blob,
+                                    size,
+                                    force,
+                                    type_code,
+                                    creator_code,
+                                });
+                                write_control(&mut writer, &Response::Ok)?;
+                            }
+                            Err(e) => reply_err(&mut writer, format!("staging upload: {e:#}"))?,
+                        }
+                    }
+                    None => {
+                        // Drain the body to keep the stream aligned, then report.
+                        let _ = read_chunks(&mut reader, &mut std::io::sink());
+                        reply_err(&mut writer, format!("no such session {session}"))?;
+                    }
+                }
+            }
+
+            Request::StageMkdir {
+                session,
+                parent,
+                name,
+            } => match sessions.get_mut(&session) {
+                Some(sess) => {
+                    sess.edits.push(StagedEdit::Mkdir { parent, name });
+                    write_control(&mut writer, &Response::Ok)?;
+                }
+                None => reply_err(&mut writer, format!("no such session {session}"))?,
+            },
+
+            Request::Apply { session } => match sessions.get(&session) {
+                Some(sess) => match apply_session(sess) {
+                    Ok(count) => write_control(&mut writer, &Response::Applied { count })?,
+                    Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                },
+                None => reply_err(&mut writer, format!("no such session {session}"))?,
+            },
+
+            Request::CloseSession { session } => {
+                // Dropping the Session drops its TempDir → staging cleaned up.
+                sessions.remove(&session);
+                write_control(&mut writer, &Response::Ok)?;
+            }
+
             Request::Bye => return Ok(()),
         }
     }
 }
 
-/// Open `rel` (relative to `root`, partition `partition`) exactly as the local
-/// CLI would, returning the live filesystem + the CLI's partition label.
+/// Send an `Error` control frame.
+fn reply_err<W: std::io::Write>(writer: &mut W, message: String) -> Result<()> {
+    write_control(writer, &Response::Error { message })?;
+    Ok(())
+}
+
+/// Read a chunk stream from the client into a staging blob file.
+fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
+    let mut f = std::fs::File::create(blob)
+        .with_context(|| format!("creating staging blob {}", blob.display()))?;
+    // std::fs::File is unbuffered, so read_chunks' write_all lands every byte
+    // before it returns — no explicit flush needed.
+    read_chunks(reader, &mut f)?;
+    Ok(())
+}
+
+/// Open `rel` (relative to `root`, partition `partition`) for reading exactly
+/// as the local CLI would, returning the live filesystem + the CLI's label.
 fn open_image(
     root: &Path,
     rel: &str,
@@ -211,6 +320,111 @@ fn open_image(
     Ok((fs, ctx.label))
 }
 
+/// Open a write session: sandbox + verify the target image exists; the editable
+/// open is deferred to `Apply`.
+fn open_session(
+    root: &Path,
+    rel: &str,
+    partition: Option<u32>,
+    staging_dir: Option<&Path>,
+) -> Result<Session> {
+    let image_path = sandbox_join(root, rel)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rb-stage-");
+    let staging = match staging_dir {
+        Some(d) => builder
+            .tempdir_in(d)
+            .with_context(|| format!("creating staging dir under {}", d.display()))?,
+        None => builder.tempdir().context("creating staging dir")?,
+    };
+    Ok(Session {
+        image_path,
+        partition,
+        staging,
+        edits: Vec::new(),
+        blob_seq: 0,
+    })
+}
+
+/// Replay a session's staged edits onto its image (open editable once, mutate,
+/// sync, commit). Mirrors the local `put` / `mkdir` verbs.
+fn apply_session(sess: &Session) -> Result<u64> {
+    let (file, ctx, commit) =
+        crate::cli::resolve::resolve_partition_rw_forced(&sess.image_path, sess.partition, None)?;
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+
+    let mut count = 0u64;
+    for edit in &sess.edits {
+        match edit {
+            StagedEdit::AddFile {
+                dest_parent,
+                name,
+                blob,
+                size,
+                force,
+                type_code,
+                creator_code,
+            } => {
+                let parent = resolve_path(&mut *fs, dest_parent)?;
+                if !parent.is_directory() {
+                    bail!("parent is not a directory: {dest_parent}");
+                }
+                if let Some(existing) = fs
+                    .list_directory(&parent)
+                    .map_err(|e| anyhow!("list_directory: {e}"))?
+                    .into_iter()
+                    .find(|e| &e.name == name)
+                {
+                    if !*force {
+                        bail!("{} already exists (use --force)", disp(dest_parent, name));
+                    }
+                    fs.delete_entry(&parent, &existing)
+                        .map_err(|e| anyhow!("delete existing {name}: {e}"))?;
+                }
+                let options = CreateFileOptions {
+                    type_code: type_code.clone(),
+                    creator_code: creator_code.clone(),
+                    ..Default::default()
+                };
+                let mut blobf = std::fs::File::open(blob)
+                    .with_context(|| format!("opening staging blob {}", blob.display()))?;
+                fs.create_file(&parent, name, &mut blobf, *size, &options)
+                    .map_err(|e| anyhow!("create_file {name}: {e}"))?;
+                count += 1;
+            }
+            StagedEdit::Mkdir { parent, name } => {
+                let parent_entry = resolve_path(&mut *fs, parent)?;
+                if !parent_entry.is_directory() {
+                    bail!("parent is not a directory: {parent}");
+                }
+                if fs
+                    .list_directory(&parent_entry)
+                    .map_err(|e| anyhow!("list_directory: {e}"))?
+                    .iter()
+                    .any(|e| &e.name == name)
+                {
+                    bail!("{} already exists", disp(parent, name));
+                }
+                fs.create_directory(&parent_entry, name, &CreateDirectoryOptions::default())
+                    .map_err(|e| anyhow!("create_directory {name}: {e}"))?;
+                count += 1;
+            }
+        }
+    }
+
+    fs.sync_metadata()
+        .map_err(|e| anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    Ok(count)
+}
+
 /// Resolve a wire path under the serve root and refuse anything that escapes
 /// it (`..`, absolute paths, symlinks out). The wire path is slash-separated
 /// with a leading `/`; we treat it as relative to `root`.
@@ -227,6 +441,15 @@ fn sandbox_join(root: &Path, rel: &str) -> Result<PathBuf> {
         bail!("path {rel:?} escapes the serve root");
     }
     Ok(canon)
+}
+
+/// Join a parent dir + name for display, avoiding a doubled slash at root.
+fn disp(parent: &str, name: &str) -> String {
+    if parent.ends_with('/') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
 }
 
 /// List a directory inside an opened image, projected to wire entries.

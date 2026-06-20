@@ -7,10 +7,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::TcpStream;
+use std::path::Path;
 
 use crate::remote::protocol::{
-    read_chunks, read_control, write_control, Request, Response, WireEntry, CAP_FAMILY_F,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
+    CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// A live connection to a daemon, after a successful Family-F handshake.
@@ -107,6 +108,102 @@ impl RemoteSession {
             }
             Response::Error { message } => bail!("read {path}: {message}"),
             other => bail!("unexpected reply to ReadFile: {other:?}"),
+        }
+    }
+
+    // --- write path (Phase 1: stage -> apply) ---
+
+    /// Open a write session bound to a destination image. Returns the session
+    /// id used by the `stage_*` / `apply` / `close_session` calls.
+    pub fn open_session(&mut self, image_path: &str, partition: Option<u32>) -> Result<u64> {
+        write_control(
+            &mut self.writer,
+            &Request::OpenSession {
+                image_path: image_path.to_string(),
+                partition,
+            },
+        )?;
+        match self.read_response()? {
+            Response::SessionOpened { session } => Ok(session),
+            Response::Error { message } => bail!("open session for {image_path}: {message}"),
+            other => bail!("unexpected reply to OpenSession: {other:?}"),
+        }
+    }
+
+    /// Stage a host file into the session: upload its bytes to the daemon's
+    /// staging area, queued as an AddFile applied at [`RemoteSession::apply`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_upload(
+        &mut self,
+        session: u64,
+        dest_parent: &str,
+        name: &str,
+        host_file: &Path,
+        force: bool,
+        type_code: Option<String>,
+        creator_code: Option<String>,
+    ) -> Result<()> {
+        let meta = std::fs::metadata(host_file)
+            .with_context(|| format!("stat {}", host_file.display()))?;
+        let size = meta.len();
+        write_control(
+            &mut self.writer,
+            &Request::StageUpload {
+                session,
+                dest_parent: dest_parent.to_string(),
+                name: name.to_string(),
+                size,
+                force,
+                type_code,
+                creator_code,
+            },
+        )?;
+        // The body follows immediately as a chunk stream.
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        {
+            let mut cw = ChunkWriter::new(&mut self.writer);
+            std::io::copy(&mut f, &mut cw)
+                .with_context(|| format!("uploading {}", host_file.display()))?;
+            cw.finish()?;
+        }
+        self.expect_ok("StageUpload")
+    }
+
+    /// Stage a directory creation under the session.
+    pub fn stage_mkdir(&mut self, session: u64, parent: &str, name: &str) -> Result<()> {
+        write_control(
+            &mut self.writer,
+            &Request::StageMkdir {
+                session,
+                parent: parent.to_string(),
+                name: name.to_string(),
+            },
+        )?;
+        self.expect_ok("StageMkdir")
+    }
+
+    /// Replay the session's staged edits onto the image; returns the count.
+    pub fn apply(&mut self, session: u64) -> Result<u64> {
+        write_control(&mut self.writer, &Request::Apply { session })?;
+        match self.read_response()? {
+            Response::Applied { count } => Ok(count),
+            Response::Error { message } => bail!("apply: {message}"),
+            other => bail!("unexpected reply to Apply: {other:?}"),
+        }
+    }
+
+    /// Discard the session and its staging blobs.
+    pub fn close_session(&mut self, session: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::CloseSession { session })?;
+        self.expect_ok("CloseSession")
+    }
+
+    fn expect_ok(&mut self, what: &str) -> Result<()> {
+        match self.read_response()? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => bail!("{what}: {message}"),
+            other => bail!("unexpected reply to {what}: {other:?}"),
         }
     }
 

@@ -71,6 +71,38 @@ pub enum Request {
     ReadFile { handle: u64, path: String },
     /// Drop an opened-image handle.
     Close { handle: u64 },
+
+    // --- Family F write path (Phase 1: stage -> apply) ---
+    /// Open a write session bound to a destination image. The image is opened
+    /// editable only at `Apply`; staged edits accumulate until then.
+    OpenSession {
+        image_path: String,
+        partition: Option<u32>,
+    },
+    /// Stage a host file into the session's queue. The file body follows
+    /// **immediately** as a chunk stream (client -> server) after this frame,
+    /// then the daemon replies `Ok`.
+    StageUpload {
+        session: u64,
+        dest_parent: String,
+        name: String,
+        size: u64,
+        force: bool,
+        type_code: Option<String>,
+        creator_code: Option<String>,
+    },
+    /// Stage a directory creation.
+    StageMkdir {
+        session: u64,
+        parent: String,
+        name: String,
+    },
+    /// Replay the session's staged edits onto the image: open editable once,
+    /// mutate, `sync_metadata`, commit.
+    Apply { session: u64 },
+    /// Discard a session and its staging blobs (also serves as abort).
+    CloseSession { session: u64 },
+
     /// Polite disconnect.
     Bye,
 }
@@ -90,6 +122,10 @@ pub enum Response {
     Dir { entries: Vec<WireEntry> },
     /// A file is about to stream as a chunk sequence (see [`read_chunks`]).
     FileBegin { size: u64 },
+    /// A write session was opened.
+    SessionOpened { session: u64 },
+    /// `Apply` finished; `count` staged edits were replayed.
+    Applied { count: u64 },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.

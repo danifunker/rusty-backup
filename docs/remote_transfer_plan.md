@@ -604,8 +604,19 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   the spec:** the `Hello` is JSON here (Family F only); the **binary** `Hello` for the JSON-free cb-dos
   client is introduced additively in Phase 5a (the magic+version fields are already in place). Not yet
   done: client read-ahead caching and a real two-machine latency measurement (loopback hides RTT).
-- **Phase 1 — Family F write path (stage→apply).** Sessions, SD staging, `StageUpload`/`Apply`, the
-  relocated `EditQueue`. *Gate:* copy a file into a remote image, pull the SD, confirm a core mounts it.
+- **Phase 1 — Family F write path (stage→apply). — DONE (loopback-validated).** Write sessions on the
+  daemon (`OpenSession`/`StageUpload`/`StageMkdir`/`Apply`/`CloseSession`): an upload lands in a
+  per-session staging dir (tempfile, configurable via `serve --staging-dir`), directory creations queue,
+  and `Apply` opens the image editable **once** and replays the queue —
+  `resolve_partition_rw_forced` → `open_editable_filesystem` → `create_file` / `create_directory` →
+  `sync_metadata` → commit, mirroring local `put` / `mkdir`. Client `RemoteSession` write methods wired
+  into `rb-cli put` / `mkdir` over `rb://`. *Gate met:* over loopback, `put` a text + a 50 KB binary into a
+  remote FAT image (binary read back **byte-exact**), `mkdir` + `put` into the new dir, `--force` overwrite,
+  duplicate-without-force errors, staging auto-cleaned; a local `ls` of the same file confirms the daemon
+  committed real changes. **Phase-1 caveats / deferred:** `Apply` writes the live image like the local CLI
+  (no atomic-batch / recoverable queue yet — plan §6/§13.2); sessions are per-connection (no idle-timeout
+  reuse); `put --zero` / `--boot`, `rm` (`StageDelete`), and `StageCopyLocal` (on-device remote→remote)
+  come with Phase 2.
 - **Phase 2 — host-FS browse + remote→remote (Family F).** `ListHostDir`/sandbox-to-root; `StageCopyLocal`
   on-device copy. *Gate:* on-device image→image copy with no desktop data round-trip; `ls rb://host/`.
 - **Phase 3 — GUI Commander remote pane (Family F).** Connect dialog, saved connections, remote source

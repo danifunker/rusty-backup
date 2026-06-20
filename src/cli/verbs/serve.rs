@@ -21,11 +21,18 @@ pub struct ServeArgs {
     /// opens is sandboxed under this directory.
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
+
+    /// Directory for per-session upload staging blobs (write path). Defaults to
+    /// the system temp dir. On a MiSTer point this at a roomy writable mount,
+    /// never tmpfs — large uploads would fill RAM.
+    #[arg(long = "staging-dir")]
+    pub staging_dir: Option<PathBuf>,
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
     serve(ServeConfig {
         bind: args.bind,
         root: args.root,
+        staging_dir: args.staging_dir,
     })
 }

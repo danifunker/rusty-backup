@@ -1192,6 +1192,7 @@ Usage: serve [OPTIONS]
 
 - `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341)
 - `--root` — Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory
+- `--staging-dir` — Directory for per-session upload staging blobs (write path). Defaults to the system temp dir. On a MiSTer point this at a roomy writable mount, never tmpfs — large uploads would fill RAM
 
 ### `setrsrc`
 
