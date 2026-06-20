@@ -41,12 +41,24 @@ BR2_PACKAGE_DOSFSTOOLS=y
 BR2_PACKAGE_E2FSPROGS=y
 BR2_PACKAGE_UTIL_LINUX=y
 BR2_PACKAGE_UTIL_LINUX_BINARIES=y
+# Bootable image: a hybrid ISO9660 (isolinux) — one file boots from a CD-ROM
+# *and* from a USB stick / CF card (dd it to the device). Covers both the CD and
+# the .img deployables with a single artifact.
+BR2_TARGET_SYSLINUX=y
+BR2_TARGET_SYSLINUX_ISOLINUX=y
+BR2_TARGET_ROOTFS_ISO9660=y
+BR2_TARGET_ROOTFS_ISO9660_ISOLINUX=y
+BR2_TARGET_ROOTFS_ISO9660_HYBRID=y
 EOF
 make olddefconfig
 make -j"$(nproc)"
 
 mkdir -p "$OUT"
 cp -v output/images/bzImage output/images/rootfs.ext2 "$OUT/"
+# The bootable hybrid ISO (name it for humans).
+if [ -f output/images/rootfs.iso9660 ]; then
+    cp -v output/images/rootfs.iso9660 "$OUT/rusty-backup-appliance.iso"
+fi
 echo
 echo "Appliance images written to buildroot/output/ :"
 ls -lh "$OUT"

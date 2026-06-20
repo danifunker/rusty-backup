@@ -23,3 +23,10 @@ CONFIG_VFAT_FS=y
 CONFIG_EXT4_FS=y
 CONFIG_NLS_CODEPAGE_437=y
 CONFIG_NLS_ISO8859_1=y
+
+# CD-ROM boot: the appliance ships as a bootable (hybrid) ISO, so the kernel
+# must mount its own root from the CD.
+CONFIG_CDROM=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_ISO9660_FS=y
+CONFIG_JOLIET=y
