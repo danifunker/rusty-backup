@@ -52,10 +52,16 @@ backup lands), not the source filesystems. See `buildroot/kernel.fragment`.
 
 - `docker/buildroot-appliance.Dockerfile` — the Buildroot build environment.
 - `buildroot/build.sh` — starts from Buildroot's `qemu_x86_defconfig`, layers in
-  the overlay + destination-FS tools + the kernel fragment, and builds.
-- `buildroot/overlay/` — the rootfs overlay (the boot banner/disk-summary init;
-  the static `rb-cli` is staged into `usr/bin/` at build time).
-- `buildroot/kernel.fragment` — IDE/SATA/USB + vfat/ext4 kernel options.
+  the overlay + destination-FS tools + the kernel fragment + the serial-console
+  isolinux.cfg, drops the deferred-network DHCP wait, and builds.
+- `buildroot/overlay/` — the rootfs overlay: the boot banner/disk-summary init,
+  the `/etc/inittab` that runs the menu on tty1 + ttyS0, and the static `rb-cli`
+  (staged into `usr/bin/` at build time).
+- `buildroot/isolinux.cfg` — bootloader config with a serial console (so the boot
+  is visible/drivable headless) + the dual-console kernel command line.
+- `buildroot/kernel.fragment` — the broad vintage-hardware driver set (IDE/SATA/
+  SCSI/USB block devices, ISA/PCI/PC-Card NICs, Multi-I/O serial/parallel, …) plus
+  the destination filesystems. See [`appliance_hardware_support.md`](appliance_hardware_support.md).
 
 ## Build
 
@@ -77,9 +83,20 @@ shape, and which machine each suits:
 
 | Artifact | Boots on | Status |
 |---|---|---|
-| **`rusty-backup-appliance.iso`** (hybrid) | a CD-ROM **or** (dd'd to a stick/CF) a USB/CF | building |
+| **`rusty-backup-appliance.iso`** (hybrid) | a CD-ROM **or** (dd'd to a stick/CF) a USB/CF | **boots to the menu** (serial + VGA verified) |
 | **GRUB boot floppy** → loads the appliance off the **CD** | pre-El-Torito BIOSes that can't boot CDs | planned |
 | **PXE bundle** (`bzImage` + initramfs + `pxelinux.cfg` + README) | a diskless backup *station* over the network | planned |
+
+The ISO boots with a **dual console** (`console=tty0 console=ttyS0,115200`, plus a
+`serial` line in [`../buildroot/isolinux.cfg`](../buildroot/isolinux.cfg)) and runs
+the rb-cli menu on both the VGA screen (`tty1`) and the serial port (`ttyS0`), so
+it works on a real monitor and headless alike. The kernel carries a broad
+vintage-hardware driver set — see
+[`appliance_hardware_support.md`](appliance_hardware_support.md).
+
+> **Watching a qemu boot:** qemu's default `-vga std` stops repainting partway
+> through the kernel boot and makes the boot *look* hung. Boot `-nographic` (watch
+> the serial console) or add `-vga cirrus`; real VGA hardware is unaffected.
 
 Notes:
 - The **hybrid ISO** is the workhorse: one file is both the "CD ISO" and the
@@ -166,16 +183,18 @@ then the destination is a second disk or a USB stick.
   refused a device restore without it).
 - qemu's PIIX IDE shows disks as `/dev/sdX` (libata), not `hdX`. A bare-IDE 486
   may present `/dev/hdX`; the banner notes both.
-- The init waits ~15 s for `eth0` (no NIC yet — networking is the deferred branch);
-  harmless boot delay.
+- ~~The init waits ~15 s for `eth0`~~ — fixed: `BR2_SYSTEM_DHCP=""` drops the
+  deferred-network DHCP client so there's no `wait_iface` stall.
 
 ## Auto-login (installer-CD style)
 
-The appliance boots **straight to a root shell — no login prompt** (the
-`S99appliance` banner is what greets you). `build.sh` sets
-`BR2_TARGET_GENERIC_GETTY_OPTIONS="-n -l /bin/sh"`, so the console `getty` runs a
-shell directly instead of `login`. A future step replaces that bare shell with a
-small backup/restore **menu** (boot straight into the tool, like an installer).
+The appliance boots **straight into the rb-cli backup/restore menu — no login
+prompt** (the `S99appliance` banner greets you, then `appliance-menu` launches
+`rb-cli menu`; quitting drops to a shell). The overlay's
+[`/etc/inittab`](../buildroot/overlay/etc/inittab) runs `appliance-menu` on
+**both** `tty1` (VGA monitor) and `ttyS0` (serial terminal / headless), so the
+menu shows up wherever you're looking. Buildroot copies the overlay after its own
+inittab fixups, so that file is authoritative.
 
 ## Open / next
 
@@ -185,7 +204,12 @@ small backup/restore **menu** (boot straight into the tool, like an installer).
 - [x] Auto-login (no login prompt) — installer-CD style.
 - [x] Backup/restore text menu (`rb-cli menu`) + folder-picker screens; appliance
       auto-launches it.
-- [~] Bootable hybrid ISO (CD + USB) — building.
+- [x] Bootable hybrid ISO (CD + USB) — boots via El-Torito to the rb-cli menu,
+      verified on serial (`-nographic`) and VGA (`-vga cirrus`). Dual console +
+      menu on tty1/ttyS0; serial console added in `buildroot/isolinux.cfg`.
+- [x] Broad vintage-hardware kernel (ISA/PCI/PC-Card NICs, SCSI, VLB+PCI IDE,
+      Multi-I/O serial/parallel, parallel ZIP, USB) + user guide
+      [`appliance_hardware_support.md`](appliance_hardware_support.md).
 - [ ] GRUB boot-floppy → loads the appliance off the CD (pre-El-Torito BIOSes).
 - [ ] PXE bundle (kernel + initramfs + pxelinux.cfg + README).
 - [ ] cb-dos FreeDOS floppy + CD (the DOS lane; see cb_dos.md).

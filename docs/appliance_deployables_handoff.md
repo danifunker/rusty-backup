@@ -21,38 +21,63 @@ Full design: [`linux_486_appliance.md`](linux_486_appliance.md) +
   cb-dos tools + banner; **booted in DOSBox-X**) and `crusty-backup/dist/cbdos.iso`
   (bootable El-Torito CD). Built by `crusty-backup/mkmedia.sh`
   (`FDBASE="/Users/dani/Downloads/Dorado'/FD14-FloppyEdition/144m/x86BOOT.img"`).
-- **Appliance hybrid ISO BUILDS** — `buildroot/output/rusty-backup-appliance.iso`
-  (32 MB, isohybrid: `ISO 9660 (DOS/MBR boot sector) bootable`). Config in
-  `buildroot/build.sh` (ISO9660 + isolinux + HYBRID) + `buildroot/kernel.fragment`
-  (CD-ROM drivers). The config is `syncconfig`-clean.
+- **Appliance hybrid ISO BUILDS + BOOTS** — `buildroot/output/rusty-backup-appliance.iso`
+  (isohybrid: `ISO 9660 (DOS/MBR boot sector) bootable`). Boots via El-Torito all
+  the way to the rb-cli menu — verified over **serial** (`-nographic`) and on
+  **VGA** (`-vga cirrus` screendump). Config in `buildroot/build.sh` (ISO9660 +
+  isolinux + HYBRID + serial-console `buildroot/isolinux.cfg`) + the broadened
+  `buildroot/kernel.fragment`. See the RESOLVED section below.
 
-## OPEN ISSUE — the appliance ISO does not boot-verify (the thing that "didn't work")
+## RESOLVED — the appliance ISO boots fine (the "hang" was a qemu display artifact)
 
-Booting the ISO with `qemu -kernel bzImage -initrd <extracted initrd> -append
-"root=/dev/sr0 console=ttyS0" -cdrom <iso> -boot d` **hung with no serial output**.
+**The ISO was never broken.** Booted via the real El-Torito CD path
+(`qemu-system-i386 -M pc -m 256 -cdrom rusty-backup-appliance.iso -boot d`) with
+**`-vga cirrus`**, the unmodified original ISO boots all the way to the rb-cli
+menu (banner + disk detection + menu + login prompt — screen-captured via the
+qemu monitor). The "silent hang" was two things stacked:
 
-The ISO's `isolinux.cfg` is: `kernel /boot/bzImage; initrd /boot/initrd; append
-root=/dev/sr0` — note **no `console=ttyS0`** (so a real CD boot goes to VGA tty0,
-which `-nographic` can't capture), and **`root=/dev/sr0`** = a *read-only* iso9660
-CD root with a 26 MB initrd.
+1. **qemu's `-vga std` (Bochs stdvga) stops repainting** the framebuffer partway
+   through the kernel boot (around the PCI/ACPI lines), so the boot *looks* frozen
+   on a `-vga std` screendump even though the kernel is running fine. Proven by
+   serial: with a serial console the same boot sails through to `/init` and the
+   menu. Use `-vga cirrus` or the serial console to watch a qemu boot.
+2. **No serial console** in the stock isolinux.cfg (`append root=/dev/sr0`, no
+   `console=`), so a `-nographic` boot showed nothing — combined with the ~15 s
+   `eth0` DHCP wait, it read as a hang.
 
-Likely causes (diagnose in this order):
-1. **Console** — the ISO boots to VGA, not serial. First, just **boot it with a
-   display window and watch it**: `qemu-system-i386 -M pc -m 256 -cdrom
-   buildroot/output/rusty-backup-appliance.iso -boot d` (no `-nographic`). That
-   shows the actual failure instead of a silent hang.
-2. **Read-only root** — the appliance init/menu were only ever verified on the
-   *read-write ext2* rootfs. On a read-only iso9660 root, `mount -o remount,rw /`
-   fails and writable dirs (/var, /root, /tmp) may not exist. Options: set up tmpfs
-   overlays for those, OR switch the ISO to the **initrd-in-RAM** model
-   (`BR2_TARGET_ROOTFS_ISO9660_INITRD`, read/write) — but that needs RAM ≥ rootfs
-   (~96 MB), excluding low-RAM machines. Pick based on target RAM.
-3. **Add `console=ttyS0 console=tty0` to the kernel cmdline** (kernel
-   `CONFIG_CMDLINE` in `buildroot/kernel.fragment`, or a Buildroot cmdline option)
-   so future boots are serial-capturable AND show on VGA.
+The initrd, by the way, is the **whole rootfs as an in-RAM initramfs** (27 MB
+uncompressed cpio with `/init`); `root=/dev/sr0` is ignored. So it's the
+read/write-in-RAM model — the read-only-root worry from the old notes was moot.
 
-The ext2 rootfs path is known-good — the regression is purely the iso9660 read-only
-boot. The hybrid MBR/El-Torito structure is fine; this is a runtime/init problem.
+### What changed to make it solid + verifiable
+
+- **`buildroot/isolinux.cfg`** (new; wired via `BR2_TARGET_ROOTFS_ISO9660_BOOT_MENU`)
+  — adds `serial 0 115200` + `append … console=tty0 console=ttyS0,115200`, so the
+  whole boot is visible/drivable on a VGA monitor **and** headless over serial
+  (`-nographic`, a real serial terminal, CI).
+- **`buildroot/overlay/etc/inittab`** (new) — runs `appliance-menu` on **both**
+  `tty1` (VGA, real hardware) and `ttyS0` (serial/headless), instead of the single
+  `/dev/console` getty. Validated by repacking the initrd and booting `-kernel`:
+  the menu appears cleanly on serial. Buildroot copies the overlay after its own
+  inittab fixups, so this file wins.
+- **`BR2_SYSTEM_DHCP=""`** in `build.sh` — drops the 15 s `wait_iface` eth0 stall
+  (networking is deferred). Re-enable when the network branch lands.
+- **`buildroot/kernel.fragment`** — broadened to a wide vintage-hardware driver
+  set (ISA/PCI/PC-Card NICs, SCSI HBAs, bare-486/VLB + PCI IDE, Multi-I/O serial
+  + parallel, parallel-port ZIP, USB storage; PCI built-in, ISA as modules).
+  User guide: [`appliance_hardware_support.md`](appliance_hardware_support.md).
+  `CONFIG_IKCONFIG_PROC` exposes the live config at `/proc/config.gz`.
+
+### Verifying a boot (the reliable recipe)
+
+```sh
+# headless / CI — drive everything over serial:
+qemu-system-i386 -M pc -m 256 -cdrom buildroot/output/rusty-backup-appliance.iso \
+  -boot d -nographic
+# or watch the VGA path with a working emulation:
+qemu-system-i386 -M pc -m 256 -cdrom …iso -boot d -vga cirrus
+```
+Do **not** judge a boot by a `-vga std` screendump — it freezes its own picture.
 
 ## NOT STARTED (remaining pipeline)
 

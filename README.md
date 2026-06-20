@@ -142,6 +142,28 @@ without the `optical` feature" message):
 Full background and the feature matrix live in
 [`docs/mister_cli.md`](docs/mister_cli.md).
 
+### Bootable backup appliances (boot the metal, no host OS)
+
+For machines too old or too bare to run the desktop app, the same engine ships
+as **bootable media you run *on* (or beside) the vintage box**:
+
+- **Linux appliance** — a minimal Buildroot Linux that boots straight into the
+  `rb-cli` backup/restore menu (on a VGA monitor *or* a serial console) with the
+  static `rb-cli` baked in. One hybrid ISO boots from a CD-ROM **or** a USB
+  stick / CF card (`dd` the same file onto the device). The kernel carries a
+  broad **vintage-hardware driver set** — ISA / PCI / PC-Card NICs, SCSI HBAs,
+  bare-486 / VL-Bus + PCI IDE, Multi-I/O serial & parallel, parallel-port ZIP,
+  USB storage — so it sees the disks and cards in a 486/Pentium-class machine
+  out of the box. **What's baked in, how to make an unusual card work (ISA
+  `modprobe io=/irq=` recipes), and how to rebuild the kernel for more** are in
+  [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md);
+  build/boot overview in [`docs/linux_486_appliance.md`](docs/linux_486_appliance.md).
+- **cb-dos** — the DOS-native lane: a FreeDOS floppy / CD that images disks with
+  a hand-written C tool over BIOS int 13h, for boxes where even a minimal Linux
+  is too heavy. See [`docs/cb_dos.md`](docs/cb_dos.md).
+
+Both build from the repo (`buildroot/`, `crusty-backup/`).
+
 ## Usage
 
 The app has five tabs:
@@ -528,6 +550,10 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
 - `CONTRIBUTING.md` — contributor guide.
 - `docs/` — per-feature deep dives (VHD export, alignment, code signing,
   Apple II floppy formats, …).
+- [`docs/linux_486_appliance.md`](docs/linux_486_appliance.md) /
+  [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md) —
+  the bootable Linux backup appliance and its vintage-hardware driver support
+  (which cards work, and how to add more in Buildroot).
 
 ## Donations
 
