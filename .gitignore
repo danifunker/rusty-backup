@@ -43,3 +43,4 @@ outputs/
 /buildroot/output
 /buildroot/dl
 /buildroot/overlay/usr/bin/rb-cli
+/crusty-backup/dist
