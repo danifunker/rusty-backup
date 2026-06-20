@@ -6,12 +6,10 @@
 # so no emulation is needed for the build.
 #
 # Build the toolchain image:
-#   docker build -f docker/cross-i586.Dockerfile -t rb-cross-i586 .
-# Cross-build (binary lands in ./target-cross/ on the host):
-#   docker run --rm -v "$PWD":/src -w /src rb-cross-i586 \
-#     cargo build --release --bin rb-cli \
-#       --no-default-features --features pure-zstd \
-#       --target i586-unknown-linux-gnu --target-dir /src/target-cross
+#   docker build -t rb-cross-i586 - < docker/cross-i586.Dockerfile
+# Cross-build (one-liner — the default command builds; binary lands in
+# ./target-cross/i586-unknown-linux-gnu/release/rb-cli on the host):
+#   docker run --rm -v "$PWD":/src rb-cross-i586
 #
 # Note: Debian's 32-bit glibc is i686-baseline, so the result runs on Pentium+.
 # A *true* 486 needs an i486 sysroot (musl / Buildroot) — see the doc.
@@ -32,3 +30,6 @@ RUN rustup target add i586-unknown-linux-gnu
 ENV CARGO_TARGET_I586_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
 
 WORKDIR /src
+CMD ["cargo", "build", "--release", "--bin", "rb-cli", \
+     "--no-default-features", "--features", "pure-zstd", \
+     "--target", "i586-unknown-linux-gnu", "--target-dir", "/src/target-cross"]

@@ -256,9 +256,19 @@ a CF/SD or small disk), which is the main practical tradeoff vs the DOS path.
 - [x] zstd backend feature-split: `native-zstd` (C) vs `pure-zstd`
       (`libzstd-bitexact-rs`). Slim build with `--features pure-zstd` is now
       **100% pure Rust** — both backends build, lint, and round-trip.
-- [x] i586 cross-build works + verified: `docker/cross-i586.Dockerfile` produces
-      a runnable `Intel 80386` ELF with no C library deps (Pentium+ glibc). Wiring
-      it into GitHub Actions CI is the remaining step.
-- [ ] i486 nightly `build-std` cross-build + link `libatomic` (same image).
-- [ ] True-486 runtime: musl or Buildroot i486 sysroot (Debian glibc is i686).
+- [x] Per-build Dockerfiles in `docker/` (see [`docker/README.md`](../docker/README.md)),
+      all verified from an arm64 host:
+  - `cross-i586` — i586 dynamic (glibc); runs (`Intel 80386`).
+  - `cross-i586-musl` — i586 **static** (musl); runs under `qemu -cpu pentium`.
+  - `cross-i486` — i486 codegen via nightly `-Z build-std` + `-latomic`; builds.
+  - `cb-dos` — DJGPP DOS tools; build verified vs DOSBox-X.
+- [x] Confirmed `qemu-i386 -cpu 486` is a real 486-compat check: the i586 static
+      binary **faults (illegal instruction)** on `-cpu 486` — proving i586 ≠ 486
+      and that bare 486 needs i486 codegen.
+- [ ] Wire the Docker cross-builds into GitHub Actions CI.
+- [ ] True-486 runtime: i486 codegen (have it) **+ an i486 libc**. Build a
+      Buildroot i486 rootfs (`BR2_x86_i486`) to run the `cross-i486` binary, or a
+      hand-populated i486-musl `build-std` sysroot for a fully static true-486
+      binary. (The custom i486-musl + build-std path is finicky — Buildroot is the
+      more maintainable route, and the natural way to ship a bootable appliance.)
 - [ ] Boot + smoke-test on real 486 (DX2/DX4) hardware.
