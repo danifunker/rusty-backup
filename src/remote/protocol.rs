@@ -32,9 +32,12 @@ pub const RB_HELLO_MAGIC: u32 = 0x5242_4B30;
 /// Current wire-protocol version. Bump on a breaking change; keep additions
 /// additive so a newer client still talks to an older daemon where possible.
 ///
-/// v2 added the block-reader tier (`HostFileSize` / `ReadHostRange`) — a daemon
-/// must be at v2 to serve ranged reads, so a remote *image inspection* (vs the
-/// v1 operation-level file browse) needs the daemon refreshed.
+/// v2 added the block-reader tier (`OpenBlock` / `ReadBlock` / `CloseBlock`,
+/// later `OpenBlockRw` / `WriteBlock` / `FlushBlock` for in-place editing) — a
+/// daemon must be at v2 to serve ranged reads/writes, so a remote *image
+/// inspection or edit* (vs the v1 operation-level file browse) needs the daemon
+/// refreshed. The write verbs are additive, so a v2 read-only daemon still
+/// serves browse / inspect / backup; only editing needs the newer build.
 pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Oldest protocol version this build still understands. The v1 verbs are
@@ -133,6 +136,25 @@ pub enum Request {
     ReadBlock { handle: u64, offset: u64, len: u32 },
     /// Close an open block handle.
     CloseBlock { handle: u64 },
+
+    // --- block tier writes (remote editing): open a host image file ---
+    // --- read-WRITE and patch byte ranges in place, so the desktop engine ---
+    // --- edits a remote image's filesystem over the wire (add/delete file, ---
+    // --- mkdir, fsck repair, resize) exactly as for a local file. ---
+    /// Open a host file as a read-WRITE block device kept open on the daemon
+    /// (reply: `BlockOpened{handle, size}`). The write-side sibling of
+    /// [`Request::OpenBlock`]; the handle accepts `WriteBlock`. Physical devices
+    /// (`OpenDevice`) stay read-only — restore-to-device is a separate path.
+    OpenBlockRw { path: String },
+    /// Write a byte range to a read-write block handle: this control frame is
+    /// followed **immediately** by a chunk stream of `len` bytes (client ->
+    /// server), then the daemon replies `Ok`. The write must lie within the
+    /// image (`offset + len <= size`) — a block-tier edit never grows the file.
+    WriteBlock { handle: u64, offset: u64, len: u32 },
+    /// Flush a read-write block handle to stable storage (`sync_all`); reply
+    /// `Ok`. The engine's `sync_metadata` calls `flush()` once at the end of an
+    /// edit, which maps to this — so a finished edit is durable on the daemon.
+    FlushBlock { handle: u64 },
 
     // --- physical-device backup (v2): the daemon enumerates its own disks ---
     // --- and serves a raw device over the same block-handle machinery, so ---

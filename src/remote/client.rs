@@ -314,6 +314,56 @@ impl RemoteSession {
         }
     }
 
+    /// Open a host image file as a read-WRITE block device on the daemon — it
+    /// stays open for the session. Returns `(handle, size)`. The write-side
+    /// sibling of [`Self::open_block`]; the handle accepts [`Self::write_block`].
+    pub fn open_block_rw(&mut self, path: &str) -> Result<(u64, u64)> {
+        write_control(
+            &mut self.writer,
+            &Request::OpenBlockRw {
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::BlockOpened { handle, size } => Ok((handle, size)),
+            Response::Error { message } => bail!("open block (rw) {path}: {message}"),
+            other => bail!("unexpected reply to OpenBlockRw: {other:?}"),
+        }
+    }
+
+    /// Write `bytes` at `offset` into a read-write block handle. The payload
+    /// follows the control frame as a chunk stream; the daemon patches the bytes
+    /// in place and replies `Ok`. The write must lie within the image (it never
+    /// grows the file). The wire primitive behind the writable
+    /// [`crate::remote::block_reader::RemoteBlockReader`].
+    pub fn write_block(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| anyhow!("write of {} bytes exceeds u32", bytes.len()))?;
+        write_control(
+            &mut self.writer,
+            &Request::WriteBlock {
+                handle,
+                offset,
+                len,
+            },
+        )?;
+        {
+            let mut cw = ChunkWriter::new(&mut self.writer);
+            cw.write_all(bytes)
+                .with_context(|| format!("uploading {len} bytes at {offset}"))?;
+            cw.finish()?;
+        }
+        self.expect_ok("WriteBlock")
+    }
+
+    /// Flush a read-write block handle to stable storage on the daemon
+    /// (`sync_all`). The engine's `sync_metadata` flush maps here, so a finished
+    /// edit is durable.
+    pub fn flush_block(&mut self, handle: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::FlushBlock { handle })?;
+        self.expect_ok("FlushBlock")
+    }
+
     /// List the daemon machine's physical disk devices.
     pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
         write_control(&mut self.writer, &Request::ListDevices)?;

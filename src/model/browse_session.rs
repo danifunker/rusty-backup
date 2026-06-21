@@ -59,9 +59,9 @@ pub struct BrowseSession {
     /// prompting the user.
     pub password: Option<String>,
     /// Remote image over the block tier: `(shared connection, remote path)`.
-    /// When set, every `open()` builds a fresh `RemoteBlockReader` on the
-    /// connection (the daemon keeps the image open and serves byte ranges).
-    /// Browse-only — `open_editable` refuses it.
+    /// When set, `open()` builds a fresh read-only `RemoteBlockReader` on the
+    /// connection and `open_editable()` a read-write one (the daemon keeps the
+    /// image open and serves / patches byte ranges).
     #[cfg(feature = "remote")]
     pub remote: Option<(Arc<Mutex<crate::remote::RemoteConnection>>, String)>,
 }
@@ -564,12 +564,21 @@ impl BrowseSession {
     pub fn open_editable(
         &self,
     ) -> Result<(Box<dyn EditableFilesystem>, ContainerEditCommit), FilesystemError> {
-        // Remote images are browse-only for now (the block reader is read-only).
+        // Remote image over the block tier — a read-write RemoteBlockReader
+        // patches byte ranges over the wire; the daemon opens the file
+        // read+write and syncs on flush/close. The commit guard is a no-op
+        // (writes land directly over the wire, like a raw image / device).
         #[cfg(feature = "remote")]
-        if self.remote.is_some() {
-            return Err(FilesystemError::Parse(
-                "remote images are browse-only (editing over the wire is not supported yet)".into(),
-            ));
+        if let Some((conn, rpath)) = &self.remote {
+            let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
+                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+            let fs = fs::open_editable_filesystem(
+                reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )?;
+            return Ok((fs, ContainerEditCommit { session: None }));
         }
 
         // Live CHD edit session: writes go through the diff (compressed

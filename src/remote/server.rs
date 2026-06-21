@@ -34,6 +34,16 @@ use crate::remote::protocol::{
     CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
+/// A block-tier handle: a host image file (or raw device) kept open for ranged
+/// reads — and, when `writable`, in-place ranged writes (remote editing). The
+/// stored `size` is the byte length captured at open: `metadata().len()` for a
+/// regular file, the ioctl size for a device (whose `metadata().len()` is 0).
+struct BlockHandle {
+    file: std::fs::File,
+    size: u64,
+    writable: bool,
+}
+
 /// Daemon configuration (from the `serve` verb).
 pub struct ServeConfig {
     /// Bind address, e.g. `0.0.0.0:7341`.
@@ -130,11 +140,9 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
     let mut handles: HashMap<u64, Box<dyn Filesystem>> = HashMap::new();
     let mut next_handle: u64 = 1;
     // Block tier: host image files (and raw physical devices) kept open for
-    // ranged reads. Shares the `next_handle` counter so handles are unique
-    // across both tables. The stored `u64` is the byte length — for a regular
-    // file it's `metadata().len()`, for a device it's the ioctl size (a
-    // device's `metadata().len()` is 0).
-    let mut block_handles: HashMap<u64, (std::fs::File, u64)> = HashMap::new();
+    // ranged reads (and in-place writes when opened read-write). Shares the
+    // `next_handle` counter so handles are unique across both tables.
+    let mut block_handles: HashMap<u64, BlockHandle> = HashMap::new();
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut next_session: u64 = 1;
 
@@ -340,7 +348,31 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 Ok((file, size)) => {
                     let handle = next_handle;
                     next_handle += 1;
-                    block_handles.insert(handle, (file, size));
+                    block_handles.insert(
+                        handle,
+                        BlockHandle {
+                            file,
+                            size,
+                            writable: false,
+                        },
+                    );
+                    write_control(&mut writer, &Response::BlockOpened { handle, size })?;
+                }
+            },
+
+            Request::OpenBlockRw { path } => match open_block_rw(root, &path) {
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                Ok((file, size)) => {
+                    let handle = next_handle;
+                    next_handle += 1;
+                    block_handles.insert(
+                        handle,
+                        BlockHandle {
+                            file,
+                            size,
+                            writable: true,
+                        },
+                    );
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
                 }
             },
@@ -358,7 +390,16 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 Ok((file, size)) => {
                     let handle = next_handle;
                     next_handle += 1;
-                    block_handles.insert(handle, (file, size));
+                    // Devices are served read-only — restore-to-remote-device is
+                    // a separate, deliberate path, not implied by a backup open.
+                    block_handles.insert(
+                        handle,
+                        BlockHandle {
+                            file,
+                            size,
+                            writable: false,
+                        },
+                    );
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
                 }
             },
@@ -369,7 +410,7 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 len,
             } => match block_handles.get_mut(&handle) {
                 None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
-                Some((file, size)) => match read_block(file, *size, offset, len) {
+                Some(bh) => match read_block(&mut bh.file, bh.size, offset, len) {
                     Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                     Ok(buf) => {
                         // Commit to the stream: FileBegin{actual len}, then the
@@ -389,8 +430,50 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 },
             },
 
+            Request::WriteBlock {
+                handle,
+                offset,
+                len,
+            } => {
+                // The payload follows as a chunk stream and MUST be consumed
+                // regardless of handle validity, or the framing desyncs.
+                let mut payload = Vec::new();
+                let drained = read_chunks(&mut reader, &mut payload);
+                match drained {
+                    Err(e) => return Err(anyhow!("reading WriteBlock payload: {e}")),
+                    Ok(_) => match block_handles.get_mut(&handle) {
+                        None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
+                        Some(bh) if !bh.writable => {
+                            reply_err(&mut writer, format!("block handle {handle} is read-only"))?
+                        }
+                        Some(bh) => match write_block(&mut bh.file, bh.size, offset, len, &payload)
+                        {
+                            Ok(()) => write_control(&mut writer, &Response::Ok)?,
+                            Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                        },
+                    },
+                }
+            }
+
+            Request::FlushBlock { handle } => match block_handles.get(&handle) {
+                None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
+                Some(bh) if !bh.writable => {
+                    reply_err(&mut writer, format!("block handle {handle} is read-only"))?
+                }
+                Some(bh) => match bh.file.sync_all() {
+                    Ok(()) => write_control(&mut writer, &Response::Ok)?,
+                    Err(e) => reply_err(&mut writer, format!("flushing block {handle}: {e}"))?,
+                },
+            },
+
             Request::CloseBlock { handle } => {
-                block_handles.remove(&handle);
+                // Sync a writable handle to disk on close as a safety net, so a
+                // finished edit is durable even if the client never flushed.
+                if let Some(bh) = block_handles.remove(&handle) {
+                    if bh.writable {
+                        bh.file.sync_all().ok();
+                    }
+                }
                 write_control(&mut writer, &Response::Ok)?;
             }
 
@@ -620,6 +703,11 @@ fn stage_copy_local(
 /// well under this; a larger ask is simply clamped.
 const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
 
+/// Largest single `WriteBlock` payload we honour. The block writer splits big
+/// writes into frames well under this; a larger `len` is rejected rather than
+/// silently truncated, so a desync can't corrupt the image.
+const MAX_RANGE_WRITE: u32 = 4 * 1024 * 1024;
+
 /// Open a host file as a raw block device (sandboxed): returns the open handle
 /// plus its length, kept open by the caller for the session's ranged reads.
 fn open_block(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
@@ -630,6 +718,62 @@ fn open_block(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
     let f = std::fs::File::open(&full).with_context(|| format!("opening {}", full.display()))?;
     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
     Ok((f, size))
+}
+
+/// Open a host file as a read-WRITE block device (sandboxed): returns the open
+/// handle plus its length, kept open by the caller for in-place ranged writes
+/// (remote editing). The file is opened read+write so the engine can both read
+/// the existing on-disk structures and patch them; the size is fixed at open
+/// (a block-tier edit never grows the file).
+fn open_block_rw(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
+    let full = sandbox_join(root, rel)?;
+    if full.is_dir() {
+        bail!("{rel} is a directory");
+    }
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&full)
+        .with_context(|| format!("opening {} read-write", full.display()))?;
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok((f, size))
+}
+
+/// Write `payload` at `offset` into an open read-write block handle. The write
+/// must lie wholly within the image (`offset + payload.len() <= size`) — a
+/// block-tier edit patches existing bytes and never extends the file. `len` is
+/// the client's declared length; it must match the bytes actually streamed and
+/// stay under [`MAX_RANGE_WRITE`].
+fn write_block(
+    file: &mut std::fs::File,
+    size: u64,
+    offset: u64,
+    len: u32,
+    payload: &[u8],
+) -> Result<()> {
+    if len > MAX_RANGE_WRITE {
+        bail!("write of {len} bytes exceeds the {MAX_RANGE_WRITE}-byte limit");
+    }
+    if payload.len() as u64 != len as u64 {
+        bail!(
+            "write payload ({} bytes) does not match declared length ({len})",
+            payload.len()
+        );
+    }
+    let end = offset
+        .checked_add(payload.len() as u64)
+        .ok_or_else(|| anyhow!("write offset {offset} + length overflows"))?;
+    if end > size {
+        bail!(
+            "write [{offset}, {end}) extends past the image end ({size}) — \
+             block-tier edits never grow the file"
+        );
+    }
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking block handle to {offset} for write"))?;
+    file.write_all(payload)
+        .with_context(|| format!("writing {} bytes at {offset}", payload.len()))?;
+    Ok(())
 }
 
 /// Open a raw physical device for read-only ranged access.

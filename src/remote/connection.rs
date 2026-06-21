@@ -110,6 +110,23 @@ impl RemoteConnection {
         self.session.open_block(path)
     }
 
+    /// Open a host image as a read-WRITE block device kept open on the daemon;
+    /// returns `(handle, size)`. The writable block reader's first call.
+    pub fn open_block_rw(&mut self, path: &str) -> Result<(u64, u64)> {
+        self.session.open_block_rw(path)
+    }
+
+    /// Write `bytes` at `offset` into a read-write block handle (the block
+    /// writer's fetch).
+    pub fn write_block(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.session.write_block(handle, offset, bytes)
+    }
+
+    /// Flush a read-write block handle to stable storage on the daemon.
+    pub fn flush_block(&mut self, handle: u64) -> Result<()> {
+        self.session.flush_block(handle)
+    }
+
     /// List the daemon machine's physical disk devices.
     pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
         self.session.list_devices()

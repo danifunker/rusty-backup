@@ -344,8 +344,94 @@ fn browse_session_opens_remote_image_over_block_tier() {
         "remote browse read must be byte-exact"
     );
 
-    // Editing a remote image is refused (browse-only).
-    assert!(session.open_editable().is_err(), "remote must be read-only");
+    // Editing a remote image now opens read-write over the block tier (the
+    // full round-trip is covered by `edit_remote_image_over_block_tier`).
+    assert!(
+        session.open_editable().is_ok(),
+        "remote image opens editable over the block tier"
+    );
+}
+
+/// Remote EDITING over the block tier: open a served FAT image read-WRITE
+/// through a `RemoteBlockReader`, add a file + sync, then re-open read-only and
+/// prove the new file is present byte-exact, the original survived, and the
+/// image was edited *in place* (size unchanged) — `open_editable_filesystem`
+/// patching byte ranges over the wire.
+#[test]
+fn edit_remote_image_over_block_tier() {
+    use rusty_backup::model::browse_session::BrowseSession;
+    use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("edit.img");
+    make_fat_image(&img, "EDITVOL", "ORIG.BIN", 0x11, 4096);
+    let size_before = std::fs::metadata(&img).unwrap().len();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let session = BrowseSession {
+        partition_offset: 0,
+        partition_type: 0, // superfloppy auto-detect
+        remote: Some((Arc::clone(&conn), "/edit.img".to_string())),
+        ..Default::default()
+    };
+
+    // Edit over the wire: open read-write, add a multi-cluster file, sync,
+    // commit (a no-op for remote — writes already landed on the daemon).
+    let new_payload = vec![0x77u8; 9000];
+    {
+        let (mut efs, commit) = session.open_editable().expect("open_editable remote");
+        let parent = efs.root().unwrap();
+        let mut data = &new_payload[..];
+        efs.create_file(
+            &parent,
+            "NEW.BIN",
+            &mut data,
+            new_payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file over the wire");
+        efs.sync_metadata().expect("sync over the wire");
+        drop(efs);
+        commit.commit().expect("commit (no-op for remote)");
+    }
+
+    // Re-open read-only over the same connection and verify the edit landed.
+    let mut fs = session.open().expect("re-open remote read-only");
+    let root_e = fs.root().unwrap();
+    let entries = fs.list_directory(&root_e).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"NEW.BIN"), "new file present: {names:?}");
+    assert!(names.contains(&"ORIG.BIN"), "original survived: {names:?}");
+
+    let new = entries.iter().find(|e| e.name == "NEW.BIN").unwrap();
+    assert_eq!(new.size, new_payload.len() as u64, "new file size recorded");
+    let mut got = Vec::new();
+    fs.write_file_to(new, &mut got).unwrap();
+    assert_eq!(got, new_payload, "remotely-written file is byte-exact");
+
+    // The edit was in place — the image file did not grow.
+    assert_eq!(
+        std::fs::metadata(&img).unwrap().len(),
+        size_before,
+        "block-tier edit must not change the image size"
+    );
+
+    // A read-only block reader refuses writes, so an image opened for
+    // inspection can't be corrupted by a stray write.
+    use std::io::Write as _;
+    let mut ro = RemoteBlockReader::open(Arc::clone(&conn), "/edit.img").unwrap();
+    assert!(
+        ro.write(&[0u8; 16]).is_err(),
+        "writing a read-only block handle must fail"
+    );
 }
 
 /// The **block tier**: the existing engine parses a *remote* partitioned disk
