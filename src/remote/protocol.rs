@@ -19,7 +19,7 @@
 //! (cb-dos) can reach Family B without a JSON parser. Phase 0 is Family F only,
 //! so the handshake here is JSON like every other control frame; it carries a
 //! `magic` + `version` so the binary form can be introduced additively in
-//! Phase 5a without breaking detection. See the plan §2.3 / §5.0.
+//! Phase 4a without breaking detection. See the plan §2.3 / §5.0.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ pub const DEFAULT_PORT: u16 = 7341;
 // Capability bits advertised in the `Hello` response.
 /// Family F — file transfer (browse / read; the only family in Phase 0).
 pub const CAP_FAMILY_F: u16 = 1 << 0;
-/// Family B — backup stream. Not implemented yet (Phase 5); flag reserved.
+/// Family B — backup stream. Not implemented yet (Phase 4); flag reserved.
 pub const CAP_FAMILY_B: u16 = 1 << 1;
 
 /// Largest control-frame body we'll accept — guards against a hostile or

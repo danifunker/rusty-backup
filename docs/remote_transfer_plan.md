@@ -602,7 +602,7 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   so remote == local. *Gate met:* over loopback, `ls` matched the local listing and `get` returned a
   20 KB file byte-exact; path-escape / missing-file / file-as-dir all error cleanly. **Simplification vs
   the spec:** the `Hello` is JSON here (Family F only); the **binary** `Hello` for the JSON-free cb-dos
-  client is introduced additively in Phase 5a (the magic+version fields are already in place). Not yet
+  client is introduced additively in Phase 4a (the magic+version fields are already in place). Not yet
   done: client read-ahead caching and a real two-machine latency measurement (loopback hides RTT).
 - **Phase 1 — Family F write path (stage→apply). — DONE (loopback-validated).** Write sessions on the
   daemon (`OpenSession`/`StageUpload`/`StageMkdir`/`Apply`/`CloseSession`): an upload lands in a
@@ -630,20 +630,25 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   recursive over `rb://`, `HostMkdir`/`HostDelete`.
 - **Phase 3 — GUI Commander remote pane (Family F).** Connect dialog, saved connections, remote source
   kind, copy arms, progress UI. *Gate:* drag a file from a remote image into a local image in the GUI.
-- **Phase 4 — MiSTer packaging & service.** `service install` + `user-startup.sh`, downloader DB,
-  CI armv7 + UPX, TUI status/enable-disable. *Gate:* enable from Scripts menu, survives reboot.
-- **Phase 5 — Family B over the unified daemon.** Bring the cb-dos doc's chunk/resume/fingerprint/manifest
-  machinery (its Phase 7a–7g) onto `rb-cli serve` as Family B, with the producer/consumer symmetry:
-  - **5a** binary `Hello` + Family-B negotiation; cb-dos client opens a socket, handshakes (cb-dos doc 7a;
+- **Phase 4 — Family B over the unified daemon.** (Reordered 2026-06-20 *ahead of* MiSTer packaging — the
+  networked backup is the priority; packaging follows it.) Bring the cb-dos doc's
+  chunk/resume/fingerprint/manifest machinery (its Phase 7a–7g) onto `rb-cli serve` as Family B, with the
+  producer/consumer symmetry:
+  - **4a** binary `Hello` + Family-B negotiation; cb-dos client opens a socket, handshakes (cb-dos doc 7a;
     resolve mTCP borrow-vs-port + the CRUSTYBK Network screen here, §10).
-  - **5b** cb-dos **push**: chunk PUT into a daemon-side `.cbk`, materialize the native folder, desktop
+  - **4b** cb-dos **push**: chunk PUT into a daemon-side `.cbk`, materialize the native folder, desktop
     restores it unchanged (cb-dos doc 7b–7c).
-  - **5c** **resume** (fsync-before-record, truncate-to-committed, `Resume` handshake, fingerprint verify)
+  - **4c** **resume** (fsync-before-record, truncate-to-committed, `Resume` handshake, fingerprint verify)
     (cb-dos doc 7d).
-  - **5d** desktop **pull** + **restore over the wire** (daemon as producer; restore as consumer with
+  - **4d** desktop **pull** + **restore over the wire** (daemon as producer; restore as consumer with
     resize) (cb-dos doc 7e). *Gate:* desktop captures a remote disk's backup, and a wire-restore boots.
-  - **5e** manifest + idempotency + boot-section + swap exclusion in the **shared** compaction path
+  - **4e** manifest + idempotency + boot-section + swap exclusion in the **shared** compaction path
     (cb-dos doc 7f–7g).
+  > **Prerequisite (unchanged by the reorder):** Family B is still gated on the cb-dos *local*
+  > removable-media round-trip proving the native format first (cb-dos Phases 1–4). Moving it ahead of
+  > packaging doesn't unblock it — it means MiSTer packaging now waits on the network-backup work.
+- **Phase 5 — MiSTer packaging & service.** `service install` + `user-startup.sh`, downloader DB,
+  CI armv7 + UPX, TUI status/enable-disable. *Gate:* enable from Scripts menu, survives reboot.
 - **Phase 6 — later/optional.** Signed push-update (§13.3) + Ed25519 release signing; mDNS discovery;
   TLS/token; pairing; mrext PR-A (Appendix A); incremental backup (cb-dos doc 7h); desktop reads `.cbk`
   directly (cb-dos doc 7i); "image in use by a core" guard hardening; optional block tier (§8).
@@ -663,7 +668,7 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
 | Push-update = remote code replacement | Device-anchored opt-in (default off), Ed25519 signing, TTY-guard, capability flag; no unsigned push. |
 | Daemon/desktop/cb-dos version skew | `Hello` + `MIN_DAEMON_VERSION` + additive protocol. |
 | FAT32 4 GiB staging limit | Configurable `staging_dir`; chunk large blobs; Family B's `.cbk` chunking sidesteps it. |
-| mTCP toolchain mixing (Watcom vs DJGPP) | Open question; resolve borrow-vs-port in the Phase-5a spike (cb-dos doc §1b, §8). |
+| mTCP toolchain mixing (Watcom vs DJGPP) | Open question; resolve borrow-vs-port in the Phase-4a spike (cb-dos doc §1b, §8). |
 | Slim-build weight | Gate networking behind a `remote` feature; std::net + serde_json (Family F) + binary frames (Family B), no async runtime. |
 
 ---
