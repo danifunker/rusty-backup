@@ -133,6 +133,18 @@ pub enum Request {
     ReadBlock { handle: u64, offset: u64, len: u32 },
     /// Close an open block handle.
     CloseBlock { handle: u64 },
+
+    // --- physical-device backup (v2): the daemon enumerates its own disks ---
+    // --- and serves a raw device over the same block-handle machinery, so ---
+    // --- the desktop can back up a remote drive without moving the media. ---
+    /// List the daemon machine's physical disk devices (reply: `Devices`).
+    ListDevices,
+    /// Open one of the **enumerated** physical devices (validated against the
+    /// live `ListDevices` set) as a raw block handle kept open on the daemon
+    /// (reply: `BlockOpened{handle, size}`). Unlike `OpenBlock` the path is NOT
+    /// joined under the serve root — it must match an enumerated device path
+    /// exactly, so this can't be used to read arbitrary files. Read-only.
+    OpenDevice { path: String },
     /// Stage an **on-device** copy: the daemon reads `src_path` from `src_image`
     /// (relative to the serve root, partition `src_partition`) and queues it as
     /// an AddFile into the session's destination image — no desktop round-trip.
@@ -181,6 +193,8 @@ pub enum Response {
     HostKind { exists: bool, is_dir: bool },
     /// `OpenBlock` result: the block handle + the image's length in bytes.
     BlockOpened { handle: u64, size: u64 },
+    /// `ListDevices` result: the daemon machine's physical disks.
+    Devices { devices: Vec<WireDevice> },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.
@@ -234,6 +248,43 @@ impl WireEntry {
 
     pub fn is_dir(&self) -> bool {
         self.kind == WireKind::Dir
+    }
+}
+
+/// Serde-friendly mirror of [`crate::device::DiskDevice`] for `ListDevices`,
+/// carrying only what the desktop's remote-device picker needs to display and
+/// then re-open (by `path`). The mount/partition detail in the engine struct is
+/// dropped — the desktop parses the partition table itself over the block tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireDevice {
+    /// Device path on the daemon machine (e.g. `/dev/sda`); the value the
+    /// desktop passes back to `OpenDevice`.
+    pub path: String,
+    /// Short device name (e.g. `sda`).
+    pub name: String,
+    pub size_bytes: u64,
+    pub is_removable: bool,
+    pub is_read_only: bool,
+    pub is_system: bool,
+    /// Bus/protocol label (e.g. `USB`, `SATA`).
+    pub bus: String,
+    /// Human-readable media/model name.
+    pub media: String,
+}
+
+impl WireDevice {
+    /// Project an engine [`crate::device::DiskDevice`] down to the wire shape.
+    pub fn from_device(d: &crate::device::DiskDevice) -> Self {
+        Self {
+            path: d.path.to_string_lossy().into_owned(),
+            name: d.name.clone(),
+            size_bytes: d.size_bytes,
+            is_removable: d.is_removable,
+            is_read_only: d.is_read_only,
+            is_system: d.is_system,
+            bus: d.bus_protocol.clone(),
+            media: d.media_name.clone(),
+        }
     }
 }
 

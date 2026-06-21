@@ -2635,6 +2635,7 @@ impl InspectTab {
             conn,
             path: rpath,
             display,
+            is_device: false,
         };
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote backup");

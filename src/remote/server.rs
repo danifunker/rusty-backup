@@ -129,9 +129,12 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
     let mut writer = BufWriter::new(stream);
     let mut handles: HashMap<u64, Box<dyn Filesystem>> = HashMap::new();
     let mut next_handle: u64 = 1;
-    // Block tier: host image files kept open for ranged reads. Shares the
-    // `next_handle` counter so handles are unique across both tables.
-    let mut block_handles: HashMap<u64, std::fs::File> = HashMap::new();
+    // Block tier: host image files (and raw physical devices) kept open for
+    // ranged reads. Shares the `next_handle` counter so handles are unique
+    // across both tables. The stored `u64` is the byte length — for a regular
+    // file it's `metadata().len()`, for a device it's the ioctl size (a
+    // device's `metadata().len()` is 0).
+    let mut block_handles: HashMap<u64, (std::fs::File, u64)> = HashMap::new();
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut next_session: u64 = 1;
 
@@ -337,7 +340,25 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 Ok((file, size)) => {
                     let handle = next_handle;
                     next_handle += 1;
-                    block_handles.insert(handle, file);
+                    block_handles.insert(handle, (file, size));
+                    write_control(&mut writer, &Response::BlockOpened { handle, size })?;
+                }
+            },
+
+            Request::ListDevices => {
+                let devices = crate::os::enumerate_devices()
+                    .iter()
+                    .map(crate::remote::protocol::WireDevice::from_device)
+                    .collect();
+                write_control(&mut writer, &Response::Devices { devices })?;
+            }
+
+            Request::OpenDevice { path } => match open_device(&path) {
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                Ok((file, size)) => {
+                    let handle = next_handle;
+                    next_handle += 1;
+                    block_handles.insert(handle, (file, size));
                     write_control(&mut writer, &Response::BlockOpened { handle, size })?;
                 }
             },
@@ -348,7 +369,7 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 len,
             } => match block_handles.get_mut(&handle) {
                 None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
-                Some(file) => match read_block(file, offset, len) {
+                Some((file, size)) => match read_block(file, *size, offset, len) {
                     Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                     Ok(buf) => {
                         // Commit to the stream: FileBegin{actual len}, then the
@@ -611,11 +632,48 @@ fn open_block(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
     Ok((f, size))
 }
 
+/// Open a raw physical device for read-only ranged access.
+///
+/// The path is **not** sandbox-joined under the serve root — a device lives at
+/// `/dev/...`, outside it. Instead the path must match one of the live
+/// `enumerate_devices()` entries exactly, so this verb can only ever open a real
+/// disk the daemon already advertises (it can't be turned into an arbitrary-file
+/// read oracle that bypasses `--root`). The device's byte length comes from the
+/// platform ioctl (`os::get_file_size`) because a block device reports
+/// `metadata().len() == 0`. Read-only; opening fails cleanly if the daemon lacks
+/// privilege (e.g. not running as root).
+fn open_device(path: &str) -> Result<(std::fs::File, u64)> {
+    let devices = crate::os::enumerate_devices();
+    let dev = devices
+        .iter()
+        .find(|d| d.path.to_string_lossy() == path)
+        .ok_or_else(|| anyhow!("{path:?} is not an enumerated device on this machine"))?;
+    let dev_path = dev.path.clone();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&dev_path)
+        .with_context(|| {
+            format!(
+                "opening device {} (the daemon may need to run as root)",
+                dev_path.display()
+            )
+        })?;
+    // Prefer the enumerated size; fall back to the ioctl probe if it's 0.
+    let size = if dev.size_bytes > 0 {
+        dev.size_bytes
+    } else {
+        crate::os::get_file_size(&f, &dev_path).unwrap_or(0)
+    };
+    if size == 0 {
+        bail!("device {} reports zero size", dev_path.display());
+    }
+    Ok((f, size))
+}
+
 /// Read up to `len` bytes from an open block handle at `offset`. A read at/after
 /// EOF returns an empty/short buffer rather than erroring — the block reader
 /// treats that as EOF.
-fn read_block(file: &mut std::fs::File, offset: u64, len: u32) -> Result<Vec<u8>> {
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+fn read_block(file: &mut std::fs::File, size: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
     if offset >= size {
         return Ok(Vec::new());
     }

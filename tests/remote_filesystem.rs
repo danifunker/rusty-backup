@@ -561,6 +561,7 @@ fn run_backup_pulls_remote_image_byte_exact() {
         conn: Arc::clone(&conn),
         path: "/disk.img".to_string(),
         display: display.clone(),
+        is_device: false,
     };
     run_backup_from(source, config, progress).expect("remote backup must succeed");
 
@@ -597,5 +598,76 @@ fn run_backup_pulls_remote_image_byte_exact() {
         &mbr_bin[..512],
         &disk_final[..512],
         "mbr.bin matches sector 0"
+    );
+}
+
+/// The physical-device path: `ListDevices` round-trips over the wire, and — when
+/// a readable device exists — `OpenDevice` + a ranged read works end-to-end.
+/// The device read is best-effort: opening a raw disk usually needs root, so a
+/// permission failure is tolerated (the verb plumbing is still proven by the
+/// `ListDevices` round-trip and the image-file block-tier tests above).
+#[test]
+fn list_devices_round_trips_and_open_device_reads() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    // 1. ListDevices round-trips: the daemon advertises its own physical disks.
+    //    The set can legitimately be empty (CI sandboxes), so only assert it
+    //    returns Ok and the entries are well-formed.
+    let devices = conn.lock().unwrap().list_devices().unwrap();
+    for d in &devices {
+        assert!(!d.path.is_empty(), "device path is non-empty");
+    }
+
+    // 2. Best-effort: open the first device that reports a non-zero size and
+    //    read its first sector over the block tier. Skip on permission errors
+    //    (raw-disk read normally needs root) so the test stays green unprivileged.
+    if let Some(dev) = devices.iter().find(|d| d.size_bytes >= 512) {
+        match RemoteBlockReader::open_device(Arc::clone(&conn), &dev.path) {
+            Ok(mut reader) => {
+                assert_eq!(
+                    reader.len(),
+                    dev.size_bytes,
+                    "device-backed reader length matches the enumerated size"
+                );
+                reader.seek(SeekFrom::Start(0)).unwrap();
+                let mut sector = [0u8; 512];
+                reader
+                    .read_exact(&mut sector)
+                    .expect("read the device's first sector over the wire");
+                // No ground truth to compare against — reaching here proves
+                // OpenDevice + ioctl-size + ReadBlock work on a real device.
+            }
+            Err(e) => {
+                eprintln!("open_device skipped (need root for raw disk read): {e:#}");
+            }
+        }
+    } else {
+        eprintln!("no readable device enumerated; ListDevices round-trip still proven");
+    }
+
+    // 3. Opening a path that isn't an enumerated device is rejected (the sandbox
+    //    guarantee: OpenDevice can't be used to read arbitrary files).
+    let bogus = conn
+        .lock()
+        .unwrap()
+        .open_device("/etc/hostname")
+        .map(|_| ())
+        .unwrap_err();
+    let msg = format!("{bogus:#}");
+    assert!(
+        msg.contains("not an enumerated device"),
+        "non-device path must be refused, got: {msg}"
     );
 }

@@ -38,14 +38,34 @@ pub struct RemoteBlockReader {
 }
 
 impl RemoteBlockReader {
-    /// Open `path` on the daemon for ranged reading — the daemon keeps the file
-    /// open and returns a handle + the image length. Blocking (one round-trip).
+    /// Open a host image file `path` on the daemon for ranged reading — the
+    /// daemon keeps the file open and returns a handle + the image length.
+    /// Blocking (one round-trip).
     pub fn open(conn: Arc<Mutex<RemoteConnection>>, path: &str) -> anyhow::Result<Self> {
+        Self::open_inner(conn, path, false)
+    }
+
+    /// Open one of the daemon's enumerated **physical devices** for ranged
+    /// reading (read-only). The device-backed sibling of [`Self::open`] — used
+    /// to back up a remote drive over the wire.
+    pub fn open_device(conn: Arc<Mutex<RemoteConnection>>, path: &str) -> anyhow::Result<Self> {
+        Self::open_inner(conn, path, true)
+    }
+
+    fn open_inner(
+        conn: Arc<Mutex<RemoteConnection>>,
+        path: &str,
+        is_device: bool,
+    ) -> anyhow::Result<Self> {
         let (handle, len) = {
             let mut c = conn
                 .lock()
                 .map_err(|_| anyhow::anyhow!("remote connection lock poisoned"))?;
-            c.open_block(path)?
+            if is_device {
+                c.open_device(path)?
+            } else {
+                c.open_block(path)?
+            }
         };
         Ok(Self {
             conn,

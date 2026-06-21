@@ -314,6 +314,33 @@ impl RemoteSession {
         }
     }
 
+    /// List the daemon machine's physical disk devices.
+    pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
+        write_control(&mut self.writer, &Request::ListDevices)?;
+        match self.read_response()? {
+            Response::Devices { devices } => Ok(devices),
+            Response::Error { message } => bail!("list devices: {message}"),
+            other => bail!("unexpected reply to ListDevices: {other:?}"),
+        }
+    }
+
+    /// Open one of the daemon's enumerated physical devices as a raw block
+    /// handle (read-only). Returns `(handle, size)`. The device-backed sibling
+    /// of [`Self::open_block`].
+    pub fn open_device(&mut self, path: &str) -> Result<(u64, u64)> {
+        write_control(
+            &mut self.writer,
+            &Request::OpenDevice {
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::BlockOpened { handle, size } => Ok((handle, size)),
+            Response::Error { message } => bail!("open device {path}: {message}"),
+            other => bail!("unexpected reply to OpenDevice: {other:?}"),
+        }
+    }
+
     /// Read a byte range `[offset, offset+len)` from an open block handle.
     /// Returns the bytes actually read (short at EOF, empty past it) — the wire
     /// primitive behind [`crate::remote::block_reader::RemoteBlockReader`].

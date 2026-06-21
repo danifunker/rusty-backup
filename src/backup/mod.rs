@@ -237,14 +237,20 @@ fn set_progress_bytes(progress: &Arc<Mutex<BackupProgress>>, current: u64, total
 pub enum BackupSource {
     /// A local file or raw device, opened (and elevated) by the engine.
     Path(PathBuf),
-    /// A remote image served over the block tier. `path` is relative to the
-    /// daemon's serve root; `display` is the human-readable label recorded in
-    /// `metadata.json`'s `source_device` (e.g. `rb://host:7341/disk.img`).
+    /// A remote source served over the block tier. For an **image file**,
+    /// `path` is relative to the daemon's serve root and `is_device` is false;
+    /// for a **physical drive** on the remote machine, `path` is the daemon's
+    /// device path (e.g. `/dev/sda`) and `is_device` is true. `display` is the
+    /// label recorded in `metadata.json`'s `source_device` (e.g.
+    /// `rb://host:7341/disk.img` or `rb://host:7341/dev/sda`).
     #[cfg(feature = "remote")]
     Remote {
         conn: Arc<Mutex<crate::remote::RemoteConnection>>,
         path: String,
         display: String,
+        /// `true` = a raw physical device (`OpenDevice`); `false` = an image
+        /// file under the serve root (`OpenBlock`).
+        is_device: bool,
     },
 }
 
@@ -278,6 +284,9 @@ pub(crate) enum SourceFactory {
         /// Total image length, captured once at construction (one round-trip)
         /// so `total_size` doesn't re-open a block handle.
         size: u64,
+        /// `true` = open `path` as a raw physical device; `false` = an image
+        /// file under the serve root.
+        is_device: bool,
     },
 }
 
@@ -290,9 +299,18 @@ impl SourceFactory {
                     .context("failed to clone local source handle")?,
             )),
             #[cfg(feature = "remote")]
-            SourceFactory::Remote { conn, path, .. } => {
-                let reader = crate::remote::RemoteBlockReader::open(Arc::clone(conn), path)
-                    .with_context(|| format!("failed to open remote image {path}"))?;
+            SourceFactory::Remote {
+                conn,
+                path,
+                is_device,
+                ..
+            } => {
+                let reader = if *is_device {
+                    crate::remote::RemoteBlockReader::open_device(Arc::clone(conn), path)
+                } else {
+                    crate::remote::RemoteBlockReader::open(Arc::clone(conn), path)
+                }
+                .with_context(|| format!("failed to open remote source {path}"))?;
                 Ok(Box::new(reader))
             }
         }
@@ -386,20 +404,34 @@ pub fn run_backup_from(
             conn,
             path,
             display,
+            is_device,
         } => {
+            let kind = if is_device { "drive" } else { "image" };
             log(
                 &progress,
                 LogLevel::Info,
-                format!("Starting backup of remote image {display}"),
+                format!("Starting backup of remote {kind} {display}"),
             );
-            set_operation(&progress, "Opening remote image...");
-            // One round-trip to learn the image length (and prove it opens).
+            set_operation(&progress, "Opening remote source...");
+            // One round-trip to learn the source length (and prove it opens).
             let size = {
-                let reader = crate::remote::RemoteBlockReader::open(Arc::clone(&conn), &path)
-                    .with_context(|| format!("failed to open remote image {path}"))?;
+                let reader = if is_device {
+                    crate::remote::RemoteBlockReader::open_device(Arc::clone(&conn), &path)
+                } else {
+                    crate::remote::RemoteBlockReader::open(Arc::clone(&conn), &path)
+                }
+                .with_context(|| format!("failed to open remote source {path}"))?;
                 reader.len()
             };
-            (SourceFactory::Remote { conn, path, size }, display)
+            (
+                SourceFactory::Remote {
+                    conn,
+                    path,
+                    size,
+                    is_device,
+                },
+                display,
+            )
         }
     };
 

@@ -110,6 +110,17 @@ impl RemoteConnection {
         self.session.open_block(path)
     }
 
+    /// List the daemon machine's physical disk devices.
+    pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
+        self.session.list_devices()
+    }
+
+    /// Open one of the daemon's enumerated physical devices as a raw block
+    /// handle (read-only); returns `(handle, size)`.
+    pub fn open_device(&mut self, path: &str) -> Result<(u64, u64)> {
+        self.session.open_device(path)
+    }
+
     /// Read a byte range from an open block handle (the block reader's fetch).
     pub fn read_block(&mut self, handle: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
         self.session.read_block(handle, offset, len)
