@@ -204,3 +204,72 @@ fn two_images_open_on_one_connection_without_reconnect() {
     drop(b);
     assert_eq!(conn.lock().unwrap().open_handle_count(), 0);
 }
+
+/// Drives the reusable browser core (`model::remote_browser::RemoteBrowser`)
+/// through the full file-browser flow on a single connection: connect -> host
+/// listing -> open image -> switch to another image without reconnecting ->
+/// close back to host. Asserts the metadata, a byte-exact in-image read, and the
+/// daemon's per-connection handle count at each step.
+#[test]
+fn browser_core_opens_switches_and_closes_on_one_connection() {
+    use rusty_backup::model::remote_browser::{BrowseMode, RemoteBrowser};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("a.img"), "VOLA", "AAA.BIN", 0x11, 4096);
+    make_fat_image(&root.join("b.img"), "VOLB", "BBB.BIN", 0x22, 4096);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // Connect -> the host browser sees both images, no handles open yet.
+    let (mut browser, mut current) = RemoteBrowser::connect(&addr, "/").unwrap();
+    assert_eq!(*browser.mode(), BrowseMode::Host);
+    assert!(current.is_host());
+    let names: Vec<&str> = current.entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"a.img") && names.contains(&"b.img"),
+        "host listing: {names:?}"
+    );
+    assert_eq!(browser.connection().lock().unwrap().open_handle_count(), 0);
+
+    // Open image A on the connection (reassigning `current` drops the host view).
+    current = browser.open_image("/a.img", None, "/").unwrap();
+    assert!(matches!(browser.mode(), BrowseMode::Image { .. }));
+    assert!(current.fs_type.starts_with("FAT"), "{}", current.fs_type);
+    assert_eq!(current.volume_label, "VOLA");
+    assert_eq!(browser.connection().lock().unwrap().open_handle_count(), 1);
+
+    // Read a file inside A byte-exact, straight through the boxed view.
+    let a_root = current.fs.root().unwrap();
+    let a_blob = current
+        .fs
+        .list_directory(&a_root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "AAA.BIN")
+        .unwrap();
+    let mut a_bytes = Vec::new();
+    current.fs.write_file_to(&a_blob, &mut a_bytes).unwrap();
+    assert_eq!(a_bytes, vec![0x11u8; 4096]);
+
+    // Switch straight to image B with NO reconnect. Reassigning `current` drops
+    // A's view (releasing its handle); B's handle replaces it -> still 1 open.
+    current = browser.open_image("/b.img", None, "/").unwrap();
+    assert_eq!(current.volume_label, "VOLB");
+    assert_eq!(browser.connection().lock().unwrap().open_handle_count(), 1);
+
+    // Close the image -> back to the host browser at the return directory; B's
+    // handle is released when its view drops on reassignment.
+    current = browser.close_image().unwrap();
+    assert!(current.is_host());
+    assert_eq!(*browser.mode(), BrowseMode::Host);
+    assert_eq!(browser.connection().lock().unwrap().open_handle_count(), 0);
+
+    drop(current);
+    drop(browser);
+}

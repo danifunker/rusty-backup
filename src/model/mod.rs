@@ -23,6 +23,10 @@ pub mod hfs_expand_runner;
 pub mod min_size_runner;
 pub mod partition_editor;
 pub mod physical_write_runner;
+// The remote file-browser core depends on `crate::remote`, which is itself
+// behind the `remote` feature.
+#[cfg(feature = "remote")]
+pub mod remote_browser;
 pub mod repack_runner;
 pub mod size_mode;
 pub mod source_reader;
