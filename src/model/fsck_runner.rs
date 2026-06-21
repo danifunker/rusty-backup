@@ -67,3 +67,18 @@ pub fn run_repair(
         .with_context(|| "failed to open editable filesystem")?;
     efs.repair().with_context(|| "repair failed")
 }
+
+/// Run repair against the partition at `offset` in a **pre-opened read-write
+/// reader** (e.g. a writable remote block reader). The reader-based sibling of
+/// [`run_repair`], so a remote image can be repaired in place over the wire —
+/// the daemon patches the bytes the repair writes back.
+pub fn run_repair_reader<R: std::io::Read + std::io::Write + std::io::Seek + Send + 'static>(
+    reader: R,
+    offset: u64,
+    ptype: u8,
+    type_string: Option<&str>,
+) -> Result<RepairReport> {
+    let mut efs = open_editable_filesystem(reader, offset, ptype, type_string)
+        .with_context(|| "failed to open editable filesystem")?;
+    efs.repair().with_context(|| "repair failed")
+}

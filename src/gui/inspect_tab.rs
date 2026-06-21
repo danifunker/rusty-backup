@@ -4650,26 +4650,46 @@ impl InspectTab {
             }
         };
 
-        let source_path = self
-            .selected_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-            .map(|d| d.path.clone())
-            .or_else(|| self.image_file_path.clone());
-
-        let path = match source_path {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source available for repair");
-                return;
+        // Remote image: repair in place over the block reader (read-write).
+        // Runs synchronously like the local path; a large remote volume pauses
+        // the UI for the duration of the repair.
+        let repair_result = if let Some((conn, rpath)) = &self.remote_inspect {
+            match rusty_backup::remote::RemoteBlockReader::open_rw(
+                std::sync::Arc::clone(conn),
+                rpath,
+            ) {
+                Ok(reader) => rusty_backup::model::fsck_runner::run_repair_reader(
+                    reader,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ),
+                Err(e) => Err(e),
             }
+        } else {
+            let source_path = self
+                .selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+                .map(|d| d.path.clone())
+                .or_else(|| self.image_file_path.clone());
+
+            let path = match source_path {
+                Some(p) => p,
+                None => {
+                    ctx.log.error("No source available for repair");
+                    return;
+                }
+            };
+
+            rusty_backup::model::fsck_runner::run_repair(
+                &path,
+                offset,
+                ptype,
+                type_string.as_deref(),
+            )
         };
 
-        match rusty_backup::model::fsck_runner::run_repair(
-            &path,
-            offset,
-            ptype,
-            type_string.as_deref(),
-        ) {
+        match repair_result {
             Ok(report) => {
                 ctx.log.info(format!(
                     "Repair complete: {} fix(es) applied, {} failed",

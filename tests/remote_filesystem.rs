@@ -434,6 +434,113 @@ fn edit_remote_image_over_block_tier() {
     );
 }
 
+/// Remote fsck REPAIR over the block tier: serve an AFFS volume with a
+/// corrupted allocation bitmap, repair it through a read-WRITE
+/// `RemoteBlockReader`, and prove fsck reports it clean afterwards — the repair
+/// patched the image in place over the wire (the read-only repair gap is now
+/// closed). Mirrors the in-module `fsck_detects_and_repairs_bitmap_mismatch`
+/// unit test, but driven entirely over the daemon.
+#[test]
+fn repair_remote_image_over_block_tier() {
+    use rusty_backup::fs::affs::create_blank_affs;
+    use rusty_backup::fs::affs_common::bitmap_checksum;
+    use rusty_backup::model::fsck_runner::{run_fsck_reader, run_repair_reader};
+    use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
+
+    const BSIZE: usize = 512;
+    const BITMAP_BLOCK: usize = 881; // 880K floppy: root=880, bitmap=881
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("affs.adf");
+
+    // Blank 880K AFFS (FFS) volume, then allocate a file so low blocks (the
+    // bitmap word covering blocks 2..33) are genuinely in use.
+    std::fs::write(&img, create_blank_affs(901_120, 1, "RemoteRepair").unwrap()).unwrap();
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0, None).unwrap();
+        let parent = efs.root().unwrap();
+        let payload = vec![0xCDu8; 1500];
+        let mut src = &payload[..];
+        efs.create_file(
+            &parent,
+            "DATA",
+            &mut src,
+            1500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // Corrupt the bitmap: flip the word covering blocks 2..33 to "all free"
+    // (set bit = free on AFFS), then fix the page checksum so fsck reads a real
+    // allocation mismatch rather than a checksum error.
+    {
+        let mut bytes = std::fs::read(&img).unwrap();
+        let bm = BITMAP_BLOCK * BSIZE;
+        bytes[bm + 4..bm + 8].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let sum = bitmap_checksum(&bytes[bm..bm + BSIZE]);
+        bytes[bm..bm + 4].copy_from_slice(&sum.to_be_bytes());
+        std::fs::write(&img, &bytes).unwrap();
+    }
+
+    // Serve it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    // fsck over the wire detects the mismatch.
+    let before = run_fsck_reader(
+        RemoteBlockReader::open(Arc::clone(&conn), "/affs.adf").unwrap(),
+        0,
+        0,
+        None,
+    )
+    .unwrap()
+    .expect("AFFS provides a checker");
+    assert!(!before.is_clean(), "fsck should detect the bitmap mismatch");
+
+    // Repair over the wire (read-write reader); a fix is applied.
+    let report = run_repair_reader(
+        RemoteBlockReader::open_rw(Arc::clone(&conn), "/affs.adf").unwrap(),
+        0,
+        0,
+        None,
+    )
+    .expect("remote repair");
+    assert!(
+        !report.fixes_applied.is_empty(),
+        "repair applied a fix over the wire (applied={}, failed={})",
+        report.fixes_applied.len(),
+        report.fixes_failed.len(),
+    );
+
+    // Re-check over the wire: clean — the repair persisted on the daemon.
+    let after = run_fsck_reader(
+        RemoteBlockReader::open(Arc::clone(&conn), "/affs.adf").unwrap(),
+        0,
+        0,
+        None,
+    )
+    .unwrap()
+    .expect("checker");
+    assert!(
+        after.is_clean(),
+        "fsck clean after remote repair; errors: {:?}",
+        after.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
 /// The **block tier**: the existing engine parses a *remote* partitioned disk
 /// image's MBR and opens the filesystem inside a partition — reading a file
 /// byte-exact — entirely over a `RemoteBlockReader` (ranged reads), with no
