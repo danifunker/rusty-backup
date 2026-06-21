@@ -2174,24 +2174,31 @@ impl<R: Read + Seek> CompactFatReader<R> {
 
         // --- Calculate new volume geometry ---
         //
-        // The FAT type is determined by a compliant driver SOLELY from the
-        // cluster count (FAT12 if < 4085, FAT16 if < 65525, else FAT32 — this
-        // is exactly what `FatFilesystem::open` re-derives). We rebuild the FAT
-        // at the *source's* entry width (12/16/32-bit), so the packed volume
-        // must keep a cluster count inside the source type's bracket — else the
-        // wide entries get re-read as a narrower type and every multi-cluster
-        // chain is misparsed (silent file truncation / read-past-EOF).
+        // We rebuild the FAT at the *source's* entry width (12/16/32-bit), so
+        // the packed cluster count must land back in the same FAT type when
+        // `FatFilesystem::open` re-derives it — otherwise the wide entries get
+        // re-read as a narrower type and every multi-cluster chain is misparsed
+        // (silent file truncation / read-past-EOF).
         //
-        // So pad the count up to the type's minimum when the live data packs
-        // below it. The padding clusters are free (FAT entry 0) and stream out
-        // as zeros (handled in the data-region `read` path), which cost almost
-        // nothing through zstd/CHD. FAT12 has no lower floor; the +16 margins
-        // keep us clear of the well-known off-by-a-few fencepost bugs in real
-        // DOS/Windows drivers around 4085 / 65525.
+        // How `open()` re-derives the type (see `FatFilesystem::open`):
+        //   * FAT32 is detected by the **BPB shape** — `sectors_per_fat_16 == 0
+        //     && root_entries == 0` — NOT by cluster count. We keep that BPB
+        //     shape, so a packed FAT32 is always re-read as FAT32 regardless of
+        //     how few clusters it has. No floor needed (real below-spec FAT32
+        //     volumes with < 65525 clusters exist, e.g. mkfs.fat -F32 on small
+        //     media — padding them up to 65525 would inflate the packed image
+        //     above the original).
+        //   * FAT12 vs FAT16 IS cluster-count-derived: < 4085 -> FAT12, else
+        //     FAT16. So a FAT16 volume packed below 4085 clusters gets re-read
+        //     as FAT12 and misparses. THAT is the real data-loss case, so FAT16
+        //     gets a floor at 4085. The +16 margin clears the well-known
+        //     off-by-a-few fencepost bugs in real DOS/Windows drivers. The pad
+        //     clusters are free and stream out as zeros (handled in the
+        //     data-region `read` path), costing ~nothing through zstd/CHD.
         let type_min_clusters: u64 = match fat_type {
             FatType::Fat12 => 0,
             FatType::Fat16 => 4085 + 16,
-            FatType::Fat32 => 65525 + 16,
+            FatType::Fat32 => 0,
         };
         let new_cluster_count = (clusters_used as u64).max(type_min_clusters);
 
