@@ -783,12 +783,14 @@ jobs:
           # v0.2.5 (Ubuntu 20.04 base) so this binary links against the same
           # glibc baseline as MiSTer's Buildroot rootfs and the upstream
           # libchdman-rs armv7 prebuilt.
+          # `remote` = the rb-cli serve daemon + rb:// (pure std::net + serde_json,
+          # no C / no extra crate), so the MiSTer can host its images on the LAN.
           cross build \
             --bin rb-cli \
             --release \
             --target armv7-unknown-linux-gnueabihf \
             --no-default-features \
-            --features chd,pure-zstd
+            --features chd,pure-zstd,remote
 
       - name: Strip binary
         run: |
