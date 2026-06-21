@@ -381,6 +381,9 @@ hook), commit, and validate over loopback.
 ## 6. Current commits (newest first, on `add-crusty-backup-dos-poc`)
 
 ```
+d092bc7 remote: back up a remote image over the block tier (per-partition)   <- Step 4 (remote backup)
+8385a72 docs: resume prompt for the remaining remote-access items
+af87ea1 remote: Inspect wired (browse/fsck/calc-min/switch over the block tier)
 afaeb91 remote: block tier — RemoteBlockReader (Read+Seek over the wire)     <- block-tier core (PROVEN)
 d8696ae remote: inline remote browse panel in the Inspect tab (op-level)     <- Step 3 (browse)
 09c45c3 remote: Commander pane uses RemoteBrowser — no reconnect on switch  <- Step 2 (GUI)
