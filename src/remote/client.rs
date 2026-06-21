@@ -271,6 +271,24 @@ impl RemoteSession {
         }
     }
 
+    /// Stream a host file's bytes into `sink` (the host-FS analog of
+    /// [`RemoteSession::read_file`]). Returns the byte count.
+    pub fn read_host_file(&mut self, path: &str, sink: &mut dyn Write) -> Result<u64> {
+        write_control(
+            &mut self.writer,
+            &Request::ReadHostFile {
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::FileBegin { .. } => {
+                read_chunks(&mut self.reader, sink).map_err(|e| anyhow!("reading {path}: {e}"))
+            }
+            Response::Error { message } => bail!("read host file {path}: {message}"),
+            other => bail!("unexpected reply to ReadHostFile: {other:?}"),
+        }
+    }
+
     /// Replay the session's staged edits onto the image; returns the count.
     pub fn apply(&mut self, session: u64) -> Result<u64> {
         write_control(&mut self.writer, &Request::Apply { session })?;

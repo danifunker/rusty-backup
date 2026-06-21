@@ -122,6 +122,102 @@ fn wire_err(e: anyhow::Error) -> FilesystemError {
     FilesystemError::Io(std::io::Error::other(e.to_string()))
 }
 
+/// A [`Filesystem`] over the daemon's **host** filesystem — the Commander remote
+/// pane's *file-browser* view. `list_directory` → `ListHostDir`,
+/// `read_file`/`write_file_to` → `ReadHostFile`. The user browses the remote
+/// machine and then double-clicks (or right-click → Open Image) a disk image,
+/// which the GUI opens as a [`RemoteFilesystem`] to browse inside.
+pub struct RemoteHostFilesystem {
+    session: RemoteSession,
+    root: FileEntry,
+}
+
+impl RemoteHostFilesystem {
+    /// Connect to `addr` and list `root_path` (e.g. `/`) on the daemon's host
+    /// filesystem. Returns the filesystem plus the root entry and its children.
+    pub fn open(addr: &str, root_path: &str) -> anyhow::Result<(Self, FileEntry, Vec<FileEntry>)> {
+        let mut session = RemoteSession::connect(addr)?;
+        let (exists, is_dir) = session.host_stat(root_path)?;
+        if !exists {
+            anyhow::bail!("no such path on the remote: {root_path}");
+        }
+        if !is_dir {
+            anyhow::bail!("{root_path} is not a directory on the remote");
+        }
+        let children = session
+            .list_host_dir(root_path)?
+            .into_iter()
+            .map(wire_to_entry)
+            .collect();
+        let root = FileEntry::new_directory("/".to_string(), root_path.to_string(), 0);
+        Ok((
+            RemoteHostFilesystem {
+                session,
+                root: root.clone(),
+            },
+            root,
+            children,
+        ))
+    }
+}
+
+impl Filesystem for RemoteHostFilesystem {
+    fn root(&mut self) -> Result<FileEntry, FilesystemError> {
+        Ok(self.root.clone())
+    }
+
+    fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        let path = if entry.path.is_empty() {
+            "/"
+        } else {
+            entry.path.as_str()
+        };
+        let wire = self.session.list_host_dir(path).map_err(wire_err)?;
+        Ok(wire.into_iter().map(wire_to_entry).collect())
+    }
+
+    fn read_file(
+        &mut self,
+        entry: &FileEntry,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let mut buf = Vec::new();
+        self.session
+            .read_host_file(&entry.path, &mut buf)
+            .map_err(wire_err)?;
+        if buf.len() > max_bytes {
+            buf.truncate(max_bytes);
+        }
+        Ok(buf)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        self.session
+            .read_host_file(&entry.path, writer)
+            .map_err(wire_err)
+    }
+
+    fn volume_label(&self) -> Option<&str> {
+        None
+    }
+
+    fn fs_type(&self) -> &str {
+        "remote-host"
+    }
+
+    fn total_size(&self) -> u64 {
+        0
+    }
+
+    fn used_size(&self) -> u64 {
+        0
+    }
+}
+
 /// Inverse of `WireEntry::from_entry` — rebuild a `FileEntry` for display /
 /// copy. The `location` field is unused remotely (the daemon addresses entries
 /// by path), so it is left 0.

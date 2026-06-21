@@ -110,6 +110,10 @@ pub enum Request {
     /// client distinguish a host directory to browse from an image file to
     /// open when no `@N` partition was given.
     HostStat { path: String },
+    /// Stream a host file's raw bytes (reply: `FileBegin`, then a chunk stream).
+    /// The host-FS analog of `ReadFile` — for copying a file off the remote, or
+    /// the file browser's preview.
+    ReadHostFile { path: String },
     /// Stage an **on-device** copy: the daemon reads `src_path` from `src_image`
     /// (relative to the serve root, partition `src_partition`) and queues it as
     /// an AddFile into the session's destination image — no desktop round-trip.

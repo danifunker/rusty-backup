@@ -136,6 +136,45 @@ fn main() {
                 args[1]
             );
         }
+        Some("set-dir") if args.len() >= 3 => {
+            // set-dir <pdi> <name>=<fileID-decimal> [<name>=<fileID> ...]
+            //
+            // Build the Cedar `client` name directory (FS B-tree) from the given
+            // name -> FileID pairs and point rootFile[client] at it, so the files
+            // browse by their real names instead of synthetic LVx_ ids. Run `add`
+            // first for each file (it prints the FileID), then name them here.
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let mut entries: Vec<(String, u16, u32)> = Vec::new();
+            for a in &args[2..] {
+                let (name, fid) = a.split_once('=').unwrap_or_else(|| {
+                    eprintln!("bad pair {a:?} (want name=fileID)");
+                    std::process::exit(2);
+                });
+                let fid: u32 = fid.parse().unwrap_or_else(|_| {
+                    eprintln!("bad FileID in {a:?} (decimal)");
+                    std::process::exit(2);
+                });
+                entries.push((name.to_string(), 1, fid));
+            }
+            let disk =
+                pilot::set_client_directory(&disk, gen, &entries).expect("set_client_directory");
+            fs::write(&args[1], pilot::write_pdi(&disk, gen)).expect("write pdi");
+            // Re-read and show the now-named files.
+            let back = open_pack(&fs::read(&args[1]).unwrap()).unwrap();
+            let mut fsv = PilotFilesystem::open(back, gen).expect("open fs");
+            let root = fsv.root().expect("root");
+            let files = fsv.list_directory(&root).expect("list");
+            println!(
+                "Installed Cedar name directory ({} entries) into {}; files now:",
+                entries.len(),
+                args[1]
+            );
+            for f in &files {
+                println!("    {:<24} {:>8} bytes", f.name, f.size);
+            }
+        }
         Some("install-boot") if args.len() == 4 => {
             // install-boot <pdi> <germ|bootfile|microcode> <hostfile>
             let slot = PvBootFile::parse(&args[2]).unwrap_or_else(|| {
@@ -387,6 +426,7 @@ fn main() {
             eprintln!("  pilot_probe new <pages> <cedar|pilot> <name> <out.pdi>");
             eprintln!("  pilot_probe probe <file.pdi>");
             eprintln!("  pilot_probe add <file.pdi> <hostfile>");
+            eprintln!("  pilot_probe set-dir <file.pdi> <name>=<fileID> [<name>=<fileID> ...]");
             eprintln!("  pilot_probe del <file.pdi> <fileID-decimal>");
             eprintln!("  pilot_probe install-boot <file.pdi> <germ|bootfile|microcode> <hostfile>");
             eprintln!("  pilot_probe extract-boot <file.pdi> <germ|bootfile|microcode> <out>");

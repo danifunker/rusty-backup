@@ -307,6 +307,28 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
             },
 
+            Request::ReadHostFile { path } => match sandbox_join(root, &path) {
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                Ok(full) if full.is_dir() => {
+                    reply_err(&mut writer, format!("{path} is a directory"))?
+                }
+                Ok(full) => match std::fs::File::open(&full) {
+                    Err(e) => reply_err(&mut writer, format!("opening {path}: {e}"))?,
+                    Ok(mut f) => {
+                        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        // Same commit-to-the-stream contract as ReadFile: once
+                        // FileBegin is on the wire a mid-stream error drops the
+                        // connection rather than corrupting the chunk stream.
+                        write_control(&mut writer, &Response::FileBegin { size })?;
+                        let mut cw = ChunkWriter::new(&mut writer);
+                        if let Err(e) = std::io::copy(&mut f, &mut cw) {
+                            return Err(anyhow!("reading host file {path}: {e}"));
+                        }
+                        cw.finish()?;
+                    }
+                },
+            },
+
             Request::StageCopyLocal {
                 session,
                 src_image,

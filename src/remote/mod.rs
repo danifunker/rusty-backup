@@ -16,6 +16,6 @@ pub mod protocol;
 pub mod server;
 
 pub use client::{OpenedImage, RemoteSession};
-pub use fs::RemoteFilesystem;
+pub use fs::{RemoteFilesystem, RemoteHostFilesystem};
 pub use protocol::RemoteRef;
 pub use server::{serve, serve_on, ServeConfig};

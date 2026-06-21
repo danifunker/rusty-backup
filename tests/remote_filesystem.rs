@@ -10,7 +10,7 @@ use std::net::TcpListener;
 use rusty_backup::cli::resolve::resolve_partition_rw;
 use rusty_backup::fs::filesystem::{CreateFileOptions, Filesystem};
 use rusty_backup::fs::{fat, open_editable_filesystem};
-use rusty_backup::remote::{serve_on, RemoteFilesystem};
+use rusty_backup::remote::{serve_on, RemoteFilesystem, RemoteHostFilesystem};
 
 #[test]
 fn remote_filesystem_browses_and_reads_over_loopback() {
@@ -44,6 +44,10 @@ fn remote_filesystem_browses_and_reads_over_loopback() {
         drop(efs);
         commit.commit().unwrap();
     }
+
+    // A plain host file in the serve root, for the host-FS browser test.
+    let note = b"a host-side note for the file browser\n";
+    std::fs::write(root.join("notes.txt"), note).unwrap();
 
     // --- start the daemon on a pre-bound port-0 listener ---
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -83,4 +87,22 @@ fn remote_filesystem_browses_and_reads_over_loopback() {
     let capped = rfs.read_file(blob, 100).unwrap();
     assert_eq!(capped.len(), 100);
     assert_eq!(&capped[..], &payload[..100]);
+
+    // --- the host-FS file browser (RemoteHostFilesystem) ---
+    let (mut host_fs, host_root, host_children) = RemoteHostFilesystem::open(&addr, "/").unwrap();
+    assert_eq!(host_fs.fs_type(), "remote-host");
+    // The serve root holds disk.img (a file to "Open Image") + notes.txt.
+    let names: Vec<&str> = host_children.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"disk.img"), "host listing: {names:?}");
+    assert!(names.contains(&"notes.txt"), "host listing: {names:?}");
+    // A fresh list_directory(root) agrees.
+    let relisted = host_fs.list_directory(&host_root).unwrap();
+    let notes = relisted
+        .iter()
+        .find(|e| e.name == "notes.txt")
+        .expect("notes.txt in host listing");
+    // Read a host file off the remote, byte-exact.
+    let mut got = Vec::new();
+    host_fs.write_file_to(notes, &mut got).unwrap();
+    assert_eq!(got, note, "host-file read must be byte-exact");
 }

@@ -87,6 +87,11 @@ const VAM_FILE_ID: [u16; 5] = [1, 0, 0, 0, 0];
 /// Word offset of `rootFile[VolumeFile::VAM]` in the LV root (`rootFile`
 /// base 85 + 7 * SIZE[RootFile](6)).
 const ROOTFILE_VAM_WORD: usize = 85 + 7 * 6;
+/// Word offset of `rootFile[VolumeFile::client]` in the LV root (slot 8): the
+/// FS name-directory file (`File.mesa!1` `VolumeFile.client = 8`). Each
+/// `RootFile` is `fp: File.FP`(4) + `page: File.PageNumber`(2) = 6 words; the
+/// `fp.id` (2-word 32-bit FileID) sits at the slot's word 0.
+const ROOTFILE_CLIENT_WORD: usize = 85 + 8 * 6;
 
 /// Words of VAM data for a volume of `volume_size` pages: `rover`(2) + `size`(2)
 /// + one bit per page.
@@ -359,6 +364,11 @@ pub struct LogicalRoot {
     pub label: String,
     pub volume_type: u16,
     pub volume_size: u32,
+    /// 32-bit `FileID` of the Cedar `client` directory file (`rootFile[client]`,
+    /// `File.VolumeFile.client = 8`), or `None` when the slot is null (no name
+    /// directory — names then come from leader pages / file IDs only). This file
+    /// holds the FS name->FileID B-tree (`BTree` + `FSBackdoor.Entry`).
+    pub client_fid: Option<u32>,
 }
 
 impl LogicalRoot {
@@ -376,11 +386,17 @@ impl LogicalRoot {
             *w = rdw(data, 2 + i);
         }
         let label_len = rdw(data, 7) as usize;
+        // rootFile[client].fp.id (2 words) at word ROOTFILE_CLIENT_WORD; 0 = null.
+        let client_fid = match rdlong(data, ROOTFILE_CLIENT_WORD) {
+            0 => None,
+            fid => Some(fid),
+        };
         Ok(LogicalRoot {
             v_id,
             label: unpack_label(data, 8, label_len),
             volume_type: rdw(data, 28),
             volume_size: rdlong(data, 29),
+            client_fid,
         })
     }
 }
@@ -889,7 +905,10 @@ pub struct PilotFilesystem {
 impl PilotFilesystem {
     pub fn open(disk: Disk, generation: Generation) -> Result<Self, FilesystemError> {
         let volume = read_volume(&disk, generation)?;
-        let files = build_files(&disk, &volume);
+        let mut files = build_files(&disk, &volume);
+        // Replace synthetic / leader names with the real names from the Cedar
+        // client name directory (rootFile[client] FS B-tree), when present.
+        apply_client_names(&disk, &volume, &mut files);
         Ok(Self {
             disk,
             generation,
@@ -1183,6 +1202,277 @@ pub fn delete_file(disk: &Disk, fid: u32) -> Result<Disk, FilesystemError> {
     }
     rebuild_vam(&mut disk, &sv);
     Ok(disk)
+}
+
+// ---- Cedar FS name directory (rootFile[client] B-tree) ----
+//
+// Cedar's nucleus has no name directory; the human name -> FileID map lives in a
+// separate "client" file (`rootFile[client]`, `File.VolumeFile.client = 8`),
+// stored as an FS B-tree. On-disk format (cedar6.1 sources under
+// `~/PARC-Stuff/cyan/cedar6.1/{btree,fs,file}`):
+//
+//   - A BTree page = 4 Pilot pages = 1024 words (`BTreeVM` filePagesPerPage = 4,
+//     `FS.WordsForPages[4]`); file page 0 of the client file is the *statePage*.
+//   - statePage (`BTreeInternal.TreeState`): seal(0) = 046273B, pageSize(1, in
+//     words), rootPage(2), greatestPage(3), firstFreePage(4), entryCount(5, LONG),
+//     depth(7).
+//   - tree page (`BTreeInternal.BTreePage`): freeWords(0), minPage(1), then
+//     packed `BTreeEntry`s from word 2. A free page has freeWords = LAST[CARDINAL].
+//   - `BTreeEntry` = grPage(1 word, the greater-than child) + ClientEntry.
+//   - ClientEntry = `FSBackdoor.Entry`: size(0, whole-entry words incl. trailing
+//     text), version(1), nameBody(2, a TextRP = word-relative pointer to a
+//     TextRep), type(3: 0 = local, 1 = attached, 2 = cached), and for `local`:
+//     keep(4), fp(5: `File.FP`).
+//   - `File.FP` = id(0: FileID[2]) + da(2: DA[2]); the 32-bit Cedar FileID is
+//     `fp.id`, equal to the nucleus label fileID's first two words.
+//   - TextRep = PACKED SEQUENCE length: CARDINAL OF CHAR — word 0 = char count,
+//     then 2 chars/word with char[0] in the high byte (so the packed chars read
+//     as a natural left-to-right byte run on a big-endian page).
+//
+// We read the directory to give files their real names, and write a minimal
+// (single root-leaf) tree so a created volume carries navigable names and the
+// reader is round-trip-testable (no period disk has a populated client
+// directory to validate against — every available real Pilot pack is classic
+// ViewPoint/XDE with clientRootFile = 0).
+
+/// `BTreeInternal.sealValue`.
+const BTREE_SEAL: u16 = 0o46273;
+/// BTree page size in words (FS opens the directory at 4 Pilot pages / BTree page).
+const BTREE_PAGE_WORDS: usize = 4 * PAGE_WORDS; // 1024
+const BTREE_PAGE_BYTES: usize = BTREE_PAGE_WORDS * 2;
+/// `BTreeInternal.nilPage` (== statePage); a leaf's grPage / minPage links.
+const BTREE_NIL_PAGE: u16 = 0;
+/// `freeWords` value marking a page as free (`BTreeInternal.freePageMarker`).
+const BTREE_FREE_MARKER: u16 = 0xffff;
+/// `FSBackdoor.EntryType.local`.
+const FS_ENTRY_LOCAL: u16 = 0;
+/// Word offset of the `local` entry's TextRep (after size, version, nameBody,
+/// type, keep, fp = id(2) + da(2) = words 0..8), so nameBody's relative pointer.
+const FS_LOCAL_TEXT_WORD: usize = 9;
+
+/// One decoded name-directory entry: a human name, its FName version, and the
+/// 32-bit Cedar `FileID` it maps to.
+#[derive(Debug, Clone)]
+struct ClientDirEntry {
+    name: String,
+    version: u16,
+    fid: u32,
+}
+
+/// Read a `TextRep` (PACKED SEQUENCE length: CARDINAL OF CHAR) at word `wi` in a
+/// BTree page: word 0 = char count, chars follow 2/word (char[0] in the high
+/// byte). Returns the printable-ASCII name, or `None` if out of range / empty.
+fn read_textrep(page: &[u8], wi: usize, page_words: usize) -> Option<String> {
+    if wi >= page_words {
+        return None;
+    }
+    let len = rdw(page, wi) as usize;
+    if len == 0 || len > 256 {
+        return None;
+    }
+    let start = (wi + 1) * 2; // chars begin at the next word; bytes are in order
+    if start + len > page.len() {
+        return None;
+    }
+    let s: String = page[start..start + len]
+        .iter()
+        .map(|&b| b as char)
+        .filter(|&c| (' '..='~').contains(&c))
+        .collect();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Parse the FS name -> FileID B-tree out of the `client` file's concatenated
+/// data pages. Best-effort and panic-free (this reads untrusted on-disk data):
+/// malformed pages/entries are skipped. Returns the `local` entries. Walks every
+/// tree page scavenger-style — a B-tree holds each entry exactly once across all
+/// nodes, so a full scan enumerates the directory without following child links.
+fn parse_client_directory(client_data: &[u8]) -> Vec<ClientDirEntry> {
+    let mut out = Vec::new();
+    if client_data.len() < BTREE_PAGE_BYTES || rdw(client_data, 0) != BTREE_SEAL {
+        return out; // missing / wrong statePage
+    }
+    let page_words = match rdw(client_data, 1) as usize {
+        w if (4..=BTREE_PAGE_WORDS).contains(&w) => w,
+        _ => BTREE_PAGE_WORDS,
+    };
+    let page_bytes = page_words * 2;
+    let n_pages = client_data.len() / page_bytes;
+    for p in 1..n_pages {
+        let base = p * page_bytes;
+        let page = &client_data[base..base + page_bytes];
+        let free_words = rdw(page, 0) as usize;
+        if free_words == BTREE_FREE_MARKER as usize || free_words >= page_words {
+            continue; // free page or implausible
+        }
+        // Entries occupy words [2, page_words - free_words), packed.
+        let used_end = page_words - free_words;
+        let mut w = 2usize; // first entry's grPage word
+        while w + 2 <= used_end {
+            let entry_w = w + 1; // Entry follows the 1-word grPage
+            let size = rdw(page, entry_w) as usize; // whole-entry words
+            if size == 0 || entry_w + size > page_words {
+                break; // corrupt; abandon this page
+            }
+            if rdw(page, entry_w + 3) == FS_ENTRY_LOCAL && size > FS_LOCAL_TEXT_WORD {
+                let version = rdw(page, entry_w + 1);
+                let name_rp = rdw(page, entry_w + 2) as usize; // word-relative ptr
+                let fid = rdlong(page, entry_w + 5); // fp.id (FileID, 2 words)
+                if let Some(name) = read_textrep(page, entry_w + name_rp, page_words) {
+                    out.push(ClientDirEntry { name, version, fid });
+                }
+            }
+            w = entry_w + size; // advance past grPage + entry
+        }
+    }
+    out
+}
+
+/// Build the `client` name-directory B-tree as a flat byte buffer — a statePage
+/// (BTree page 0) plus a single root *leaf* page (BTree page 1) — from `entries`,
+/// sorted in `FSDir.Compare` order (case-insensitive name, then version). Errors
+/// if the entries don't fit one leaf page (multi-page trees are a future
+/// extension; one 1024-word page holds ~50 typical names).
+fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, FilesystemError> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|a, b| {
+        a.name
+            .to_ascii_uppercase()
+            .cmp(&b.name.to_ascii_uppercase())
+            .then(a.version.cmp(&b.version))
+    });
+
+    let mut state = vec![0u8; BTREE_PAGE_BYTES];
+    let mut leaf = vec![0u8; BTREE_PAGE_BYTES];
+
+    // Root leaf page: freeWords(0), minPage(1) = nil, then packed local entries.
+    let mut w = 2usize;
+    for e in &sorted {
+        let name_bytes = e.name.as_bytes();
+        let text_words = 1 + name_bytes.len().div_ceil(2); // length word + chars
+        let entry_words = FS_LOCAL_TEXT_WORD + text_words;
+        let total = 1 + entry_words; // grPage + entry
+        if w + total > BTREE_PAGE_WORDS {
+            return Err(FilesystemError::DiskFull(format!(
+                "Pilot: Cedar name directory of {} entries exceeds one B-tree page \
+                 (multi-page trees not yet written)",
+                sorted.len()
+            )));
+        }
+        let entry_w = w + 1;
+        wrw(&mut leaf, w, BTREE_NIL_PAGE); // grPage = nil (leaf)
+        wrw(&mut leaf, entry_w, entry_words as u16); // size
+        wrw(&mut leaf, entry_w + 1, e.version); // version
+        wrw(&mut leaf, entry_w + 2, FS_LOCAL_TEXT_WORD as u16); // nameBody rel ptr
+        wrw(&mut leaf, entry_w + 3, FS_ENTRY_LOCAL); // type = local
+        wrw(&mut leaf, entry_w + 4, 0); // keep
+        wrlong(&mut leaf, entry_w + 5, e.fid); // fp.id (FileID); fp.da left 0
+        let text_w = entry_w + FS_LOCAL_TEXT_WORD;
+        wrw(&mut leaf, text_w, name_bytes.len() as u16); // char count
+        let cbase = (text_w + 1) * 2;
+        leaf[cbase..cbase + name_bytes.len()].copy_from_slice(name_bytes);
+        w = entry_w + entry_words;
+    }
+    wrw(&mut leaf, 0, (BTREE_PAGE_WORDS - w) as u16); // freeWords
+    wrw(&mut leaf, 1, BTREE_NIL_PAGE); // minPage = nil (leaf)
+
+    // statePage (TreeState).
+    wrw(&mut state, 0, BTREE_SEAL);
+    wrw(&mut state, 1, BTREE_PAGE_WORDS as u16); // pageSize (words)
+    wrw(&mut state, 2, 1); // rootPage = BTree page 1
+    wrw(&mut state, 3, 1); // greatestPage
+    wrw(&mut state, 4, BTREE_NIL_PAGE); // firstFreePage = nil
+    wrlong(&mut state, 5, sorted.len() as u32); // entryCount
+    wrw(&mut state, 7, 1); // depth = 1 (single leaf)
+
+    let mut out = state;
+    out.extend_from_slice(&leaf);
+    Ok(out)
+}
+
+/// Install (or replace) the Cedar `client` name directory: build the FS B-tree
+/// from `entries` (name, version, 32-bit FileID), store it as a nucleus file via
+/// [`add_file`], and point `rootFile[client]` at it. `entries` should reference
+/// FileIDs already present on the volume (e.g. from prior [`add_file`] calls).
+/// Returns the updated disk.
+///
+/// `rootFile[client].fp.da` / `.page` are left 0: our reader resolves the
+/// directory file by FileID via the page-label scan. A faithful Cedar FS would
+/// also want the disk-address hint, but it is not needed to round-trip here.
+pub fn set_client_directory(
+    disk: &Disk,
+    generation: Generation,
+    entries: &[(String, u16, u32)],
+) -> Result<Disk, FilesystemError> {
+    let dir_entries: Vec<ClientDirEntry> = entries
+        .iter()
+        .map(|(name, version, fid)| ClientDirEntry {
+            name: name.clone(),
+            version: *version,
+            fid: *fid,
+        })
+        .collect();
+    let btree = build_client_directory(&dir_entries)?;
+    let (mut disk, client_fid) = add_file(disk, generation, &btree)?;
+
+    let vol = read_volume(&disk, generation)?;
+    let sv = vol
+        .physical_root
+        .sub_volumes
+        .iter()
+        .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+        .cloned()
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
+    let lv_root_vda = sv.pv_page as usize;
+    let d = &mut disk.sectors[lv_root_vda].data;
+    wrlong(d, ROOTFILE_CLIENT_WORD, client_fid); // rootFile[client].fp.id
+    set_page_checksum(d);
+    Ok(disk)
+}
+
+/// If the volume has a Cedar `client` name directory, read it and replace the
+/// synthetic / leader names of the files it references with their real names,
+/// then drop the directory file itself from the user-visible list.
+fn apply_client_names(disk: &Disk, volume: &PilotVolume, files: &mut Vec<PilotFile>) {
+    let Some(client_fid) = volume.logical_root.client_fid else {
+        return;
+    };
+    let target = [(client_fid & 0xffff) as u16, (client_fid >> 16) as u16];
+    let Some(dir_idx) = files
+        .iter()
+        .position(|f| f.file_id[0] == target[0] && f.file_id[1] == target[1])
+    else {
+        return; // directory FileID not found among scanned files
+    };
+    // The directory file's data pages are its B-tree (header run-table excluded
+    // from the scan), already ordered by file page; concatenating yields it.
+    let mut client_data = Vec::new();
+    for &(_lp, vda) in &files[dir_idx].pages {
+        if let Some(s) = disk.sector(vda) {
+            client_data.extend_from_slice(&s.data);
+        }
+    }
+    let entries = parse_client_directory(&client_data);
+    if entries.is_empty() {
+        return;
+    }
+    // FileID -> name (highest version wins on duplicates).
+    let mut by_fid: HashMap<u32, (u16, String)> = HashMap::new();
+    for e in entries {
+        let slot = by_fid.entry(e.fid).or_insert((e.version, e.name.clone()));
+        if e.version >= slot.0 {
+            *slot = (e.version, e.name);
+        }
+    }
+    for f in files.iter_mut() {
+        let fid = (f.file_id[0] as u32) | ((f.file_id[1] as u32) << 16);
+        if let Some((_v, name)) = by_fid.get(&fid) {
+            f.name = name.clone();
+        }
+    }
+    files.remove(dir_idx); // the directory file is metadata, not user-visible
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    dedup_names(files);
 }
 
 // ---- bootingInfo: installing a disk-resident germ / boot file ----
@@ -1781,5 +2071,129 @@ mod tests {
             saw_link,
             "expected a non-trivial bootChainLink across the hole"
         );
+    }
+
+    #[test]
+    fn client_directory_btree_build_parse_round_trips() {
+        // The B-tree the writer emits is parsed back to the same name->FileID set
+        // (the format-level contract, independent of the nucleus file plumbing).
+        let entries = vec![
+            ClientDirEntry {
+                name: "Compiler.bcd".into(),
+                version: 3,
+                fid: 42,
+            },
+            ClientDirEntry {
+                name: "Tioga.bcd".into(),
+                version: 1,
+                fid: 7,
+            },
+            ClientDirEntry {
+                name: "a".into(),
+                version: 1,
+                fid: 99,
+            }, // odd length
+        ];
+        let bytes = build_client_directory(&entries).expect("build");
+        assert_eq!(bytes.len(), BTREE_PAGE_BYTES * 2, "statePage + one leaf");
+        assert_eq!(rdw(&bytes, 0), BTREE_SEAL);
+        assert_eq!(rdlong(&bytes, 5), 3, "entryCount in statePage");
+
+        let got = parse_client_directory(&bytes);
+        let mut map: std::collections::HashMap<u32, (u16, String)> = Default::default();
+        for e in got {
+            map.insert(e.fid, (e.version, e.name));
+        }
+        assert_eq!(map[&42], (3, "Compiler.bcd".into()));
+        assert_eq!(map[&7], (1, "Tioga.bcd".into()));
+        assert_eq!(map[&99], (1, "a".into()));
+    }
+
+    #[test]
+    fn client_directory_overflows_one_page_errors() {
+        // A single root leaf is ~1022 words; many long names must error cleanly
+        // rather than silently truncate (multi-page trees are a future extension).
+        let entries: Vec<ClientDirEntry> = (0..200)
+            .map(|i| ClientDirEntry {
+                name: format!("AVeryLongCedarFileName-{i:04}.bcd"),
+                version: 1,
+                fid: 1000 + i,
+            })
+            .collect();
+        assert!(matches!(
+            build_client_directory(&entries),
+            Err(FilesystemError::DiskFull(_))
+        ));
+    }
+
+    #[test]
+    fn client_directory_names_files_through_full_stack() {
+        use super::super::pdi;
+        use crate::fs::filesystem::Filesystem;
+
+        let geo = pilot_geometry(160);
+        let blank = create_blank(geo, Generation::CedarNucleus, "Named").expect("create");
+
+        // Two user files; FileID 1 is the VAM, so these get 2 and 3.
+        let pa: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        let pb: Vec<u8> = (0..50u32)
+            .map(|i| (i.wrapping_mul(3) % 256) as u8)
+            .collect();
+        let (disk, fa) = add_file(&blank, Generation::CedarNucleus, &pa).expect("add a");
+        let (disk, fb) = add_file(&disk, Generation::CedarNucleus, &pb).expect("add b");
+
+        // Before installing the directory: synthetic names, no client dir.
+        assert!(read_volume(&disk, Generation::CedarNucleus)
+            .unwrap()
+            .logical_root
+            .client_fid
+            .is_none());
+        {
+            let mut fs = PilotFilesystem::open(disk.clone(), Generation::CedarNucleus).unwrap();
+            let root = fs.root().unwrap();
+            let names: Vec<String> = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(names.len(), 2);
+            assert!(
+                names.iter().all(|n| n.starts_with("LV0_")),
+                "synthetic: {names:?}"
+            );
+        }
+
+        // Install the name directory mapping each FileID to a human name.
+        let dir = vec![
+            ("Hello.mesa".to_string(), 1u16, fa),
+            ("Othello.boot".to_string(), 2u16, fb),
+        ];
+        let disk = set_client_directory(&disk, Generation::CedarNucleus, &dir).expect("set dir");
+        assert_eq!(
+            read_volume(&disk, Generation::CedarNucleus)
+                .unwrap()
+                .logical_root
+                .client_fid,
+            Some(4), // VAM=1, files 2 & 3, directory file = 4
+        );
+
+        // Through a PDI round trip, the browse view shows the real names (the
+        // directory file itself is hidden), and the data still reads back.
+        let pdi = write_pdi(&disk, Generation::CedarNucleus);
+        let back = pdi::read(&pdi).expect("pdi read");
+        let mut fs = PilotFilesystem::open(back, Generation::CedarNucleus).expect("open");
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Hello.mesa", "Othello.boot"],
+            "real names, dir hidden"
+        );
+
+        let hello = entries.iter().find(|e| e.name == "Hello.mesa").unwrap();
+        let got = fs.read_file(hello, usize::MAX).unwrap();
+        assert_eq!(&got[..pa.len()], &pa[..], "file content preserved");
     }
 }
