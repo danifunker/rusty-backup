@@ -137,6 +137,14 @@ impl RemoteSession {
         }
     }
 
+    /// Drop an opened-image handle on the daemon (the read-side `Close`). The
+    /// daemon's handle table is per-connection, so closing a handle frees its
+    /// open image without affecting other handles on the same session.
+    pub fn close(&mut self, handle: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::Close { handle })?;
+        self.expect_ok("Close")
+    }
+
     // --- write path (Phase 1: stage -> apply) ---
 
     /// Open a write session bound to a destination image. Returns the session

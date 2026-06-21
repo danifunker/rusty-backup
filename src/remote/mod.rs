@@ -11,11 +11,13 @@
 //! new dependency), so the slim build can drop or keep it cheaply.
 
 pub mod client;
+pub mod connection;
 pub mod fs;
 pub mod protocol;
 pub mod server;
 
 pub use client::{OpenedImage, RemoteSession};
+pub use connection::RemoteConnection;
 pub use fs::{RemoteFilesystem, RemoteHostFilesystem};
 pub use protocol::RemoteRef;
 pub use server::{serve, serve_on, ServeConfig};
