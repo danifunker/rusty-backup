@@ -720,6 +720,17 @@ impl TempFileGuard {
     pub fn path(&self) -> Option<&Path> {
         self.temp_path.as_deref()
     }
+
+    /// A guard that deletes `path` when dropped, with no disk claim. Used for
+    /// engine-created scratch files (e.g. a remote disk materialized to a local
+    /// temp before a CHD / shrink backup) so they're cleaned up on any exit.
+    pub fn deleting(path: PathBuf) -> Self {
+        Self {
+            temp_path: Some(path),
+            #[cfg(target_os = "macos")]
+            _disk_claim: None,
+        }
+    }
 }
 
 impl Drop for TempFileGuard {

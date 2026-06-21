@@ -728,3 +728,139 @@ fn backup_remote_core_lists_and_loads_partitions() {
     assert_eq!(real.len(), 1, "one FAT partition parsed over the wire");
     assert_eq!(real[0].start_lba, part_lba as u64);
 }
+
+/// Remote **CHD** backup: a single-file CHD needs random-access local `File`
+/// reads, so the engine materializes the remote disk to a local temp first,
+/// then runs the normal local CHD pipeline. Proves the produced `.chd` opens
+/// and the partition data round-trips byte-exact — over the wire.
+///
+/// Uses `sector_by_sector` (a verbatim disk copy into the CHD) so the assertion
+/// is a clean byte-exact round-trip, isolated from the FAT defrag-packing path
+/// (`packed_partition_reader_padded`) which has a pre-existing multi-cluster
+/// truncation bug affecting local CHD backups too — out of scope here.
+#[cfg(feature = "chd")]
+#[test]
+fn run_backup_chd_materializes_remote_and_round_trips() {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Mutex;
+
+    use rusty_backup::backup::{
+        run_backup_from, BackupConfig, BackupProgress, BackupSource, ChecksumType, CompressionType,
+    };
+    use rusty_backup::fs::open_filesystem;
+    use rusty_backup::partition::mbr::{build_minimal_mbr, Mbr};
+    use rusty_backup::rbformats::chd::ChdReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("disk.img");
+
+    let part_lba = 2048u32;
+    let part_bytes = 8 * 1024 * 1024usize;
+    let part_sectors = (part_bytes / 512) as u32;
+    let fat_blob = fat::create_blank_fat(part_bytes as u64, Some("CHDVOL")).unwrap();
+    let mbr = build_minimal_mbr(
+        0xC0FF_EE00,
+        &[(0x06, part_lba, part_sectors, true)],
+        255,
+        63,
+    );
+    let mut disk = vec![0u8; part_lba as usize * 512 + part_bytes];
+    disk[..512].copy_from_slice(&mbr);
+    disk[part_lba as usize * 512..].copy_from_slice(&fat_blob);
+    std::fs::write(&img, &disk).unwrap();
+
+    let payload = vec![0x7Eu8; 21000];
+    {
+        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1)).unwrap();
+        let mut efs =
+            open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
+                .unwrap();
+        let parent = efs.root().unwrap();
+        let mut data = &payload[..];
+        efs.create_file(
+            &parent,
+            "CHD.BIN",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+        drop(efs);
+        commit.commit().unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    let dest = root.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let config = BackupConfig {
+        source_path: std::path::PathBuf::from("/disk.img"),
+        destination_dir: dest.clone(),
+        backup_name: "remote-chd".to_string(),
+        compression: CompressionType::Chd,
+        checksum: ChecksumType::Crc32,
+        split_size_mib: None,
+        // Verbatim copy into the CHD (no FAT packing) for a clean round-trip.
+        sector_by_sector: true,
+        partition_filter: None,
+        chd_options: None,
+        size_policy: None,
+        partition_target_sizes: None,
+        shrink_to_minimum: false,
+        precomputed_minimum_sizes: None,
+        defrag_partition_indices: None,
+    };
+    let progress = Arc::new(Mutex::new(BackupProgress::default()));
+    let source = BackupSource::Remote {
+        conn: Arc::clone(&conn),
+        path: "/disk.img".to_string(),
+        display: format!("rb://{addr}/disk.img"),
+        is_device: false,
+    };
+    run_backup_from(source, config, progress).expect("remote CHD backup must succeed");
+
+    // The single-file CHD lands at <dest>/<name>/<name>.chd; the scratch temp
+    // is cleaned up.
+    let backup_dir = dest.join("remote-chd");
+    let chd_path = backup_dir.join("remote-chd.chd");
+    assert!(chd_path.exists(), "single-file CHD written");
+    assert!(
+        !dest.join(".remote-chd.remote-download.tmp").exists(),
+        "the materialize scratch file is cleaned up"
+    );
+
+    // Open the produced CHD and round-trip the partition data over it.
+    let mut reader = ChdReader::open(&chd_path).expect("open produced CHD");
+    let mut sector = [0u8; 512];
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    reader.read_exact(&mut sector).unwrap();
+    let parsed = Mbr::parse(&sector).unwrap();
+    let p = parsed
+        .entries
+        .iter()
+        .find(|e| !e.is_empty())
+        .expect("partition in the CHD's MBR");
+    assert_eq!(p.start_lba, part_lba);
+    let mut fs = open_filesystem(reader, p.start_lba as u64 * 512, p.partition_type, None).unwrap();
+    let root_e = fs.root().unwrap();
+    let blob = fs
+        .list_directory(&root_e)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "CHD.BIN")
+        .expect("CHD.BIN in the round-tripped CHD");
+    let mut got = Vec::new();
+    fs.write_file_to(&blob, &mut got).unwrap();
+    assert_eq!(
+        got, payload,
+        "partition data round-trips byte-exact through the remote-materialized CHD"
+    );
+}

@@ -1856,8 +1856,9 @@ impl BackupTab {
                 if info.partitions.len() == 1 { "" } else { "s" }
             ));
             // Reuse the standard partition-selection state; the advanced
-            // per-partition columns (min-size / frag / compact) stay empty for
-            // a remote source and the engine ignores shrink/CHD over the wire.
+            // per-partition columns (min-size / frag) stay empty for a remote
+            // source. CHD + shrink-to-minimum still work — the engine
+            // materializes the remote disk to a local temp first.
             self.source_partitions = info.partitions;
             self.source_partition_table_desc = Some(info.table_desc);
             self.partition_load_error = None;
@@ -2003,14 +2004,10 @@ impl BackupTab {
                 return;
             }
         };
-        if matches!(
+        let is_chd = matches!(
             self.compression_type,
             CompressionType::Chd | CompressionType::Dvd
-        ) {
-            ctx.log
-                .error("CHD output isn't supported for a remote drive; choose Zstd, Raw, or VHD.");
-            return;
-        }
+        );
 
         let partition_filter = if self.selected_partitions.len()
             < self
@@ -2030,19 +2027,22 @@ impl BackupTab {
             backup_name: self.backup_name.clone(),
             compression: self.compression_type,
             checksum: self.checksum_type,
-            split_size_mib: if self.split_archives {
+            // CHD/DVD are single-file and can't be split.
+            split_size_mib: if self.split_archives && !is_chd {
                 Some(self.split_size_mib)
             } else {
                 None
             },
             sector_by_sector: self.sector_by_sector,
             partition_filter,
-            chd_options: None,
+            // CHD codec/hunk options when the output is a CHD profile.
+            chd_options: self.chd_options_for_compression(),
             size_policy: None,
             partition_target_sizes: None,
-            // Defrag-clone / in-place shrink need File-specific access the block
-            // tier doesn't expose; the engine ignores this for a remote source.
-            shrink_to_minimum: false,
+            // CHD + shrink-to-minimum work for a remote drive too: the engine
+            // materializes the remote disk to a local temp first, then runs the
+            // normal local pipeline (HFS+/PFS3 defrag-clone included).
+            shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
             precomputed_minimum_sizes: None,
             defrag_partition_indices: None,
         };

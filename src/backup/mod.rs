@@ -412,30 +412,181 @@ pub fn run_backup_from(
                 LogLevel::Info,
                 format!("Starting backup of remote {kind} {display}"),
             );
-            set_operation(&progress, "Opening remote source...");
-            // One round-trip to learn the source length (and prove it opens).
-            let size = {
-                let reader = if is_device {
-                    crate::remote::RemoteBlockReader::open_device(Arc::clone(&conn), &path)
+
+            // Single-file CHD and the HFS+/PFS3 defrag-clone (shrink-to-minimum)
+            // paths read the whole disk with positioned, random-access local
+            // `File` reads. Rather than refuse them over the wire, stream the
+            // remote disk to a local scratch file once (sequential bulk read)
+            // and run the *normal local pipeline* on it — full feature parity.
+            // The streaming per-partition path (Zstd/Raw/VHD, no shrink) stays
+            // direct, with no whole-disk temp.
+            let needs_local_copy = matches!(
+                config.compression,
+                CompressionType::Chd | CompressionType::Dvd
+            ) || config.shrink_to_minimum;
+
+            if needs_local_copy {
+                let reason = if matches!(
+                    config.compression,
+                    CompressionType::Chd | CompressionType::Dvd
+                ) {
+                    "CHD output"
                 } else {
-                    crate::remote::RemoteBlockReader::open(Arc::clone(&conn), &path)
-                }
-                .with_context(|| format!("failed to open remote source {path}"))?;
-                reader.len()
-            };
-            (
-                SourceFactory::Remote {
-                    conn,
-                    path,
-                    size,
+                    "shrink-to-minimum"
+                };
+                log(
+                    &progress,
+                    LogLevel::Info,
+                    format!(
+                        "{reason} needs a local copy of the remote {kind}; \
+                         downloading it first..."
+                    ),
+                );
+                let (file, guard, temp_path) = materialize_remote_to_temp(
+                    &conn,
+                    &path,
                     is_device,
-                },
-                display,
-            )
+                    &config.destination_dir,
+                    &config.backup_name,
+                    &progress,
+                )?;
+                (
+                    SourceFactory::Local {
+                        file,
+                        _guard: guard,
+                        path: temp_path,
+                    },
+                    display,
+                )
+            } else {
+                set_operation(&progress, "Opening remote source...");
+                // One round-trip to learn the source length (and prove it opens).
+                let size = {
+                    let reader = if is_device {
+                        crate::remote::RemoteBlockReader::open_device(Arc::clone(&conn), &path)
+                    } else {
+                        crate::remote::RemoteBlockReader::open(Arc::clone(&conn), &path)
+                    }
+                    .with_context(|| format!("failed to open remote source {path}"))?;
+                    reader.len()
+                };
+                (
+                    SourceFactory::Remote {
+                        conn,
+                        path,
+                        size,
+                        is_device,
+                    },
+                    display,
+                )
+            }
         }
     };
 
     run_backup_inner(&factory, source_display, config, progress)
+}
+
+/// Stream a whole remote source (image or device) to a local scratch file so
+/// the `File`-specific backup paths (single-file CHD, HFS+/PFS3 defrag-clone)
+/// can run on it exactly as for a local disk. Returns the read-only temp
+/// `File`, its auto-deleting guard, and the path. The temp lives in `dest_dir`
+/// (where the backup is written — the user already chose a roomy location) and
+/// is removed on any exit. Bulk sequential download in `MAX_RANGE_READ`-sized
+/// chunks (no random access), with progress + cancel.
+#[cfg(feature = "remote")]
+fn materialize_remote_to_temp(
+    conn: &Arc<Mutex<crate::remote::RemoteConnection>>,
+    path: &str,
+    is_device: bool,
+    dest_dir: &std::path::Path,
+    backup_name: &str,
+    progress: &Arc<Mutex<BackupProgress>>,
+) -> Result<(File, crate::os::TempFileGuard, PathBuf)> {
+    use std::io::Write;
+
+    // 4 MiB per request — the server's per-read cap; far fewer round-trips than
+    // the 256 KiB window the seekable RemoteBlockReader uses.
+    const CHUNK: u32 = 4 * 1024 * 1024;
+
+    let (handle, total) = {
+        let mut c = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote connection lock poisoned"))?;
+        if is_device {
+            c.open_device(path)
+        } else {
+            c.open_block(path)
+        }
+        .with_context(|| format!("failed to open remote source {path}"))?
+    };
+
+    std::fs::create_dir_all(dest_dir).ok();
+    let temp_path = dest_dir.join(format!(".{backup_name}.remote-download.tmp"));
+    // Build the delete-guard *before* writing so a mid-stream failure (or
+    // cancel) still removes the partial scratch file.
+    let guard = crate::os::TempFileGuard::deleting(temp_path.clone());
+
+    set_operation(progress, "Downloading remote disk...");
+    log(
+        progress,
+        LogLevel::Info,
+        format!(
+            "Downloading {} from the remote to a local scratch file ({})...",
+            partition::format_size(total),
+            temp_path.display()
+        ),
+    );
+    if let Ok(mut p) = progress.lock() {
+        p.total_bytes = total;
+        p.full_size_bytes = total;
+        p.current_bytes = 0;
+    }
+
+    let download = (|| -> Result<()> {
+        let mut writer = std::io::BufWriter::new(
+            File::create(&temp_path)
+                .with_context(|| format!("creating scratch file {}", temp_path.display()))?,
+        );
+        let mut offset: u64 = 0;
+        while offset < total {
+            if is_cancelled(progress) {
+                bail!("backup cancelled");
+            }
+            let want = (total - offset).min(CHUNK as u64) as u32;
+            let chunk = {
+                let mut c = conn
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("remote connection lock poisoned"))?;
+                c.read_block(handle, offset, want)
+                    .with_context(|| format!("reading remote disk at offset {offset}"))?
+            };
+            if chunk.is_empty() {
+                break; // short of `total` — the daemon hit EOF
+            }
+            writer
+                .write_all(&chunk)
+                .context("writing the scratch file")?;
+            offset += chunk.len() as u64;
+            set_progress_bytes(progress, offset, total);
+        }
+        writer.flush().context("flushing the scratch file")?;
+        Ok(())
+    })();
+
+    // Close the daemon-side handle regardless of how the download went.
+    if let Ok(mut c) = conn.lock() {
+        let _ = c.close_block(handle);
+    }
+    download?;
+
+    let file = File::open(&temp_path)
+        .with_context(|| format!("reopening scratch file {}", temp_path.display()))?;
+    log(
+        progress,
+        LogLevel::Info,
+        "Remote download complete; building the backup from the local copy...",
+    );
+    Ok((file, guard, temp_path))
 }
 
 /// The actual backup pipeline, source-agnostic via [`SourceFactory`].
@@ -445,30 +596,11 @@ fn run_backup_inner(
     config: BackupConfig,
     progress: Arc<Mutex<BackupProgress>>,
 ) -> Result<()> {
-    // A remote image is read-only over the block tier: the CHD single-file
-    // layout and the HFS+/PFS3 defrag-clone path both need `File`-specific
-    // access (whole-disk staging, positioned reads), so reject them up front
-    // with a clear message rather than silently producing a wrong artifact.
-    if factory.is_remote() {
-        if matches!(
-            config.compression,
-            CompressionType::Chd | CompressionType::Dvd
-        ) {
-            bail!(
-                "CHD backup of a remote image is not yet supported; \
-                 choose Zstd, Raw, or VHD output"
-            );
-        }
-        if config.shrink_to_minimum {
-            log(
-                &progress,
-                LogLevel::Warning,
-                "shrink-to-minimum is not yet supported over a remote image; \
-                 ignoring the flag (partitions keep their original size).",
-            );
-        }
-    }
-    // Effective shrink flag — never on for a remote source.
+    // CHD output and shrink-to-minimum need `File`-specific random-access
+    // reads, so `run_backup_from` materializes a remote source to a local temp
+    // before reaching here for those cases — the factory is `Local` by then.
+    // A `Remote` factory therefore only ever runs the streaming per-partition
+    // path (Zstd/Raw/VHD, no shrink); the guard keeps defrag-clone off it.
     let shrink_to_minimum = config.shrink_to_minimum && !factory.is_remote();
 
     set_operation(&progress, "Reading partition table...");
