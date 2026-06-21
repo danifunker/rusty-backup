@@ -52,15 +52,43 @@ CHD → clear bail; remote + shrink-to-minimum → warn + ignore). So remote bac
   partition, `mbr.bin` == sector 0, and metadata records the `rb://…` source +
   full size. 7/7 remote loopback tests green.
 - GUI (compile-verified only): Inspect tab → inspect a remote image → **"Back Up
-  Image..."** button (next to "Pick Another Image" / "Close Remote") picks a
-  destination folder and spawns `run_backup_from(BackupSource::Remote)` on a
-  worker, polled into the log via `poll_remote_backup_status`. **Needs an
-  interactive check.**
-- **Bigger sibling (still open):** remote **physical-drive** backup — daemon
-  enumerates devices (`os::enumerate_devices`), runs elevated, + a `ListDevices`
-  verb + raw-device block reads (handoff §2/§8). The image-file backup above was
-  the smaller first step on the same block tier; the `SourceFactory` seam is the
-  reusable foundation for it.
+  Image..."** button picks a destination folder and spawns
+  `run_backup_from(BackupSource::Remote)`.
+- **NOTE (user feedback):** image-file backup is "cool but not the target" — the
+  real goal is the physical-drive backup below. See memory
+  `[[remote-backup-priority]]`.
+
+### 1b. Remote PHYSICAL-DRIVE backup — DONE (the actual goal)
+**DONE — engine `ce8fbfc` + Backup-tab GUI `29a4245`.** The daemon enumerates its
+own disks and serves a raw device over the same block tier; the desktop pulls a
+backup of a remote drive without moving the media.
+- **Daemon (`ce8fbfc`):** protocol v2 adds `ListDevices -> Devices{Vec<WireDevice>}`
+  and `OpenDevice{path}` (device-backed sibling of `OpenBlock`). `OpenDevice` is
+  **not** sandbox-joined under `--root`; the path must match a live
+  `enumerate_devices()` entry exactly (so it can't read arbitrary files),
+  read-only, size via ioctl (a device's `metadata().len()` is 0). `block_handles`
+  now stores `(File, size)`. **Needs root** on the daemon for raw-disk read (the
+  MiSTer runs as root, so fine).
+- **Desktop:** `RemoteBlockReader::open_device`; `BackupSource::Remote` /
+  `SourceFactory::Remote` gain `is_device` → `run_backup_from` opens the right
+  kind; the rest of the pipeline is identical (a drive backs up exactly like a
+  remote image). Testable core `src/model/backup_remote.rs`
+  (`connect_and_list_devices` / `load_remote_source`).
+- **Backup tab GUI (compile-verified only):** source dropdown → **"Remote
+  Drive..."** → connect dialog (host:port) → device list → pick a drive → loads
+  its partition table over the wire → Start Backup runs
+  `run_backup_from(BackupSource::Remote{is_device:true})`. Zstd/Raw/VHD
+  per-partition (CHD + shrink steered off). `RemoteSourceState` + `poll_remote` +
+  `show_remote_picker` + `start_remote_backup`.
+- Tests: `list_devices_round_trips_and_open_device_reads` (ListDevices round-trips;
+  `/etc/hostname` refused as "not an enumerated device"; real-device read is
+  best-effort, skipped without root) + `backup_remote_core_lists_and_loads_partitions`.
+  9/9 remote loopback tests green.
+- **TO TEST:** reload `rb-cli` on the MiSTer (new daemon verbs) + interactive
+  Backup-tab check: connect → pick a drive → Start Backup → byte-exact pull.
+- **Still open:** Restore-tab remote **target**; whole-disk (no partition table)
+  device handling polish; macOS `/dev/rdiskN` read-alignment (the daemon target is
+  Linux/MiSTer, so unaddressed).
 
 ### 2. Remote EDITING (write back) — `open_editable` refuses remote today
 Two options (decide first):

@@ -381,7 +381,9 @@ hook), commit, and validate over loopback.
 ## 6. Current commits (newest first, on `add-crusty-backup-dos-poc`)
 
 ```
-d092bc7 remote: back up a remote image over the block tier (per-partition)   <- Step 4 (remote backup)
+29a4245 remote: back up a remote physical drive from the Backup tab          <- Step 4 (device backup GUI)
+ce8fbfc remote: daemon serves physical devices for backup (ListDevices+OpenDevice) <- Step 4 (device engine)
+d092bc7 remote: back up a remote image over the block tier (per-partition)   <- Step 4 (remote image backup)
 8385a72 docs: resume prompt for the remaining remote-access items
 af87ea1 remote: Inspect wired (browse/fsck/calc-min/switch over the block tier)
 afaeb91 remote: block tier — RemoteBlockReader (Read+Seek over the wire)     <- block-tier core (PROVEN)
