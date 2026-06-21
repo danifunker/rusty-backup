@@ -3,7 +3,6 @@
 //!
 //! Binds a port-0 listener *before* spawning the daemon thread, so the connect
 //! lands in the OS listen backlog with no sleep/race, then drives the adapter.
-#![cfg(feature = "remote")]
 
 use std::net::TcpListener;
 

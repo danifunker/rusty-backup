@@ -205,7 +205,6 @@ pub enum Command {
     /// Run the network daemon so a remote `rb-cli` can browse and read
     /// files inside images this host holds (`rb://host:port/img@N`).
     /// Family F read-only (Phase 0). See docs/remote_transfer_plan.md.
-    #[cfg(feature = "remote")]
     Serve(verbs::serve::ServeArgs),
 
     /// Back up a disk image or device to a backup folder.
@@ -336,7 +335,6 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
-        #[cfg(feature = "remote")]
         Command::Serve(args) => verbs::serve::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),

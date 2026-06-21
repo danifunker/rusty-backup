@@ -131,7 +131,6 @@ pub struct CpArgs {
 pub fn run(args: CpArgs) -> Result<()> {
     // On-device remote->remote copy: both images are rb:// refs on the same
     // daemon, so the file data never round-trips through the desktop.
-    #[cfg(feature = "remote")]
     {
         let src_remote = crate::remote::RemoteRef::parse(&args.src_image.path.to_string_lossy());
         let dst_remote = crate::remote::RemoteRef::parse(&args.dst_image.path.to_string_lossy());
@@ -245,7 +244,6 @@ pub fn run(args: CpArgs) -> Result<()> {
 /// On-device remote→remote copy: read SRC from one image on the daemon and
 /// write it into another image on the **same** daemon, with no desktop data
 /// round-trip. Phase 2: a single literal file (globs / `-r` deferred).
-#[cfg(feature = "remote")]
 fn remote_cp(
     src: &crate::remote::RemoteRef,
     dst: &crate::remote::RemoteRef,
@@ -295,7 +293,6 @@ fn remote_cp(
 }
 
 /// Last `/`-separated component of a source path.
-#[cfg(feature = "remote")]
 fn src_basename(src: &str) -> &str {
     src.trim_end_matches('/').rsplit('/').next().unwrap_or(src)
 }
