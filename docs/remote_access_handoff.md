@@ -288,8 +288,18 @@ engine does ALL parsing. **DONE & PROVEN (commit `afaeb91`):**
   response. Server reads a sandboxed file's range (4 MiB/read cap). Client
   `RemoteSession::{host_file_size,read_host_range}` + `RemoteConnection` brokers.
 - **`RemoteBlockReader`** (`src/remote/block_reader.rs`): `Read + Seek` over the
-  wire via `ReadHostRange`, one 256 KiB read-ahead window cached. `Send +
-  'static` → feeds straight into `open_filesystem` / any `Read+Seek` engine code.
+  wire, one 256 KiB read-ahead window cached. `Send + 'static` → feeds straight
+  into `open_filesystem` / any `Read+Seek` engine code.
+- **Handle-based — the image STAYS OPEN on the daemon (commit `dacda9c`).** Per
+  user direction, the v2 verbs are now `OpenBlock{path}->BlockOpened{handle,size}`
+  / `ReadBlock{handle,offset,len}` / `CloseBlock{handle}`: the daemon keeps the
+  file open in a per-connection block-handle table for the session (the user
+  works against one open image), and `RemoteBlockReader` closes the handle on
+  drop. (Replaced the earlier stateless `HostFileSize`/`ReadHostRange`.)
+- **Scope trim (user, 2026-06-21):** **skip export-to-new-files over the wire
+  initially** — the remote interaction is "simple read requests, daemon reflects
+  the open image." So the near-term integration is inspect + per-partition browse
+  + read; backup/export/resize over the wire come later.
 - **Headless test** `block_reader_parses_remote_partition_table_and_filesystem`:
   builds a real MBR-partitioned FAT disk, serves it, and over the block reader
   reads byte-exact across seeks, parses the MBR, opens the partition's FS, reads a
