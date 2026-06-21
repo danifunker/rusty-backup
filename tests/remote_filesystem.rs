@@ -734,10 +734,9 @@ fn backup_remote_core_lists_and_loads_partitions() {
 /// then runs the normal local CHD pipeline. Proves the produced `.chd` opens
 /// and the partition data round-trips byte-exact — over the wire.
 ///
-/// Uses `sector_by_sector` (a verbatim disk copy into the CHD) so the assertion
-/// is a clean byte-exact round-trip, isolated from the FAT defrag-packing path
-/// (`packed_partition_reader_padded`) which has a pre-existing multi-cluster
-/// truncation bug affecting local CHD backups too — out of scope here.
+/// Smart (defrag-packed) mode, so it also exercises the FAT packer through the
+/// full remote→materialize→CHD→pack→round-trip path. The 21000-byte file spans
+/// many clusters, which would truncate before the FAT-type-preservation fix.
 #[cfg(feature = "chd")]
 #[test]
 fn run_backup_chd_materializes_remote_and_round_trips() {
@@ -808,8 +807,8 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
         compression: CompressionType::Chd,
         checksum: ChecksumType::Crc32,
         split_size_mib: None,
-        // Verbatim copy into the CHD (no FAT packing) for a clean round-trip.
-        sector_by_sector: true,
+        // Smart mode: defrag-pack the FAT into the CHD (exercises the packer).
+        sector_by_sector: false,
         partition_filter: None,
         chd_options: None,
         size_policy: None,
