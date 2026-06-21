@@ -44,6 +44,11 @@ const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
 const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 /// Tint for an existing entry with staged metadata edits (type/dates/perms).
 const META_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 190, 255);
+/// A file in a remote-host listing that looks like a disk image we can open
+/// (a teal, distinct from the folder blue and the gray of plain files).
+const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
+/// The "Close Image" affordance — amber, to read as "step back out".
+const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
 
 /// What a pane reports back to [`super::CommanderMode`] after a frame.
 #[derive(Default)]
@@ -153,6 +158,9 @@ pub(crate) struct CommanderPane {
     pending_remote: Option<Arc<Mutex<RemoteOpenStatus>>>,
     /// The open "Connect to remote..." dialog, if any.
     connect_dialog: Option<ConnectDialog>,
+    /// The host-FS directory an image was opened from, so "Close Image" returns
+    /// there instead of the host root.
+    remote_host_return: Option<String>,
 }
 
 /// A live remote-pane connection (and the marker that the pane is remote).
@@ -273,6 +281,7 @@ impl CommanderPane {
             remote: None,
             pending_remote: None,
             connect_dialog: None,
+            remote_host_return: None,
         }
     }
 
@@ -360,7 +369,8 @@ impl CommanderPane {
             checksums = actions.checksums;
             detail = actions.detail;
             focused = actions.focused;
-            // Open a file on a remote-host pane as a disk image.
+            // Open a file on a remote-host pane as a disk image. Remember the
+            // host folder it came from so "Close Image" returns here.
             if let Some(name) = actions.open_image {
                 let path = self
                     .listing
@@ -370,6 +380,7 @@ impl CommanderPane {
                     .map(|e| e.path.clone());
                 let addr = self.remote.as_ref().map(|r| r.addr.clone());
                 if let (Some(path), Some(addr)) = (path, addr) {
+                    self.remote_host_return = Some(self.listing.cwd_path().to_string());
                     status = Some(self.spawn_open_image(addr, path, None));
                 }
             }
@@ -750,14 +761,16 @@ impl CommanderPane {
                 )
             };
             self.connect_dialog = None;
-            return Some(self.spawn_connect_host(addr));
+            return Some(self.spawn_connect_host(addr, "/".to_string()));
         }
         None
     }
 
-    /// Connect and open the daemon's host filesystem (the file browser) on a
-    /// worker thread — a connect can block on an unreachable host.
-    fn spawn_connect_host(&mut self, addr: String) -> String {
+    /// Connect and open the daemon's host filesystem (the file browser) at
+    /// `root_path` on a worker thread — a connect can block on an unreachable
+    /// host. Used for the initial connect (`/`) and for "Close Image" (back to
+    /// the folder the image was opened from).
+    fn spawn_connect_host(&mut self, addr: String, root_path: String) -> String {
         let status = Arc::new(Mutex::new(RemoteOpenStatus {
             addr: addr.clone(),
             ..Default::default()
@@ -766,7 +779,7 @@ impl CommanderPane {
         self.open_phase = format!("Connecting to {addr}...");
         let msg = format!("[{}] connecting to {addr}...", self.side.label());
         std::thread::spawn(move || {
-            let result = rusty_backup::remote::RemoteHostFilesystem::open(&addr, "/")
+            let result = rusty_backup::remote::RemoteHostFilesystem::open(&addr, &root_path)
                 .map(|(fs, root, entries)| RemoteOpened::Host { fs, root, entries })
                 .map_err(|e| format!("{e:#}"));
             if let Ok(mut s) = status.lock() {
@@ -1094,8 +1107,14 @@ impl CommanderPane {
                 match &r.mode {
                     RemoteMode::Host => format!("Remote {} (host)", r.addr),
                     RemoteMode::Image { path, partition } => {
+                        // Host + image basename only — the full remote path is
+                        // long and the in-image position shows in the breadcrumb.
+                        let base = path
+                            .rsplit('/')
+                            .find(|s| !s.is_empty())
+                            .unwrap_or(path.as_str());
                         let part = partition.map(|n| format!("@{n}")).unwrap_or_default();
-                        format!("Remote {}{}{}", r.addr, path, part)
+                        format!("Remote {}: {base}{part}", r.addr)
                     }
                 }
             } else if self.listing.is_host() {
@@ -1180,11 +1199,38 @@ impl CommanderPane {
                 });
             }
 
+            // When inside a remote image, "Close Image" steps back to the host
+            // browser (the folder it was opened from) — distinct from "Close",
+            // which unloads the whole connection.
+            if matches!(
+                &self.remote,
+                Some(RemoteConn {
+                    mode: RemoteMode::Image { .. },
+                    ..
+                })
+            ) {
+                let btn =
+                    egui::Button::new(egui::RichText::new("Close Image").color(CLOSE_IMAGE_COLOR));
+                if ui
+                    .add_enabled(self.queue.is_empty(), btn)
+                    .on_hover_text("Back to browsing the remote host filesystem")
+                    .clicked()
+                {
+                    if let Some(addr) = self.remote.as_ref().map(|r| r.addr.clone()) {
+                        let ret = self
+                            .remote_host_return
+                            .clone()
+                            .unwrap_or_else(|| "/".to_string());
+                        status = Some(self.spawn_connect_host(addr, ret));
+                    }
+                }
+            }
+
             // Close (unload) this pane — guarded by unsaved staged edits.
             if (self.source.is_some() || self.listing.is_loaded())
                 && ui
                     .button("Close")
-                    .on_hover_text("Unload this pane")
+                    .on_hover_text("Unload this pane / disconnect")
                     .clicked()
             {
                 if self.queue.is_empty() {
@@ -2124,6 +2170,9 @@ struct DisplayRow {
     /// A metadata edit (type/creator, dates, permissions, ...) is staged for
     /// this existing entry — tints the row blue.
     meta_changed: bool,
+    /// A file in a remote-host listing whose name looks like a disk image we can
+    /// open — tinted so the user knows it's openable (double-click / Open Image).
+    is_image: bool,
 }
 
 impl DisplayRow {
@@ -2132,12 +2181,25 @@ impl DisplayRow {
     }
 }
 
+/// Whether a filename's extension is one of the disk-image containers the
+/// engine can open (so the remote file browser can tint it as openable).
+fn looks_like_disk_image(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, ext)| {
+            rusty_backup::model::file_types::DISK_IMAGE_EXTS
+                .contains(&ext.to_ascii_lowercase().as_str())
+        })
+        .unwrap_or(false)
+}
+
 impl CommanderPane {
     /// Build the rendered rows, merging the staged-edit overlay: real entries
     /// flagged pending-delete where the queue has a delete for them, and the
     /// queue's pending adds for this directory appended as green rows.
     fn build_display_rows(&self) -> Vec<DisplayRow> {
         let cwd_path = self.listing.cwd_path().to_string();
+        // On a remote-host pane, flag files that look like disk images.
+        let remote_host = self.is_remote_host();
         let mut rows: Vec<DisplayRow> = self
             .listing
             .current_rows()
@@ -2152,6 +2214,7 @@ impl CommanderPane {
                     kind: RowKind::Parent,
                     rename_to: None,
                     meta_changed: false,
+                    is_image: false,
                 },
                 Row::Entry(e) => {
                     let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
@@ -2163,6 +2226,9 @@ impl CommanderPane {
                         RowKind::Normal
                     };
                     DisplayRow {
+                        is_image: remote_host
+                            && !e.is_directory()
+                            && looks_like_disk_image(&e.name),
                         name: e.name.clone(),
                         is_dir: e.is_directory(),
                         size: e.size,
@@ -2186,6 +2252,7 @@ impl CommanderPane {
                 kind: RowKind::PendingAdd,
                 rename_to: None,
                 meta_changed: false,
+                is_image: false,
             });
         }
         rows
@@ -2247,6 +2314,7 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
         RowKind::PendingRename => ADD_COLOR,
         RowKind::PendingDelete => DEL_COLOR,
         RowKind::Normal if row.meta_changed => META_COLOR,
+        RowKind::Normal if row.is_image => IMAGE_COLOR,
         RowKind::Normal if row.is_dir => egui::Color32::from_rgb(120, 160, 255),
         RowKind::Normal => base,
     };

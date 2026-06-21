@@ -465,12 +465,28 @@ impl CommanderMode {
                     Err(e) => format!("Copy failed: {e:#}"),
                 }
             }
-            // image -> host: immediate extraction on a worker thread.
+            // image -> host: immediate extraction.
             (false, true) => {
+                let dest_dir = PathBuf::from(&dest_parent.path);
+                // A remote image pane has no local BrowseSession (the threaded
+                // host-copy job needs one), so extract over the wire via its
+                // filesystem instead. Synchronous for now — fine for the small
+                // files this targets; large-file async is a follow-up.
+                if src.session().is_none() {
+                    let Some(src_fs) = src.fs_mut() else {
+                        return "Source volume is not open.".to_string();
+                    };
+                    return match extract_entries_to_host(src_fs, &entries, &dest_dir) {
+                        Ok(n) => {
+                            dest.reload_listing();
+                            format!("Copied {n} item(s) to the {other} folder.")
+                        }
+                        Err(e) => format!("Copy failed: {e}"),
+                    };
+                }
                 let Some(session) = src.session() else {
                     return "Source volume is not open.".to_string();
                 };
-                let dest_dir = PathBuf::from(&dest_parent.path);
                 let job = HostCopyJob::ImageToHost {
                     session,
                     entries,
@@ -915,6 +931,35 @@ impl CommanderMode {
 }
 
 /// Local-time `HH:MM:SS` stamp prefixed to each session-log entry.
+/// Recursively extract `entries` from a source filesystem to a host directory.
+/// Used for a remote image -> host copy, where there's no local `BrowseSession`
+/// for the threaded host-copy job — the remote `Filesystem` streams the bytes
+/// over the wire via `write_file_to`.
+fn extract_entries_to_host(
+    src_fs: &mut dyn rusty_backup::fs::filesystem::Filesystem,
+    entries: &[FileEntry],
+    dest_dir: &std::path::Path,
+) -> std::io::Result<usize> {
+    let mut count = 0;
+    for e in entries {
+        let target = dest_dir.join(&e.name);
+        if e.is_directory() {
+            std::fs::create_dir_all(&target)?;
+            let children = src_fs
+                .list_directory(e)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            count += extract_entries_to_host(src_fs, &children, &target)?;
+        } else {
+            let mut f = std::fs::File::create(&target)?;
+            src_fs
+                .write_file_to(e, &mut f)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn log_timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
