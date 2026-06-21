@@ -219,8 +219,41 @@ A **`RemoteBrowser` window/component** (own module, e.g.
    refactor `RemoteFilesystem`/`RemoteHostFilesystem` into views over it. Keep the
    loopback test green; add a test that **opens two images on one connection**
    (proves no-reconnect switching).
+   **DONE — commit `92829b6`.** `src/remote/connection.rs`: `RemoteConnection`
+   owns the one `RemoteSession`, tracks open-image handles, brokers
+   `open_image`/`close_image`/`list_dir`/`read_file` + host browse;
+   `connect_shared(addr) -> Arc<Mutex<RemoteConnection>>`. The two FS adapters are
+   now thin views holding `Arc<Mutex<RemoteConnection>>` + a handle, locking per
+   `Filesystem` call (`lock_conn` maps a poisoned mutex to an I/O error). New
+   constructors: `RemoteFilesystem::on_connection(conn, path, partition)` /
+   `RemoteHostFilesystem::on_connection(conn, root_path)` (the no-reconnect path);
+   the old `open(addr, …)` stays as a fresh-connection convenience (creates its
+   own `connect_shared`), so Commander + the CLI compile unchanged. A
+   `RemoteFilesystem` releases its handle on **drop via `try_lock`** (never
+   blocks — skips if an op holds the lock, daemon reaps on disconnect). Added
+   `RemoteSession::close` for the read-side `Close{handle}`. Both views expose
+   `connection()` to clone the shared `Arc<Mutex<…>>` (open another image on it).
+   Test: `two_images_open_on_one_connection_without_reconnect` in
+   `tests/remote_filesystem.rs` — interleaved byte-exact reads of two images on
+   one connection + handle bookkeeping.
 2. **`RemoteBrowser`** egui component; refactor Commander's pane to use it
    (behavior parity: connect → host browse → open image → Close Image → copy).
+   **NEXT.** The plumbing the pane needs now exists: keep an
+   `Option<Arc<Mutex<RemoteConnection>>>` on the browser; **initial connect** (and
+   "Remote…" to a new host) calls `RemoteConnection::connect_shared` then
+   `RemoteHostFilesystem::on_connection`; **open image** reuses that same
+   connection via `RemoteFilesystem::on_connection(conn.clone(), …)`; **Close
+   Image** re-browses host via `RemoteHostFilesystem::on_connection(conn.clone(),
+   return_dir)` — *no reconnect*. Today's `pane.rs` `spawn_connect_host` /
+   `spawn_open_image` each call the old `open(addr, …)` (fresh connection every
+   time); the refactor is to thread the shared `conn` through both and only
+   create a new one on the initial/explicit connect. Drop ordering is safe: an
+   open runs on a worker thread holding an `Arc` clone; when `poll_remote` swaps
+   the new fs into the listing, the old view drops on the UI thread and its
+   `try_lock` close runs uncontended (the worker has finished). Consider building
+   a **testable browser-state core** (connection + nav state machine, headlessly
+   tested over `serve_on`) with the egui `show()` as a thin renderer, so Inspect
+   (Step 3) reuses the same core.
 3. **Inspect "Open Remote…"** → `RemoteBrowser` → open image; switch without
    reconnect.
 4. **Backup/Restore tabs** — remote image source/target first (reuses the read
@@ -265,6 +298,7 @@ hook), commit, and validate over loopback.
 ## 6. Current commits (newest first, on `add-crusty-backup-dos-poc`)
 
 ```
+92829b6 remote: shared RemoteConnection (one session, many open images)   <- Step 1
 942e3db remote: UI polish + fix remote-image -> host copy
 a161b4e remote: rework GUI pane into a file browser (connect -> browse -> open image)
 bc6e672 remote: RemoteHostFilesystem + ReadHostFile — the file-browser foundation
