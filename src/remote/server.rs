@@ -129,6 +129,9 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
     let mut writer = BufWriter::new(stream);
     let mut handles: HashMap<u64, Box<dyn Filesystem>> = HashMap::new();
     let mut next_handle: u64 = 1;
+    // Block tier: host image files kept open for ranged reads. Shares the
+    // `next_handle` counter so handles are unique across both tables.
+    let mut block_handles: HashMap<u64, std::fs::File> = HashMap::new();
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut next_session: u64 = 1;
 
@@ -329,19 +332,23 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 },
             },
 
-            Request::HostFileSize { path } => match sandbox_join(root, &path) {
+            Request::OpenBlock { path } => match open_block(root, &path) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
-                Ok(full) => match std::fs::metadata(&full) {
-                    Ok(m) if m.is_dir() => {
-                        reply_err(&mut writer, format!("{path} is a directory"))?
-                    }
-                    Ok(m) => write_control(&mut writer, &Response::FileSize { len: m.len() })?,
-                    Err(e) => reply_err(&mut writer, format!("stat {path}: {e}"))?,
-                },
+                Ok((file, size)) => {
+                    let handle = next_handle;
+                    next_handle += 1;
+                    block_handles.insert(handle, file);
+                    write_control(&mut writer, &Response::BlockOpened { handle, size })?;
+                }
             },
 
-            Request::ReadHostRange { path, offset, len } => {
-                match read_host_range(root, &path, offset, len) {
+            Request::ReadBlock {
+                handle,
+                offset,
+                len,
+            } => match block_handles.get_mut(&handle) {
+                None => reply_err(&mut writer, format!("no such block handle {handle}"))?,
+                Some(file) => match read_block(file, offset, len) {
                     Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
                     Ok(buf) => {
                         // Commit to the stream: FileBegin{actual len}, then the
@@ -354,11 +361,16 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                         )?;
                         let mut cw = ChunkWriter::new(&mut writer);
                         if let Err(e) = cw.write_all(&buf) {
-                            return Err(anyhow!("sending range of {path}: {e}"));
+                            return Err(anyhow!("sending block of handle {handle}: {e}"));
                         }
                         cw.finish()?;
                     }
-                }
+                },
+            },
+
+            Request::CloseBlock { handle } => {
+                block_handles.remove(&handle);
+                write_control(&mut writer, &Response::Ok)?;
             }
 
             Request::StageCopyLocal {
@@ -582,32 +594,38 @@ fn stage_copy_local(
     ))
 }
 
-/// Largest single `ReadHostRange` we honour — bounds one block-reader fetch so a
+/// Largest single `ReadBlock` we honour — bounds one block-reader fetch so a
 /// hostile `len` can't make us allocate unbounded. The reader fetches in windows
 /// well under this; a larger ask is simply clamped.
 const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
 
-/// Read up to `len` bytes of a host file starting at `offset` (sandboxed). A read
-/// at/after EOF returns an empty/short buffer rather than erroring — the
-/// block-reader treats that as EOF.
-fn read_host_range(root: &Path, rel: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+/// Open a host file as a raw block device (sandboxed): returns the open handle
+/// plus its length, kept open by the caller for the session's ranged reads.
+fn open_block(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
     let full = sandbox_join(root, rel)?;
     if full.is_dir() {
         bail!("{rel} is a directory");
     }
-    let mut f =
-        std::fs::File::open(&full).with_context(|| format!("opening {}", full.display()))?;
+    let f = std::fs::File::open(&full).with_context(|| format!("opening {}", full.display()))?;
     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok((f, size))
+}
+
+/// Read up to `len` bytes from an open block handle at `offset`. A read at/after
+/// EOF returns an empty/short buffer rather than erroring — the block reader
+/// treats that as EOF.
+fn read_block(file: &mut std::fs::File, offset: u64, len: u32) -> Result<Vec<u8>> {
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     if offset >= size {
         return Ok(Vec::new());
     }
     let want = len.min(MAX_RANGE_READ) as u64;
     let avail = (size - offset).min(want) as usize;
-    f.seek(SeekFrom::Start(offset))
-        .with_context(|| format!("seeking {rel} to {offset}"))?;
+    file.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking block handle to {offset}"))?;
     let mut buf = vec![0u8; avail];
-    f.read_exact(&mut buf)
-        .with_context(|| format!("reading {avail} bytes of {rel} at {offset}"))?;
+    file.read_exact(&mut buf)
+        .with_context(|| format!("reading {avail} bytes at {offset}"))?;
     Ok(buf)
 }
 

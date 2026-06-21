@@ -22,9 +22,14 @@ use crate::remote::connection::RemoteConnection;
 const WINDOW: u64 = 256 * 1024;
 
 /// A `Read + Seek` view over a disk image on a remote daemon.
+///
+/// Holds a block **handle** that keeps the image open on the daemon for the
+/// reader's lifetime (closed on drop), so the user works against one open image
+/// rather than reopening it per read.
 pub struct RemoteBlockReader {
     conn: Arc<Mutex<RemoteConnection>>,
     path: String,
+    handle: u64,
     len: u64,
     pos: u64,
     /// Cached window covering `[cache_start, cache_start + cache.len())`.
@@ -33,18 +38,19 @@ pub struct RemoteBlockReader {
 }
 
 impl RemoteBlockReader {
-    /// Open `path` on the daemon for ranged reading: fetch its length, ready to
-    /// seek/read. Blocking (one round-trip for the size).
+    /// Open `path` on the daemon for ranged reading — the daemon keeps the file
+    /// open and returns a handle + the image length. Blocking (one round-trip).
     pub fn open(conn: Arc<Mutex<RemoteConnection>>, path: &str) -> anyhow::Result<Self> {
-        let len = {
+        let (handle, len) = {
             let mut c = conn
                 .lock()
                 .map_err(|_| anyhow::anyhow!("remote connection lock poisoned"))?;
-            c.host_file_size(path)?
+            c.open_block(path)?
         };
         Ok(Self {
             conn,
             path: path.to_string(),
+            handle,
             len,
             pos: 0,
             cache: Vec::new(),
@@ -82,12 +88,23 @@ impl RemoteBlockReader {
                 .conn
                 .lock()
                 .map_err(|_| io::Error::other("remote connection lock poisoned"))?;
-            c.read_host_range(&self.path, start, want as u32)
+            c.read_block(self.handle, start, want as u32)
                 .map_err(io::Error::other)?
         };
         self.cache_start = start;
         self.cache = buf;
         Ok(())
+    }
+}
+
+impl Drop for RemoteBlockReader {
+    fn drop(&mut self) {
+        // Best-effort: close the daemon-side block handle so the image doesn't
+        // stay open after the reader goes away. `try_lock` never blocks — if an
+        // op holds the lock we skip and the daemon reaps it on disconnect.
+        if let Ok(mut c) = self.conn.try_lock() {
+            let _ = c.close_block(self.handle);
+        }
     }
 }
 

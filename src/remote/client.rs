@@ -297,30 +297,31 @@ impl RemoteSession {
         }
     }
 
-    /// Report a host file's size in bytes (the block-reader's first call, to
-    /// learn an image's length before ranged reads).
-    pub fn host_file_size(&mut self, path: &str) -> Result<u64> {
+    /// Open a host image file as a raw block device on the daemon — it stays
+    /// open for the session. Returns `(handle, size)`. The block-reader's first
+    /// call.
+    pub fn open_block(&mut self, path: &str) -> Result<(u64, u64)> {
         write_control(
             &mut self.writer,
-            &Request::HostFileSize {
+            &Request::OpenBlock {
                 path: path.to_string(),
             },
         )?;
         match self.read_response()? {
-            Response::FileSize { len } => Ok(len),
-            Response::Error { message } => bail!("size {path}: {message}"),
-            other => bail!("unexpected reply to HostFileSize: {other:?}"),
+            Response::BlockOpened { handle, size } => Ok((handle, size)),
+            Response::Error { message } => bail!("open block {path}: {message}"),
+            other => bail!("unexpected reply to OpenBlock: {other:?}"),
         }
     }
 
-    /// Read a byte range `[offset, offset+len)` of a host file into a buffer.
+    /// Read a byte range `[offset, offset+len)` from an open block handle.
     /// Returns the bytes actually read (short at EOF, empty past it) — the wire
     /// primitive behind [`crate::remote::block_reader::RemoteBlockReader`].
-    pub fn read_host_range(&mut self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+    pub fn read_block(&mut self, handle: u64, offset: u64, len: u32) -> Result<Vec<u8>> {
         write_control(
             &mut self.writer,
-            &Request::ReadHostRange {
-                path: path.to_string(),
+            &Request::ReadBlock {
+                handle,
                 offset,
                 len,
             },
@@ -329,12 +330,18 @@ impl RemoteSession {
             Response::FileBegin { .. } => {
                 let mut buf = Vec::new();
                 read_chunks(&mut self.reader, &mut buf)
-                    .map_err(|e| anyhow!("reading range of {path}: {e}"))?;
+                    .map_err(|e| anyhow!("reading block of handle {handle}: {e}"))?;
                 Ok(buf)
             }
-            Response::Error { message } => bail!("read range {path}: {message}"),
-            other => bail!("unexpected reply to ReadHostRange: {other:?}"),
+            Response::Error { message } => bail!("read block {handle}: {message}"),
+            other => bail!("unexpected reply to ReadBlock: {other:?}"),
         }
+    }
+
+    /// Close an open block handle on the daemon.
+    pub fn close_block(&mut self, handle: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::CloseBlock { handle })?;
+        self.expect_ok("CloseBlock")
     }
 
     /// Replay the session's staged edits onto the image; returns the count.

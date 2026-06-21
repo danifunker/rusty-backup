@@ -119,15 +119,20 @@ pub enum Request {
     /// The host-FS analog of `ReadFile` — for copying a file off the remote, or
     /// the file browser's preview.
     ReadHostFile { path: String },
-    /// Report a host file's size in bytes (reply: `FileSize`). Used by the
-    /// block-reader tier to learn an image's length before ranged reads.
-    HostFileSize { path: String },
-    /// Read a byte **range** of a host file (reply: `FileBegin{size: actual}`,
-    /// then a chunk stream of that many bytes). `len` is capped server-side; a
-    /// read past EOF returns the short tail. The wire primitive behind a
-    /// `RemoteBlockReader` — seekable raw access to a remote image so the desktop
-    /// engine parses partitions / filesystems without downloading the whole disk.
-    ReadHostRange { path: String, offset: u64, len: u32 },
+
+    // --- block tier (v2): a host image file kept OPEN on the daemon for ---
+    // --- seekable ranged reads, so the desktop engine parses partitions / ---
+    // --- filesystems (and inspects) without downloading the whole disk. ---
+    /// Open a host file as a raw block device and keep it open on the daemon
+    /// (reply: `BlockOpened{handle, size}`). The handle lives until `CloseBlock`
+    /// or the connection drops — so the user works against one open image.
+    OpenBlock { path: String },
+    /// Read a byte range from an open block handle (reply: `FileBegin{size:
+    /// actual}`, then a chunk stream of that many bytes). `len` is capped
+    /// server-side; a read past EOF returns the short tail.
+    ReadBlock { handle: u64, offset: u64, len: u32 },
+    /// Close an open block handle.
+    CloseBlock { handle: u64 },
     /// Stage an **on-device** copy: the daemon reads `src_path` from `src_image`
     /// (relative to the serve root, partition `src_partition`) and queues it as
     /// an AddFile into the session's destination image — no desktop round-trip.
@@ -174,8 +179,8 @@ pub enum Response {
     Applied { count: u64 },
     /// `HostStat` result: whether the path exists and is a directory.
     HostKind { exists: bool, is_dir: bool },
-    /// `HostFileSize` result: the file's length in bytes.
-    FileSize { len: u64 },
+    /// `OpenBlock` result: the block handle + the image's length in bytes.
+    BlockOpened { handle: u64, size: u64 },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.
