@@ -9,6 +9,12 @@ left" pointer.
 
 ## Where we are (2026-06-21, branch `add-crusty-backup-dos-poc`)
 
+> **Update (later 2026-06-21):** remote **editing**, **fsck repair**, and
+> **resize** all shipped over the block tier (engine + headless tests; GUI/CLI
+> wired). See "Remaining items" §1–§2 below — the read-write story is done; the
+> next big item is **Restore to a remote target** (§3). Also fixed a CI-red
+> FAT32 compaction over-pad regression (`993d2ac`).
+
 Everything is over the **block tier**: the daemon (`rb-cli serve`, protocol v2)
 keeps a file/device open and serves raw byte ranges (`OpenBlock`/`OpenDevice` →
 `ReadBlock` → `CloseBlock`); the desktop does ALL parsing via `RemoteBlockReader`
@@ -64,23 +70,37 @@ On real hardware (the MiSTer), confirm end-to-end and report any breakage:
 Hand the produced backup folder back for desktop verification (metadata
 `source_device` = `rb://…/dev/sdX`, partition files round-trip in Inspect).
 
-### 1. Remote EDITING (write back) — `open_editable_filesystem` refuses remote
-The next big engine feature. Two options (decide first):
-- **(a) Block-level write:** add `WriteBlock{handle,offset,bytes}` verb + a
-  read-WRITE `RemoteBlockReader` so `open_editable_filesystem` edits in place over
-  the wire. General (any fs edit + repair + resize), writes raw blocks. The
-  `block_handles` table already stores `(File,size)` — would need a RW open.
-- **(b) Operation-level:** route browse-view edits (add file / mkdir / delete)
-  through the daemon's existing stage→apply path (`OpenSession`/`StageUpload`/
-  `StageMkdir`/`Apply`, already in Family F). Simpler for file ops; doesn't cover
-  arbitrary fs-structure edits. Caveat: a block-opened image (inspect) and a write
-  session are different daemon handles — reconcile.
-- Recommendation: **(a)** is the general answer and unlocks #2 cleanly; (b) is a
-  shortcut for the common add/delete case.
+### 1. Remote EDITING (write back) — ENGINE DONE (`22f1812`, option a)
+Chose **(a) block-level write**. Added `OpenBlockRw`/`WriteBlock`/`FlushBlock`
+(protocol v2, additive), a read-WRITE `RemoteBlockReader` (`open_rw` + `impl
+Write`: write-through `WriteBlock` + read-cache patch, `flush` -> `FlushBlock`;
+daemon syncs writable handles on `CloseBlock` too). `BrowseSession::open_editable`
+now builds a RW reader for a remote source. Devices stay read-only. Headless test
+`edit_remote_image_over_block_tier`. **Left:** GUI browse-view "Edit Mode" on a
+remote-inspected image is COMPILE-ONLY — the engine works (`open_editable` no
+longer refuses remote), but the inspect-tab Edit-Mode reachability needs an
+interactive check (does `edit_supported` light up + the staged-edit Apply route
+through `session.open_editable()` for a remote browse?).
 
-### 2. fsck REPAIR + RESIZE over the wire — gated on #1 (both are read-write).
+### 2. fsck REPAIR + RESIZE over the wire — DONE.
+- **Repair** (`65c2919`): `run_repair_reader` (RW reader) + inspect-tab repair
+  dispatch builds a RW `RemoteBlockReader` for remote. Headless test
+  `repair_remote_image_over_block_tier` (AFFS bitmap mismatch, fixed over the
+  wire). GUI repair is the fsck-popup "Repair" button (only gated on
+  `result.repairable`, so it lights up for remote) — interactive-verify.
+- **Resize** (`d0ba6f3`): FS-only in-place resize (`resize_filesystem_for`) over
+  a RW reader — `model::resize_remote::resize_remote_partition` +
+  `cli::resolve::resolve_partition_in_reader` (shared `@N` semantics) +
+  `rb-cli resize rb://host/img@N --size`. Headless test
+  `resize_remote_image_over_block_tier`. Partition-table resize
+  (`partition::apply_resize`, moves/truncates) is NOT offered over the wire — it
+  would grow the image, which the block tier can't. CLI-only (the GUI resize
+  popup is the partition-table kind); no GUI remote-resize surface.
 
-### 3. Restore-tab remote TARGET
+### 3. Restore-tab remote TARGET  <- NEXT big item
+We did Backup (remote source); Restore to a remote drive/image is the mirror.
+The write seam now exists (`WriteBlock` + RW `RemoteBlockReader` = a remote
+`Write+Seek`).
 We did Backup (remote source); Restore to a remote drive/image is the mirror.
 `restore/mod.rs` writes to a path/device — needs the same write seam as #1
 (`WriteBlock` / a remote `Write+Seek`), plus a Restore-tab "Remote…" target
@@ -115,15 +135,24 @@ round-trip). MiSTer install packaging/service (Scripts `.sh` + downloader DB).
 - `remote` is **feature-gated**; gate model-layer remote code with
   `#[cfg(feature = "remote")]` (see `backup_remote.rs`, `browse_session.rs`).
   `gui` always pulls `remote`.
-- Pre-commit hook enforces `cargo fmt` + `clippy --all-targets -D warnings`.
+- Pre-commit hook enforces `cargo fmt` + `cargo check` + `clippy --all-targets
+  -D warnings` — but **NOT tests**. Run the full `cargo test` (not just `--lib`)
+  before committing FS/format changes: the FAT32 over-pad regression (`993d2ac`)
+  passed lib+remote tests but broke `tests/filesystem_e2e.rs` on every CI target.
 - Lib must still build **without** the feature:
-  `cargo build --lib --no-default-features --features pure-zstd`.
+  `cargo build --lib --no-default-features --features pure-zstd`. (Also confirm
+  the slim CLI: `cargo build --bin rb-cli --no-default-features --features
+  pure-zstd` — remote CLI branches must be `#[cfg(feature = "remote")]` gated.)
 - Keep each slice green, commit, validate over loopback; push the branch to get
   CI builds (a published Release is `main`-only; the armv7 MiSTer `rb-cli-mini`
   artifact is what you reload on the device).
 
 ## Commit trail (this push, newest first)
 ```
+d0ba6f3 remote: resize a remote filesystem in place over the block tier
+993d2ac fix: FAT compaction over-padded FAT32, breaking small volumes (CI red)
+65c2919 remote: fsck repair over the wire (run_repair_reader)
+22f1812 remote: edit a remote image in place over the block tier (WriteBlock)
 940013b fix: CHD/zstd FAT compaction truncated multi-cluster files (data loss)
 f406a4a remote: CHD + shrink backup of a remote source (materialize-to-temp)
 29a4245 remote: back up a remote physical drive from the Backup tab
