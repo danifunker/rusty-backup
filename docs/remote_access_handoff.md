@@ -250,12 +250,36 @@ A **`RemoteBrowser` window/component** (own module, e.g.
    create a new one on the initial/explicit connect. Drop ordering is safe: an
    open runs on a worker thread holding an `Arc` clone; when `poll_remote` swaps
    the new fs into the listing, the old view drops on the UI thread and its
-   `try_lock` close runs uncontended (the worker has finished). Consider building
-   a **testable browser-state core** (connection + nav state machine, headlessly
-   tested over `serve_on`) with the egui `show()` as a thin renderer, so Inspect
-   (Step 3) reuses the same core.
+   `try_lock` close runs uncontended (the worker has finished).
+   **DONE — commits `f11c103` (core) + `09c45c3` (Commander).** Chose the
+   testable-core route: `src/model/remote_browser.rs` `RemoteBrowser` =
+   `{conn, addr, mode, image_return_dir}` with blocking transitions
+   `connect`/`browse_host`/`open_image(path,part,opened_from)`/`close_image`,
+   each returning a `BrowseTarget { fs: Box<dyn Filesystem>, root, entries, mode,
+   fs_type, volume_label, total/used }` ready for `DirListing::load_root`.
+   `#[cfg(feature="remote")]`. Headless test
+   `browser_core_opens_switches_and_closes_on_one_connection`. Commander's
+   `pane.rs` now holds `Option<RemoteBrowser>` (moved in/out of the worker per
+   transition) + a `RemoteConn{addr, BrowseMode}` display cache; `spawn_connect`
+   (fresh conn) / `spawn_open_image` (same conn) / `spawn_close_image` (same
+   conn); `poll_remote` re-installs the browser + loads the target. A failed
+   open/close keeps the connection + listing (status only); a failed fresh
+   connect surfaces the error. Removed the duplicate `RemoteMode`, the
+   `RemoteOpened` enum, and `remote_host_return`. **GUI wiring is COMPILE-VERIFIED
+   ONLY — needs an interactive check** (connect → open image → Close Image → open
+   a *different* image, confirming no reconnect; copy still works).
 3. **Inspect "Open Remote…"** → `RemoteBrowser` → open image; switch without
-   reconnect.
+   reconnect. **NEXT.** The core (`model::remote_browser::RemoteBrowser`) is ready
+   to reuse. Step 3 needs a **reusable egui browser *window*** (the handoff §3c
+   `src/gui/remote_browser.rs`): a modal/dockable file-browser over a
+   `RemoteBrowser` + its own `DirListing` grid, with an "Open" that hands the
+   chosen image's `BrowseTarget` (or the shared connection + path/partition) back
+   to the caller; Inspect's file/source options gain "Open Remote…" to pop it.
+   Commander's pane has the browse UI inline today — ideally the new window
+   component is factored so Commander can later adopt it too (don't fork the grid
+   twice). This is a sizable new egui surface with UX choices (window shape, how
+   Inspect consumes a remote image) — worth confirming the Commander experience
+   interactively first.
 4. **Backup/Restore tabs** — remote image source/target first (reuses the read
    path); then the **remote-disk backup** (block tier `ReadAt`/`RemoteBlockReader`
    §8 of the plan + the `run_backup` reader-seam refactor + device enumeration +
@@ -298,6 +322,9 @@ hook), commit, and validate over loopback.
 ## 6. Current commits (newest first, on `add-crusty-backup-dos-poc`)
 
 ```
+09c45c3 remote: Commander pane uses RemoteBrowser — no reconnect on switch  <- Step 2 (GUI)
+f11c103 remote: testable RemoteBrowser core (connect / open / switch / close) <- Step 2 (core)
+b027e92 docs: mark remote-access Step 1 done; refine Step 2 plan
 92829b6 remote: shared RemoteConnection (one session, many open images)   <- Step 1
 942e3db remote: UI polish + fix remote-image -> host copy
 a161b4e remote: rework GUI pane into a file browser (connect -> browse -> open image)
