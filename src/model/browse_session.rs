@@ -58,6 +58,12 @@ pub struct BrowseSession {
     /// `open()` passes it to the decryption API. The GUI sets this after
     /// prompting the user.
     pub password: Option<String>,
+    /// Remote image over the block tier: `(shared connection, remote path)`.
+    /// When set, every `open()` builds a fresh `RemoteBlockReader` on the
+    /// connection (the daemon keeps the image open and serves byte ranges).
+    /// Browse-only — `open_editable` refuses it.
+    #[cfg(feature = "remote")]
+    pub remote: Option<(Arc<Mutex<crate::remote::RemoteConnection>>, String)>,
 }
 
 /// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
@@ -80,6 +86,20 @@ impl BrowseSession {
 
     /// Open a read-only filesystem from this session.
     pub fn open(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
+        // Remote image over the block tier — a fresh RemoteBlockReader per open
+        // (the daemon keeps the image open and serves byte ranges).
+        #[cfg(feature = "remote")]
+        if let Some((conn, rpath)) = &self.remote {
+            let reader = crate::remote::RemoteBlockReader::open(Arc::clone(conn), rpath)
+                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+            return fs::open_filesystem(
+                reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         // Live CHD edit session — read-through preserves any unflushed
         // writes the editor has staged in memory.
         if let Some(arc) = &self.chd_edit_session {
@@ -544,6 +564,14 @@ impl BrowseSession {
     pub fn open_editable(
         &self,
     ) -> Result<(Box<dyn EditableFilesystem>, ContainerEditCommit), FilesystemError> {
+        // Remote images are browse-only for now (the block reader is read-only).
+        #[cfg(feature = "remote")]
+        if self.remote.is_some() {
+            return Err(FilesystemError::Parse(
+                "remote images are browse-only (editing over the wire is not supported yet)".into(),
+            ));
+        }
+
         // Live CHD edit session: writes go through the diff (compressed
         // parent) or in-place (uncompressed). No File handle to source_path
         // is opened.

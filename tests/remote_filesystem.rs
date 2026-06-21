@@ -274,6 +274,54 @@ fn browser_core_opens_switches_and_closes_on_one_connection() {
     drop(browser);
 }
 
+/// The exact per-partition **browse** path the Inspect GUI uses: a
+/// `BrowseSession` with a remote source opens the filesystem over the block tier
+/// (a `RemoteBlockReader`) and reads a file byte-exact. Editing is refused.
+#[test]
+fn browse_session_opens_remote_image_over_block_tier() {
+    use rusty_backup::model::browse_session::BrowseSession;
+    use rusty_backup::remote::RemoteConnection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("vol.img"), "BROWSEVOL", "HELLO.TXT", 0x5A, 2048);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let session = BrowseSession {
+        partition_offset: 0,
+        partition_type: 0, // auto-detect superfloppy
+        remote: Some((conn, "/vol.img".to_string())),
+        ..Default::default()
+    };
+
+    // open() builds a RemoteBlockReader and parses the FS over the wire.
+    let mut fs = session.open().unwrap();
+    assert!(fs.fs_type().starts_with("FAT"), "fs_type {}", fs.fs_type());
+    let root_e = fs.root().unwrap();
+    let entries = fs.list_directory(&root_e).unwrap();
+    let f = entries
+        .iter()
+        .find(|e| e.name == "HELLO.TXT")
+        .expect("HELLO.TXT in remote volume");
+    let mut got = Vec::new();
+    fs.write_file_to(f, &mut got).unwrap();
+    assert_eq!(
+        got,
+        vec![0x5A; 2048],
+        "remote browse read must be byte-exact"
+    );
+
+    // Editing a remote image is refused (browse-only).
+    assert!(session.open_editable().is_err(), "remote must be read-only");
+}
+
 /// The **block tier**: the existing engine parses a *remote* partitioned disk
 /// image's MBR and opens the filesystem inside a partition — reading a file
 /// byte-exact — entirely over a `RemoteBlockReader` (ranged reads), with no

@@ -4782,6 +4782,29 @@ impl InspectTab {
         partition_type_string: Option<String>,
         ctx: &mut TabContext,
     ) {
+        // Case 0: remote image over the block tier — browse the partition's
+        // filesystem over the wire (a fresh RemoteBlockReader per operation on
+        // the open daemon-side image). Read-only.
+        if let Some((conn, rpath)) = &self.remote_inspect {
+            ctx.log.info(format!(
+                "Browsing remote partition {part_index} at offset {offset}"
+            ));
+            let mut session = rusty_backup::model::browse_session::BrowseSession::new();
+            session.partition_offset = offset;
+            session.partition_type = ptype;
+            session.partition_type_string = partition_type_string;
+            session.remote = Some((std::sync::Arc::clone(conn), rpath.clone()));
+            self.browse_view.open_with_session(session);
+            if let Some(part) = self.partitions.iter().find(|p| p.index == part_index) {
+                if let Some(drv) = part.drv_name.as_deref() {
+                    if !drv.is_empty() {
+                        self.browse_view.set_label_prefix(drv.to_string());
+                    }
+                }
+            }
+            return;
+        }
+
         // Case 1: device or raw image file
         let device_path = self
             .selected_device_idx
