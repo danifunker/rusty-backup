@@ -68,8 +68,10 @@ required-features = ["mock_gui"]
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
 default = ["gui", "chd", "optical", "native-zlib", "native-zstd", "remote"]
-# Pull in eframe / egui / rfd plus the update-checker's reqwest client.
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+# Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
+# pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
+# in a GUI build.
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser", "remote"]
 # Fast C zlib (zlib-ng) for flate2. The always-on baseline is flate2's pure-Rust
 # `rust_backend` (miniz_oxide); this feature overrides it with the C backend for
 # desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486

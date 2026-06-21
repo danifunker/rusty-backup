@@ -628,8 +628,19 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   basename); mixed-local/remote and cross-host `cp` rejected cleanly; local `ls` confirms the daemon
   committed real changes. **Deferred:** mixed local↔remote `cp` (round-trips; use `get`+`put`), globs /
   recursive over `rb://`, `HostMkdir`/`HostDelete`.
-- **Phase 3 — GUI Commander remote pane (Family F).** Connect dialog, saved connections, remote source
-  kind, copy arms, progress UI. *Gate:* drag a file from a remote image into a local image in the GUI.
+- **Phase 3 — GUI Commander remote pane (Family F). — DONE-MINIMAL (compile-verified; needs interactive
+  check).** A `RemoteFilesystem: Filesystem` adapter (`src/remote/fs.rs`, headlessly integration-tested
+  over a loopback daemon) lets a remote image plug into Commander as an ordinary `ListingSource::Image`,
+  so **remote→local copy works through the existing copy arm with no new copy code** (the remote pane's
+  `fs_mut()` streams file data over the wire via `write_file_to`). A pane "Remote..." button opens a
+  "Connect to remote..." dialog (host:port / image path / partition); the connect + open runs **off the UI
+  thread** (`spawn_remote_open` → `poll_remote`, since a connect can block) and swaps the remote image into
+  the listing. *Gate (browse a remote image + copy a file from it into a local image):* met by
+  construction; the `RemoteFilesystem` read path is byte-exact in `tests/remote_filesystem.rs`. **Not
+  runtime-verified in the GUI** (no display here) — needs an interactive pass. **Deferred to a Phase 3
+  follow-up:** local→**remote** copy (remote panes report `can_receive()=false` for now — needs the copy
+  dispatch to route a remote destination through `open_session`/`stage_upload`/`apply`), saved
+  connections, and a wire-transfer progress bar.
 - **Phase 4 — Family B over the unified daemon.** (Reordered 2026-06-20 *ahead of* MiSTer packaging — the
   networked backup is the priority; packaging follows it.) Bring the cb-dos doc's
   chunk/resume/fingerprint/manifest machinery (its Phase 7a–7g) onto `rb-cli serve` as Family B, with the
