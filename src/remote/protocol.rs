@@ -31,9 +31,14 @@ pub const RB_HELLO_MAGIC: u32 = 0x5242_4B30;
 
 /// Current wire-protocol version. Bump on a breaking change; keep additions
 /// additive so a newer client still talks to an older daemon where possible.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// v2 added the block-reader tier (`HostFileSize` / `ReadHostRange`) — a daemon
+/// must be at v2 to serve ranged reads, so a remote *image inspection* (vs the
+/// v1 operation-level file browse) needs the daemon refreshed.
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Oldest protocol version this build still understands.
+/// Oldest protocol version this build still understands. The v1 verbs are
+/// unchanged, so a v1 daemon still serves browse / read / write.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
 /// Default daemon port (mrext owns 8182; we take 7341). Configurable on both
@@ -114,6 +119,15 @@ pub enum Request {
     /// The host-FS analog of `ReadFile` — for copying a file off the remote, or
     /// the file browser's preview.
     ReadHostFile { path: String },
+    /// Report a host file's size in bytes (reply: `FileSize`). Used by the
+    /// block-reader tier to learn an image's length before ranged reads.
+    HostFileSize { path: String },
+    /// Read a byte **range** of a host file (reply: `FileBegin{size: actual}`,
+    /// then a chunk stream of that many bytes). `len` is capped server-side; a
+    /// read past EOF returns the short tail. The wire primitive behind a
+    /// `RemoteBlockReader` — seekable raw access to a remote image so the desktop
+    /// engine parses partitions / filesystems without downloading the whole disk.
+    ReadHostRange { path: String, offset: u64, len: u32 },
     /// Stage an **on-device** copy: the daemon reads `src_path` from `src_image`
     /// (relative to the serve root, partition `src_partition`) and queues it as
     /// an AddFile into the session's destination image — no desktop round-trip.
@@ -160,6 +174,8 @@ pub enum Response {
     Applied { count: u64 },
     /// `HostStat` result: whether the path exists and is a directory.
     HostKind { exists: bool, is_dir: bool },
+    /// `HostFileSize` result: the file's length in bytes.
+    FileSize { len: u64 },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.

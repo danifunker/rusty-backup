@@ -10,12 +10,14 @@
 //! Gated behind the `remote` cargo feature (pure `std::net` + `serde_json`, no
 //! new dependency), so the slim build can drop or keep it cheaply.
 
+pub mod block_reader;
 pub mod client;
 pub mod connection;
 pub mod fs;
 pub mod protocol;
 pub mod server;
 
+pub use block_reader::RemoteBlockReader;
 pub use client::{OpenedImage, RemoteSession};
 pub use connection::RemoteConnection;
 pub use fs::{RemoteFilesystem, RemoteHostFilesystem};

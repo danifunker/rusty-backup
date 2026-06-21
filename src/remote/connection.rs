@@ -104,6 +104,16 @@ impl RemoteConnection {
         self.session.read_host_file(path, sink)
     }
 
+    /// A host file's size in bytes (the block reader's first call).
+    pub fn host_file_size(&mut self, path: &str) -> Result<u64> {
+        self.session.host_file_size(path)
+    }
+
+    /// Read a byte range of a host file (the block reader's fetch primitive).
+    pub fn read_host_range(&mut self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.session.read_host_range(path, offset, len)
+    }
+
     /// How many open-image handles this connection currently holds (diagnostics
     /// / tests).
     pub fn open_handle_count(&self) -> usize {

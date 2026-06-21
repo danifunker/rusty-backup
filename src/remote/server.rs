@@ -23,7 +23,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
@@ -329,6 +329,38 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 },
             },
 
+            Request::HostFileSize { path } => match sandbox_join(root, &path) {
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                Ok(full) => match std::fs::metadata(&full) {
+                    Ok(m) if m.is_dir() => {
+                        reply_err(&mut writer, format!("{path} is a directory"))?
+                    }
+                    Ok(m) => write_control(&mut writer, &Response::FileSize { len: m.len() })?,
+                    Err(e) => reply_err(&mut writer, format!("stat {path}: {e}"))?,
+                },
+            },
+
+            Request::ReadHostRange { path, offset, len } => {
+                match read_host_range(root, &path, offset, len) {
+                    Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                    Ok(buf) => {
+                        // Commit to the stream: FileBegin{actual len}, then the
+                        // bytes as one chunk frame (len is capped, so it fits).
+                        write_control(
+                            &mut writer,
+                            &Response::FileBegin {
+                                size: buf.len() as u64,
+                            },
+                        )?;
+                        let mut cw = ChunkWriter::new(&mut writer);
+                        if let Err(e) = cw.write_all(&buf) {
+                            return Err(anyhow!("sending range of {path}: {e}"));
+                        }
+                        cw.finish()?;
+                    }
+                }
+            }
+
             Request::StageCopyLocal {
                 session,
                 src_image,
@@ -548,6 +580,35 @@ fn stage_copy_local(
         entry.type_code.clone(),
         entry.creator_code.clone(),
     ))
+}
+
+/// Largest single `ReadHostRange` we honour — bounds one block-reader fetch so a
+/// hostile `len` can't make us allocate unbounded. The reader fetches in windows
+/// well under this; a larger ask is simply clamped.
+const MAX_RANGE_READ: u32 = 4 * 1024 * 1024;
+
+/// Read up to `len` bytes of a host file starting at `offset` (sandboxed). A read
+/// at/after EOF returns an empty/short buffer rather than erroring — the
+/// block-reader treats that as EOF.
+fn read_host_range(root: &Path, rel: &str, offset: u64, len: u32) -> Result<Vec<u8>> {
+    let full = sandbox_join(root, rel)?;
+    if full.is_dir() {
+        bail!("{rel} is a directory");
+    }
+    let mut f =
+        std::fs::File::open(&full).with_context(|| format!("opening {}", full.display()))?;
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if offset >= size {
+        return Ok(Vec::new());
+    }
+    let want = len.min(MAX_RANGE_READ) as u64;
+    let avail = (size - offset).min(want) as usize;
+    f.seek(SeekFrom::Start(offset))
+        .with_context(|| format!("seeking {rel} to {offset}"))?;
+    let mut buf = vec![0u8; avail];
+    f.read_exact(&mut buf)
+        .with_context(|| format!("reading {avail} bytes of {rel} at {offset}"))?;
+    Ok(buf)
 }
 
 /// List a directory on the host filesystem (sandboxed to the serve root).
