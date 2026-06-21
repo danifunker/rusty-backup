@@ -307,21 +307,27 @@ engine does ALL parsing. **DONE & PROVEN (commit `afaeb91`):**
 - **v2 means the MiSTer daemon must be refreshed** to serve ranged reads (image
   *inspection*); the v1 operation-level browse still works on an old daemon.
 
-**NEXT — the reader seam (the remaining integration, a big careful refactor of
-core Inspect code; verify interactively at each step):**
-- `run_inspect` (`inspect_tab.rs:~2838`) already builds `reader: Box<dyn
-  rbformats::ReadSeek>` and parses partitions from it — `RemoteBlockReader` boxes
-  straight into that slot. Restructure `run_inspect` to take a **source** =
-  `Path | Box<dyn ReadSeek+Send>`; for the remote case skip the device-claim /
-  container-decode / GHO-metadata path-specific logic and just parse the table.
-  → delivers the **partition-table view of a remote image** (first visible win).
-- Then the per-partition operations, each currently path-based, need the same
-  seam: **browse** (`BrowseSession` is path/session-based — add a reader-source
-  open), **min-size** (`partition_minimum_size` opens from path), **backup**
-  (`run_backup(BackupConfig{source_path})` — the handoff's known seam),
-  **export**, **resize**. Wire the panel's image-pick to build a
-  `RemoteBlockReader` and hand it to `run_inspect` instead of operation-level
-  `open_image`.
+**Reader seam DONE — remote Inspect is wired (read-only) over the block tier:**
+- `run_inspect` (`928810c`) takes a source = local path | `remote:
+  Option<(conn,path)>`; the remote branch builds a `RemoteBlockReader`, skips
+  device-claim / container-decode / format-detect, and parses the table. Every
+  per-partition probe funnels through `make_probe_reader` + the min-size reader,
+  both of which build fresh block readers for remote → volume labels / APM / 0x83
+  / HFS probes / min-size all work over the wire. Local path untouched.
+- Panel is now a **picker**: connect → host browse → pick image → emits
+  `inspect_request(conn,path)` and collapses; Inspect runs the full partition
+  view. **Browse** (`52e352a`, `BrowseSession.remote` source), **Calc min**
+  (`4c40b70`, `MinSizeSource::Remote`), **fsck/Check** (`4b0183d`,
+  `run_fsck_reader`), and **Re-inspect** all work over the wire. **Switch images
+  without reconnect** (`442184f`, `RemoteBrowser::from_connection` +
+  panel.`browse_on` + "Pick Another Image"). Write/path-based actions (Export,
+  Edit Table, Add/Resize Partition, HFS Expand/Export) are disabled for remote.
+- Headless tests: `browse_session_opens_remote_image_over_block_tier`,
+  `fsck_runs_over_block_reader` (+ the block-reader + partition-table tests).
+- **NOT yet over the wire (deferred):** **editing** a remote image
+  (`open_editable` refuses it), **backup/export** of a remote image
+  (`run_backup`/export still path-based; backup = the remote-disk-backup feature,
+  step 4), **resize**. fsck **repair** (vs check) is still path-based.
 4. **Backup/Restore tabs** — remote image source/target first (reuses the read
    path); then the **remote-disk backup** (block tier `ReadAt`/`RemoteBlockReader`
    §8 of the plan + the `run_backup` reader-seam refactor + device enumeration +
