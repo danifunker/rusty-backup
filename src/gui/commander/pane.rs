@@ -34,6 +34,7 @@ use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
+use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::status::BlockCacheScan;
 use rusty_backup::partition::{format_size, PartitionInfo};
 
@@ -151,66 +152,46 @@ pub(crate) struct CommanderPane {
     /// Data-changing operations completed this frame, drained into the
     /// `PaneResponse` at the end of `show()` for the session log.
     log_events: Vec<String>,
-    /// When this pane browses a disk image on a remote daemon, the connection
-    /// info. Also the marker that this is a remote pane. `None` for local.
+    /// The remote file-browser session driving this pane when it browses a
+    /// daemon — the shared-connection engine (`model::remote_browser`). One
+    /// connection holds every image the user opens, so switching images never
+    /// reconnects. `None` when local, or *transiently* while a blocking
+    /// transition runs on a worker thread (the browser is moved into the worker
+    /// and re-installed on completion).
+    browser: Option<RemoteBrowser>,
+    /// Display cache mirroring the browser's identity (addr + mode). Stays set
+    /// across an in-flight transition so the source bar's label holds steady
+    /// while `browser` is on the worker thread. Also the marker that this is a
+    /// remote pane. `None` for local.
     remote: Option<RemoteConn>,
-    /// In-flight async remote connect + open (spinner).
-    pending_remote: Option<Arc<Mutex<RemoteOpenStatus>>>,
+    /// In-flight async remote transition (connect / open image / close image).
+    pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
     /// The open "Connect to remote..." dialog, if any.
     connect_dialog: Option<ConnectDialog>,
-    /// The host-FS directory an image was opened from, so "Close Image" returns
-    /// there instead of the host root.
-    remote_host_return: Option<String>,
 }
 
-/// A live remote-pane connection (and the marker that the pane is remote).
-/// `mode` is what the pane currently shows: the daemon's host filesystem (a
-/// file browser), or inside an image opened from it.
+/// Display cache for a remote pane (addr + what it's browsing). The live engine
+/// is [`CommanderPane::browser`]; this mirror lets the source bar render even
+/// while the browser is moved onto a worker thread for a blocking transition.
 struct RemoteConn {
     addr: String,
-    mode: RemoteMode,
+    mode: BrowseMode,
 }
 
-/// What a remote pane is currently browsing.
-enum RemoteMode {
-    /// The daemon's host filesystem — a file browser. Files can be opened as
-    /// images (double-click / right-click -> Open Image).
-    Host,
-    /// Inside a disk image opened on the daemon.
-    Image {
-        path: String,
-        partition: Option<u32>,
-    },
-}
-
-/// Async status for a remote connect + open running on a worker thread. The
-/// opened filesystem is `Send`, so it moves back to the UI thread here.
+/// Async status for a remote transition (connect / open image / close image)
+/// running on a worker thread. Both the `RemoteBrowser` and the produced
+/// `BrowseTarget` are `Send`, so they move back to the UI thread here.
 #[derive(Default)]
-struct RemoteOpenStatus {
+struct RemoteTransition {
     done: bool,
     addr: String,
-    result: Option<Result<RemoteOpened, String>>,
-}
-
-/// The successful payload of a remote open — the host file browser, or an image
-/// opened from it — handed back to the UI thread.
-enum RemoteOpened {
-    Host {
-        fs: rusty_backup::remote::RemoteHostFilesystem,
-        root: FileEntry,
-        entries: Vec<FileEntry>,
-    },
-    Image {
-        fs: rusty_backup::remote::RemoteFilesystem,
-        root: FileEntry,
-        entries: Vec<FileEntry>,
-        fs_type: String,
-        volume_label: String,
-        total_size: u64,
-        used_size: u64,
-        path: String,
-        partition: Option<u32>,
-    },
+    /// The browser, returned so the UI thread re-installs it. `Some` after any
+    /// op on an existing browser (success *or* failure — the browser survives a
+    /// failed open/close), and after a successful fresh connect. `None` only
+    /// when a fresh connect failed (no browser was created).
+    browser: Option<RemoteBrowser>,
+    /// The new listing target, or an error message.
+    result: Option<Result<BrowseTarget, String>>,
 }
 
 /// State for the modal "Connect to remote..." dialog (host only — you browse the
@@ -278,10 +259,10 @@ impl CommanderPane {
             new_folder_dialog: None,
             show_edits_popup: false,
             log_events: Vec::new(),
+            browser: None,
             remote: None,
             pending_remote: None,
             connect_dialog: None,
-            remote_host_return: None,
         }
     }
 
@@ -369,8 +350,9 @@ impl CommanderPane {
             checksums = actions.checksums;
             detail = actions.detail;
             focused = actions.focused;
-            // Open a file on a remote-host pane as a disk image. Remember the
-            // host folder it came from so "Close Image" returns here.
+            // Open a file on a remote-host pane as a disk image, on the same
+            // connection. The browser remembers the host folder it came from so
+            // "Close Image" returns there.
             if let Some(name) = actions.open_image {
                 let path = self
                     .listing
@@ -378,10 +360,9 @@ impl CommanderPane {
                     .iter()
                     .find(|e| e.name == name)
                     .map(|e| e.path.clone());
-                let addr = self.remote.as_ref().map(|r| r.addr.clone());
-                if let (Some(path), Some(addr)) = (path, addr) {
-                    self.remote_host_return = Some(self.listing.cwd_path().to_string());
-                    status = Some(self.spawn_open_image(addr, path, None));
+                if let Some(path) = path {
+                    let opened_from = self.listing.cwd_path().to_string();
+                    status = Some(self.spawn_open_image(path, None, opened_from));
                 }
             }
         } else {
@@ -761,7 +742,7 @@ impl CommanderPane {
                 )
             };
             self.connect_dialog = None;
-            return Some(self.spawn_connect_host(addr, "/".to_string()));
+            return Some(self.spawn_connect(addr, "/".to_string()));
         }
         None
     }
@@ -770,19 +751,59 @@ impl CommanderPane {
     /// `root_path` on a worker thread — a connect can block on an unreachable
     /// host. Used for the initial connect (`/`) and for "Close Image" (back to
     /// the folder the image was opened from).
-    fn spawn_connect_host(&mut self, addr: String, root_path: String) -> String {
-        let status = Arc::new(Mutex::new(RemoteOpenStatus {
+    fn spawn_connect(&mut self, addr: String, root_path: String) -> String {
+        let status = Arc::new(Mutex::new(RemoteTransition {
             addr: addr.clone(),
             ..Default::default()
         }));
         self.pending_remote = Some(status.clone());
+        // A fresh connect drops any previous browser (a new connection replaces
+        // the old). Disconnect happens when the old browser's Arc drops.
+        self.browser = None;
         self.open_phase = format!("Connecting to {addr}...");
         let msg = format!("[{}] connecting to {addr}...", self.side.label());
         std::thread::spawn(move || {
-            let result = rusty_backup::remote::RemoteHostFilesystem::open(&addr, &root_path)
-                .map(|(fs, root, entries)| RemoteOpened::Host { fs, root, entries })
+            let outcome = RemoteBrowser::connect(&addr, &root_path);
+            if let Ok(mut s) = status.lock() {
+                match outcome {
+                    Ok((browser, target)) => {
+                        s.browser = Some(browser);
+                        s.result = Some(Ok(target));
+                    }
+                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
+                }
+                s.done = true;
+            }
+        });
+        msg
+    }
+
+    /// Open an image found while browsing the remote host FS as a new handle on
+    /// the **same** connection (no reconnect), on a worker thread. `opened_from`
+    /// is the host directory it was found in, so "Close Image" returns there.
+    fn spawn_open_image(
+        &mut self,
+        path: String,
+        partition: Option<u32>,
+        opened_from: String,
+    ) -> String {
+        let Some(mut browser) = self.browser.take() else {
+            return format!("[{}] not connected to a remote.", self.side.label());
+        };
+        let addr = browser.addr().to_string();
+        let status = Arc::new(Mutex::new(RemoteTransition {
+            addr,
+            ..Default::default()
+        }));
+        self.pending_remote = Some(status.clone());
+        self.open_phase = format!("Opening {path}...");
+        let msg = format!("[{}] opening {path}...", self.side.label());
+        std::thread::spawn(move || {
+            let result = browser
+                .open_image(&path, partition, &opened_from)
                 .map_err(|e| format!("{e:#}"));
             if let Ok(mut s) = status.lock() {
+                s.browser = Some(browser);
                 s.result = Some(result);
                 s.done = true;
             }
@@ -790,30 +811,25 @@ impl CommanderPane {
         msg
     }
 
-    /// Open an image found while browsing the remote host FS, on a worker thread.
-    fn spawn_open_image(&mut self, addr: String, path: String, partition: Option<u32>) -> String {
-        let status = Arc::new(Mutex::new(RemoteOpenStatus {
-            addr: addr.clone(),
+    /// Step back out of an open image to the host file browser (at the directory
+    /// the image was opened from), reusing the same connection, on a worker
+    /// thread.
+    fn spawn_close_image(&mut self) -> String {
+        let Some(mut browser) = self.browser.take() else {
+            return format!("[{}] not connected to a remote.", self.side.label());
+        };
+        let addr = browser.addr().to_string();
+        let status = Arc::new(Mutex::new(RemoteTransition {
+            addr,
             ..Default::default()
         }));
         self.pending_remote = Some(status.clone());
-        self.open_phase = format!("Opening {path}...");
-        let msg = format!("[{}] opening {path}...", self.side.label());
+        self.open_phase = "Returning to host browser...".to_string();
+        let msg = format!("[{}] closing image...", self.side.label());
         std::thread::spawn(move || {
-            let result = rusty_backup::remote::RemoteFilesystem::open(&addr, &path, partition)
-                .map(|(fs, root, entries)| RemoteOpened::Image {
-                    fs_type: fs.fs_type().to_string(),
-                    volume_label: fs.volume_label().unwrap_or_default().to_string(),
-                    total_size: fs.total_size(),
-                    used_size: fs.used_size(),
-                    fs,
-                    root,
-                    entries,
-                    path,
-                    partition,
-                })
-                .map_err(|e| format!("{e:#}"));
+            let result = browser.close_image().map_err(|e| format!("{e:#}"));
             if let Ok(mut s) = status.lock() {
+                s.browser = Some(browser);
                 s.result = Some(result);
                 s.done = true;
             }
@@ -832,8 +848,9 @@ impl CommanderPane {
         self.error = None;
     }
 
-    /// Poll an in-flight remote open; when done, swap the result (the host file
-    /// browser, or an opened image) into the listing.
+    /// Poll an in-flight remote transition; when done, re-install the browser and
+    /// swap the new target (the host file browser, or an opened image) into the
+    /// listing.
     fn poll_remote(&mut self, ctx: &egui::Context) -> Option<String> {
         let done = match self.pending_remote.as_ref() {
             Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
@@ -843,60 +860,59 @@ impl CommanderPane {
             ctx.request_repaint();
             return None;
         }
-        let (addr, result) = {
+        let (addr, browser, result) = {
             let arc = self.pending_remote.take()?;
             let mut g = arc.lock().ok()?;
-            (g.addr.clone(), g.result.take()?)
+            (g.addr.clone(), g.browser.take(), g.result.take()?)
         };
         self.open_phase.clear();
+        // Re-install the browser (absent only when a fresh connect failed).
+        let had_browser = browser.is_some();
+        if let Some(b) = browser {
+            self.browser = Some(b);
+        }
 
         match result {
-            Ok(RemoteOpened::Host { fs, root, entries }) => {
+            Ok(target) => {
+                let mode = target.mode.clone();
                 self.reset_for_remote();
-                self.fs_type = "remote-host".to_string();
-                self.volume_label = String::new();
-                self.total_size = 0;
-                self.used_size = 0;
+                self.fs_type = target.fs_type.clone();
+                self.volume_label = target.volume_label.clone();
+                self.total_size = target.total_size;
+                self.used_size = target.used_size;
                 self.remote = Some(RemoteConn {
                     addr: addr.clone(),
-                    mode: RemoteMode::Host,
+                    mode: mode.clone(),
                 });
-                self.listing.load_root(Box::new(fs), root, entries, false);
-                Some(format!(
-                    "[{}] connected to {addr} (browsing host)",
-                    self.side.label()
-                ))
-            }
-            Ok(RemoteOpened::Image {
-                fs,
-                root,
-                entries,
-                fs_type,
-                volume_label,
-                total_size,
-                used_size,
-                path,
-                partition,
-            }) => {
-                self.reset_for_remote();
-                self.fs_type = fs_type;
-                self.volume_label = volume_label;
-                self.total_size = total_size;
-                self.used_size = used_size;
-                let shown = path.clone();
-                self.remote = Some(RemoteConn {
-                    addr: addr.clone(),
-                    mode: RemoteMode::Image { path, partition },
-                });
-                self.listing.load_root(Box::new(fs), root, entries, false);
-                Some(format!("[{}] opened rb://{addr}{shown}", self.side.label()))
+                self.listing
+                    .load_root(target.fs, target.root, target.entries, false);
+                match mode {
+                    BrowseMode::Host => Some(format!(
+                        "[{}] connected to {addr} (browsing host)",
+                        self.side.label()
+                    )),
+                    BrowseMode::Image { path, .. } => {
+                        Some(format!("[{}] opened rb://{addr}{path}", self.side.label()))
+                    }
+                }
             }
             Err(e) => {
-                self.error = Some(e.clone());
-                Some(format!(
-                    "[{}] remote connect failed: {e}",
-                    self.side.label()
-                ))
+                if had_browser {
+                    // The connection survived a failed open / close — keep the
+                    // current listing, just report it.
+                    Some(format!(
+                        "[{}] remote operation failed: {e}",
+                        self.side.label()
+                    ))
+                } else {
+                    // A fresh connect failed — nothing to show but the error.
+                    self.error = Some(e.clone());
+                    self.remote = None;
+                    Some(format!(
+                        "[{}] remote connect failed: {e}",
+                        self.side.label()
+                    ))
+                }
             }
         }
     }
@@ -907,7 +923,7 @@ impl CommanderPane {
         matches!(
             self.remote,
             Some(RemoteConn {
-                mode: RemoteMode::Host,
+                mode: BrowseMode::Host,
                 ..
             })
         )
@@ -1105,8 +1121,8 @@ impl CommanderPane {
             let is_backup = self.resolved_backup.is_some();
             let current_label = if let Some(r) = &self.remote {
                 match &r.mode {
-                    RemoteMode::Host => format!("Remote {} (host)", r.addr),
-                    RemoteMode::Image { path, partition } => {
+                    BrowseMode::Host => format!("Remote {} (host)", r.addr),
+                    BrowseMode::Image { path, partition } => {
                         // Host + image basename only — the full remote path is
                         // long and the in-image position shows in the breadcrumb.
                         let base = path
@@ -1205,7 +1221,7 @@ impl CommanderPane {
             if matches!(
                 &self.remote,
                 Some(RemoteConn {
-                    mode: RemoteMode::Image { .. },
+                    mode: BrowseMode::Image { .. },
                     ..
                 })
             ) {
@@ -1216,13 +1232,9 @@ impl CommanderPane {
                     .on_hover_text("Back to browsing the remote host filesystem")
                     .clicked()
                 {
-                    if let Some(addr) = self.remote.as_ref().map(|r| r.addr.clone()) {
-                        let ret = self
-                            .remote_host_return
-                            .clone()
-                            .unwrap_or_else(|| "/".to_string());
-                        status = Some(self.spawn_connect_host(addr, ret));
-                    }
+                    // Reuses the live connection (the browser remembers the host
+                    // folder the image was opened from) — no reconnect.
+                    status = Some(self.spawn_close_image());
                 }
             }
 
@@ -1364,6 +1376,12 @@ impl CommanderPane {
         self.error = None;
         self.pending_host_delete = None;
         self.rename_dialog = None;
+        // Disconnect any remote session: dropping the browser drops the last
+        // Arc to the shared connection (the daemon reaps its handles).
+        self.browser = None;
+        self.remote = None;
+        self.pending_remote = None;
+        self.connect_dialog = None;
         format!("[{}] closed.", self.side.label())
     }
 
