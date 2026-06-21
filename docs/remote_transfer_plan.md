@@ -628,9 +628,20 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   basename); mixed-local/remote and cross-host `cp` rejected cleanly; local `ls` confirms the daemon
   committed real changes. **Deferred:** mixed local↔remote `cp` (round-trips; use `get`+`put`), globs /
   recursive over `rb://`, `HostMkdir`/`HostDelete`.
-- **Phase 3 — GUI Commander remote pane (Family F). — DONE-MINIMAL (compile-verified; needs interactive
-  check).** A `RemoteFilesystem: Filesystem` adapter (`src/remote/fs.rs`, headlessly integration-tested
-  over a loopback daemon) lets a remote image plug into Commander as an ordinary `ListingSource::Image`,
+- **Phase 3 — GUI Commander remote pane (Family F). — REWORKED into a file browser (compile-verified;
+  needs interactive check).** Per UX feedback the remote pane is now a **file browser**: connect to the
+  host (host:port only) → browse the daemon's host filesystem (`RemoteHostFilesystem` over
+  `ListHostDir`/`ReadHostFile`) → **double-click a file, or right-click → "Open Image"**, to open it as a
+  `RemoteFilesystem` and browse inside. `RemoteConn` carries a `mode` (Host | Image). Both the connect and
+  the open run off the UI thread. Headlessly tested in `tests/remote_filesystem.rs` (host browse + image
+  browse + byte-exact reads). **Still needs an interactive GUI pass.** (Superseded the first
+  connect-with-image-path-upfront attempt.) **Remote-disk BACKUP** (connect → pick a physical drive →
+  pull a backup to the desktop via the block tier + `run_backup`; elevated daemon enumerating devices;
+  whole-machine browse) is the next, separate piece — `run_backup` is path-based today so it needs a
+  reader seam. File "backup" of an image = a transfer (FTP-like copy), already covered by
+  `ReadHostFile`/`get`.
+  (original minimal note:) A `RemoteFilesystem: Filesystem` adapter lets a remote image plug into Commander
+  as an ordinary `ListingSource::Image`,
   so **remote→local copy works through the existing copy arm with no new copy code** (the remote pane's
   `fs_mut()` streams file data over the wire via `write_file_to`). A pane "Remote..." button opens a
   "Connect to remote..." dialog (host:port / image path / partition); the connect + open runs **off the UI
