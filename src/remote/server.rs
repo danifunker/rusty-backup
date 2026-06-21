@@ -477,6 +477,33 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 write_control(&mut writer, &Response::Ok)?;
             }
 
+            Request::OpenWriteTarget {
+                path,
+                is_device,
+                size,
+            } => match open_write_target(root, &path, is_device, size) {
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                Ok((file, actual_size)) => {
+                    let handle = next_handle;
+                    next_handle += 1;
+                    block_handles.insert(
+                        handle,
+                        BlockHandle {
+                            file,
+                            size: actual_size,
+                            writable: true,
+                        },
+                    );
+                    write_control(
+                        &mut writer,
+                        &Response::BlockOpened {
+                            handle,
+                            size: actual_size,
+                        },
+                    )?;
+                }
+            },
+
             Request::StageCopyLocal {
                 session,
                 src_image,
@@ -739,6 +766,67 @@ fn open_block_rw(root: &Path, rel: &str) -> Result<(std::fs::File, u64)> {
     Ok((f, size))
 }
 
+/// Open a **restore write target**: where the desktop pushes a finished disk
+/// image via `WriteBlock`. For a device (`is_device`), validate against the
+/// enumerated set and open it read-write (the daemon must run elevated); the
+/// requested `size` is advisory and the device's real capacity is returned. For
+/// an image file, create/truncate it under the serve root to exactly `size`
+/// bytes and open it read-write. Destructive — restore overwrites the target.
+fn open_write_target(
+    root: &Path,
+    path: &str,
+    is_device: bool,
+    size: u64,
+) -> Result<(std::fs::File, u64)> {
+    if is_device {
+        // Same validation as the read-side `open_device`: the path must match a
+        // live enumerated device exactly, so this can't write an arbitrary file.
+        let devices = crate::os::enumerate_devices();
+        let dev = devices
+            .iter()
+            .find(|d| d.path.to_string_lossy() == path)
+            .ok_or_else(|| anyhow!("{path:?} is not an enumerated device on this machine"))?;
+        let dev_path = dev.path.clone();
+        // `open_target_for_writing` does the platform-appropriate prep (unmount /
+        // lock); on Linux/MiSTer — the supported daemon target — it returns a
+        // plain read-write File. (A Windows/macOS daemon would need to keep the
+        // returned handle's volume locks alive; out of scope here.)
+        let handle = crate::os::open_target_for_writing(&dev_path).with_context(|| {
+            format!(
+                "opening device {} for writing (the daemon may need to run as root)",
+                dev_path.display()
+            )
+        })?;
+        let dev_size = if dev.size_bytes > 0 {
+            dev.size_bytes
+        } else {
+            crate::os::get_file_size(&handle.file, &dev_path).unwrap_or(0)
+        };
+        if dev_size == 0 {
+            bail!("device {} reports zero size", dev_path.display());
+        }
+        if size > dev_size {
+            bail!(
+                "restore image ({size} bytes) is larger than device {} ({dev_size} bytes)",
+                dev_path.display()
+            );
+        }
+        Ok((handle.file, dev_size))
+    } else {
+        let full = sandbox_join_create(root, path)?;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&full)
+            .with_context(|| format!("creating image target {}", full.display()))?;
+        f.set_len(size)
+            .with_context(|| format!("sizing image target {} to {size} bytes", full.display()))?;
+        Ok((f, size))
+    }
+}
+
 /// Write `payload` at `offset` into an open read-write block handle. The write
 /// must lie wholly within the image (`offset + payload.len() <= size`) — a
 /// block-tier edit patches existing bytes and never extends the file. `len` is
@@ -926,6 +1014,31 @@ fn sandbox_join(root: &Path, rel: &str) -> Result<PathBuf> {
         bail!("path {rel:?} escapes the serve root");
     }
     Ok(canon)
+}
+
+/// Resolve a wire path under the serve root for a file that may **not exist
+/// yet** (a restore target). Canonicalizes the parent directory (which must
+/// exist and stay under the root) and appends the final component, so the
+/// not-yet-created target still can't escape the sandbox via `..` or a symlink.
+fn sandbox_join_create(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        bail!("no target path given");
+    }
+    let joined = root.join(rel);
+    let parent = joined
+        .parent()
+        .ok_or_else(|| anyhow!("target path {rel:?} has no parent directory"))?;
+    let file_name = joined
+        .file_name()
+        .ok_or_else(|| anyhow!("target path {rel:?} has no file name"))?;
+    let canon_parent = parent
+        .canonicalize()
+        .with_context(|| format!("resolving parent of {rel:?} under serve root"))?;
+    if !canon_parent.starts_with(root) {
+        bail!("target path {rel:?} escapes the serve root");
+    }
+    Ok(canon_parent.join(file_name))
 }
 
 /// Join a parent dir + name for display, avoiding a doubled slash at root.

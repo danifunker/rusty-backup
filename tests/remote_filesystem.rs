@@ -352,6 +352,164 @@ fn browse_session_opens_remote_image_over_block_tier() {
     );
 }
 
+/// Remote RESTORE: back up a partitioned FAT disk locally, then restore that
+/// backup folder to an **image-file target on a remote daemon** over the block
+/// tier (materialize-to-temp + WriteBlock push). Proves the landed remote image
+/// is a full disk the engine can parse end to end — MBR + FAT partition + the
+/// file byte-exact — i.e. the restore reached the daemon intact.
+#[test]
+fn restore_to_remote_image_round_trips() {
+    use std::sync::Mutex;
+
+    use rusty_backup::backup::{
+        run_backup, BackupConfig, BackupProgress, ChecksumType, CompressionType,
+    };
+    use rusty_backup::fs::open_filesystem;
+    use rusty_backup::model::restore_remote::restore_to_remote;
+    use rusty_backup::partition::mbr::{build_minimal_mbr, Mbr};
+    use rusty_backup::remote::RemoteConnection;
+    use rusty_backup::restore::{RestoreAlignment, RestoreConfig, RestoreProgress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().canonicalize().unwrap();
+
+    // --- build a partitioned disk: MBR + one FAT16 partition with a file ---
+    let part_lba = 2048u32;
+    let part_bytes = 8 * 1024 * 1024usize;
+    let part_sectors = (part_bytes / 512) as u32;
+    let fat_blob = fat::create_blank_fat(part_bytes as u64, Some("RSTVOL")).unwrap();
+    let mbr = build_minimal_mbr(
+        0x5152_5354,
+        &[(0x06, part_lba, part_sectors, true)],
+        255,
+        63,
+    );
+    let mut disk = vec![0u8; part_lba as usize * 512 + part_bytes];
+    disk[..512].copy_from_slice(&mbr);
+    disk[part_lba as usize * 512..].copy_from_slice(&fat_blob);
+    let src_img = work.join("source.img");
+    std::fs::write(&src_img, &disk).unwrap();
+
+    let payload = vec![0x42u8; 11000]; // multi-cluster
+    {
+        let (file, ctx, commit) = resolve_partition_rw(&src_img, Some(1)).unwrap();
+        let mut efs =
+            open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
+                .unwrap();
+        let parent = efs.root().unwrap();
+        let mut data = &payload[..];
+        efs.create_file(
+            &parent,
+            "DOC.BIN",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+        drop(efs);
+        commit.commit().unwrap();
+    }
+    let disk_size = std::fs::metadata(&src_img).unwrap().len();
+
+    // --- back it up locally (raw, sector-by-sector) ---
+    let backups = work.join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    let bcfg = BackupConfig {
+        source_path: src_img.clone(),
+        destination_dir: backups.clone(),
+        backup_name: "rst".to_string(),
+        compression: CompressionType::None,
+        checksum: ChecksumType::Crc32,
+        split_size_mib: None,
+        sector_by_sector: true,
+        partition_filter: None,
+        chd_options: None,
+        size_policy: None,
+        partition_target_sizes: None,
+        shrink_to_minimum: false,
+        precomputed_minimum_sizes: None,
+        defrag_partition_indices: None,
+    };
+    run_backup(bcfg, Arc::new(Mutex::new(BackupProgress::default()))).expect("local backup");
+    let backup_folder = backups.join("rst");
+    assert!(
+        backup_folder.join("metadata.json").exists(),
+        "backup created"
+    );
+
+    // --- serve an (initially empty) restore-target root ---
+    let serve_root = work.join("serve");
+    std::fs::create_dir_all(&serve_root).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let sr = serve_root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, sr, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    // --- restore the backup to a remote image file over the wire ---
+    let rcfg = RestoreConfig {
+        backup_folder,
+        target_path: std::path::PathBuf::new(),
+        target_is_device: false,
+        target_size: disk_size,
+        alignment: RestoreAlignment::Original,
+        partition_sizes: Vec::new(),
+        write_zeros_to_unused: false,
+    };
+    let progress = Arc::new(Mutex::new(RestoreProgress::default()));
+    restore_to_remote(
+        rcfg,
+        Arc::clone(&conn),
+        "/restored.img",
+        false,
+        progress,
+        None,
+    )
+    .expect("remote restore");
+
+    // --- the landed remote image is a full, parseable disk ---
+    let restored = serve_root.join("restored.img");
+    assert_eq!(
+        std::fs::metadata(&restored).unwrap().len(),
+        disk_size,
+        "restored image is the full disk size"
+    );
+    let mut f = std::fs::File::open(&restored).unwrap();
+    let mut sector = [0u8; 512];
+    use std::io::Read as _;
+    f.read_exact(&mut sector).unwrap();
+    let p = Mbr::parse(&sector)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| !e.is_empty())
+        .expect("a partition in the restored MBR");
+    assert_eq!(p.partition_type, 0x06);
+    let mut fs = open_filesystem(
+        std::fs::File::open(&restored).unwrap(),
+        p.start_lba as u64 * 512,
+        p.partition_type,
+        None,
+    )
+    .unwrap();
+    let root_e = fs.root().unwrap();
+    let doc = fs
+        .list_directory(&root_e)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "DOC.BIN")
+        .expect("DOC.BIN in the restored partition");
+    let mut got = Vec::new();
+    fs.write_file_to(&doc, &mut got).unwrap();
+    assert_eq!(
+        got, payload,
+        "restored file is byte-exact after the remote push"
+    );
+}
+
 /// Remote RESIZE over the block tier: shrink a served FAT superfloppy's
 /// filesystem in place through the read-write block reader, then re-open and
 /// prove the volume now reports the smaller size and the file still round-trips

@@ -156,6 +156,21 @@ pub enum Request {
     /// edit, which maps to this — so a finished edit is durable on the daemon.
     FlushBlock { handle: u64 },
 
+    /// Open a **write target** for restore: a destination the desktop pushes a
+    /// finished disk image to via `WriteBlock` (reply: `BlockOpened{handle,
+    /// size}`). When `is_device` is true the target is one of the daemon's
+    /// **enumerated** physical devices (validated against `ListDevices`, opened
+    /// read-write, elevated) and `size` is advisory — the reply carries the
+    /// device's real capacity. When false it is a host **image file** under the
+    /// serve root, created/truncated to `size` bytes and opened read-write.
+    /// Destructive by nature (restore overwrites the target). The handle is a
+    /// writable block handle, so it accepts `WriteBlock` / `FlushBlock`.
+    OpenWriteTarget {
+        path: String,
+        is_device: bool,
+        size: u64,
+    },
+
     // --- physical-device backup (v2): the daemon enumerates its own disks ---
     // --- and serves a raw device over the same block-handle machinery, so ---
     // --- the desktop can back up a remote drive without moving the media. ---

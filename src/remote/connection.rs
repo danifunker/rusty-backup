@@ -127,6 +127,17 @@ impl RemoteConnection {
         self.session.flush_block(handle)
     }
 
+    /// Open a restore write target (device or freshly-sized image file) on the
+    /// daemon; returns `(handle, size)`.
+    pub fn open_write_target(
+        &mut self,
+        path: &str,
+        is_device: bool,
+        size: u64,
+    ) -> Result<(u64, u64)> {
+        self.session.open_write_target(path, is_device, size)
+    }
+
     /// List the daemon machine's physical disk devices.
     pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
         self.session.list_devices()

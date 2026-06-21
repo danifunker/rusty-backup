@@ -1160,6 +1160,8 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
 
+`<TARGET>` may be a remote `rb://host[:port]/path` ref — restore over the block tier. With `--device` the target is one of the daemon's enumerated physical drives (the daemon must run elevated; `--yes` required); otherwise it's an image file created under the serve root. The restore is materialized to a local staging image first, then pushed to the daemon via ranged writes, so every backup layout (per-partition / single-file-CHD / Clonezilla) is supported.
+
 ### `rm`
 
 Delete a file or directory from a filesystem

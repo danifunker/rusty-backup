@@ -364,6 +364,31 @@ impl RemoteSession {
         self.expect_ok("FlushBlock")
     }
 
+    /// Open a restore **write target** (a device or a freshly-sized image file)
+    /// on the daemon; returns `(handle, size)` where `size` is the device's real
+    /// capacity (device) or the requested image size. The handle accepts
+    /// [`Self::write_block`].
+    pub fn open_write_target(
+        &mut self,
+        path: &str,
+        is_device: bool,
+        size: u64,
+    ) -> Result<(u64, u64)> {
+        write_control(
+            &mut self.writer,
+            &Request::OpenWriteTarget {
+                path: path.to_string(),
+                is_device,
+                size,
+            },
+        )?;
+        match self.read_response()? {
+            Response::BlockOpened { handle, size } => Ok((handle, size)),
+            Response::Error { message } => bail!("open write target {path}: {message}"),
+            other => bail!("unexpected reply to OpenWriteTarget: {other:?}"),
+        }
+    }
+
     /// List the daemon machine's physical disk devices.
     pub fn list_devices(&mut self) -> Result<Vec<crate::remote::protocol::WireDevice>> {
         write_control(&mut self.writer, &Request::ListDevices)?;

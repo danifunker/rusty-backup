@@ -32,6 +32,8 @@ pub mod remote_browser;
 pub mod repack_runner;
 #[cfg(feature = "remote")]
 pub mod resize_remote;
+#[cfg(feature = "remote")]
+pub mod restore_remote;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;
