@@ -1,18 +1,14 @@
-//! Remote browse panel for the Inspect tab: connect to an `rb-cli serve`
-//! daemon, pick a disk image, and browse its contents **operation-by-operation
-//! over the wire** — the daemon parses the filesystem; we send
-//! `list_dir`/`read_file`. No download: this is the same daemon-served model
-//! Commander uses, built on the testable [`RemoteBrowser`] core.
+//! Remote image **picker** for the Inspect tab: connect to an `rb-cli serve`
+//! daemon and browse its host filesystem (folders + disk images) inline in the
+//! Inspect main area, built on the testable [`RemoteBrowser`] core's host-browse
+//! mode.
 //!
-//! The panel renders **inline** in the Inspect tab's main area (not a floating
-//! window): a host file-picker grid until an image is opened, then the image's
-//! file grid. The connection is persistent — opening / closing / switching
-//! images never reconnects (the daemon's handle table is per-connection). The
-//! source bar grows two controls: "Close Remote Image" (close the image, keep
-//! the connection) and "Disconnect from <addr>" (drop the connection).
-//!
-//! Read-only for now; the write path (staged add/delete/rename -> Apply, which
-//! the daemon already supports) is a planned follow-up.
+//! Picking an image (double-click a teal entry) emits an `inspect_request`
+//! carrying the shared connection + remote path; the Inspect tab opens it over
+//! the **block tier** (a `RemoteBlockReader`) and runs its full pipeline
+//! (partition table, per-partition probes) against the remote image with **no
+//! download** — the daemon keeps the image open and serves raw byte ranges. Once
+//! emitted, the panel collapses (yields the main area to the partition view).
 
 use std::sync::{Arc, Mutex};
 
@@ -21,13 +17,12 @@ use eframe::egui;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::partition::format_size;
+use rusty_backup::remote::RemoteConnection;
 
 /// Folder rows — a blue distinct from plain files.
 const FOLDER_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 170, 255);
 /// A file that looks like a disk image we can open (teal).
 const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
-/// The "Close Remote Image" affordance — amber, reads as "step back out".
-const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
 
 /// Whether a filename's extension is one of the disk-image containers the engine
 /// can open (so the host picker tints it as openable).
@@ -89,6 +84,11 @@ pub struct RemoteBrowsePanel {
     error: Option<String>,
     /// Status lines accumulated this frame, drained by the caller for the log.
     log: Vec<String>,
+    /// Set when the user picks an image to inspect: `(shared connection, remote
+    /// path)`. The Inspect tab drains it, opens a `RemoteBlockReader` on the
+    /// connection, and runs its full pipeline (partition table, browse) over the
+    /// wire. The panel collapses (yields the main area) once emitted.
+    inspect_request: Option<(Arc<Mutex<RemoteConnection>>, String)>,
 }
 
 impl RemoteBrowsePanel {
@@ -129,27 +129,19 @@ impl RemoteBrowsePanel {
         std::mem::take(&mut self.log)
     }
 
-    /// Render the source-bar controls (Close Remote Image / Disconnect). Call
-    /// inside the Inspect source-bar row, after the source dropdown.
+    /// Drain a pending "inspect this remote image" request — `(shared
+    /// connection, remote path)`. The caller opens it over the block tier.
+    pub fn take_inspect_request(&mut self) -> Option<(Arc<Mutex<RemoteConnection>>, String)> {
+        self.inspect_request.take()
+    }
+
+    /// Render the source-bar controls (Disconnect, while picking). Call inside
+    /// the Inspect source-bar row, after the source dropdown.
     pub fn source_bar_controls(&mut self, ui: &mut egui::Ui) {
-        // Only meaningful once a connection exists (or is being established).
+        // Only meaningful while the picker is connected (before an image is
+        // handed off to Inspect, at which point the panel collapses).
         if self.browser.is_none() && self.pending.is_none() {
             return;
-        }
-        // "Close Remote Image" — only when an image is open; keeps the connection.
-        if matches!(self.mode, Some(BrowseMode::Image { .. })) {
-            let btn = egui::Button::new(
-                egui::RichText::new("Close Remote Image").color(CLOSE_IMAGE_COLOR),
-            );
-            let enabled = self.pending.is_none();
-            if ui
-                .add_enabled(enabled, btn)
-                .on_hover_text("Close the image but stay connected to the daemon")
-                .clicked()
-            {
-                let s = self.spawn_close_image();
-                self.log.push(s);
-            }
         }
         if !self.addr.is_empty() {
             let enabled = self.pending.is_none();
@@ -215,12 +207,32 @@ impl RemoteBrowsePanel {
                 }
             }
             GridAction::OpenImage(path) => {
-                let opened_from = self.listing.cwd_path().to_string();
-                let s = self.spawn_open_image(path, None, opened_from);
-                self.log.push(s);
+                // Hand the image to Inspect to open over the block tier (full
+                // partition view). The connection rides along in the request, so
+                // the panel can collapse (yield the main area) — the daemon keeps
+                // the image open via the block reader on that connection.
+                if let Some(b) = &self.browser {
+                    self.inspect_request = Some((b.connection(), path.clone()));
+                    self.log.push(format!("inspecting remote image {path}"));
+                    self.collapse();
+                }
             }
         }
         true
+    }
+
+    /// Collapse the panel UI after handing an image off to Inspect: the
+    /// connection now lives in `inspect_request`, so reset the browse state
+    /// without a "disconnected" log.
+    fn collapse(&mut self) {
+        self.browser = None;
+        self.mode = None;
+        self.pending = None;
+        self.connect_dialog = None;
+        self.listing = DirListing::new();
+        self.error = None;
+        self.phase.clear();
+        self.addr.clear();
     }
 
     /// Render the listing grid. Read-only over `self`; returns one action.
@@ -379,63 +391,6 @@ impl RemoteBrowsePanel {
                     }
                     Err(e) => s.result = Some(Err(format!("{e:#}"))),
                 }
-                s.done = true;
-            }
-        });
-        msg
-    }
-
-    /// Open an image found in the host picker as a new handle on the **same**
-    /// connection (no reconnect), on a worker thread.
-    fn spawn_open_image(
-        &mut self,
-        path: String,
-        partition: Option<u32>,
-        opened_from: String,
-    ) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return "not connected to a remote.".to_string();
-        };
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr: browser.addr().to_string(),
-            ..Default::default()
-        }));
-        self.pending = Some(status.clone());
-        self.error = None;
-        self.phase = format!("Opening {path}...");
-        let msg = format!("opening {path}...");
-        std::thread::spawn(move || {
-            let result = browser
-                .open_image(&path, partition, &opened_from)
-                .map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
-                s.done = true;
-            }
-        });
-        msg
-    }
-
-    /// Step back out of an open image to the host picker (same connection), on a
-    /// worker thread.
-    fn spawn_close_image(&mut self) -> String {
-        let Some(mut browser) = self.browser.take() else {
-            return "not connected to a remote.".to_string();
-        };
-        let status = Arc::new(Mutex::new(RemoteTransition {
-            addr: browser.addr().to_string(),
-            ..Default::default()
-        }));
-        self.pending = Some(status.clone());
-        self.error = None;
-        self.phase = "Returning to host browser...".to_string();
-        let msg = "closing image...".to_string();
-        std::thread::spawn(move || {
-            let result = browser.close_image().map_err(|e| format!("{e:#}"));
-            if let Ok(mut s) = status.lock() {
-                s.browser = Some(browser);
-                s.result = Some(result);
                 s.done = true;
             }
         });

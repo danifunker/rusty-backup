@@ -120,8 +120,16 @@ pub struct InspectTab {
     /// Filesystem browser
     browse_view: BrowseView,
     /// "Connect to Remote..." — an inline panel browsing an `rb-cli serve`
-    /// daemon (connect, pick + browse images on one persistent connection).
+    /// daemon (connect + pick an image on one persistent connection).
     remote_browser: super::remote_browser::RemoteBrowsePanel,
+    /// When set, the inspected source is a **remote image** opened over the
+    /// block tier: `(shared connection, remote path)`. `run_inspect` builds a
+    /// `RemoteBlockReader` from it and parses the partition table over the wire,
+    /// so the whole Inspect view works on a remote image with no download.
+    remote_inspect: Option<(
+        std::sync::Arc<std::sync::Mutex<rusty_backup::remote::RemoteConnection>>,
+        String,
+    )>,
     /// Export: true if the export popup is open
     export_popup: bool,
     /// Export mode: true = whole disk, false = per partition
@@ -267,6 +275,7 @@ impl Default for InspectTab {
             pending_open_archive: None,
             browse_view: BrowseView::default(),
             remote_browser: super::remote_browser::RemoteBrowsePanel::default(),
+            remote_inspect: None,
             export_popup: false,
             export_whole_disk: true,
             export_format: ExportFormat::Vhd,
@@ -441,7 +450,10 @@ impl InspectTab {
         ui.horizontal(|ui| {
             ui.label("Source:");
 
-            let current_label = if let Some(path) = &self.backup_folder_path {
+            let current_label = if let Some((_, rpath)) = &self.remote_inspect {
+                let base = rpath.rsplit('/').find(|s| !s.is_empty()).unwrap_or(rpath);
+                format!("Remote image: {base}")
+            } else if let Some(path) = &self.backup_folder_path {
                 format!("Backup: {}", path.display())
             } else if let Some(path) = &self.image_file_path {
                 if let Some(label) = &self.image_format_label {
@@ -494,6 +506,7 @@ impl InspectTab {
                     self.remote_browser.open();
                 } else {
                     self.remote_browser.disconnect();
+                    self.remote_inspect = None;
                     if self.browse_view.has_unsaved_edits() {
                         // Gate the switch on unsaved browse edits: defer it behind
                         // the confirm prompt so the live source is untouched (and
@@ -505,18 +518,41 @@ impl InspectTab {
                 }
             }
 
-            // Remote session controls (Close Remote Image / Disconnect) sit
-            // beside the source dropdown once a connection exists.
+            // Remote picker controls (Disconnect) sit beside the source dropdown
+            // while connecting / picking.
             self.remote_browser.source_bar_controls(ui);
+
+            // While inspecting a remote image, offer to close it (drops the
+            // connection — the daemon reaps the open block handle).
+            if self.remote_inspect.is_some()
+                && ui
+                    .button("Close Remote")
+                    .on_hover_text("Disconnect from the remote daemon")
+                    .clicked()
+            {
+                self.remote_inspect = None;
+                self.clear_results();
+            }
         });
 
         ui.add_space(4.0);
 
-        // When a remote session is active, the panel takes over the main area
-        // (its own browse grid) and the normal local inspection is skipped.
+        // While the remote picker is active it takes over the main area; once
+        // the user picks an image it hands it off here and collapses.
         let remote_active = self.remote_browser.show(ui);
         for line in self.remote_browser.take_log() {
             ctx.log.info(format!("Remote: {line}"));
+        }
+        // Picked a remote image: switch the inspected source to it (block tier)
+        // and run the full inspect over the wire — no download.
+        if let Some((conn, rpath)) = self.remote_browser.take_inspect_request() {
+            self.browse_view.close();
+            self.image_file_path = None;
+            self.amiga_tempdir = None;
+            self.selected_device_idx = None;
+            self.backup_folder_path = None;
+            self.remote_inspect = Some((conn, rpath));
+            self.run_inspect(ctx);
         }
         if remote_active {
             return;
@@ -2733,7 +2769,14 @@ impl InspectTab {
     fn run_inspect(&mut self, ctx: &mut TabContext) {
         self.clear_results();
 
-        let path = if let Some(img_path) = &self.image_file_path {
+        // A remote image (block tier) takes precedence: there's no local path,
+        // so `path` is synthetic (display/logging only) and the worker reads via
+        // a `RemoteBlockReader` instead of opening a local file/device.
+        let remote = self.remote_inspect.clone();
+
+        let path = if let Some((_, rpath)) = &remote {
+            PathBuf::from(rpath)
+        } else if let Some(img_path) = &self.image_file_path {
             img_path.clone()
         } else if let Some(idx) = self.selected_device_idx {
             if let Some(device) = ctx.devices.get(idx) {
@@ -2746,16 +2789,23 @@ impl InspectTab {
             return;
         };
 
-        ctx.log.info(format!("Inspecting {}...", path.display()));
+        if remote.is_some() {
+            ctx.log
+                .info(format!("Inspecting remote image {}...", path.display()));
+        } else {
+            ctx.log.info(format!("Inspecting {}...", path.display()));
+        }
 
         // Cache CHD path: subsequent per-partition probes (HFS variant probe,
         // hfs_block_size, partition_minimum_size) need a fresh ChdReader rather
-        // than reading partition_offset off the raw .chd file.
-        self.chd_image_path = if rusty_backup::model::source_reader::is_chd_path(&path) {
-            Some(path.clone())
-        } else {
-            None
-        };
+        // than reading partition_offset off the raw .chd file. A remote image is
+        // never a local CHD.
+        self.chd_image_path =
+            if remote.is_none() && rusty_backup::model::source_reader::is_chd_path(&path) {
+                Some(path.clone())
+            } else {
+                None
+            };
 
         // All device I/O runs on a background thread so DA unmount/claim
         // (which can block up to ~5 s) never freezes the GUI.
@@ -2796,8 +2846,11 @@ impl InspectTab {
                 }
             };
 
-            let is_device = path.to_string_lossy().starts_with("/dev/")
-                || path.to_string_lossy().starts_with("\\\\.\\");
+            // A remote image is a raw disk over the wire — never a local device
+            // or container, so these path-specific flags are all false for it.
+            let is_device = remote.is_none()
+                && (path.to_string_lossy().starts_with("/dev/")
+                    || path.to_string_lossy().starts_with("\\\\.\\"));
 
             // File containers decode to a flat sector stream via
             // source_reader::open_read — no tempfile, no elevation needed.
@@ -2805,19 +2858,23 @@ impl InspectTab {
             // / DIM / XDF / HDM / Apple-II / Arculator HDF). CHD is also a
             // container but keeps its own specialized detection below (CD-CHD
             // cooked sectors, format metadata + sidecar), so exclude it here.
-            let uses_streaming_reader = !is_device
+            let uses_streaming_reader = remote.is_none()
+                && !is_device
                 && rusty_backup::model::source_reader::is_container_path(&path)
                 && !rusty_backup::model::source_reader::is_chd_path(&path);
 
             // Open the device/file with full elevation: unmounts volumes and
             // claims exclusive DA access for the duration of the inspect.
-            // Streaming-reader containers skip this (they open via open_read).
+            // Streaming-reader containers and remote images skip this (they open
+            // via open_read / a RemoteBlockReader).
             // `guard` is held purely for RAII: it keeps the volume locks / DA
             // claim alive for the duration of the inspect. On macOS the fd +
             // claim are handed off to the main thread below; on every other
             // platform `guard` is unused, so silence the lint there.
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-            let (device_file, guard) = if !uses_streaming_reader {
+            let (device_file, guard) = if remote.is_some() || uses_streaming_reader {
+                (None, None)
+            } else {
                 let elevated = match rusty_backup::os::open_source_for_reading(&path) {
                     Ok(e) => e,
                     Err(e) => {
@@ -2827,34 +2884,45 @@ impl InspectTab {
                 };
                 let (f, g) = elevated.into_parts();
                 (Some(f), Some(g))
-            } else {
-                (None, None)
             };
 
             set_step("Reading partition table...");
 
-            // Build the initial reader: streaming reader for GHO/IMZ,
-            // cloned File for everything else.
-            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if uses_streaming_reader {
-                match rusty_backup::model::source_reader::open_read(&path) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
-                        return;
+            // Build the initial reader: a RemoteBlockReader for a remote image, a
+            // streaming reader for GHO/IMZ, a cloned File for everything else.
+            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> =
+                if let Some((conn, rpath)) = &remote {
+                    match rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            finish_err(format!("Cannot open remote image {rpath}: {e:#}"));
+                            return;
+                        }
                     }
-                }
-            } else {
-                match device_file.as_ref().unwrap().try_clone() {
-                    Ok(f) => Box::new(BufReader::new(f)),
-                    Err(e) => {
-                        finish_err(format!("Cannot clone file handle: {e}"));
-                        return;
+                } else if uses_streaming_reader {
+                    match rusty_backup::model::source_reader::open_read(&path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            finish_err(format!("Cannot open {}: {e:#}", path.display()));
+                            return;
+                        }
                     }
-                }
-            };
+                } else {
+                    match device_file.as_ref().unwrap().try_clone() {
+                        Ok(f) => Box::new(BufReader::new(f)),
+                        Err(e) => {
+                            finish_err(format!("Cannot clone file handle: {e}"));
+                            return;
+                        }
+                    }
+                };
 
             let detect_result =
-                if uses_streaming_reader {
+                if remote.is_some() {
+                    // A remote image is served as a raw disk; parse the table
+                    // directly over the wire (no local format detection).
+                    PartitionTable::detect(&mut reader)
+                } else if uses_streaming_reader {
                     // Streaming containers (GHO, IMZ) already provide a decoded
                     // raw disk image; skip VHD/2MG/DMG format detection.
                     let ext = path
@@ -2959,10 +3027,19 @@ impl InspectTab {
                     // (e.g. 0x504D "PM" inside an APM map). Open a fresh
                     // ChdReader instead so partition_offset addresses the
                     // unwrapped disk image.
-                    let is_chd = rusty_backup::model::source_reader::is_chd_path(&path);
+                    let is_chd =
+                        remote.is_none() && rusty_backup::model::source_reader::is_chd_path(&path);
                     let make_probe_reader =
                         || -> Option<Box<dyn rusty_backup::rbformats::ReadSeek>> {
-                            if uses_streaming_reader || is_chd {
+                            if let Some((conn, rpath)) = &remote {
+                                // Each probe gets its own block reader on the same
+                                // connection (a fresh daemon-side open handle).
+                                rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath)
+                                    .ok()
+                                    .map(|r| {
+                                        Box::new(r) as Box<dyn rusty_backup::rbformats::ReadSeek>
+                                    })
+                            } else if uses_streaming_reader || is_chd {
                                 rusty_backup::model::source_reader::open_read(&path).ok()
                             } else {
                                 device_file.as_ref()?.try_clone().ok().map(|f| {
@@ -3287,7 +3364,25 @@ impl InspectTab {
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        let result = if uses_streaming_reader || is_chd {
+                        let result = if let Some((conn, rpath)) = &remote {
+                            // Remote image: compute the minimum over a block
+                            // reader on the same connection (cheap FS read a few
+                            // ranges; expensive FS come back Deferred).
+                            match rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath)
+                            {
+                                Ok(r) => rusty_backup::fs::partition_minimum_size(
+                                    r,
+                                    part.byte_offset(),
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    None,
+                                    &|_| {},
+                                ),
+                                Err(_) => continue,
+                            }
+                        } else if uses_streaming_reader || is_chd {
                             // GHO containers with compressed NTFS
                             // require decompressing the entire file to
                             // compute minimum sizes — defer to avoid
