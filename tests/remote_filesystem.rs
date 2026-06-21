@@ -467,3 +467,135 @@ fn block_reader_parses_remote_partition_table_and_filesystem() {
         "remote file read via the block reader must be byte-exact"
     );
 }
+
+/// End-to-end remote backup: serve a partitioned image, pull a full backup to a
+/// local destination over the block tier, and prove the captured partition is
+/// byte-exact vs the source. This is the headline "remote-image BACKUP" path —
+/// `run_backup_from` reading every byte through a `RemoteBlockReader`.
+#[test]
+fn run_backup_pulls_remote_image_byte_exact() {
+    use std::sync::Mutex;
+
+    use rusty_backup::backup::{
+        run_backup_from, BackupConfig, BackupProgress, BackupSource, ChecksumType, CompressionType,
+    };
+    use rusty_backup::partition::mbr::build_minimal_mbr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("disk.img");
+
+    // Build a partitioned disk: MBR + one FAT16 partition at LBA 2048, with a
+    // known file inside it.
+    let part_lba = 2048u32;
+    let part_bytes = 8 * 1024 * 1024usize;
+    let part_sectors = (part_bytes / 512) as u32;
+    let fat_blob = fat::create_blank_fat(part_bytes as u64, Some("BKUPVOL")).unwrap();
+    let mbr = build_minimal_mbr(
+        0x1234_5678,
+        &[(0x06, part_lba, part_sectors, true)],
+        255,
+        63,
+    );
+    let mut disk = vec![0u8; part_lba as usize * 512 + part_bytes];
+    disk[..512].copy_from_slice(&mbr);
+    disk[part_lba as usize * 512..].copy_from_slice(&fat_blob);
+    std::fs::write(&img, &disk).unwrap();
+
+    let payload = vec![0x5Au8; 12345];
+    {
+        let (file, ctx, commit) = resolve_partition_rw(&img, Some(1)).unwrap();
+        let mut efs =
+            open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
+                .unwrap();
+        let parent = efs.root().unwrap();
+        let mut data = &payload[..];
+        efs.create_file(
+            &parent,
+            "BACKUP.BIN",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+        drop(efs);
+        commit.commit().unwrap();
+    }
+    let disk_final = std::fs::read(&img).unwrap();
+    let part_off = part_lba as usize * 512;
+    let source_partition = &disk_final[part_off..part_off + part_bytes];
+
+    // Serve it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    // Pull a raw, sector-by-sector backup over the wire so the captured
+    // partition bytes can be compared verbatim against the source.
+    let dest = root.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let display = format!("rb://{addr}/disk.img");
+    let config = BackupConfig {
+        source_path: std::path::PathBuf::from("/disk.img"),
+        destination_dir: dest.clone(),
+        backup_name: "remote-backup".to_string(),
+        compression: CompressionType::None,
+        checksum: ChecksumType::Crc32,
+        split_size_mib: None,
+        sector_by_sector: true,
+        partition_filter: None,
+        chd_options: None,
+        size_policy: None,
+        partition_target_sizes: None,
+        shrink_to_minimum: false,
+        precomputed_minimum_sizes: None,
+        defrag_partition_indices: None,
+    };
+    let progress = Arc::new(Mutex::new(BackupProgress::default()));
+    let source = BackupSource::Remote {
+        conn: Arc::clone(&conn),
+        path: "/disk.img".to_string(),
+        display: display.clone(),
+    };
+    run_backup_from(source, config, progress).expect("remote backup must succeed");
+
+    // The backup folder records the remote source and the full disk size.
+    let backup_dir = dest.join("remote-backup");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup_dir.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["source_device"], display,
+        "metadata records the remote source label"
+    );
+    assert_eq!(
+        metadata["source_size_bytes"].as_u64().unwrap(),
+        disk_final.len() as u64,
+        "metadata records the full remote image size"
+    );
+
+    // The captured partition is byte-exact vs the source partition.
+    let captured = std::fs::read(backup_dir.join("partition-0.raw"))
+        .expect("partition-0.raw written by the remote backup");
+    assert_eq!(
+        captured.len(),
+        source_partition.len(),
+        "captured partition size matches source"
+    );
+    assert_eq!(
+        captured, source_partition,
+        "remote-pulled partition must be byte-exact vs the local source"
+    );
+
+    // And the MBR sidecar matches sector 0 of the source.
+    let mbr_bin = std::fs::read(backup_dir.join("mbr.bin")).expect("mbr.bin written");
+    assert_eq!(
+        &mbr_bin[..512],
+        &disk_final[..512],
+        "mbr.bin matches sector 0"
+    );
+}

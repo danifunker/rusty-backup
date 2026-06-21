@@ -33,19 +33,34 @@ source. The v1 operation-level browse (Commander) still works on an old daemon.
 
 ## Remaining items (prioritized)
 
-### 1. Remote-image BACKUP (pull to the desktop) — headline next feature
-`run_backup(BackupConfig{ source_path: PathBuf })` is **path-based**
-(`src/backup/mod.rs` ~line 244, opens via `os::open_source_for_reading` →
-`BufReader`). Add a **reader seam** exactly like the `run_inspect` one: let the
-backup engine take a source = path | `Box<dyn ReadSeek + Send>`, and for a remote
-image feed a `RemoteBlockReader` (the block tier exists + is tested). Then add a
-"Backup" affordance for a remote image (Inspect, or the Backup tab). Headlessly
-testable: build a partitioned image, serve it, `run_backup` over a
-`RemoteBlockReader`, verify the backup folder round-trips byte-exact.
-- **Bigger sibling:** remote **physical-drive** backup — daemon enumerates
-  devices (`os::enumerate_devices`), runs elevated, + a `ListDevices` verb +
-  raw-device block reads. That's the plan's "remote-disk backup" (handoff §2/§8).
-  The image-file backup above is the smaller first step on the same block tier.
+### 1. Remote-image BACKUP (pull to the desktop) — DONE (per-partition)
+**DONE — reader seam shipped.** `run_backup` is now a thin wrapper over
+`run_backup_from(BackupSource, config, progress)` (`src/backup/mod.rs`). The
+source funnels through a `SourceFactory` enum (`Local{File,guard,path}` /
+`Remote{conn,path,size}`) that mints fresh seekable readers: `open() ->
+Box<dyn ReadSeek>` (cloned `File` locally, a fresh `RemoteBlockReader` over the
+wire), `total_size()`, `local_file()`. Every generic engine path (partition-table
+parse, FS probes, `analyze_partitions` in `sizes.rs`, compaction, trim read,
+`gpt.bin` export, per-partition metadata) goes through `factory.open()`. The two
+`File`-bound paths — **single-file CHD** and **HFS+/PFS3 defrag-clone** — stay
+**local-only** via `factory.local_file()` and are gated off for remote (remote +
+CHD → clear bail; remote + shrink-to-minimum → warn + ignore). So remote backup =
+**Zstd / Raw / VHD per-partition**, which round-trips byte-exact.
+- Headless test `run_backup_pulls_remote_image_byte_exact`
+  (`tests/remote_filesystem.rs`): partitioned FAT image → serve → `run_backup_from`
+  over the block tier → asserts `partition-0.raw` is byte-exact vs the source
+  partition, `mbr.bin` == sector 0, and metadata records the `rb://…` source +
+  full size. 7/7 remote loopback tests green.
+- GUI (compile-verified only): Inspect tab → inspect a remote image → **"Back Up
+  Image..."** button (next to "Pick Another Image" / "Close Remote") picks a
+  destination folder and spawns `run_backup_from(BackupSource::Remote)` on a
+  worker, polled into the log via `poll_remote_backup_status`. **Needs an
+  interactive check.**
+- **Bigger sibling (still open):** remote **physical-drive** backup — daemon
+  enumerates devices (`os::enumerate_devices`), runs elevated, + a `ListDevices`
+  verb + raw-device block reads (handoff §2/§8). The image-file backup above was
+  the smaller first step on the same block tier; the `SourceFactory` seam is the
+  reusable foundation for it.
 
 ### 2. Remote EDITING (write back) — `open_editable` refuses remote today
 Two options (decide first):

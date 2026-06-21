@@ -325,13 +325,24 @@ engine does ALL parsing. **DONE & PROVEN (commit `afaeb91`):**
 - Headless tests: `browse_session_opens_remote_image_over_block_tier`,
   `fsck_runs_over_block_reader` (+ the block-reader + partition-table tests).
 - **NOT yet over the wire (deferred):** **editing** a remote image
-  (`open_editable` refuses it), **backup/export** of a remote image
-  (`run_backup`/export still path-based; backup = the remote-disk-backup feature,
-  step 4), **resize**. fsck **repair** (vs check) is still path-based.
-4. **Backup/Restore tabs** — remote image source/target first (reuses the read
-   path); then the **remote-disk backup** (block tier `ReadAt`/`RemoteBlockReader`
-   §8 of the plan + the `run_backup` reader-seam refactor + device enumeration +
-   elevated daemon).
+  (`open_editable` refuses it), **resize**. fsck **repair** (vs check) is still
+  path-based. **Backup of a remote image now works — see step 4.**
+4. **Remote-image BACKUP — DONE (per-partition).** `run_backup` is now a thin
+   wrapper over `run_backup_from(BackupSource, config, progress)`; the source
+   funnels through a `SourceFactory` enum (`Local{File,guard,path}` /
+   `Remote{conn,path,size}`) with `open()->Box<dyn ReadSeek>` (cloned `File` /
+   fresh `RemoteBlockReader`), `total_size()`, `local_file()`. Generic engine
+   paths (table parse, FS probes, `sizes::analyze_partitions`, compaction, trim
+   read, gpt.bin, per-partition metadata) go through `factory.open()`; the two
+   `File`-bound paths (single-file CHD, HFS+/PFS3 defrag-clone) stay local-only
+   via `factory.local_file()` and are gated off for remote (remote+CHD bails;
+   remote+shrink warns+ignores). Remote backup = **Zstd / Raw / VHD
+   per-partition**, byte-exact. Test `run_backup_pulls_remote_image_byte_exact`.
+   GUI: Inspect "Back Up Image..." button (compile-verified, needs interactive
+   check). **Still open:** Restore-tab remote **target**; and the bigger
+   **remote-disk backup** (block-tier raw-device reads §8 + device enumeration +
+   elevated daemon + `ListDevices` verb) — the `SourceFactory` seam is its
+   foundation (just feed the device-backed `RemoteBlockReader`).
 5. **TUI** remote browser.
 
 GUI work can only be **compile-verified here** (no display in the agent env) — the

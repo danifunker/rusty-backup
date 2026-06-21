@@ -9,7 +9,6 @@
 //! layout-preserving), see the comments in `run_backup` where this module is
 //! called from.
 
-use std::fs::File;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 
@@ -37,8 +36,12 @@ pub(super) struct PartitionSizing {
 }
 
 /// Per-partition analysis: try compaction, fall back to trim-based sizing.
+///
+/// `source` mints fresh seekable readers (a cloned local `File` or a
+/// `RemoteBlockReader`) per partition probe — the analysis never holds more
+/// than one open at a time.
 pub(super) fn analyze_partitions(
-    source: &File,
+    source: &super::SourceFactory,
     partitions: &[PartitionInfo],
     sector_by_sector: bool,
     is_superfloppy: bool,
@@ -81,7 +84,7 @@ pub(super) fn analyze_partitions(
             format!("Attempting compaction for partition-{}...", part.index),
         );
         let part_offset = part.start_lba * 512;
-        let clone_result = source.try_clone();
+        let clone_result = source.open();
         if let Err(ref e) = clone_result {
             log(
                 progress,
@@ -157,7 +160,7 @@ pub(super) fn analyze_partitions(
                 Some(result.data_size)
             } else {
                 source
-                    .try_clone()
+                    .open()
                     .ok()
                     .and_then(|clone| {
                         fs::effective_partition_size(
@@ -227,7 +230,7 @@ pub(super) fn analyze_partitions(
                 Some(v.min(part.size_bytes)).filter(|&d| d < part.size_bytes)
             } else {
                 source
-                    .try_clone()
+                    .open()
                     .ok()
                     .and_then(|clone| {
                         fs::defragmented_partition_size(
@@ -280,7 +283,7 @@ pub(super) fn analyze_partitions(
         } else {
             // Trim-based fallback.
             let effective = source
-                .try_clone()
+                .open()
                 .ok()
                 .and_then(|clone| {
                     fs::effective_partition_size(

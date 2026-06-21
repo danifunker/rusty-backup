@@ -250,6 +250,9 @@ pub struct InspectTab {
     single_file_chd_backup_folder: Option<PathBuf>,
     /// "Physical Disk Export" sub-window state.
     physical_disk_export: PhysicalDiskExport,
+    /// Status of a background "Back Up Image…" pull of the currently-inspected
+    /// remote image to a local folder. `None` when none is running.
+    remote_backup_status: Option<Arc<Mutex<rusty_backup::backup::BackupProgress>>>,
 }
 
 impl Default for InspectTab {
@@ -321,6 +324,7 @@ impl Default for InspectTab {
             chd_info_text: None,
             single_file_chd_backup_folder: None,
             physical_disk_export: PhysicalDiskExport::default(),
+            remote_backup_status: None,
         }
     }
 }
@@ -524,16 +528,33 @@ impl InspectTab {
 
             // While inspecting a remote image: switch to another image on the
             // SAME connection (no reconnect), or close the session entirely.
-            if let Some((conn, _)) = self.remote_inspect.clone() {
+            if let Some((conn, rpath)) = self.remote_inspect.clone() {
                 if ui
                     .button("Pick Another Image")
                     .on_hover_text("Browse the daemon for another image (no reconnect)")
                     .clicked()
                 {
-                    self.remote_browser.browse_on(conn);
+                    self.remote_browser.browse_on(conn.clone());
+                }
+                // Pull a full backup of this remote image to a local folder.
+                // Read-only over the block tier (no CHD / shrink-to-minimum).
+                let backup_running = self.remote_backup_status.is_some();
+                if ui
+                    .add_enabled(
+                        !self.partitions.is_empty() && !backup_running,
+                        egui::Button::new("Back Up Image..."),
+                    )
+                    .on_hover_text("Pull a full backup of this remote image to a local folder")
+                    .clicked()
+                {
+                    self.start_remote_backup(ctx, conn.clone(), rpath.clone());
+                }
+                if backup_running {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Backing up...");
                 }
                 if ui
-                    .button("Close Remote")
+                    .add_enabled(!backup_running, egui::Button::new("Close Remote"))
                     .on_hover_text("Disconnect from the remote daemon")
                     .clicked()
                 {
@@ -601,6 +622,9 @@ impl InspectTab {
 
         // Poll export status
         self.poll_export_status(ctx);
+
+        // Poll a running "Back Up Image…" pull of a remote image
+        self.poll_remote_backup_status(ctx);
 
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
@@ -2545,6 +2569,120 @@ impl InspectTab {
             }
             drop(status);
             self.export_status = None;
+        }
+    }
+
+    /// Kick off a background "Back Up Image…" pull of the currently-inspected
+    /// remote image to a user-picked local folder. Read-only over the block
+    /// tier: Zstd per-partition output, no CHD / shrink-to-minimum (those need
+    /// `File`-specific access the daemon doesn't expose). GUI-only entry point;
+    /// the engine work is [`rusty_backup::backup::run_backup_from`].
+    fn start_remote_backup(
+        &mut self,
+        ctx: &mut TabContext,
+        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        rpath: String,
+    ) {
+        let Some(dest) = super::file_dialog().pick_folder() else {
+            return;
+        };
+        let stem = std::path::Path::new(&rpath)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("remote-image");
+        let backup_name = format!("{stem}-backup");
+        let display = {
+            let addr = conn
+                .lock()
+                .ok()
+                .map(|c| c.addr().to_string())
+                .unwrap_or_default();
+            let path_part = if rpath.starts_with('/') {
+                rpath.clone()
+            } else {
+                format!("/{rpath}")
+            };
+            format!("rb://{addr}{path_part}")
+        };
+
+        let config = rusty_backup::backup::BackupConfig {
+            source_path: std::path::PathBuf::from(&rpath),
+            destination_dir: dest.clone(),
+            backup_name: backup_name.clone(),
+            // Zstd per-partition is the only remote-supported output (CHD needs
+            // whole-disk staging the block tier doesn't expose).
+            compression: rusty_backup::backup::CompressionType::Zstd,
+            checksum: rusty_backup::backup::ChecksumType::Sha256,
+            split_size_mib: None,
+            sector_by_sector: false,
+            partition_filter: None,
+            chd_options: None,
+            size_policy: None,
+            partition_target_sizes: None,
+            shrink_to_minimum: false,
+            precomputed_minimum_sizes: None,
+            defrag_partition_indices: None,
+        };
+
+        let progress = Arc::new(Mutex::new(rusty_backup::backup::BackupProgress::new()));
+        self.remote_backup_status = Some(Arc::clone(&progress));
+        ctx.log.info(format!(
+            "Backing up remote image {display} -> {}",
+            dest.join(&backup_name).display()
+        ));
+
+        let source = rusty_backup::backup::BackupSource::Remote {
+            conn,
+            path: rpath,
+            display,
+        };
+        std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote backup");
+            let progress_for_panic = Arc::clone(&progress);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress))
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some("remote backup worker panicked".to_string());
+                        p.finished = true;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Drain log messages from the remote-backup worker into the global log
+    /// panel and react to completion (success/error).
+    fn poll_remote_backup_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.remote_backup_status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            match msg.level {
+                rusty_backup::backup::LogLevel::Error => ctx.log.error(msg.message),
+                rusty_backup::backup::LogLevel::Warning => ctx.log.warn(msg.message),
+                rusty_backup::backup::LogLevel::Info => ctx.log.info(msg.message),
+            }
+        }
+        if status.finished {
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Remote backup failed: {err}"));
+            } else {
+                ctx.log.info("Remote backup completed successfully.");
+            }
+            drop(status);
+            self.remote_backup_status = None;
         }
     }
 
