@@ -119,6 +119,9 @@ pub struct InspectTab {
     pending_open_archive: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
+    /// "Open Remote..." — a self-contained file-browser window over an `rb-cli
+    /// serve` daemon (connect, browse, open/switch images on one connection).
+    remote_browser: super::remote_browser::RemoteBrowserWindow,
     /// Export: true if the export popup is open
     export_popup: bool,
     /// Export mode: true = whole disk, false = per partition
@@ -263,6 +266,7 @@ impl Default for InspectTab {
             pending_source_change: None,
             pending_open_archive: None,
             browse_view: BrowseView::default(),
+            remote_browser: super::remote_browser::RemoteBrowserWindow::default(),
             export_popup: false,
             export_whole_disk: true,
             export_format: ExportFormat::Vhd,
@@ -491,6 +495,17 @@ impl InspectTab {
                 } else {
                     self.apply_source_event(ev);
                 }
+            }
+
+            // Browse a disk image on a remote rb-cli serve daemon, in a
+            // self-contained file-browser window (connect -> browse -> open an
+            // image -> switch images without reconnecting).
+            if ui
+                .button("Open Remote...")
+                .on_hover_text("Browse a remote rb-cli serve daemon's filesystem")
+                .clicked()
+            {
+                self.remote_browser.open();
             }
         });
 
@@ -933,6 +948,12 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
+        }
+
+        // The "Open Remote..." file-browser window (renders itself as a floating
+        // egui window when open); route its status to the app log.
+        if let Some(s) = self.remote_browser.show(ui.ctx()) {
+            ctx.log.info(format!("Remote: {s}"));
         }
     }
 
