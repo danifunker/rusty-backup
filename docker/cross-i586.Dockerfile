@@ -31,5 +31,5 @@ ENV CARGO_TARGET_I586_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
 
 WORKDIR /src
 CMD ["cargo", "build", "--release", "--bin", "rb-cli", \
-     "--no-default-features", "--features", "pure-zstd", \
+     "--no-default-features", "--features", "pure-zstd,remote", \
      "--target", "i586-unknown-linux-gnu", "--target-dir", "/src/target-cross"]

@@ -118,6 +118,7 @@ impl ConflictMode {
 pub fn run(args: GetArgs) -> Result<()> {
     // Remote source: `rb-cli get rb://host:port/img@N SRC DST`. The daemon
     // streams the file's bytes; the client lands them on the host.
+    #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
         return remote_get(
             &rref,
@@ -204,6 +205,7 @@ pub fn run(args: GetArgs) -> Result<()> {
 /// Remote single-file extract over an `rb://` reference (Phase 0: one literal
 /// file — globs and recursive-directory pulls need server-side walking and are
 /// deferred to a later phase).
+#[cfg(feature = "remote")]
 fn remote_get(
     rref: &crate::remote::RemoteRef,
     partition: Option<u32>,
@@ -255,6 +257,7 @@ fn remote_get(
 }
 
 /// Last path component of a slash-separated source path.
+#[cfg(feature = "remote")]
 fn remote_basename(src: &str) -> &str {
     src.trim_end_matches('/').rsplit('/').next().unwrap_or(src)
 }

@@ -122,6 +122,7 @@ pub fn run(args: PutArgs) -> Result<()> {
 
     // Remote destination: `rb-cli put rb://host:port/img@N HOST /DEST`. Upload
     // the host file into the daemon's staging area and apply it.
+    #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
         return remote_put(
             &rref,
@@ -233,6 +234,7 @@ pub fn run(args: PutArgs) -> Result<()> {
 /// `rb-cli put rb://host:port/img@N HOST /DEST` — stage a host file into a
 /// remote image and apply it. Phase 1: a single host file (not `--zero` /
 /// `--boot`, which are deferred over `rb://`).
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 fn remote_put(
     rref: &crate::remote::RemoteRef,

@@ -122,11 +122,9 @@ SIMD paths disabled). For typical DX2/DX4 hardware this is a non-issue.
 ## Dependencies: what's pure Rust and what isn't
 
 The decoupling work is already in `Cargo.toml`. The slim build
-(`--no-default-features`) drops the whole GUI / update-check / CHD / optical
-stack (eframe, egui, glow, winit, rfd/GTK, reqwest, tokio, libchdman,
-opticaldiscs). What remains is almost entirely pure Rust. Note the **`rb-cli
-serve` network daemon stays in** — it's pure `std::net` + `serde_json` (not a
-feature), so even the i486 slim binary can host its images on the LAN.
+(`--no-default-features`) drops the whole GUI/network/CHD/optical stack
+(eframe, egui, glow, winit, rfd/GTK, reqwest, tokio, libchdman, opticaldiscs).
+What remains is almost entirely pure Rust.
 
 **Native (C) libraries — both are now solved.** With `--no-default-features
 --features pure-zstd`, the slim build pulls **no C at all**:

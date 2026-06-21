@@ -57,6 +57,7 @@ pub struct LsArgs {
 pub fn run(args: LsArgs) -> Result<()> {
     // Remote source: `rb-cli ls rb://host:port/img@N /path`. The daemon parses
     // the filesystem and returns the listing; we never pull raw blocks.
+    #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
         return remote_ls(&rref, args.image.partition, &args.path);
     }
@@ -134,6 +135,7 @@ pub fn run(args: LsArgs) -> Result<()> {
 /// daemon's host filesystem (`rb://host/` or a host directory) or the contents
 /// of an image on it (`rb://host/img@N`), auto-detected. Literal paths only —
 /// globbing would need server-side volume walking, deferred.
+#[cfg(feature = "remote")]
 fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str) -> Result<()> {
     if has_glob_chars(path) {
         bail!("glob patterns aren't supported over rb:// yet (literal paths only)");
@@ -164,6 +166,7 @@ fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str
 }
 
 /// Mirror of [`print_entry`] for a [`crate::remote::protocol::WireEntry`].
+#[cfg(feature = "remote")]
 fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
     let kind = if entry.is_dir() { "DIR " } else { "FILE" };
     let t = entry.type_code.as_deref().unwrap_or("    ");

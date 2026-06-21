@@ -34,7 +34,7 @@ ENV CARGO_TARGET_I486_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc \
 
 WORKDIR /src
 CMD ["cargo", "+nightly", "build", "--release", "--bin", "rb-cli", \
-     "--no-default-features", "--features", "pure-zstd", \
+     "--no-default-features", "--features", "pure-zstd,remote", \
      "-Z", "build-std=std,panic_abort", "-Z", "json-target-spec", \
      "--target", "/src/targets/i486-unknown-linux-gnu.json", \
      "--target-dir", "/src/target-cross"]

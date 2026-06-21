@@ -7,9 +7,8 @@
 //! at the operation level. The write path (stage→apply), Family B (backup
 //! stream), the MiSTer TUI/service, and push-update all land in later phases.
 //!
-//! Compiled into **every** rb-cli build — not feature-gated — since it's pure
-//! `std::net` + `serde_json` + `tempfile` (all always-on, no new dependency).
-//! So the MiSTer / appliance / any slim build carries the daemon.
+//! Gated behind the `remote` cargo feature (pure `std::net` + `serde_json`, no
+//! new dependency), so the slim build can drop or keep it cheaply.
 
 pub mod client;
 pub mod fs;

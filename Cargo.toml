@@ -67,9 +67,11 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "native-zlib", "native-zstd"]
-# Pull in eframe / egui / rfd plus the update-checker's reqwest client.
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+default = ["gui", "chd", "optical", "native-zlib", "native-zstd", "remote"]
+# Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
+# pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
+# in a GUI build.
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser", "remote"]
 # Fast C zlib (zlib-ng) for flate2. The always-on baseline is flate2's pure-Rust
 # `rust_backend` (miniz_oxide); this feature overrides it with the C backend for
 # desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486
@@ -95,10 +97,14 @@ chd = ["dep:libchdman-rs"]
 # Physical optical-drive I/O (rip / data-track read). MiSTer has no optical
 # drive; leaving this off also drops a libcdio Buildroot dep.
 optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
-# NOTE: the network daemon + client (`rb-cli serve` / `rb://host:port/img@N`) in
-# `src/remote/` is NOT a feature — it is compiled into EVERY rb-cli build
-# (pure std::net + serde_json + tempfile, all always-on, no extra crate), so the
-# MiSTer / appliance / any slim build carries the daemon. See docs/remote_transfer_plan.md.
+# Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
+# ON BY DEFAULT, and every shipped build opts in: the desktop release via
+# `default`, and the slim/cross pipelines (armv7 MiSTer, i486/i586 appliance)
+# all pass `--features ...,remote`. Pure std::net + serde_json (both always-on),
+# so it adds NO new dependency. To build WITHOUT the daemon, use
+# `--no-default-features` and leave `remote` out of the feature list.
+# See docs/remote_transfer_plan.md.
+remote = []
 
 [dependencies]
 # Optional, gated behind feature flags. See [features] above.

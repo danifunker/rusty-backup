@@ -35,8 +35,8 @@ RUN rustup target add i586-unknown-linux-musl
 ENV CARGO_TARGET_I586_UNKNOWN_LINUX_MUSL_LINKER=i686-linux-gnu-gcc
 
 WORKDIR /src
-# The rb-cli serve daemon (src/remote/) is compiled into every build (not a
-# feature), so this static appliance binary carries it automatically.
+# `remote` adds the rb-cli serve daemon + rb:// (pure std::net + serde_json, no
+# C / no extra crate) so the appliance can host its images over the network.
 CMD ["cargo", "build", "--release", "--bin", "rb-cli", \
-     "--no-default-features", "--features", "pure-zstd", \
+     "--no-default-features", "--features", "pure-zstd,remote", \
      "--target", "i586-unknown-linux-musl", "--target-dir", "/src/target-cross"]

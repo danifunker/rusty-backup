@@ -27,6 +27,7 @@ pub fn run(args: MkdirArgs) -> Result<()> {
     }
 
     // Remote: `rb-cli mkdir rb://host:port/img@N /NEWDIR` — stage + apply.
+    #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
         let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
         let sid = session.open_session(&rref.path, args.image.partition)?;
