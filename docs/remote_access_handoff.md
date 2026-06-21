@@ -268,18 +268,50 @@ A **`RemoteBrowser` window/component** (own module, e.g.
    `RemoteOpened` enum, and `remote_host_return`. **GUI wiring is COMPILE-VERIFIED
    ONLY — needs an interactive check** (connect → open image → Close Image → open
    a *different* image, confirming no reconnect; copy still works).
-3. **Inspect "Open Remote…"** → `RemoteBrowser` → open image; switch without
-   reconnect. **NEXT.** The core (`model::remote_browser::RemoteBrowser`) is ready
-   to reuse. Step 3 needs a **reusable egui browser *window*** (the handoff §3c
-   `src/gui/remote_browser.rs`): a modal/dockable file-browser over a
-   `RemoteBrowser` + its own `DirListing` grid, with an "Open" that hands the
-   chosen image's `BrowseTarget` (or the shared connection + path/partition) back
-   to the caller; Inspect's file/source options gain "Open Remote…" to pop it.
-   Commander's pane has the browse UI inline today — ideally the new window
-   component is factored so Commander can later adopt it too (don't fork the grid
-   twice). This is a sizable new egui surface with UX choices (window shape, how
-   Inspect consumes a remote image) — worth confirming the Commander experience
-   interactively first.
+3. **Inspect "Connect to Remote…"** → browse + (eventually) full inspect.
+   **PARTIALLY DONE — see the block-tier pivot below.** Shipped: `src/gui/
+   remote_browser.rs` `RemoteBrowsePanel` (inline, not a window) wired into the
+   Inspect source dropdown (`source_picker` gained `show_remote` + `SourceEvent::
+   Remote`); connect → host picker → operation-level browse of an image's files,
+   persistent connection, Close-Remote-Image / Disconnect buttons (commit
+   `d8696ae`). This is **operation-level** (one daemon-mounted FS = a file
+   browser) — it does NOT yet show the partition table or run backup/export/resize
+   on a remote image.
+
+### Block-tier pivot (user direction, 2026-06-21): remote images must run Inspect's FULL pipeline
+
+The operation-level model can't give Inspect the partition table / backup /
+export / resize (those need seekable raw access to the whole disk). The correct
+model is the **block tier**: the daemon serves raw byte *ranges*; the desktop
+engine does ALL parsing. **DONE & PROVEN (commit `afaeb91`):**
+- **Protocol v2** (additive): `HostFileSize` + `ReadHostRange` verbs, `FileSize`
+  response. Server reads a sandboxed file's range (4 MiB/read cap). Client
+  `RemoteSession::{host_file_size,read_host_range}` + `RemoteConnection` brokers.
+- **`RemoteBlockReader`** (`src/remote/block_reader.rs`): `Read + Seek` over the
+  wire via `ReadHostRange`, one 256 KiB read-ahead window cached. `Send +
+  'static` → feeds straight into `open_filesystem` / any `Read+Seek` engine code.
+- **Headless test** `block_reader_parses_remote_partition_table_and_filesystem`:
+  builds a real MBR-partitioned FAT disk, serves it, and over the block reader
+  reads byte-exact across seeks, parses the MBR, opens the partition's FS, reads a
+  file byte-exact. **The whole engine stack works over ranged reads.**
+- **v2 means the MiSTer daemon must be refreshed** to serve ranged reads (image
+  *inspection*); the v1 operation-level browse still works on an old daemon.
+
+**NEXT — the reader seam (the remaining integration, a big careful refactor of
+core Inspect code; verify interactively at each step):**
+- `run_inspect` (`inspect_tab.rs:~2838`) already builds `reader: Box<dyn
+  rbformats::ReadSeek>` and parses partitions from it — `RemoteBlockReader` boxes
+  straight into that slot. Restructure `run_inspect` to take a **source** =
+  `Path | Box<dyn ReadSeek+Send>`; for the remote case skip the device-claim /
+  container-decode / GHO-metadata path-specific logic and just parse the table.
+  → delivers the **partition-table view of a remote image** (first visible win).
+- Then the per-partition operations, each currently path-based, need the same
+  seam: **browse** (`BrowseSession` is path/session-based — add a reader-source
+  open), **min-size** (`partition_minimum_size` opens from path), **backup**
+  (`run_backup(BackupConfig{source_path})` — the handoff's known seam),
+  **export**, **resize**. Wire the panel's image-pick to build a
+  `RemoteBlockReader` and hand it to `run_inspect` instead of operation-level
+  `open_image`.
 4. **Backup/Restore tabs** — remote image source/target first (reuses the read
    path); then the **remote-disk backup** (block tier `ReadAt`/`RemoteBlockReader`
    §8 of the plan + the `run_backup` reader-seam refactor + device enumeration +
@@ -322,6 +354,8 @@ hook), commit, and validate over loopback.
 ## 6. Current commits (newest first, on `add-crusty-backup-dos-poc`)
 
 ```
+afaeb91 remote: block tier — RemoteBlockReader (Read+Seek over the wire)     <- block-tier core (PROVEN)
+d8696ae remote: inline remote browse panel in the Inspect tab (op-level)     <- Step 3 (browse)
 09c45c3 remote: Commander pane uses RemoteBrowser — no reconnect on switch  <- Step 2 (GUI)
 f11c103 remote: testable RemoteBrowser core (connect / open / switch / close) <- Step 2 (core)
 b027e92 docs: mark remote-access Step 1 done; refine Step 2 plan
