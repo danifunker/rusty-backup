@@ -352,6 +352,94 @@ fn browse_session_opens_remote_image_over_block_tier() {
     );
 }
 
+/// Remote RESIZE over the block tier: shrink a served FAT superfloppy's
+/// filesystem in place through the read-write block reader, then re-open and
+/// prove the volume now reports the smaller size and the file still round-trips
+/// — `resize_filesystem_for` patching the BPB/FAT over the wire, never touching
+/// the image's byte length.
+#[test]
+fn resize_remote_image_over_block_tier() {
+    use rusty_backup::model::resize_remote::resize_remote_partition;
+    use rusty_backup::remote::RemoteConnection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("resize.img");
+    // 8 MiB FAT superfloppy with a multi-cluster file near the start.
+    make_fat_image(&img, "RESIZEVOL", "KEEP.BIN", 0x5E, 9000);
+    let image_len_before = std::fs::metadata(&img).unwrap().len();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    // Baseline FS size over the wire (before resize).
+    let size_before = rusty_backup::model::browse_session::BrowseSession {
+        partition_offset: 0,
+        partition_type: 0,
+        remote: Some((Arc::clone(&conn), "/resize.img".to_string())),
+        ..Default::default()
+    }
+    .open()
+    .unwrap()
+    .total_size();
+
+    // Shrink the filesystem to 6 MiB, in place over the wire.
+    let new_size = 6 * 1024 * 1024;
+    let mut log = Vec::new();
+    let outcome =
+        resize_remote_partition(Arc::clone(&conn), "/resize.img", None, new_size, &mut |s| {
+            log.push(s.to_string())
+        })
+        .expect("remote resize");
+    assert_eq!(outcome.partition_offset, 0, "superfloppy resizes at byte 0");
+
+    // Re-open over the wire: the volume shrank and the file still round-trips.
+    let session = rusty_backup::model::browse_session::BrowseSession {
+        partition_offset: 0,
+        partition_type: 0,
+        remote: Some((Arc::clone(&conn), "/resize.img".to_string())),
+        ..Default::default()
+    };
+    let mut fs = session.open().unwrap();
+    let size_after = fs.total_size();
+    assert!(
+        size_after < size_before,
+        "FS shrank over the wire ({size_before} -> {size_after})"
+    );
+    assert!(
+        size_after <= new_size,
+        "resized FS fits the requested {new_size} bytes (got {size_after})"
+    );
+    let root_e = fs.root().unwrap();
+    let keep = fs
+        .list_directory(&root_e)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "KEEP.BIN")
+        .expect("KEEP.BIN survives the resize");
+    let mut got = Vec::new();
+    fs.write_file_to(&keep, &mut got).unwrap();
+    assert_eq!(
+        got,
+        vec![0x5E; 9000],
+        "file round-trips after remote resize"
+    );
+
+    // The resize patched FS metadata in place — the image file did not change
+    // length (a block-tier resize never grows/truncates the image).
+    assert_eq!(
+        std::fs::metadata(&img).unwrap().len(),
+        image_len_before,
+        "remote resize must not change the image's byte length"
+    );
+}
+
 /// Remote EDITING over the block tier: open a served FAT image read-WRITE
 /// through a `RemoteBlockReader`, add a file + sync, then re-open read-only and
 /// prove the new file is present byte-exact, the original survived, and the

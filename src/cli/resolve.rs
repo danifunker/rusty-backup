@@ -349,6 +349,18 @@ fn resolve<R: Read + Seek>(reader: &mut R, selector: Option<u32>) -> Result<Part
     resolve_with_override(reader, selector, None)
 }
 
+/// Resolve which partition a `Read + Seek` source's `IMG[@N]` selector points at,
+/// returning the offset / type / size context — the reader-based sibling of
+/// [`resolve_partition_ro`]. Used for sources that aren't a local file handle
+/// (e.g. a [`crate::remote::RemoteBlockReader`] over the block tier), so a remote
+/// image gets the **exact same** `@N` semantics as a local one.
+pub fn resolve_partition_in_reader<R: Read + Seek>(
+    reader: &mut R,
+    selector: Option<u32>,
+) -> Result<PartitionContext> {
+    resolve(reader, selector)
+}
+
 /// As [`resolve`], but `fs_override` (the `--fs-type` value, if any) makes
 /// a partition-table detection *failure* non-fatal: when the user has
 /// explicitly declared a filesystem, an image with neither a partition

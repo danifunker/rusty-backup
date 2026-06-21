@@ -30,6 +30,8 @@ pub mod physical_write_runner;
 #[cfg(feature = "remote")]
 pub mod remote_browser;
 pub mod repack_runner;
+#[cfg(feature = "remote")]
+pub mod resize_remote;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;

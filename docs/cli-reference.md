@@ -1135,6 +1135,8 @@ Usage: resize --size <SIZE> <IMAGE>
 
 - `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
 
+`<IMAGE>` may be a remote `rb://host[:port]/img@N` ref — the filesystem is resized in place over the block tier (same `@N`/`--size` meaning; only the I/O is ranged daemon requests). Resizes the filesystem *within* its partition; it never changes the partition table or the image's byte length.
+
 ### `restore`
 
 Restore a backup folder to a target image or device

@@ -35,6 +35,15 @@ pub struct ResizeArgs {
 
 pub fn run(args: ResizeArgs) -> Result<()> {
     let new_size = parse_size(&args.size).context("parsing --size")?;
+
+    // Remote ref (`rb://host[:port]/img`): resize the filesystem in place over
+    // the block tier. The `IMG@N` selector + `--size` mean the same as locally;
+    // only the I/O path differs (ranged read/write requests to the daemon).
+    #[cfg(feature = "remote")]
+    if let Some(remote) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
+        return run_remote(remote, args.image.partition, new_size);
+    }
+
     let (mut file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
     log_stderr(format!(
@@ -60,6 +69,34 @@ pub fn run(args: ResizeArgs) -> Result<()> {
     // changed the flat length can't be re-encoded; commit() surfaces that as a
     // clear error rather than writing a malformed container.
     commit.commit()?;
+    log_stderr("resize complete");
+    Ok(())
+}
+
+/// Resize a remote image's filesystem in place over the block tier. Connects to
+/// the daemon, then defers to the testable [`resize_remote_partition`] core.
+#[cfg(feature = "remote")]
+fn run_remote(
+    remote: crate::remote::RemoteRef,
+    partition: Option<u32>,
+    new_size: u64,
+) -> Result<()> {
+    use crate::model::resize_remote::resize_remote_partition;
+    use crate::remote::RemoteConnection;
+
+    log_stderr(format!(
+        "resize: remote {} (partition {}), target size {} ({new_size} bytes)",
+        remote.path,
+        partition
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "auto".into()),
+        format_size(new_size),
+    ));
+    let conn = RemoteConnection::connect_shared(&remote.addr())
+        .with_context(|| format!("connecting to {}", remote.addr()))?;
+    let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
+    let outcome = resize_remote_partition(conn, &remote.path, partition, new_size, &mut log_cb)?;
+    log_stderr(outcome.label);
     log_stderr("resize complete");
     Ok(())
 }
