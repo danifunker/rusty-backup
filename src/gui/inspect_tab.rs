@@ -627,7 +627,8 @@ impl InspectTab {
         ui.horizontal(|ui| {
             let has_source = self.selected_device_idx.is_some()
                 || self.image_file_path.is_some()
-                || self.backup_folder_path.is_some();
+                || self.backup_folder_path.is_some()
+                || self.remote_inspect.is_some();
             let inspect_running = self.inspect_status.is_some();
             if ui
                 .add_enabled(
@@ -643,12 +644,13 @@ impl InspectTab {
                 }
             }
 
-            // Export button — available when we have partition data and no export running
+            // Export button — available when we have partition data and no export
+            // running. Not for a remote image yet (export is path-based).
             let has_partitions = !self.partitions.is_empty();
             let export_running = self.export_status.is_some();
             if ui
                 .add_enabled(
-                    has_partitions && !export_running,
+                    has_partitions && !export_running && self.remote_inspect.is_none(),
                     egui::Button::new("Export Disk Image..."),
                 )
                 .clicked()
@@ -676,10 +678,12 @@ impl InspectTab {
                 }
             }
 
-            // Edit Partition Table button — only for devices and image files (not backups)
+            // Edit Partition Table button — only for devices and image files
+            // (not backups, not remote images — the editor writes back locally).
             let is_editable_source = self.partition_table.is_some()
                 && self.backup_folder_path.is_none()
                 && self.clonezilla_image.is_none()
+                && self.remote_inspect.is_none()
                 && !matches!(
                     self.partition_table.as_ref(),
                     Some(PartitionTable::None { .. })
@@ -3752,6 +3756,10 @@ impl InspectTab {
         let is_image_source = self.image_file_path.is_some()
             && self.selected_device_idx.is_none()
             && self.backup_folder_path.is_none();
+        // A remote image is read-only over the wire: the HFS Expand/Export action
+        // re-floors or rewrites the volume (path-based), so it's disabled. Browse,
+        // Calc min, and Check (fsck) all work over the block reader.
+        let is_remote = self.remote_inspect.is_some();
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -3969,13 +3977,14 @@ impl InspectTab {
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
-                            ) && ui
-                                .small_button("Expand/Export…")
-                                .on_hover_text(
-                                    "Re-floor this classic-HFS volume to a new size / block \
-                                     size (APM .hda) or export it as a flat BasiliskII HFV.",
-                                )
-                                .clicked()
+                            ) && !is_remote
+                                && ui
+                                    .small_button("Expand/Export…")
+                                    .on_hover_text(
+                                        "Re-floor this classic-HFS volume to a new size / block \
+                                         size (APM .hda) or export it as a flat BasiliskII HFV.",
+                                    )
+                                    .clicked()
                             {
                                 expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
@@ -4233,26 +4242,38 @@ impl InspectTab {
         type_string: Option<String>,
         ctx: &mut TabContext,
     ) {
-        let source_path = self
-            .selected_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-            .map(|d| d.path.clone())
-            .or_else(|| self.image_file_path.clone());
-
-        let path = match source_path {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source available for filesystem check");
-                return;
+        // Remote image: check over the block reader (read-only). This runs
+        // synchronously like the local path; a large remote volume will pause
+        // the UI for the duration of the check.
+        let result = if let Some((conn, rpath)) = &self.remote_inspect {
+            match rusty_backup::remote::RemoteBlockReader::open(std::sync::Arc::clone(conn), rpath)
+            {
+                Ok(reader) => rusty_backup::model::fsck_runner::run_fsck_reader(
+                    reader,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ),
+                Err(e) => Err(e),
             }
+        } else {
+            let source_path = self
+                .selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+                .map(|d| d.path.clone())
+                .or_else(|| self.image_file_path.clone());
+
+            let path = match source_path {
+                Some(p) => p,
+                None => {
+                    ctx.log.error("No source available for filesystem check");
+                    return;
+                }
+            };
+            rusty_backup::model::fsck_runner::run_fsck(&path, offset, ptype, type_string.as_deref())
         };
 
-        match rusty_backup::model::fsck_runner::run_fsck(
-            &path,
-            offset,
-            ptype,
-            type_string.as_deref(),
-        ) {
+        match result {
             Ok(Some(result)) => {
                 if result.is_clean() {
                     ctx.log.info(format!(

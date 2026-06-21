@@ -274,6 +274,32 @@ fn browser_core_opens_switches_and_closes_on_one_connection() {
     drop(browser);
 }
 
+/// fsck over the wire: `run_fsck_reader` opens a remote image's filesystem
+/// through a `RemoteBlockReader` and runs its checker — read-only, no download.
+#[test]
+fn fsck_runs_over_block_reader() {
+    use rusty_backup::model::fsck_runner::run_fsck_reader;
+    use rusty_backup::remote::{RemoteBlockReader, RemoteConnection};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_fat_image(&root.join("chk.img"), "CHKVOL", "DATA.BIN", 0x33, 1024);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let reader = RemoteBlockReader::open(conn, "/chk.img").unwrap();
+    // Opens the filesystem over the wire and runs its checker (Some) or reports
+    // "not supported" (None) — either way it must not error.
+    let res = run_fsck_reader(reader, 0, 0, None);
+    assert!(res.is_ok(), "fsck over the block reader errored: {res:?}");
+}
+
 /// The exact per-partition **browse** path the Inspect GUI uses: a
 /// `BrowseSession` with a remote source opens the filesystem over the block tier
 /// (a `RemoteBlockReader`) and reads a file byte-exact. Editing is refused.

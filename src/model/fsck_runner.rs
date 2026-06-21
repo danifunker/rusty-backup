@@ -26,6 +26,18 @@ pub fn run_fsck(
     type_string: Option<&str>,
 ) -> Result<Option<FsckResult>> {
     let reader = open_read(path)?;
+    run_fsck_reader(reader, offset, ptype, type_string)
+}
+
+/// Run `fsck` against the partition at `offset` in a **pre-opened reader** (e.g.
+/// a remote block reader). Read-only — same checker as [`run_fsck`], just
+/// reader-based so a remote image can be checked over the wire.
+pub fn run_fsck_reader<R: std::io::Read + std::io::Seek + Send + 'static>(
+    reader: R,
+    offset: u64,
+    ptype: u8,
+    type_string: Option<&str>,
+) -> Result<Option<FsckResult>> {
     let mut fs = open_filesystem(reader, offset, ptype, type_string)
         .with_context(|| "failed to open filesystem")?;
     match fs.fsck() {
