@@ -522,16 +522,24 @@ impl InspectTab {
             // while connecting / picking.
             self.remote_browser.source_bar_controls(ui);
 
-            // While inspecting a remote image, offer to close it (drops the
-            // connection — the daemon reaps the open block handle).
-            if self.remote_inspect.is_some()
-                && ui
+            // While inspecting a remote image: switch to another image on the
+            // SAME connection (no reconnect), or close the session entirely.
+            if let Some((conn, _)) = self.remote_inspect.clone() {
+                if ui
+                    .button("Pick Another Image")
+                    .on_hover_text("Browse the daemon for another image (no reconnect)")
+                    .clicked()
+                {
+                    self.remote_browser.browse_on(conn);
+                }
+                if ui
                     .button("Close Remote")
                     .on_hover_text("Disconnect from the remote daemon")
                     .clicked()
-            {
-                self.remote_inspect = None;
-                self.clear_results();
+                {
+                    self.remote_inspect = None;
+                    self.clear_results();
+                }
             }
         });
 

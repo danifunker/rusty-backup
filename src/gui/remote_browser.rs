@@ -101,6 +101,37 @@ impl RemoteBrowsePanel {
         });
     }
 
+    /// Re-open the host picker on an **existing** connection (no reconnect), so
+    /// the caller can switch to a different image on the same daemon session.
+    /// Runs on a worker thread.
+    pub fn browse_on(&mut self, conn: Arc<Mutex<RemoteConnection>>) {
+        let addr = conn
+            .lock()
+            .ok()
+            .map(|c| c.addr().to_string())
+            .unwrap_or_default();
+        let status = Arc::new(Mutex::new(RemoteTransition {
+            addr,
+            ..Default::default()
+        }));
+        self.pending = Some(status.clone());
+        self.error = None;
+        self.phase = "Reopening remote browser...".to_string();
+        std::thread::spawn(move || {
+            let outcome = RemoteBrowser::from_connection(conn, "/");
+            if let Ok(mut s) = status.lock() {
+                match outcome {
+                    Ok((browser, target)) => {
+                        s.browser = Some(browser);
+                        s.result = Some(Ok(target));
+                    }
+                    Err(e) => s.result = Some(Err(format!("{e:#}"))),
+                }
+                s.done = true;
+            }
+        });
+    }
+
     /// True when a remote session is live or being established — the Inspect tab
     /// renders this panel's browse area instead of the normal inspection.
     pub fn is_active(&self) -> bool {

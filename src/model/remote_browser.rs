@@ -101,6 +101,30 @@ impl RemoteBrowser {
         Ok((browser, BrowseTarget::host(Box::new(fs), root, entries)))
     }
 
+    /// Build a browser on an **existing** shared connection (no reconnect) and
+    /// browse its host FS at `root_path`. Lets a caller that already holds a
+    /// connection (e.g. Inspect, after picking an image) re-open the picker to
+    /// switch images on the same daemon session.
+    pub fn from_connection(
+        conn: Arc<Mutex<RemoteConnection>>,
+        root_path: &str,
+    ) -> anyhow::Result<(Self, BrowseTarget)> {
+        let addr = conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote connection lock poisoned"))?
+            .addr()
+            .to_string();
+        let (fs, root, entries) =
+            RemoteHostFilesystem::on_connection(Arc::clone(&conn), root_path)?;
+        let browser = RemoteBrowser {
+            conn,
+            addr,
+            mode: BrowseMode::Host,
+            image_return_dir: None,
+        };
+        Ok((browser, BrowseTarget::host(Box::new(fs), root, entries)))
+    }
+
     /// Browse the daemon's host FS at `root_path` on the existing connection.
     pub fn browse_host(&mut self, root_path: &str) -> anyhow::Result<BrowseTarget> {
         let (fs, root, entries) =
