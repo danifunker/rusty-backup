@@ -119,9 +119,9 @@ pub struct InspectTab {
     pending_open_archive: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
-    /// "Open Remote..." — a self-contained file-browser window over an `rb-cli
-    /// serve` daemon (connect, browse, open/switch images on one connection).
-    remote_browser: super::remote_browser::RemoteBrowserWindow,
+    /// "Connect to Remote..." — an inline panel browsing an `rb-cli serve`
+    /// daemon (connect, pick + browse images on one persistent connection).
+    remote_browser: super::remote_browser::RemoteBrowsePanel,
     /// Export: true if the export popup is open
     export_popup: bool,
     /// Export mode: true = whole disk, false = per partition
@@ -266,7 +266,7 @@ impl Default for InspectTab {
             pending_source_change: None,
             pending_open_archive: None,
             browse_view: BrowseView::default(),
-            remote_browser: super::remote_browser::RemoteBrowserWindow::default(),
+            remote_browser: super::remote_browser::RemoteBrowsePanel::default(),
             export_popup: false,
             export_whole_disk: true,
             export_format: ExportFormat::Vhd,
@@ -473,6 +473,7 @@ impl InspectTab {
                 show_image: true,
                 show_host_folder: false,
                 show_backup_folder: true,
+                show_remote: true,
                 materialize_image: true,
                 include_mac_archives: true,
                 width: 400.0,
@@ -487,29 +488,39 @@ impl InspectTab {
             if let Some(ev) =
                 super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
             {
-                // Gate the switch on unsaved browse edits: defer it behind the
-                // confirm prompt so the live source is untouched (and no new
-                // disk partially loads) until the user resolves it.
-                if self.browse_view.has_unsaved_edits() {
-                    self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                // "Connect to Remote..." opens the inline remote panel; any other
+                // source ends a remote session and switches to that local source.
+                if matches!(ev, super::source_picker::SourceEvent::Remote) {
+                    self.remote_browser.open();
                 } else {
-                    self.apply_source_event(ev);
+                    self.remote_browser.disconnect();
+                    if self.browse_view.has_unsaved_edits() {
+                        // Gate the switch on unsaved browse edits: defer it behind
+                        // the confirm prompt so the live source is untouched (and
+                        // no new disk partially loads) until the user resolves it.
+                        self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                    } else {
+                        self.apply_source_event(ev);
+                    }
                 }
             }
 
-            // Browse a disk image on a remote rb-cli serve daemon, in a
-            // self-contained file-browser window (connect -> browse -> open an
-            // image -> switch images without reconnecting).
-            if ui
-                .button("Open Remote...")
-                .on_hover_text("Browse a remote rb-cli serve daemon's filesystem")
-                .clicked()
-            {
-                self.remote_browser.open();
-            }
+            // Remote session controls (Close Remote Image / Disconnect) sit
+            // beside the source dropdown once a connection exists.
+            self.remote_browser.source_bar_controls(ui);
         });
 
         ui.add_space(4.0);
+
+        // When a remote session is active, the panel takes over the main area
+        // (its own browse grid) and the normal local inspection is skipped.
+        let remote_active = self.remote_browser.show(ui);
+        for line in self.remote_browser.take_log() {
+            ctx.log.info(format!("Remote: {line}"));
+        }
+        if remote_active {
+            return;
+        }
 
         // Auto-inspect on selection change
         let selection_changed = self.selected_device_idx != self.prev_device_idx
@@ -948,12 +959,6 @@ impl InspectTab {
         if self.browse_view.is_active() {
             //ui.add_space(4.0);
             self.browse_view.show(ui);
-        }
-
-        // The "Open Remote..." file-browser window (renders itself as a floating
-        // egui window when open); route its status to the app log.
-        if let Some(s) = self.remote_browser.show(ui.ctx()) {
-            ctx.log.info(format!("Remote: {s}"));
         }
     }
 
@@ -2556,6 +2561,9 @@ impl InspectTab {
             }
             // Inspect's picker doesn't offer a host folder.
             SourceEvent::HostFolder(_) => {}
+            // "Connect to Remote..." is intercepted at the call site (it pops a
+            // window rather than changing the source); never reaches here.
+            SourceEvent::Remote => {}
         }
     }
 

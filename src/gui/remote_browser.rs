@@ -1,16 +1,18 @@
-//! A reusable, self-contained remote file-browser **window** (egui).
+//! Remote browse panel for the Inspect tab: connect to an `rb-cli serve`
+//! daemon, pick a disk image, and browse its contents **operation-by-operation
+//! over the wire** — the daemon parses the filesystem; we send
+//! `list_dir`/`read_file`. No download: this is the same daemon-served model
+//! Commander uses, built on the testable [`RemoteBrowser`] core.
 //!
-//! Wraps the testable [`RemoteBrowser`] core (`model::remote_browser`) in a
-//! floating window any tab can pop: connect to an `rb-cli serve` daemon, browse
-//! its host filesystem, open a disk image found there — and **switch between
-//! images on the same connection without reconnecting** — then browse the files
-//! inside it. The listing renders through the shared [`DirListing`] grid model.
+//! The panel renders **inline** in the Inspect tab's main area (not a floating
+//! window): a host file-picker grid until an image is opened, then the image's
+//! file grid. The connection is persistent — opening / closing / switching
+//! images never reconnects (the daemon's handle table is per-connection). The
+//! source bar grows two controls: "Close Remote Image" (close the image, keep
+//! the connection) and "Disconnect from <addr>" (drop the connection).
 //!
-//! It is its *own* browser: Inspect's `BrowseView` rebuilds a filesystem from a
-//! local path and can't accept the daemon's `Box<dyn Filesystem>`, so the whole
-//! browse experience lives in this window. The blocking transitions (connect /
-//! open image / close image) run on a worker thread; per-directory navigation
-//! within an already-open filesystem is a quick synchronous `list_dir`.
+//! Read-only for now; the write path (staged add/delete/rename -> Apply, which
+//! the daemon already supports) is a planned follow-up.
 
 use std::sync::{Arc, Mutex};
 
@@ -22,13 +24,13 @@ use rusty_backup::partition::format_size;
 
 /// Folder rows — a blue distinct from plain files.
 const FOLDER_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 170, 255);
-/// A file in a host listing that looks like a disk image we can open (teal).
+/// A file that looks like a disk image we can open (teal).
 const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
-/// The "Close Image" affordance — amber, reads as "step back out".
+/// The "Close Remote Image" affordance — amber, reads as "step back out".
 const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
 
 /// Whether a filename's extension is one of the disk-image containers the engine
-/// can open (so the host browser can tint it as openable).
+/// can open (so the host picker tints it as openable).
 fn looks_like_disk_image(name: &str) -> bool {
     name.rsplit_once('.')
         .map(|(_, ext)| {
@@ -38,8 +40,8 @@ fn looks_like_disk_image(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Worker-thread handoff for a blocking remote transition. Both `RemoteBrowser`
-/// and `BrowseTarget` are `Send`, so they move back to the UI thread here.
+/// Worker-thread handoff for a blocking transition (connect / open / close).
+/// Both `RemoteBrowser` and `BrowseTarget` are `Send`, so they move back here.
 #[derive(Default)]
 struct RemoteTransition {
     done: bool,
@@ -51,20 +53,13 @@ struct RemoteTransition {
     result: Option<Result<BrowseTarget, String>>,
 }
 
-/// Display cache (addr + mode) — held across an in-flight transition so the
-/// source bar's label stays stable while the browser is on the worker thread.
-struct RemoteConn {
-    addr: String,
-    mode: BrowseMode,
-}
-
 /// State of the modal "Connect to remote..." prompt.
 struct ConnectDialog {
     host: String,
     error: Option<String>,
 }
 
-/// What the listing grid reports the user did this frame (at most one action).
+/// What the grid reports the user did this frame (at most one action).
 enum GridAction {
     None,
     Up,
@@ -72,17 +67,17 @@ enum GridAction {
     OpenImage(String),
 }
 
-/// A self-contained remote file-browser window, poppable from any tab.
+/// Inline remote browse panel for the Inspect tab.
 #[derive(Default)]
-pub struct RemoteBrowserWindow {
-    /// Whether the window is shown at all.
-    open: bool,
-    /// The live browser session (connection + mode). `None` until connected, or
-    /// transiently while a transition runs on the worker thread.
+pub struct RemoteBrowsePanel {
+    /// The live browser session (connection + mode). `None` when disconnected,
+    /// or transiently while a transition runs on the worker thread.
     browser: Option<RemoteBrowser>,
-    /// Display cache (addr + mode).
-    remote: Option<RemoteConn>,
-    /// The listing grid model (host browse, or inside an image).
+    /// Daemon address (display / reconnect seed).
+    addr: String,
+    /// Display cache of the current mode (held across an in-flight transition).
+    mode: Option<BrowseMode>,
+    /// The listing grid (host picker, or inside an image).
     listing: DirListing,
     /// In-flight transition (connect / open image / close image).
     pending: Option<Arc<Mutex<RemoteTransition>>>,
@@ -90,141 +85,130 @@ pub struct RemoteBrowserWindow {
     connect_dialog: Option<ConnectDialog>,
     /// Spinner phase text while a transition runs.
     phase: String,
-    /// Last error, shown in the window body.
+    /// Last error, shown in the panel body.
     error: Option<String>,
+    /// Status lines accumulated this frame, drained by the caller for the log.
+    log: Vec<String>,
 }
 
-impl RemoteBrowserWindow {
-    /// Open the window. If not already connected (and not mid-connect), pops the
-    /// connect prompt seeded with the last-used host.
+impl RemoteBrowsePanel {
+    /// Start the connect flow (pops the host:port prompt). If already connected,
+    /// re-pops it so the user can switch daemons.
     pub fn open(&mut self) {
-        self.open = true;
+        self.connect_dialog = Some(ConnectDialog {
+            host: self.addr.clone(),
+            error: None,
+        });
+    }
+
+    /// True when a remote session is live or being established — the Inspect tab
+    /// renders this panel's browse area instead of the normal inspection.
+    pub fn is_active(&self) -> bool {
+        self.pending.is_some() || self.browser.is_some() || self.error.is_some()
+    }
+
+    /// Disconnect: drop the browser (the last Arc to the shared connection goes
+    /// with it; the daemon reaps its handles) and reset.
+    pub fn disconnect(&mut self) {
+        let was = !self.addr.is_empty();
+        self.browser = None;
+        self.mode = None;
+        self.pending = None;
+        self.connect_dialog = None;
+        self.listing = DirListing::new();
+        self.error = None;
+        self.phase.clear();
+        if was {
+            self.log.push(format!("disconnected from {}", self.addr));
+        }
+        self.addr.clear();
+    }
+
+    /// Drain the status lines accumulated this frame.
+    pub fn take_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.log)
+    }
+
+    /// Render the source-bar controls (Close Remote Image / Disconnect). Call
+    /// inside the Inspect source-bar row, after the source dropdown.
+    pub fn source_bar_controls(&mut self, ui: &mut egui::Ui) {
+        // Only meaningful once a connection exists (or is being established).
         if self.browser.is_none() && self.pending.is_none() {
-            self.connect_dialog = Some(ConnectDialog {
-                host: self
-                    .remote
-                    .as_ref()
-                    .map(|r| r.addr.clone())
-                    .unwrap_or_default(),
-                error: None,
-            });
+            return;
+        }
+        // "Close Remote Image" — only when an image is open; keeps the connection.
+        if matches!(self.mode, Some(BrowseMode::Image { .. })) {
+            let btn = egui::Button::new(
+                egui::RichText::new("Close Remote Image").color(CLOSE_IMAGE_COLOR),
+            );
+            let enabled = self.pending.is_none();
+            if ui
+                .add_enabled(enabled, btn)
+                .on_hover_text("Close the image but stay connected to the daemon")
+                .clicked()
+            {
+                let s = self.spawn_close_image();
+                self.log.push(s);
+            }
+        }
+        if !self.addr.is_empty() {
+            let enabled = self.pending.is_none();
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(format!("Disconnect from {}", self.addr)),
+                )
+                .on_hover_text("Close the connection to the remote daemon")
+                .clicked()
+            {
+                self.disconnect();
+            }
         }
     }
 
-    /// Render the window (no-op when closed). Returns an optional status line for
-    /// the caller's log.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<String> {
-        if !self.open {
-            return None;
+    /// Render the panel (connect modal + browse area). Returns `true` when a
+    /// remote session is active, so the Inspect tab skips its normal inspection.
+    pub fn show(&mut self, ui: &mut egui::Ui) -> bool {
+        if let Some(s) = self.poll(ui.ctx()) {
+            self.log.push(s);
         }
-        let mut status = self.poll(ctx);
-        if let Some(s) = self.render_connect_dialog(ctx) {
-            status = Some(s);
+        if let Some(s) = self.render_connect_dialog(ui.ctx()) {
+            self.log.push(s);
+        }
+        if !self.is_active() {
+            return false;
         }
 
-        let mut keep_open = true;
+        ui.separator();
         let mut action = GridAction::None;
-        let mut do_close_image = false;
-        let mut do_reconnect = false;
-        egui::Window::new("Remote Browser")
-            .open(&mut keep_open)
-            .resizable(true)
-            .default_width(560.0)
-            .default_height(420.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let label = match &self.remote {
-                        Some(r) => match &r.mode {
-                            BrowseMode::Host => format!("Remote {} (host)", r.addr),
-                            BrowseMode::Image { path, partition } => {
-                                let base = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path);
-                                let part = partition.map(|n| format!("@{n}")).unwrap_or_default();
-                                format!("Remote {}: {base}{part}", r.addr)
-                            }
-                        },
-                        None => "Not connected".to_string(),
-                    };
-                    ui.strong(label);
-                    if ui
-                        .button("Connect...")
-                        .on_hover_text("Connect to a remote rb-cli serve daemon")
-                        .clicked()
-                    {
-                        do_reconnect = true;
-                    }
-                    // When inside an image, "Close Image" steps back to the host
-                    // file browser on the SAME connection (no reconnect).
-                    if matches!(
-                        &self.remote,
-                        Some(RemoteConn {
-                            mode: BrowseMode::Image { .. },
-                            ..
-                        })
-                    ) {
-                        let btn = egui::Button::new(
-                            egui::RichText::new("Close Image").color(CLOSE_IMAGE_COLOR),
-                        );
-                        if ui
-                            .add(btn)
-                            .on_hover_text("Back to browsing the remote host filesystem")
-                            .clicked()
-                        {
-                            do_close_image = true;
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let p = self.listing.cwd_path();
-                    ui.monospace(if p.is_empty() { "/" } else { p });
-                });
-                ui.separator();
-
-                if self.pending.is_some() {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label(if self.phase.is_empty() {
-                            "Working...".to_string()
-                        } else {
-                            self.phase.clone()
-                        });
-                    });
-                } else if let Some(e) = &self.error {
-                    ui.add_space(8.0);
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
-                } else if self.listing.is_loaded() {
-                    action = self.render_grid(ui);
+        if self.pending.is_some() {
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label(if self.phase.is_empty() {
+                    "Working...".to_string()
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.weak("Connect to a remote daemon to browse it here.");
-                    });
-                }
+                    self.phase.clone()
+                });
             });
-
-        if !keep_open {
-            return Some(self.close());
-        }
-        if do_reconnect {
-            self.connect_dialog = Some(ConnectDialog {
-                host: self
-                    .remote
-                    .as_ref()
-                    .map(|r| r.addr.clone())
-                    .unwrap_or_default(),
-                error: None,
-            });
-        }
-        if do_close_image {
-            status = Some(self.spawn_close_image());
+        } else if let Some(e) = &self.error {
+            ui.add_space(8.0);
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+        } else if self.listing.is_loaded() {
+            let hint = if matches!(self.mode, Some(BrowseMode::Host)) {
+                "Double-click a folder to open it, or a disk image to inspect it."
+            } else {
+                "Browsing the remote image (read-only). Double-click a folder to open it."
+            };
+            ui.label(egui::RichText::new(hint).weak().small());
+            action = self.render_grid(ui);
         }
 
-        // Apply the grid action (mutates the listing or spawns an open).
+        // Apply the grid action (mutate the listing / spawn an open).
         match action {
             GridAction::None => {}
-            GridAction::Up => {
-                self.listing.up();
-            }
+            GridAction::Up => self.listing.up(),
             GridAction::Enter(name) => {
                 if let Err(e) = self.listing.enter(&name) {
                     self.error = Some(format!("{e}"));
@@ -232,28 +216,21 @@ impl RemoteBrowserWindow {
             }
             GridAction::OpenImage(path) => {
                 let opened_from = self.listing.cwd_path().to_string();
-                status = Some(self.spawn_open_image(path, None, opened_from));
+                let s = self.spawn_open_image(path, None, opened_from);
+                self.log.push(s);
             }
         }
-
-        status
+        true
     }
 
-    /// Render the listing grid. Read-only over `self` — it returns at most one
-    /// `GridAction`; the caller applies the mutation afterwards.
+    /// Render the listing grid. Read-only over `self`; returns one action.
     fn render_grid(&self, ui: &mut egui::Ui) -> GridAction {
-        let host_mode = matches!(
-            self.remote,
-            Some(RemoteConn {
-                mode: BrowseMode::Host,
-                ..
-            })
-        );
+        let host_mode = matches!(self.mode, Some(BrowseMode::Host));
         let mut action = GridAction::None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("remote_browser_grid")
+                egui::Grid::new("remote_inspect_grid")
                     .num_columns(3)
                     .striped(true)
                     .spacing([12.0, 2.0])
@@ -313,8 +290,7 @@ impl RemoteBrowserWindow {
         action
     }
 
-    /// The modal "Connect to remote..." prompt (host:port only — you browse the
-    /// daemon and open an image you find, rather than naming it up front).
+    /// The modal "Connect to remote..." prompt (host:port only).
     fn render_connect_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
         self.connect_dialog.as_ref()?;
         let mut do_connect = false;
@@ -324,6 +300,7 @@ impl RemoteBrowserWindow {
             egui::Window::new("Connect to remote")
                 .collapsible(false)
                 .resizable(false)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label("Host (rb-cli serve daemon):");
@@ -381,8 +358,7 @@ impl RemoteBrowserWindow {
         None
     }
 
-    /// Connect to `addr` and browse the host FS at `/`, on a worker thread. A
-    /// fresh connection (replaces any prior browser).
+    /// Connect to `addr` and browse the host FS at `/`, on a worker thread.
     fn spawn_connect(&mut self, addr: String) -> String {
         let status = Arc::new(Mutex::new(RemoteTransition {
             addr: addr.clone(),
@@ -409,7 +385,7 @@ impl RemoteBrowserWindow {
         msg
     }
 
-    /// Open an image found in the host browser as a new handle on the **same**
+    /// Open an image found in the host picker as a new handle on the **same**
     /// connection (no reconnect), on a worker thread.
     fn spawn_open_image(
         &mut self,
@@ -441,8 +417,8 @@ impl RemoteBrowserWindow {
         msg
     }
 
-    /// Step back out of an open image to the host file browser (same
-    /// connection), on a worker thread.
+    /// Step back out of an open image to the host picker (same connection), on a
+    /// worker thread.
     fn spawn_close_image(&mut self) -> String {
         let Some(mut browser) = self.browser.take() else {
             return "not connected to a remote.".to_string();
@@ -466,8 +442,8 @@ impl RemoteBrowserWindow {
         msg
     }
 
-    /// Poll an in-flight transition; when done, re-install the browser and swap
-    /// the new target into the listing.
+    /// Poll an in-flight transition; on completion re-install the browser and
+    /// swap the new target into the listing.
     fn poll(&mut self, ctx: &egui::Context) -> Option<String> {
         let done = match self.pending.as_ref() {
             Some(s) => s.lock().ok().map(|g| g.done).unwrap_or(false),
@@ -487,15 +463,12 @@ impl RemoteBrowserWindow {
         if let Some(b) = browser {
             self.browser = Some(b);
         }
-
         match result {
             Ok(target) => {
                 let mode = target.mode.clone();
+                self.addr = addr.clone();
+                self.mode = Some(mode.clone());
                 self.error = None;
-                self.remote = Some(RemoteConn {
-                    addr: addr.clone(),
-                    mode: mode.clone(),
-                });
                 self.listing
                     .load_root(target.fs, target.root, target.entries, false);
                 match mode {
@@ -505,30 +478,16 @@ impl RemoteBrowserWindow {
             }
             Err(e) => {
                 if had_browser {
-                    // The connection survived a failed open / close — keep the
-                    // current listing, just report it.
+                    // Connection survived a failed open/close — keep the listing.
                     Some(format!("remote operation failed: {e}"))
                 } else {
                     // A fresh connect failed — nothing to show but the error.
                     self.error = Some(e.clone());
-                    self.remote = None;
+                    self.mode = None;
+                    self.addr.clear();
                     Some(format!("remote connect failed: {e}"))
                 }
             }
         }
-    }
-
-    /// Close the window and disconnect: dropping the browser drops the last Arc
-    /// to the shared connection (the daemon reaps its handles).
-    fn close(&mut self) -> String {
-        self.open = false;
-        self.browser = None;
-        self.remote = None;
-        self.pending = None;
-        self.connect_dialog = None;
-        self.listing = DirListing::new();
-        self.error = None;
-        self.phase.clear();
-        "closed remote browser".to_string()
     }
 }

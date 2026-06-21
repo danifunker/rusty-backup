@@ -1156,6 +1156,8 @@ impl CommanderPane {
                 show_image: true,
                 show_host_folder: true,
                 show_backup_folder: true,
+                // Commander keeps its own dedicated "Remote..." button.
+                show_remote: false,
                 materialize_image: false,
                 include_mac_archives: false,
                 width: 200.0,
@@ -1195,6 +1197,9 @@ impl CommanderPane {
                         }
                     }
                     SourceEvent::Device(_) => {}
+                    // Commander doesn't offer "Connect to Remote..." in the
+                    // picker (it has its own dedicated button); never emitted.
+                    SourceEvent::Remote => {}
                 }
             }
 
