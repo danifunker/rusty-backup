@@ -80,7 +80,6 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         .root
         .canonicalize()
         .with_context(|| format!("serve root {:?}", cfg.root))?;
-    let staging_dir = cfg.staging_dir.clone();
     let listener = TcpListener::bind(&cfg.bind).with_context(|| format!("binding {}", cfg.bind))?;
     let bound = listener
         .local_addr()
@@ -92,7 +91,14 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         root.display()
     );
     eprintln!("rb-cli serve: Family F read+write (stage->apply). Ctrl-C to stop.");
+    serve_on(listener, root, cfg.staging_dir)
+}
 
+/// Run the accept loop on an already-bound listener. `root` must already be
+/// canonicalized (the sandbox check compares paths against it). Blocks until the
+/// process exits. Exposed so integration tests can bind a port-0 listener and
+/// drive the daemon without guessing a port.
+pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBuf>) -> Result<()> {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -154,11 +160,21 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
             }
 
             Request::OpenImage { path, partition } => match open_image(root, &path, partition) {
-                Ok((fs, label)) => {
+                Ok(o) => {
                     let handle = next_handle;
                     next_handle += 1;
-                    handles.insert(handle, fs);
-                    write_control(&mut writer, &Response::Opened { handle, label })?;
+                    handles.insert(handle, o.fs);
+                    write_control(
+                        &mut writer,
+                        &Response::Opened {
+                            handle,
+                            label: o.label,
+                            fs_type: o.fs_type,
+                            volume_label: o.volume_label,
+                            total_size: o.total_size,
+                            used_size: o.used_size,
+                        },
+                    )?;
                 }
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
             },
@@ -341,13 +357,19 @@ fn stage_blob<R: std::io::Read>(reader: &mut R, blob: &Path) -> Result<()> {
     Ok(())
 }
 
+/// An opened filesystem plus the metadata a remote pane displays.
+struct OpenedFs {
+    fs: Box<dyn Filesystem>,
+    label: String,
+    fs_type: String,
+    volume_label: Option<String>,
+    total_size: u64,
+    used_size: u64,
+}
+
 /// Open `rel` (relative to `root`, partition `partition`) for reading exactly
-/// as the local CLI would, returning the live filesystem + the CLI's label.
-fn open_image(
-    root: &Path,
-    rel: &str,
-    partition: Option<u32>,
-) -> Result<(Box<dyn Filesystem>, String)> {
+/// as the local CLI would, returning the live filesystem + display metadata.
+fn open_image(root: &Path, rel: &str, partition: Option<u32>) -> Result<OpenedFs> {
     let full = sandbox_join(root, rel)?;
     let (reader, ctx) = crate::cli::resolve::resolve_partition_streaming_forced_inside(
         &full, partition, None, None, None,
@@ -359,7 +381,14 @@ fn open_image(
         ctx.type_string.as_deref(),
     )
     .map_err(|e| anyhow!("opening filesystem: {e}"))?;
-    Ok((fs, ctx.label))
+    Ok(OpenedFs {
+        fs_type: fs.fs_type().to_string(),
+        volume_label: fs.volume_label().map(|s| s.to_string()),
+        total_size: fs.total_size(),
+        used_size: fs.used_size(),
+        fs,
+        label: ctx.label,
+    })
 }
 
 /// Open a write session: sandbox + verify the target image exists; the editable
@@ -478,8 +507,8 @@ fn stage_copy_local(
     src_path: &str,
     sess: &mut Session,
 ) -> Result<(PathBuf, u64, Option<String>, Option<String>)> {
-    let (mut src_fs, _label) = open_image(root, src_rel, src_partition)?;
-    let entry = resolve_path(&mut *src_fs, src_path)?;
+    let mut opened = open_image(root, src_rel, src_partition)?;
+    let entry = resolve_path(&mut *opened.fs, src_path)?;
     if entry.is_directory() {
         bail!("{src_path} is a directory (recursive copy over rb:// isn't supported yet)");
     }
@@ -487,7 +516,8 @@ fn stage_copy_local(
     sess.blob_seq += 1;
     let mut f = std::fs::File::create(&blob)
         .with_context(|| format!("creating staging blob {}", blob.display()))?;
-    src_fs
+    opened
+        .fs
         .write_file_to(&entry, &mut f)
         .map_err(|e| anyhow!("reading {src_path}: {e}"))?;
     Ok((

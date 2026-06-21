@@ -217,8 +217,9 @@ fn remote_get(
         bail!("glob patterns aren't supported over rb:// yet (Phase 0 fetches one literal file)");
     }
     let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
-    let (handle, label) = session.open_image(&rref.path, partition)?;
-    log_stderr(label);
+    let opened = session.open_image(&rref.path, partition)?;
+    let handle = opened.handle;
+    log_stderr(opened.label);
 
     // If DST is an existing dir (or written with a trailing separator), land
     // the file under it as SRC's basename — same rule as the local path.

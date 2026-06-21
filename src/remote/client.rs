@@ -14,6 +14,18 @@ use crate::remote::protocol::{
     CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
+/// Result of opening a remote image: a handle + the filesystem's display
+/// metadata.
+#[derive(Debug, Clone)]
+pub struct OpenedImage {
+    pub handle: u64,
+    pub label: String,
+    pub fs_type: String,
+    pub volume_label: Option<String>,
+    pub total_size: u64,
+    pub used_size: u64,
+}
+
 /// A live connection to a daemon, after a successful Family-F handshake.
 pub struct RemoteSession {
     reader: BufReader<TcpStream>,
@@ -60,9 +72,9 @@ impl RemoteSession {
         }
     }
 
-    /// Open a disk image on the daemon. Returns `(handle, label)` where
-    /// `label` mirrors the CLI's partition line (printed to stderr by callers).
-    pub fn open_image(&mut self, path: &str, partition: Option<u32>) -> Result<(u64, String)> {
+    /// Open a disk image on the daemon. `label` mirrors the CLI's partition
+    /// line; the rest is the opened filesystem's display metadata.
+    pub fn open_image(&mut self, path: &str, partition: Option<u32>) -> Result<OpenedImage> {
         write_control(
             &mut self.writer,
             &Request::OpenImage {
@@ -71,7 +83,21 @@ impl RemoteSession {
             },
         )?;
         match self.read_response()? {
-            Response::Opened { handle, label } => Ok((handle, label)),
+            Response::Opened {
+                handle,
+                label,
+                fs_type,
+                volume_label,
+                total_size,
+                used_size,
+            } => Ok(OpenedImage {
+                handle,
+                label,
+                fs_type,
+                volume_label,
+                total_size,
+                used_size,
+            }),
             Response::Error { message } => bail!("open {path}: {message}"),
             other => bail!("unexpected reply to OpenImage: {other:?}"),
         }

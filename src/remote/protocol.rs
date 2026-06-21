@@ -136,8 +136,16 @@ pub enum Response {
         capabilities: u16,
         platform: String,
     },
-    /// Image opened; `label` mirrors the CLI's partition label line.
-    Opened { handle: u64, label: String },
+    /// Image opened. `label` mirrors the CLI's partition line; the rest is the
+    /// opened filesystem's metadata, for a remote pane's display.
+    Opened {
+        handle: u64,
+        label: String,
+        fs_type: String,
+        volume_label: Option<String>,
+        total_size: u64,
+        used_size: u64,
+    },
     /// Directory listing.
     Dir { entries: Vec<WireEntry> },
     /// A file is about to stream as a chunk sequence (see [`read_chunks`]).

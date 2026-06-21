@@ -157,9 +157,9 @@ fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str
         }
     }
 
-    let (handle, label) = session.open_image(&rref.path, partition)?;
-    log_stderr(label);
-    for entry in session.list_dir(handle, path)? {
+    let opened = session.open_image(&rref.path, partition)?;
+    log_stderr(opened.label);
+    for entry in session.list_dir(opened.handle, path)? {
         print_wire_entry(&entry);
     }
     Ok(())
