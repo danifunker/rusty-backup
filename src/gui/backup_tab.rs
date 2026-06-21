@@ -98,6 +98,52 @@ pub struct BackupTab {
     vhd_partition_configs: Vec<VhdPartitionConfig>,
     /// VHD whole-disk export status (runs independently from run_backup)
     vhd_export_status: Option<Arc<Mutex<VhdExportStatus>>>,
+    /// Remote-source state: when active, the backup source is a physical drive
+    /// (or image) on an `rb-cli serve` daemon, pulled over the block tier.
+    #[cfg(feature = "remote")]
+    remote: RemoteSourceState,
+}
+
+/// Backup-tab state for a remote source (a drive/image on a daemon).
+///
+/// A small state machine: open the connect dialog -> connect+list devices on a
+/// worker -> pick a device -> load its partition table over the wire -> the
+/// usual partition-selection UI drives a `run_backup_from(BackupSource::Remote)`.
+/// Network ops run on a worker thread surfaced through `status`.
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteSourceState {
+    /// `Some` while the connect dialog is open; holds the host:port input.
+    dialog_addr: Option<String>,
+    /// The live shared connection once connected.
+    conn: Option<Arc<Mutex<rusty_backup::remote::RemoteConnection>>>,
+    /// `addr` we connected to, for display labels.
+    addr: Option<String>,
+    /// Devices advertised by the daemon (after a successful connect).
+    devices: Vec<rusty_backup::remote::protocol::WireDevice>,
+    /// The picked source: `(device_path, display_label)`. `Some` => remote
+    /// source is the active backup source.
+    selected: Option<(String, String)>,
+    /// Background connect/list/load worker status.
+    status: Option<Arc<Mutex<RemoteOpStatus>>>,
+    /// Last error, shown inline.
+    error: Option<String>,
+}
+
+/// One pending remote network op (connect+list, or load-source) for the Backup
+/// tab. The worker fills exactly one of the result fields, then `finished`.
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteOpStatus {
+    finished: bool,
+    error: Option<String>,
+    /// connect+list result.
+    connected: Option<(
+        Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        Vec<rusty_backup::remote::protocol::WireDevice>,
+    )>,
+    /// load-source result.
+    loaded: Option<rusty_backup::model::backup_remote::RemoteSourceInfo>,
 }
 
 /// Per-partition size config for VHD backup popup.
@@ -179,6 +225,8 @@ impl Default for BackupTab {
             vhd_whole_disk: true,
             vhd_partition_configs: Vec::new(),
             vhd_export_status: None,
+            #[cfg(feature = "remote")]
+            remote: RemoteSourceState::default(),
         }
     }
 }
@@ -187,6 +235,10 @@ impl BackupTab {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background backup thread
         self.poll_progress(ctx, progress);
+
+        // Poll a pending remote connect / device-load worker
+        #[cfg(feature = "remote")]
+        self.poll_remote(ctx);
 
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
@@ -210,7 +262,14 @@ impl BackupTab {
         ui.horizontal(|ui| {
             ui.label("Source:");
             ui.add_enabled_ui(controls_enabled, |ui| {
-                let current_label = if let Some(path) = &self.image_file_path {
+                #[cfg(feature = "remote")]
+                let remote_label = self.remote.selected.as_ref().map(|(_, d)| d.clone());
+                #[cfg(not(feature = "remote"))]
+                let remote_label: Option<String> = None;
+
+                let current_label = if let Some(d) = &remote_label {
+                    format!("Remote: {d}")
+                } else if let Some(path) = &self.image_file_path {
                     format!("Image: {}", path.display())
                 } else if let Some(idx) = self.selected_device_idx {
                     ctx.devices
@@ -286,12 +345,52 @@ impl BackupTab {
                                 self.update_backup_name(ctx);
                             }
                         }
+                        #[cfg(feature = "remote")]
+                        {
+                            ui.separator();
+                            if ui
+                                .selectable_label(self.remote_active(), "Remote Drive...")
+                                .on_hover_text(
+                                    "Back up a physical drive on a remote machine running \
+                                     `rb-cli serve` (pulled over the network)",
+                                )
+                                .clicked()
+                            {
+                                // Open the connect dialog (host:port).
+                                self.remote.dialog_addr =
+                                    Some(self.remote.addr.clone().unwrap_or_default());
+                            }
+                        }
                     });
             });
+            #[cfg(feature = "remote")]
+            if self.remote_active()
+                && controls_enabled
+                && ui
+                    .button("X")
+                    .on_hover_text("Disconnect / clear the remote source")
+                    .clicked()
+            {
+                self.clear_remote();
+            }
         });
 
-        // Auto-load partition info when source changes
-        if !self.backup_running {
+        // When the user picks a LOCAL device/image while a remote source was
+        // active, drop the remote source so the two don't fight.
+        #[cfg(feature = "remote")]
+        if self.remote_active()
+            && (self.selected_device_idx.is_some() || self.image_file_path.is_some())
+        {
+            self.clear_remote();
+        }
+
+        // Remote connect dialog + device picker.
+        #[cfg(feature = "remote")]
+        self.show_remote_picker(ui, ctx);
+
+        // Auto-load partition info when source changes (local sources only —
+        // a remote source loads its own partitions via the device picker).
+        if !self.backup_running && !self.remote_active() {
             let source_changed = self.selected_device_idx != self.prev_device_idx
                 || self.image_file_path != self.prev_image_path;
             if source_changed {
@@ -615,8 +714,9 @@ impl BackupTab {
         let vhd_exporting = self.vhd_export_status.is_some();
         ui.horizontal(|ui| {
             if !self.backup_running && !vhd_exporting {
-                let has_source =
-                    self.selected_device_idx.is_some() || self.image_file_path.is_some();
+                let has_source = self.selected_device_idx.is_some()
+                    || self.image_file_path.is_some()
+                    || self.remote_active();
                 let has_partitions =
                     self.source_partitions.is_empty() || !self.selected_partitions.is_empty();
                 let chd_ok = match self.compression_type {
@@ -639,7 +739,13 @@ impl BackupTab {
                     .add_enabled(button_enabled, egui::Button::new(button_label))
                     .clicked()
                 {
-                    if self.compression_type == CompressionType::Vhd {
+                    if self.remote_active() {
+                        // A remote source routes straight through run_backup_from
+                        // (per-partition output over the block tier); the
+                        // whole-disk VHD popup and CHD min-size walks are
+                        // local-only.
+                        self.start_backup(ctx);
+                    } else if self.compression_type == CompressionType::Vhd {
                         // Scan partitions if not already loaded
                         if self.source_partitions.is_empty() {
                             self.scan_source_partitions(ctx);
@@ -1659,7 +1765,336 @@ impl BackupTab {
         let _ = cfg.save();
     }
 
+    /// Whether a remote source (drive/image on a daemon) is the active backup
+    /// source. When true, the local device/image source machinery is bypassed.
+    #[cfg(feature = "remote")]
+    fn remote_active(&self) -> bool {
+        self.remote.selected.is_some()
+    }
+    #[cfg(not(feature = "remote"))]
+    fn remote_active(&self) -> bool {
+        false
+    }
+
+    /// Spawn a worker to connect to `addr` and list the daemon's devices.
+    #[cfg(feature = "remote")]
+    fn spawn_remote_connect(&mut self, addr: String) {
+        let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
+        self.remote.status = Some(Arc::clone(&status));
+        self.remote.error = None;
+        self.remote.addr = Some(addr.clone());
+        std::thread::spawn(move || {
+            let result = rusty_backup::model::backup_remote::connect_and_list_devices(&addr);
+            if let Ok(mut s) = status.lock() {
+                match result {
+                    Ok((conn, devices)) => s.connected = Some((conn, devices)),
+                    Err(e) => s.error = Some(format!("{e:#}")),
+                }
+                s.finished = true;
+            }
+        });
+    }
+
+    /// Spawn a worker to open a remote device + parse its partition table.
+    #[cfg(feature = "remote")]
+    fn spawn_remote_load(
+        &mut self,
+        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        path: String,
+    ) {
+        let status = Arc::new(Mutex::new(RemoteOpStatus::default()));
+        self.remote.status = Some(Arc::clone(&status));
+        self.remote.error = None;
+        std::thread::spawn(move || {
+            // Backup targets a physical drive on the daemon → is_device = true.
+            let result = rusty_backup::model::backup_remote::load_remote_source(conn, &path, true);
+            if let Ok(mut s) = status.lock() {
+                match result {
+                    Ok(info) => s.loaded = Some(info),
+                    Err(e) => s.error = Some(format!("{e:#}")),
+                }
+                s.finished = true;
+            }
+        });
+    }
+
+    /// Drain a finished remote connect/load worker into tab state.
+    #[cfg(feature = "remote")]
+    fn poll_remote(&mut self, ctx: &mut TabContext) {
+        let status = match &self.remote.status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let (connected, loaded, error) = {
+            let Ok(mut s) = status.lock() else { return };
+            if !s.finished {
+                return;
+            }
+            (s.connected.take(), s.loaded.take(), s.error.take())
+        };
+        self.remote.status = None;
+
+        if let Some(err) = error {
+            self.remote.error = Some(err.clone());
+            ctx.log.error(format!("Remote: {err}"));
+            return;
+        }
+        if let Some((conn, devices)) = connected {
+            ctx.log.info(format!(
+                "Connected to remote daemon ({} device{})",
+                devices.len(),
+                if devices.len() == 1 { "" } else { "s" }
+            ));
+            self.remote.conn = Some(conn);
+            self.remote.devices = devices;
+        }
+        if let Some(info) = loaded {
+            ctx.log.info(format!(
+                "Remote source: {} ({} partition{})",
+                info.table_desc,
+                info.partitions.len(),
+                if info.partitions.len() == 1 { "" } else { "s" }
+            ));
+            // Reuse the standard partition-selection state; the advanced
+            // per-partition columns (min-size / frag / compact) stay empty for
+            // a remote source and the engine ignores shrink/CHD over the wire.
+            self.source_partitions = info.partitions;
+            self.source_partition_table_desc = Some(info.table_desc);
+            self.partition_load_error = None;
+            self.select_all_partitions();
+        }
+    }
+
+    /// Clear all remote-source state (back to a local source).
+    #[cfg(feature = "remote")]
+    fn clear_remote(&mut self) {
+        self.remote = RemoteSourceState::default();
+        self.source_partitions.clear();
+        self.selected_partitions.clear();
+        self.source_partition_table_desc = None;
+    }
+
+    /// The "Remote Drive" connect dialog + device picker. Shown while
+    /// `remote.dialog_addr` is `Some`. Connect lists the daemon's drives;
+    /// picking one loads its partition table over the wire and activates it as
+    /// the backup source.
+    #[cfg(feature = "remote")]
+    fn show_remote_picker(&mut self, ui: &mut egui::Ui, _ctx: &mut TabContext) {
+        if self.remote.dialog_addr.is_none() {
+            return;
+        }
+        let busy = self.remote.status.is_some();
+        let mut do_connect: Option<String> = None;
+        let mut pick: Option<(String, u64)> = None;
+        let mut close = false;
+
+        egui::Window::new("Remote Drive")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Host:");
+                    let addr = self.remote.dialog_addr.as_mut().unwrap();
+                    ui.add(
+                        egui::TextEdit::singleline(addr)
+                            .hint_text("192.168.1.50:7341")
+                            .desired_width(220.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if ui.button("Connect").clicked() {
+                            let a = self
+                                .remote
+                                .dialog_addr
+                                .clone()
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            if !a.is_empty() {
+                                do_connect = Some(if a.contains(':') {
+                                    a
+                                } else {
+                                    format!("{a}:7341")
+                                });
+                            }
+                        }
+                    });
+                    if busy {
+                        ui.add(egui::Spinner::new());
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+                if let Some(err) = &self.remote.error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+                }
+                if self.remote.conn.is_some() {
+                    ui.separator();
+                    if self.remote.devices.is_empty() {
+                        ui.label(
+                            "No physical drives reported. The daemon may need to run as root.",
+                        );
+                    } else {
+                        ui.label("Pick a drive to back up:");
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for d in &self.remote.devices {
+                                    let mut label = format!(
+                                        "{} ({})",
+                                        d.path,
+                                        rusty_backup::partition::format_size(d.size_bytes)
+                                    );
+                                    if !d.media.is_empty() {
+                                        label.push_str(&format!(" - {}", d.media));
+                                    }
+                                    if d.is_removable {
+                                        label.push_str(" [removable]");
+                                    }
+                                    if ui.selectable_label(false, label).clicked() {
+                                        pick = Some((d.path.clone(), d.size_bytes));
+                                    }
+                                }
+                            });
+                    }
+                }
+            });
+
+        if let Some(addr) = do_connect {
+            self.spawn_remote_connect(addr);
+        }
+        if let Some((path, size)) = pick {
+            if let Some(conn) = self.remote.conn.clone() {
+                let addr = self.remote.addr.clone().unwrap_or_default();
+                let display = format!("rb://{addr}{path}");
+                self.backup_name = rusty_backup::backup::format::generate_backup_name(
+                    std::path::Path::new(&path),
+                    Some(size),
+                    None,
+                );
+                self.remote.selected = Some((path.clone(), display));
+                self.spawn_remote_load(conn, path);
+            }
+            self.remote.dialog_addr = None;
+        }
+        if close {
+            self.remote.dialog_addr = None;
+        }
+    }
+
+    /// Pull a backup of the remote drive over the block tier. Read-only:
+    /// Zstd / Raw / VHD per-partition (CHD + shrink-to-minimum aren't supported
+    /// over the wire — the engine bails / ignores them, so we steer here too).
+    #[cfg(feature = "remote")]
+    fn start_remote_backup(
+        &mut self,
+        ctx: &mut TabContext,
+        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        path: String,
+        display: String,
+    ) {
+        let destination_dir = match &self.destination_folder {
+            Some(d) => d.clone(),
+            None => {
+                ctx.log.error("No destination folder selected");
+                return;
+            }
+        };
+        if matches!(
+            self.compression_type,
+            CompressionType::Chd | CompressionType::Dvd
+        ) {
+            ctx.log
+                .error("CHD output isn't supported for a remote drive; choose Zstd, Raw, or VHD.");
+            return;
+        }
+
+        let partition_filter = if self.selected_partitions.len()
+            < self
+                .source_partitions
+                .iter()
+                .filter(|p| !p.is_extended_container)
+                .count()
+        {
+            Some(self.selected_partitions.iter().copied().collect())
+        } else {
+            None
+        };
+
+        let config = BackupConfig {
+            source_path: PathBuf::from(&path),
+            destination_dir,
+            backup_name: self.backup_name.clone(),
+            compression: self.compression_type,
+            checksum: self.checksum_type,
+            split_size_mib: if self.split_archives {
+                Some(self.split_size_mib)
+            } else {
+                None
+            },
+            sector_by_sector: self.sector_by_sector,
+            partition_filter,
+            chd_options: None,
+            size_policy: None,
+            partition_target_sizes: None,
+            // Defrag-clone / in-place shrink need File-specific access the block
+            // tier doesn't expose; the engine ignores this for a remote source.
+            shrink_to_minimum: false,
+            precomputed_minimum_sizes: None,
+            defrag_partition_indices: None,
+        };
+
+        let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
+        self.backup_progress = Some(Arc::clone(&progress_arc));
+        self.backup_running = true;
+        ctx.log.info(format!(
+            "Starting remote backup: {display} -> {}",
+            config.destination_dir.join(&config.backup_name).display()
+        ));
+
+        let source = rusty_backup::backup::BackupSource::Remote {
+            conn,
+            path,
+            display,
+            is_device: true,
+        };
+        std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote drive backup");
+            let progress_for_panic = Arc::clone(&progress_arc);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress_arc))
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some("remote backup worker panicked".to_string());
+                        p.finished = true;
+                    }
+                }
+            }
+        });
+    }
+
     fn start_backup(&mut self, ctx: &mut TabContext) {
+        // Remote source: pull a backup of the remote drive over the block tier.
+        #[cfg(feature = "remote")]
+        if let (Some(conn), Some((path, display))) =
+            (self.remote.conn.clone(), self.remote.selected.clone())
+        {
+            self.start_remote_backup(ctx, conn, path, display);
+            return;
+        }
+
         let source_path = match self.source_path(ctx) {
             Some(p) => p,
             None => {

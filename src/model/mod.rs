@@ -5,6 +5,8 @@
 
 pub mod archive_edit;
 pub mod backup_loader;
+#[cfg(feature = "remote")]
+pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
 pub mod cache_runner;

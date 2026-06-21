@@ -671,3 +671,60 @@ fn list_devices_round_trips_and_open_device_reads() {
         "non-device path must be refused, got: {msg}"
     );
 }
+
+/// The Backup-tab remote-source core: connect + list devices, then parse a
+/// remote source's partition table over the block tier. Exercised against a
+/// served image (`is_device=false`) because the device-open path needs root;
+/// the partition-load logic is identical either way.
+#[test]
+fn backup_remote_core_lists_and_loads_partitions() {
+    use rusty_backup::model::backup_remote::{connect_and_list_devices, load_remote_source};
+    use rusty_backup::partition::mbr::build_minimal_mbr;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("disk.img");
+
+    let part_lba = 2048u32;
+    let part_bytes = 8 * 1024 * 1024usize;
+    let part_sectors = (part_bytes / 512) as u32;
+    let fat_blob = fat::create_blank_fat(part_bytes as u64, Some("BKVOL")).unwrap();
+    let mbr = build_minimal_mbr(
+        0x0BAD_F00D,
+        &[(0x06, part_lba, part_sectors, true)],
+        255,
+        63,
+    );
+    let mut disk = vec![0u8; part_lba as usize * 512 + part_bytes];
+    disk[..512].copy_from_slice(&mbr);
+    disk[part_lba as usize * 512..].copy_from_slice(&fat_blob);
+    std::fs::write(&img, &disk).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // connect + list devices in one call (devices may be empty in CI).
+    let (conn, _devices) = connect_and_list_devices(&addr).unwrap();
+
+    // Parse the served image's partition table over the wire.
+    let info = load_remote_source(Arc::clone(&conn), "/disk.img", false).unwrap();
+    assert_eq!(info.size, disk.len() as u64, "reported full source size");
+    assert!(!info.is_superfloppy, "MBR disk is not a superfloppy");
+    assert!(
+        info.table_desc.contains("MBR"),
+        "table_desc was {:?}",
+        info.table_desc
+    );
+    let real: Vec<_> = info
+        .partitions
+        .iter()
+        .filter(|p| !p.is_extended_container)
+        .collect();
+    assert_eq!(real.len(), 1, "one FAT partition parsed over the wire");
+    assert_eq!(real[0].start_lba, part_lba as u64);
+}
