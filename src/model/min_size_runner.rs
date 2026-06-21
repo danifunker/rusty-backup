@@ -70,6 +70,14 @@ pub enum MinSizeSource {
     /// Path to a GHO/GHS container (or any file of its span set) — the worker
     /// opens its own `GhoReader` over the logical (decompressed) volume.
     Gho(PathBuf),
+    /// A remote image over the block tier: the worker opens its own
+    /// `RemoteBlockReader` on the shared connection (the daemon keeps the image
+    /// open and serves byte ranges).
+    #[cfg(feature = "remote")]
+    Remote {
+        conn: Arc<Mutex<crate::remote::RemoteConnection>>,
+        path: String,
+    },
 }
 
 /// Inputs to `spawn`.
@@ -147,6 +155,28 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         wrapper_hint,
                         &progress,
                     )
+                }
+            }
+            #[cfg(feature = "remote")]
+            MinSizeSource::Remote { conn, path } => {
+                match crate::remote::RemoteBlockReader::open(conn, &path) {
+                    Ok(reader) => fs::partition_minimum_size(
+                        reader,
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        None,
+                        &progress,
+                    ),
+                    Err(e) => {
+                        if let Ok(mut s) = status_thread.lock() {
+                            s.error = Some(format!("{e:#}"));
+                            s.finished = true;
+                        }
+                        return;
+                    }
                 }
             }
             MinSizeSource::Chd(path) => match ChdReader::open(&path) {

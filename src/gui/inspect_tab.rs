@@ -4548,9 +4548,15 @@ impl InspectTab {
             })
             .unwrap_or(false);
 
+        // Remote image: compute over a block reader on the shared connection.
+        let source = if let Some((conn, rpath)) = &self.remote_inspect {
+            rusty_backup::model::min_size_runner::MinSizeSource::Remote {
+                conn: std::sync::Arc::clone(conn),
+                path: rpath.clone(),
+            }
         // Prefer a CHD path source over the raw device handle: opening the
         // raw .chd file at partition_offset would read compressed bytes.
-        let source = if let Some(chd_path) = self.chd_image_path.clone() {
+        } else if let Some(chd_path) = self.chd_image_path.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::Chd(chd_path)
         } else if let Some(gho_path) = self
             .image_file_path
