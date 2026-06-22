@@ -59,6 +59,47 @@ enum AlignmentChoice {
     Custom,
 }
 
+/// Restore-tab state for a remote target (a drive/image on a daemon). Mirrors
+/// the Backup tab's `RemoteSourceState`: open the connect dialog -> connect+list
+/// devices on a worker -> pick a device (or name an image file under the serve
+/// root) -> Start Restore pushes the restored image via
+/// `model::restore_remote::restore_to_remote`.
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteTargetState {
+    /// True when the restore target is a remote daemon (vs a local device/file).
+    active: bool,
+    /// `Some` while the connect dialog is open; holds the host:port input.
+    dialog_addr: Option<String>,
+    /// The live shared connection once connected.
+    conn: Option<Arc<Mutex<rusty_backup::remote::RemoteConnection>>>,
+    /// `addr` we connected to, for display labels.
+    addr: Option<String>,
+    /// Devices advertised by the daemon (after a successful connect).
+    devices: Vec<rusty_backup::remote::protocol::WireDevice>,
+    /// Image-file target name under the serve root (when not writing a device).
+    image_name: String,
+    /// The chosen target: `(path, display, is_device)`. `Some` => a remote
+    /// target is selected and ready to restore to.
+    selected: Option<(String, String, bool)>,
+    /// Background connect+list worker status.
+    status: Option<Arc<Mutex<RemoteConnectStatus>>>,
+    /// Last error, shown inline.
+    error: Option<String>,
+}
+
+/// One pending remote connect+list op for the Restore tab.
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteConnectStatus {
+    finished: bool,
+    error: Option<String>,
+    connected: Option<(
+        Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        Vec<rusty_backup::remote::protocol::WireDevice>,
+    )>,
+}
+
 /// State for the Restore tab.
 pub struct RestoreTab {
     // Mode
@@ -76,6 +117,10 @@ pub struct RestoreTab {
     selected_device_idx: Option<usize>,
     image_file_path: Option<PathBuf>,
     target_is_device: bool,
+    /// Remote-target state: when active, the restore target is a drive/image on
+    /// an `rb-cli serve` daemon, pushed over the block tier.
+    #[cfg(feature = "remote")]
+    remote: RemoteTargetState,
 
     // Alignment (Full Disk)
     alignment_choice: AlignmentChoice,
@@ -152,6 +197,8 @@ impl Default for RestoreTab {
             selected_device_idx: None,
             image_file_path: None,
             target_is_device: true,
+            #[cfg(feature = "remote")]
+            remote: RemoteTargetState::default(),
             alignment_choice: AlignmentChoice::Original,
             custom_alignment_sectors: 2048,
             partition_configs: Vec::new(),
@@ -213,6 +260,10 @@ impl RestoreTab {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext, progress: &mut ProgressState) {
         // Poll background restore thread
         self.poll_progress(ctx, progress);
+
+        // Poll a pending remote connect/list worker
+        #[cfg(feature = "remote")]
+        self.poll_remote(ctx);
 
         ui.heading("Restore Backup");
         ui.add_space(8.0);
@@ -339,73 +390,100 @@ impl RestoreTab {
         ui.separator();
 
         ui.add_enabled_ui(controls_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.target_is_device, true, "Write to device");
-                ui.radio_value(&mut self.target_is_device, false, "Save as image file");
-            });
+            #[cfg(feature = "remote")]
+            {
+                ui.checkbox(
+                    &mut self.remote.active,
+                    "Restore to a remote machine (rb-cli serve)",
+                )
+                .on_hover_text(
+                    "Push the restored image to a drive or image file on a remote \
+                     daemon over the network",
+                );
+            }
+            #[cfg(feature = "remote")]
+            let remote_active = self.remote.active;
+            #[cfg(not(feature = "remote"))]
+            let remote_active = false;
 
-            if self.target_is_device {
+            if !remote_active {
                 ui.horizontal(|ui| {
-                    ui.label("Device:");
-                    let current_label = self
-                        .selected_device_idx
-                        .and_then(|idx| ctx.devices.get(idx))
-                        .map(|d| d.display_name())
-                        .unwrap_or_else(|| "Select a target device...".into());
-
-                    egui::ComboBox::from_id_salt("restore_target_device")
-                        .selected_text(&current_label)
-                        .width(400.0)
-                        .height(400.0) // Allow more items to be visible without scrolling
-                        .show_ui(ui, |ui| {
-                            for (i, device) in ctx.devices.iter().enumerate() {
-                                let label = format!(
-                                    "{} ({}){}",
-                                    device.display_name(),
-                                    partition::format_size(device.size_bytes),
-                                    if device.is_system { " [SYSTEM]" } else { "" },
-                                );
-                                ui.selectable_value(&mut self.selected_device_idx, Some(i), label);
-                            }
-                            if ctx.devices.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(super::no_devices_hint())
-                                        .italics()
-                                        .weak(),
-                                );
-                            }
-                        });
+                    ui.radio_value(&mut self.target_is_device, true, "Write to device");
+                    ui.radio_value(&mut self.target_is_device, false, "Save as image file");
                 });
 
-                // Show warning for system disks
-                if let Some(idx) = self.selected_device_idx {
-                    if let Some(device) = ctx.devices.get(idx) {
-                        if device.is_system {
-                            ui.colored_label(
+                if self.target_is_device {
+                    ui.horizontal(|ui| {
+                        ui.label("Device:");
+                        let current_label = self
+                            .selected_device_idx
+                            .and_then(|idx| ctx.devices.get(idx))
+                            .map(|d| d.display_name())
+                            .unwrap_or_else(|| "Select a target device...".into());
+
+                        egui::ComboBox::from_id_salt("restore_target_device")
+                            .selected_text(&current_label)
+                            .width(400.0)
+                            .height(400.0) // Allow more items to be visible without scrolling
+                            .show_ui(ui, |ui| {
+                                for (i, device) in ctx.devices.iter().enumerate() {
+                                    let label = format!(
+                                        "{} ({}){}",
+                                        device.display_name(),
+                                        partition::format_size(device.size_bytes),
+                                        if device.is_system { " [SYSTEM]" } else { "" },
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_device_idx,
+                                        Some(i),
+                                        label,
+                                    );
+                                }
+                                if ctx.devices.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(super::no_devices_hint())
+                                            .italics()
+                                            .weak(),
+                                    );
+                                }
+                            });
+                    });
+
+                    // Show warning for system disks
+                    if let Some(idx) = self.selected_device_idx {
+                        if let Some(device) = ctx.devices.get(idx) {
+                            if device.is_system {
+                                ui.colored_label(
                                 egui::Color32::from_rgb(255, 100, 100),
                                 "WARNING: This is a system disk! Restoring will destroy your OS.",
                             );
+                            }
                         }
                     }
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Image File:");
+                        let label = self
+                            .image_file_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "No file selected".into());
+                        ui.label(&label);
+                        if ui.button("Save As...").clicked() {
+                            if let Some(path) = super::file_dialog()
+                                .add_filter("Disk Images", &["img", "raw", "bin"])
+                                .save_file()
+                            {
+                                self.image_file_path = Some(path);
+                            }
+                        }
+                    });
                 }
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("Image File:");
-                    let label = self
-                        .image_file_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "No file selected".into());
-                    ui.label(&label);
-                    if ui.button("Save As...").clicked() {
-                        if let Some(path) = super::file_dialog()
-                            .add_filter("Disk Images", &["img", "raw", "bin"])
-                            .save_file()
-                        {
-                            self.image_file_path = Some(path);
-                        }
-                    }
-                });
+            } // end: if !remote_active
+
+            #[cfg(feature = "remote")]
+            if remote_active {
+                self.remote_target_ui(ui);
             }
 
             // Show target size comparison
@@ -1305,6 +1383,10 @@ impl RestoreTab {
     }
 
     fn has_target(&self, ctx: &TabContext) -> bool {
+        #[cfg(feature = "remote")]
+        if self.remote.active {
+            return self.remote.selected.is_some();
+        }
         if self.target_is_device {
             self.selected_device_idx
                 .and_then(|idx| ctx.devices.get(idx))
@@ -1324,7 +1406,17 @@ impl RestoreTab {
             .show(ui.ctx(), |ui| {
                 match self.restore_mode {
                     RestoreMode::FullDisk => {
-                        let target_name = if self.target_is_device {
+                        #[cfg(feature = "remote")]
+                        let remote_target = self
+                            .remote
+                            .active
+                            .then(|| self.remote.selected.as_ref().map(|(_, d, _)| d.clone()))
+                            .flatten();
+                        #[cfg(not(feature = "remote"))]
+                        let remote_target: Option<String> = None;
+                        let target_name = if let Some(d) = remote_target {
+                            d
+                        } else if self.target_is_device {
                             self.selected_device_idx
                                 .and_then(|idx| ctx.devices.get(idx))
                                 .map(|d| d.display_name())
@@ -1441,6 +1533,13 @@ impl RestoreTab {
     }
 
     fn start_restore(&mut self, ctx: &mut TabContext) {
+        // A remote target pushes the restored image over the block tier.
+        #[cfg(feature = "remote")]
+        if self.remote.active {
+            self.start_remote_restore(ctx);
+            return;
+        }
+
         let backup_folder = match &self.backup_folder {
             Some(f) => f.clone(),
             None => {
@@ -1482,54 +1581,8 @@ impl RestoreTab {
             (path, false, size)
         };
 
-        let alignment = match self.alignment_choice {
-            AlignmentChoice::Original => RestoreAlignment::Original,
-            AlignmentChoice::Modern1MB => RestoreAlignment::Modern1MB,
-            AlignmentChoice::Custom => {
-                RestoreAlignment::Custom(self.custom_alignment_sectors as u64)
-            }
-        };
-
-        // Mode B of the disk-expansion feature: when "Extend last partition
-        // automatically" is selected alongside an image-file target, force
-        // the last partition's size to FillRemaining so the restore engine
-        // grows it over the trailing free space. Mode A (the default) skips
-        // this — the trailing region stays unallocated.
-        let last_idx = self.partition_configs.last().map(|c| c.index);
-        let mode_b_active =
-            self.expand_disk_enabled && self.expand_extend_last_partition && !self.target_is_device;
-
-        let partition_sizes: Vec<RestorePartitionSize> = self
-            .partition_configs
-            .iter()
-            .map(|cfg| RestorePartitionSize {
-                index: cfg.index,
-                size_choice: if mode_b_active && Some(cfg.index) == last_idx {
-                    RestoreSizeChoice::FillRemaining
-                } else {
-                    match cfg.choice {
-                        SizeMode::Original => RestoreSizeChoice::Original,
-                        SizeMode::Minimum => {
-                            // Pass the concrete minimum size so layout calculation
-                            // doesn't need to re-derive it (especially for Clonezilla
-                            // where the partclone header has the real used size).
-                            RestoreSizeChoice::Custom(cfg.minimum_size)
-                        }
-                        SizeMode::MinPlus20 => {
-                            RestoreSizeChoice::Custom(cfg.choice.effective_size(
-                                cfg.original_size,
-                                cfg.minimum_size,
-                                cfg.custom_size_mib,
-                            ))
-                        }
-                        SizeMode::Custom => {
-                            RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
-                        }
-                        SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
-                    }
-                },
-            })
-            .collect();
+        let alignment = self.resolve_alignment();
+        let partition_sizes = self.build_partition_sizes(target_is_device);
 
         let config = RestoreConfig {
             backup_folder,
@@ -1557,6 +1610,313 @@ impl RestoreTab {
                 }
             }
         });
+    }
+
+    /// Resolve the alignment radio into a `RestoreAlignment`.
+    fn resolve_alignment(&self) -> RestoreAlignment {
+        match self.alignment_choice {
+            AlignmentChoice::Original => RestoreAlignment::Original,
+            AlignmentChoice::Modern1MB => RestoreAlignment::Modern1MB,
+            AlignmentChoice::Custom => {
+                RestoreAlignment::Custom(self.custom_alignment_sectors as u64)
+            }
+        }
+    }
+
+    /// Build the per-partition size overrides from the GUI's per-partition
+    /// config. `target_is_device` gates Mode B of the disk-expansion feature
+    /// (extend-last-partition only applies to image-file-shaped targets).
+    fn build_partition_sizes(&self, target_is_device: bool) -> Vec<RestorePartitionSize> {
+        // Mode B: when "Extend last partition automatically" is selected
+        // alongside an image-file-shaped target, force the last partition to
+        // FillRemaining so the engine grows it over the trailing free space.
+        let last_idx = self.partition_configs.last().map(|c| c.index);
+        let mode_b_active =
+            self.expand_disk_enabled && self.expand_extend_last_partition && !target_is_device;
+
+        self.partition_configs
+            .iter()
+            .map(|cfg| RestorePartitionSize {
+                index: cfg.index,
+                size_choice: if mode_b_active && Some(cfg.index) == last_idx {
+                    RestoreSizeChoice::FillRemaining
+                } else {
+                    match cfg.choice {
+                        SizeMode::Original => RestoreSizeChoice::Original,
+                        SizeMode::Minimum => RestoreSizeChoice::Custom(cfg.minimum_size),
+                        SizeMode::MinPlus20 => {
+                            RestoreSizeChoice::Custom(cfg.choice.effective_size(
+                                cfg.original_size,
+                                cfg.minimum_size,
+                                cfg.custom_size_mib,
+                            ))
+                        }
+                        SizeMode::Custom => {
+                            RestoreSizeChoice::Custom(cfg.custom_size_mib as u64 * 1024 * 1024)
+                        }
+                        SizeMode::FillRemaining => RestoreSizeChoice::FillRemaining,
+                    }
+                },
+            })
+            .collect()
+    }
+
+    /// Push the restored image to a remote target (device or image file) over
+    /// the block tier. Materializes to a local staging image, then writes it to
+    /// the daemon — see `model::restore_remote`.
+    #[cfg(feature = "remote")]
+    fn start_remote_restore(&mut self, ctx: &mut TabContext) {
+        let backup_folder = match &self.backup_folder {
+            Some(f) => f.clone(),
+            None => {
+                ctx.log.error("No backup folder selected");
+                return;
+            }
+        };
+        let (path, display, is_device) = match self.remote.selected.clone() {
+            Some(t) => t,
+            None => {
+                ctx.log.error("No remote target selected");
+                return;
+            }
+        };
+        let conn = match self.remote.conn.clone() {
+            Some(c) => c,
+            None => {
+                ctx.log.error("Not connected to a remote daemon");
+                return;
+            }
+        };
+
+        let base = self
+            .backup_metadata
+            .as_ref()
+            .map(|m| m.source_size_bytes)
+            .or_else(|| self.clonezilla_image.as_ref().map(|c| c.source_size_bytes))
+            .unwrap_or(0);
+        // Image targets honour the trailing-free-space request; a device's
+        // size is fixed by the hardware (the daemon checks the image fits).
+        let target_size = if is_device {
+            base
+        } else {
+            base.saturating_add(self.expand_free_space_bytes())
+        };
+
+        let config = RestoreConfig {
+            backup_folder,
+            // Overridden by restore_to_remote (a local staging image is used).
+            target_path: PathBuf::new(),
+            target_is_device: false,
+            target_size,
+            alignment: self.resolve_alignment(),
+            partition_sizes: self.build_partition_sizes(is_device),
+            write_zeros_to_unused: false,
+        };
+
+        let progress_arc = Arc::new(Mutex::new(RestoreProgress::new()));
+        self.restore_progress = Some(Arc::clone(&progress_arc));
+        self.restore_running = true;
+        ctx.log.info(format!("Starting restore to {display}"));
+
+        std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote restore");
+            if let Err(e) = rusty_backup::model::restore_remote::restore_to_remote(
+                config,
+                conn,
+                &path,
+                is_device,
+                Arc::clone(&progress_arc),
+                None,
+            ) {
+                if let Ok(mut p) = progress_arc.lock() {
+                    p.error = Some(format!("{e:#}"));
+                    p.finished = true;
+                }
+            }
+        });
+    }
+
+    /// Spawn a worker to connect to `addr` and list the daemon's devices.
+    #[cfg(feature = "remote")]
+    fn spawn_remote_connect(&mut self, addr: String) {
+        let status = Arc::new(Mutex::new(RemoteConnectStatus::default()));
+        self.remote.status = Some(Arc::clone(&status));
+        self.remote.error = None;
+        self.remote.addr = Some(addr.clone());
+        std::thread::spawn(move || {
+            let result = rusty_backup::model::backup_remote::connect_and_list_devices(&addr);
+            if let Ok(mut s) = status.lock() {
+                match result {
+                    Ok((conn, devices)) => s.connected = Some((conn, devices)),
+                    Err(e) => s.error = Some(format!("{e:#}")),
+                }
+                s.finished = true;
+            }
+        });
+    }
+
+    /// Drain a finished remote connect/list worker into tab state.
+    #[cfg(feature = "remote")]
+    fn poll_remote(&mut self, ctx: &mut TabContext) {
+        let status = match &self.remote.status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let (connected, error) = {
+            let Ok(mut s) = status.lock() else { return };
+            if !s.finished {
+                return;
+            }
+            (s.connected.take(), s.error.take())
+        };
+        self.remote.status = None;
+        if let Some(err) = error {
+            self.remote.error = Some(err.clone());
+            ctx.log.error(format!("Remote: {err}"));
+            return;
+        }
+        if let Some((conn, devices)) = connected {
+            ctx.log.info(format!(
+                "Connected to remote daemon ({} device{})",
+                devices.len(),
+                if devices.len() == 1 { "" } else { "s" }
+            ));
+            self.remote.conn = Some(conn);
+            self.remote.devices = devices;
+        }
+    }
+
+    /// Inline remote-target picker: connect to a daemon, then pick a physical
+    /// drive or name an image file under its serve root as the restore target.
+    #[cfg(feature = "remote")]
+    fn remote_target_ui(&mut self, ui: &mut egui::Ui) {
+        let busy = self.remote.status.is_some();
+        let connected = self.remote.conn.is_some();
+        if self.remote.dialog_addr.is_none() {
+            self.remote.dialog_addr = Some(self.remote.addr.clone().unwrap_or_default());
+        }
+        let mut do_connect: Option<String> = None;
+        let mut pick: Option<(String, String, bool)> = None;
+
+        ui.horizontal(|ui| {
+            ui.label("Host:");
+            if let Some(addr) = self.remote.dialog_addr.as_mut() {
+                ui.add(
+                    egui::TextEdit::singleline(addr)
+                        .hint_text("192.168.1.50:7341")
+                        .desired_width(200.0),
+                );
+            }
+            let clicked = ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(if connected { "Reconnect" } else { "Connect" }),
+                )
+                .clicked();
+            if busy {
+                ui.add(egui::Spinner::new());
+            }
+            if clicked {
+                let a = self
+                    .remote
+                    .dialog_addr
+                    .clone()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !a.is_empty() {
+                    do_connect = Some(if a.contains(':') {
+                        a
+                    } else {
+                        format!("{a}:7341")
+                    });
+                }
+            }
+        });
+        if let Some(err) = &self.remote.error {
+            ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
+        }
+
+        if connected {
+            ui.separator();
+            ui.label("Restore target on the remote machine:");
+            let addr = self.remote.addr.clone().unwrap_or_default();
+            if self.remote.devices.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No physical drives reported (the daemon may need to run as root). \
+                         You can still restore to an image file below.",
+                    )
+                    .italics()
+                    .weak(),
+                );
+            } else {
+                let selected_dev_path = self
+                    .remote
+                    .selected
+                    .as_ref()
+                    .filter(|(_, _, is_dev)| *is_dev)
+                    .map(|(p, _, _)| p.clone());
+                egui::ScrollArea::vertical()
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        for d in &self.remote.devices {
+                            let is_sel = selected_dev_path.as_deref() == Some(d.path.as_str());
+                            let mut label =
+                                format!("{} ({})", d.path, partition::format_size(d.size_bytes));
+                            if !d.media.is_empty() {
+                                label.push_str(&format!(" - {}", d.media));
+                            }
+                            if d.is_removable {
+                                label.push_str(" [removable]");
+                            }
+                            if ui.selectable_label(is_sel, label).clicked() {
+                                let display = format!(
+                                    "rb://{addr}{} ({})",
+                                    d.path,
+                                    partition::format_size(d.size_bytes)
+                                );
+                                pick = Some((d.path.clone(), display, true));
+                            }
+                        }
+                    });
+            }
+            ui.horizontal(|ui| {
+                ui.label("or image file:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.remote.image_name)
+                        .hint_text("restored.img")
+                        .desired_width(200.0),
+                );
+                let name = self.remote.image_name.trim().to_string();
+                if ui
+                    .add_enabled(!name.is_empty(), egui::Button::new("Use file"))
+                    .clicked()
+                {
+                    let path = if name.starts_with('/') {
+                        name.clone()
+                    } else {
+                        format!("/{name}")
+                    };
+                    let display = format!("rb://{addr}{path} (image)");
+                    pick = Some((path, display, false));
+                }
+            });
+            if let Some((_, display, _)) = &self.remote.selected {
+                ui.colored_label(egui::Color32::GRAY, format!("Selected target: {display}"));
+            }
+        }
+
+        if let Some(addr) = do_connect {
+            // A fresh connect clears any prior selection / device list.
+            self.remote.selected = None;
+            self.remote.devices.clear();
+            self.remote.conn = None;
+            self.spawn_remote_connect(addr);
+        }
+        if let Some(sel) = pick {
+            self.remote.selected = Some(sel);
+        }
     }
 
     fn start_single_partition_restore(&mut self, ctx: &mut TabContext) {

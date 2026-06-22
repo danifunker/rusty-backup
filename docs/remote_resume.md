@@ -134,8 +134,16 @@ round-trip). MiSTer install packaging/service (Scripts `.sh` + downloader DB).
   `PartitionTable::None` path for a bare-FS device.
 - **macOS `/dev/rdiskN` read-alignment** — `OpenDevice` reads are unaligned;
   fine on Linux/MiSTer (the target), would need aligned reads for a macOS daemon.
-- **NTFS/exFAT packer floor** — the FAT fix's sibling: verify the NTFS/exFAT
-  `compact_partition_reader` packers don't have an analogous below-minimum bug.
+- **NTFS/exFAT packer** — INVESTIGATED, unresolved. `CompactNtfsReader`
+  dense-packs used clusters **by index** without rewriting the MFT's absolute-LCN
+  data runs, and restore writes the compacted bytes verbatim + zero-pads (no
+  re-scatter) — which *would* lose non-resident file data on fragmented volumes.
+  But the only round-trip test uses a **resident** (inline) file, so the path is
+  untested, and the test passes in a way the dense-pack reading doesn't fully
+  predict, so it's unconfirmed. Pre-existing + identical local/remote (doesn't
+  gate Family F). Needs a fragmented-NTFS fixture to settle (no
+  `create_blank_ntfs` yet); likely fix = route through `into_layout_preserving()`.
+  See memory note `[[ntfs-exfat-packer-audit]]`.
 - **Per-partition sizing UI for remote** — the Backup tab's min-size / frag /
   Compact columns stay empty for a remote source (the engine computes shrink on
   the materialized temp, but the user can't pick per-partition custom sizes).

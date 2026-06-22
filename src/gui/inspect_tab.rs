@@ -4989,6 +4989,11 @@ impl InspectTab {
             session.partition_type_string = partition_type_string;
             session.remote = Some((std::sync::Arc::clone(conn), rpath.clone()));
             self.browse_view.open_with_session(session);
+            // Editing a remote image is supported over the block tier (a
+            // read-write RemoteBlockReader). Enable the Edit Mode toggle; the
+            // open_editable probe surfaces a clear error for any FS that can't
+            // be edited, exactly as on the local path.
+            self.browse_view.mark_edit_supported();
             if let Some(part) = self.partitions.iter().find(|p| p.index == part_index) {
                 if let Some(drv) = part.drv_name.as_deref() {
                     if !drv.is_empty() {
