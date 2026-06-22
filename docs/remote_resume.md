@@ -9,12 +9,18 @@ left" pointer.
 
 ## Where we are (2026-06-21, branch `add-crusty-backup-dos-poc`)
 
-> **Update (later 2026-06-21):** remote **editing**, **fsck repair**,
-> **resize**, and **restore-to-a-remote-target** (engine + CLI) all shipped
-> over the block tier (each with a headless test). See §1–§3 below. The full
-> remote read-write story is done on the engine/CLI side; what's left is GUI
-> wiring (compile-only here) + the TUI (§4) + Family B (§5). Also fixed a
-> CI-red FAT32 compaction over-pad regression (`993d2ac`).
+> **Update (later 2026-06-21):** Family F is **feature-complete** on the
+> engine/CLI/GUI side. Remote **editing**, **fsck repair**, **resize**, and
+> **restore-to-a-remote-target** all shipped over the block tier (engine +
+> headless tests), and the GUI surfaces are wired (browse-view Edit Mode,
+> fsck Repair, Restore-tab "Remote…" target picker) — **compile-verified
+> only**. See §1–§3. What remains: (a) the **interactive hardware-verification
+> pass** (§0 — only the user can run it), (b) two flagged items — per-partition
+> sizing UI for a remote backup source (enhancement) + the NTFS/exFAT packer
+> audit (`[[ntfs-exfat-packer-audit]]`, pre-existing, needs a fragmented
+> fixture), and (c) the **TUI** (§4, deprioritized — the MiSTer just needs the
+> daemon installer/packaging, §5). Also fixed a CI-red FAT32 over-pad
+> regression (`993d2ac`).
 
 Everything is over the **block tier**: the daemon (`rb-cli serve`, protocol v2)
 keeps a file/device open and serves raw byte ranges (`OpenBlock`/`OpenDevice` →
@@ -77,11 +83,11 @@ Chose **(a) block-level write**. Added `OpenBlockRw`/`WriteBlock`/`FlushBlock`
 Write`: write-through `WriteBlock` + read-cache patch, `flush` -> `FlushBlock`;
 daemon syncs writable handles on `CloseBlock` too). `BrowseSession::open_editable`
 now builds a RW reader for a remote source. Devices stay read-only. Headless test
-`edit_remote_image_over_block_tier`. **Left:** GUI browse-view "Edit Mode" on a
-remote-inspected image is COMPILE-ONLY — the engine works (`open_editable` no
-longer refuses remote), but the inspect-tab Edit-Mode reachability needs an
-interactive check (does `edit_supported` light up + the staged-edit Apply route
-through `session.open_editable()` for a remote browse?).
+`edit_remote_image_over_block_tier`. **GUI wired (`8da635c`, compile-only):**
+`open_browse`'s remote branch now calls `mark_edit_supported()`, so the
+browse-view "Edit Mode" button appears for a remote-inspected image and the
+staged-edit Apply routes through `session.open_editable()` (the RW reader).
+Needs an interactive check on hardware.
 
 ### 2. fsck REPAIR + RESIZE over the wire — DONE.
 - **Repair** (`65c2919`): `run_repair_reader` (RW reader) + inspect-tab repair
@@ -110,24 +116,26 @@ finalization via `&mut File`), so instead of rewriting it target-generic this
 - `model::restore_remote::restore_to_remote` (run_restore -> staging -> push).
 - `rb-cli restore ./backup rb://host/img` (or device path + `--device --yes`).
 - Headless test `restore_to_remote_image_round_trips`.
-- **Left:** GUI Restore-tab "Remote…" target picker (reuse `model::backup_remote`
-  connect + the `RemoteSourceState` UI shape) — not started; restore-to-remote
-  is **CLI-only** so far. Device-write target needs an elevated daemon + is
-  interactive-verify only (image-file target is the headlessly-tested path).
-  Future optimization: a streaming target seam (make `run_restore` target-
-  generic) to skip the staging image + second pass.
-We did Backup (remote source); Restore to a remote drive/image is the mirror.
-`restore/mod.rs` writes to a path/device — needs the same write seam as #1
-(`WriteBlock` / a remote `Write+Seek`), plus a Restore-tab "Remote…" target
-picker (reuse `model::backup_remote` connect + `RemoteSourceState` UI shape).
+- **GUI wired (`8da635c`, compile-only):** Restore-tab "Restore to a remote
+  machine" checkbox -> connect (`connect_and_list_devices`) -> pick a device or
+  name an image file -> Start Restore pushes via `restore_to_remote` on a worker
+  (shared `resolve_alignment` / `build_partition_sizes` with the local path).
+  Device-write target needs an elevated daemon + is interactive-verify only
+  (image-file target is the headlessly-tested path). Future optimization: a
+  streaming target seam (make `run_restore` target-generic) to skip staging.
 
-### 4. TUI remote browser
-A crossterm remote browser reusing `RemoteConnection` (ASCII-only, TTY-guard;
-follow the `bless pick` conventions, `[[cli-tui-crossterm]]`).
+### 4. TUI remote browser — DEPRIORITIZED (user, 2026-06-21)
+A crossterm remote browser was planned (reuse `RemoteConnection`, ASCII-only,
+TTY-guard, `[[cli-tui-crossterm]]`), but the user decided the MiSTer doesn't
+need an on-device browser TUI — it just needs the **daemon installer/packaging**
+(§5). So skip the TUI; the desktop is the smart client. Revisit only if an
+on-device interactive browser is actually wanted later.
 
 ### 5. Family B + MiSTer packaging (handoff §4, plan §)
 Family B = the chunked cb-dos backup stream (Phase 4, blocked on cb-dos local
-round-trip). MiSTer install packaging/service (Scripts `.sh` + downloader DB).
+round-trip). **MiSTer install packaging/service** (Scripts `.sh` + downloader
+DB) is what the MiSTer actually needs to run the daemon — the near-term §4
+replacement per the user. Not started.
 
 ### Smaller cleanups / risks
 - **Superfloppy remote device** (no partition table) — exercise + polish the
@@ -172,6 +180,7 @@ round-trip). MiSTer install packaging/service (Scripts `.sh` + downloader DB).
 
 ## Commit trail (this push, newest first)
 ```
+8da635c remote: wire GUI edit-mode + Restore-tab remote target
 d79eb60 remote: restore a backup to a remote target (device or image)
 d0ba6f3 remote: resize a remote filesystem in place over the block tier
 993d2ac fix: FAT compaction over-padded FAT32, breaking small volumes (CI red)
