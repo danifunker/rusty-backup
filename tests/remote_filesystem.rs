@@ -1302,3 +1302,152 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
         "partition data round-trips byte-exact through the remote-materialized CHD"
     );
 }
+
+/// Remote per-partition MINIMUM-SIZE calc over the block tier: drive the
+/// `min_size_runner` worker with a `MinSizeSource::Remote { is_device: false }`
+/// against a served FAT image and prove it computes an in-place minimum well
+/// below the volume size — entirely over ranged reads, no download. This is the
+/// runner path the Backup-tab "Calc min" / eager-calc UI uses for a remote
+/// source. (The `is_device: true` device path needs root + a real disk, so it's
+/// left to interactive hardware verification.)
+#[test]
+fn remote_min_size_calc_over_block_tier() {
+    use rusty_backup::model::min_size_runner::{spawn, MinSizeRequest, MinSizeSource};
+    use rusty_backup::remote::RemoteConnection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("minsize.img");
+    // 8 MiB FAT superfloppy with one small file: the used region (the in-place
+    // minimum) is far below the 8 MiB volume size.
+    make_fat_image(&img, "MINVOL", "SMALL.BIN", 0x42, 4096);
+    let img_len = std::fs::metadata(&img).unwrap().len();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    let status = spawn(MinSizeRequest {
+        source: MinSizeSource::Remote {
+            conn: Arc::clone(&conn),
+            path: "/minsize.img".to_string(),
+            is_device: false,
+        },
+        partition_offset: 0,
+        partition_type: 0, // superfloppy auto-detect
+        partition_type_string: None,
+        partition_size: img_len,
+        partition_index: 0,
+    });
+
+    // Poll the shared status the GUI would poll, bounded so a hang fails loudly.
+    let mut result = None;
+    for _ in 0..600 {
+        {
+            let s = status.lock().unwrap();
+            if s.finished {
+                assert!(
+                    s.error.is_none(),
+                    "remote min-size worker errored: {:?}",
+                    s.error
+                );
+                result = Some(s.result);
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let min = result
+        .expect("remote min-size worker finished within the timeout")
+        .expect("worker computed an in-place minimum over the wire");
+    assert!(
+        min > 0 && min < img_len,
+        "remote min size {min} should be > 0 and < the {img_len}-byte volume",
+    );
+}
+
+/// Remote SUPERFLOPPY backup (no partition table) over the block tier: serve a
+/// bare FAT image (no MBR/GPT), pull a raw backup of its single offset-0
+/// partition, and prove the capture is byte-exact and the metadata records
+/// `partition_table_type == "None"`. Proves the `PartitionTable::None` path runs
+/// end to end over the wire — the no-table sibling of
+/// `run_backup_pulls_remote_image_byte_exact`.
+#[test]
+fn run_backup_pulls_remote_superfloppy_byte_exact() {
+    use std::sync::Mutex;
+
+    use rusty_backup::backup::{
+        run_backup_from, BackupConfig, BackupProgress, BackupSource, ChecksumType, CompressionType,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("floppy.img");
+    // A bare FAT superfloppy (no MBR/GPT) with a known multi-cluster file.
+    make_fat_image(&img, "SFVOL", "SF.BIN", 0x5A, 9000);
+    let disk_final = std::fs::read(&img).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+
+    let dest = root.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let display = format!("rb://{addr}/floppy.img");
+    let config = BackupConfig {
+        source_path: std::path::PathBuf::from("/floppy.img"),
+        destination_dir: dest.clone(),
+        backup_name: "remote-superfloppy".to_string(),
+        compression: CompressionType::None,
+        checksum: ChecksumType::Crc32,
+        split_size_mib: None,
+        sector_by_sector: true,
+        partition_filter: None,
+        chd_options: None,
+        size_policy: None,
+        partition_target_sizes: None,
+        shrink_to_minimum: false,
+        precomputed_minimum_sizes: None,
+        defrag_partition_indices: None,
+    };
+    let progress = Arc::new(Mutex::new(BackupProgress::default()));
+    let source = BackupSource::Remote {
+        conn: Arc::clone(&conn),
+        path: "/floppy.img".to_string(),
+        display: display.clone(),
+        is_device: false,
+    };
+    run_backup_from(source, config, progress).expect("remote superfloppy backup must succeed");
+
+    // Metadata records the no-table layout and the full source size.
+    let backup_dir = dest.join("remote-superfloppy");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup_dir.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(
+        metadata["partition_table_type"], "None",
+        "superfloppy records no partition table"
+    );
+    assert_eq!(
+        metadata["source_size_bytes"].as_u64().unwrap(),
+        disk_final.len() as u64,
+        "metadata records the full bare-FS image size"
+    );
+
+    // The single offset-0 partition captures the whole bare-FS image
+    // byte-exact. A superfloppy's raw capture is renamed `.raw` -> `.img` (a
+    // universally-mountable flat image), so it lands as `partition-0.img`.
+    let captured = std::fs::read(backup_dir.join("partition-0.img"))
+        .expect("partition-0.img written by the superfloppy backup");
+    assert_eq!(
+        captured, disk_final,
+        "captured superfloppy is byte-exact vs the source"
+    );
+}

@@ -70,13 +70,17 @@ pub enum MinSizeSource {
     /// Path to a GHO/GHS container (or any file of its span set) — the worker
     /// opens its own `GhoReader` over the logical (decompressed) volume.
     Gho(PathBuf),
-    /// A remote image over the block tier: the worker opens its own
-    /// `RemoteBlockReader` on the shared connection (the daemon keeps the image
-    /// open and serves byte ranges).
+    /// A remote source over the block tier: the worker opens its own
+    /// `RemoteBlockReader` on the shared connection (the daemon keeps the
+    /// source open and serves byte ranges). `is_device` picks the daemon's
+    /// physical-device opener (`open_device`, a Backup-tab remote drive) over
+    /// the host-image-file opener (`open`, an Inspect-tab remote image) — the
+    /// two RPCs are not interchangeable.
     #[cfg(feature = "remote")]
     Remote {
         conn: Arc<Mutex<crate::remote::RemoteConnection>>,
         path: String,
+        is_device: bool,
     },
 }
 
@@ -158,8 +162,17 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                 }
             }
             #[cfg(feature = "remote")]
-            MinSizeSource::Remote { conn, path } => {
-                match crate::remote::RemoteBlockReader::open(conn, &path) {
+            MinSizeSource::Remote {
+                conn,
+                path,
+                is_device,
+            } => {
+                let opened = if is_device {
+                    crate::remote::RemoteBlockReader::open_device(conn, &path)
+                } else {
+                    crate::remote::RemoteBlockReader::open(conn, &path)
+                };
+                match opened {
                     Ok(reader) => fs::partition_minimum_size(
                         reader,
                         req.partition_offset,

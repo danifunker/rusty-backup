@@ -1,5 +1,17 @@
 # Resume prompt — remote per-partition sizing UI + superfloppy remote device
 
+> **STATUS: DONE (2026-06-21).** Both items below shipped (engine + GUI wiring +
+> headless tests). Item 1: `min_size_runner::MinSizeSource::Remote` gained an
+> `is_device` flag; `backup_tab::poll_remote` now fills the per-partition Min
+> Size / Frag / Compact maps (cheap FS eagerly, expensive FS behind "Calc min"),
+> `start_min_size_calc` has a Remote arm (device opener), and both backup paths
+> route through a shared `build_partition_sizing` helper so picked sizes are
+> honored. Item 2: the bare-FS `PartitionTable::None` remote path is covered.
+> Headless tests: `remote_min_size_calc_over_block_tier` +
+> `run_backup_pulls_remote_superfloppy_byte_exact`. **What's left is only the
+> interactive (real-device, root daemon) checks** in the Verification sections.
+> The rest of this file is kept as the design record + the device test script.
+
 **Paste this into a fresh session to pick up these two Backup-tab items.** They
 are the last "Smaller cleanups / risks" left on the otherwise feature-complete
 remote/Family-F work. First read `docs/remote_resume.md` (the umbrella state) and

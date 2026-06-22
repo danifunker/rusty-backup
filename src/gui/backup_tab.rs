@@ -740,11 +740,22 @@ impl BackupTab {
                     .clicked()
                 {
                     if self.remote_active() {
-                        // A remote source routes straight through run_backup_from
-                        // (per-partition output over the block tier); the
-                        // whole-disk VHD popup and CHD min-size walks are
-                        // local-only.
-                        self.start_backup(ctx);
+                        // A remote source routes through run_backup_from (the
+                        // whole-disk VHD popup stays local-only). For a CHD
+                        // resize-to-minimum, expensive filesystems still need a
+                        // walk over the wire first — kick those deferred calcs
+                        // and let show()'s poll loop start the backup once they
+                        // land, mirroring the local CHD branch below.
+                        if self.compression_type == CompressionType::Chd
+                            && !self.sector_by_sector
+                            && self.resize_partitions
+                            && self.has_deferred_selected_partitions()
+                        {
+                            self.kick_off_pending_min_size_calcs(ctx);
+                            self.pending_backup_after_min_sizes = true;
+                        } else {
+                            self.start_backup(ctx);
+                        }
                     } else if self.compression_type == CompressionType::Vhd {
                         // Scan partitions if not already loaded
                         if self.source_partitions.is_empty() {
@@ -1088,6 +1099,55 @@ impl BackupTab {
         else {
             return;
         };
+
+        // Remote source: compute over a block reader against the daemon's
+        // physical-**device** handle (a Backup-tab remote source is a drive, so
+        // `is_device: true` — the image-file opener would misbehave on a device
+        // path). The runner builds its own RemoteBlockReader on the shared
+        // connection. Done before the local path/CHD/GHO dispatch below.
+        #[cfg(feature = "remote")]
+        if self.remote_active() {
+            let Some((conn, rpath)) = self
+                .remote
+                .conn
+                .clone()
+                .zip(self.remote.selected.as_ref().map(|(p, _)| p.clone()))
+            else {
+                ctx.log.error(format!(
+                    "Cannot calculate minimum size for partition {part_index}: remote source not connected",
+                ));
+                return;
+            };
+            let fs_name = self
+                .deferred_min_sizes
+                .get(&part_index)
+                .copied()
+                .unwrap_or_else(|| {
+                    fs::fs_name_for(
+                        part.partition_type_byte,
+                        part.partition_type_string.as_deref(),
+                    )
+                });
+            ctx.log.info(format!(
+                "Calculating minimum size for partition {part_index} ({fs_name}) over the wire...",
+            ));
+            let req = rusty_backup::model::min_size_runner::MinSizeRequest {
+                source: rusty_backup::model::min_size_runner::MinSizeSource::Remote {
+                    conn,
+                    path: rpath,
+                    is_device: true,
+                },
+                partition_offset: part.byte_offset(),
+                partition_type: part.partition_type_byte,
+                partition_type_string: part.partition_type_string.clone(),
+                partition_size: part.size_bytes,
+                partition_index: part_index,
+            };
+            let status = rusty_backup::model::min_size_runner::spawn(req);
+            self.pending_min_size_calcs.insert(part_index, status);
+            return;
+        }
+
         let path = self.source_path(ctx);
         let is_device = path
             .as_ref()
@@ -1855,14 +1915,45 @@ impl BackupTab {
                 info.partitions.len(),
                 if info.partitions.len() == 1 { "" } else { "s" }
             ));
-            // Reuse the standard partition-selection state; the advanced
-            // per-partition columns (min-size / frag) stay empty for a remote
-            // source. CHD + shrink-to-minimum still work — the engine
-            // materializes the remote disk to a local temp first.
+            // Reuse the standard partition-selection state.
+            let is_superfloppy = info.is_superfloppy;
             self.source_partitions = info.partitions;
             self.source_partition_table_desc = Some(info.table_desc);
             self.partition_load_error = None;
             self.select_all_partitions();
+
+            // Populate the per-partition Min Size / Frag / Compact columns just
+            // like a local source. Cheap filesystems (FAT/NTFS/exFAT — a couple
+            // of ranged bitmap reads) compute eagerly over the wire; expensive
+            // ones (HFS/HFS+/ext/btrfs/ProDOS — a full catalog walk that would
+            // be many round-trips on a slow link) defer behind a per-row "Calc
+            // min" button. Partitions with no recognizable filesystem are
+            // skipped (no worker), except a superfloppy whose single offset-0
+            // partition bears an FS under a type byte of 0. Mirrors the local
+            // load_partitions eager/deferred split.
+            let mut to_defer: Vec<(usize, &'static str)> = Vec::new();
+            let mut to_kick: Vec<usize> = Vec::new();
+            for part in &self.source_partitions {
+                if part.is_extended_container {
+                    continue;
+                }
+                let type_byte = part.partition_type_byte;
+                let type_str = part.partition_type_string.as_deref();
+                if !is_superfloppy && fs::fs_name_for(type_byte, type_str) == "unknown" {
+                    continue;
+                }
+                if fs::is_expensive_minimum(type_byte, type_str) {
+                    to_defer.push((part.index, fs::fs_name_for(type_byte, type_str)));
+                } else {
+                    to_kick.push(part.index);
+                }
+            }
+            for (idx, fs_name) in to_defer {
+                self.deferred_min_sizes.insert(idx, fs_name);
+            }
+            for idx in to_kick {
+                self.start_min_size_calc(idx, ctx);
+            }
         }
     }
 
@@ -1986,9 +2077,11 @@ impl BackupTab {
         }
     }
 
-    /// Pull a backup of the remote drive over the block tier. Read-only:
-    /// Zstd / Raw / VHD per-partition (CHD + shrink-to-minimum aren't supported
-    /// over the wire — the engine bails / ignores them, so we steer here too).
+    /// Pull a backup of the remote drive over the block tier. Zstd / Raw / VHD
+    /// stream the per-partition data directly; CHD and shrink-to-minimum
+    /// materialize the remote disk to a local temp first, then run the normal
+    /// local pipeline — so per-partition sizing (custom/minimum sizes + the
+    /// Compact toggle) is honored identically to a local source.
     #[cfg(feature = "remote")]
     fn start_remote_backup(
         &mut self,
@@ -2021,6 +2114,14 @@ impl BackupTab {
             None
         };
 
+        // Same per-partition sizing the local path assembles. For a remote
+        // CHD / shrink backup the engine materializes to a local temp and runs
+        // the local pipeline, so the chosen target sizes + Compact opt-ins flow
+        // through unchanged. (Computed minimums come from the eager / "Calc
+        // min" worker runs on the loaded remote partitions.)
+        let (size_policy, partition_target_sizes, defrag_set, precomputed_minimum_sizes) =
+            self.build_partition_sizing();
+
         let config = BackupConfig {
             source_path: PathBuf::from(&path),
             destination_dir,
@@ -2037,14 +2138,14 @@ impl BackupTab {
             partition_filter,
             // CHD codec/hunk options when the output is a CHD profile.
             chd_options: self.chd_options_for_compression(),
-            size_policy: None,
-            partition_target_sizes: None,
+            size_policy,
+            partition_target_sizes,
             // CHD + shrink-to-minimum work for a remote drive too: the engine
             // materializes the remote disk to a local temp first, then runs the
             // normal local pipeline (HFS+/PFS3 defrag-clone included).
             shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
-            precomputed_minimum_sizes: None,
-            defrag_partition_indices: None,
+            precomputed_minimum_sizes,
+            defrag_partition_indices: Some(defrag_set),
         };
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
@@ -2085,44 +2186,26 @@ impl BackupTab {
         });
     }
 
-    fn start_backup(&mut self, ctx: &mut TabContext) {
-        // Remote source: pull a backup of the remote drive over the block tier.
-        #[cfg(feature = "remote")]
-        if let (Some(conn), Some((path, display))) =
-            (self.remote.conn.clone(), self.remote.selected.clone())
-        {
-            self.start_remote_backup(ctx, conn, path, display);
-            return;
-        }
-
-        let source_path = match self.source_path(ctx) {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source selected");
-                return;
-            }
-        };
-
-        let destination_dir = match &self.destination_folder {
-            Some(d) => d.clone(),
-            None => {
-                ctx.log.error("No destination folder selected");
-                return;
-            }
-        };
-
-        let partition_filter = if self.selected_partitions.len()
-            < self
-                .source_partitions
-                .iter()
-                .filter(|p| !p.is_extended_container)
-                .count()
-        {
-            Some(self.selected_partitions.iter().copied().collect())
-        } else {
-            None // All selected — no filter needed
-        };
-
+    /// Assemble the per-partition sizing inputs shared by the local and remote
+    /// backup-config builders: the single-file-CHD size policy + explicit
+    /// per-partition target sizes, the per-partition Compact (defrag-clone)
+    /// opt-in set, and the toggle-aware precomputed effective minimums.
+    ///
+    /// A pure function of the current partition selection and per-partition
+    /// toggles — independent of whether the backup source is a local path or a
+    /// remote drive. A remote CHD / shrink-to-minimum backup materializes the
+    /// disk to a local temp and runs the *same* pipeline, so it honors these
+    /// identically; that's why both `start_backup` and `start_remote_backup`
+    /// feed the engine the same four values.
+    #[allow(clippy::type_complexity)]
+    fn build_partition_sizing(
+        &self,
+    ) -> (
+        Option<SizePolicy>,
+        Option<Vec<(usize, u64)>>,
+        std::collections::HashSet<usize>,
+        Option<Vec<(usize, u64)>>,
+    ) {
         // Single-file CHD: derive size_policy + per-partition target sizes
         // from the simple "Resize partitions to minimum size" checkbox. When
         // the box is on, every partition with a known minimum gets MinPlus20;
@@ -2133,7 +2216,7 @@ impl BackupTab {
         // `run_backup` activates via `shrink_to_minimum`. The clone uses the
         // partition's defragmented minimum (a true lower bound) — emitting a
         // MinPlus20-of-the-in-place-trim entry here would either no-op
-        // (MinPlus20 ≥ original collapses to original) or override the
+        // (MinPlus20 >= original collapses to original) or override the
         // clone target.
         let resize_for_chd = matches!(self.compression_type, CompressionType::Chd)
             && !self.sector_by_sector
@@ -2192,10 +2275,6 @@ impl BackupTab {
             (None, None)
         };
 
-        let split_disabled_for_compression = matches!(
-            self.compression_type,
-            CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
-        );
         // Per-partition defrag opt-in: only HFS+/HFSX partitions whose
         // checkbox is checked AND whose FS has a defragmenting writer.
         let mut defrag_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -2237,6 +2316,67 @@ impl BackupTab {
                 .map(|sz| (p.index, sz))
             })
             .collect();
+        let precomputed_opt = if precomputed.is_empty() {
+            None
+        } else {
+            Some(precomputed)
+        };
+
+        (
+            size_policy,
+            partition_target_sizes,
+            defrag_set,
+            precomputed_opt,
+        )
+    }
+
+    fn start_backup(&mut self, ctx: &mut TabContext) {
+        // Remote source: pull a backup of the remote drive over the block tier.
+        #[cfg(feature = "remote")]
+        if let (Some(conn), Some((path, display))) =
+            (self.remote.conn.clone(), self.remote.selected.clone())
+        {
+            self.start_remote_backup(ctx, conn, path, display);
+            return;
+        }
+
+        let source_path = match self.source_path(ctx) {
+            Some(p) => p,
+            None => {
+                ctx.log.error("No source selected");
+                return;
+            }
+        };
+
+        let destination_dir = match &self.destination_folder {
+            Some(d) => d.clone(),
+            None => {
+                ctx.log.error("No destination folder selected");
+                return;
+            }
+        };
+
+        let partition_filter = if self.selected_partitions.len()
+            < self
+                .source_partitions
+                .iter()
+                .filter(|p| !p.is_extended_container)
+                .count()
+        {
+            Some(self.selected_partitions.iter().copied().collect())
+        } else {
+            None // All selected — no filter needed
+        };
+
+        // Per-partition sizing (CHD size policy + targets, Compact opt-in set,
+        // precomputed minimums) — shared verbatim with the remote path.
+        let (size_policy, partition_target_sizes, defrag_set, precomputed_minimum_sizes) =
+            self.build_partition_sizing();
+
+        let split_disabled_for_compression = matches!(
+            self.compression_type,
+            CompressionType::Vhd | CompressionType::Chd | CompressionType::Dvd
+        );
 
         let config = BackupConfig {
             source_path,
@@ -2264,11 +2404,7 @@ impl BackupTab {
             // that get the clone is further narrowed by
             // `defrag_partition_indices` below.
             shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
-            precomputed_minimum_sizes: if precomputed.is_empty() {
-                None
-            } else {
-                Some(precomputed)
-            },
+            precomputed_minimum_sizes,
             defrag_partition_indices: Some(defrag_set),
         };
 

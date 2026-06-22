@@ -4733,6 +4733,8 @@ impl InspectTab {
             rusty_backup::model::min_size_runner::MinSizeSource::Remote {
                 conn: std::sync::Arc::clone(conn),
                 path: rpath.clone(),
+                // The Inspect tab inspects a remote image *file*, not a device.
+                is_device: false,
             }
         // Prefer a CHD path source over the raw device handle: opening the
         // raw .chd file at partition_offset would read compressed bytes.

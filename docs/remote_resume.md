@@ -138,12 +138,16 @@ DB) is what the MiSTer actually needs to run the daemon — the near-term §4
 replacement per the user. Not started.
 
 ### Smaller cleanups / risks
-> **Per-partition remote sizing + superfloppy remote device have a dedicated,
-> scoped resume prompt: `docs/remote_backup_sizing_resume.md`** (file:line seams,
-> the image-vs-device runner gotcha, and headless test plan). Start there for
-> those two.
-- **Superfloppy remote device** (no partition table) — exercise + polish the
-  `PartitionTable::None` path for a bare-FS device. See the dedicated prompt above.
+> **Per-partition remote sizing + superfloppy remote device — DONE.** Both items
+> from the scoped prompt `docs/remote_backup_sizing_resume.md` shipped: the
+> `min_size_runner::MinSizeSource::Remote` arm gained an `is_device` flag (picks
+> `open_device` vs `open`); the Backup tab now populates the per-partition Min
+> Size / Frag / Compact columns for a remote source (cheap FAT/NTFS/exFAT
+> eagerly, expensive HFS/ext/btrfs behind the "Calc min" button) and honors the
+> chosen sizes by routing remote backups through the same `build_partition_sizing`
+> helper as local. Headless tests `remote_min_size_calc_over_block_tier` +
+> `run_backup_pulls_remote_superfloppy_byte_exact` in `tests/remote_filesystem.rs`.
+> Still **interactive-verify only** for the real device path (root + a real disk).
 - **macOS `/dev/rdiskN` read-alignment** — `OpenDevice` reads are unaligned;
   fine on Linux/MiSTer (the target), would need aligned reads for a macOS daemon.
 - **NTFS/exFAT packer** — FIXED (`462f371`). Was a confirmed data-loss bug: the
@@ -156,13 +160,10 @@ replacement per the user. Not started.
   (position-preserving). Regression tests in `tests/filesystem_e2e.rs`
   (`*_smart_compaction_is_layout_preserving`, `ntfs_compaction_preserves_nonresident_file`).
   See `[[ntfs-exfat-packer-audit]]`.
-- **Per-partition sizing UI for remote** — the Backup tab's min-size / frag /
-  Compact columns stay empty for a remote source (the engine computes shrink on
-  the materialized temp, but the user can't pick per-partition custom sizes).
-  **Scoped prompt: `docs/remote_backup_sizing_resume.md`** — root cause is the
-  maps are never populated (`poll_remote` skips it, `start_min_size_calc` has no
-  Remote arm); the `min_size_runner` Remote arm already works but opens an image,
-  not a device (the one real fix).
+- **Per-partition sizing UI for remote** — DONE (see the merged item above):
+  `poll_remote` now fills the maps, `start_min_size_calc` has a Remote arm, and
+  the `min_size_runner` Remote arm takes an `is_device` flag so a Backup-tab
+  remote source opens via `open_device`.
 - **Daemon elevation** — we *require* the daemon already runs as root for
   `OpenDevice`; we don't escalate. Fine for the MiSTer; a general desktop daemon
   just errors if unprivileged.
