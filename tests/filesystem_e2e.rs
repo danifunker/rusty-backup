@@ -948,6 +948,128 @@ fn test_exfat_compaction_round_trip() {
 }
 
 // ============================================================================
+// Test Group R2: NTFS/exFAT smart compaction must be layout-preserving
+//
+// Regression guard for the dense-packer bug (see the ntfs-exfat-packer-audit
+// note): `CompactNtfsReader` prepends the boot cluster (LCN 0) AND lists LCN 0
+// among its allocated clusters, emitting it twice and shifting every subsequent
+// cluster off its real LCN. Because the MFT's data runs reference absolute LCNs
+// and restore writes the stream verbatim, that silently corrupted non-resident
+// files. The fix routes NTFS/exFAT smart compaction through the
+// layout-preserving reader, which keeps every cluster at its true offset.
+// ============================================================================
+
+/// The smart-compaction dispatch (`compact_partition_reader`, what backup uses)
+/// must hand NTFS a **layout-preserving** stream: full volume length, and every
+/// byte is either the source byte (allocated cluster at its true offset) or zero
+/// (free cluster). The old dense packer moved clusters, which this would catch.
+#[test]
+fn ntfs_smart_compaction_is_layout_preserving() {
+    let img = load_fixture("test_ntfs.img.zst");
+    let (mut r, info) =
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+            .expect("NTFS compact reader");
+    assert_eq!(
+        info.compacted_size, info.original_size,
+        "NTFS smart compaction must be layout-preserving (not the dense packer)"
+    );
+    let mut out = Vec::new();
+    r.read_to_end(&mut out).unwrap();
+    assert_eq!(out.len() as u64, info.original_size);
+    // Position preservation: no allocated cluster was moved off its offset.
+    let moved = (0..out.len()).find(|&i| out[i] != img[i] && out[i] != 0);
+    assert!(
+        moved.is_none(),
+        "cluster moved at offset {moved:?} — NTFS compaction is not position-preserving"
+    );
+}
+
+/// Same guard for exFAT (its dense packer shares the same boot-double-count
+/// shape).
+#[test]
+fn exfat_smart_compaction_is_layout_preserving() {
+    let img = load_fixture("test_exfat.img.zst");
+    let (mut r, info) =
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+            .expect("exFAT compact reader");
+    assert_eq!(
+        info.compacted_size, info.original_size,
+        "exFAT smart compaction must be layout-preserving (not the dense packer)"
+    );
+    let mut out = Vec::new();
+    r.read_to_end(&mut out).unwrap();
+    let moved = (0..out.len()).find(|&i| out[i] != img[i] && out[i] != 0);
+    assert!(
+        moved.is_none(),
+        "cluster moved at offset {moved:?} — exFAT compaction is not position-preserving"
+    );
+}
+
+/// End-to-end proof: write a multi-cluster (non-resident) file into a real NTFS
+/// volume, smart-compact it through the backup dispatch, re-open the stream, and
+/// read the file back byte-exact. With the old dense packer the file's clusters
+/// landed at the wrong offsets and this read returned corrupt data.
+#[test]
+fn ntfs_compaction_preserves_nonresident_file() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{compact_partition_reader, open_editable_filesystem, open_filesystem};
+
+    let img = load_fixture("test_ntfs.img.zst");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ntfs.img");
+    std::fs::write(&path, &img).unwrap();
+
+    // A 60 KB file with a distinctive pattern — comfortably non-resident
+    // (spans many clusters), so reading it back follows the MFT data runs.
+    let payload: Vec<u8> = (0..60_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x07, None).unwrap();
+        let root = efs.root().unwrap();
+        let mut data = &payload[..];
+        efs.create_file(
+            &root,
+            "BIG.DAT",
+            &mut data,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    let modified = std::fs::read(&path).unwrap();
+
+    // Smart-compact via the dispatch the backup uses, then reconstruct the
+    // stream the way restore does (zero-pad to original_size — a no-op for the
+    // layout-preserving reader, which already emits the full length).
+    let (mut r, info) =
+        compact_partition_reader(Cursor::new(modified), 0, 0x07, None).expect("compact reader");
+    let mut packed = Vec::new();
+    r.read_to_end(&mut packed).unwrap();
+    packed.resize(info.original_size as usize, 0);
+
+    let mut fs = open_filesystem(Cursor::new(packed), 0, 0x07, None).unwrap();
+    let root = fs.root().unwrap();
+    let big = fs
+        .list_directory(&root)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "BIG.DAT")
+        .expect("BIG.DAT present after compaction");
+    let got = fs.read_file(&big, payload.len()).unwrap();
+    assert_eq!(
+        got, payload,
+        "non-resident file must survive smart-mode compaction byte-exact"
+    );
+}
+
+// ============================================================================
 // Test Group S: HFS compaction round-trip
 // ============================================================================
 
