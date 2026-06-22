@@ -783,12 +783,14 @@ jobs:
           # v0.2.5 (Ubuntu 20.04 base) so this binary links against the same
           # glibc baseline as MiSTer's Buildroot rootfs and the upstream
           # libchdman-rs armv7 prebuilt.
+          # `remote` = the rb-cli serve daemon + rb:// (pure std::net + serde_json,
+          # no C / no extra crate), so the MiSTer can host its images on the LAN.
           cross build \
             --bin rb-cli \
             --release \
             --target armv7-unknown-linux-gnueabihf \
             --no-default-features \
-            --features chd
+            --features chd,pure-zstd,remote
 
       - name: Strip binary
         run: |
@@ -827,6 +829,163 @@ jobs:
           name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
 
+  build-appliance:
+    name: Build Linux appliance (${{ matrix.arch }})
+    # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
+    # toolchain from scratch). TEMPORARILY skipped on auto-releases so we can
+    # ship the desktop/CLI/MiSTer/cb-dos artifacts quickly; build the i586/i686
+    # appliance on demand via "Run workflow" (workflow_dispatch). To re-enable
+    # it on every main release, restore:
+    #   github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' ||
+    if: github.event_name == 'workflow_dispatch'
+    needs: generate-version
+    runs-on: ubuntu-latest
+    # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
+    # ship. Cap the runtime so a wedged build can't burn the 6 h default.
+    continue-on-error: true
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # i586 = broadest reach (Pentium / 5x86 / Vortex86 / ITX-Llama and up);
+        # i686 = a touch faster on Pentium-Pro+ but won't run on a plain Pentium.
+        # (A true 486 is cb-dos, built by the separate build-cb-dos job.)
+        arch: [i586, i686]
+    env:
+      VER: ${{ needs.generate-version.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free up disk space (Buildroot needs several GB)
+        run: |
+          # GitHub runners ship ~25 GB of preinstalled SDKs we don't use; drop the
+          # big ones so the Buildroot toolchain + image build has room.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -af || true
+          df -h /
+
+      - name: Cache Buildroot source downloads
+        uses: actions/cache@v4
+        with:
+          path: buildroot/dl
+          key: buildroot-dl-2024.02
+          restore-keys: buildroot-dl-
+
+      - name: Cache Buildroot ccache (${{ matrix.arch }})
+        # run_id in the key makes every run save a fresh entry; restore-keys
+        # pulls the newest previous one — so the ccache keeps warming up. After
+        # the first ~1 h build, warm-cache rebuilds are much faster.
+        uses: actions/cache@v4
+        with:
+          path: buildroot/ccache
+          key: buildroot-ccache-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: buildroot-ccache-${{ matrix.arch }}-
+
+      - name: Build the static i586-musl rb-cli (baked into the appliance)
+        # The i586 static binary runs on both i586 and i686 appliances.
+        run: |
+          docker build -t rb-cross-i586-musl - < docker/cross-i586-musl.Dockerfile
+          docker run --rm -v "$PWD":/src rb-cross-i586-musl
+          ls -lh target-cross/i586-unknown-linux-musl/release/rb-cli
+
+      - name: Build the Buildroot appliance (${{ matrix.arch }} kernel + rootfs + hybrid ISO)
+        run: |
+          docker build -t rb-buildroot - < docker/buildroot-appliance.Dockerfile
+          docker run --rm -e APPLIANCE_ARCH="${ARCH}" -v "$PWD":/work rb-buildroot
+          ls -lh buildroot/output/
+
+      - name: Take ownership of the Buildroot output (Docker writes it root-owned)
+        # Buildroot runs as root in the container (-v "$PWD":/work), so everything
+        # under buildroot/output/ lands root-owned. The host-side packaging steps
+        # below (package-pxe, GRUB floppy, ISO naming) run as the unprivileged
+        # runner and must be able to create files there — chown the tree first,
+        # else they die with "cp: cannot create ... Permission denied".
+        run: sudo chown -R "$(id -u):$(id -g)" buildroot/output
+
+      - name: Install media tooling (PXE initrd extract + GRUB floppy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso grub-pc-bin mtools
+
+      - name: Package PXE network-boot bundle
+        run: sh buildroot/package-pxe.sh "${ARCH}-${VER}"
+
+      - name: Build GRUB boot floppy (pre-El-Torito BIOS bridge)
+        run: |
+          sh buildroot/make-grub-floppy.sh
+          mv buildroot/output/rusty-backup-grub-floppy.img \
+             "buildroot/output/rusty-backup-grub-floppy-${ARCH}-${VER}.img"
+
+      - name: Name the ISO for the release
+        # Block scalar (run: |) so the `\` is a real shell line-continuation.
+        # As a plain scalar, YAML folds the newline to a space first, leaving
+        # bash a `\<space>` (escaped space) that corrupts the destination path.
+        run: |
+          cp buildroot/output/rusty-backup-appliance.iso \
+             "buildroot/output/rusty-backup-appliance-${ARCH}-${VER}.iso"
+
+      - name: Upload appliance artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: rusty-backup-appliance-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            buildroot/output/rusty-backup-appliance-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.iso
+            buildroot/output/rusty-backup-appliance-pxe-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+            buildroot/output/rusty-backup-grub-floppy-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.img
+
+      - name: Make Buildroot caches readable for actions/cache
+        # Buildroot runs as root in the container, so dl/ccache land root-owned;
+        # let the runner user read them when the cache@v4 post-step saves.
+        if: always()
+        run: sudo chmod -R a+rX buildroot/dl buildroot/ccache 2>/dev/null || true
+
+  build-cb-dos:
+    name: Build cb-dos media (FreeDOS floppy + CD)
+    # Cheap (~2-3 min: DJGPP build + a FreeDOS fetch), so run it on every push
+    # like the desktop builds — no gate. Only `release` (main-only) publishes.
+    needs: generate-version
+    runs-on: ubuntu-latest
+    # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP
+    # hiccup shouldn't hold up the desktop release.
+    continue-on-error: true
+    env:
+      VER: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the cb-dos DOS tools (DJGPP cross-compiler)
+        run: |
+          docker build --platform linux/amd64 -t rb-cb-dos - < docker/cb-dos.Dockerfile
+          docker run --rm --platform linux/amd64 -v "$PWD":/src rb-cb-dos
+          ls -lh crusty-backup/build/*.exe
+
+      - name: Fetch the FreeDOS 1.4 base floppy
+        run: |
+          # The FreeDOS 1.4 FloppyEdition is freely redistributable; fetch the
+          # 1.44 MB boot floppy in CI rather than vendoring it in the repo.
+          curl -fsSL -o /tmp/fd14-floppy.zip \
+            https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-FloppyEdition.zip
+          unzip -o -j /tmp/fd14-floppy.zip 144m/x86BOOT.img -d /tmp
+          ls -lh /tmp/x86BOOT.img
+
+      - name: Build the cb-dos floppy + CD
+        run: FDBASE=/tmp/x86BOOT.img sh crusty-backup/mkmedia.sh
+
+      - name: Name the artifacts for the release
+        run: |
+          cp crusty-backup/dist/cbdos-freedos.img "crusty-backup/dist/cbdos-freedos-${VER}.img"
+          cp crusty-backup/dist/cbdos.iso         "crusty-backup/dist/cbdos-${VER}.iso"
+
+      - name: Upload cb-dos artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cbdos-${{ needs.generate-version.outputs.version }}
+          path: |
+            crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
+            crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
+
   release:
     name: Create Release
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
@@ -844,6 +1003,11 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-rb-cli-mini-armv7
+      # Temporarily disabled with the build-appliance job below: a skipped
+      # `needs` job would otherwise skip this whole release. Re-enable both
+      # together (uncomment here + restore the job's `if`).
+      # - build-appliance
+      - build-cb-dos
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -857,7 +1021,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release-files
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" \) -exec cp {} release-files/ \;
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       # Build a download-picker table from the (fixed) build matrix. Links
@@ -883,7 +1047,11 @@ jobs:
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
             "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
-            "rb-cli-mini-armv7-linux-${VER}.tar.gz"; do
+            "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
+            "rusty-backup-appliance-i586-${VER}.iso" "rusty-backup-appliance-i686-${VER}.iso" \
+            "rusty-backup-appliance-pxe-i586-${VER}.tar.gz" "rusty-backup-appliance-pxe-i686-${VER}.tar.gz" \
+            "rusty-backup-grub-floppy-i586-${VER}.img" "rusty-backup-grub-floppy-i686-${VER}.img" \
+            "cbdos-freedos-${VER}.img" "cbdos-${VER}.iso"; do
             [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
           done
 
@@ -903,6 +1071,21 @@ jobs:
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
           <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+
+          ### Boot the vintage machine itself (Linux appliance)
+
+          For 486/Pentium-class boxes too old to run the desktop app — boot the rusty-backup backup/restore menu straight on the metal (VGA monitor or serial console), with a broad vintage NIC / SCSI / IDE driver set baked in.
+
+          Pick **i586** unless you know your box is a Pentium Pro or newer: i586 runs on i586 *and* i686 (Pentium / MMX / K6 / Cyrix / 5x86 / Vortex86-ITX-Llama and up); i686 is a touch faster but needs a Pentium-Pro-class CPU. A true 486 uses **cb-dos**.
+
+          | Artifact | Boots from | Notes |
+          |---|---|---|
+          | **Appliance ISO** — [i586](${BASE}/rusty-backup-appliance-i586-${VER}.iso) · [i686](${BASE}/rusty-backup-appliance-i686-${VER}.iso) | CD-ROM **or** USB / CF (\`dd\` the same file on) | The workhorse hybrid image. |
+          | **PXE bundle** — [i586](${BASE}/rusty-backup-appliance-pxe-i586-${VER}.tar.gz) · [i686](${BASE}/rusty-backup-appliance-pxe-i686-${VER}.tar.gz) | the network (TFTP / PXE) | A diskless backup *station*. |
+          | **GRUB boot floppy** — [i586](${BASE}/rusty-backup-grub-floppy-i586-${VER}.img) · [i686](${BASE}/rusty-backup-grub-floppy-i686-${VER}.img) | a floppy that then loads the appliance off the CD | For pre-El-Torito BIOSes that can't boot a CD directly. |
+          | **cb-dos** ([floppy](${BASE}/cbdos-freedos-${VER}.img) · [CD](${BASE}/cbdos-${VER}.iso)) | a FreeDOS floppy or CD | The DOS-native lane (no Linux) for a true 486, or any box where even a minimal Linux is too heavy. |
+
+          <sub>Which cards work and how to add more: [\`docs/appliance_hardware_support.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/appliance_hardware_support.md). cb-dos background: [\`docs/cb_dos.md\`](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/cb_dos.md).</sub>
 
           ---
           EOF

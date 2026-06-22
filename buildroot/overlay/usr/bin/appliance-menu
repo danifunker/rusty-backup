@@ -1,0 +1,8 @@
+#!/bin/sh
+# Appliance front-end: boot straight into the rb-cli backup/restore menu, like
+# an installer CD. When the user quits the menu, drop to a shell (rb-cli is in
+# PATH; run `appliance-menu` to return). getty respawns this on shell exit.
+rb-cli menu
+echo
+echo "Menu exited. Type 'appliance-menu' to return to it, or use rb-cli directly."
+exec /bin/sh

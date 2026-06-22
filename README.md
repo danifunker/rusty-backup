@@ -91,14 +91,16 @@ checker's reqwest client — but **keeps CHD support** via the upstream
 device.
 
 The desktop release builds use the full feature set; only the MiSTer
-artifact runs `--no-default-features --features chd`.
+artifact runs `--no-default-features --features chd,pure-zstd` (CHD via the
+C prebuilt; zstd via the pure-Rust bit-exact backend, since a cross build
+won't link C libzstd).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features --features chd
+            --no-default-features --features chd,pure-zstd
 
 # Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
 # do the local rename here too so the on-MiSTer filename matches the
@@ -141,6 +143,28 @@ without the `optical` feature" message):
 
 Full background and the feature matrix live in
 [`docs/mister_cli.md`](docs/mister_cli.md).
+
+### Bootable backup appliances (boot the metal, no host OS)
+
+For machines too old or too bare to run the desktop app, the same engine ships
+as **bootable media you run *on* (or beside) the vintage box**:
+
+- **Linux appliance** — a minimal Buildroot Linux that boots straight into the
+  `rb-cli` backup/restore menu (on a VGA monitor *or* a serial console) with the
+  static `rb-cli` baked in. One hybrid ISO boots from a CD-ROM **or** a USB
+  stick / CF card (`dd` the same file onto the device). The kernel carries a
+  broad **vintage-hardware driver set** — ISA / PCI / PC-Card NICs, SCSI HBAs,
+  bare-486 / VL-Bus + PCI IDE, Multi-I/O serial & parallel, parallel-port ZIP,
+  USB storage — so it sees the disks and cards in a 486/Pentium-class machine
+  out of the box. **What's baked in, how to make an unusual card work (ISA
+  `modprobe io=/irq=` recipes), and how to rebuild the kernel for more** are in
+  [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md);
+  build/boot overview in [`docs/linux_486_appliance.md`](docs/linux_486_appliance.md).
+- **cb-dos** — the DOS-native lane: a FreeDOS floppy / CD that images disks with
+  a hand-written C tool over BIOS int 13h, for boxes where even a minimal Linux
+  is too heavy. See [`docs/cb_dos.md`](docs/cb_dos.md).
+
+Both build from the repo (`buildroot/`, `crusty-backup/`).
 
 ## Usage
 
@@ -241,14 +265,16 @@ The app has five tabs:
   optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
   discs. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
-  StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), and
-  BinHex (`.hqx`) wrappers around any of them. Pick an archive, browse the
-  entry tree (name / type / creator / size / codec), tick the entries to
-  keep, and extract to a folder in your choice of fork-preserving
-  container — BinHex, MacBinary, AppleDouble, or raw data + `.rsrc`
-  sidecar. Single-entry archives whose payload is itself a disk image
-  (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click "Mount in new
-  Inspect tab" handoff. `rb-cli sit list` / `sit extract` is the
+  StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
+  (`.mar`, read + write), and BinHex (`.hqx`) wrappers around any of them.
+  Pick an archive, browse the entry tree (name / type / creator / size /
+  codec), tick the entries to keep, and extract to a folder in your choice
+  of fork-preserving container — BinHex, MacBinary, AppleDouble, or raw
+  data + `.rsrc` sidecar. Export a file or folder back out as `.sit`,
+  `.sit.hqx`, `.hqx`, or `.mar`. Single-entry archives whose payload is
+  itself a disk image (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click
+  "Mount in new Inspect tab" handoff. `rb-cli archive list` / `archive
+  extract` / `archive create` (formerly `sit`, still accepted) is the
   scriptable counterpart.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,
@@ -338,7 +364,7 @@ readable.
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
 | Amiga ADF / HDF | `.adf`, `.hdf` | Yes            | Yes (raw)       | Floppy + hard-disk images. RDB partition tables parsed. Arculator-wrapped `.hdf` (Acorn) auto-detected. |
-| Amiga gzipped  | `.adz`, `.hdz`  | Yes            | No              | Transparently decompressed to a temp file at open |
+| Gzip-wrapped    | `.adz`, `.hdz`, `.gz` | Yes      | `.adz`/`.hdz` only | Any gzip-wrapped disk image, transparently decompressed at open. `.adz`/`.hdz` are the editable Amiga floppy/HDD wrappers; a bare `.gz` (e.g. a `.pdi.gz` Alto/Pilot pack or a gzipped raw image) is read-only. |
 | Atari MSA      | `.msa`          | Yes            | No              | Magic Shadow Archiver — Atari ST 720K / 800K / 1.44MB floppy |
 | CPCEMU DSK / EDSK | `.dsk`       | Yes            | No              | Amstrad CPC / PCW / Einstein / Oric CP/M floppies |
 | Commodore disk | `.d64`, `.d71`, `.d81`, `.d80`, `.d82` | Yes  | Yes (in-place edit) | 1541 / 1571 / 1581 + PET 8050 / 8250 (IEEE-488) flat sector dumps for the C64 / C128 / C16 / VIC-20 / PET cores. Read/browse/extract + add/delete persist back into the image (bidirectionally cross-validated against the `c1541` / Python `d64` reference). |
@@ -398,7 +424,7 @@ inspect-tab Edit Mode.
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
 | Alto BFS / TFS | Yes | Yes | Yes (resize) | — | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). |
-| Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so names are recovered from each file's leader page where present — XDE volumes name ~90% of files this way, ViewPoint names its boot/system files — and otherwise synthesized from the file ID); blank-volume creation + add/delete files via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |
+| Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so real names come from the Cedar **client name directory** — the FS name->FileID B-tree in `rootFile[client]`, decoded when present — then from each file's leader page (XDE volumes name ~90% of files this way, ViewPoint names its boot/system files), and otherwise are synthesized from the file ID); blank-volume creation + add/delete files + **installing a client name directory** (`pilot_probe set-dir`) via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |
 | Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
 
 ### Partition tables
@@ -528,6 +554,10 @@ first and then ingested as a `.woz` / `.dc42` / `.2mg` image.
 - `CONTRIBUTING.md` — contributor guide.
 - `docs/` — per-feature deep dives (VHD export, alignment, code signing,
   Apple II floppy formats, …).
+- [`docs/linux_486_appliance.md`](docs/linux_486_appliance.md) /
+  [`docs/appliance_hardware_support.md`](docs/appliance_hardware_support.md) —
+  the bootable Linux backup appliance and its vintage-hardware driver support
+  (which cards work, and how to add more in Buildroot).
 
 ## Donations
 

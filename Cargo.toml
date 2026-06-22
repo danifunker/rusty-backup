@@ -67,9 +67,26 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical"]
-# Pull in eframe / egui / rfd plus the update-checker's reqwest client.
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser"]
+default = ["gui", "chd", "optical", "native-zlib", "native-zstd", "remote"]
+# Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
+# pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
+# in a GUI build.
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:reqwest", "dep:webbrowser", "remote"]
+# Fast C zlib (zlib-ng) for flate2. The always-on baseline is flate2's pure-Rust
+# `rust_backend` (miniz_oxide); this feature overrides it with the C backend for
+# desktop perf. Leave it OFF for the slim/cross builds (rb-cli-mini, i586/i486
+# Linux, armv7/MiSTer) so flate2 stays pure Rust — no zlib-ng C cross-compile.
+native-zlib = ["flate2/zlib-ng"]
+# zstd backend selection (exactly one must be on; `native-zstd` is in `default`).
+# `native-zstd` = the C libzstd (zstd + zeekstd crates), fast, for the desktop.
+# `pure-zstd`   = the pure-Rust, bit-exact `libzstd-bitexact-rs` for slim/cross
+# builds (i586/i486 Linux, armv7/MiSTer) — no C zstd to cross-compile. Bit-exact
+# means a backup made by either backend is byte-identical, so the two are
+# interchangeable. Slim build: `--no-default-features --features pure-zstd`.
+# The seekable-zstd cache (zeekstd) is C-only; the pure path full-decompresses
+# such caches to a tempfile instead of seeking. See docs/linux_486_build.md.
+native-zstd = ["dep:zstd", "dep:zeekstd"]
+pure-zstd = ["dep:libzstd-bitexact-rs"]
 # eframe + egui only (no rfd/reqwest), used by the throwaway Commander Mode
 # layout mock: `cargo run --example commander_mock --features mock_gui`.
 mock_gui = ["dep:eframe", "dep:egui"]
@@ -80,6 +97,14 @@ chd = ["dep:libchdman-rs"]
 # Physical optical-drive I/O (rip / data-track read). MiSTer has no optical
 # drive; leaving this off also drops a libcdio Buildroot dep.
 optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
+# Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
+# ON BY DEFAULT, and every shipped build opts in: the desktop release via
+# `default`, and the slim/cross pipelines (armv7 MiSTer, i486/i586 appliance)
+# all pass `--features ...,remote`. Pure std::net + serde_json (both always-on),
+# so it adds NO new dependency. To build WITHOUT the daemon, use
+# `--no-default-features` and leave `remote` out of the feature list.
+# See docs/remote_transfer_plan.md.
+remote = []
 
 [dependencies]
 # Optional, gated behind feature flags. See [features] above.
@@ -106,8 +131,11 @@ byteorder = "1"
 encoding_rs = "0.8"
 log = "0.4"
 env_logger = "0.11"
-zstd = "0.13"
-zeekstd = "0.6"
+# zstd backend — exactly one of native-zstd / pure-zstd selects these. See the
+# [features] section. C libzstd (fast, desktop) vs pure-Rust bit-exact (cross).
+zstd = { version = "0.13", optional = true }
+zeekstd = { version = "0.6", optional = true }
+libzstd-bitexact-rs = { version = "0.157", optional = true }
 sha2 = "0.11"
 md-5 = "0.11"
 sha1 = "0.11"
@@ -120,7 +148,10 @@ tempfile = "3"
 image = "0.25"
 dirs = "6"
 unicode-normalization = "0.1"
-flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
+# Baseline is the pure-Rust backend (miniz_oxide) so the slim/cross builds need
+# no C zlib. The desktop `native-zlib` feature adds `flate2/zlib-ng`, which
+# flate2 prioritizes over the Rust backend when both are enabled.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }

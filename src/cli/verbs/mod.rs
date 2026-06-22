@@ -6,6 +6,7 @@
 //! touches threads or status structs directly; long-running work goes
 //! through `src/model/*_runner.rs` runners shared with the GUI.
 
+pub mod archive;
 pub mod backup;
 pub mod batch;
 pub mod batch_template;
@@ -27,6 +28,7 @@ pub mod locate;
 pub mod ls;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
+pub mod menu;
 pub mod mkdir;
 pub mod new;
 pub mod new_sgi_cdrom;
@@ -42,11 +44,12 @@ pub mod repack;
 pub mod resize;
 pub mod restore;
 pub mod rm;
+#[cfg(feature = "remote")]
+pub mod serve;
 pub mod setrsrc;
 pub mod setvolname;
 pub mod show;
 pub mod shrink;
-pub mod sit;
 pub mod tar;
 pub mod terminal;
 pub mod untar;

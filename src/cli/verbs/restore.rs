@@ -73,6 +73,14 @@ pub struct RestoreArgs {
 }
 
 pub fn run(args: RestoreArgs) -> Result<()> {
+    // Remote target (`rb://host[:port]/path`): restore over the block tier. The
+    // local device-safety preflight below is for local device paths only; a
+    // remote device is gated on the daemon side, so dispatch before it.
+    #[cfg(feature = "remote")]
+    if let Some(remote) = crate::remote::RemoteRef::parse(&args.target.to_string_lossy()) {
+        return run_remote(args, remote);
+    }
+
     if args.device && !args.yes {
         bail!(
             "--device target requires --yes (this will overwrite {}).",
@@ -140,6 +148,67 @@ pub fn run(args: RestoreArgs) -> Result<()> {
     ));
 
     run_restore(config, progress).context("restore failed")
+}
+
+/// Restore a backup folder to a remote target (device or image file) over the
+/// block tier. Materializes locally then pushes — see
+/// [`crate::model::restore_remote`].
+#[cfg(feature = "remote")]
+fn run_remote(args: RestoreArgs, remote: crate::remote::RemoteRef) -> Result<()> {
+    use crate::model::restore_remote::restore_to_remote;
+    use crate::remote::RemoteConnection;
+
+    if args.device && !args.yes {
+        bail!(
+            "--device target requires --yes (this will overwrite the remote device {}).",
+            remote.path
+        );
+    }
+
+    let target_size = match args.target_size {
+        Some(n) => n,
+        None => read_source_size_from_metadata(&args.backup_dir)?,
+    };
+    let alignment_choice = args
+        .alignment
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("restore", "alignment"))
+                .and_then(parse_alignment_mode)
+        })
+        .unwrap_or(AlignmentMode::Original);
+    let alignment = match alignment_choice {
+        AlignmentMode::Original => RestoreAlignment::Original,
+        AlignmentMode::Modern1mb => RestoreAlignment::Modern1MB,
+    };
+
+    let config = RestoreConfig {
+        backup_folder: args.backup_dir,
+        // Overridden by restore_to_remote (a local staging image is used for the
+        // materialize step before the push); set to a placeholder.
+        target_path: PathBuf::new(),
+        target_is_device: false,
+        target_size,
+        alignment,
+        partition_sizes: Vec::new(),
+        write_zeros_to_unused: args.write_zeros_to_unused,
+    };
+
+    let progress = Arc::new(Mutex::new(RestoreProgress::default()));
+    spawn_progress_pump(progress.clone());
+
+    log_stderr(format!(
+        "rb-cli restore: {} -> rb://{}{} ({})",
+        config.backup_folder.display(),
+        remote.addr(),
+        remote.path,
+        if args.device { "device" } else { "image" },
+    ));
+
+    let conn = RemoteConnection::connect_shared(&remote.addr())
+        .with_context(|| format!("connecting to {}", remote.addr()))?;
+    restore_to_remote(config, conn, &remote.path, args.device, progress, None)
+        .context("remote restore failed")
 }
 
 fn read_source_size_from_metadata(backup_dir: &std::path::Path) -> Result<u64> {

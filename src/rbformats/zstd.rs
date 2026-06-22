@@ -41,7 +41,8 @@ pub(crate) fn compress_zstd(
         Some(h) => Box::new(ChecksumWriter::new(split_writer, h)),
         None => Box::new(split_writer),
     };
-    let mut encoder = zstd::Encoder::new(sink, 3).context("failed to create zstd encoder")?;
+    let mut encoder =
+        super::zstd_compat::ZstdEncoder::new(sink, 3).context("failed to create zstd encoder")?;
     files.push(file_name(&first_path));
 
     let mut buf = vec![0u8; CHUNK_SIZE];
@@ -100,7 +101,7 @@ mod tests {
         assert!(compressed.len() < 65536);
 
         // Decompress and verify
-        let decompressed = zstd::decode_all(&compressed[..]).unwrap();
+        let decompressed = super::super::zstd_compat::decode_all(&compressed[..]).unwrap();
         assert_eq!(decompressed.len(), 65536);
         assert!(decompressed.iter().all(|&b| b == 0));
     }

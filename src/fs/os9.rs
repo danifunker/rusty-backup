@@ -987,7 +987,7 @@ mod tests {
         use std::io::Read as _;
         let compressed =
             std::fs::read("tests/fixtures/test_coco_os9l2.dsk.zst").expect("read fixture");
-        let mut dec = zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed))
+        let mut dec = crate::rbformats::zstd_compat::decoder(std::io::Cursor::new(compressed))
             .expect("zstd decoder");
         let mut bytes = Vec::new();
         dec.read_to_end(&mut bytes).expect("decompress");

@@ -559,6 +559,40 @@ pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
     })
 }
 
+/// Build the **layout-preserving** compact reader for an NTFS partition:
+/// allocated clusters stream verbatim at their true byte offsets; free clusters
+/// emit zeros (which compress away in zstd/CHD).
+///
+/// We deliberately do NOT use the dense-packed `CompactNtfsReader` stream
+/// directly: it prepends the boot region (LCN 0) and *also* lists LCN 0 in its
+/// allocated-cluster set, so the boot cluster is emitted twice and every
+/// subsequent cluster lands one slot off its real LCN. Since the packer never
+/// rewrites the MFT's data runs (which reference absolute LCNs) and restore
+/// writes the stream verbatim, that misalignment corrupts non-resident files.
+/// The layout-preserving variant keeps every cluster at its LCN, so the MFT's
+/// runs stay valid. See the `ntfs-exfat-packer-audit` memory note.
+fn ntfs_compact_reader<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (packed, _) = CompactNtfsReader::new(reader, partition_offset).ok()?;
+    let (lp, info) = packed.into_layout_preserving();
+    Some((Box::new(lp), info))
+}
+
+/// Build the **layout-preserving** compact reader for an exFAT partition — the
+/// exFAT sibling of [`ntfs_compact_reader`], for the same reason (the dense
+/// packer would move clusters off the offsets the directory/FAT entries point
+/// at). Allocated clusters stay at their true offsets; free clusters emit zeros.
+fn exfat_compact_reader<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (packed, _) = CompactExfatReader::new(reader, partition_offset).ok()?;
+    let (lp, info) = packed.into_layout_preserving();
+    Some((Box::new(lp), info))
+}
+
 /// Try to create a compacted reader for a partition.
 ///
 /// Returns `None` for unsupported filesystem types. On success, returns a
@@ -583,14 +617,8 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
-                "ntfs" => {
-                    let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "exfat" => {
-                    let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
+                "ntfs" => ntfs_compact_reader(reader, partition_offset),
+                "exfat" => exfat_compact_reader(reader, partition_offset),
                 "ext" => {
                     let (reader, info) = CompactExtReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
@@ -628,14 +656,8 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         0x07 => {
             let fs_type = detect_0x07_type(&mut reader, partition_offset);
             match fs_type {
-                "ntfs" => {
-                    let (reader, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
-                "exfat" => {
-                    let (reader, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
+                "ntfs" => ntfs_compact_reader(reader, partition_offset),
+                "exfat" => exfat_compact_reader(reader, partition_offset),
                 _ => None,
             }
         }
@@ -789,14 +811,8 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
                     let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
                     (Box::new(r), info)
                 }
-                "ntfs" => {
-                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    (Box::new(r), info)
-                }
-                "exfat" => {
-                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    (Box::new(r), info)
-                }
+                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                "exfat" => exfat_compact_reader(reader, partition_offset)?,
                 _ => {
                     return compact_partition_reader(
                         reader,
@@ -814,14 +830,8 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
         0x07 => {
             let fs_type = detect_0x07_type(&mut reader, partition_offset);
             match fs_type {
-                "ntfs" => {
-                    let (r, info) = CompactNtfsReader::new(reader, partition_offset).ok()?;
-                    (Box::new(r), info)
-                }
-                "exfat" => {
-                    let (r, info) = CompactExfatReader::new(reader, partition_offset).ok()?;
-                    (Box::new(r), info)
-                }
+                "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
+                "exfat" => exfat_compact_reader(reader, partition_offset)?,
                 _ => return None,
             }
         }

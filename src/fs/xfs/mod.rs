@@ -1085,7 +1085,7 @@ mod tests {
             .join(name);
         let compressed = std::fs::read(&path).expect("fixture present");
         let mut decoder =
-            zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
+            crate::rbformats::zstd_compat::decoder(Cursor::new(compressed)).expect("zstd decoder");
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("decompress");
         // Leak the decompressed image so the slice lives for the whole test run;

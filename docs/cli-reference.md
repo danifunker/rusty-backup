@@ -235,6 +235,60 @@ Usage: shrink <INPUT> <OUTPUT>
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
 
+### `archive`
+
+Read/write classic Mac archives (list / extract / create; accepts .sit, .sea, .cpt, .mar, and their BinHex-wrapped .hqx forms)
+
+```
+Usage: archive <COMMAND>
+```
+
+### `archive create`
+
+Create a StuffIt or MAR archive from host files (.hqx / .bin / plain)
+
+```
+Usage: create [OPTIONS] <OUTPUT> <INPUTS>...
+```
+
+**Arguments**
+
+- `<OUTPUT>` — Output path. `.sit` writes a raw StuffIt archive; `.hqx` BinHex-wraps it (the classic `.sit.hqx` format); `.mar` writes a stored MAR archive (a single file, or several wrapped in a folder named after the output)
+- `<INPUTS>` — Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)
+
+**Options**
+
+- `--rle` — Compress forks with RLE90 (method 1) instead of storing uncompressed
+
+### `archive extract`
+
+Extract a StuffIt archive to a directory on the host
+
+```
+Usage: extract [OPTIONS] <ARCHIVE> <DEST>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+- `<DEST>` — Destination directory on the host (created if missing)
+
+**Options**
+
+- `--format` — Container format for the extracted files
+
+### `archive list`
+
+List the entries in a StuffIt archive
+
+```
+Usage: list <ARCHIVE>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+
 ### `backup`
 
 Back up a disk image or device to a backup folder
@@ -714,6 +768,14 @@ Usage: make-bootable [OPTIONS] <IMAGE>
 - `--bless` — Absolute Mac path of the folder to bless (e.g. `/System Folder`). Defaults to auto-blessing a root folder named "System Folder"
 - `--dry-run` — Report what would change without writing anything
 
+### `menu`
+
+Interactive backup/restore menu (the appliance UI): pick a disk, then Inspect / Backup / Restore. Needs an interactive terminal
+
+```
+Usage: menu
+```
+
 ### `mkdir`
 
 Create a directory inside a filesystem
@@ -1172,6 +1234,20 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
+### `serve`
+
+Run the network daemon so a remote `rb-cli` can browse and read files inside images this host holds (`rb://host:port/img@N`). Family F read-only (Phase 0). See docs/remote_transfer_plan.md
+
+```
+Usage: serve [OPTIONS]
+```
+
+**Options**
+
+- `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341)
+- `--root` — Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory
+- `--staging-dir` — Directory for per-session upload staging blobs (write path). Defaults to the system temp dir. On a MiSTer point this at a roomy writable mount, never tmpfs — large uploads would fill RAM
+
 ### `setrsrc`
 
 Write the resource fork of an existing HFS / HFS+ file from a host file
@@ -1283,60 +1359,6 @@ Usage: shrink <INPUT> <OUTPUT>
 
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
-
-### `sit`
-
-Read classic StuffIt and Compact Pro archives (list / extract; accepts .sit, .sea, .cpt, and their BinHex-wrapped .hqx forms)
-
-```
-Usage: sit <COMMAND>
-```
-
-### `sit create`
-
-Create a StuffIt archive from host files (.hqx / .bin / plain)
-
-```
-Usage: create [OPTIONS] <OUTPUT> <INPUTS>...
-```
-
-**Arguments**
-
-- `<OUTPUT>` — Output path. A `.sit` extension writes a raw archive; a `.hqx` extension BinHex-wraps it (the classic `.sit.hqx` format)
-- `<INPUTS>` — Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)
-
-**Options**
-
-- `--rle` — Compress forks with RLE90 (method 1) instead of storing uncompressed
-
-### `sit extract`
-
-Extract a StuffIt archive to a directory on the host
-
-```
-Usage: extract [OPTIONS] <ARCHIVE> <DEST>
-```
-
-**Arguments**
-
-- `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
-- `<DEST>` — Destination directory on the host (created if missing)
-
-**Options**
-
-- `--format` — Container format for the extracted files
-
-### `sit list`
-
-List the entries in a StuffIt archive
-
-```
-Usage: list <ARCHIVE>
-```
-
-**Arguments**
-
-- `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
 
 ### `tar`
 

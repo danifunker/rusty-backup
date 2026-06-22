@@ -989,7 +989,7 @@ mod finobt_sync_tests {
     // Decompress the bundled v5 fixture, helper mirrors mod.rs's.
     fn load_modern_fixture() -> Vec<u8> {
         let bytes = include_bytes!("../../../tests/fixtures/sgi/xfs_v5_modern_small.img.zst");
-        let mut decoder = zstd::stream::read::Decoder::new(&bytes[..]).unwrap();
+        let mut decoder = crate::rbformats::zstd_compat::decoder(&bytes[..]).unwrap();
         let mut out = Vec::new();
         std::io::copy(&mut decoder, &mut out).unwrap();
         out

@@ -1,0 +1,40 @@
+#!/bin/sh
+# rusty-backup appliance — boot banner + disk summary.
+# Drops to a root shell with rb-cli in PATH (backup AND restore).
+
+case "$1" in
+  start)
+    clear 2>/dev/null
+    cat <<'BANNER'
+
+  ====================================================
+   rusty-backup appliance  (rb-cli)
+   backup + restore for vintage disks, from the metal
+  ====================================================
+
+BANNER
+    echo " Detected block devices:"
+    # /sys/block lists hda, sda, etc.; show size in MiB.
+    for d in /sys/block/*; do
+      [ -e "$d/size" ] || continue
+      name=$(basename "$d")
+      case "$name" in loop*|ram*) continue ;; esac
+      sectors=$(cat "$d/size")
+      mib=$(( sectors / 2048 ))
+      echo "   /dev/$name   ${mib} MiB"
+    done
+    echo
+    echo " Quick start (disks show as /dev/sdX here; bare-IDE 486 may use hdX):"
+    echo "   rb-cli inspect /dev/sdb                                # layout"
+    echo "   rb-cli backup  /dev/sdb /mnt/bkp --format zstd         # back up"
+    echo "   rb-cli restore /mnt/bkp/sdb-* /dev/sdb --device --yes  # restore"
+    echo "   rb-cli --help                                          # all verbs"
+    echo
+    echo " Notes: image with --format zstd (CHD/VHD are desktop-only); writing"
+    echo " a device needs --device --yes. Mount your destination on /mnt first"
+    echo " (2nd disk or USB) until networking lands."
+    echo
+    ;;
+  stop) : ;;
+esac
+exit 0

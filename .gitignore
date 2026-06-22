@@ -39,3 +39,14 @@ flatpak/bin/
 # Generated test images (keep .zst compressed fixtures in repo)
 tests/fixtures/*.img
 outputs/
+/target-cross
+/buildroot/output
+/buildroot/dl
+/buildroot/ccache
+/buildroot/overlay/usr/bin/rb-cli
+/crusty-backup/dist
+/crusty-backup/dl
+/crusty-backup/net/dl
+/crusty-backup/net/mtcp
+/crusty-backup/net/watt32
+/crusty-backup/net/drivers/*.COM

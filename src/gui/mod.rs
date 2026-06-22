@@ -18,6 +18,7 @@ mod optical_tab;
 mod partition_bar;
 mod physical_disk_export;
 mod progress;
+mod remote_browser;
 mod resize_popup;
 mod restore_tab;
 mod settings_dialog;

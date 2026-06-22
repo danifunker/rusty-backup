@@ -243,7 +243,7 @@ pub fn decompress_to_writer(
         "zstd" => {
             let file = File::open(data_path)
                 .with_context(|| format!("failed to open {}", data_path.display()))?;
-            let mut decoder = ::zstd::Decoder::new(BufReader::new(file))
+            let mut decoder = super::zstd_compat::decoder(BufReader::new(file))
                 .context("failed to create zstd decoder")?;
             loop {
                 if cancel_check() {

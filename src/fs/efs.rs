@@ -2614,7 +2614,7 @@ mod tests {
             .join("tests/fixtures/sgi/efs_small.img.zst");
         let compressed = std::fs::read(&path).expect("fixture present");
         let mut decoder =
-            zstd::stream::read::Decoder::new(Cursor::new(compressed)).expect("zstd decoder");
+            crate::rbformats::zstd_compat::decoder(Cursor::new(compressed)).expect("zstd decoder");
         let mut out = Vec::new();
         decoder.read_to_end(&mut out).expect("decompress");
         out

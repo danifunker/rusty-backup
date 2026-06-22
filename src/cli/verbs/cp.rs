@@ -129,6 +129,22 @@ pub struct CpArgs {
 }
 
 pub fn run(args: CpArgs) -> Result<()> {
+    // On-device remote->remote copy: both images are rb:// refs on the same
+    // daemon, so the file data never round-trips through the desktop.
+    #[cfg(feature = "remote")]
+    {
+        let src_remote = crate::remote::RemoteRef::parse(&args.src_image.path.to_string_lossy());
+        let dst_remote = crate::remote::RemoteRef::parse(&args.dst_image.path.to_string_lossy());
+        match (src_remote, dst_remote) {
+            (Some(s), Some(d)) => return remote_cp(&s, &d, &args),
+            (Some(_), None) | (None, Some(_)) => bail!(
+                "mixed local/remote cp over rb:// isn't supported yet; Phase 2 does on-device \
+                 remote->remote (both images on the same daemon). Use `get` + `put` to bridge."
+            ),
+            (None, None) => {}
+        }
+    }
+
     // --- Guards -----------------------------------------------------------
     if same_file(&args.src_image.path, &args.dst_image.path) {
         bail!(
@@ -224,6 +240,64 @@ pub fn run(args: CpArgs) -> Result<()> {
 
     summarize(&stats);
     Ok(())
+}
+
+/// On-device remote→remote copy: read SRC from one image on the daemon and
+/// write it into another image on the **same** daemon, with no desktop data
+/// round-trip. Phase 2: a single literal file (globs / `-r` deferred).
+#[cfg(feature = "remote")]
+fn remote_cp(
+    src: &crate::remote::RemoteRef,
+    dst: &crate::remote::RemoteRef,
+    args: &CpArgs,
+) -> Result<()> {
+    if src.host != dst.host || src.port != dst.port {
+        bail!(
+            "both images must be on the same daemon for an on-device copy (src {}, dst {})",
+            src.addr(),
+            dst.addr()
+        );
+    }
+    if has_glob_chars(&args.src) || !args.exclude.is_empty() {
+        bail!("glob/exclude source isn't supported over rb:// yet (Phase 2 copies a single file)");
+    }
+    if args.recursive {
+        bail!("recursive (-r) directory copy isn't supported over rb:// yet");
+    }
+    if args.skip_existing {
+        bail!("--skip-existing isn't supported over rb:// yet (use --force to overwrite)");
+    }
+
+    // Destination: split into (parent, name); a trailing '/' (empty name) keeps
+    // the source basename — cp-into-directory semantics.
+    let (parent, mut name) = split_mac_path(&args.dst)?;
+    if name.is_empty() {
+        name = src_basename(&args.src).to_string();
+    }
+
+    let mut session = crate::remote::RemoteSession::connect(&dst.addr())?;
+    let sid = session.open_session(&dst.path, args.dst_image.partition)?;
+    session.stage_copy_local(
+        sid,
+        &src.path,
+        args.src_image.partition,
+        &args.src,
+        &parent,
+        &name,
+        args.force,
+    )?;
+    let n = session.apply(sid)?;
+    session.close_session(sid)?;
+    out_stdout(format!(
+        "Copied {name} on-device ({n} edit applied over rb://)"
+    ));
+    Ok(())
+}
+
+/// Last `/`-separated component of a source path.
+#[cfg(feature = "remote")]
+fn src_basename(src: &str) -> &str {
+    src.trim_end_matches('/').rsplit('/').next().unwrap_or(src)
 }
 
 /// Literal (non-glob) source: a single file or a directory tree.

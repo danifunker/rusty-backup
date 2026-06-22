@@ -1823,6 +1823,17 @@ impl BrowseView {
                                     ArchiveExportFormat::SitHqx,
                                 );
                             }
+                            if ui
+                                .button("MAR (.mar)")
+                                .on_hover_text(
+                                    "Hampa Hug's MAR format: a single file or folder tree with \
+                                 both forks, stored uncompressed. Folders walk recursively; \
+                                 multiple items are wrapped in a folder.",
+                                )
+                                .clicked()
+                            {
+                                self.export_selection_as_archive(&entry, ArchiveExportFormat::Mar);
+                            }
                         });
                     }
                 }
@@ -3498,6 +3509,15 @@ impl BrowseView {
                     return;
                 }
             },
+            ArchiveExportFormat::Mar => {
+                match rusty_backup::macarchive::mar::build_archive(&entry.name, &nodes) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.edit_result = Some(format!("MAR build failed: {e}"));
+                        return;
+                    }
+                }
+            }
             ArchiveExportFormat::SitHqx => {
                 let sit = match build_archive_tree(&nodes, WriteMethod::Store) {
                     Ok(b) => b,
@@ -3897,7 +3917,8 @@ impl BrowseView {
             MacArchiveKind::Sit
             | MacArchiveKind::Sit5
             | MacArchiveKind::Sea
-            | MacArchiveKind::CompactPro => "Expand archive?",
+            | MacArchiveKind::CompactPro
+            | MacArchiveKind::Mar => "Expand archive?",
             MacArchiveKind::BinHexOverSit
             | MacArchiveKind::BinHexOverSea
             | MacArchiveKind::BinHexOverCompactPro => "Convert and/or expand?",
@@ -3918,7 +3939,8 @@ impl BrowseView {
                     MacArchiveKind::Sit
                     | MacArchiveKind::Sit5
                     | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro => {
+                    | MacArchiveKind::CompactPro
+                    | MacArchiveKind::Mar => {
                         format!("Would you like to expand the contents of {filename}?")
                     }
                     MacArchiveKind::BinHexOverSit
@@ -3957,7 +3979,8 @@ impl BrowseView {
                     MacArchiveKind::Sit
                     | MacArchiveKind::Sit5
                     | MacArchiveKind::Sea
-                    | MacArchiveKind::CompactPro => {
+                    | MacArchiveKind::CompactPro
+                    | MacArchiveKind::Mar => {
                         if ui
                             .button("Expand")
                             .on_hover_text(
@@ -5623,6 +5646,9 @@ enum ArchiveExportFormat {
     Sit,
     /// `.sit.hqx` — StuffIt-over-BinHex. Any selection.
     SitHqx,
+    /// `.mar` — Hampa Hug's MAR (stored). A single file or folder selection
+    /// (multiple top-level items are wrapped in a folder).
+    Mar,
 }
 
 impl ArchiveExportFormat {
@@ -5631,6 +5657,7 @@ impl ArchiveExportFormat {
             ArchiveExportFormat::Hqx => ".hqx",
             ArchiveExportFormat::Sit => ".sit",
             ArchiveExportFormat::SitHqx => ".sit.hqx",
+            ArchiveExportFormat::Mar => ".mar",
         }
     }
     fn label(self) -> &'static str {
@@ -5638,6 +5665,7 @@ impl ArchiveExportFormat {
             ArchiveExportFormat::Hqx => "BinHex 4.0 (.hqx)",
             ArchiveExportFormat::Sit => "StuffIt (.sit)",
             ArchiveExportFormat::SitHqx => "StuffIt-over-BinHex (.sit.hqx)",
+            ArchiveExportFormat::Mar => "MAR (.mar)",
         }
     }
 }

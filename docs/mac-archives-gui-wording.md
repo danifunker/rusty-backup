@@ -49,6 +49,8 @@ by a `detect_mac_archive(&[u8]) -> Option<MacArchiveKind>` routine in
 | `Sit`               | SIT magic at offset 0                                               | "Expand contents" modal    |
 | `Sit5`              | SIT5 magic at offset 0                                              | "Expand contents" modal    |
 | `Sea`               | Mac app data fork with SEA-style SIT find                           | "Expand contents" modal    |
+| `CompactPro`        | `0x01` marker + CRC-validated index                                 | "Expand contents" modal    |
+| `Mar`               | `MAR\x80` magic + valid 128-byte header CRC                         | "Expand contents" modal    |
 
 The same enum drives Workflows A / C / D / E uniformly.
 
@@ -74,7 +76,7 @@ have resource forks to preserve anyway.
 | **Add as-is**      | Add the .hqx file unchanged.                                                                           |
 | **Cancel**         | -                                                                                                      |
 
-### `Sit` / `Sit5` / `Sea` (.sit, .sea)
+### `Sit` / `Sit5` / `Sea` / `CompactPro` / `Mar` (.sit, .sea, .cpt, .mar)
 
 **Title:** Expand archive?
 
@@ -85,7 +87,7 @@ have resource forks to preserve anyway.
 | Label              | Action                                                                                                 |
 |--------------------|--------------------------------------------------------------------------------------------------------|
 | **Expand**         | Decompress the archive and add each enclosed file to this directory (forks preserved on HFS/HFS+).     |
-| **Add as-is**      | Add the .sit / .sea file unchanged.                                                                    |
+| **Add as-is**      | Add the archive file unchanged.                                                                       |
 | **Cancel**         | -                                                                                                      |
 
 ### `BinHexOverSit` (.sit.hqx) / `BinHexOverSea` (.sea.hqx)

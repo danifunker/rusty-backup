@@ -2173,11 +2173,34 @@ impl<R: Read + Seek> CompactFatReader<R> {
         }
 
         // --- Calculate new volume geometry ---
-        // Use exactly the number of allocated clusters — no padding.
-        // The FAT type is preserved in the BPB and FAT entry width regardless
-        // of cluster count. Padding to the FAT type minimum would waste
-        // significant space (e.g. 65525 * 32KB = 2GB for FAT32).
-        let new_cluster_count = clusters_used as u64;
+        //
+        // We rebuild the FAT at the *source's* entry width (12/16/32-bit), so
+        // the packed cluster count must land back in the same FAT type when
+        // `FatFilesystem::open` re-derives it — otherwise the wide entries get
+        // re-read as a narrower type and every multi-cluster chain is misparsed
+        // (silent file truncation / read-past-EOF).
+        //
+        // How `open()` re-derives the type (see `FatFilesystem::open`):
+        //   * FAT32 is detected by the **BPB shape** — `sectors_per_fat_16 == 0
+        //     && root_entries == 0` — NOT by cluster count. We keep that BPB
+        //     shape, so a packed FAT32 is always re-read as FAT32 regardless of
+        //     how few clusters it has. No floor needed (real below-spec FAT32
+        //     volumes with < 65525 clusters exist, e.g. mkfs.fat -F32 on small
+        //     media — padding them up to 65525 would inflate the packed image
+        //     above the original).
+        //   * FAT12 vs FAT16 IS cluster-count-derived: < 4085 -> FAT12, else
+        //     FAT16. So a FAT16 volume packed below 4085 clusters gets re-read
+        //     as FAT12 and misparses. THAT is the real data-loss case, so FAT16
+        //     gets a floor at 4085. The +16 margin clears the well-known
+        //     off-by-a-few fencepost bugs in real DOS/Windows drivers. The pad
+        //     clusters are free and stream out as zeros (handled in the
+        //     data-region `read` path), costing ~nothing through zstd/CHD.
+        let type_min_clusters: u64 = match fat_type {
+            FatType::Fat12 => 0,
+            FatType::Fat16 => 4085 + 16,
+            FatType::Fat32 => 0,
+        };
+        let new_cluster_count = (clusters_used as u64).max(type_min_clusters);
 
         let new_sectors_per_fat = if fat_type == FatType::Fat12 {
             let fat_bytes = ((new_cluster_count + 2) * 3).div_ceil(2);
@@ -4088,6 +4111,66 @@ fn fat_label_bytes(label: Option<&str>) -> [u8; 11] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-cluster file must survive `CompactFatReader` packing: the packed
+    /// volume has to keep the *source* FAT type, because a compliant driver (and
+    /// `FatFilesystem::open`) derives the type from the cluster count alone. If
+    /// packing dropped a FAT16 volume below 4085 clusters, its rebuilt 16-bit
+    /// FAT would be re-read as FAT12 and every chain past the first cluster would
+    /// be misparsed — silent file truncation. Regression guard for that fix.
+    #[test]
+    fn compact_fat16_preserves_type_and_round_trips_multicluster() {
+        use std::io::{Cursor, Read};
+
+        let blank = create_blank_fat(8 * 1024 * 1024, Some("VOL")).unwrap();
+        let mut img = Cursor::new(blank);
+        let payload = vec![0x7Eu8; 21_000]; // ~21 clusters
+        {
+            let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+            let root = fs.root().unwrap();
+            let mut data = &payload[..];
+            fs.create_file(
+                &root,
+                "BIG.BIN",
+                &mut data,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let disk = img.into_inner();
+
+        let (mut packer, info) = CompactFatReader::new(Cursor::new(disk), 0).unwrap();
+        let mut packed = Vec::new();
+        packer.read_to_end(&mut packed).unwrap();
+        assert!(
+            info.compacted_size < info.original_size,
+            "packing still shrinks the volume ({} -> {})",
+            info.original_size,
+            info.compacted_size
+        );
+
+        let mut cur = Cursor::new(packed);
+        let mut fs = FatFilesystem::open(&mut cur, 0).unwrap();
+        assert_eq!(
+            fs.fs_type(),
+            "FAT16",
+            "packed volume must keep the source FAT type"
+        );
+        let root = fs.root().unwrap();
+        let entry = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "BIG.BIN")
+            .expect("BIG.BIN present in the packed volume");
+        let got = fs.read_file(&entry, usize::MAX).unwrap();
+        assert_eq!(
+            got, payload,
+            "multi-cluster file round-trips byte-exact through the packer"
+        );
+    }
 
     #[test]
     fn test_build_short_name() {

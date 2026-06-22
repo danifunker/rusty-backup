@@ -58,6 +58,12 @@ pub struct BrowseSession {
     /// `open()` passes it to the decryption API. The GUI sets this after
     /// prompting the user.
     pub password: Option<String>,
+    /// Remote image over the block tier: `(shared connection, remote path)`.
+    /// When set, `open()` builds a fresh read-only `RemoteBlockReader` on the
+    /// connection and `open_editable()` a read-write one (the daemon keeps the
+    /// image open and serves / patches byte ranges).
+    #[cfg(feature = "remote")]
+    pub remote: Option<(Arc<Mutex<crate::remote::RemoteConnection>>, String)>,
 }
 
 /// True when the session is opening an HFS+ (or HFSX, or APM Apple_HFS that
@@ -80,6 +86,20 @@ impl BrowseSession {
 
     /// Open a read-only filesystem from this session.
     pub fn open(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
+        // Remote image over the block tier — a fresh RemoteBlockReader per open
+        // (the daemon keeps the image open and serves byte ranges).
+        #[cfg(feature = "remote")]
+        if let Some((conn, rpath)) = &self.remote {
+            let reader = crate::remote::RemoteBlockReader::open(Arc::clone(conn), rpath)
+                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+            return fs::open_filesystem(
+                reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            );
+        }
+
         // Live CHD edit session — read-through preserves any unflushed
         // writes the editor has staged in memory.
         if let Some(arc) = &self.chd_edit_session {
@@ -149,6 +169,22 @@ impl BrowseSession {
             let _ = f.read(&mut magic);
         }
 
+        // A gzip-wrapped Alto/Pilot pack (`.pdi.gz`, gzipped CopyDisk) shows gzip
+        // magic on the raw file. Sniff the *decompressed* prefix so the Alto
+        // branch below sees the real container magic; the pack itself is small,
+        // so it's decompressed in full only when that magic matches (further
+        // down). Flat gzip images (`.adz`/`.hdz`) keep streaming through the
+        // dedicated gzip branch later in this function.
+        let is_gzip = magic[0] == 0x1f && magic[1] == 0x8b;
+        let probe_magic: [u8; 8] = if is_gzip {
+            crate::model::source_reader::gunzip_prefix(path, 8)
+                .ok()
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .unwrap_or(magic)
+        } else {
+            magic
+        };
+
         // Xerox Alto disk packs (PARC Disk Image, or a CopyDisk stream). These
         // are label-bearing disks that can't be represented as a flat sector
         // stream the way every other source here can, so they bypass
@@ -175,14 +211,17 @@ impl BrowseSession {
         } else {
             None
         };
-        if &magic == b"PARCDISK"
-            || magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
+        if &probe_magic == b"PARCDISK"
+            || probe_magic[0..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]
             || is_salto_dsk
             || is_trident
             || zdisk_bytes.is_some()
         {
             let bytes = match zdisk_bytes {
                 Some(b) => b,
+                None if is_gzip => {
+                    crate::model::source_reader::gunzip_to_vec(path).map_err(FilesystemError::Io)?
+                }
                 None => std::fs::read(path).map_err(FilesystemError::Io)?,
             };
             let disk = crate::fs::alto::open_pack(&bytes)?;
@@ -321,22 +360,53 @@ impl BrowseSession {
                 .unwrap_or(false);
 
         if is_seekable_zst {
-            let file = File::open(path).map_err(FilesystemError::Io)?;
-            let decoder = match zeekstd::Decoder::new(file) {
-                Ok(d) => d,
-                Err(e) => {
+            // Native (C) zstd has a seekable random-access decoder (zeekstd).
+            #[cfg(feature = "native-zstd")]
+            {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let decoder = match zeekstd::Decoder::new(file) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(path);
+                        return Err(FilesystemError::Parse(format!(
+                            "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
+                        )));
+                    }
+                };
+                return fs::open_filesystem(
+                    decoder,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
+            // Pure-Rust zstd has no seekable reader; a seekable-zstd file is
+            // still a valid sequence of zstd frames (+ a skippable seek-table
+            // frame), so fully decompress it to an anonymous tempfile that
+            // gives Read + Seek. Correct, just not random-access. Gate on
+            // pure-zstd actually being on (matching zstd_compat.rs) — plain
+            // `not(native-zstd)` also matched a no-backend build, where the
+            // `libzstd_bitexact_rs` crate isn't linked.
+            #[cfg(all(not(feature = "native-zstd"), feature = "pure-zstd"))]
+            {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let mut dec = libzstd_bitexact_rs::StreamDecoder::new(file);
+                let mut tmp = tempfile::tempfile().map_err(FilesystemError::Io)?;
+                if let Err(e) = std::io::copy(&mut dec, &mut tmp) {
                     let _ = std::fs::remove_file(path);
                     return Err(FilesystemError::Parse(format!(
                         "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
                     )));
                 }
-            };
-            return fs::open_filesystem(
-                decoder,
-                self.partition_offset,
-                self.partition_type,
-                self.partition_type_string.as_deref(),
-            );
+                std::io::Seek::seek(&mut tmp, std::io::SeekFrom::Start(0))
+                    .map_err(FilesystemError::Io)?;
+                return fs::open_filesystem(
+                    tmp,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
         }
 
         // For all other formats (raw images, VHD, 2MG, DiskCopy 4.2,
@@ -494,6 +564,23 @@ impl BrowseSession {
     pub fn open_editable(
         &self,
     ) -> Result<(Box<dyn EditableFilesystem>, ContainerEditCommit), FilesystemError> {
+        // Remote image over the block tier — a read-write RemoteBlockReader
+        // patches byte ranges over the wire; the daemon opens the file
+        // read+write and syncs on flush/close. The commit guard is a no-op
+        // (writes land directly over the wire, like a raw image / device).
+        #[cfg(feature = "remote")]
+        if let Some((conn, rpath)) = &self.remote {
+            let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
+                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+            let fs = fs::open_editable_filesystem(
+                reader,
+                self.partition_offset,
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )?;
+            return Ok((fs, ContainerEditCommit { session: None }));
+        }
+
         // Live CHD edit session: writes go through the diff (compressed
         // parent) or in-place (uncompressed). No File handle to source_path
         // is opened.

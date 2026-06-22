@@ -24,6 +24,7 @@ pub mod backup_edit;
 pub mod config;
 pub mod copy_paths;
 pub mod device_safety;
+pub mod dir_picker;
 pub mod exit;
 pub mod glob;
 pub mod img_at;
@@ -32,6 +33,7 @@ pub mod logging;
 pub mod output;
 pub mod parse;
 pub mod resolve;
+pub mod tui;
 pub mod verbs;
 
 #[derive(Parser, Debug)]
@@ -200,11 +202,21 @@ pub enum Command {
     /// summary + CHD metadata when applicable).
     Inspect(verbs::inspect::InspectArgs),
 
+    /// Run the network daemon so a remote `rb-cli` can browse and read
+    /// files inside images this host holds (`rb://host:port/img@N`).
+    /// Family F read-only (Phase 0). See docs/remote_transfer_plan.md.
+    #[cfg(feature = "remote")]
+    Serve(verbs::serve::ServeArgs),
+
     /// Back up a disk image or device to a backup folder.
     Backup(verbs::backup::BackupArgs),
 
     /// Restore a backup folder to a target image or device.
     Restore(verbs::restore::RestoreArgs),
+
+    /// Interactive backup/restore menu (the appliance UI): pick a disk, then
+    /// Inspect / Backup / Restore. Needs an interactive terminal.
+    Menu(verbs::menu::MenuArgs),
 
     /// Stream an image file onto a block device.
     Write(verbs::write::WriteArgs),
@@ -252,11 +264,12 @@ pub enum Command {
         cmd: verbs::partmap::PartmapCommand,
     },
 
-    /// Read classic StuffIt and Compact Pro archives (list / extract; accepts
-    /// .sit, .sea, .cpt, and their BinHex-wrapped .hqx forms).
-    Sit {
+    /// Read/write classic Mac archives (list / extract / create; accepts
+    /// .sit, .sea, .cpt, .mar, and their BinHex-wrapped .hqx forms).
+    #[command(alias = "sit")]
+    Archive {
         #[command(subcommand)]
-        cmd: verbs::sit::SitCommand,
+        cmd: verbs::archive::ArchiveCommand,
     },
 
     /// Open an interactive rb-cli shell (rustyline-based REPL).
@@ -324,8 +337,11 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Expand(args) => verbs::expand::run(args),
         Command::Grow(args) => verbs::grow::run(args),
         Command::Inspect(args) => verbs::inspect::run(args),
+        #[cfg(feature = "remote")]
+        Command::Serve(args) => verbs::serve::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
+        Command::Menu(args) => verbs::menu::run(args),
         Command::Write(args) => verbs::write::run(args),
         Command::Convert(args) => verbs::convert::run(args),
         Command::Batch(args) => verbs::batch::run(args),
@@ -336,7 +352,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Floppy { cmd } => verbs::floppy::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
-        Command::Sit { cmd } => verbs::sit::run(cmd),
+        Command::Archive { cmd } => verbs::archive::run(cmd),
         Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

@@ -116,6 +116,19 @@ impl ConflictMode {
 }
 
 pub fn run(args: GetArgs) -> Result<()> {
+    // Remote source: `rb-cli get rb://host:port/img@N SRC DST`. The daemon
+    // streams the file's bytes; the client lands them on the host.
+    #[cfg(feature = "remote")]
+    if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
+        return remote_get(
+            &rref,
+            args.image.partition,
+            &args.src,
+            &args.dst,
+            ConflictMode::from_flags(args.force, args.skip_existing),
+        );
+    }
+
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
     let (reader, mut ctx) = resolve_partition_streaming_forced_inside(
         &args.image.path,
@@ -187,6 +200,66 @@ pub fn run(args: GetArgs) -> Result<()> {
     extract_file_to_host(&mut *fs, &entry, &host_target, conflict)
         .map(|_written| ())
         .with_context(|| format!("extracting {} to {}", args.src, host_target.display()))
+}
+
+/// Remote single-file extract over an `rb://` reference (Phase 0: one literal
+/// file — globs and recursive-directory pulls need server-side walking and are
+/// deferred to a later phase).
+#[cfg(feature = "remote")]
+fn remote_get(
+    rref: &crate::remote::RemoteRef,
+    partition: Option<u32>,
+    src: &str,
+    dst: &Path,
+    conflict: ConflictMode,
+) -> Result<()> {
+    if has_glob_chars(src) {
+        bail!("glob patterns aren't supported over rb:// yet (Phase 0 fetches one literal file)");
+    }
+    let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
+    let opened = session.open_image(&rref.path, partition)?;
+    let handle = opened.handle;
+    log_stderr(opened.label);
+
+    // If DST is an existing dir (or written with a trailing separator), land
+    // the file under it as SRC's basename — same rule as the local path.
+    let dst_str = dst.to_string_lossy();
+    let trailing_sep = dst_str.ends_with('/') || dst_str.ends_with('\\');
+    let host_target = if dst.is_dir() || trailing_sep {
+        dst.join(remote_basename(src))
+    } else {
+        dst.to_path_buf()
+    };
+
+    if host_target.exists() {
+        match conflict {
+            ConflictMode::Force => {}
+            ConflictMode::SkipExisting => {
+                log_stderr(format!("  skip (exists): {}", host_target.display()));
+                return Ok(());
+            }
+            ConflictMode::Error => bail!(
+                "destination exists: {} (pass --force or --skip-existing)",
+                host_target.display()
+            ),
+        }
+    }
+    if let Some(parent) = host_target.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut out = std::fs::File::create(&host_target)
+        .with_context(|| format!("creating {}", host_target.display()))?;
+    let n = session
+        .read_file(handle, src, &mut out)
+        .with_context(|| format!("fetching {src}"))?;
+    out_stdout(format!("Extracted: 1 file ({n} bytes)"));
+    Ok(())
+}
+
+/// Last path component of a slash-separated source path.
+#[cfg(feature = "remote")]
+fn remote_basename(src: &str) -> &str {
+    src.trim_end_matches('/').rsplit('/').next().unwrap_or(src)
 }
 
 fn run_glob(

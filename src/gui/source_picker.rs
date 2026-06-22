@@ -34,6 +34,9 @@ pub enum SourceEvent {
     HostFolder(PathBuf),
     /// A rusty-backup backup folder was opened.
     BackupFolder(PathBuf),
+    /// The user chose "Connect to Remote..." — open the remote file-browser
+    /// window. The connection details are gathered by that window, not here.
+    Remote,
 }
 
 /// Which entries the picker offers.
@@ -46,6 +49,9 @@ pub struct PickerConfig {
     pub show_host_folder: bool,
     /// Offer "Open Backup Folder…" (a rusty-backup backup).
     pub show_backup_folder: bool,
+    /// Offer "Connect to Remote…" (browse an `rb-cli serve` daemon in a
+    /// file-browser window).
+    pub show_remote: bool,
     /// Materialize wrapper image formats (`.adz`/`.hdz`/…) to a tempfile via
     /// `prepare_disk_image_path`. Inspect sets this; Commander leaves it off
     /// and lets `BrowseSession` peel the container itself.
@@ -161,6 +167,18 @@ pub fn show(
             {
                 if let Some(dir) = super::file_dialog().pick_folder() {
                     event = Some(SourceEvent::BackupFolder(dir));
+                }
+            }
+            if cfg.show_remote {
+                if cfg.show_image || cfg.show_host_folder || cfg.show_backup_folder {
+                    ui.separator();
+                }
+                if ui
+                    .selectable_label(false, "Connect to Remote...")
+                    .on_hover_text("Browse a remote rb-cli serve daemon's filesystem")
+                    .clicked()
+                {
+                    event = Some(SourceEvent::Remote);
                 }
             }
         });

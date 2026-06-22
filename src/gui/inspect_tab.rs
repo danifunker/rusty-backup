@@ -119,6 +119,17 @@ pub struct InspectTab {
     pending_open_archive: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
+    /// "Connect to Remote..." — an inline panel browsing an `rb-cli serve`
+    /// daemon (connect + pick an image on one persistent connection).
+    remote_browser: super::remote_browser::RemoteBrowsePanel,
+    /// When set, the inspected source is a **remote image** opened over the
+    /// block tier: `(shared connection, remote path)`. `run_inspect` builds a
+    /// `RemoteBlockReader` from it and parses the partition table over the wire,
+    /// so the whole Inspect view works on a remote image with no download.
+    remote_inspect: Option<(
+        std::sync::Arc<std::sync::Mutex<rusty_backup::remote::RemoteConnection>>,
+        String,
+    )>,
     /// Export: true if the export popup is open
     export_popup: bool,
     /// Export mode: true = whole disk, false = per partition
@@ -239,6 +250,9 @@ pub struct InspectTab {
     single_file_chd_backup_folder: Option<PathBuf>,
     /// "Physical Disk Export" sub-window state.
     physical_disk_export: PhysicalDiskExport,
+    /// Status of a background "Back Up Image…" pull of the currently-inspected
+    /// remote image to a local folder. `None` when none is running.
+    remote_backup_status: Option<Arc<Mutex<rusty_backup::backup::BackupProgress>>>,
 }
 
 impl Default for InspectTab {
@@ -263,6 +277,8 @@ impl Default for InspectTab {
             pending_source_change: None,
             pending_open_archive: None,
             browse_view: BrowseView::default(),
+            remote_browser: super::remote_browser::RemoteBrowsePanel::default(),
+            remote_inspect: None,
             export_popup: false,
             export_whole_disk: true,
             export_format: ExportFormat::Vhd,
@@ -308,6 +324,7 @@ impl Default for InspectTab {
             chd_info_text: None,
             single_file_chd_backup_folder: None,
             physical_disk_export: PhysicalDiskExport::default(),
+            remote_backup_status: None,
         }
     }
 }
@@ -437,7 +454,10 @@ impl InspectTab {
         ui.horizontal(|ui| {
             ui.label("Source:");
 
-            let current_label = if let Some(path) = &self.backup_folder_path {
+            let current_label = if let Some((_, rpath)) = &self.remote_inspect {
+                let base = rpath.rsplit('/').find(|s| !s.is_empty()).unwrap_or(rpath);
+                format!("Remote image: {base}")
+            } else if let Some(path) = &self.backup_folder_path {
                 format!("Backup: {}", path.display())
             } else if let Some(path) = &self.image_file_path {
                 if let Some(label) = &self.image_format_label {
@@ -469,6 +489,7 @@ impl InspectTab {
                 show_image: true,
                 show_host_folder: false,
                 show_backup_folder: true,
+                show_remote: true,
                 materialize_image: true,
                 include_mac_archives: true,
                 width: 400.0,
@@ -483,18 +504,88 @@ impl InspectTab {
             if let Some(ev) =
                 super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
             {
-                // Gate the switch on unsaved browse edits: defer it behind the
-                // confirm prompt so the live source is untouched (and no new
-                // disk partially loads) until the user resolves it.
-                if self.browse_view.has_unsaved_edits() {
-                    self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                // "Connect to Remote..." opens the inline remote panel; any other
+                // source ends a remote session and switches to that local source.
+                if matches!(ev, super::source_picker::SourceEvent::Remote) {
+                    self.remote_browser.open();
                 } else {
-                    self.apply_source_event(ev);
+                    self.remote_browser.disconnect();
+                    self.remote_inspect = None;
+                    if self.browse_view.has_unsaved_edits() {
+                        // Gate the switch on unsaved browse edits: defer it behind
+                        // the confirm prompt so the live source is untouched (and
+                        // no new disk partially loads) until the user resolves it.
+                        self.pending_source_change = Some(PendingSourceChange::Open(ev));
+                    } else {
+                        self.apply_source_event(ev);
+                    }
+                }
+            }
+
+            // Remote picker controls (Disconnect) sit beside the source dropdown
+            // while connecting / picking.
+            self.remote_browser.source_bar_controls(ui);
+
+            // While inspecting a remote image: switch to another image on the
+            // SAME connection (no reconnect), or close the session entirely.
+            if let Some((conn, rpath)) = self.remote_inspect.clone() {
+                if ui
+                    .button("Pick Another Image")
+                    .on_hover_text("Browse the daemon for another image (no reconnect)")
+                    .clicked()
+                {
+                    self.remote_browser.browse_on(conn.clone());
+                }
+                // Pull a full backup of this remote image to a local folder.
+                // Read-only over the block tier (no CHD / shrink-to-minimum).
+                let backup_running = self.remote_backup_status.is_some();
+                if ui
+                    .add_enabled(
+                        !self.partitions.is_empty() && !backup_running,
+                        egui::Button::new("Back Up Image..."),
+                    )
+                    .on_hover_text("Pull a full backup of this remote image to a local folder")
+                    .clicked()
+                {
+                    self.start_remote_backup(ctx, conn.clone(), rpath.clone());
+                }
+                if backup_running {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Backing up...");
+                }
+                if ui
+                    .add_enabled(!backup_running, egui::Button::new("Close Remote"))
+                    .on_hover_text("Disconnect from the remote daemon")
+                    .clicked()
+                {
+                    self.remote_inspect = None;
+                    self.clear_results();
                 }
             }
         });
 
         ui.add_space(4.0);
+
+        // While the remote picker is active it takes over the main area; once
+        // the user picks an image it hands it off here and collapses.
+        let remote_active = self.remote_browser.show(ui);
+        for line in self.remote_browser.take_log() {
+            ctx.log.info(format!("Remote: {line}"));
+        }
+        // Picked a remote image: switch the inspected source to it (block tier)
+        // and run the full inspect over the wire — no download.
+        if let Some((conn, rpath)) = self.remote_browser.take_inspect_request() {
+            self.browse_view.close();
+            self.image_file_path = None;
+            self.amiga_tempdir = None;
+            self.selected_device_idx = None;
+            self.backup_folder_path = None;
+            self.remote_inspect = Some((conn, rpath));
+            self.run_inspect(ctx);
+        }
+        if remote_active {
+            return;
+        }
 
         // Auto-inspect on selection change
         let selection_changed = self.selected_device_idx != self.prev_device_idx
@@ -532,6 +623,9 @@ impl InspectTab {
         // Poll export status
         self.poll_export_status(ctx);
 
+        // Poll a running "Back Up Image…" pull of a remote image
+        self.poll_remote_backup_status(ctx);
+
         // Poll any pending per-partition minimum-size calculations
         self.poll_min_size_calcs(ctx);
         self.poll_volume_label_probes(ctx);
@@ -557,7 +651,8 @@ impl InspectTab {
         ui.horizontal(|ui| {
             let has_source = self.selected_device_idx.is_some()
                 || self.image_file_path.is_some()
-                || self.backup_folder_path.is_some();
+                || self.backup_folder_path.is_some()
+                || self.remote_inspect.is_some();
             let inspect_running = self.inspect_status.is_some();
             if ui
                 .add_enabled(
@@ -573,12 +668,13 @@ impl InspectTab {
                 }
             }
 
-            // Export button — available when we have partition data and no export running
+            // Export button — available when we have partition data and no export
+            // running. Not for a remote image yet (export is path-based).
             let has_partitions = !self.partitions.is_empty();
             let export_running = self.export_status.is_some();
             if ui
                 .add_enabled(
-                    has_partitions && !export_running,
+                    has_partitions && !export_running && self.remote_inspect.is_none(),
                     egui::Button::new("Export Disk Image..."),
                 )
                 .clicked()
@@ -606,10 +702,12 @@ impl InspectTab {
                 }
             }
 
-            // Edit Partition Table button — only for devices and image files (not backups)
+            // Edit Partition Table button — only for devices and image files
+            // (not backups, not remote images — the editor writes back locally).
             let is_editable_source = self.partition_table.is_some()
                 && self.backup_folder_path.is_none()
                 && self.clonezilla_image.is_none()
+                && self.remote_inspect.is_none()
                 && !matches!(
                     self.partition_table.as_ref(),
                     Some(PartitionTable::None { .. })
@@ -2474,6 +2572,121 @@ impl InspectTab {
         }
     }
 
+    /// Kick off a background "Back Up Image…" pull of the currently-inspected
+    /// remote image to a user-picked local folder. Read-only over the block
+    /// tier: Zstd per-partition output, no CHD / shrink-to-minimum (those need
+    /// `File`-specific access the daemon doesn't expose). GUI-only entry point;
+    /// the engine work is [`rusty_backup::backup::run_backup_from`].
+    fn start_remote_backup(
+        &mut self,
+        ctx: &mut TabContext,
+        conn: Arc<Mutex<rusty_backup::remote::RemoteConnection>>,
+        rpath: String,
+    ) {
+        let Some(dest) = super::file_dialog().pick_folder() else {
+            return;
+        };
+        let stem = std::path::Path::new(&rpath)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("remote-image");
+        let backup_name = format!("{stem}-backup");
+        let display = {
+            let addr = conn
+                .lock()
+                .ok()
+                .map(|c| c.addr().to_string())
+                .unwrap_or_default();
+            let path_part = if rpath.starts_with('/') {
+                rpath.clone()
+            } else {
+                format!("/{rpath}")
+            };
+            format!("rb://{addr}{path_part}")
+        };
+
+        let config = rusty_backup::backup::BackupConfig {
+            source_path: std::path::PathBuf::from(&rpath),
+            destination_dir: dest.clone(),
+            backup_name: backup_name.clone(),
+            // Zstd per-partition is the only remote-supported output (CHD needs
+            // whole-disk staging the block tier doesn't expose).
+            compression: rusty_backup::backup::CompressionType::Zstd,
+            checksum: rusty_backup::backup::ChecksumType::Sha256,
+            split_size_mib: None,
+            sector_by_sector: false,
+            partition_filter: None,
+            chd_options: None,
+            size_policy: None,
+            partition_target_sizes: None,
+            shrink_to_minimum: false,
+            precomputed_minimum_sizes: None,
+            defrag_partition_indices: None,
+        };
+
+        let progress = Arc::new(Mutex::new(rusty_backup::backup::BackupProgress::new()));
+        self.remote_backup_status = Some(Arc::clone(&progress));
+        ctx.log.info(format!(
+            "Backing up remote image {display} -> {}",
+            dest.join(&backup_name).display()
+        ));
+
+        let source = rusty_backup::backup::BackupSource::Remote {
+            conn,
+            path: rpath,
+            display,
+            is_device: false,
+        };
+        std::thread::spawn(move || {
+            let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: remote backup");
+            let progress_for_panic = Arc::clone(&progress);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rusty_backup::backup::run_backup_from(source, config, Arc::clone(&progress))
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some(format!("{e:#}"));
+                        p.finished = true;
+                    }
+                }
+                Err(_) => {
+                    if let Ok(mut p) = progress_for_panic.lock() {
+                        p.error = Some("remote backup worker panicked".to_string());
+                        p.finished = true;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Drain log messages from the remote-backup worker into the global log
+    /// panel and react to completion (success/error).
+    fn poll_remote_backup_status(&mut self, ctx: &mut TabContext) {
+        let arc = match &self.remote_backup_status {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+        let Ok(mut status) = arc.lock() else { return };
+        for msg in status.log_messages.drain(..) {
+            match msg.level {
+                rusty_backup::backup::LogLevel::Error => ctx.log.error(msg.message),
+                rusty_backup::backup::LogLevel::Warning => ctx.log.warn(msg.message),
+                rusty_backup::backup::LogLevel::Info => ctx.log.info(msg.message),
+            }
+        }
+        if status.finished {
+            if let Some(err) = &status.error {
+                ctx.log.error(format!("Remote backup failed: {err}"));
+            } else {
+                ctx.log.info("Remote backup completed successfully.");
+            }
+            drop(status);
+            self.remote_backup_status = None;
+        }
+    }
+
     /// Drain log messages from the CHD-expand worker into the global log
     /// panel and react to completion (success/error). On success we
     /// invalidate `cached_disk_size` so the user's next re-inspect picks
@@ -2535,6 +2748,9 @@ impl InspectTab {
             }
             // Inspect's picker doesn't offer a host folder.
             SourceEvent::HostFolder(_) => {}
+            // "Connect to Remote..." is intercepted at the call site (it pops a
+            // window rather than changing the source); never reaches here.
+            SourceEvent::Remote => {}
         }
     }
 
@@ -2704,7 +2920,14 @@ impl InspectTab {
     fn run_inspect(&mut self, ctx: &mut TabContext) {
         self.clear_results();
 
-        let path = if let Some(img_path) = &self.image_file_path {
+        // A remote image (block tier) takes precedence: there's no local path,
+        // so `path` is synthetic (display/logging only) and the worker reads via
+        // a `RemoteBlockReader` instead of opening a local file/device.
+        let remote = self.remote_inspect.clone();
+
+        let path = if let Some((_, rpath)) = &remote {
+            PathBuf::from(rpath)
+        } else if let Some(img_path) = &self.image_file_path {
             img_path.clone()
         } else if let Some(idx) = self.selected_device_idx {
             if let Some(device) = ctx.devices.get(idx) {
@@ -2717,16 +2940,23 @@ impl InspectTab {
             return;
         };
 
-        ctx.log.info(format!("Inspecting {}...", path.display()));
+        if remote.is_some() {
+            ctx.log
+                .info(format!("Inspecting remote image {}...", path.display()));
+        } else {
+            ctx.log.info(format!("Inspecting {}...", path.display()));
+        }
 
         // Cache CHD path: subsequent per-partition probes (HFS variant probe,
         // hfs_block_size, partition_minimum_size) need a fresh ChdReader rather
-        // than reading partition_offset off the raw .chd file.
-        self.chd_image_path = if rusty_backup::model::source_reader::is_chd_path(&path) {
-            Some(path.clone())
-        } else {
-            None
-        };
+        // than reading partition_offset off the raw .chd file. A remote image is
+        // never a local CHD.
+        self.chd_image_path =
+            if remote.is_none() && rusty_backup::model::source_reader::is_chd_path(&path) {
+                Some(path.clone())
+            } else {
+                None
+            };
 
         // All device I/O runs on a background thread so DA unmount/claim
         // (which can block up to ~5 s) never freezes the GUI.
@@ -2767,8 +2997,11 @@ impl InspectTab {
                 }
             };
 
-            let is_device = path.to_string_lossy().starts_with("/dev/")
-                || path.to_string_lossy().starts_with("\\\\.\\");
+            // A remote image is a raw disk over the wire — never a local device
+            // or container, so these path-specific flags are all false for it.
+            let is_device = remote.is_none()
+                && (path.to_string_lossy().starts_with("/dev/")
+                    || path.to_string_lossy().starts_with("\\\\.\\"));
 
             // File containers decode to a flat sector stream via
             // source_reader::open_read — no tempfile, no elevation needed.
@@ -2776,19 +3009,23 @@ impl InspectTab {
             // / DIM / XDF / HDM / Apple-II / Arculator HDF). CHD is also a
             // container but keeps its own specialized detection below (CD-CHD
             // cooked sectors, format metadata + sidecar), so exclude it here.
-            let uses_streaming_reader = !is_device
+            let uses_streaming_reader = remote.is_none()
+                && !is_device
                 && rusty_backup::model::source_reader::is_container_path(&path)
                 && !rusty_backup::model::source_reader::is_chd_path(&path);
 
             // Open the device/file with full elevation: unmounts volumes and
             // claims exclusive DA access for the duration of the inspect.
-            // Streaming-reader containers skip this (they open via open_read).
+            // Streaming-reader containers and remote images skip this (they open
+            // via open_read / a RemoteBlockReader).
             // `guard` is held purely for RAII: it keeps the volume locks / DA
             // claim alive for the duration of the inspect. On macOS the fd +
             // claim are handed off to the main thread below; on every other
             // platform `guard` is unused, so silence the lint there.
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-            let (device_file, guard) = if !uses_streaming_reader {
+            let (device_file, guard) = if remote.is_some() || uses_streaming_reader {
+                (None, None)
+            } else {
                 let elevated = match rusty_backup::os::open_source_for_reading(&path) {
                     Ok(e) => e,
                     Err(e) => {
@@ -2798,34 +3035,45 @@ impl InspectTab {
                 };
                 let (f, g) = elevated.into_parts();
                 (Some(f), Some(g))
-            } else {
-                (None, None)
             };
 
             set_step("Reading partition table...");
 
-            // Build the initial reader: streaming reader for GHO/IMZ,
-            // cloned File for everything else.
-            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> = if uses_streaming_reader {
-                match rusty_backup::model::source_reader::open_read(&path) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        finish_err(format!("Cannot open {}: {e:#}", path.display()));
-                        return;
+            // Build the initial reader: a RemoteBlockReader for a remote image, a
+            // streaming reader for GHO/IMZ, a cloned File for everything else.
+            let mut reader: Box<dyn rusty_backup::rbformats::ReadSeek> =
+                if let Some((conn, rpath)) = &remote {
+                    match rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath) {
+                        Ok(r) => Box::new(r),
+                        Err(e) => {
+                            finish_err(format!("Cannot open remote image {rpath}: {e:#}"));
+                            return;
+                        }
                     }
-                }
-            } else {
-                match device_file.as_ref().unwrap().try_clone() {
-                    Ok(f) => Box::new(BufReader::new(f)),
-                    Err(e) => {
-                        finish_err(format!("Cannot clone file handle: {e}"));
-                        return;
+                } else if uses_streaming_reader {
+                    match rusty_backup::model::source_reader::open_read(&path) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            finish_err(format!("Cannot open {}: {e:#}", path.display()));
+                            return;
+                        }
                     }
-                }
-            };
+                } else {
+                    match device_file.as_ref().unwrap().try_clone() {
+                        Ok(f) => Box::new(BufReader::new(f)),
+                        Err(e) => {
+                            finish_err(format!("Cannot clone file handle: {e}"));
+                            return;
+                        }
+                    }
+                };
 
             let detect_result =
-                if uses_streaming_reader {
+                if remote.is_some() {
+                    // A remote image is served as a raw disk; parse the table
+                    // directly over the wire (no local format detection).
+                    PartitionTable::detect(&mut reader)
+                } else if uses_streaming_reader {
                     // Streaming containers (GHO, IMZ) already provide a decoded
                     // raw disk image; skip VHD/2MG/DMG format detection.
                     let ext = path
@@ -2930,10 +3178,19 @@ impl InspectTab {
                     // (e.g. 0x504D "PM" inside an APM map). Open a fresh
                     // ChdReader instead so partition_offset addresses the
                     // unwrapped disk image.
-                    let is_chd = rusty_backup::model::source_reader::is_chd_path(&path);
+                    let is_chd =
+                        remote.is_none() && rusty_backup::model::source_reader::is_chd_path(&path);
                     let make_probe_reader =
                         || -> Option<Box<dyn rusty_backup::rbformats::ReadSeek>> {
-                            if uses_streaming_reader || is_chd {
+                            if let Some((conn, rpath)) = &remote {
+                                // Each probe gets its own block reader on the same
+                                // connection (a fresh daemon-side open handle).
+                                rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath)
+                                    .ok()
+                                    .map(|r| {
+                                        Box::new(r) as Box<dyn rusty_backup::rbformats::ReadSeek>
+                                    })
+                            } else if uses_streaming_reader || is_chd {
                                 rusty_backup::model::source_reader::open_read(&path).ok()
                             } else {
                                 device_file.as_ref()?.try_clone().ok().map(|f| {
@@ -3258,7 +3515,25 @@ impl InspectTab {
                         if part.partition_type_byte == 0xEE {
                             continue;
                         }
-                        let result = if uses_streaming_reader || is_chd {
+                        let result = if let Some((conn, rpath)) = &remote {
+                            // Remote image: compute the minimum over a block
+                            // reader on the same connection (cheap FS read a few
+                            // ranges; expensive FS come back Deferred).
+                            match rusty_backup::remote::RemoteBlockReader::open(conn.clone(), rpath)
+                            {
+                                Ok(r) => rusty_backup::fs::partition_minimum_size(
+                                    r,
+                                    part.byte_offset(),
+                                    part.partition_type_byte,
+                                    part.partition_type_string.as_deref(),
+                                    part.size_bytes,
+                                    false,
+                                    None,
+                                    &|_| {},
+                                ),
+                                Err(_) => continue,
+                            }
+                        } else if uses_streaming_reader || is_chd {
                             // GHO containers with compressed NTFS
                             // require decompressing the entire file to
                             // compute minimum sizes — defer to avoid
@@ -3620,6 +3895,10 @@ impl InspectTab {
         let is_image_source = self.image_file_path.is_some()
             && self.selected_device_idx.is_none()
             && self.backup_folder_path.is_none();
+        // A remote image is read-only over the wire: the HFS Expand/Export action
+        // re-floors or rewrites the volume (path-based), so it's disabled. Browse,
+        // Calc min, and Check (fsck) all work over the block reader.
+        let is_remote = self.remote_inspect.is_some();
 
         egui::Grid::new("partition_table")
             .striped(true)
@@ -3837,13 +4116,14 @@ impl InspectTab {
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                                 &part.type_name,
-                            ) && ui
-                                .small_button("Expand/Export…")
-                                .on_hover_text(
-                                    "Re-floor this classic-HFS volume to a new size / block \
-                                     size (APM .hda) or export it as a flat BasiliskII HFV.",
-                                )
-                                .clicked()
+                            ) && !is_remote
+                                && ui
+                                    .small_button("Expand/Export…")
+                                    .on_hover_text(
+                                        "Re-floor this classic-HFS volume to a new size / block \
+                                         size (APM .hda) or export it as a flat BasiliskII HFV.",
+                                    )
+                                    .clicked()
                             {
                                 expand_request = Some((part.byte_offset(), part.size_bytes));
                             }
@@ -4101,26 +4381,38 @@ impl InspectTab {
         type_string: Option<String>,
         ctx: &mut TabContext,
     ) {
-        let source_path = self
-            .selected_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-            .map(|d| d.path.clone())
-            .or_else(|| self.image_file_path.clone());
-
-        let path = match source_path {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source available for filesystem check");
-                return;
+        // Remote image: check over the block reader (read-only). This runs
+        // synchronously like the local path; a large remote volume will pause
+        // the UI for the duration of the check.
+        let result = if let Some((conn, rpath)) = &self.remote_inspect {
+            match rusty_backup::remote::RemoteBlockReader::open(std::sync::Arc::clone(conn), rpath)
+            {
+                Ok(reader) => rusty_backup::model::fsck_runner::run_fsck_reader(
+                    reader,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ),
+                Err(e) => Err(e),
             }
+        } else {
+            let source_path = self
+                .selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+                .map(|d| d.path.clone())
+                .or_else(|| self.image_file_path.clone());
+
+            let path = match source_path {
+                Some(p) => p,
+                None => {
+                    ctx.log.error("No source available for filesystem check");
+                    return;
+                }
+            };
+            rusty_backup::model::fsck_runner::run_fsck(&path, offset, ptype, type_string.as_deref())
         };
 
-        match rusty_backup::model::fsck_runner::run_fsck(
-            &path,
-            offset,
-            ptype,
-            type_string.as_deref(),
-        ) {
+        match result {
             Ok(Some(result)) => {
                 if result.is_clean() {
                     ctx.log.info(format!(
@@ -4358,26 +4650,46 @@ impl InspectTab {
             }
         };
 
-        let source_path = self
-            .selected_device_idx
-            .and_then(|idx| ctx.devices.get(idx))
-            .map(|d| d.path.clone())
-            .or_else(|| self.image_file_path.clone());
-
-        let path = match source_path {
-            Some(p) => p,
-            None => {
-                ctx.log.error("No source available for repair");
-                return;
+        // Remote image: repair in place over the block reader (read-write).
+        // Runs synchronously like the local path; a large remote volume pauses
+        // the UI for the duration of the repair.
+        let repair_result = if let Some((conn, rpath)) = &self.remote_inspect {
+            match rusty_backup::remote::RemoteBlockReader::open_rw(
+                std::sync::Arc::clone(conn),
+                rpath,
+            ) {
+                Ok(reader) => rusty_backup::model::fsck_runner::run_repair_reader(
+                    reader,
+                    offset,
+                    ptype,
+                    type_string.as_deref(),
+                ),
+                Err(e) => Err(e),
             }
+        } else {
+            let source_path = self
+                .selected_device_idx
+                .and_then(|idx| ctx.devices.get(idx))
+                .map(|d| d.path.clone())
+                .or_else(|| self.image_file_path.clone());
+
+            let path = match source_path {
+                Some(p) => p,
+                None => {
+                    ctx.log.error("No source available for repair");
+                    return;
+                }
+            };
+
+            rusty_backup::model::fsck_runner::run_repair(
+                &path,
+                offset,
+                ptype,
+                type_string.as_deref(),
+            )
         };
 
-        match rusty_backup::model::fsck_runner::run_repair(
-            &path,
-            offset,
-            ptype,
-            type_string.as_deref(),
-        ) {
+        match repair_result {
             Ok(report) => {
                 ctx.log.info(format!(
                     "Repair complete: {} fix(es) applied, {} failed",
@@ -4416,9 +4728,17 @@ impl InspectTab {
             })
             .unwrap_or(false);
 
+        // Remote image: compute over a block reader on the shared connection.
+        let source = if let Some((conn, rpath)) = &self.remote_inspect {
+            rusty_backup::model::min_size_runner::MinSizeSource::Remote {
+                conn: std::sync::Arc::clone(conn),
+                path: rpath.clone(),
+                // The Inspect tab inspects a remote image *file*, not a device.
+                is_device: false,
+            }
         // Prefer a CHD path source over the raw device handle: opening the
         // raw .chd file at partition_offset would read compressed bytes.
-        let source = if let Some(chd_path) = self.chd_image_path.clone() {
+        } else if let Some(chd_path) = self.chd_image_path.clone() {
             rusty_backup::model::min_size_runner::MinSizeSource::Chd(chd_path)
         } else if let Some(gho_path) = self
             .image_file_path
@@ -4658,6 +4978,34 @@ impl InspectTab {
         partition_type_string: Option<String>,
         ctx: &mut TabContext,
     ) {
+        // Case 0: remote image over the block tier — browse the partition's
+        // filesystem over the wire (a fresh RemoteBlockReader per operation on
+        // the open daemon-side image). Read-only.
+        if let Some((conn, rpath)) = &self.remote_inspect {
+            ctx.log.info(format!(
+                "Browsing remote partition {part_index} at offset {offset}"
+            ));
+            let mut session = rusty_backup::model::browse_session::BrowseSession::new();
+            session.partition_offset = offset;
+            session.partition_type = ptype;
+            session.partition_type_string = partition_type_string;
+            session.remote = Some((std::sync::Arc::clone(conn), rpath.clone()));
+            self.browse_view.open_with_session(session);
+            // Editing a remote image is supported over the block tier (a
+            // read-write RemoteBlockReader). Enable the Edit Mode toggle; the
+            // open_editable probe surfaces a clear error for any FS that can't
+            // be edited, exactly as on the local path.
+            self.browse_view.mark_edit_supported();
+            if let Some(part) = self.partitions.iter().find(|p| p.index == part_index) {
+                if let Some(drv) = part.drv_name.as_deref() {
+                    if !drv.is_empty() {
+                        self.browse_view.set_label_prefix(drv.to_string());
+                    }
+                }
+            }
+            return;
+        }
+
         // Case 1: device or raw image file
         let device_path = self
             .selected_device_idx

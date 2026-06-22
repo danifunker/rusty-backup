@@ -70,6 +70,18 @@ pub enum MinSizeSource {
     /// Path to a GHO/GHS container (or any file of its span set) — the worker
     /// opens its own `GhoReader` over the logical (decompressed) volume.
     Gho(PathBuf),
+    /// A remote source over the block tier: the worker opens its own
+    /// `RemoteBlockReader` on the shared connection (the daemon keeps the
+    /// source open and serves byte ranges). `is_device` picks the daemon's
+    /// physical-device opener (`open_device`, a Backup-tab remote drive) over
+    /// the host-image-file opener (`open`, an Inspect-tab remote image) — the
+    /// two RPCs are not interchangeable.
+    #[cfg(feature = "remote")]
+    Remote {
+        conn: Arc<Mutex<crate::remote::RemoteConnection>>,
+        path: String,
+        is_device: bool,
+    },
 }
 
 /// Inputs to `spawn`.
@@ -147,6 +159,37 @@ pub fn spawn(req: MinSizeRequest) -> Arc<Mutex<MinSizeStatus>> {
                         wrapper_hint,
                         &progress,
                     )
+                }
+            }
+            #[cfg(feature = "remote")]
+            MinSizeSource::Remote {
+                conn,
+                path,
+                is_device,
+            } => {
+                let opened = if is_device {
+                    crate::remote::RemoteBlockReader::open_device(conn, &path)
+                } else {
+                    crate::remote::RemoteBlockReader::open(conn, &path)
+                };
+                match opened {
+                    Ok(reader) => fs::partition_minimum_size(
+                        reader,
+                        req.partition_offset,
+                        req.partition_type,
+                        req.partition_type_string.as_deref(),
+                        req.partition_size,
+                        true,
+                        None,
+                        &progress,
+                    ),
+                    Err(e) => {
+                        if let Ok(mut s) = status_thread.lock() {
+                            s.error = Some(format!("{e:#}"));
+                            s.finished = true;
+                        }
+                        return;
+                    }
                 }
             }
             MinSizeSource::Chd(path) => match ChdReader::open(&path) {

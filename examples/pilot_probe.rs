@@ -24,6 +24,19 @@ fn parse_gen(s: &str) -> Generation {
     }
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// First byte offset at which two slices differ, or `None` if the shorter is a
+/// prefix of the longer.
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
 /// Recover the file-ID generation from a PDI's `flags` bit 2 (default Cedar).
 fn pdi_generation(bytes: &[u8]) -> Generation {
     pdi::read_header(bytes)
@@ -123,6 +136,45 @@ fn main() {
                 args[1]
             );
         }
+        Some("set-dir") if args.len() >= 3 => {
+            // set-dir <pdi> <name>=<fileID-decimal> [<name>=<fileID> ...]
+            //
+            // Build the Cedar `client` name directory (FS B-tree) from the given
+            // name -> FileID pairs and point rootFile[client] at it, so the files
+            // browse by their real names instead of synthetic LVx_ ids. Run `add`
+            // first for each file (it prints the FileID), then name them here.
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let mut entries: Vec<(String, u16, u32)> = Vec::new();
+            for a in &args[2..] {
+                let (name, fid) = a.split_once('=').unwrap_or_else(|| {
+                    eprintln!("bad pair {a:?} (want name=fileID)");
+                    std::process::exit(2);
+                });
+                let fid: u32 = fid.parse().unwrap_or_else(|_| {
+                    eprintln!("bad FileID in {a:?} (decimal)");
+                    std::process::exit(2);
+                });
+                entries.push((name.to_string(), 1, fid));
+            }
+            let disk =
+                pilot::set_client_directory(&disk, gen, &entries).expect("set_client_directory");
+            fs::write(&args[1], pilot::write_pdi(&disk, gen)).expect("write pdi");
+            // Re-read and show the now-named files.
+            let back = open_pack(&fs::read(&args[1]).unwrap()).unwrap();
+            let mut fsv = PilotFilesystem::open(back, gen).expect("open fs");
+            let root = fsv.root().expect("root");
+            let files = fsv.list_directory(&root).expect("list");
+            println!(
+                "Installed Cedar name directory ({} entries) into {}; files now:",
+                entries.len(),
+                args[1]
+            );
+            for f in &files {
+                println!("    {:<24} {:>8} bytes", f.name, f.size);
+            }
+        }
         Some("install-boot") if args.len() == 4 => {
             // install-boot <pdi> <germ|bootfile|microcode> <hostfile>
             let slot = PvBootFile::parse(&args[2]).unwrap_or_else(|| {
@@ -207,6 +259,157 @@ fn main() {
                 }
             }
         }
+        Some("verify") if args.len() >= 2 => {
+            // verify <pdi> [germ=<src>] [bootfile=<src>] [microcode=<src>]
+            //
+            // One-command audit of a Cedar boot fixture: structure (seals, VAM),
+            // the PV-root bootingInfo each boot stage reads, the per-slot boot
+            // chain the microcode walks, optional byte-exactness against the
+            // canonical germ/boot sources, and a PDI writer round-trip. Exit 0
+            // only when every check passes.
+            let path = &args[1];
+            let mut sources: std::collections::HashMap<&str, String> = Default::default();
+            for a in &args[2..] {
+                if let Some((k, v)) = a.split_once('=') {
+                    sources.insert(
+                        match k.to_ascii_lowercase().as_str() {
+                            "boot" | "bootfile" | "pilot" => "bootfile",
+                            "mc" | "ucode" | "microcode" => "microcode",
+                            other => Box::leak(other.to_string().into_boxed_str()),
+                        },
+                        v.to_string(),
+                    );
+                }
+            }
+
+            let bytes = fs::read(path).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let mut pass = true;
+            println!("VERIFY  {path}  ({} bytes)", bytes.len());
+
+            // --- structure ---
+            match pilot::read_volume(&disk, gen) {
+                Ok(vol) => {
+                    print_volume(&vol);
+                    match vol.vam_free_pages {
+                        Some(vf) if vf == vol.free_pages => {}
+                        _ => {
+                            pass = false;
+                            println!("  FAIL: VAM free-page count disagrees with the page labels");
+                        }
+                    }
+                }
+                Err(e) => {
+                    pass = false;
+                    println!("  FAIL: volume does not parse: {e}");
+                }
+            }
+
+            // --- bootingInfo + per-slot chain + optional source compare ---
+            println!(
+                "  bootingInfo @PV-root word {} (slot stride {} words):",
+                pilot::BOOTING_INFO_BASE,
+                pilot::DISK_FILE_ID_WORDS
+            );
+            for (slot, key) in [
+                (PvBootFile::Microcode, "microcode"),
+                (PvBootFile::Germ, "germ"),
+                (PvBootFile::BootFile, "bootfile"),
+                (PvBootFile::Checkpoint, "checkpoint"),
+            ] {
+                let entry = pilot::boot_file_entry(&disk, slot).expect("boot_file_entry");
+                if !entry.is_present() {
+                    if let Some(src) = sources.get(key) {
+                        pass = false;
+                        println!(
+                            "    {:<10}: (empty)  FAIL: expected to match {src}",
+                            slot.label()
+                        );
+                    } else {
+                        println!("    {:<10}: (empty)", slot.label());
+                    }
+                    continue;
+                }
+                match pilot::read_boot_file(&disk, slot) {
+                    Ok(Some(data)) => {
+                        let pages = data.len() / 512;
+                        let last = entry.first_link + pages as u32 - 1;
+                        println!(
+                            "    {:<10}: fileID {:04X}{:04X}  firstPage {}  firstLink VDA {}  ({} pages, VDA {}..={} if contiguous)  chain OK",
+                            slot.label(),
+                            entry.file_id[0], entry.file_id[1],
+                            entry.first_page, entry.first_link, pages,
+                            entry.first_link, last,
+                        );
+                        println!("               sha256 {}", sha256_hex(&data));
+                        if let Some(src) = sources.get(key) {
+                            let want = fs::read(src).expect("read source");
+                            // The chain reads page-granular (zero-padded); the
+                            // source is exact, so compare over the source length.
+                            let ok = data.len() >= want.len()
+                                && first_diff(&data[..want.len()], &want).is_none()
+                                && data[want.len()..].iter().all(|&b| b == 0);
+                            if ok {
+                                println!(
+                                    "               vs {src}: IDENTICAL ({} bytes, sha256 {})",
+                                    want.len(),
+                                    sha256_hex(&want)
+                                );
+                            } else {
+                                pass = false;
+                                let at = first_diff(&data, &want)
+                                    .map(|o| format!("first diff @byte {o}"))
+                                    .unwrap_or_else(|| "length mismatch".into());
+                                println!("               vs {src}: DIFFERS ({at}; chain {} bytes, source {} bytes)  FAIL",
+                                    data.len(), want.len());
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        pass = false;
+                        println!(
+                            "    {:<10}: present but chain INVALID: {e}  FAIL",
+                            slot.label()
+                        );
+                    }
+                }
+            }
+
+            // --- PDI writer round-trip (read -> write -> read must be stable) ---
+            let rewritten = pilot::write_pdi(&disk, gen);
+            if rewritten == bytes {
+                println!(
+                    "  round-trip: write_pdi reproduces the file byte-for-byte ({} bytes)",
+                    bytes.len()
+                );
+            } else {
+                // Not necessarily a failure (header normalization is allowed),
+                // but the re-read must still verify identically.
+                let back = open_pack(&rewritten).expect("reopen rewritten");
+                let mut stable = true;
+                for slot in [PvBootFile::Germ, PvBootFile::BootFile] {
+                    let a = pilot::read_boot_file(&disk, slot).ok().flatten();
+                    let b = pilot::read_boot_file(&back, slot).ok().flatten();
+                    if a != b {
+                        stable = false;
+                    }
+                }
+                if stable {
+                    println!("  round-trip: file bytes differ ({} -> {}) but boot files re-read IDENTICAL (writer normalized header)",
+                        bytes.len(), rewritten.len());
+                } else {
+                    pass = false;
+                    println!("  round-trip: FAIL -- re-read boot files differ after write_pdi");
+                }
+            }
+
+            println!("  ==> {}", if pass { "PASS" } else { "FAIL" });
+            if !pass {
+                std::process::exit(1);
+            }
+        }
         Some("roundtrip") if args.len() == 4 => {
             let pages: u16 = args[1].parse().expect("pages");
             let gen = parse_gen(&args[2]);
@@ -223,10 +426,14 @@ fn main() {
             eprintln!("  pilot_probe new <pages> <cedar|pilot> <name> <out.pdi>");
             eprintln!("  pilot_probe probe <file.pdi>");
             eprintln!("  pilot_probe add <file.pdi> <hostfile>");
+            eprintln!("  pilot_probe set-dir <file.pdi> <name>=<fileID> [<name>=<fileID> ...]");
             eprintln!("  pilot_probe del <file.pdi> <fileID-decimal>");
             eprintln!("  pilot_probe install-boot <file.pdi> <germ|bootfile|microcode> <hostfile>");
             eprintln!("  pilot_probe extract-boot <file.pdi> <germ|bootfile|microcode> <out>");
             eprintln!("  pilot_probe boot-info <file.pdi>");
+            eprintln!(
+                "  pilot_probe verify <file.pdi> [germ=<src>] [bootfile=<src>] [microcode=<src>]"
+            );
             eprintln!("  pilot_probe roundtrip <pages> <cedar|pilot> <name>");
             std::process::exit(2);
         }

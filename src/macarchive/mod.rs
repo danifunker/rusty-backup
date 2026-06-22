@@ -9,6 +9,8 @@
 //!   self-extracting archives (`.sea`).
 //! - [`compactpro`] — Compact Pro (`.cpt`, and `.sea` self-extracting),
 //!   commonly distributed BinHex-wrapped.
+//! - [`mar`] — Hampa Hug's `mar` archive (`.mar`): a single Mac file or folder
+//!   tree, read + written (stored).
 //!
 //! See `docs/native_mac_archives.md` for the format references and roadmap.
 
@@ -16,6 +18,7 @@ pub mod bitreader_be;
 pub mod compactpro;
 pub mod detect;
 pub mod extract;
+pub mod mar;
 pub mod stuffit;
 pub mod stuffit13_tables;
 pub mod stuffit5;

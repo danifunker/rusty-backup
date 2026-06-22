@@ -1,13 +1,15 @@
-//! `rb-cli sit <SUBCOMMAND>` — read classic StuffIt and Compact Pro archives.
+//! `rb-cli archive <SUBCOMMAND>` — read/write classic Mac archives (StuffIt,
+//! Compact Pro, MAR, BinHex). (`sit` is kept as a hidden back-compat alias.)
 //!
-//! `sit list ARCHIVE` prints the entries; `sit extract ARCHIVE DEST` unpacks
-//! them to the host, preserving both forks and Finder info via a chosen
+//! `archive list ARCHIVE` prints the entries; `archive extract ARCHIVE DEST`
+//! unpacks them to the host, preserving both forks and Finder info via a chosen
 //! container format (BinHex by default).
 //!
-//! ARCHIVE may be a raw `.sit` / `.cpt`, a self-extracting `.sea`, or any of
-//! these BinHex-wrapped as `.hqx` — the wrapper is decoded transparently, and
-//! the format (classic StuffIt, StuffIt 5, or Compact Pro) is detected from
-//! content. StuffIt X (`.sitx`) is recognized but not yet extractable.
+//! ARCHIVE may be a raw `.sit` / `.cpt` / `.mar`, a self-extracting `.sea`, or
+//! any of the StuffIt/Compact-Pro forms BinHex-wrapped as `.hqx` — the wrapper
+//! is decoded transparently, and the format (classic StuffIt, StuffIt 5,
+//! Compact Pro, or MAR) is detected from content. StuffIt X (`.sitx`) is
+//! recognized but not yet extractable; LZW/LZ4-compressed MAR isn't yet either.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -17,22 +19,24 @@ use crate::cli::logging::log_stderr;
 use crate::fs::binhex;
 use crate::fs::resource_fork;
 use crate::macarchive::extract;
+use crate::macarchive::mar;
 use crate::macarchive::stuffit;
 
 #[derive(Debug, Subcommand)]
-pub enum SitCommand {
+pub enum ArchiveCommand {
     /// List the entries in a StuffIt archive.
     List(ListArgs),
     /// Extract a StuffIt archive to a directory on the host.
     Extract(ExtractArgs),
-    /// Create a StuffIt archive from host files (.hqx / .bin / plain).
+    /// Create a StuffIt or MAR archive from host files (.hqx / .bin / plain).
     Create(CreateArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct CreateArgs {
-    /// Output path. A `.sit` extension writes a raw archive; a `.hqx`
-    /// extension BinHex-wraps it (the classic `.sit.hqx` format).
+    /// Output path. `.sit` writes a raw StuffIt archive; `.hqx` BinHex-wraps it
+    /// (the classic `.sit.hqx` format); `.mar` writes a stored MAR archive
+    /// (a single file, or several wrapped in a folder named after the output).
     pub output: PathBuf,
 
     /// Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a
@@ -47,13 +51,13 @@ pub struct CreateArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`).
+    /// StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`).
     pub archive: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct ExtractArgs {
-    /// StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`).
+    /// StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`).
     pub archive: PathBuf,
 
     /// Destination directory on the host (created if missing).
@@ -91,11 +95,11 @@ impl ForkFormat {
     }
 }
 
-pub fn run(cmd: SitCommand) -> Result<()> {
+pub fn run(cmd: ArchiveCommand) -> Result<()> {
     match cmd {
-        SitCommand::List(args) => run_list(args),
-        SitCommand::Extract(args) => run_extract(args),
-        SitCommand::Create(args) => run_create(args),
+        ArchiveCommand::List(args) => run_list(args),
+        ArchiveCommand::Extract(args) => run_extract(args),
+        ArchiveCommand::Create(args) => run_create(args),
     }
 }
 
@@ -147,7 +151,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     )?;
 
     log_stderr(format!(
-        "sit extract: {} files extracted to {}{}",
+        "archive extract: {} files extracted to {}{}",
         stats.files,
         args.dest.display(),
         if stats.skipped > 0 {
@@ -179,6 +183,37 @@ fn run_create(args: CreateArgs) -> Result<()> {
         bail!("no input files to archive");
     }
 
+    // A `.mar` output writes a MAR archive instead of StuffIt. MAR holds a
+    // single root (file or folder), so multiple inputs are wrapped in a folder
+    // named after the output; MAR is always stored (no `--rle`).
+    let out_ext = args
+        .output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    if out_ext.as_deref() == Some("mar") {
+        let root_name = args
+            .output
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("archive");
+        let nodes: Vec<stuffit::StuffItInputNode> = files
+            .iter()
+            .cloned()
+            .map(stuffit::StuffItInputNode::File)
+            .collect();
+        let bytes = mar::build_archive(root_name, &nodes)?;
+        std::fs::write(&args.output, &bytes)
+            .with_context(|| format!("writing {}", args.output.display()))?;
+        log_stderr(format!(
+            "archive create: {} file(s) -> {} (mar format, {} bytes)",
+            files.len(),
+            args.output.display(),
+            bytes.len()
+        ));
+        return Ok(());
+    }
+
     let sit_bytes = stuffit::build_archive(&files, method)?;
 
     // If the output ends in `.hqx`, BinHex-wrap the archive (the classic
@@ -207,7 +242,7 @@ fn run_create(args: CreateArgs) -> Result<()> {
         .with_context(|| format!("writing {}", args.output.display()))?;
 
     log_stderr(format!(
-        "sit create: {} file(s) -> {} ({} format, {} bytes)",
+        "archive create: {} file(s) -> {} ({} format, {} bytes)",
         files.len(),
         args.output.display(),
         kind,

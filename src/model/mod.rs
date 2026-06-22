@@ -5,6 +5,8 @@
 
 pub mod archive_edit;
 pub mod backup_loader;
+#[cfg(feature = "remote")]
+pub mod backup_remote;
 pub mod browse_session;
 pub mod bulk_convert_runner;
 pub mod cache_runner;
@@ -23,7 +25,15 @@ pub mod hfs_expand_runner;
 pub mod min_size_runner;
 pub mod partition_editor;
 pub mod physical_write_runner;
+// The remote file-browser core depends on `crate::remote`, which is itself
+// behind the `remote` feature.
+#[cfg(feature = "remote")]
+pub mod remote_browser;
 pub mod repack_runner;
+#[cfg(feature = "remote")]
+pub mod resize_remote;
+#[cfg(feature = "remote")]
+pub mod restore_remote;
 pub mod size_mode;
 pub mod source_reader;
 pub mod status;

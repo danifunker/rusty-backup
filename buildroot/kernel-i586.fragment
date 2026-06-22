@@ -1,0 +1,11 @@
+# Kernel processor-family override for an i586 (Pentium-class) appliance.
+# Merged on top of qemu_x86's pinned kernel config (which selects M686 = i686),
+# because Buildroot's BR2_x86_i586 only retargets the toolchain/userland — the
+# kernel keeps its own .config and would otherwise still emit CMOV (an i686
+# instruction) and fault on a real Pentium.
+#
+# M586TSC = Pentium-classic: CMPXCHG8B + TSC, but NO CMOV — the same floor as
+# the bundled i586 static rb-cli. X86_CMOV / X86_CMPXCHG64 cascade from this
+# choice automatically (see arch/x86/Kconfig.cpu), so only the choice is set here.
+# CONFIG_M686 is not set
+CONFIG_M586TSC=y

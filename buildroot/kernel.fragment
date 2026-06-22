@@ -1,0 +1,302 @@
+# Extra kernel options merged into qemu_x86's config (via
+# BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES in build.sh) so the appliance can see
+# the disks it backs up/restores, the medium it writes to, and as much vintage
+# 486/Pentium-era hardware as is practical.
+#
+# rb-cli reads RAW block devices and parses FAT/NTFS/HFS/etc. itself, so the
+# kernel needs *block-device* drivers + the DESTINATION filesystems, not the
+# source ones.
+#
+# Policy used throughout this file:
+#   * PCI / onboard controllers  -> built-in (=y): they enumerate on the PCI bus
+#     and bind automatically, so the disk/NIC "just works" with no config.
+#   * ISA / PC-Card add-in cards  -> modules (=m): blind ISA probing at boot is
+#     slow and risky, so these load on demand with the right I/O port + IRQ, e.g.
+#         modprobe ne     io=0x300 irq=10        # NE2000 ISA NIC
+#         modprobe aha152x io=0x340 irq=11 scsiid=7
+#     The modules ship in the image under /lib/modules. See
+#     docs/appliance_hardware_support.md for the full how-to and how to add more.
+#
+# To customise: edit this file and rebuild, or run `make linux-menuconfig` in
+# the Buildroot tree for an interactive picker (see the hardware-support doc).
+# The running kernel's exact config is readable on the appliance at
+# /proc/config.gz (zcat it), thanks to CONFIG_IKCONFIG below.
+
+# --- Loadable-module support (needed for the =m drivers above) --------------
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+
+# --- Buses ------------------------------------------------------------------
+# PCI is on in the base config; ISA is needed for the legacy add-in cards and
+# the bare-486 Multi-I/O IDE/serial controllers below.
+CONFIG_ISA=y
+
+# ===========================================================================
+#  Storage controllers
+# ===========================================================================
+# libata (the modern PATA/SATA stack; the old CONFIG_IDE subsystem is gone).
+CONFIG_ATA=y
+CONFIG_ATA_GENERIC=y
+CONFIG_ATA_PIIX=y
+CONFIG_SATA_AHCI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_CHR_DEV_SG=y
+CONFIG_MSDOS_PARTITION=y
+CONFIG_EFI_PARTITION=y
+
+# Bare-486 / VLB / ISA "Multi-I/O" IDE — the controller on a 486's I/O card,
+# at the legacy 0x1F0/0x170 ports. PATA_LEGACY is the catch-all; QDI/Winbond
+# are the common VL-Bus IDE chips.
+CONFIG_PATA_LEGACY=y
+CONFIG_PATA_QDI=y
+CONFIG_PATA_WINBOND_VLB=y
+CONFIG_PATA_RZ1000=y
+CONFIG_PATA_CMD640_PCI=y
+CONFIG_PATA_ISAPNP=y
+CONFIG_PATA_PLATFORM=y
+
+# PCI IDE chipsets found on Pentium-era boards & cards.
+CONFIG_PATA_ALI=y
+CONFIG_PATA_AMD=y
+CONFIG_PATA_ARTOP=y
+CONFIG_PATA_ATIIXP=y
+CONFIG_PATA_CMD64X=y
+CONFIG_PATA_CYPRESS=y
+CONFIG_PATA_EFAR=y
+CONFIG_PATA_HPT366=y
+CONFIG_PATA_HPT37X=y
+CONFIG_PATA_HPT3X2N=y
+CONFIG_PATA_HPT3X3=y
+CONFIG_PATA_IT821X=y
+CONFIG_PATA_IT8213=y
+CONFIG_PATA_JMICRON=y
+CONFIG_PATA_MARVELL=y
+CONFIG_PATA_NETCELL=y
+CONFIG_PATA_NINJA32=y
+CONFIG_PATA_NS87410=y
+CONFIG_PATA_NS87415=y
+CONFIG_PATA_OLDPIIX=y
+CONFIG_PATA_OPTI=y
+CONFIG_PATA_OPTIDMA=y
+CONFIG_PATA_PDC2027X=y
+CONFIG_PATA_PDC_OLD=y
+CONFIG_PATA_RADISYS=y
+CONFIG_PATA_RDC=y
+CONFIG_PATA_SC1200=y
+CONFIG_PATA_SERVERWORKS=y
+CONFIG_PATA_SIL680=y
+CONFIG_PATA_SIS=y
+CONFIG_PATA_TOSHIBA=y
+CONFIG_PATA_TRIFLEX=y
+CONFIG_PATA_VIA=y
+CONFIG_PATA_WINBOND=y
+
+# Floppy — a real medium on these machines.
+CONFIG_BLK_DEV_FD=y
+
+# --- SCSI ------------------------------------------------------------------
+# Common on vintage workstations & as a backup destination (tape/JAZ/etc.).
+CONFIG_SCSI=y
+CONFIG_SCSI_CONSTANTS=y
+CONFIG_SCSI_SPI_ATTRS=y
+# PCI host adapters -> built-in (auto-bind).
+CONFIG_SCSI_AIC7XXX=y
+CONFIG_SCSI_AIC79XX=y
+CONFIG_SCSI_SYM53C8XX_2=y
+CONFIG_SCSI_BUSLOGIC=y
+CONFIG_SCSI_ADVANSYS=y
+CONFIG_SCSI_INITIO=y
+CONFIG_SCSI_AM53C974=y
+CONFIG_SCSI_DC395x=y
+CONFIG_SCSI_QLOGIC_1280=y
+# ISA host adapters -> modules (need io=/irq= params).
+# (the generic NCR5380 driver covers the DTC/PAS16/T128-class ISA cards whose
+# individual drivers were retired from the kernel.)
+CONFIG_SCSI_AHA152X=m
+CONFIG_SCSI_AHA1542=m
+CONFIG_SCSI_AHA1740=m
+CONFIG_SCSI_GENERIC_NCR5380=m
+CONFIG_SCSI_QLOGIC_FAS=m
+# Parallel-port Iomega ZIP / JAZ (a classic vintage backup medium).
+CONFIG_SCSI_PPA=m
+CONFIG_SCSI_IMM=m
+
+# --- USB mass storage (a USB stick / drive as backup destination) ----------
+CONFIG_USB=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_UHCI_HCD=y
+CONFIG_USB_OHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_PRINTER=m
+
+# ===========================================================================
+#  Networking — NICs (the destination becomes a remote host once the network
+#  branch lands; building the drivers now is harmless and gets us ready).
+# ===========================================================================
+CONFIG_NETDEVICES=y
+CONFIG_ETHERNET=y
+
+# National Semiconductor 8390 family (NE2000 & friends).
+CONFIG_NET_VENDOR_8390=y
+CONFIG_NE2K_PCI=y
+CONFIG_NE2000=m
+CONFIG_ULTRA=m
+CONFIG_WD80x3=m
+
+# 3Com.
+CONFIG_NET_VENDOR_3COM=y
+CONFIG_VORTEX=y
+CONFIG_EL3=m
+CONFIG_3C515=m
+
+# AMD / Lance / PCnet.
+CONFIG_NET_VENDOR_AMD=y
+CONFIG_PCNET32=y
+CONFIG_AMD8111_ETH=y
+CONFIG_LANCE=m
+CONFIG_NI65=m
+
+# Intel.
+CONFIG_NET_VENDOR_INTEL=y
+CONFIG_E100=y
+CONFIG_E1000=y
+CONFIG_E1000E=y
+
+# Realtek.
+CONFIG_NET_VENDOR_REALTEK=y
+CONFIG_8139TOO=y
+CONFIG_8139CP=y
+CONFIG_R8169=y
+CONFIG_ATP=m
+
+# DEC Tulip & clones.
+CONFIG_NET_VENDOR_DEC=y
+CONFIG_NET_TULIP=y
+CONFIG_DE2104X=y
+CONFIG_TULIP=y
+CONFIG_WINBOND_840=y
+CONFIG_DM9102=y
+CONFIG_ULI526X=y
+
+# RDC R6040 — the on-SoC Fast Ethernet MAC in the DM&P Vortex86 family, i.e. the
+# built-in NIC on modern retro boards like the ITX-Llama (Vortex86EX). PCI MAC,
+# binds automatically. (Booting the appliance on a Vortex86EX board also needs
+# an i586 kernel — see the CPU-baseline note in docs/linux_486_appliance.md;
+# this driver is what makes its onboard Ethernet work once that lands.)
+CONFIG_NET_VENDOR_RDC=y
+CONFIG_R6040=y
+
+# VIA.
+CONFIG_NET_VENDOR_VIA=y
+CONFIG_VIA_RHINE=y
+CONFIG_VIA_VELOCITY=y
+
+# SiS.
+CONFIG_NET_VENDOR_SIS=y
+CONFIG_SIS900=y
+CONFIG_SIS190=y
+
+# National Semiconductor PCI.
+CONFIG_NET_VENDOR_NATSEMI=y
+CONFIG_NATSEMI=y
+CONFIG_NS83820=y
+
+# SMSC / SMC.
+CONFIG_NET_VENDOR_SMSC=y
+CONFIG_EPIC100=y
+CONFIG_SMC9194=m
+
+# Cirrus Logic CS89x0 (common on industrial / embedded 486 boards). The ISA
+# driver's symbol is CS89x0_ISA (CS89x0 itself is a hidden helper it selects).
+CONFIG_NET_VENDOR_CIRRUS=y
+CONFIG_CS89x0_ISA=m
+
+# D-Link / Sundance, Adaptec Starfire, Packet Engines, Myson, TI ThunderLAN.
+CONFIG_NET_VENDOR_DLINK=y
+CONFIG_SUNDANCE=y
+CONFIG_DL2K=y
+CONFIG_NET_VENDOR_ADAPTEC=y
+CONFIG_ADAPTEC_STARFIRE=y
+CONFIG_NET_VENDOR_PACKET_ENGINES=y
+CONFIG_HAMACHI=y
+CONFIG_YELLOWFIN=y
+CONFIG_NET_VENDOR_MYSON=y
+CONFIG_FEALNX=y
+CONFIG_NET_VENDOR_TI=y
+CONFIG_TLAN=y
+
+# Parallel-line IP (PLIP) — networking over a parallel cable, period-appropriate.
+CONFIG_PLIP=m
+
+# ===========================================================================
+#  PCMCIA / CardBus — vintage laptops (NICs, storage, serial on a PC Card)
+# ===========================================================================
+CONFIG_PCCARD=y
+CONFIG_PCMCIA=y
+CONFIG_PCMCIA_LOAD_CIS=y
+CONFIG_CARDBUS=y
+CONFIG_YENTA=y
+CONFIG_PD6729=y
+CONFIG_I82092=y
+CONFIG_I82365=y
+CONFIG_TCIC=y
+CONFIG_PATA_PCMCIA=m
+CONFIG_PCMCIA_3C589=m
+CONFIG_PCMCIA_3C574=m
+CONFIG_PCMCIA_PCNET=m
+CONFIG_PCMCIA_AXNET=m
+CONFIG_PCMCIA_NMCLAN=m
+CONFIG_PCMCIA_SMC91C92=m
+CONFIG_PCMCIA_XIRC2PS=m
+CONFIG_PCMCIA_FMVJ18X=m
+CONFIG_SERIAL_8250_CS=m
+
+# ===========================================================================
+#  Multi-I/O: extra serial ports + parallel port
+# ===========================================================================
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_SERIAL_8250_PCI=y
+CONFIG_SERIAL_8250_NR_UARTS=8
+CONFIG_SERIAL_8250_RUNTIME_UARTS=8
+CONFIG_SERIAL_8250_EXTENDED=y
+CONFIG_SERIAL_8250_MANY_PORTS=y
+CONFIG_SERIAL_8250_SHARE_IRQ=y
+CONFIG_SERIAL_8250_DETECT_IRQ=y
+CONFIG_SERIAL_8250_RSA=y
+CONFIG_PARPORT=y
+CONFIG_PARPORT_PC=y
+CONFIG_PARPORT_PC_FIFO=y
+CONFIG_PARPORT_1284=y
+
+# ===========================================================================
+#  Display / console
+# ===========================================================================
+# vgacon (standard VGA text mode) drives EVERY VGA/SVGA card and is the
+# appliance's primary console; the VESA/VGA16 framebuffers are extra options
+# for SVGA cards (need a vga= mode on the kernel command line to activate).
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_VGA_CONSOLE=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FB=y
+CONFIG_FB_VESA=y
+CONFIG_FB_VGA16=y
+
+# ===========================================================================
+#  Destination filesystems (where backups land — sources are parsed by rb-cli)
+# ===========================================================================
+CONFIG_VFAT_FS=y
+CONFIG_EXT4_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+
+# CD-ROM boot: the appliance ships as a bootable (hybrid) ISO, so the kernel
+# must mount its own root from the CD.
+CONFIG_CDROM=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_ISO9660_FS=y
+CONFIG_JOLIET=y

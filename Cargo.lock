@@ -2896,6 +2896,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libzstd-bitexact-rs"
+version = "0.157.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b1f70c29953c0f4651a21c2739052a5b94902686897c016fd6f142cd4232e09"
+
+[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4530,6 +4536,7 @@ dependencies = [
  "image",
  "libc",
  "libchdman-rs 0.288.5",
+ "libzstd-bitexact-rs",
  "log",
  "md-5",
  "nix",

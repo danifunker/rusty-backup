@@ -1021,7 +1021,7 @@ pub fn assemble_from_staging(
         // efficient chunked reads. Cap to `part_length` so a
         // miscompressed staging file can't overrun its assigned
         // segment.
-        let decoder = zstd::Decoder::new(file)
+        let decoder = crate::rbformats::zstd_compat::decoder(file)
             .with_context(|| format!("failed to open zstd decoder on {}", staged.display(),))?;
         // Tee through a ChecksumReader so the encoder's pull of these
         // bytes also feeds the partition's hasher. After the encode
@@ -1029,9 +1029,8 @@ pub fn assemble_from_staging(
         let hasher = Arc::new(Mutex::new(Some(super::verify::RunningHasher::new(
             inputs.checksum_type,
         ))));
-        let hashed: super::verify::ChecksumReader<
-            std::io::Take<zstd::Decoder<std::io::BufReader<File>>>,
-        > = super::verify::ChecksumReader::new(decoder.take(part_length), hasher.clone());
+        let hashed: super::verify::ChecksumReader<std::io::Take<Box<dyn Read + Send>>> =
+            super::verify::ChecksumReader::new(decoder.take(part_length), hasher.clone());
         let reader: Box<dyn Read + Send> = Box::new(hashed);
         builder
             .add_segment(part_offset, part_length, reader)
@@ -2928,7 +2927,7 @@ mod tests {
         let staged_path = staging.join("partition-0.zst");
         {
             let f = File::create(&staged_path).unwrap();
-            let mut enc = zstd::Encoder::new(f, 3).unwrap();
+            let mut enc = crate::rbformats::zstd_compat::ZstdEncoder::new(f, 3).unwrap();
             enc.write_all(body).unwrap();
             enc.finish().unwrap();
         }

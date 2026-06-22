@@ -120,6 +120,23 @@ pub fn run(args: PutArgs) -> Result<()> {
         bail!("destination path has no filename");
     }
 
+    // Remote destination: `rb-cli put rb://host:port/img@N HOST /DEST`. Upload
+    // the host file into the daemon's staging area and apply it.
+    #[cfg(feature = "remote")]
+    if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
+        return remote_put(
+            &rref,
+            args.image.partition,
+            &parent_path,
+            &name,
+            args.host_file,
+            args.zero,
+            args.force,
+            args.type_code,
+            args.creator,
+        );
+    }
+
     let (file, mut ctx, commit) = resolve_partition_rw_forced(
         &args.image.path,
         args.image.partition,
@@ -211,6 +228,60 @@ pub fn run(args: PutArgs) -> Result<()> {
         super::locate::emit_locate(crate::cli::output::OutputFormat::Json, &payload)?;
     }
 
+    Ok(())
+}
+
+/// `rb-cli put rb://host:port/img@N HOST /DEST` — stage a host file into a
+/// remote image and apply it. Phase 1: a single host file (not `--zero` /
+/// `--boot`, which are deferred over `rb://`).
+#[cfg(feature = "remote")]
+#[allow(clippy::too_many_arguments)]
+fn remote_put(
+    rref: &crate::remote::RemoteRef,
+    partition: Option<u32>,
+    parent_path: &str,
+    name: &str,
+    host_file: Option<PathBuf>,
+    zero: Option<u64>,
+    force: bool,
+    type_code: Option<String>,
+    creator: Option<String>,
+) -> Result<()> {
+    if zero.is_some() {
+        bail!("--zero isn't supported over rb:// yet (Phase 1 copies a host file)");
+    }
+    let host = host_file.ok_or_else(|| anyhow!("host file required (positional HOST argument)"))?;
+
+    // Type/creator defaults mirror the local path: flag, else config, else BINA/????.
+    let type_code = type_code
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("put", "type"))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "BINA".to_string());
+    let creator = creator
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("put", "creator"))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "????".to_string());
+
+    let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
+    let sid = session.open_session(&rref.path, partition)?;
+    session.stage_upload(
+        sid,
+        parent_path,
+        name,
+        &host,
+        force,
+        Some(type_code),
+        Some(creator),
+    )?;
+    let n = session.apply(sid)?;
+    session.close_session(sid)?;
+    crate::cli::logging::out_stdout(format!("Wrote {name} ({n} edit applied over rb://)"));
     Ok(())
 }
 
