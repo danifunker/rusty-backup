@@ -627,7 +627,13 @@ fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc) {
         let d = &mut disk.sectors[pv].data;
         wrw(d, ROOTFILE_VAM_WORD, VAM_FILE_ID[0]); // fp.id low
         wrw(d, ROOTFILE_VAM_WORD + 1, VAM_FILE_ID[1]); // fp.id high
-                                                       // fp.da (words +2..+3) = 0
+                                                       // fp.da (File.FP.da, words +2..+3) = VAM leader's LOGICAL page. Cedar's
+                                                       // File.Open -> DoOpen reads the file header starting at logicalRun
+                                                       // [first: fp.da] (FileImpl.mesa DoOpen; File.DA == VolumeFormat.LogicalPage),
+                                                       // so this MUST point at the VAM header (logical page `header_lp`). Leaving
+                                                       // it 0 makes ReadVAM read logical page 0 (the LV root) as the VAM leader,
+                                                       // corrupting the run table -> vamStatus inconsistent.
+        wrlong(d, ROOTFILE_VAM_WORD + 2, header_lp as u32); // fp.da = VAM leader logical page
         wrlong(d, ROOTFILE_VAM_WORD + 4, header_lp as u32); // RootFile.page
         wrlong(d, 253, 1); // lastFileID = 1 (the VAM)
         set_page_checksum(d);
