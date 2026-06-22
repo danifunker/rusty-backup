@@ -235,6 +235,60 @@ Usage: shrink <INPUT> <OUTPUT>
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
 
+### `archive`
+
+Read/write classic Mac archives (list / extract / create; accepts .sit, .sea, .cpt, .mar, and their BinHex-wrapped .hqx forms)
+
+```
+Usage: archive <COMMAND>
+```
+
+### `archive create`
+
+Create a StuffIt or MAR archive from host files (.hqx / .bin / plain)
+
+```
+Usage: create [OPTIONS] <OUTPUT> <INPUTS>...
+```
+
+**Arguments**
+
+- `<OUTPUT>` — Output path. `.sit` writes a raw StuffIt archive; `.hqx` BinHex-wraps it (the classic `.sit.hqx` format); `.mar` writes a stored MAR archive (a single file, or several wrapped in a folder named after the output)
+- `<INPUTS>` — Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)
+
+**Options**
+
+- `--rle` — Compress forks with RLE90 (method 1) instead of storing uncompressed
+
+### `archive extract`
+
+Extract a StuffIt archive to a directory on the host
+
+```
+Usage: extract [OPTIONS] <ARCHIVE> <DEST>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+- `<DEST>` — Destination directory on the host (created if missing)
+
+**Options**
+
+- `--format` — Container format for the extracted files
+
+### `archive list`
+
+List the entries in a StuffIt archive
+
+```
+Usage: list <ARCHIVE>
+```
+
+**Arguments**
+
+- `<ARCHIVE>` — StuffIt, Compact Pro, or MAR archive (`.sit`, `.sea`, `.cpt`, `.mar`, or `.hqx`)
+
 ### `backup`
 
 Back up a disk image or device to a backup folder
@@ -1135,8 +1189,6 @@ Usage: resize --size <SIZE> <IMAGE>
 
 - `--size` — New filesystem size in bytes. Accepts suffixes (`K`, `M`, `G`)
 
-`<IMAGE>` may be a remote `rb://host[:port]/img@N` ref — the filesystem is resized in place over the block tier (same `@N`/`--size` meaning; only the I/O is ranged daemon requests). Resizes the filesystem *within* its partition; it never changes the partition table or the image's byte length.
-
 ### `restore`
 
 Restore a backup folder to a target image or device
@@ -1159,8 +1211,6 @@ Usage: restore [OPTIONS] <BACKUP_DIR> <TARGET>
 - `--yes` — Confirm destructive write to the target (required for device targets). For file targets the flag is a no-op
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default; only meaningful with `--device`)
 - `--write-zeros-to-unused` — Write zeros to unused filesystem space
-
-`<TARGET>` may be a remote `rb://host[:port]/path` ref — restore over the block tier. With `--device` the target is one of the daemon's enumerated physical drives (the daemon must run elevated; `--yes` required); otherwise it's an image file created under the serve root. The restore is materialized to a local staging image first, then pushed to the daemon via ranged writes, so every backup layout (per-partition / single-file-CHD / Clonezilla) is supported.
 
 ### `rm`
 
@@ -1309,60 +1359,6 @@ Usage: shrink <INPUT> <OUTPUT>
 
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
-
-### `sit`
-
-Read classic StuffIt and Compact Pro archives (list / extract; accepts .sit, .sea, .cpt, and their BinHex-wrapped .hqx forms)
-
-```
-Usage: sit <COMMAND>
-```
-
-### `sit create`
-
-Create a StuffIt archive from host files (.hqx / .bin / plain)
-
-```
-Usage: create [OPTIONS] <OUTPUT> <INPUTS>...
-```
-
-**Arguments**
-
-- `<OUTPUT>` — Output path. A `.sit` extension writes a raw archive; a `.hqx` extension BinHex-wraps it (the classic `.sit.hqx` format)
-- `<INPUTS>` — Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)
-
-**Options**
-
-- `--rle` — Compress forks with RLE90 (method 1) instead of storing uncompressed
-
-### `sit extract`
-
-Extract a StuffIt archive to a directory on the host
-
-```
-Usage: extract [OPTIONS] <ARCHIVE> <DEST>
-```
-
-**Arguments**
-
-- `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
-- `<DEST>` — Destination directory on the host (created if missing)
-
-**Options**
-
-- `--format` — Container format for the extracted files
-
-### `sit list`
-
-List the entries in a StuffIt archive
-
-```
-Usage: list <ARCHIVE>
-```
-
-**Arguments**
-
-- `<ARCHIVE>` — StuffIt or Compact Pro archive (`.sit`, `.sea`, `.cpt`, or `.hqx`)
 
 ### `tar`
 

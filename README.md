@@ -265,14 +265,16 @@ The app has five tabs:
   optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
   discs. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
-  StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), and
-  BinHex (`.hqx`) wrappers around any of them. Pick an archive, browse the
-  entry tree (name / type / creator / size / codec), tick the entries to
-  keep, and extract to a folder in your choice of fork-preserving
-  container — BinHex, MacBinary, AppleDouble, or raw data + `.rsrc`
-  sidecar. Single-entry archives whose payload is itself a disk image
-  (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click "Mount in new
-  Inspect tab" handoff. `rb-cli sit list` / `sit extract` is the
+  StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
+  (`.mar`, read + write), and BinHex (`.hqx`) wrappers around any of them.
+  Pick an archive, browse the entry tree (name / type / creator / size /
+  codec), tick the entries to keep, and extract to a folder in your choice
+  of fork-preserving container — BinHex, MacBinary, AppleDouble, or raw
+  data + `.rsrc` sidecar. Export a file or folder back out as `.sit`,
+  `.sit.hqx`, `.hqx`, or `.mar`. Single-entry archives whose payload is
+  itself a disk image (DiskCopy 4.2, raw HFS, raw HFS+) get a one-click
+  "Mount in new Inspect tab" handoff. `rb-cli archive list` / `archive
+  extract` / `archive create` (formerly `sit`, still accepted) is the
   scriptable counterpart.
 
 Most popups (Resize Partitions, Edit Partition Table, Export Disk Image,

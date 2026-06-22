@@ -832,9 +832,12 @@ jobs:
   build-appliance:
     name: Build Linux appliance (${{ matrix.arch }})
     # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
-    # toolchain from scratch), so only spend it on release branches — or trigger
-    # it by hand (workflow_dispatch) to validate a change on a feature branch.
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    # toolchain from scratch). TEMPORARILY skipped on auto-releases so we can
+    # ship the desktop/CLI/MiSTer/cb-dos artifacts quickly; build the i586/i686
+    # appliance on demand via "Run workflow" (workflow_dispatch). To re-enable
+    # it on every main release, restore:
+    #   github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' ||
+    if: github.event_name == 'workflow_dispatch'
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
@@ -1000,7 +1003,10 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-rb-cli-mini-armv7
-      - build-appliance
+      # Temporarily disabled with the build-appliance job below: a skipped
+      # `needs` job would otherwise skip this whole release. Re-enable both
+      # together (uncomment here + restore the job's `if`).
+      # - build-appliance
       - build-cb-dos
     runs-on: ubuntu-latest
     steps:

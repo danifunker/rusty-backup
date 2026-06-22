@@ -55,6 +55,9 @@ pub enum MacArchiveKind {
     CompactPro,
     /// A `.cpt.hqx` / `.sea.hqx`: BinHex-wrapped Compact Pro archive.
     BinHexOverCompactPro,
+    /// A `mar` archive (`.mar`, `MAR\x80` magic) — a single Mac file or folder
+    /// tree. Only the stored (unwrapped) form is recognized here.
+    Mar,
 }
 
 impl MacArchiveKind {
@@ -71,6 +74,7 @@ impl MacArchiveKind {
             MacArchiveKind::Sea => "SEA",
             MacArchiveKind::CompactPro => "Compact Pro",
             MacArchiveKind::BinHexOverCompactPro => "Compact-Pro-over-BinHex",
+            MacArchiveKind::Mar => "MAR",
         }
     }
 
@@ -139,6 +143,9 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
     }
     if is_compactpro(bytes) {
         return Some(MacArchiveKind::CompactPro);
+    }
+    if super::mar::is_mar(bytes) {
+        return Some(MacArchiveKind::Mar);
     }
     if find_sea_archive(bytes).is_some() {
         return Some(MacArchiveKind::Sea);
@@ -417,8 +424,34 @@ mod tests {
             MacArchiveKind::Sit,
             MacArchiveKind::Sit5,
             MacArchiveKind::Sea,
+            MacArchiveKind::Mar,
         ] {
             assert!(k.is_multi_file(), "{k:?}");
         }
+    }
+
+    #[test]
+    fn detects_mar() {
+        // A stored MAR built by our own writer classifies as Mar (magic +
+        // header CRC), is not BinHex-wrapped, and counts as multi-file.
+        let mar = crate::macarchive::mar::build_archive(
+            "x",
+            &[crate::macarchive::stuffit::StuffItInputNode::File(
+                crate::macarchive::stuffit::StuffItInput {
+                    name: "f".into(),
+                    type_code: *b"TEXT",
+                    creator_code: *b"ttxt",
+                    finder_flags: 0,
+                    create_date: 0,
+                    mod_date: 0,
+                    data_fork: b"hi".to_vec(),
+                    resource_fork: Vec::new(),
+                },
+            )],
+        )
+        .unwrap();
+        assert_eq!(detect_mac_archive(&mar), Some(MacArchiveKind::Mar));
+        assert!(!MacArchiveKind::Mar.is_binhex_wrapped());
+        assert_eq!(MacArchiveKind::Mar.label(), "MAR");
     }
 }

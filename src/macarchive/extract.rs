@@ -90,6 +90,7 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
             let archive = super::compactpro::parse(&raw)?;
             Ok((raw, archive))
         }
+        Some(MacArchiveKind::Mar) => super::mar::parse(&raw),
         Some(MacArchiveKind::Sit) | Some(MacArchiveKind::Sit5) | Some(MacArchiveKind::Sea) => {
             parse_sit_family(raw)
         }

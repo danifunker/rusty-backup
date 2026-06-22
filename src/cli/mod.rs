@@ -264,11 +264,12 @@ pub enum Command {
         cmd: verbs::partmap::PartmapCommand,
     },
 
-    /// Read classic StuffIt and Compact Pro archives (list / extract; accepts
-    /// .sit, .sea, .cpt, and their BinHex-wrapped .hqx forms).
-    Sit {
+    /// Read/write classic Mac archives (list / extract / create; accepts
+    /// .sit, .sea, .cpt, .mar, and their BinHex-wrapped .hqx forms).
+    #[command(alias = "sit")]
+    Archive {
         #[command(subcommand)]
-        cmd: verbs::sit::SitCommand,
+        cmd: verbs::archive::ArchiveCommand,
     },
 
     /// Open an interactive rb-cli shell (rustyline-based REPL).
@@ -351,7 +352,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Optical { cmd } => verbs::optical::run(cmd),
         Command::Floppy { cmd } => verbs::floppy::run(cmd),
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
-        Command::Sit { cmd } => verbs::sit::run(cmd),
+        Command::Archive { cmd } => verbs::archive::run(cmd),
         Command::Terminal => verbs::terminal::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),

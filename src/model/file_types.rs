@@ -39,7 +39,7 @@ pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
 /// Macintosh archive / encoding extensions (StuffIt + Compact Pro + BinHex), a
 /// picker group for the Archives tab. Includes uppercase variants for
 /// case-sensitive pickers; new entries are lowercase-only (`cpt`).
-pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "cpt", "SIT", "HQX", "SEA"];
+pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "cpt", "mar", "SIT", "HQX", "SEA"];
 
 /// ProgId registered under `HKCU\Software\Classes` for disk-image associations.
 pub const DISK_IMAGE_PROGID: &str = "RustyBackup.DiskImage";
@@ -158,10 +158,10 @@ mod tests {
 
     #[test]
     fn mac_archive_family_present() {
-        // StuffIt (.sit/.sea), BinHex (.hqx), and Compact Pro (.cpt) all flow
-        // through `macarchive` detection + the Archives tab. Pin them so a
-        // picker-list cleanup can't silently drop a supported archive format.
-        for must in ["sit", "hqx", "sea", "cpt"] {
+        // StuffIt (.sit/.sea), BinHex (.hqx), Compact Pro (.cpt), and MAR
+        // (.mar) all flow through `macarchive` detection + the Archives tab.
+        // Pin them so a picker-list cleanup can't silently drop a format.
+        for must in ["sit", "hqx", "sea", "cpt", "mar"] {
             assert!(
                 MAC_ARCHIVE_EXTS.contains(&must),
                 "missing Mac archive extension {must}"
