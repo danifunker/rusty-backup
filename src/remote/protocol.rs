@@ -29,6 +29,13 @@ use std::io::{self, Read, Write};
 /// peer immediately ("RBK0" as a u32).
 pub const RB_HELLO_MAGIC: u32 = 0x5242_4B30;
 
+/// The magic as on-the-wire bytes (`b"RBK0"`, network/big-endian order). The
+/// **binary** Family-B handshake (cb-dos) leads with these four bytes; the
+/// daemon peeks them to tell a JSON-free DOS client from a JSON Family-F frame
+/// (whose first four bytes are a little-endian length prefix, always a small
+/// number — never the magic). See [`read_handshake`].
+pub const RB_HELLO_MAGIC_BYTES: [u8; 4] = RB_HELLO_MAGIC.to_be_bytes();
+
 /// Current wire-protocol version. Bump on a breaking change; keep additions
 /// additive so a newer client still talks to an older daemon where possible.
 ///
@@ -51,7 +58,9 @@ pub const DEFAULT_PORT: u16 = 7341;
 // Capability bits advertised in the `Hello` response.
 /// Family F — file transfer (browse / read; the only family in Phase 0).
 pub const CAP_FAMILY_F: u16 = 1 << 0;
-/// Family B — backup stream. Not implemented yet (Phase 4); flag reserved.
+/// Family B — backup stream. The binary **handshake** is implemented (phase
+/// 7a — [`read_handshake`] / [`write_binary_hello`]); the chunk/`.cbk` data
+/// protocol is not, so this bit is advertised only once that lands (7b).
 pub const CAP_FAMILY_B: u16 = 1 << 1;
 
 /// Largest control-frame body we'll accept — guards against a hostile or
@@ -360,6 +369,69 @@ pub fn read_control<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
 
 fn json_err(e: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+// ---------------------------------------------------------------------------
+// Handshake — dual binary (Family B / cb-dos) vs JSON (Family F / desktop)
+// ---------------------------------------------------------------------------
+
+/// The first thing a connection sends, disambiguated by its leading 4 bytes.
+///
+/// A JSON-free DOS client (cb-dos) leads with [`RB_HELLO_MAGIC_BYTES`]; a
+/// desktop client leads with a JSON control frame (its 4-byte little-endian
+/// length prefix). The two are unambiguous because a real JSON frame length is
+/// always far below the magic's numeric value.
+#[derive(Debug)]
+pub enum Handshake {
+    /// Binary Family-B handshake: the client's `(version, capabilities)`.
+    Binary { version: u16, capabilities: u16 },
+    /// A JSON Family-F connection: the first deserialized [`Request`] (its
+    /// length prefix was already consumed while peeking).
+    Json(Request),
+}
+
+/// Read the opening handshake. Peeks the leading 4 bytes: the binary-magic path
+/// reads the rest of the binary `Hello` (`version: u16, capabilities: u16`, both
+/// big-endian); otherwise the 4 bytes are a JSON frame length and the first
+/// [`Request`] is deserialized. Surfaces `UnexpectedEof` verbatim so a peer that
+/// connects and hangs up is a clean disconnect.
+pub fn read_handshake<R: Read>(r: &mut R) -> io::Result<Handshake> {
+    let mut first = [0u8; 4];
+    r.read_exact(&mut first)?;
+    if first == RB_HELLO_MAGIC_BYTES {
+        let mut rest = [0u8; 4];
+        r.read_exact(&mut rest)?;
+        Ok(Handshake::Binary {
+            version: u16::from_be_bytes([rest[0], rest[1]]),
+            capabilities: u16::from_be_bytes([rest[2], rest[3]]),
+        })
+    } else {
+        let len = u32::from_le_bytes(first) as usize;
+        if len > MAX_CONTROL_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control frame exceeds limit",
+            ));
+        }
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)?;
+        serde_json::from_slice(&buf)
+            .map(Handshake::Json)
+            .map_err(json_err)
+    }
+}
+
+/// Write the binary `Hello` reply a cb-dos client expects: the 4 magic bytes
+/// (echoed as an ack), then `version: u16` and `capabilities: u16`, both
+/// big-endian. 8 bytes total; flushed. The mirror of the binary arm of
+/// [`read_handshake`].
+pub fn write_binary_hello<W: Write>(w: &mut W, version: u16, capabilities: u16) -> io::Result<()> {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&RB_HELLO_MAGIC_BYTES);
+    buf[4..6].copy_from_slice(&version.to_be_bytes());
+    buf[6..8].copy_from_slice(&capabilities.to_be_bytes());
+    w.write_all(&buf)?;
+    w.flush()
 }
 
 // ---------------------------------------------------------------------------

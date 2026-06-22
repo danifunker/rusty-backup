@@ -48,4 +48,5 @@ outputs/
 /crusty-backup/dl
 /crusty-backup/net/dl
 /crusty-backup/net/mtcp
+/crusty-backup/net/watt32
 /crusty-backup/net/drivers/*.COM

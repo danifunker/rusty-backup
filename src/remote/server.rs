@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry, WireKind,
-    CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    read_chunks, read_control, read_handshake, write_binary_hello, write_control, ChunkWriter,
+    Handshake, Request, Response, WireEntry, WireKind, CAP_FAMILY_F, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -132,6 +133,32 @@ pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBu
     Ok(())
 }
 
+/// Handle a binary Family-B client (cb-dos / `CRUSTYBK.EXE`).
+///
+/// **Phase 7a — handshake only.** The opening binary `Hello` has already been
+/// read; here we reply with our version + capabilities and acknowledge the
+/// peer. The chunk / `.cbk` data protocol (7b onward) isn't implemented yet, so
+/// after the reply we log and close — a hello-world client confirms the
+/// transport + handshake and disconnects. The reader is retained (not yet read)
+/// so the signature is stable when the chunk loop lands.
+fn handle_family_b(
+    _reader: BufReader<TcpStream>,
+    mut writer: BufWriter<TcpStream>,
+    client_version: u16,
+    client_caps: u16,
+) -> Result<()> {
+    eprintln!(
+        "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x}); \
+         chunk protocol not yet implemented (7a handshake only)"
+    );
+    // Advertise the capabilities we actually serve. Family B's data protocol
+    // isn't built, so we report CAP_FAMILY_F only for now; the CAP_FAMILY_B bit
+    // flips on when the chunk stream (7b) lands.
+    write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F)
+        .context("writing Family-B hello reply")?;
+    Ok(())
+}
+
 /// Serve one connection until the peer says `Bye` or hangs up.
 fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Result<()> {
     stream.set_nodelay(true).ok();
@@ -146,12 +173,41 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut next_session: u64 = 1;
 
+    // The opening frame disambiguates a JSON-free Family-B client (cb-dos —
+    // leads with the binary magic) from a JSON Family-F client (desktop). A
+    // binary client diverges entirely into the Family-B handler; a JSON client
+    // seeds the first request into the existing operation loop.
+    let mut pending: Option<Request> = match read_handshake(&mut reader) {
+        Ok(Handshake::Binary {
+            version,
+            capabilities,
+        }) => {
+            if version < MIN_PROTOCOL_VERSION {
+                // Can't speak the JSON error path to a binary client; just log
+                // and drop. The reply omits any capability so the client sees
+                // the mismatch (its own version is above ours).
+                eprintln!(
+                    "rb-cli serve: rejecting Family-B client (version {version} < {MIN_PROTOCOL_VERSION})"
+                );
+                return Ok(());
+            }
+            return handle_family_b(reader, writer, version, capabilities);
+        }
+        // Peer hung up before sending anything — a clean end, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e).context("reading handshake"),
+        Ok(Handshake::Json(req)) => Some(req),
+    };
+
     loop {
-        let req: Request = match read_control(&mut reader) {
-            Ok(r) => r,
-            // Peer hung up between requests — a clean end, not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e).context("reading request"),
+        let req: Request = match pending.take() {
+            Some(r) => r,
+            None => match read_control(&mut reader) {
+                Ok(r) => r,
+                // Peer hung up between requests — a clean end, not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) => return Err(e).context("reading request"),
+            },
         };
 
         match req {

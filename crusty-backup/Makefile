@@ -31,7 +31,23 @@ size: all
 	@echo "=== cb-dos POC .exe sizes ==="
 	@ls -l $(POCS) | awk '{printf "%8d bytes  %s\n", $$5, $$9}'
 
+# --- Networked client (WATT-32) -------------------------------------------
+# Not part of `all`: it needs the WATT-32 DJGPP package, fetched separately
+# (BSD-licensed, gitignored). Run `sh net/fetch-watt32.sh` once, then
+# `make net`. WATT-32 gives DJGPP BSD sockets over a packet driver -- see
+# docs/cb_dos_network_and_state.md (§1b) and docs/cb_dos_networking.md.
+WATT32  := net/watt32
+WATTINC := $(WATT32)/inc
+WATTLIB := $(WATT32)/lib
+
+net: $(BUILD)/nethello.exe
+
+$(BUILD)/nethello.exe: src/net_hello.c | $(BUILD)
+	@test -f $(WATTLIB)/libwatt.a || { \
+	  echo "WATT-32 not found -- run: sh net/fetch-watt32.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(WATTINC) $(LDFLAGS) -o $@ $< -L$(WATTLIB) -lwatt
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all size clean
+.PHONY: all size net clean

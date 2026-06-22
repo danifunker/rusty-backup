@@ -1303,6 +1303,72 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
     );
 }
 
+/// Family B binary HANDSHAKE (cb-dos / phase 7a): a JSON-free client connects,
+/// sends the raw binary `Hello` (`b"RBK0"` + version + caps, big-endian), and
+/// reads back the daemon's binary reply (magic echo + version + caps). Proves
+/// the daemon disambiguates a binary Family-B client from a JSON Family-F frame
+/// on the same port and round-trips the exact bytes the DJGPP client will send.
+/// Also asserts a normal JSON Family-F client still connects on the same daemon.
+#[test]
+fn family_b_binary_handshake_over_loopback() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    use rusty_backup::remote::protocol::{PROTOCOL_VERSION, RB_HELLO_MAGIC, RB_HELLO_MAGIC_BYTES};
+    use rusty_backup::remote::RemoteConnection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // A served image, so the JSON-client half of the test has something to open.
+    make_fat_image(&root.join("disk.img"), "HSVOL", "H.BIN", 0x33, 1024);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // --- binary Family-B client (what cb-dos sends): 8 bytes out, 8 bytes in ---
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    let mut req = Vec::new();
+    req.extend_from_slice(&RB_HELLO_MAGIC_BYTES); // b"RBK0"
+    req.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes()); // client version
+    req.extend_from_slice(&0u16.to_be_bytes()); // client caps (none yet)
+    sock.write_all(&req).unwrap();
+    sock.flush().unwrap();
+
+    let mut reply = [0u8; 8];
+    sock.read_exact(&mut reply).unwrap();
+    assert_eq!(
+        &reply[0..4],
+        &RB_HELLO_MAGIC_BYTES,
+        "daemon echoes the magic so the client can confirm it reached an rb daemon"
+    );
+    let reply_version = u16::from_be_bytes([reply[4], reply[5]]);
+    let reply_caps = u16::from_be_bytes([reply[6], reply[7]]);
+    assert_eq!(
+        reply_version, PROTOCOL_VERSION,
+        "daemon reports its version"
+    );
+    // The magic round-trips as a u32 too (documents the byte order).
+    assert_eq!(
+        u32::from_be_bytes([reply[0], reply[1], reply[2], reply[3]]),
+        RB_HELLO_MAGIC
+    );
+    // 7a advertises Family F (the chunk protocol isn't built yet); just assert
+    // the daemon answered with a well-formed, non-garbage capability word.
+    assert!(reply_caps != 0xFFFF, "capabilities are a real bitfield");
+
+    // --- a JSON Family-F client still connects on the same daemon ---
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let devices = conn.lock().unwrap().list_devices();
+    assert!(
+        devices.is_ok(),
+        "JSON Family-F handshake still works alongside the binary one"
+    );
+}
+
 /// Remote per-partition MINIMUM-SIZE calc over the block tier: drive the
 /// `min_size_runner` worker with a `MinSizeSource::Remote { is_device: false }`
 /// against a served FAT image and prove it computes an in-place minimum well

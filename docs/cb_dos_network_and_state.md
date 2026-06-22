@@ -107,17 +107,34 @@ retransmit, compile-in/out features for size). Docs:
 - FreeDOS setup guide: <http://help.fdos.org/en/hhstndrd/network/mtcp.htm>
 - Source (unofficial fork w/ DOS build host): <https://github.com/retrohun/mTCP>
 
-**Open decision — borrow vs port.** mTCP is **Open Watcom / C++**; our POC is
-**DJGPP / C**. Options:
-- **Borrow mTCP TCP**: get correct TCP for free, but solve toolchain mixing
-  (build mTCP objects under Watcom and link, or switch cb-dos to Watcom).
-- **Port mTCP's UDP/IP/ARP to DJGPP** and hand-roll our thin reliability layer on
-  UDP (a few hundred lines) — keeps one toolchain, avoids inheriting TCP.
-- **Hand-roll TCP**: rejected — connection state machine / RTT / congestion is a
-  real project; mTCP exists precisely so we don't.
+**Decision (2026-06-21) — WATT-32, not mTCP.** mTCP is **Open Watcom / C++**;
+cb-dos is **DJGPP / C**, and the borrow-vs-port question (build mTCP under Watcom
+and link, switch cb-dos to Watcom, or port mTCP's UDP/IP to DJGPP and hand-roll
+reliability) all carried real cost. **WATT-32** (Gisle Vanem / Erick Engelke,
+the Waterloo-TCP lineage) dissolves it: it builds **natively under DJGPP** and
+exposes a **BSD-sockets API** (`socket`/`connect`/`send`/`recv`/`closesocket`)
+over the same Crynwr packet driver. One toolchain, real TCP, no Watcom.
 
-Leaning: if we want TCP, **borrow mTCP**; resolve the toolchain question in the
-Phase-7 spike. Reserve raw-L2/UDP only if a reason resurfaces.
+- **Acquisition:** the **prebuilt DJGPP binary package** (`wat3211b.zip` on the
+  DJGPP mirrors) ships `libwatt.a` + headers — no cross-build of the stack from
+  source. Fetched by [`../crusty-backup/net/fetch-watt32.sh`](../crusty-backup/net/fetch-watt32.sh)
+  into `net/watt32/` (gitignored, like the mTCP apps); the `make net` target
+  links `-Lnet/watt32/lib -lwatt`.
+- **License:** WATT-32 is **BSD** (Regents of California). The historical
+  advertising-acknowledgment clause is a **permitted additional term under
+  AGPL-3.0 §7**, so it is compatible with this project's AGPL-3.0 — the license
+  file travels with the library.
+- **Startup:** `sock_init()` brings up the packet driver + IP (DHCP or static
+  from `WATTCP.CFG`); blocking `recv`/`send` drive the stack internally — no
+  hand-rolled tick loop in the client.
+- Considered-and-rejected: **borrow mTCP** (Watcom toolchain split), **port
+  mTCP UDP + hand-rolled reliability** (gives up free TCP), **hand-roll TCP**
+  (a real project — the whole reason a stack exists). Reserve raw-L2/UDP only if
+  a reason resurfaces.
+
+mTCP's prebuilt **apps** (DHCP/FTP/PING) still ride the CD for manual/diagnostic
+use ([`cb_dos_networking.md`](cb_dos_networking.md)); WATT-32 is specifically the
+*library the streaming client links*.
 
 ### 1c. The DOS driver requirement (no way around *some* driver)
 
@@ -489,8 +506,9 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## 8. Open risks / unknowns
 
-- **mTCP toolchain mixing** — Open Watcom/C++ vs our DJGPP/C. Resolve borrow-vs-
-  port in the Phase-7 spike (§1b).
+- ~~**mTCP toolchain mixing** — Open Watcom/C++ vs our DJGPP/C.~~ **Resolved
+  (§1b): WATT-32** (DJGPP-native BSD sockets, prebuilt `libwatt.a`) — no Watcom,
+  one toolchain. The `nethello` client links it and compiles clean under DJGPP.
 - **DOS IP config UX** — static IP (one `AUTOEXEC.BAT` line) vs DHCP client;
   detect/guide.
 - **Container ↔ folder bridge** — ship (a) materialize-at-finalize first; (b)
@@ -515,11 +533,21 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 > the native format first. Networking only swaps the *destination* under a working
 > engine.
 
-- [ ] **7a — Frame/socket hello-world.** DOS: bind packet driver, bring up
-      IP/ARP (borrowed or minimal), open a TCP socket to the host, exchange a
-      greeting. Host: `rb-cli serve` (Family B) accepts a plain socket, prints peer.
-      Resolve the mTCP borrow-vs-port question here. Test in 86Box (SLiRP +
-      port-forward).
+- [~] **7a — Frame/socket hello-world.** **Engine + client written; runtime
+      check pending.**
+      - **Host (done, headless-tested):** `rb-cli serve` now accepts a **binary
+        Family-B handshake** alongside the JSON Family-F one on the same port —
+        `read_handshake` peeks the 4-byte magic (`b"RBK0"`) to disambiguate, and
+        `write_binary_hello` replies (`magic + version + caps`, big-endian).
+        `src/remote/{protocol,server}.rs`; loopback test
+        `family_b_binary_handshake_over_loopback`.
+      - **DOS client (done, compile-verified):** `crusty-backup/src/net_hello.c`
+        (`NETHELLO.EXE`) — **WATT-32** `sock_init` + BSD `socket`/`connect`/
+        `send`/`recv`, sends the binary Hello to `<agent-ip>:7341`, prints the
+        reply. Builds clean under DJGPP (`make -C crusty-backup net`).
+      - **Pending (user, hardware/emulator):** run `NETHELLO` in DOSBox-X/86Box
+        (SLiRP + port-forward to a host `rb-cli serve`) or on a real NIC; confirm
+        the handshake round-trips. Resolve the WATTCP.CFG/DHCP UX while there.
 - [ ] **7b — Chunk protocol + container.** Define `.cbk` chunk header + index;
       stop-and-go single-member PUT DOS→host; byte-verify; write/read the index.
 - [ ] **7c — Whole-folder backup over wire.** Stream a full native folder as
@@ -542,6 +570,19 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-21 — **Phase 7a started (socket + handshake hello-world).** Resolved
+  the long-open **TCP-stack question: WATT-32** (DJGPP-native BSD sockets,
+  prebuilt `libwatt.a`, BSD/AGPL-compatible) over mTCP/Watcom (§1b). Host:
+  `rb-cli serve` gained a **binary Family-B handshake** path that coexists with
+  the JSON Family-F handshake on one port (peek the `b"RBK0"` magic) —
+  `read_handshake` / `write_binary_hello` in `src/remote/protocol.rs`,
+  `handle_family_b` in `server.rs`; headless test
+  `family_b_binary_handshake_over_loopback`. DOS client:
+  `crusty-backup/src/net_hello.c` (`NETHELLO.EXE`) connects to an agent IP and
+  exchanges the binary Hello — compiles clean under DJGPP via the new `make net`
+  target + `net/fetch-watt32.sh`. Runtime check on real NIC / DOSBox-X is the
+  next step (the only remaining 7a item). The chunk/`.cbk` data protocol (7b+)
+  is untouched.
 - 2026-06-03 — Scoping discussion captured into this doc. **Transport: TCP/IP over
   the Crynwr packet driver** (not raw L2 / serial / parallel) — chosen for TCP's
   free reliability + a **plain-socket, unprivileged, SLiRP-friendly host** (vs.
