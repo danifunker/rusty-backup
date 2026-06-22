@@ -138,8 +138,12 @@ DB) is what the MiSTer actually needs to run the daemon — the near-term §4
 replacement per the user. Not started.
 
 ### Smaller cleanups / risks
+> **Per-partition remote sizing + superfloppy remote device have a dedicated,
+> scoped resume prompt: `docs/remote_backup_sizing_resume.md`** (file:line seams,
+> the image-vs-device runner gotcha, and headless test plan). Start there for
+> those two.
 - **Superfloppy remote device** (no partition table) — exercise + polish the
-  `PartitionTable::None` path for a bare-FS device.
+  `PartitionTable::None` path for a bare-FS device. See the dedicated prompt above.
 - **macOS `/dev/rdiskN` read-alignment** — `OpenDevice` reads are unaligned;
   fine on Linux/MiSTer (the target), would need aligned reads for a macOS daemon.
 - **NTFS/exFAT packer** — FIXED (`462f371`). Was a confirmed data-loss bug: the
@@ -155,6 +159,10 @@ replacement per the user. Not started.
 - **Per-partition sizing UI for remote** — the Backup tab's min-size / frag /
   Compact columns stay empty for a remote source (the engine computes shrink on
   the materialized temp, but the user can't pick per-partition custom sizes).
+  **Scoped prompt: `docs/remote_backup_sizing_resume.md`** — root cause is the
+  maps are never populated (`poll_remote` skips it, `start_min_size_calc` has no
+  Remote arm); the `min_size_runner` Remote arm already works but opens an image,
+  not a device (the one real fix).
 - **Daemon elevation** — we *require* the daemon already runs as root for
   `OpenDevice`; we don't escalate. Fine for the MiSTer; a general desktop daemon
   just errors if unprivileged.
