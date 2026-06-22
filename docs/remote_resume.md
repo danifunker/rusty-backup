@@ -142,16 +142,16 @@ replacement per the user. Not started.
   `PartitionTable::None` path for a bare-FS device.
 - **macOS `/dev/rdiskN` read-alignment** — `OpenDevice` reads are unaligned;
   fine on Linux/MiSTer (the target), would need aligned reads for a macOS daemon.
-- **NTFS/exFAT packer** — INVESTIGATED, unresolved. `CompactNtfsReader`
-  dense-packs used clusters **by index** without rewriting the MFT's absolute-LCN
-  data runs, and restore writes the compacted bytes verbatim + zero-pads (no
-  re-scatter) — which *would* lose non-resident file data on fragmented volumes.
-  But the only round-trip test uses a **resident** (inline) file, so the path is
-  untested, and the test passes in a way the dense-pack reading doesn't fully
-  predict, so it's unconfirmed. Pre-existing + identical local/remote (doesn't
-  gate Family F). Needs a fragmented-NTFS fixture to settle (no
-  `create_blank_ntfs` yet); likely fix = route through `into_layout_preserving()`.
-  See memory note `[[ntfs-exfat-packer-audit]]`.
+- **NTFS/exFAT packer** — FIXED (`462f371`). Was a confirmed data-loss bug: the
+  dense `CompactNtfsReader`/`CompactExfatReader` emitted the boot cluster (LCN 0)
+  twice (prepended boot region + `used_cluster_list[0]==0`), misaligning the
+  stream; with the MFT's absolute-LCN runs unchanged and restore writing verbatim
+  + zero-padding, non-resident files were silently corrupted in smart mode. The
+  old test passed only by a hole/dup cancellation coincidence + read a resident
+  file. Fix routes NTFS/exFAT smart compaction through `into_layout_preserving()`
+  (position-preserving). Regression tests in `tests/filesystem_e2e.rs`
+  (`*_smart_compaction_is_layout_preserving`, `ntfs_compaction_preserves_nonresident_file`).
+  See `[[ntfs-exfat-packer-audit]]`.
 - **Per-partition sizing UI for remote** — the Backup tab's min-size / frag /
   Compact columns stay empty for a remote source (the engine computes shrink on
   the materialized temp, but the user can't pick per-partition custom sizes).
@@ -180,6 +180,7 @@ replacement per the user. Not started.
 
 ## Commit trail (this push, newest first)
 ```
+462f371 fix: NTFS/exFAT smart compaction corrupted non-resident files (data loss)
 8da635c remote: wire GUI edit-mode + Restore-tab remote target
 d79eb60 remote: restore a backup to a remote target (device or image)
 d0ba6f3 remote: resize a remote filesystem in place over the block tier
