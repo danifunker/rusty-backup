@@ -9,11 +9,12 @@ left" pointer.
 
 ## Where we are (2026-06-21, branch `add-crusty-backup-dos-poc`)
 
-> **Update (later 2026-06-21):** remote **editing**, **fsck repair**, and
-> **resize** all shipped over the block tier (engine + headless tests; GUI/CLI
-> wired). See "Remaining items" §1–§2 below — the read-write story is done; the
-> next big item is **Restore to a remote target** (§3). Also fixed a CI-red
-> FAT32 compaction over-pad regression (`993d2ac`).
+> **Update (later 2026-06-21):** remote **editing**, **fsck repair**,
+> **resize**, and **restore-to-a-remote-target** (engine + CLI) all shipped
+> over the block tier (each with a headless test). See §1–§3 below. The full
+> remote read-write story is done on the engine/CLI side; what's left is GUI
+> wiring (compile-only here) + the TUI (§4) + Family B (§5). Also fixed a
+> CI-red FAT32 compaction over-pad regression (`993d2ac`).
 
 Everything is over the **block tier**: the daemon (`rb-cli serve`, protocol v2)
 keeps a file/device open and serves raw byte ranges (`OpenBlock`/`OpenDevice` →
@@ -97,10 +98,24 @@ through `session.open_editable()` for a remote browse?).
   would grow the image, which the block tier can't. CLI-only (the GUI resize
   popup is the partition-table kind); no GUI remote-resize surface.
 
-### 3. Restore-tab remote TARGET  <- NEXT big item
-We did Backup (remote source); Restore to a remote drive/image is the mirror.
-The write seam now exists (`WriteBlock` + RW `RemoteBlockReader` = a remote
-`Write+Seek`).
+### 3. Restore-tab remote TARGET — ENGINE + CLI DONE (`d79eb60`)
+Restore a backup folder to a remote drive/image. `restore::run_restore` is
+`File`-bound (SectorAlignedWriter, set_len, mid-restore re-opens, FS
+finalization via `&mut File`), so instead of rewriting it target-generic this
+**materializes to a local staging image then raw-pushes it** to the remote via
+`WriteBlock` (mirror of remote-CHD backup) — every layout works unchanged.
+- Daemon `OpenWriteTarget{path,is_device,size}`: device opens RW (validated vs
+  `enumerate_devices`, `open_target_for_writing`, elevated); image file is
+  created/truncated to `size` (new `sandbox_join_create`) + opened RW.
+- `model::restore_remote::restore_to_remote` (run_restore -> staging -> push).
+- `rb-cli restore ./backup rb://host/img` (or device path + `--device --yes`).
+- Headless test `restore_to_remote_image_round_trips`.
+- **Left:** GUI Restore-tab "Remote…" target picker (reuse `model::backup_remote`
+  connect + the `RemoteSourceState` UI shape) — not started; restore-to-remote
+  is **CLI-only** so far. Device-write target needs an elevated daemon + is
+  interactive-verify only (image-file target is the headlessly-tested path).
+  Future optimization: a streaming target seam (make `run_restore` target-
+  generic) to skip the staging image + second pass.
 We did Backup (remote source); Restore to a remote drive/image is the mirror.
 `restore/mod.rs` writes to a path/device — needs the same write seam as #1
 (`WriteBlock` / a remote `Write+Seek`), plus a Restore-tab "Remote…" target
@@ -149,6 +164,7 @@ round-trip). MiSTer install packaging/service (Scripts `.sh` + downloader DB).
 
 ## Commit trail (this push, newest first)
 ```
+d79eb60 remote: restore a backup to a remote target (device or image)
 d0ba6f3 remote: resize a remote filesystem in place over the block tier
 993d2ac fix: FAT compaction over-padded FAT32, breaking small volumes (CI red)
 65c2919 remote: fsck repair over the wire (run_repair_reader)
