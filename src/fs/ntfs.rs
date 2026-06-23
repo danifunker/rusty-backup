@@ -9,6 +9,12 @@ use super::filesystem::{
 };
 use super::CompactResult;
 
+/// NTFS update-sequence (fixup) block size: one USA entry protects each
+/// 512-byte block of a multi-sector structure, regardless of the volume's
+/// actual sector size. (A 4096-byte record on a 4096-byte-sector volume still
+/// carries 4096/512 + 1 = 9 USA entries.)
+const NTFS_BLOCK_SIZE: usize = 512;
+
 // Well-known MFT record numbers
 const MFT_RECORD_VOLUME: u64 = 3;
 const MFT_RECORD_ROOT: u64 = 5;
@@ -334,7 +340,7 @@ pub(crate) fn parse_mft_attributes(record: &[u8], record_size: u32) -> Vec<MftAt
 }
 
 /// Apply fixup array to an MFT record buffer.
-pub(crate) fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<(), FilesystemError> {
+pub(crate) fn apply_fixup(record: &mut [u8]) -> Result<(), FilesystemError> {
     if record.len() < 48 {
         return Err(FilesystemError::Parse(
             "MFT record too small for fixup".into(),
@@ -351,7 +357,9 @@ pub(crate) fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<()
     let signature = u16::from_le_bytes([record[fixup_offset], record[fixup_offset + 1]]);
 
     for i in 1..fixup_count {
-        let sector_end = i * bytes_per_sector as usize;
+        // NTFS fixups are spaced one per 512-byte block, independent of the
+        // volume's actual sector size (a 4096-byte record uses 9 USA entries).
+        let sector_end = i * NTFS_BLOCK_SIZE;
         if sector_end < 2 || sector_end > record.len() {
             break;
         }
@@ -359,7 +367,7 @@ pub(crate) fn apply_fixup(record: &mut [u8], bytes_per_sector: u64) -> Result<()
         let stored = u16::from_le_bytes([record[pos], record[pos + 1]]);
         if stored != signature {
             return Err(FilesystemError::Parse(format!(
-                "MFT fixup mismatch at sector {i}: expected {signature:#06x}, got {stored:#06x}"
+                "MFT fixup mismatch at block {i}: expected {signature:#06x}, got {stored:#06x}"
             )));
         }
         let replace_offset = fixup_offset + i * 2;
@@ -499,7 +507,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             )));
         }
 
-        apply_fixup(&mut record, self.bytes_per_sector)?;
+        apply_fixup(&mut record)?;
 
         if self.mft_cache.len() >= Self::MFT_CACHE_MAX {
             self.mft_cache.clear();
@@ -977,7 +985,7 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
                 continue;
             }
 
-            if apply_fixup(&mut record_buf, self.bytes_per_sector).is_err() {
+            if apply_fixup(&mut record_buf).is_err() {
                 continue;
             }
 
@@ -1280,9 +1288,12 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
     /// See [`crate::fs::ntfs_format::ntfs_min_packed_size`] and `ntfs_clone`.
     fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
         let entries = self.mft_record_capacity().saturating_sub(24);
+        // The defragmenting clone inherits the source volume's cluster size, so
+        // size the target with the same cluster.
         Ok(crate::fs::ntfs_format::ntfs_min_packed_size(
             self.used_bytes,
             entries,
+            self.cluster_size,
         ))
     }
 }
@@ -1396,7 +1407,7 @@ fn validate_ntfs_name(name: &str) -> Result<(), FilesystemError> {
 }
 
 /// Prepare fixup array for writing an MFT record (inverse of apply_fixup).
-fn prepare_fixup(record: &mut [u8], bytes_per_sector: u64) {
+fn prepare_fixup(record: &mut [u8]) {
     let fixup_offset = u16::from_le_bytes([record[0x04], record[0x05]]) as usize;
     let fixup_count = u16::from_le_bytes([record[0x06], record[0x07]]) as usize;
 
@@ -1413,7 +1424,8 @@ fn prepare_fixup(record: &mut [u8], bytes_per_sector: u64) {
     // For each sector, save the real last-2-bytes into the fixup array slot,
     // then write the USN at the sector end
     for i in 1..fixup_count {
-        let sector_end = i * bytes_per_sector as usize;
+        // One USA entry per 512-byte NTFS block (see apply_fixup).
+        let sector_end = i * NTFS_BLOCK_SIZE;
         if sector_end < 2 || sector_end > record.len() {
             break;
         }
@@ -1683,8 +1695,8 @@ fn assemble_mft_record(attrs: &[Vec<u8>], flags: u16, record_size: u32) -> Vec<u
     record[0..4].copy_from_slice(b"FILE");
     // Fixup offset = 0x30
     record[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
-    // Fixup count = 3 (for 1024-byte record with 512-byte sectors: 1 USN + 2 entries)
-    let fixup_count = (record_size / 512 + 1) as u16;
+    // One USN entry per 512-byte NTFS block (1024-byte record -> 3 entries).
+    let fixup_count = (record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
     record[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
     // Log file sequence = 0 (offset 0x08..0x10)
     // Sequence number = 1 (offset 0x10..0x12)
@@ -1759,7 +1771,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
         record_number: u64,
         record: &mut [u8],
     ) -> Result<(), FilesystemError> {
-        prepare_fixup(record, self.bytes_per_sector);
+        prepare_fixup(record);
         let logical = record_number * self.mft_record_size as u64;
         if self.mft_data_runs.is_empty() {
             let record_offset = self.cluster_offset(self.mft_cluster) + logical;
@@ -1934,7 +1946,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                         blank[0..4].copy_from_slice(b"FILE");
                         blank[0x04..0x06].copy_from_slice(&0x0030u16.to_le_bytes());
                         let fixup_count =
-                            (self.mft_record_size / self.bytes_per_sector as u32 + 1) as u16;
+                            (self.mft_record_size / NTFS_BLOCK_SIZE as u32 + 1) as u16;
                         blank[0x06..0x08].copy_from_slice(&fixup_count.to_le_bytes());
                         blank[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // seq = 1
                         let first_attr = (0x30 + fixup_count as usize * 2 + 7) & !7;
@@ -2288,7 +2300,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
             // Apply fixup to work with the record
             let mut indx = alloc_data[pos..pos + indx_size].to_vec();
-            let _ = apply_fixup(&mut indx, self.bytes_per_sector);
+            let _ = apply_fixup(&mut indx);
 
             let node_offset = 0x18;
             if node_offset + 16 > indx.len() {
@@ -2334,7 +2346,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                     .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
 
                 // Apply fixup for writing back
-                prepare_fixup(&mut indx, self.bytes_per_sector);
+                prepare_fixup(&mut indx);
                 alloc_data[pos..pos + indx_size].copy_from_slice(&indx);
                 return Ok(true);
             }
@@ -2541,7 +2553,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
             }
 
             let mut indx = alloc_data[pos..pos + indx_size].to_vec();
-            let _ = apply_fixup(&mut indx, self.bytes_per_sector);
+            let _ = apply_fixup(&mut indx);
 
             let node_offset = 0x18;
             if node_offset + 16 > indx.len() {
@@ -2577,7 +2589,7 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
                 indx[node_offset + 4..node_offset + 8]
                     .copy_from_slice(&(new_entries_size as u32).to_le_bytes());
 
-                prepare_fixup(&mut indx, self.bytes_per_sector);
+                prepare_fixup(&mut indx);
                 alloc_data[pos..pos + indx_size].copy_from_slice(&indx);
                 return Ok(true);
             }
@@ -2963,7 +2975,7 @@ impl<R: Read + Seek> CompactNtfsReader<R> {
         if &record[0..4] != b"FILE" {
             return Err(FilesystemError::Parse("$Bitmap MFT record invalid".into()));
         }
-        apply_fixup(&mut record, vbr.bytes_per_sector)?;
+        apply_fixup(&mut record)?;
 
         let attrs = parse_mft_attributes(&record, vbr.mft_record_size);
         let mut bitmap_data = Vec::new();
@@ -3209,7 +3221,6 @@ pub fn resize_ntfs_in_place(
         bitmap_offset,
         partition_offset,
         mft_record_size,
-        bytes_per_sector,
         cluster_size,
     ) {
         let last_data_byte = (last_cluster + 1) * cluster_size;
@@ -3254,7 +3265,6 @@ fn read_last_used_cluster_from_bitmap(
     bitmap_record_offset: u64,
     partition_offset: u64,
     mft_record_size: u32,
-    bytes_per_sector: u64,
     cluster_size: u64,
 ) -> Result<u64> {
     file.seek(SeekFrom::Start(bitmap_record_offset))?;
@@ -3264,7 +3274,7 @@ fn read_last_used_cluster_from_bitmap(
     if &record[0..4] != b"FILE" {
         bail!("$Bitmap MFT record invalid");
     }
-    apply_fixup(&mut record, bytes_per_sector).map_err(|e| anyhow::anyhow!("{e}"))?;
+    apply_fixup(&mut record).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let attrs = parse_mft_attributes(&record, mft_record_size);
     for attr in &attrs {
@@ -3352,7 +3362,7 @@ pub fn validate_ntfs_integrity(
         return Ok(false);
     }
 
-    if let Err(e) = apply_fixup(&mut record, bytes_per_sector) {
+    if let Err(e) = apply_fixup(&mut record) {
         log_cb(&format!("NTFS validation: $MFT fixup failed: {e}"));
         return Ok(false);
     }
@@ -3637,7 +3647,7 @@ mod tests {
         let original = record.clone();
 
         // prepare_fixup should save original bytes and stamp USN
-        prepare_fixup(&mut record, 512);
+        prepare_fixup(&mut record);
 
         // The sector ends should now contain the USN
         let usn = u16::from_le_bytes([record[0x30], record[0x31]]);
@@ -3653,7 +3663,7 @@ mod tests {
         assert_eq!(record[0x35], original[1023]);
 
         // apply_fixup should restore original bytes
-        apply_fixup(&mut record, 512).unwrap();
+        apply_fixup(&mut record).unwrap();
         assert_eq!(record[510], original[510]);
         assert_eq!(record[511], original[511]);
         assert_eq!(record[1022], original[1022]);

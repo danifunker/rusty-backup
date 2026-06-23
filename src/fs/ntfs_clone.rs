@@ -229,7 +229,7 @@ mod tests {
         write_file(&mut src, &sub, "nested.bin", &[1, 2, 3, 4, 5, 6, 7, 8]);
         EditableFilesystem::sync_metadata(&mut src).unwrap();
 
-        let target_size = ntfs_min_packed_size(src.used_size(), 64);
+        let target_size = ntfs_min_packed_size(src.used_size(), 64, 4096);
         let mut out = Cursor::new(Vec::<u8>::new());
         let report =
             stream_defragmented_ntfs(&mut src, target_size, &mut out, &mut |_| {}, &mut |_| {})
