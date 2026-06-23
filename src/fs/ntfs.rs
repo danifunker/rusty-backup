@@ -447,6 +447,24 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         Ok(fs)
     }
 
+    /// Consume the filesystem and return the underlying reader/writer. Used by
+    /// the defragmenting clone to drain the freshly repacked tempfile.
+    pub(crate) fn into_reader(self) -> R {
+        self.reader
+    }
+
+    /// Number of MFT records the source `$MFT` can address (its `$DATA`
+    /// allocation / record size). A safe upper bound on the records the clone
+    /// target needs — the repacked volume holds the same files. Used to size
+    /// the blank target's MFT via [`crate::fs::ntfs_format::create_blank_ntfs`].
+    pub fn mft_record_capacity(&self) -> u64 {
+        let clusters: u64 = self.mft_data_runs.iter().map(|r| r.length).sum();
+        if self.mft_record_size == 0 {
+            return 64;
+        }
+        (clusters * self.cluster_size / self.mft_record_size as u64).max(64)
+    }
+
     /// Absolute byte offset for a cluster number.
     fn cluster_offset(&self, cluster: u64) -> u64 {
         self.partition_offset + cluster * self.cluster_size
@@ -1253,6 +1271,19 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
         // NTFS has a backup boot sector at the last sector
         let backup_boot = self.total_sectors * self.bytes_per_sector;
         Ok(data_end.max(backup_boot))
+    }
+
+    /// The packed (defragmenting-clone) target size: a fresh NTFS holding only
+    /// the used data + the system files + an MFT sized for this volume's file
+    /// count. Unlike `last_data_byte` (the in-place trim, pinned high by a lone
+    /// allocated cluster on a fragmented volume), this is what the clone emits.
+    /// See [`crate::fs::ntfs_format::ntfs_min_packed_size`] and `ntfs_clone`.
+    fn defragmented_minimum_size(&mut self) -> Result<u64, FilesystemError> {
+        let entries = self.mft_record_capacity().saturating_sub(24);
+        Ok(crate::fs::ntfs_format::ntfs_min_packed_size(
+            self.used_bytes,
+            entries,
+        ))
     }
 }
 
@@ -2164,6 +2195,16 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
                 // Index node header is at ir_start + 16
                 let node_start = ir_start + 16;
+                // If this $INDEX_ROOT is a B-tree ROOT (flags bit 0 = "node has
+                // children" — entries carry trailing child VCNs into
+                // $INDEX_ALLOCATION), a new leaf entry must NOT be spliced in
+                // here; that mangles the internal node and breaks name lookups
+                // (e.g. ntfs-3g resolving $Secure through the root index).
+                // Defer to the leaf INDX block instead.
+                let node_flags = record[node_start + 0x0C];
+                if node_flags & 0x01 != 0 {
+                    return Ok(false);
+                }
                 let entries_offset = u32::from_le_bytes([
                     record[node_start],
                     record[node_start + 1],

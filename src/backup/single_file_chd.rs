@@ -1463,6 +1463,8 @@ fn stage_partitions_to_zst(
                 fs::DefragCloneShape::Flat => "flat HFS+",
                 fs::DefragCloneShape::Wrapped => "wrapped HFS+",
                 fs::DefragCloneShape::Pfs3 => "PFS3 (Amiga)",
+                fs::DefragCloneShape::Exfat => "exFAT",
+                fs::DefragCloneShape::Ntfs => "NTFS",
             };
             phase_cb(&format!(
                 "Staging partition-{} ({} of {}): analyzing {} catalog (may take minutes)...",
@@ -1539,6 +1541,72 @@ fn stage_partitions_to_zst(
                                 rsrc_bytes_copied: 0,
                                 xattrs_copied: 0,
                                 hardlinks_copied: pr.hardlinks_copied,
+                                dir_hardlinks_copied: 0,
+                                bytes_emitted: target_len,
+                            })
+                        }
+                        fs::DefragCloneShape::Exfat => {
+                            let br = std::io::BufReader::new(producer_clone);
+                            let mut ex = fs::exfat::ExfatFilesystem::open(br, part_offset)
+                                .context("open source exFAT for defrag-clone")?;
+                            let sink_for_log = sink_for_clone.clone();
+                            let mut clone_log = |s: &str| {
+                                if let Some(sink) = &sink_for_log {
+                                    sink(s);
+                                }
+                            };
+                            let mut clone_progress = |_emitted: u64| {};
+                            let pr = fs::exfat_clone::stream_defragmented_exfat(
+                                &mut ex,
+                                target_len,
+                                &mut writer,
+                                &mut clone_log,
+                                &mut clone_progress,
+                            )
+                            .context("stream_defragmented_exfat")?;
+                            for w in &pr.warnings {
+                                eprintln!("exFAT clone warning: {w}");
+                            }
+                            Ok(fs::hfsplus_defrag::DefragReport {
+                                files_copied: pr.files_copied,
+                                dirs_copied: pr.dirs_copied,
+                                data_bytes_copied: pr.bytes_copied,
+                                rsrc_bytes_copied: 0,
+                                xattrs_copied: 0,
+                                hardlinks_copied: 0,
+                                dir_hardlinks_copied: 0,
+                                bytes_emitted: target_len,
+                            })
+                        }
+                        fs::DefragCloneShape::Ntfs => {
+                            let br = std::io::BufReader::new(producer_clone);
+                            let mut nt = fs::ntfs::NtfsFilesystem::open(br, part_offset)
+                                .context("open source NTFS for defrag-clone")?;
+                            let sink_for_log = sink_for_clone.clone();
+                            let mut clone_log = |s: &str| {
+                                if let Some(sink) = &sink_for_log {
+                                    sink(s);
+                                }
+                            };
+                            let mut clone_progress = |_emitted: u64| {};
+                            let pr = fs::ntfs_clone::stream_defragmented_ntfs(
+                                &mut nt,
+                                target_len,
+                                &mut writer,
+                                &mut clone_log,
+                                &mut clone_progress,
+                            )
+                            .context("stream_defragmented_ntfs")?;
+                            for w in &pr.warnings {
+                                eprintln!("NTFS clone warning: {w}");
+                            }
+                            Ok(fs::hfsplus_defrag::DefragReport {
+                                files_copied: pr.files_copied,
+                                dirs_copied: pr.dirs_copied,
+                                data_bytes_copied: pr.bytes_copied,
+                                rsrc_bytes_copied: 0,
+                                xattrs_copied: 0,
+                                hardlinks_copied: 0,
                                 dir_hardlinks_copied: 0,
                                 bytes_emitted: target_len,
                             })

@@ -404,8 +404,8 @@ inspect-tab Edit Mode.
 | FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies |
 | FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x |
 | FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux |
-| exFAT          | Yes    | Yes  | Yes             | —    | Modern removable media |
-| NTFS           | Yes    | Yes  | Yes             | —    | Windows NT / 2000 / XP |
+| exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. |
+| NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch formatter, validated to mount under ntfs-3g). |
 | ext2 / ext3 / ext4 | Yes | Yes | Yes             | —    | Early Linux installs onward |
 | HFS (Mac OS Standard) | Yes | Yes | Yes         | Yes (check + repair: replica copy, bitmap fixup, lost+found for orphans) | Classic Mac OS 68k / early PowerPC. Includes block-size expansion via clone (`Expand HFS Volume…`). |
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. |
