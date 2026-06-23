@@ -37,6 +37,12 @@ pub struct PutArgs {
     /// Destination path inside the filesystem (cp-like positional).
     pub dst: Option<String>,
 
+    /// Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the
+    /// destination as an exact literal path (it never globs), so glob
+    /// metacharacters in a name are used verbatim with or without it.
+    #[arg(short = 'L', long = "literal", alias = "no-glob")]
+    pub literal: bool,
+
     /// Pre-allocate N zero bytes instead of copying a host file. Pair
     /// with `--dst`.
     #[arg(long, conflicts_with_all = ["host_file", "boot"])]

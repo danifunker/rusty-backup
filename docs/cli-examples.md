@@ -48,6 +48,19 @@ rb-cli put   disk.dsk ./Extensions/ATM /System/Extensions/ATM
 rb-cli put disk.dsk --boot ./bootblocks.bin
 ```
 
+## Create a blank NTFS volume
+
+```bash
+# Auto geometry (cluster size chosen from the volume size, 512-byte sectors)
+rb-cli new disk.img --fs ntfs --size 64M --name DATA
+
+# Pick the cluster and sector size explicitly
+rb-cli new disk.img --fs ntfs --size 1G --cluster-size 64K --sector-size 4096
+```
+
+The result is a bare single-partition NTFS superfloppy (no MBR/GPT), validated
+to mount under ntfs-3g; the size is rounded down to a whole cluster.
+
 ## Round-trip a real device through backup + restore
 
 ```bash
@@ -77,6 +90,20 @@ rb-cli ls disk.hda '/Apps/*.{bin,exe}' --exclude '/Apps/uninstall.exe'
 
 # Recursively remove every match (deepest-first, atomic-ish — one sync)
 rb-cli rm disk.hda '/Apps/temp/*' -r
+```
+
+When a name itself contains a glob metacharacter (`* ? [ ] { }` — common on
+classic-Mac volumes), pass `--literal` (`-L`) to address it verbatim instead of
+treating it as a pattern:
+
+```bash
+# A folder literally named "Columns ][ 1.1" — without --literal the `][`
+# parses as an unclosed character class and the command fails.
+rb-cli ls --literal disk.hda '/Games/1992/Columns ][ 1.1'
+
+# Extract or remove an exact path containing brackets or braces
+rb-cli get-binhex --literal disk.hda '/Games/Foo/Bar [data].rsrc' out.hqx
+rb-cli rm --literal disk.hda '/Apps/Maze Wars+ {old}'
 ```
 
 ## Drive everything from a batch JSON script

@@ -36,7 +36,7 @@ pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Filesystem to format.
+    /// Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 

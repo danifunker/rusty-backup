@@ -18,6 +18,12 @@ pub struct MkdirArgs {
     /// Directory path to create. The parent must exist (no `-p`-style
     /// auto-creation in Phase B).
     pub path: String,
+
+    /// Accepted for consistency with `ls`/`get`/`rm`; `mkdir` always treats
+    /// the path as an exact literal path (it never globs), so glob
+    /// metacharacters in a name are used verbatim with or without it.
+    #[arg(short = 'L', long = "literal", alias = "no-glob")]
+    pub literal: bool,
 }
 
 pub fn run(args: MkdirArgs) -> Result<()> {

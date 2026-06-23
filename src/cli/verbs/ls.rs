@@ -22,7 +22,8 @@ pub struct LsArgs {
     /// Path or glob pattern inside the filesystem (use `/` as the
     /// separator). A plain path lists that directory's contents;
     /// patterns containing `*`, `?`, `[`, or `{` walk the volume and
-    /// emit one line per match.
+    /// emit one line per match. Pass `--literal` to address a path
+    /// verbatim when its name contains those characters.
     #[arg(default_value = "/")]
     pub path: String,
 
@@ -30,6 +31,17 @@ pub struct LsArgs {
     /// Exclude always wins over `--include` / a positional path.
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
+
+    /// Treat the path as an exact, literal path: never interpret `*`, `?`,
+    /// `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain
+    /// those characters. Conflicts with `--exclude`.
+    #[arg(
+        short = 'L',
+        long = "literal",
+        alias = "no-glob",
+        conflicts_with = "exclude"
+    )]
+    pub literal: bool,
 
     /// Treat case-insensitively, regardless of the target's native rule.
     #[arg(long, conflicts_with = "case_sensitive")]
@@ -101,9 +113,11 @@ pub fn run(args: LsArgs) -> Result<()> {
         _ => true,
     };
 
-    let is_glob = has_glob_chars(&args.path);
+    // `--literal` forces the exact-path branch even when the name contains
+    // glob metacharacters.
+    let use_glob = !args.literal && (has_glob_chars(&args.path) || !args.exclude.is_empty());
 
-    if is_glob || !args.exclude.is_empty() {
+    if use_glob {
         // Glob path — walk the volume.
         let includes = compile_patterns(&args.path, case_insensitive)?;
         let mut excludes = Vec::new();
