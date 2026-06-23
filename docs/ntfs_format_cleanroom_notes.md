@@ -103,13 +103,18 @@ clusters are available explicitly via `with_cluster_size`.
 
 ## Validation
 
-`scripts/ntfs-oracle.sh` and the `#[cfg(test)]` harness in `ntfs_format.rs`
-cross-check every formatted geometry with the real NTFS tooling
-(`ntfsfix -n`, `ntfsinfo`) and field-diff the geometry-dependent BPB/record
-fields against an equivalent `mkntfs` image, then round-trip files through both
-our own reader and `ntfs-3g`. The same `scripts/ntfs-oracle.sh matrix` runs in
-CI on any change to the NTFS sources
-(`.github/workflows/ntfs-oracle.yml`, unprivileged on `ubuntu-latest`).
+The `#[cfg(test)]` harness in `ntfs_format.rs` and `ntfs_clone.rs` formats
+every supported geometry and round-trips files back through our own reader;
+these run in the normal `cargo test` suite (and therefore in the existing
+release CI).
+
+`scripts/ntfs-oracle.sh` is a **manual** developer tool — not wired into CI —
+that cross-checks our output against the real, independent NTFS tooling
+(`ntfsfix -n`, `ntfsinfo`, `mkntfs`). It needs `ntfs-3g` installed but the
+read-only checks run unprivileged on a plain image file. Run
+`scripts/ntfs-oracle.sh matrix` after any change to the formatter (e.g. before
+a release) to confirm the output still mounts under ntfs-3g across the geometry
+matrix.
 
 ## Geometry surface (CLI + clone)
 
