@@ -473,6 +473,19 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
         (clusters * self.cluster_size / self.mft_record_size as u64).max(64)
     }
 
+    /// Bytes per sector of the source volume. Used by the defragmenting clone
+    /// so the repacked target inherits the source geometry rather than forcing
+    /// a fixed sector size.
+    pub fn bytes_per_sector(&self) -> u64 {
+        self.bytes_per_sector
+    }
+
+    /// Cluster (allocation unit) size of the source volume, in bytes. Inherited
+    /// by the defragmenting clone target so it stays geometry-compatible.
+    pub fn cluster_size(&self) -> u64 {
+        self.cluster_size
+    }
+
     /// Absolute byte offset for a cluster number.
     fn cluster_offset(&self, cluster: u64) -> u64 {
         self.partition_offset + cluster * self.cluster_size

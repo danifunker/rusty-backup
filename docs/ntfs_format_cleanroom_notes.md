@@ -107,4 +107,19 @@ clusters are available explicitly via `with_cluster_size`.
 cross-check every formatted geometry with the real NTFS tooling
 (`ntfsfix -n`, `ntfsinfo`) and field-diff the geometry-dependent BPB/record
 fields against an equivalent `mkntfs` image, then round-trip files through both
-our own reader and `ntfs-3g`.
+our own reader and `ntfs-3g`. The same `scripts/ntfs-oracle.sh matrix` runs in
+CI on any change to the NTFS sources
+(`.github/workflows/ntfs-oracle.yml`, unprivileged on `ubuntu-latest`).
+
+## Geometry surface (CLI + clone)
+
+- `rb-cli new --fs ntfs` formats a blank NTFS superfloppy. `--cluster-size`
+  (e.g. `4K`, `64K`) and `--sector-size` (512/1024/2048/4096) select the
+  geometry; both default automatically (`NtfsGeometry::for_volume_size`, then
+  floored to the sector size). The requested size is rounded down to a whole
+  cluster.
+- The defragmenting clone `ntfs_clone::stream_defragmented_ntfs` **inherits the
+  source volume's sector and cluster size** (via `NtfsGeometry::with_cluster_size`)
+  rather than forcing a fixed 4 KiB/512 geometry, so a repacked volume stays
+  geometry-compatible with the original. `defragmented_minimum_size` already
+  sizes the target as a multiple of that inherited cluster.

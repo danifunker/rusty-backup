@@ -1,0 +1,81 @@
+name: NTFS formatter oracle
+
+# Cross-checks the clean-room NTFS formatter against the real ntfs-3g / ntfsprogs
+# tooling (mkntfs, ntfsfix, ntfsinfo). The read-only oracle checks operate on a
+# plain image file (no root, no mount), so the whole matrix runs unprivileged.
+# License note: we only observe mkntfs OUTPUT (a published format) — we never
+# read or translate its GPL-2 source. See docs/ntfs_format_cleanroom_notes.md.
+
+on:
+  push:
+    paths:
+      - "src/fs/ntfs.rs"
+      - "src/fs/ntfs_format.rs"
+      - "src/fs/ntfs_tables.rs"
+      - "src/fs/ntfs_clone.rs"
+      - "src/fs/ntfs_template/**"
+      - "scripts/ntfs-oracle.sh"
+      - "examples/make_blank_ntfs.rs"
+      - ".github/workflows/ntfs-oracle.yml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "src/fs/ntfs.rs"
+      - "src/fs/ntfs_format.rs"
+      - "src/fs/ntfs_tables.rs"
+      - "src/fs/ntfs_clone.rs"
+      - "src/fs/ntfs_template/**"
+      - "scripts/ntfs-oracle.sh"
+      - "examples/make_blank_ntfs.rs"
+      - ".github/workflows/ntfs-oracle.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  oracle:
+    name: NTFS oracle matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NTFS tooling
+        # ntfs-3g provides mkntfs, ntfsfix and ntfsinfo on Ubuntu.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ntfs-3g
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-ntfs-oracle-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify oracle tooling
+        run: bash scripts/ntfs-oracle.sh deps
+
+      - name: NTFS lib tests
+        run: cargo test --lib ntfs
+
+      - name: NTFS oracle geometry matrix
+        # Formats every supported geometry with our formatter and cross-checks
+        # each with ntfsfix -n (sector 512/4096 x cluster 512..128K x several
+        # volume sizes + an odd-aligned size).
+        run: bash scripts/ntfs-oracle.sh matrix

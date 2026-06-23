@@ -803,7 +803,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format
+- `--fs` — Filesystem to format. One of: `hfs`, `hfv`, `fat`, `efs`, `affs`, `ntfs`
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
@@ -812,6 +812,18 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+- `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain byte count. A power of two from 512 to 2 MiB and at least the sector size. When unset, chosen automatically from the volume size (the classic mkntfs default-by-size table). Ignored for other filesystems
+- `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512. Ignored for other filesystems
+
+Examples:
+
+```
+rb-cli new --fs ntfs --size 64M disk.img                       # auto geometry
+rb-cli new --fs ntfs --size 256M --cluster-size 4K disk.img    # explicit cluster
+rb-cli new --fs ntfs --size 1G --cluster-size 64K --sector-size 4096 disk.img
+```
+
+The blank volume is a bare single-partition NTFS superfloppy (no MBR/GPT), validated to mount under ntfs-3g. The size is rounded down to a whole cluster.
 
 ### `new-sgi-cdrom`
 
