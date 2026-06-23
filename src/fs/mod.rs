@@ -20,6 +20,7 @@ pub mod efs_fsck;
 pub mod efs_resize;
 pub mod entry;
 pub mod exfat;
+pub mod exfat_clone;
 pub mod ext;
 pub mod fat;
 pub mod filesystem;
@@ -46,6 +47,8 @@ pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod mfs;
 pub mod ntfs;
+pub mod ntfs_clone;
+pub mod ntfs_format;
 pub mod os9;
 pub mod patch;
 pub mod pfs3;
@@ -2330,6 +2333,27 @@ pub fn probe_hfsplus_signature<R: Read + Seek>(
     Some(u16::from_be_bytes(sig))
 }
 
+/// True when the partition's VBR carries the exFAT filesystem signature.
+/// Used by the backup defrag-clone preflight to gate the packed-clone path
+/// (the MBR type byte 0x07 is shared with NTFS, so signature-probe).
+pub fn probe_exfat_signature<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
+        return false;
+    }
+    let mut vbr = [0u8; 512];
+    reader.read_exact(&mut vbr).is_ok() && &vbr[3..11] == b"EXFAT   "
+}
+
+/// True when the partition's VBR carries the NTFS OEM signature. Gates the
+/// backup defrag-clone preflight (MBR type 0x07 is shared with exFAT).
+pub fn probe_ntfs_signature<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
+        return false;
+    }
+    let mut vbr = [0u8; 512];
+    reader.read_exact(&mut vbr).is_ok() && &vbr[3..11] == b"NTFS    "
+}
+
 /// Shape of HFS+ defrag-clone the backup pipeline should use for a
 /// partition. Returned by [`defrag_clone_shape`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2344,6 +2368,14 @@ pub enum DefragCloneShape {
     /// [`pfs3_clone::stream_defragmented_pfs3`]. Two-pass walk via the
     /// EditableFilesystem trait; tempfile-backed to bound RAM.
     Pfs3,
+    /// exFAT volume. Use [`exfat_clone::stream_defragmented_exfat`]. Tree-walk
+    /// replay via the EditableFilesystem trait into a freshly-formatted blank;
+    /// tempfile-backed to bound RAM.
+    Exfat,
+    /// NTFS volume. Use [`ntfs_clone::stream_defragmented_ntfs`]. Tree-walk
+    /// replay into a freshly-formatted blank (`ntfs_format::create_blank_ntfs`);
+    /// tempfile-backed.
+    Ntfs,
 }
 
 /// Pre-flight check for the streamed defrag-clone backup path. Returns
@@ -2453,6 +2485,20 @@ pub fn detect_defrag_clone_shape<R: Read + Seek>(
                 "partition tagged {s} but rootblock id {:?} is not PFS3",
                 id
             ));
+        }
+    }
+    // exFAT / NTFS (MBR type 0x07, no type string): probe the VBR signature so
+    // the backup streams a packed clone instead of the unshrinkable
+    // layout-preserving image.
+    if reader.seek(SeekFrom::Start(partition_offset)).is_ok() {
+        let mut vbr = [0u8; 512];
+        if reader.read_exact(&mut vbr).is_ok() {
+            if &vbr[3..11] == b"EXFAT   " {
+                return Ok(DefragCloneShape::Exfat);
+            }
+            if &vbr[3..11] == b"NTFS    " {
+                return Ok(DefragCloneShape::Ntfs);
+            }
         }
     }
     defrag_clone_shape(reader, partition_offset)

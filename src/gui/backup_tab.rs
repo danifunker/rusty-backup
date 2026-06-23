@@ -373,6 +373,22 @@ impl BackupTab {
             {
                 self.clear_remote();
             }
+
+            // Release a selected LOCAL device or image so the drive can be
+            // safely removed and the partition selection reset. (Remote
+            // sources use the "X" button above.)
+            if (self.selected_device_idx.is_some() || self.image_file_path.is_some())
+                && controls_enabled
+                && ui
+                    .button("Close Drive")
+                    .on_hover_text(
+                        "Release the selected disk / image and clear the partition \
+                         selection so the drive can be safely removed",
+                    )
+                    .clicked()
+            {
+                self.close_source();
+            }
         });
 
         // When the user picks a LOCAL device/image while a remote source was
@@ -538,19 +554,24 @@ impl BackupTab {
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                             );
-                            let has_clone = fs::has_defragmenting_writer(
+                            // Compact/Defrag is live when the FS has a registered
+                            // defragmenting writer (HFS+/HFSX/PFS3) OR the engine
+                            // computed a packed minimum that beats the in-place
+                            // trim (exFAT today; NTFS once its packer lands).
+                            let available = self.defrag_clone_available(
+                                part.index,
                                 part.partition_type_byte,
                                 part.partition_type_string.as_deref(),
                             );
-                            if is_layout {
+                            if is_layout || available {
                                 let mut enabled = self
                                     .partition_defrag_enabled
                                     .get(&part.index)
                                     .copied()
                                     .unwrap_or(false);
                                 let resp = ui
-                                    .add_enabled(has_clone, egui::Checkbox::new(&mut enabled, ""));
-                                if !has_clone {
+                                    .add_enabled(available, egui::Checkbox::new(&mut enabled, ""));
+                                if !available {
                                     resp.on_hover_text(
                                         "Compact Space not yet implemented for this filesystem",
                                     );
@@ -558,8 +579,6 @@ impl BackupTab {
                                     defrag_toggles.push((part.index, enabled));
                                 }
                             } else {
-                                // FAT/NTFS/exFAT: the packing CompactReader
-                                // already emits a defragmented layout.
                                 ui.label("");
                             }
                             ui.end_row();
@@ -1213,7 +1232,7 @@ impl BackupTab {
     ) -> Option<u64> {
         let in_place = self.partition_min_sizes.get(&idx).copied();
         let defrag = self.partition_defrag_min_sizes.get(&idx).copied();
-        let has_clone = fs::has_defragmenting_writer(partition_type, partition_type_string);
+        let has_clone = self.defrag_clone_available(idx, partition_type, partition_type_string);
         let enabled = self
             .partition_defrag_enabled
             .get(&idx)
@@ -1224,6 +1243,32 @@ impl BackupTab {
         } else {
             in_place.or(defrag)
         }
+    }
+
+    /// Whether the per-partition Compact/Defrag toggle should be live for this
+    /// partition: either the FS has a registered defragmenting writer
+    /// (HFS+/HFSX/PFS3 via [`fs::has_defragmenting_writer`]), or the engine
+    /// computed a packed defragmented minimum that actually beats the in-place
+    /// trim (exFAT today; NTFS once its packer lands). Confined to the backup
+    /// tab so VHD-export / shrink-target paths (which don't run the clone) are
+    /// unaffected. The size-based arm requires the per-partition min-size walk
+    /// to have completed, so the toggle appears once the Min Size cell resolves.
+    fn defrag_clone_available(
+        &self,
+        idx: usize,
+        partition_type: u8,
+        partition_type_string: Option<&str>,
+    ) -> bool {
+        if fs::has_defragmenting_writer(partition_type, partition_type_string) {
+            return true;
+        }
+        matches!(
+            (
+                self.partition_defrag_min_sizes.get(&idx),
+                self.partition_min_sizes.get(&idx),
+            ),
+            (Some(&d), Some(&p)) if d < p
+        )
     }
 
     /// Common post-min-size-walk bookkeeping shared between the auto-load
@@ -1262,7 +1307,7 @@ impl BackupTab {
         // the decision signal — a volume with 0% file fragmentation can
         // still have meaningful inter-file holes that compaction recovers.
         if !self.partition_defrag_default_applied.contains(&idx)
-            && fs::has_defragmenting_writer(partition_type, partition_type_string)
+            && self.defrag_clone_available(idx, partition_type, partition_type_string)
         {
             if let (Some(ip), Some(df)) = (in_place_clamped, defrag_clamped) {
                 if ip > 0 && df < ip {
@@ -1964,6 +2009,37 @@ impl BackupTab {
         self.source_partitions.clear();
         self.selected_partitions.clear();
         self.source_partition_table_desc = None;
+    }
+
+    /// Release the currently-selected LOCAL source (physical device or image
+    /// file): drop the open file handle so the OS releases the drive, and
+    /// clear every piece of derived partition state. Mirrors the per-source
+    /// reset in `load_partition_preview` plus the selection itself, returning
+    /// the tab to its "Select a device or image..." state.
+    fn close_source(&mut self) {
+        self.selected_device_idx = None;
+        self.image_file_path = None;
+        self.amiga_tempdir = None;
+        // Dropping the Arc<File> here releases the OS handle on the drive so it
+        // can be safely ejected (min-size workers hold their own clones).
+        self.source_file = None;
+        self.source_partitions.clear();
+        self.selected_partitions.clear();
+        self.partition_min_sizes.clear();
+        self.partition_defrag_min_sizes.clear();
+        self.partition_fragmentation.clear();
+        self.partition_defrag_enabled.clear();
+        self.partition_defrag_default_applied.clear();
+        self.deferred_min_sizes.clear();
+        self.pending_min_size_calcs.clear();
+        self.last_logged_min_size_phase.clear();
+        self.source_partition_table_desc = None;
+        self.partition_load_error = None;
+        self.pending_backup_after_min_sizes = false;
+        // Keep prev_* in sync with the now-empty selection so the
+        // source-changed detector in `show()` doesn't immediately re-fire.
+        self.prev_device_idx = None;
+        self.prev_image_path = None;
     }
 
     /// The "Remote Drive" connect dialog + device picker. Shown while

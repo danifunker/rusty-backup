@@ -447,6 +447,20 @@ impl RestoreTab {
                                     );
                                 }
                             });
+
+                        // Clear the selected target device so the drive can be
+                        // safely removed or a different one chosen.
+                        if self.selected_device_idx.is_some()
+                            && ui
+                                .button("Close Drive")
+                                .on_hover_text(
+                                    "Clear the selected target device so the drive \
+                                     can be safely removed",
+                                )
+                                .clicked()
+                        {
+                            self.selected_device_idx = None;
+                        }
                     });
 
                     // Show warning for system disks
