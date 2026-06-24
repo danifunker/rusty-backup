@@ -42,27 +42,25 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 1. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
    target disk, no intermediate file). Reuses the `cbbackup` engine. *Recommended
    next.*
-2. **Desktop `--partitions` off-by-one (bug).** rb-cli's `--partitions` is
-   documented "1-based" but filters on a renumbered 0-based `part.index` and
-   `parse_indices` rejects 0 → the **first partition is unselectable** and `N`
-   selects the `(N)`-th 0-based partition. Either fix the help text + accept 0, or
-   subtract 1 before building `partition_filter` (and update `docs/cli-reference.md`).
-   cb-dos's `/PARTS` already uses the clean 0-based MBR-slot scheme.
-3. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
+2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
    format already supports multiple chunks/member) and make the reader decompress
    only the members a seek touches. No format change.
-4. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+3. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
-5. **`cbbackup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+4. **`cbbackup` mbr.bin corruption under stdout redirection (bug, low-priority).**
    Redirecting `cbbackup`'s stdout to a file on the *same drive* it writes the
    backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
    boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
    quirk (gotcha #3), not a cbrestore bug — run `cbbackup` without `>` and it's
    clean. Worth root-causing (likely a DTA / FILE-buffer aliasing in `cbbackup.c`).
-6. **Real-486 hardware** validation (everything so far is qemu/emulator).
+5. **Real-486 hardware** validation (everything so far is qemu/emulator).
+
+(Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
+now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
+`37b9b70`.)
 
 ## Key files
 
