@@ -17,13 +17,14 @@ use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
 use crate::rbformats::{BoxReadSeek, BoxRwSeek};
+use std::path::PathBuf; // used by RwCommit::Cbk regardless of the chd feature
 
 #[cfg(feature = "chd")]
 use crate::cli::logging::log_stderr;
 #[cfg(feature = "chd")]
 use crate::rbformats::chd_edit;
 #[cfg(feature = "chd")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Resolved partition context — what to pass to
 /// [`crate::fs::open_filesystem`] / [`crate::fs::open_editable_filesystem`].
