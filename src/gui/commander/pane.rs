@@ -1156,8 +1156,9 @@ impl CommanderPane {
                 show_image: true,
                 show_host_folder: true,
                 show_backup_folder: true,
-                // Commander keeps its own dedicated "Remote..." button.
-                show_remote: false,
+                // "Connect to Remote..." lives in this dropdown now (no
+                // separate button).
+                show_remote: true,
                 materialize_image: false,
                 include_mac_archives: false,
                 width: 200.0,
@@ -1197,27 +1198,28 @@ impl CommanderPane {
                         }
                     }
                     SourceEvent::Device(_) => {}
-                    // Commander doesn't offer "Connect to Remote..." in the
-                    // picker (it has its own dedicated button); never emitted.
-                    SourceEvent::Remote => {}
+                    // "Connect to Remote..." opens the host:port dialog. Like the
+                    // other switch events it's blocked while edits are staged
+                    // (connecting replaces the listing), so we hint instead of
+                    // silently doing nothing.
+                    SourceEvent::Remote => {
+                        if self.queue.is_empty() {
+                            self.connect_dialog = Some(ConnectDialog {
+                                host: self
+                                    .remote
+                                    .as_ref()
+                                    .map(|r| r.addr.clone())
+                                    .unwrap_or_default(),
+                                error: None,
+                            });
+                        } else {
+                            status = Some(
+                                "Apply or discard staged edits before connecting to a remote."
+                                    .to_string(),
+                            );
+                        }
+                    }
                 }
-            }
-
-            // Browse a disk image on a remote rb-cli serve daemon. Disabled
-            // while edits are staged (connecting replaces the listing).
-            if ui
-                .add_enabled(self.queue.is_empty(), egui::Button::new("Remote..."))
-                .on_hover_text("Browse a remote rb-cli serve daemon's filesystem")
-                .clicked()
-            {
-                self.connect_dialog = Some(ConnectDialog {
-                    host: self
-                        .remote
-                        .as_ref()
-                        .map(|r| r.addr.clone())
-                        .unwrap_or_default(),
-                    error: None,
-                });
             }
 
             // When inside a remote image, "Close Image" steps back to the host

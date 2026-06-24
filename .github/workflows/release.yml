@@ -815,11 +815,18 @@ jobs:
           # at runtime, so `rb-cli-mini install-completions` writes its
           # script to `bash-completion/completions/rb-cli-mini` and bash
           # finds it via the standard filename-based lookup.
+          # Also bundle the MiSTer daemon shim + installer (mister/) so a user
+          # can drop the daemon onto the SD card with one script. The transform
+          # only rewrites an entry named exactly `rb-cli`, so the .sh files keep
+          # their names. install.sh copies rb-cli-mini -> Scripts/rb-cli and
+          # rb-daemon.sh -> Scripts/rb-daemon.sh (the only menu entry).
           TGZ="rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz"
-          tar -C target/armv7-unknown-linux-gnueabihf/release \
-              --transform 's,^rb-cli$,rb-cli-mini,' \
-              -czf "$TGZ" rb-cli
-          # Sanity: the archive should hold `rb-cli-mini`, not `rb-cli`.
+          tar --transform 's,^rb-cli$,rb-cli-mini,' \
+              -czf "$TGZ" \
+              -C target/armv7-unknown-linux-gnueabihf/release rb-cli \
+              -C "$GITHUB_WORKSPACE/mister" rb-daemon.sh install.sh
+          # Sanity: the archive should hold `rb-cli-mini` (not `rb-cli`) plus the
+          # MiSTer scripts.
           tar -tzf "$TGZ"
           ls -lh "$TGZ"
 
