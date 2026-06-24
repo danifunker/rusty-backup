@@ -56,8 +56,14 @@ ZLIBINC := $(ZLIB)/inc
 ZLIBLIB := $(ZLIB)/lib
 
 backup: $(BUILD)/cbbackup.exe
+restore: $(BUILD)/cbrestore.exe
 
 $(BUILD)/cbbackup.exe: src/cbbackup.c | $(BUILD)
+	@test -f $(ZLIBLIB)/libz.a || { \
+	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $< -L$(ZLIBLIB) -lz
+
+$(BUILD)/cbrestore.exe: src/cbrestore.c | $(BUILD)
 	@test -f $(ZLIBLIB)/libz.a || { \
 	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
 	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $< -L$(ZLIBLIB) -lz
@@ -65,4 +71,4 @@ $(BUILD)/cbbackup.exe: src/cbbackup.c | $(BUILD)
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all size net backup clean
+.PHONY: all size net backup restore clean

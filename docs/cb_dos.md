@@ -524,9 +524,19 @@ over the wire now.
       it). Not a backup-logic bug (disk_spike repros; DOSBox-X's own DPMI host
       doesn't hang) — candidate fix is an alternate DPMI host on the boot media.
       Remaining polish: NTFS/logical partitions (skipped), the exit-hang, real-486.
-- [ ] **Phase 3 — Restore MVP (DOS).** cb-dos restores the native folder back to
-      a disk, with **resize options** (entire / minimum / custom per partition);
-      verify the restored card boots. Restore from a DOS path **or CD (MSCDEX)**.
+- [x] **Phase 3 — Restore MVP (DOS). DONE (2026-06-24) — byte-identical restore.**
+      `crusty-backup/src/cbrestore.c` (`CBRESTORE.EXE`) reads the native folder,
+      writes `mbr.bin` to sector 0 and streams each `partition-N.gz` (zlib
+      `gzread`) back to its `start_lba` via **int13h write** (AH=43h/03h),
+      zero-padding compacted partitions out to their original window. Restores at
+      **original size** (a minimal `metadata.json` field-scanner reads `start_lba`
+      / `original_size_bytes` / `imaged_size_bytes` / `compressed_files`). `/Y`
+      gates the destructive write. **Proof:** restored a Phase-2 folder onto a
+      *blank* disk on real FreeDOS in qemu — the result is **byte-for-byte
+      identical to the original source disk** (50,331,648 bytes), mounts as
+      `CBDOSFAT16`, file intact. `make restore`. Remaining (next increment):
+      on-DOS **resize** (entire/minimum/custom — desktop already resizes cb-dos
+      backups meanwhile), CD/MSCDEX source, NTFS/logical, the CWSDPMI exit-hang.
 - [ ] **Phase 4 — Per-partition selective backup/restore (DOS).** Mirror
       `partition_filter` — pick which partitions to image/restore.
 - [ ] **Phase 4b — Direct disk-to-disk clone mode (DOS).** Source → on-the-fly
@@ -562,6 +572,21 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 3 complete — cb-dos restores a folder to a disk on real
+  DOS, byte-identically.** Wrote `crusty-backup/src/cbrestore.c`
+  (`CBRESTORE.EXE`): a minimal `metadata.json` field-scanner (no JSON lib),
+  `mbr.bin` → sector 0, and each `partition-N.gz` streamed via zlib `gzread`
+  straight to its `start_lba` with **int13h write** (AH=43h ext / AH=03h CHS),
+  zero-padding the compacted tail out to the original window. `/Y` confirms the
+  destructive write. **Proof:** staged a Phase-2 backup folder onto FreeDOS,
+  booted qemu with a *blank* 48 MB target as 0x81, ran `CBRESTORE C:\BK 81 /Y`,
+  and the reconstructed disk is **byte-for-byte identical to the original source**
+  (whole-disk `cmp` clean, 50,331,648 bytes) — mounts as `CBDOSFAT16`, `HELLO.TXT`
+  intact, MBR partition entry exact. int13h writes commit immediately, so the
+  restore lands even though the process hits the documented CWSDPMI exit-hang
+  (which also blocks chaining backup→restore in one boot — done as two boots).
+  The full DOS-native cycle now works both ways. **Next:** on-DOS resize, then
+  Phase 4 (per-partition selection) / the `.cbk` container.
 - 2026-06-24 — **Phase 2 complete — cb-dos images a FAT disk on real DOS and the
   desktop restores it.** Wrote `crusty-backup/src/cbbackup.c` (`CBBACKUP.EXE`):
   int13h read (LBA + CHS fallback, mirroring disk_spike), whole-FAT load,
