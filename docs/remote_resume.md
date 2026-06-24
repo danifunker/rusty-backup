@@ -125,17 +125,36 @@ finalization via `&mut File`), so instead of rewriting it target-generic this
   streaming target seam (make `run_restore` target-generic) to skip staging.
 
 ### 4. TUI remote browser — DEPRIORITIZED (user, 2026-06-21)
-A crossterm remote browser was planned (reuse `RemoteConnection`, ASCII-only,
+A crossterm remote *browser* was planned (reuse `RemoteConnection`, ASCII-only,
 TTY-guard, `[[cli-tui-crossterm]]`), but the user decided the MiSTer doesn't
 need an on-device browser TUI — it just needs the **daemon installer/packaging**
-(§5). So skip the TUI; the desktop is the smart client. Revisit only if an
-on-device interactive browser is actually wanted later.
+(§5). So skip the browser TUI; the desktop is the smart client. Revisit only if
+an on-device interactive browser is actually wanted later.
 
-### 5. Family B + MiSTer packaging (handoff §4, plan §)
+> **Note:** the daemon **setup console** (different thing — install/start/stop/
+> enable-on-boot, *not* a file browser) shipped under §5 below as `rb-cli serve
+> setup`. That's the mrext-*Remote*-style "do you want to install the daemon?"
+> screen the user asked for; the deprioritized item here is the file-browser TUI.
+
+### 5. Family B + MiSTer packaging (handoff §4, plan §) — packaging/service DONE
 Family B = the chunked cb-dos backup stream (Phase 4, blocked on cb-dos local
-round-trip). **MiSTer install packaging/service** (Scripts `.sh` + downloader
-DB) is what the MiSTer actually needs to run the daemon — the near-term §4
-replacement per the user. Not started.
+round-trip; still open). **MiSTer install packaging/service** — the near-term
+need per the user — is now **shipped** (plan §15 Phase 5):
+- `src/remote/service.rs` — `rb-cli serve service {start|stop|restart|status|
+  install|uninstall}`: PID + `kill(0)` liveness, detached `setsid` spawn →
+  `/tmp/rb-daemon.log`, mrext-compatible `user-startup.sh` section add/remove,
+  `rb-daemon.ini`, getifaddrs IP discovery.
+- `src/cli/verbs/setup.rs` — `rb-cli serve setup`: the crossterm install/control
+  console (ACTIVE/INACTIVE + autostart + connect IP:port; Start Now / Stop Now /
+  Install Autostart / Uninstall Autostart).
+- `mister/rb-daemon.sh` (the one Scripts-menu entry, a shim → `serve setup`) +
+  `mister/install.sh`, bundled into the armv7 `rb-cli-mini` tarball. `rb-cli`
+  installs as `/media/fat/Scripts/rb-cli` (no `.sh` → not a second menu entry).
+- Tests: service unit tests + `tests/daemon_service.rs` (real spawn→stop,
+  install/uninstall section editing). **Compile + headless only — needs the
+  interactive on-hardware pass** (Scripts-menu launch, enable, reboot-survives).
+- **Still open:** downloader DB JSON + UPX `-9`; the live connection/transfer
+  table (plan §14 full variant, deferred).
 
 ### Smaller cleanups / risks
 > **Per-partition remote sizing + superfloppy remote device — DONE.** Both items

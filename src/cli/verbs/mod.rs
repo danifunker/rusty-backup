@@ -47,6 +47,8 @@ pub mod rm;
 #[cfg(feature = "remote")]
 pub mod serve;
 pub mod setrsrc;
+#[cfg(feature = "remote")]
+pub mod setup;
 pub mod setvolname;
 pub mod show;
 pub mod shrink;

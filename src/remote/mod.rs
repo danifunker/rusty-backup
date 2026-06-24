@@ -16,6 +16,7 @@ pub mod connection;
 pub mod fs;
 pub mod protocol;
 pub mod server;
+pub mod service;
 
 pub use block_reader::RemoteBlockReader;
 pub use client::{OpenedImage, RemoteSession};

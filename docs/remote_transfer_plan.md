@@ -560,6 +560,14 @@ software-replacement primitive**, so it ships gated:
 
 ## 14. MiSTer-side TUI (the daemon's console)
 
+**Status (shipped, lean variant):** the install/enable/disable console below is built — `rb-cli serve
+setup` (`src/cli/verbs/setup.rs`), launched by the `rb-daemon.sh` Scripts shim. It shows ACTIVE/INACTIVE,
+autostart on/off, and the connect IP:port, with Start Now / Stop Now / Install Autostart / Uninstall
+Autostart actions. The **live connection/transfer table** drawn below (per-peer bytes/speed/phase, and
+killable connections) is **deferred** — it needs the daemon to track shared per-connection status and
+expose it over a local `/tmp/rb-daemon.sock`; revisit when on-device visibility of active transfers is
+actually wanted. The mock below is the eventual full shape.
+
 Runs when you launch `rb-daemon.sh` from the Scripts menu. Built on the existing crossterm MiSTer-TUI
 conventions (ASCII-only per the no-Unicode rule, TTY-guard, RAII terminal restore, testable-core —
 established by `bless pick`). Shows **both families' connections**:
@@ -669,8 +677,28 @@ removable-media round-trip proving the native format first (cb-dos Phases 2–4)
   > **Prerequisite (unchanged by the reorder):** Family B is still gated on the cb-dos *local*
   > removable-media round-trip proving the native format first (cb-dos Phases 1–4). Moving it ahead of
   > packaging doesn't unblock it — it means MiSTer packaging now waits on the network-backup work.
-- **Phase 5 — MiSTer packaging & service.** `service install` + `user-startup.sh`, downloader DB,
-  CI armv7 + UPX, TUI status/enable-disable. *Gate:* enable from Scripts menu, survives reboot.
+- **Phase 5 — MiSTer packaging & service. — LARGELY DONE (service + console + packaging shipped;
+  downloader-DB/UPX + the live-connection table deferred).** Shipped:
+  - **Service lifecycle** — `rb-cli serve service {start|stop|restart|status|install|uninstall}`
+    (`src/remote/service.rs`): PID file at `/tmp/rb-daemon.pid` + `kill(pid,0)` liveness, detached
+    `setsid` spawn with stdio → `/tmp/rb-daemon.log`, mrext-compatible named-section add/remove in
+    `user-startup.sh` (install also writes a default `rb-daemon.ini`; uninstall leaves a running daemon
+    alone), getifaddrs IPv4 discovery.
+  - **Setup console (the §14 UI, lean variant)** — `rb-cli serve setup` (`src/cli/verbs/setup.rs`): a
+    crossterm screen over `cli::tui` showing ACTIVE/INACTIVE + autostart state + the connect IP:port,
+    with **Start Now / Stop Now / Install Autostart / Uninstall Autostart / Quit**. ASCII-only,
+    reflects state and changes nothing until a key is pressed.
+  - **Packaging** — `mister/rb-daemon.sh` (the only Scripts-menu entry; a shim → `rb-cli serve setup`,
+    forwards args so `rb-daemon.sh service start` also works) + `mister/install.sh`, both bundled into
+    the armv7 `rb-cli-mini` release tarball. `rb-cli` installs as `/media/fat/Scripts/rb-cli` (no `.sh`
+    → invisible to the menu); the boot line is `[[ -e .../rb-cli ]] && .../rb-cli serve service start`.
+  - **Tests** — service unit tests (INI round-trip, section editing, PID, IP, action selection) +
+    `tests/daemon_service.rs` (real spawn→stop round-trip, double-start refusal, install/uninstall
+    section editing leaving co-resident entries + a live daemon intact).
+
+  **Still open:** the downloader DB JSON (§12) + UPX `-9` compression; the **live connection/transfer
+  table** (§14 full variant — deferred per user, the lean status console shipped instead); and the
+  interactive on-hardware verification (enable from the Scripts menu, confirm it survives a reboot).
 - **Phase 6 — later/optional.** Signed push-update (§13.3) + Ed25519 release signing; mDNS discovery;
   TLS/token; pairing; mrext PR-A (Appendix A); incremental backup (cb-dos doc 7h); desktop reads `.cbk`
   directly (cb-dos doc 7i); "image in use by a core" guard hardening; optional block tier (§8).

@@ -91,16 +91,17 @@ checker's reqwest client — but **keeps CHD support** via the upstream
 device.
 
 The desktop release builds use the full feature set; only the MiSTer
-artifact runs `--no-default-features --features chd,pure-zstd` (CHD via the
-C prebuilt; zstd via the pure-Rust bit-exact backend, since a cross build
-won't link C libzstd).
+artifact runs `--no-default-features --features chd,pure-zstd,remote` (CHD
+via the C prebuilt; zstd via the pure-Rust bit-exact backend, since a cross
+build won't link C libzstd; `remote` for the network daemon — see
+[rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features --features chd,pure-zstd
+            --no-default-features --features chd,pure-zstd,remote
 
 # Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
 # do the local rename here too so the on-MiSTer filename matches the
@@ -133,6 +134,10 @@ What's in the MiSTer build:
   the X68000 workflow runs inline on the device.
 - Partition table editing (`partmap`), backup-folder operations.
 - `shrink`, `grow .chd`, single-file CHD backups — all work.
+- The **rb-daemon** network daemon (`serve`) — host this device's images
+  and disks on the LAN so the desktop app can browse/back up/restore them
+  over `rb://`. Installs from the Scripts menu; see
+  [below](#run-this-device-as-a-network-daemon-rb-daemon).
 
 What's excluded (operations exit with a clear "this binary was built
 without the `optical` feature" message):
@@ -143,6 +148,52 @@ without the `optical` feature" message):
 
 Full background and the feature matrix live in
 [`docs/mister_cli.md`](docs/mister_cli.md).
+
+#### Run this device as a network daemon (rb-daemon)
+
+The MiSTer build can run as a small **network daemon** so the desktop
+Rusty Backup app reaches into the MiSTer over your LAN — browse the SD
+card and the disk images on it, copy files in and out, and back up /
+restore whole disks — without pulling the card. It works like mrext's
+*Remote*: one entry in the Scripts menu, auto-start on boot once enabled.
+
+Install it from the `rb-cli-mini` release tarball (it now bundles the
+daemon shim + installer):
+
+```
+# On the MiSTer (or over SSH), from the unpacked tarball:
+./install.sh
+```
+
+That drops two files onto the SD card:
+
+- `/media/fat/Scripts/rb-cli` — the program (no `.sh`, so it is **not** a
+  second Scripts-menu entry).
+- `/media/fat/Scripts/rb-daemon.sh` — the **only** menu entry: open it to
+  bring up the daemon console.
+
+Then open **rb-daemon** from the MiSTer Scripts menu. The console shows
+whether the daemon is running, whether it auto-starts on boot, and the
+**IP:port** other machines connect to, with these actions:
+
+- **Start Now** / **Stop Now** — run or stop the daemon immediately.
+- **Install Autostart** — start it now *and* launch it on every boot.
+- **Uninstall Autostart** — stop launching it on boot (a running daemon
+  keeps running).
+
+Everything is scriptable too — no console needed:
+
+```
+rb-cli serve service install     # enable on boot + start now
+rb-cli serve service status      # ACTIVE/INACTIVE, autostart, IP:port
+rb-cli serve service stop        # stop the running daemon
+rb-cli serve service uninstall   # remove the boot entry
+```
+
+Defaults (editable in `/media/fat/Scripts/rb-daemon.ini`) serve the whole
+`/media/fat` card on `0.0.0.0:7341`, writable. From the desktop, connect to
+`rb://<mister-ip>:7341/`. The daemon design lives in
+[`docs/remote_transfer_plan.md`](docs/remote_transfer_plan.md).
 
 ### Bootable backup appliances (boot the metal, no host OS)
 
