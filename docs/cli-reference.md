@@ -308,7 +308,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--format` — Output format. Defaults to `chd`, or the `[backup] format` value from the config file when set
 - `--checksum` — Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
-- `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`). Default is "all partitions"
+- `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
 - `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
 
 ### `batch`
@@ -396,6 +396,40 @@ Usage: show <IMAGE>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N`)
+
+### `cbk`
+
+Pack a backup folder into a single `.cbk` container, or unpack one (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly
+
+```
+Usage: cbk <COMMAND>
+```
+
+### `cbk pack`
+
+Pack a native backup folder into a single `.cbk` container
+
+```
+Usage: pack <FOLDER> <OUT>
+```
+
+**Arguments**
+
+- `<FOLDER>` — The backup folder (the directory containing `metadata.json`)
+- `<OUT>` — Output `.cbk` file
+
+### `cbk unpack`
+
+Unpack a `.cbk` container back into a native backup folder
+
+```
+Usage: unpack <CONTAINER> <FOLDER>
+```
+
+**Arguments**
+
+- `<CONTAINER>` — Input `.cbk` file
+- `<FOLDER>` — Output folder (created if absent)
 
 ### `chmeta`
 
@@ -1251,14 +1285,34 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 Run the network daemon so a remote `rb-cli` can browse and read files inside images this host holds (`rb://host:port/img@N`). Family F read-only (Phase 0). See docs/remote_transfer_plan.md
 
 ```
-Usage: serve [OPTIONS]
+Usage: serve [OPTIONS] [COMMAND]
 ```
 
 **Options**
 
-- `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341)
+- `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341). Ignored by the `service` / `setup` subcommands (those read `rb-daemon.ini`)
 - `--root` — Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory
 - `--staging-dir` — Directory for per-session upload staging blobs (write path). Defaults to the system temp dir. On a MiSTer point this at a roomy writable mount, never tmpfs — large uploads would fill RAM
+
+### `serve service`
+
+Manage the boot service (start/stop/restart/status/install/uninstall)
+
+```
+Usage: service <ACTION>
+```
+
+**Arguments**
+
+- `<ACTION>` — What to do with the daemon service
+
+### `serve setup`
+
+Open the interactive setup console (the MiSTer Scripts-menu screen)
+
+```
+Usage: setup
+```
 
 ### `setrsrc`
 

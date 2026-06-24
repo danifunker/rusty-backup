@@ -90,7 +90,8 @@ pub struct BackupArgs {
     pub sector_by_sector: bool,
 
     /// Per-partition filter — comma-separated 1-based indices to
-    /// include (e.g. `1,3,4`). Default is "all partitions".
+    /// include (e.g. `1,3,4`; `1` is the first partition, matching the
+    /// `img@N` selector). Default is "all partitions".
     #[arg(long)]
     pub partitions: Option<String>,
 
@@ -185,20 +186,22 @@ fn parse_checksum(s: &str) -> Option<ChecksumKind> {
     }
 }
 
+/// Parse the `--partitions` value: comma-separated **1-based** indices (the
+/// same numbering as the `img@N` selector, where `1` is the first partition)
+/// into the **0-based** indices `partition_filter` matches against
+/// `PartitionInfo::index`. So `--partitions 1,3` keeps the 1st and 3rd
+/// partitions. Rejects `0` (1-based has no partition 0) and non-numbers.
 fn parse_indices(s: &str) -> Result<Vec<usize>> {
     s.split(',')
         .map(|p| {
             let trimmed = p.trim();
-            trimmed
+            let n = trimmed
                 .parse::<usize>()
-                .map_err(|_| anyhow!("invalid partition index {trimmed:?}"))
-                .and_then(|n| {
-                    if n == 0 {
-                        bail!("partition indices are 1-based")
-                    } else {
-                        Ok(n)
-                    }
-                })
+                .map_err(|_| anyhow!("invalid partition index {trimmed:?}"))?;
+            if n == 0 {
+                bail!("partition indices are 1-based (the first partition is 1, matching img@N)")
+            }
+            Ok(n - 1)
         })
         .collect()
 }
@@ -255,4 +258,30 @@ fn spawn_progress_pump(progress: Arc<Mutex<BackupProgress>>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_indices;
+
+    #[test]
+    fn parse_indices_is_one_based_to_zero_based() {
+        // `1` (the first partition, like img@1) maps to the 0-based index 0
+        // that partition_filter matches against PartitionInfo::index.
+        assert_eq!(parse_indices("1").unwrap(), vec![0]);
+        assert_eq!(parse_indices("1,3,4").unwrap(), vec![0, 2, 3]);
+        // whitespace tolerated
+        assert_eq!(parse_indices(" 2 , 1 ").unwrap(), vec![1, 0]);
+    }
+
+    #[test]
+    fn parse_indices_rejects_zero_and_garbage() {
+        // 0 is invalid in 1-based numbering (the regression: the first
+        // partition used to be unreachable because 0 was rejected *and* the
+        // values were never decremented).
+        assert!(parse_indices("0").is_err());
+        assert!(parse_indices("1,0").is_err());
+        assert!(parse_indices("x").is_err());
+        assert!(parse_indices("1,,2").is_err());
+    }
 }
