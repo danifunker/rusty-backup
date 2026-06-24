@@ -518,12 +518,12 @@ over the wire now.
       `rb-cli restore` rebuilt a byte-faithful disk (FS mounts, file intact).
       zlib is cross-built by `deps/fetch-zlib.sh`; `make backup`. **Two findings:**
       (1) the FD 1.4 *installer* kernel reports **no LFN** (`71A0h` → ax 0x7100),
-      so `DOSLFN` must be loaded or names mangle to 8.3 — see §1; (2) under
-      **CWSDPMI** any int13h-reading DJGPP program hangs at *process termination*
-      after the work is done (the folder is fully written; the desktop restores
-      it). Not a backup-logic bug (disk_spike repros; DOSBox-X's own DPMI host
-      doesn't hang) — candidate fix is an alternate DPMI host on the boot media.
-      Remaining polish: NTFS/logical partitions (skipped), the exit-hang, real-486.
+      so `DOSLFN` must be loaded or names mangle to 8.3 — see §1; (2) the tools
+      used to hang at *process termination* under CWSDPMI — **root-caused and
+      fixed 2026-06-24** (a 1-paragraph DOS-buffer under-allocation let the
+      int13h DAP overrun the next MCB; DOS hung walking the arena at exit). The
+      tools now exit cleanly (qemu poweroff). Remaining polish: NTFS/logical
+      partitions (skipped), real-486.
 - [x] **Phase 3 — Restore MVP (DOS). DONE (2026-06-24) — byte-identical restore.**
       `crusty-backup/src/cbrestore.c` (`CBRESTORE.EXE`) reads the native folder,
       writes `mbr.bin` to sector 0 and streams each `partition-N.gz` (zlib
@@ -536,7 +536,8 @@ over the wire now.
       identical to the original source disk** (50,331,648 bytes), mounts as
       `CBDOSFAT16`, file intact. `make restore`. Remaining (next increment):
       on-DOS **resize** (entire/minimum/custom — desktop already resizes cb-dos
-      backups meanwhile), CD/MSCDEX source, NTFS/logical, the CWSDPMI exit-hang.
+      backups meanwhile), CD/MSCDEX source, NTFS/logical. (The CWSDPMI exit-hang
+      that blocked chaining backup→restore in one boot is now fixed — see the log.)
 - [ ] **Phase 4 — Per-partition selective backup/restore (DOS).** Mirror
       `partition_filter` — pick which partitions to image/restore.
 - [ ] **Phase 4b — Direct disk-to-disk clone mode (DOS).** Source → on-the-fly
@@ -572,6 +573,23 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Fixed the CWSDPMI termination hang (root-caused).** The DOS
+  tools (cbbackup, cbrestore, disk_spike) finished their work but then hung at
+  *process exit* under CWSDPMI on real FreeDOS — backups were always complete
+  and restorable, the process just never returned (so it couldn't chain
+  backup→restore in one boot, and a real user would have to power-cycle).
+  Isolated it with a minimal mode-switching probe (`t_exit.c`): a bare int13h
+  **AH=08** exits cleanly, but an **AH=42 LBA read** hangs. Cause: `xfer_init`
+  allocated the DOS transfer buffer as exactly `XFER_BYTES`, but `read_lba`
+  places the 16-byte int13h **Disk Address Packet** at offset `XFER_BYTES` — one
+  byte past the block — overrunning the adjacent **memory-control block**. DOS
+  doesn't notice until it walks the arena to free memory at exit, so the
+  corruption surfaces as a hang *at termination* (and only after a DAP-using
+  read; AH=08 never touches it). DOSBox-X's DPMI host happened to tolerate it.
+  Fix: allocate `XFER_BYTES + 16` (one extra paragraph) so the DAP lives inside
+  the owned block. Verified the probe (buggy alloc hangs, fixed alloc exits 0)
+  and the real tool: cbbackup now returns to the batch and **qemu powers off
+  cleanly (rc 0)** while still producing a byte-faithful, restorable backup.
 - 2026-06-24 — **Phase 3 complete — cb-dos restores a folder to a disk on real
   DOS, byte-identically.** Wrote `crusty-backup/src/cbrestore.c`
   (`CBRESTORE.EXE`): a minimal `metadata.json` field-scanner (no JSON lib),

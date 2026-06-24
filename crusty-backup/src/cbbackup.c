@@ -37,14 +37,15 @@
 #include <sys/movedata.h>
 #include <zlib.h>
 
-/* KNOWN ISSUE (2026-06-24): under CWSDPMI on real FreeDOS, a DJGPP program
- * that issues int 13h reads via __dpmi_int hangs during program *termination*
- * AFTER all work is done (the backup folder is fully written and fsync'd; the
- * desktop restores it). disk_spike.c reproduces the same hang, so it is the
- * int13h/DPMI exit path, not anything in the backup logic. It does NOT occur
- * under DOSBox-X (which supplies its own DPMI host), so it is a CWSDPMI exit
- * quirk -- candidate fix is shipping an alternate DPMI host (HDPMI32 / JEMMEX)
- * on the cb-dos boot media. Tracked in docs/cb_dos.md. */
+/* FIXED (2026-06-24): the cb-dos tools used to hang at *program termination*
+ * under CWSDPMI on real FreeDOS (the backup completed and restored fine; the
+ * process just never returned). Root cause: xfer_init allocated the DOS
+ * transfer buffer as exactly XFER_BYTES, but read_lba places the 16-byte int13h
+ * Disk Address Packet at offset XFER_BYTES -- one byte past the block -- which
+ * overran the adjacent memory-control block. DOS only notices the corrupt MCB
+ * when it walks the arena to free memory at exit, hence a hang at termination
+ * (only after an AH=42 LBA read; AH=08 alone never touches the DAP). DOSBox-X's
+ * DPMI was just more forgiving. The fix is the +16 in xfer_init below. */
 
 /* ----- DOS-memory transfer buffer (real-mode reachable) ------------- */
 
@@ -53,7 +54,11 @@
 static int g_buf_seg, g_buf_sel;
 
 static int xfer_init(void) {
-    int para = (XFER_BYTES + 15) >> 4;
+    /* +16 bytes for the int13h Disk Address Packet that read_lba places at
+     * offset XFER_BYTES. Without it the block is exactly XFER_BYTES and the DAP
+     * overruns the next MCB, which DOS only trips over when it walks the memory
+     * arena at program exit -> the long-mysterious CWSDPMI termination hang. */
+    int para = (XFER_BYTES + 16 + 15) >> 4;
     g_buf_seg = __dpmi_allocate_dos_memory(para, &g_buf_sel);
     return g_buf_seg;
 }
@@ -466,8 +471,5 @@ int main(int argc, char **argv) {
     printf("backup complete: %d partition%s in %s\n",
            nparts, nparts == 1 ? "" : "s", dest);
     xfer_free();
-    /* See the KNOWN ISSUE note at the top: under CWSDPMI this return may hang
-     * the process at termination, but every output file is already written
-     * and closed, so the backup folder on disk is complete and restorable. */
     return 0;
 }

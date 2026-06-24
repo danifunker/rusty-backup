@@ -37,7 +37,11 @@
 static int g_buf_seg, g_buf_sel;
 
 static int xfer_init(void) {
-    int para = (XFER_BYTES + 15) >> 4;
+    /* +16 bytes for the int13h Disk Address Packet that write_lba/read_lba place
+     * at offset XFER_BYTES. Without it the block is exactly XFER_BYTES and the
+     * DAP overruns the next MCB, which DOS only trips over when it walks the
+     * memory arena at program exit -> the CWSDPMI termination hang. */
+    int para = (XFER_BYTES + 16 + 15) >> 4;
     g_buf_seg = __dpmi_allocate_dos_memory(para, &g_buf_sel);
     return g_buf_seg;
 }

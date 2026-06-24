@@ -56,7 +56,11 @@ static int      g_buf_seg;              /* real-mode segment of the buffer */
 static int      g_buf_sel;             /* selector, for freeing */
 
 static int xfer_init(void) {
-    int para = (XFER_BYTES + 15) >> 4;
+    /* +16 bytes for the int13h Disk Address Packet read_lba places at offset
+     * XFER_BYTES. Without the slack the DAP overruns the next MCB, which DOS
+     * trips over when it walks the arena at exit -> the CWSDPMI termination
+     * hang (the DAP write looks harmless until the program tries to leave). */
+    int para = (XFER_BYTES + 16 + 15) >> 4;
     g_buf_seg = __dpmi_allocate_dos_memory(para, &g_buf_sel);
     return g_buf_seg;                    /* -1 on failure */
 }
