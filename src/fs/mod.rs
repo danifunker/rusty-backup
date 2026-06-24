@@ -49,6 +49,7 @@ pub mod mfs;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
+mod ntfs_tables;
 pub mod os9;
 pub mod patch;
 pub mod pfs3;

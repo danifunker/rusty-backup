@@ -607,13 +607,14 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match
+- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters
 - `<DST>` — Destination path on the host. Single-match: the literal target file. Multi-match or directory source: a directory under which matched entries are laid out (created if it doesn't exist)
 
 **Options**
 
 - `-r` / `--recursive` — Recursively extract directories (literal dir source or glob match against a directory). Without this flag, matched directories are skipped with a warning
 - `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / the positional source
+- `-L` / `--literal` — Treat the source as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
@@ -640,6 +641,7 @@ Usage: get-binhex [OPTIONS] <IMAGE> <SRC> <DST>
 **Options**
 
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it
 
 ### `grow`
 
@@ -706,6 +708,7 @@ Usage: locate [OPTIONS] <IMAGE> <PATH>
 **Options**
 
 - `--format` — Output format. `json` is the default because the load-bearing consumer is a build script
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `locate` always treats the path as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it
 
 ### `ls`
 
@@ -718,11 +721,12 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path or glob pattern inside the filesystem (use `/` as the separator). A plain path lists that directory's contents; patterns containing `*`, `?`, `[`, or `{` walk the volume and emit one line per match
+- `<PATH>` — Path or glob pattern inside the filesystem (use `/` as the separator). A plain path lists that directory's contents; patterns containing `*`, `?`, `[`, or `{` walk the volume and emit one line per match. Pass `--literal` to address a path verbatim when its name contains those characters
 
 **Options**
 
 - `--exclude` — Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / a positional path
+- `-L` / `--literal` — Treat the path as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
@@ -781,13 +785,17 @@ Usage: menu
 Create a directory inside a filesystem
 
 ```
-Usage: mkdir <IMAGE> <PATH>
+Usage: mkdir [OPTIONS] <IMAGE> <PATH>
 ```
 
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
 - `<PATH>` — Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B)
+
+**Options**
+
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `mkdir` always treats the path as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
 
 ### `new`
 
@@ -803,7 +811,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format
+- `--fs` — Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
@@ -812,6 +820,8 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
+- `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain byte count. A power of two from 512 to 2 MiB and at least the sector size. When unset, chosen automatically from the volume size (the classic mkntfs default-by-size table). Ignored for other filesystems
+- `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512. Ignored for other filesystems
 
 ### `new-sgi-cdrom`
 
@@ -1088,6 +1098,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 
 **Options**
 
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
 - `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
@@ -1223,12 +1234,13 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match
+- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters
 
 **Options**
 
 - `-r` / `--recursive` — Recursively delete directories (matches will include directories without this flag, but they get rejected unless --recursive)
 - `--exclude` — Exclude paths matching this glob from deletion. Repeatable. Exclude always wins over the positional pattern
+- `-L` / `--literal` — Treat the path as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch

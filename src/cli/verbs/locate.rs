@@ -45,6 +45,12 @@ pub struct LocateArgs {
     /// consumer is a build script.
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
+
+    /// Accepted for consistency with `ls`/`get`/`rm`; `locate` always treats
+    /// the path as an exact literal path (it never globs), so glob
+    /// metacharacters in a name are addressed verbatim with or without it.
+    #[arg(short = 'L', long = "literal", alias = "no-glob")]
+    pub literal: bool,
 }
 
 #[derive(Debug, Serialize)]

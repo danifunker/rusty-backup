@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::cli::logging::log_stderr;
 use crate::cli::parse::parse_size;
+use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum FsKind {
@@ -25,6 +26,9 @@ pub enum FsKind {
     Efs,
     /// Amiga FFS / OFS (variant selected via --affs-variant).
     Affs,
+    /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
+    /// --cluster-size / --sector-size; both auto-selected when unset.
+    Ntfs,
 }
 
 #[derive(Debug, Args)]
@@ -32,7 +36,7 @@ pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Filesystem to format.
+    /// Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -82,11 +86,32 @@ pub struct NewArgs {
     /// `--inodes`.
     #[arg(long)]
     pub bytes_per_inode: Option<u64>,
+
+    /// NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain
+    /// byte count. A power of two from 512 to 2 MiB and at least the sector
+    /// size. When unset, chosen automatically from the volume size (the classic
+    /// mkntfs default-by-size table). Ignored for other filesystems.
+    #[arg(long = "cluster-size")]
+    pub cluster_size: Option<String>,
+
+    /// NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512.
+    /// Ignored for other filesystems.
+    #[arg(long = "sector-size")]
+    pub sector_size: Option<u32>,
 }
 
 pub fn run(args: NewArgs) -> Result<()> {
     if (args.inodes.is_some() || args.bytes_per_inode.is_some()) && args.fs != FsKind::Efs {
         anyhow::bail!("--inodes / --bytes-per-inode are only valid with --fs efs");
+    }
+    let cluster_bytes = args
+        .cluster_size
+        .as_deref()
+        .map(|s| parse_size(s).context("parsing --cluster-size"))
+        .transpose()?
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    if (cluster_bytes.is_some() || args.sector_size.is_some()) && args.fs != FsKind::Ntfs {
+        anyhow::bail!("--cluster-size / --sector-size are only valid with --fs ntfs");
     }
     match args.fs {
         FsKind::Hfs => {
@@ -140,6 +165,39 @@ pub fn run(args: NewArgs) -> Result<()> {
                 crate::fs::affs::create_blank_affs(size, variant, name)
             })
         }
+        FsKind::Ntfs => {
+            let raw = parse_size(&args.size).context("parsing --size")?;
+            let sector = args.sector_size.unwrap_or(512);
+            // Auto cluster follows the mkntfs default-by-size table (512-byte
+            // sectors); when an explicit sector size is given the cluster is
+            // floored to it so the geometry stays valid.
+            let geometry = match cluster_bytes {
+                Some(c) => NtfsGeometry::with_cluster_size(c, sector)?,
+                None => {
+                    let auto = NtfsGeometry::for_volume_size(raw).cluster_size() as u32;
+                    NtfsGeometry::with_cluster_size(auto.max(sector), sector)?
+                }
+            };
+            let cluster = geometry.cluster_size();
+            let total_size = raw / cluster * cluster;
+            if total_size == 0 {
+                anyhow::bail!("--size {raw} is smaller than one {cluster}-byte NTFS cluster");
+            }
+            if total_size != raw {
+                log_stderr(format!(
+                    "Note: NTFS size rounded down to {total_size} bytes (multiple of the {cluster}-byte cluster)"
+                ));
+            }
+            // ~1 MFT record per 256 KiB, with a 128-record floor for headroom.
+            let mft_records_hint = (total_size / (256 * 1024)).clamp(128, 1 << 20);
+            write_blank_ntfs_image(
+                &args.image,
+                total_size,
+                geometry,
+                mft_records_hint,
+                &args.name,
+            )
+        }
     }
 }
 
@@ -156,6 +214,43 @@ fn format_and_write(
         "wrote {} ({} bytes, volume {:?})",
         image.display(),
         bytes.len(),
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare NTFS superfloppy straight into the target file. `create_ntfs`
+/// seeks and writes only the populated regions (boot, MFT, metadata, backup
+/// boot at the last sector), so the bulk of the volume stays sparse rather than
+/// being materialized in RAM.
+fn write_blank_ntfs_image(
+    image: &std::path::Path,
+    total_size: u64,
+    geometry: NtfsGeometry,
+    mft_records_hint: u64,
+    name: &str,
+) -> Result<()> {
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    create_ntfs(
+        &mut file,
+        &NtfsFormatParams {
+            total_size,
+            geometry,
+            mft_records_hint,
+            label: Some(name.to_string()),
+        },
+    )
+    .with_context(|| format!("formatting NTFS into {}", image.display()))?;
+    // Ensure the file is exactly the requested size even though the trailing
+    // clusters are sparse.
+    file.set_len(total_size)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({total_size} bytes, NTFS cluster={} sector={}, volume {:?})",
+        image.display(),
+        geometry.cluster_size(),
+        geometry.bytes_per_sector,
         name
     ));
     Ok(())

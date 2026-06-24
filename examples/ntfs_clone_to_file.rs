@@ -28,7 +28,7 @@ fn main() {
     w(&mut src, &sub, "note.txt", b"nested file\n");
     EditableFilesystem::sync_metadata(&mut src).unwrap();
 
-    let target_size = ntfs_min_packed_size(src.used_size(), 64);
+    let target_size = ntfs_min_packed_size(src.used_size(), 64, 4096);
     let mut f = std::fs::File::create(&out).unwrap();
     let r =
         stream_defragmented_ntfs(&mut src, target_size, &mut f, &mut |_| {}, &mut |_| {}).unwrap();

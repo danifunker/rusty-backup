@@ -46,6 +46,8 @@ pub struct GetArgs {
 
     /// Source path or glob inside the filesystem. Patterns containing
     /// `*`, `?`, `[`, or `{` walk the volume and extract every match.
+    /// Pass `--literal` to extract a single path verbatim when its name
+    /// contains those characters.
     pub src: String,
 
     /// Destination path on the host. Single-match: the literal target
@@ -63,6 +65,17 @@ pub struct GetArgs {
     /// Exclude always wins over `--include` / the positional source.
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
+
+    /// Treat the source as an exact, literal path: never interpret `*`, `?`,
+    /// `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain
+    /// those characters. Conflicts with `--exclude`.
+    #[arg(
+        short = 'L',
+        long = "literal",
+        alias = "no-glob",
+        conflicts_with = "exclude"
+    )]
+    pub literal: bool,
 
     /// Match case-insensitively regardless of the target's native rule.
     #[arg(long, conflicts_with = "case_sensitive")]
@@ -157,7 +170,9 @@ pub fn run(args: GetArgs) -> Result<()> {
     // Decide the dispatch shape. Globs and exclude lists always go
     // through the glob walker; a literal source goes through resolve_path
     // and is treated as a single file or a recursive directory dump.
-    if has_glob_chars(&args.src) || !args.exclude.is_empty() {
+    // `--literal` forces the resolve_path branch even for names that contain
+    // glob metacharacters.
+    if !args.literal && (has_glob_chars(&args.src) || !args.exclude.is_empty()) {
         return run_glob(
             &mut *fs,
             &args.src,

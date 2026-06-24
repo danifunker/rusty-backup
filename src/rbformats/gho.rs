@@ -5081,7 +5081,7 @@ fn parse_inline_mft_from_buf(
                 continue;
             }
             let mut rec = buf[rec_off..rec_off + rec_size].to_vec();
-            let _ = apply_fixup(&mut rec, vbr.bytes_per_sector);
+            let _ = apply_fixup(&mut rec);
             let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
             for attr in &attrs {
                 if !attr.resident && !attr.data_runs.is_empty() {
@@ -5340,7 +5340,7 @@ fn parse_inline_mft_records<R: Read + Seek>(
                 pos = rec_off + rec_size;
                 continue;
             }
-            let _ = apply_fixup(&mut rec, vbr.bytes_per_sector);
+            let _ = apply_fixup(&mut rec);
             let attrs = parse_mft_attributes(&rec, vbr.mft_record_size);
             for attr in &attrs {
                 if !attr.resident && !attr.data_runs.is_empty() {
@@ -5448,7 +5448,7 @@ fn index_ntfs_file_aware<R: Read + Seek>(
         if rec_num == 8 {
             continue;
         }
-        let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+        let _ = apply_fixup(&mut rec_buf);
         let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
         for attr in &attrs {
             if attr.resident || attr.data_runs.is_empty() {
@@ -5945,7 +5945,7 @@ fn open_ntfs_compressed_mft_only(
                         continue;
                     }
                     let mut rec_buf = rec.to_vec();
-                    let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+                    let _ = apply_fixup(&mut rec_buf);
                     let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
                     for attr in &attrs {
                         if attr.resident || attr.data_runs.is_empty() {
@@ -6851,7 +6851,7 @@ fn fixup_ntfs_typed_misalignments(
             total += n;
         }
     }
-    let _ = apply_fixup(&mut rec0, vbr.bytes_per_sector);
+    let _ = apply_fixup(&mut rec0);
     // $MFT's own $DATA runs, as (vcn_start, cluster_count, lcn_start) in order.
     // Used to place FILE-magic MFT-fragment runs deterministically by content:
     // an MFT fragment's first record carries its own record number, which fixes
@@ -6982,7 +6982,7 @@ fn fixup_ntfs_typed_misalignments(
         if self_rec == 8 {
             continue;
         }
-        let _ = apply_fixup(&mut rec_buf, vbr.bytes_per_sector);
+        let _ = apply_fixup(&mut rec_buf);
         let attrs = parse_mft_attributes(&rec_buf, vbr.mft_record_size);
         // Capture the file name from a base record's resident $FILE_NAME (0x30)
         // for the residual-hole report. Value layout: parent ref (8) ... name

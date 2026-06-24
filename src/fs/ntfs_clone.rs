@@ -23,7 +23,7 @@ use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
 use super::ntfs::NtfsFilesystem;
-use super::ntfs_format::create_blank_ntfs;
+use super::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
 
 /// Per-clone result: counters + non-fatal warnings.
 #[derive(Debug, Default, Clone)]
@@ -154,10 +154,19 @@ where
 {
     let mft_records = source.mft_record_capacity();
     let label = source.volume_label().map(|s| s.to_string());
+    // Inherit the source volume's geometry so the repacked target keeps the
+    // same sector and cluster size (the target size from
+    // `defragmented_minimum_size` is already a multiple of the source cluster).
+    let geometry = NtfsGeometry::with_cluster_size(
+        source.cluster_size() as u32,
+        source.bytes_per_sector() as u32,
+    )?;
 
     log_cb(&format!(
-        "NTFS clone: formatting blank {} MiB target volume",
-        target_size / (1024 * 1024)
+        "NTFS clone: formatting blank {} MiB target volume (cluster {}, sector {})",
+        target_size / (1024 * 1024),
+        geometry.cluster_size(),
+        geometry.bytes_per_sector,
     ));
 
     let mut tmp = tempfile::tempfile().map_err(|e| {
@@ -165,7 +174,15 @@ where
             "create tempfile for NTFS clone: {e}"
         )))
     })?;
-    create_blank_ntfs(&mut tmp, target_size, mft_records, label.as_deref())?;
+    create_ntfs(
+        &mut tmp,
+        &NtfsFormatParams {
+            total_size: target_size,
+            geometry,
+            mft_records_hint: mft_records,
+            label,
+        },
+    )?;
     tmp.seek(SeekFrom::Start(0))?;
 
     let mut target = NtfsFilesystem::open(tmp, 0)?;
@@ -189,12 +206,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::ntfs_format::{create_blank_ntfs, ntfs_min_packed_size};
+    use crate::fs::ntfs_format::ntfs_min_packed_size;
     use std::io::Cursor;
 
-    fn blank(size: u64) -> Cursor<Vec<u8>> {
+    fn blank(size: u64, cluster: u32, sector: u32) -> Cursor<Vec<u8>> {
         let mut cur = Cursor::new(Vec::<u8>::new());
-        create_blank_ntfs(&mut cur, size, 128, Some("SRC")).unwrap();
+        create_ntfs(
+            &mut cur,
+            &NtfsFormatParams {
+                total_size: size,
+                geometry: NtfsGeometry::with_cluster_size(cluster, sector).unwrap(),
+                mft_records_hint: 128,
+                label: Some("SRC".to_string()),
+            },
+        )
+        .unwrap();
         cur.seek(SeekFrom::Start(0)).unwrap();
         cur
     }
@@ -218,47 +244,65 @@ mod tests {
 
     #[test]
     fn stream_defragmented_ntfs_round_trips() {
-        let mut src = NtfsFilesystem::open(blank(48 * 1024 * 1024), 0).unwrap();
-        let root = src.root().unwrap();
-        write_file(&mut src, &root, "readme.txt", b"hello ntfs");
-        let big = vec![0x5Au8; 20_000]; // multi-cluster, non-resident
-        write_file(&mut src, &root, "big.bin", &big);
-        let sub = src
-            .create_directory(&root, "sub", &CreateDirectoryOptions::default())
-            .unwrap();
-        write_file(&mut src, &sub, "nested.bin", &[1, 2, 3, 4, 5, 6, 7, 8]);
-        EditableFilesystem::sync_metadata(&mut src).unwrap();
+        // Across a few source geometries: the clone must preserve the source's
+        // sector + cluster size and round-trip every file.
+        for (cluster, sector) in [(512u32, 512u32), (4096, 512), (4096, 4096)] {
+            let label = format!("c{cluster}s{sector}");
+            let mut src = NtfsFilesystem::open(blank(48 * 1024 * 1024, cluster, sector), 0)
+                .unwrap_or_else(|e| panic!("open source {label}: {e:?}"));
+            let root = src.root().unwrap();
+            write_file(&mut src, &root, "readme.txt", b"hello ntfs");
+            let big = vec![0x5Au8; 20_000]; // multi-cluster, non-resident
+            write_file(&mut src, &root, "big.bin", &big);
+            let sub = src
+                .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+                .unwrap();
+            write_file(&mut src, &sub, "nested.bin", &[1, 2, 3, 4, 5, 6, 7, 8]);
+            EditableFilesystem::sync_metadata(&mut src).unwrap();
 
-        let target_size = ntfs_min_packed_size(src.used_size(), 64);
-        let mut out = Cursor::new(Vec::<u8>::new());
-        let report =
-            stream_defragmented_ntfs(&mut src, target_size, &mut out, &mut |_| {}, &mut |_| {})
-                .expect("stream clone");
-        assert_eq!(report.files_copied, 3);
-        assert_eq!(report.dirs_copied, 1);
-        assert_eq!(out.get_ref().len() as u64, target_size);
+            let target_size = ntfs_min_packed_size(src.used_size(), 64, cluster as u64);
+            let mut out = Cursor::new(Vec::<u8>::new());
+            let report =
+                stream_defragmented_ntfs(&mut src, target_size, &mut out, &mut |_| {}, &mut |_| {})
+                    .unwrap_or_else(|e| panic!("stream clone {label}: {e:?}"));
+            assert_eq!(report.files_copied, 3, "{label}");
+            assert_eq!(report.dirs_copied, 1, "{label}");
+            assert_eq!(out.get_ref().len() as u64, target_size, "{label}");
 
-        out.seek(SeekFrom::Start(0)).unwrap();
-        let mut dst = NtfsFilesystem::open(out, 0).unwrap();
-        let droot = dst.root().unwrap();
-        let entries = dst.list_directory(&droot).unwrap();
-        let e = entries
-            .iter()
-            .find(|e| e.name == "big.bin")
-            .expect("big present");
-        assert_eq!(dst.read_file(e, e.size as usize).unwrap(), big);
-        let sub = entries
-            .iter()
-            .find(|e| e.name == "sub" && e.is_directory())
-            .expect("subdir present");
-        let nested = dst.list_directory(sub).unwrap();
-        let n = nested
-            .iter()
-            .find(|e| e.name == "nested.bin")
-            .expect("nested");
-        assert_eq!(
-            dst.read_file(n, n.size as usize).unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8]
-        );
+            out.seek(SeekFrom::Start(0)).unwrap();
+            let mut dst = NtfsFilesystem::open(out, 0).unwrap();
+            // Geometry inherited from the source.
+            assert_eq!(
+                dst.cluster_size(),
+                cluster as u64,
+                "cluster preserved {label}"
+            );
+            assert_eq!(
+                dst.bytes_per_sector(),
+                sector as u64,
+                "sector preserved {label}"
+            );
+            let droot = dst.root().unwrap();
+            let entries = dst.list_directory(&droot).unwrap();
+            let e = entries
+                .iter()
+                .find(|e| e.name == "big.bin")
+                .expect("big present");
+            assert_eq!(dst.read_file(e, e.size as usize).unwrap(), big, "{label}");
+            let sub = entries
+                .iter()
+                .find(|e| e.name == "sub" && e.is_directory())
+                .expect("subdir present");
+            let nested = dst.list_directory(sub).unwrap();
+            let n = nested
+                .iter()
+                .find(|e| e.name == "nested.bin")
+                .expect("nested");
+            assert_eq!(
+                dst.read_file(n, n.size as usize).unwrap(),
+                vec![1, 2, 3, 4, 5, 6, 7, 8],
+                "{label}"
+            );
+        }
     }
 }

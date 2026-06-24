@@ -334,6 +334,8 @@ pub fn parent_device_name(partition_name: &str) -> String {
 }
 
 #[cfg(test)]
+// This module's helper fns intentionally live after the tests in this file.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -536,7 +538,7 @@ impl PrivilegedDiskAccess for LinuxDiskAccess {
     }
 
     fn write_sectors(&mut self, handle: DiskHandle, lba: u64, data: &[u8]) -> Result<()> {
-        if data.len() % 512 != 0 {
+        if !data.len().is_multiple_of(512) {
             anyhow::bail!(
                 "Data size must be a multiple of 512 bytes, got {}",
                 data.len()
@@ -644,7 +646,7 @@ pub fn real_user_home() -> Option<PathBuf> {
     // HOME was passed through pkexec env wrapper
     if let Ok(home) = std::env::var("HOME") {
         let p = PathBuf::from(&home);
-        if p != PathBuf::from("/root") && p.exists() {
+        if p != std::path::Path::new("/root") && p.exists() {
             return Some(p);
         }
     }

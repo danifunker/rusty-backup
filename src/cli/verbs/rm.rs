@@ -17,6 +17,8 @@ pub struct RmArgs {
 
     /// Path or glob pattern inside the filesystem. Patterns containing
     /// `*`, `?`, `[`, or `{` walk the volume and delete every match.
+    /// Pass `--literal` to delete a single path verbatim when its name
+    /// contains those characters.
     pub path: String,
 
     /// Recursively delete directories (matches will include directories
@@ -28,6 +30,17 @@ pub struct RmArgs {
     /// Exclude always wins over the positional pattern.
     #[arg(long = "exclude")]
     pub exclude: Vec<String>,
+
+    /// Treat the path as an exact, literal path: never interpret `*`, `?`,
+    /// `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain
+    /// those characters. Conflicts with `--exclude`.
+    #[arg(
+        short = 'L',
+        long = "literal",
+        alias = "no-glob",
+        conflicts_with = "exclude"
+    )]
+    pub literal: bool,
 
     /// Match case-insensitively regardless of the target's native rule.
     #[arg(long, conflicts_with = "case_sensitive")]
@@ -63,7 +76,9 @@ pub fn run(args: RmArgs) -> Result<()> {
         _ => true,
     };
 
-    if has_glob_chars(&args.path) || !args.exclude.is_empty() {
+    // `--literal` forces the exact single-path delete even for names that
+    // contain glob metacharacters.
+    if !args.literal && (has_glob_chars(&args.path) || !args.exclude.is_empty()) {
         // Glob path — collect everything, sort deepest-first so we delete
         // children before parents, then apply.
         let includes = compile_patterns(&args.path, case_insensitive)?;

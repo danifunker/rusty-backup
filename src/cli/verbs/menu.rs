@@ -249,10 +249,10 @@ fn pick_action(labels: &[String]) -> Result<Option<(usize, Action)>> {
                     return Ok(Some((idx, action)));
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
-                if state.on_back() {
-                    return Ok(None);
-                }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h')
+                if state.on_back() =>
+            {
+                return Ok(None);
             }
             _ if ctrl_c => return Ok(None),
             _ => {}

@@ -58,6 +58,12 @@ pub struct GetBinHexArgs {
     /// Password for encrypted containers (currently: WinImage IMZ).
     #[arg(long)]
     pub password: Option<String>,
+
+    /// Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always
+    /// treats the source as an exact literal path (it never globs), so glob
+    /// metacharacters in a name are addressed verbatim with or without it.
+    #[arg(short = 'L', long = "literal", alias = "no-glob")]
+    pub literal: bool,
 }
 
 /// Convert a 4-char Finder code string into a padded 4-byte array.
