@@ -533,21 +533,31 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 > the native format first. Networking only swaps the *destination* under a working
 > engine.
 
-- [~] **7a — Frame/socket hello-world.** **Engine + client written; runtime
-      check pending.**
+- [x] **7a — Frame/socket hello-world.** **Done — handshake round-trips
+      end-to-end (real FreeDOS in qemu over an NE2000 packet driver + SLiRP,
+      2026-06-24).**
       - **Host (done, headless-tested):** `rb-cli serve` now accepts a **binary
         Family-B handshake** alongside the JSON Family-F one on the same port —
         `read_handshake` peeks the 4-byte magic (`b"RBK0"`) to disambiguate, and
         `write_binary_hello` replies (`magic + version + caps`, big-endian).
         `src/remote/{protocol,server}.rs`; loopback test
         `family_b_binary_handshake_over_loopback`.
-      - **DOS client (done, compile-verified):** `crusty-backup/src/net_hello.c`
+      - **DOS client (done, runtime-verified):** `crusty-backup/src/net_hello.c`
         (`NETHELLO.EXE`) — **WATT-32** `sock_init` + BSD `socket`/`connect`/
         `send`/`recv`, sends the binary Hello to `<agent-ip>:7341`, prints the
         reply. Builds clean under DJGPP (`make -C crusty-backup net`).
-      - **Pending (user, hardware/emulator):** run `NETHELLO` in DOSBox-X/86Box
-        (SLiRP + port-forward to a host `rb-cli serve`) or on a real NIC; confirm
-        the handshake round-trips. Resolve the WATTCP.CFG/DHCP UX while there.
+      - **Runtime check (done, 2026-06-24, emulator):** booted the FreeDOS 1.4
+        image headless in **qemu-system-i386** (`-device ne2k_isa,iobase=0x300,
+        irq=3` + `-netdev user` SLiRP), loaded the Crynwr **`NE2000.COM`** packet
+        driver (`NE2000 0x60 3 0x300`), and ran `NETHELLO 10.0.2.2 7341` against a
+        host `rb-cli serve`. Handshake round-tripped: client printed *"Connected.
+        Agent protocol v2, capabilities 0x0001 [file]"* (exit 0), host logged
+        *"Family-B client connected (version 2, caps 0x0000)"*. **WATTCP.CFG UX:**
+        a one-line `my_ip = dhcp` is enough — SLiRP's DHCP leases the guest and
+        `10.0.2.2` reaches the host listener. **DOS gotcha:** FreeCOM doesn't honor
+        `2>`/`2>&1` (parses the `2` as an argv) — pass the port explicitly and use
+        single `>` redirects, or all output goes to stderr/console. CWSDPMI.EXE
+        must sit next to `NETHELLO.EXE` (real FreeDOS has no DPMI host).
 - [ ] **7b — Chunk protocol + container.** Define `.cbk` chunk header + index;
       stop-and-go single-member PUT DOS→host; byte-verify; write/read the index.
 - [ ] **7c — Whole-folder backup over wire.** Stream a full native folder as
@@ -570,6 +580,23 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 7a complete — handshake round-trips on real FreeDOS.**
+  Closed the only open 7a item (the runtime check) on a headless Linux box, no
+  86Box/DOSBox-X GUI needed: **qemu-system-i386** booting the FreeDOS 1.4 image
+  with an emulated **NE2000** (`-device ne2k_isa,iobase=0x300,irq=3`) + **SLiRP**
+  usermode net (`-netdev user`). Pulled the Crynwr **`NE2000.COM`** out of the
+  FreeDOS image's own `crynwr.zip`, loaded it on int `0x60`, and ran
+  `NETHELLO 10.0.2.2 7341` against `rb-cli serve`. Both ends confirmed: client
+  *"Connected. Agent protocol v2, capabilities 0x0001 [file]"* (exit 0), host
+  *"Family-B client connected (version 2, caps 0x0000)"*. The binary `RBK0`
+  Family-B handshake is now proven over a true DOS TCP stack, not just the
+  loopback unit test. Two lessons worth keeping: (1) **FreeCOM mis-parses `2>` /
+  `2>&1`** — it treats the `2` as a program argument (which silently sent
+  `NETHELLO` to *port 2*), so pass the port explicitly and stick to single `>`
+  redirects; (2) **`my_ip = dhcp`** in WATTCP.CFG is the whole network config —
+  SLiRP's DHCP does the rest. CWSDPMI.EXE must travel next to the exe (real
+  FreeDOS provides no DPMI host; only the disk-spike's DOSBox-X faked one).
+  Next: **7b** (the `.cbk` chunk protocol + container). The transport is unblocked.
 - 2026-06-21 — **Phase 7a started (socket + handshake hello-world).** Resolved
   the long-open **TCP-stack question: WATT-32** (DJGPP-native BSD sockets,
   prebuilt `libwatt.a`, BSD/AGPL-compatible) over mTCP/Watcom (§1b). Host:
