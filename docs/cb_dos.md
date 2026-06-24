@@ -534,10 +534,21 @@ over the wire now.
       gates the destructive write. **Proof:** restored a Phase-2 folder onto a
       *blank* disk on real FreeDOS in qemu — the result is **byte-for-byte
       identical to the original source disk** (50,331,648 bytes), mounts as
-      `CBDOSFAT16`, file intact. `make restore`. Remaining (next increment):
-      on-DOS **resize** (entire/minimum/custom — desktop already resizes cb-dos
-      backups meanwhile), CD/MSCDEX source, NTFS/logical. (The CWSDPMI exit-hang
-      that blocked chaining backup→restore in one boot is now fixed — see the log.)
+      `CBDOSFAT16`, file intact. `make restore`. (The CWSDPMI exit-hang that
+      blocked chaining backup→restore in one boot is now fixed — see the log.)
+      **On-DOS resize SHIPPED (2026-06-24):** `/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM`
+      (`/CUSTOM:<bytes>`) does a full bidirectional FAT12/16/32 resize on DOS — the
+      C port of the desktop's `resize_fat_in_place`: grow = forward-shift data +
+      zero-extend the FAT (capped at the FAT16 cluster ceiling, since wider needs
+      FAT32 re-clustering); shrink = backward-shift data + truncate the FAT (floored
+      at a valid FAT16); no-op when the window already matches (keeps ORIGINAL
+      byte-identical). FAT16/32 clean-shutdown flags + FAT32 FSInfo reset after.
+      Handles **both** producer shapes: cbbackup's full-size BPB and the desktop's
+      pre-minimized gzip BPB (so ORIGINAL *grows* the latter back). The MBR window +
+      CHS are patched only when a partition's size changes (verbatim otherwise).
+      Verified on real FreeDOS/qemu across every direction with a 16 MB file intact
+      through large bidirectional shifts, read back by *both* mtools and the
+      desktop's own FAT driver. Remaining: CD/MSCDEX source, NTFS/logical, real-486.
 - [ ] **Phase 4 — Per-partition selective backup/restore (DOS).** Mirror
       `partition_filter` — pick which partitions to image/restore.
 - [ ] **Phase 4b — Direct disk-to-disk clone mode (DOS).** Source → on-the-fly
@@ -573,6 +584,38 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **On-DOS FAT resize shipped — cbrestore grows/shrinks the
+  filesystem on the 486 itself.** `cbrestore.c` gained
+  `/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM` (`/CUSTOM:<bytes>`), a full bidirectional
+  FAT16/32 resizer that is the C port of the desktop's `resize_fat_in_place`.
+  Added the missing disk primitives (`read_lba`, AH=48h true disk size for
+  ENTIRE), `compute_fat_sectors`, forward + backward sector-region shifts, the
+  FAT16/32 clean-shutdown flags, and FAT32 FSInfo reset. **Algorithm:** grow =
+  shift the data region forward + zero-extend the FAT, **capped** at the FAT16
+  cluster ceiling (65 524 — wider would need FAT32 re-clustering we don't do on
+  DOS); shrink = write the truncated FAT then shift the data region backward onto
+  it, **floored** at a valid FAT16 (4 085 clusters); same-size = no-op (keeps the
+  proven byte-identical ORIGINAL restore). The MBR window + CHS-end are patched
+  only for partitions whose size changed (verbatim otherwise). **Key discovery:**
+  the two producers store *different* gz representations — `cbbackup` keeps the
+  original BPB with free clusters zeroed (`ts32`=full), while the desktop's
+  compacted gzip (`CompactFatReader`) rewrites the BPB to a pre-minimized FS
+  (`ts32`=minimum). cbrestore reads the gz's actual BPB total and resizes against
+  it, so **ORIGINAL grows the desktop's minimal gz back to full size** while
+  staying a no-op for cbbackup's full-size gz. Non-512-byte/non-FAT partitions
+  fall back to original size with a note (resize on the desktop). **Verified on
+  real FreeDOS in qemu** across every path — ORIGINAL (byte-identical from a
+  cbbackup folder; grow from a desktop folder), MINIMUM (no-op on a minimal gz;
+  251→16 spf backward-shift + floor clamp on a full gz), ENTIRE (forward-shift
+  grow capped at the FAT16 limit), CUSTOM (mid-range 251→96 spf backward shift of
+  ~16 MB of data, and a 32 MB grow) — each mounts and reads back **bit-identical
+  files** (incl. a 16 MB random blob) under *both* mtools and the desktop's own
+  FAT driver. **Test-rig note:** redirecting `cbbackup`'s stdout to a file on the
+  same drive it writes the backup folder to corrupts `mbr.bin` (its
+  "wrote metadata.json" banner bleeds into the boot-code area) — a FreeCOM
+  redirection quirk (gotcha #3), *not* a cbrestore bug; run `cbbackup` without
+  `>` (the Phase-2 recipe never redirected it). `make restore`. **Next:** Phase 4
+  (per-partition selection), 4b (disk-to-disk clone), then the `.cbk` wire (7b).
 - 2026-06-24 — **Fixed the CWSDPMI termination hang (root-caused).** The DOS
   tools (cbbackup, cbrestore, disk_spike) finished their work but then hung at
   *process exit* under CWSDPMI on real FreeDOS — backups were always complete

@@ -7,9 +7,11 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-24)
 
-Branch **`cbdos`** (off `main`), 9 commits, all verified, tree clean:
+Branch **`cbdos`** (off `main`), 10 commits, all verified, tree clean (latest
+commit lands with this hand-off):
 
 ```
+(pending) feat(cb-dos): on-DOS FAT resize in cbrestore — /SIZE entire/minimum/custom
 ec66eef fix(cb-dos): root-cause + fix the CWSDPMI termination hang (DAP buffer overrun)
 61dfb64 fix(cbk): make PathBuf import unconditional so no-chd builds compile
 ba93140 feat(cbk): edit a partition inside a .cbk (materialize -> edit -> repack)
@@ -29,28 +31,33 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
+| **Phase 3 resize** — `cbrestore /SIZE` | bidirectional FAT16/32 resize on DOS (entire/minimum/custom); grow+shrink verified on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **On-DOS resize (Phase 3 stretch).** `cbrestore` currently restores at
-   *original* size only. Add `--size {entire,minimum,custom}` doing FAT resize on
-   DOS (the desktop's `resize_fat_in_place` in `src/fs/fat.rs` is the reference
-   algorithm; cb-dos already reads the FAT in `cbbackup`). Start in
-   `crusty-backup/src/cbrestore.c`. *Recommended next.*
-2. **Phase 4 — per-partition selective** backup/restore (mirror the desktop's
+1. **Phase 4 — per-partition selective** backup/restore (mirror the desktop's
    `partition_filter`): a CLI flag picking which partition indices to image/restore.
-3. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
+   *Recommended next.* (cbrestore already parses all partitions into an array and
+   computes per-partition no-overlap windows, so the selective restore hook is
+   small; the resize code handles multi-partition layout already.)
+2. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
    target disk, no intermediate file). Reuses the `cbbackup` engine.
-4. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
+3. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
    format already supports multiple chunks/member) and make the reader decompress
    only the members a seek touches. No format change.
-5. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+4. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
+5. **`cbbackup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+   Redirecting `cbbackup`'s stdout to a file on the *same drive* it writes the
+   backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
+   boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
+   quirk (gotcha #3), not a cbrestore bug — run `cbbackup` without `>` and it's
+   clean. Worth root-causing (likely a DTA / FILE-buffer aliasing in `cbbackup.c`).
 6. **Real-486 hardware** validation (everything so far is qemu/emulator).
 
 ## Key files
@@ -70,8 +77,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 
 **DOS (C) — `crusty-backup/src/`:**
 - `cbbackup.c` (`CBBACKUP.EXE`) — backup engine. `cbrestore.c` (`CBRESTORE.EXE`)
-  — restore engine. `disk_spike.c` — disk/FS spike. `net_hello.c` — WATT-32
-  handshake client. `lfn_test.c` — raw LFN-API probe.
+  — restore engine **+ on-DOS FAT resize** (`/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM`,
+  `/CUSTOM:<bytes>`): `fat_resize` (bidirectional, the C port of
+  `resize_fat_in_place`), `shift_region_forward`/`_backward`, `compute_fat_sectors`,
+  `max_fat_window`/`min_fat_window` (cluster cap/floor), `set_clean_flags`,
+  `reset_fsinfo`, AH=48h `drive_total_sectors`. `disk_spike.c` — disk/FS spike.
+  `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
 - `Makefile` targets: `make backup` / `restore` / `net` / `all` / `size`.
 - `deps/fetch-zlib.sh`, `net/fetch-watt32.sh` — cross-built deps (gitignored).
 
@@ -121,6 +132,20 @@ attach as `index=1` (0x81), and `CBRESTORE C:\BK 81 /Y`. Build an MBR FAT16 test
 disk with `mformat -i disk.img@@1048576 ...` after writing an MBR partition entry
 (type 0x06, start LBA 2048) — see the Phase-1 history in `cb_dos.md`.
 
+**Resize tests** (`/SIZE:{ORIGINAL|MINIMUM|ENTIRE|CUSTOM}`, `/CUSTOM:<bytes>`):
+attach several blank targets (`index=1..3` → `0x81..0x83`) of *different* sizes
+and resize into each, e.g.
+`CBRESTORE C:\BK 82 /Y /SIZE:ENTIRE` (grow to fill the disk),
+`CBRESTORE C:\BK 83 /Y /SIZE:CUSTOM /CUSTOM:33554432`. To exercise both the
+**grow** (forward-shift + FAT extend, capped at the FAT16 cluster ceiling) *and*
+**shrink** (backward-shift + FAT truncate, floored at a valid FAT16) paths, test
+with **both** producers: a `cbbackup` folder (gz keeps the original full-size BPB
+→ MINIMUM/CUSTOM actually shrink) and a desktop `rb-cli backup --format gzip`
+folder (gz is pre-minimized → ORIGINAL/ENTIRE grow it). Pull each target with
+`mcopy -i tgt.img@@1048576 ::/FILE out` and diff checksums; the desktop's
+`rb-cli ls tgt.img@1` is a good independent FAT-reader cross-check. **Don't
+redirect `cbbackup`** when making the folder (gotcha #3 corrupts `mbr.bin`).
+
 ## Gotchas learned the hard way (do not relearn these)
 
 1. **No LFN on the FD14FULL kernel.** `71A0h` returns ax `0x7100`. You **must**
@@ -134,7 +159,13 @@ disk with `mformat -i disk.img@@1048576 ...` after writing an MBR partition entr
    don't reintroduce it when copying the disk primitives into new tools.
 3. **FreeCOM redirection quirks.** `2>` / `2>&1` are mis-parsed (the `2` becomes a
    program argument — silently sent `NETHELLO` to *port 2*); `>>` append is
-   unreliable. Use a single `>` and pass args explicitly.
+   unreliable. Use a single `>` and pass args explicitly. **Also:** redirecting
+   `cbbackup`'s stdout to a file on the *same drive* it writes the backup folder
+   to corrupts `mbr.bin` (the "wrote metadata.json" banner bleeds into the
+   boot-code area) → restores from that folder get a garbled MBR. Run `cbbackup`
+   **without** `>`; only redirect `cbrestore` (it writes nothing to DOS files, so
+   it's safe). Don't trust a folder for a byte-identical check if cbbackup was
+   redirected. Likely a `cbbackup.c` DTA/FILE-buffer aliasing bug to root-cause.
 4. **int13h writes are immediate** (not DOS-file-cached), so a restore lands on
    disk even if the process were killed mid-run — handy for headless tests.
 5. **`.cbk` v1 is frozen** (`cbk.rs` doc-comment). The future DOS network producer
