@@ -47,7 +47,22 @@ $(BUILD)/nethello.exe: src/net_hello.c | $(BUILD)
 	  echo "WATT-32 not found -- run: sh net/fetch-watt32.sh"; exit 1; }
 	$(CC) $(CFLAGS) -I$(WATTINC) $(LDFLAGS) -o $@ $< -L$(WATTLIB) -lwatt
 
+# --- Backup engine (zlib) -------------------------------------------------
+# Not part of `all`: needs the DJGPP zlib static lib, cross-built separately
+# (gitignored). Run `sh deps/fetch-zlib.sh` once, then `make backup`. Writes
+# the desktop's native PerPartition folder to a DOS path -- see docs/cb_dos.md.
+ZLIB    := deps/zlib
+ZLIBINC := $(ZLIB)/inc
+ZLIBLIB := $(ZLIB)/lib
+
+backup: $(BUILD)/cbbackup.exe
+
+$(BUILD)/cbbackup.exe: src/cbbackup.c | $(BUILD)
+	@test -f $(ZLIBLIB)/libz.a || { \
+	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $< -L$(ZLIBLIB) -lz
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all size net clean
+.PHONY: all size net backup clean

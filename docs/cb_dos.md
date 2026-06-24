@@ -83,9 +83,15 @@ per-partition selective restore nor resize.
   through `__dpmi_int` + the transfer buffer (`__tb`, `dosmemget`/`dosmemput`).
   CF/SD-over-IDE presents as a normal BIOS drive (0x80, 0x81…).
 - **LFN**: cb-dos writes long filenames via the DOS LFN API (int 21h/71xxh).
-  The **FreeDOS kernel provides LFN natively** (no TSR), which is the main reason
-  we ship our own FreeDOS boot media (see *Distribution* below). On a stock
-  MS-DOS install the user loads a `doslfn`-style TSR instead.
+  Many FreeDOS kernels provide LFN natively (no TSR). **Reality check
+  (2026-06-24):** the **FreeDOS 1.4 FULL *installer* image kernel reports no LFN**
+  — `71A0h` returns ax `0x7100` (multiplex not installed), and DJGPP then mangles
+  `partition-0.gz` → `PARTITIO.GZ` (and collides the `.crc32` sidecar). The fix is
+  to **load `DOSLFN.COM`** (shipped at `\FREEDOS\BIN\DOSLFN.COM`) before running
+  cb-dos; once loaded, names round-trip verbatim. So the boot media must either
+  ship a kernel built with LFN **or** `DEVLOAD`/run `DOSLFN` at boot — do not
+  assume kernel-native LFN. On stock MS-DOS the user loads a `doslfn`-style TSR
+  the same way.
 
 Alternative considered: **OpenWatcom C/C++** + DOS/4GW. DJGPP preferred for
 gcc/zlib familiarity.
@@ -502,10 +508,22 @@ over the wire now.
       Verified end-to-end: gzip backup → restore of an MBR FAT16 disk round-trips
       and is metadata-identical to the `.zst` path (resize machinery reused 100%).
       `metadata.json` field set **frozen** in §3 above.
-- [ ] **Phase 2 — Backup MVP (DOS).** cb-dos reads a FAT disk, zero-then-gzip per
-      partition, writes the native folder (`metadata.json`, `mbr.bin`,
-      `partition-N.gz`, CRC32) to a DOS path. Restore it **on the desktop** to
-      prove the format round-trips.
+- [x] **Phase 2 — Backup MVP (DOS). DONE (2026-06-24) — format round-trips.**
+      `crusty-backup/src/cbbackup.c` (`CBBACKUP.EXE`) reads a FAT disk via int13h,
+      smart-compacts each partition (image up to the last used cluster, zero the
+      interior free clusters), streams it through **zlib gzwrite**, and writes the
+      native folder (`metadata.json`, `mbr.bin`, `partition-N.gz`,
+      `partition-N.gz.crc32`) to a DOS path. Proven end-to-end on **real FreeDOS in
+      qemu**: imaged a 47 MB MBR FAT16 disk, copied the folder off, and
+      `rb-cli restore` rebuilt a byte-faithful disk (FS mounts, file intact).
+      zlib is cross-built by `deps/fetch-zlib.sh`; `make backup`. **Two findings:**
+      (1) the FD 1.4 *installer* kernel reports **no LFN** (`71A0h` → ax 0x7100),
+      so `DOSLFN` must be loaded or names mangle to 8.3 — see §1; (2) under
+      **CWSDPMI** any int13h-reading DJGPP program hangs at *process termination*
+      after the work is done (the folder is fully written; the desktop restores
+      it). Not a backup-logic bug (disk_spike repros; DOSBox-X's own DPMI host
+      doesn't hang) — candidate fix is an alternate DPMI host on the boot media.
+      Remaining polish: NTFS/logical partitions (skipped), the exit-hang, real-486.
 - [ ] **Phase 3 — Restore MVP (DOS).** cb-dos restores the native folder back to
       a disk, with **resize options** (entire / minimum / custom per partition);
       verify the restored card boots. Restore from a DOS path **or CD (MSCDEX)**.
@@ -544,6 +562,25 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 2 complete — cb-dos images a FAT disk on real DOS and the
+  desktop restores it.** Wrote `crusty-backup/src/cbbackup.c` (`CBBACKUP.EXE`):
+  int13h read (LBA + CHS fallback, mirroring disk_spike), whole-FAT load,
+  smart-compaction (image to the last used cluster, zero interior free clusters),
+  streamed **zlib `gzwrite`** to `partition-N.gz`, CRC32 of the compressed file
+  into the `.gz.crc32` sidecar, raw `mbr.bin`, and a `metadata.json` matching the
+  Phase-1 frozen schema. zlib is cross-built for DJGPP by `deps/fetch-zlib.sh`
+  (gitignored), linked via `make backup`. **Proof:** booted FreeDOS headless in
+  qemu (hda=boot, hdb=the FAT16 disk as 0x81), ran `CBBACKUP C:\BK 81`, pulled
+  `C:\BK` off with mtools, and `rb-cli restore` rebuilt a 50331648-byte disk —
+  FS mounts as `CBDOSFAT16`, `HELLO.TXT` intact, partition table correct. The
+  DOS→desktop format interop is real. **Two findings worth keeping:** (1) the FD
+  1.4 installer kernel has **no LFN** (`71A0h`→`0x7100`); must `DOSLFN` first or
+  names truncate to 8.3 (and the `.gz` / `.gz.crc32` 8.3-collide) — §1 updated;
+  (2) under **CWSDPMI**, an int13h-reading DJGPP program **hangs at termination**
+  after finishing — `disk_spike` repros it, DOSBox-X's DPMI doesn't, so it's a
+  CWSDPMI exit quirk, not a backup bug; the folder is fully written before the
+  hang. Candidate fix: ship an alternate DPMI host (HDPMI32/JEMMEX). **Next:
+  Phase 3** (cb-dos restores the folder back to a disk on DOS, with resize).
 - 2026-06-24 — **Phase 1 complete — desktop `Gzip` codec shipped + metadata
   frozen.** Added `CompressionType::Gzip` (`"gzip"` / `.gz`) and a new
   `src/rbformats/gzip.rs` (`compress_gzip`, a streamed `GzEncoder` mirroring the

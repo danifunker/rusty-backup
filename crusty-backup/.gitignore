@@ -1,2 +1,8 @@
 build/
 *.exe
+deps/zlib/
+deps/dl/
+net/watt32/
+net/dl/
+net/mtcp/
+net/drivers/*.COM
