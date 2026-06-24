@@ -680,18 +680,22 @@ bogus = ignored
     }
 
     #[test]
-    fn pid_round_trips_and_self_is_alive() {
+    fn pid_file_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let pid_path = dir.path().join("rb-daemon.pid");
         let me = std::process::id() as i32;
         std::fs::write(&pid_path, me.to_string()).unwrap();
         assert_eq!(read_pid(&pid_path), Some(me));
-        assert!(pid_alive(me));
     }
 
+    // `pid_alive` is only implemented on Unix (the service lifecycle is
+    // Unix-only; the non-Unix stub is conservatively always-false), so the
+    // liveness checks below are Unix-gated.
+    #[cfg(unix)]
     #[test]
-    fn dead_pid_reads_as_not_alive() {
-        // PID 1 exists; a very large PID almost certainly doesn't.
+    fn self_pid_is_alive_and_dead_pid_is_not() {
+        assert!(pid_alive(std::process::id() as i32));
+        // A very large PID almost certainly doesn't exist.
         assert!(!pid_alive(0x3FFF_FFFF));
     }
 
