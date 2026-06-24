@@ -320,9 +320,16 @@ Phased plan (this is the work, in order):
 - **(iv) Restore parity** — already done for the CLI (materialize-to-temp arm in
   `restore.rs`); GUI restore picks up `.cbk` for free once it's in
   `DISK_IMAGE_EXTS` and routed like a folder.
-- **(v) Edit (lower priority)** — write-through to a `.cbk` is materialize →
-  edit the folder/partition → repack (`pack_folder_to_cbk`). Acceptable to be a
-  copy-on-write repack rather than in-place.
+- **(v) Edit — DONE (2026-06-24).** `resolve_partition_rw_forced` detects a
+  `.cbk`, materializes it to a temp folder, edits the partition via the existing
+  backup-folder RW path (`open_backup_partition_rw`), and on commit
+  (`RwCommit::Cbk`) recompresses `partition-N.gz` + rewrites `metadata.json` and
+  **repacks the folder over the original `.cbk`** (write-to-`.tmp` + rename).
+  `gzip` was added to the editable-codec whitelist (decompress/recompress
+  already handled it). So `rb-cli put/rm/mkdir/cp X.cbk@N …` all work; verified
+  `put` → `ls`/`get` → `restore` round-trips with both old and new files intact.
+  Like editing a `.zst` backup, the edit decompresses to full size and drops
+  cb-dos's smart compaction (the container grows) — correct, just larger.
 
 ---
 
@@ -666,6 +673,19 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-24 — **`.cbk` is now fully first-class — native read + edit (§2e).**
+  Two steps. (1) **Native read:** a `CbkTempReader` arm in `open_read_dispatch`
+  (`source_reader.rs`) + `is_container_path` + a `BrowseSession::open_image` arm
+  + `"cbk"` in `DISK_IMAGE_EXTS` — so `inspect`, `ls`/`get`, `fsck`, GUI Inspect,
+  and `restore` all treat a `.cbk` like a flat disk image (it reconstructs the
+  disk into a temp file behind the trait; no user-visible extract). (2) **Edit:**
+  `resolve_partition_rw_forced` materializes the `.cbk`, edits the partition via
+  the backup-folder RW path, and `RwCommit::Cbk` recompresses + repacks over the
+  original on commit; `gzip` added to the editable-codec whitelist. Verified:
+  `inspect`/`ls`/`get` read a cb-dos `.cbk` natively, and `put` → `ls`/`get` →
+  `restore` round-trips an edit with both files intact. Lib suite (2086) + clippy
+  green. The user's whole `.cbk` ask (read/inspect/browse/extract/restore like
+  native, edit with extra legwork) is delivered.
 - 2026-06-24 — **`.cbk` container frozen + shipped desktop-first (§2d).** Built
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`),
   the `rb-cli cbk pack|unpack` verb, and taught `rb-cli restore` to read a `.cbk`
