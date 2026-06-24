@@ -280,6 +280,50 @@ materializer reads. The network `.idx` sidecar (§2b/§3) layers *on top* of thi
 it is the same per-member chunk-offset list written incrementally for crash-safe
 resume, with the trailer index as the finalized form.
 
+### 2e. `.cbk` as a first-class image — native inspect/browse/restore (planned)
+
+**Decision (2026-06-24):** a `.cbk` must behave like any other disk image
+everywhere in the app — `inspect`, `ls`/`get` (browse + extract files), `fsck`,
+GUI Inspect/Restore — **with no user-visible "extract first" step**. Restore from
+`.cbk` is treated exactly like a folder restore. *Editing* a `.cbk` may do extra
+legwork (materialize → edit → repack) and is in scope but lower priority.
+
+The whole app reads disks through one abstraction — `Box<dyn ReadSeek>`
+(`ReadSeek: Read + Seek + Send`, `src/rbformats/mod.rs`) — and a partition is just
+a byte offset into that whole-disk reader (`open_filesystem(reader, offset, …)`).
+So native `.cbk` support = **present the container as a reconstructed whole disk**
+(table at sector 0, partitions at their `byte_offset()`, gaps zero) behind that
+trait, then hook it into the **one** open/detect dispatch every consumer funnels
+through.
+
+Phased plan (this is the work, in order):
+
+- **(i) `CbkReader: ReadSeek`** — open a `.cbk` as a seekable disk. v1
+  implementation reuses the existing compressed-image precedent
+  (`ZipDiskReader` / `GzipTempReader`): materialize the container to a temp
+  folder, reconstruct the disk into a **sparse temp file**
+  (`reconstruct_disk_from_backup`, `src/rbformats/mod.rs`), and delegate
+  `Read`/`Seek` to it. Transparent — the user never runs an extract step; the
+  temp disk is the app's business, exactly like opening a `.zip`-wrapped image
+  today. *(Future: a truly lazy reader that decompresses only the chunked
+  members a seek touches — the §2c/§2d span layout is designed for this; it's a
+  reader upgrade, no format change.)*
+- **(ii) Hook the dispatch** — add an `is_cbk_path` arm to `open_read_dispatch`
+  (`src/model/source_reader.rs`) and `.cbk` to `is_container_path`. That single
+  arm lights up **inspect**, the CLI `resolve` layer (`ls`/`get`/`fsck` via
+  `open_peeled_read`), and GUI Inspect automatically. Add a `.cbk` arm to
+  `BrowseSession::open_image` (`src/model/browse_session.rs`) for browse/extract.
+- **(iii) GUI picker + associations** — add `"cbk"` to `DISK_IMAGE_EXTS`
+  (`src/model/file_types.rs`; *not* `NON_ASSOCIATED_EXTS` — a `.cbk` should
+  double-click-open) + a regression test. The Inspect/Restore tabs then accept a
+  `.cbk` with no further change.
+- **(iv) Restore parity** — already done for the CLI (materialize-to-temp arm in
+  `restore.rs`); GUI restore picks up `.cbk` for free once it's in
+  `DISK_IMAGE_EXTS` and routed like a folder.
+- **(v) Edit (lower priority)** — write-through to a `.cbk` is materialize →
+  edit the folder/partition → repack (`pack_folder_to_cbk`). Acceptable to be a
+  copy-on-write repack rather than in-place.
+
 ---
 
 ## 3. Resume — the transfer map

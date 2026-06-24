@@ -405,7 +405,7 @@ readable.
 | VMDK (VMware)  | `.vmdk`         | Yes            | Yes (create / edit) | Flat and monolithic-sparse |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
 | Gzip stream    | `.gz`           | Yes            | Yes             | DEFLATE per-partition member; the codec shared with crusty-backup (`cb-dos`) so DOS-side backups restore + resize here unchanged. `--format gzip` |
-| cb-dos container | `.cbk`        | Yes (restore)  | Yes (`cbk pack`) | Single-file form of a backup folder (chunked gzip members + index). `rb-cli cbk pack/unpack`; `rb-cli restore x.cbk` restores it directly. Frozen v1; the eventual cb-dos network transport's on-disk artifact |
+| cb-dos container | `.cbk`        | Yes (native)   | Yes (`cbk pack`) | Single-file form of a backup folder (chunked gzip members + index). Opens like any disk image — `inspect`, `ls`/`get` (browse + extract), `fsck`, GUI Inspect, and `restore` all work directly, no extract step. `rb-cli cbk pack/unpack` convert to/from a folder. Frozen v1; the eventual cb-dos network transport's on-disk artifact |
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |

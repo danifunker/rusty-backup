@@ -22,7 +22,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
     "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz",
+    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -113,6 +113,22 @@ mod tests {
         assert!(
             !association_exts().contains(&"gz".to_string()),
             "gz must NOT be registered as an OS file association"
+        );
+    }
+
+    #[test]
+    fn cbk_is_picker_and_associated() {
+        // `.cbk` is the cb-dos backup container; the app opens it as a native
+        // disk image (inspect/browse/restore), so it belongs in the picker AND,
+        // unlike `.zip`/`.gz`, should own its file association (a `.cbk` is
+        // always ours — there's no foreign `.cbk` to clobber).
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"cbk"),
+            "cbk must be in the picker list so a .cbk is selectable"
+        );
+        assert!(
+            association_exts().contains(&"cbk".to_string()),
+            "cbk should be registered as an OS file association"
         );
     }
 

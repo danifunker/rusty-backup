@@ -393,6 +393,79 @@ impl std::io::Seek for GzipTempReader {
     }
 }
 
+/// A seekable reader over a `.cbk` backup container, presented as the whole
+/// reconstructed disk so inspect/browse/restore treat it like any flat image
+/// (no user-visible "extract first" step — cb_dos_network_and_state.md §2e).
+///
+/// v1 strategy (the `GzipTempReader`/`ZipDiskReader` precedent): materialize the
+/// container to a temp folder, reconstruct the disk into a temp image at its
+/// original geometry via the restore engine, and delegate `Read`/`Seek` to that
+/// temp file. (A future lazy reader can decompress only the chunked members a
+/// seek touches; that's a reader upgrade, no format change.)
+struct CbkTempReader {
+    file: File,
+    _temp: tempfile::TempPath,
+}
+
+impl std::io::Read for CbkTempReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl std::io::Seek for CbkTempReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// Reconstruct a `.cbk` container into a temp disk image and return a seekable
+/// reader over it. The materialized folder is dropped once the disk is built.
+fn open_cbk_as_disk(path: &Path) -> Result<CbkTempReader> {
+    use crate::restore::{run_restore, RestoreAlignment, RestoreConfig, RestoreProgress};
+
+    // 1. Materialize the container into a temp backup folder.
+    let folder = tempfile::Builder::new()
+        .prefix(".rb-cbk-folder-")
+        .tempdir()
+        .context("create temp folder for .cbk")?;
+    crate::rbformats::cbk::materialize_cbk_to_folder(path, folder.path())
+        .with_context(|| format!("materialize {}", path.display()))?;
+
+    // 2. Read the disk size the backup recorded.
+    let meta_str = std::fs::read_to_string(folder.path().join("metadata.json"))
+        .context("read materialized metadata.json")?;
+    let meta: crate::backup::metadata::BackupMetadata =
+        serde_json::from_str(&meta_str).context("parse materialized metadata.json")?;
+
+    // 3. Reconstruct the disk into a temp image at original geometry, reusing the
+    //    restore engine (it builds the per-partition placement/overrides itself).
+    let temp = tempfile::Builder::new()
+        .prefix(".rb-cbk-disk-")
+        .tempfile()
+        .context("create .cbk reconstruct tempfile")?;
+    let temp_path = temp.into_temp_path();
+    let cfg = RestoreConfig {
+        backup_folder: folder.path().to_path_buf(),
+        target_path: temp_path.to_path_buf(),
+        target_is_device: false,
+        target_size: meta.source_size_bytes,
+        alignment: RestoreAlignment::Original,
+        partition_sizes: Vec::new(),
+        write_zeros_to_unused: false,
+    };
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(RestoreProgress::default()));
+    run_restore(cfg, progress).context("reconstruct .cbk into a temp disk")?;
+    drop(folder); // the materialized folder is no longer needed
+
+    // 4. Read-only handle over the reconstructed disk.
+    let file = File::open(&temp_path).context("reopen reconstructed .cbk disk")?;
+    Ok(CbkTempReader {
+        file,
+        _temp: temp_path,
+    })
+}
+
 /// Open `path` for reading, transparently wrapping CHD and SECTOR-mode
 /// GHO files in their respective streaming readers.
 ///
@@ -438,6 +511,12 @@ fn open_read_dispatch(
     if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
+    } else if crate::rbformats::cbk::is_cbk(path) {
+        // .cbk backup container: present the reconstructed disk so partition
+        // parse + filesystem open + browse/extract all work natively.
+        let reader = open_cbk_as_disk(path)
+            .with_context(|| format!("open .cbk container {}", path.display()))?;
+        Ok(Box::new(reader))
     } else if is_gho_path(path) {
         let gho = GhoReader::open_with_password(path, password)
             .with_context(|| format!("open GHO {}", path.display()))?;
@@ -682,6 +761,7 @@ pub fn is_editable_container_path(path: &Path) -> bool {
 /// re-listed (and drifting) at every call site.
 pub fn is_container_path(path: &Path) -> bool {
     is_chd_path(path)
+        || crate::rbformats::cbk::is_cbk(path)
         || is_gho_path(path)
         || is_imz_path(path)
         || is_zip_image_path(path)
