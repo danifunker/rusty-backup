@@ -297,21 +297,27 @@ MYDISK\                      (a normal folder; LFN-capable DOS)
   ...
 ```
 
-### The one desktop change: a `Gzip` codec
-Today `CompressionType` is `Chd / Dvd / Vhd / Zstd / None` — **no gzip**
-(`src/backup/mod.rs:28`). zstd is impractical on DOS and raw loses compression,
-so we add a **`Gzip` variant → `.gz`**. This is small because the **decoder
-already exists in-tree**: `flate2::GzDecoder` is used by the Ghost (`gho.rs`) and
-IMZ (`imz.rs`) paths. Touch points:
+### The one desktop change: a `Gzip` codec — **SHIPPED (Phase 1, 2026-06-24)**
+`CompressionType` gained a **`Gzip` variant → `.gz`** (`"gzip"` /
+`file_extension()` `"gz"` in `src/backup/mod.rs`). Implemented as:
 
-- `CompressionType::{as_str, file_extension}` (`src/backup/mod.rs:28`) → `"gzip"`
-  / `.gz`.
-- `src/rbformats/compress.rs` — add a `gzip` compressor alongside zstd/raw and a
-  decompress case in `decompress_to_writer()` (`GzDecoder`).
-- Restore reads the codec from `metadata.json`; no restore-pipeline change.
+- `src/rbformats/gzip.rs` — `compress_gzip` (mirrors `zstd.rs`: streamed
+  `flate2::write::GzEncoder`, optional hasher tee for the `.gz.crc32` sidecar,
+  one contiguous member per partition).
+- `src/rbformats/compress.rs` — `Gzip` arm in `compress_partition_hashed`, a
+  `"gzip"` decompress arm in `decompress_to_writer()` using
+  **`flate2::read::MultiGzDecoder`** (so a multi-member `.cbk`-style file decodes
+  too, not just a single cb-dos member), and a `"gzip"` arm in
+  `compress_file_to_archive`.
+- `rb-cli backup --format gzip` (and `gzip`/`gz` accepted in the config-file
+  `[backup] format` parser).
 
-Once `Gzip` exists, the **desktop restore + resize path is reused 100%** — it
-doesn't care whether a `partition-N` member is `.zst` or `.gz`.
+The **restore + resize path is reused 100%** — verified end-to-end: a
+`rb-cli backup --format gzip` of an MBR FAT16 disk produced `partition-0.gz` +
+`metadata.json` (`"compression_type": "gzip"`, `compacted: true`), and
+`rb-cli restore` rebuilt a byte-faithful disk (only the MBR CHS + FAT BPB
+fields restore deliberately patches differ). Output is **metadata-identical to
+the `.zst` path** for the same source, so the engine can't tell gzip from zstd.
 
 ### Compaction = per-partition zero-then-gzip
 For each FAT partition, cb-dos walks the FAT and streams **real bytes for
@@ -334,12 +340,63 @@ required" reported to the user is the **estimated compressed size** (+ margin),
 not the used-data size. (Smart mode images used data only; a sector-by-sector
 mode images every sector and needs proportionally more.)
 
-### What cb-dos must put in `metadata.json`
-The restore/resize path keys off metadata, so cb-dos must emit the fields it
-reads: per-partition `original_size`, `minimum_size` (FAT last-used-cluster —
-cb-dos is already reading the FAT), partition type byte, alignment, codec
-(`"gzip"`), and the per-file CRC32. JSON is trivial to emit on DOS (`printf`).
-**Freeze the exact field set against `src/backup/metadata.rs` in Phase 1.**
+### What cb-dos must put in `metadata.json` — **FROZEN (Phase 1)**
+Frozen against `src/backup/metadata.rs` (`BackupMetadata` / `PartitionMetadata`
+/ `AlignmentMetadata`). Field names are the JSON keys verbatim (serde, no
+`rename_all` on these structs → snake_case). A field is **required** unless it
+carries `#[serde(default)]` / `skip_serializing_if` in the struct. The minimal
+shape cb-dos must emit for a gzipped MBR-FAT backup:
+
+```json
+{
+  "version": 1,
+  "created": "2026-06-24T09:45:00Z",            // ISO-8601; any parseable string
+  "source_device": "0x80",                       // free-form label
+  "source_size_bytes": 50331648,
+  "partition_table_type": "MBR",                 // "MBR" | "GPT" | "None"
+  "checksum_type": "crc32",                      // "crc32" | "sha256"
+  "compression_type": "gzip",
+  "split_size_mib": null,                        // REQUIRED KEY (may be null)
+  "sector_by_sector": false,
+  "layout": "per-partition",
+  "alignment": {                                 // all five keys required
+    "detected_type": "DOS Traditional (255x63)",
+    "first_partition_lba": 2048,
+    "alignment_sectors": 2048,
+    "heads": 255,
+    "sectors_per_track": 63
+  },
+  "partitions": [
+    {
+      "index": 0,
+      "type_name": "FAT16",
+      "partition_type_byte": 6,                  // 0x06 FAT16, 0x0E/0x0C FAT16/32-LBA …
+      "start_lba": 2048,
+      "original_size_bytes": 49283072,           // partition window size
+      "imaged_size_bytes": 4233728,              // = minimum_size_bytes when compacted
+      "compressed_files": ["partition-0.gz"],
+      "checksum": "cbf421a8",                     // lowercase hex CRC32 of the .gz
+      "resized": false,
+      "compacted": true,                          // free clusters zeroed pre-gzip
+      "is_logical": false,
+      "minimum_size_bytes": 4233728               // FAT last-used-cluster byte size
+    }
+  ]
+}
+```
+
+Required top-level keys (no serde default): `version`, `created`,
+`source_device`, `source_size_bytes`, `partition_table_type`, `checksum_type`,
+`compression_type`, **`split_size_mib`** (emit `null`, not omit), `alignment`,
+`partitions`. Required per-partition keys: `index`, `type_name`, `start_lba`,
+`original_size_bytes`, `compressed_files`, `checksum`, `resized`. Everything
+else (`sector_by_sector`, `layout`, `partition_type_byte`, `imaged_size_bytes`,
+`compacted`, `is_logical`, `minimum_size_bytes`, …) has a serde default and may
+be omitted — but cb-dos **should** emit `partition_type_byte`, `compacted`,
+`imaged_size_bytes`, and `minimum_size_bytes` so the desktop's
+shrink-to-minimum restore works (it offers the minimum size only when present).
+The per-`.gz` checksum sidecar is `partition-N.gz.crc32` containing the same
+lowercase-hex CRC32. JSON is trivial to emit on DOS (`printf`).
 
 ---
 
@@ -439,10 +496,12 @@ over the wire now.
       fixup + `$DATA` runs; exFAT scans the root for the 0x81 bitmap entry and
       counts the contiguous bitmap. Remaining: real-**486 hardware** and a
       **booted-FreeDOS** run.*
-- [ ] **Phase 1 — Desktop `Gzip` codec.** Add `CompressionType::Gzip` (+
-      `compress.rs` compress/decompress). Verify the desktop can back up *and*
-      restore a FAT disk with gzip, incl. resize-to-different-size. Freeze the
-      `metadata.json` field set cb-dos must emit.
+- [x] **Phase 1 — Desktop `Gzip` codec. DONE (2026-06-24).** Added
+      `CompressionType::Gzip` + `src/rbformats/gzip.rs` + the three `compress.rs`
+      dispatch arms (`MultiGzDecoder` on decode) + `rb-cli backup --format gzip`.
+      Verified end-to-end: gzip backup → restore of an MBR FAT16 disk round-trips
+      and is metadata-identical to the `.zst` path (resize machinery reused 100%).
+      `metadata.json` field set **frozen** in §3 above.
 - [ ] **Phase 2 — Backup MVP (DOS).** cb-dos reads a FAT disk, zero-then-gzip per
       partition, writes the native folder (`metadata.json`, `mbr.bin`,
       `partition-N.gz`, CRC32) to a DOS path. Restore it **on the desktop** to
@@ -485,6 +544,24 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 1 complete — desktop `Gzip` codec shipped + metadata
+  frozen.** Added `CompressionType::Gzip` (`"gzip"` / `.gz`) and a new
+  `src/rbformats/gzip.rs` (`compress_gzip`, a streamed `GzEncoder` mirroring the
+  zstd module, with the optional checksum tee). Wired three dispatch points in
+  `src/rbformats/compress.rs`: the `Gzip` compress arm, a `"gzip"` decode arm on
+  **`MultiGzDecoder`** (forward-compatible with the multi-member `.cbk` shape),
+  and the recompress arm. Exposed `rb-cli backup --format gzip` (+ `gzip`/`gz`
+  in the config parser). Built a host MBR FAT16 disk and proved the full
+  round-trip: `--format gzip` backup → `partition-0.gz` (4.4 KB from a 47 MB
+  mostly-empty partition) + `metadata.json` `"compression_type": "gzip"` →
+  `rb-cli restore` rebuilds a byte-faithful disk (only the MBR CHS + FAT BPB
+  bytes the restorer deliberately patches differ; FS mounts, file intact). A
+  zstd backup of the same disk is **metadata-identical**, confirming the
+  restore + resize path is reused 100% — the engine can't distinguish gzip from
+  zstd. Froze the exact `metadata.json` field set cb-dos must emit in §3 (which
+  keys are serde-required vs defaulted). Unit test `rbformats::gzip::
+  test_compress_gzip`; clippy clean. **Next: Phase 2** (cb-dos writes the native
+  folder on DOS), the first phase that runs on the 486 itself.
 - 2026-06-20 — **Boots into the TUI on real FreeDOS.** The cb-dos disk now
   auto-launches the text UI at boot (FDAUTO.BAT runs `CRUSTYBK.EXE`, renamed from
   `tui_poc`), and the FreeDOS installer's `SETUP.BAT` is stripped. **Key fix:**

@@ -58,6 +58,11 @@ pub enum CompressionType {
     Dvd,
     Vhd,
     Zstd,
+    /// gzip/DEFLATE → `partition-N.gz`. The shared codec with
+    /// **crusty-backup** (`cb-dos`): zstd is impractical under DJGPP and
+    /// raw loses compression, so the DOS tool emits gzip and the desktop
+    /// reuses its restore + resize path unchanged (see `docs/cb_dos.md` §3).
+    Gzip,
     None,
 }
 
@@ -68,6 +73,7 @@ impl CompressionType {
             CompressionType::Dvd => "chd-dvd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
+            CompressionType::Gzip => "gzip",
             CompressionType::None => "none",
         }
     }
@@ -77,6 +83,7 @@ impl CompressionType {
             CompressionType::Chd | CompressionType::Dvd => "chd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
+            CompressionType::Gzip => "gz",
             CompressionType::None => "raw",
         }
     }

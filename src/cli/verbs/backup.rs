@@ -25,6 +25,10 @@ pub enum BackupFormat {
     Vhd,
     /// Zstd-compressed raw per-partition.
     Zstd,
+    /// Gzip-compressed raw per-partition (`partition-N.gz`). The codec
+    /// shared with crusty-backup (`cb-dos`) — the desktop restores and
+    /// resizes it exactly like a `.zst` member.
+    Gzip,
     /// Uncompressed raw per-partition.
     Raw,
 }
@@ -36,6 +40,7 @@ impl From<BackupFormat> for CompressionType {
             BackupFormat::Dvd => CompressionType::Dvd,
             BackupFormat::Vhd => CompressionType::Vhd,
             BackupFormat::Zstd => CompressionType::Zstd,
+            BackupFormat::Gzip => CompressionType::Gzip,
             BackupFormat::Raw => CompressionType::None,
         }
     }
@@ -166,6 +171,7 @@ fn parse_format(s: &str) -> Option<BackupFormat> {
         "dvd" => Some(BackupFormat::Dvd),
         "vhd" => Some(BackupFormat::Vhd),
         "zstd" => Some(BackupFormat::Zstd),
+        "gzip" | "gz" => Some(BackupFormat::Gzip),
         "raw" => Some(BackupFormat::Raw),
         _ => None,
     }
