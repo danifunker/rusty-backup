@@ -7,11 +7,12 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-24)
 
-Branch **`cbdos`** (off `main`), 10 commits, all verified, tree clean (latest
+Branch **`cbdos`** (off `main`), 11 commits, all verified, tree clean (latest
 commit lands with this hand-off):
 
 ```
-(pending) feat(cb-dos): on-DOS FAT resize in cbrestore — /SIZE entire/minimum/custom
+(pending) feat(cb-dos): Phase 4 — per-partition selective backup/restore (/PARTS)
+028b3c1 feat(cb-dos): on-DOS FAT resize in cbrestore — /SIZE entire/minimum/custom
 ec66eef fix(cb-dos): root-cause + fix the CWSDPMI termination hang (DAP buffer overrun)
 61dfb64 fix(cbk): make PathBuf import unconditional so no-chd builds compile
 ba93140 feat(cbk): edit a partition inside a .cbk (materialize -> edit -> repack)
@@ -32,18 +33,21 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
 | **Phase 3 resize** — `cbrestore /SIZE` | bidirectional FAT16/32 resize on DOS (entire/minimum/custom); grow+shrink verified on FreeDOS/qemu |
+| **Phase 4** — `/PARTS:i,j` selective | per-partition backup *and* restore (0-based MBR slot indices); verified on a 2-partition disk on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Phase 4 — per-partition selective** backup/restore (mirror the desktop's
-   `partition_filter`): a CLI flag picking which partition indices to image/restore.
-   *Recommended next.* (cbrestore already parses all partitions into an array and
-   computes per-partition no-overlap windows, so the selective restore hook is
-   small; the resize code handles multi-partition layout already.)
-2. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
-   target disk, no intermediate file). Reuses the `cbbackup` engine.
+1. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
+   target disk, no intermediate file). Reuses the `cbbackup` engine. *Recommended
+   next.*
+2. **Desktop `--partitions` off-by-one (bug).** rb-cli's `--partitions` is
+   documented "1-based" but filters on a renumbered 0-based `part.index` and
+   `parse_indices` rejects 0 → the **first partition is unselectable** and `N`
+   selects the `(N)`-th 0-based partition. Either fix the help text + accept 0, or
+   subtract 1 before building `partition_filter` (and update `docs/cli-reference.md`).
+   cb-dos's `/PARTS` already uses the clean 0-based MBR-slot scheme.
 3. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
@@ -76,8 +80,9 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
   — `gzip` in the editable-codec whitelist.
 
 **DOS (C) — `crusty-backup/src/`:**
-- `cbbackup.c` (`CBBACKUP.EXE`) — backup engine. `cbrestore.c` (`CBRESTORE.EXE`)
-  — restore engine **+ on-DOS FAT resize** (`/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM`,
+- `cbbackup.c` (`CBBACKUP.EXE`) — backup engine **+ `/PARTS:i,j` selective**
+  (`pfx_ci`/`parse_parts`, slot bitmask). `cbrestore.c` (`CBRESTORE.EXE`)
+  — restore engine **+ on-DOS FAT resize + `/PARTS:i,j` selective** (`/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM`,
   `/CUSTOM:<bytes>`): `fat_resize` (bidirectional, the C port of
   `resize_fat_in_place`), `shift_region_forward`/`_backward`, `compute_fat_sectors`,
   `max_fat_window`/`min_fat_window` (cluster cap/floor), `set_clean_flags`,
@@ -173,6 +178,13 @@ redirect `cbbackup`** when making the folder (gotcha #3 corrupts `mbr.bin`).
    network producer will emit many — both valid.
 6. **CWSDPMI vs DOSBox-X.** DOSBox-X supplies its own DPMI host and masked the DAP
    overrun; always validate exit behavior under **CWSDPMI on real FreeDOS** (qemu).
+7. **`mformat -i img@@OFF` sizes the FS to EOF, not the partition count.** Building
+   a multi-partition test disk by `mformat`-ing each `@@offset` makes every FS span
+   from its offset to end-of-file → overlapping volumes whose BPB `total_sectors`
+   ignore the MBR entry. Build each partition FS in its **own exact-size file**
+   (`dd ... count=<sectors>; mformat -i p.img ::`) and `dd` it into the disk at the
+   slot offset, so each BPB total matches its MBR count (needed for a clean
+   ORIGINAL/`/PARTS` round-trip).
 
 ## Doc-sync reminder (CLAUDE.md)
 

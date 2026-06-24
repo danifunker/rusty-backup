@@ -401,20 +401,64 @@ static void write_metadata(const char *dest, const char *src_label,
     printf("wrote metadata.json (%d partition%s)\n", nparts, nparts == 1 ? "" : "s");
 }
 
+/* ----- partition selection (/PARTS) --------------------------------- */
+
+/* If `arg` begins with `prefix` (case-insensitive), return the rest; else NULL. */
+static const char *pfx_ci(const char *arg, const char *prefix) {
+    int i;
+    for (i = 0; prefix[i]; i++) {
+        char a = arg[i], b = prefix[i];
+        if (a >= 'a' && a <= 'z') a -= 32;
+        if (b >= 'a' && b <= 'z') b -= 32;
+        if (a != b) return NULL;
+    }
+    return arg + i;
+}
+
+/* Parse a comma/space-separated list of MBR slot indices (0-3) into a bitmask.
+ * Returns 0 (and sets *mask) if at least one index was read, else -1. */
+static int parse_parts(const char *v, unsigned *mask) {
+    unsigned m = 0; int any = 0;
+    while (*v) {
+        while (*v == ',' || *v == ' ') v++;
+        if (!*v) break;
+        if (*v < '0' || *v > '9') return -1;
+        int n = 0;
+        while (*v >= '0' && *v <= '9') { n = n * 10 + (*v - '0'); v++; }
+        if (n >= 0 && n < 32) { m |= (1u << n); any = 1; }
+    }
+    *mask = m;
+    return any ? 0 : -1;
+}
+
 /* ----- main --------------------------------------------------------- */
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("cb-dos backup (Phase 2 MVP)\n");
-        printf("usage: CBBACKUP <dest-dir> [drive-hex]\n");
-        printf("  e.g. CBBACKUP A:\\BK 80   (default drive 0x80)\n");
+        printf("cb-dos backup (Phase 2 + selective)\n");
+        printf("usage: CBBACKUP <dest-dir> [drive-hex] [/PARTS:i,j]\n");
+        printf("  e.g. CBBACKUP A:\\BK 80           image every FAT partition\n");
+        printf("       CBBACKUP A:\\BK 80 /PARTS:0  image only MBR slot 0\n");
+        printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
+        printf("  numbers below and the metadata.json \"index\" values).\n");
         return 2;
     }
     /* Unbuffered so progress survives a redirect (and any abnormal exit). */
     setvbuf(stdout, NULL, _IONBF, 0);
 
     const char *dest = argv[1];
-    int drive = (argc >= 3) ? (int)strtol(argv[2], NULL, 16) : 0x80;
+    int drive = 0x80, drive_set = 0;
+    unsigned sel_mask = 0; int has_filter = 0;
+    for (int a = 2; a < argc; a++) {
+        const char *v = pfx_ci(argv[a], "/PARTS:");
+        if (v) {
+            if (parse_parts(v, &sel_mask) != 0) { printf("bad /PARTS list\n"); return 2; }
+            has_filter = 1;
+        } else if (!drive_set) {
+            drive = (int)strtol(argv[a], NULL, 16);
+            drive_set = 1;
+        }
+    }
 
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
 
@@ -424,6 +468,7 @@ int main(int argc, char **argv) {
     di.ext = drive_has_ext(drive);
     printf("source drive 0x%02X: %u cyl %u head %u spt, LBA-ext=%s\n",
            drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
+    if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
 
     uint8_t mbr[512];
     if (read_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR read failed\n"); xfer_free(); return 1; }
@@ -451,9 +496,13 @@ int main(int argc, char **argv) {
         uint32_t lba = rd32(e + 8);
         uint32_t cnt = rd32(e + 12);
         if (type == 0 || cnt == 0) continue;
-        if (first_lba == 0) first_lba = lba;
+        if (first_lba == 0) first_lba = lba;       /* disk-wide alignment hint */
         uint64_t end = (uint64_t)lba + cnt;
         if (end * 512 > disk_bytes) disk_bytes = end * 512;
+        if (has_filter && !(sel_mask & (1u << i))) {
+            printf("  part %d: not in /PARTS -- skipped\n", i);
+            continue;
+        }
         if (!is_fat_part_type(type)) {
             printf("  part %d: type 0x%02X not FAT -- skipped (MVP)\n", i, type);
             continue;

@@ -549,8 +549,23 @@ over the wire now.
       Verified on real FreeDOS/qemu across every direction with a 16 MB file intact
       through large bidirectional shifts, read back by *both* mtools and the
       desktop's own FAT driver. Remaining: CD/MSCDEX source, NTFS/logical, real-486.
-- [ ] **Phase 4 — Per-partition selective backup/restore (DOS).** Mirror
-      `partition_filter` — pick which partitions to image/restore.
+- [x] **Phase 4 — Per-partition selective backup/restore (DOS). DONE
+      (2026-06-24).** `/PARTS:i,j` on **both** `cbbackup` (image only those slots)
+      and `cbrestore` (restore only those indices); default = all. Indices are the
+      **0-based MBR primary slots** — the same `index` written in `metadata.json`
+      and printed as "part N" (cb-dos is MBR-primary-only, so the physical slot is
+      the natural key). Note this is *cleaner than* the desktop's `--partitions`,
+      which is documented "1-based" but actually filters on a renumbered 0-based
+      `part.index` and rejects 0 — leaving the first partition unselectable (a
+      desktop CLI bug worth a separate fix). Selective backup keeps the whole
+      `mbr.bin`; selective restore writes the saved MBR verbatim and only the
+      chosen partitions' data (unselected regions stay blank). Verified on real
+      FreeDOS/qemu with a 2-partition FAT16 disk: `cbbackup /PARTS:1` emits only
+      `partition-1.gz`; `cbrestore /PARTS:0` / `/PARTS:1` populate exactly one slot
+      (file checksums match) and leave the other blank. Fixed a latent
+      multi-partition `metadata.json` parse bug uncovered here: `index` was read
+      via `u64_after(idx,"index")`, which grabbed the *next* partition's index and
+      swapped them (harmless while every backup had one partition).
 - [ ] **Phase 4b — Direct disk-to-disk clone mode (DOS).** Source → on-the-fly
       compact/resize → target disk, no intermediate file (see §2e). Reuses the
       backup engine.
@@ -584,6 +599,28 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 4 — per-partition selective backup/restore on DOS.**
+  Added `/PARTS:i,j` to **both** `cbbackup` (image only the listed MBR slots) and
+  `cbrestore` (restore only the listed indices); default stays "all". Indices are
+  the **0-based MBR primary slot** = the `metadata.json` "index" = cbbackup's
+  "part N" output — the natural key for an MBR-primary-only tool. (Deliberately
+  *not* the desktop's `--partitions` scheme, which empirically filters on a
+  renumbered 0-based `part.index` while its help says "1-based" and `parse_indices`
+  rejects 0 → the first partition is unselectable: a desktop CLI off-by-one worth
+  fixing separately.) Selective backup keeps the whole `mbr.bin` and lists only
+  the imaged partitions in metadata; selective restore writes the saved MBR
+  verbatim and only the chosen partitions' data, leaving unselected regions blank.
+  **Found + fixed** a latent multi-partition parse bug in `cbrestore` while
+  testing: `p->index` was read with `u64_after(idx,"index")`, which matched the
+  *next* partition's `"index"` and swapped the two (invisible while every prior
+  backup had a single partition) — now read in place with a new `u64_at`.
+  **Verified on real FreeDOS/qemu** with a 2-partition FAT16 disk (each FS sized
+  to its slot — note `mformat -i img@@off` sizes to EOF, so build each partition
+  FS in its own exact-size file and `dd` it in): `cbbackup /PARTS:1` emitted only
+  `partition-1.gz` + an index-1-only metadata; `cbrestore /PARTS:0` and `/PARTS:1`
+  each populated exactly one slot (P0/P1 checksums match) and left the other
+  unformatted. `make backup restore`. **Next:** Phase 4b (direct disk-to-disk
+  clone), then the `.cbk` wire (7b).
 - 2026-06-24 — **On-DOS FAT resize shipped — cbrestore grows/shrinks the
   filesystem on the 486 itself.** `cbrestore.c` gained
   `/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM` (`/CUSTOM:<bytes>`), a full bidirectional

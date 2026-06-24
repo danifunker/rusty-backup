@@ -253,6 +253,16 @@ static uint64_t u64_after(const char *cur, const char *key, uint64_t dflt) {
     return any ? v : dflt;
 }
 
+/* Read the unsigned value that immediately follows the cursor (which already
+ * sits just past a key) -- unlike u64_after, this does NOT search for another
+ * occurrence of the key (which, for "index", would grab the next partition's). */
+static uint64_t u64_at(const char *p, uint64_t dflt) {
+    p = skip_to_value(p);
+    uint64_t v = 0; int any = 0;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (uint64_t)(*p - '0'); p++; any = 1; }
+    return any ? v : dflt;
+}
+
 /* Copy the first quoted string after `"key"` into out (size cap). */
 static int str_after(const char *cur, const char *key, char *out, int cap) {
     const char *p = find_key(cur, key);
@@ -692,6 +702,22 @@ static int eq_ci(const char *a, const char *b) {
 
 static uint64_t round_up_512(uint64_t v) { return (v + 511) & ~(uint64_t)511; }
 
+/* Parse a comma/space-separated list of partition indices (the metadata "index"
+ * / MBR slot) into a bitmask. Returns 0 (and sets *mask) on success, else -1. */
+static int parse_parts(const char *v, unsigned *mask) {
+    unsigned m = 0; int any = 0;
+    while (*v) {
+        while (*v == ',' || *v == ' ') v++;
+        if (!*v) break;
+        if (*v < '0' || *v > '9') return -1;
+        int n = 0;
+        while (*v >= '0' && *v <= '9') { n = n * 10 + (*v - '0'); v++; }
+        if (n >= 0 && n < 32) { m |= (1u << n); any = 1; }
+    }
+    *mask = m;
+    return any ? 0 : -1;
+}
+
 /* A parsed partition entry from metadata.json. */
 typedef struct {
     int      index;
@@ -709,19 +735,21 @@ typedef struct {
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 3) {
-        printf("cb-dos restore (Phase 3 + on-DOS resize)\n");
-        printf("usage: CBRESTORE <folder> <target-drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes]\n");
+        printf("cb-dos restore (Phase 3 + on-DOS resize + selective)\n");
+        printf("usage: CBRESTORE <folder> <target-drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
         printf("  /Y               confirms the destructive write to the target drive\n");
         printf("  /SIZE:ORIGINAL   restore at the recorded sizes (default)\n");
         printf("  /SIZE:MINIMUM    shrink each FAT partition to its used data\n");
         printf("  /SIZE:ENTIRE     grow each FAT partition to fill the disk\n");
         printf("  /SIZE:CUSTOM     resize to /CUSTOM:<bytes>\n");
+        printf("  /PARTS:i,j       restore only these partition indices (metadata \"index\")\n");
         return 2;
     }
     const char *folder = argv[1];
     int drive = (int)strtol(argv[2], NULL, 16);
     int confirmed = 0, mode = SZ_ORIGINAL;
     uint64_t custom_bytes = 0;
+    unsigned sel_mask = 0; int has_filter = 0;
     for (int i = 3; i < argc; i++) {
         const char *v;
         if (eq_ci(argv[i], "/Y")) { confirmed = 1; }
@@ -735,6 +763,10 @@ int main(int argc, char **argv) {
         else if ((v = switch_val(argv[i], "/CUSTOM:")) != NULL) {
             custom_bytes = strtoul(v, NULL, 10);
             if (mode == SZ_ORIGINAL) mode = SZ_CUSTOM;
+        }
+        else if ((v = switch_val(argv[i], "/PARTS:")) != NULL) {
+            if (parse_parts(v, &sel_mask) != 0) { printf("bad /PARTS list\n"); return 2; }
+            has_filter = 1;
         }
     }
     if (mode == SZ_CUSTOM && custom_bytes == 0) {
@@ -774,7 +806,7 @@ int main(int argc, char **argv) {
             if (!idx) break;
             part_t *p = &parts[nparts];
             memset(p, 0, sizeof *p);
-            p->index = (int)u64_after(idx, "index", 0);
+            p->index = (int)u64_at(idx, 0);   /* value right after THIS "index" */
             p->start_lba = u64_after(idx, "start_lba", 0);
             p->original = u64_after(idx, "original_size_bytes", 0);
             p->imaged = u64_after(idx, "imaged_size_bytes", p->original);
@@ -802,6 +834,7 @@ int main(int argc, char **argv) {
         printf("size policy: custom (%lu bytes)\n", (unsigned long)custom_bytes);
     else if (mode != SZ_ORIGINAL)
         printf("size policy: %s\n", mode == SZ_MINIMUM ? "minimum" : "entire");
+    if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
 
     if (!confirmed) {
         printf("REFUSING to write without /Y (this ERASES drive 0x%02X)\n", drive);
@@ -823,6 +856,11 @@ int main(int argc, char **argv) {
     for (int k = 0; k < nparts; k++) {
         part_t *p = &parts[k];
         p->window_sec = p->original / 512;            /* default: original window */
+        if (has_filter && (p->index < 0 || p->index >= 32 ||
+                           !(sel_mask & (1u << p->index)))) {
+            printf("  partition %d: not in /PARTS -- skipped\n", p->index);
+            continue;
+        }
         if (!p->is_fat) {
             if (p->gz[0])
                 printf("  partition %d: codec not gzip (%s) -- MVP restores .gz only\n",
