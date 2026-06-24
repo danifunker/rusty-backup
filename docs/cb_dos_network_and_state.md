@@ -238,6 +238,48 @@ Tradeoff: independent members reset the deflate dictionary each span — negligi
 ratio loss at MB granularity. Tune span up for ratio/fewer fsyncs, down for finer
 resume.
 
+### 2d. Frozen v1 on-disk format (shipped desktop-first, 2026-06-24)
+
+Implemented on the desktop ahead of the network transport — `src/rbformats/cbk.rs`
+(`pack_folder_to_cbk` / `materialize_cbk_to_folder`), `rb-cli cbk pack|unpack`, and
+`rb-cli restore <x>.cbk` (materializes a temp folder, then restores). **This
+freezes the format the DOS Family-B producer (7b) must emit.** All integers
+big-endian (the `RBK` convention).
+
+```text
+file = [chunk]* [index] [footer:16]
+
+chunk (24-byte header + payload):
+  magic       u32 = "RBKC" (0x5242_4B43)
+  version     u16 = 1
+  logical_id  u16              member index (into the index table)
+  src_offset  u64              uncompressed offset of this span in the member
+  len         u32              payload byte length
+  crc32       u32              CRC32 of the payload bytes
+  payload     [len]            one independent gzip member
+
+index:
+  magic        u32 = "RBKI" (0x5242_4B49)
+  version      u16 = 1
+  member_count u16
+  per member:  name_len u16, name (UTF-8, folder-relative),
+               kind u8  (0=Gz: payloads concatenated ARE the file, e.g.
+                         partition-N.gz; 1=Raw: file = gunzip(concat payloads),
+                         e.g. metadata.json / mbr.bin),
+               logical_id u16, chunk_count u32, chunk_count × chunk_offset u64
+
+footer (last 16 bytes): magic u32 = "RBKF" (0x5242_4B46), index_offset u64,
+                        index_len u32
+```
+
+A reader seeks EOF−16, reads the footer, jumps to the index — no full scan. The
+desktop packer emits **one chunk per member** (simplest valid chunking); the DOS
+producer will append **many** chunks per partition (each a ~1–4 MB-span gzip
+member) for the resume granularity §2c/§3 need. Both are valid `.cbk` this
+materializer reads. The network `.idx` sidecar (§2b/§3) layers *on top* of this:
+it is the same per-member chunk-offset list written incrementally for crash-safe
+resume, with the trailer index as the finalized form.
+
 ---
 
 ## 3. Resume — the transfer map
@@ -580,6 +622,19 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-24 — **`.cbk` container frozen + shipped desktop-first (§2d).** Built
+  `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`),
+  the `rb-cli cbk pack|unpack` verb, and taught `rb-cli restore` to read a `.cbk`
+  directly (materialize a temp folder, then restore — §2b option a). The on-disk
+  format is now **frozen at v1** (RBKC chunk headers = gzip members, RBKI trailer
+  index, RBKF footer; big-endian) so the future DOS Family-B producer (7b) emits
+  the same bytes. Verified: a cb-dos backup folder → `.cbk` (1255 B vs 1882 B
+  folder) → `rb-cli restore MYDISK.cbk` rebuilds a valid disk (FS mounts, file
+  intact), and `cbk unpack` round-trips every folder file byte-for-byte. Desktop
+  packer emits one chunk/member; the network producer will append many (per-span)
+  for resume — both valid. The §3 `.idx` sidecar layers on top (incremental form
+  of the same chunk-offset table). 3 unit tests; clippy clean. Bridges 7b: the
+  container exists, so 7b is now just the wire framing + incremental index.
 - 2026-06-24 — **Phase 7a complete — handshake round-trips on real FreeDOS.**
   Closed the only open 7a item (the runtime check) on a headless Linux box, no
   86Box/DOSBox-X GUI needed: **qemu-system-i386** booting the FreeDOS 1.4 image

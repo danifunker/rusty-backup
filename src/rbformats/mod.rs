@@ -164,6 +164,7 @@ pub mod chd_edit {
         bail!("chd feature not built into this binary")
     }
 }
+pub mod cbk;
 pub mod compress;
 pub mod containers;
 pub mod dc42;
