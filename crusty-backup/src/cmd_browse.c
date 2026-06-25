@@ -33,12 +33,41 @@
  * cluster, and root-dir offsets all are); for the live path the common
  * aligned case reads straight into `buf`, and a sector-padded bounce buffer
  * covers any unaligned head/tail (an odd root_entries count). */
+/* lz4 backend: an LZ4 frame isn't seekable, so reach `off` by decompressing
+ * forward from the current position (reopening from the start on a backward
+ * seek). O(off) like a gzseek rewind -- fine for browse + extract. */
+static int lz4_seek_read(fatvol_t *v, uint64_t off, void *buf, uint32_t len) {
+    if (off < v->lz4_pos) {
+        cbr_close(v->lz4);
+        v->lz4 = cbr_open(v->lz4_path, CODEC_LZ4);
+        if (!v->lz4) return -1;
+        v->lz4_pos = 0;
+    }
+    uint8_t skip[4096];
+    while (v->lz4_pos < off) {
+        uint32_t want = (off - v->lz4_pos > sizeof skip) ? (uint32_t)sizeof skip
+                                                         : (uint32_t)(off - v->lz4_pos);
+        int n = cbr_read(v->lz4, skip, (int)want);
+        if (n <= 0) return -1;
+        v->lz4_pos += (uint32_t)n;
+    }
+    uint32_t got = 0;
+    while (got < len) {
+        int n = cbr_read(v->lz4, (uint8_t *)buf + got, (int)(len - got));
+        if (n <= 0) break;
+        got += (uint32_t)n;
+    }
+    v->lz4_pos += got;
+    return (got == len) ? 0 : -1;
+}
+
 static int vol_read_at(fatvol_t *v, uint64_t off, void *buf, uint32_t len) {
     if (v->gz) {
         if (gzseek(v->gz, (z_off_t)off, SEEK_SET) < 0) return -1;
         int n = gzread(v->gz, buf, len);
         return (n == (int)len) ? 0 : -1;
     }
+    if (v->lz4) return lz4_seek_read(v, off, buf, len);
     /* live disk: off is a byte offset within the partition */
     uint64_t abs = (v->part_lba << 9) + off;       /* absolute disk byte */
     uint64_t lba = abs >> 9;
@@ -66,9 +95,12 @@ static uint32_t eoc_mark(int fat_bits) {
 int cbk_default_part(const char *folder, int part) {
     if (part >= 0) return part;
     for (int n = 0; n < 16; n++) {
-        char path[200];
+        char path[208];
         sprintf(path, "%s\\partition-%d.gz", folder, n);
         FILE *f = fopen(path, "rb");
+        if (f) { fclose(f); return n; }
+        sprintf(path, "%s\\partition-%d.lz4", folder, n);
+        f = fopen(path, "rb");
         if (f) { fclose(f); return n; }
     }
     return 0;
@@ -96,11 +128,16 @@ static int vol_finish_open(fatvol_t *v) {
 }
 
 int cbk_open_vol(const char *folder, int part, fatvol_t *v) {
-    char path[200];
-    sprintf(path, "%s\\partition-%d.gz", folder, part);
+    char path[208];
     memset(v, 0, sizeof *v);
+    /* Prefer a gzip member; fall back to an lz4 member (seek-by-decode backend). */
+    sprintf(path, "%s\\partition-%d.gz", folder, part);
     v->gz = gzopen(path, "rb");
-    if (!v->gz) { printf("cannot open %s\n", path); return -1; }
+    if (!v->gz) {
+        sprintf(v->lz4_path, "%s\\partition-%d.lz4", folder, part);
+        v->lz4 = cbr_open(v->lz4_path, CODEC_LZ4);
+        if (!v->lz4) { printf("cannot open %s\\partition-%d.gz or .lz4\n", folder, part); return -1; }
+    }
     if (vol_finish_open(v) != 0) { cbk_close_vol(v); return -1; }
     return 0;
 }
@@ -118,7 +155,8 @@ int cbk_open_vol_live(const drive_info_t *di, int drive, uint64_t part_lba, fatv
 void cbk_close_vol(fatvol_t *v) {
     if (v->fat) free(v->fat);
     if (v->gz) gzclose(v->gz);
-    v->fat = NULL; v->gz = NULL;
+    if (v->lz4) cbr_close(v->lz4);
+    v->fat = NULL; v->gz = NULL; v->lz4 = NULL;
 }
 
 /* Read all bytes of a directory (root or a subdir chain) into a malloc'd buffer. */

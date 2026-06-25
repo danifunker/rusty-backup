@@ -78,6 +78,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
   produces a target with files byte-identical and defragged (IO.SYS at cluster 2,
   TAIL relocated, all contiguous). Defrag + `/SIZE` resize together is still a
   future combo (defrag forces same-size).
+- [x] **lz4 browse. DONE (2026-06-25).** `ls`/`get` from an `.lz4` backup. Added an
+  lz4 backend to the browse engine (`cbbrowse.h` / `cmd_browse.c`): since LZ4 frames
+  aren't seekable, `vol_read_at` reaches an offset by decompressing forward from the
+  current position (reopening from the start on a backward seek) — O(off), like a
+  gzseek rewind. `cbk_open_vol` prefers `.gz`, falls back to `.lz4`. Verified on
+  FreeDOS/qemu: `ls` lists the tree and `get` extracts a root file, an LFN file, and
+  a deep 300 KB multi-cluster file from a `partition-0.lz4`, all byte-identical.
 - [ ] **Desktop defrag parity** — the desktop backup could optionally repack FAT
   partitions the same way (it already has the FAT machinery). Not in the cb-dos
   scope; a separate GUI/CLI feature if wanted.

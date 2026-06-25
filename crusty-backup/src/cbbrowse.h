@@ -12,12 +12,19 @@
 #define CBBROWSE_H
 
 #include "cbdisk.h"
+#include "cbcodec.h"
 #include <zlib.h>
 
 typedef struct {
-    /* Read backend: a backup gz when gz != NULL, otherwise a live BIOS disk
-     * (di/drive/part_lba). Exactly one is active for the volume's lifetime. */
+    /* Read backend (exactly one active for the volume's lifetime):
+     *   - a backup `partition-N.gz`   -> gz != NULL  (zlib gzseek random access)
+     *   - a backup `partition-N.lz4`  -> lz4 != NULL (seek by sequential decode,
+     *     since LZ4 frames aren't seekable; reopen on a backward seek)
+     *   - a live FAT partition on a BIOS drive (di/drive/part_lba). */
     gzFile       gz;
+    cbr_t       *lz4;           /* lz4 backend (forward-only; lz4_path to reopen) */
+    char         lz4_path[208];
+    uint64_t     lz4_pos;       /* current decompressed offset of the lz4 reader */
     drive_info_t di;            /* live backend: drive geometry for int13h */
     int          drive;         /* live backend: BIOS drive number (0x80..) */
     uint64_t     part_lba;      /* live backend: partition start LBA */
