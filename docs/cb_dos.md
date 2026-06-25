@@ -632,6 +632,35 @@ over the wire now.
       multi-cluster blob — each **byte-identical** to source; and the **TUI F6**
       flow (navigate to the live FAT partition, mark, F2 -> `C:\TX`) extracted
       byte-identically and returned cleanly. `make crustybk`.
+- [x] **Phase 4d — NTFS backup / restore / clone (DOS). DONE (2026-06-25).**
+      cb-dos now images **NTFS** (MBR type 0x07) partitions, not just FAT. A small
+      shared `cbntfs.{h,c}` reads the volume's cluster allocation bitmap — parse
+      the NTFS BPB, read `$Bitmap` (MFT record #6) with the update-sequence fixup,
+      decode its `$DATA` (resident or non-resident runs) into a RAM bitmap (set bit
+      = used) — lifted from the `disk_spike.c` probe that already validated those
+      counts bit-exact vs a host scan. `backup` (`backup_ntfs_partition`) and
+      `clone` (`clone_ntfs_partition`) drive the same smart-compaction from that
+      bitmap instead of the FAT: image the **full partition window** but zero the
+      free clusters before gzip (so the volume's backup boot sector + tail are
+      preserved verbatim and the round-trip is byte-faithful at the original size;
+      gzip still crushes the zeroed free space). **Restore needed no change** — its
+      write path is FS-agnostic and its resize gate already keys on a 512-byte FAT,
+      so NTFS restores **same-size on DOS** and prints the "resize on the desktop"
+      hint for `/SIZE`. NTFS resize on DOS stays out of scope (the heavy lift); the
+      desktop's `resize_ntfs_in_place` handles it. `metadata.json` emits
+      `partition_type_byte: 7` / `type_name: "NTFS"` / `compacted: true`, with
+      `minimum_size == original` (the desktop computes the true NTFS minimum via its
+      own resize, not from our metadata). **Verified on real FreeDOS/qemu**: a 63 MB
+      NTFS partition **pre-filled with random garbage** then formatted + two files
+      (a text file + a 200 KB multi-cluster blob) — `backup` produced a **0.4 MB**
+      `partition-0.gz` (proof the `$Bitmap` zeroing worked; a failed compaction
+      would be ~63 MB of incompressible random), `restore` (to a blank disk) and
+      `clone` (direct disk-to-disk) both rebuilt a volume that `ntfsfix -n` passes
+      ("processed successfully", alternate boot sector OK) with **both files
+      byte-identical** (md5) under `ntfscat`; and the desktop `rb-cli restore` of
+      the same folder recovers both files too. `make crustybk` (+4.6 KB). Remaining
+      FS gaps: exFAT/HPFS (type 0x07 but skipped with a clear message), ext2/3
+      (stretch), and logical/extended partitions.
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -662,6 +691,34 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 4d — NTFS backup / restore / clone on DOS.** cb-dos images
+  NTFS partitions now, closing the biggest FS gap (the spec scoped "NTFS + FAT16/32"
+  from day one; the `$Bitmap` parser was proven in `disk_spike.c` but never wired
+  into the engine). New shared `cbntfs.{h,c}`: `ntfs_parse` (BPB), `ntfs_load_bitmap`
+  (read MFT #6 `$Bitmap` with fixup, decode `$DATA` resident/non-resident runs into
+  a RAM bitmap, set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check
+  to distinguish NTFS from exFAT/HPFS). `cmd_backup` (`backup_ntfs_partition`) and
+  `cmd_clone` (`clone_ntfs_partition`) dispatch type 0x07 to the NTFS path and run
+  the same smart-compaction the FAT path does — image the full partition window,
+  zero free clusters per the bitmap before gzip. Full-window (not last-used-cluster
+  truncation) keeps the backup boot sector + tail verbatim, so the round-trip is
+  byte-faithful at original size; gzip crushes the zeroed free space so the `.gz`
+  still tracks used data. **`cmd_restore` was untouched**: its `is_fat` flag really
+  means "has a restorable `.gz`" and its resize is gated on a 512-byte FAT BPB, so
+  NTFS already restored same-size and pointed `/SIZE` at the desktop. On-DOS NTFS
+  resize stays out of scope; the desktop's `resize_ntfs_in_place` does it. Factored
+  the CRC/sidecar block into `gz_crc_sidecar` (shared by the FAT + NTFS paths);
+  added `rd64` to `cbdisk`. metadata: `partition_type_byte: 7`, `type_name: "NTFS"`,
+  `compacted: true`, `minimum_size == original` (desktop computes the real NTFS
+  min). **Verified on real FreeDOS/qemu**: a 63 MB NTFS partition pre-filled with
+  **random** then formatted (`mkntfs -Q`) + two files (text + a 200 KB multi-cluster
+  blob) — `CRUSTYBK backup` made a **0.4 MB** `partition-0.gz` (proof the bitmap
+  zeroing worked: incompressible random free space would be ~63 MB), and both
+  `restore` (-> blank 0x82) and `clone` (0x81 -> 0x83) produced volumes that
+  `ntfsfix -n` passes (alternate boot sector OK) with both files **byte-identical**
+  under `ntfscat`; desktop `rb-cli restore` of the same folder also recovers both.
+  `make crustybk` (+4.6 KB, no warnings). **Next:** exFAT (type 0x07, parser proven
+  in the spike), logical/extended partitions, or Phase 5 (boot-aware defrag).
 - 2026-06-25 — **Phase 4c-c — browse a *live disk*, not just a backup.** Fronted
   the browse engine with a single dispatched read primitive (`vol_read_at` in
   `cmd_browse.c`) so `fatvol_t` reads its bytes from **either** a backup

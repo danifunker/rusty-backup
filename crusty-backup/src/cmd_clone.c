@@ -1,11 +1,14 @@
-/* cmd_clone.c -- the `clone` command (Phase 4b, docs/cb_dos.md S2e).
+/* cmd_clone.c -- the `clone` command (Phase 4b, docs/cb_dos.md S2e) + NTFS.
  *
  * Direct disk-to-disk clone with no intermediate file: read source (int13h) ->
- * smart-compact each FAT partition on the fly (zero free clusters) -> write
- * straight to the target, optionally resizing. cbbackup's read+compaction fused
- * with cbrestore's write+resize, over the shared cbdisk engine. */
+ * smart-compact each partition on the fly (zero free clusters) -> write straight
+ * to the target, optionally resizing. cbbackup's read+compaction fused with
+ * cbrestore's write+resize, over the shared cbdisk engine. FAT partitions resize
+ * (FAT from its FAT); NTFS partitions clone same-size (free clusters zeroed from
+ * the $Bitmap) -- on-DOS NTFS resize is out of scope, the desktop handles it. */
 
 #include "cbdisk.h"
+#include "cbntfs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,6 +54,36 @@ static int clone_partition(const drive_info_t *sdi, int sdrive,
         if (secs < 1) break;
         if (write_lba(tdi, tdrive, start_lba + written / 512, secs, buf) != 0) break;
         written += (uint64_t)secs * 512;
+    }
+    return 0;
+}
+
+/* Clone an NTFS partition same-size: copy the full window [start, start+win_sec)
+ * to the target at the same start_lba, zeroing free clusters in flight per the
+ * $Bitmap. No resize (NTFS resize is desktop-only), so no zero-pad beyond. */
+static int clone_ntfs_partition(const drive_info_t *sdi, int sdrive,
+                                const drive_info_t *tdi, int tdrive,
+                                uint64_t start_lba, uint64_t win_sec,
+                                const ntfs_vol_t *v, const uint8_t *bm) {
+    uint8_t buf[XFER_BYTES];
+    uint64_t s = 0;
+    while (s < win_sec) {
+        int n = (int)(win_sec - s);
+        if (n > XFER_SECTORS) n = XFER_SECTORS;
+        if (read_lba(sdi, sdrive, start_lba + s, n, buf) != 0) {
+            printf("  clone: source read error at sector %lu\n", (unsigned long)s);
+            return -1;
+        }
+        for (int j = 0; j < n; j++) {
+            uint64_t lcn = (s + j) / v->sec_per_clus;
+            if (lcn < v->total_clusters && !ntfs_cluster_used(bm, v->total_clusters, lcn))
+                memset(buf + j * 512, 0, 512);
+        }
+        if (write_lba(tdi, tdrive, start_lba + s, n, buf) != 0) {
+            printf("  clone: target write error at sector %lu\n", (unsigned long)s);
+            return -1;
+        }
+        s += n;
     }
     return 0;
 }
@@ -143,16 +176,51 @@ int cmd_clone(int argc, char **argv) {
             printf("  slot %d: not in /PARTS -- skipped\n", p->slot);
             continue;
         }
-        if (!is_fat_part_type(p->type)) {
-            printf("  slot %d: type 0x%02X not FAT -- skipped\n", p->slot, p->type);
-            continue;
-        }
-
         uint8_t vbr[512];
         if (read_lba(&sdi, sdrive, p->start, 1, vbr) != 0) {
             printf("  slot %d: VBR read failed -- skipped\n", p->slot);
             continue;
         }
+
+        /* NTFS: same-size clone (no on-DOS resize), free clusters zeroed. */
+        if (!is_fat_part_type(p->type)) {
+            if (p->type != 0x07 || !ntfs_is_ntfs(vbr)) {
+                printf("  slot %d: type 0x%02X not FAT/NTFS -- skipped\n", p->slot, p->type);
+                continue;
+            }
+            ntfs_vol_t nv;
+            if (ntfs_parse(vbr, &nv) != 0) {
+                printf("  slot %d: NTFS BPB unsupported -- skipped\n", p->slot);
+                continue;
+            }
+            uint8_t *nbm = NULL;
+            if (ntfs_load_bitmap(&sdi, sdrive, p->start, &nv, &nbm) != 0) {
+                printf("  slot %d: NTFS $Bitmap read failed -- skipped\n", p->slot);
+                continue;
+            }
+            if (mode != SZ_ORIGINAL)
+                printf("  slot %d: NTFS -- on-DOS resize unsupported, cloning same size "
+                       "(resize on desktop)\n", p->slot);
+            uint64_t win = p->count;                 /* same size -> MBR verbatim */
+            uint64_t limit_sec = tgt_sectors;
+            for (int j = 0; j < np; j++)
+                if (P[j].start > p->start && P[j].start < limit_sec) limit_sec = P[j].start;
+            if (p->start + win > tgt_sectors ||
+                (limit_sec > p->start && win > limit_sec - p->start)) {
+                printf("  slot %d: target too small for the NTFS partition -- aborting\n", p->slot);
+                free(nbm); xfer_free(); return 1;
+            }
+            printf("  slot %d (NTFS) lba %lu: %lu KiB window (compacted)\n",
+                   p->slot, (unsigned long)p->start, (unsigned long)(win * 512 / 1024));
+            if (clone_ntfs_partition(&sdi, sdrive, &tdi, tdrive, p->start, win, &nv, nbm) != 0) {
+                free(nbm); xfer_free(); return 1;
+            }
+            free(nbm);
+            p->window_sec = win;
+            cloned++;
+            continue;
+        }
+
         fatlay_t L;
         parse_fatlay(vbr, &L);
         if (!L.ok || L.bps != 512) {

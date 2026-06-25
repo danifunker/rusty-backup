@@ -24,6 +24,7 @@ void xfer_free(void);
 /* Little-endian field helpers. */
 uint16_t rd16(const uint8_t *p);
 uint32_t rd32(const uint8_t *p);
+uint64_t rd64(const uint8_t *p);
 void     wr16(uint8_t *p, uint16_t v);
 void     wr32(uint8_t *p, uint32_t v);
 

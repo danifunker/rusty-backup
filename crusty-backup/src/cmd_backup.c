@@ -1,11 +1,14 @@
-/* cmd_backup.c -- the `backup` command (Phase 2 + selective).
+/* cmd_backup.c -- the `backup` command (Phase 2 + selective + NTFS).
  *
- * Images a FAT disk read via int13h to the desktop's native PerPartition folder
- * (metadata.json + mbr.bin + partition-N.gz). Each FAT partition is smart-
- * compacted (image up to the last used cluster, zero the interior free clusters)
- * and streamed through zlib gzwrite. The disk/FAT engine lives in cbdisk. */
+ * Images a disk read via int13h to the desktop's native PerPartition folder
+ * (metadata.json + mbr.bin + partition-N.gz). Each partition is smart-compacted
+ * (free clusters zeroed pre-gzip) and streamed through zlib gzwrite: FAT from its
+ * FAT (image up to the last used cluster), NTFS from its $Bitmap (full window,
+ * free clusters zeroed). The disk/FAT engine lives in cbdisk, the NTFS $Bitmap
+ * reader in cbntfs. */
 
 #include "cbdisk.h"
+#include "cbntfs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +22,7 @@ static const char *part_type_name(uint8_t t) {
         case 0x01: return "FAT12";
         case 0x04: return "FAT16 (<32MB)";
         case 0x06: return "FAT16 (>32MB)";
+        case 0x07: return "NTFS";
         case 0x0B: return "FAT32 (CHS)";
         case 0x0C: return "FAT32 (LBA)";
         case 0x0E: return "FAT16 (LBA)";
@@ -37,6 +41,26 @@ typedef struct {
     char     gz_name[24];
     char     crc_hex[9];
 } part_meta_t;
+
+/* CRC32 the finished .gz (the desktop's checksum) and write its .crc32 sidecar. */
+static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
+    char path[160];
+    sprintf(path, "%s\\%s", dest, pm->gz_name);
+    FILE *f = fopen(path, "rb");
+    uLong crc = crc32(0L, Z_NULL, 0);
+    if (f) {
+        uint8_t rb[4096]; size_t got;
+        while ((got = fread(rb, 1, sizeof rb, f)) > 0)
+            crc = crc32(crc, rb, (uInt)got);
+        fclose(f);
+    }
+    sprintf(pm->crc_hex, "%08lx", (unsigned long)crc);
+
+    char crcpath[180];
+    sprintf(crcpath, "%s\\%s.crc32", dest, pm->gz_name);
+    FILE *cf = fopen(crcpath, "wb");
+    if (cf) { fprintf(cf, "%s", pm->crc_hex); fclose(cf); }
+}
 
 /* Smart-compact + gzip a FAT partition into <dest>/partition-N.gz, fill `pm`. */
 static int backup_fat_partition(const drive_info_t *di, int drive,
@@ -107,26 +131,89 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
     free(fat);
     if (rc != 0) return rc;
 
-    /* CRC32 over the compressed .gz file (the desktop's checksum). */
-    FILE *f = fopen(path, "rb");
-    uLong crc = crc32(0L, Z_NULL, 0);
-    if (f) {
-        uint8_t rb[4096]; size_t got;
-        while ((got = fread(rb, 1, sizeof rb, f)) > 0)
-            crc = crc32(crc, rb, (uInt)got);
-        fclose(f);
-    }
-    sprintf(pm->crc_hex, "%08lx", (unsigned long)crc);
-
-    char crcpath[180];
-    sprintf(crcpath, "%s\\%s.crc32", dest, pm->gz_name);
-    FILE *cf = fopen(crcpath, "wb");
-    if (cf) { fprintf(cf, "%s", pm->crc_hex); fclose(cf); }
+    gz_crc_sidecar(dest, pm);
 
     printf("  part %d (%s): imaged %lu KiB -> %s, crc %s%s\n",
            index, part_type_name(type_byte),
            (unsigned long)(pm->imaged_size / 1024), pm->gz_name, pm->crc_hex,
            pm->compacted ? " [compacted]" : "");
+    return 0;
+}
+
+/* Smart-compact + gzip an NTFS partition into <dest>/partition-N.gz, fill `pm`.
+ * Mirrors backup_fat_partition but drives the free-cluster zeroing from the NTFS
+ * $Bitmap instead of the FAT. Images the FULL partition window (zeroing only free
+ * clusters), so the volume's backup boot sector + any tail are preserved verbatim
+ * and restore is byte-faithful at the original size. On-DOS NTFS resize is out of
+ * scope; the desktop resizes via resize_ntfs_in_place. gzip crushes the zeroed
+ * free space, so the .gz still tracks used data. */
+static int backup_ntfs_partition(const drive_info_t *di, int drive,
+                                 const char *dest, int index, uint8_t type_byte,
+                                 uint64_t start_lba, uint64_t part_sectors,
+                                 part_meta_t *pm) {
+    uint8_t vbr[512];
+    if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
+        printf("  part %d: VBR read failed\n", index);
+        return -1;
+    }
+    if (!ntfs_is_ntfs(vbr)) {
+        printf("  part %d: type 0x07 but not NTFS (exFAT/HPFS?) -- skipped\n", index);
+        return -1;
+    }
+    ntfs_vol_t v;
+    if (ntfs_parse(vbr, &v) != 0) {
+        printf("  part %d: NTFS BPB unsupported (need 512-byte sectors) -- skipped\n", index);
+        return -1;
+    }
+    uint8_t *bm = NULL;
+    if (ntfs_load_bitmap(di, drive, start_lba, &v, &bm) != 0) {
+        printf("  part %d: NTFS $Bitmap read failed -- skipped\n", index);
+        return -1;
+    }
+
+    pm->index = index;
+    pm->type_byte = type_byte;
+    pm->start_lba = start_lba;
+    pm->original_size = part_sectors * 512ULL;
+    pm->imaged_size = part_sectors * 512ULL;     /* full window, free clusters zeroed */
+    pm->minimum_size = pm->imaged_size;          /* desktop computes the true NTFS min */
+    pm->compacted = 1;
+    sprintf(pm->gz_name, "partition-%d.gz", index);
+
+    char path[160];
+    sprintf(path, "%s\\%s", dest, pm->gz_name);
+    gzFile gz = gzopen(path, "wb6");
+    if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(bm); return -1; }
+
+    uint8_t buf[XFER_BYTES];
+    uint64_t s = 0;
+    int rc = 0;
+    while (s < part_sectors) {
+        int n = (int)(part_sectors - s);
+        if (n > XFER_SECTORS) n = XFER_SECTORS;
+        if (read_lba(di, drive, start_lba + s, n, buf) != 0) {
+            printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
+            rc = -1; break;
+        }
+        for (int j = 0; j < n; j++) {
+            uint64_t lcn = (s + j) / v.sec_per_clus;
+            if (lcn < v.total_clusters && !ntfs_cluster_used(bm, v.total_clusters, lcn))
+                memset(buf + j * 512, 0, 512);
+        }
+        if (gzwrite(gz, buf, n * 512) != n * 512) {
+            printf("  part %d: gzwrite failed\n", index);
+            rc = -1; break;
+        }
+        s += n;
+    }
+    gzclose(gz);
+    free(bm);
+    if (rc != 0) return rc;
+
+    gz_crc_sidecar(dest, pm);
+
+    printf("  part %d (NTFS): imaged %lu KiB -> %s, crc %s [compacted]\n",
+           index, (unsigned long)(pm->imaged_size / 1024), pm->gz_name, pm->crc_hex);
     return 0;
 }
 
@@ -194,7 +281,7 @@ int cmd_backup(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
         printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j]\n");
-        printf("  e.g. CRUSTYBK backup A:\\BK 80           image every FAT partition\n");
+        printf("  e.g. CRUSTYBK backup A:\\BK 80           image every FAT/NTFS partition\n");
         printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0  image only MBR slot 0\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
@@ -256,12 +343,16 @@ int cmd_backup(int argc, char **argv) {
             printf("  part %d: not in /PARTS -- skipped\n", i);
             continue;
         }
-        if (!is_fat_part_type(type)) {
-            printf("  part %d: type 0x%02X not FAT -- skipped\n", i, type);
+        int ok;
+        if (is_fat_part_type(type))
+            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]);
+        else if (type == 0x07)
+            ok = backup_ntfs_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]);
+        else {
+            printf("  part %d: type 0x%02X not FAT/NTFS -- skipped\n", i, type);
             continue;
         }
-        if (backup_fat_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]) == 0)
-            nparts++;
+        if (ok == 0) nparts++;
     }
 
     if (nparts == 0) { printf("no FAT partitions imaged\n"); xfer_free(); return 1; }
