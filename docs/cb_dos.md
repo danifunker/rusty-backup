@@ -763,6 +763,20 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Fix: `backup` mbr.bin corruption under stdout redirection.** The
+  long-standing gotcha (redirecting `CRUSTYBK BACKUP`'s stdout to a same-drive file
+  corrupted `mbr.bin`) is root-caused and fixed. Reproduced it, then bisected: the
+  corrupted span in `mbr.bin` (bytes 158–232) was *exactly* the final stdout output
+  ("wrote metadata.json…backup complete…"), at the *same offset* it occupies in the
+  redirect target — i.e. the unbuffered stdout writes bled into a just-closed DOS
+  file's clusters. The trigger is `setvbuf(stdout, NULL, _IONBF, 0)`: removing it
+  makes the redirected `mbr.bin` byte-identical to source. Fix: all six `cmd_*` now
+  use **`_IOLBF`** (line-buffered) instead of `_IONBF` — writes leave in buffered
+  chunks like the clean non-redirected path, while line flushes + the progress
+  line's explicit `fflush` keep interactive output prompt. **Verified on real
+  FreeDOS/qemu:** `CRUSTYBK BACKUP … > C:\LOG.TXT` leaves `mbr.bin` clean, a
+  redirected `GET` leaves the extracted file clean, and a non-redirected
+  backup→restore round-trip is still byte-identical. `make crustybk`.
 - 2026-06-25 — **Phase 6 — LZ4 codec (desktop `--format lz4` + DOS `/CODEC:LZ4`).**
   A second codec shared between the desktop and cb-dos, for slow 486 CPUs where
   DEFLATE is the bottleneck: LZ4 is dramatically cheaper to compress at a lower

@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 int cmd_inspect(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     int only = -1;
     if (argc >= 2) only = (int)strtol(argv[1], NULL, 16);
 

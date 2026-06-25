@@ -102,7 +102,7 @@ static int clone_ntfs_partition(const drive_info_t *sdi, int sdrive,
 }
 
 int cmd_clone(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 3) {
         printf("usage: CRUSTYBK clone <src-hex> <tgt-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
         printf("  direct disk-to-disk clone, no staging file\n");

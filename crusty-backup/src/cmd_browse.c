@@ -376,7 +376,7 @@ static int open_browse_src(const char *src, int part, fatvol_t *v, int *held) {
 }
 
 int cmd_ls(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
         printf("usage: CRUSTYBK ls <src> [N] [path]\n");
         printf("  <src>  a backup folder, or @HH for live BIOS drive 0xHH\n");
@@ -412,7 +412,7 @@ int cmd_ls(int argc, char **argv) {
 }
 
 int cmd_get(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 4) {
         printf("usage: CRUSTYBK get <src> [N] <path> <dest-file>\n");
         printf("  <src>  a backup folder, or @HH for live BIOS drive 0xHH\n");

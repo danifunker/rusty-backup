@@ -314,13 +314,14 @@ extra flag is needed. Browsing (`ls`/`get`) an lz4 backup is **not** supported
    don't reintroduce it when copying the disk primitives into new tools.
 3. **FreeCOM redirection quirks.** `2>` / `2>&1` are mis-parsed (the `2` becomes a
    program argument — silently sent `NETHELLO` to *port 2*); `>>` append is
-   unreliable. Use a single `>` and pass args explicitly. **Also:** redirecting
-   `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes the backup
-   folder to corrupts `mbr.bin` (the "wrote metadata.json" banner bleeds into the
-   boot-code area) → restores from that folder get a garbled MBR. Run the backup
-   subcommand **without** `>`; restore/clone/inspect write nothing to DOS files so
-   redirecting those is safe. Don't trust a folder for a byte-identical check if
-   backup was redirected. Likely a `cmd_backup.c` DTA/FILE-buffer aliasing bug.
+   unreliable. Use a single `>` and pass args explicitly. **(RESOLVED 2026-06-25)**
+   The old "redirecting `CRUSTYBK BACKUP`'s stdout corrupts `mbr.bin`" bug is
+   **fixed**: the root cause was `setvbuf(stdout, NULL, _IONBF, 0)` — unbuffered
+   stdout, when redirected on FreeDOS, bled its final writes into a just-closed DOS
+   file's clusters (the banner landed at `mbr.bin` byte 158). All `cmd_*` now use
+   `_IOLBF` (line-buffered), so `CRUSTYBK BACKUP … > C:\LOG.TXT` (and a redirected
+   `get`) are clean — verified on qemu. The other two parts of this gotcha (the
+   `2>` mis-parse and `>>` flakiness) are FreeCOM quirks, still true.
 4. **int13h writes are immediate** (not DOS-file-cached), so a restore lands on
    disk even if the process were killed mid-run — handy for headless tests.
 5. **`.cbk` v1 is frozen** (`cbk.rs` doc-comment). The future DOS network producer

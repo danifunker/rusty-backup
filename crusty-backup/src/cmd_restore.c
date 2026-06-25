@@ -151,7 +151,7 @@ typedef struct {
 } part_t;
 
 int cmd_restore(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 3) {
         printf("usage: CRUSTYBK restore <folder> <target-drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
         printf("  /Y               confirms the destructive write to the target drive\n");

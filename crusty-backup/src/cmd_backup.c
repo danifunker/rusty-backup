@@ -336,7 +336,7 @@ static void write_metadata(const char *dest, const char *src_label,
 }
 
 int cmd_backup(int argc, char **argv) {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
         printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j] [/DEFRAG] [/CODEC:LZ4]\n");
         printf("  e.g. CRUSTYBK backup A:\\BK 80            image every FAT/NTFS partition\n");

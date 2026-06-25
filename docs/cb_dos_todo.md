@@ -43,12 +43,16 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
     `/DEFRAG`. Size note: on a mostly-incompressible source lz4 ran ~7% larger
     than gzip (the expected ratio-for-speed trade); the win is CPU time on a 486.
 
-- [ ] **Bug — `backup` mbr.bin corruption under stdout redirection** (low-pri).
-  Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* bleeds its
-  "wrote metadata.json" banner into `mbr.bin`'s boot-code area. Likely a DTA /
-  FILE-buffer aliasing in `cmd_backup.c` (gotcha #3).
-  - [ ] Root-cause + fix; `get` writes a DOS file too — check the same path.
-  - **Done when:** `CRUSTYBK BACKUP … > C:\LOG.TXT` leaves `mbr.bin` clean.
+- [x] **Bug — `backup` mbr.bin corruption under stdout redirection. FIXED
+  (2026-06-25).** Root cause: `setvbuf(stdout, NULL, _IONBF, 0)` — **unbuffered**
+  stdout, when redirected on FreeDOS, bled its final writes into a recently-closed
+  DOS file's clusters at the matching offset (the "wrote metadata.json…" banner
+  landed in `mbr.bin` at byte 158). Bisected: removing `_IONBF` makes it clean.
+  Fix: switch all six `cmd_*` to **`_IOLBF`** (line-buffered) — writes go out in
+  buffered chunks like the clean non-redirected path, while per-line + the
+  progress line's explicit `fflush` keep output prompt. Verified on FreeDOS/qemu:
+  redirected `backup` (mbr.bin == source) **and** redirected `get` (extracted file
+  intact) are both clean, and the non-redirected round-trip still works.
 
 - [ ] **Net 7b–7i — networked backup/restore** (the path to "both" local + net).
   Only **7a** (binary handshake) is done; the `.cbk` container is frozen, so this
