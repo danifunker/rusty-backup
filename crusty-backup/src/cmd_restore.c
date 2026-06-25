@@ -44,6 +44,12 @@ static uint64_t u64_at(const char *p, uint64_t dflt) {
     while (*p >= '0' && *p <= '9') { v = v * 10 + (uint64_t)(*p - '0'); p++; any = 1; }
     return any ? v : dflt;
 }
+static int bool_after(const char *cur, const char *key, int dflt) {
+    const char *p = find_key(cur, key);
+    if (!p) return dflt;
+    p = skip_to_value(p);
+    return (strncmp(p, "true", 4) == 0) ? 1 : 0;
+}
 static int str_after(const char *cur, const char *key, char *out, int cap) {
     const char *p = find_key(cur, key);
     if (!p) return -1;
@@ -134,6 +140,8 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
 
 typedef struct {
     int      index;
+    uint8_t  type_byte;
+    int      is_logical;
     uint64_t start_lba, original, imaged, minimum;
     char     gz[40];
     int      is_fat;
@@ -197,21 +205,31 @@ int cmd_restore(int argc, char **argv) {
     uint32_t md_heads = (uint32_t)u64_after(meta, "heads", 0);
     uint32_t md_spt = (uint32_t)u64_after(meta, "sectors_per_track", 0);
 
-    static part_t parts[16];
+    /* Extended-partition container (emitted after "partitions"), for rebuilding
+     * the EBR chain. Falls back to scanning mbr.bin for an extended entry. */
+    uint64_t ext_base = 0;
+    {
+        const char *ec = strstr(meta, "\"extended_container\"");
+        if (ec) ext_base = u64_after(ec, "start_lba", 0);
+    }
+
+    static part_t parts[24];
     int nparts = 0;
     {
         const char *cur = strstr(meta, "\"partitions\"");
         if (!cur) cur = meta;
-        for (; nparts < 16;) {
+        for (; nparts < 24;) {
             const char *idx = find_key(cur, "index");
             if (!idx) break;
             part_t *p = &parts[nparts];
             memset(p, 0, sizeof *p);
             p->index = (int)u64_at(idx, 0);
+            p->type_byte = (uint8_t)u64_after(idx, "partition_type_byte", 0);
             p->start_lba = u64_after(idx, "start_lba", 0);
             p->original = u64_after(idx, "original_size_bytes", 0);
             p->imaged = u64_after(idx, "imaged_size_bytes", p->original);
             p->minimum = u64_after(idx, "minimum_size_bytes", p->imaged);
+            p->is_logical = bool_after(idx, "is_logical", p->index >= 4);
             str_after(idx, "compressed_files", p->gz, sizeof p->gz);
             p->is_fat = (p->gz[0] != 0 && strstr(p->gz, ".gz") != NULL &&
                          p->start_lba != 0 && p->original != 0);
@@ -274,6 +292,11 @@ int cmd_restore(int argc, char **argv) {
         for (int j = 0; j < nparts; j++)
             if (parts[j].start_lba > p->start_lba && parts[j].start_lba < limit_sec)
                 limit_sec = parts[j].start_lba;
+        /* The extended container isn't in parts[], so clamp a primary's growth
+         * to it too -- otherwise a primary just before the container can resize
+         * into it (the logicals live there). */
+        if (!p->is_logical && ext_base > p->start_lba && ext_base < limit_sec)
+            limit_sec = ext_base;
         uint64_t limit_window = (limit_sec > p->start_lba) ? limit_sec - p->start_lba : 0;
         uint64_t imaged_sec = round_up_512(p->imaged) / 512;
 
@@ -288,12 +311,15 @@ int cmd_restore(int argc, char **argv) {
             default:         win = p->original / 512; break;
         }
 
-        int can_resize = is_512_fat;
+        /* Logical partitions restore same-size on DOS (resizing one shifts the
+         * whole EBR chain -- the desktop's packing path); resize them there. */
+        int can_resize = is_512_fat && !p->is_logical;
         if (!can_resize) {
             if (mode != SZ_ORIGINAL)
-                printf("  partition %d: %s -- on-DOS resize needs a 512-byte FAT; "
-                       "original size (resize on desktop)\n",
-                       p->index, pl.ok ? "non-512 sectors" : "not FAT");
+                printf("  partition %d: %s -- original size (resize on desktop)\n",
+                       p->index,
+                       p->is_logical ? "logical partition" :
+                       pl.ok ? "non-512 sectors" : "not FAT/NTFS");
             win = p->original / 512;
         }
 
@@ -339,6 +365,43 @@ int cmd_restore(int argc, char **argv) {
     }
 
     if (restored == 0) { printf("no partitions restored\n"); xfer_free(); return 1; }
+
+    /* Rebuild + write the EBR chain for any logical partitions (same-size), so
+     * the extended container's logical volumes are addressable. */
+    {
+        uint64_t lstarts[24], lcounts[24]; uint8_t ltypes[24]; int nl = 0;
+        for (int k = 0; k < nparts; k++) {
+            part_t *p = &parts[k];
+            if (!(p->is_logical || p->index >= 4) || nl >= 24) continue;
+            lstarts[nl] = p->start_lba;
+            lcounts[nl] = p->window_sec;          /* original size for logicals */
+            ltypes[nl]  = p->type_byte;
+            nl++;
+        }
+        if (nl > 0) {
+            for (int a = 1; a < nl; a++) {        /* sort ascending by start_lba */
+                uint64_t ss = lstarts[a], cc = lcounts[a]; uint8_t tt = ltypes[a];
+                int b = a - 1;
+                while (b >= 0 && lstarts[b] > ss) {
+                    lstarts[b + 1] = lstarts[b]; lcounts[b + 1] = lcounts[b]; ltypes[b + 1] = ltypes[b];
+                    b--;
+                }
+                lstarts[b + 1] = ss; lcounts[b + 1] = cc; ltypes[b + 1] = tt;
+            }
+            if (ext_base == 0)                    /* fallback: extended entry in the MBR */
+                for (int e = 0; e < 4; e++) {
+                    const uint8_t *ent = mbr + 446 + e * 16;
+                    if (is_extended_type(ent[4]) && rd32(ent + 12) != 0) { ext_base = rd32(ent + 8); break; }
+                }
+            if (ext_base == 0)
+                printf("  warning: logical partitions but no extended container -- EBR chain skipped\n");
+            else if (write_ebr_chain(&di, drive, ext_base, lstarts, lcounts, ltypes, nl) == 0)
+                printf("wrote %d EBR sector%s (ext base lba %lu)\n",
+                       nl, nl == 1 ? "" : "s", (unsigned long)ext_base);
+            else
+                printf("EBR chain write failed\n");
+        }
+    }
 
     {
         uint32_t h = md_heads ? md_heads : di.heads;

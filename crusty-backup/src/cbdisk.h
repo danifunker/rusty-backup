@@ -56,6 +56,31 @@ typedef struct {
 void     parse_fatlay(const uint8_t *bpb, fatlay_t *L);    /* ok=0 if not a FAT BPB */
 uint32_t fat_entry(const uint8_t *fat, int bits, uint32_t n); /* 0 == free cluster */
 int      is_fat_part_type(uint8_t t);                      /* MBR FAT12/16/32 types */
+int      is_extended_type(uint8_t t);                      /* 0x05 | 0x0F | 0x85 */
+
+/* ----- extended-partition / EBR chain ------------------------------- */
+
+/* A logical partition discovered by walking an extended partition's EBR chain. */
+typedef struct {
+    uint64_t start_lba;   /* absolute LBA of the logical partition's data */
+    uint64_t count;       /* size in sectors */
+    uint64_t ebr_lba;     /* absolute LBA of this partition's EBR sector */
+    uint8_t  type;        /* MBR partition type byte */
+} logical_t;
+
+/* Walk the EBR chain of the extended partition based at `ext_base`. Fills `out`
+ * (up to `max`) with the logical partitions in chain order, absolute LBAs.
+ * Returns the count (>=0), or -1 on a read error. Loop/overflow guarded. */
+int walk_ebr_chain(const drive_info_t *di, int drive, uint64_t ext_base,
+                   logical_t *out, int max);
+
+/* Reconstruct + write the EBR chain for `n` logical partitions (the `starts`/
+ * `counts`/`types` arrays, sorted ascending by start) to the disk, mirroring the
+ * desktop's build_ebr_chain: first EBR at `ext_base`, each later EBR one sector
+ * before its logical. Returns 0 / -1. */
+int write_ebr_chain(const drive_info_t *di, int drive, uint64_t ext_base,
+                    const uint64_t *starts, const uint64_t *counts,
+                    const uint8_t *types, int n);
 
 uint64_t max_fat_window(const fatlay_t *L);   /* largest window keeping a valid FAT */
 uint64_t min_fat_window(const fatlay_t *L);   /* smallest window keeping a valid FAT */

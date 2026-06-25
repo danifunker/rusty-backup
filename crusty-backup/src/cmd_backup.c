@@ -38,9 +38,20 @@ typedef struct {
     uint64_t imaged_size;     /* bytes actually imaged */
     uint64_t minimum_size;    /* == imaged_size here */
     int      compacted;
+    int      is_logical;      /* inside an extended container (EBR chain) */
     char     gz_name[24];
     char     crc_hex[9];
 } part_meta_t;
+
+/* The MBR extended-partition container (if any), for the metadata sidecar so
+ * restore can rebuild the EBR chain. */
+typedef struct {
+    int      found;
+    int      mbr_index;       /* primary slot 0-3 holding the container */
+    uint8_t  type_byte;       /* 0x05 | 0x0F | 0x85 */
+    uint64_t start_lba;
+    uint64_t size_bytes;
+} ext_meta_t;
 
 /* CRC32 the finished .gz (the desktop's checksum) and write its .crc32 sidecar. */
 static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
@@ -234,7 +245,8 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
 static void write_metadata(const char *dest, const char *src_label,
                            uint64_t disk_bytes, uint64_t first_lba,
                            const drive_info_t *di,
-                           const part_meta_t *parts, int nparts) {
+                           const part_meta_t *parts, int nparts,
+                           const ext_meta_t *ext) {
     char path[160];
     sprintf(path, "%s\\metadata.json", dest);
     FILE *f = fopen(path, "wb");
@@ -281,11 +293,23 @@ static void write_metadata(const char *dest, const char *src_label,
         fprintf(f, "      \"checksum\": \"%s\",\n", p->crc_hex);
         fprintf(f, "      \"resized\": false,\n");
         fprintf(f, "      \"compacted\": %s,\n", p->compacted ? "true" : "false");
-        fprintf(f, "      \"is_logical\": false,\n");
+        fprintf(f, "      \"is_logical\": %s,\n", p->is_logical ? "true" : "false");
         fprintf(f, "      \"minimum_size_bytes\": %lu\n", (unsigned long)p->minimum_size);
         fprintf(f, "    }%s\n", (i + 1 < nparts) ? "," : "");
     }
-    fprintf(f, "  ]\n");
+    fprintf(f, "  ]");
+    if (ext && ext->found) {
+        /* Emitted after "partitions" so cb-dos restore's positional scanner reads
+         * the container's own start_lba/type without hitting a partition's. */
+        fprintf(f, ",\n  \"extended_container\": {\n");
+        fprintf(f, "    \"mbr_index\": %d,\n", ext->mbr_index);
+        fprintf(f, "    \"partition_type_byte\": %u,\n", ext->type_byte);
+        fprintf(f, "    \"start_lba\": %lu,\n", (unsigned long)ext->start_lba);
+        fprintf(f, "    \"size_bytes\": %lu\n", (unsigned long)ext->size_bytes);
+        fprintf(f, "  }\n");
+    } else {
+        fprintf(f, "\n");
+    }
     fprintf(f, "}\n");
     fclose(f);
     printf("wrote metadata.json (%d partition%s)\n", nparts, nparts == 1 ? "" : "s");
@@ -342,9 +366,10 @@ int cmd_backup(int argc, char **argv) {
     uint64_t disk_bytes = (uint64_t)di.cyls * di.heads * di.spt * 512;
     uint64_t first_lba = 0;
 
-    part_meta_t parts[4];
+    part_meta_t parts[24];
+    ext_meta_t ext; memset(&ext, 0, sizeof ext);
     int nparts = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 4 && nparts < 24; i++) {
         const uint8_t *e = mbr + 446 + i * 16;
         uint8_t type = e[4];
         uint32_t lba = rd32(e + 8);
@@ -353,6 +378,40 @@ int cmd_backup(int argc, char **argv) {
         if (first_lba == 0) first_lba = lba;       /* disk-wide alignment hint */
         uint64_t end = (uint64_t)lba + cnt;
         if (end * 512 > disk_bytes) disk_bytes = end * 512;
+
+        /* Extended container: image the logical partitions inside its EBR chain. */
+        if (is_extended_type(type)) {
+            ext.found = 1; ext.mbr_index = i; ext.type_byte = type;
+            ext.start_lba = lba; ext.size_bytes = (uint64_t)cnt * 512;
+            printf("  part %d: extended container (type 0x%02X) lba %lu, %lu MB\n",
+                   i, type, (unsigned long)lba, (unsigned long)(cnt / 2048));
+            logical_t logs[20];
+            int nl = walk_ebr_chain(&di, drive, lba, logs, 20);
+            if (nl < 0) { printf("  (EBR chain read failed)\n"); continue; }
+            for (int j = 0; j < nl && nparts < 24; j++) {
+                int lidx = 4 + j;
+                uint64_t lend = logs[j].start_lba + logs[j].count;
+                if (lend * 512 > disk_bytes) disk_bytes = lend * 512;
+                if (has_filter && !(sel_mask & (1u << lidx))) {
+                    printf("  logical %d: not in /PARTS -- skipped\n", lidx);
+                    continue;
+                }
+                int lok;
+                if (is_fat_part_type(logs[j].type))
+                    lok = backup_fat_partition(&di, drive, dest, lidx, logs[j].type,
+                                               logs[j].start_lba, logs[j].count, &parts[nparts]);
+                else if (logs[j].type == 0x07)
+                    lok = backup_ntfs_partition(&di, drive, dest, lidx, logs[j].type,
+                                                logs[j].start_lba, logs[j].count, &parts[nparts]);
+                else {
+                    printf("  logical %d: type 0x%02X not FAT/NTFS -- skipped\n", lidx, logs[j].type);
+                    continue;
+                }
+                if (lok == 0) { parts[nparts].is_logical = 1; nparts++; }
+            }
+            continue;
+        }
+
         if (has_filter && !(sel_mask & (1u << i))) {
             printf("  part %d: not in /PARTS -- skipped\n", i);
             continue;
@@ -366,14 +425,14 @@ int cmd_backup(int argc, char **argv) {
             printf("  part %d: type 0x%02X not FAT/NTFS -- skipped\n", i, type);
             continue;
         }
-        if (ok == 0) nparts++;
+        if (ok == 0) { parts[nparts].is_logical = 0; nparts++; }
     }
 
-    if (nparts == 0) { printf("no FAT partitions imaged\n"); xfer_free(); return 1; }
+    if (nparts == 0) { printf("no FAT/NTFS partitions imaged\n"); xfer_free(); return 1; }
 
     char label[16];
     sprintf(label, "0x%02X", drive);
-    write_metadata(dest, label, disk_bytes, first_lba, &di, parts, nparts);
+    write_metadata(dest, label, disk_bytes, first_lba, &di, parts, nparts, &ext);
 
     printf("backup complete: %d partition%s in %s\n", nparts, nparts == 1 ? "" : "s", dest);
     xfer_free();

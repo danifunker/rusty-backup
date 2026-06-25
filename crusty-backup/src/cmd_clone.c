@@ -185,6 +185,69 @@ int cmd_clone(int argc, char **argv) {
     int cloned = 0;
     for (int k = 0; k < np; k++) {
         clp_t *p = &P[k];
+
+        /* Extended container: copy each EBR sector verbatim (chain stays intact
+         * on the target) and clone each logical FAT/NTFS volume same-size. */
+        if (is_extended_type(p->type)) {
+            printf("  slot %d: extended container (type 0x%02X) -- cloning logicals\n",
+                   p->slot, p->type);
+            if (mode != SZ_ORIGINAL)
+                printf("  (logicals clone same-size; resize on the desktop)\n");
+            logical_t logs[20];
+            int nl = walk_ebr_chain(&sdi, sdrive, p->start, logs, 20);
+            if (nl < 0) { printf("  (EBR chain read failed)\n"); continue; }
+            for (int j = 0; j < nl; j++) {
+                int lidx = 4 + j;
+                uint8_t ebrsec[512];                 /* copy the EBR verbatim */
+                if (read_lba(&sdi, sdrive, logs[j].ebr_lba, 1, ebrsec) == 0)
+                    write_lba(&tdi, tdrive, logs[j].ebr_lba, 1, ebrsec);
+                if (has_filter && !(sel_mask & (1u << lidx))) {
+                    printf("  logical %d: not in /PARTS -- skipped\n", lidx);
+                    continue;
+                }
+                uint8_t lvbr[512];
+                if (read_lba(&sdi, sdrive, logs[j].start_lba, 1, lvbr) != 0) {
+                    printf("  logical %d: VBR read failed -- skipped\n", lidx);
+                    continue;
+                }
+                char llbl[40];
+                fatlay_t L; parse_fatlay(lvbr, &L);
+                if (L.ok && L.bps == 512) {
+                    uint8_t *fat = malloc(L.old_spf * L.bps);
+                    if (!fat) { printf("  logical %d: out of memory\n", lidx); xfer_free(); return 1; }
+                    if (load_region(&sdi, sdrive, logs[j].start_lba + L.reserved, L.old_spf * L.bps, fat) != 0) {
+                        printf("  logical %d: FAT read failed -- skipped\n", lidx); free(fat); continue;
+                    }
+                    uint32_t last_used = 0;
+                    for (uint32_t cl = 2; cl < L.clusters + 2; cl++)
+                        if (fat_entry(fat, L.fat_bits, cl) != 0) last_used = cl;
+                    uint32_t imaged_secs = (last_used >= 2) ? L.first_data_sec + (last_used - 1) * L.spc : L.first_data_sec;
+                    if (imaged_secs > L.old_total) imaged_secs = L.old_total;
+                    sprintf(llbl, "logical %d (FAT%d)", lidx, L.fat_bits);
+                    printf("  logical %d (FAT%d) lba %lu: %lu KiB (same-size)\n", lidx, L.fat_bits,
+                           (unsigned long)logs[j].start_lba, (unsigned long)(logs[j].count * 512 / 1024));
+                    if (clone_partition(&sdi, sdrive, &tdi, tdrive, logs[j].start_lba, logs[j].count * 512ULL,
+                                        &L, fat, imaged_secs, llbl) != 0) { free(fat); xfer_free(); return 1; }
+                    free(fat);
+                    cloned++;
+                } else if (ntfs_is_ntfs(lvbr)) {
+                    ntfs_vol_t nv;
+                    if (ntfs_parse(lvbr, &nv) != 0) { printf("  logical %d: NTFS BPB unsupported -- skipped\n", lidx); continue; }
+                    uint8_t *nbm = NULL;
+                    if (ntfs_load_bitmap(&sdi, sdrive, logs[j].start_lba, &nv, &nbm) != 0) { printf("  logical %d: NTFS $Bitmap read failed -- skipped\n", lidx); continue; }
+                    sprintf(llbl, "logical %d (NTFS)", lidx);
+                    printf("  logical %d (NTFS) lba %lu: %lu KiB (same-size)\n", lidx,
+                           (unsigned long)logs[j].start_lba, (unsigned long)(logs[j].count * 512 / 1024));
+                    if (clone_ntfs_partition(&sdi, sdrive, &tdi, tdrive, logs[j].start_lba, logs[j].count, &nv, nbm, llbl) != 0) { free(nbm); xfer_free(); return 1; }
+                    free(nbm);
+                    cloned++;
+                } else {
+                    printf("  logical %d: type 0x%02X not FAT/NTFS -- skipped\n", lidx, logs[j].type);
+                }
+            }
+            continue;
+        }
+
         if (has_filter && !(sel_mask & (1u << p->slot))) {
             printf("  slot %d: not in /PARTS -- skipped\n", p->slot);
             continue;

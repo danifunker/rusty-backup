@@ -271,6 +271,71 @@ int is_fat_part_type(uint8_t t) {
            t == 0x0B || t == 0x0C || t == 0x0E;
 }
 
+int is_extended_type(uint8_t t) {
+    return t == 0x05 || t == 0x0F || t == 0x85;
+}
+
+/* ----- extended-partition / EBR chain ------------------------------- */
+
+/* Port of partition/mbr.rs::parse_ebr_chain. Entry 0 of each EBR describes the
+ * logical partition (start relative to *this* EBR); entry 1 links to the next
+ * EBR (start relative to the *container* base). A visited check + a hard cap
+ * guard against corrupt loops. */
+int walk_ebr_chain(const drive_info_t *di, int drive, uint64_t ext_base,
+                   logical_t *out, int max) {
+    uint64_t cur = ext_base;
+    uint64_t visited[64];
+    int n = 0, nvisited = 0;
+    uint8_t ebr[512];
+
+    while (n < max && nvisited < 64) {
+        for (int i = 0; i < nvisited; i++)
+            if (visited[i] == cur) return n;         /* loop -- stop */
+        visited[nvisited++] = cur;
+
+        if (read_lba(di, drive, cur, 1, ebr) != 0) return (n > 0) ? n : -1;
+
+        const uint8_t *e0 = ebr + 446, *e1 = ebr + 446 + 16;
+        if (e0[4] != 0 && rd32(e0 + 12) != 0) {      /* entry 0: the logical part */
+            out[n].type      = e0[4];
+            out[n].start_lba = cur + rd32(e0 + 8);   /* relative to this EBR */
+            out[n].count     = rd32(e0 + 12);
+            out[n].ebr_lba   = cur;
+            n++;
+        }
+        if (e1[4] == 0 || rd32(e1 + 12) == 0) break; /* entry 1: link to next EBR */
+        cur = ext_base + rd32(e1 + 8);               /* relative to container base */
+    }
+    return n;
+}
+
+/* Port of partition/mbr.rs::build_ebr_chain. */
+int write_ebr_chain(const drive_info_t *di, int drive, uint64_t ext_base,
+                    const uint64_t *starts, const uint64_t *counts,
+                    const uint8_t *types, int n) {
+    for (int i = 0; i < n; i++) {
+        uint8_t ebr[512];
+        memset(ebr, 0, sizeof ebr);
+        uint64_t ebr_lba = (i == 0) ? ext_base : (starts[i] - 1);
+
+        uint8_t *e0 = ebr + 446;                     /* entry 0: this logical part */
+        e0[4] = types[i];
+        wr32(e0 + 8, (uint32_t)(starts[i] - ebr_lba));
+        wr32(e0 + 12, (uint32_t)counts[i]);
+
+        if (i + 1 < n) {                             /* entry 1: link to next EBR */
+            uint8_t *e1 = ebr + 446 + 16;
+            uint64_t next_ebr = starts[i + 1] - 1;
+            e1[4] = 0x05;
+            wr32(e1 + 8, (uint32_t)(next_ebr - ext_base));
+            wr32(e1 + 12, (uint32_t)(1 + counts[i + 1]));
+        }
+        ebr[510] = 0x55; ebr[511] = 0xAA;
+        if (write_lba(di, drive, ebr_lba, 1, ebr) != 0) return -1;
+    }
+    return 0;
+}
+
 /* ----- FAT resize (the C port of resize_fat_in_place) --------------- */
 
 static uint32_t compute_fat_sectors(uint32_t total, uint32_t reserved, uint32_t num_fats,
