@@ -166,6 +166,7 @@ pub fn unix_entry_from_inode(
         amiga_comment: None,
         amiga_date: None,
         dos_attributes: None,
+        finder_flags: None,
         mac_dates: None,
     }
 }

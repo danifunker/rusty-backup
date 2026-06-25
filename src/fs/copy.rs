@@ -473,8 +473,42 @@ fn copy_file(
         .seek(SeekFrom::Start(0))
         .map_err(|e| anyhow!("rewinding spool for {}: {e}", src_entry.path))?;
 
-    dst.create_file(dst_parent, &name, &mut spool, len, &options)
+    let created = dst
+        .create_file(dst_parent, &name, &mut spool, len, &options)
         .map_err(|e| anyhow!("writing {name}: {e}"))?;
+
+    // Finder flags (hasBundle, hasCustomIcon, isInvisible, ...) don't ride in
+    // CreateFileOptions; stamp them after creation via set_finder_info — the
+    // same path put-binhex / put-macbinary use. Only on Mac destinations
+    // (type/creator capable) under Preserve, and only when the source carried
+    // non-zero flags. set_finder_info rewrites the whole FInfo, so re-supply
+    // the type/creator create_file just wrote. See docs/bug_binhex_finder_flags.md.
+    if opts.attrs == AttrPolicy::Preserve && dst_caps.type_creator {
+        if let Some(flags) = src_entry.finder_flags.filter(|&f| f != 0) {
+            use crate::fs::hfs_common::encode_fourcc;
+            let type_code = options
+                .type_code
+                .as_deref()
+                .or(created.type_code.as_deref())
+                .map(encode_fourcc)
+                .unwrap_or([0; 4]);
+            let creator_code = options
+                .creator_code
+                .as_deref()
+                .or(created.creator_code.as_deref())
+                .map(encode_fourcc)
+                .unwrap_or([0; 4]);
+            let mut finfo = [0u8; 16];
+            finfo[0..4].copy_from_slice(&type_code);
+            finfo[4..8].copy_from_slice(&creator_code);
+            finfo[8..10].copy_from_slice(&flags.to_be_bytes());
+            if let Err(e) = dst.set_finder_info(&created, finfo, [0u8; 16]) {
+                log(&format!(
+                    "Warning: could not set Finder flags on {name}: {e}"
+                ));
+            }
+        }
+    }
 
     stats.files += 1;
     stats.bytes = stats.bytes.saturating_add(len);
@@ -773,6 +807,78 @@ fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Disk-to-disk copy of a Mac file must preserve its Finder flags
+    /// (`fdFlags`), so harvested apps keep their hasBundle/custom-icon bits.
+    /// Regression for docs/bug_binhex_finder_flags.md (the `cp` half).
+    #[test]
+    fn copy_preserves_finder_flags_hfs_to_hfs() {
+        use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+        use std::io::Cursor;
+
+        let mut src = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Src").unwrap()),
+            0,
+        )
+        .unwrap();
+        let sroot = src.root().unwrap();
+        let body = b"app";
+        let fe = src
+            .create_file(
+                &sroot,
+                "Game",
+                &mut Cursor::new(body.as_slice()),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"APPL");
+        finfo[4..8].copy_from_slice(b"Po.P");
+        finfo[8..10].copy_from_slice(&0x2000u16.to_be_bytes()); // hasBundle
+        src.set_finder_info(&fe, finfo, [0u8; 16]).unwrap();
+
+        // Read back so the FileEntry carries finder_flags, as a real copy would.
+        let src_entry = src
+            .list_directory(&sroot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Game")
+            .unwrap();
+        assert_eq!(src_entry.finder_flags, Some(0x2000));
+
+        let mut dst = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Dst").unwrap()),
+            0,
+        )
+        .unwrap();
+        let droot = dst.root().unwrap();
+
+        let mut stats = CopyStats::default();
+        copy_into(
+            &mut src,
+            &src_entry,
+            &mut dst,
+            &droot,
+            "Game",
+            &CopyOptions::default(),
+            &mut stats,
+            &|_| {},
+        )
+        .unwrap();
+
+        let copied = dst
+            .list_directory(&droot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Game")
+            .unwrap();
+        assert_eq!(
+            copied.finder_flags,
+            Some(0x2000),
+            "fdFlags must survive disk-to-disk cp"
+        );
+    }
 
     #[test]
     fn caps_hfs_has_forks_and_type_creator() {

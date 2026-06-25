@@ -65,6 +65,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
             mac_dates: None,
         })
     }

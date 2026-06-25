@@ -224,6 +224,13 @@ impl MfsDirEntry {
     fn creator_code_str(&self) -> String {
         ostype_to_string(&self.finder_info[4..8])
     }
+
+    /// Finder flags (`FInfo.fdFlags`) — the big-endian 2-byte field at offset 8
+    /// of the 16-byte Finder info. Surfaced on `FileEntry` so copy /
+    /// `get-binhex` round-trips preserve them.
+    fn finder_flags(&self) -> u16 {
+        u16::from_be_bytes([self.finder_info[8], self.finder_info[9]])
+    }
 }
 
 fn ostype_to_string(b: &[u8]) -> String {
@@ -758,6 +765,7 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
             );
             fe.type_code = Some(de.type_code_str());
             fe.creator_code = Some(de.creator_code_str());
+            fe.finder_flags = Some(de.finder_flags());
             if de.rsrc_logical_length > 0 {
                 fe.resource_fork_size = Some(de.rsrc_logical_length as u64);
             }

@@ -220,8 +220,12 @@ pub fn run_get(args: GetBinHexArgs) -> Result<()> {
         name: entry.name.clone(),
         type_code,
         creator_code,
-        // FileEntry doesn't surface Finder flags today; default to 0.
-        flags: 0,
+        // Preserve the source's Finder flags verbatim (hasBundle 0x2000,
+        // hasCustomIcon 0x0400, isInvisible, ...). The previously hard-coded 0
+        // dropped them, so harvested apps lost their BNDL registration and
+        // showed generic icons (docs/bug_binhex_finder_flags.md). put-binhex
+        // reads the same word back, so the high byte round-trips intact.
+        flags: entry.finder_flags.unwrap_or(0),
         data_fork,
         resource_fork,
     };

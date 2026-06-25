@@ -2461,6 +2461,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                finder_flags: None,
                 mac_dates: None,
             };
             let children =
@@ -2497,6 +2498,7 @@ fn adopt_orphans_into_lost_found_ufs<R: Read + Write + Seek + Send>(
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                finder_flags: None,
                 mac_dates: None,
             };
             let lf = fs.create_directory(

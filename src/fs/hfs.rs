@@ -2590,6 +2590,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
             mac_dates: None,
         })
     }
@@ -2637,6 +2638,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.finder_flags = Some(finder_flags);
                     fe.modified = hfs_common::format_mac_date(dates.1);
                     fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
@@ -5168,6 +5170,31 @@ mod tests {
         let rec = fs.locate_record_data(fe.location as u32).unwrap();
         assert_eq!(&fs.catalog_data[rec + 4..rec + 20], &finfo);
         assert_eq!(&fs.catalog_data[rec + 56..rec + 72], &fxinfo);
+
+        // The read path must surface fdFlags on FileEntry so get-binhex / cp
+        // preserve them (docs/bug_binhex_finder_flags.md).
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let entry = listed.iter().find(|e| e.name == "thing.bin").unwrap();
+        assert_eq!(entry.finder_flags, Some(0x4000));
+    }
+
+    /// Regression for the dropped-Finder-flags bug: a file with hasBundle
+    /// (0x2000) set must report `finder_flags == Some(0x2000)` on read, which
+    /// is the value get-binhex now encodes into the .hqx header.
+    #[test]
+    fn test_hfs_read_surfaces_has_bundle_flag() {
+        let (mut fs, fe) = make_fs_with_file();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"APPL");
+        finfo[4..8].copy_from_slice(b"Po.P");
+        BigEndian::write_u16(&mut finfo[8..10], 0x2000); // fdFlags hasBundle
+        fs.set_finder_info(&fe, finfo, [0u8; 16]).unwrap();
+
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let entry = listed.iter().find(|e| e.name == "thing.bin").unwrap();
+        assert_eq!(entry.finder_flags, Some(0x2000));
     }
 
     #[test]

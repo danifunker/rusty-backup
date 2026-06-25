@@ -2784,6 +2784,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
             mac_dates: None,
         })
     }
@@ -2862,6 +2863,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, display_size, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.finder_flags = Some(finder_flags);
                     if display_rsrc > 0 {
                         fe.resource_fork_size = Some(display_rsrc);
                     }
@@ -2889,7 +2891,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     // on the alias having a resolved target. So we drop the
                     // eager resolution and let the preview path do the read
                     // when (and only when) the user actually clicks.
-                    let _ = (data_fork, rsrc_fork, finder_flags);
+                    let _ = (data_fork, rsrc_fork);
                     entries.push(fe);
                 }
             }

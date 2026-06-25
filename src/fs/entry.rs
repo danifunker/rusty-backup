@@ -13,6 +13,14 @@ pub struct FileEntry {
     pub type_code: Option<String>,
     /// HFS/HFS+ creator code (e.g. "MSWD", "ttxt"). Four ASCII characters.
     pub creator_code: Option<String>,
+    /// HFS/HFS+/MFS Finder flags (`FInfo.fdFlags`): `hasBundle` (0x2000),
+    /// `hasCustomIcon` (0x0400), `isInvisible` (0x4000), `nameLocked`,
+    /// `isStationery`, the `kIsAlias` bit (0x8000), etc. The 2-byte field at
+    /// offset 8 of the 16-byte Finder info. `None` on non-Mac filesystems.
+    /// Carried so copy / `get-binhex` round-trips preserve a file's real icon
+    /// (a dropped `hasBundle` makes an app and its documents show generic
+    /// icons). See `docs/bug_binhex_finder_flags.md`.
+    pub finder_flags: Option<u16>,
     /// Symlink target path (only set for `EntryType::Symlink`).
     pub symlink_target: Option<String>,
     /// Special file type description (e.g. "block device", "char device", "socket", "fifo").
@@ -90,6 +98,7 @@ impl FileEntry {
             modified: None,
             type_code: None,
             creator_code: None,
+            finder_flags: None,
             symlink_target: None,
             special_type: None,
             mode: None,
@@ -116,6 +125,7 @@ impl FileEntry {
             modified: None,
             type_code: None,
             creator_code: None,
+            finder_flags: None,
             symlink_target: None,
             special_type: None,
             mode: None,
@@ -142,6 +152,7 @@ impl FileEntry {
             modified: None,
             type_code: None,
             creator_code: None,
+            finder_flags: None,
             symlink_target: None,
             special_type: None,
             mode: None,
@@ -174,6 +185,7 @@ impl FileEntry {
             modified: None,
             type_code: None,
             creator_code: None,
+            finder_flags: None,
             symlink_target: Some(target),
             special_type: None,
             mode: None,
@@ -205,6 +217,7 @@ impl FileEntry {
             modified: None,
             type_code: None,
             creator_code: None,
+            finder_flags: None,
             symlink_target: None,
             special_type: Some(special_type_str),
             mode: None,
