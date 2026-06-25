@@ -86,6 +86,33 @@ static uint32_t eoc_threshold(int fat_bits) {
     return (fat_bits == 12) ? 0x0FF8u : (fat_bits == 16) ? 0xFFF8u : 0x0FFFFFF8u;
 }
 
+/* CRC32 over a file's content (its first `size` bytes, in FAT chain order). A
+ * pure live read, cluster by cluster -- and deterministic across a block-level
+ * restore (the data clusters and the chain both round-trip verbatim), so it is a
+ * stable boot-file fingerprint for the §5b idempotency gate, not just metadata.
+ * Hashes exactly `size` bytes (not the padded cluster tail) so it equals the
+ * file's content hash. */
+static unsigned long chain_crc32(fatvol_t *v, const drive_info_t *di, int drive,
+                                 uint64_t start_lba, uint32_t first, uint32_t size) {
+    unsigned long crc = crc32(0L, Z_NULL, 0);
+    if (size == 0 || first < 2) return crc;
+    uint32_t csize = (uint32_t)v->L.spc * v->L.bps;
+    uint8_t *cbuf = malloc(csize ? csize : 1);
+    if (!cbuf) return crc;
+    uint32_t eoc = eoc_threshold(v->L.fat_bits);
+    uint32_t cl = first, remaining = size;
+    while (cl >= 2 && cl < eoc && remaining > 0) {
+        uint64_t lba = start_lba + (uint64_t)v->L.first_data_sec + (uint64_t)(cl - 2) * v->L.spc;
+        if (load_region(di, drive, lba, csize, cbuf) != 0) break;
+        uint32_t take = (remaining < csize) ? remaining : csize;
+        crc = crc32(crc, cbuf, take);
+        remaining -= take;
+        cl = fat_entry(v->fat, v->L.fat_bits, cl);
+    }
+    free(cbuf);
+    return crc;
+}
+
 /* Is a file's cluster chain a single contiguous run of the right length? Boot
  * loaders care (the SYS rule pins IO.SYS first + contiguous). Pure FAT walk, no
  * data read. */
@@ -181,10 +208,11 @@ static void emit_system(mbuf_t *m, fatvol_t *v, const drive_info_t *di, int driv
             mb_puts(m, "\n      {\"name\": ");
             mb_json_str(m, ents[i].name);
             mb_printf(m, ", \"size\": %lu, \"mtime\": \"%s\", \"attr\": %u, "
-                         "\"first_cluster\": %lu, \"contiguous\": %s}",
+                         "\"first_cluster\": %lu, \"contiguous\": %s, \"hash\": \"%08lx\"}",
                       (unsigned long)ents[i].size, iso, (unsigned)ents[i].attr,
                       (unsigned long)ents[i].first_cluster,
-                      chain_contiguous(v, ents[i].first_cluster, ents[i].size) ? "true" : "false");
+                      chain_contiguous(v, ents[i].first_cluster, ents[i].size) ? "true" : "false",
+                      chain_crc32(v, di, drive, start_lba, ents[i].first_cluster, ents[i].size));
         }
         free(ents);
     }
