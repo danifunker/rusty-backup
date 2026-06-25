@@ -720,8 +720,17 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       only — target ≥ original; resize-over-the-wire is a follow-up, since the
       socket is forward-only and the local peek-then-resize two-pass doesn't apply
       yet. gzip members, FAT + NTFS, primaries + logicals.)*
-- [ ] **7f — Manifest + idempotency.** Emit the file manifest (§5); restore
-      replays mtime/attribs; prove backup→restore→backup is a no-op.
+- [x] **7f — Manifest + idempotency. Done — qemu-verified (2026-06-25).** Emit a
+      per-FAT-partition `manifest-N.json` sidecar (§5a files[] + the §5d `system`
+      boot-fingerprint block) and prove backup→restore→backup is a no-op.
+      **Idempotency is structural, not replayed:** cb-dos restore is block-level
+      (`write_lba` only), so every dir entry — mtime, attribs, the archive bit —
+      round-trips verbatim inside the image; re-building the manifest from the
+      restored disk yields the byte-identical document, so the §5c int-21h
+      attribute replay a file-level tool would need is unnecessary here. The
+      manifest rides the folder / `.cbk` / network PUT as an ordinary Raw member.
+      Also bundled DOSLFN on the boot media so the non-8.3 member names work on a
+      bare DOS host (the FreeDOS kernel has no LFN API of its own).
 - [ ] **7g — Boot section + swap exclusion.** System-block fingerprint/round-trip
       (§5d); Level-1 swap zeroing (§6c) in the **shared** compaction path.
 - [ ] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
@@ -732,6 +741,35 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7f complete — per-partition file manifest + idempotency,
+  qemu-verified.** Backup now emits a `manifest-N.json` sidecar per FAT partition:
+  a depth-first `files[]` list (path / size / mtime / attr / start_cluster, dirs
+  flagged) plus a `system` boot-fingerprint block (MBR boot-code CRC, the
+  partition's reserved/boot-sectors CRC, and the DOS sysfiles
+  IO.SYS/MSDOS.SYS/COMMAND.COM/… with size/mtime/attr/first_cluster/contiguity).
+  New `cbmanifest.{c,h}` walks the live source read-only via the `cbbrowse` FAT
+  reader (extended to carry the dir write-time + date); `cmd_backup` writes it
+  locally, `cmd_netbackup` ships it as a Raw member (the PUT member count grew by
+  one per FAT partition), so it rides the folder / `.cbk` / network PUT for free —
+  `pack_folder_to_cbk` and `receive_put` already carry arbitrary members. FAT
+  only (NTFS has no on-DOS directory reader). **Idempotency turned out to be
+  structural:** cb-dos restore is block-level (`write_lba`), so dir entries —
+  mtime, attribs, the archive bit — round-trip verbatim in the image; a same-size
+  backup→restore→backup is a no-op and re-building the manifest yields the
+  byte-identical document (the §5b gate), making the §5c int-21h attribute replay
+  unnecessary. **Also** bundled DOSLFN on the boot media (vendored adoxa/doslfn
+  v0.42 `doslfn.com` + attribution, shipped at the media root via `mkmedia.sh` and
+  auto-loaded in `cbdos-autoexec.bat`): the backup-folder names are not 8.3-clean
+  (`metadata.json` / `partition-N.gz` / `manifest-N.json`) and the FreeDOS kernel
+  has no LFN API, so a *local-folder* backup/restore on a bare DOS host needs the
+  LFN TSR (the `.cbk` + network paths don't — those names never become DOS
+  files). **Verified on qemu** (FreeDOS 1.4): a FAT32 disk (system files, nested
+  dirs, an LFN file) → `BACKUP 81` → `RESTORE 82 /Y` → `BACKUP 82` produced a
+  **byte-identical** `manifest-0.json` (vendored DOSLFN wrote every non-8.3 name
+  cleanly), and a `BACKUP rb://…/MYDISK 81` PUT (4 members) assembled a
+  `MYDISK.cbk` whose unpacked `manifest-0.json` is byte-identical to the local
+  one. Lib (2093) + cbk pack/unpack round-trip (now covers a manifest member) +
+  clippy green. Next: **7g** (boot section deepening + swap exclusion, §5d/§6).
 - 2026-06-25 — **Phase 7e complete — restore over the wire (loop closed),
   qemu-verified.** A vintage box with a blank disk now pulls a `.cbk` back from
   the agent and rebuilds the disk over the network — the mirror of `backup

@@ -10,7 +10,7 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), ~54 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), ~57 commits ahead of `main`, all verified, tree
 clean:
 
 ```
@@ -58,6 +58,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | Net **7c** (block-level networked backup) | **baked into `CRUSTYBK BACKUP rb://...`** — images the disk over int13h and streams gzip-member spans straight to `rb-cli serve` (no local folder); host assembles `.cbk`, `rb-cli restore` rebuilds it byte-identical. `cbnet.{h,c}` (WATT-32 + span streamer) + `cmd_netbackup` in `cmd_backup.c`. Verified on FreeDOS/qemu (3.5 MiB → 4 spans) |
 | Net **7d** (resume) | a killed transfer **resumes** instead of restarting: §4 fingerprint in the PUT header, daemon resume-map reply, persistent staging + durable `journal.json` (fsync-then-record, truncate-to-committed), host-owned gz checksum. cb-dos seeks the source to the committed span. Verified on FreeDOS/qemu — drop after 2 of 4 spans → reconnect → resume → byte-identical restore |
 | Net **7e** (restore over the wire) | **loop closed** — `CRUSTYBK RESTORE rb://...` pulls a `.cbk` back from the agent (GET op) and rebuilds the disk over int13h, no local folder, same-size. `serve_get` (host) + `cbnet` GET client (multi-member inflate) + `cmd_netrestore`. Verified on FreeDOS/qemu — one boot backed up 0x81 over the wire then restored to a blank 0x82, byte-identical |
+| Net **7f** (manifest + idempotency) | per-FAT-partition `manifest-N.json` sidecar (depth-first `files[]` + a `system` boot-fingerprint block) via new `cbmanifest.{c,h}`; written locally by `cmd_backup`, shipped as a Raw member by `cmd_netbackup`, carried into the `.cbk` for free. **Idempotency is structural** (block-level restore round-trips dir entries verbatim → backup→restore→backup is a no-op). Boot media now bundles + auto-loads **DOSLFN** so the non-8.3 names work on a bare DOS host. Verified on FreeDOS/qemu — local backup→restore→backup byte-identical manifest, + a 4-member networked PUT whose `.cbk` manifest matches |
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
@@ -84,12 +85,14 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Net 7f–7i** — networked backup/restore (7a handshake + 7b chunk-PUT protocol
-   + 7c block-level backup + 7d resume + 7e restore-over-the-wire all done — the
-   loop is closed). Next: **7f manifest + idempotency** (§5 — round-trip
-   mtime/attribs, prove backup→restore→backup is a no-op) or **7g boot + swap**.
-   **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase
-   hand-off + the qemu NE2000/SLiRP rig + the 7f "done" definition).
+1. **Net 7g–7i** — networked backup/restore (7a handshake + 7b chunk-PUT protocol
+   + 7c block-level backup + 7d resume + 7e restore-over-the-wire + 7f
+   manifest/idempotency all done — the loop is closed, resumable, file-aware).
+   Next: **7g boot section + swap exclusion** (§5d/§6 — deepen the boot fingerprint
+   with sysfile content hashes, add the swap allowlist + Level-1 zeroing), then the
+   optional **7h incremental**. **Kick off from
+   [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase hand-off + the
+   qemu NE2000/SLiRP rig + the 7g "done" definition).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu

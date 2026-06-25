@@ -1,12 +1,13 @@
 # crusty-backup (`cb-dos`) — **network phase** resume prompt
 
-Hand-off for continuing **Net 7f–7i** (networked backup/restore over TCP). The
+Hand-off for continuing **Net 7g–7i** (networked backup/restore over TCP). The
 local removable-media engine is complete and qemu-verified; networking only swaps
 the *destination* under it. **7a (handshake), 7b (chunk PUT protocol + host
 `.cbk`), 7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d (resume),
-and 7e (restore over the wire `CRUSTYBK RESTORE rb://...`) are done and
-qemu-verified — the backup↔restore loop is closed.** Paste the section below
-(from "Resume the…" down) to kick off the next session.
+7e (restore over the wire `CRUSTYBK RESTORE rb://...`), and 7f (per-partition file
+manifest + idempotency) are done and qemu-verified — the backup↔restore loop is
+closed, resumable, and file-aware.** Paste the section below (from "Resume the…"
+down) to kick off the next session.
 
 ---
 
@@ -25,11 +26,11 @@ Read these first, in order, before doing anything:
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
 **Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently
-`7f — Manifest + idempotency` (§5), then `7g — Boot section + swap exclusion`.**
+`7g — Boot section + swap exclusion` (§5d/§6), then `7h — Incremental backup`.**
 
 ## Where we are
 
-Branch `cbdos` (off `main`), ~54 commits ahead, tree clean, **everything below
+Branch `cbdos` (off `main`), ~57 commits ahead, tree clean, **everything below
 qemu-verified on real FreeDOS**.
 
 - **Local cb-dos engine — DONE.** backup / restore / clone / browse across
@@ -83,6 +84,26 @@ qemu-verified on real FreeDOS**.
   zero-pad, rebuild EBR, write MBR verbatim). Loopback test
   `family_b_get_serves_cbk_members_over_loopback`; qemu-verified backup-then-restore
   byte-identical. *(Same-size only; resize-over-the-wire is the follow-up.)*
+- **Net 7f — DONE.** **Per-partition file manifest + idempotency.** Backup emits a
+  `manifest-N.json` sidecar per FAT partition — a depth-first `files[]` list
+  (path / size / mtime / attr / start_cluster, dirs flagged) plus a `system`
+  boot-fingerprint block (MBR boot-code CRC, the partition's reserved/boot-sectors
+  CRC, the DOS sysfiles with size/mtime/attr/first_cluster/contiguity). New
+  `crusty-backup/src/cbmanifest.{c,h}` walks the live source read-only via the
+  `cbbrowse` FAT reader (extended to carry the dir write-time); `cmd_backup` writes
+  it locally, `cmd_netbackup` ships it as a Raw member, so it rides the folder /
+  `.cbk` / network PUT for free. **Idempotency is structural** — cb-dos restore is
+  block-level (`write_lba`), so dir entries (mtime/attribs/archive bit) round-trip
+  verbatim; a same-size backup→restore→backup is a no-op and re-building the
+  manifest yields the byte-identical document, so the §5c int-21h replay isn't
+  needed. *(FAT only — NTFS has no on-DOS dir reader.)* **Also** bundled DOSLFN on
+  the boot media (vendored adoxa/doslfn v0.42 `media/DOSLFN.COM` + attribution,
+  shipped at the media root via `mkmedia.sh`, auto-loaded in `cbdos-autoexec.bat`)
+  so the non-8.3 member names (`metadata.json` / `partition-N.gz` /
+  `manifest-N.json`) work on a bare DOS host — the FreeDOS kernel has no LFN API of
+  its own. qemu-verified: local backup→restore→backup byte-identical manifest, and
+  a networked PUT (4 members) assembling a `.cbk` whose manifest matches the local
+  one.
 - **The `.cbk` container — FROZEN v1 and already the producer's chunk shape.**
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`, RBKC
   chunks / RBKI index / RBKF footer, big-endian). The desktop reads `.cbk` as a
@@ -96,39 +117,46 @@ qemu-verified on real FreeDOS**.
   (qemu-verified). So 7b is **wire framing + index over a producer/format that's
   already built**, not new container work.
 
-## What 7a–7e already give us (the closed loop)
+## What 7a–7f already give us (the closed loop)
 
 A vintage box boots cb-dos and backs up **and** restores over the network, no local
 folder either side:
 - `CRUSTYBK BACKUP rb://<agent>:7341/MYDISK 81` — images the disk **block-level over
   int13h** and streams gzip-member spans to `rb-cli serve`, which assembles
   `MYDISK.cbk`. **Resumable** (7d): kill it, re-run, it continues from the last
-  committed span (§4 fingerprint guards a swapped card).
+  committed span (§4 fingerprint guards a swapped card). Each FAT partition also
+  ships a **`manifest-N.json`** (7f) Raw member.
 - `CRUSTYBK RESTORE rb://<agent>:7341/MYDISK 82 /Y` — pulls the `.cbk`'s members back
   (GET) and rebuilds the disk over int13h, same-size.
-Both directions are qemu-verified byte-identical. **Block-level, baked in,
-crash-proof, bidirectional.** What's missing is the *state* layer (§5): the file
-manifest, idempotency, boot protection, and swap exclusion.
+Both directions are qemu-verified byte-identical, and the round-trip is **idempotent**
+(7f: a re-backup of a freshly-restored disk yields a byte-identical manifest).
+**Block-level, baked in, crash-proof, bidirectional, file-aware.** What's left is the
+rest of the *state* layer (§5d/§6): deepening the boot fingerprint and swap exclusion.
 
-## 7f — manifest + idempotency (what "done" looks like) — §5
+## 7g — boot section + swap exclusion (what "done" looks like) — §5d/§6
 
-Make backup↔restore **idempotent** and add file-level awareness:
-- **Backup** emits a per-partition **file manifest** sidecar (§5a: `path, size,
-  mtime, attribs{archive,hidden,system,readonly}, start_cluster` from one dir-tree
-  walk) plus the `system` block (MBR boot code / VBR / `IO.SYS`/`MSDOS.SYS`/
-  `COMMAND.COM` hashes, §5d). The payload stays a block image.
-- **Restore replays** each file's recorded mtime + attribs (incl. the archive bit)
-  via int 21h/5701h + 4301h (§5c), so a fresh restore doesn't look "freshly
-  modified" — and a re-backup right after sees no change (§5b whole-disk identity
-  gate). **Prove `backup → restore → backup` is a no-op.**
-- This is mostly **local-engine** work (the manifest rides in the folder/`.cbk` like
-  any other member); the network paths carry it for free once it's a member.
+7f laid the **file manifest** + the cheap `system` block (MBR boot-code CRC, the
+partition's reserved/boot-sectors CRC, and the root DOS sysfiles with
+size/mtime/attr/first_cluster/contiguity) and proved backup→restore→backup is a
+no-op. 7g deepens boot protection and adds swap handling — a **shared** compaction
+concern (desktop benefits too, §6e):
+- **Boot deepening (§5d):** add the sysfiles' **content hashes** to the `system`
+  block (7f records their metadata + contiguity but not a content CRC), and surface
+  a bootability-change flag when the prior backup's `system` block differs.
+- **Swap exclusion (§6):** identify swap/page files by a strict **allowlist**
+  (`386SPART.PAR`, `WIN386.SWP`, `pagefile.sys`, `hiberfil.sys`, `SWAPPER.DAT` — in
+  the expected location with the expected attribs; **never** DBLSPACE/DRVSPACE/
+  STACVOL), flag them `volatile:true` in the manifest, **exclude them from the change
+  counter always** (§6b), and **Level-1 zero their content in the payload** by
+  default (`--keep-swap` to opt back in, §6c — keep the allocation, emit zeros, log
+  every exclusion). The manifest already exists, so this is mostly a compaction-side
+  filter + manifest flags.
 
-After 7f: **7g** (boot section + Level-1 swap zeroing, §5d/§6c — a *shared*
-compaction concern), the optional **7h** (incremental — reuse the §4d fingerprint +
-§5 manifest to skip unchanged partitions), **7i** (Level-2 swap dealloc; desktop
-reads `.cbk` directly), and the deferred **resize-over-the-wire** (a forward-only
-streaming peek-then-resize, the one gap 7e left). Pick the top unchecked box in §9.
+After 7g: the optional **7h** (incremental — reuse the §4d fingerprint + §5 manifest
+to skip unchanged partitions; the manifest from 7f is the index), **7i** (Level-2
+swap dealloc; desktop reads `.cbk` directly), and the deferred **resize-over-the-wire**
+(a forward-only streaming peek-then-resize, the one gap 7e left). Pick the top
+unchecked box in §9.
 
 ## How we work
 
@@ -207,11 +235,29 @@ and `cmp` against the source. The target must be `>=` the source size (same-size
 restore). The guest console isn't captured by `-display none` without `-serial`, so
 read success from the serve log + the byte compare.
 
+**7f manifest/idempotency proof (2026-06-25):** one boot with three drives — boot
+(0x80), source FAT (0x81), blank same-size target (0x82) — running `BACKUP C:\BK1 81`
+→ `RESTORE C:\BK1 82 /Y` → `BACKUP C:\BK2 82`, then `cmp BK1\manifest-0.json
+BK2\manifest-0.json` off the boot disk → **byte-identical** (the no-op proof; the
+source 0x81 is only read, never written). Build the source with a real directory
+tree (nested dirs + an LFN file + root `IO.SYS`/`MSDOS.SYS`/`COMMAND.COM`) so the
+walk, the sysfiles block, and LFN reassembly are all exercised. To test the
+**vendored** `DOSLFN.COM` (not FD14's), copy `crusty-backup/media/DOSLFN.COM` into
+`\CB` and load it with a bare `DOSLFN` from there (as `cbdos-autoexec.bat` does from
+the media root). Network half: `BACKUP rb://10.0.2.2:7341/MYDISK 81` (NE2000+SLiRP,
+no DOSLFN needed — the net path writes no DOS files) → the serve log shows a
+**4-member** PUT → `rb-cli cbk unpack MYDISK.cbk` → its `manifest-0.json` is
+byte-identical to the local one (same source disk).
+
 **Net gotchas (do not relearn):** (1) FreeCOM mis-parses `2>` / `2>&1` (the `2`
 becomes an argv) — pass the port explicitly, use single `>`. (2) `CWSDPMI.EXE`
 must travel next to the net `.EXE`. (3) `my_ip = dhcp` is the whole network config
 under SLiRP. (4) The protocol is unauthenticated/unencrypted by design (isolated
-host↔vintage LAN; §1e) — do not bolt on crypto.
+host↔vintage LAN; §1e) — do not bolt on crypto. (5) **Local-folder** backup/restore
+needs **DOSLFN** loaded — the member names (`metadata.json`/`partition-N.gz`/
+`manifest-N.json`) aren't 8.3 and the FreeDOS kernel has no LFN API; the boot media
+now auto-loads the vendored `DOSLFN.COM`. The `.cbk` + network paths don't need it
+(those names never become DOS files).
 
 ## Key files
 
@@ -239,13 +285,24 @@ host↔vintage LAN; §1e) — do not bolt on crypto.
   **`cmd_netrestore`** (GET metadata/mbr, `netrestore_partition` streams gz →
   int13h same-size, `scan_parts`/`rebuild_ebr_chain` shared with the local path).
   `net_hello.c` (`NETHELLO.EXE`, `make net`) is the standalone handshake probe.
+- **File manifest (7f):** `crusty-backup/src/cbmanifest.{h,c}` — `manifest_build_fat`
+  walks the live FAT volume read-only via `cbbrowse` (a grow-on-demand JSON buffer;
+  `dirent_t` gained `dos_time`/`dos_date`) and emits the §5 `manifest-N.json`.
+  Called by `cmd_backup`'s `emit_partition_manifest` (local) and `cmd_netbackup`
+  (Raw member; the PUT member count = `1 + nsel + n_fat_manifests + 1`). The
+  desktop carries it for free — `pack_folder_to_cbk` / `receive_put` already pack
+  arbitrary members; `cbk.rs`'s round-trip test now covers a manifest member.
+- **Boot media (DOSLFN):** `crusty-backup/media/DOSLFN.COM` (vendored adoxa/doslfn
+  v0.42 + `DOSLFN-ATTRIBUTION.md`), shipped at the media root by `mkmedia.sh` and
+  auto-loaded in `media/cbdos-autoexec.bat` so local-folder backups' non-8.3 names
+  work on a bare DOS host.
 - **The local engines the net paths mirror:** `cmd_backup.c`'s
   `backup_fat_partition`/`backup_ntfs_partition` (smart-compaction) and
   `cmd_restore.c`'s `restore_partition` (the file path, with peek+resize — the
   forward-only socket path can't peek, so resize-over-the-wire is deferred),
   `cbdisk.{h,c}`, `cbcodec.{h,c}`.
 
-Start by reading the four docs, then plan and implement **7f** (manifest +
-idempotency, §5) or **7g** (boot + swap, §5d/§6). Keep each box small
-(one commit or a small handful), verify on real FreeDOS in qemu, and tick §9 +
-refresh the resume as you go.
+Start by reading the four docs, then plan and implement **7g** (boot section
+deepening + swap exclusion, §5d/§6) — 7f (manifest + idempotency) is done. Keep
+each box small (one commit or a small handful), verify on real FreeDOS in qemu,
+and tick §9 + refresh the resume as you go.
