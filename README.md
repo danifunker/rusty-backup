@@ -455,9 +455,9 @@ inspect-tab Edit Mode.
 
 | Filesystem     | Browse | Edit | Shrink / expand | fsck | Notes |
 |----------------|:------:|:----:|:---------------:|:----:|-------|
-| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies |
-| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x |
-| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux |
+| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
+| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
+| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
 | exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. |
 | NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch clean-room formatter, validated to mount under ntfs-3g). Create blank volumes with `rb-cli new --fs ntfs` (selectable `--cluster-size` / `--sector-size`, 512 B–2 MiB clusters); the defragmenting clone inherits the source volume's cluster and sector size. |
 | ext2 / ext3 / ext4 | Yes | Yes | Yes             | —    | Early Linux installs onward |

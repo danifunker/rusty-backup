@@ -597,6 +597,20 @@ fn exfat_compact_reader<R: Read + Seek + Send + 'static>(
     Some((Box::new(lp), info))
 }
 
+/// Build the **defrag** compact reader for a FAT partition: like the FAT path of
+/// [`compact_partition_reader`] but each file's clusters are relocated into a
+/// contiguous run (boot files first), so the restored disk is defragmented. The
+/// output is the same *size* as plain compaction — only the cluster order
+/// changes. Returns `None` if the partition isn't a FAT volume, so the backup
+/// path falls back to ordinary compaction for non-FAT filesystems.
+pub fn defrag_fat_partition_reader<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (reader, info) = CompactFatReader::new_defrag(reader, partition_offset).ok()?;
+    Some((Box::new(reader), info))
+}
+
 /// Try to create a compacted reader for a partition.
 ///
 /// Returns `None` for unsupported filesystem types. On success, returns a

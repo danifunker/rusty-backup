@@ -430,6 +430,7 @@ fn restore_to_remote_image_round_trips() {
         shrink_to_minimum: false,
         precomputed_minimum_sizes: None,
         defrag_partition_indices: None,
+        defrag_fat: false,
     };
     run_backup(bcfg, Arc::new(Mutex::new(BackupProgress::default()))).expect("local backup");
     let backup_folder = backups.join("rst");
@@ -994,6 +995,7 @@ fn run_backup_pulls_remote_image_byte_exact() {
         shrink_to_minimum: false,
         precomputed_minimum_sizes: None,
         defrag_partition_indices: None,
+        defrag_fat: false,
     };
     let progress = Arc::new(Mutex::new(BackupProgress::default()));
     let source = BackupSource::Remote {
@@ -1255,6 +1257,7 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
         shrink_to_minimum: false,
         precomputed_minimum_sizes: None,
         defrag_partition_indices: None,
+        defrag_fat: false,
     };
     let progress = Arc::new(Mutex::new(BackupProgress::default()));
     let source = BackupSource::Remote {
@@ -1483,6 +1486,7 @@ fn run_backup_pulls_remote_superfloppy_byte_exact() {
         shrink_to_minimum: false,
         precomputed_minimum_sizes: None,
         defrag_partition_indices: None,
+        defrag_fat: false,
     };
     let progress = Arc::new(Mutex::new(BackupProgress::default()));
     let source = BackupSource::Remote {

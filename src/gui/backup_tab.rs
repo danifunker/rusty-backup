@@ -2222,6 +2222,7 @@ impl BackupTab {
             shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
             precomputed_minimum_sizes,
             defrag_partition_indices: Some(defrag_set),
+            defrag_fat: false,
         };
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
@@ -2482,6 +2483,7 @@ impl BackupTab {
             shrink_to_minimum: self.resize_partitions && !self.sector_by_sector,
             precomputed_minimum_sizes,
             defrag_partition_indices: Some(defrag_set),
+            defrag_fat: false,
         };
 
         self.maybe_persist_chd_options();

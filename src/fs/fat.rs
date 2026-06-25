@@ -2000,9 +2000,28 @@ impl<R: Read + Seek> CompactFatReader<R> {
     /// The constructor reads the BPB and entire FAT table, scans for allocated
     /// clusters, builds the remapping, and pre-computes boot sector, FAT tables,
     /// and root directory bytes.
-    pub fn new(
+    pub fn new(source: R, partition_offset: u64) -> Result<(Self, CompactResult), FilesystemError> {
+        Self::new_inner(source, partition_offset, false)
+    }
+
+    /// Like [`new`](Self::new) but **defragments**: each file's clusters are
+    /// relocated into a contiguous run, walking the directory tree (boot files
+    /// `IO.SYS`/`MSDOS.SYS`/`IBMBIO.COM`/`IBMDOS.COM`/`KERNEL.SYS` pinned first so
+    /// the volume still boots), with any lost/unreferenced clusters preserved at
+    /// the end. The output is the same *size* as plain compaction — only the
+    /// cluster ordering changes — so restore is unaffected and produces a
+    /// defragmented disk.
+    pub fn new_defrag(
+        source: R,
+        partition_offset: u64,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        Self::new_inner(source, partition_offset, true)
+    }
+
+    fn new_inner(
         mut source: R,
         partition_offset: u64,
+        defrag: bool,
     ) -> Result<(Self, CompactResult), FilesystemError> {
         // --- Parse BPB ---
         source.seek(SeekFrom::Start(partition_offset))?;
@@ -2096,6 +2115,29 @@ impl<R: Read + Seek> CompactFatReader<R> {
         }
 
         let clusters_used = allocated.len() as u32;
+
+        // --- Defrag: reorder the allocated clusters file-by-file (boot first) ---
+        // Same set of clusters, just a contiguous-per-file ordering, so the new
+        // image is the same size as plain compaction but defragmented.
+        if defrag {
+            allocated = build_defrag_order(
+                &mut source,
+                partition_offset,
+                &fat_data,
+                fat_type,
+                original_root_cluster,
+                reserved_sectors,
+                num_fats,
+                original_sectors_per_fat,
+                root_entry_count,
+                bytes_per_sector,
+                sectors_per_cluster,
+                original_data_start_sector,
+                cluster_size,
+                total_entries,
+            )?;
+            debug_assert_eq!(allocated.len() as u32, clusters_used);
+        }
 
         // --- Build cluster mapping ---
         let mut old_to_new: HashMap<u32, u32> = HashMap::with_capacity(allocated.len());
@@ -2797,6 +2839,231 @@ fn read_chain_from_source<R: Read + Seek>(
     }
 
     Ok(data)
+}
+
+/// Boot files pinned first in a defrag so the volume still boots (the DOS `SYS`
+/// rule). Matched by raw 8.3 name (padded) in the root directory.
+const DEFRAG_BOOT_FILES: [&[u8; 11]; 5] = [
+    b"IO      SYS",
+    b"MSDOS   SYS",
+    b"IBMBIO  COM",
+    b"IBMDOS  COM",
+    b"KERNEL  SYS",
+];
+
+/// Follow a cluster chain from `start`, returning its (old) cluster numbers.
+/// Bounded by `max_entries` against a corrupt loop.
+fn chain_clusters(fat_data: &[u8], fat_type: FatType, start: u32, max_entries: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut c = start;
+    while c >= 2 && c < max_entries && (out.len() as u32) <= max_entries {
+        out.push(c);
+        let e = read_fat_entry(fat_data, c, fat_type);
+        if is_end_of_chain(e, fat_type) || e < 2 {
+            break;
+        }
+        c = e;
+    }
+    out
+}
+
+/// Append `start`'s chain to `order`, skipping clusters already placed.
+fn push_chain(
+    order: &mut Vec<u32>,
+    placed: &mut HashSet<u32>,
+    fat_data: &[u8],
+    fat_type: FatType,
+    start: u32,
+    max_entries: u32,
+) {
+    for c in chain_clusters(fat_data, fat_type, start, max_entries) {
+        if placed.insert(c) {
+            order.push(c);
+        }
+    }
+}
+
+/// Find a root-level entry by raw 8.3 name; returns its first cluster (or None).
+/// `want_dir` selects a directory vs a file entry.
+fn find_entry_cluster(dir_data: &[u8], name11: &[u8; 11], want_dir: bool) -> Option<u32> {
+    let n = dir_data.len() / DIR_ENTRY_SIZE;
+    for i in 0..n {
+        let off = i * DIR_ENTRY_SIZE;
+        let e = &dir_data[off..off + DIR_ENTRY_SIZE];
+        if e[0] == 0x00 {
+            break;
+        }
+        if e[0] == 0xE5 {
+            continue;
+        }
+        let attr = e[11];
+        if attr == ATTR_LONG_NAME || (attr & ATTR_VOLUME_ID) != 0 {
+            continue;
+        }
+        if ((attr & ATTR_DIRECTORY) != 0) != want_dir {
+            continue;
+        }
+        if &e[0..11] == name11 {
+            let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+            let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+            return Some((hi << 16) | lo);
+        }
+    }
+    None
+}
+
+/// Build a file-aware **defrag ordering** of a FAT volume's allocated clusters:
+/// boot files first, then a depth-first walk of the directory tree (each file's
+/// and subdir's chain contiguous), then any allocated-but-unreferenced (lost)
+/// clusters appended in source order. The result is a permutation of every
+/// allocated cluster — `CompactFatReader` then renumbers them 2,3,4,… in this
+/// order, so files come out contiguous.
+#[allow(clippy::too_many_arguments)]
+fn build_defrag_order<R: Read + Seek>(
+    source: &mut R,
+    partition_offset: u64,
+    fat_data: &[u8],
+    fat_type: FatType,
+    fat32_root_cluster: u32,
+    reserved_sectors: u64,
+    num_fats: u64,
+    sectors_per_fat: u64,
+    root_entry_count: u16,
+    bytes_per_sector: u64,
+    sectors_per_cluster: u64,
+    data_start_sector: u64,
+    cluster_size: usize,
+    total_entries: u32,
+) -> Result<Vec<u32>, FilesystemError> {
+    let mut order: Vec<u32> = Vec::new();
+    let mut placed: HashSet<u32> = HashSet::new();
+
+    // Read the root directory's entry bytes. For FAT32 the root is a cluster
+    // chain (assign its clusters first, so the root lands at cluster 2); for
+    // FAT12/16 it's the fixed region just before the data area.
+    let root_data: Vec<u8> = if fat_type == FatType::Fat32 {
+        push_chain(
+            &mut order,
+            &mut placed,
+            fat_data,
+            fat_type,
+            fat32_root_cluster,
+            total_entries,
+        );
+        read_chain_from_source(
+            source,
+            partition_offset,
+            fat_data,
+            fat_type,
+            fat32_root_cluster,
+            bytes_per_sector,
+            sectors_per_cluster,
+            data_start_sector,
+            cluster_size,
+            total_entries,
+        )?
+    } else {
+        let root_start_sector = reserved_sectors + num_fats * sectors_per_fat;
+        let root_size = root_entry_count as usize * DIR_ENTRY_SIZE;
+        let abs = partition_offset + root_start_sector * bytes_per_sector;
+        source.seek(SeekFrom::Start(abs))?;
+        let mut buf = vec![0u8; root_size];
+        source.read_exact(&mut buf)?;
+        buf
+    };
+
+    // Boot files pinned first (root-level files matching a boot 8.3 name).
+    for boot in DEFRAG_BOOT_FILES {
+        if let Some(fc) = find_entry_cluster(&root_data, boot, false) {
+            if fc >= 2 {
+                push_chain(
+                    &mut order,
+                    &mut placed,
+                    fat_data,
+                    fat_type,
+                    fc,
+                    total_entries,
+                );
+            }
+        }
+    }
+
+    // Depth-first walk: each file's chain, then recurse into subdirs.
+    let mut stack: Vec<Vec<u8>> = vec![root_data];
+    let mut guard = 0u32;
+    while let Some(dir_data) = stack.pop() {
+        guard += 1;
+        if guard > total_entries.saturating_add(64) {
+            break; // loop guard against a corrupt tree
+        }
+        let n = dir_data.len() / DIR_ENTRY_SIZE;
+        let mut subdirs: Vec<u32> = Vec::new();
+        for i in 0..n {
+            let off = i * DIR_ENTRY_SIZE;
+            let e = &dir_data[off..off + DIR_ENTRY_SIZE];
+            if e[0] == 0x00 {
+                break;
+            }
+            if e[0] == 0xE5 || e[0] == b'.' {
+                continue; // deleted, or "." / ".."
+            }
+            let attr = e[11];
+            if attr == ATTR_LONG_NAME || (attr & ATTR_VOLUME_ID) != 0 {
+                continue;
+            }
+            let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+            let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+            let fc = (hi << 16) | lo;
+            if (attr & ATTR_DIRECTORY) != 0 {
+                if fc >= 2 && !placed.contains(&fc) {
+                    push_chain(
+                        &mut order,
+                        &mut placed,
+                        fat_data,
+                        fat_type,
+                        fc,
+                        total_entries,
+                    );
+                    subdirs.push(fc);
+                }
+            } else if fc >= 2 {
+                push_chain(
+                    &mut order,
+                    &mut placed,
+                    fat_data,
+                    fat_type,
+                    fc,
+                    total_entries,
+                );
+            }
+        }
+        // Recurse (reverse so the first child is processed first off the stack).
+        for &sub in subdirs.iter().rev() {
+            let d = read_chain_from_source(
+                source,
+                partition_offset,
+                fat_data,
+                fat_type,
+                sub,
+                bytes_per_sector,
+                sectors_per_cluster,
+                data_start_sector,
+                cluster_size,
+                total_entries,
+            )?;
+            stack.push(d);
+        }
+    }
+
+    // Lost / unreferenced allocated clusters: preserve them, appended in source
+    // order. Guarantees `order` is a permutation of every allocated cluster.
+    for c in 2..total_entries {
+        if read_fat_entry(fat_data, c, fat_type) != 0 && placed.insert(c) {
+            order.push(c);
+        }
+    }
+
+    Ok(order)
 }
 
 /// Scan directory data for subdirectory entries, adding them to the BFS queue.
@@ -4170,6 +4437,149 @@ mod tests {
             got, payload,
             "multi-cluster file round-trips byte-exact through the packer"
         );
+    }
+
+    /// `CompactFatReader::new_defrag` must relocate each file's clusters into a
+    /// contiguous run, while plain packing (ascending source order) leaves an
+    /// already-fragmented file fragmented. Both must round-trip the file bytes.
+    #[test]
+    fn defrag_makes_a_fragmented_file_contiguous() {
+        use std::io::{Cursor, Read};
+
+        // D.BIN's cluster chain in a raw image (by raw 8.3 name).
+        fn d_chain(image: &[u8], fat_type: FatType) -> Vec<u32> {
+            let bps = u16::from_le_bytes([image[11], image[12]]) as usize;
+            let reserved = u16::from_le_bytes([image[14], image[15]]) as usize;
+            let num_fats = image[16] as usize;
+            let root_ents = u16::from_le_bytes([image[17], image[18]]) as usize;
+            let spf = u16::from_le_bytes([image[22], image[23]]) as usize;
+            let fat = &image[reserved * bps..reserved * bps + spf * bps];
+            let root_off = (reserved + num_fats * spf) * bps;
+            let root = &image[root_off..root_off + root_ents * 32];
+            let mut first = 0u32;
+            for i in 0..root_ents {
+                let e = &root[i * 32..i * 32 + 32];
+                if e[0] == 0 {
+                    break;
+                }
+                if &e[0..11] == b"D       BIN" {
+                    first = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16)
+                        | (u16::from_le_bytes([e[26], e[27]]) as u32);
+                    break;
+                }
+            }
+            let mut chain = Vec::new();
+            let mut c = first;
+            while c >= 2 && chain.len() < 64 {
+                chain.push(c);
+                let e = read_fat_entry(fat, c, fat_type);
+                if is_end_of_chain(e, fat_type) || e < 2 {
+                    break;
+                }
+                c = e;
+            }
+            chain
+        }
+        let contiguous = |ch: &[u32]| ch.len() >= 2 && ch.windows(2).all(|w| w[1] == w[0] + 1);
+
+        // Build a volume with a deliberately fragmented file D. The allocator
+        // hands out clusters from a forward hint, so to force fragmentation we
+        // FILL the disk (hint reaches the end), free two non-adjacent 1-cluster
+        // holes, then create D(2) — which wraps and lands in the two holes.
+        let blank = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        let mut img = Cursor::new(blank);
+        let cs;
+        let fat_type;
+        {
+            let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+            cs = fs.cluster_size() as usize;
+            fat_type = fs.fat_type;
+            let total = fs.total_clusters as usize;
+            let opt = CreateFileOptions::default();
+            let root = fs.root().unwrap();
+            // S0..S4 take clusters 2..6.
+            for i in 0..5u8 {
+                let data = vec![0x10 + i; cs];
+                let mut r = &data[..];
+                fs.create_file(&root, &format!("S{i}.BIN"), &mut r, cs as u64, &opt)
+                    .unwrap();
+            }
+            // FILL takes the rest, so the disk is full and the hint is at the end.
+            let remaining = total.saturating_sub(5);
+            assert!(remaining > 2, "test disk too small ({total} clusters)");
+            let fill = vec![0xEEu8; remaining * cs];
+            let mut r = &fill[..];
+            fs.create_file(&root, "FILL.BIN", &mut r, fill.len() as u64, &opt)
+                .unwrap();
+            // Free two non-adjacent holes (S1 -> cluster 3, S3 -> cluster 5).
+            let root2 = fs.root().unwrap();
+            for nm in ["S1.BIN", "S3.BIN"] {
+                let e = fs
+                    .list_directory(&root2)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.name == nm)
+                    .unwrap();
+                fs.delete_entry(&root2, &e).unwrap();
+            }
+            // D(2) wraps into the two holes -> a fragmented chain.
+            let d = vec![0xD4u8; cs * 2];
+            let mut r = &d[..];
+            fs.create_file(&root, "D.BIN", &mut r, d.len() as u64, &opt)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let disk = img.into_inner();
+
+        // Sanity: D really is fragmented on the source.
+        let src = d_chain(&disk, fat_type);
+        assert_eq!(src.len(), 2, "D should be 2 clusters, got {src:?}");
+        assert!(
+            !contiguous(&src),
+            "test setup: D must be fragmented on the source ({src:?})"
+        );
+
+        // Pack plain + defrag.
+        let mut plain = Vec::new();
+        CompactFatReader::new(Cursor::new(disk.clone()), 0)
+            .unwrap()
+            .0
+            .read_to_end(&mut plain)
+            .unwrap();
+        let mut defr = Vec::new();
+        CompactFatReader::new_defrag(Cursor::new(disk.clone()), 0)
+            .unwrap()
+            .0
+            .read_to_end(&mut defr)
+            .unwrap();
+
+        // Defrag makes D contiguous; plain (ascending source) leaves it fragmented.
+        assert!(
+            contiguous(&d_chain(&defr, fat_type)),
+            "defrag must make D contiguous, got {:?}",
+            d_chain(&defr, fat_type)
+        );
+        assert!(
+            !contiguous(&d_chain(&plain, fat_type)),
+            "plain packing should leave D fragmented, got {:?}",
+            d_chain(&plain, fat_type)
+        );
+
+        // Both must round-trip D byte-exact.
+        let want = vec![0xD4u8; cs * 2];
+        for (label, image) in [("plain", &plain), ("defrag", &defr)] {
+            let mut cur = Cursor::new(image.clone());
+            let mut fs = FatFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let d = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "D.BIN")
+                .unwrap();
+            let got = fs.read_file(&d, usize::MAX).unwrap();
+            assert_eq!(got, want, "{label}: D.BIN round-trips byte-exact");
+        }
     }
 
     #[test]

@@ -164,6 +164,14 @@ pub struct BackupConfig {
     /// `shrink_to_minimum=false` for that partition). Drives the new
     /// per-partition Defrag checkbox in the backup UI.
     pub defrag_partition_indices: Option<std::collections::HashSet<usize>>,
+    /// When `true`, **FAT** partitions are repacked so each file's clusters are
+    /// contiguous (boot files first), the desktop sibling of crusty-backup's
+    /// `backup /DEFRAG`. The image is the same size as ordinary compaction (only
+    /// the cluster order changes), so restore is unaffected and yields a
+    /// defragmented disk. Non-FAT filesystems fall back to ordinary compaction;
+    /// ignored when [`BackupConfig::sector_by_sector`] is on. Distinct from
+    /// [`BackupConfig::defrag_partition_indices`] (the HFS+/NTFS defrag-clone).
+    pub defrag_fat: bool,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -1683,13 +1691,43 @@ fn run_backup_inner(
             let clone = factory
                 .open()
                 .context("failed to open source for compaction")?;
-            let (compact_reader, _) = fs::compact_partition_reader(
-                BufReader::new(clone),
-                part_offset,
-                part.partition_type_byte,
-                part.partition_type_string.as_deref(),
-            )
-            .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
+            // `--defrag` repacks FAT volumes file-by-file (boot-aware); non-FAT
+            // partitions return None and fall back to ordinary compaction. Same
+            // output size either way, so the precomputed `stream_size` still fits.
+            let compact_reader = if config.defrag_fat {
+                match fs::defrag_fat_partition_reader(BufReader::new(clone), part_offset) {
+                    Some((r, _)) => {
+                        log(
+                            &progress,
+                            LogLevel::Info,
+                            format!("Defragmenting FAT partition {part_label}"),
+                        );
+                        r
+                    }
+                    None => {
+                        let clone2 = factory
+                            .open()
+                            .context("failed to open source for compaction")?;
+                        fs::compact_partition_reader(
+                            BufReader::new(clone2),
+                            part_offset,
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                        )
+                        .map(|(r, _)| r)
+                        .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
+                    }
+                }
+            } else {
+                fs::compact_partition_reader(
+                    BufReader::new(clone),
+                    part_offset,
+                    part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
+                )
+                .map(|(r, _)| r)
+                .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
+            };
 
             // Trim the stream to stream_size.  For layout-preserving readers this
             // drops the zero-filled free tail; for packed readers stream_size equals

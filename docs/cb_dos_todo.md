@@ -85,9 +85,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
   gzseek rewind. `cbk_open_vol` prefers `.gz`, falls back to `.lz4`. Verified on
   FreeDOS/qemu: `ls` lists the tree and `get` extracts a root file, an LFN file, and
   a deep 300 KB multi-cluster file from a `partition-0.lz4`, all byte-identical.
-- [ ] **Desktop defrag parity** — the desktop backup could optionally repack FAT
-  partitions the same way (it already has the FAT machinery). Not in the cb-dos
-  scope; a separate GUI/CLI feature if wanted.
+- [x] **Desktop defrag parity. DONE (2026-06-25).** `rb-cli backup --defrag`
+  repacks FAT partitions so each file's clusters are contiguous (boot files first),
+  the desktop sibling of cb-dos `backup /DEFRAG`. Reused `CompactFatReader` (which
+  already renumbers + remaps clusters) by adding a `new_defrag` mode that orders
+  clusters file-by-file (tree walk, boot-pinned, lost clusters preserved) instead
+  of ascending source order — same output *size*, just contiguous. Verified: a
+  unit test proves a fragmented file comes out contiguous (plain packing leaves it
+  fragmented) + byte-exact, and an `rb-cli backup --defrag` → restore round-trip is
+  byte-identical. GUI checkbox parity is a possible follow-up (CLI ships now).
 - [ ] **Lazy-reader follow-up — packer re-chunking** for intra-partition random
   access: re-chunk `pack_folder_to_cbk` into ~1–4 MB source-span gzip members so a
   deep seek decompresses only its chunk. Not "free" — it re-frames

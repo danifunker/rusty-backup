@@ -2622,6 +2622,7 @@ impl InspectTab {
             shrink_to_minimum: false,
             precomputed_minimum_sizes: None,
             defrag_partition_indices: None,
+            defrag_fat: false,
         };
 
         let progress = Arc::new(Mutex::new(rusty_backup::backup::BackupProgress::new()));
