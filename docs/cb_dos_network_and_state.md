@@ -687,9 +687,22 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       source. *(Primaries + FAT/NTFS, gzip only; extended/logical, `/DEFRAG`, and
       LZ4 over the wire compose later. Materialize-at-finalize is the host's
       `pack_folder_to_cbk`; desktop restore is unchanged — §2b option a.)*
-- [ ] **7d — Resume.** fsync-before-record + truncate-to-last-committed +
-      `RESUME` handshake + fingerprint verify (§4). Kill mid-transfer, reconnect,
-      finish; verify end-to-end checksum.
+- [x] **7d — Resume. Done — qemu-verified (2026-06-25).** A killed transfer
+      resumes instead of restarting. The PUT header carries the §4 source
+      **fingerprint**; the daemon replies with a **resume map** (`RBKR`) of
+      per-member committed chunks. `receive_put` assembles into a *persistent*
+      per-container staging dir guarded by a durable `journal.json` — each Gz
+      chunk's bytes are **fsynced before** the journal records it committed (the
+      ddrescue-mapfile pattern), and a reconnect with a matching fingerprint
+      **truncates each member to its last committed chunk** and resumes (a
+      mismatched fingerprint discards the stale staging and starts fresh). The
+      producer (`cbnet`) skips committed spans by seeking the source to
+      `committed·CBNET_SPAN`, never recompressing. The daemon **owns the gz
+      checksum** (the rebooted client can't recompute a CRC across a resume) and
+      fills it at finalize. Loopback test `family_b_chunk_put_resumes_after_drop`;
+      qemu proof: a backup dropped after 2 committed spans (`RB_SERVE_TEST_DROP_
+      AFTER_CHUNKS=2`), reconnected, was told to resume at span 2, finished, and
+      `rb-cli restore` rebuilt a byte-identical disk.
 - [ ] **7e — Restore over wire.** Host serves members on `GET`; cb-dos restores
       with resize; restored card boots.
 - [ ] **7f — Manifest + idempotency.** Emit the file manifest (§5); restore
@@ -704,6 +717,33 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7d complete — resumable networked backup, qemu-verified.**
+  A killed transfer now resumes instead of restarting from zero. **Host**
+  (`src/remote/{protocol,server}.rs`): the PUT header gained the §4 source
+  fingerprint, and the daemon answers with a resume map (`RBKR`) of per-member
+  committed-chunk counts. `receive_put` was reworked from a throwaway temp dir
+  into a **persistent per-container staging dir + `journal.json`**: each Gz
+  chunk's bytes are fsynced, *then* the journal records it committed (atomic
+  rename), *then* the ack goes out — so the resume cursor only ever advances past
+  durable data (§3a). A reconnect loads the journal, and if the fingerprint
+  matches, truncates each member to `committed_bytes` (discarding a half-written
+  trailing chunk) and resumes; a mismatch discards the stale staging. The daemon
+  **owns each partition's gz checksum** — it fills `metadata.json` at finalize
+  (the rebooted client can't CRC a member it streamed across two sessions), packs
+  with `pack_folder_to_cbk`, and clears the staging. **DOS** (`cbnet.{h,c}` +
+  `cmd_backup.c`): `cmd_netbackup` computes the fingerprint (CRC over MBR + disk
+  size + each partition's boot sector + FAT — the allocation-map workhorse);
+  `cbnet` reads the resume map and skips committed spans by seeking the source to
+  `committed·CBNET_SPAN`; the producer dropped its gz-CRC accumulation (ships a
+  placeholder) and Raw members are re-sent fresh. A test-only
+  `RB_SERVE_TEST_DROP_AFTER_CHUNKS` knob makes the drop deterministic.
+  **Verified on qemu** (FreeDOS 1.4 + NE2000 + SLiRP): RUN 1 dropped after 2 of 4
+  committed spans (`journal.json` = `committed_chunks:2`), RUN 2 reconnected —
+  *"PUT resuming (fingerprint 0xd4be9d7d matches)"* — resumed at span 2 and
+  completed; `rb-cli restore` rebuilt a disk with both files byte-identical and
+  the agent-filled checksum (`2a6324cc`) equal to the real partition gz CRC. Lib
+  (2093) + loopback resume test + clippy green. Next: **7e** (restore over the
+  wire) or **7f** (manifest + idempotency).
 - 2026-06-25 — **Phase 7c complete — networked backup baked into `CRUSTYBK`,
   block-level, qemu-verified.** Reworked the producer after the first 7b cut went
   the wrong way: the interim standalone `NETPUT.EXE` read a *saved backup folder*
