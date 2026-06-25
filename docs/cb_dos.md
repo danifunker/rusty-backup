@@ -612,6 +612,26 @@ over the wire now.
       source. This rounds out the browse feature: single file, multi-select, and
       whole folders — no full restore. (Later: point the same reader at a live
       disk by swapping the `gzseek` backend for `read_lba`.)
+- [x] **Phase 4c-c — Browse a *live disk* (DOS). DONE (2026-06-25).** The browse
+      engine now reads through one dispatched primitive (`vol_read_at`) with two
+      interchangeable byte backends: the existing `partition-N.gz` (zlib gzseek)
+      **or** a live FAT partition on a BIOS drive (int13h `read_lba`/`load_region`).
+      Every other line — the FAT walk, LFN reassembly, file/tree extract — is
+      backend-blind, so `ls` / `get` / TUI-browse all work straight off a
+      mounted/attached card with **no imaging first** (recover a file without the
+      space or time of a full backup). `fatvol_t` carries either a `gzFile` or a
+      `{drive_info_t, drive, part_lba}`; `cbk_open_vol_live` opens the latter.
+      **CLI:** `CRUSTYBK ls @HH [N] [path]` / `get @HH [N] <path> <dest>`, where
+      `@HH` is BIOS drive 0xHH and `N` is the MBR slot (default: first FAT slot;
+      a table-less superfloppy reads sector 0). **TUI:** F6 on a highlighted FAT
+      partition row browses it live; F6 elsewhere still prompts for a backup folder.
+      Source disk is **read-only** (no int13h writes). **Verified on real
+      FreeDOS/qemu**: live `ls`/`get` against both a **FAT32** (root-cluster path)
+      and a **FAT16** (fixed-root path) attached disk listed root/`\DOCS`/`\DOCS\DEEP`
+      with long names verbatim and extracted an 8.3 file, an LFN file, and a 65 KB
+      multi-cluster blob — each **byte-identical** to source; and the **TUI F6**
+      flow (navigate to the live FAT partition, mark, F2 -> `C:\TX`) extracted
+      byte-identically and returned cleanly. `make crustybk`.
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -642,6 +662,37 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 4c-c — browse a *live disk*, not just a backup.** Fronted
+  the browse engine with a single dispatched read primitive (`vol_read_at` in
+  `cmd_browse.c`) so `fatvol_t` reads its bytes from **either** a backup
+  `partition-N.gz` (zlib `gzseek`, as before) **or** a live FAT partition on a
+  BIOS drive (int13h `read_lba`/`load_region`). The directory walk, LFN
+  reassembly, and file/tree extract are all backend-agnostic, so they didn't
+  change — only the open path forks: `cbk_open_vol` (gz) vs the new
+  `cbk_open_vol_live(di, drive, part_lba)`, both finishing through a shared
+  `vol_finish_open` (parse BPB, cache the first FAT, compute the root layout).
+  `fatvol_t` gained `{drive_info_t di; int drive; uint64_t part_lba;}` next to
+  the `gzFile` (exactly one backend active). **CLI grammar:** the `ls`/`get`
+  source is a backup folder *or* `@HH` for live BIOS drive 0xHH, with `N` the MBR
+  slot (default first FAT slot; no-table superfloppy reads sector 0) — e.g.
+  `CRUSTYBK ls @81`, `CRUSTYBK get @81 0 \DOCS\F.TXT C:\OUT.TXT`. A live open
+  borrows the shared transfer buffer (`xfer_init`) and frees it after close.
+  **TUI:** F6 on a highlighted FAT partition row browses that partition live
+  (`do_browse_live` rebuilds the `drive_info_t` from the cached `disk_t` + reads
+  `start_lba` from the cached MBR entry, then runs the same `browse_loop`); F6 on
+  anything else still prompts for a backup folder. The browsed disk is
+  **read-only** — the engine never issues an int13h write to the source.
+  **Verified on real FreeDOS/qemu**: built an MBR **FAT32** and a separate MBR
+  **FAT16** source disk, attached each as 0x81, and (a) via the **CLI** listed
+  `\` / `\DOCS` / `\DOCS\DEEP` (long names verbatim) and `get`-extracted an 8.3
+  file, an LFN file, and a 65 KB multi-cluster blob — all **byte-identical** to
+  source on **both** filesystems (covering the FAT32 root-cluster *and* FAT16
+  fixed-root paths); and (b) via the **TUI**, drove F6 over the qemu monitor:
+  highlighted the live FAT16 partition row -> F6 rendered the live root listing
+  -> marked `HELLO.TXT` -> F2 -> `C:\TX`, which extracted **byte-identical** and
+  returned cleanly to the menu (F10 -> clean poweroff). `make crustybk` (+1.5 KB,
+  no warnings). **Next:** lazy `.cbk` reader (perf), or Net 7b, or Phase 5
+  (boot-aware defrag).
 - 2026-06-24 — **Phase 4c-b — TUI browse/mark/extract.** Lifted the browse engine
   into `src/cbbrowse.h` (`fatvol_t`/`dirent_t` + `cbk_open_vol`/`cbk_list_dir`/
   `cbk_extract`/`cbk_extract_tree`) so the CLI (`cmd_browse.c`) and the TUI

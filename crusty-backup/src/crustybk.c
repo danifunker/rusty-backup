@@ -471,30 +471,20 @@ static void browse_extract(fatvol_t *v, dirent_t *ents, int nent, char *marks)
     op_end();
 }
 
-static void do_browse(void)
+/* The interactive browse loop over an already-open volume (navigate + mark +
+ * extract). Shared by the backup-folder and live-disk browse entry points --
+ * the volume's read backend (gz or live int13h) is invisible here. The caller
+ * opens and closes the volume. */
+static void browse_loop(fatvol_t *vol)
 {
-    char folder[80], pn[8];
-    op_begin("Browse a backup");
-    if (!read_line("Backup folder (e.g. C:\\BK): ", folder, sizeof folder) || !folder[0]) {
-        printf("\nCancelled.\n"); op_end(); return;
-    }
-    pn[0] = 0;
-    read_line("Partition number (Enter = first): ", pn, sizeof pn);
-    int part = pn[0] ? atoi(pn) : -1;
-    part = cbk_default_part(folder, part);
-
-    fatvol_t vol;
-    if (cbk_open_vol(folder, part, &vol) != 0) { op_end(); return; }
-    _setcursortype(_NOCURSOR);
-
     static dirent_t ents[256];
     static char marks[256];
     bframe_t stack[20];
     int depth = 0, sel = 0, top = 0;
-    stack[0].cluster = vol.root_cluster;
-    stack[0].fixed_root = !vol.L.is_fat32;
+    stack[0].cluster = vol->root_cluster;
+    stack[0].fixed_root = !vol->L.is_fat32;
     strcpy(stack[0].name, "\\");
-    int nent = cbk_list_dir(&vol, stack[0].cluster, stack[0].fixed_root, ents, 256);
+    int nent = cbk_list_dir(vol, stack[0].cluster, stack[0].fixed_root, ents, 256);
     if (nent < 0) nent = 0;
     memset(marks, 0, sizeof marks);
 
@@ -519,7 +509,7 @@ static void do_browse(void)
             case K_UP:   if (sel > 0) sel--; break;
             case K_DOWN: if (sel < nent - 1) sel++; break;
             case K_LEFT: if (depth > 0) { depth--; reload = 1; } break;
-            case K_F2:   browse_extract(&vol, ents, nent, marks);
+            case K_F2:   browse_extract(vol, ents, nent, marks);
                          _setcursortype(_NOCURSOR); break;
             default: break;
             }
@@ -540,13 +530,58 @@ static void do_browse(void)
             break;
         }
         if (reload) {
-            nent = cbk_list_dir(&vol, stack[depth].cluster, stack[depth].fixed_root, ents, 256);
+            nent = cbk_list_dir(vol, stack[depth].cluster, stack[depth].fixed_root, ents, 256);
             if (nent < 0) nent = 0;
             sel = 0; top = 0;
             memset(marks, 0, sizeof marks);
         }
     }
+}
+
+/* F6 on a backup folder: prompt for the folder + partition, then browse it. */
+static void do_browse_backup(void)
+{
+    char folder[80], pn[8];
+    op_begin("Browse a backup");
+    if (!read_line("Backup folder (e.g. C:\\BK): ", folder, sizeof folder) || !folder[0]) {
+        printf("\nCancelled.\n"); op_end(); return;
+    }
+    pn[0] = 0;
+    read_line("Partition number (Enter = first): ", pn, sizeof pn);
+    int part = pn[0] ? atoi(pn) : -1;
+    part = cbk_default_part(folder, part);
+
+    fatvol_t vol;
+    if (cbk_open_vol(folder, part, &vol) != 0) { op_end(); return; }
+    _setcursortype(_NOCURSOR);
+    browse_loop(&vol);
     cbk_close_vol(&vol);
+}
+
+/* F6 on a highlighted FAT partition row: browse the live partition straight off
+ * the disk (read-only int13h), no imaging first. */
+static void do_browse_live(int disk_idx, int slot)
+{
+    disk_t *dk = &disks[disk_idx];
+    const uint8_t *e = dk->mbr + 446 + slot * 16;
+    uint64_t plba = rd32(e + 8);
+
+    drive_info_t di;
+    memset(&di, 0, sizeof di);
+    di.present = 1; di.ext = dk->ext;
+    di.cyls = dk->cyls; di.heads = dk->heads; di.spt = dk->spt;
+
+    op_begin("Browse a live partition");
+    printf("Disk 0x%02X, MBR slot %d, start LBA %lu\n\n",
+           dk->drive, slot, (unsigned long)plba);
+    if (xfer_init() < 0) { printf("DOS memory alloc failed.\n"); op_end(); return; }
+
+    fatvol_t vol;
+    if (cbk_open_vol_live(&di, dk->drive, plba, &vol) != 0) { xfer_free(); op_end(); return; }
+    _setcursortype(_NOCURSOR);
+    browse_loop(&vol);
+    cbk_close_vol(&vol);
+    xfer_free();
 }
 
 /* ---- text-UI entry ----------------------------------------------------- */
@@ -598,7 +633,13 @@ static int tui_main(void)
                 snprintf(status_msg, sizeof status_msg, "Returned from Clone.");
                 break;
             case K_F6:
-                do_browse();
+                /* A highlighted FAT partition row browses live off the disk;
+                 * anything else falls back to browsing a backup folder. */
+                if (nitems > 0 && !items[sel].is_disk &&
+                    is_fat_part_type(disks[items[sel].disk].mbr[446 + items[sel].slot * 16 + 4]))
+                    do_browse_live(items[sel].disk, items[sel].slot);
+                else
+                    do_browse_backup();
                 strcpy(status_msg, "Returned from Browse.");
                 break;
             case K_F5:
@@ -631,8 +672,9 @@ static void usage(void)
     printf("  restore <folder> <drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
     printf("  clone   <src-hex> <tgt-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
     printf("  inspect [drive-hex]   list BIOS hard drives + partitions\n");
-    printf("  ls      <folder> [N] [path]            list files in a backup\n");
-    printf("  get     <folder> [N] <path> <dest>     extract one file from a backup\n");
+    printf("  ls      <src> [N] [path]            list files in a backup or live disk\n");
+    printf("  get     <src> [N] <path> <dest>     extract one file from a backup or live disk\n");
+    printf("    <src> = a backup folder, or @HH for live BIOS drive 0xHH (N = MBR slot)\n");
     printf("  /SIZE modes: ORIGINAL (default), MINIMUM, ENTIRE, CUSTOM\n");
 }
 

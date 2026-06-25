@@ -25,11 +25,35 @@
 #define ATTR_VOL  0x08
 #define ATTR_LFN  0x0F
 
-/* Random read at an absolute partition byte offset, via gzseek. 0 / -1. */
-static int gz_read_at(fatvol_t *v, uint64_t off, void *buf, uint32_t len) {
-    if (gzseek(v->gz, (z_off_t)off, SEEK_SET) < 0) return -1;
-    int n = gzread(v->gz, buf, len);
-    return (n == (int)len) ? 0 : -1;
+/* Random read of `len` bytes at partition byte offset `off`, dispatched to
+ * whichever backend the volume was opened with: zlib gzseek for a backup, or
+ * int13h sector reads for a live disk. 0 / -1.
+ *
+ * In practice every offset the engine asks for is sector-aligned (BPB, FAT,
+ * cluster, and root-dir offsets all are); for the live path the common
+ * aligned case reads straight into `buf`, and a sector-padded bounce buffer
+ * covers any unaligned head/tail (an odd root_entries count). */
+static int vol_read_at(fatvol_t *v, uint64_t off, void *buf, uint32_t len) {
+    if (v->gz) {
+        if (gzseek(v->gz, (z_off_t)off, SEEK_SET) < 0) return -1;
+        int n = gzread(v->gz, buf, len);
+        return (n == (int)len) ? 0 : -1;
+    }
+    /* live disk: off is a byte offset within the partition */
+    uint64_t abs = (v->part_lba << 9) + off;       /* absolute disk byte */
+    uint64_t lba = abs >> 9;
+    uint32_t head = (uint32_t)(abs & 511);
+    if (head == 0 && (len & 511) == 0)
+        return load_region(&v->di, v->drive, lba, len, (uint8_t *)buf);
+
+    uint32_t span = head + len;
+    uint32_t nsec = (span + 511) >> 9;
+    uint8_t *tmp = malloc((size_t)nsec * 512);
+    if (!tmp) return -1;
+    int rc = load_region(&v->di, v->drive, lba, nsec * 512, tmp);
+    if (rc == 0) memcpy(buf, tmp + head, len);
+    free(tmp);
+    return rc;
 }
 
 static uint64_t cluster_off(const fatvol_t *v, uint32_t cl) {
@@ -50,28 +74,47 @@ int cbk_default_part(const char *folder, int part) {
     return 0;
 }
 
-int cbk_open_vol(const char *folder, int part, fatvol_t *v) {
-    char path[200];
-    sprintf(path, "%s\\partition-%d.gz", folder, part);
-    memset(v, 0, sizeof *v);
-    v->gz = gzopen(path, "rb");
-    if (!v->gz) { printf("cannot open %s\n", path); return -1; }
+/* Finish opening a volume whose read backend (gz or live disk) is already set
+ * on `v`: read + parse the BPB, cache the first FAT, compute the root layout.
+ * Leaves the backend handle for cbk_close_vol to release on the error path. */
+static int vol_finish_open(fatvol_t *v) {
     uint8_t bpb[512];
-    if (gzread(v->gz, bpb, 512) != 512) { printf("short read on %s\n", path); gzclose(v->gz); return -1; }
+    if (vol_read_at(v, 0, bpb, 512) != 0) { printf("BPB read failed\n"); return -1; }
     parse_fatlay(bpb, &v->L);
-    if (!v->L.ok) { printf("partition %d is not a FAT volume\n", part); gzclose(v->gz); return -1; }
-    if (v->L.bps != 512) { printf("only 512-byte sectors supported\n"); gzclose(v->gz); return -1; }
+    if (!v->L.ok)        { printf("not a FAT volume\n"); return -1; }
+    if (v->L.bps != 512) { printf("only 512-byte sectors supported\n"); return -1; }
     v->fat_bytes = v->L.old_spf * v->L.bps;
     v->fat = malloc(v->fat_bytes);
-    if (!v->fat) { printf("out of memory\n"); gzclose(v->gz); return -1; }
-    if (gz_read_at(v, (uint64_t)v->L.reserved * v->L.bps, v->fat, v->fat_bytes) != 0) {
-        printf("FAT read failed\n"); free(v->fat); gzclose(v->gz); return -1;
+    if (!v->fat)         { printf("out of memory\n"); return -1; }
+    if (vol_read_at(v, (uint64_t)v->L.reserved * v->L.bps, v->fat, v->fat_bytes) != 0) {
+        printf("FAT read failed\n"); return -1;
     }
     v->root_off = (uint32_t)((uint64_t)(v->L.reserved + v->L.num_fats * v->L.old_spf) * v->L.bps);
     v->root_bytes = v->L.root_entries * 32;
     v->root_cluster = v->L.is_fat32 ? rd32(bpb + 44) : 0;
     return 0;
 }
+
+int cbk_open_vol(const char *folder, int part, fatvol_t *v) {
+    char path[200];
+    sprintf(path, "%s\\partition-%d.gz", folder, part);
+    memset(v, 0, sizeof *v);
+    v->gz = gzopen(path, "rb");
+    if (!v->gz) { printf("cannot open %s\n", path); return -1; }
+    if (vol_finish_open(v) != 0) { cbk_close_vol(v); return -1; }
+    return 0;
+}
+
+int cbk_open_vol_live(const drive_info_t *di, int drive, uint64_t part_lba, fatvol_t *v) {
+    memset(v, 0, sizeof *v);
+    v->gz = NULL;                         /* live backend */
+    v->di = *di;
+    v->drive = drive;
+    v->part_lba = part_lba;
+    if (vol_finish_open(v) != 0) { cbk_close_vol(v); return -1; }
+    return 0;
+}
+
 void cbk_close_vol(fatvol_t *v) {
     if (v->fat) free(v->fat);
     if (v->gz) gzclose(v->gz);
@@ -83,7 +126,7 @@ static uint8_t *read_dir_bytes(fatvol_t *v, uint32_t first_cluster, int is_fixed
     if (is_fixed_root) {
         uint8_t *buf = malloc(v->root_bytes ? v->root_bytes : 1);
         if (!buf) return NULL;
-        if (v->root_bytes && gz_read_at(v, v->root_off, buf, v->root_bytes) != 0) { free(buf); return NULL; }
+        if (v->root_bytes && vol_read_at(v, v->root_off, buf, v->root_bytes) != 0) { free(buf); return NULL; }
         *out_len = v->root_bytes;
         return buf;
     }
@@ -97,7 +140,7 @@ static uint8_t *read_dir_bytes(fatvol_t *v, uint32_t first_cluster, int is_fixed
     cl = first_cluster;
     uint32_t pos = 0;
     for (uint32_t i = 0; i < ncl; i++) {
-        if (gz_read_at(v, cluster_off(v, cl), buf + pos, csize) != 0) { free(buf); return NULL; }
+        if (vol_read_at(v, cluster_off(v, cl), buf + pos, csize) != 0) { free(buf); return NULL; }
         pos += csize;
         cl = fat_entry(v->fat, v->L.fat_bits, cl);
     }
@@ -230,7 +273,7 @@ int cbk_extract(fatvol_t *v, const dirent_t *f, const char *dest) {
     uint32_t cl = f->first_cluster, remaining = f->size, written = 0;
     int rc = 0;
     while (remaining > 0 && cl >= 2 && cl < eoc) {
-        if (gz_read_at(v, cluster_off(v, cl), buf, csize) != 0) { printf("read error\n"); rc = -1; break; }
+        if (vol_read_at(v, cluster_off(v, cl), buf, csize) != 0) { printf("read error\n"); rc = -1; break; }
         uint32_t w = remaining < csize ? remaining : csize;
         if (fwrite(buf, 1, w, out) != w) { printf("write error\n"); rc = -1; break; }
         written += w; remaining -= w;
@@ -287,25 +330,71 @@ static int all_digits(const char *s) {
     return 1;
 }
 
+/* Resolve an MBR slot -> partition start LBA on a live disk. slot>=0 picks that
+ * MBR primary slot; slot<0 picks the first FAT slot (or the whole disk as a
+ * superfloppy when there is no partition table). 0 / -1. */
+static int live_part_lba(const drive_info_t *di, int drive, int slot, uint64_t *out_lba) {
+    uint8_t mbr[512];
+    if (read_lba(di, drive, 0, 1, mbr) != 0) { printf("sector 0 read failed\n"); return -1; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        if (slot > 0) { printf("no partition table; cannot select slot %d\n", slot); return -1; }
+        *out_lba = 0;                          /* superfloppy: FAT BPB at sector 0 */
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = mbr + 446 + i * 16;
+        if (e[4] == 0 || rd32(e + 12) == 0) continue;
+        if (slot >= 0) { if (i != slot) continue; *out_lba = rd32(e + 8); return 0; }
+        if (is_fat_part_type(e[4])) { *out_lba = rd32(e + 8); return 0; }
+    }
+    if (slot >= 0) printf("slot %d is empty\n", slot);
+    else           printf("no FAT partition found on drive 0x%02X\n", drive);
+    return -1;
+}
+
+/* Open a browse source named on the command line: either a backup folder, or
+ * "@HH" for live BIOS drive 0xHH (then `part` is the MBR slot, <0 = first FAT).
+ * On a live open *held becomes 1 -- the caller must xfer_free() after closing
+ * the volume (the engine borrowed the shared transfer buffer). 0 / -1. */
+static int open_browse_src(const char *src, int part, fatvol_t *v, int *held) {
+    *held = 0;
+    if (src[0] != '@')
+        return cbk_open_vol(src, cbk_default_part(src, part), v);
+
+    int drive = (int)strtol(src + 1, NULL, 16);
+    if (drive < 0x80 || drive > 0xFF) { printf("bad drive %s (use @80, @81, ...)\n", src); return -1; }
+    if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return -1; }
+    *held = 1;
+    drive_info_t di;
+    drive_params(drive, &di);
+    if (!di.present) { printf("drive 0x%02X not present\n", drive); xfer_free(); *held = 0; return -1; }
+    di.ext = drive_has_ext(drive);
+    uint64_t plba;
+    if (live_part_lba(&di, drive, part, &plba) != 0 ||
+        cbk_open_vol_live(&di, drive, plba, v) != 0) { xfer_free(); *held = 0; return -1; }
+    return 0;
+}
+
 int cmd_ls(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
-        printf("usage: CRUSTYBK ls <folder> [N] [path]\n");
-        printf("  list a directory inside partition N of a backup folder\n");
+        printf("usage: CRUSTYBK ls <src> [N] [path]\n");
+        printf("  <src>  a backup folder, or @HH for live BIOS drive 0xHH\n");
+        printf("  N      partition / MBR slot (default: first FAT)\n");
         return 2;
     }
-    const char *folder = argv[1];
+    const char *src = argv[1];
     int part = -1;
     const char *path = "";
     for (int i = 2; i < argc; i++) {
         if (part < 0 && all_digits(argv[i])) part = atoi(argv[i]);
         else path = argv[i];
     }
-    part = cbk_default_part(folder, part);
 
     fatvol_t v;
-    if (cbk_open_vol(folder, part, &v) != 0) return 1;
-    printf("partition %d: FAT%d, %lu KiB imaged\n", part, v.L.fat_bits,
+    int held;
+    if (open_browse_src(src, part, &v, &held) != 0) return 1;
+    printf("FAT%d, %lu KiB\n", v.L.fat_bits,
            (unsigned long)((uint64_t)v.L.old_total * v.L.bps / 1024));
 
     int rc = 0;
@@ -318,26 +407,28 @@ int cmd_ls(int argc, char **argv) {
         else printf("  %10lu  %s\n", (unsigned long)d.size, d.name);
     }
     cbk_close_vol(&v);
+    if (held) xfer_free();
     return rc;
 }
 
 int cmd_get(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 4) {
-        printf("usage: CRUSTYBK get <folder> [N] <path> <dest-file>\n");
-        printf("  extract one file from partition N of a backup folder to a DOS path\n");
+        printf("usage: CRUSTYBK get <src> [N] <path> <dest-file>\n");
+        printf("  <src>  a backup folder, or @HH for live BIOS drive 0xHH\n");
+        printf("  extract one file (partition / MBR slot N) to a DOS path\n");
         return 2;
     }
-    const char *folder = argv[1];
+    const char *src = argv[1];
     int part = -1, ai = 2;
     if (all_digits(argv[ai]) && argc >= 5) part = atoi(argv[ai++]);
     if (ai + 1 >= argc) { printf("need <path> <dest-file>\n"); return 2; }
     const char *path = argv[ai++];
     const char *dest = argv[ai++];
-    part = cbk_default_part(folder, part);
 
     fatvol_t v;
-    if (cbk_open_vol(folder, part, &v) != 0) return 1;
+    int held;
+    if (open_browse_src(src, part, &v, &held) != 0) return 1;
 
     int rc = 0;
     dirent_t d; int is_dir;
@@ -346,5 +437,6 @@ int cmd_get(int argc, char **argv) {
     else if (cbk_extract(&v, &d, dest) != 0) rc = 1;
     else printf("extracted %s\n", dest);
     cbk_close_vol(&v);
+    if (held) xfer_free();
     return rc;
 }
