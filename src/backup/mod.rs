@@ -63,6 +63,11 @@ pub enum CompressionType {
     /// raw loses compression, so the DOS tool emits gzip and the desktop
     /// reuses its restore + resize path unchanged (see `docs/cb_dos.md` §3).
     Gzip,
+    /// LZ4 frame format → `partition-N.lz4`. The other codec shared with
+    /// **crusty-backup** (`cb-dos` `/CODEC:LZ4`): much cheaper than gzip on a
+    /// slow 486 CPU at a lower ratio; gzip stays the default. Standard LZ4
+    /// frame, so DOS-written and desktop-written members interchange.
+    Lz4,
     None,
 }
 
@@ -74,6 +79,7 @@ impl CompressionType {
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
             CompressionType::Gzip => "gzip",
+            CompressionType::Lz4 => "lz4",
             CompressionType::None => "none",
         }
     }
@@ -84,6 +90,7 @@ impl CompressionType {
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
             CompressionType::Gzip => "gz",
+            CompressionType::Lz4 => "lz4",
             CompressionType::None => "raw",
         }
     }

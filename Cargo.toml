@@ -152,6 +152,11 @@ unicode-normalization = "0.1"
 # no C zlib. The desktop `native-zlib` feature adds `flate2/zlib-ng`, which
 # flate2 prioritizes over the Rust backend when both are enabled.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# LZ4 (frame format) — the optional faster-on-slow-CPUs codec shared with
+# crusty-backup (`cb-dos` `/CODEC:LZ4`); gzip stays the default. Pure-Rust like
+# the flate2 baseline (no C lz4 to cross-compile), and lz4_flex's `frame` module
+# produces the standard LZ4 frame, interoperable with the DOS tool's liblz4.
+lz4_flex = "0.13"
 tar = "0.4"
 bzip2 = "0.6"
 zip = { version = "8", default-features = false, features = ["deflate", "aes-crypto"] }

@@ -29,6 +29,10 @@ pub enum BackupFormat {
     /// shared with crusty-backup (`cb-dos`) — the desktop restores and
     /// resizes it exactly like a `.zst` member.
     Gzip,
+    /// LZ4-compressed raw per-partition (`partition-N.lz4`). The other codec
+    /// shared with crusty-backup (`cb-dos` `/CODEC:LZ4`) — faster than gzip on
+    /// a slow CPU, lower ratio; restored/resized exactly like a `.gz` member.
+    Lz4,
     /// Uncompressed raw per-partition.
     Raw,
 }
@@ -41,6 +45,7 @@ impl From<BackupFormat> for CompressionType {
             BackupFormat::Vhd => CompressionType::Vhd,
             BackupFormat::Zstd => CompressionType::Zstd,
             BackupFormat::Gzip => CompressionType::Gzip,
+            BackupFormat::Lz4 => CompressionType::Lz4,
             BackupFormat::Raw => CompressionType::None,
         }
     }
@@ -173,6 +178,7 @@ fn parse_format(s: &str) -> Option<BackupFormat> {
         "vhd" => Some(BackupFormat::Vhd),
         "zstd" => Some(BackupFormat::Zstd),
         "gzip" | "gz" => Some(BackupFormat::Gzip),
+        "lz4" => Some(BackupFormat::Lz4),
         "raw" => Some(BackupFormat::Raw),
         _ => None,
     }
