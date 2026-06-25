@@ -995,6 +995,47 @@ impl RemoteRef {
 mod tests {
     use super::*;
 
+    /// The PUT header's incremental flag round-trips (7h): write → read_family_b_op.
+    #[test]
+    fn put_header_incremental_flag_round_trips() {
+        for incremental in [false, true] {
+            let mut buf = Vec::new();
+            write_put_header(&mut buf, "MYDISK", 0xDEAD_BEEF, 3, incremental).unwrap();
+            let op = read_family_b_op(&mut &buf[..]).unwrap().unwrap();
+            match op {
+                FamilyBOp::Put(h) => {
+                    assert_eq!(h.name, "MYDISK");
+                    assert_eq!(h.fingerprint, 0xDEAD_BEEF);
+                    assert_eq!(h.member_count, 3);
+                    assert_eq!(h.incremental, incremental);
+                }
+                _ => panic!("expected a PUT op"),
+            }
+        }
+    }
+
+    /// The resume-map reply's skip flag + entries round-trip (7h).
+    #[test]
+    fn resume_map_skip_flag_round_trips() {
+        // skip set, no entries (the whole-disk skip reply).
+        let mut buf = Vec::new();
+        write_resume_map(&mut buf, true, &[]).unwrap();
+        let reply = read_resume_map(&mut &buf[..]).unwrap();
+        assert!(reply.skip);
+        assert!(reply.entries.is_empty());
+
+        // skip clear, with entries (the normal resume reply).
+        let entries = vec![ResumeEntry {
+            name: "partition-0.gz".into(),
+            committed_chunks: 2,
+        }];
+        let mut buf = Vec::new();
+        write_resume_map(&mut buf, false, &entries).unwrap();
+        let reply = read_resume_map(&mut &buf[..]).unwrap();
+        assert!(!reply.skip);
+        assert_eq!(reply.entries, entries);
+    }
+
     #[test]
     fn parses_host_port_path() {
         let r = RemoteRef::parse("rb://mister:7341/games/dos.img").unwrap();
