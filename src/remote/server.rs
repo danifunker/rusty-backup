@@ -27,13 +27,16 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
     read_chunk_header, read_chunks, read_control, read_handshake, read_member_header,
     read_put_header, write_binary_hello, write_control, write_put_ack, write_put_result,
-    ChunkWriter, Handshake, PutHeader, Request, Response, WireEntry, WireKind, CAP_FAMILY_B,
-    CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    write_resume_map, ChunkWriter, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
+    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -164,14 +167,109 @@ fn handle_family_b(
     }
 }
 
-/// Receive a chunk PUT and assemble it into a frozen `.cbk` under the serve root.
-///
-/// Each logical member is staged to a temp folder (its chunk payloads streamed
-/// in arrival order, each CRC-verified and fsynced before the stop-and-go ack),
-/// then the whole folder is packed with the frozen `pack_folder_to_cbk` writer —
-/// so the daemon never invents a second container format and the result is
-/// byte-identical to a locally-packed `.cbk` of the same folder. The pack lands
-/// atomically (write `<name>.cbk.tmp`, fsync, rename).
+/// Durable resume state for an in-progress PUT (the ddrescue-mapfile analog,
+/// §3). Lives as `journal.json` in the persistent staging dir; rewritten
+/// atomically after each chunk's bytes are fsynced (fsync-data-then-record), so
+/// a crash can never mark a chunk committed that isn't on disk. Only **Gz**
+/// members (partitions) are tracked — Raw members (`mbr.bin`/`metadata.json`)
+/// are tiny and re-sent fresh on every (re)connect.
+#[derive(Serialize, Deserialize, Default)]
+struct ResumeJournal {
+    /// The §4 source fingerprint this staging belongs to. A reconnect with a
+    /// different fingerprint means a swapped/edited card → discard and restart.
+    fingerprint: u32,
+    members: Vec<MemberProgress>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct MemberProgress {
+    name: String,
+    total_chunks: u32,
+    committed_chunks: u32,
+    committed_bytes: u64,
+}
+
+impl ResumeJournal {
+    fn get(&self, name: &str) -> Option<&MemberProgress> {
+        self.members.iter().find(|m| m.name == name)
+    }
+    fn upsert(&mut self, name: &str, total: u32, committed: u32, bytes: u64) {
+        if let Some(m) = self.members.iter_mut().find(|m| m.name == name) {
+            m.total_chunks = total;
+            m.committed_chunks = committed;
+            m.committed_bytes = bytes;
+        } else {
+            self.members.push(MemberProgress {
+                name: name.to_string(),
+                total_chunks: total,
+                committed_chunks: committed,
+                committed_bytes: bytes,
+            });
+        }
+    }
+}
+
+fn journal_path(staging: &Path) -> PathBuf {
+    staging.join("journal.json")
+}
+
+fn load_journal(staging: &Path) -> Option<ResumeJournal> {
+    let data = std::fs::read(journal_path(staging)).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Write the journal atomically (write `.tmp`, fsync, rename) so a crash leaves
+/// either the old or the new map, never a torn one.
+fn save_journal(staging: &Path, j: &ResumeJournal) -> Result<()> {
+    let p = journal_path(staging);
+    let tmp = staging.join("journal.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(j)?).context("writing resume journal")?;
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &p).context("committing resume journal")?;
+    Ok(())
+}
+
+/// The stable, persistent staging dir for a container `name` (so a reconnect
+/// finds the partial transfer). The name is already validated as a flat base.
+fn staging_path_for(staging_dir: Option<&Path>, name: &str) -> PathBuf {
+    let base = staging_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("rb-cbk-{name}"))
+}
+
+/// Open a staging member for append, first truncating to `committed_bytes` — so
+/// a half-written trailing chunk from a crash (bytes fsynced but the journal not
+/// yet updated) is discarded and the client re-sends it. Returns the file seeked
+/// to the (new) end.
+fn open_staging_for_append(path: &Path, committed_bytes: u64) -> Result<std::fs::File> {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening staging member {}", path.display()))?;
+    f.set_len(committed_bytes).with_context(|| {
+        format!(
+            "truncating staging member {} to last commit",
+            path.display()
+        )
+    })?;
+    f.seek(SeekFrom::Start(committed_bytes))?;
+    Ok(f)
+}
+
+/// Receive a chunk PUT and assemble it into a frozen `.cbk` under the serve root,
+/// resumably (§3). A persistent per-container staging dir + `journal.json` is the
+/// durable assembly point: each Gz chunk's bytes are fsynced **before** the
+/// journal records it committed, and a reconnect (same `name` + fingerprint)
+/// truncates each member to its last committed chunk and tells the client where
+/// to resume. At finalize the daemon fills each partition's real checksum (it
+/// owns the bytes — the rebooted client can't recompute a CRC across a resume),
+/// packs with the frozen `pack_folder_to_cbk`, and drops the staging.
 fn receive_put(
     reader: &mut BufReader<TcpStream>,
     writer: &mut BufWriter<TcpStream>,
@@ -180,6 +278,50 @@ fn receive_put(
     hdr: PutHeader,
 ) -> Result<()> {
     let dest = cbk_dest_path(root, &hdr.name)?;
+    let staging = staging_path_for(staging_dir, &hdr.name);
+
+    // Load durable state, or discard it on a fingerprint mismatch (the source
+    // disk changed since the partial transfer — splicing would corrupt §4b).
+    let mut journal = match load_journal(&staging) {
+        Some(j) if j.fingerprint == hdr.fingerprint => {
+            eprintln!(
+                "rb-cli serve: PUT {:?} resuming (fingerprint {:#010x} matches, {} member(s) in progress)",
+                hdr.name,
+                hdr.fingerprint,
+                j.members.len()
+            );
+            j
+        }
+        Some(_) => {
+            eprintln!(
+                "rb-cli serve: PUT {:?} fingerprint changed — discarding stale staging, starting fresh",
+                hdr.name
+            );
+            std::fs::remove_dir_all(&staging).ok();
+            ResumeJournal {
+                fingerprint: hdr.fingerprint,
+                members: Vec::new(),
+            }
+        }
+        None => ResumeJournal {
+            fingerprint: hdr.fingerprint,
+            members: Vec::new(),
+        },
+    };
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("creating PUT staging dir {}", staging.display()))?;
+
+    // Tell the client what's already committed (Gz members only).
+    let entries: Vec<ResumeEntry> = journal
+        .members
+        .iter()
+        .map(|m| ResumeEntry {
+            name: m.name.clone(),
+            committed_chunks: m.committed_chunks,
+        })
+        .collect();
+    write_resume_map(writer, &entries).context("writing resume map")?;
+
     eprintln!(
         "rb-cli serve: PUT {:?} ({} member{}) -> {}",
         hdr.name,
@@ -188,24 +330,31 @@ fn receive_put(
         dest.display()
     );
 
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("rb-put-");
-    let staging = match staging_dir {
-        Some(d) => builder
-            .tempdir_in(d)
-            .with_context(|| format!("creating PUT staging dir under {}", d.display()))?,
-        None => builder.tempdir().context("creating PUT staging dir")?,
-    };
+    // Test-only fault injection: drop the connection after N Gz chunks are
+    // durably committed, to exercise the resume path deterministically. Set
+    // `RB_SERVE_TEST_DROP_AFTER_CHUNKS=N`. Never set in production.
+    let drop_after: Option<u64> = std::env::var("RB_SERVE_TEST_DROP_AFTER_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut gz_committed: u64 = 0;
 
     for mi in 0..hdr.member_count {
         let m =
             read_member_header(reader).with_context(|| format!("reading member {mi} header"))?;
         validate_member_name(&m.name)?;
-        let path = staging.path().join(&m.name);
-        let mut f = std::fs::File::create(&path)
-            .with_context(|| format!("creating staging member {}", path.display()))?;
+        let path = staging.join(&m.name);
+        let is_gz = m.kind == 0;
 
-        for ci in 0..m.chunk_count {
+        // Resume applies to Gz (partition) members only; Raw members are re-sent
+        // fresh each session (cheap), so they always start from chunk 0.
+        let prior = if is_gz { journal.get(&m.name) } else { None };
+        let committed = prior.map(|p| p.committed_chunks).unwrap_or(0);
+        let committed_bytes = prior.map(|p| p.committed_bytes).unwrap_or(0);
+
+        let mut f = open_staging_for_append(&path, committed_bytes)?;
+        let mut written = committed_bytes;
+
+        for ci in committed..m.chunk_count {
             let ch = read_chunk_header(reader)
                 .with_context(|| format!("reading {} chunk {ci} header", m.name))?;
             if ch.len > MAX_PUT_CHUNK {
@@ -239,26 +388,48 @@ fn receive_put(
                     ch.crc32
                 );
             }
-            // fsync the staged bytes before acking — the ack means "durable".
+            written += ch.len as u64;
+            // fsync the staged bytes, THEN record the commit, THEN ack — so the
+            // ack (and the resume cursor) only ever advance past durable data.
             f.flush().ok();
             f.sync_all()
                 .with_context(|| format!("fsync staging member {}", m.name))?;
+            if is_gz {
+                journal.upsert(&m.name, m.chunk_count, ci + 1, written);
+                save_journal(&staging, &journal)?;
+            }
             write_put_ack(writer, true)?;
+            if is_gz {
+                gz_committed += 1;
+                if drop_after == Some(gz_committed) {
+                    eprintln!(
+                        "rb-cli serve: TEST drop after {gz_committed} committed chunk(s) — resume to continue"
+                    );
+                    bail!("test-induced drop after {gz_committed} committed chunks");
+                }
+            }
         }
     }
 
-    // All members staged: pack with the frozen writer (atomic .tmp + rename).
+    // All members complete. Fill the partition checksums (the daemon owns the
+    // bytes — authoritative across a resume), drop the journal so it isn't
+    // packed, then pack atomically and clear the staging.
+    fill_partition_checksums(&staging)?;
+    std::fs::remove_file(journal_path(&staging)).ok();
+    std::fs::remove_file(staging.join("journal.json.tmp")).ok();
+
     let tmp = dest.with_file_name(format!(
         "{}.tmp",
         dest.file_name().unwrap_or_default().to_string_lossy()
     ));
-    crate::rbformats::cbk::pack_folder_to_cbk(staging.path(), &tmp)
+    crate::rbformats::cbk::pack_folder_to_cbk(&staging, &tmp)
         .with_context(|| format!("packing PUT into {}", tmp.display()))?;
     if let Ok(f) = std::fs::File::open(&tmp) {
         f.sync_all().ok();
     }
     std::fs::rename(&tmp, &dest)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    std::fs::remove_dir_all(&staging).ok();
     let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
 
     eprintln!(
@@ -266,6 +437,67 @@ fn receive_put(
         dest.display()
     );
     write_put_result(writer, 0, cbk_size)?;
+    Ok(())
+}
+
+/// `partition-N.gz` → `Some(N)`; anything else (`.gz.crc32`, `.idx`, `mbr.bin`,
+/// `metadata.json`) → `None`.
+fn partition_gz_index(name: &str) -> Option<usize> {
+    let stem = name.strip_prefix("partition-")?.strip_suffix(".gz")?;
+    stem.parse().ok()
+}
+
+/// CRC32 of a file's bytes, streamed.
+fn crc32_of_file(path: &Path) -> Result<u32> {
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize())
+}
+
+/// Fill each `partition-N.gz` member's real checksum into the staged
+/// `metadata.json`. The networked producer ships a placeholder (it can't compute
+/// the gz CRC across a resume — it never holds the whole compressed member), so
+/// the daemon, which does hold every byte, computes it here. Best-effort: a
+/// `metadata.json` that isn't a parseable backup manifest is left untouched (the
+/// checksum is informational — restore doesn't re-verify it).
+fn fill_partition_checksums(staging: &Path) -> Result<()> {
+    let meta_path = staging.join("metadata.json");
+    let Ok(data) = std::fs::read_to_string(&meta_path) else {
+        return Ok(());
+    };
+    let mut metadata: crate::backup::metadata::BackupMetadata = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rb-cli serve: metadata.json not a fillable manifest ({e}); leaving checksums as-is");
+            return Ok(());
+        }
+    };
+    let mut changed = false;
+    for entry in
+        std::fs::read_dir(staging).with_context(|| format!("reading {}", staging.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(idx) = partition_gz_index(&name) {
+            let crc = crc32_of_file(&entry.path())?;
+            if let Some(p) = metadata.partitions.iter_mut().find(|p| p.index == idx) {
+                p.checksum = format!("{crc:08x}");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&metadata)?)
+            .with_context(|| format!("rewriting {}", meta_path.display()))?;
+    }
     Ok(())
 }
 

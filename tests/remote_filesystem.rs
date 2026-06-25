@@ -1388,8 +1388,8 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
     use flate2::Compression;
     use rusty_backup::rbformats::cbk::{is_cbk, materialize_cbk_to_folder, pack_folder_to_cbk};
     use rusty_backup::remote::protocol::{
-        read_put_ack, read_put_result, write_chunk_header, write_member_header, write_put_header,
-        ChunkHeader, CAP_FAMILY_B, PROTOCOL_VERSION, RB_HELLO_MAGIC_BYTES,
+        read_put_ack, read_put_result, read_resume_map, write_chunk_header, write_member_header,
+        write_put_header, ChunkHeader, CAP_FAMILY_B, PROTOCOL_VERSION, RB_HELLO_MAGIC_BYTES,
     };
 
     // Build a tiny native-ish backup folder: metadata.json + mbr.bin (raw
@@ -1443,7 +1443,10 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    write_put_header(&mut sock, "MYDISK", names.len() as u16).unwrap();
+    write_put_header(&mut sock, "MYDISK", 0xDEAD_BEEF, names.len() as u16).unwrap();
+    // The daemon replies with the resume map (empty — a fresh transfer).
+    let resume = read_resume_map(&mut sock).unwrap();
+    assert!(resume.is_empty(), "a fresh PUT has nothing to resume");
     for name in &names {
         let bytes = std::fs::read(folder.join(name)).unwrap();
         let is_gz = name.to_ascii_lowercase().ends_with(".gz");
@@ -1520,6 +1523,178 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
             "member {name} round-trips byte-for-byte through the PUT + .cbk"
         );
     }
+}
+
+/// Family B RESUME (cb-dos / phase 7d): a PUT is killed mid-partition, then a
+/// reconnect (same name + fingerprint) is told where to resume and finishes the
+/// transfer. Proves the daemon's durable journal (fsync-before-record),
+/// truncate-to-last-committed, the resume-map reply, and the host filling the
+/// partition checksum the rebooted client can't recompute across a resume.
+#[test]
+fn family_b_chunk_put_resumes_after_drop() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use rusty_backup::rbformats::cbk::materialize_cbk_to_folder;
+    use rusty_backup::remote::protocol::{
+        read_put_ack, read_put_result, read_resume_map, write_chunk_header, write_member_header,
+        write_put_header, ChunkHeader, PROTOCOL_VERSION, RB_HELLO_MAGIC_BYTES,
+    };
+
+    const FP: u32 = 0xCAFE_F00D;
+
+    // Do the binary handshake on a fresh socket.
+    fn connect_hello(addr: &str) -> TcpStream {
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let mut req = Vec::new();
+        req.extend_from_slice(&RB_HELLO_MAGIC_BYTES);
+        req.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        sock.write_all(&req).unwrap();
+        sock.flush().unwrap();
+        let mut reply = [0u8; 8];
+        sock.read_exact(&mut reply).unwrap();
+        sock
+    }
+    fn send_gz_chunk(sock: &mut TcpStream, src_offset: u64, payload: &[u8]) {
+        write_chunk_header(
+            sock,
+            &ChunkHeader {
+                src_offset,
+                len: payload.len() as u32,
+                crc32: crc32fast::hash(payload),
+            },
+        )
+        .unwrap();
+        sock.write_all(payload).unwrap();
+        sock.flush().unwrap();
+        assert!(read_put_ack(sock).unwrap(), "daemon ACKs the chunk");
+    }
+    fn send_raw_member(sock: &mut TcpStream, name: &str, bytes: &[u8]) {
+        write_member_header(sock, 1, name, 1).unwrap();
+        send_gz_chunk(sock, 0, bytes); // src_offset is ignored for a 1-chunk Raw member
+    }
+
+    // The partition is four independent 1 KiB gzip members (the §2c span shape);
+    // concatenated they are one valid multi-member partition-0.gz.
+    let spans: Vec<Vec<u8>> = (0..4u8)
+        .map(|i| {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(&vec![b'A' + i; 1000]).unwrap();
+            e.finish().unwrap()
+        })
+        .collect();
+    let full_gz: Vec<u8> = spans.iter().flatten().copied().collect();
+    let mbr = vec![0x55u8; 512];
+    // A realistic metadata.json (cb-dos format) with a placeholder checksum the
+    // daemon must overwrite with the real gz CRC at finalize.
+    let metadata = r#"{
+  "version": 1,
+  "created": "2026-06-25T00:00:00Z",
+  "source_device": "0x81",
+  "source_size_bytes": 17825792,
+  "partition_table_type": "MBR",
+  "checksum_type": "crc32",
+  "compression_type": "gzip",
+  "split_size_mib": null,
+  "sector_by_sector": false,
+  "layout": "per-partition",
+  "alignment": { "detected_type": "Modern 1MB boundaries", "first_partition_lba": 2048, "alignment_sectors": 2048, "heads": 64, "sectors_per_track": 32 },
+  "partitions": [
+    { "index": 0, "type_name": "FAT16 (>32MB)", "partition_type_byte": 6, "start_lba": 2048, "original_size_bytes": 16777216, "imaged_size_bytes": 4000, "compressed_files": ["partition-0.gz"], "checksum": "00000000", "resized": false, "compacted": true, "is_logical": false, "minimum_size_bytes": 4000 }
+  ]
+}
+"#;
+
+    let root_tmp = tempfile::tempdir().unwrap();
+    let root = root_tmp.path().canonicalize().unwrap();
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging));
+    });
+
+    // --- connection 1: send mbr + the first 2 of 4 partition spans, then drop ---
+    {
+        let mut sock = connect_hello(&addr);
+        write_put_header(&mut sock, "MYDISK", FP, 3).unwrap();
+        assert!(
+            read_resume_map(&mut sock).unwrap().is_empty(),
+            "fresh: nothing to resume"
+        );
+        send_raw_member(&mut sock, "mbr.bin", &mbr);
+        write_member_header(&mut sock, 0, "partition-0.gz", 4).unwrap();
+        let mut off = 0u64;
+        for span in &spans[..2] {
+            send_gz_chunk(&mut sock, off, span);
+            off += 1000;
+        }
+        // Simulate a crash mid-partition: close the socket before chunk 2.
+        drop(sock);
+    }
+
+    // --- connection 2: reconnect, get told to resume at span 2, finish ---
+    let mut sock = connect_hello(&addr);
+    write_put_header(&mut sock, "MYDISK", FP, 3).unwrap();
+    let resume = read_resume_map(&mut sock).unwrap();
+    let part = resume
+        .iter()
+        .find(|e| e.name == "partition-0.gz")
+        .expect("the daemon remembers the in-progress partition");
+    assert_eq!(
+        part.committed_chunks, 2,
+        "two spans were durably committed before the drop"
+    );
+    // Raw members are re-sent fresh; the partition resumes at the committed span.
+    send_raw_member(&mut sock, "mbr.bin", &mbr);
+    write_member_header(&mut sock, 0, "partition-0.gz", 4).unwrap();
+    for (k, span) in spans
+        .iter()
+        .enumerate()
+        .skip(part.committed_chunks as usize)
+    {
+        send_gz_chunk(&mut sock, (k as u64) * 1000, span);
+    }
+    send_raw_member(&mut sock, "metadata.json", metadata.as_bytes());
+    let (status, cbk_size) = read_put_result(&mut sock).unwrap();
+    assert_eq!(status, 0, "the resumed PUT finished");
+    assert!(cbk_size > 0);
+    drop(sock);
+
+    // --- verify the assembled container ---
+    let received = root.join("MYDISK.cbk");
+    assert!(received.is_file(), "the resumed PUT produced MYDISK.cbk");
+    let out = root_tmp.path().join("out");
+    materialize_cbk_to_folder(&received, &out).unwrap();
+    assert_eq!(
+        std::fs::read(out.join("partition-0.gz")).unwrap(),
+        full_gz,
+        "the resumed partition is the full 4-span gz (committed prefix + resumed tail)"
+    );
+    assert_eq!(std::fs::read(out.join("mbr.bin")).unwrap(), mbr);
+
+    // The daemon filled the real checksum (the rebooted client only sent a
+    // placeholder — it can't CRC a member it streamed across two sessions).
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("metadata.json")).unwrap()).unwrap();
+    let got_checksum = meta["partitions"][0]["checksum"].as_str().unwrap();
+    assert_eq!(
+        got_checksum,
+        format!("{:08x}", crc32fast::hash(&full_gz)),
+        "metadata checksum was filled with the real partition gz CRC"
+    );
+
+    // Staging was cleared on success — a re-backup of the same name starts fresh.
+    assert!(
+        !staging.join("rb-cbk-MYDISK").exists(),
+        "the per-container staging dir is removed after finalize"
+    );
 }
 
 /// Remote per-partition MINIMUM-SIZE calc over the block tier: drive the

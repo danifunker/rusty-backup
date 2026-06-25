@@ -34,28 +34,35 @@
 
 typedef struct cbnet cbnet_t;
 
-/* Bring up WATT-32, connect to host:port, do the Family-B handshake, and send
- * the PUT header (the container becomes `<cbk_name>.cbk` on the daemon).
- * `member_count` = the total members that will follow. NULL on failure (a
- * message is printed). */
+/* Bring up WATT-32, connect to host:port, do the Family-B handshake, send the
+ * PUT header (the container becomes `<cbk_name>.cbk` on the daemon), and read
+ * back the daemon's resume map. `fingerprint` is the cheap §4 source fingerprint
+ * the daemon uses to decide whether a reconnect may resume a prior partial
+ * transfer for this `cbk_name`. `member_count` = the total members that will
+ * follow. NULL on failure (a message is printed). */
 cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
-                     int member_count);
+                     unsigned long fingerprint, int member_count);
 
 /* Send a Raw member (a small verbatim file: mbr.bin / metadata.json) as one
- * chunk. 0 ok / -1 error. */
+ * chunk. Raw members are always re-sent fresh (not resumed). 0 ok / -1 error. */
 int cbnet_raw_member(cbnet_t *n, const char *name, const void *buf, uint32_t len);
 
 /* Begin a Gz member (a partition). `imaged_bytes` is the exact uncompressed
  * length that will be fed via cbnet_part_write -- it fixes the chunk (span)
- * count up front. 0 / -1. */
-int cbnet_part_begin(cbnet_t *n, const char *name, int logical_id, uint64_t imaged_bytes);
-/* Feed the member's (smart-compacted) block stream. Cut into gzip-member spans
- * and sent as chunks at each CBNET_SPAN boundary. 0 / -1. */
+ * count up front. On resume the daemon may already hold the first spans:
+ * `*committed_out` receives how many spans (chunks) to SKIP, so the caller
+ * seeks the source to `(*committed_out) * CBNET_SPAN` and feeds only the rest.
+ * 0 / -1. */
+int cbnet_part_begin(cbnet_t *n, const char *name, int logical_id, uint64_t imaged_bytes,
+                     uint32_t *committed_out);
+/* Feed the member's (smart-compacted) block stream, starting at the resume
+ * offset. Cut into gzip-member spans and sent as chunks at each CBNET_SPAN
+ * boundary. 0 / -1. */
 int cbnet_part_write(cbnet_t *n, const void *buf, uint32_t len);
-/* Finish the member: flush the final span. Returns the CRC32 of the whole `.gz`
- * (all span payloads in order -- the desktop's per-partition checksum) and its
- * compressed byte size. 0 / -1. */
-int cbnet_part_end(cbnet_t *n, unsigned long *gz_crc, unsigned long *gz_bytes);
+/* Finish the member: flush the final span. The daemon owns the partition's gz
+ * checksum (it can't be recomputed by the client across a resume), so nothing is
+ * returned. 0 / -1. */
+int cbnet_part_end(cbnet_t *n);
 
 /* All members sent: read the daemon's result frame. 0 ok (sets *cbk_size), -1 on
  * a NAK / short read / non-zero status. */

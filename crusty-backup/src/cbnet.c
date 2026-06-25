@@ -20,9 +20,12 @@
 static const unsigned char RB_MAGIC[4] = {'R', 'B', 'K', '0'};
 static const unsigned char PUT_MAGIC[4] = {'R', 'B', 'K', 'P'};
 static const unsigned char MEMBER_MAGIC[4] = {'R', 'B', 'K', 'M'};
+static const unsigned char RESUME_MAGIC[4] = {'R', 'B', 'K', 'R'};
 #define RB_PROTO_VER 2
 #define CAP_FAMILY_B 0x0002
 #define PUT_ACK 0x06
+
+#define MAX_RESUME 16 /* distinct Gz members the daemon can report resumable */
 
 struct cbnet {
     int sock;
@@ -35,9 +38,21 @@ struct cbnet {
     /* current Gz member */
     int in_member;
     unsigned long span_uoff; /* uncompressed offset of the current span */
-    unsigned long gz_crc;    /* running CRC of all emitted compressed bytes */
-    unsigned long gz_bytes;  /* total compressed bytes for the member */
+    /* resume map from the daemon (Gz members it already holds chunks for) */
+    struct {
+        char name[28];
+        uint32_t committed;
+    } resume[MAX_RESUME];
+    int nresume;
 };
+
+/* committed chunk count the daemon reported for `name`, or 0 if none. */
+static uint32_t resume_committed(const cbnet_t *n, const char *name) {
+    for (int i = 0; i < n->nresume; i++)
+        if (strcmp(n->resume[i].name, name) == 0)
+            return n->resume[i].committed;
+    return 0;
+}
 
 /* ----- big-endian field writers ----- */
 static void be16(unsigned char *p, unsigned v) {
@@ -96,7 +111,9 @@ static int send_chunk(cbnet_t *n, unsigned long long src_offset, const unsigned 
     return 0;
 }
 
-/* Compress inbuf[0..inlen] into a gzip member and ship it as one chunk. */
+/* Compress inbuf[0..inlen] into a gzip member and ship it as one chunk. The
+ * chunk's crc32 is the wire-integrity check of the compressed payload (the
+ * daemon owns the whole-member gz checksum, so we don't accumulate it). */
 static int flush_span(cbnet_t *n) {
     z_stream s;
     memset(&s, 0, sizeof s);
@@ -117,15 +134,47 @@ static int flush_span(cbnet_t *n) {
     if (send_chunk(n, (unsigned long long)n->span_uoff, n->outbuf, clen, crc) != 0)
         return -1;
 
-    n->gz_crc = crc32(n->gz_crc, n->outbuf, clen);
-    n->gz_bytes += clen;
     n->span_uoff += n->inlen;
     n->inlen = 0;
     return 0;
 }
 
+/* Read the daemon's RBKR resume map into n->resume. 0 / -1. */
+static int read_resume_map(cbnet_t *n) {
+    unsigned char hdr[6];
+    if (recv_all(n->sock, hdr, 6) != 0)
+        return -1;
+    if (memcmp(hdr, RESUME_MAGIC, 4) != 0)
+        return -1;
+    int count = (hdr[4] << 8) | hdr[5];
+    n->nresume = 0;
+    for (int i = 0; i < count; i++) {
+        unsigned char nl[2];
+        if (recv_all(n->sock, nl, 2) != 0)
+            return -1;
+        int len = (nl[0] << 8) | nl[1];
+        char name[64];
+        if (len >= (int)sizeof name) /* skip an over-long name we wouldn't match */
+            return -1;
+        if (len && recv_all(n->sock, (unsigned char *)name, len) != 0)
+            return -1;
+        name[len] = 0;
+        unsigned char cc[4];
+        if (recv_all(n->sock, cc, 4) != 0)
+            return -1;
+        uint32_t committed = ((uint32_t)cc[0] << 24) | ((uint32_t)cc[1] << 16) |
+                             ((uint32_t)cc[2] << 8) | cc[3];
+        if (n->nresume < MAX_RESUME && len < (int)sizeof n->resume[0].name) {
+            strcpy(n->resume[n->nresume].name, name);
+            n->resume[n->nresume].committed = committed;
+            n->nresume++;
+        }
+    }
+    return 0;
+}
+
 cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
-                     int member_count) {
+                     unsigned long fingerprint, int member_count) {
     cbnet_t *n = calloc(1, sizeof *n);
     if (!n)
         return NULL;
@@ -184,20 +233,31 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
     if (!((((unsigned)reply[6] << 8) | reply[7]) & CAP_FAMILY_B))
         fprintf(stderr, "warning: agent does not advertise the backup stream (old daemon?)\n");
 
-    /* PUT header: RBKP, name, member_count. */
+    /* PUT header: RBKP, name, fingerprint (u32), member_count (u16). */
     int nlen = (int)strlen(cbk_name);
     unsigned char ph[8];
     memcpy(ph, PUT_MAGIC, 4);
     be16(ph + 4, (unsigned)nlen);
+    unsigned char fp[4];
+    be32(fp, fingerprint);
     unsigned char mc[2];
     be16(mc, (unsigned)member_count);
     if (send_all(n->sock, ph, 6) != 0 ||
         send_all(n->sock, (const unsigned char *)cbk_name, nlen) != 0 ||
-        send_all(n->sock, mc, 2) != 0) {
+        send_all(n->sock, fp, 4) != 0 || send_all(n->sock, mc, 2) != 0) {
         fprintf(stderr, "sending PUT header failed\n");
         cbnet_close(n);
         return NULL;
     }
+
+    /* Daemon's resume map (which members it already holds, and how far). */
+    if (read_resume_map(n) != 0) {
+        fprintf(stderr, "reading resume map failed\n");
+        cbnet_close(n);
+        return NULL;
+    }
+    if (n->nresume > 0)
+        printf("agent has partial data for %d member(s) -- resuming\n", n->nresume);
     return n;
 }
 
@@ -223,18 +283,24 @@ int cbnet_raw_member(cbnet_t *n, const char *name, const void *buf, uint32_t len
     return send_chunk(n, 0ULL, (const unsigned char *)buf, len, crc);
 }
 
-int cbnet_part_begin(cbnet_t *n, const char *name, int logical_id, uint64_t imaged_bytes) {
+int cbnet_part_begin(cbnet_t *n, const char *name, int logical_id, uint64_t imaged_bytes,
+                     uint32_t *committed_out) {
     (void)logical_id;
     uint32_t chunk_count = (uint32_t)((imaged_bytes + CBNET_SPAN - 1) / CBNET_SPAN);
     if (chunk_count == 0)
         chunk_count = 1; /* always at least one (possibly empty) span */
+    /* The daemon may already hold the first `committed` spans (a resumed
+     * transfer); skip them and start emitting at span `committed`. */
+    uint32_t committed = resume_committed(n, name);
+    if (committed > chunk_count)
+        committed = chunk_count; /* defensive: never under-send */
     if (send_member_header(n, 0 /*Gz*/, name, chunk_count) != 0)
         return -1;
     n->in_member = 1;
     n->inlen = 0;
-    n->span_uoff = 0;
-    n->gz_crc = crc32(0L, Z_NULL, 0);
-    n->gz_bytes = 0;
+    n->span_uoff = (unsigned long)committed * CBNET_SPAN;
+    if (committed_out)
+        *committed_out = committed;
     return 0;
 }
 
@@ -253,16 +319,12 @@ int cbnet_part_write(cbnet_t *n, const void *buf, uint32_t len) {
     return 0;
 }
 
-int cbnet_part_end(cbnet_t *n, unsigned long *gz_crc, unsigned long *gz_bytes) {
+int cbnet_part_end(cbnet_t *n) {
     /* Flush a trailing partial span. (An exact-multiple member already flushed
      * its last full span at the boundary, leaving inlen == 0.) */
     if (n->inlen > 0 && flush_span(n) != 0)
         return -1;
     n->in_member = 0;
-    if (gz_crc)
-        *gz_crc = n->gz_crc;
-    if (gz_bytes)
-        *gz_bytes = n->gz_bytes;
     return 0;
 }
 

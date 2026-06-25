@@ -402,15 +402,21 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
     pm->original_size = part_sectors * 512ULL;
     sprintf(pm->gz_name, "partition-%d.gz", index);
 
-    if (cbnet_part_begin(net, pm->gz_name, index, (uint64_t)norm_imaged * 512) != 0) {
+    uint32_t committed = 0;
+    if (cbnet_part_begin(net, pm->gz_name, index, (uint64_t)norm_imaged * 512, &committed) != 0) {
         printf("  part %d: net begin failed\n", index); free(fat); return -1;
     }
+    /* On resume the agent already holds `committed` spans -- skip them in the
+     * source (each span is CBNET_SPAN/512 sectors of uncompressed data). */
+    uint32_t resume_sec = committed * (CBNET_SPAN / 512);
+    if (resume_sec > norm_imaged) resume_sec = norm_imaged;
+
     progress_t pr; char lbl[40];
     sprintf(lbl, "part %d (%s)", index, part_type_name(type_byte));
     progress_begin(&pr, lbl, (uint64_t)norm_imaged * 512);
 
     uint8_t buf[XFER_BYTES];
-    uint32_t s = 0; int rc = 0;
+    uint32_t s = resume_sec; int rc = 0;
     while (s < norm_imaged) {
         int nsec = (int)(norm_imaged - s);
         if (nsec > XFER_SECTORS) nsec = XFER_SECTORS;
@@ -435,8 +441,7 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
     progress_finish(&pr);
     free(fat);
 
-    unsigned long gz_crc = 0, gz_bytes = 0;
-    if (cbnet_part_end(net, &gz_crc, &gz_bytes) != 0 && rc == 0) {
+    if (cbnet_part_end(net) != 0 && rc == 0) {
         printf("  part %d: net finalize failed\n", index); rc = -1;
     }
     if (rc != 0) return rc;
@@ -444,11 +449,10 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
     pm->imaged_size = (uint64_t)norm_imaged * L.bps;
     pm->minimum_size = pm->imaged_size;
     pm->compacted = (norm_imaged < part_sectors) ? 1 : 0;
-    sprintf(pm->crc_hex, "%08lx", gz_crc);
-    printf("  part %d (%s): streamed %lu KiB -> %s (%lu KiB gz), crc %s%s\n",
+    strcpy(pm->crc_hex, "00000000");  /* placeholder; the agent fills the real gz CRC */
+    printf("  part %d (%s): streamed %lu KiB -> %s%s%s\n",
            index, part_type_name(type_byte), (unsigned long)(pm->imaged_size / 1024),
-           pm->gz_name, (unsigned long)(gz_bytes / 1024), pm->crc_hex,
-           pm->compacted ? " [compacted]" : "");
+           pm->gz_name, committed ? " [resumed]" : "", pm->compacted ? " [compacted]" : "");
     return 0;
 }
 
@@ -480,15 +484,19 @@ static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *
     pm->compacted = 1;
     sprintf(pm->gz_name, "partition-%d.gz", index);
 
-    if (cbnet_part_begin(net, pm->gz_name, index, part_sectors * 512ULL) != 0) {
+    uint32_t committed = 0;
+    if (cbnet_part_begin(net, pm->gz_name, index, part_sectors * 512ULL, &committed) != 0) {
         printf("  part %d: net begin failed\n", index); free(bm); return -1;
     }
+    uint64_t resume_sec = (uint64_t)committed * (CBNET_SPAN / 512);
+    if (resume_sec > part_sectors) resume_sec = part_sectors;
+
     progress_t pr; char lbl[40];
     sprintf(lbl, "part %d (NTFS)", index);
     progress_begin(&pr, lbl, part_sectors * 512ULL);
 
     uint8_t buf[XFER_BYTES];
-    uint64_t s = 0; int rc = 0;
+    uint64_t s = resume_sec; int rc = 0;
     while (s < part_sectors) {
         int nsec = (int)(part_sectors - s);
         if (nsec > XFER_SECTORS) nsec = XFER_SECTORS;
@@ -510,16 +518,15 @@ static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *
     progress_finish(&pr);
     free(bm);
 
-    unsigned long gz_crc = 0, gz_bytes = 0;
-    if (cbnet_part_end(net, &gz_crc, &gz_bytes) != 0 && rc == 0) {
+    if (cbnet_part_end(net) != 0 && rc == 0) {
         printf("  part %d: net finalize failed\n", index); rc = -1;
     }
     if (rc != 0) return rc;
 
-    sprintf(pm->crc_hex, "%08lx", gz_crc);
-    printf("  part %d (NTFS): streamed %lu KiB -> %s (%lu KiB gz), crc %s\n",
+    strcpy(pm->crc_hex, "00000000");  /* placeholder; the agent fills the real gz CRC */
+    printf("  part %d (NTFS): streamed %lu KiB -> %s%s\n",
            index, (unsigned long)(pm->imaged_size / 1024), pm->gz_name,
-           (unsigned long)(gz_bytes / 1024), pm->crc_hex);
+           committed ? " [resumed]" : "");
     return 0;
 }
 
@@ -598,8 +605,38 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec
         printf("  note: extended/logical partitions are not yet streamed over the wire (skipped)\n");
     if (nsel == 0) { printf("no FAT/NTFS primary partitions to back up\n"); xfer_free(); return 1; }
 
+    /* Cheap source fingerprint for the resume gate (§4): CRC32 over the MBR, the
+     * disk size, and each selected partition's boot sector + FAT (the allocation
+     * map -- the workhorse that catches add/delete/move/resize/reformat). The
+     * agent only checks equality; a mismatch means a swapped/edited card -> it
+     * restarts rather than splice two vintages of the disk together. */
+    unsigned long fingerprint = crc32(0L, mbr, 512);
+    {
+        uint64_t tot = drive_total_sectors(&di, drive);
+        unsigned char tb[8];
+        for (int i = 0; i < 8; i++) tb[i] = (unsigned char)((tot >> (8 * i)) & 0xFF);
+        fingerprint = crc32(fingerprint, tb, 8);
+        for (int k = 0; k < nsel; k++) {
+            uint8_t vbr[512];
+            if (read_lba(&di, drive, sel[k].lba, 1, vbr) != 0) continue;
+            fingerprint = crc32(fingerprint, vbr, 512);
+            if (is_fat_part_type(sel[k].type)) {
+                fatlay_t L; parse_fatlay(vbr, &L);
+                if (L.ok) {
+                    uint8_t *fat = malloc(L.old_spf * L.bps);
+                    if (fat) {
+                        if (load_region(&di, drive, sel[k].lba + L.reserved,
+                                        L.old_spf * L.bps, fat) == 0)
+                            fingerprint = crc32(fingerprint, fat, L.old_spf * L.bps);
+                        free(fat);
+                    }
+                }
+            }
+        }
+    }
+
     int member_count = 1 /*mbr.bin*/ + nsel + 1 /*metadata.json*/;
-    cbnet_t *net = cbnet_start(host, port, name, member_count);
+    cbnet_t *net = cbnet_start(host, port, name, fingerprint, member_count);
     if (!net) { xfer_free(); return 1; }
 
     if (cbnet_raw_member(net, "mbr.bin", mbr, 512) != 0) {

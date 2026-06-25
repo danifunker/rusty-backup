@@ -470,11 +470,30 @@ pub const MAX_PUT_CHUNK: u32 = MAX_CHUNK as u32;
 const MAX_PUT_NAME: usize = 1024;
 
 /// A chunk-PUT request header: the container base name (→ `<name>.cbk` on the
-/// daemon) and how many logical members follow.
+/// daemon), a cheap **source fingerprint** (§4 — geometry + ptable + allocation
+/// CRC; the daemon uses it to decide whether a reconnect may *resume* a prior
+/// partial transfer for the same `name`, or must start fresh), and how many
+/// logical members follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutHeader {
     pub name: String,
+    pub fingerprint: u32,
     pub member_count: u16,
+}
+
+/// Magic leading the daemon's resume-map reply (`b"RBKR"`), sent right after the
+/// PUT header. It tells the client, per member it already holds bytes for, how
+/// many chunks are durably committed — so the client skips those and resumes at
+/// the source offset for the next chunk (§3). An empty map means a fresh start.
+pub const RESUME_MAGIC: u32 = 0x5242_4B52; // "RBKR"
+
+/// One entry in the resume map: a member's folder-relative name and how many of
+/// its chunks the daemon has durably committed (the client resumes at chunk
+/// `committed_chunks`, source offset `committed_chunks · span`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeEntry {
+    pub name: String,
+    pub committed_chunks: u32,
 }
 
 /// One member descriptor inside a PUT: its folder-relative file name, its kind
@@ -560,16 +579,63 @@ pub fn read_put_header<R: Read>(r: &mut R) -> io::Result<Option<PutHeader>> {
         ));
     }
     let name = read_short_string(r)?;
+    let fingerprint = read_u32_be(r)?;
     let member_count = read_u16_be(r)?;
-    Ok(Some(PutHeader { name, member_count }))
+    Ok(Some(PutHeader {
+        name,
+        fingerprint,
+        member_count,
+    }))
 }
 
 /// Write a chunk-PUT request header (client side).
-pub fn write_put_header<W: Write>(w: &mut W, name: &str, member_count: u16) -> io::Result<()> {
+pub fn write_put_header<W: Write>(
+    w: &mut W,
+    name: &str,
+    fingerprint: u32,
+    member_count: u16,
+) -> io::Result<()> {
     w.write_all(&PUT_MAGIC.to_be_bytes())?;
     write_short_string(w, name)?;
+    w.write_all(&fingerprint.to_be_bytes())?;
     w.write_all(&member_count.to_be_bytes())?;
     Ok(())
+}
+
+/// Write the resume-map reply (daemon side): the `RBKR` magic, an entry count,
+/// then each `{name, committed_chunks}`. Flushed.
+pub fn write_resume_map<W: Write>(w: &mut W, entries: &[ResumeEntry]) -> io::Result<()> {
+    w.write_all(&RESUME_MAGIC.to_be_bytes())?;
+    let count = u16::try_from(entries.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many resume entries"))?;
+    w.write_all(&count.to_be_bytes())?;
+    for e in entries {
+        write_short_string(w, &e.name)?;
+        w.write_all(&e.committed_chunks.to_be_bytes())?;
+    }
+    w.flush()
+}
+
+/// Read the resume-map reply (client side).
+pub fn read_resume_map<R: Read>(r: &mut R) -> io::Result<Vec<ResumeEntry>> {
+    let magic = read_u32_be(r)?;
+    if magic != RESUME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad resume-map magic {magic:#010x} (expected {RESUME_MAGIC:#010x})"),
+        ));
+    }
+    let count = read_u16_be(r)? as usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = read_short_string(r)?;
+        let committed_chunks = read_u32_be(r)?;
+        out.push(ResumeEntry {
+            name,
+            committed_chunks,
+        });
+    }
+    Ok(out)
 }
 
 /// Read one member descriptor (the `RBKM` magic + kind + name + chunk count).
