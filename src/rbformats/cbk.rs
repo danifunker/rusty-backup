@@ -611,10 +611,20 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a tiny native-ish backup folder: metadata.json (raw) + a real
-    /// gzip member (partition-0.gz) + a crc32 sidecar.
+    /// gzip member (partition-0.gz) + a crc32 sidecar + the cb-dos file
+    /// manifest sidecar (manifest-0.json, a Raw member — the Net 7f artifact
+    /// that must ride the container untouched).
     fn sample_folder(dir: &Path) {
         fs::write(dir.join("metadata.json"), b"{\n  \"version\": 1\n}\n").unwrap();
         fs::write(dir.join("mbr.bin"), vec![0xAAu8; 512]).unwrap();
+        fs::write(
+            dir.join("manifest-0.json"),
+            b"{\n  \"manifest_version\": 1,\n  \"filesystem\": \"fat16\",\n  \
+\"files\": [\n    {\"path\": \"\\\\IO.SYS\", \"size\": 40566, \
+\"mtime\": \"1998-05-11T20:01:00\", \"attr\": 39, \"start_cluster\": 2}\n  ]\n}\n"
+                .as_ref(),
+        )
+        .unwrap();
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&vec![0u8; 100_000]).unwrap();
         enc.write_all(b"some real bytes in the middle").unwrap();
@@ -641,6 +651,7 @@ mod tests {
         for name in [
             "metadata.json",
             "mbr.bin",
+            "manifest-0.json",
             "partition-0.gz",
             "partition-0.gz.crc32",
         ] {

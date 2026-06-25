@@ -238,6 +238,8 @@ static int dir_iter_next(dir_iter_t *it, dirent_t *d) {
         d->attr = attr;
         d->first_cluster = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
         d->size = rd32(e + 28);
+        d->dos_time = rd16(e + 22);   /* write time (the file's mtime) */
+        d->dos_date = rd16(e + 24);   /* write date */
         return 1;
     }
     return 0;

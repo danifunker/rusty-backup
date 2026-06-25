@@ -40,6 +40,8 @@ typedef struct {
     uint8_t  attr;
     uint32_t first_cluster;
     uint32_t size;
+    uint16_t dos_time;       /* FAT write time (dir offset 22), DOS-packed */
+    uint16_t dos_date;       /* FAT write date (dir offset 24), DOS-packed */
 } dirent_t;
 
 #define CBK_ATTR_DIR 0x10

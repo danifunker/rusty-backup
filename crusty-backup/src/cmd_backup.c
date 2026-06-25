@@ -12,6 +12,7 @@
 #include "cbdefrag.h"
 #include "cbcodec.h"
 #include "cbnet.h"
+#include "cbmanifest.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -367,6 +368,32 @@ static void write_metadata(const char *dest, const char *src_label,
     printf("wrote metadata.json (%d partition%s)\n", nparts, nparts == 1 ? "" : "s");
 }
 
+/* Build the FAT partition's file manifest (§5) from the live source and write it
+ * as <dest>\manifest-<index>.json next to partition-<index>.gz. Best-effort: a
+ * failure logs and leaves the block backup intact (the manifest is a change-
+ * detection sidecar, not required for restore). FAT only -- NTFS has no on-DOS
+ * directory reader. */
+static void emit_partition_manifest(const char *dest, int index, const drive_info_t *di,
+                                    int drive, uint64_t start_lba, const uint8_t *mbr) {
+    char *buf;
+    uint32_t len;
+    if (manifest_build_fat(di, drive, start_lba, mbr, &buf, &len) != 0) {
+        printf("  part %d: manifest skipped (could not read directory tree)\n", index);
+        return;
+    }
+    char mp[160];
+    sprintf(mp, "%s\\manifest-%d.json", dest, index);
+    FILE *f = fopen(mp, "wb");
+    if (f) {
+        fwrite(buf, 1, len, f);
+        fclose(f);
+        printf("  wrote manifest-%d.json (%lu bytes)\n", index, (unsigned long)len);
+    } else {
+        printf("  cannot write manifest-%d.json\n", index);
+    }
+    free(buf);
+}
+
 /* ---- networked backup: image a disk block-level straight to an rb-cli serve
  * daemon as a Family-B chunk PUT (no intermediate folder on the DOS box). The
  * partition is read over int13h, smart-compacted, and compressed into gzip-member
@@ -606,7 +633,16 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec
         }
     }
 
-    int member_count = 1 /*mbr.bin*/ + nsel + 1 /*metadata.json*/;
+    /* Each FAT partition also ships a manifest-<idx>.json Raw member (§5); count
+     * them up front so the fixed member_count matches what we send. A FAT
+     * partition whose directory tree can't be read still sends a placeholder
+     * manifest so the count never desyncs. NTFS gets no manifest (no on-DOS
+     * dir reader). */
+    int n_manifests = 0;
+    for (int k = 0; k < nsel; k++)
+        if (is_fat_part_type(sel[k].type)) n_manifests++;
+
+    int member_count = 1 /*mbr.bin*/ + nsel + n_manifests + 1 /*metadata.json*/;
     cbnet_t *net = cbnet_start(host, port, name, fingerprint, member_count);
     if (!net) { xfer_free(); return 1; }
 
@@ -629,6 +665,31 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec
         }
         parts[nparts].is_logical = 0;
         nparts++;
+
+        /* Ship this FAT partition's file manifest right after its image (rides
+         * into the .cbk as a Raw member via the host's pack_folder_to_cbk). */
+        if (is_fat_part_type(sel[k].type)) {
+            char mn[24];
+            sprintf(mn, "manifest-%d.json", sel[k].idx);
+            char *mbuf;
+            uint32_t mblen;
+            int sent;
+            if (manifest_build_fat(&di, drive, sel[k].lba, mbr, &mbuf, &mblen) == 0) {
+                printf("  part %d: manifest %lu bytes -> %s\n",
+                       sel[k].idx, (unsigned long)mblen, mn);
+                sent = cbnet_raw_member(net, mn, mbuf, mblen);
+                free(mbuf);
+            } else {
+                static const char ph[] =
+                    "{\n  \"manifest_version\": 1,\n  \"error\": \"manifest unavailable\"\n}\n";
+                printf("  part %d: manifest unavailable -- sending placeholder\n", sel[k].idx);
+                sent = cbnet_raw_member(net, mn, ph, (uint32_t)(sizeof ph - 1));
+            }
+            if (sent != 0) {
+                printf("sending %s failed\n", mn);
+                cbnet_close(net); xfer_free(); return 1;
+            }
+        }
     }
 
     char label[16];
@@ -773,7 +834,12 @@ int cmd_backup(int argc, char **argv) {
                     printf("  logical %d: type 0x%02X not FAT/NTFS -- skipped\n", lidx, logs[j].type);
                     continue;
                 }
-                if (lok == 0) { parts[nparts].is_logical = 1; nparts++; }
+                if (lok == 0) {
+                    parts[nparts].is_logical = 1;
+                    nparts++;
+                    if (is_fat_part_type(logs[j].type))
+                        emit_partition_manifest(dest, lidx, &di, drive, logs[j].start_lba, mbr);
+                }
             }
             continue;
         }
@@ -791,7 +857,12 @@ int cmd_backup(int argc, char **argv) {
             printf("  part %d: type 0x%02X not FAT/NTFS -- skipped\n", i, type);
             continue;
         }
-        if (ok == 0) { parts[nparts].is_logical = 0; nparts++; }
+        if (ok == 0) {
+            parts[nparts].is_logical = 0;
+            nparts++;
+            if (is_fat_part_type(type))
+                emit_partition_manifest(dest, i, &di, drive, lba, mbr);
+        }
     }
 
     if (nparts == 0) { printf("no FAT/NTFS partitions imaged\n"); xfer_free(); return 1; }

@@ -18,10 +18,12 @@ FDBASE="${FDBASE:?set FDBASE=/path/to/FreeDOS x86BOOT.img}"
 BUILD="$HERE/build"
 DIST="$HERE/dist"
 AUTOEXEC="$HERE/media/cbdos-autoexec.bat"
+DOSLFN="$HERE/media/DOSLFN.COM"     # long-filename TSR (vendored; see media/DOSLFN-ATTRIBUTION.md)
 
 for e in crustybk disk_spike lfn_test; do
     [ -f "$BUILD/$e.exe" ] || { echo "missing $BUILD/$e.exe (run make / cb-dos.Dockerfile first)"; exit 1; }
 done
+[ -f "$DOSLFN" ] || { echo "missing $DOSLFN (vendored long-filename TSR)"; exit 1; }
 
 mkdir -p "$DIST"
 cp "$FDBASE" "$DIST/cbdos-freedos.img"
@@ -43,6 +45,7 @@ docker run --rm \
     -v "$DIST/cbdos-freedos.img":/fd.img \
     -v "$BUILD":/exe:ro \
     -v "$DL/CWSDPMI.EXE":/dpmi/CWSDPMI.EXE:ro \
+    -v "$DOSLFN":/dpmi/DOSLFN.COM:ro \
     -v "$AUTOEXEC":/in/fdauto.bat:ro \
     debian:bookworm-slim sh -c '
         apt-get update >/dev/null 2>&1
@@ -51,6 +54,7 @@ docker run --rm \
         sed "s/\$/\r/" /in/fdauto.bat > /tmp/fdauto.bat   # CRLF for DOS
         mcopy -o -i /fd.img /tmp/fdauto.bat     ::FDAUTO.BAT
         mcopy -o -i /fd.img /dpmi/CWSDPMI.EXE   ::CWSDPMI.EXE
+        mcopy -o -i /fd.img /dpmi/DOSLFN.COM    ::DOSLFN.COM
         mcopy -o -i /fd.img /exe/crustybk.exe   ::CRUSTYBK.EXE
         mcopy -o -i /fd.img /exe/disk_spike.exe ::DISKSPK.EXE
         mcopy -o -i /fd.img /exe/lfn_test.exe   ::LFNTEST.EXE
