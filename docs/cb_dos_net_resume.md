@@ -1,16 +1,18 @@
 # crusty-backup (`cb-dos`) — **network phase** resume prompt
 
-Hand-off for continuing the **optional Net 7h–7i** (networked backup/restore over
-TCP). The local removable-media engine is complete and qemu-verified; networking
-only swaps the *destination* under it. **7a (handshake), 7b (chunk PUT protocol +
-host `.cbk`), 7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d
-(resume), 7e (restore over the wire `CRUSTYBK RESTORE rb://...`), 7f (per-partition
-file manifest + idempotency), and 7g (boot-section deepening + Level-1 swap
-exclusion) are done and qemu-verified — the backup↔restore loop is closed,
-resumable, file-aware, boot-fingerprinted, and swap-aware.** What remains is
-explicitly **optional** (7h incremental, 7i Level-2 swap dealloc + desktop swap
-parity). Paste the section below (from "Resume the…" down) to kick off the next
-session.
+Hand-off for the **network phase — now COMPLETE through Net 7h**. The local
+removable-media engine is complete and qemu-verified; networking only swaps the
+*destination* under it. **7a (handshake), 7b (chunk PUT protocol + host `.cbk`),
+7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d (resume), 7e
+(restore over the wire `CRUSTYBK RESTORE rb://...`), 7f (per-partition file
+manifest + idempotency), 7g (boot-section deepening + Level-1 swap exclusion), and
+7h (incremental: host-side change detection + the §5d bootability flag + opt-in
+whole-disk skip `/INCREMENTAL`) are done and qemu-verified — the backup↔restore
+loop is closed, resumable, file-aware, boot-fingerprinted, swap-aware, and
+incremental.** §6e desktop swap parity + single-file-CHD swap also shipped. What
+remains is genuinely **optional polish** (per-partition incremental skip; 7i
+Level-2 swap dealloc, deferred by design; resize-over-the-wire). Paste the section
+below (from "Resume the…" down) to kick off the next session.
 
 ---
 
@@ -28,16 +30,19 @@ Read these first, in order, before doing anything:
    and the "gotchas learned the hard way" (do not relearn them).
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
-**Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md. 7h(a)
-(host-side change detection + the §5d bootability-change flag) and §6e desktop
-swap parity are DONE; what's left is optional: the `7h` **streaming-skip**
-optimization (per-partition fingerprints → daemon skip-map → cb-dos skips
-unchanged partitions → host copies them from the prior `.cbk`) and `7i` (Level-2
-swap dealloc + single-file-CHD swap). The core loop is done; these are stretch.**
+**7a–7h are DONE + qemu-verified, and §6e desktop swap parity + single-file-CHD
+swap are DONE. The networked feature is COMPLETE.** What remains is genuinely
+optional polish: the **per-partition** incremental skip refinement (7h(b) ships
+opt-in **whole-disk** skip via `/INCREMENTAL`; per-partition would skip only the
+changed partitions of a multi-partition disk via per-partition fingerprints +
+copying unchanged members from the prior `.cbk`), and **7i Level-2 swap dealloc**
+(deferred by design, §6c — the OS recreates swap anyway, so the only gain over the
+Level-1 zeroing already shipped is a smaller resize-down minimum). Also still open
+from before networking: the deferred **resize-over-the-wire** (§7e).**
 
 ## Where we are
 
-Branch `cbdos` (off `main`), ~65 commits ahead, tree clean, **everything below
+Branch `cbdos` (off `main`), ~71 commits ahead, tree clean, **everything below
 qemu-verified on real FreeDOS**.
 
 - **Local cb-dos engine — DONE.** backup / restore / clone / browse across
@@ -126,7 +131,29 @@ qemu-verified on real FreeDOS**.
   logged. qemu-verified local (restored swap files full-size + all-zero; IO.SYS
   byte-identical; BK1==BK2 manifest byte-identical; `/KEEPSWAP` images verbatim)
   **and** network (4-member PUT whose `.cbk` manifest is byte-identical to the
-  local one). *(FAT only; §6e desktop-compaction parity deferred to 7i.)*
+  local one). *(FAT only; §6e desktop-compaction parity shipped — see below.)*
+- **Net 7h — DONE.** **Incremental backup.** **(a)** Host-side change detection +
+  the §5d bootability flag: a networked PUT over a prior `NAME.cbk` diffs the
+  staged `manifest-N.json` against the prior's (`src/remote/manifest.rs` +
+  `server.rs::compare_to_prior_cbk`) and logs unchanged / N-files-changed /
+  BOOTABILITY-CHANGED + "identical to prior backup"; swap files excluded (§6b).
+  **(b)** Opt-in **whole-disk skip** (`/INCREMENTAL`): the PUT header carries a
+  flags byte (incremental) and the daemon's RBKR reply a flags byte (skip); if the
+  §4 disk fingerprint equals a `<name>.fp` sidecar (written on every completed
+  PUT) and the prior `.cbk` exists and no partial staging is in flight, the daemon
+  replies skip + result and cb-dos (`cbnet_skip()` → `cbnet_finish`) sends nothing.
+  Opt-in so a §4c false-negative can't silently drop a change. qemu-verified
+  (3 `/INCREMENTAL` PUTs: full + `.fp` → "skipping" → changed → full). *(Reuses the
+  disk-wide fingerprint; per-partition skip is an optional refinement.)*
+- **§6e desktop swap parity + single-file-CHD swap — DONE.** The Rust desktop
+  backup Level-1 excludes swap too: `CompactFatReader::new_excluding_swap`
+  (`src/fs/fat.rs`) zeros allowlisted swap files' content while keeping the
+  allocation, threaded as `keep_swap` through `BackupConfig` →
+  `compact_partition_reader`/`defrag_fat_partition_reader`/`packed_partition_reader_padded`,
+  surfaced as an rb-cli `--keep-swap` flag + a GUI checkbox (default = exclude);
+  single-file-CHD honors it via `SingleFileChdInputs`. Verified by unit tests +
+  real `rb-cli backup`→`restore` (swap full-size + zeroed by default, verbatim
+  under `--keep-swap`).
 - **The `.cbk` container — FROZEN v1 and already the producer's chunk shape.**
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`, RBKC
   chunks / RBKI index / RBKF footer, big-endian). The desktop reads `.cbk` as a
@@ -156,23 +183,27 @@ Both directions are qemu-verified byte-identical, and the round-trip is **idempo
 (7f/7g: a re-backup of a freshly-restored disk yields a byte-identical manifest,
 hashes and swap flags included).
 **Block-level, baked in, crash-proof, bidirectional, file-aware, boot-fingerprinted,
-swap-aware.** The core feature is **complete**; what remains (7h/7i) is optional.
+swap-aware, incremental.** The core feature is **complete**; what remains is optional
+polish.
 
-## What's left — optional 7h / 7i (pick the top unchecked box in §9)
+## What's left — optional polish
 
-- **7h — incremental.** **7h(a) DONE** (2026-06-25): host-side change detection +
-  the §5d **bootability-change flag** — a networked PUT over a prior `NAME.cbk`
-  logs which partitions are unchanged / changed and whether the boot chain differs
-  (`src/remote/manifest.rs` diff + `server.rs::compare_to_prior_cbk`; reuses the
-  7f/7g manifests, no wire change). **Remaining:** the **streaming-skip**
-  optimization — send per-partition fingerprints in the PUT, the daemon replies a
-  skip-map, cb-dos skips imaging the unchanged partitions, and the host copies them
-  from the prior `.cbk`. (The §4d fingerprint + §5 manifest are the index.)
-- **7i — Level-2 swap dealloc** (free the FAT chain + drop the dir entry so a
-  resize-down minimum shrinks; 7g only zeros content). **Desktop swap parity is
-  DONE** (§6e, 2026-06-25 — the Rust backup now Level-1 excludes swap via
-  `CompactFatReader::new_excluding_swap` + a `--keep-swap` flag / GUI checkbox);
-  only Level-2 dealloc and single-file-CHD swap exclusion remain under 7i.
+- **7h — incremental: DONE.** **7h(a):** host-side change detection + the §5d
+  **bootability-change flag** — a networked PUT over a prior `NAME.cbk` logs which
+  partitions are unchanged / changed and whether the boot chain differs
+  (`src/remote/manifest.rs` diff + `server.rs::compare_to_prior_cbk`). **7h(b):**
+  opt-in **whole-disk skip** (`/INCREMENTAL`) — the §4 fingerprint vs a `<name>.fp`
+  sidecar; on a match the daemon replies *skip* (RBKR flag) and cb-dos sends
+  nothing, the prior `.cbk` stands. *Optional refinement:* **per-partition** skip
+  (per-partition fingerprints → a partition skip-map → copy unchanged partition
+  members from the prior `.cbk`) for multi-partition disks where only some change.
+- **7i — desktop swap parity + single-file-CHD swap: DONE** (§6e, 2026-06-25 — the
+  Rust backup Level-1 excludes swap via `CompactFatReader::new_excluding_swap` + a
+  `--keep-swap` flag / GUI checkbox; single-file-CHD honors it too). **Level-2 swap
+  dealloc is deferred by design** (§6c — free the FAT chain + drop the dir entry so
+  the resize-down minimum shrinks; the OS recreates swap anyway, so the only gain
+  over the shipped Level-1 zeroing is a smaller resize-down minimum — not worth the
+  FS-mutation risk now).
 - The deferred **resize-over-the-wire** (a forward-only streaming peek-then-resize,
   the one gap 7e left) also lives here.
 

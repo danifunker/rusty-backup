@@ -746,14 +746,18 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       by name+location+attribs and marks their cluster chains; the shared
       compaction (local + net) zeros that content while keeping the allocation, the
       manifest flags them `volatile`/`content:zeroed`, and `/KEEPSWAP` opts out.
-- [~] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
-      manifest to skip unchanged partitions/files. **7h(a) DONE (2026-06-25):**
-      host-side change detection + the §5d bootability-change flag — a networked
-      PUT over a prior `NAME.cbk` logs which partitions are unchanged / changed and
-      whether the boot chain differs (`src/remote/manifest.rs` diff +
-      `server.rs::compare_to_prior_cbk`). Remaining: the **streaming-skip**
-      optimization (per-partition fingerprints in the PUT → daemon skip-map →
-      cb-dos skips unchanged partitions → host copies them from the prior `.cbk`).
+- [x] **7h — Incremental backup. Done — qemu-verified (2026-06-25).** Two parts.
+      **7h(a):** host-side change detection + the §5d bootability-change flag — a
+      networked PUT over a prior `NAME.cbk` logs which partitions are unchanged /
+      changed and whether the boot chain differs (`src/remote/manifest.rs` diff +
+      `server.rs::compare_to_prior_cbk`). **7h(b):** **opt-in whole-disk skip**
+      (`/INCREMENTAL`) — if the §4 disk fingerprint matches the prior backup's
+      (recorded in a `<name>.fp` sidecar), the daemon replies *skip* in the RBKR
+      reply and cb-dos sends nothing; the prior `.cbk` stands. Opt-in, so a §4c
+      fingerprint false-negative can never silently drop a real change. *(Optional
+      refinement: per-partition skip — per-partition fingerprints → a partition
+      skip-map → copy unchanged partition members from the prior `.cbk` — for
+      multi-partition disks where only some partitions change.)*
 - [~] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
       **Desktop swap parity DONE (§6e, 2026-06-25)** — the Rust backup now Level-1
       excludes swap too (`--keep-swap` / GUI checkbox). Remaining: Level-2 dealloc
@@ -763,6 +767,27 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7h(b) — opt-in incremental whole-disk skip, qemu-verified.**
+  The streaming-skip half of incremental: a networked backup of an unchanged disk
+  now **skips the whole transfer** instead of re-imaging it. Opt-in via
+  `/INCREMENTAL` (without it, every backup is full — safe by default), so a §4c
+  fingerprint false-negative can never silently drop a real change. **Wire:** the
+  PUT header gains a flags byte (bit0 = incremental requested) and the daemon's
+  RBKR resume-map reply gains a flags byte (bit0 = skip). On an incremental PUT,
+  if the daemon holds a prior `NAME.cbk` **and** a recorded fingerprint sidecar
+  (`<name>.fp`) equal to the new header fingerprint **and** no partial staging is
+  in flight, it replies skip=1 + the result frame and returns; cb-dos
+  (`cbnet_skip()` → `cbnet_finish`) sends no members and the prior `.cbk` stands.
+  The daemon writes `<name>.fp` on every completed PUT. Reuses the existing §4
+  disk-wide fingerprint as the gate (per-partition skip is a later refinement).
+  cb-dos: `cbnet_start(...,incremental)`, `cmd_netbackup` short-circuit,
+  `/INCREMENTAL` parsed in `cmd_backup` (rb:// only). **Verified on FreeDOS/qemu:**
+  three `/INCREMENTAL` backups of one disk — boot 1 (no prior) full PUT + writes
+  `MYDISK.fp`; boot 2 (unchanged) logs *"source unchanged … skipping, prior
+  MYDISK.cbk stands"* and streams **nothing**; boot 3 (after adding `SECOND.TXT`)
+  the fingerprint differs → full PUT. Protocol round-trip unit tests (PUT
+  incremental flag, RBKR skip flag) + family_b loopback + clippy
+  (incl. `--features remote`) green; cb-dos builds clean. **7h complete.**
 - 2026-06-25 — **Phase 7h(a) — host-side incremental change detection, qemu-verified.**
   First slice of incremental (§5b/§5d): when a networked PUT arrives for a NAME that
   already has a `NAME.cbk`, the daemon diffs the freshly staged `manifest-N.json`

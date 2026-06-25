@@ -63,8 +63,8 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
   - [x] 7b chunk wire protocol  - [x] 7c block-level backup over wire
   - [x] 7d resume (journal + fingerprint)  - [x] 7e restore over wire
   - [x] 7f manifest + idempotency  - [x] 7g boot hashes + swap exclusion
-  - [~] 7h incremental backup *(detection + bootability flag DONE; streaming-skip remains)*
-  - [~] 7i level-2 swap dealloc + desktop swap parity *(desktop parity DONE; level-2 + CHD swap remain)*
+  - [x] 7h incremental backup *(detection + bootability flag + opt-in whole-disk skip /INCREMENTAL; per-partition skip = optional refinement)*
+  - [~] 7i level-2 swap dealloc + desktop swap parity *(desktop parity + CHD swap DONE; level-2 dealloc deferred per §6c)*
 
 - [ ] **Real-486 hardware validation.** Everything so far is qemu/emulator. Run
   the full matrix (backup / restore / clone / browse, FAT + NTFS,
