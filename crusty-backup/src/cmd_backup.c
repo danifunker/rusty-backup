@@ -103,6 +103,11 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
     gzFile gz = gzopen(path, "wb6");
     if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(fat); return -1; }
 
+    progress_t pr;
+    char lbl[40];
+    sprintf(lbl, "part %d (%s)", index, part_type_name(type_byte));
+    progress_begin(&pr, lbl, (uint64_t)imaged_secs * 512);
+
     uint8_t buf[XFER_BYTES];
     uint32_t s = 0;
     int rc = 0;
@@ -126,9 +131,11 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
             rc = -1; break;
         }
         s += n;
+        progress_update(&pr, (uint64_t)s * 512);
     }
     gzclose(gz);
     free(fat);
+    progress_finish(&pr);
     if (rc != 0) return rc;
 
     gz_crc_sidecar(dest, pm);
@@ -185,6 +192,11 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
     gzFile gz = gzopen(path, "wb6");
     if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(bm); return -1; }
 
+    progress_t pr;
+    char lbl[40];
+    sprintf(lbl, "part %d (NTFS)", index);
+    progress_begin(&pr, lbl, part_sectors * 512ULL);
+
     uint8_t buf[XFER_BYTES];
     uint64_t s = 0;
     int rc = 0;
@@ -205,9 +217,11 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
             rc = -1; break;
         }
         s += n;
+        progress_update(&pr, s * 512ULL);
     }
     gzclose(gz);
     free(bm);
+    progress_finish(&pr);
     if (rc != 0) return rc;
 
     gz_crc_sidecar(dest, pm);

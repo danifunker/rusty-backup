@@ -80,6 +80,9 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
     gzFile gz = gzopen(path, "rb");
     if (!gz) { printf("  cannot open %s\n", path); return -1; }
 
+    progress_t pr;
+    progress_begin(&pr, gzname, window_bytes);
+
     uint8_t acc[XFER_BYTES];
     int acc_len = 0;
     uint64_t written = 0;
@@ -101,6 +104,7 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
             int rem = acc_len - full * 512;
             if (rem) memmove(acc, acc + full * 512, rem);
             acc_len = rem;
+            progress_update(&pr, written);
         }
         if (n == 0) break;
     }
@@ -110,7 +114,7 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
             written += 512;
     }
     gzclose(gz);
-    if (rc != 0) return rc;
+    if (rc != 0) { progress_finish(&pr); return rc; }
 
     if (written < window_bytes) {
         memset(acc, 0, XFER_BYTES);
@@ -120,8 +124,11 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
             if (secs < 1) break;
             if (write_lba(di, drive, start_lba + written / 512, secs, acc) != 0) break;
             written += (uint64_t)secs * 512;
+            progress_update(&pr, written);
         }
     }
+    progress_update(&pr, window_bytes);
+    progress_finish(&pr);
     return 0;
 }
 

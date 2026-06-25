@@ -22,7 +22,10 @@ enum { SZ_ORIGINAL, SZ_MINIMUM, SZ_ENTIRE, SZ_CUSTOM };
 static int clone_partition(const drive_info_t *sdi, int sdrive,
                            const drive_info_t *tdi, int tdrive,
                            uint64_t start_lba, uint64_t window_bytes,
-                           const fatlay_t *L, const uint8_t *fat, uint32_t imaged_secs) {
+                           const fatlay_t *L, const uint8_t *fat, uint32_t imaged_secs,
+                           const char *label) {
+    progress_t pr;
+    progress_begin(&pr, label, window_bytes);
     uint8_t buf[XFER_BYTES];
     uint32_t s = 0;
     while (s < imaged_secs) {
@@ -30,7 +33,7 @@ static int clone_partition(const drive_info_t *sdi, int sdrive,
         if (n > XFER_SECTORS) n = XFER_SECTORS;
         if (read_lba(sdi, sdrive, start_lba + s, n, buf) != 0) {
             printf("  clone: source read error at sector %lu\n", (unsigned long)s);
-            return -1;
+            progress_finish(&pr); return -1;
         }
         for (int j = 0; j < n; j++) {
             uint32_t rel = s + j;
@@ -42,9 +45,10 @@ static int clone_partition(const drive_info_t *sdi, int sdrive,
         }
         if (write_lba(tdi, tdrive, start_lba + s, n, buf) != 0) {
             printf("  clone: target write error at sector %lu\n", (unsigned long)s);
-            return -1;
+            progress_finish(&pr); return -1;
         }
         s += n;
+        progress_update(&pr, (uint64_t)s * 512);
     }
     memset(buf, 0, XFER_BYTES);
     uint64_t written = (uint64_t)imaged_secs * 512;
@@ -54,7 +58,10 @@ static int clone_partition(const drive_info_t *sdi, int sdrive,
         if (secs < 1) break;
         if (write_lba(tdi, tdrive, start_lba + written / 512, secs, buf) != 0) break;
         written += (uint64_t)secs * 512;
+        progress_update(&pr, written);
     }
+    progress_update(&pr, window_bytes);
+    progress_finish(&pr);
     return 0;
 }
 
@@ -64,7 +71,10 @@ static int clone_partition(const drive_info_t *sdi, int sdrive,
 static int clone_ntfs_partition(const drive_info_t *sdi, int sdrive,
                                 const drive_info_t *tdi, int tdrive,
                                 uint64_t start_lba, uint64_t win_sec,
-                                const ntfs_vol_t *v, const uint8_t *bm) {
+                                const ntfs_vol_t *v, const uint8_t *bm,
+                                const char *label) {
+    progress_t pr;
+    progress_begin(&pr, label, win_sec * 512ULL);
     uint8_t buf[XFER_BYTES];
     uint64_t s = 0;
     while (s < win_sec) {
@@ -72,7 +82,7 @@ static int clone_ntfs_partition(const drive_info_t *sdi, int sdrive,
         if (n > XFER_SECTORS) n = XFER_SECTORS;
         if (read_lba(sdi, sdrive, start_lba + s, n, buf) != 0) {
             printf("  clone: source read error at sector %lu\n", (unsigned long)s);
-            return -1;
+            progress_finish(&pr); return -1;
         }
         for (int j = 0; j < n; j++) {
             uint64_t lcn = (s + j) / v->sec_per_clus;
@@ -81,10 +91,13 @@ static int clone_ntfs_partition(const drive_info_t *sdi, int sdrive,
         }
         if (write_lba(tdi, tdrive, start_lba + s, n, buf) != 0) {
             printf("  clone: target write error at sector %lu\n", (unsigned long)s);
-            return -1;
+            progress_finish(&pr); return -1;
         }
         s += n;
+        progress_update(&pr, s * 512ULL);
     }
+    progress_update(&pr, win_sec * 512ULL);
+    progress_finish(&pr);
     return 0;
 }
 
@@ -212,7 +225,9 @@ int cmd_clone(int argc, char **argv) {
             }
             printf("  slot %d (NTFS) lba %lu: %lu KiB window (compacted)\n",
                    p->slot, (unsigned long)p->start, (unsigned long)(win * 512 / 1024));
-            if (clone_ntfs_partition(&sdi, sdrive, &tdi, tdrive, p->start, win, &nv, nbm) != 0) {
+            char nlbl[40];
+            sprintf(nlbl, "slot %d (NTFS)", p->slot);
+            if (clone_ntfs_partition(&sdi, sdrive, &tdi, tdrive, p->start, win, &nv, nbm, nlbl) != 0) {
                 free(nbm); xfer_free(); return 1;
             }
             free(nbm);
@@ -273,8 +288,10 @@ int cmd_clone(int argc, char **argv) {
                p->slot, L.fat_bits, (unsigned long)p->start,
                (unsigned long)((uint64_t)imaged_secs * 512 / 1024),
                (unsigned long)(win * 512 / 1024));
+        char flbl[40];
+        sprintf(flbl, "slot %d (FAT%d)", p->slot, L.fat_bits);
         if (clone_partition(&sdi, sdrive, &tdi, tdrive, p->start, win * 512ULL,
-                            &L, fat, imaged_secs) != 0) {
+                            &L, fat, imaged_secs, flbl) != 0) {
             free(fat); xfer_free(); return 1;
         }
         free(fat);

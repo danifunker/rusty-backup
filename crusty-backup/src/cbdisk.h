@@ -69,6 +69,26 @@ int  fat_resize(const drive_info_t *di, int drive, uint64_t part_lba,
 /* Set the FAT16/32 clean-shutdown flags in FAT[1] (each copy). FAT12 has none. */
 void set_clean_flags(const drive_info_t *di, int drive, uint64_t part_lba);
 
+/* ----- transfer progress (live %, speed, ETA on the console) -------- */
+
+/* A live one-line progress meter for a single partition's transfer. Updates in
+ * place with \r (percentage, transferred/total MiB, MiB/s, ETA) using the BIOS
+ * tick counter, throttled to a few updates a second. Suppressed when stdout is
+ * not a console (so redirected output keeps its clean per-partition summaries),
+ * so both the CLI and the TUI operation screen show it but pipes/files don't. */
+typedef struct {
+    uint64_t      total;        /* total bytes this transfer will move */
+    unsigned long start_tick;   /* BIOS tick at begin */
+    unsigned long last_tick;    /* last drawn tick (throttle) */
+    int           tty;          /* 1 if stdout is a console */
+    int           shown;        /* a line has been drawn (finish -> newline) */
+    char          label[40];
+} progress_t;
+
+void progress_begin(progress_t *p, const char *label, uint64_t total_bytes);
+void progress_update(progress_t *p, uint64_t done_bytes);   /* throttled redraw */
+void progress_finish(progress_t *p);                        /* terminate the line */
+
 /* ----- command-parser helpers --------------------------------------- */
 
 /* If arg begins with prefix (case-insensitive) return the rest, else NULL. */

@@ -691,6 +691,23 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Live transfer progress (%, speed, ETA) for backup/restore/clone.**
+  Until now the transfer loops printed nothing while running — just a per-partition
+  summary *after* each partition finished, so a multi-minute image looked frozen.
+  Added a shared progress meter to `cbdisk` (`progress_t` + `progress_begin`/
+  `progress_update`/`progress_finish`): a single `\r`-updated line showing percent,
+  transferred/total MiB, MiB/s, and ETA, computed from the BIOS tick counter
+  (`0040:006C`, ~18.2 Hz) and throttled to a few redraws a second. Because it lives
+  in the shared engine, all five streaming loops feed it — `backup_fat_partition`,
+  `backup_ntfs_partition`, `restore_partition`, `clone_partition`,
+  `clone_ntfs_partition` — so **CLI and TUI both** show it (the TUI runs the same
+  `cmd_*` on a plain console screen). It's gated on `isatty(stdout)`, so redirected
+  output keeps its clean per-partition summaries (and gotcha #3 is unaffected).
+  Example line: `  part 0 (NTFS):  83%  52.5 / 63.0 MiB  4.4 MiB/s  ETA 0:02`.
+  **Verified on real FreeDOS/qemu** by screendumping the console mid-operation: the
+  live line renders for **backup** and **restore** in the **CLI**, and for a
+  **backup** driven through the **TUI** (F2) operation screen — percent, MiB/s and
+  ETA all updating. `make crustybk` (+1.5 KB, no warnings).
 - 2026-06-25 — **Phase 4d — NTFS backup / restore / clone on DOS.** cb-dos images
   NTFS partitions now, closing the biggest FS gap (the spec scoped "NTFS + FAT16/32"
   from day one; the `$Bitmap` parser was proven in `disk_spike.c` but never wired

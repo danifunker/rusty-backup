@@ -9,9 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <dpmi.h>
 #include <go32.h>
 #include <sys/movedata.h>
+#include <sys/farptr.h>
 
 /* ----- DOS-memory transfer buffer ----------------------------------- */
 
@@ -43,6 +45,55 @@ void wr16(uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
 void wr32(uint8_t *p, uint32_t v) {
     p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF;
     p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+
+/* ----- transfer progress -------------------------------------------- */
+
+/* BIOS tick counter at 0040:006C (~18.2065 Hz, resets at midnight). */
+static unsigned long bios_ticks(void) { return _farpeekl(_dos_ds, 0x46c); }
+
+#define TICKS_PER_SEC 18.2065
+#define REDRAW_TICKS  4            /* ~0.22s between redraws -> a few per second */
+
+void progress_begin(progress_t *p, const char *label, uint64_t total_bytes) {
+    memset(p, 0, sizeof *p);
+    p->total = total_bytes;
+    p->start_tick = p->last_tick = bios_ticks();
+    p->tty = isatty(fileno(stdout));
+    strncpy(p->label, label, sizeof p->label - 1);
+}
+
+void progress_update(progress_t *p, uint64_t done) {
+    if (!p->tty) return;
+    unsigned long now = bios_ticks();
+    /* throttle, but never skip the final 100% frame */
+    if (p->shown && done < p->total && (now - p->last_tick) < REDRAW_TICKS) return;
+
+    double elapsed  = (now >= p->start_tick) ? (now - p->start_tick) / TICKS_PER_SEC : 0.0;
+    double done_mib = done / 1048576.0, total_mib = p->total / 1048576.0;
+    int pct = (p->total > 0) ? (int)((done * 100) / p->total) : 100;
+    if (pct > 100) pct = 100;
+
+    char buf[160];
+    if (elapsed > 0.3 && done > 0) {
+        double sp = done_mib / elapsed;                 /* MiB/s */
+        long eta = (sp > 0.001 && p->total > done)
+                 ? (long)((total_mib - done_mib) / sp + 0.5) : 0;
+        snprintf(buf, sizeof buf,
+                 "  %s: %3d%%  %.1f / %.1f MiB  %.1f MiB/s  ETA %ld:%02ld",
+                 p->label, pct, done_mib, total_mib, sp, eta / 60, eta % 60);
+    } else {
+        snprintf(buf, sizeof buf, "  %s: %3d%%  %.1f / %.1f MiB",
+                 p->label, pct, done_mib, total_mib);
+    }
+    printf("\r%-78s", buf);                             /* pad clears stale tail */
+    fflush(stdout);
+    p->last_tick = now;
+    p->shown = 1;
+}
+
+void progress_finish(progress_t *p) {
+    if (p->tty && p->shown) { printf("\n"); fflush(stdout); }
 }
 
 /* ----- drive geometry + sector I/O ---------------------------------- */
