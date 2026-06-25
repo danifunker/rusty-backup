@@ -7,11 +7,14 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-24)
 
-Branch **`cbdos`** (off `main`), 11 commits, all verified, tree clean (latest
+Branch **`cbdos`** (off `main`), 14 commits, all verified, tree clean (latest
 commit lands with this hand-off):
 
 ```
-(pending) feat(cb-dos): Phase 4 — per-partition selective backup/restore (/PARTS)
+(pending) feat(cb-dos): Phase 4b — direct disk-to-disk clone (cbclone)
+7a8830d docs(cb-dos): mark desktop --partitions off-by-one resolved in resume next-work
+37b9b70 fix(cli): make backup --partitions actually 1-based (first partition selectable)
+3109e50 feat(cb-dos): Phase 4 — per-partition selective backup/restore (/PARTS)
 028b3c1 feat(cb-dos): on-DOS FAT resize in cbrestore — /SIZE entire/minimum/custom
 ec66eef fix(cb-dos): root-cause + fix the CWSDPMI termination hang (DAP buffer overrun)
 61dfb64 fix(cbk): make PathBuf import unconditional so no-chd builds compile
@@ -34,14 +37,18 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
 | **Phase 3 resize** — `cbrestore /SIZE` | bidirectional FAT16/32 resize on DOS (entire/minimum/custom); grow+shrink verified on FreeDOS/qemu |
 | **Phase 4** — `/PARTS:i,j` selective | per-partition backup *and* restore (0-based MBR slot indices); verified on a 2-partition disk on FreeDOS/qemu |
+| **Phase 4b** — `cbclone` (DOS) | direct disk-to-disk clone, no staging file; compact + `/SIZE` resize + `/PARTS`; verified grow/shrink/subset on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Phase 4b — direct disk-to-disk clone** (source → on-the-fly compact/resize →
-   target disk, no intermediate file). Reuses the `cbbackup` engine. *Recommended
-   next.*
+1. **`cbdisk.{h,c}` extraction (refactor — now well-motivated).** cbbackup,
+   cbrestore, and cbclone now carry **three copies** of the same int13h / FAT /
+   resize primitives (~400 lines each). Lift the shared engine into
+   `crusty-backup/src/cbdisk.{h,c}` and link all three. Re-verify each in qemu
+   after (the primitives are identical, so this is mechanical but touches proven
+   code). Do this before Phase 5 adds a fourth consumer.
 2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
@@ -84,9 +91,14 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
   `/CUSTOM:<bytes>`): `fat_resize` (bidirectional, the C port of
   `resize_fat_in_place`), `shift_region_forward`/`_backward`, `compute_fat_sectors`,
   `max_fat_window`/`min_fat_window` (cluster cap/floor), `set_clean_flags`,
-  `reset_fsinfo`, AH=48h `drive_total_sectors`. `disk_spike.c` — disk/FS spike.
-  `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
-- `Makefile` targets: `make backup` / `restore` / `net` / `all` / `size`.
+  `reset_fsinfo`, AH=48h `drive_total_sectors`. `cbclone.c` (`CBCLONE.EXE`) —
+  **direct disk-to-disk clone** (Phase 4b): cbbackup's read+compaction fused with
+  cbrestore's write+resize, **no zlib**, no staging file; same `/SIZE` + `/PARTS`
+  grammar (`CBCLONE <src-hex> <tgt-hex> /Y [...]`). `disk_spike.c` — disk/FS
+  spike. `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API
+  probe. (cbbackup/cbrestore/cbclone share ~400 lines of inline primitives — a
+  `cbdisk.{h,c}` lift is pending; see next-work #1.)
+- `Makefile` targets: `make backup` / `restore` / `clone` / `net` / `all` / `size`.
 - `deps/fetch-zlib.sh`, `net/fetch-watt32.sh` — cross-built deps (gitignored).
 
 ## Build + unit test
@@ -94,7 +106,7 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
 ```bash
 cargo build --bin rb-cli          # desktop CLI
 cargo test --lib                  # 2086 tests; clippy --all-targets -D warnings via pre-commit
-make -C crusty-backup backup restore net all   # DOS .exes -> crusty-backup/build/
+make -C crusty-backup backup restore clone net all   # DOS .exes -> crusty-backup/build/
 ```
 
 ## The qemu test rig (the scratch harnesses are EPHEMERAL — rebuild as below)
@@ -148,6 +160,13 @@ folder (gz is pre-minimized → ORIGINAL/ENTIRE grow it). Pull each target with
 `mcopy -i tgt.img@@1048576 ::/FILE out` and diff checksums; the desktop's
 `rb-cli ls tgt.img@1` is a good independent FAT-reader cross-check. **Don't
 redirect `cbbackup`** when making the folder (gotcha #3 corrupts `mbr.bin`).
+
+**Clone tests** (`cbclone`, no staging file): attach the **source** as one drive
+and a blank **target** as another (e.g. source `index=1`/`0x81`, target
+`index=2`/`0x82`), then `CBCLONE 81 82 /Y [/SIZE:mode] [/PARTS:i,j]`. cbclone
+writes nothing to DOS files, so **redirecting its stdout is safe** (unlike
+cbbackup) — `CBCLONE 81 82 /Y /SIZE:ENTIRE > C:\OUT.TXT`. Verify the target the
+same way (`mcopy ... tgt.img@@1048576`, `rb-cli ls`). It refuses `src == tgt`.
 
 ## Gotchas learned the hard way (do not relearn these)
 

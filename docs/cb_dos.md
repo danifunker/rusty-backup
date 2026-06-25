@@ -566,9 +566,23 @@ over the wire now.
       multi-partition `metadata.json` parse bug uncovered here: `index` was read
       via `u64_after(idx,"index")`, which grabbed the *next* partition's index and
       swapped them (harmless while every backup had one partition).
-- [ ] **Phase 4b — Direct disk-to-disk clone mode (DOS).** Source → on-the-fly
-      compact/resize → target disk, no intermediate file (see §2e). Reuses the
-      backup engine.
+- [x] **Phase 4b — Direct disk-to-disk clone mode (DOS). DONE (2026-06-24).**
+      `crusty-backup/src/cbclone.c` (`CBCLONE.EXE`) clones one FAT disk straight
+      onto another with **no intermediate `.gz` folder**: read source (int13h) ->
+      smart-compact each partition on the fly (zero free clusters) -> write
+      directly to the target, optionally resizing. It is cbbackup's read+compaction
+      engine fused with cbrestore's write+resize engine, minus the gzip/file layer
+      (so **no zlib** — `make clone`, ~101 KB). Same `/SIZE:ORIGINAL|MINIMUM|ENTIRE
+      |CUSTOM` + `/PARTS:i,j` grammar; refuses to clone a disk onto itself; `/Y`
+      gates the destructive write; source is read-only. `CBCLONE <src-hex>
+      <tgt-hex> /Y [...]`. Verified on real FreeDOS/qemu across every mode
+      (single- and 2-partition sources, target disks of different sizes): ORIGINAL
+      (compacted same-size copy of both partitions), ENTIRE (grow capped at the
+      FAT16 cluster limit), MINIMUM (251->16 spf backward-shift to the FAT16
+      floor), and `/PARTS:1` (only the selected slot) — every file intact
+      (incl. a 100 KB blob) under both mtools and the desktop's FAT reader.
+      Note: three tools now carry the same inline disk/FAT/resize primitives — a
+      `cbdisk.{h,c}` extraction is now well-motivated.
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -599,6 +613,30 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 4b — direct disk-to-disk clone on DOS.** New
+  `crusty-backup/src/cbclone.c` (`CBCLONE.EXE`): clones a FAT disk straight onto
+  a second disk with **no intermediate file** — read source via int13h,
+  smart-compact each partition on the fly (zero the free clusters), write
+  directly to the target, optionally resizing the filesystem. It's literally
+  cbbackup's read+compaction engine fused with cbrestore's write+resize engine
+  minus the gzip/file layer, so it needs **no zlib** (`make clone`, ~101 KB,
+  builds via the generic Makefile rule). Same `/SIZE` + `/PARTS` grammar as
+  cbrestore; `CBCLONE <src-hex> <tgt-hex> /Y [/SIZE:mode] [/CUSTOM:bytes]
+  [/PARTS:i,j]`. Refuses to clone a disk onto itself, source is read-only, `/Y`
+  gates the destructive target write. The target *is* the destination, so this
+  sidesteps the "where do I stage the backup?" problem entirely (boot from a
+  floppy/Gotek, source on one IDE channel, target on the other). **Verified on
+  real FreeDOS/qemu** across every mode: ORIGINAL (compacted same-size copy of a
+  2-partition disk — both slots' files intact), ENTIRE (grow to fill a 96 MB
+  target, capped at the FAT16 cluster ceiling 129024->131593), MINIMUM (shrink a
+  64 MB source to the FAT16 floor, spf 251->16 backward shift), and `/PARTS:1`
+  (clone only slot 1, slot 0 left blank) — every file (incl. a 100 KB random
+  blob) reads back bit-identical under both mtools and the desktop's own FAT
+  driver, with no `.gz` ever written. cbclone redirects safely (it writes nothing
+  to DOS files, unlike cbbackup — gotcha #3). **Observation:** three tools now
+  duplicate the same ~400 lines of int13h / FAT / resize primitives — a
+  `cbdisk.{h,c}` lift is now clearly worth doing. **Next:** lazy `.cbk` reader
+  (perf) or Phase 5 (boot-aware defrag).
 - 2026-06-24 — **Phase 4 — per-partition selective backup/restore on DOS.**
   Added `/PARTS:i,j` to **both** `cbbackup` (image only the listed MBR slots) and
   `cbrestore` (restore only the listed indices); default stays "all". Indices are

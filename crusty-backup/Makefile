@@ -58,6 +58,10 @@ ZLIBLIB := $(ZLIB)/lib
 backup: $(BUILD)/cbbackup.exe
 restore: $(BUILD)/cbrestore.exe
 
+# Direct disk-to-disk clone (Phase 4b). No zlib -- there is no intermediate
+# file, so it builds via the generic pattern rule above.
+clone: $(BUILD)/cbclone.exe
+
 $(BUILD)/cbbackup.exe: src/cbbackup.c | $(BUILD)
 	@test -f $(ZLIBLIB)/libz.a || { \
 	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
@@ -71,4 +75,4 @@ $(BUILD)/cbrestore.exe: src/cbrestore.c | $(BUILD)
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all size net backup restore clean
+.PHONY: all size net backup restore clone clean
