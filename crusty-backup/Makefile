@@ -28,8 +28,9 @@ ZLIBLIB := $(ZLIB)/lib
 # static lib (gzip codec for backup/restore), cross-built separately and
 # gitignored -- run `sh deps/fetch-zlib.sh` once.
 CB_SRCS := src/crustybk.c src/cmd_backup.c src/cmd_restore.c src/cmd_clone.c \
-           src/cmd_inspect.c src/cmd_browse.c src/cbdisk.c src/cbntfs.c
-CB_HDRS := src/cbdisk.h src/cbbrowse.h src/cbntfs.h
+           src/cmd_inspect.c src/cmd_browse.c src/cbdisk.c src/cbntfs.c \
+           src/cbdefrag.c
+CB_HDRS := src/cbdisk.h src/cbbrowse.h src/cbntfs.h src/cbdefrag.h
 
 # Diagnostics POCs (no zlib): single-source, built by the generic rule below.
 DIAG := $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe

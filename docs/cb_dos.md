@@ -693,7 +693,28 @@ over the wire now.
       double-counted logicals + the container span and wrongly rejected same-size
       extended restores (`src/restore/mod.rs`). `make crustybk`. Remaining FS gaps:
       exFAT (spike-proven bitmap), ext2/3 (stretch).
-- [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
+- [x] **Phase 5 — File-level repack/defrag (Phase B), boot-file aware. DONE
+      (2026-06-25).** `backup /DEFRAG` relocates a FAT12/16/32 volume's files +
+      directories into contiguous runs packed to the front of the data area before
+      imaging, so the emitted `partition-N.gz` is a defragmented (and far smaller
+      `imaged_size`) copy in the same format. New `cbdefrag.{h,c}` walks the dir
+      tree **read-only** on the source, assigns new contiguous cluster numbers
+      (boot files `IO.SYS`/`MSDOS.SYS`/`IBMBIO.COM`/`IBMDOS.COM`/`KERNEL.SYS`
+      pinned first for the `SYS` rule), builds a fresh FAT, and streams the
+      relocated image to gzip — directory entries (incl. `.`/`..`) repointed
+      through the relocation map, LFN entries riding along verbatim, FAT32 root
+      moved to cluster 2 + FSInfo invalidated. Conservative: a not-provably-clean
+      FS (lost/bad/cross-linked clusters, OOM) **declines** before writing a gzip
+      byte and the volume images with the ordinary compaction path. The source is
+      never written, so a defrag bug can only yield a bad backup, never corrupt the
+      source. **Verified on real FreeDOS/qemu:** FAT16 `imaged_size` 25.2 MB → 1.2 MB
+      and FAT32 72.7 MB → 2.7 MB, every file byte-identical under **both** the
+      desktop `rb-cli restore` and cb-dos's own on-DOS restore, every file
+      contiguous with the boot file at cluster 2 (FAT16 `..`=0, FAT32 `..`=root);
+      a real SYS'd bootable FreeDOS disk, defragged + restored, **boots standalone**
+      (its AUTOEXEC writes the marker → BIOS→MBR→VBR→KERNEL.SYS→COMMAND.COM ran);
+      and a disk seeded with a lost cluster correctly **declined** to plain
+      compaction (no data loss). `make crustybk` (+5.6 KB).
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
 - [ ] **Phase 7 (deferred)** — built-in network transport (host + DOS client,
@@ -723,6 +744,38 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 5 — boot-aware FAT file-level defrag (`backup /DEFRAG`).**
+  Until now backup compacted only by *zeroing* free clusters (gzip crushes them),
+  but a fragmented disk with one used cluster near the end still imaged the whole
+  partition window. `/DEFRAG` adds a true repack: new `cbdefrag.{h,c}` walks the
+  FAT dir tree **read-only** on the source, assigns each file + subdir a contiguous
+  run of new cluster numbers (boot files `IO.SYS`/`MSDOS.SYS`/`IBMBIO.COM`/
+  `IBMDOS.COM`/`KERNEL.SYS` pinned first so the disk still boots — the `SYS` rule),
+  builds a fresh FAT, and streams the relocated image straight to gzip: reserved
+  sectors verbatim (FAT32 BPB root-cluster repointed to 2 + FSInfo invalidated),
+  the new FAT(s), the FAT12/16 root region, then the data area object-by-object in
+  new-cluster order. Directory entries — including each subdir's `.`/`..` links —
+  are rewritten through the relocation map; LFN entries carry no cluster and ride
+  along verbatim; deleted (0xE5) slots are preserved. It's deliberately
+  conservative: a not-provably-clean FS (lost/bad/cross-linked clusters, an
+  unreadable dir, or OOM) makes it **decline** *before writing a gzip byte*, and
+  the volume images with the ordinary compaction path — so the fallback is
+  seamless. The source disk is never written, so a defrag bug can only yield a bad
+  backup (caught by verification), never corrupt the source. Wired as a `/DEFRAG`
+  flag on `cmd_backup` (FAT only; NTFS images as before). **Verified on real
+  FreeDOS/qemu**: a fragmented FAT16 (`TAIL.BIN` parked ~24 MB in) imaged
+  **25.2 MB → 1.2 MB** and an 80 MB FAT32 (`TAIL32.BIN` ~70 MB in) **72.7 MB →
+  2.7 MB**; **every file byte-identical** under *both* the desktop `rb-cli restore`
+  and cb-dos's own on-DOS `RESTORE`; an independent FAT reader confirmed every file
+  contiguous, the boot file at cluster 2, `..`=0 on FAT16 vs `..`=root(2) on FAT32,
+  and FSInfo reset; a genuinely bootable FreeDOS disk (made with the real `SYS`),
+  defragged + restored, **boots standalone** in qemu (its AUTOEXEC wrote the
+  `IBOOTED.TXT` marker → BIOS→MBR→VBR→KERNEL.SYS→COMMAND.COM all ran) with
+  KERNEL.SYS/COMMAND.COM byte-identical; and a disk seeded with a lost cluster
+  correctly **declined** to plain compaction (imaged 30 MB, not the ~1.2 MB a wrong
+  engage would give by dropping the lost chain — no data loss). `make crustybk`
+  (+5.6 KB, no warnings). **Next:** `clone /DEFRAG` (the "and maybe clone" half),
+  Phase 6 (LZ4), or Net 7b.
 - 2026-06-25 — **Lazy `.cbk` reader (desktop perf).** Reading a `.cbk` as a disk
   used to materialize every member + reconstruct the whole disk into a tempfile at
   open (O(whole disk), slow for multi-GB even when a consumer reads a few KB). New

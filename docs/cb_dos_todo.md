@@ -11,17 +11,23 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
 
 ## Now (priority order)
 
-- [ ] **Phase 5 — file-level repack/defrag (FAT, boot-aware).** Reorder files
-  contiguously inside the emitted partition before zeroing the now-contiguous free
-  tail → a defragmented `partition-N.gz` (same format, just packed). Optional
-  mode; ships after the round-trip is proven (it is).
-  - [ ] Walk the FAT dir tree + cluster chains (reuse `cbbrowse.h`'s FAT reader).
-  - [ ] Compute a packed layout; keep `IO.SYS` / `MSDOS.SYS` **first + contiguous**
-        at the data-area start (the `SYS`-command rule) so the disk still boots.
-  - [ ] Rewrite FAT + dir entries + relocate clusters into the output image.
-  - [ ] Expose it as a `/DEFRAG` flag on `backup` (and maybe `clone`).
-  - **Done when:** defrag a fragmented FAT disk on qemu → boots, every file
-    byte-identical, `.gz` smaller; desktop restore agrees.
+- [x] **Phase 5 — file-level repack/defrag (FAT, boot-aware). DONE (2026-06-25).**
+  `backup /DEFRAG` reorders files contiguously inside the emitted partition → a
+  defragmented `partition-N.gz` (same format, just packed). New `cbdefrag.{h,c}`.
+  - [x] Walk the FAT dir tree + cluster chains (own read-only walk over the
+        `cbdisk` FAT primitives; LFN + deleted-slot safe).
+  - [x] Compute a packed layout; keep `IO.SYS` / `MSDOS.SYS` / `IBMBIO.COM` /
+        `IBMDOS.COM` / `KERNEL.SYS` **first + contiguous** at the data-area start
+        (the `SYS`-command rule) so the disk still boots.
+  - [x] Rewrite FAT + dir entries (incl. `.` / `..`) + relocate clusters into the
+        gzip stream; FAT32 root repointed to cluster 2 + FSInfo invalidated.
+  - [x] Expose it as a `/DEFRAG` flag on `backup`. (`clone /DEFRAG` is a deferred
+        follow-up — see *Later / optional*.)
+  - **Done when (all met on real FreeDOS/qemu):** FAT16 imaged 25.2 MB → 1.2 MB
+    and FAT32 72.7 MB → 2.7 MB; **every file byte-identical** (desktop *and*
+    on-DOS cb-dos restore); a SYS'd bootable FreeDOS disk defragged + restored
+    **boots** (AUTOEXEC marker written); an unclean FS (lost cluster) **declines**
+    to plain compaction (no data loss).
 
 - [ ] **Phase 6 — LZ4 codec** (faster on slow CPUs; gzip stays the default).
   - [ ] Desktop: `CompressionType::Lz4` + `src/rbformats/lz4.rs` (mirror
@@ -52,6 +58,13 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
 
 ## Later / optional
 
+- [ ] **`clone /DEFRAG`** — wire the cbdefrag planner into `clone` too (emit the
+  relocated image straight to the target disk instead of gzip; share the planner
+  via a write-sink). Same-size only at first (defrag + `/SIZE` resize is a later
+  combo). `backup /DEFRAG` shipped; this is the remaining "and maybe clone" half.
+- [ ] **Desktop defrag parity** — the desktop backup could optionally repack FAT
+  partitions the same way (it already has the FAT machinery). Not in the cb-dos
+  scope; a separate GUI/CLI feature if wanted.
 - [ ] **Lazy-reader follow-up — packer re-chunking** for intra-partition random
   access: re-chunk `pack_folder_to_cbk` into ~1–4 MB source-span gzip members so a
   deep seek decompresses only its chunk. Not "free" — it re-frames
@@ -69,6 +82,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
 
 ## Done
 
-Phases 1–4e, live progress, the lazy `.cbk` reader, and the FreeDOS floppy + CD in
-CI are all shipped and qemu-verified — see the "done & proven" table in
-[`cb_dos_resume.md`](cb_dos_resume.md) and the progress log in [`cb_dos.md`](cb_dos.md).
+Phases 1–4e, live progress, the lazy `.cbk` reader, the FreeDOS floppy + CD in CI,
+and **Phase 5 (boot-aware FAT defrag, `backup /DEFRAG`)** are all shipped and
+qemu-verified — see the "done & proven" table in [`cb_dos_resume.md`](cb_dos_resume.md)
+and the progress log in [`cb_dos.md`](cb_dos.md).

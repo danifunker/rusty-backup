@@ -9,6 +9,7 @@
 
 #include "cbdisk.h"
 #include "cbntfs.h"
+#include "cbdefrag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,11 +74,15 @@ static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
     if (cf) { fprintf(cf, "%s", pm->crc_hex); fclose(cf); }
 }
 
-/* Smart-compact + gzip a FAT partition into <dest>/partition-N.gz, fill `pm`. */
+/* Smart-compact + gzip a FAT partition into <dest>/partition-N.gz, fill `pm`.
+ * When `defrag` is set, the volume's files are first relocated into contiguous
+ * runs (boot-file aware) via cbdefrag; if that path declines (an unclean FS, or
+ * out of memory) it falls back to the plain last-used-cluster compaction, with
+ * the gzip stream untouched up to that point. */
 static int backup_fat_partition(const drive_info_t *di, int drive,
                                 const char *dest, int index, uint8_t type_byte,
                                 uint64_t start_lba, uint64_t part_sectors,
-                                part_meta_t *pm) {
+                                int defrag, part_meta_t *pm) {
     uint8_t vbr[512];
     if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
         printf("  part %d: VBR read failed\n", index);
@@ -96,17 +101,14 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
     uint32_t last_used = 0;
     for (uint32_t n = 2; n < L.clusters + 2; n++)
         if (fat_entry(fat, L.fat_bits, n) != 0) last_used = n;
-    uint32_t imaged_secs = (last_used >= 2)
+    uint32_t norm_imaged = (last_used >= 2)
         ? L.first_data_sec + (last_used - 1) * L.spc : L.first_data_sec;
-    if (imaged_secs > L.old_total) imaged_secs = L.old_total;
+    if (norm_imaged > L.old_total) norm_imaged = L.old_total;
 
     pm->index = index;
     pm->type_byte = type_byte;
     pm->start_lba = start_lba;
     pm->original_size = part_sectors * 512ULL;
-    pm->imaged_size = (uint64_t)imaged_secs * L.bps;
-    pm->minimum_size = pm->imaged_size;
-    pm->compacted = (imaged_secs < part_sectors) ? 1 : 0;
     sprintf(pm->gz_name, "partition-%d.gz", index);
 
     char path[160];
@@ -117,44 +119,61 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
     progress_t pr;
     char lbl[40];
     sprintf(lbl, "part %d (%s)", index, part_type_name(type_byte));
-    progress_begin(&pr, lbl, (uint64_t)imaged_secs * 512);
 
-    uint8_t buf[XFER_BYTES];
-    uint32_t s = 0;
-    int rc = 0;
-    while (s < imaged_secs) {
-        int n = (int)(imaged_secs - s);
-        if (n > XFER_SECTORS) n = XFER_SECTORS;
-        if (read_lba(di, drive, start_lba + s, n, buf) != 0) {
-            printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
-            rc = -1; break;
-        }
-        for (int j = 0; j < n; j++) {
-            uint32_t rel = s + j;
-            if (rel >= L.first_data_sec) {
-                uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
-                if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
-                    memset(buf + j * 512, 0, 512);
-            }
-        }
-        if (gzwrite(gz, buf, n * 512) != n * 512) {
-            printf("  part %d: gzwrite failed\n", index);
-            rc = -1; break;
-        }
-        s += n;
-        progress_update(&pr, (uint64_t)s * 512);
+    uint32_t imaged_secs = norm_imaged;
+    int used_defrag = 0, rc = 0;
+
+    if (defrag) {
+        uint32_t ds;
+        int dr = defrag_backup_fat(di, drive, start_lba, &L, fat, gz, lbl, &pr, &ds);
+        if (dr < 0) { gzclose(gz); free(fat); printf("  part %d: defrag emit failed\n", index); return -1; }
+        if (dr == 0) { imaged_secs = ds; used_defrag = 1; }
+        /* dr == 1: declined; gz is still empty -- fall through to plain compaction */
     }
+
+    if (!used_defrag) {
+        progress_begin(&pr, lbl, (uint64_t)norm_imaged * 512);
+        uint8_t buf[XFER_BYTES];
+        uint32_t s = 0;
+        while (s < norm_imaged) {
+            int n = (int)(norm_imaged - s);
+            if (n > XFER_SECTORS) n = XFER_SECTORS;
+            if (read_lba(di, drive, start_lba + s, n, buf) != 0) {
+                printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
+                rc = -1; break;
+            }
+            for (int j = 0; j < n; j++) {
+                uint32_t rel = s + j;
+                if (rel >= L.first_data_sec) {
+                    uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
+                    if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
+                        memset(buf + j * 512, 0, 512);
+                }
+            }
+            if (gzwrite(gz, buf, n * 512) != n * 512) {
+                printf("  part %d: gzwrite failed\n", index);
+                rc = -1; break;
+            }
+            s += n;
+            progress_update(&pr, (uint64_t)s * 512);
+        }
+        progress_finish(&pr);
+    }
+
     gzclose(gz);
     free(fat);
-    progress_finish(&pr);
     if (rc != 0) return rc;
+
+    pm->imaged_size = (uint64_t)imaged_secs * L.bps;
+    pm->minimum_size = pm->imaged_size;
+    pm->compacted = (imaged_secs < part_sectors) ? 1 : 0;
 
     gz_crc_sidecar(dest, pm);
 
-    printf("  part %d (%s): imaged %lu KiB -> %s, crc %s%s\n",
+    printf("  part %d (%s): imaged %lu KiB -> %s, crc %s%s%s\n",
            index, part_type_name(type_byte),
            (unsigned long)(pm->imaged_size / 1024), pm->gz_name, pm->crc_hex,
-           pm->compacted ? " [compacted]" : "");
+           used_defrag ? " [defragged]" : "", pm->compacted ? " [compacted]" : "");
     return 0;
 }
 
@@ -318,22 +337,27 @@ static void write_metadata(const char *dest, const char *src_label,
 int cmd_backup(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
-        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j]\n");
+        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j] [/DEFRAG]\n");
         printf("  e.g. CRUSTYBK backup A:\\BK 80           image every FAT/NTFS partition\n");
         printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0  image only MBR slot 0\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG   repack FAT files contiguously\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
+        printf("  /DEFRAG relocates each FAT volume's files into contiguous runs\n");
+        printf("  (boot files first) before imaging -- smaller .gz, defragged restore.\n");
         return 2;
     }
 
     const char *dest = argv[1];
     int drive = 0x80, drive_set = 0;
-    unsigned sel_mask = 0; int has_filter = 0;
+    unsigned sel_mask = 0; int has_filter = 0, defrag = 0;
     for (int a = 2; a < argc; a++) {
         const char *v = switch_val(argv[a], "/PARTS:");
         if (v) {
             if (parse_parts(v, &sel_mask) != 0) { printf("bad /PARTS list\n"); return 2; }
             has_filter = 1;
+        } else if (eq_ci(argv[a], "/DEFRAG")) {
+            defrag = 1;
         } else if (!drive_set) {
             drive = (int)strtol(argv[a], NULL, 16);
             drive_set = 1;
@@ -349,6 +373,7 @@ int cmd_backup(int argc, char **argv) {
     printf("source drive 0x%02X: %u cyl %u head %u spt, LBA-ext=%s\n",
            drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
     if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
+    if (defrag) printf("defrag: FAT volumes will be repacked contiguously (boot-aware)\n");
 
     uint8_t mbr[512];
     if (read_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR read failed\n"); xfer_free(); return 1; }
@@ -399,7 +424,7 @@ int cmd_backup(int argc, char **argv) {
                 int lok;
                 if (is_fat_part_type(logs[j].type))
                     lok = backup_fat_partition(&di, drive, dest, lidx, logs[j].type,
-                                               logs[j].start_lba, logs[j].count, &parts[nparts]);
+                                               logs[j].start_lba, logs[j].count, defrag, &parts[nparts]);
                 else if (logs[j].type == 0x07)
                     lok = backup_ntfs_partition(&di, drive, dest, lidx, logs[j].type,
                                                 logs[j].start_lba, logs[j].count, &parts[nparts]);
@@ -418,7 +443,7 @@ int cmd_backup(int argc, char **argv) {
         }
         int ok;
         if (is_fat_part_type(type))
-            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]);
+            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, defrag, &parts[nparts]);
         else if (type == 0x07)
             ok = backup_ntfs_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]);
         else {
