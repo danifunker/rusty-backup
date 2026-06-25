@@ -763,6 +763,22 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Polish: `clone /DEFRAG` + lz4 browse.** Two completions of the
+  Phase 5/6 surface. **`clone /DEFRAG`:** refactored cbdefrag's emit to a *sink* so
+  one relocation engine serves both `backup` (sink = the compressed writer) and
+  `clone` (sink = the target disk), extracted a shared `defrag_plan_build`, and
+  added `defrag_clone_fat` — it reads the source read-only, relocates files into
+  contiguous runs (boot files pinned), writes straight to the target at the same
+  `start_lba` (same-size; MBR window unchanged), and zero-fills the free tail.
+  `cmd_clone` gained `/DEFRAG` on the primary + logical FAT paths (declines → plain
+  clone). Verified on qemu: a fragmented FAT16 cloned `/DEFRAG` is byte-identical +
+  defragged (IO.SYS at cluster 2, TAIL relocated). **lz4 browse:** `ls`/`get` now
+  read a `partition-N.lz4` backup — since LZ4 frames aren't seekable, the browse
+  engine's `vol_read_at` reaches an offset by decompressing forward (reopening on a
+  backward seek), O(off) like a gzseek rewind; `cbk_open_vol` prefers `.gz` and
+  falls back to `.lz4`. Verified on qemu: `ls` lists the tree and `get` extracts a
+  root file, an LFN file, and a deep 300 KB multi-cluster file from an lz4 backup,
+  all byte-identical. `make crustybk`.
 - 2026-06-25 — **Fix: `backup` mbr.bin corruption under stdout redirection.** The
   long-standing gotcha (redirecting `CRUSTYBK BACKUP`'s stdout to a same-drive file
   corrupted `mbr.bin`) is root-caused and fixed. Reproduced it, then bisected: the

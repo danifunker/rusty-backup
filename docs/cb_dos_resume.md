@@ -10,10 +10,13 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 38 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 42 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+6aa3eef feat(cb-dos): lz4 browse — ls/get from a partition-N.lz4 backup
+53ca69e feat(cb-dos): clone /DEFRAG — repack FAT volumes contiguously onto the target
+4c847ed fix(cb-dos): mbr.bin corruption under stdout redirection (_IONBF -> _IOLBF)
 a900b24 feat(cb-dos): Phase 6 — LZ4 codec on DOS (backup /CODEC:LZ4 + restore)
 9f036c8 feat(rbformats): LZ4 codec (Phase 6 desktop half) — CompressionType::Lz4
 23a74d9 feat(cb-dos): Phase 5 — boot-aware FAT file-level defrag (backup /DEFRAG)
@@ -61,8 +64,9 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4d** — NTFS (DOS) | `backup`/`clone` image NTFS (type 0x07) via `$Bitmap` compaction (`cbntfs.{h,c}`); restore same-size on DOS (resize via desktop `resize_ntfs_in_place`); verified on FreeDOS/qemu — 63 MB random-filled NTFS → 0.4 MB gz, restore + clone `ntfsfix`-clean with files byte-identical, desktop restore cross-checked |
 | **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
 | **Phase 4e** — extended/logical (DOS) | backup/restore/clone follow the **EBR chain** of an extended container (`walk_ebr_chain`/`write_ebr_chain` in `cbdisk`, ports of parse/build_ebr_chain); logicals (index 4+) imaged with `is_logical` + an `extended_container` block; same-size on DOS (resize via desktop); verified on FreeDOS/qemu — primary FAT16 + ext { FAT16, NTFS } round-trips byte-identical via cb-dos restore, cb-dos clone, **and** desktop restore (after fixing a desktop pre-flight double-count) |
-| **Phase 5** — FAT defrag (DOS) | `backup /DEFRAG` repacks a FAT12/16/32 volume's files+dirs into contiguous runs (boot files pinned first) before imaging (`cbdefrag.{h,c}`), read-only on the source; smaller `imaged_size`, defragged restore. Declines safely on an unclean FS. Verified on FreeDOS/qemu — FAT16 25.2→1.2 MB, FAT32 72.7→2.7 MB, byte-identical (desktop **and** on-DOS restore), a SYS'd bootable disk defragged+restored **boots**, lost-cluster disk declines (no data loss) |
-| **Phase 6** — LZ4 codec (both) | a second shared codec: desktop `rb-cli backup --format lz4` (`lz4_flex` frame, `src/rbformats/lz4.rs`) + DOS `CRUSTYBK backup /CODEC:LZ4` (liblz4 frame via `cbcodec.{h,c}`; restore auto-detects). Cheaper than gzip on a 486 at a lower ratio; gzip stays default. Standard LZ4 frame so members interchange. Verified on FreeDOS/qemu — byte-identical all three ways (DOS↔desktop, DOS↔DOS) + composes with `/DEFRAG`. Browse stays gzip-only (frames aren't seekable) |
+| **Phase 5** — FAT defrag (DOS) | `backup /DEFRAG` **and `clone /DEFRAG`** repack a FAT12/16/32 volume's files+dirs into contiguous runs (boot files pinned first) — read-only on the source; backup → smaller `imaged_size`, clone → defragged target (same-size), both via the shared `cbdefrag` planner (sink = compressed writer / target disk). Declines safely on an unclean FS. Verified on FreeDOS/qemu — backup FAT16 25.2→1.2 MB / FAT32 72.7→2.7 MB, byte-identical (desktop **and** on-DOS restore), a SYS'd bootable disk defragged+restored **boots**, lost-cluster disk declines; clone /DEFRAG byte-identical + defragged target |
+| **Phase 6** — LZ4 codec (both) | a second shared codec: desktop `rb-cli backup --format lz4` (`lz4_flex` frame, `src/rbformats/lz4.rs`) + DOS `CRUSTYBK backup /CODEC:LZ4` (liblz4 frame via `cbcodec.{h,c}`; restore auto-detects). Cheaper than gzip on a 486 at a lower ratio; gzip stays default. Standard LZ4 frame so members interchange. Verified on FreeDOS/qemu — byte-identical all three ways (DOS↔desktop, DOS↔DOS) + composes with `/DEFRAG`. **Browse** (`ls`/`get`) reads `.lz4` too (seek-by-decode) |
+| **Fix** — redirected backup | the long-standing "redirecting `BACKUP` corrupts `mbr.bin`" gotcha is fixed: `_IONBF`→`_IOLBF` in all `cmd_*`. Redirected `backup`/`get` verified clean on qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back; byte-identical test + `rb-cli`-verified |
 | **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
@@ -73,16 +77,16 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
-2. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
-3. **Real-486 hardware** validation (everything so far is qemu).
-4. **`clone /DEFRAG`** *(optional)* — the cbdefrag planner emits straight to the
-   target disk instead of gzip; the "and maybe clone" half of Phase 5.
-5. **lz4 browse** *(optional)* — `ls`/`get` from an `.lz4` backup (sequential
-   decompress to the offset, since LZ4 frames aren't seekable).
+1. **Net 7b–7i** — networked backup/restore (only 7a/handshake done). The local
+   foundation + the frozen `.cbk` are all in place; this is the next big phase.
+2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
+   fully set up.
+3. *(optional, bigger)* **Desktop defrag parity** (repack FAT on the desktop too),
+   **lazy-reader packer re-chunking** (source-span gzip members + recomputed CRC),
+   **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu entries).
 
-Dropped by decision: exFAT backup-source, ext2/3. Deferred: the lazy-reader
-packer re-chunking (re-frames `partition-N.gz`, needs a recomputed CRC).
+Done since the last refresh: the mbr.bin-under-redirection bug (fixed), `clone
+/DEFRAG`, and lz4 browse. Dropped by decision: exFAT backup-source, ext2/3.
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
@@ -129,13 +133,15 @@ subcommands for scripting), built from:
   `cbr_close`) over zlib `gzFile` (gzip) and liblz4 `LZ4F` streaming frame (lz4),
   with a fixed bounce buffer so any partition size streams. `cbr_read` mirrors
   `gzread`'s contract (bytes / 0 EOF / -1 err). Used by `cmd_backup` (`/CODEC:LZ4`),
-  `cbdefrag` (emit), and `cmd_restore` (codec auto-detected from the member ext).
-  Browse stays direct-zlib (gzip-only). liblz4 is cross-built by `deps/fetch-lz4.sh`.
+  `cbdefrag` (emit), `cmd_restore` (codec auto-detected from the member ext), and
+  `cmd_browse` (the lz4 read backend). liblz4 is cross-built by `deps/fetch-lz4.sh`.
 - `cbdefrag.{h,c}` — the **FAT file-level defragmenter** for `backup /DEFRAG`
-  (`defrag_backup_fat`). Walks the dir tree **read-only** on the source, assigns
-  each file/subdir a contiguous run of new clusters (boot files
+  (`defrag_backup_fat`) **and `clone /DEFRAG`** (`defrag_clone_fat`). A shared
+  `defrag_plan_build` + a sink-based emit (sink = the compressed writer for backup,
+  the target disk for clone). Walks the dir tree **read-only** on the source,
+  assigns each file/subdir a contiguous run of new clusters (boot files
   `IO.SYS`/`MSDOS.SYS`/`IBMBIO.COM`/`IBMDOS.COM`/`KERNEL.SYS` pinned first),
-  builds a fresh FAT, and streams the relocated image to gzip — dir entries
+  builds a fresh FAT, and streams the relocated image out — dir entries
   (incl. `.`/`..`) repointed via the relocation map, LFN entries verbatim, FAT32
   root → cluster 2 + FSInfo reset. **Declines** (returns 1, gz untouched) on a
   not-provably-clean FS (lost/bad/cross-linked clusters, OOM) → caller images
@@ -158,9 +164,11 @@ subcommands for scripting), built from:
   `ls` / `get` **and the shared browse engine** (`fatvol_t`, `cbk_open_vol`/
   `cbk_open_vol_live`/`cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a
   FAT12/16/32 directory reader with LFN reassembly + a file/tree extractor over a
-  single dispatched read primitive (`vol_read_at`) with **two backends** — a
-  backup `partition-N.gz` (`gzseek`) **or** a live FAT partition on a BIOS drive
-  (int13h `read_lba`); both finish through `vol_finish_open`. No scratch, no full
+  single dispatched read primitive (`vol_read_at`) with **three backends** — a
+  backup `partition-N.gz` (`gzseek`), a backup `partition-N.lz4` (seek by forward
+  decode, reopen on backward seek — frames aren't seekable), **or** a live FAT
+  partition on a BIOS drive (int13h `read_lba`); all finish through
+  `vol_finish_open`. `cbk_open_vol` prefers `.gz`, falls back to `.lz4`. No scratch, no full
   restore. CLI source is a backup folder or `@HH` (live drive 0xHH, `N`=MBR slot;
   `open_browse_src`/`live_part_lba`). Each command exposes `int cmd_X(argc,argv)`.
 - `crustybk.c` — `main()` dispatches the subcommands or launches the **text UI**
