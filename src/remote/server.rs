@@ -337,6 +337,28 @@ fn receive_put(
     let dest = cbk_dest_path(root, &hdr.name)?;
     let staging = staging_path_for(staging_dir, &hdr.name);
 
+    // Incremental whole-disk skip (Phase 7h, §5b): an opt-in client (`/INCREMENTAL`)
+    // whose §4 fingerprint equals the prior completed backup's is unchanged — tell
+    // it to skip the whole transfer; the prior `.cbk` stands. Opt-in, so a §4c
+    // fingerprint false-negative can never silently drop a real change. A partial
+    // staging in flight (a crash mid-transfer) blocks the skip — finish it first.
+    if hdr.incremental
+        && dest.exists()
+        && !staging.exists()
+        && read_prior_fingerprint(root, &hdr.name) == Some(hdr.fingerprint)
+    {
+        let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "rb-cli serve: PUT {:?} incremental — source unchanged (fingerprint {:#010x}); skipping, prior {} stands ({cbk_size} bytes)",
+            hdr.name,
+            hdr.fingerprint,
+            dest.display()
+        );
+        write_resume_map(writer, true, &[]).context("writing skip reply")?;
+        write_put_result(writer, 0, cbk_size)?;
+        return Ok(());
+    }
+
     // Load durable state, or discard it on a fingerprint mismatch (the source
     // disk changed since the partial transfer — splicing would corrupt §4b).
     let mut journal = match load_journal(&staging) {
@@ -377,7 +399,7 @@ fn receive_put(
             committed_chunks: m.committed_chunks,
         })
         .collect();
-    write_resume_map(writer, &entries).context("writing resume map")?;
+    write_resume_map(writer, false, &entries).context("writing resume map")?;
 
     eprintln!(
         "rb-cli serve: PUT {:?} ({} member{}) -> {}",
@@ -499,12 +521,43 @@ fn receive_put(
     std::fs::remove_dir_all(&staging).ok();
     let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
 
+    // Record this completed backup's fingerprint so a later `/INCREMENTAL` PUT of
+    // an unchanged disk can skip (§5b). Best-effort — a missing/stale sidecar just
+    // costs a full backup, never correctness (the skip also requires `.cbk` to
+    // exist and is opt-in). Written after the `.cbk` so the two stay consistent.
+    write_fingerprint(root, &hdr.name, hdr.fingerprint);
+
     eprintln!(
         "rb-cli serve: PUT complete -> {} ({cbk_size} bytes)",
         dest.display()
     );
     write_put_result(writer, 0, cbk_size)?;
     Ok(())
+}
+
+/// The per-container fingerprint sidecar path (`<root>/<name>.fp`), next to the
+/// `.cbk`. Reuses `cbk_dest_path`'s name sanitization.
+fn fingerprint_sidecar_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let cbk = cbk_dest_path(root, name).ok()?;
+    Some(cbk.with_extension("fp"))
+}
+
+/// The fingerprint of the last completed backup for `name`, if recorded.
+fn read_prior_fingerprint(root: &Path, name: &str) -> Option<u32> {
+    let path = fingerprint_sidecar_path(root, name)?;
+    let bytes = std::fs::read(&path).ok()?;
+    (bytes.len() == 4).then(|| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Record the just-completed backup's fingerprint (best-effort, atomic).
+fn write_fingerprint(root: &Path, name: &str, fingerprint: u32) {
+    let Some(path) = fingerprint_sidecar_path(root, name) else {
+        return;
+    };
+    let tmp = path.with_extension("fp.tmp");
+    if std::fs::write(&tmp, fingerprint.to_be_bytes()).is_ok() {
+        std::fs::rename(&tmp, &path).ok();
+    }
 }
 
 /// `partition-N.gz` → `Some(N)`; anything else (`.gz.crc32`, `.idx`, `mbr.bin`,

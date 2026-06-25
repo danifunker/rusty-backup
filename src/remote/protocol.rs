@@ -484,7 +484,19 @@ pub struct PutHeader {
     pub name: String,
     pub fingerprint: u32,
     pub member_count: u16,
+    /// The client requested an **incremental** backup (`/INCREMENTAL`): if the
+    /// daemon holds a prior `NAME.cbk` whose recorded fingerprint equals this
+    /// one, it may tell the client to skip the whole transfer (§5b whole-disk
+    /// identity gate; the skip bit in the resume-map reply). Opt-in, so a
+    /// fingerprint false-negative (§4c) never silently drops a real change.
+    pub incremental: bool,
 }
+
+/// PUT-header flag bits (the trailing flags byte). Bit 0 = incremental requested.
+pub const PUT_FLAG_INCREMENTAL: u8 = 0x01;
+/// Resume-map reply flag bits (the byte after `RBKR`). Bit 0 = skip the whole
+/// transfer — the prior `NAME.cbk` is unchanged and stands.
+pub const RESUME_FLAG_SKIP: u8 = 0x01;
 
 /// Magic leading the daemon's resume-map reply (`b"RBKR"`), sent right after the
 /// PUT header. It tells the client, per member it already holds bytes for, how
@@ -590,10 +602,13 @@ pub fn read_family_b_op<R: Read>(r: &mut R) -> io::Result<Option<FamilyBOp>> {
             let name = read_short_string(r)?;
             let fingerprint = read_u32_be(r)?;
             let member_count = read_u16_be(r)?;
+            let mut flags = [0u8; 1];
+            r.read_exact(&mut flags)?;
             Ok(Some(FamilyBOp::Put(PutHeader {
                 name,
                 fingerprint,
                 member_count,
+                incremental: (flags[0] & PUT_FLAG_INCREMENTAL) != 0,
             })))
         }
         GET_MAGIC => {
@@ -704,18 +719,36 @@ pub fn write_put_header<W: Write>(
     name: &str,
     fingerprint: u32,
     member_count: u16,
+    incremental: bool,
 ) -> io::Result<()> {
     w.write_all(&PUT_MAGIC.to_be_bytes())?;
     write_short_string(w, name)?;
     w.write_all(&fingerprint.to_be_bytes())?;
     w.write_all(&member_count.to_be_bytes())?;
+    let flags = if incremental { PUT_FLAG_INCREMENTAL } else { 0 };
+    w.write_all(&[flags])?;
     Ok(())
 }
 
-/// Write the resume-map reply (daemon side): the `RBKR` magic, an entry count,
-/// then each `{name, committed_chunks}`. Flushed.
-pub fn write_resume_map<W: Write>(w: &mut W, entries: &[ResumeEntry]) -> io::Result<()> {
+/// The daemon's resume-map reply: a `skip` flag (the whole transfer may be
+/// elided — the prior `NAME.cbk` is unchanged) plus the per-member resume
+/// entries (empty on a fresh start).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeReply {
+    pub skip: bool,
+    pub entries: Vec<ResumeEntry>,
+}
+
+/// Write the resume-map reply (daemon side): the `RBKR` magic, a flags byte
+/// (`skip`), an entry count, then each `{name, committed_chunks}`. Flushed.
+pub fn write_resume_map<W: Write>(
+    w: &mut W,
+    skip: bool,
+    entries: &[ResumeEntry],
+) -> io::Result<()> {
     w.write_all(&RESUME_MAGIC.to_be_bytes())?;
+    let flags = if skip { RESUME_FLAG_SKIP } else { 0 };
+    w.write_all(&[flags])?;
     let count = u16::try_from(entries.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many resume entries"))?;
     w.write_all(&count.to_be_bytes())?;
@@ -727,7 +760,7 @@ pub fn write_resume_map<W: Write>(w: &mut W, entries: &[ResumeEntry]) -> io::Res
 }
 
 /// Read the resume-map reply (client side).
-pub fn read_resume_map<R: Read>(r: &mut R) -> io::Result<Vec<ResumeEntry>> {
+pub fn read_resume_map<R: Read>(r: &mut R) -> io::Result<ResumeReply> {
     let magic = read_u32_be(r)?;
     if magic != RESUME_MAGIC {
         return Err(io::Error::new(
@@ -735,17 +768,22 @@ pub fn read_resume_map<R: Read>(r: &mut R) -> io::Result<Vec<ResumeEntry>> {
             format!("bad resume-map magic {magic:#010x} (expected {RESUME_MAGIC:#010x})"),
         ));
     }
+    let mut flags = [0u8; 1];
+    r.read_exact(&mut flags)?;
     let count = read_u16_be(r)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let name = read_short_string(r)?;
         let committed_chunks = read_u32_be(r)?;
-        out.push(ResumeEntry {
+        entries.push(ResumeEntry {
             name,
             committed_chunks,
         });
     }
-    Ok(out)
+    Ok(ResumeReply {
+        skip: (flags[0] & RESUME_FLAG_SKIP) != 0,
+        entries,
+    })
 }
 
 /// Read one member descriptor (the `RBKM` magic + kind + name + chunk count).

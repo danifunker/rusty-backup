@@ -605,7 +605,8 @@ static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *
 /* Networked backup: scan the MBR, stream the selected primary FAT/NTFS
  * partitions block-level to the agent, send mbr.bin + metadata.json, finish. */
 static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int keep_swap,
-                         int codec, const char *host, unsigned short port, const char *name) {
+                         int incremental, int codec, const char *host, unsigned short port,
+                         const char *name) {
     if (codec != CODEC_GZIP) { printf("network backup is gzip-only for now\n"); return 2; }
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
 
@@ -688,8 +689,20 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int keep_
         if (is_fat_part_type(sel[k].type)) n_manifests++;
 
     int member_count = 1 /*mbr.bin*/ + nsel + n_manifests + 1 /*metadata.json*/;
-    cbnet_t *net = cbnet_start(host, port, name, fingerprint, member_count);
+    cbnet_t *net = cbnet_start(host, port, name, fingerprint, member_count, incremental);
     if (!net) { xfer_free(); return 1; }
+
+    /* Incremental (7h): the daemon may say the source is unchanged vs the prior
+     * backup -- then send nothing, the prior NAME.cbk stands. */
+    if (cbnet_skip(net)) {
+        unsigned long long cbk_size = 0;
+        int rc = cbnet_finish(net, &cbk_size);
+        cbnet_close(net); xfer_free();
+        if (rc != 0) { printf("network backup failed\n"); return 1; }
+        printf("source unchanged since last backup -- skipped (%s.cbk on %s:%u stands, %llu bytes)\n",
+               name, host, (unsigned)port, cbk_size);
+        return 0;
+    }
 
     if (cbnet_raw_member(net, "mbr.bin", mbr, 512) != 0) {
         printf("sending mbr.bin failed\n"); cbnet_close(net); xfer_free(); return 1;
@@ -767,6 +780,7 @@ int cmd_backup(int argc, char **argv) {
         printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG       repack FAT files contiguously\n");
         printf("       CRUSTYBK backup A:\\BK 80 /CODEC:LZ4    LZ4 instead of gzip (faster, larger)\n");
         printf("       CRUSTYBK backup A:\\BK 80 /KEEPSWAP    keep swap/page-file content (don't zero)\n");
+        printf("       CRUSTYBK backup rb://10.0.2.2/MYDISK 80 /INCREMENTAL  skip if unchanged\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
         printf("  rb:// streams the disk block-level to the agent (no local folder);\n");
@@ -778,12 +792,14 @@ int cmd_backup(int argc, char **argv) {
         printf("  By default swap/page files (WIN386.SWP, 386SPART.PAR, PAGEFILE.SYS,\n");
         printf("  HIBERFIL.SYS, SWAPPER.DAT) are kept full-size but zeroed (they\n");
         printf("  reinitialize on boot); /KEEPSWAP images their content verbatim.\n");
+        printf("  /INCREMENTAL (rb:// only): if the disk's allocation fingerprint matches\n");
+        printf("  the prior backup, skip the whole transfer (the prior NAME.cbk stands).\n");
         return 2;
     }
 
     const char *dest = argv[1];
     int drive = 0x80, drive_set = 0;
-    unsigned sel_mask = 0; int has_filter = 0, defrag = 0, keep_swap = 0, codec = CODEC_GZIP;
+    unsigned sel_mask = 0; int has_filter = 0, defrag = 0, keep_swap = 0, incremental = 0, codec = CODEC_GZIP;
     for (int a = 2; a < argc; a++) {
         const char *v = switch_val(argv[a], "/PARTS:");
         const char *cv = switch_val(argv[a], "/CODEC:");
@@ -797,6 +813,8 @@ int cmd_backup(int argc, char **argv) {
             defrag = 1;
         } else if (eq_ci(argv[a], "/KEEPSWAP")) {
             keep_swap = 1;
+        } else if (eq_ci(argv[a], "/INCREMENTAL")) {
+            incremental = 1;
         } else if (!drive_set) {
             drive = (int)strtol(argv[a], NULL, 16);
             drive_set = 1;
@@ -813,7 +831,11 @@ int cmd_backup(int argc, char **argv) {
             printf("bad rb:// destination (use rb://HOST[:PORT]/NAME)\n");
             return 2;
         }
-        return cmd_netbackup(drive, sel_mask, has_filter, keep_swap, codec, host, port, name);
+        return cmd_netbackup(drive, sel_mask, has_filter, keep_swap, incremental, codec, host, port, name);
+    }
+    if (incremental) {
+        printf("/INCREMENTAL only applies to a network (rb://) backup\n");
+        return 2;
     }
 
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }

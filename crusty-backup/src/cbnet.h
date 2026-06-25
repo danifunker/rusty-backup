@@ -44,9 +44,16 @@ int cbnet_parse_url(const char *url, char *host, int hostcap, unsigned short *po
  * back the daemon's resume map. `fingerprint` is the cheap §4 source fingerprint
  * the daemon uses to decide whether a reconnect may resume a prior partial
  * transfer for this `cbk_name`. `member_count` = the total members that will
- * follow. NULL on failure (a message is printed). */
+ * follow. When `incremental` is nonzero (`/INCREMENTAL`) the daemon may reply a
+ * **skip** (the source is unchanged vs a prior backup) -- check `cbnet_skip()`
+ * before sending members. NULL on failure (a message is printed). */
 cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
-                     unsigned long fingerprint, int member_count);
+                     unsigned long fingerprint, int member_count, int incremental);
+
+/* Nonzero if the daemon told us to skip the whole transfer (7h incremental: the
+ * source is unchanged and the prior `<cbk_name>.cbk` stands). When set, send NO
+ * members -- go straight to cbnet_finish (the daemon already replied a result). */
+int cbnet_skip(const cbnet_t *n);
 
 /* Send a Raw member (a small verbatim file: mbr.bin / metadata.json) as one
  * chunk. Raw members are always re-sent fresh (not resumed). 0 ok / -1 error. */

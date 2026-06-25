@@ -1446,10 +1446,13 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    write_put_header(&mut sock, "MYDISK", 0xDEAD_BEEF, names.len() as u16).unwrap();
+    write_put_header(&mut sock, "MYDISK", 0xDEAD_BEEF, names.len() as u16, false).unwrap();
     // The daemon replies with the resume map (empty — a fresh transfer).
     let resume = read_resume_map(&mut sock).unwrap();
-    assert!(resume.is_empty(), "a fresh PUT has nothing to resume");
+    assert!(
+        resume.entries.is_empty(),
+        "a fresh PUT has nothing to resume"
+    );
     for name in &names {
         let bytes = std::fs::read(folder.join(name)).unwrap();
         let is_gz = name.to_ascii_lowercase().ends_with(".gz");
@@ -1626,9 +1629,9 @@ fn family_b_chunk_put_resumes_after_drop() {
     // --- connection 1: send mbr + the first 2 of 4 partition spans, then drop ---
     {
         let mut sock = connect_hello(&addr);
-        write_put_header(&mut sock, "MYDISK", FP, 3).unwrap();
+        write_put_header(&mut sock, "MYDISK", FP, 3, false).unwrap();
         assert!(
-            read_resume_map(&mut sock).unwrap().is_empty(),
+            read_resume_map(&mut sock).unwrap().entries.is_empty(),
             "fresh: nothing to resume"
         );
         send_raw_member(&mut sock, "mbr.bin", &mbr);
@@ -1644,9 +1647,10 @@ fn family_b_chunk_put_resumes_after_drop() {
 
     // --- connection 2: reconnect, get told to resume at span 2, finish ---
     let mut sock = connect_hello(&addr);
-    write_put_header(&mut sock, "MYDISK", FP, 3).unwrap();
+    write_put_header(&mut sock, "MYDISK", FP, 3, false).unwrap();
     let resume = read_resume_map(&mut sock).unwrap();
     let part = resume
+        .entries
         .iter()
         .find(|e| e.name == "partition-0.gz")
         .expect("the daemon remembers the in-progress partition");

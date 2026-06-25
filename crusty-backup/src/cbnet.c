@@ -44,6 +44,7 @@ struct cbnet {
         uint32_t committed;
     } resume[MAX_RESUME];
     int nresume;
+    int skip; /* daemon's RBKR skip bit: source unchanged, prior .cbk stands (7h) */
     /* GET (restore): a member byte stream the daemon frames as [u32 BE n][n]*
      * terminated by [u32 0]; for a .gz member we inflate it (multi-member gzip). */
     unsigned char *framebuf; /* current frame's bytes from the socket */
@@ -178,14 +179,17 @@ static int flush_span(cbnet_t *n) {
     return 0;
 }
 
-/* Read the daemon's RBKR resume map into n->resume. 0 / -1. */
+/* Read the daemon's RBKR resume map into n->resume. 0 / -1.
+ * Wire: RBKR(4) + flags(1) + count(2) + entries. flags bit0 = skip (7h: the
+ * source is unchanged vs a prior backup, so the whole transfer is elided). */
 static int read_resume_map(cbnet_t *n) {
-    unsigned char hdr[6];
-    if (recv_all(n->sock, hdr, 6) != 0)
+    unsigned char hdr[7];
+    if (recv_all(n->sock, hdr, 7) != 0)
         return -1;
     if (memcmp(hdr, RESUME_MAGIC, 4) != 0)
         return -1;
-    int count = (hdr[4] << 8) | hdr[5];
+    n->skip = (hdr[4] & 0x01) ? 1 : 0;
+    int count = (hdr[5] << 8) | hdr[6];
     n->nresume = 0;
     for (int i = 0; i < count; i++) {
         unsigned char nl[2];
@@ -268,7 +272,7 @@ static cbnet_t *cbnet_connect(const char *host, unsigned short port) {
 }
 
 cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
-                     unsigned long fingerprint, int member_count) {
+                     unsigned long fingerprint, int member_count, int incremental) {
     cbnet_t *n = cbnet_connect(host, port);
     if (!n)
         return NULL;
@@ -281,7 +285,8 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
         return NULL;
     }
 
-    /* PUT header: RBKP, name, fingerprint (u32), member_count (u16). */
+    /* PUT header: RBKP, name, fingerprint (u32), member_count (u16), flags (u8).
+     * flags bit0 = incremental requested (7h: the daemon may reply skip). */
     int nlen = (int)strlen(cbk_name);
     unsigned char ph[8];
     memcpy(ph, PUT_MAGIC, 4);
@@ -290,9 +295,12 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
     be32(fp, fingerprint);
     unsigned char mc[2];
     be16(mc, (unsigned)member_count);
+    unsigned char flags[1];
+    flags[0] = incremental ? 0x01 : 0x00;
     if (send_all(n->sock, ph, 6) != 0 ||
         send_all(n->sock, (const unsigned char *)cbk_name, nlen) != 0 ||
-        send_all(n->sock, fp, 4) != 0 || send_all(n->sock, mc, 2) != 0) {
+        send_all(n->sock, fp, 4) != 0 || send_all(n->sock, mc, 2) != 0 ||
+        send_all(n->sock, flags, 1) != 0) {
         fprintf(stderr, "sending PUT header failed\n");
         cbnet_close(n);
         return NULL;
@@ -307,6 +315,10 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
     if (n->nresume > 0)
         printf("agent has partial data for %d member(s) -- resuming\n", n->nresume);
     return n;
+}
+
+int cbnet_skip(const cbnet_t *n) {
+    return n->skip;
 }
 
 /* Send a member header (RBKM, kind, name, chunk_count). 0 / -1. */
