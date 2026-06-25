@@ -10,10 +10,11 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 32 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 35 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+23a74d9 feat(cb-dos): Phase 5 — boot-aware FAT file-level defrag (backup /DEFRAG)
 e45bf49 perf(cbk): lazy .cbk disk reader (skip the whole-disk reconstruct)
 dbcdfc7 feat(cb-dos): extended / logical partition backup, restore, and clone
 6ffe918 fix(restore): don't double-count logical partitions in the restore pre-flight
@@ -58,6 +59,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4d** — NTFS (DOS) | `backup`/`clone` image NTFS (type 0x07) via `$Bitmap` compaction (`cbntfs.{h,c}`); restore same-size on DOS (resize via desktop `resize_ntfs_in_place`); verified on FreeDOS/qemu — 63 MB random-filled NTFS → 0.4 MB gz, restore + clone `ntfsfix`-clean with files byte-identical, desktop restore cross-checked |
 | **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
 | **Phase 4e** — extended/logical (DOS) | backup/restore/clone follow the **EBR chain** of an extended container (`walk_ebr_chain`/`write_ebr_chain` in `cbdisk`, ports of parse/build_ebr_chain); logicals (index 4+) imaged with `is_logical` + an `extended_container` block; same-size on DOS (resize via desktop); verified on FreeDOS/qemu — primary FAT16 + ext { FAT16, NTFS } round-trips byte-identical via cb-dos restore, cb-dos clone, **and** desktop restore (after fixing a desktop pre-flight double-count) |
+| **Phase 5** — FAT defrag (DOS) | `backup /DEFRAG` repacks a FAT12/16/32 volume's files+dirs into contiguous runs (boot files pinned first) before imaging (`cbdefrag.{h,c}`), read-only on the source; smaller `imaged_size`, defragged restore. Declines safely on an unclean FS. Verified on FreeDOS/qemu — FAT16 25.2→1.2 MB, FAT32 72.7→2.7 MB, byte-identical (desktop **and** on-DOS restore), a SYS'd bootable disk defragged+restored **boots**, lost-cluster disk declines (no data loss) |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back; byte-identical test + `rb-cli`-verified |
 | **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
@@ -68,11 +70,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Phase 5** — file-level repack/defrag (FAT, boot-file aware).
-2. **Phase 6** — LZ4 codec for slower machines.
-3. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
-4. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
-5. **Real-486 hardware** validation (everything so far is qemu).
+1. **Phase 6** — LZ4 codec for slower machines.
+2. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
+3. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
+4. **Real-486 hardware** validation (everything so far is qemu).
+5. **`clone /DEFRAG`** *(optional)* — the cbdefrag planner emits straight to the
+   target disk instead of gzip; the "and maybe clone" half of Phase 5.
 
 Dropped by decision: exFAT backup-source, ext2/3. Deferred: the lazy-reader
 packer re-chunking (re-frames `partition-N.gz`, needs a recomputed CRC).
@@ -114,11 +117,22 @@ subcommands for scripting), built from:
   `ntfs_load_bitmap` (MFT #6 `$Bitmap` + fixup + `$DATA` run decode → RAM bitmap,
   set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check vs exFAT/HPFS).
   Lifted from the `disk_spike.c` probe. Used by `backup`/`clone` for NTFS compaction.
+- `cbdefrag.{h,c}` — the **FAT file-level defragmenter** for `backup /DEFRAG`
+  (`defrag_backup_fat`). Walks the dir tree **read-only** on the source, assigns
+  each file/subdir a contiguous run of new clusters (boot files
+  `IO.SYS`/`MSDOS.SYS`/`IBMBIO.COM`/`IBMDOS.COM`/`KERNEL.SYS` pinned first),
+  builds a fresh FAT, and streams the relocated image to gzip — dir entries
+  (incl. `.`/`..`) repointed via the relocation map, LFN entries verbatim, FAT32
+  root → cluster 2 + FSInfo reset. **Declines** (returns 1, gz untouched) on a
+  not-provably-clean FS (lost/bad/cross-linked clusters, OOM) → caller images
+  with plain compaction. Source never written, so a bug can only yield a bad
+  backup, never corrupt the source.
 - `cmd_backup.c` — `backup` (image FAT/NTFS disk → native folder, smart-compact +
-  gzip, `/PARTS`): FAT compacts from its FAT, NTFS (`backup_ntfs_partition`) from
-  the `$Bitmap` (full window, free clusters zeroed); **extended containers** are
-  walked and their **logical** volumes imaged (`is_logical`, index 4+, +
-  `extended_container` metadata). `cmd_restore.c` — `restore` (folder → disk,
+  gzip, `/PARTS`, `/DEFRAG`): FAT compacts from its FAT (or, with `/DEFRAG`,
+  repacks via `cbdefrag` then falls back to plain compaction if it declines),
+  NTFS (`backup_ntfs_partition`) from the `$Bitmap` (full window, free clusters
+  zeroed); **extended containers** are walked and their **logical** volumes
+  imaged (`is_logical`, index 4+, + `extended_container` metadata). `cmd_restore.c` — `restore` (folder → disk,
   `/SIZE` resize + `/PARTS`, the metadata.json scanner + gzip stream; **FS-agnostic**
   so NTFS restores same-size; logicals same-size + the **EBR chain rebuilt** via
   `write_ebr_chain`; resize gated on 512-byte FAT, primary growth clamped at the
@@ -239,6 +253,26 @@ disk and diff. Source is **read-only** (no int13h writes). The **TUI** path:
 highlight the live FAT partition row in the menu and press **F6** (a backup folder
 is still reachable by pressing F6 on a disk row / when nothing FAT is selected).
 Verified on both FAT32 (root-cluster) and FAT16 (fixed-root) attached disks.
+
+**Defrag tests** (`backup /DEFRAG`, Phase 5): the win is only visible on a
+**fragmented** disk, and mtools writes contiguously, so *manufacture* fragmentation:
+copy the real files first (low clusters), then a pile of filler files, then a small
+`TAIL.BIN` (lands at the end), then `mdel` the filler — now `TAIL.BIN` is parked at
+a high cluster with a free gap before it. Build the FS in its own exact-size file
+(gotcha #7), `dd` into a type-0x06/0x0C MBR slot, attach as `0x81`. Run **both**
+`CRUSTYBK BACKUP C:\BKD 81 /DEFRAG` and a plain `CRUSTYBK BACKUP C:\BKP 81`: the
+proof is `imaged_size_bytes` in `metadata.json` — plain images up to `TAIL`
+(tens of MB), `/DEFRAG` packs to ~the used-data size (the `.gz` is only slightly
+smaller because plain already zeroes+gzips the gap). Restore the `/DEFRAG` folder
+(desktop `rb-cli restore` *and* a cb-dos `RESTORE`), `mcopy` every file off and
+`md5` vs source; a tiny FAT-reader script confirms each file is contiguous, the
+boot file sits at cluster 2, and FAT32 `..`=root(2) / FSInfo reset. **Boot test:**
+`SYS` a fresh FAT16 (own MBR boot code + active flag) inside qemu, put an
+`AUTOEXEC.BAT` that writes a `C:\IBOOTED.TXT` marker + `FDAPM POWEROFF`,
+`/DEFRAG`-back-it-up, restore to a blank disk, boot **that disk alone** — the
+marker file appearing proves the chain booted. **Decline test:** patch a free FAT
+cluster to `0xFFFF` in both copies (a lost cluster); `/DEFRAG` must fall back to
+plain (large `imaged_size`), never silently drop it.
 
 ## Gotchas learned the hard way (do not relearn these)
 
