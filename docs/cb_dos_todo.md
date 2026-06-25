@@ -94,10 +94,22 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
   unit test proves a fragmented file comes out contiguous (plain packing leaves it
   fragmented) + byte-exact, and an `rb-cli backup --defrag` → restore round-trip is
   byte-identical. GUI checkbox parity is a possible follow-up (CLI ships now).
-- [ ] **Lazy-reader follow-up — packer re-chunking** for intra-partition random
-  access: re-chunk `pack_folder_to_cbk` into ~1–4 MB source-span gzip members so a
-  deep seek decompresses only its chunk. Not "free" — it re-frames
-  `partition-N.gz` and needs a recomputed per-partition CRC32.
+- [x] **Lazy-reader packer re-chunking. DONE (2026-06-25).** Solved without the
+  feared round-trip break: backups emit `partition-N.gz` as **source-span
+  multi-member** gzip (a fresh member every 4 MiB uncompressed) + a regenerable
+  `partition-N.gz.idx` seek layout (`src/rbformats/gz_index.rs`), pre-cached during
+  backup *and* edit. The `.cbk` packer splits the member into per-span chunks
+  carrying the existing `src_offset`, and `CbkLazyReader` seeks to the covering
+  chunk — O(one span) forward *and* backward. The chunk payloads concatenated are
+  byte-identical to the `.gz`, so `cbk unpack` reproduces it exactly and checksums
+  stay valid (the original round-trip worry). A `gz_index_matches` guard + the
+  stale-`.idx` cleanup keep a mismatched layout from ever mis-splitting. Verified:
+  unit tests + `rb-cli` (2-chunk `.cbk`, byte-identical unpack, edit re-chunks
+  2→9, deep `get` correct) and **on FreeDOS/qemu cb-dos restores + `gzseek`-browses
+  a desktop multi-member backup byte-identically** (zlib reads concatenated
+  members transparently). Small partitions stay single-member (byte-identical to
+  the old output, no `.idx`). Possible follow-up: use the `.idx` for fast seeks
+  when browsing a *folder* backup too (today only the `.cbk` path uses it).
 - [ ] **Boot-media driver profiles** — the FreeDOS floppy/CD ship today with the
   plain IDE/CF path only; add CONFIG.SYS boot-menu entries for CD-ROM / USB
   mass-storage (see `cb_dos.md` *Distribution* → "Bundled drivers").

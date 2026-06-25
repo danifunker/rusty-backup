@@ -10,10 +10,13 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 42 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 46 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+412e3a6 feat(cbk): per-chunk seek into multi-member partitions (stages B + C)
+1812548 feat(rbformats): source-span multi-member gzip + .gz.idx seek layout (stage A)
+b00cd9f feat(backup): rb-cli backup --defrag — contiguous FAT repack (desktop parity)
 6aa3eef feat(cb-dos): lz4 browse — ls/get from a partition-N.lz4 backup
 53ca69e feat(cb-dos): clone /DEFRAG — repack FAT volumes contiguously onto the target
 4c847ed fix(cb-dos): mbr.bin corruption under stdout redirection (_IONBF -> _IOLBF)
@@ -68,7 +71,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 6** — LZ4 codec (both) | a second shared codec: desktop `rb-cli backup --format lz4` (`lz4_flex` frame, `src/rbformats/lz4.rs`) + DOS `CRUSTYBK backup /CODEC:LZ4` (liblz4 frame via `cbcodec.{h,c}`; restore auto-detects). Cheaper than gzip on a 486 at a lower ratio; gzip stays default. Standard LZ4 frame so members interchange. Verified on FreeDOS/qemu — byte-identical all three ways (DOS↔desktop, DOS↔DOS) + composes with `/DEFRAG`. **Browse** (`ls`/`get`) reads `.lz4` too (seek-by-decode) |
 | **Fix** — redirected backup | the long-standing "redirecting `BACKUP` corrupts `mbr.bin`" gotcha is fixed: `_IONBF`→`_IOLBF` in all `cmd_*`. Redirected `backup`/`get` verified clean on qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
-| **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back; byte-identical test + `rb-cli`-verified |
+| **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back. **Now per-chunk-seekable**: backups emit source-span multi-member gzip + a `.gz.idx` layout (`gz_index.rs`), the packer splits the partition into per-span chunks (`src_offset`), and the reader seeks to the covering chunk — O(one span) either direction. Byte-identical round-trip preserved (chunk payloads concat = the `.gz`); cb-dos restores/`gzseek`-browses the multi-member gz too (qemu-verified) |
 | **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
@@ -81,12 +84,14 @@ The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_to
    foundation + the frozen `.cbk` are all in place; this is the next big phase.
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
-3. *(optional, bigger)* **Desktop defrag parity** (repack FAT on the desktop too),
-   **lazy-reader packer re-chunking** (source-span gzip members + recomputed CRC),
-   **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu entries).
+3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu
+   entries — deferred by request), a GUI checkbox for `backup --defrag`, and using
+   the `.gz.idx` for fast seeks when browsing a *folder* backup (today only `.cbk`).
 
 Done since the last refresh: the mbr.bin-under-redirection bug (fixed), `clone
-/DEFRAG`, and lz4 browse. Dropped by decision: exFAT backup-source, ext2/3.
+/DEFRAG`, lz4 browse, **`rb-cli backup --defrag`** (desktop FAT defrag parity), and
+the **lazy-reader packer re-chunking** (source-span multi-member gzip + `.gz.idx`,
+per-chunk `.cbk` seeks). Dropped by decision: exFAT backup-source, ext2/3.
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
@@ -97,12 +102,19 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
 **Desktop (Rust):**
 - `src/backup/mod.rs` — `CompressionType::Gzip` / `CompressionType::Lz4`.
 - `src/rbformats/gzip.rs` — gzip codec; `compress.rs` — `Gzip` arm + `"gzip"`
-  decode (`MultiGzDecoder`).
+  decode (`MultiGzDecoder`). Emits **source-span multi-member** gzip (4 MiB spans)
+  + writes/clears the `.gz.idx`. `src/rbformats/gz_index.rs` — the `.gz.idx` seek
+  layout (`GzSpan`, encode/decode/read/write, `GZ_SPAN_BYTES`).
+- For desktop FAT defrag (`backup --defrag`): `CompactFatReader::new_defrag` +
+  `build_defrag_order` (`src/fs/fat.rs`), `fs::defrag_fat_partition_reader`,
+  `BackupConfig::defrag_fat`, `--defrag` in `cli/verbs/backup.rs`.
 - `src/rbformats/lz4.rs` — LZ4 frame codec (`lz4_flex`); `compress.rs` — `Lz4` arm
   + `"lz4"` decode (`FrameDecoder`); `BackupFormat::Lz4` / `--format lz4` in
   `cli/verbs/backup.rs`. `Cargo.toml` `lz4_flex` dep.
 - `src/rbformats/cbk.rs` — **the `.cbk` format** (RBKC chunks / RBKI index / RBKF
-  footer), `pack_folder_to_cbk`, `materialize_cbk_to_folder`, `is_cbk`.
+  footer), `pack_folder_to_cbk` (splits a multi-member `.gz` into per-span chunks
+  via its `.gz.idx`), `materialize_cbk_to_folder`, `is_cbk`; `CbkMember` exposes
+  per-chunk `src_offset`s; `CbkLazyReader::read_member` seeks to the covering chunk.
 - `src/cli/verbs/cbk.rs` — `rb-cli cbk pack|unpack`.
 - `src/model/source_reader.rs` — `CbkTempReader` + `open_read_dispatch` arm (native
   read); `browse_session.rs` — `.cbk` browse arm; `file_types.rs` — `"cbk"` in

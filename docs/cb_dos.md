@@ -763,6 +763,27 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Lazy-reader packer re-chunking (fast intra-`.cbk` random access).**
+  Deep seeks into a large `.cbk` used to decompress a partition's gzip member from
+  byte 0. Now backups write `partition-N.gz` as **source-span multi-member** gzip (a
+  fresh member every 4 MiB uncompressed) plus a regenerable `partition-N.gz.idx`
+  seek layout (`src/rbformats/gz_index.rs`), pre-cached at backup *and* edit time;
+  the `.cbk` packer splits the member into per-span chunks (each carrying the
+  format's existing `src_offset`), and `CbkLazyReader` jumps to the chunk covering
+  an offset — O(one span) forward and backward. The original round-trip worry is
+  avoided entirely: the chunk payloads concatenated are byte-identical to the
+  `.gz`, so `cbk unpack` reproduces it exactly and the `.crc32`/metadata checksums
+  stay valid. A `gz_index_matches` guard + a stale-`.idx` cleanup in `compress_gzip`
+  prevent a mismatched layout from mis-splitting. Small partitions stay
+  single-member (byte-identical to the old output, no `.idx`). **Verified**: unit
+  tests (2-member gz → 2 chunks, correct `chunk_for_offset`, byte-exact unpack) and
+  `rb-cli` (a >4 MiB backup → 2-chunk `.cbk`; `ls`/`get`; a `put` edit re-chunks
+  2→9 with the new file + a deep-seek `TAIL.BIN` both byte-identical); and **on real
+  FreeDOS/qemu cb-dos `restore`s and `gzseek`-browses a desktop multi-member backup
+  byte-identically** (zlib reads concatenated members transparently — the cross-tool
+  contract holds). `cargo test --lib` green (2093). Desktop perf, but it closes the
+  `.cbk` lazy-reader follow-up; the frozen `.cbk` v1 is unchanged (multi-chunk
+  members were always valid).
 - 2026-06-25 — **Polish: `clone /DEFRAG` + lz4 browse.** Two completions of the
   Phase 5/6 surface. **`clone /DEFRAG`:** refactored cbdefrag's emit to a *sink* so
   one relocation engine serves both `backup` (sink = the compressed writer) and
