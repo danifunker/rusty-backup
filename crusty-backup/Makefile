@@ -29,7 +29,7 @@ ZLIBLIB := $(ZLIB)/lib
 # gitignored -- run `sh deps/fetch-zlib.sh` once.
 CB_SRCS := src/crustybk.c src/cmd_backup.c src/cmd_restore.c src/cmd_clone.c \
            src/cmd_inspect.c src/cmd_browse.c src/cbdisk.c
-CB_HDRS := src/cbdisk.h
+CB_HDRS := src/cbdisk.h src/cbbrowse.h
 
 # Diagnostics POCs (no zlib): single-source, built by the generic rule below.
 DIAG := $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe

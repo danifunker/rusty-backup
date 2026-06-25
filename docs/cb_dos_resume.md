@@ -42,18 +42,17 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4b** — `cbclone` (DOS) | direct disk-to-disk clone, no staging file; compact + `/SIZE` resize + `/PARTS`; verified grow/shrink/subset on FreeDOS/qemu |
 | **One exe** — `CRUSTYBK.EXE` | backup/restore/clone/inspect subcommands **+ a real text UI** (live int13h enum; F2/F3/F4 drive the cmd_* engine) over the shared `cbdisk` engine; both verified on FreeDOS/qemu |
 | **Phase 4c-a** — `ls` / `get` (DOS) | browse + extract single files from a backup `partition-N.gz` (FAT dir reader + LFN over `gzseek`), no scratch/no full restore; verified incl. LFN + nested + multi-cluster on FreeDOS/qemu |
+| **Phase 4c-b** — TUI browse (DOS) | F6 Browse: interactive file browser, mark files+folders, F2 extract (folders recurse); verified extracting a file + a folder tree byte-identical on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Phase 4c-b — a TUI browse/extract screen.** 4c-a shipped `ls`/`get` (the FAT
-   directory reader + extractor in `cmd_browse.c`). Add a TUI flow: pick a backup
-   folder, browse its tree (navigate dirs, Space-mark files/folders), Enter to
-   extract the selection to a chosen DOS path — reusing `dir_iter`/`resolve_path`/
-   `extract_file`. *Recommended next — finishes the browse feature in the UI.*
-   (Later: point the same reader at a **live disk** by swapping the `gzseek`
-   backend for `read_lba`, so you can browse/extract from a disk too.)
+1. **Browse a *live disk* (not just a backup).** The browse engine (`cbbrowse.h`)
+   is parameterized only by how it reads bytes — front it with `read_lba` instead
+   of `gzseek` and the same `ls`/`get`/TUI-browse work against a mounted/attached
+   disk too (recover a file from a card without imaging it first). Small, high-
+   value. *Recommended next.*
 2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
@@ -106,14 +105,17 @@ subcommands for scripting), built from:
   gzip, `/PARTS`). `cmd_restore.c` — `restore` (folder → disk, `/SIZE` resize +
   `/PARTS`, the metadata.json scanner + gzip stream). `cmd_clone.c` — `clone`
   (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
-  `inspect` (list BIOS drives + partitions). `cmd_browse.c` — `ls` / `get`:
-  browse + extract single files from a backup's `partition-N.gz` (a FAT12/16/32
-  directory reader with LFN reassembly + a file extractor over `gzseek` random
-  access — no scratch, no full restore). Each exposes `int cmd_X(argc,argv)`.
+  `inspect` (list BIOS drives + partitions). `cmd_browse.c` + `cbbrowse.h` —
+  `ls` / `get` **and the shared browse engine** (`fatvol_t`, `cbk_open_vol`/
+  `cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a FAT12/16/32 directory reader
+  with LFN reassembly + a file/tree extractor over `gzseek` random access (no
+  scratch, no full restore). Each command exposes `int cmd_X(argc,argv)`.
 - `crustybk.c` — `main()` dispatches the subcommands or launches the **text UI**
   (`tui_main`): `scan_disks` does live int13h enumeration; F2/F3/F4 gather params
-  (`read_line`/`pick_size`/`confirm_erase`) and call `cmd_*()` on a plain screen.
-  `disk_spike.c` — disk/FS spike.
+  (`read_line`/`pick_size`/`confirm_erase`) and call `cmd_*()` on a plain screen;
+  **F6 `do_browse`** opens an interactive file browser over `cbbrowse.h` (mark
+  files+folders, F2 extracts the selection, folders recurse). `disk_spike.c` —
+  disk/FS spike.
   `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
 - `Makefile` targets: `make crustybk` (the tool; links zlib once) / `make all`
   (+ diagnostics) / `make net` / `make size`.

@@ -595,9 +595,23 @@ over the wire now.
       (long names shown verbatim), and extracted three files — an 8.3 name, an
       LFN-named file, and a 65 KB multi-cluster blob three dirs deep — each
       **byte-identical** to the source. Works on both producer shapes (the reader
-      walks whatever BPB the gz carries). Next (4c-b): a TUI browse/mark screen on
-      top; later, the same reader can front a live disk (swap the gz backend for
-      int13h). The desktop already does this via `rb-cli ls`/`get`.
+      walks whatever BPB the gz carries). The desktop already does this via
+      `rb-cli ls`/`get`.
+- [x] **Phase 4c-b — TUI browse/mark/extract screen. DONE (2026-06-24).** The
+      browse engine moved to a shared header (`src/cbbrowse.h`: `fatvol_t`,
+      `dirent_t`, `cbk_open_vol`/`cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`)
+      so both `cmd_browse.c` (the CLI) and `crustybk.c` (the TUI) use it. The TUI
+      gained **F6 Browse**: prompt a backup folder + partition, then an interactive
+      file browser (Up/Down + Enter to open a dir, Bksp to go up, **Space to mark
+      files AND folders**, F2 to extract the selection to a typed destination,
+      Esc to leave). Folders extract **recursively** (`cbk_extract_tree`),
+      preserving the tree. **Verified on real FreeDOS/qemu** by driving it over the
+      qemu monitor: opened `C:\BK`, marked `HELLO.TXT` + the `DOCS` folder, F2 ->
+      `C:\EXTRACT` — the result tree (`HELLO.TXT`, `DOCS\INNER.TXT`,
+      `DOCS\DEEP\BURIED.BIN`) was structure-preserved and **byte-identical** to
+      source. This rounds out the browse feature: single file, multi-select, and
+      whole folders — no full restore. (Later: point the same reader at a live
+      disk by swapping the `gzseek` backend for `read_lba`.)
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -628,6 +642,22 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 4c-b — TUI browse/mark/extract.** Lifted the browse engine
+  into `src/cbbrowse.h` (`fatvol_t`/`dirent_t` + `cbk_open_vol`/`cbk_list_dir`/
+  `cbk_extract`/`cbk_extract_tree`) so the CLI (`cmd_browse.c`) and the TUI
+  (`crustybk.c`) share one reader. Added **F6 Browse** to the menu: prompt a
+  backup folder + partition, then an interactive file browser — Up/Down to move,
+  Enter to descend a dir, Bksp/Left to go up, **Space to mark files *and*
+  folders**, F2 to extract the marked set to a typed destination, Esc to leave.
+  Files extract directly; folders extract **recursively** (`cbk_extract_tree`,
+  depth-guarded), recreating the subtree. **Verified on real FreeDOS/qemu** over
+  the qemu monitor: opened `C:\BK`, marked `HELLO.TXT` (a file) + `DOCS` (a
+  folder), F2 -> `C:\EXTRACT`; the extracted tree (`HELLO.TXT`, `DOCS\INNER.TXT`,
+  `DOCS\DEEP\BURIED.BIN`) was structure-preserved and **byte-identical** to source
+  under md5. With 4c-a's `ls`/`get`, single-file / multi-select / whole-folder
+  recovery from a backup is done — no full restore. `make crustybk`. **Next:**
+  point the same reader at a live disk (swap `gzseek` for `read_lba`), or the lazy
+  `.cbk` reader (perf), or Phase 5 (boot-aware defrag).
 - 2026-06-24 — **Phase 4c-a — browse + extract single files from a backup, on
   DOS.** New `src/cmd_browse.c` adds two subcommands to `CRUSTYBK.EXE`:
   `ls <folder> [N] [path]` (list a directory inside `partition-N.gz`) and

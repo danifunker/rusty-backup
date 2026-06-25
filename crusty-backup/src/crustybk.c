@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "cbdisk.h"
+#include "cbbrowse.h"
 
 /* The scriptable commands, each its own module over the shared cbdisk engine. */
 extern int cmd_backup(int argc, char **argv);
@@ -41,11 +42,13 @@ extern int cmd_get(int argc, char **argv);
 /* Extended-key scancodes returned after getch() yields 0. */
 #define K_UP    72
 #define K_DOWN  80
+#define K_LEFT  75
 #define K_F1    59
 #define K_F2    60
 #define K_F3    61
 #define K_F4    62
 #define K_F5    63
+#define K_F6    64
 #define K_F10   68
 #define K_ESC   27
 #define K_ENTER 13
@@ -182,8 +185,8 @@ static void render(int sel)
 
     put_row(rows - 2, A_STATUS, status_msg);
     put_row(rows - 1, A_ACTION,
-            " \x18\x19 Move  F2 Backup  F3 Restore  F4 Clone  F5 Rescan  "
-            "F1 About  F10 Quit ");
+            " \x18\x19  F2 Backup  F3 Restore  F4 Clone  F6 Browse  "
+            "F5 Rescan  F1 About  F10 Quit ");
 
     if (nitems == 0) {
         put(4, 3, A_DISK, "No BIOS hard drives found (need at least a second drive).");
@@ -389,6 +392,163 @@ static void do_clone(int src_drive)
     op_end();
 }
 
+/* ---- browse a backup: navigate + mark + extract ------------------------ */
+
+typedef struct { uint32_t cluster; int fixed_root; char name[40]; } bframe_t;
+
+static void build_path(char *out, int cap, bframe_t *stack, int depth)
+{
+    out[0] = '\\'; out[1] = 0;
+    for (int i = 1; i <= depth; i++) {
+        if (strcmp(out, "\\") != 0) strncat(out, "\\", cap - (int)strlen(out) - 1);
+        strncat(out, stack[i].name, cap - (int)strlen(out) - 1);
+    }
+}
+
+static void render_browse(const char *pathstr, dirent_t *ents, int nent,
+                          const char *marks, int sel, int top, int nmark)
+{
+    char line[96];
+    for (int y = 0; y < rows; y++) put_row(y, A_PAGE, NULL);
+
+    snprintf(line, sizeof line, "Browse  %.80s", pathstr);
+    put_row(0, A_TITLE, line);
+    put(cols - (int)strlen("v" CB_VERSION) - 1, 0, A_TITLE, "v" CB_VERSION);
+
+    int visible = rows - 4;
+    if (nent == 0) put(4, 2, A_DISK, "(empty directory)");
+    for (int i = 0; i < visible && top + i < nent; i++) {
+        int idx = top + i;
+        int attr = (idx == sel) ? A_SEL : A_PAGE;
+        char box = marks[idx] ? 'X' : ' ';
+        if (ents[idx].attr & CBK_ATTR_DIR)
+            snprintf(line, sizeof line, "[%c] %-40.40s  <DIR>", box, ents[idx].name);
+        else
+            snprintf(line, sizeof line, "[%c] %-40.40s  %lu", box, ents[idx].name,
+                     (unsigned long)ents[idx].size);
+        int y = 2 + i;
+        if (idx == sel) { put_row(y, attr, NULL); cell(1, y, attr, G_PTR); }
+        put(4, y, attr, line);
+    }
+    if (nent > visible) { cell(cols - 2, 2, A_PAGE, G_UP); cell(cols - 2, rows - 3, A_PAGE, G_DOWN); }
+
+    snprintf(line, sizeof line, "%d item%s, %d marked", nent, nent == 1 ? "" : "s", nmark);
+    put_row(rows - 2, A_STATUS, line);
+    put_row(rows - 1, A_ACTION,
+            " \x18\x19 Move  Enter Open  Bksp Up  Space Mark  F2 Extract  Esc Back ");
+    ScreenUpdate(backbuf);
+}
+
+/* Extract the marked entries to a destination directory the user types. */
+static void browse_extract(fatvol_t *v, dirent_t *ents, int nent, char *marks)
+{
+    int nmark = 0;
+    for (int i = 0; i < nent; i++) if (marks[i]) nmark++;
+    if (nmark == 0) { strcpy(status_msg, "Nothing marked (Space to mark)."); return; }
+
+    char dest[80];
+    op_begin("Extract");
+    printf("Extracting %d item%s.\n\n", nmark, nmark == 1 ? "" : "s");
+    if (!read_line("Destination folder (e.g. C:\\OUT): ", dest, sizeof dest) || !dest[0]) {
+        printf("\nCancelled.\n"); op_end(); return;
+    }
+    mkdir(dest, 0777);
+    printf("\n");
+    int ok = 0, fail = 0;
+    for (int i = 0; i < nent; i++) {
+        if (!marks[i]) continue;
+        char child[340];
+        snprintf(child, sizeof child, "%.80s\\%.255s", dest, ents[i].name);
+        if (ents[i].attr & CBK_ATTR_DIR) {
+            printf("dir  %s\\\n", ents[i].name);
+            if (cbk_extract_tree(v, ents[i].first_cluster, child) == 0) ok++; else fail++;
+        } else {
+            printf("file %s\n", ents[i].name);
+            if (cbk_extract(v, &ents[i], child) == 0) ok++; else fail++;
+        }
+    }
+    printf("\nDone: %d ok, %d failed.\n", ok, fail);
+    op_end();
+}
+
+static void do_browse(void)
+{
+    char folder[80], pn[8];
+    op_begin("Browse a backup");
+    if (!read_line("Backup folder (e.g. C:\\BK): ", folder, sizeof folder) || !folder[0]) {
+        printf("\nCancelled.\n"); op_end(); return;
+    }
+    pn[0] = 0;
+    read_line("Partition number (Enter = first): ", pn, sizeof pn);
+    int part = pn[0] ? atoi(pn) : -1;
+    part = cbk_default_part(folder, part);
+
+    fatvol_t vol;
+    if (cbk_open_vol(folder, part, &vol) != 0) { op_end(); return; }
+    _setcursortype(_NOCURSOR);
+
+    static dirent_t ents[256];
+    static char marks[256];
+    bframe_t stack[20];
+    int depth = 0, sel = 0, top = 0;
+    stack[0].cluster = vol.root_cluster;
+    stack[0].fixed_root = !vol.L.is_fat32;
+    strcpy(stack[0].name, "\\");
+    int nent = cbk_list_dir(&vol, stack[0].cluster, stack[0].fixed_root, ents, 256);
+    if (nent < 0) nent = 0;
+    memset(marks, 0, sizeof marks);
+
+    for (;;) {
+        if (sel >= nent) sel = nent > 0 ? nent - 1 : 0;
+        if (sel < 0) sel = 0;
+        int visible = rows - 4;
+        if (sel < top) top = sel;
+        if (sel >= top + visible) top = sel - visible + 1;
+
+        char pathstr[120];
+        build_path(pathstr, sizeof pathstr, stack, depth);
+        int nmark = 0;
+        for (int i = 0; i < nent; i++) if (marks[i]) nmark++;
+        render_browse(pathstr, ents, nent, marks, sel, top, nmark);
+
+        int key = getch();
+        int reload = 0;
+        if (key == 0) {
+            key = getch();
+            switch (key) {
+            case K_UP:   if (sel > 0) sel--; break;
+            case K_DOWN: if (sel < nent - 1) sel++; break;
+            case K_LEFT: if (depth > 0) { depth--; reload = 1; } break;
+            case K_F2:   browse_extract(&vol, ents, nent, marks);
+                         _setcursortype(_NOCURSOR); break;
+            default: break;
+            }
+        } else if (key == K_ENTER) {
+            if (nent > 0 && (ents[sel].attr & CBK_ATTR_DIR) && depth < 19) {
+                depth++;
+                stack[depth].cluster = ents[sel].first_cluster;
+                stack[depth].fixed_root = 0;
+                strncpy(stack[depth].name, ents[sel].name, sizeof stack[depth].name - 1);
+                stack[depth].name[sizeof stack[depth].name - 1] = 0;
+                reload = 1;
+            }
+        } else if (key == ' ') {
+            if (nent > 0) marks[sel] = !marks[sel];
+        } else if (key == '\b') {
+            if (depth > 0) { depth--; reload = 1; }
+        } else if (key == K_ESC) {
+            break;
+        }
+        if (reload) {
+            nent = cbk_list_dir(&vol, stack[depth].cluster, stack[depth].fixed_root, ents, 256);
+            if (nent < 0) nent = 0;
+            sel = 0; top = 0;
+            memset(marks, 0, sizeof marks);
+        }
+    }
+    cbk_close_vol(&vol);
+}
+
 /* ---- text-UI entry ----------------------------------------------------- */
 
 static int tui_main(void)
@@ -436,6 +596,10 @@ static int tui_main(void)
                 do_clone(drive);
                 scan_disks();
                 snprintf(status_msg, sizeof status_msg, "Returned from Clone.");
+                break;
+            case K_F6:
+                do_browse();
+                strcpy(status_msg, "Returned from Browse.");
                 break;
             case K_F5:
                 scan_disks();
