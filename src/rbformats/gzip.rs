@@ -130,9 +130,14 @@ pub(crate) fn compress_gzip(
     let mut w = encoder.finish().context("failed to finalize gzip stream")?;
     w.flush().context("failed to flush gzip output")?;
 
+    // Write the seek layout for a multi-member partition, or remove any stale one
+    // (e.g. when re-compressing — during an edit — a partition that is now small
+    // enough to be single-member, so a leftover `.idx` can't mis-describe it).
+    let idx_path = gz_index_path(&first_path);
     if multimember && spans.len() > 1 {
-        write_gz_index(&gz_index_path(&first_path), &spans)
-            .context("failed to write gzip seek index")?;
+        write_gz_index(&idx_path, &spans).context("failed to write gzip seek index")?;
+    } else {
+        let _ = std::fs::remove_file(&idx_path);
     }
     Ok(files)
 }

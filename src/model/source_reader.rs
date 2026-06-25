@@ -18,7 +18,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::rbformats::cbk::{
-    cbk_member_content_reader, read_cbk_index, CbkMember, CbkPayloadReader,
+    cbk_member_content_reader, cbk_member_content_reader_at, read_cbk_index, CbkMember,
+    CbkPayloadReader,
 };
 use crate::rbformats::chd::ChdReader;
 use crate::rbformats::containers::atr::{decode_atr_bytes, looks_like_atr_header};
@@ -516,14 +517,23 @@ impl CbkLazyReader {
         off: u64,
         buf: &mut [u8],
     ) -> std::io::Result<usize> {
+        // Pick the chunk (source-span gzip member) covering `off`. For a
+        // single-chunk member this is always 0 (`chunk_start` 0), so the behavior
+        // is unchanged. For a multi-chunk member we start decode at that chunk
+        // (its content begins at `chunk_start`), so we never decode more than one
+        // span to reach `off` — fast random access, forward *and* backward.
+        let k = self.members[member_idx].chunk_for_offset(off);
+        let chunk_start = self.members[member_idx].chunk_src_offset(k);
         let recreate = match &self.active {
-            Some((m, _, decoded)) => *m != member_idx || *decoded > off,
+            // recreate on member switch, backward seek, or a forward jump into a
+            // later chunk (decoding from `chunk_start` skips less than continuing).
+            Some((m, _, decoded)) => *m != member_idx || *decoded > off || chunk_start > *decoded,
             None => true,
         };
         if recreate {
-            let dec =
-                cbk_member_content_reader(&self.path, &self.members[member_idx]).map_err(to_io)?;
-            self.active = Some((member_idx, dec, 0));
+            let dec = cbk_member_content_reader_at(&self.path, &self.members[member_idx], k)
+                .map_err(to_io)?;
+            self.active = Some((member_idx, dec, chunk_start));
         }
         let (_, dec, decoded) = self.active.as_mut().unwrap();
         let mut skip = [0u8; 16384];

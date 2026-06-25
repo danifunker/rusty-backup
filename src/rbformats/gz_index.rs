@@ -46,11 +46,6 @@ pub fn gz_index_path(gz: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// True if `name` is a `.gz.idx` seek-layout sidecar.
-pub fn is_gz_index_name(name: &str) -> bool {
-    name.ends_with(".gz.idx")
-}
-
 /// Serialize a span table.
 pub fn encode_gz_index(spans: &[GzSpan]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(10 + spans.len() * 16);

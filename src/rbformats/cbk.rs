@@ -47,6 +47,58 @@ use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use super::gz_index::{gz_index_path, read_gz_index, GzSpan};
+
+/// True if every span offset starts at a gzip member (`1f 8b`) within `gz` — a
+/// cheap guard so a stale/corrupt `.idx` can never mis-split the `.gz` (we fall
+/// back to a single verbatim chunk if it doesn't match).
+fn gz_index_matches(gz: &Path, gz_len: u64, spans: &[GzSpan]) -> bool {
+    let mut f = match File::open(gz) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    for s in spans {
+        if s.compressed_offset + 2 > gz_len {
+            return false;
+        }
+        let mut m = [0u8; 2];
+        if f.seek(SeekFrom::Start(s.compressed_offset)).is_err() || f.read_exact(&mut m).is_err() {
+            return false;
+        }
+        if m != [0x1f, 0x8b] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Copy exactly `n` bytes from `f` to `w`, returning the CRC32 of those bytes.
+fn copy_n_hashed(f: &mut impl Read, w: &mut impl Write, n: u64) -> Result<u32> {
+    let mut hasher = crc32fast::Hasher::new();
+    let mut remaining = n;
+    let mut buf = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let want = (remaining as usize).min(buf.len());
+        let got = f.read(&mut buf[..want])?;
+        if got == 0 {
+            bail!("cbk: short read copying chunk payload");
+        }
+        hasher.update(&buf[..got]);
+        w.write_all(&buf[..got])?;
+        remaining -= got as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+/// Back-patch the CRC field (byte +20) of the chunk header at `chunk_off`.
+fn back_patch_crc(w: &mut (impl Write + Seek), chunk_off: u64, crc: u32) -> Result<()> {
+    let end = w.stream_position()?;
+    w.seek(SeekFrom::Start(chunk_off + 20))?;
+    w.write_all(&crc.to_be_bytes())?;
+    w.seek(SeekFrom::Start(end))?;
+    Ok(())
+}
+
 pub const CHUNK_MAGIC: u32 = 0x5242_4B43; // "RBKC"
 pub const INDEX_MAGIC: u32 = 0x5242_4B49; // "RBKI"
 pub const FOOTER_MAGIC: u32 = 0x5242_4B46; // "RBKF"
@@ -142,33 +194,59 @@ pub fn pack_folder_to_cbk(folder: &Path, out: &Path) -> Result<()> {
         let logical_id = i as u16;
         let kind = Kind::for_file(name);
         let path = folder.join(name);
-        let chunk_off = w.stream_position()?;
 
-        match kind {
+        let chunk_offsets: Vec<u64> = match kind {
             Kind::Gz => {
-                // Verbatim: header (len from stat, crc back-patched after streaming).
-                let len = fs::metadata(&path)?.len();
-                let len_u32: u32 = len
-                    .try_into()
-                    .with_context(|| format!("{name}: gz member exceeds 4 GiB chunk limit"))?;
-                write_chunk_header(&mut w, logical_id, 0, len_u32, 0)?;
+                // A multi-member `.gz` (with a `.gz.idx` seek layout) is split into
+                // one chunk per source-span member, each carrying its uncompressed
+                // `src_offset`, so the lazy reader can seek per-chunk. The chunk
+                // payloads concatenated are byte-identical to the original `.gz`,
+                // so `cbk unpack` reproduces it exactly. A single-member `.gz` (no
+                // `.idx`) stays one verbatim chunk, as before.
+                let gz_len = fs::metadata(&path)?.len();
+                let spans = read_gz_index(&gz_index_path(&path))
+                    .ok()
+                    .filter(|s| s.len() > 1)
+                    .filter(|s| gz_index_matches(&path, gz_len, s));
                 let mut f = BufReader::new(File::open(&path)?);
-                let mut hasher = crc32fast::Hasher::new();
-                let mut buf = vec![0u8; 256 * 1024];
-                loop {
-                    let n = f.read(&mut buf)?;
-                    if n == 0 {
-                        break;
+                let mut offsets = Vec::new();
+                match spans {
+                    Some(spans) => {
+                        for (k, span) in spans.iter().enumerate() {
+                            let start = span.compressed_offset;
+                            let end = spans
+                                .get(k + 1)
+                                .map(|s| s.compressed_offset)
+                                .unwrap_or(gz_len);
+                            let payload_len: u32 = (end.saturating_sub(start))
+                                .try_into()
+                                .with_context(|| format!("{name}: gz span exceeds 4 GiB"))?;
+                            let chunk_off = w.stream_position()?;
+                            write_chunk_header(
+                                &mut w,
+                                logical_id,
+                                span.uncompressed_offset,
+                                payload_len,
+                                0,
+                            )?;
+                            f.seek(SeekFrom::Start(start))?;
+                            let crc = copy_n_hashed(&mut f, &mut w, payload_len as u64)?;
+                            back_patch_crc(&mut w, chunk_off, crc)?;
+                            offsets.push(chunk_off);
+                        }
                     }
-                    hasher.update(&buf[..n]);
-                    w.write_all(&buf[..n])?;
+                    None => {
+                        let len_u32: u32 = gz_len.try_into().with_context(|| {
+                            format!("{name}: gz member exceeds 4 GiB chunk limit")
+                        })?;
+                        let chunk_off = w.stream_position()?;
+                        write_chunk_header(&mut w, logical_id, 0, len_u32, 0)?;
+                        let crc = copy_n_hashed(&mut f, &mut w, gz_len)?;
+                        back_patch_crc(&mut w, chunk_off, crc)?;
+                        offsets.push(chunk_off);
+                    }
                 }
-                let crc = hasher.finalize();
-                // Back-patch the crc field of this chunk header.
-                let end = w.stream_position()?;
-                w.seek(SeekFrom::Start(chunk_off + 20))?;
-                w.write_all(&crc.to_be_bytes())?;
-                w.seek(SeekFrom::Start(end))?;
+                offsets
             }
             Kind::Raw => {
                 // gzip-wrap the raw file bytes into one member.
@@ -181,16 +259,18 @@ pub fn pack_folder_to_cbk(folder: &Path, out: &Path) -> Result<()> {
                     .len()
                     .try_into()
                     .with_context(|| format!("{name}: payload exceeds 4 GiB chunk limit"))?;
+                let chunk_off = w.stream_position()?;
                 write_chunk_header(&mut w, logical_id, 0, len_u32, crc)?;
                 w.write_all(&payload)?;
+                vec![chunk_off]
             }
-        }
+        };
 
         members.push(MemberOut {
             name: name.clone(),
             kind,
             logical_id,
-            chunk_offsets: vec![chunk_off],
+            chunk_offsets,
         });
     }
 
@@ -387,25 +467,65 @@ pub fn is_cbk(path: &Path) -> bool {
     .unwrap_or(false)
 }
 
-/// A `.cbk` index entry: a member file and the file-offsets of its chunks.
-/// Enough for a lazy reader to stream a single member without materializing the
-/// whole container.
+/// A `.cbk` index entry: a member file and the file-offsets of its chunks, plus
+/// each chunk's uncompressed start offset (its `src_offset`). Enough for a lazy
+/// reader to stream a member, and — for a multi-chunk member — to **seek** to the
+/// chunk covering a wanted uncompressed offset without decoding from byte 0.
 pub struct CbkMember {
     pub name: String,
     chunk_offsets: Vec<u64>,
+    chunk_src_offsets: Vec<u64>,
+}
+
+impl CbkMember {
+    /// Number of chunks (independent gzip members) in this member.
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_offsets.len()
+    }
+    /// The chunk index whose span covers uncompressed offset `off` (the last
+    /// chunk whose `src_offset <= off`; 0 for a single-chunk member).
+    pub fn chunk_for_offset(&self, off: u64) -> usize {
+        match self.chunk_src_offsets.partition_point(|&s| s <= off) {
+            0 => 0,
+            k => k - 1,
+        }
+    }
+    /// The uncompressed start offset of chunk `k`.
+    pub fn chunk_src_offset(&self, k: usize) -> u64 {
+        self.chunk_src_offsets.get(k).copied().unwrap_or(0)
+    }
+}
+
+/// Read chunk `offset`'s `src_offset` field (uncompressed start) from its header.
+fn read_chunk_src_offset(f: &mut File, offset: u64) -> Result<u64> {
+    f.seek(SeekFrom::Start(offset))?;
+    let mut hdr = [0u8; CHUNK_HEADER_LEN];
+    f.read_exact(&mut hdr)?;
+    if read_u32(&hdr, 0) != CHUNK_MAGIC {
+        bail!("cbk: bad chunk magic at offset {offset}");
+    }
+    Ok(read_u64(&hdr, 8))
 }
 
 /// Read a `.cbk`'s index (no payloads) — the member list with each member's
-/// chunk offsets. Cheap: one footer read + one index read.
+/// chunk offsets + per-chunk uncompressed offsets. Cheap: one footer read, one
+/// index read, then one 24-byte header read per chunk.
 pub fn read_cbk_index(path: &Path) -> Result<Vec<CbkMember>> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    Ok(read_index(&mut f)?
-        .into_iter()
-        .map(|m| CbkMember {
+    let members = read_index(&mut f)?;
+    let mut out = Vec::with_capacity(members.len());
+    for m in members {
+        let mut srcs = Vec::with_capacity(m.chunk_offsets.len());
+        for &off in &m.chunk_offsets {
+            srcs.push(read_chunk_src_offset(&mut f, off)?);
+        }
+        out.push(CbkMember {
             name: m.name,
             chunk_offsets: m.chunk_offsets,
-        })
-        .collect())
+            chunk_src_offsets: srcs,
+        });
+    }
+    Ok(out)
 }
 
 /// A `Read` over a member's concatenated chunk payloads (the raw member bytes),
@@ -425,10 +545,17 @@ pub struct CbkPayloadReader {
 
 impl CbkPayloadReader {
     pub fn open(path: &Path, member: &CbkMember) -> Result<Self> {
+        Self::open_at(path, member, 0)
+    }
+
+    /// Open starting at chunk `start_chunk` — the payload stream then begins at
+    /// that chunk's gzip member (whose decompressed content starts at the chunk's
+    /// `src_offset`). Used to seek into a multi-chunk member.
+    pub fn open_at(path: &Path, member: &CbkMember, start_chunk: usize) -> Result<Self> {
         Ok(Self {
             file: File::open(path)?,
             chunk_offsets: member.chunk_offsets.clone(),
-            next_chunk: 0,
+            next_chunk: start_chunk.min(member.chunk_offsets.len()),
             buf: Vec::new(),
             buf_pos: 0,
         })
@@ -460,7 +587,22 @@ pub fn cbk_member_content_reader(
     path: &Path,
     member: &CbkMember,
 ) -> Result<MultiGzDecoder<CbkPayloadReader>> {
-    Ok(MultiGzDecoder::new(CbkPayloadReader::open(path, member)?))
+    cbk_member_content_reader_at(path, member, 0)
+}
+
+/// Like [`cbk_member_content_reader`] but starting decode at chunk `start_chunk`
+/// — the decoded stream then begins at that chunk's `src_offset`. The caller
+/// skips the remaining `off - src_offset(start_chunk)` bytes to reach `off`.
+pub fn cbk_member_content_reader_at(
+    path: &Path,
+    member: &CbkMember,
+    start_chunk: usize,
+) -> Result<MultiGzDecoder<CbkPayloadReader>> {
+    Ok(MultiGzDecoder::new(CbkPayloadReader::open_at(
+        path,
+        member,
+        start_chunk,
+    )?))
 }
 
 #[cfg(test)]
@@ -506,6 +648,76 @@ mod tests {
             let b = fs::read(out.join(name)).unwrap();
             assert_eq!(a, b, "member {name} did not round-trip byte-for-byte");
         }
+    }
+
+    /// A multi-member `partition-N.gz` (with a `.gz.idx`) packs into per-span
+    /// chunks carrying the right `src_offset`s; the lazy reader can start decode
+    /// at the chunk covering an offset; and unpack reproduces the `.gz` byte-exact.
+    #[test]
+    fn multi_chunk_member_packs_seeks_and_round_trips() {
+        use crate::rbformats::gz_index::{write_gz_index, GzSpan};
+
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("MM");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("metadata.json"), b"{\n  \"version\": 1\n}\n").unwrap();
+
+        // A two-member gz: member A = 1000 'A's, member B = 1000 'B's.
+        let (a, b) = (vec![b'A'; 1000], vec![b'B'; 1000]);
+        let mut gz = Vec::new();
+        let mut e = GzEncoder::new(&mut gz, Compression::default());
+        e.write_all(&a).unwrap();
+        e.finish().unwrap();
+        let comp_b_start = gz.len() as u64;
+        let mut e = GzEncoder::new(&mut gz, Compression::default());
+        e.write_all(&b).unwrap();
+        e.finish().unwrap();
+        fs::write(src.join("partition-0.gz"), &gz).unwrap();
+        write_gz_index(
+            &src.join("partition-0.gz.idx"),
+            &[
+                GzSpan {
+                    uncompressed_offset: 0,
+                    compressed_offset: 0,
+                },
+                GzSpan {
+                    uncompressed_offset: 1000,
+                    compressed_offset: comp_b_start,
+                },
+            ],
+        )
+        .unwrap();
+
+        let cbk = tmp.path().join("MM.cbk");
+        pack_folder_to_cbk(&src, &cbk).unwrap();
+
+        let members = read_cbk_index(&cbk).unwrap();
+        let pm = members.iter().find(|m| m.name == "partition-0.gz").unwrap();
+        assert_eq!(pm.chunk_count(), 2, "partition split into 2 chunks");
+        assert_eq!(pm.chunk_src_offset(0), 0);
+        assert_eq!(pm.chunk_src_offset(1), 1000);
+        assert_eq!(pm.chunk_for_offset(0), 0);
+        assert_eq!(pm.chunk_for_offset(999), 0);
+        assert_eq!(pm.chunk_for_offset(1000), 1);
+        assert_eq!(pm.chunk_for_offset(1500), 1);
+
+        // Starting decode at chunk 1 yields member B directly (no decode of A).
+        let mut dec = cbk_member_content_reader_at(&cbk, pm, 1).unwrap();
+        let mut got = Vec::new();
+        dec.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b, "chunk-1 decode yields member B");
+
+        // Full decode (chunk 0) = A then B.
+        let mut dec0 = cbk_member_content_reader(&cbk, pm).unwrap();
+        let mut all = Vec::new();
+        dec0.read_to_end(&mut all).unwrap();
+        assert_eq!(&all[..1000], &a[..]);
+        assert_eq!(&all[1000..], &b[..]);
+
+        // Unpack reproduces the multi-member gz byte-for-byte.
+        let out = tmp.path().join("out");
+        materialize_cbk_to_folder(&cbk, &out).unwrap();
+        assert_eq!(fs::read(out.join("partition-0.gz")).unwrap(), gz);
     }
 
     #[test]
