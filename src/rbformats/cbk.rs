@@ -387,6 +387,82 @@ pub fn is_cbk(path: &Path) -> bool {
     .unwrap_or(false)
 }
 
+/// A `.cbk` index entry: a member file and the file-offsets of its chunks.
+/// Enough for a lazy reader to stream a single member without materializing the
+/// whole container.
+pub struct CbkMember {
+    pub name: String,
+    chunk_offsets: Vec<u64>,
+}
+
+/// Read a `.cbk`'s index (no payloads) — the member list with each member's
+/// chunk offsets. Cheap: one footer read + one index read.
+pub fn read_cbk_index(path: &Path) -> Result<Vec<CbkMember>> {
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(read_index(&mut f)?
+        .into_iter()
+        .map(|m| CbkMember {
+            name: m.name,
+            chunk_offsets: m.chunk_offsets,
+        })
+        .collect())
+}
+
+/// A `Read` over a member's concatenated chunk payloads (the raw member bytes),
+/// streamed one chunk at a time (no full-member buffering). Each payload's CRC
+/// is verified as it's read. Wrap in `MultiGzDecoder` to get the member's
+/// *logical content*: the decompressed partition for a `*.gz` (`Gz`) member, or
+/// the file itself for a gzip-wrapped (`Raw`) member — so
+/// `MultiGzDecoder::new(CbkPayloadReader::open(..))` yields the right bytes for
+/// either kind.
+pub struct CbkPayloadReader {
+    file: File,
+    chunk_offsets: Vec<u64>,
+    next_chunk: usize,
+    buf: Vec<u8>,
+    buf_pos: usize,
+}
+
+impl CbkPayloadReader {
+    pub fn open(path: &Path, member: &CbkMember) -> Result<Self> {
+        Ok(Self {
+            file: File::open(path)?,
+            chunk_offsets: member.chunk_offsets.clone(),
+            next_chunk: 0,
+            buf: Vec::new(),
+            buf_pos: 0,
+        })
+    }
+}
+
+impl Read for CbkPayloadReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.buf_pos >= self.buf.len() {
+            if self.next_chunk >= self.chunk_offsets.len() {
+                return Ok(0); // all chunks consumed
+            }
+            let off = self.chunk_offsets[self.next_chunk];
+            self.next_chunk += 1;
+            self.buf = read_chunk_payload(&mut self.file, off)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            self.buf_pos = 0;
+        }
+        let n = (self.buf.len() - self.buf_pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        Ok(n)
+    }
+}
+
+/// A streaming reader over a member's logical content (decompressed partition,
+/// or the raw small file), via `MultiGzDecoder` over its chunk payloads.
+pub fn cbk_member_content_reader(
+    path: &Path,
+    member: &CbkMember,
+) -> Result<MultiGzDecoder<CbkPayloadReader>> {
+    Ok(MultiGzDecoder::new(CbkPayloadReader::open(path, member)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
