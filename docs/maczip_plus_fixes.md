@@ -47,28 +47,28 @@ Finder-flags field, so `get-binhex` (and `cp`) hard-code `flags: 0`.
 
 Ref: `docs/native_mac_archives.md` (Phases 0–5). Self-contained spec.
 
-- [ ] **B0.** New `src/macarchive/macbinary.rs`: one full-fidelity parser.
+- [x] **B0.** New `src/macarchive/macbinary.rs`: one full-fidelity parser.
       `is_macbinary() -> Option<MacBinaryVersion>` (the §2.4 confidence
       heuristic); `parse() -> MacBinaryFile` (filename, type/creator, both forks,
       full 16-bit Finder flags = `$49` hi + `$65` lo, location, folder,
       create/mod dates, version). Reuse `resource_fork::macbinary_crc16`.
       **Accept an empty resource fork** (fixes the old reject bug).
-- [ ] **B0b.** Migrate `cli/verbs/put_macbinary.rs::parse_macbinary_header` and
+- [x] **B0b.** Migrate `cli/verbs/put_macbinary.rs::parse_macbinary_header` and
       `resource_fork::parse_macbinary` call sites onto the new parser; keep the
       `build_macbinary` writer.
-- [ ] **B1.** `detect.rs`: add `MacArchiveKind::MacBinary` (`label`/`is_multi_file
+- [x] **B1.** `detect.rs`: add `MacArchiveKind::MacBinary` (`label`/`is_multi_file
       = false`/`is_binhex_wrapped = false`); probe **after** strong-magic formats,
       gated by the heuristic.
-- [ ] **B2.** `extract.rs`: `open_bytes` arm → `synth_from_macbinary`
+- [x] **B2.** `extract.rs`: `open_bytes` arm → `synth_from_macbinary`
       (single-entry, method 0/store).
-- [ ] **B3.** Nested payloads: peel when the data fork is a SIT/SIT5/SEA/CPT;
+- [x] **B3.** Nested payloads: peel when the data fork is a SIT/SIT5/SEA/CPT;
       surface "Mount" when `detect_mountable_image` matches; plain app otherwise
       (NDIF `.smi` stays out of scope).
-- [ ] **B4.** `.bin` overload: route by content, not extension. Broaden the
+- [x] **B4.** `.bin` overload: route by content, not extension. Broaden the
       Archives-tab Browse filter to include `.bin`/`.macbin`; do **not** add
       `bin` to `MAC_ARCHIVE_EXTS`. Source-picker/inspect redirect only when
       `detect_mac_archive` confirms MacBinary.
-- [ ] **B5.** Docs/tests: flip `native_mac_archives.md` MacBinary entries to
+- [x] **B5.** Docs/tests: flip `native_mac_archives.md` MacBinary entries to
       Done; README image-formats + Mac-archive coverage; MiSTer status if
       affected. Tests per §6 matrix (use `~/Downloads/ProblemFiles` fixtures if
       present, else synthesize; include a "raw `.bin` is not MacBinary"

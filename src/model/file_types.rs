@@ -41,6 +41,34 @@ pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
 /// case-sensitive pickers; new entries are lowercase-only (`cpt`).
 pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "cpt", "mar", "SIT", "HQX", "SEA"];
 
+/// Extra extensions shown in the Archives-tab Browse picker for MacBinary
+/// files, *in addition to* [`MAC_ARCHIVE_EXTS`]. Deliberately kept out of
+/// `MAC_ARCHIVE_EXTS` (which drives content-routing / the source-picker
+/// redirect): `.bin` is overwhelmingly a raw disk/optical image, so it stays a
+/// disk image by default and is only treated as a Mac archive when
+/// `macarchive::detect::detect_mac_archive` confirms MacBinary on the actual
+/// bytes. This list only widens the *picker filter* so a user can select a
+/// `.bin` to inspect in the Archives tab; the content sniff is still the gate.
+pub const MACBINARY_PICKER_EXTS: &[&str] = &["bin", "macbin"];
+
+/// Every extension the **Archives tab** Browse picker should surface, so a user
+/// can select any archive format the engine knows how to open. This is the
+/// single source of truth for that picker and is kept in parity with
+/// `macarchive::detect::detect_mac_archive`'s coverage: the canonical Mac
+/// archive set ([`MAC_ARCHIVE_EXTS`]) plus the content-overloaded extensions
+/// ([`MACBINARY_PICKER_EXTS`]; `.zip` MacZip is added when that reader lands)
+/// that can't live in the routing list. Detection stays content-driven; this
+/// only controls which files the dialog shows.
+pub fn archives_picker_exts() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for ext in MAC_ARCHIVE_EXTS.iter().chain(MACBINARY_PICKER_EXTS) {
+        if !out.contains(ext) {
+            out.push(ext);
+        }
+    }
+    out
+}
+
 /// ProgId registered under `HKCU\Software\Classes` for disk-image associations.
 pub const DISK_IMAGE_PROGID: &str = "RustyBackup.DiskImage";
 
@@ -170,6 +198,46 @@ mod tests {
                 "missing Alto/Pilot pack extension {must}"
             );
         }
+    }
+
+    #[test]
+    fn macbinary_picker_is_separate_from_routing_list() {
+        // `.bin` must be selectable in the Archives picker but must NOT join
+        // MAC_ARCHIVE_EXTS — otherwise every raw `.bin` disk image would be
+        // routed to the Mac-archive path by extension. Content detection
+        // (detect_mac_archive) is the real gate.
+        assert!(MACBINARY_PICKER_EXTS.contains(&"bin"));
+        assert!(
+            !MAC_ARCHIVE_EXTS.contains(&"bin"),
+            "bin must stay out of the content-routing list"
+        );
+        // And it stays a disk image by default.
+        assert!(DISK_IMAGE_EXTS.contains(&"bin"));
+    }
+
+    #[test]
+    fn archives_picker_covers_every_supported_format() {
+        // The Archives-tab Browse picker must surface every archive format the
+        // engine can open (detect_mac_archive's coverage): StuffIt (.sit), SEA
+        // (.sea), BinHex (.hqx), Compact Pro (.cpt), MAR (.mar), MacBinary
+        // (.bin/.macbin), and MacZip (.zip). If a new format is added to the
+        // classifier, add its picker extension here too.
+        let picker = archives_picker_exts();
+        // .zip (MacZip) is added to this list when that reader lands.
+        for must in ["sit", "hqx", "sea", "cpt", "mar", "bin", "macbin"] {
+            assert!(
+                picker.contains(&must),
+                "Archives picker is missing supported format .{must}"
+            );
+        }
+        // Superset of the routing list, and de-duplicated.
+        for ext in MAC_ARCHIVE_EXTS {
+            assert!(picker.contains(ext), "picker dropped routing ext {ext}");
+        }
+        let mut sorted = picker.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), picker.len(), "picker has duplicates");
     }
 
     #[test]

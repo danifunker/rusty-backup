@@ -317,7 +317,10 @@ The app has five tabs:
   discs. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
   StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
-  (`.mar`, read + write), and BinHex (`.hqx`) wrappers around any of them.
+  (`.mar`, read + write), MacBinary I/II/III (`.bin`, content-detected so a raw
+  `.bin` disk image stays a disk image), and BinHex (`.hqx`) wrappers around any
+  of them. A MacBinary whose data fork is itself a StuffIt/Compact Pro archive
+  is peeled through to the inner entries.
   Pick an archive, browse the entry tree (name / type / creator / size /
   codec), tick the entries to keep, and extract to a folder in your choice
   of fork-preserving container — BinHex, MacBinary, AppleDouble, or raw

@@ -58,6 +58,10 @@ pub enum MacArchiveKind {
     /// A `mar` archive (`.mar`, `MAR\x80` magic) — a single Mac file or folder
     /// tree. Only the stored (unwrapped) form is recognized here.
     Mar,
+    /// A MacBinary I/II/III file (`.bin`): a transport wrapper holding one Mac
+    /// file's two forks plus Finder info. Content-detected (it has no reliable
+    /// extension), so a raw `.bin` disk image stays a disk image.
+    MacBinary,
 }
 
 impl MacArchiveKind {
@@ -75,6 +79,7 @@ impl MacArchiveKind {
             MacArchiveKind::CompactPro => "Compact Pro",
             MacArchiveKind::BinHexOverCompactPro => "Compact-Pro-over-BinHex",
             MacArchiveKind::Mar => "MAR",
+            MacArchiveKind::MacBinary => "MacBinary",
         }
     }
 
@@ -94,7 +99,10 @@ impl MacArchiveKind {
     /// SEA, possibly wrapped in BinHex). The opposite case is a
     /// `BinHexSingleFile`, which only ever holds one file.
     pub fn is_multi_file(self) -> bool {
-        !matches!(self, MacArchiveKind::BinHexSingleFile)
+        !matches!(
+            self,
+            MacArchiveKind::BinHexSingleFile | MacArchiveKind::MacBinary
+        )
     }
 }
 
@@ -146,6 +154,14 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
     }
     if super::mar::is_mar(bytes) {
         return Some(MacArchiveKind::Mar);
+    }
+    // MacBinary after the strong-magic formats (it has no magic of its own and
+    // uses a confidence heuristic), but before the broad SEA signature scan so
+    // a MacBinary wrapping a SEA app still classifies as MacBinary. The
+    // heuristic is conservative enough that a raw `.bin` disk image is not
+    // matched (see is_macbinary's floor checks).
+    if super::macbinary::is_macbinary(bytes).is_some() {
+        return Some(MacArchiveKind::MacBinary);
     }
     if find_sea_archive(bytes).is_some() {
         return Some(MacArchiveKind::Sea);
@@ -428,6 +444,38 @@ mod tests {
         ] {
             assert!(k.is_multi_file(), "{k:?}");
         }
+    }
+
+    #[test]
+    fn detects_macbinary_and_not_raw_disk_image() {
+        use byteorder::{BigEndian, ByteOrder};
+        // A CRC-valid MacBinary II classifies as MacBinary (single-file).
+        let mut hdr = [0u8; 128];
+        hdr[1] = 1;
+        hdr[2] = b'x';
+        hdr[65..69].copy_from_slice(b"TEXT");
+        hdr[69..73].copy_from_slice(b"ttxt");
+        BigEndian::write_u32(&mut hdr[83..87], 4); // data fork len
+        hdr[122] = 129;
+        hdr[123] = 129;
+        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        BigEndian::write_u16(&mut hdr[124..126], crc);
+        let mut mb = hdr.to_vec();
+        mb.extend_from_slice(b"DATA");
+        while mb.len() % 128 != 0 {
+            mb.push(0);
+        }
+        assert_eq!(detect_mac_archive(&mb), Some(MacArchiveKind::MacBinary));
+        assert!(!MacArchiveKind::MacBinary.is_multi_file());
+
+        // A raw HFS volume (MDB sig at byte 1024) must NOT be a Mac archive —
+        // the .bin overload stays a disk image.
+        let mut hfs = vec![0u8; 2048];
+        hfs[0] = 0x4C;
+        hfs[1] = 0x4B;
+        hfs[1024] = 0x42;
+        hfs[1025] = 0x44;
+        assert_eq!(detect_mac_archive(&hfs), None);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod bitreader_be;
 pub mod compactpro;
 pub mod detect;
 pub mod extract;
+pub mod macbinary;
 pub mod mar;
 pub mod stuffit;
 pub mod stuffit13_tables;

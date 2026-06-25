@@ -274,7 +274,7 @@ impl ArchivesTab {
                 if let Some(path) = super::file_dialog()
                     .add_filter(
                         "Mac Archives",
-                        rusty_backup::model::file_types::MAC_ARCHIVE_EXTS,
+                        &rusty_backup::model::file_types::archives_picker_exts(),
                     )
                     .add_filter("All Files", &["*"])
                     .pick_file()

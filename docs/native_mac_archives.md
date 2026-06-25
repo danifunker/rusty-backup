@@ -8,6 +8,14 @@ relevant format details are embedded inline.
 Status legend: **Done** (shipping), **Plan** (this document's roadmap), **Out of
 scope** (noted boundary).
 
+> **MacBinary I/II/III is now Done** (2026-06-25). The canonical parser lives in
+> `src/macarchive/macbinary.rs` (`is_macbinary` heuristic + lenient `parse`),
+> `put-macbinary` was migrated onto it, `MacArchiveKind::MacBinary` is
+> content-detected and routed through `open_bytes` (with peel-to-inner-archive),
+> and the `.bin` overload is resolved by content (a raw `.bin` disk image stays
+> a disk image; see `MACBINARY_PICKER_EXTS`). The Phase markers below are kept
+> for historical context.
+
 ---
 
 ## 1. What `src/macarchive/` already does (Done)
@@ -29,8 +37,8 @@ rusty-backup has a working, multi-codec Mac archive decoder family. The pieces:
   `detect_mac_archive(bytes) -> Option<MacArchiveKind>`. Extension-independent,
   content-driven. Today's `MacArchiveKind` variants: `BinHexSingleFile`,
   `BinHexOverSit`, `BinHexOverSea`, `BinHexOverCompactPro`, `Sit`, `Sit5`,
-  `Sea`, `CompactPro`, `Mar`. **There is no `MacBinary` variant yet — that is
-  the gap this plan closes.**
+  `Sea`, `CompactPro`, `Mar`, and now `MacBinary` (Done — content-detected via
+  the `is_macbinary` confidence heuristic).
 
 - **Orchestrator** (`src/macarchive/extract.rs`):
   - `open(path)` / `open_bytes(raw) -> Result<(Vec<u8>, StuffItArchive)>` —
@@ -180,7 +188,7 @@ the model's `create_date` / `mod_date` the same way the StuffIt parsers do.
 
 ---
 
-## 3. Implementation plan — MacBinary as a first-class Mac archive (Plan)
+## 3. Implementation plan — MacBinary as a first-class Mac archive (Done)
 
 Goal: a `.bin` MacBinary I/II/III file behaves exactly like every other member
 of the family — it is detected by content, listed in the Archives tab, extracted
