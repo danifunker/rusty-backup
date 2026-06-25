@@ -2094,6 +2094,7 @@ fn run_single_file_chd_path(
         };
 
     let inputs = single_file_chd::SingleFileChdInputs {
+        keep_swap: config.keep_swap,
         source_file: source.get_ref(),
         source_size,
         source_partition_table_bytes: mbr_bytes,

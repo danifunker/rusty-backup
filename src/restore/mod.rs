@@ -2789,6 +2789,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2927,6 +2928,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -3096,6 +3098,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -3307,6 +3310,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
