@@ -15,6 +15,10 @@ only desktop addition is a gzip codec (see §3).
 Update the checkboxes and the **Progress log** at the bottom as work lands.
 Keep each step small enough to be one commit.
 
+> **What's left?** The short, prioritized backlog is [`cb_dos_todo.md`](cb_dos_todo.md)
+> — the single tick-it-off checklist. This file keeps the full scope + progress log;
+> the to-do file is the resume/track surface.
+
 Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[-]` dropped/out of scope
 
 ---

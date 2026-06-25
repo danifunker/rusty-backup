@@ -5,6 +5,9 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 [`cb_dos_network_and_state.md`](cb_dos_network_and_state.md) (the `.cbk` container
 + network plan, §2). Everything below was verified on **real FreeDOS in qemu**.
 
+**The remaining-work checklist lives in [`cb_dos_todo.md`](cb_dos_todo.md)** — the
+single tick-it-off backlog. Resume here for context; work from there.
+
 ## Where we are (2026-06-25)
 
 Branch **`cbdos`** (off `main`), 32 commits ahead of `main`, all verified, tree
@@ -60,30 +63,19 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
-## Next work (prioritized — pick up here)
+## Next work — see [`cb_dos_todo.md`](cb_dos_todo.md)
 
-1. **Phase 5 — file-level repack/defrag** (boot-file aware: keep `IO.SYS`/
-   `MSDOS.SYS` first + contiguous; FAT-only). Still emits a plain `partition-N.gz`,
-   just defragmented. The biggest remaining DOS-side feature.
-2. **Phase 6 — LZ4 codec** for slower machines (needs a matching desktop `Lz4`
-   variant alongside `Gzip`).
-3. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
-   Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
-   the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
-   boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
-   quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
-   `get` also writes a DOS file, so the same caution applies; don't redirect it on
-   the same drive. Worth root-causing (likely a DTA/FILE-buffer aliasing).
-4. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
-   this is mainly framing + the incremental `.idx` resume sidecar). See
-   `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i). The path to networked
-   backup/restore ("both" local + network).
-5. **Real-486 hardware** validation (everything so far is qemu/emulator).
+The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
+(one source of truth; update it as items land). Top of the queue, in order:
 
-(Out of scope per the maintainer: **exFAT** backup-source — no DOS-era OS mounts
-it; **ext2/3** — those users would run a Linux build. The lazy-reader follow-up of
-re-chunking the packer into source-span members for intra-partition random access
-is deferred — it re-frames `partition-N.gz` and needs a recomputed CRC.)
+1. **Phase 5** — file-level repack/defrag (FAT, boot-file aware).
+2. **Phase 6** — LZ4 codec for slower machines.
+3. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
+4. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
+5. **Real-486 hardware** validation (everything so far is qemu).
+
+Dropped by decision: exFAT backup-source, ext2/3. Deferred: the lazy-reader
+packer re-chunking (re-frames `partition-N.gz`, needs a recomputed CRC).
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
