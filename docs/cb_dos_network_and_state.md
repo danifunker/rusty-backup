@@ -703,8 +703,23 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       qemu proof: a backup dropped after 2 committed spans (`RB_SERVE_TEST_DROP_
       AFTER_CHUNKS=2`), reconnected, was told to resume at span 2, finished, and
       `rb-cli restore` rebuilt a byte-identical disk.
-- [ ] **7e — Restore over wire.** Host serves members on `GET`; cb-dos restores
-      with resize; restored card boots.
+- [x] **7e — Restore over wire. Done — qemu-verified (2026-06-25).** Closes the
+      producer/consumer loop: `CRUSTYBK RESTORE rb://HOST/NAME 81 /Y` pulls a
+      `.cbk` back from the agent and rebuilds the disk over int13h, no local
+      folder. A **GET** op (`RBKG`) joins PUT under one post-handshake dispatcher
+      (`read_family_b_op`); the daemon (`serve_get`) advertises the container's
+      members and streams each on request — a `*.gz` member as its **raw gzip
+      bytes** (the client inflates), a Raw member **decompressed** — reusing the
+      native `.cbk` readers (`CbkPayloadReader` / `cbk_member_content_reader`), no
+      new format. cb-dos (`cbnet` GET client + `cmd_netrestore`) streams each
+      partition gz straight to the disk (manual multi-member `inflateReset`),
+      same-size: zero-pad to original, rebuild the EBR chain, write the MBR
+      verbatim. **Verified on qemu:** one boot backed disk 0x81 up over the wire
+      then restored it over the wire to a blank 0x82 — files byte-identical.
+      Loopback test `family_b_get_serves_cbk_members_over_loopback`. *(Same-size
+      only — target ≥ original; resize-over-the-wire is a follow-up, since the
+      socket is forward-only and the local peek-then-resize two-pass doesn't apply
+      yet. gzip members, FAT + NTFS, primaries + logicals.)*
 - [ ] **7f — Manifest + idempotency.** Emit the file manifest (§5); restore
       replays mtime/attribs; prove backup→restore→backup is a no-op.
 - [ ] **7g — Boot section + swap exclusion.** System-block fingerprint/round-trip
@@ -717,6 +732,32 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7e complete — restore over the wire (loop closed),
+  qemu-verified.** A vintage box with a blank disk now pulls a `.cbk` back from
+  the agent and rebuilds the disk over the network — the mirror of `backup
+  rb://...`, no intermediate folder either side. **Wire**
+  (`src/remote/protocol.rs`): a **GET** op (`RBKG`) joins PUT under one
+  post-handshake dispatcher (`read_family_b_op`/`FamilyBOp`). GET-open advertises
+  the container's members; the client fetches each by name, streamed as
+  big-endian length-delimited frames; a `*.gz` member is served as its **raw gzip
+  bytes** (client inflates), a Raw member **decompressed**. **Host**
+  (`serve_get`) reuses the native `.cbk` readers (`read_cbk_index`,
+  `CbkPayloadReader`, `cbk_member_content_reader`) — read-only, no new format.
+  **DOS** (`cbnet.{h,c}` GET client + `cmd_restore.c`'s `cmd_netrestore`): cbnet
+  gained `cbnet_start_get` / `cbnet_get_raw` / a streaming `cbnet_get_member_*`
+  that inflates a multi-member gzip from the framed socket (manual
+  `inflateReset` across members); `restore rb://...` GETs metadata.json + mbr.bin,
+  then streams each partition gz straight to int13h **same-size** (zero-pad to
+  original), rebuilds the EBR chain, writes the MBR verbatim. Reuses the metadata
+  scanner + `part_t` + `write_ebr_chain`; the `rb://` parser moved to
+  `cbnet_parse_url` (shared by backup + restore). **Verified on qemu** (FreeDOS
+  1.4 + NE2000 + SLiRP): one boot ran `CRUSTYBK BACKUP rb://…/MYDISK 81` then
+  `CRUSTYBK RESTORE rb://…/MYDISK 82 /Y` — disk 0x81 backed up over the wire,
+  restored over the wire to a blank 0x82, files **byte-identical** (a byte-exact
+  restore of a bootable disk boots). Lib (2093) + the 4 family_b loopback tests
+  (incl. `family_b_get_serves_cbk_members_over_loopback`) + clippy green. Deferred:
+  resize-over-the-wire (the socket is forward-only; the local peek-then-resize
+  two-pass doesn't apply). Next: **7f** (manifest + idempotency, §5).
 - 2026-06-25 — **Phase 7d complete — resumable networked backup, qemu-verified.**
   A killed transfer now resumes instead of restarting from zero. **Host**
   (`src/remote/{protocol,server}.rs`): the PUT header gained the §4 source

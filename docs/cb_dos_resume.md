@@ -10,7 +10,7 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), ~52 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), ~54 commits ahead of `main`, all verified, tree
 clean:
 
 ```
@@ -57,6 +57,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | Net **7b** (chunk PUT protocol + host `.cbk`) | the Family-B chunk-PUT wire framing + the host receiver: `receive_put` (server.rs) stages a member/chunk stream and assembles a frozen `.cbk` via `pack_folder_to_cbk`. Loopback-tested |
 | Net **7c** (block-level networked backup) | **baked into `CRUSTYBK BACKUP rb://...`** — images the disk over int13h and streams gzip-member spans straight to `rb-cli serve` (no local folder); host assembles `.cbk`, `rb-cli restore` rebuilds it byte-identical. `cbnet.{h,c}` (WATT-32 + span streamer) + `cmd_netbackup` in `cmd_backup.c`. Verified on FreeDOS/qemu (3.5 MiB → 4 spans) |
 | Net **7d** (resume) | a killed transfer **resumes** instead of restarting: §4 fingerprint in the PUT header, daemon resume-map reply, persistent staging + durable `journal.json` (fsync-then-record, truncate-to-committed), host-owned gz checksum. cb-dos seeks the source to the committed span. Verified on FreeDOS/qemu — drop after 2 of 4 spans → reconnect → resume → byte-identical restore |
+| Net **7e** (restore over the wire) | **loop closed** — `CRUSTYBK RESTORE rb://...` pulls a `.cbk` back from the agent (GET op) and rebuilds the disk over int13h, no local folder, same-size. `serve_get` (host) + `cbnet` GET client (multi-member inflate) + `cmd_netrestore`. Verified on FreeDOS/qemu — one boot backed up 0x81 over the wire then restored to a blank 0x82, byte-identical |
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
@@ -83,12 +84,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Net 7e–7i** — networked backup/restore (7a handshake + 7b chunk-PUT protocol
-   + 7c block-level networked backup baked into `CRUSTYBK BACKUP rb://...` + 7d
-   resume all done). Next: **7e restore over the wire** (close the loop — feed the
-   `cmd_restore.c` engine from the socket) or **7f manifest + idempotency**.
+1. **Net 7f–7i** — networked backup/restore (7a handshake + 7b chunk-PUT protocol
+   + 7c block-level backup + 7d resume + 7e restore-over-the-wire all done — the
+   loop is closed). Next: **7f manifest + idempotency** (§5 — round-trip
+   mtime/attribs, prove backup→restore→backup is a no-op) or **7g boot + swap**.
    **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase
-   hand-off + the qemu NE2000/SLiRP rig + the 7e "done" definition).
+   hand-off + the qemu NE2000/SLiRP rig + the 7f "done" definition).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu
@@ -171,11 +172,14 @@ subcommands for scripting), built from:
   repacks via `cbdefrag` then falls back to plain compaction if it declines),
   NTFS (`backup_ntfs_partition`) from the `$Bitmap` (full window, free clusters
   zeroed); **extended containers** are walked and their **logical** volumes
-  imaged (`is_logical`, index 4+, + `extended_container` metadata). `cmd_restore.c` — `restore` (folder → disk,
+  imaged (`is_logical`, index 4+, + `extended_container` metadata). A network dest
+  `backup rb://...` streams the same members to `rb-cli serve` (`cmd_netbackup`).
+  `cmd_restore.c` — `restore` (folder → disk,
   `/SIZE` resize + `/PARTS`, the metadata.json scanner + gzip stream; **FS-agnostic**
   so NTFS restores same-size; logicals same-size + the **EBR chain rebuilt** via
   `write_ebr_chain`; resize gated on 512-byte FAT, primary growth clamped at the
-  extended container). `cmd_clone.c` — `clone` (direct disk-to-disk, no staging
+  extended container). A network source `restore rb://...` pulls the `.cbk`'s members
+  from the agent (`cmd_netrestore`, same-size — GET op via `cbnet`). `cmd_clone.c` — `clone` (direct disk-to-disk, no staging
   file, `/SIZE` + `/PARTS`; FAT resizes, NTFS clones same-size via
   `clone_ntfs_partition`; **logicals cloned same-size + EBRs copied verbatim**).
   `cmd_inspect.c` —

@@ -1,11 +1,12 @@
 # crusty-backup (`cb-dos`) — **network phase** resume prompt
 
-Hand-off for continuing **Net 7e–7i** (networked backup/restore over TCP). The
+Hand-off for continuing **Net 7f–7i** (networked backup/restore over TCP). The
 local removable-media engine is complete and qemu-verified; networking only swaps
 the *destination* under it. **7a (handshake), 7b (chunk PUT protocol + host
-`.cbk`), 7c (block-level networked backup baked into `CRUSTYBK BACKUP rb://...`),
-and 7d (resume — crash-proof transfer) are done and qemu-verified.** Paste the
-section below (from "Resume the…" down) to kick off the next session.
+`.cbk`), 7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d (resume),
+and 7e (restore over the wire `CRUSTYBK RESTORE rb://...`) are done and
+qemu-verified — the backup↔restore loop is closed.** Paste the section below
+(from "Resume the…" down) to kick off the next session.
 
 ---
 
@@ -24,12 +25,11 @@ Read these first, in order, before doing anything:
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
 **Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently
-`7e — Restore over wire` (close the producer/consumer loop), or `7f — Manifest +
-idempotency`.**
+`7f — Manifest + idempotency` (§5), then `7g — Boot section + swap exclusion`.**
 
 ## Where we are
 
-Branch `cbdos` (off `main`), ~52 commits ahead, tree clean, **everything below
+Branch `cbdos` (off `main`), ~54 commits ahead, tree clean, **everything below
 qemu-verified on real FreeDOS**.
 
 - **Local cb-dos engine — DONE.** backup / restore / clone / browse across
@@ -72,6 +72,17 @@ qemu-verified on real FreeDOS**.
   → resume → byte-identical restore). *(Per-Gz-member resume; Raw members re-sent
   fresh. The host still stage-then-packs — a true streaming-append `.cbk` is a
   later optimization, not needed for correctness.)*
+- **Net 7e — DONE.** **Restore over the wire — the loop is closed.** `CRUSTYBK
+  RESTORE rb://HOST/NAME 81 /Y` pulls a `.cbk` back from the agent and rebuilds the
+  disk over int13h, no local folder. A **GET** op (`RBKG`) joins PUT under one
+  dispatcher (`read_family_b_op`); the daemon (`serve_get`) serves a `*.gz` member
+  as raw gzip bytes (client inflates) and a Raw member decompressed, reusing
+  `CbkPayloadReader` / `cbk_member_content_reader`. DOS: a `cbnet` GET client
+  (`cbnet_start_get` / `cbnet_get_raw` / `cbnet_get_member_*` with manual
+  multi-member `inflateReset`) + `cmd_netrestore` (same-size: stream gz → int13h,
+  zero-pad, rebuild EBR, write MBR verbatim). Loopback test
+  `family_b_get_serves_cbk_members_over_loopback`; qemu-verified backup-then-restore
+  byte-identical. *(Same-size only; resize-over-the-wire is the follow-up.)*
 - **The `.cbk` container — FROZEN v1 and already the producer's chunk shape.**
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`, RBKC
   chunks / RBKI index / RBKF footer, big-endian). The desktop reads `.cbk` as a
@@ -85,37 +96,39 @@ qemu-verified on real FreeDOS**.
   (qemu-verified). So 7b is **wire framing + index over a producer/format that's
   already built**, not new container work.
 
-## What 7a–7d already give us (the working baseline)
+## What 7a–7e already give us (the closed loop)
 
-A vintage box boots cb-dos and runs one command —
-`CRUSTYBK BACKUP rb://<agent-ip>:7341/MYDISK 81` — which images the disk
-**block-level over int13h** and streams it straight to `rb-cli serve` as gzip-member
-spans; the agent assembles `MYDISK.cbk` and `rb-cli restore MYDISK.cbk` rebuilds the
-disk. No local folder, no second tool. The transfer is **resumable** (7d): kill it
-mid-stream, run the same command again, and it continues from the last committed
-span (the §4 fingerprint guards against a swapped card). **Block-level, baked in,
-crash-proof.** What's missing is the *other* direction — restore over the wire.
+A vintage box boots cb-dos and backs up **and** restores over the network, no local
+folder either side:
+- `CRUSTYBK BACKUP rb://<agent>:7341/MYDISK 81` — images the disk **block-level over
+  int13h** and streams gzip-member spans to `rb-cli serve`, which assembles
+  `MYDISK.cbk`. **Resumable** (7d): kill it, re-run, it continues from the last
+  committed span (§4 fingerprint guards a swapped card).
+- `CRUSTYBK RESTORE rb://<agent>:7341/MYDISK 82 /Y` — pulls the `.cbk`'s members back
+  (GET) and rebuilds the disk over int13h, same-size.
+Both directions are qemu-verified byte-identical. **Block-level, baked in,
+crash-proof, bidirectional.** What's missing is the *state* layer (§5): the file
+manifest, idempotency, boot protection, and swap exclusion.
 
-## 7e — restore over the wire (what "done" looks like)
+## 7f — manifest + idempotency (what "done" looks like) — §5
 
-Close the producer/consumer loop: a vintage box with a blank/wrong disk pulls a
-`.cbk` back from the agent and restores it, so backup **and** restore both work
-over the network.
-- **Host:** serve a container's members on a `GET`. The desktop already reads a
-  `.cbk` natively (`read_cbk_index`, `cbk_member_content_reader`,
-  `materialize_cbk_to_folder`), so the daemon has the bytes — add a Family-B GET
-  (request metadata.json + mbr.bin, then stream each `partition-N.gz` member's
-  chunks). Mirror the PUT framing.
-- **DOS client:** a `CRUSTYBK RESTORE rb://HOST/NAME 81 [/SIZE:...]`. cb-dos already
-  has the full restore engine (`cmd_restore.c`: folder → disk, FAT `/SIZE` resize,
-  EBR rebuild). Feed it members from the socket instead of a local folder — stream
-  the gz bytes into zlib inflate → int13h write. Resize stays as-is.
-- **Verify on qemu:** back a disk up over the wire, wipe the target, restore it over
-  the wire, and **boot it** (the SYS'd-marker test from cb_dos_resume.md).
+Make backup↔restore **idempotent** and add file-level awareness:
+- **Backup** emits a per-partition **file manifest** sidecar (§5a: `path, size,
+  mtime, attribs{archive,hidden,system,readonly}, start_cluster` from one dir-tree
+  walk) plus the `system` block (MBR boot code / VBR / `IO.SYS`/`MSDOS.SYS`/
+  `COMMAND.COM` hashes, §5d). The payload stays a block image.
+- **Restore replays** each file's recorded mtime + attribs (incl. the archive bit)
+  via int 21h/5701h + 4301h (§5c), so a fresh restore doesn't look "freshly
+  modified" — and a re-backup right after sees no change (§5b whole-disk identity
+  gate). **Prove `backup → restore → backup` is a no-op.**
+- This is mostly **local-engine** work (the manifest rides in the folder/`.cbk` like
+  any other member); the network paths carry it for free once it's a member.
 
-After 7e: **7f** (file manifest + idempotency, §5), **7g** (boot section + swap
-exclusion), the optional **7h** (incremental), and **7i** (Level-2 swap dealloc;
-desktop reads `.cbk` directly). Pick the top unchecked box in §9.
+After 7f: **7g** (boot section + Level-1 swap zeroing, §5d/§6c — a *shared*
+compaction concern), the optional **7h** (incremental — reuse the §4d fingerprint +
+§5 manifest to skip unchanged partitions), **7i** (Level-2 swap dealloc; desktop
+reads `.cbk` directly), and the deferred **resize-over-the-wire** (a forward-only
+streaming peek-then-resize, the one gap 7e left). Pick the top unchecked box in §9.
 
 ## How we work
 
@@ -124,12 +137,12 @@ desktop reads `.cbk` directly). Pick the top unchecked box in §9.
   The pre-commit hook runs `cargo fmt` + `clippy --all-targets -D warnings` on Rust
   changes (no Rust staged → it skips). New files need an explicit `git add`.
 - **Build.** Host: `cargo build --bin rb-cli`; `cargo test --lib` (2093+ tests) +
-  `cargo test --test remote_filesystem --features remote family_b` (the PUT +
-  resume loopback tests). The DOS tool: `make -C crusty-backup crustybk` — it now
-  links zlib + lz4 + WATT-32, so run all three fetches once (`deps/fetch-zlib.sh`,
-  `deps/fetch-lz4.sh`, `net/fetch-watt32.sh`). Networked backup is **in CRUSTYBK**
-  (`backup rb://...`), not a separate tool; `make net` still builds the `NETHELLO`
-  handshake probe.
+  `cargo test --test remote_filesystem --features remote family_b` (the 4 PUT /
+  resume / GET loopback tests). The DOS tool: `make -C crusty-backup crustybk` — it
+  now links zlib + lz4 + WATT-32, so run all three fetches once
+  (`deps/fetch-zlib.sh`, `deps/fetch-lz4.sh`, `net/fetch-watt32.sh`). Networked
+  backup **and restore** are **in CRUSTYBK** (`backup`/`restore rb://...`), not a
+  separate tool; `make net` still builds the `NETHELLO` handshake probe.
 - **VERIFY ON REAL FREEDOS IN QEMU before claiming anything done.** The transport
   must be exercised against a live `rb-cli serve`, not just a loopback unit test.
 - **As each box lands:** tick it in §9 of cb_dos_network_and_state.md, add a
@@ -185,6 +198,15 @@ killed-but-orphaned qemu keeps the boot.img write-lock and the next boot fails
 *"Failed to get write lock"*). The staging must be a fixed `--staging-dir` (not
 the default temp) so it survives the daemon restart between runs.
 
+**7e restore proof (2026-06-25):** one qemu boot with **three** drives —
+boot (0x80), source FAT (0x81), blank same-size target (0x82) — and an `FDAUTO.BAT`
+that runs `CRUSTYBK BACKUP rb://10.0.2.2:7341/MYDISK 81` then `CRUSTYBK RESTORE
+rb://10.0.2.2:7341/MYDISK 82 /Y` against one `rb-cli serve --root`. The host logs a
+`PUT … complete` then a `GET … serving N member(s)`; pull 0x82's files with `mcopy`
+and `cmp` against the source. The target must be `>=` the source size (same-size
+restore). The guest console isn't captured by `-display none` without `-serial`, so
+read success from the serve log + the byte compare.
+
 **Net gotchas (do not relearn):** (1) FreeCOM mis-parses `2>` / `2>&1` (the `2`
 becomes an argv) — pass the port explicitly, use single `>`. (2) `CWSDPMI.EXE`
 must travel next to the net `.EXE`. (3) `my_ip = dhcp` is the whole network config
@@ -200,29 +222,30 @@ host↔vintage LAN; §1e) — do not bolt on crypto.
   — `handle_family_b` (reads the post-handshake frame: EOF=clean close, `RBKP`=PUT)
   + `receive_put` (persistent staging + `ResumeJournal`/`journal.json`,
   fsync-then-record, truncate-to-committed on a fingerprint match,
-  `fill_partition_checksums` at finalize, then `pack_folder_to_cbk`). The
-  `RB_SERVE_TEST_DROP_AFTER_CHUNKS` knob lives here. **For 7e** add a Family-B GET
-  that streams a `.cbk`'s members back to cb-dos.
+  `fill_partition_checksums` at finalize, then `pack_folder_to_cbk`) +
+  **`serve_get`** (GET: advertise members, then stream each — `*.gz` raw,
+  Raw decompressed). One post-handshake dispatcher: `read_family_b_op`/`FamilyBOp`
+  (PUT/GET). The `RB_SERVE_TEST_DROP_AFTER_CHUNKS` knob lives here.
 - **`.cbk` format:** `src/rbformats/cbk.rs` (RBKC/RBKI/RBKF, `pack_folder_to_cbk`,
-  `materialize_cbk_to_folder`, `read_cbk_index`, `cbk_member_content_reader` — the
-  GET source for 7e) + `src/rbformats/gz_index.rs` (`GzSpan`, the `.gz.idx` seek
-  layout). **Reuse these — the DOS producer must emit identical bytes.**
-- **DOS networked backup (baked into `CRUSTYBK`):** `crusty-backup/src/cbnet.{h,c}`
-  — WATT-32 sockets + the chunk-PUT framing (hand-rolled BE writers, send_chunk +
-  stop-and-go ack, `read_resume_map`/`resume_committed`) + the **zlib gzip span
-  streamer** (`cbnet_part_begin{committed_out}`/`_part_write`/`flush_span`/
-  `_part_end`, `cbnet_raw_member`). `cmd_backup.c` — `parse_rb_dest` +
-  `cmd_netbackup` (computes the §4 fingerprint) + `netstream_fat_partition`/
-  `netstream_ntfs_partition` (int13h block loop + smart-compaction feeding the span
-  streamer, seeking to the resumed span) + the shared `build_metadata`. **For 7e:**
-  feed the existing `cmd_restore.c` engine from the socket instead of a folder.
-  `net_hello.c`
-  (`NETHELLO.EXE`, `make net`) is the standalone handshake probe.
-- **The local engine the net path mirrors:** `cmd_backup.c`'s local
-  `backup_fat_partition`/`backup_ntfs_partition` (same smart-compaction; the net
-  path streams spans instead of writing a `gzFile`), `cbdisk.{h,c}`, `cbcodec.{h,c}`.
+  `materialize_cbk_to_folder`, `read_cbk_index`, `CbkPayloadReader` /
+  `cbk_member_content_reader` — the GET source) + `src/rbformats/gz_index.rs`
+  (`GzSpan`). **Reuse these — the DOS producer must emit identical bytes.**
+- **DOS networked backup + restore (baked into `CRUSTYBK`):**
+  `crusty-backup/src/cbnet.{h,c}` — WATT-32 sockets + `cbnet_parse_url`; the **PUT**
+  side (chunk framing, span streamer `cbnet_part_*`, `read_resume_map`); the **GET**
+  side (`cbnet_start_get`, `cbnet_get_raw`, the inflating `cbnet_get_member_*` with
+  manual multi-member `inflateReset`). `cmd_backup.c` — `cmd_netbackup` (§4
+  fingerprint + `netstream_fat`/`_ntfs_partition`). `cmd_restore.c` —
+  **`cmd_netrestore`** (GET metadata/mbr, `netrestore_partition` streams gz →
+  int13h same-size, `scan_parts`/`rebuild_ebr_chain` shared with the local path).
+  `net_hello.c` (`NETHELLO.EXE`, `make net`) is the standalone handshake probe.
+- **The local engines the net paths mirror:** `cmd_backup.c`'s
+  `backup_fat_partition`/`backup_ntfs_partition` (smart-compaction) and
+  `cmd_restore.c`'s `restore_partition` (the file path, with peek+resize — the
+  forward-only socket path can't peek, so resize-over-the-wire is deferred),
+  `cbdisk.{h,c}`, `cbcodec.{h,c}`.
 
-Start by reading the four docs, then plan and implement **7e** (restore over the
-wire — close the loop) or **7f** (manifest + idempotency). Keep each box small
+Start by reading the four docs, then plan and implement **7f** (manifest +
+idempotency, §5) or **7g** (boot + swap, §5d/§6). Keep each box small
 (one commit or a small handful), verify on real FreeDOS in qemu, and tick §9 +
 refresh the resume as you go.
