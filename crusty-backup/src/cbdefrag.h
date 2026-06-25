@@ -22,21 +22,21 @@
 #define CBDEFRAG_H
 
 #include "cbdisk.h"
-#include <zlib.h>
+#include "cbcodec.h"
 
 /* Defrag the FAT volume at `start_lba` on `drive` and write the defragmented,
- * compacted partition image to the already-open gzip stream `gz`. `L` is the
- * parsed BPB and `fat` the whole first FAT (already loaded by the caller).
- * `label` is the progress-line label and `pr` the caller's progress meter
- * (defrag drives it). On success the imaged sector count is returned via
- * `*out_imaged_secs`.
+ * compacted partition image to the already-open compressed stream `w` (gzip or
+ * lz4 -- defrag is codec-agnostic). `L` is the parsed BPB and `fat` the whole
+ * first FAT (already loaded by the caller). `label` is the progress-line label
+ * and `pr` the caller's progress meter (defrag drives it). On success the imaged
+ * sector count is returned via `*out_imaged_secs`.
  *
- * Returns 0 on success (defragged image fully written to gz),
- *         1 if defrag declined (gz untouched -- caller should image as-is),
- *        -1 on a hard error mid-emit (gz partially written -- abort the backup).
+ * Returns 0 on success (defragged image fully written to `w`),
+ *         1 if defrag declined (`w` untouched -- caller should image as-is),
+ *        -1 on a hard error mid-emit (`w` partially written -- abort the backup).
  */
 int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
-                      const fatlay_t *L, uint8_t *fat, gzFile gz,
+                      const fatlay_t *L, uint8_t *fat, cbw_t *w,
                       const char *label, progress_t *pr, uint32_t *out_imaged_secs);
 
 #endif /* CBDEFRAG_H */

@@ -10,6 +10,7 @@
 #include "cbdisk.h"
 #include "cbntfs.h"
 #include "cbdefrag.h"
+#include "cbcodec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
 static int backup_fat_partition(const drive_info_t *di, int drive,
                                 const char *dest, int index, uint8_t type_byte,
                                 uint64_t start_lba, uint64_t part_sectors,
-                                int defrag, part_meta_t *pm) {
+                                int defrag, int codec, part_meta_t *pm) {
     uint8_t vbr[512];
     if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
         printf("  part %d: VBR read failed\n", index);
@@ -109,12 +110,12 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
     pm->type_byte = type_byte;
     pm->start_lba = start_lba;
     pm->original_size = part_sectors * 512ULL;
-    sprintf(pm->gz_name, "partition-%d.gz", index);
+    sprintf(pm->gz_name, "partition-%d.%s", index, codec_ext(codec));
 
     char path[160];
     sprintf(path, "%s\\%s", dest, pm->gz_name);
-    gzFile gz = gzopen(path, "wb6");
-    if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(fat); return -1; }
+    cbw_t *w = cbw_open(path, codec);
+    if (!w) { printf("  part %d: cannot create %s\n", index, path); free(fat); return -1; }
 
     progress_t pr;
     char lbl[40];
@@ -125,10 +126,10 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
 
     if (defrag) {
         uint32_t ds;
-        int dr = defrag_backup_fat(di, drive, start_lba, &L, fat, gz, lbl, &pr, &ds);
-        if (dr < 0) { gzclose(gz); free(fat); printf("  part %d: defrag emit failed\n", index); return -1; }
+        int dr = defrag_backup_fat(di, drive, start_lba, &L, fat, w, lbl, &pr, &ds);
+        if (dr < 0) { cbw_close(w); free(fat); printf("  part %d: defrag emit failed\n", index); return -1; }
         if (dr == 0) { imaged_secs = ds; used_defrag = 1; }
-        /* dr == 1: declined; gz is still empty -- fall through to plain compaction */
+        /* dr == 1: declined; `w` is still empty -- fall through to plain compaction */
     }
 
     if (!used_defrag) {
@@ -150,8 +151,8 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
                         memset(buf + j * 512, 0, 512);
                 }
             }
-            if (gzwrite(gz, buf, n * 512) != n * 512) {
-                printf("  part %d: gzwrite failed\n", index);
+            if (cbw_write(w, buf, n * 512) != 0) {
+                printf("  part %d: compress write failed\n", index);
                 rc = -1; break;
             }
             s += n;
@@ -160,7 +161,7 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
         progress_finish(&pr);
     }
 
-    gzclose(gz);
+    if (cbw_close(w) != 0 && rc == 0) { printf("  part %d: compress finalize failed\n", index); rc = -1; }
     free(fat);
     if (rc != 0) return rc;
 
@@ -187,7 +188,7 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
 static int backup_ntfs_partition(const drive_info_t *di, int drive,
                                  const char *dest, int index, uint8_t type_byte,
                                  uint64_t start_lba, uint64_t part_sectors,
-                                 part_meta_t *pm) {
+                                 int codec, part_meta_t *pm) {
     uint8_t vbr[512];
     if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
         printf("  part %d: VBR read failed\n", index);
@@ -215,12 +216,12 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
     pm->imaged_size = part_sectors * 512ULL;     /* full window, free clusters zeroed */
     pm->minimum_size = pm->imaged_size;          /* desktop computes the true NTFS min */
     pm->compacted = 1;
-    sprintf(pm->gz_name, "partition-%d.gz", index);
+    sprintf(pm->gz_name, "partition-%d.%s", index, codec_ext(codec));
 
     char path[160];
     sprintf(path, "%s\\%s", dest, pm->gz_name);
-    gzFile gz = gzopen(path, "wb6");
-    if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(bm); return -1; }
+    cbw_t *w = cbw_open(path, codec);
+    if (!w) { printf("  part %d: cannot create %s\n", index, path); free(bm); return -1; }
 
     progress_t pr;
     char lbl[40];
@@ -242,14 +243,14 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
             if (lcn < v.total_clusters && !ntfs_cluster_used(bm, v.total_clusters, lcn))
                 memset(buf + j * 512, 0, 512);
         }
-        if (gzwrite(gz, buf, n * 512) != n * 512) {
-            printf("  part %d: gzwrite failed\n", index);
+        if (cbw_write(w, buf, n * 512) != 0) {
+            printf("  part %d: compress write failed\n", index);
             rc = -1; break;
         }
         s += n;
         progress_update(&pr, s * 512ULL);
     }
-    gzclose(gz);
+    if (cbw_close(w) != 0 && rc == 0) { printf("  part %d: compress finalize failed\n", index); rc = -1; }
     free(bm);
     progress_finish(&pr);
     if (rc != 0) return rc;
@@ -265,7 +266,7 @@ static void write_metadata(const char *dest, const char *src_label,
                            uint64_t disk_bytes, uint64_t first_lba,
                            const drive_info_t *di,
                            const part_meta_t *parts, int nparts,
-                           const ext_meta_t *ext) {
+                           const ext_meta_t *ext, int codec) {
     char path[160];
     sprintf(path, "%s\\metadata.json", dest);
     FILE *f = fopen(path, "wb");
@@ -287,7 +288,7 @@ static void write_metadata(const char *dest, const char *src_label,
     fprintf(f, "  \"source_size_bytes\": %lu,\n", (unsigned long)disk_bytes);
     fprintf(f, "  \"partition_table_type\": \"MBR\",\n");
     fprintf(f, "  \"checksum_type\": \"crc32\",\n");
-    fprintf(f, "  \"compression_type\": \"gzip\",\n");
+    fprintf(f, "  \"compression_type\": \"%s\",\n", codec_name(codec));
     fprintf(f, "  \"split_size_mib\": null,\n");
     fprintf(f, "  \"sector_by_sector\": false,\n");
     fprintf(f, "  \"layout\": \"per-partition\",\n");
@@ -337,25 +338,32 @@ static void write_metadata(const char *dest, const char *src_label,
 int cmd_backup(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
-        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j] [/DEFRAG]\n");
-        printf("  e.g. CRUSTYBK backup A:\\BK 80           image every FAT/NTFS partition\n");
-        printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0  image only MBR slot 0\n");
-        printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG   repack FAT files contiguously\n");
+        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j] [/DEFRAG] [/CODEC:LZ4]\n");
+        printf("  e.g. CRUSTYBK backup A:\\BK 80            image every FAT/NTFS partition\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0   image only MBR slot 0\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG    repack FAT files contiguously\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /CODEC:LZ4 LZ4 instead of gzip (faster, larger)\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
         printf("  /DEFRAG relocates each FAT volume's files into contiguous runs\n");
-        printf("  (boot files first) before imaging -- smaller .gz, defragged restore.\n");
+        printf("  (boot files first) before imaging -- smaller image, defragged restore.\n");
+        printf("  /CODEC:LZ4 trades ratio for speed on a slow CPU (default GZIP);\n");
+        printf("  restore auto-detects the codec from metadata.\n");
         return 2;
     }
 
     const char *dest = argv[1];
     int drive = 0x80, drive_set = 0;
-    unsigned sel_mask = 0; int has_filter = 0, defrag = 0;
+    unsigned sel_mask = 0; int has_filter = 0, defrag = 0, codec = CODEC_GZIP;
     for (int a = 2; a < argc; a++) {
         const char *v = switch_val(argv[a], "/PARTS:");
+        const char *cv = switch_val(argv[a], "/CODEC:");
         if (v) {
             if (parse_parts(v, &sel_mask) != 0) { printf("bad /PARTS list\n"); return 2; }
             has_filter = 1;
+        } else if (cv) {
+            codec = codec_from_name(cv);
+            if (codec < 0) { printf("bad /CODEC (use GZIP or LZ4)\n"); return 2; }
         } else if (eq_ci(argv[a], "/DEFRAG")) {
             defrag = 1;
         } else if (!drive_set) {
@@ -374,6 +382,7 @@ int cmd_backup(int argc, char **argv) {
            drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
     if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
     if (defrag) printf("defrag: FAT volumes will be repacked contiguously (boot-aware)\n");
+    if (codec != CODEC_GZIP) printf("codec: %s (partition-N.%s)\n", codec_name(codec), codec_ext(codec));
 
     uint8_t mbr[512];
     if (read_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR read failed\n"); xfer_free(); return 1; }
@@ -424,10 +433,10 @@ int cmd_backup(int argc, char **argv) {
                 int lok;
                 if (is_fat_part_type(logs[j].type))
                     lok = backup_fat_partition(&di, drive, dest, lidx, logs[j].type,
-                                               logs[j].start_lba, logs[j].count, defrag, &parts[nparts]);
+                                               logs[j].start_lba, logs[j].count, defrag, codec, &parts[nparts]);
                 else if (logs[j].type == 0x07)
                     lok = backup_ntfs_partition(&di, drive, dest, lidx, logs[j].type,
-                                                logs[j].start_lba, logs[j].count, &parts[nparts]);
+                                                logs[j].start_lba, logs[j].count, codec, &parts[nparts]);
                 else {
                     printf("  logical %d: type 0x%02X not FAT/NTFS -- skipped\n", lidx, logs[j].type);
                     continue;
@@ -443,9 +452,9 @@ int cmd_backup(int argc, char **argv) {
         }
         int ok;
         if (is_fat_part_type(type))
-            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, defrag, &parts[nparts]);
+            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, defrag, codec, &parts[nparts]);
         else if (type == 0x07)
-            ok = backup_ntfs_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]);
+            ok = backup_ntfs_partition(&di, drive, dest, i, type, lba, cnt, codec, &parts[nparts]);
         else {
             printf("  part %d: type 0x%02X not FAT/NTFS -- skipped\n", i, type);
             continue;
@@ -457,7 +466,7 @@ int cmd_backup(int argc, char **argv) {
 
     char label[16];
     sprintf(label, "0x%02X", drive);
-    write_metadata(dest, label, disk_bytes, first_lba, &di, parts, nparts, &ext);
+    write_metadata(dest, label, disk_bytes, first_lba, &di, parts, nparts, &ext, codec);
 
     printf("backup complete: %d partition%s in %s\n", nparts, nparts == 1 ? "" : "s", dest);
     xfer_free();

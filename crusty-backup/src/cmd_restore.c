@@ -6,12 +6,12 @@
  * the metadata.json scanner and the gzip restore stream. */
 
 #include "cbdisk.h"
+#include "cbcodec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <zlib.h>
 
 enum { SZ_ORIGINAL, SZ_MINIMUM, SZ_ENTIRE, SZ_CUSTOM };
 
@@ -65,26 +65,27 @@ static int str_after(const char *cur, const char *key, char *out, int cap) {
 /* ----- restore one partition (gzip stream -> disk) ------------------ */
 
 /* Peek the first sector of <folder>/<gzname> and parse its FAT layout. */
-static int peek_partition(const char *folder, const char *gzname, fatlay_t *L) {
+static int peek_partition(const char *folder, const char *gzname, int codec, fatlay_t *L) {
     char path[200];
     sprintf(path, "%s\\%s", folder, gzname);
     memset(L, 0, sizeof *L);
-    gzFile gz = gzopen(path, "rb");
-    if (!gz) return -1;
+    cbr_t *r = cbr_open(path, codec);
+    if (!r) return -1;
     uint8_t first[512];
-    int n = gzread(gz, first, 512);
-    gzclose(gz);
+    int n = cbr_read(r, first, 512);
+    cbr_close(r);
     if (n >= 512) parse_fatlay(first, L);
     return 0;
 }
 
 /* Stream <folder>/<gzname> to start_lba, zero-padding out to window_bytes. */
 static int restore_partition(const drive_info_t *di, int drive, const char *folder,
-                             const char *gzname, uint64_t start_lba, uint64_t window_bytes) {
+                             const char *gzname, int codec, uint64_t start_lba,
+                             uint64_t window_bytes) {
     char path[200];
     sprintf(path, "%s\\%s", folder, gzname);
-    gzFile gz = gzopen(path, "rb");
-    if (!gz) { printf("  cannot open %s\n", path); return -1; }
+    cbr_t *r = cbr_open(path, codec);
+    if (!r) { printf("  cannot open %s\n", path); return -1; }
 
     progress_t pr;
     progress_begin(&pr, gzname, window_bytes);
@@ -96,8 +97,8 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
 
     for (;;) {
         int want = XFER_BYTES - acc_len;
-        int n = gzread(gz, acc + acc_len, want);
-        if (n < 0) { printf("  gzread error\n"); rc = -1; break; }
+        int n = cbr_read(r, acc + acc_len, want);
+        if (n < 0) { printf("  decompress error\n"); rc = -1; break; }
         if (n == 0 && acc_len == 0) break;
         acc_len += n;
         int full = acc_len / 512;
@@ -119,7 +120,7 @@ static int restore_partition(const drive_info_t *di, int drive, const char *fold
         if (write_lba(di, drive, start_lba + written / 512, 1, acc) == 0)
             written += 512;
     }
-    gzclose(gz);
+    cbr_close(r);
     if (rc != 0) { progress_finish(&pr); return rc; }
 
     if (written < window_bytes) {
@@ -144,7 +145,8 @@ typedef struct {
     int      is_logical;
     uint64_t start_lba, original, imaged, minimum;
     char     gz[40];
-    int      is_fat;
+    int      is_fat;       /* has a restorable compressed member (.gz / .lz4) */
+    int      codec;        /* CODEC_GZIP | CODEC_LZ4, from the member extension */
     uint64_t window_sec;
 } part_t;
 
@@ -231,7 +233,8 @@ int cmd_restore(int argc, char **argv) {
             p->minimum = u64_after(idx, "minimum_size_bytes", p->imaged);
             p->is_logical = bool_after(idx, "is_logical", p->index >= 4);
             str_after(idx, "compressed_files", p->gz, sizeof p->gz);
-            p->is_fat = (p->gz[0] != 0 && strstr(p->gz, ".gz") != NULL &&
+            p->codec = codec_for_file(p->gz);
+            p->is_fat = (p->gz[0] != 0 && p->codec >= 0 &&
                          p->start_lba != 0 && p->original != 0);
             const char *next = find_key(idx, "compacted");
             cur = next ? next : (idx + 1);
@@ -276,12 +279,12 @@ int cmd_restore(int argc, char **argv) {
         }
         if (!p->is_fat) {
             if (p->gz[0])
-                printf("  partition %d: codec not gzip (%s) -- restores .gz only\n", p->index, p->gz);
+                printf("  partition %d: unknown codec (%s) -- restores .gz / .lz4 only\n", p->index, p->gz);
             continue;
         }
 
         fatlay_t pl;
-        if (peek_partition(folder, p->gz, &pl) != 0) {
+        if (peek_partition(folder, p->gz, p->codec, &pl) != 0) {
             printf("  cannot open %s\\%s\n", folder, p->gz);
             xfer_free();
             return 1;
@@ -347,7 +350,7 @@ int cmd_restore(int argc, char **argv) {
         }
         p->window_sec = win;
 
-        if (restore_partition(&di, drive, folder, p->gz, p->start_lba, win * 512ULL) != 0) {
+        if (restore_partition(&di, drive, folder, p->gz, p->codec, p->start_lba, win * 512ULL) != 0) {
             xfer_free();
             return 1;
         }

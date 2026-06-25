@@ -1,6 +1,7 @@
 build/
 *.exe
 deps/zlib/
+deps/lz4/
 deps/dl/
 net/watt32/
 net/dl/

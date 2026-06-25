@@ -1,7 +1,7 @@
 /* cbdefrag.c -- file-level FAT defragmentation for `backup /DEFRAG` (see
  * cbdefrag.h). The C analogue of a classic defragmenter, but it never touches
  * the source: it walks the live volume read-only and writes a relocated,
- * compacted partition image straight into the gzip stream.
+ * compacted partition image straight into the compressed stream (gzip or lz4).
  *
  * Algorithm:
  *   1. Walk the directory tree from the root, following each file's + subdir's
@@ -244,12 +244,12 @@ static void patch_dir(plan_t *P, uint8_t *dir, uint32_t len, const dfobj_t *self
 
 /* ----- emit --------------------------------------------------------------- */
 
-static int emit_bytes(gzFile gz, const uint8_t *p, uint32_t len, progress_t *pr, uint64_t *emitted) {
+static int emit_bytes(cbw_t *w, const uint8_t *p, uint32_t len, progress_t *pr, uint64_t *emitted) {
     uint32_t off = 0;
     while (off < len) {
         uint32_t chunk = len - off;
         if (chunk > XFER_BYTES) chunk = XFER_BYTES;
-        if (gzwrite(gz, p + off, chunk) != (int)chunk) return -1;
+        if (cbw_write(w, p + off, (int)chunk) != 0) return -1;
         off += chunk;
         *emitted += chunk;
         progress_update(pr, *emitted);
@@ -257,7 +257,7 @@ static int emit_bytes(gzFile gz, const uint8_t *p, uint32_t len, progress_t *pr,
     return 0;
 }
 
-static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t root_new,
+static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root_new,
                        uint32_t root_cluster, uint32_t imaged_secs,
                        const char *label, progress_t *pr) {
     const fatlay_t *L = P->L;
@@ -283,7 +283,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
                 }
             }
         }
-        int rc = emit_bytes(gz, res, rb, pr, &emitted);
+        int rc = emit_bytes(w, res, rb, pr, &emitted);
         free(res);
         if (rc != 0) return -1;
         (void)root_cluster;
@@ -291,7 +291,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
 
     /* 2. the new FAT, num_fats copies. */
     for (uint32_t c = 0; c < L->num_fats; c++)
-        if (emit_bytes(gz, newfat, L->old_spf * L->bps, pr, &emitted) != 0) return -1;
+        if (emit_bytes(w, newfat, L->old_spf * L->bps, pr, &emitted) != 0) return -1;
 
     /* 3. FAT12/16 fixed root region (FAT32's root is a data-area object). */
     if (!L->is_fat32) {
@@ -299,7 +299,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
         uint8_t *root = read_dir_region(P, 0, 1, &rl);
         if (!root) return -1;
         patch_dir(P, root, rl, NULL);
-        int rc = emit_bytes(gz, root, rl, pr, &emitted);
+        int rc = emit_bytes(w, root, rl, pr, &emitted);
         free(root);
         if (rc != 0) return -1;
     }
@@ -317,7 +317,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
             uint8_t *d = read_dir_region(P, o->old_first, 0, &dl);
             if (!d) { free(cb); return -1; }
             patch_dir(P, d, dl, o);
-            int rc = emit_bytes(gz, d, dl, pr, &emitted);
+            int rc = emit_bytes(w, d, dl, pr, &emitted);
             free(d);
             if (rc != 0) { free(cb); return -1; }
         } else {
@@ -325,7 +325,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
             for (uint32_t k = 0; k < o->ncl && cl >= 2 && cl < eoc; k++) {
                 uint64_t sec = (uint64_t)L->first_data_sec + (uint64_t)(cl - 2) * L->spc;
                 if (load_region(P->di, P->drive, P->start_lba + sec, csize, cb) != 0) { free(cb); return -1; }
-                if (emit_bytes(gz, cb, csize, pr, &emitted) != 0) { free(cb); return -1; }
+                if (emit_bytes(w, cb, csize, pr, &emitted) != 0) { free(cb); return -1; }
                 cl = fat_entry(P->oldfat, bits, cl);
             }
         }
@@ -340,7 +340,7 @@ static int defrag_emit(plan_t *P, gzFile gz, const uint8_t *newfat, uint32_t roo
 static const char *BOOT_FILES[] = { "IO.SYS", "MSDOS.SYS", "IBMBIO.COM", "IBMDOS.COM", "KERNEL.SYS" };
 
 int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
-                      const fatlay_t *L, uint8_t *fat, gzFile gz,
+                      const fatlay_t *L, uint8_t *fat, cbw_t *w,
                       const char *label, progress_t *pr, uint32_t *out_imaged_secs) {
     plan_t P;
     memset(&P, 0, sizeof P);
@@ -402,7 +402,7 @@ int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
     uint32_t imaged_secs = L->first_data_sec + P.total_alloc * L->spc;
     if (imaged_secs > L->old_total) imaged_secs = L->old_total;
 
-    int rc = defrag_emit(&P, gz, newfat, root_new, root_cluster, imaged_secs, label, pr);
+    int rc = defrag_emit(&P, w, newfat, root_new, root_cluster, imaged_secs, label, pr);
     free(newfat);
     if (rc != 0) { free(P.objs); free(P.remap); return -1; }
 

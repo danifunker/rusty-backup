@@ -22,15 +22,20 @@ ZLIB    := deps/zlib
 ZLIBINC := $(ZLIB)/inc
 ZLIBLIB := $(ZLIB)/lib
 
+LZ4     := deps/lz4
+LZ4INC  := $(LZ4)/inc
+LZ4LIB  := $(LZ4)/lib
+
 # --- The unified cb-dos tool ----------------------------------------------
 # One executable: the text UI when run bare, plus backup / restore / clone /
 # inspect subcommands, all over the shared cbdisk engine. Needs the DJGPP zlib
-# static lib (gzip codec for backup/restore), cross-built separately and
-# gitignored -- run `sh deps/fetch-zlib.sh` once.
+# (gzip codec) + liblz4 (LZ4 frame codec) static libs, both cross-built
+# separately and gitignored -- run `sh deps/fetch-zlib.sh` and
+# `sh deps/fetch-lz4.sh` once.
 CB_SRCS := src/crustybk.c src/cmd_backup.c src/cmd_restore.c src/cmd_clone.c \
            src/cmd_inspect.c src/cmd_browse.c src/cbdisk.c src/cbntfs.c \
-           src/cbdefrag.c
-CB_HDRS := src/cbdisk.h src/cbbrowse.h src/cbntfs.h src/cbdefrag.h
+           src/cbdefrag.c src/cbcodec.c
+CB_HDRS := src/cbdisk.h src/cbbrowse.h src/cbntfs.h src/cbdefrag.h src/cbcodec.h
 
 # Diagnostics POCs (no zlib): single-source, built by the generic rule below.
 DIAG := $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe
@@ -41,7 +46,10 @@ all: crustybk $(DIAG)
 $(BUILD)/crustybk.exe: $(CB_SRCS) $(CB_HDRS) | $(BUILD)
 	@test -f $(ZLIBLIB)/libz.a || { \
 	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
-	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $(CB_SRCS) -L$(ZLIBLIB) -lz
+	@test -f $(LZ4LIB)/liblz4.a || { \
+	  echo "lz4 not built -- run: sh deps/fetch-lz4.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(ZLIBINC) -I$(LZ4INC) $(LDFLAGS) -o $@ $(CB_SRCS) \
+	  -L$(ZLIBLIB) -lz -L$(LZ4LIB) -llz4
 
 # Generic single-source rule (the diagnostics).
 $(BUILD)/%.exe: src/%.c | $(BUILD)
