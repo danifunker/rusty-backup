@@ -295,6 +295,7 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                         defrag: false,
                         partitions: None,
                         split_size_mib: None,
+                        keep_swap: false,
                     });
                     report(r, "backup");
                 }

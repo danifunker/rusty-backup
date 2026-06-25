@@ -1969,6 +1969,10 @@ pub struct CompactFatReader<R> {
     new_to_old: Vec<u32>,
     old_to_new: HashMap<u32, u32>,
     directory_clusters: HashSet<u32>,
+    /// Old cluster numbers belonging to excluded swap/page files (§6 Level-1).
+    /// Empty when `keep_swap`. Their allocation is preserved (the file stays
+    /// full-size in the packed image) but their content is emitted as zeros.
+    swap_clusters: HashSet<u32>,
 
     // Source geometry (original, for seeking to source clusters)
     src_data_start_abs: u64,
@@ -2001,7 +2005,22 @@ impl<R: Read + Seek> CompactFatReader<R> {
     /// clusters, builds the remapping, and pre-computes boot sector, FAT tables,
     /// and root directory bytes.
     pub fn new(source: R, partition_offset: u64) -> Result<(Self, CompactResult), FilesystemError> {
-        Self::new_inner(source, partition_offset, false)
+        Self::new_inner(source, partition_offset, false, true)
+    }
+
+    /// Like [`new`](Self::new) / [`new_defrag`](Self::new_defrag) but **excludes
+    /// swap/page files** (§6 Level-1): allowlisted swap files keep their
+    /// allocation (the file stays full-size in the packed image) but their
+    /// content is emitted as zeros — gzip/zstd/CHD then crush them. `defrag`
+    /// selects the plain-compaction vs. file-contiguous ordering, exactly as the
+    /// two constructors above. The desktop sibling of cb-dos's default swap
+    /// zeroing (its `/KEEPSWAP` opts back in); see `crusty-backup/src/cbswap.c`.
+    pub fn new_excluding_swap(
+        source: R,
+        partition_offset: u64,
+        defrag: bool,
+    ) -> Result<(Self, CompactResult), FilesystemError> {
+        Self::new_inner(source, partition_offset, defrag, false)
     }
 
     /// Like [`new`](Self::new) but **defragments**: each file's clusters are
@@ -2015,13 +2034,14 @@ impl<R: Read + Seek> CompactFatReader<R> {
         source: R,
         partition_offset: u64,
     ) -> Result<(Self, CompactResult), FilesystemError> {
-        Self::new_inner(source, partition_offset, true)
+        Self::new_inner(source, partition_offset, true, true)
     }
 
     fn new_inner(
         mut source: R,
         partition_offset: u64,
         defrag: bool,
+        keep_swap: bool,
     ) -> Result<(Self, CompactResult), FilesystemError> {
         // --- Parse BPB ---
         source.seek(SeekFrom::Start(partition_offset))?;
@@ -2213,6 +2233,32 @@ impl<R: Read + Seek> CompactFatReader<R> {
                 );
             }
         }
+
+        // --- Identify swap/page-file clusters to exclude (§6 Level-1) ---
+        // Allocation is kept (the file stays full-size); only the *content* is
+        // zeroed in the data-region read path. Keyed by old cluster number, which
+        // survives the defrag remap, so this works in both plain and defrag mode.
+        let swap_clusters: HashSet<u32> = if keep_swap {
+            HashSet::new()
+        } else {
+            collect_swap_clusters(
+                &mut source,
+                partition_offset,
+                &fat_data,
+                fat_type,
+                original_root_cluster,
+                reserved_sectors,
+                num_fats,
+                original_sectors_per_fat,
+                root_entry_count,
+                bytes_per_sector,
+                sectors_per_cluster,
+                original_data_start_sector,
+                cluster_size,
+                total_entries,
+            )
+            .unwrap_or_default()
+        };
 
         // --- Calculate new volume geometry ---
         //
@@ -2455,6 +2501,7 @@ impl<R: Read + Seek> CompactFatReader<R> {
                 new_to_old,
                 old_to_new,
                 directory_clusters,
+                swap_clusters,
                 src_data_start_abs,
                 bytes_per_sector,
                 sectors_per_cluster,
@@ -2481,6 +2528,14 @@ impl<R: Read + Seek> CompactFatReader<R> {
         }
 
         let old_cluster = self.new_to_old[new_cluster_idx];
+
+        // Excluded swap/page-file cluster (§6 Level-1): keep the allocation but
+        // emit zeros for the content (no source read needed).
+        if self.swap_clusters.contains(&old_cluster) {
+            self.cluster_buf.iter_mut().for_each(|b| *b = 0);
+            self.cluster_buf_idx = Some(new_cluster_idx);
+            return Ok(());
+        }
 
         // Compute source absolute offset for this cluster
         let src_offset = self.src_data_start_abs
@@ -2910,6 +2965,228 @@ fn find_entry_cluster(dir_data: &[u8], name11: &[u8; 11], want_dir: bool) -> Opt
         }
     }
     None
+}
+
+/// A swap/page file we Level-1 exclude during compaction (§6 of
+/// docs/cb_dos_network_and_state.md): keep the allocation, zero the content.
+/// Strict allowlist — exact 8.3 name + required attribute mask + accepted
+/// location. The cb-dos sibling is `crusty-backup/src/cbswap.c`.
+/// DBLSPACE/DRVSPACE/STACVOL are deliberately absent — those ARE the filesystem.
+struct SwapRule {
+    /// Raw 8.3 directory name (8 name + 3 ext, space-padded), as stored on disk.
+    name11: &'static [u8; 11],
+    /// Required attribute bits: a match needs `(attr & need_attr) == need_attr`
+    /// (0 = no attribute requirement — name + location are specific enough).
+    need_attr: u8,
+    in_root: bool,
+    in_windows: bool,
+    in_os2sys: bool,
+}
+
+const SWAP_RULES: [SwapRule; 5] = [
+    // Win3.x permanent swap (root, hidden).
+    SwapRule {
+        name11: b"386SPARTPAR",
+        need_attr: ATTR_HIDDEN,
+        in_root: true,
+        in_windows: false,
+        in_os2sys: false,
+    },
+    // Win3.x temp swap / Win9x (root or \WINDOWS).
+    SwapRule {
+        name11: b"WIN386  SWP",
+        need_attr: 0,
+        in_root: true,
+        in_windows: true,
+        in_os2sys: false,
+    },
+    // NT/2k/XP page file + hibernation (root, hidden+system).
+    SwapRule {
+        name11: b"PAGEFILESYS",
+        need_attr: ATTR_HIDDEN | ATTR_SYSTEM,
+        in_root: true,
+        in_windows: false,
+        in_os2sys: false,
+    },
+    SwapRule {
+        name11: b"HIBERFILSYS",
+        need_attr: ATTR_HIDDEN | ATTR_SYSTEM,
+        in_root: true,
+        in_windows: false,
+        in_os2sys: false,
+    },
+    // OS/2 swap (\OS2\SYSTEM).
+    SwapRule {
+        name11: b"SWAPPER DAT",
+        need_attr: 0,
+        in_root: false,
+        in_windows: false,
+        in_os2sys: true,
+    },
+];
+
+/// Does the 32-byte directory entry `e` match an allowlisted swap file at the
+/// given location? (`e` is one regular directory slot.)
+fn entry_is_swap(e: &[u8], in_root: bool, in_win: bool, in_os2: bool) -> bool {
+    let attr = e[11];
+    if attr == ATTR_LONG_NAME || (attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY)) != 0 {
+        return false;
+    }
+    SWAP_RULES.iter().any(|r| {
+        let loc_ok = (r.in_root && in_root) || (r.in_windows && in_win) || (r.in_os2sys && in_os2);
+        loc_ok && &e[0..11] == r.name11.as_slice() && (attr & r.need_attr) == r.need_attr
+    })
+}
+
+/// Scan one directory's raw bytes for allowlisted swap files; add each match's
+/// cluster chain (old cluster numbers) to `out`.
+fn scan_dir_for_swap(
+    dir_data: &[u8],
+    in_root: bool,
+    in_win: bool,
+    in_os2: bool,
+    fat_data: &[u8],
+    fat_type: FatType,
+    total_entries: u32,
+    out: &mut HashSet<u32>,
+) {
+    let n = dir_data.len() / DIR_ENTRY_SIZE;
+    for i in 0..n {
+        let off = i * DIR_ENTRY_SIZE;
+        let e = &dir_data[off..off + DIR_ENTRY_SIZE];
+        if e[0] == 0x00 {
+            break;
+        }
+        if e[0] == 0xE5 || e[0] == b'.' {
+            continue;
+        }
+        if !entry_is_swap(e, in_root, in_win, in_os2) {
+            continue;
+        }
+        let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+        let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+        let fc = (hi << 16) | lo;
+        if fc >= 2 {
+            for c in chain_clusters(fat_data, fat_type, fc, total_entries) {
+                out.insert(c);
+            }
+        }
+    }
+}
+
+/// Walk the volume for Level-1 swap/page files and return their data clusters
+/// (old cluster numbers). Targets just the directories swap files live in (root,
+/// `\WINDOWS`, `\OS2\SYSTEM`) rather than the whole tree. Mirrors cb-dos's
+/// `cbswap_collect`.
+#[allow(clippy::too_many_arguments)]
+fn collect_swap_clusters<R: Read + Seek>(
+    source: &mut R,
+    partition_offset: u64,
+    fat_data: &[u8],
+    fat_type: FatType,
+    fat32_root_cluster: u32,
+    reserved_sectors: u64,
+    num_fats: u64,
+    sectors_per_fat: u64,
+    root_entry_count: u16,
+    bytes_per_sector: u64,
+    sectors_per_cluster: u64,
+    data_start_sector: u64,
+    cluster_size: usize,
+    total_entries: u32,
+) -> Result<HashSet<u32>, FilesystemError> {
+    let mut out: HashSet<u32> = HashSet::new();
+
+    // Root directory bytes (FAT32: a cluster chain; FAT12/16: the fixed region).
+    let root_data: Vec<u8> = if fat_type == FatType::Fat32 {
+        read_chain_from_source(
+            source,
+            partition_offset,
+            fat_data,
+            fat_type,
+            fat32_root_cluster,
+            bytes_per_sector,
+            sectors_per_cluster,
+            data_start_sector,
+            cluster_size,
+            total_entries,
+        )?
+    } else {
+        let root_start_sector = reserved_sectors + num_fats * sectors_per_fat;
+        let root_size = root_entry_count as usize * DIR_ENTRY_SIZE;
+        let abs = partition_offset + root_start_sector * bytes_per_sector;
+        source.seek(SeekFrom::Start(abs))?;
+        let mut buf = vec![0u8; root_size];
+        source.read_exact(&mut buf)?;
+        buf
+    };
+
+    let read_subdir = |source: &mut R, fc: u32| -> Result<Vec<u8>, FilesystemError> {
+        read_chain_from_source(
+            source,
+            partition_offset,
+            fat_data,
+            fat_type,
+            fc,
+            bytes_per_sector,
+            sectors_per_cluster,
+            data_start_sector,
+            cluster_size,
+            total_entries,
+        )
+    };
+
+    scan_dir_for_swap(
+        &root_data,
+        true,
+        false,
+        false,
+        fat_data,
+        fat_type,
+        total_entries,
+        &mut out,
+    );
+
+    // \WINDOWS\WIN386.SWP
+    if let Some(win_fc) = find_entry_cluster(&root_data, b"WINDOWS    ", true) {
+        if win_fc >= 2 {
+            let win_data = read_subdir(source, win_fc)?;
+            scan_dir_for_swap(
+                &win_data,
+                false,
+                true,
+                false,
+                fat_data,
+                fat_type,
+                total_entries,
+                &mut out,
+            );
+        }
+    }
+
+    // \OS2\SYSTEM\SWAPPER.DAT
+    if let Some(os2_fc) = find_entry_cluster(&root_data, b"OS2        ", true) {
+        if os2_fc >= 2 {
+            let os2_data = read_subdir(source, os2_fc)?;
+            if let Some(sys_fc) = find_entry_cluster(&os2_data, b"SYSTEM     ", true) {
+                if sys_fc >= 2 {
+                    let sys_data = read_subdir(source, sys_fc)?;
+                    scan_dir_for_swap(
+                        &sys_data,
+                        false,
+                        false,
+                        true,
+                        fat_data,
+                        fat_type,
+                        total_entries,
+                        &mut out,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Build a file-aware **defrag ordering** of a FAT volume's allocated clusters:
@@ -4580,6 +4857,88 @@ mod tests {
             let got = fs.read_file(&d, usize::MAX).unwrap();
             assert_eq!(got, want, "{label}: D.BIN round-trips byte-exact");
         }
+    }
+
+    /// Level-1 swap exclusion (§6): `new_excluding_swap` keeps a swap/page
+    /// file's allocation (the file stays full-size in the packed image) but zeros
+    /// its content, while a non-swap file — and the plain `new` constructor —
+    /// preserve content verbatim.
+    #[test]
+    fn excluding_swap_zeros_swap_content_keeps_allocation() {
+        use std::io::{Cursor, Read};
+
+        let blank = create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap();
+        let mut img = Cursor::new(blank);
+        let cs;
+        {
+            let mut fs = FatFilesystem::open(&mut img, 0).unwrap();
+            cs = fs.cluster_size() as usize;
+            let opt = CreateFileOptions::default();
+            let root = fs.root().unwrap();
+            let keep = vec![0xAAu8; cs];
+            let mut r = &keep[..];
+            fs.create_file(&root, "KEEP.BIN", &mut r, keep.len() as u64, &opt)
+                .unwrap();
+            // WIN386.SWP matches the swap allowlist by name + root location (no
+            // attribute requirement), so it is excluded with no attr fiddling.
+            let swap = vec![0xCDu8; cs * 2];
+            let mut r = &swap[..];
+            fs.create_file(&root, "WIN386.SWP", &mut r, swap.len() as u64, &opt)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let disk = img.into_inner();
+
+        // Read a named root file's bytes back out of a packed image.
+        let read_named = |image: &[u8], name: &str| -> Vec<u8> {
+            let mut cur = Cursor::new(image.to_vec());
+            let mut fs = FatFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let e = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == name)
+                .unwrap();
+            fs.read_file(&e, usize::MAX).unwrap()
+        };
+
+        // Plain `new` keeps swap content verbatim.
+        let mut kept = Vec::new();
+        CompactFatReader::new(Cursor::new(disk.clone()), 0)
+            .unwrap()
+            .0
+            .read_to_end(&mut kept)
+            .unwrap();
+        assert_eq!(
+            read_named(&kept, "WIN386.SWP"),
+            vec![0xCDu8; cs * 2],
+            "plain new keeps swap content verbatim"
+        );
+        assert_eq!(read_named(&kept, "KEEP.BIN"), vec![0xAAu8; cs]);
+
+        // `new_excluding_swap`: swap content zeroed, full size kept; KEEP intact.
+        let mut excl = Vec::new();
+        CompactFatReader::new_excluding_swap(Cursor::new(disk.clone()), 0, false)
+            .unwrap()
+            .0
+            .read_to_end(&mut excl)
+            .unwrap();
+        let swap_out = read_named(&excl, "WIN386.SWP");
+        assert_eq!(
+            swap_out.len(),
+            cs * 2,
+            "swap file keeps full size (allocation preserved)"
+        );
+        assert!(
+            swap_out.iter().all(|&b| b == 0),
+            "swap content must be zeroed"
+        );
+        assert_eq!(
+            read_named(&excl, "KEEP.BIN"),
+            vec![0xAAu8; cs],
+            "non-swap file preserved"
+        );
     }
 
     #[test]

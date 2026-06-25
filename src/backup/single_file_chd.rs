@@ -611,11 +611,15 @@ fn build_partition_reader(
         let clone = source_file
             .try_clone()
             .context("failed to clone source for compact reader")?;
+        // keep_swap=true: single-file-CHD does not yet honor swap exclusion
+        // (it would need threading through SingleFileChdInputs); the per-partition
+        // formats (gzip/zstd/raw/vhd) do. Tracked as a follow-up.
         if let Some((reader, info)) = fs::packed_partition_reader_padded(
             clone,
             part_offset,
             part.partition_type_byte,
             part.partition_type_string.as_deref(),
+            true,
         ) {
             // After padding, the stream must be exactly the partition
             // extent's length; an earlier regression let a packed

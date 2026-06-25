@@ -172,6 +172,14 @@ pub struct BackupConfig {
     /// ignored when [`BackupConfig::sector_by_sector`] is on. Distinct from
     /// [`BackupConfig::defrag_partition_indices`] (the HFS+/NTFS defrag-clone).
     pub defrag_fat: bool,
+    /// When `false` (the default), allowlisted swap/page files (`386SPART.PAR`,
+    /// `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) on a FAT
+    /// volume are **Level-1 excluded**: their allocation is kept (the file stays
+    /// full-size, the OS reinitializes swap on next boot) but their content is
+    /// imaged as zeros, which the codec crushes. `true` (`--keep-swap`) images
+    /// swap verbatim. The desktop sibling of cb-dos's default zeroing / `/KEEPSWAP`
+    /// (see `crusty-backup/src/cbswap.c`). FAT-only.
+    pub keep_swap: bool,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -1695,7 +1703,11 @@ fn run_backup_inner(
             // partitions return None and fall back to ordinary compaction. Same
             // output size either way, so the precomputed `stream_size` still fits.
             let compact_reader = if config.defrag_fat {
-                match fs::defrag_fat_partition_reader(BufReader::new(clone), part_offset) {
+                match fs::defrag_fat_partition_reader(
+                    BufReader::new(clone),
+                    part_offset,
+                    config.keep_swap,
+                ) {
                     Some((r, _)) => {
                         log(
                             &progress,
@@ -1713,6 +1725,7 @@ fn run_backup_inner(
                             part_offset,
                             part.partition_type_byte,
                             part.partition_type_string.as_deref(),
+                            config.keep_swap,
                         )
                         .map(|(r, _)| r)
                         .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
@@ -1724,6 +1737,7 @@ fn run_backup_inner(
                     part_offset,
                     part.partition_type_byte,
                     part.partition_type_string.as_deref(),
+                    config.keep_swap,
                 )
                 .map(|(r, _)| r)
                 .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?

@@ -2623,6 +2623,9 @@ impl InspectTab {
             precomputed_minimum_sizes: None,
             defrag_partition_indices: None,
             defrag_fat: false,
+            // Remote/block-tier backup: swap exclusion happens agent-side
+            // (cb-dos CRUSTYBK already zeros swap), so this is moot here.
+            keep_swap: false,
         };
 
         let progress = Arc::new(Mutex::new(rusty_backup::backup::BackupProgress::new()));

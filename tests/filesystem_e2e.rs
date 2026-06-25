@@ -967,7 +967,7 @@ fn test_exfat_compaction_round_trip() {
 fn ntfs_smart_compaction_is_layout_preserving() {
     let img = load_fixture("test_ntfs.img.zst");
     let (mut r, info) =
-        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None, true)
             .expect("NTFS compact reader");
     assert_eq!(
         info.compacted_size, info.original_size,
@@ -990,7 +990,7 @@ fn ntfs_smart_compaction_is_layout_preserving() {
 fn exfat_smart_compaction_is_layout_preserving() {
     let img = load_fixture("test_exfat.img.zst");
     let (mut r, info) =
-        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None, true)
             .expect("exFAT compact reader");
     assert_eq!(
         info.compacted_size, info.original_size,
@@ -1048,8 +1048,8 @@ fn ntfs_compaction_preserves_nonresident_file() {
     // Smart-compact via the dispatch the backup uses, then reconstruct the
     // stream the way restore does (zero-pad to original_size — a no-op for the
     // layout-preserving reader, which already emits the full length).
-    let (mut r, info) =
-        compact_partition_reader(Cursor::new(modified), 0, 0x07, None).expect("compact reader");
+    let (mut r, info) = compact_partition_reader(Cursor::new(modified), 0, 0x07, None, true)
+        .expect("compact reader");
     let mut packed = Vec::new();
     r.read_to_end(&mut packed).unwrap();
     packed.resize(info.original_size as usize, 0);

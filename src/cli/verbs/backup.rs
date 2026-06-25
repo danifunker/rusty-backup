@@ -110,6 +110,14 @@ pub struct BackupArgs {
     /// Split each output stream after this many MiB (Zstd / Raw only).
     #[arg(long = "split-size")]
     pub split_size_mib: Option<u32>,
+
+    /// Image swap/page files verbatim instead of excluding them. By default a
+    /// FAT volume's swap/page files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`,
+    /// `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is
+    /// zeroed (they reinitialize on boot), which the codec crushes; `--keep-swap`
+    /// images them as-is. (The desktop sibling of cb-dos `/KEEPSWAP`.)
+    #[arg(long = "keep-swap")]
+    pub keep_swap: bool,
 }
 
 pub fn run(args: BackupArgs) -> Result<()> {
@@ -155,6 +163,7 @@ pub fn run(args: BackupArgs) -> Result<()> {
         precomputed_minimum_sizes: None,
         defrag_partition_indices: None,
         defrag_fat: args.defrag,
+        keep_swap: args.keep_swap,
     };
 
     let progress = Arc::new(Mutex::new(BackupProgress::default()));

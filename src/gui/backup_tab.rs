@@ -35,6 +35,11 @@ pub struct BackupTab {
     destination_folder: Option<PathBuf>,
     backup_name: String,
     sector_by_sector: bool,
+    /// When `false` (default), a FAT volume's swap/page files are imaged
+    /// full-size but zeroed (§6 Level-1, the cb-dos `/KEEPSWAP` sibling); when
+    /// `true`, swap is imaged verbatim. Drives the "Keep swap/page-file content"
+    /// checkbox.
+    keep_swap: bool,
     resize_partitions: bool,
     split_archives: bool,
     split_size_mib: u32,
@@ -178,6 +183,7 @@ impl Default for BackupTab {
             destination_folder: None,
             backup_name: String::new(),
             sector_by_sector: false,
+            keep_swap: false,
             resize_partitions: true,
             split_archives: true,
             split_size_mib: 4000,
@@ -683,6 +689,27 @@ impl BackupTab {
                     ui.checkbox(
                         &mut self.resize_partitions,
                         "Resize partitions to minimum size",
+                    );
+                    if self.sector_by_sector {
+                        ui.label("(not available with sector-by-sector copy)");
+                    }
+                });
+            });
+
+            // Swap/page-file exclusion (FAT). On by default: swap files are kept
+            // full-size but zeroed so the codec crushes them. Not applicable to a
+            // sector-by-sector copy (which images every block verbatim).
+            ui.add_enabled_ui(!self.sector_by_sector, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.keep_swap,
+                        "Keep swap/page-file content (don't exclude)",
+                    )
+                    .on_hover_text(
+                        "By default a FAT volume's swap/page files (WIN386.SWP, \
+                         386SPART.PAR, PAGEFILE.SYS, HIBERFIL.SYS, SWAPPER.DAT) are \
+                         imaged full-size but zeroed -- they reinitialize on boot, \
+                         and the codec crushes the zeros. Check to image them as-is.",
                     );
                     if self.sector_by_sector {
                         ui.label("(not available with sector-by-sector copy)");
@@ -2223,6 +2250,7 @@ impl BackupTab {
             precomputed_minimum_sizes,
             defrag_partition_indices: Some(defrag_set),
             defrag_fat: false,
+            keep_swap: self.keep_swap,
         };
 
         let progress_arc = Arc::new(Mutex::new(BackupProgress::new()));
@@ -2484,6 +2512,7 @@ impl BackupTab {
             precomputed_minimum_sizes,
             defrag_partition_indices: Some(defrag_set),
             defrag_fat: false,
+            keep_swap: self.keep_swap,
         };
 
         self.maybe_persist_chd_options();
