@@ -90,10 +90,12 @@ The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_to
    protocol + 7c block-level backup + 7d resume + 7e restore-over-the-wire + 7f
    manifest/idempotency + 7g boot hashes + swap exclusion). The loop is closed,
    resumable, file-aware, boot-fingerprinted, and swap-aware — **the core network
-   feature is complete**. Only the **optional 7h** (incremental + the §5d
-   bootability-change flag) and **7i** (Level-2 swap dealloc + §6e desktop swap
-   parity) remain. **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)**
-   (the net-phase hand-off + the qemu NE2000/SLiRP rig).
+   feature is complete**. **§6e desktop swap parity is also DONE** (2026-06-25 —
+   the Rust backup now Level-1 excludes swap via `--keep-swap` / a GUI checkbox).
+   Only the **optional 7h** (incremental + the §5d bootability-change flag) and the
+   rest of **7i** (Level-2 swap dealloc + single-file-CHD swap) remain. **Kick off
+   from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase hand-off +
+   the qemu NE2000/SLiRP rig).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu

@@ -309,6 +309,7 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--checksum` — Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
 - `--defrag` — Defragment FAT partitions: relocate each file's clusters into a contiguous run (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of crusty-backup's `/DEFRAG`.)
+- `--keep-swap` — Image a FAT volume's swap/page files verbatim instead of excluding them. By default these files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed — they reinitialize on boot and the codec crushes the zeros — so the image is smaller; `--keep-swap` images them as-is. FAT only; not applied to a `--sector-by-sector` copy. (The desktop sibling of crusty-backup's `/KEEPSWAP`.)
 - `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
 - `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
 

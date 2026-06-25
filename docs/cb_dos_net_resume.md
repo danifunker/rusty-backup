@@ -163,9 +163,10 @@ swap-aware.** The core feature is **complete**; what remains (7h/7i) is optional
   **bootability-change flag** lands — it needs a *prior* manifest to diff the
   `system` block against, which is exactly 7h's prior-backup comparison.
 - **7i — Level-2 swap dealloc** (free the FAT chain + drop the dir entry so a
-  resize-down minimum shrinks; 7g only zeros content) **+ desktop swap parity**
-  (§6e — the Rust native-format compaction doesn't zero swap either; per CLAUDE.md's
-  shared-logic rule, swap exclusion is a candidate for the desktop path too).
+  resize-down minimum shrinks; 7g only zeros content). **Desktop swap parity is
+  DONE** (§6e, 2026-06-25 — the Rust backup now Level-1 excludes swap via
+  `CompactFatReader::new_excluding_swap` + a `--keep-swap` flag / GUI checkbox);
+  only Level-2 dealloc and single-file-CHD swap exclusion remain under 7i.
 - The deferred **resize-over-the-wire** (a forward-only streaming peek-then-resize,
   the one gap 7e left) also lives here.
 

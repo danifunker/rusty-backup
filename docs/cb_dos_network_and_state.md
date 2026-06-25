@@ -570,12 +570,18 @@ the only gain over Level 1 is a smaller resize-down minimum. Defer.
 - **Record** `excluded:true, content:zeroed` in the manifest so restore recreates
   the file and the counter keeps ignoring it.
 
-### 6e. Feature-parity note
+### 6e. Feature-parity note — **shipped (2026-06-25)**
 
-The desktop's native-format compaction is bitmap-based and doesn't zero swap
-either. Per CLAUDE.md's GUI/CLI parity + shared-business-logic rules, swap
-exclusion is a candidate for the **shared** path (desktop benefits identically),
-not a cb-dos-only trick.
+Per CLAUDE.md's GUI/CLI parity + shared-business-logic rules, swap exclusion is
+**not** a cb-dos-only trick — the Rust desktop backup now does the same Level-1
+zeroing. `CompactFatReader::new_excluding_swap` (`src/fs/fat.rs`) runs the same
+strict allowlist over root / `\WINDOWS` / `\OS2\SYSTEM` and zeros the swap files'
+content while keeping their allocation; `keep_swap` threads through `BackupConfig`
+to an rb-cli `--keep-swap` flag and a GUI checkbox (default = exclude). It works
+in both plain and defrag compaction (the set is keyed by old cluster number, which
+survives the defrag remap — unlike cb-dos's by-position mask, which `/DEFRAG`
+skips). single-file-CHD is the one desktop format that still images swap verbatim
+(a documented follow-up).
 
 ---
 
@@ -743,12 +749,30 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 - [ ] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
       manifest to skip unchanged partitions/files. The bootability-change flag
       (diff a prior `system` block, §5d) lands here -- it needs the prior manifest.
-- [ ] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
+- [~] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
+      **Desktop swap parity DONE (§6e, 2026-06-25)** — the Rust backup now Level-1
+      excludes swap too (`--keep-swap` / GUI checkbox). Remaining: Level-2 dealloc
+      (free the chain so resize-down shrinks) + single-file-CHD swap exclusion.
 
 ---
 
 ## Progress log
 
+- 2026-06-25 — **Desktop swap parity (§6e / part of 7i) — shipped.** Brought 7g's
+  Level-1 swap exclusion to the Rust desktop backup (CLAUDE.md GUI/CLI parity).
+  `CompactFatReader::new_excluding_swap` (`src/fs/fat.rs`) runs the same strict
+  allowlist (386SPART.PAR / WIN386.SWP / PAGEFILE.SYS / HIBERFIL.SYS / SWAPPER.DAT,
+  mirroring `cbswap.c`) over root / `\WINDOWS` / `\OS2\SYSTEM`, collecting the swap
+  files' cluster chains; `load_cluster` emits zeros for them, keeping the
+  allocation. Keyed by **old cluster number**, so it works in both plain and defrag
+  compaction (cb-dos's by-position mask had to skip `/DEFRAG`; the desktop doesn't).
+  Threaded as `keep_swap: bool` through `BackupConfig` → `compact_partition_reader`
+  / `defrag_fat_partition_reader` / `packed_partition_reader_padded`, surfaced as an
+  rb-cli `--keep-swap` flag + a GUI "Keep swap/page-file content" checkbox (default
+  off = exclude). Unit test proves a packed image zeros WIN386.SWP full-size while a
+  normal file + plain `new` are byte-preserved; lib + clippy `-D warnings` green.
+  single-file-CHD still images swap verbatim (a documented follow-up); the
+  remaining 7i piece is Level-2 dealloc.
 - 2026-06-25 — **Phase 7g complete — boot section deepening + swap exclusion,
   qemu-verified (local + network).** Two parts. **(a) Boot deepening (§5d):** each
   DOS system file in the manifest `system` block now carries a `hash` (CRC32 over
