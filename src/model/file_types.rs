@@ -51,17 +51,29 @@ pub const MAC_ARCHIVE_EXTS: &[&str] = &["sit", "hqx", "sea", "cpt", "mar", "SIT"
 /// `.bin` to inspect in the Archives tab; the content sniff is still the gate.
 pub const MACBINARY_PICKER_EXTS: &[&str] = &["bin", "macbin"];
 
+/// Extra extensions shown in the Archives-tab Browse picker for MacZip
+/// archives. `.zip` is content-overloaded (a MacZip archive of Mac files vs. a
+/// plain disk-image-in-a-zip — distinguished by `detect_mac_archive` finding a
+/// `Mac3` extra field, not by extension), so like [`MACBINARY_PICKER_EXTS`] it
+/// stays OUT of [`MAC_ARCHIVE_EXTS`] and [`DISK_IMAGE_EXTS`] keeps `.zip` as a
+/// disk image by default.
+pub const MACZIP_PICKER_EXTS: &[&str] = &["zip"];
+
 /// Every extension the **Archives tab** Browse picker should surface, so a user
 /// can select any archive format the engine knows how to open. This is the
 /// single source of truth for that picker and is kept in parity with
 /// `macarchive::detect::detect_mac_archive`'s coverage: the canonical Mac
 /// archive set ([`MAC_ARCHIVE_EXTS`]) plus the content-overloaded extensions
-/// ([`MACBINARY_PICKER_EXTS`]; `.zip` MacZip is added when that reader lands)
-/// that can't live in the routing list. Detection stays content-driven; this
-/// only controls which files the dialog shows.
+/// ([`MACBINARY_PICKER_EXTS`], [`MACZIP_PICKER_EXTS`]) that can't live in the
+/// routing list. Detection stays content-driven; this only controls which
+/// files the dialog shows.
 pub fn archives_picker_exts() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
-    for ext in MAC_ARCHIVE_EXTS.iter().chain(MACBINARY_PICKER_EXTS) {
+    for ext in MAC_ARCHIVE_EXTS
+        .iter()
+        .chain(MACBINARY_PICKER_EXTS)
+        .chain(MACZIP_PICKER_EXTS)
+    {
         if !out.contains(ext) {
             out.push(ext);
         }
@@ -216,6 +228,17 @@ mod tests {
     }
 
     #[test]
+    fn maczip_picker_is_separate_from_routing_list() {
+        // `.zip` is selectable in the Archives picker but must NOT join
+        // MAC_ARCHIVE_EXTS (extension routing) — a plain disk-image-in-a-zip
+        // would otherwise be force-routed to the Mac-archive path. It stays a
+        // disk image by default; detect_mac_archive (Mac3 field) is the gate.
+        assert!(MACZIP_PICKER_EXTS.contains(&"zip"));
+        assert!(!MAC_ARCHIVE_EXTS.contains(&"zip"));
+        assert!(DISK_IMAGE_EXTS.contains(&"zip"));
+    }
+
+    #[test]
     fn archives_picker_covers_every_supported_format() {
         // The Archives-tab Browse picker must surface every archive format the
         // engine can open (detect_mac_archive's coverage): StuffIt (.sit), SEA
@@ -223,8 +246,7 @@ mod tests {
         // (.bin/.macbin), and MacZip (.zip). If a new format is added to the
         // classifier, add its picker extension here too.
         let picker = archives_picker_exts();
-        // .zip (MacZip) is added to this list when that reader lands.
-        for must in ["sit", "hqx", "sea", "cpt", "mar", "bin", "macbin"] {
+        for must in ["sit", "hqx", "sea", "cpt", "mar", "bin", "macbin", "zip"] {
             assert!(
                 picker.contains(&must),
                 "Archives picker is missing supported format .{must}"

@@ -37,8 +37,10 @@ rusty-backup has a working, multi-codec Mac archive decoder family. The pieces:
   `detect_mac_archive(bytes) -> Option<MacArchiveKind>`. Extension-independent,
   content-driven. Today's `MacArchiveKind` variants: `BinHexSingleFile`,
   `BinHexOverSit`, `BinHexOverSea`, `BinHexOverCompactPro`, `Sit`, `Sit5`,
-  `Sea`, `CompactPro`, `Mar`, and now `MacBinary` (Done — content-detected via
-  the `is_macbinary` confidence heuristic).
+  `Sea`, `CompactPro`, `Mar`, `MacBinary` (Done — content-detected via the
+  `is_macbinary` confidence heuristic), and `MacZip` (Done — Info-ZIP's
+  Macintosh port; a `.zip` carrying `Mac3` (`0x334D`) extra fields and
+  `XtraStuf.mac/` resource forks. Reader: `src/macarchive/maczip.rs`).
 
 - **Orchestrator** (`src/macarchive/extract.rs`):
   - `open(path)` / `open_bytes(raw) -> Result<(Vec<u8>, StuffItArchive)>` —

@@ -91,6 +91,7 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
             Ok((raw, archive))
         }
         Some(MacArchiveKind::Mar) => super::mar::parse(&raw),
+        Some(MacArchiveKind::MacZip) => super::maczip::parse(&raw),
         Some(MacArchiveKind::MacBinary) => {
             let mb = super::macbinary::parse(&raw)?;
             // Peel: a MacBinary's data fork is frequently itself an archive we

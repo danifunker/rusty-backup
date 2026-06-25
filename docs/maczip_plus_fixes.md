@@ -78,31 +78,31 @@ Ref: `docs/native_mac_archives.md` (Phases 0–5). Self-contained spec.
 
 New format joining the `macarchive` family, mirroring Task B's integration.
 
-- [ ] **C1.** New `src/macarchive/maczip.rs`:
-  - [ ] Walk the ZIP central directory + local headers (via `zip` v8; `flate2`
+- [x] **C1.** New `src/macarchive/maczip.rs`:
+  - [x] Walk the ZIP central directory + local headers (via `zip` v8; `flate2`
         for inflate).
-  - [ ] Pair each data-fork entry with its resource-fork entry, identified by a
+  - [x] Pair each data-fork entry with its resource-fork entry, identified by a
         `XtraStuf.mac/` path component (`ResourceMark = "XtraStuf.mac:"`); cross-
         check with the MAC3 `EB_M3_FL_DATFRK` (0x01) info bit.
-  - [ ] Parse the **MAC3 (`0x334D`)** extra field: type/creator from the
+  - [x] Parse the **MAC3 (`0x334D`)** extra field: type/creator from the
         always-uncompressed 18-byte header; Finder flags + dates + comment from
         the local-header blob — `memextract` = `[method u16][crc u32]` + raw
         deflate, or raw bytes when `EB_M3_FL_UNCMPR` (0x04) is set.
-  - [ ] Best-effort JLEE (`0x07c8`) fallback for older Info-ZIP Mac archives
+  - [x] Best-effort JLEE (`0x07c8`) fallback for older Info-ZIP Mac archives
         (type/creator/flags only).
-  - [ ] Emit a `StuffItArchive` (method 0/store; forks laid back-to-back), so
+  - [x] Emit a `StuffItArchive` (method 0/store; forks laid back-to-back), so
         the whole extract/browse path is reused unchanged.
-- [ ] **C2.** `detect.rs`: `MacArchiveKind::MacZip` = ZIP magic **and**
+- [x] **C2.** `detect.rs`: `MacArchiveKind::MacZip` = ZIP magic **and**
       (a `XtraStuf.mac/` entry **or** a `0x334D` extra field) — distinguishes a
       MacZip archive from a plain disk-image-in-zip.
-- [ ] **C3.** `extract.rs`: `open_bytes` arm.
-- [ ] **C4.** `.zip` overload (like `.bin`): raw `.zip` stays a disk image;
+- [x] **C3.** `extract.rs`: `open_bytes` arm.
+- [x] **C4.** `.zip` overload (like `.bin`): raw `.zip` stays a disk image;
       content-sniff routes MacZip archives to the Archives tab. Broaden the
       Archives picker with a content gate; keep `zip` picker-only / non-associated.
-- [ ] **C5.** Validation: extract `MacZipSrc106b1.zip` with the new reader and
+- [x] **C5.** Validation: extract `MacZipSrc106b1.zip` with the new reader and
       diff forks + type/creator against system `unzip` (993-entry oracle). Unit
       tests + a "plain disk-image zip is not MacZip" regression.
-- [ ] **C6.** Docs: README formats/filesystems/Mac-archive coverage; MiSTer
+- [x] **C6.** Docs: README formats/filesystems/Mac-archive coverage; MiSTer
       status; a MacZip note in `native_mac_archives.md`; `MAC_ARCHIVE_EXTS` /
       picker regression test.
 

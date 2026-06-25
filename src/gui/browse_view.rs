@@ -3919,7 +3919,8 @@ impl BrowseView {
             | MacArchiveKind::Sea
             | MacArchiveKind::CompactPro
             | MacArchiveKind::Mar
-            | MacArchiveKind::MacBinary => "Expand archive?",
+            | MacArchiveKind::MacBinary
+            | MacArchiveKind::MacZip => "Expand archive?",
             MacArchiveKind::BinHexOverSit
             | MacArchiveKind::BinHexOverSea
             | MacArchiveKind::BinHexOverCompactPro => "Convert and/or expand?",
@@ -3942,7 +3943,8 @@ impl BrowseView {
                     | MacArchiveKind::Sea
                     | MacArchiveKind::CompactPro
                     | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary => {
+                    | MacArchiveKind::MacBinary
+                    | MacArchiveKind::MacZip => {
                         format!("Would you like to expand the contents of {filename}?")
                     }
                     MacArchiveKind::BinHexOverSit
@@ -3983,7 +3985,8 @@ impl BrowseView {
                     | MacArchiveKind::Sea
                     | MacArchiveKind::CompactPro
                     | MacArchiveKind::Mar
-                    | MacArchiveKind::MacBinary => {
+                    | MacArchiveKind::MacBinary
+                    | MacArchiveKind::MacZip => {
                         if ui
                             .button("Expand")
                             .on_hover_text(

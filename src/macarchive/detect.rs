@@ -62,6 +62,12 @@ pub enum MacArchiveKind {
     /// file's two forks plus Finder info. Content-detected (it has no reliable
     /// extension), so a raw `.bin` disk image stays a disk image.
     MacBinary,
+    /// A MacZip archive (`.zip`): Info-ZIP's Macintosh port stores each Mac
+    /// file's data fork as a normal ZIP entry and its resource fork under a
+    /// `XtraStuf.mac/` component, with Finder info in a `Mac3` extra field.
+    /// Content-detected (presence of a `Mac3` field), so a plain
+    /// disk-image-in-a-zip stays a disk image.
+    MacZip,
 }
 
 impl MacArchiveKind {
@@ -80,6 +86,7 @@ impl MacArchiveKind {
             MacArchiveKind::BinHexOverCompactPro => "Compact-Pro-over-BinHex",
             MacArchiveKind::Mar => "MAR",
             MacArchiveKind::MacBinary => "MacBinary",
+            MacArchiveKind::MacZip => "MacZip",
         }
     }
 
@@ -162,6 +169,12 @@ pub fn detect_mac_archive(bytes: &[u8]) -> Option<MacArchiveKind> {
     // matched (see is_macbinary's floor checks).
     if super::macbinary::is_macbinary(bytes).is_some() {
         return Some(MacArchiveKind::MacBinary);
+    }
+    // MacZip is a ZIP carrying Mac3 extra fields. Cheap PK-magic gate inside
+    // is_maczip means a non-zip input bails immediately; a plain
+    // disk-image-in-a-zip has no Mac3 field and is not matched.
+    if super::maczip::is_maczip(bytes) {
+        return Some(MacArchiveKind::MacZip);
     }
     if find_sea_archive(bytes).is_some() {
         return Some(MacArchiveKind::Sea);

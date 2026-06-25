@@ -19,6 +19,7 @@ pub mod compactpro;
 pub mod detect;
 pub mod extract;
 pub mod macbinary;
+pub mod maczip;
 pub mod mar;
 pub mod stuffit;
 pub mod stuffit13_tables;
