@@ -7,10 +7,11 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 30 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 32 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+e45bf49 perf(cbk): lazy .cbk disk reader (skip the whole-disk reconstruct)
 dbcdfc7 feat(cb-dos): extended / logical partition backup, restore, and clone
 6ffe918 fix(restore): don't double-count logical partitions in the restore pre-flight
 e3284d6 feat(cb-dos): live progress (%, speed, ETA) for backup/restore/clone
@@ -55,21 +56,17 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
 | **Phase 4e** — extended/logical (DOS) | backup/restore/clone follow the **EBR chain** of an extended container (`walk_ebr_chain`/`write_ebr_chain` in `cbdisk`, ports of parse/build_ebr_chain); logicals (index 4+) imaged with `is_logical` + an `extended_container` block; same-size on DOS (resize via desktop); verified on FreeDOS/qemu — primary FAT16 + ext { FAT16, NTFS } round-trips byte-identical via cb-dos restore, cb-dos clone, **and** desktop restore (after fixing a desktop pre-flight double-count) |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
+| **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back; byte-identical test + `rb-cli`-verified |
+| **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
-   to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
-   packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
-   format already supports multiple chunks/member) and make the reader decompress
-   only the members a seek touches. No format change. (Also makes `get`'s backward
-   gzseeks cheap — today they rewind to the gz start. The new live-disk backend is
-   already seek-cheap — `read_lba` is O(1) per seek — so it's a clean perf
-   reference for what the lazy `.cbk` reader should match.)
-2. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
-   this is mainly framing + the incremental `.idx` resume sidecar). See
-   `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
+1. **Phase 5 — file-level repack/defrag** (boot-file aware: keep `IO.SYS`/
+   `MSDOS.SYS` first + contiguous; FAT-only). Still emits a plain `partition-N.gz`,
+   just defragmented. The biggest remaining DOS-side feature.
+2. **Phase 6 — LZ4 codec** for slower machines (needs a matching desktop `Lz4`
+   variant alongside `Gzip`).
 3. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
    Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
    the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
@@ -77,13 +74,16 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
    quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
    `get` also writes a DOS file, so the same caution applies; don't redirect it on
    the same drive. Worth root-causing (likely a DTA/FILE-buffer aliasing).
-4. **Real-486 hardware** validation (everything so far is qemu/emulator).
-5. **Remaining FS coverage on DOS** — **exFAT** (also MBR type 0x07; the
-   allocation-bitmap parser is already proven in `disk_spike.c`, so this is
-   wiring it into `cbntfs`-style backup/clone, gated by the `EXFAT   ` OEM id),
-   and **ext2/3** (stretch). (NTFS landed in Phase 4d; extended/logical
-   partitions in Phase 4e.)
-6. **Phase 5 — file-level repack/defrag** (boot-file aware).
+4. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+   this is mainly framing + the incremental `.idx` resume sidecar). See
+   `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i). The path to networked
+   backup/restore ("both" local + network).
+5. **Real-486 hardware** validation (everything so far is qemu/emulator).
+
+(Out of scope per the maintainer: **exFAT** backup-source — no DOS-era OS mounts
+it; **ext2/3** — those users would run a Linux build. The lazy-reader follow-up of
+re-chunking the packer into source-span members for intra-partition random access
+is deferred — it re-frames `partition-N.gz` and needs a recomputed CRC.)
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit

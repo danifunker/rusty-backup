@@ -108,13 +108,17 @@ testing without real hardware. This setup is the gating step for the size POC.
 
 ## Distribution — bootable FreeDOS floppy / Gotek image
 
-> **Status: deferred — design later.** The concrete boot-disk composition and
-> the destination/driver matrix (IDE/CF vs +CD vs +USB) are **not decided**. The
-> material below is captured as reference for when we pick this up. v1 of cb-dos
-> can be developed and tested without finalized boot media — run it from any
-> FreeDOS / LFN-equipped DOS install (see *Fallback*). **Decoupling note**: the
-> cb-dos engine (read FAT → zero-then-gzip → native folder → restore+resize) is
-> independent of how it's booted, so this can be settled any time before release.
+> **Status: SHIPPED in CI (2026-06-25).** The release pipeline builds a bootable
+> **FreeDOS floppy + CD** on every push and attaches them to the GitHub release.
+> `.github/workflows/release.yml`'s **`build-cb-dos`** job cross-builds the DOS
+> tools (DJGPP, `docker/cb-dos.Dockerfile`), fetches the FreeDOS 1.4 FloppyEdition
+> base, and runs **`crusty-backup/mkmedia.sh`**, which `mcopy`s `FDAUTO.BAT` +
+> `CWSDPMI.EXE` + `CRUSTYBK.EXE` (+ `DISKSPK`/`LFNTEST`) onto `cbdos-freedos.img`
+> and wraps it in an El-Torito `cbdos.iso`. The `release` job (`needs:
+> build-cb-dos`) ships both as `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`.
+> `appliance-media.yml` builds them on demand for iteration. The driver matrix
+> (IDE/CF vs +CD vs +USB) is still minimal (plain IDE/CF); the reference material
+> below remains the plan for richer boot-menu driver profiles.
 
 Ship cb-dos as a **bootable FreeDOS disk image** so the user never has to
 assemble an environment:
@@ -715,6 +719,27 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Lazy `.cbk` reader (desktop perf).** Reading a `.cbk` as a disk
+  used to materialize every member + reconstruct the whole disk into a tempfile at
+  open (O(whole disk), slow for multi-GB even when a consumer reads a few KB). New
+  `CbkLazyReader` (`src/model/source_reader.rs`) is a Read+Seek over the
+  reconstructed disk that builds only the small structural sectors eagerly (MBR +
+  CHS via `patch_mbr_entries`, EBR chain via `build_restore_ebr_chain` — exactly as
+  `reconstruct_disk_from_backup`) and decompresses each partition on demand, only
+  the member a seek lands in (streaming `MultiGzDecoder` over that member's `.cbk`
+  chunk payloads via new `cbk.rs` helpers `read_cbk_index`/`CbkPayloadReader`).
+  Compacted tails + gaps read as zeros. **Correctness is guaranteed**: it engages
+  only for plain MBR backups where the restore engine's per-partition
+  `hidden_sectors` patch is a *provable no-op* (run the real patch on a 32 KB head
+  buffer; if it changes anything → fall back), so verbatim member bytes equal the
+  full reconstruct; everything else (GPT/APM/RDB/X68k tables, hidden-sectors
+  mismatches) falls back to the old `open_cbk_as_disk`. A unit test asserts the
+  lazy reader is byte-identical to the full reconstruct for an MBR `.cbk` with a
+  primary + a logical partition (EBR chain, compacted tails, gaps) incl. random
+  seeks; `rb-cli` confirms a hidden_sectors-correct FAT `.cbk` engages the lazy
+  path while an mformat fixture (hidden_sectors 0) correctly falls back, both
+  inspecting correctly. (No `.cbk` format change; re-chunking the packer into
+  source-span members for intra-partition random access remains a future step.)
 - 2026-06-25 — **Phase 4e — extended / logical partition backup/restore/clone.**
   cb-dos was MBR-primary-only; now it follows the **EBR chain** of an extended
   container (type 0x05/0x0F/0x85) and images the **logical** partitions inside it.
