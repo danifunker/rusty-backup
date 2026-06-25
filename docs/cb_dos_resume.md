@@ -10,10 +10,12 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 35 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 38 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+a900b24 feat(cb-dos): Phase 6 — LZ4 codec on DOS (backup /CODEC:LZ4 + restore)
+9f036c8 feat(rbformats): LZ4 codec (Phase 6 desktop half) — CompressionType::Lz4
 23a74d9 feat(cb-dos): Phase 5 — boot-aware FAT file-level defrag (backup /DEFRAG)
 e45bf49 perf(cbk): lazy .cbk disk reader (skip the whole-disk reconstruct)
 dbcdfc7 feat(cb-dos): extended / logical partition backup, restore, and clone
@@ -60,6 +62,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
 | **Phase 4e** — extended/logical (DOS) | backup/restore/clone follow the **EBR chain** of an extended container (`walk_ebr_chain`/`write_ebr_chain` in `cbdisk`, ports of parse/build_ebr_chain); logicals (index 4+) imaged with `is_logical` + an `extended_container` block; same-size on DOS (resize via desktop); verified on FreeDOS/qemu — primary FAT16 + ext { FAT16, NTFS } round-trips byte-identical via cb-dos restore, cb-dos clone, **and** desktop restore (after fixing a desktop pre-flight double-count) |
 | **Phase 5** — FAT defrag (DOS) | `backup /DEFRAG` repacks a FAT12/16/32 volume's files+dirs into contiguous runs (boot files pinned first) before imaging (`cbdefrag.{h,c}`), read-only on the source; smaller `imaged_size`, defragged restore. Declines safely on an unclean FS. Verified on FreeDOS/qemu — FAT16 25.2→1.2 MB, FAT32 72.7→2.7 MB, byte-identical (desktop **and** on-DOS restore), a SYS'd bootable disk defragged+restored **boots**, lost-cluster disk declines (no data loss) |
+| **Phase 6** — LZ4 codec (both) | a second shared codec: desktop `rb-cli backup --format lz4` (`lz4_flex` frame, `src/rbformats/lz4.rs`) + DOS `CRUSTYBK backup /CODEC:LZ4` (liblz4 frame via `cbcodec.{h,c}`; restore auto-detects). Cheaper than gzip on a 486 at a lower ratio; gzip stays default. Standard LZ4 frame so members interchange. Verified on FreeDOS/qemu — byte-identical all three ways (DOS↔desktop, DOS↔DOS) + composes with `/DEFRAG`. Browse stays gzip-only (frames aren't seekable) |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **Lazy `.cbk` reader** (desktop) | `CbkLazyReader` reads a `.cbk` as a disk without the whole-disk reconstruct — structural sectors eager (MBR+CHS, EBR), partition bytes decompressed on demand; engages only when the `hidden_sectors` patch is a provable no-op, else falls back; byte-identical test + `rb-cli`-verified |
 | **Distribution** (CI) | release pipeline builds + ships a bootable **FreeDOS floppy + CD** (`build-cb-dos` job → `mkmedia.sh` → `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`) |
@@ -70,12 +73,13 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Phase 6** — LZ4 codec for slower machines.
-2. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
-3. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
-4. **Real-486 hardware** validation (everything so far is qemu).
-5. **`clone /DEFRAG`** *(optional)* — the cbdefrag planner emits straight to the
+1. **Bug** — `backup` mbr.bin corruption under stdout redirection (low-pri).
+2. **Net 7b–7i** — networked backup/restore (only 7a/handshake done).
+3. **Real-486 hardware** validation (everything so far is qemu).
+4. **`clone /DEFRAG`** *(optional)* — the cbdefrag planner emits straight to the
    target disk instead of gzip; the "and maybe clone" half of Phase 5.
+5. **lz4 browse** *(optional)* — `ls`/`get` from an `.lz4` backup (sequential
+   decompress to the offset, since LZ4 frames aren't seekable).
 
 Dropped by decision: exFAT backup-source, ext2/3. Deferred: the lazy-reader
 packer re-chunking (re-frames `partition-N.gz`, needs a recomputed CRC).
@@ -87,9 +91,12 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
 ## Key files
 
 **Desktop (Rust):**
-- `src/backup/mod.rs` — `CompressionType::Gzip`.
+- `src/backup/mod.rs` — `CompressionType::Gzip` / `CompressionType::Lz4`.
 - `src/rbformats/gzip.rs` — gzip codec; `compress.rs` — `Gzip` arm + `"gzip"`
   decode (`MultiGzDecoder`).
+- `src/rbformats/lz4.rs` — LZ4 frame codec (`lz4_flex`); `compress.rs` — `Lz4` arm
+  + `"lz4"` decode (`FrameDecoder`); `BackupFormat::Lz4` / `--format lz4` in
+  `cli/verbs/backup.rs`. `Cargo.toml` `lz4_flex` dep.
 - `src/rbformats/cbk.rs` — **the `.cbk` format** (RBKC chunks / RBKI index / RBKF
   footer), `pack_folder_to_cbk`, `materialize_cbk_to_folder`, `is_cbk`.
 - `src/cli/verbs/cbk.rs` — `rb-cli cbk pack|unpack`.
@@ -117,6 +124,13 @@ subcommands for scripting), built from:
   `ntfs_load_bitmap` (MFT #6 `$Bitmap` + fixup + `$DATA` run decode → RAM bitmap,
   set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check vs exFAT/HPFS).
   Lifted from the `disk_spike.c` probe. Used by `backup`/`clone` for NTFS compaction.
+- `cbcodec.{h,c}` — the **compressed-stream abstraction** (gzip + LZ4): a writer
+  (`cbw_open`/`cbw_write`/`cbw_close`) and reader (`cbr_open`/`cbr_read`/
+  `cbr_close`) over zlib `gzFile` (gzip) and liblz4 `LZ4F` streaming frame (lz4),
+  with a fixed bounce buffer so any partition size streams. `cbr_read` mirrors
+  `gzread`'s contract (bytes / 0 EOF / -1 err). Used by `cmd_backup` (`/CODEC:LZ4`),
+  `cbdefrag` (emit), and `cmd_restore` (codec auto-detected from the member ext).
+  Browse stays direct-zlib (gzip-only). liblz4 is cross-built by `deps/fetch-lz4.sh`.
 - `cbdefrag.{h,c}` — the **FAT file-level defragmenter** for `backup /DEFRAG`
   (`defrag_backup_fat`). Walks the dir tree **read-only** on the source, assigns
   each file/subdir a contiguous run of new clusters (boot files
@@ -157,15 +171,17 @@ subcommands for scripting), built from:
   browses that partition **live** (`do_browse_live`), otherwise it prompts for a
   backup folder (`do_browse_backup`). `disk_spike.c` — disk/FS spike.
   `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
-- `Makefile` targets: `make crustybk` (the tool; links zlib once) / `make all`
-  (+ diagnostics) / `make net` / `make size`.
-- `deps/fetch-zlib.sh`, `net/fetch-watt32.sh` — cross-built deps (gitignored).
+- `Makefile` targets: `make crustybk` (the tool; links zlib + liblz4 once) /
+  `make all` (+ diagnostics) / `make net` / `make size`.
+- `deps/fetch-zlib.sh`, `deps/fetch-lz4.sh`, `net/fetch-watt32.sh` — cross-built
+  deps (gitignored). Run both `fetch-*` once before `make crustybk`.
 
 ## Build + unit test
 
 ```bash
 cargo build --bin rb-cli          # desktop CLI
-cargo test --lib                  # 2086 tests; clippy --all-targets -D warnings via pre-commit
+cargo test --lib                  # 2090+ tests; clippy --all-targets -D warnings via pre-commit
+sh crusty-backup/deps/fetch-zlib.sh && sh crusty-backup/deps/fetch-lz4.sh  # once
 make -C crusty-backup crustybk      # the unified CRUSTYBK.EXE -> crusty-backup/build/
 make -C crusty-backup all net       # + diagnostics (disk_spike/lfn_test) + nethello
 ```
@@ -273,6 +289,17 @@ boot file sits at cluster 2, and FAT32 `..`=root(2) / FSInfo reset. **Boot test:
 marker file appearing proves the chain booted. **Decline test:** patch a free FAT
 cluster to `0xFFFF` in both copies (a lost cluster); `/DEFRAG` must fall back to
 plain (large `imaged_size`), never silently drop it.
+
+**LZ4 tests** (`backup /CODEC:LZ4`, Phase 6): prove the **standard frame**
+interoperates both ways. (a) `CRUSTYBK BACKUP C:\BL 81 /CODEC:LZ4` writes
+`partition-0.lz4` + `compression_type: "lz4"`; pull it off and `rb-cli restore`
+it on the desktop (DOS liblz4 → desktop `lz4_flex`). (b) `rb-cli backup … --format
+lz4` on the host, stage the folder on a DOS drive, `CRUSTYBK RESTORE` it (desktop
+`lz4_flex` → DOS liblz4). (c) `CRUSTYBK RESTORE C:\BL 82 /Y` (DOS → DOS). All three
+must be byte-identical. Also confirm `/DEFRAG /CODEC:LZ4` composes (defragged lz4,
+IO.SYS at cluster 2). `restore` picks the codec from the member extension, so no
+extra flag is needed. Browsing (`ls`/`get`) an lz4 backup is **not** supported
+(frames aren't seekable) — restore it first.
 
 ## Gotchas learned the hard way (do not relearn these)
 

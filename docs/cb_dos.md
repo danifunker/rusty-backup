@@ -715,8 +715,27 @@ over the wire now.
       (its AUTOEXEC writes the marker → BIOS→MBR→VBR→KERNEL.SYS→COMMAND.COM ran);
       and a disk seeded with a lost cluster correctly **declined** to plain
       compaction (no data loss). `make crustybk` (+5.6 KB).
-- [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
-      desktop `Lz4` variant).
+- [x] **Phase 6 — LZ4 codec for slower machines. DONE (2026-06-25).** A second
+      shared codec alongside gzip: LZ4 trades ratio for far lower CPU cost than
+      DEFLATE, the point on a 486; gzip stays the default. **Desktop:**
+      `CompressionType::Lz4` + `src/rbformats/lz4.rs` (the `lz4_flex` frame
+      encoder, mirroring `gzip.rs`) + the three `compress.rs` dispatch arms +
+      `BackupFormat::Lz4` / `--format lz4`. **DOS:** `deps/fetch-lz4.sh`
+      cross-builds liblz4 (frame API) under DJGPP; new `cbcodec.{h,c}` is a small
+      writer/reader abstraction over zlib's `gzFile` (gzip) and liblz4's `LZ4F`
+      streaming frame (lz4) with a fixed bounce buffer (any partition size
+      streams); `cmd_backup` gains `/CODEC:LZ4` (names the member by codec, writes
+      the right `compression_type`, threads through FAT + NTFS, and composes with
+      `/DEFRAG`); `cmd_restore` derives the codec per partition from the member
+      extension and reads through the same abstraction. The on-disk `.lz4` is the
+      standard LZ4 frame, byte-interchangeable with the desktop's `lz4_flex`.
+      Browse (`ls`/`get`) stays gzip-only (LZ4 frames aren't seekable). **Verified
+      on real FreeDOS/qemu** — byte-identical across **all three** directions
+      (DOS-lz4 → desktop restore, desktop `--format lz4` → DOS restore, DOS-lz4 →
+      DOS restore) and `/DEFRAG /CODEC:LZ4` together (defragged lz4, IO.SYS pinned
+      at cluster 2). Size note: on a mostly-incompressible source lz4 ran ~7%
+      larger than gzip (the expected ratio-for-speed trade). `make crustybk`
+      (+126 KB liblz4).
 - [ ] **Phase 7 (deferred)** — built-in network transport (host + DOS client,
       both ours), only if removable media proves insufficient. Full design +
       sub-phases (7a–7i) in
@@ -744,6 +763,35 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 6 — LZ4 codec (desktop `--format lz4` + DOS `/CODEC:LZ4`).**
+  A second codec shared between the desktop and cb-dos, for slow 486 CPUs where
+  DEFLATE is the bottleneck: LZ4 is dramatically cheaper to compress at a lower
+  ratio. gzip stays the default. **Desktop:** added a pure-Rust `lz4_flex`
+  dependency (frame format; like the flate2 rust_backend baseline, no C lz4 to
+  cross-compile), `src/rbformats/lz4.rs` (`compress_lz4`, mirroring `gzip.rs`),
+  the three `compress.rs` arms (`compress_partition_hashed`, the `"lz4"`
+  `decompress_to_writer` via `FrameDecoder`, `compress_file_to_archive`),
+  `CompressionType::Lz4` (as_str/file_extension "lz4"), `BackupFormat::Lz4` +
+  `parse_format`, the editable-codec whitelist, and the README image-formats row.
+  **DOS:** `deps/fetch-lz4.sh` cross-builds liblz4's frame API under DJGPP (it
+  compiles unmodified, like zlib); new `cbcodec.{h,c}` abstracts a compressed
+  writer (`cbw_*`) + reader (`cbr_*`) over zlib `gzFile` (gzip) and liblz4 `LZ4F`
+  (lz4) with a fixed bounce buffer, the reader mirroring `gzread`'s contract so it
+  drops into the restore loop. `cmd_backup` parses `/CODEC:LZ4`, names the member
+  by codec, writes the matching `compression_type`, and threads the codec through
+  the FAT + NTFS paths; `cbdefrag` emits through the same writer (so `/DEFRAG`
+  composes with `/CODEC:LZ4`); `cmd_restore` derives the codec per partition from
+  the member extension and reads via `cbr`. Clone is untouched (no compressed
+  artifact); browse (`ls`/`get`) stays gzip-only since LZ4 frames aren't seekable.
+  The `.lz4` on disk is the **standard LZ4 frame**, so DOS-written and
+  desktop-written members interchange. **Verified on real FreeDOS/qemu** — every
+  file byte-identical across **all three** directions: cb-dos liblz4 → desktop
+  `lz4_flex` restore, desktop `--format lz4` → cb-dos restore, and cb-dos → cb-dos;
+  plus `/DEFRAG /CODEC:LZ4` together (defragged lz4 image, IO.SYS pinned at cluster
+  2, files intact). Size: on a mostly-incompressible source lz4 ran ~7% larger
+  than gzip (the expected trade — the win is CPU time, not size). `cargo test
+  --lib` green (2090 + the new lz4 test); `make crustybk` (+126 KB, no warnings).
+  **Next:** `clone /DEFRAG` (optional), Net 7b, or real-486 hardware.
 - 2026-06-25 — **Phase 5 — boot-aware FAT file-level defrag (`backup /DEFRAG`).**
   Until now backup compacted only by *zeroing* free clusters (gzip crushes them),
   but a fragmented disk with one used cluster near the end still imaged the whole

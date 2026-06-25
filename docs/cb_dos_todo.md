@@ -29,12 +29,19 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
     **boots** (AUTOEXEC marker written); an unclean FS (lost cluster) **declines**
     to plain compaction (no data loss).
 
-- [ ] **Phase 6 — LZ4 codec** (faster on slow CPUs; gzip stays the default).
-  - [ ] Desktop: `CompressionType::Lz4` + `src/rbformats/lz4.rs` (mirror
-        `gzip.rs`) + the three `compress.rs` dispatch arms; `--format lz4`.
-  - [ ] DOS: link an LZ4 (de)compressor; `/CODEC:LZ4` on `backup`/`clone`,
-        auto-detected on restore from metadata `compression_type: "lz4"`.
-  - **Done when:** an lz4 backup round-trips on qemu; size/speed vs gzip noted.
+- [x] **Phase 6 — LZ4 codec. DONE (2026-06-25).** Faster on slow CPUs; gzip
+  stays the default.
+  - [x] Desktop: `CompressionType::Lz4` + `src/rbformats/lz4.rs` (mirror
+        `gzip.rs`, `lz4_flex` frame) + the three `compress.rs` dispatch arms;
+        `--format lz4`.
+  - [x] DOS: cross-build liblz4 (`deps/fetch-lz4.sh`); `cbcodec.{h,c}` wraps
+        gzip (zlib) + lz4 (LZ4F); `/CODEC:LZ4` on `backup`, auto-detected on
+        restore from the member extension / metadata `compression_type`. (Clone
+        has no compressed artifact, so `/CODEC` doesn't apply there.)
+  - **Done when (met on FreeDOS/qemu):** lz4 round-trips **all three directions**
+    byte-identical (DOS↔desktop, both ways, + DOS↔DOS) and composes with
+    `/DEFRAG`. Size note: on a mostly-incompressible source lz4 ran ~7% larger
+    than gzip (the expected ratio-for-speed trade); the win is CPU time on a 486.
 
 - [ ] **Bug — `backup` mbr.bin corruption under stdout redirection** (low-pri).
   Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* bleeds its
@@ -83,6 +90,7 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
 ## Done
 
 Phases 1–4e, live progress, the lazy `.cbk` reader, the FreeDOS floppy + CD in CI,
-and **Phase 5 (boot-aware FAT defrag, `backup /DEFRAG`)** are all shipped and
-qemu-verified — see the "done & proven" table in [`cb_dos_resume.md`](cb_dos_resume.md)
-and the progress log in [`cb_dos.md`](cb_dos.md).
+**Phase 5 (boot-aware FAT defrag, `backup /DEFRAG`)**, and **Phase 6 (LZ4 codec,
+`--format lz4` / `/CODEC:LZ4`)** are all shipped and qemu-verified — see the
+"done & proven" table in [`cb_dos_resume.md`](cb_dos_resume.md) and the progress
+log in [`cb_dos.md`](cb_dos.md).
