@@ -11,7 +11,8 @@ Branch **`cbdos`** (off `main`), 14 commits, all verified, tree clean (latest
 commit lands with this hand-off):
 
 ```
-(pending) refactor(cb-dos): consolidate into one CRUSTYBK.EXE (cbdisk + cmd_* + dispatcher)
+(pending) feat(cb-dos): Stage 2 — real TUI front-end (live enum + drives cmd_*)
+7c8245c refactor(cb-dos): consolidate into one CRUSTYBK.EXE (cbdisk + cmd_* + dispatcher)
 93e5c2c feat(cb-dos): Phase 4b — direct disk-to-disk clone (cbclone)
 7a8830d docs(cb-dos): mark desktop --partitions off-by-one resolved in resume next-work
 37b9b70 fix(cli): make backup --partitions actually 1-based (first partition selectable)
@@ -39,33 +40,29 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 3 resize** — `cbrestore /SIZE` | bidirectional FAT16/32 resize on DOS (entire/minimum/custom); grow+shrink verified on FreeDOS/qemu |
 | **Phase 4** — `/PARTS:i,j` selective | per-partition backup *and* restore (0-based MBR slot indices); verified on a 2-partition disk on FreeDOS/qemu |
 | **Phase 4b** — `cbclone` (DOS) | direct disk-to-disk clone, no staging file; compact + `/SIZE` resize + `/PARTS`; verified grow/shrink/subset on FreeDOS/qemu |
-| **One exe** — `CRUSTYBK.EXE` (Stage 1) | backup/restore/clone/inspect as subcommands over the shared `cbdisk` engine; TUI on bare invocation (still the Stage-2 mock); verified on FreeDOS/qemu |
+| **One exe** — `CRUSTYBK.EXE` | backup/restore/clone/inspect subcommands **+ a real text UI** (live int13h enum; F2/F3/F4 drive the cmd_* engine) over the shared `cbdisk` engine; both verified on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Single-exe Stage 2 — wire the real TUI.** Stage 1 consolidated the CLI into
-   `CRUSTYBK.EXE` (cbdisk + cmd_*); bare invocation still launches the **mock**
-   `crustybk.c` TUI (dummy disk list). Replace it with real int13h drive/partition
-   enumeration and make F2/F3/F4 Backup/Restore/Clone gather params (incl. a text-
-   input dest path + size mode) and call `cmd_*()` on a cleared screen. *Recommended
-   next — it's the other half of the single-exe vision.*
-2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
+1. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
    format already supports multiple chunks/member) and make the reader decompress
    only the members a seek touches. No format change.
-3. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+2. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
-4. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+3. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
    Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
    the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
    boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
    quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
    Worth root-causing (likely a DTA / FILE-buffer aliasing in `cmd_backup.c`).
-5. **Real-486 hardware** validation (everything so far is qemu/emulator).
+4. **Real-486 hardware** validation (everything so far is qemu/emulator).
+5. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
+   logical-partition** backup gaps — the remaining FS coverage on DOS.
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
@@ -100,8 +97,10 @@ subcommands for scripting), built from:
   `/PARTS`, the metadata.json scanner + gzip stream). `cmd_clone.c` — `clone`
   (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
   `inspect` (list BIOS drives + partitions). Each exposes `int cmd_X(argc,argv)`.
-- `crustybk.c` — `main()` dispatches the subcommands or launches the text UI
-  (`tui_main`, still the Stage-2 mock list). `disk_spike.c` — disk/FS spike.
+- `crustybk.c` — `main()` dispatches the subcommands or launches the **text UI**
+  (`tui_main`): `scan_disks` does live int13h enumeration; F2/F3/F4 gather params
+  (`read_line`/`pick_size`/`confirm_erase`) and call `cmd_*()` on a plain screen.
+  `disk_spike.c` — disk/FS spike.
   `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
 - `Makefile` targets: `make crustybk` (the tool; links zlib once) / `make all`
   (+ diagnostics) / `make net` / `make size`.

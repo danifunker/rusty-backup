@@ -484,13 +484,14 @@ over the wire now.
 
 ## 8. Phased plan
 
-- [~] **Phase 0a — Toolchain + UI size POC.** Install DJGPP cross-compiler +
-      DOSBox-X/86Box. Build a minimal **text-UI POC** (`conio`: screen draw +
-      `int 16h` keys + bottom function-key action bar + dummy disk list) and
-      **measure the `.exe`** to confirm the floppy budget. Establish
-      engine/front-end project layout (core C lib + TUI + CLI stubs).
-      *DJGPP + DOSBox-X installed; POC built (~108 KB / 55 KB UPX), measured, and
-      now run under DOSBox-X. Remaining: core-C-lib / CLI-stub project layout.*
+- [x] **Phase 0a — Toolchain + UI + project layout. DONE (2026-06-24).** DJGPP +
+      DOSBox-X/qemu installed; the text-UI POC built/measured (~108 KB / 55 KB
+      UPX). The **engine/front-end project layout shipped** with the single-exe
+      consolidation: core engine `cbdisk.{h,c}` + per-command modules
+      (`cmd_backup/restore/clone/inspect.c`) + the `crustybk.c` dispatcher/TUI —
+      one `CRUSTYBK.EXE`, TUI on bare invocation, subcommands for scripting. The
+      TUI is now **real** (live int13h drive/partition enumeration; F2/F3/F4 drive
+      backup/restore/clone through the cmd_* engine), verified on FreeDOS/qemu.
 - [~] **Phase 0b — Disk spike.** "hello disk": enumerate BIOS drives, `int 13h`
       ext read with CHS fallback, dump MBR, parse FAT/NTFS BPB + read the
       allocation bitmap, write a long-named file via the LFN API. Prove on real
@@ -613,6 +614,24 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Single-exe Stage 2 — the TUI is real.** Replaced the mock disk
+  list in `crustybk.c` with live **int13h enumeration**: bare `CRUSTYBK` scans
+  drives 0x80..0x87 (`scan_disks` — geometry, total sectors via AH=48h, MBR
+  partitions) and renders them in the double-buffered list. `F2 Backup` /
+  `F3 Restore` / `F4 Clone` (+ `F5 Rescan`, `F1 About`, `F10 Quit`) act on the
+  highlighted disk: each drops to a plain text screen, gathers params (a text-
+  input dest/folder path, an `[O]riginal/[M]inimum/[E]ntire/[C]ustom` size
+  picker, a `Type Y` erase confirm for the destructive ops), then calls the same
+  `cmd_*()` engine the CLI uses and shows its progress before returning to the
+  menu. The scan is self-contained around `xfer_init/free` so it never overlaps a
+  command's transfer buffer. **Verified on real FreeDOS/qemu** by screen-dumping
+  the menu (correctly lists Disk 0x80 1024 MB / 0x81 64 MB FAT16 / 0x82 "no
+  partition table") and driving a full clone over the qemu monitor's `sendkey`:
+  picked Disk 0x81 → F4 → target 0x82 → Minimum → confirmed → the clone ran
+  (251->16 spf shrink to the FAT16 floor) → returned to the menu, and the target
+  read back bit-identical (HELLO.TXT + a 100 KB blob) under mtools and the
+  desktop. The single-exe vision (TUI + CLI over one shared engine) is complete.
+  **Next:** lazy `.cbk` reader (perf) or Phase 5 (boot-aware defrag).
 - 2026-06-24 — **Consolidated into one executable: `CRUSTYBK.EXE` (Stage 1 —
   CLI).** Merged the three separate tools (CBBACKUP/CBRESTORE/CBCLONE) into a
   single binary with subcommands over a shared engine, the design the spec always
