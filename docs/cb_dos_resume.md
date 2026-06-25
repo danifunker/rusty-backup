@@ -5,13 +5,15 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 [`cb_dos_network_and_state.md`](cb_dos_network_and_state.md) (the `.cbk` container
 + network plan, §2). Everything below was verified on **real FreeDOS in qemu**.
 
-## Where we are (2026-06-24)
+## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 14 commits, all verified, tree clean (latest
-commit lands with this hand-off):
+Branch **`cbdos`** (off `main`), 20 commits ahead of `main`, all verified, tree
+clean:
 
 ```
-(pending) feat(cb-dos): Stage 2 — real TUI front-end (live enum + drives cmd_*)
+c59cd83 feat(cb-dos): Phase 4c-b — TUI browse/mark/extract (single file, multi, folders)
+54322ab feat(cb-dos): Phase 4c-a — browse + extract single files from a backup (ls/get)
+7a2c603 feat(cb-dos): Stage 2 — real TUI front-end (live enum, drives the cmd_* engine)
 7c8245c refactor(cb-dos): consolidate into one CRUSTYBK.EXE (cbdisk + cmd_* + dispatcher)
 93e5c2c feat(cb-dos): Phase 4b — direct disk-to-disk clone (cbclone)
 7a8830d docs(cb-dos): mark desktop --partitions off-by-one resolved in resume next-work
