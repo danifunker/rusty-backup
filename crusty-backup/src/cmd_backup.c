@@ -11,11 +11,13 @@
 #include "cbntfs.h"
 #include "cbdefrag.h"
 #include "cbcodec.h"
+#include "cbnet.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <time.h>
 #include <zlib.h>
 
@@ -262,16 +264,26 @@ static int backup_ntfs_partition(const drive_info_t *di, int drive,
     return 0;
 }
 
-static void write_metadata(const char *dest, const char *src_label,
-                           uint64_t disk_bytes, uint64_t first_lba,
-                           const drive_info_t *di,
-                           const part_meta_t *parts, int nparts,
-                           const ext_meta_t *ext, int codec) {
-    char path[160];
-    sprintf(path, "%s\\metadata.json", dest);
-    FILE *f = fopen(path, "wb");
-    if (!f) { printf("cannot write metadata.json\n"); return; }
+/* Append printf-style to buf[*pos..cap); advances *pos (clamped to cap). */
+static void apnd(char *buf, int cap, int *pos, const char *fmt, ...) {
+    if (*pos >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *pos, (size_t)(cap - *pos), fmt, ap);
+    va_end(ap);
+    if (w > 0) *pos += w;
+    if (*pos > cap) *pos = cap;   /* truncated -- caller sizes generously */
+}
 
+/* Build the metadata.json text into `out` (cap bytes). Returns the length, or -1
+ * on overflow. The single source of truth for the metadata layout, shared by the
+ * local-folder backup (write_metadata) and the networked PUT (cmd_backup's
+ * rb:// path) so the two never drift. */
+static int build_metadata(char *out, int cap, const char *src_label,
+                          uint64_t disk_bytes, uint64_t first_lba,
+                          const drive_info_t *di,
+                          const part_meta_t *parts, int nparts,
+                          const ext_meta_t *ext, int codec) {
     char created[32];
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
@@ -281,70 +293,369 @@ static void write_metadata(const char *dest, const char *src_label,
         (first_lba == 2048) ? "Modern 1MB boundaries" :
         (first_lba == 63)   ? "DOS Traditional (255x63)" : "Custom";
 
-    fprintf(f, "{\n");
-    fprintf(f, "  \"version\": 1,\n");
-    fprintf(f, "  \"created\": \"%s\",\n", created);
-    fprintf(f, "  \"source_device\": \"%s\",\n", src_label);
-    fprintf(f, "  \"source_size_bytes\": %lu,\n", (unsigned long)disk_bytes);
-    fprintf(f, "  \"partition_table_type\": \"MBR\",\n");
-    fprintf(f, "  \"checksum_type\": \"crc32\",\n");
-    fprintf(f, "  \"compression_type\": \"%s\",\n", codec_name(codec));
-    fprintf(f, "  \"split_size_mib\": null,\n");
-    fprintf(f, "  \"sector_by_sector\": false,\n");
-    fprintf(f, "  \"layout\": \"per-partition\",\n");
-    fprintf(f, "  \"alignment\": {\n");
-    fprintf(f, "    \"detected_type\": \"%s\",\n", aligntype);
-    fprintf(f, "    \"first_partition_lba\": %lu,\n", (unsigned long)first_lba);
-    fprintf(f, "    \"alignment_sectors\": %lu,\n", (unsigned long)first_lba);
-    fprintf(f, "    \"heads\": %u,\n", di->heads);
-    fprintf(f, "    \"sectors_per_track\": %u\n", di->spt);
-    fprintf(f, "  },\n");
-    fprintf(f, "  \"partitions\": [\n");
+    int pos = 0;
+    apnd(out, cap, &pos, "{\n");
+    apnd(out, cap, &pos, "  \"version\": 1,\n");
+    apnd(out, cap, &pos, "  \"created\": \"%s\",\n", created);
+    apnd(out, cap, &pos, "  \"source_device\": \"%s\",\n", src_label);
+    apnd(out, cap, &pos, "  \"source_size_bytes\": %lu,\n", (unsigned long)disk_bytes);
+    apnd(out, cap, &pos, "  \"partition_table_type\": \"MBR\",\n");
+    apnd(out, cap, &pos, "  \"checksum_type\": \"crc32\",\n");
+    apnd(out, cap, &pos, "  \"compression_type\": \"%s\",\n", codec_name(codec));
+    apnd(out, cap, &pos, "  \"split_size_mib\": null,\n");
+    apnd(out, cap, &pos, "  \"sector_by_sector\": false,\n");
+    apnd(out, cap, &pos, "  \"layout\": \"per-partition\",\n");
+    apnd(out, cap, &pos, "  \"alignment\": {\n");
+    apnd(out, cap, &pos, "    \"detected_type\": \"%s\",\n", aligntype);
+    apnd(out, cap, &pos, "    \"first_partition_lba\": %lu,\n", (unsigned long)first_lba);
+    apnd(out, cap, &pos, "    \"alignment_sectors\": %lu,\n", (unsigned long)first_lba);
+    apnd(out, cap, &pos, "    \"heads\": %u,\n", di->heads);
+    apnd(out, cap, &pos, "    \"sectors_per_track\": %u\n", di->spt);
+    apnd(out, cap, &pos, "  },\n");
+    apnd(out, cap, &pos, "  \"partitions\": [\n");
     for (int i = 0; i < nparts; i++) {
         const part_meta_t *p = &parts[i];
-        fprintf(f, "    {\n");
-        fprintf(f, "      \"index\": %d,\n", p->index);
-        fprintf(f, "      \"type_name\": \"%s\",\n", part_type_name(p->type_byte));
-        fprintf(f, "      \"partition_type_byte\": %u,\n", p->type_byte);
-        fprintf(f, "      \"start_lba\": %lu,\n", (unsigned long)p->start_lba);
-        fprintf(f, "      \"original_size_bytes\": %lu,\n", (unsigned long)p->original_size);
-        fprintf(f, "      \"imaged_size_bytes\": %lu,\n", (unsigned long)p->imaged_size);
-        fprintf(f, "      \"compressed_files\": [\"%s\"],\n", p->gz_name);
-        fprintf(f, "      \"checksum\": \"%s\",\n", p->crc_hex);
-        fprintf(f, "      \"resized\": false,\n");
-        fprintf(f, "      \"compacted\": %s,\n", p->compacted ? "true" : "false");
-        fprintf(f, "      \"is_logical\": %s,\n", p->is_logical ? "true" : "false");
-        fprintf(f, "      \"minimum_size_bytes\": %lu\n", (unsigned long)p->minimum_size);
-        fprintf(f, "    }%s\n", (i + 1 < nparts) ? "," : "");
+        apnd(out, cap, &pos, "    {\n");
+        apnd(out, cap, &pos, "      \"index\": %d,\n", p->index);
+        apnd(out, cap, &pos, "      \"type_name\": \"%s\",\n", part_type_name(p->type_byte));
+        apnd(out, cap, &pos, "      \"partition_type_byte\": %u,\n", p->type_byte);
+        apnd(out, cap, &pos, "      \"start_lba\": %lu,\n", (unsigned long)p->start_lba);
+        apnd(out, cap, &pos, "      \"original_size_bytes\": %lu,\n", (unsigned long)p->original_size);
+        apnd(out, cap, &pos, "      \"imaged_size_bytes\": %lu,\n", (unsigned long)p->imaged_size);
+        apnd(out, cap, &pos, "      \"compressed_files\": [\"%s\"],\n", p->gz_name);
+        apnd(out, cap, &pos, "      \"checksum\": \"%s\",\n", p->crc_hex);
+        apnd(out, cap, &pos, "      \"resized\": false,\n");
+        apnd(out, cap, &pos, "      \"compacted\": %s,\n", p->compacted ? "true" : "false");
+        apnd(out, cap, &pos, "      \"is_logical\": %s,\n", p->is_logical ? "true" : "false");
+        apnd(out, cap, &pos, "      \"minimum_size_bytes\": %lu\n", (unsigned long)p->minimum_size);
+        apnd(out, cap, &pos, "    }%s\n", (i + 1 < nparts) ? "," : "");
     }
-    fprintf(f, "  ]");
+    apnd(out, cap, &pos, "  ]");
     if (ext && ext->found) {
         /* Emitted after "partitions" so cb-dos restore's positional scanner reads
          * the container's own start_lba/type without hitting a partition's. */
-        fprintf(f, ",\n  \"extended_container\": {\n");
-        fprintf(f, "    \"mbr_index\": %d,\n", ext->mbr_index);
-        fprintf(f, "    \"partition_type_byte\": %u,\n", ext->type_byte);
-        fprintf(f, "    \"start_lba\": %lu,\n", (unsigned long)ext->start_lba);
-        fprintf(f, "    \"size_bytes\": %lu\n", (unsigned long)ext->size_bytes);
-        fprintf(f, "  }\n");
+        apnd(out, cap, &pos, ",\n  \"extended_container\": {\n");
+        apnd(out, cap, &pos, "    \"mbr_index\": %d,\n", ext->mbr_index);
+        apnd(out, cap, &pos, "    \"partition_type_byte\": %u,\n", ext->type_byte);
+        apnd(out, cap, &pos, "    \"start_lba\": %lu,\n", (unsigned long)ext->start_lba);
+        apnd(out, cap, &pos, "    \"size_bytes\": %lu\n", (unsigned long)ext->size_bytes);
+        apnd(out, cap, &pos, "  }\n");
     } else {
-        fprintf(f, "\n");
+        apnd(out, cap, &pos, "\n");
     }
-    fprintf(f, "}\n");
+    apnd(out, cap, &pos, "}\n");
+    return (pos >= cap) ? -1 : pos;
+}
+
+/* Shared metadata buffer (cb-dos is single-threaded; a 24-partition image fits). */
+static char g_meta[16384];
+
+static void write_metadata(const char *dest, const char *src_label,
+                           uint64_t disk_bytes, uint64_t first_lba,
+                           const drive_info_t *di,
+                           const part_meta_t *parts, int nparts,
+                           const ext_meta_t *ext, int codec) {
+    int len = build_metadata(g_meta, (int)sizeof g_meta, src_label, disk_bytes,
+                             first_lba, di, parts, nparts, ext, codec);
+    if (len < 0) { printf("metadata.json too large\n"); return; }
+    char path[160];
+    sprintf(path, "%s\\metadata.json", dest);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("cannot write metadata.json\n"); return; }
+    fwrite(g_meta, 1, (size_t)len, f);
     fclose(f);
     printf("wrote metadata.json (%d partition%s)\n", nparts, nparts == 1 ? "" : "s");
+}
+
+/* ---- networked backup: image a disk block-level straight to an rb-cli serve
+ * daemon as a Family-B chunk PUT (no intermediate folder on the DOS box). The
+ * partition is read over int13h, smart-compacted, and compressed into gzip-member
+ * spans streamed as chunks; mbr.bin + metadata.json ride as small Raw members.
+ * docs/cb_dos_network_and_state.md §2. */
+
+/* Stream one FAT partition's smart-compacted image as a Gz member into `net`. */
+static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *net,
+                                   int index, uint8_t type_byte,
+                                   uint64_t start_lba, uint64_t part_sectors,
+                                   part_meta_t *pm) {
+    uint8_t vbr[512];
+    if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
+        printf("  part %d: VBR read failed\n", index); return -1;
+    }
+    fatlay_t L;
+    parse_fatlay(vbr, &L);
+    if (!L.ok) { printf("  part %d: not a FAT BPB, skipping\n", index); return -1; }
+
+    uint8_t *fat = malloc(L.old_spf * L.bps);
+    if (!fat) { printf("  part %d: out of memory\n", index); return -1; }
+    if (load_region(di, drive, start_lba + L.reserved, L.old_spf * L.bps, fat) != 0) {
+        printf("  part %d: FAT load failed\n", index); free(fat); return -1;
+    }
+    uint32_t last_used = 0;
+    for (uint32_t nn = 2; nn < L.clusters + 2; nn++)
+        if (fat_entry(fat, L.fat_bits, nn) != 0) last_used = nn;
+    uint32_t norm_imaged = (last_used >= 2)
+        ? L.first_data_sec + (last_used - 1) * L.spc : L.first_data_sec;
+    if (norm_imaged > L.old_total) norm_imaged = L.old_total;
+
+    pm->index = index; pm->type_byte = type_byte; pm->start_lba = start_lba;
+    pm->original_size = part_sectors * 512ULL;
+    sprintf(pm->gz_name, "partition-%d.gz", index);
+
+    if (cbnet_part_begin(net, pm->gz_name, index, (uint64_t)norm_imaged * 512) != 0) {
+        printf("  part %d: net begin failed\n", index); free(fat); return -1;
+    }
+    progress_t pr; char lbl[40];
+    sprintf(lbl, "part %d (%s)", index, part_type_name(type_byte));
+    progress_begin(&pr, lbl, (uint64_t)norm_imaged * 512);
+
+    uint8_t buf[XFER_BYTES];
+    uint32_t s = 0; int rc = 0;
+    while (s < norm_imaged) {
+        int nsec = (int)(norm_imaged - s);
+        if (nsec > XFER_SECTORS) nsec = XFER_SECTORS;
+        if (read_lba(di, drive, start_lba + s, nsec, buf) != 0) {
+            printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
+            rc = -1; break;
+        }
+        for (int j = 0; j < nsec; j++) {
+            uint32_t rel = s + j;
+            if (rel >= L.first_data_sec) {
+                uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
+                if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
+                    memset(buf + j * 512, 0, 512);
+            }
+        }
+        if (cbnet_part_write(net, buf, (uint32_t)nsec * 512) != 0) {
+            printf("  part %d: network send failed\n", index); rc = -1; break;
+        }
+        s += nsec;
+        progress_update(&pr, (uint64_t)s * 512);
+    }
+    progress_finish(&pr);
+    free(fat);
+
+    unsigned long gz_crc = 0, gz_bytes = 0;
+    if (cbnet_part_end(net, &gz_crc, &gz_bytes) != 0 && rc == 0) {
+        printf("  part %d: net finalize failed\n", index); rc = -1;
+    }
+    if (rc != 0) return rc;
+
+    pm->imaged_size = (uint64_t)norm_imaged * L.bps;
+    pm->minimum_size = pm->imaged_size;
+    pm->compacted = (norm_imaged < part_sectors) ? 1 : 0;
+    sprintf(pm->crc_hex, "%08lx", gz_crc);
+    printf("  part %d (%s): streamed %lu KiB -> %s (%lu KiB gz), crc %s%s\n",
+           index, part_type_name(type_byte), (unsigned long)(pm->imaged_size / 1024),
+           pm->gz_name, (unsigned long)(gz_bytes / 1024), pm->crc_hex,
+           pm->compacted ? " [compacted]" : "");
+    return 0;
+}
+
+/* Stream one NTFS partition (full window, $Bitmap free clusters zeroed). */
+static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *net,
+                                    int index, uint8_t type_byte,
+                                    uint64_t start_lba, uint64_t part_sectors,
+                                    part_meta_t *pm) {
+    uint8_t vbr[512];
+    if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
+        printf("  part %d: VBR read failed\n", index); return -1;
+    }
+    if (!ntfs_is_ntfs(vbr)) {
+        printf("  part %d: type 0x07 but not NTFS -- skipped\n", index); return -1;
+    }
+    ntfs_vol_t v;
+    if (ntfs_parse(vbr, &v) != 0) {
+        printf("  part %d: NTFS BPB unsupported -- skipped\n", index); return -1;
+    }
+    uint8_t *bm = NULL;
+    if (ntfs_load_bitmap(di, drive, start_lba, &v, &bm) != 0) {
+        printf("  part %d: NTFS $Bitmap read failed -- skipped\n", index); return -1;
+    }
+
+    pm->index = index; pm->type_byte = type_byte; pm->start_lba = start_lba;
+    pm->original_size = part_sectors * 512ULL;
+    pm->imaged_size = part_sectors * 512ULL;
+    pm->minimum_size = pm->imaged_size;
+    pm->compacted = 1;
+    sprintf(pm->gz_name, "partition-%d.gz", index);
+
+    if (cbnet_part_begin(net, pm->gz_name, index, part_sectors * 512ULL) != 0) {
+        printf("  part %d: net begin failed\n", index); free(bm); return -1;
+    }
+    progress_t pr; char lbl[40];
+    sprintf(lbl, "part %d (NTFS)", index);
+    progress_begin(&pr, lbl, part_sectors * 512ULL);
+
+    uint8_t buf[XFER_BYTES];
+    uint64_t s = 0; int rc = 0;
+    while (s < part_sectors) {
+        int nsec = (int)(part_sectors - s);
+        if (nsec > XFER_SECTORS) nsec = XFER_SECTORS;
+        if (read_lba(di, drive, start_lba + s, nsec, buf) != 0) {
+            printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
+            rc = -1; break;
+        }
+        for (int j = 0; j < nsec; j++) {
+            uint64_t lcn = (s + j) / v.sec_per_clus;
+            if (lcn < v.total_clusters && !ntfs_cluster_used(bm, v.total_clusters, lcn))
+                memset(buf + j * 512, 0, 512);
+        }
+        if (cbnet_part_write(net, buf, (uint32_t)nsec * 512) != 0) {
+            printf("  part %d: network send failed\n", index); rc = -1; break;
+        }
+        s += nsec;
+        progress_update(&pr, s * 512ULL);
+    }
+    progress_finish(&pr);
+    free(bm);
+
+    unsigned long gz_crc = 0, gz_bytes = 0;
+    if (cbnet_part_end(net, &gz_crc, &gz_bytes) != 0 && rc == 0) {
+        printf("  part %d: net finalize failed\n", index); rc = -1;
+    }
+    if (rc != 0) return rc;
+
+    sprintf(pm->crc_hex, "%08lx", gz_crc);
+    printf("  part %d (NTFS): streamed %lu KiB -> %s (%lu KiB gz), crc %s\n",
+           index, (unsigned long)(pm->imaged_size / 1024), pm->gz_name,
+           (unsigned long)(gz_bytes / 1024), pm->crc_hex);
+    return 0;
+}
+
+/* Parse rb://HOST[:PORT]/NAME. 0 ok / -1 malformed. Defaults: port 7341,
+ * NAME = "MYDISK". */
+static int parse_rb_dest(const char *dest, char *host, int hostcap,
+                         unsigned short *port, char *name, int namecap) {
+    const char *p = dest + 5; /* skip "rb://" */
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    const char *hostend;
+    *port = 7341;
+    if (colon && (!slash || colon < slash)) {
+        hostend = colon;
+        *port = (unsigned short)atoi(colon + 1);
+    } else {
+        hostend = slash ? slash : p + strlen(p);
+    }
+    int hl = (int)(hostend - p);
+    if (hl <= 0 || hl >= hostcap) return -1;
+    memcpy(host, p, hl);
+    host[hl] = 0;
+    if (slash && slash[1]) {
+        if ((int)strlen(slash + 1) >= namecap) return -1;
+        strcpy(name, slash + 1);
+    } else {
+        strncpy(name, "MYDISK", namecap - 1);
+        name[namecap - 1] = 0;
+    }
+    return 0;
+}
+
+/* Networked backup: scan the MBR, stream the selected primary FAT/NTFS
+ * partitions block-level to the agent, send mbr.bin + metadata.json, finish. */
+static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec,
+                         const char *host, unsigned short port, const char *name) {
+    if (codec != CODEC_GZIP) { printf("network backup is gzip-only for now\n"); return 2; }
+    if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
+
+    drive_info_t di;
+    drive_params(drive, &di);
+    if (!di.present) { printf("drive 0x%02X not present\n", drive); xfer_free(); return 1; }
+    di.ext = drive_has_ext(drive);
+    printf("source drive 0x%02X: %u cyl %u head %u spt, LBA-ext=%s\n",
+           drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
+
+    uint8_t mbr[512];
+    if (read_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR read failed\n"); xfer_free(); return 1; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        printf("no MBR signature -- superfloppy not supported\n"); xfer_free(); return 1;
+    }
+
+    /* Enumerate the selected primary FAT/NTFS partitions (logicals: TODO). */
+    struct { int idx; uint8_t type; uint64_t lba, cnt; } sel[4];
+    int nsel = 0, saw_ext = 0;
+    uint64_t disk_bytes = (uint64_t)di.cyls * di.heads * di.spt * 512;
+    uint64_t first_lba = 0;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = mbr + 446 + i * 16;
+        uint8_t type = e[4];
+        uint32_t lba = rd32(e + 8), cnt = rd32(e + 12);
+        if (type == 0 || cnt == 0) continue;
+        if (first_lba == 0) first_lba = lba;
+        uint64_t end = (uint64_t)lba + cnt;
+        if (end * 512 > disk_bytes) disk_bytes = end * 512;
+        if (is_extended_type(type)) { saw_ext = 1; continue; }
+        if (has_filter && !(sel_mask & (1u << i))) continue;
+        if (!is_fat_part_type(type) && type != 0x07) {
+            printf("  part %d: type 0x%02X not FAT/NTFS -- skipped\n", i, type);
+            continue;
+        }
+        sel[nsel].idx = i; sel[nsel].type = type; sel[nsel].lba = lba; sel[nsel].cnt = cnt;
+        nsel++;
+    }
+    if (saw_ext)
+        printf("  note: extended/logical partitions are not yet streamed over the wire (skipped)\n");
+    if (nsel == 0) { printf("no FAT/NTFS primary partitions to back up\n"); xfer_free(); return 1; }
+
+    int member_count = 1 /*mbr.bin*/ + nsel + 1 /*metadata.json*/;
+    cbnet_t *net = cbnet_start(host, port, name, member_count);
+    if (!net) { xfer_free(); return 1; }
+
+    if (cbnet_raw_member(net, "mbr.bin", mbr, 512) != 0) {
+        printf("sending mbr.bin failed\n"); cbnet_close(net); xfer_free(); return 1;
+    }
+
+    part_meta_t parts[4];
+    ext_meta_t ext; memset(&ext, 0, sizeof ext);
+    int nparts = 0;
+    for (int k = 0; k < nsel; k++) {
+        int ok = is_fat_part_type(sel[k].type)
+            ? netstream_fat_partition(&di, drive, net, sel[k].idx, sel[k].type,
+                                      sel[k].lba, sel[k].cnt, &parts[nparts])
+            : netstream_ntfs_partition(&di, drive, net, sel[k].idx, sel[k].type,
+                                       sel[k].lba, sel[k].cnt, &parts[nparts]);
+        if (ok != 0) {
+            printf("aborting network backup (partition %d failed)\n", sel[k].idx);
+            cbnet_close(net); xfer_free(); return 1;
+        }
+        parts[nparts].is_logical = 0;
+        nparts++;
+    }
+
+    char label[16];
+    sprintf(label, "0x%02X", drive);
+    int mlen = build_metadata(g_meta, (int)sizeof g_meta, label, disk_bytes, first_lba,
+                              &di, parts, nparts, &ext, codec);
+    if (mlen < 0) { printf("metadata too large\n"); cbnet_close(net); xfer_free(); return 1; }
+    if (cbnet_raw_member(net, "metadata.json", g_meta, (uint32_t)mlen) != 0) {
+        printf("sending metadata.json failed\n"); cbnet_close(net); xfer_free(); return 1;
+    }
+
+    unsigned long long cbk_size = 0;
+    int rc = cbnet_finish(net, &cbk_size);
+    cbnet_close(net);
+    xfer_free();
+    if (rc != 0) { printf("network backup failed\n"); return 1; }
+    printf("network backup complete: %s.cbk assembled on %s:%u (%llu bytes)\n",
+           name, host, (unsigned)port, cbk_size);
+    return 0;
 }
 
 int cmd_backup(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 2) {
-        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j] [/DEFRAG] [/CODEC:LZ4]\n");
-        printf("  e.g. CRUSTYBK backup A:\\BK 80            image every FAT/NTFS partition\n");
-        printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0   image only MBR slot 0\n");
-        printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG    repack FAT files contiguously\n");
-        printf("       CRUSTYBK backup A:\\BK 80 /CODEC:LZ4 LZ4 instead of gzip (faster, larger)\n");
+        printf("usage: CRUSTYBK backup <dest> [drive-hex] [/PARTS:i,j] [/DEFRAG] [/CODEC:LZ4]\n");
+        printf("  <dest> is a folder (A:\\BK) OR a network agent rb://HOST[:PORT]/NAME\n");
+        printf("  e.g. CRUSTYBK backup A:\\BK 80               image to a local folder\n");
+        printf("       CRUSTYBK backup rb://10.0.2.2/MYDISK 80 stream straight to an rb-cli serve\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0      image only MBR slot 0\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG       repack FAT files contiguously\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /CODEC:LZ4    LZ4 instead of gzip (faster, larger)\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
+        printf("  rb:// streams the disk block-level to the agent (no local folder);\n");
+        printf("  the agent assembles a NAME.cbk. gzip only, primaries only for now.\n");
         printf("  /DEFRAG relocates each FAT volume's files into contiguous runs\n");
         printf("  (boot files first) before imaging -- smaller image, defragged restore.\n");
         printf("  /CODEC:LZ4 trades ratio for speed on a slow CPU (default GZIP);\n");
@@ -370,6 +681,19 @@ int cmd_backup(int argc, char **argv) {
             drive = (int)strtol(argv[a], NULL, 16);
             drive_set = 1;
         }
+    }
+
+    /* Network destination: stream the disk block-level to an rb-cli serve daemon
+     * instead of writing a local folder (no spare DOS storage needed). */
+    if (strncmp(dest, "rb://", 5) == 0) {
+        if (defrag) { printf("network backup does not support /DEFRAG yet\n"); return 2; }
+        char host[64], name[64];
+        unsigned short port;
+        if (parse_rb_dest(dest, host, sizeof host, &port, name, sizeof name) != 0) {
+            printf("bad rb:// destination (use rb://HOST[:PORT]/NAME)\n");
+            return 2;
+        }
+        return cmd_netbackup(drive, sel_mask, has_filter, codec, host, port, name);
     }
 
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }

@@ -1446,27 +1446,43 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
     write_put_header(&mut sock, "MYDISK", names.len() as u16).unwrap();
     for name in &names {
         let bytes = std::fs::read(folder.join(name)).unwrap();
-        let kind = if name.to_ascii_lowercase().ends_with(".gz") {
-            0
+        let is_gz = name.to_ascii_lowercase().ends_with(".gz");
+        // The real producer (CRUSTYBK streaming a disk) sends a partition as
+        // several gzip-member span chunks; small raw members ride as one chunk.
+        // Split the .gz member into two chunks here to exercise the daemon's
+        // multi-chunk concatenation path the same way.
+        let chunks: Vec<&[u8]> = if is_gz && bytes.len() > 1 {
+            let mid = bytes.len() / 2;
+            vec![&bytes[..mid], &bytes[mid..]]
         } else {
-            1
+            vec![&bytes[..]]
         };
-        write_member_header(&mut sock, kind, name, 1).unwrap();
-        write_chunk_header(
+        write_member_header(
             &mut sock,
-            &ChunkHeader {
-                src_offset: 0,
-                len: bytes.len() as u32,
-                crc32: crc32fast::hash(&bytes),
-            },
+            if is_gz { 0 } else { 1 },
+            name,
+            chunks.len() as u32,
         )
         .unwrap();
-        sock.write_all(&bytes).unwrap();
-        sock.flush().unwrap();
-        assert!(
-            read_put_ack(&mut sock).unwrap(),
-            "daemon ACKs the {name} chunk"
-        );
+        let mut off = 0u64;
+        for part in &chunks {
+            write_chunk_header(
+                &mut sock,
+                &ChunkHeader {
+                    src_offset: off,
+                    len: part.len() as u32,
+                    crc32: crc32fast::hash(part),
+                },
+            )
+            .unwrap();
+            sock.write_all(part).unwrap();
+            sock.flush().unwrap();
+            assert!(
+                read_put_ack(&mut sock).unwrap(),
+                "daemon ACKs a {name} chunk"
+            );
+            off += part.len() as u64;
+        }
     }
     // 3) the result frame.
     let (status, cbk_size) = read_put_result(&mut sock).unwrap();
