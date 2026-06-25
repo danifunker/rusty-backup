@@ -7,10 +7,11 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 25 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 27 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+e3284d6 feat(cb-dos): live progress (%, speed, ETA) for backup/restore/clone
 7a8c246 feat(cb-dos): Phase 4d — NTFS backup/restore/clone via $Bitmap compaction
 13b32cf feat(cb-dos): Phase 4c-c — browse a live disk (ls/get/TUI over read_lba)
 c59cd83 feat(cb-dos): Phase 4c-b — TUI browse/mark/extract (single file, multi, folders)
@@ -49,6 +50,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4c-b** — TUI browse (DOS) | F6 Browse: interactive file browser, mark files+folders, F2 extract (folders recurse); verified extracting a file + a folder tree byte-identical on FreeDOS/qemu |
 | **Phase 4c-c** — live-disk browse (DOS) | same `ls`/`get`/TUI-browse against a *mounted/attached* disk (no imaging first): `vol_read_at` dispatches gzseek **or** int13h `read_lba`; CLI `@HH` + MBR slot, TUI F6 on a FAT partition row; read-only on source; verified byte-identical on FAT32 + FAT16 (CLI + TUI) on FreeDOS/qemu |
 | **Phase 4d** — NTFS (DOS) | `backup`/`clone` image NTFS (type 0x07) via `$Bitmap` compaction (`cbntfs.{h,c}`); restore same-size on DOS (resize via desktop `resize_ntfs_in_place`); verified on FreeDOS/qemu — 63 MB random-filled NTFS → 0.4 MB gz, restore + clone `ntfsfix`-clean with files byte-identical, desktop restore cross-checked |
+| **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
@@ -107,7 +109,10 @@ subcommands for scripting), built from:
   (`shift_region_forward`/`_backward`, `compute_fat_sectors`,
   `max_fat_window`/`min_fat_window` cluster cap/floor, `set_clean_flags`,
   `reset_fsinfo`), and the arg helpers (`switch_val`/`eq_ci`/`round_up_512`/
-  `parse_parts`, `rd64`). The single source of truth — no more triplicated primitives.
+  `parse_parts`, `rd64`), and the **live transfer progress** meter (`progress_t` +
+  `progress_begin`/`progress_update`/`progress_finish`: `\r` line with %, MiB,
+  MiB/s, ETA from the BIOS tick counter, `isatty`-gated). The single source of
+  truth — no more triplicated primitives.
 - `cbntfs.{h,c}` — the **NTFS `$Bitmap` reader** (no driver): `ntfs_parse` (BPB),
   `ntfs_load_bitmap` (MFT #6 `$Bitmap` + fixup + `$DATA` run decode → RAM bitmap,
   set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check vs exFAT/HPFS).
