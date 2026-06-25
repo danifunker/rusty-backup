@@ -28,10 +28,12 @@ Read these first, in order, before doing anything:
    and the "gotchas learned the hard way" (do not relearn them).
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
-**Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently the
-optional `7h — Incremental backup` (which also lands the §5d bootability-change
-flag, since that needs a prior manifest to diff), then `7i — Level-2 swap dealloc
-+ desktop swap parity`. The core loop is done; 7h/7i are stretch.**
+**Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md. 7h(a)
+(host-side change detection + the §5d bootability-change flag) and §6e desktop
+swap parity are DONE; what's left is optional: the `7h` **streaming-skip**
+optimization (per-partition fingerprints → daemon skip-map → cb-dos skips
+unchanged partitions → host copies them from the prior `.cbk`) and `7i` (Level-2
+swap dealloc + single-file-CHD swap). The core loop is done; these are stretch.**
 
 ## Where we are
 
@@ -158,10 +160,14 @@ swap-aware.** The core feature is **complete**; what remains (7h/7i) is optional
 
 ## What's left — optional 7h / 7i (pick the top unchecked box in §9)
 
-- **7h — incremental** (reuse the §4d fingerprint + §5 manifest to skip unchanged
-  partitions/files; the manifest is the index). This is also where the §5d
-  **bootability-change flag** lands — it needs a *prior* manifest to diff the
-  `system` block against, which is exactly 7h's prior-backup comparison.
+- **7h — incremental.** **7h(a) DONE** (2026-06-25): host-side change detection +
+  the §5d **bootability-change flag** — a networked PUT over a prior `NAME.cbk`
+  logs which partitions are unchanged / changed and whether the boot chain differs
+  (`src/remote/manifest.rs` diff + `server.rs::compare_to_prior_cbk`; reuses the
+  7f/7g manifests, no wire change). **Remaining:** the **streaming-skip**
+  optimization — send per-partition fingerprints in the PUT, the daemon replies a
+  skip-map, cb-dos skips imaging the unchanged partitions, and the host copies them
+  from the prior `.cbk`. (The §4d fingerprint + §5 manifest are the index.)
 - **7i — Level-2 swap dealloc** (free the FAT chain + drop the dir entry so a
   resize-down minimum shrinks; 7g only zeros content). **Desktop swap parity is
   DONE** (§6e, 2026-06-25 — the Rust backup now Level-1 excludes swap via

@@ -60,6 +60,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | Net **7e** (restore over the wire) | **loop closed** — `CRUSTYBK RESTORE rb://...` pulls a `.cbk` back from the agent (GET op) and rebuilds the disk over int13h, no local folder, same-size. `serve_get` (host) + `cbnet` GET client (multi-member inflate) + `cmd_netrestore`. Verified on FreeDOS/qemu — one boot backed up 0x81 over the wire then restored to a blank 0x82, byte-identical |
 | Net **7f** (manifest + idempotency) | per-FAT-partition `manifest-N.json` sidecar (depth-first `files[]` + a `system` boot-fingerprint block) via new `cbmanifest.{c,h}`; written locally by `cmd_backup`, shipped as a Raw member by `cmd_netbackup`, carried into the `.cbk` for free. **Idempotency is structural** (block-level restore round-trips dir entries verbatim → backup→restore→backup is a no-op). Boot media now bundles + auto-loads **DOSLFN** so the non-8.3 names work on a bare DOS host. Verified on FreeDOS/qemu — local backup→restore→backup byte-identical manifest, + a 4-member networked PUT whose `.cbk` manifest matches |
 | Net **7g** (boot hashes + swap exclusion) | manifest `system` block gains each sysfile's **content hash** (CRC32, FAT-chain order — `cbmanifest.c` `chain_crc32`); new `cbswap.{c,h}` allowlists swap/page files (name+location+attribs: 386SPART.PAR/WIN386.SWP/PAGEFILE.SYS/HIBERFIL.SYS/SWAPPER.DAT; never DBLSPACE/DRVSPACE/STACVOL) and the shared FAT compaction (local + net, `build_swap_mask`/`swap_hit`) **Level-1 zeros** their content (allocation kept), flagging them `volatile`/`content:zeroed`; `/KEEPSWAP` opts out. Verified on FreeDOS/qemu — restored swap files full-size + all-zero, IO.SYS byte-identical, BK1==BK2 manifest byte-identical (hashes + flags round-trip), `/KEEPSWAP` images verbatim, networked PUT manifest byte-identical to local |
+| Net **7h(a)** (incremental change detection) | host-side §5b/§5d: a networked PUT over a prior `NAME.cbk` diffs the staged `manifest-N.json` against the prior's (new `src/remote/manifest.rs` + `server.rs::compare_to_prior_cbk`) and logs per-partition **unchanged / N file(s) changed / BOOTABILITY CHANGED** + a whole-disk "identical to prior backup"; swap files (`volatile`) excluded from the counter (§6b). Reuses the 7f/7g manifests — no wire/cb-dos change. Verified on FreeDOS/qemu (3 sequential PUTs: create → "identical" → "1 file changed"). **Streaming-skip half still TODO.** Also: **desktop swap parity** (§6e) — Rust `CompactFatReader::new_excluding_swap` + `--keep-swap` / GUI checkbox |
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
@@ -91,11 +92,15 @@ The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_to
    manifest/idempotency + 7g boot hashes + swap exclusion). The loop is closed,
    resumable, file-aware, boot-fingerprinted, and swap-aware — **the core network
    feature is complete**. **§6e desktop swap parity is also DONE** (2026-06-25 —
-   the Rust backup now Level-1 excludes swap via `--keep-swap` / a GUI checkbox).
-   Only the **optional 7h** (incremental + the §5d bootability-change flag) and the
-   rest of **7i** (Level-2 swap dealloc + single-file-CHD swap) remain. **Kick off
-   from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase hand-off +
-   the qemu NE2000/SLiRP rig).
+   the Rust backup now Level-1 excludes swap via `--keep-swap` / a GUI checkbox),
+   and **7h(a)** — host-side incremental change detection + the §5d
+   bootability-change flag (a networked PUT over a prior `NAME.cbk` logs unchanged /
+   changed partitions). Remaining is optional: the **7h streaming-skip** half
+   (per-partition fingerprints → daemon skip-map → cb-dos skips unchanged
+   partitions → host copies from the prior `.cbk`) and the rest of **7i** (Level-2
+   swap dealloc + single-file-CHD swap). **Kick off from
+   [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase hand-off + the
+   qemu NE2000/SLiRP rig).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu

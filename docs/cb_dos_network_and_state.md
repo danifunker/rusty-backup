@@ -746,9 +746,14 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       by name+location+attribs and marks their cluster chains; the shared
       compaction (local + net) zeros that content while keeping the allocation, the
       manifest flags them `volatile`/`content:zeroed`, and `/KEEPSWAP` opts out.
-- [ ] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
-      manifest to skip unchanged partitions/files. The bootability-change flag
-      (diff a prior `system` block, §5d) lands here -- it needs the prior manifest.
+- [~] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
+      manifest to skip unchanged partitions/files. **7h(a) DONE (2026-06-25):**
+      host-side change detection + the §5d bootability-change flag — a networked
+      PUT over a prior `NAME.cbk` logs which partitions are unchanged / changed and
+      whether the boot chain differs (`src/remote/manifest.rs` diff +
+      `server.rs::compare_to_prior_cbk`). Remaining: the **streaming-skip**
+      optimization (per-partition fingerprints in the PUT → daemon skip-map →
+      cb-dos skips unchanged partitions → host copies them from the prior `.cbk`).
 - [~] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
       **Desktop swap parity DONE (§6e, 2026-06-25)** — the Rust backup now Level-1
       excludes swap too (`--keep-swap` / GUI checkbox). Remaining: Level-2 dealloc
@@ -758,6 +763,26 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7h(a) — host-side incremental change detection, qemu-verified.**
+  First slice of incremental (§5b/§5d): when a networked PUT arrives for a NAME that
+  already has a `NAME.cbk`, the daemon diffs the freshly staged `manifest-N.json`
+  against the prior backup's and logs which partitions are unchanged + whether the
+  boot chain changed — the cheap-gate / bootability-flag half, on which a later
+  streaming-skip optimization builds. Reuses the 7f/7g manifests, so **no wire or
+  cb-dos change**. New `src/remote/manifest.rs` parses + diffs a partition (§5b
+  rsync-tier: size+mtime+attr+start-cluster per file; the whole `system` block for
+  the §5d bootability flag); swap files (`volatile`) are excluded from the change
+  counter (§6b). `server.rs::compare_to_prior_cbk` (testable) reads the prior
+  members via the existing cbk readers; `report_incremental` logs at PUT finalize
+  before the pack renames over the prior `.cbk`. **Verified on FreeDOS/qemu:** three
+  sequential networked backups of one disk — first creates `MYDISK.cbk`; the second
+  (unchanged) logs *"partition 0: unchanged => identical to prior backup"*; a third
+  after adding `NEWFILE.TXT` logs *"partition 0: 1 file(s) changed"*. Unit tests
+  (identical / changed-file / changed-sysfile-hash / placeholder + a `.cbk`
+  round-trip glue test) + family_b loopback + clippy (incl. `--features remote`)
+  green. **Remaining for 7h:** the streaming-skip optimization (per-partition
+  fingerprints → daemon skip-map → cb-dos skips unchanged partitions → host copies
+  them from the prior `.cbk`).
 - 2026-06-25 — **Desktop swap parity (§6e / part of 7i) — shipped.** Brought 7g's
   Level-1 swap exclusion to the Rust desktop backup (CLAUDE.md GUI/CLI parity).
   `CompactFatReader::new_excluding_swap` (`src/fs/fat.rs`) runs the same strict
