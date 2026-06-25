@@ -472,6 +472,16 @@ fn receive_put(
     // bytes — authoritative across a resume), drop the journal so it isn't
     // packed, then pack atomically and clear the staging.
     fill_partition_checksums(&staging)?;
+
+    // Incremental change detection (§5b/§5d): if a prior NAME.cbk exists, diff
+    // the staged manifests against it and log what changed. Read it now, before
+    // the pack below renames over it. Best-effort — never fails the PUT.
+    if dest.exists() {
+        if let Err(e) = report_incremental(&staging, &dest, &hdr.name) {
+            eprintln!("rb-cli serve: incremental compare skipped ({e:#})");
+        }
+    }
+
     std::fs::remove_file(journal_path(&staging)).ok();
     std::fs::remove_file(staging.join("journal.json.tmp")).ok();
 
@@ -554,6 +564,96 @@ fn fill_partition_checksums(staging: &Path) -> Result<()> {
     if changed {
         std::fs::write(&meta_path, serde_json::to_vec_pretty(&metadata)?)
             .with_context(|| format!("rewriting {}", meta_path.display()))?;
+    }
+    Ok(())
+}
+
+/// `manifest-N.json` → `Some(N)`.
+fn manifest_partition_index(name: &str) -> Option<usize> {
+    name.strip_prefix("manifest-")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
+}
+
+/// Compare the freshly staged `manifest-N.json` files against the same-named
+/// members in a prior `NAME.cbk`, returning the per-partition diff for every
+/// comparable partition (ascending index). The testable core of the §5b/§5d
+/// incremental detection; `report_incremental` formats + logs the result. Swap
+/// files (`volatile`) are excluded from the change counter (§6b).
+pub(crate) fn compare_to_prior_cbk(
+    staging: &Path,
+    prior_cbk: &Path,
+) -> Result<Vec<(usize, crate::remote::manifest::PartitionDiff)>> {
+    use crate::remote::manifest::{diff_partition, PartitionManifest};
+
+    let members = crate::rbformats::cbk::read_cbk_index(prior_cbk)?;
+
+    let mut staged: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if let Some(idx) = manifest_partition_index(&fname) {
+            staged.push((idx, entry.path()));
+        }
+    }
+    staged.sort_by_key(|(i, _)| *i);
+
+    let mut out = Vec::new();
+    for (idx, path) in &staged {
+        let member_name = format!("manifest-{idx}.json");
+        let Some(member) = members.iter().find(|m| m.name == member_name) else {
+            continue; // prior backup had no manifest for this partition
+        };
+        let new_bytes = std::fs::read(path)?;
+        let mut prior_bytes = Vec::new();
+        crate::rbformats::cbk::cbk_member_content_reader(prior_cbk, member)?
+            .read_to_end(&mut prior_bytes)?;
+
+        let (Ok(new_m), Ok(prior_m)) = (
+            PartitionManifest::parse(&new_bytes),
+            PartitionManifest::parse(&prior_bytes),
+        ) else {
+            continue;
+        };
+
+        let d = diff_partition(&prior_m, &new_m);
+        if d.comparable {
+            out.push((*idx, d));
+        }
+    }
+    Ok(out)
+}
+
+/// Incremental change detection (Phase 7h, §5b/§5d): log which partitions are
+/// unchanged + whether the boot chain changed, vs. a prior `NAME.cbk`.
+/// Best-effort and **log-only** — the new backup is always written in full; this
+/// surfaces what an eventual streaming-skip optimization could elide, plus the
+/// §5d bootability warning.
+fn report_incremental(staging: &Path, prior_cbk: &Path, name: &str) -> Result<()> {
+    let diffs = compare_to_prior_cbk(staging, prior_cbk)?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    eprintln!("rb-cli serve: incremental vs prior {name}.cbk:");
+    let mut all_unchanged = true;
+    for (idx, d) in &diffs {
+        if d.is_unchanged() {
+            eprintln!("  partition {idx}: unchanged");
+        } else {
+            all_unchanged = false;
+            let mut what = Vec::new();
+            if d.bootability_changed {
+                what.push("BOOTABILITY CHANGED (system block differs)".to_string());
+            }
+            if d.files_changed > 0 {
+                what.push(format!("{} file(s) changed", d.files_changed));
+            }
+            eprintln!("  partition {idx}: {}", what.join(", "));
+        }
+    }
+    if all_unchanged {
+        eprintln!("  => identical to prior backup (nothing changed)");
     }
     Ok(())
 }
@@ -1548,4 +1648,61 @@ fn list_dir(fs: &mut dyn Filesystem, path: &str) -> Result<Vec<WireEntry>> {
         .list_directory(&entry)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     Ok(children.iter().map(WireEntry::from_entry).collect())
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"{
+  "manifest_version": 1,
+  "filesystem": "fat16",
+  "system": {
+    "mbr_boot_code_crc": "aed2dfe7",
+    "boot_sectors_crc": "4b0f3e71",
+    "sysfiles": [
+      {"name": "IO.SYS", "size": 8192, "mtime": "2026-06-25T16:24:30", "attr": 32, "first_cluster": 2, "contiguous": true, "hash": "beac2c52"}
+    ]
+  },
+  "files": [
+    {"path": "\\IO.SYS", "size": 8192, "mtime": "2026-06-25T16:24:30", "attr": 32, "start_cluster": 2},
+    {"path": "\\REPORT.TXT", "size": 4096, "mtime": "2026-06-25T16:24:30", "attr": 32, "start_cluster": 40}
+  ]
+}
+"#;
+
+    /// Pack a one-partition manifest into a prior `.cbk`, then diff a staging dir
+    /// against it — identical staged manifest reads back "unchanged"; a modified
+    /// one is counted. Exercises the .cbk read + manifest-member matching glue.
+    #[test]
+    fn compare_to_prior_cbk_detects_unchanged_and_changed() {
+        let prior_folder = tempfile::tempdir().unwrap();
+        std::fs::write(prior_folder.path().join("manifest-0.json"), MANIFEST).unwrap();
+        // pack_folder_to_cbk requires a metadata.json to exist (packed as a member).
+        std::fs::write(prior_folder.path().join("metadata.json"), b"{}").unwrap();
+        std::fs::write(prior_folder.path().join("mbr.bin"), [0u8; 512]).unwrap();
+        let cbk = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        crate::rbformats::cbk::pack_folder_to_cbk(prior_folder.path(), &cbk).unwrap();
+
+        // Unchanged: staged manifest identical to the prior's.
+        let same = tempfile::tempdir().unwrap();
+        std::fs::write(same.path().join("manifest-0.json"), MANIFEST).unwrap();
+        let diffs = compare_to_prior_cbk(same.path(), &cbk).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].0, 0);
+        assert!(diffs[0].1.is_unchanged(), "{:?}", diffs[0].1);
+
+        // Changed: REPORT.TXT grows.
+        let changed = tempfile::tempdir().unwrap();
+        let modified = MANIFEST.replace(
+            r#""path": "\\REPORT.TXT", "size": 4096"#,
+            r#""path": "\\REPORT.TXT", "size": 9000"#,
+        );
+        std::fs::write(changed.path().join("manifest-0.json"), modified).unwrap();
+        let diffs = compare_to_prior_cbk(changed.path(), &cbk).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(!diffs[0].1.is_unchanged());
+        assert_eq!(diffs[0].1.files_changed, 1);
+        assert!(!diffs[0].1.bootability_changed);
+    }
 }

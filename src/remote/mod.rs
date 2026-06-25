@@ -14,6 +14,7 @@ pub mod block_reader;
 pub mod client;
 pub mod connection;
 pub mod fs;
+pub mod manifest;
 pub mod protocol;
 pub mod server;
 pub mod service;
