@@ -10,7 +10,7 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 46 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), ~48 commits ahead of `main`, all verified, tree
 clean:
 
 ```
@@ -54,6 +54,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | Area | State |
 |------|-------|
 | Net **7a** (binary Family-B handshake) | `NETHELLO` ↔ `rb-cli serve` round-trips on FreeDOS/qemu |
+| Net **7b** (chunk PUT → host `.cbk`) | `NETPUT` streams a backup folder DOS→host; host assembles a frozen `.cbk` (reuses `pack_folder_to_cbk`) **byte-identical** to a desktop pack; `rb-cli restore` rebuilds the disk. `net_put.c`/`NETPUT.EXE` + `receive_put` in `server.rs`. Verified on FreeDOS/qemu |
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
@@ -80,10 +81,11 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Net 7b–7i** — networked backup/restore (only 7a/handshake done). The local
-   foundation + the frozen `.cbk` are all in place; this is the next big phase.
+1. **Net 7c–7i** — networked backup/restore (7a handshake + 7b chunk PUT done).
+   The local foundation + the frozen `.cbk` + the whole-folder PUT are all in
+   place; 7c streams a live disk straight to the wire (no intermediate folder).
    **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase
-   hand-off + the qemu NE2000/SLiRP rig + the 7b "done" definition).
+   hand-off + the qemu NE2000/SLiRP rig + the 7c "done" definition).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu
@@ -192,7 +194,9 @@ subcommands for scripting), built from:
   folders recurse) over `cbbrowse.h` — on a highlighted **FAT partition row** it
   browses that partition **live** (`do_browse_live`), otherwise it prompts for a
   backup folder (`do_browse_backup`). `disk_spike.c` — disk/FS spike.
-  `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
+  `net_hello.c` — WATT-32 handshake probe (`NETHELLO.EXE`); `net_put.c` — the 7b
+  chunk-PUT client (`NETPUT.EXE`: streams a backup folder → host `.cbk`).
+  `lfn_test.c` — raw LFN-API probe.
 - `Makefile` targets: `make crustybk` (the tool; links zlib + liblz4 once) /
   `make all` (+ diagnostics) / `make net` / `make size`.
 - `deps/fetch-zlib.sh`, `deps/fetch-lz4.sh`, `net/fetch-watt32.sh` — cross-built

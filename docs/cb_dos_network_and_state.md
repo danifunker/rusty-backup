@@ -651,8 +651,24 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
         `2>`/`2>&1` (parses the `2` as an argv) — pass the port explicitly and use
         single `>` redirects, or all output goes to stderr/console. CWSDPMI.EXE
         must sit next to `NETHELLO.EXE` (real FreeDOS has no DPMI host).
-- [ ] **7b — Chunk protocol + container.** Define `.cbk` chunk header + index;
-      stop-and-go single-member PUT DOS→host; byte-verify; write/read the index.
+- [x] **7b — Chunk protocol + container. Done — chunk PUT round-trips on real
+      FreeDOS in qemu (2026-06-25).** The DOS `NETPUT.EXE`
+      (`crusty-backup/src/net_put.c`, `make net`) does the Family-B handshake,
+      then streams a `CRUSTYBK BACKUP` folder as one ordered member stream — per
+      member an `RBKM` descriptor (kind + name + chunk_count), per chunk a
+      `{src_offset, len, crc32}` header + payload, **stop-and-go** (the daemon
+      acks each chunk after the bytes are fsynced). The host
+      (`src/remote/{protocol,server}.rs`, `read_put_header`/`receive_put`) stages
+      each member to a temp folder (CRC re-checked) and assembles the frozen
+      `.cbk` with the **existing `pack_folder_to_cbk` writer** (atomic `.tmp` +
+      rename) — no second format. `CAP_FAMILY_B` now flips on in the hello reply.
+      One chunk per member (cb-dos images each partition as a single gzip
+      member); per-span chunking + the incremental `.idx` resume log are 7d.
+      **Verified:** a FAT16 disk imaged on FreeDOS → `NETPUT` → host `MYDISK.cbk`
+      that is **byte-identical** to a desktop `rb-cli cbk pack` of the same
+      folder, and `rb-cli restore MYDISK.cbk` rebuilds a disk whose files are
+      byte-identical to the source. Loopback unit test
+      `family_b_chunk_put_assembles_cbk_over_loopback`.
 - [ ] **7c — Whole-folder backup over wire.** Stream a full native folder as
       members into `.cbk`; materialize the folder at finalize; desktop restores it
       unchanged.
@@ -673,6 +689,29 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7b complete — the chunk PUT round-trips on real FreeDOS
+  in qemu.** Built the Family-B **chunk-PUT** protocol (the §2a/§2d chunk shape on
+  the wire) and proved it end-to-end. **DOS producer:** `NETPUT.EXE`
+  (`crusty-backup/src/net_put.c`, `make net` — WATT-32, no zlib) enumerates a
+  `CRUSTYBK BACKUP` folder, does the 7a handshake, then streams it as one ordered
+  member stream: per member an `RBKM` descriptor `{kind, name, chunk_count}`, per
+  chunk a `{src_offset, len, crc32}` header + payload, **stop-and-go** (waits for
+  the daemon's ack per chunk). One chunk per member (cb-dos writes a single gzip
+  member per partition). **Host:** `src/remote/protocol.rs` gained the PUT framing
+  (`read_put_header`/`read_member_header`/`read_chunk_header` + the client-side
+  writers for the loopback test); `src/remote/server.rs`'s `handle_family_b` now
+  reads the post-handshake frame — EOF (a bare `NETHELLO`) closes cleanly, an
+  `RBKP` PUT goes to `receive_put`, which stages each member to a temp folder
+  (CRC re-checked, fsync-before-ack) and assembles the frozen `.cbk` via the
+  **existing `pack_folder_to_cbk`** (atomic `.tmp` + rename) — reuse, not a second
+  format. `CAP_FAMILY_B` now advertised. **Verified on qemu** (FreeDOS 1.4,
+  NE2000 + SLiRP): a FAT16 disk imaged on DOS → `NETPUT 10.0.2.2 7341 C:\BK
+  MYDISK` → host `MYDISK.cbk` **byte-identical** to a desktop `rb-cli cbk pack` of
+  the mcopy'd folder, and `rb-cli restore MYDISK.cbk` rebuilt a disk with both
+  files byte-identical to the source. Lib suite (2093) + the loopback test
+  `family_b_chunk_put_assembles_cbk_over_loopback` green; clippy clean. Next:
+  **7c** (whole-folder backup straight off the live disk over the wire) then
+  **7d** (resume: per-span chunks + fsync-before-record + the incremental `.idx`).
 - 2026-06-24 — **`.cbk` is now fully first-class — native read + edit (§2e).**
   Two steps. (1) **Native read:** a `CbkTempReader` arm in `open_read_dispatch`
   (`source_reader.rs`) + `is_container_path` + a `BrowseSession::open_image` arm
