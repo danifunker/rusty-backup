@@ -661,6 +661,30 @@ over the wire now.
       the same folder recovers both files too. `make crustybk` (+4.6 KB). Remaining
       FS gaps: exFAT/HPFS (type 0x07 but skipped with a clear message), ext2/3
       (stretch), and logical/extended partitions.
+- [x] **Phase 4e — Extended / logical partition backup/restore/clone (DOS). DONE
+      (2026-06-25).** cb-dos handles the MBR **extended container** (type
+      0x05/0x0F/0x85) and its **logical** partitions (the EBR chain), not just the
+      4 primaries. Shared `cbdisk` helpers port the desktop's logic: `walk_ebr_chain`
+      (= `parse_ebr_chain`: entry 0 = logical relative to its EBR, entry 1 = link
+      relative to the container base) and `write_ebr_chain` (= `build_ebr_chain`:
+      first EBR at the container start, each later EBR one sector before its
+      logical). **Backup** detects the container, walks the chain, and images each
+      logical FAT/NTFS volume with `is_logical: true` + `index 4+`, emitting an
+      `extended_container` metadata block. **Restore** reproduces the EBR chain
+      exactly (logicals same-size on DOS — resizing one shifts the whole chain, a
+      desktop job) and writes the rebuilt EBR sectors. **Clone** copies each EBR
+      sector verbatim and clones each logical same-size. Logicals index 4+ are
+      `/PARTS`-selectable. **Verified on real FreeDOS/qemu** with a disk carrying a
+      primary FAT16 + an extended container holding a FAT16 logical *and* an NTFS
+      logical: cb-dos backup -> restore (blank disk) and -> clone both reproduce the
+      exact partition layout (`fdisk -l` identical) with **all files byte-identical**
+      across the primary + both logicals (NTFS `ntfsfix`-clean); the desktop
+      `rb-cli restore` of the same folder round-trips too. Fixed two bugs found en
+      route: (1) cb-dos restore's `limit_window` ignored the extended container, so
+      a primary just before it could resize *into* it; (2) a **desktop** pre-flight
+      double-counted logicals + the container span and wrongly rejected same-size
+      extended restores (`src/restore/mod.rs`). `make crustybk`. Remaining FS gaps:
+      exFAT (spike-proven bitmap), ext2/3 (stretch).
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -691,6 +715,28 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 4e — extended / logical partition backup/restore/clone.**
+  cb-dos was MBR-primary-only; now it follows the **EBR chain** of an extended
+  container (type 0x05/0x0F/0x85) and images the **logical** partitions inside it.
+  New shared `cbdisk` helpers port the desktop verbatim: `walk_ebr_chain`
+  (parse_ebr_chain) and `write_ebr_chain` (build_ebr_chain) -- first EBR at the
+  container start, each later EBR one sector before its logical. **backup** records
+  an `extended_container` block + each logical as `is_logical:true` / `index 4+`;
+  **restore** rebuilds the EBR chain (logicals same-size on DOS, resize on the
+  desktop) and writes the EBR sectors; **clone** copies the EBR sectors verbatim
+  and clones each logical same-size. Both FAT and NTFS logicals work; logicals are
+  `/PARTS`-selectable (indices 4+). **Verified on real FreeDOS/qemu** with a disk =
+  primary FAT16 + extended container { FAT16 logical, NTFS logical }: backup ->
+  restore (blank) and -> clone both reproduce the exact layout (`fdisk -l`
+  identical) with every file byte-identical across the primary + both logicals
+  (NTFS `ntfsfix`-clean); desktop `rb-cli restore` of the same folder round-trips
+  too. **Found + fixed two bugs:** (1) cb-dos restore's `limit_window` didn't
+  account for the extended container, so a primary just before it could grow into
+  it (an overlap) -- now clamped at the container; (2) a **desktop** restore
+  pre-flight summed both the logicals *and* the extended-container override that
+  spans them, double-counting and rejecting valid same-size extended restores
+  (`src/restore/mod.rs`, separate commit). `make crustybk`. **Next:** exFAT
+  (type 0x07, spike-proven), or Phase 5 (boot-aware defrag).
 - 2026-06-25 — **Live transfer progress (%, speed, ETA) for backup/restore/clone.**
   Until now the transfer loops printed nothing while running — just a per-partition
   summary *after* each partition finished, so a multi-minute image looked frozen.
