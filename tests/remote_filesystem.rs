@@ -1372,6 +1372,140 @@ fn family_b_binary_handshake_over_loopback() {
     );
 }
 
+/// Family B chunk PUT (cb-dos / phase 7b): a JSON-free client does the binary
+/// handshake, then streams a native backup folder as members → chunks, and the
+/// daemon assembles them into a frozen `.cbk` under the serve root. Emulates the
+/// exact bytes `NETPUT.EXE` sends (handshake + `RBKP` PUT header + per-member
+/// `RBKM` descriptors + per-chunk `{src_offset,len,crc32}` + stop-and-go acks),
+/// then asserts the received container is **byte-identical** to a locally-packed
+/// `.cbk` of the same folder and materializes back to the original files.
+#[test]
+fn family_b_chunk_put_assembles_cbk_over_loopback() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use rusty_backup::rbformats::cbk::{is_cbk, materialize_cbk_to_folder, pack_folder_to_cbk};
+    use rusty_backup::remote::protocol::{
+        read_put_ack, read_put_result, write_chunk_header, write_member_header, write_put_header,
+        ChunkHeader, CAP_FAMILY_B, PROTOCOL_VERSION, RB_HELLO_MAGIC_BYTES,
+    };
+
+    // Build a tiny native-ish backup folder: metadata.json + mbr.bin (raw
+    // members the host gzip-wraps) + a real gzip member + its crc32 sidecar.
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("MYDISK");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("metadata.json"), b"{\n  \"version\": 1\n}\n").unwrap();
+    std::fs::write(folder.join("mbr.bin"), vec![0xAAu8; 512]).unwrap();
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&vec![0u8; 80_000]).unwrap();
+    enc.write_all(b"real bytes in the middle of the partition")
+        .unwrap();
+    enc.write_all(&vec![0u8; 40_000]).unwrap();
+    let gz = enc.finish().unwrap();
+    std::fs::write(folder.join("partition-0.gz"), &gz).unwrap();
+    std::fs::write(folder.join("partition-0.gz.crc32"), b"deadbeef").unwrap();
+
+    // The serve root the daemon writes the assembled .cbk into.
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // --- the bytes NETPUT sends ---
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    // 1) binary Family-B handshake.
+    let mut req = Vec::new();
+    req.extend_from_slice(&RB_HELLO_MAGIC_BYTES);
+    req.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    req.extend_from_slice(&0u16.to_be_bytes());
+    sock.write_all(&req).unwrap();
+    sock.flush().unwrap();
+    let mut reply = [0u8; 8];
+    sock.read_exact(&mut reply).unwrap();
+    let reply_caps = u16::from_be_bytes([reply[6], reply[7]]);
+    assert!(
+        reply_caps & CAP_FAMILY_B != 0,
+        "the daemon now advertises Family B (the chunk PUT protocol is built)"
+    );
+
+    // 2) the PUT: enumerate the folder and stream each file as one chunk.
+    let mut names: Vec<String> = std::fs::read_dir(&folder)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    write_put_header(&mut sock, "MYDISK", names.len() as u16).unwrap();
+    for name in &names {
+        let bytes = std::fs::read(folder.join(name)).unwrap();
+        let kind = if name.to_ascii_lowercase().ends_with(".gz") {
+            0
+        } else {
+            1
+        };
+        write_member_header(&mut sock, kind, name, 1).unwrap();
+        write_chunk_header(
+            &mut sock,
+            &ChunkHeader {
+                src_offset: 0,
+                len: bytes.len() as u32,
+                crc32: crc32fast::hash(&bytes),
+            },
+        )
+        .unwrap();
+        sock.write_all(&bytes).unwrap();
+        sock.flush().unwrap();
+        assert!(
+            read_put_ack(&mut sock).unwrap(),
+            "daemon ACKs the {name} chunk"
+        );
+    }
+    // 3) the result frame.
+    let (status, cbk_size) = read_put_result(&mut sock).unwrap();
+    assert_eq!(status, 0, "PUT succeeded");
+    assert!(cbk_size > 0, "the daemon reports the .cbk size");
+    drop(sock);
+
+    // --- verify the assembled container ---
+    let received = root.join("MYDISK.cbk");
+    assert!(received.is_file(), "the daemon wrote MYDISK.cbk under root");
+    assert!(is_cbk(&received), "it is a recognizable .cbk container");
+    assert_eq!(
+        std::fs::metadata(&received).unwrap().len(),
+        cbk_size,
+        "the reported size matches the file"
+    );
+
+    // Byte-identical to a locally-packed .cbk of the same folder (the daemon
+    // reuses the frozen pack_folder_to_cbk writer, so the bytes match exactly).
+    let local = dir.path().join("local.cbk");
+    pack_folder_to_cbk(&folder, &local).unwrap();
+    assert_eq!(
+        std::fs::read(&received).unwrap(),
+        std::fs::read(&local).unwrap(),
+        "the PUT-assembled .cbk is byte-identical to a locally-packed one"
+    );
+
+    // And it materializes back to the original folder, file-for-file.
+    let restored = dir.path().join("restored");
+    materialize_cbk_to_folder(&received, &restored).unwrap();
+    for name in &names {
+        assert_eq!(
+            std::fs::read(folder.join(name)).unwrap(),
+            std::fs::read(restored.join(name)).unwrap(),
+            "member {name} round-trips byte-for-byte through the PUT + .cbk"
+        );
+    }
+}
+
 /// Remote per-partition MINIMUM-SIZE calc over the block tier: drive the
 /// `min_size_runner` worker with a `MinSizeSource::Remote { is_device: false }`
 /// against a served FAT image and prove it computes an in-place minimum well

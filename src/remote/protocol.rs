@@ -435,6 +435,229 @@ pub fn write_binary_hello<W: Write>(w: &mut W, version: u16, capabilities: u16) 
 }
 
 // ---------------------------------------------------------------------------
+// Family-B chunk PUT (cb-dos backup → host `.cbk`) — phase 7b
+// ---------------------------------------------------------------------------
+//
+// After the binary handshake a Family-B client either disconnects (a bare
+// hello-and-quit probe like `NETHELLO` → EOF) or streams a **chunk PUT**: an
+// ordered sequence of logical members (`metadata.json`, `mbr.bin`,
+// `partition-N.gz`, …), each a run of chunks, that the daemon assembles into a
+// frozen `.cbk` container (`docs/cb_dos_network_and_state.md` §2). The on-wire
+// chunk shape mirrors §2a/§2d: a member is one or more spans, each span a
+// payload (a verbatim gzip member, or a raw file the host gzip-wraps when
+// packing) with a CRC32 the daemon re-checks. Stop-and-go: the daemon acks each
+// chunk after the bytes are durable, so the client never outruns the assembler.
+
+/// Magic leading a chunk-PUT request (`b"RBKP"`). Sent after the handshake; it
+/// lets the daemon tell a real PUT from a hello-only client (EOF) or a future
+/// op, mirroring how the handshake magic disambiguates the connection itself.
+pub const PUT_MAGIC: u32 = 0x5242_4B50; // "RBKP"
+
+/// Magic leading each member descriptor inside a PUT (`b"RBKM"`).
+pub const MEMBER_MAGIC: u32 = 0x5242_4B4D; // "RBKM"
+
+/// Per-chunk stop-and-go acknowledgement bytes (daemon → client).
+pub const PUT_ACK: u8 = 0x06; // ASCII ACK — chunk durable, send the next
+pub const PUT_NAK: u8 = 0x15; // ASCII NAK — CRC/format error, abort
+
+/// Largest single PUT chunk payload the daemon buffers/streams. A member is one
+/// or more chunks of at most this (the §2c span granularity); 4 MiB matches the
+/// bulk-stream cap.
+pub const MAX_PUT_CHUNK: u32 = MAX_CHUNK as u32;
+
+/// Cap on a wire string (container / member name). Folder-relative file names
+/// are short; this just bounds a hostile length prefix.
+const MAX_PUT_NAME: usize = 1024;
+
+/// A chunk-PUT request header: the container base name (→ `<name>.cbk` on the
+/// daemon) and how many logical members follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutHeader {
+    pub name: String,
+    pub member_count: u16,
+}
+
+/// One member descriptor inside a PUT: its folder-relative file name, its kind
+/// (0 = a verbatim gzip member like `partition-N.gz`; 1 = a raw file the host
+/// gzip-wraps when packing, like `metadata.json`/`mbr.bin`), and the chunk
+/// count. `kind` is advisory — the daemon re-derives the real `.cbk` member kind
+/// from the file name when packing (matching the desktop packer) — but it's
+/// carried so a future streaming receiver can frame chunks without a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberHeader {
+    pub kind: u8,
+    pub name: String,
+    pub chunk_count: u32,
+}
+
+/// One chunk header inside a member: the uncompressed span offset, the payload
+/// byte length, and the CRC32 of the payload (the daemon re-checks it — §2c's
+/// "each member self-verifies"). The §2a/§2d magic + version + logical_id are
+/// implied by the enclosing member framing, so they're omitted on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHeader {
+    pub src_offset: u64,
+    pub len: u32,
+    pub crc32: u32,
+}
+
+fn read_u16_be<R: Read>(r: &mut R) -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    r.read_exact(&mut b)?;
+    Ok(u16::from_be_bytes(b))
+}
+fn read_u32_be<R: Read>(r: &mut R) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+fn read_u64_be<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+/// Read a `u16`-length-prefixed UTF-8 string (the wire form for names).
+fn read_short_string<R: Read>(r: &mut R) -> io::Result<String> {
+    let len = read_u16_be(r)? as usize;
+    if len > MAX_PUT_NAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PUT string exceeds length limit",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    String::from_utf8(buf)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PUT name not UTF-8"))
+}
+
+/// Write a `u16`-length-prefixed UTF-8 string.
+fn write_short_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    let bytes = s.as_bytes();
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PUT name too long"))?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(bytes)
+}
+
+/// Read the opening frame of a Family-B session after the handshake. Returns
+/// `Ok(None)` when the peer hung up first (a bare hello-then-disconnect, e.g.
+/// `NETHELLO`), `Ok(Some(header))` for a chunk PUT, or an error for an unknown
+/// leading magic.
+pub fn read_put_header<R: Read>(r: &mut R) -> io::Result<Option<PutHeader>> {
+    let mut magic = [0u8; 4];
+    match r.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let m = u32::from_be_bytes(magic);
+    if m != PUT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected Family-B op magic {m:#010x} (expected PUT {PUT_MAGIC:#010x})"),
+        ));
+    }
+    let name = read_short_string(r)?;
+    let member_count = read_u16_be(r)?;
+    Ok(Some(PutHeader { name, member_count }))
+}
+
+/// Write a chunk-PUT request header (client side).
+pub fn write_put_header<W: Write>(w: &mut W, name: &str, member_count: u16) -> io::Result<()> {
+    w.write_all(&PUT_MAGIC.to_be_bytes())?;
+    write_short_string(w, name)?;
+    w.write_all(&member_count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Read one member descriptor (the `RBKM` magic + kind + name + chunk count).
+pub fn read_member_header<R: Read>(r: &mut R) -> io::Result<MemberHeader> {
+    let magic = read_u32_be(r)?;
+    if magic != MEMBER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad member magic {magic:#010x} (expected {MEMBER_MAGIC:#010x})"),
+        ));
+    }
+    let mut kind = [0u8; 1];
+    r.read_exact(&mut kind)?;
+    let name = read_short_string(r)?;
+    let chunk_count = read_u32_be(r)?;
+    Ok(MemberHeader {
+        kind: kind[0],
+        name,
+        chunk_count,
+    })
+}
+
+/// Write one member descriptor (client side).
+pub fn write_member_header<W: Write>(
+    w: &mut W,
+    kind: u8,
+    name: &str,
+    chunk_count: u32,
+) -> io::Result<()> {
+    w.write_all(&MEMBER_MAGIC.to_be_bytes())?;
+    w.write_all(&[kind])?;
+    write_short_string(w, name)?;
+    w.write_all(&chunk_count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Read one chunk header (`src_offset` + `len` + `crc32`). The payload follows
+/// immediately as `len` raw bytes.
+pub fn read_chunk_header<R: Read>(r: &mut R) -> io::Result<ChunkHeader> {
+    let src_offset = read_u64_be(r)?;
+    let len = read_u32_be(r)?;
+    let crc32 = read_u32_be(r)?;
+    Ok(ChunkHeader {
+        src_offset,
+        len,
+        crc32,
+    })
+}
+
+/// Write one chunk header (client side). The caller streams the `len`-byte
+/// payload right after.
+pub fn write_chunk_header<W: Write>(w: &mut W, hdr: &ChunkHeader) -> io::Result<()> {
+    w.write_all(&hdr.src_offset.to_be_bytes())?;
+    w.write_all(&hdr.len.to_be_bytes())?;
+    w.write_all(&hdr.crc32.to_be_bytes())?;
+    Ok(())
+}
+
+/// Send the per-chunk acknowledgement (daemon side); `true` → [`PUT_ACK`].
+pub fn write_put_ack<W: Write>(w: &mut W, ok: bool) -> io::Result<()> {
+    w.write_all(&[if ok { PUT_ACK } else { PUT_NAK }])?;
+    w.flush()
+}
+
+/// Read a per-chunk acknowledgement (client side); `Ok(true)` on [`PUT_ACK`].
+pub fn read_put_ack<R: Read>(r: &mut R) -> io::Result<bool> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0] == PUT_ACK)
+}
+
+/// Send the final PUT result (daemon side): a status byte (0 = ok) and the
+/// written container's byte size.
+pub fn write_put_result<W: Write>(w: &mut W, status: u8, cbk_size: u64) -> io::Result<()> {
+    w.write_all(&[status])?;
+    w.write_all(&cbk_size.to_be_bytes())?;
+    w.flush()
+}
+
+/// Read the final PUT result (client side): `(status, cbk_size)`.
+pub fn read_put_result<R: Read>(r: &mut R) -> io::Result<(u8, u64)> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    let cbk_size = read_u64_be(r)?;
+    Ok((status[0], cbk_size))
+}
+
+// ---------------------------------------------------------------------------
 // Framing — bulk chunk stream
 // ---------------------------------------------------------------------------
 

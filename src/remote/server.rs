@@ -30,9 +30,10 @@ use std::path::{Path, PathBuf};
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_chunks, read_control, read_handshake, write_binary_hello, write_control, ChunkWriter,
-    Handshake, Request, Response, WireEntry, WireKind, CAP_FAMILY_F, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    read_chunk_header, read_chunks, read_control, read_handshake, read_member_header,
+    read_put_header, write_binary_hello, write_control, write_put_ack, write_put_result,
+    ChunkWriter, Handshake, PutHeader, Request, Response, WireEntry, WireKind, CAP_FAMILY_B,
+    CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -135,27 +136,169 @@ pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBu
 
 /// Handle a binary Family-B client (cb-dos / `CRUSTYBK.EXE`).
 ///
-/// **Phase 7a — handshake only.** The opening binary `Hello` has already been
-/// read; here we reply with our version + capabilities and acknowledge the
-/// peer. The chunk / `.cbk` data protocol (7b onward) isn't implemented yet, so
-/// after the reply we log and close — a hello-world client confirms the
-/// transport + handshake and disconnects. The reader is retained (not yet read)
-/// so the signature is stable when the chunk loop lands.
+/// **Phase 7b — chunk PUT.** The opening binary `Hello` has already been read;
+/// we reply with our version + capabilities, then read the next frame: either
+/// the peer hangs up (a bare hello-and-quit probe like `NETHELLO` → EOF, a clean
+/// close) or it streams a chunk PUT (`NETPUT` → a `.cbk` on the host). A PUT is
+/// assembled into the frozen `.cbk` container under the serve root via
+/// [`receive_put`].
 fn handle_family_b(
-    _reader: BufReader<TcpStream>,
+    mut reader: BufReader<TcpStream>,
     mut writer: BufWriter<TcpStream>,
     client_version: u16,
     client_caps: u16,
+    root: &Path,
+    staging_dir: Option<&Path>,
 ) -> Result<()> {
     eprintln!(
-        "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x}); \
-         chunk protocol not yet implemented (7a handshake only)"
+        "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x})"
     );
-    // Advertise the capabilities we actually serve. Family B's data protocol
-    // isn't built, so we report CAP_FAMILY_F only for now; the CAP_FAMILY_B bit
-    // flips on when the chunk stream (7b) lands.
-    write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F)
+    // The chunk PUT protocol (7b) exists now, so advertise Family B alongside F.
+    write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F | CAP_FAMILY_B)
         .context("writing Family-B hello reply")?;
+
+    match read_put_header(&mut reader).context("reading Family-B PUT header")? {
+        // Hello-only client (e.g. NETHELLO): clean disconnect, nothing to do.
+        None => Ok(()),
+        Some(hdr) => receive_put(&mut reader, &mut writer, root, staging_dir, hdr),
+    }
+}
+
+/// Receive a chunk PUT and assemble it into a frozen `.cbk` under the serve root.
+///
+/// Each logical member is staged to a temp folder (its chunk payloads streamed
+/// in arrival order, each CRC-verified and fsynced before the stop-and-go ack),
+/// then the whole folder is packed with the frozen `pack_folder_to_cbk` writer —
+/// so the daemon never invents a second container format and the result is
+/// byte-identical to a locally-packed `.cbk` of the same folder. The pack lands
+/// atomically (write `<name>.cbk.tmp`, fsync, rename).
+fn receive_put(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    root: &Path,
+    staging_dir: Option<&Path>,
+    hdr: PutHeader,
+) -> Result<()> {
+    let dest = cbk_dest_path(root, &hdr.name)?;
+    eprintln!(
+        "rb-cli serve: PUT {:?} ({} member{}) -> {}",
+        hdr.name,
+        hdr.member_count,
+        if hdr.member_count == 1 { "" } else { "s" },
+        dest.display()
+    );
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rb-put-");
+    let staging = match staging_dir {
+        Some(d) => builder
+            .tempdir_in(d)
+            .with_context(|| format!("creating PUT staging dir under {}", d.display()))?,
+        None => builder.tempdir().context("creating PUT staging dir")?,
+    };
+
+    for mi in 0..hdr.member_count {
+        let m =
+            read_member_header(reader).with_context(|| format!("reading member {mi} header"))?;
+        validate_member_name(&m.name)?;
+        let path = staging.path().join(&m.name);
+        let mut f = std::fs::File::create(&path)
+            .with_context(|| format!("creating staging member {}", path.display()))?;
+
+        for ci in 0..m.chunk_count {
+            let ch = read_chunk_header(reader)
+                .with_context(|| format!("reading {} chunk {ci} header", m.name))?;
+            if ch.len > MAX_PUT_CHUNK {
+                write_put_ack(writer, false).ok();
+                bail!(
+                    "PUT chunk on {} is {} bytes (over the {MAX_PUT_CHUNK}-byte limit)",
+                    m.name,
+                    ch.len
+                );
+            }
+            // Stream the payload into the staging file, hashing as we go.
+            let mut hasher = crc32fast::Hasher::new();
+            let mut remaining = ch.len as usize;
+            let mut buf = vec![0u8; 256 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buf.len());
+                reader
+                    .read_exact(&mut buf[..want])
+                    .with_context(|| format!("reading {} chunk payload", m.name))?;
+                hasher.update(&buf[..want]);
+                f.write_all(&buf[..want])
+                    .with_context(|| format!("writing staging member {}", m.name))?;
+                remaining -= want;
+            }
+            let got = hasher.finalize();
+            if got != ch.crc32 {
+                write_put_ack(writer, false).ok();
+                bail!(
+                    "PUT chunk CRC mismatch on {} (wire {:#010x} != computed {got:#010x})",
+                    m.name,
+                    ch.crc32
+                );
+            }
+            // fsync the staged bytes before acking — the ack means "durable".
+            f.flush().ok();
+            f.sync_all()
+                .with_context(|| format!("fsync staging member {}", m.name))?;
+            write_put_ack(writer, true)?;
+        }
+    }
+
+    // All members staged: pack with the frozen writer (atomic .tmp + rename).
+    let tmp = dest.with_file_name(format!(
+        "{}.tmp",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    crate::rbformats::cbk::pack_folder_to_cbk(staging.path(), &tmp)
+        .with_context(|| format!("packing PUT into {}", tmp.display()))?;
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &dest)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+
+    eprintln!(
+        "rb-cli serve: PUT complete -> {} ({cbk_size} bytes)",
+        dest.display()
+    );
+    write_put_result(writer, 0, cbk_size)?;
+    Ok(())
+}
+
+/// The destination `.cbk` path for a PUT, under the serve root. The container
+/// name is a flat base (a `.cbk` suffix is optional); anything with a path
+/// separator or traversal is refused so a client can't escape the root.
+fn cbk_dest_path(root: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() {
+        bail!("PUT container name is empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        bail!("PUT container name {name:?} is not a flat base name");
+    }
+    let file = if name.to_ascii_lowercase().ends_with(".cbk") {
+        name.to_string()
+    } else {
+        format!("{name}.cbk")
+    };
+    Ok(root.join(file))
+}
+
+/// Reject an unsafe member name (path separators / traversal / NUL) before it's
+/// used as a staging file name — mirrors the guard `materialize_cbk_to_folder`
+/// applies on the way out.
+fn validate_member_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+    {
+        bail!("PUT member name {name:?} is unsafe");
+    }
     Ok(())
 }
 
@@ -191,7 +334,7 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 );
                 return Ok(());
             }
-            return handle_family_b(reader, writer, version, capabilities);
+            return handle_family_b(reader, writer, version, capabilities, root, staging_dir);
         }
         // Peer hung up before sending anything — a clean end, not an error.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),

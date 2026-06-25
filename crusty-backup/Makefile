@@ -71,9 +71,15 @@ WATT32  := net/watt32
 WATTINC := $(WATT32)/inc
 WATTLIB := $(WATT32)/lib
 
-net: $(BUILD)/nethello.exe
+net: $(BUILD)/nethello.exe $(BUILD)/netput.exe
 
 $(BUILD)/nethello.exe: src/net_hello.c | $(BUILD)
+	@test -f $(WATTLIB)/libwatt.a || { \
+	  echo "WATT-32 not found -- run: sh net/fetch-watt32.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(WATTINC) $(LDFLAGS) -o $@ $< -L$(WATTLIB) -lwatt
+
+# NETPUT: stream a CRUSTYBK backup folder to `rb-cli serve` as a .cbk (phase 7b).
+$(BUILD)/netput.exe: src/net_put.c | $(BUILD)
 	@test -f $(WATTLIB)/libwatt.a || { \
 	  echo "WATT-32 not found -- run: sh net/fetch-watt32.sh"; exit 1; }
 	$(CC) $(CFLAGS) -I$(WATTINC) $(LDFLAGS) -o $@ $< -L$(WATTLIB) -lwatt
