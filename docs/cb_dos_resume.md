@@ -82,6 +82,8 @@ The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_to
 
 1. **Net 7b–7i** — networked backup/restore (only 7a/handshake done). The local
    foundation + the frozen `.cbk` are all in place; this is the next big phase.
+   **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase
+   hand-off + the qemu NE2000/SLiRP rig + the 7b "done" definition).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu
