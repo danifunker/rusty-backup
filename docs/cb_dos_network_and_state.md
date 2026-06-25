@@ -651,27 +651,42 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
         `2>`/`2>&1` (parses the `2` as an argv) — pass the port explicitly and use
         single `>` redirects, or all output goes to stderr/console. CWSDPMI.EXE
         must sit next to `NETHELLO.EXE` (real FreeDOS has no DPMI host).
-- [x] **7b — Chunk protocol + container. Done — chunk PUT round-trips on real
-      FreeDOS in qemu (2026-06-25).** The DOS `NETPUT.EXE`
-      (`crusty-backup/src/net_put.c`, `make net`) does the Family-B handshake,
-      then streams a `CRUSTYBK BACKUP` folder as one ordered member stream — per
-      member an `RBKM` descriptor (kind + name + chunk_count), per chunk a
-      `{src_offset, len, crc32}` header + payload, **stop-and-go** (the daemon
-      acks each chunk after the bytes are fsynced). The host
-      (`src/remote/{protocol,server}.rs`, `read_put_header`/`receive_put`) stages
-      each member to a temp folder (CRC re-checked) and assembles the frozen
-      `.cbk` with the **existing `pack_folder_to_cbk` writer** (atomic `.tmp` +
-      rename) — no second format. `CAP_FAMILY_B` now flips on in the hello reply.
-      One chunk per member (cb-dos images each partition as a single gzip
-      member); per-span chunking + the incremental `.idx` resume log are 7d.
-      **Verified:** a FAT16 disk imaged on FreeDOS → `NETPUT` → host `MYDISK.cbk`
-      that is **byte-identical** to a desktop `rb-cli cbk pack` of the same
-      folder, and `rb-cli restore MYDISK.cbk` rebuilds a disk whose files are
-      byte-identical to the source. Loopback unit test
-      `family_b_chunk_put_assembles_cbk_over_loopback`.
-- [ ] **7c — Whole-folder backup over wire.** Stream a full native folder as
-      members into `.cbk`; materialize the folder at finalize; desktop restores it
-      unchanged.
+- [x] **7b — Chunk protocol + container. Done (2026-06-25).** The Family-B
+      **chunk-PUT** wire framing (the §2a/§2d chunk shape) + the host receiver.
+      `src/remote/protocol.rs`: `PutHeader`/`MemberHeader`/`ChunkHeader` +
+      `read_put_header`/`read_member_header`/`read_chunk_header` and the
+      stop-and-go ack/result. `src/remote/server.rs`: `handle_family_b` reads the
+      post-handshake frame (EOF = bare handshake → clean close; `RBKP` → PUT) and
+      `receive_put` streams each member's chunks to a temp folder (CRC re-checked,
+      fsync-before-ack) then assembles the frozen `.cbk` with the **existing
+      `pack_folder_to_cbk` writer** (atomic `.tmp` + rename) — no second format.
+      `CAP_FAMILY_B` advertised. Loopback test
+      `family_b_chunk_put_assembles_cbk_over_loopback` (multi-chunk members).
+      *(An interim standalone `NETPUT.EXE` that read a saved backup folder and
+      shipped its files was the first cut; it was the wrong shape — file-level and
+      it needed a spare local DOS disk to stage the folder — so it was replaced by
+      the integrated block-level producer in 7c. The host/protocol here are
+      unchanged and reused.)*
+- [x] **7c — Whole-disk backup over the wire (block-level, integrated). Done —
+      qemu-verified (2026-06-25).** Networked backup is **baked into
+      `CRUSTYBK BACKUP`**: a `rb://HOST[:PORT]/NAME` destination images the disk
+      **block-by-block over int13h** and streams it straight to the agent — *no
+      intermediate folder on the DOS box*, so a machine with no spare storage can
+      back itself up. Each partition is smart-compacted and compressed into
+      independent **1 MiB gzip-member spans** (`cbnet.c`'s span streamer, zlib
+      `deflateInit2` gzip), each shipped as a chunk `{src_offset, len, crc32}`
+      stop-and-go; `mbr.bin` + `metadata.json` ride as small Raw members
+      (metadata last, carrying the per-partition gz CRC accumulated mid-stream).
+      The host's `receive_put` concatenates the span chunks into a valid
+      multi-member `partition-N.gz` and packs the `.cbk` — unchanged from 7b.
+      `CRUSTYBK.EXE` now links WATT-32 (alongside zlib + lz4). **Verified on qemu**
+      (FreeDOS 1.4, NE2000 + SLiRP): `CRUSTYBK BACKUP rb://10.0.2.2:7341/MYDISK 81`
+      on a FAT16 disk → host `MYDISK.cbk`; a 3.5 MiB used-data disk streamed as
+      **4 gzip-member spans** that the host assembled into one multi-member `.gz`;
+      `rb-cli restore MYDISK.cbk` rebuilt a disk with files byte-identical to the
+      source. *(Primaries + FAT/NTFS, gzip only; extended/logical, `/DEFRAG`, and
+      LZ4 over the wire compose later. Materialize-at-finalize is the host's
+      `pack_folder_to_cbk`; desktop restore is unchanged — §2b option a.)*
 - [ ] **7d — Resume.** fsync-before-record + truncate-to-last-committed +
       `RESUME` handshake + fingerprint verify (§4). Kill mid-transfer, reconnect,
       finish; verify end-to-end checksum.
@@ -689,6 +704,32 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7c complete — networked backup baked into `CRUSTYBK`,
+  block-level, qemu-verified.** Reworked the producer after the first 7b cut went
+  the wrong way: the interim standalone `NETPUT.EXE` read a *saved backup folder*
+  off a DOS disk and shipped its *files* — exactly the "folder-of-files on the
+  wire" §0 rules out (file-level, and it needed a spare local disk to stage the
+  folder first). Replaced it with the right shape: `CRUSTYBK BACKUP
+  rb://HOST[:PORT]/NAME` images the disk **block-by-block over int13h** and
+  streams it straight to the agent, no intermediate folder. New `cbnet.{h,c}`
+  (WATT-32 sockets + the chunk-PUT framing + a **zlib gzip span streamer**): each
+  partition is smart-compacted and compressed into independent **1 MiB
+  gzip-member spans**, each sent as a chunk `{src_offset, len, crc32}`
+  stop-and-go (memory bounded to one span); `mbr.bin` + `metadata.json` ride as
+  Raw members (metadata last, with the per-partition gz CRC accumulated during
+  the stream). `cmd_backup.c` detects the `rb://` dest, pre-scans the MBR for
+  selected primary FAT/NTFS partitions, and `build_metadata` is now shared by the
+  local-folder and networked paths so the JSON never drifts. `CRUSTYBK.EXE` links
+  WATT-32 now (the Makefile + `docker/cb-dos.Dockerfile` fetch it alongside
+  zlib/lz4). The host side (`receive_put`, `pack_folder_to_cbk`) is **unchanged**
+  — it already concatenates multi-chunk members and assembles the `.cbk`.
+  **Verified on qemu** (FreeDOS 1.4 + NE2000 + SLiRP, a live `rb-cli serve
+  --root`): a 3.5 MiB used-data FAT16 disk streamed as **4 gzip-member spans**,
+  the host assembled a valid multi-member `MYDISK.cbk`, and `rb-cli restore`
+  rebuilt a disk with `BIG.BIN`/`HELLO.TXT` byte-identical to the source. Lib
+  suite (2093) + the loopback test (now multi-chunk) green; clippy clean.
+  Deferred (compose later): extended/logical partitions, `/DEFRAG`, LZ4, and 7d's
+  per-span resume `.idx`. Next: **7d** (resume) or **7e** (restore over the wire).
 - 2026-06-25 — **Phase 7b complete — the chunk PUT round-trips on real FreeDOS
   in qemu.** Built the Family-B **chunk-PUT** protocol (the §2a/§2d chunk shape on
   the wire) and proved it end-to-end. **DOS producer:** `NETPUT.EXE`

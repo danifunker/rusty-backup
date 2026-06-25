@@ -1,10 +1,11 @@
 # crusty-backup (`cb-dos`) — **network phase** resume prompt
 
-Hand-off for continuing **Net 7c–7i** (networked backup/restore over TCP). The
+Hand-off for continuing **Net 7d–7i** (networked backup/restore over TCP). The
 local removable-media engine is complete and qemu-verified; networking only swaps
-the *destination* under it. **7a (handshake) and 7b (chunk PUT → host `.cbk`) are
-done and qemu-verified.** Paste the section below (from "Resume the…" down) to
-kick off the next session.
+the *destination* under it. **7a (handshake), 7b (chunk PUT protocol + host
+`.cbk`), and 7c (block-level networked backup baked into `CRUSTYBK BACKUP
+rb://...`) are done and qemu-verified.** Paste the section below (from "Resume
+the…" down) to kick off the next session.
 
 ---
 
@@ -23,11 +24,12 @@ Read these first, in order, before doing anything:
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
 **Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently
-`7c — Whole-folder backup over wire`.**
+`7d — Resume` (or `7e — Restore over wire` if you'd rather close the loop
+first).**
 
 ## Where we are
 
-Branch `cbdos` (off `main`), ~48 commits ahead, tree clean, **everything below
+Branch `cbdos` (off `main`), ~50 commits ahead, tree clean, **everything below
 qemu-verified on real FreeDOS**.
 
 - **Local cb-dos engine — DONE.** backup / restore / clone / browse across
@@ -41,16 +43,24 @@ qemu-verified on real FreeDOS**.
   `src/remote/{protocol,server}.rs` (`read_handshake` peeks the magic;
   `write_binary_hello`). DOS client: `crusty-backup/src/net_hello.c`
   (`NETHELLO.EXE`, `make -C crusty-backup net`).
-- **Net 7b — DONE.** The **chunk PUT** streams a `CRUSTYBK BACKUP` folder DOS→host
-  and the host assembles a frozen `.cbk` — qemu-verified byte-identical to a
-  desktop pack, and `rb-cli restore` rebuilds the disk. DOS client:
-  `crusty-backup/src/net_put.c` (`NETPUT.EXE`, `make net`): handshake, then per
-  member an `RBKM` `{kind, name, chunk_count}` + per chunk `{src_offset, len,
-  crc32}` + payload, **stop-and-go**. Host: `src/remote/protocol.rs`
-  (`read_put_header`/`read_member_header`/`read_chunk_header` + the client-side
-  writers) + `server.rs` `receive_put` (stage members to a temp folder, CRC-check,
-  fsync, then `pack_folder_to_cbk` atomic `.tmp`+rename). `CAP_FAMILY_B` advertised.
-  Loopback test `family_b_chunk_put_assembles_cbk_over_loopback`.
+- **Net 7b — DONE.** The **chunk-PUT wire protocol + the host receiver**.
+  `src/remote/protocol.rs` (`PutHeader`/`MemberHeader`/`ChunkHeader`,
+  `read_put_header`/`read_member_header`/`read_chunk_header` + client-side writers,
+  ack/result) + `server.rs` `handle_family_b`/`receive_put` (stage each member's
+  chunks to a temp folder, CRC-check, fsync-before-ack, then `pack_folder_to_cbk`
+  atomic `.tmp`+rename — reuse, not a second format). `CAP_FAMILY_B` advertised.
+  Loopback test `family_b_chunk_put_assembles_cbk_over_loopback` (multi-chunk).
+- **Net 7c — DONE.** **Networked backup baked into `CRUSTYBK BACKUP rb://...`**,
+  block-level, no intermediate folder. `crusty-backup/src/cbnet.{h,c}` (WATT-32
+  sockets + the chunk-PUT framing + a zlib **gzip span streamer**): each partition
+  is imaged over int13h, smart-compacted, and compressed into independent **1 MiB
+  gzip-member spans** sent as chunks stop-and-go; `mbr.bin`/`metadata.json` ride as
+  Raw members (metadata last, with the per-partition gz CRC accumulated mid-stream).
+  `cmd_backup.c` detects the `rb://` dest (`parse_rb_dest`/`cmd_netbackup`);
+  `build_metadata` is now shared by the local + net paths. `CRUSTYBK.EXE` links
+  WATT-32. Host unchanged. qemu-verified: a 3.5 MiB disk → 4 spans → multi-member
+  `.cbk` → `rb-cli restore` byte-identical. *(Primaries + FAT/NTFS, gzip only;
+  extended/logical, `/DEFRAG`, LZ4 over the wire compose later.)*
 - **The `.cbk` container — FROZEN v1 and already the producer's chunk shape.**
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`, RBKC
   chunks / RBKI index / RBKF footer, big-endian). The desktop reads `.cbk` as a
@@ -64,36 +74,36 @@ qemu-verified on real FreeDOS**.
   (qemu-verified). So 7b is **wire framing + index over a producer/format that's
   already built**, not new container work.
 
-## What 7b already gave us (so 7c is small)
+## What 7a–7c already give us (the working baseline)
 
-`NETPUT.EXE` already streams a **whole** `CRUSTYBK BACKUP` folder (every member —
-metadata.json, mbr.bin, partition-N.gz, the .crc32 sidecars) DOS→host, the host
-assembles the frozen `.cbk` (reusing `pack_folder_to_cbk`, byte-identical to a
-desktop pack), and `rb-cli restore MYDISK.cbk` rebuilds the disk. So the wire
-protocol + container + whole-folder transfer + materialize/restore are **done**.
+A vintage box boots cb-dos and runs one command —
+`CRUSTYBK BACKUP rb://<agent-ip>:7341/MYDISK 81` — which images the disk
+**block-level over int13h** and streams it straight to `rb-cli serve` as gzip-member
+spans; the agent assembles `MYDISK.cbk` and `rb-cli restore MYDISK.cbk` rebuilds the
+disk. No local folder, no second tool. The cb-dos producer (`cbnet.c`) emits **1 MiB
+gzip-member spans** as chunks; the host (`receive_put`) concatenates them into a
+multi-member `partition-N.gz` and packs the frozen `.cbk`. **Block-level, baked in.**
 
-## 7c — what "done" looks like
+## 7d — resume (what "done" looks like)
 
-The gap 7b left: today the DOS box must **image to a local folder first**
-(`CRUSTYBK BACKUP C:\BK 81`) and then `NETPUT` it — two steps, and it needs a
-spare DOS disk big enough for the folder. 7c removes the intermediate folder by
-**imaging the live disk straight to the wire**:
-- **DOS client:** teach the imaging engine (`cmd_backup.c` / `cbdisk`) to stream
-  each member to the agent **as it images** — open the socket, send the PUT +
-  member headers, and pipe the compressed `partition-N.gz` member out in chunks
-  instead of (or as well as) to a `gzFile` on a DOS disk. Likely a `netbackup`
-  subcommand or a `\\host:port` destination on `backup`, reusing `net_put.c`'s
-  framing helpers. metadata.json/mbr.bin are tiny — buffer + send last (§3
-  ordering). One ordered chunk stream, still stop-and-go.
-- **Host:** unchanged — `receive_put` already assembles any member stream.
-- **Verify:** a one-step networked backup of a live FAT (and NTFS) disk →
-  `MYDISK.cbk` → `rb-cli restore` rebuilds it, files byte-identical, on qemu.
+7c streams stop-and-go but a crash/reboot loses everything — there's no resume yet.
+7d makes the transfer **resumable** (§3 + §4):
+- **Host:** instead of stage-then-pack, write the `.cbk` **incrementally** — append
+  each span chunk as an `RBKC` chunk, fsync-before-record, and maintain the `.idx`
+  sidecar (atomic rename) as the durable transfer map; truncate to the last
+  committed chunk on reconnect. The `.cbk` writers in `cbk.rs` are the reference
+  for the exact bytes (don't drift).
+- **DOS client:** on reconnect send a `RESUME session, source=<fingerprint>` (§4:
+  geometry + MBR/ptable CRC + volume serials + **allocation-bitmap CRC** — cheap,
+  already walked for compaction); the host replies "resume member K at span S", and
+  cbnet `int13h`-seeks to S·SPAN and continues (never recompresses — the span model
+  is built for this). The §4 fingerprint guards against a swapped/edited card.
+- **Verify:** kill mid-transfer, reconnect, finish; the assembled `.cbk` restores
+  byte-identical and the per-partition checksum matches.
 
-After 7c, **7d — resume**: per-span chunks (cb-dos emits source-span multi-member
-gzip like the desktop does — `gz_index.rs`), fsync-before-record into the `.cbk`
-incrementally, the `.idx` resume log, the `RESUME` handshake + §4 fingerprint, and
-the truncate-to-last-committed receive loop. That's where the streaming-append
-(vs. the 7b stage-then-pack) and the incremental index actually land.
+Alternatively close the producer/consumer loop first with **7e — restore over the
+wire** (host serves members on a `GET`; cb-dos restores with resize; restored card
+boots). Either is a fine next box; pick from §9.
 
 ## How we work
 
@@ -134,17 +144,20 @@ qemu-system-i386 -m 64 -display none \
 ```
 
 In the guest (via `FDAUTO.BAT`): load the packet driver `NE2000 0x60 3 0x300`,
-a one-line `WATTCP.CFG` = `my_ip = dhcp` (SLiRP's DHCP does the rest), then run the
-DOS client against `10.0.2.2 7341`. The 7a proof: `NETHELLO 10.0.2.2 7341` printed
-*"Connected. Agent protocol v2, capabilities 0x0001 [file]"*. The **7b** proof
-(2026-06-25): `FDAUTO.BAT` = `NE2000 0x60 3 0x300` → `CRUSTYBK BACKUP C:\BK 81` →
-`NETPUT 10.0.2.2 7341 C:\BK MYDISK` → `FDAPM POWEROFF`, with the host serving
-`--root /tmp/agent`; the host logged *"PUT \"MYDISK\" (4 members) … complete …
-(21824 bytes)"*, the `.cbk` was byte-identical to `rb-cli cbk pack` of the mcopy'd
-folder, and `rb-cli restore` rebuilt the disk (both files byte-identical). Copy
-`CRUSTYBK.EXE`, `NETPUT.EXE`, `CWSDPMI.EXE`, `NE2000.COM`, `WATTCP.CFG` into `\CB`;
-run from there (CWSDPMI + WATTCP.CFG must be reachable from the cwd). Grow the
-imaging engine into a one-step streaming backup for 7c.
+a one-line `WATTCP.CFG` = `my_ip = dhcp` (SLiRP's DHCP does the rest), then run
+`CRUSTYBK` against the agent. The **7c** proof (2026-06-25): `FDAUTO.BAT` =
+`NE2000 0x60 3 0x300` → `CD \CB` → `CRUSTYBK BACKUP rb://10.0.2.2:7341/MYDISK 81`
+→ `FDAPM POWEROFF`, with the host serving `--root /tmp/agent` (hdb 0x81 = the
+source FAT disk). The host logged *"PUT \"MYDISK\" (3 members) … complete"*; a
+3.5 MiB used-data disk streamed as **4 gzip-member spans** the host concatenated
+into one multi-member `partition-0.gz`, and `rb-cli restore` rebuilt the disk
+(`BIG.BIN`/`HELLO.TXT` byte-identical). Copy `CRUSTYBK.EXE`, `CWSDPMI.EXE`,
+`NE2000.COM`, `WATTCP.CFG` into `\CB`; run from there (CWSDPMI + WATTCP.CFG must
+be reachable from the cwd). A throwaway `/tmp/run_netbackup.sh` (serve + qemu) was
+the harness; rebuild it from this recipe. **Build the source disk**: an MBR FAT16
+partition (type 0x06, LBA 2048) in a 17 MiB image (`mformat -i img@@1048576`),
+attached as `index=1` (0x81). For multi-span coverage drop a >1 MiB *incompressible*
+file in it. (`NETHELLO` still exists as a handshake-only probe: `make net`.)
 
 **Net gotchas (do not relearn):** (1) FreeCOM mis-parses `2>` / `2>&1` (the `2`
 becomes an argv) — pass the port explicitly, use single `>`. (2) `CWSDPMI.EXE`
@@ -160,21 +173,25 @@ host↔vintage LAN; §1e) — do not bolt on crypto.
   writers used by the loopback test, `write_put_ack`/`write_put_result`).
   `src/remote/server.rs` — `handle_family_b` (reads the post-handshake frame:
   EOF=clean close, `RBKP`=PUT) + `receive_put` (stage members → `pack_folder_to_cbk`
-  atomic `.tmp`+rename). **For 7c:** the host needs no change — `receive_put` already
-  assembles any member stream.
+  atomic `.tmp`+rename). **For 7d** this stage-then-pack host becomes an
+  incremental streaming-append + `.idx` resume log; for 7c it was unchanged.
 - **`.cbk` format:** `src/rbformats/cbk.rs` (RBKC/RBKI/RBKF, `pack_folder_to_cbk`,
   `materialize_cbk_to_folder`, `read_cbk_index`) + `src/rbformats/gz_index.rs`
   (`GzSpan`, the `.gz.idx` seek layout — for 7d per-span chunks). **Reuse these —
   the DOS producer must emit identical bytes.**
-- **DOS net clients:** `crusty-backup/src/net_put.c` (`NETPUT.EXE`) — the 7b
-  whole-folder PUT client (hand-rolled CRC32, BE field writers, `opendir`/`readdir`
-  enumeration, `put_member` stop-and-go). `net_hello.c` (`NETHELLO.EXE`) — the
-  handshake-only probe. Both `make -C crusty-backup net` (WATT-32 only, no zlib).
-- **The local engine 7c streams from:** `crusty-backup/src/cmd_backup.c`
-  (smart-compaction + the §2c member shape — teach it to pipe members to the socket
-  via `net_put.c`'s framing instead of/as well as a `gzFile`), `cbdisk.{h,c}`,
-  `cbcodec.{h,c}`.
+- **DOS networked backup (baked into `CRUSTYBK`):** `crusty-backup/src/cbnet.{h,c}`
+  — WATT-32 sockets + the chunk-PUT framing (hand-rolled BE writers, send_chunk +
+  stop-and-go ack) + the **zlib gzip span streamer** (`cbnet_part_begin`/
+  `_part_write`/`flush_span`/`_part_end`, `cbnet_raw_member`). `cmd_backup.c` —
+  `parse_rb_dest` + `cmd_netbackup` + `netstream_fat_partition`/
+  `netstream_ntfs_partition` (the int13h block loop + smart-compaction feeding the
+  span streamer) + the shared `build_metadata`. **For 7d:** add per-span resume
+  (seek by source offset) + the `RESUME`/fingerprint handshake. `net_hello.c`
+  (`NETHELLO.EXE`, `make net`) is the standalone handshake probe.
+- **The local engine the net path mirrors:** `cmd_backup.c`'s local
+  `backup_fat_partition`/`backup_ntfs_partition` (same smart-compaction; the net
+  path streams spans instead of writing a `gzFile`), `cbdisk.{h,c}`, `cbcodec.{h,c}`.
 
-Start by reading the four docs, then plan and implement **7c**. Keep each box small
-(one commit or a small handful), verify on real FreeDOS in qemu, and tick §9 +
-refresh the resume as you go.
+Start by reading the four docs, then plan and implement **7d** (resume) or **7e**
+(restore over the wire). Keep each box small (one commit or a small handful),
+verify on real FreeDOS in qemu, and tick §9 + refresh the resume as you go.

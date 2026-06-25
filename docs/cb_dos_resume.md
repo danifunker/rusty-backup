@@ -10,7 +10,7 @@ single tick-it-off backlog. Resume here for context; work from there.
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), ~48 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), ~50 commits ahead of `main`, all verified, tree
 clean:
 
 ```
@@ -54,7 +54,8 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | Area | State |
 |------|-------|
 | Net **7a** (binary Family-B handshake) | `NETHELLO` ↔ `rb-cli serve` round-trips on FreeDOS/qemu |
-| Net **7b** (chunk PUT → host `.cbk`) | `NETPUT` streams a backup folder DOS→host; host assembles a frozen `.cbk` (reuses `pack_folder_to_cbk`) **byte-identical** to a desktop pack; `rb-cli restore` rebuilds the disk. `net_put.c`/`NETPUT.EXE` + `receive_put` in `server.rs`. Verified on FreeDOS/qemu |
+| Net **7b** (chunk PUT protocol + host `.cbk`) | the Family-B chunk-PUT wire framing + the host receiver: `receive_put` (server.rs) stages a member/chunk stream and assembles a frozen `.cbk` via `pack_folder_to_cbk`. Loopback-tested |
+| Net **7c** (block-level networked backup) | **baked into `CRUSTYBK BACKUP rb://...`** — images the disk over int13h and streams gzip-member spans straight to `rb-cli serve` (no local folder); host assembles `.cbk`, `rb-cli restore` rebuilds it byte-identical. `cbnet.{h,c}` (WATT-32 + span streamer) + `cmd_netbackup` in `cmd_backup.c`. Verified on FreeDOS/qemu (3.5 MiB → 4 spans) |
 | **Phase 1** — desktop `Gzip` codec (`.gz`) | `rb-cli backup --format gzip`; restore/resize reuse it 100% |
 | **Phase 2** — `cbbackup` (DOS) | images a FAT disk → native folder; desktop restores it |
 | **Phase 3** — `cbrestore` (DOS) | folder → disk on DOS; **byte-identical** to source |
@@ -81,11 +82,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 The prioritized, tick-it-off backlog now lives in **[`cb_dos_todo.md`](cb_dos_todo.md)**
 (one source of truth; update it as items land). Top of the queue, in order:
 
-1. **Net 7c–7i** — networked backup/restore (7a handshake + 7b chunk PUT done).
-   The local foundation + the frozen `.cbk` + the whole-folder PUT are all in
-   place; 7c streams a live disk straight to the wire (no intermediate folder).
+1. **Net 7d–7i** — networked backup/restore (7a handshake + 7b chunk-PUT protocol
+   + 7c block-level networked backup baked into `CRUSTYBK BACKUP rb://...` all
+   done). Next: **7d resume** (incremental `.cbk` append + `.idx` + `RESUME`/§4
+   fingerprint + seek-by-source) or **7e restore over the wire**.
    **Kick off from [`cb_dos_net_resume.md`](cb_dos_net_resume.md)** (the net-phase
-   hand-off + the qemu NE2000/SLiRP rig + the 7c "done" definition).
+   hand-off + the qemu NE2000/SLiRP rig + the 7d "done" definition).
 2. **Real-486 hardware** validation (everything so far is qemu) — once the rig is
    fully set up.
 3. *(optional)* **boot-media driver profiles** (CD-ROM / USB CONFIG.SYS menu
@@ -194,21 +196,27 @@ subcommands for scripting), built from:
   folders recurse) over `cbbrowse.h` — on a highlighted **FAT partition row** it
   browses that partition **live** (`do_browse_live`), otherwise it prompts for a
   backup folder (`do_browse_backup`). `disk_spike.c` — disk/FS spike.
-  `net_hello.c` — WATT-32 handshake probe (`NETHELLO.EXE`); `net_put.c` — the 7b
-  chunk-PUT client (`NETPUT.EXE`: streams a backup folder → host `.cbk`).
-  `lfn_test.c` — raw LFN-API probe.
-- `Makefile` targets: `make crustybk` (the tool; links zlib + liblz4 once) /
-  `make all` (+ diagnostics) / `make net` / `make size`.
+  `net_hello.c` — WATT-32 handshake probe (`NETHELLO.EXE`). `lfn_test.c` — raw
+  LFN-API probe. (Networked **backup** lives in `cbnet.{h,c}` + `cmd_backup.c`'s
+  `rb://` path, not a standalone tool.)
+- `cbnet.{h,c}` — the **networked-backup transport**: WATT-32 BSD sockets + the
+  Family-B chunk-PUT framing + a zlib **gzip span streamer** (`cbnet_part_*` cut
+  the int13h block stream into independent 1 MiB gzip-member chunks). Used by
+  `cmd_backup`'s `rb://` destination (`cmd_netbackup`). Links into CRUSTYBK.EXE.
+- `Makefile` targets: `make crustybk` (the tool; links zlib + liblz4 + WATT-32) /
+  `make all` (+ diagnostics) / `make net` (the `NETHELLO` probe) / `make size`.
 - `deps/fetch-zlib.sh`, `deps/fetch-lz4.sh`, `net/fetch-watt32.sh` — cross-built
-  deps (gitignored). Run both `fetch-*` once before `make crustybk`.
+  deps (gitignored). Run all **three** once before `make crustybk` (it now links
+  WATT-32 for `backup rb://...`).
 
 ## Build + unit test
 
 ```bash
 cargo build --bin rb-cli          # desktop CLI
 cargo test --lib                  # 2090+ tests; clippy --all-targets -D warnings via pre-commit
-sh crusty-backup/deps/fetch-zlib.sh && sh crusty-backup/deps/fetch-lz4.sh  # once
-make -C crusty-backup crustybk      # the unified CRUSTYBK.EXE -> crusty-backup/build/
+sh crusty-backup/deps/fetch-zlib.sh && sh crusty-backup/deps/fetch-lz4.sh \
+  && sh crusty-backup/net/fetch-watt32.sh                                  # once (3 deps)
+make -C crusty-backup crustybk      # the unified CRUSTYBK.EXE (zlib+lz4+WATT-32)
 make -C crusty-backup all net       # + diagnostics (disk_spike/lfn_test) + nethello
 ```
 
