@@ -55,13 +55,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
   intact) are both clean, and the non-redirected round-trip still works.
 
 - [~] **Net 7b–7i — networked backup/restore** (the path to "both" local + net).
-  **7a–7f done + qemu-verified** — the backup↔restore loop is closed, resumable,
-  and now file-aware/idempotent. Full sub-checklist + design in
+  **7a–7g done + qemu-verified — the core network feature is complete**: the
+  backup↔restore loop is closed, resumable, file-aware/idempotent,
+  boot-fingerprinted, and swap-aware. Only optional 7h/7i remain. Full
+  sub-checklist + design in
   [`cb_dos_network_and_state.md`](cb_dos_network_and_state.md) §9:
   - [x] 7b chunk wire protocol  - [x] 7c block-level backup over wire
   - [x] 7d resume (journal + fingerprint)  - [x] 7e restore over wire
-  - [x] 7f manifest + idempotency  - [ ] **7g boot section + swap exclusion (next)**
-  - [ ] 7h incremental backup *(opt)*  - [ ] 7i level-2 swap dealloc *(opt)*
+  - [x] 7f manifest + idempotency  - [x] 7g boot hashes + swap exclusion
+  - [ ] 7h incremental backup *(opt)*  - [ ] 7i level-2 swap dealloc + desktop swap parity *(opt)*
 
 - [ ] **Real-486 hardware validation.** Everything so far is qemu/emulator. Run
   the full matrix (backup / restore / clone / browse, FAT + NTFS,

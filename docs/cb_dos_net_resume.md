@@ -1,13 +1,16 @@
 # crusty-backup (`cb-dos`) — **network phase** resume prompt
 
-Hand-off for continuing **Net 7g–7i** (networked backup/restore over TCP). The
-local removable-media engine is complete and qemu-verified; networking only swaps
-the *destination* under it. **7a (handshake), 7b (chunk PUT protocol + host
-`.cbk`), 7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d (resume),
-7e (restore over the wire `CRUSTYBK RESTORE rb://...`), and 7f (per-partition file
-manifest + idempotency) are done and qemu-verified — the backup↔restore loop is
-closed, resumable, and file-aware.** Paste the section below (from "Resume the…"
-down) to kick off the next session.
+Hand-off for continuing the **optional Net 7h–7i** (networked backup/restore over
+TCP). The local removable-media engine is complete and qemu-verified; networking
+only swaps the *destination* under it. **7a (handshake), 7b (chunk PUT protocol +
+host `.cbk`), 7c (block-level networked backup `CRUSTYBK BACKUP rb://...`), 7d
+(resume), 7e (restore over the wire `CRUSTYBK RESTORE rb://...`), 7f (per-partition
+file manifest + idempotency), and 7g (boot-section deepening + Level-1 swap
+exclusion) are done and qemu-verified — the backup↔restore loop is closed,
+resumable, file-aware, boot-fingerprinted, and swap-aware.** What remains is
+explicitly **optional** (7h incremental, 7i Level-2 swap dealloc + desktop swap
+parity). Paste the section below (from "Resume the…" down) to kick off the next
+session.
 
 ---
 
@@ -25,12 +28,14 @@ Read these first, in order, before doing anything:
    and the "gotchas learned the hard way" (do not relearn them).
 4. docs/cb_dos.md — full scope + progress log (skim the recent entries).
 
-**Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently
-`7g — Boot section + swap exclusion` (§5d/§6), then `7h — Incremental backup`.**
+**Work the TOP UNCHECKED box in §9 of cb_dos_network_and_state.md — currently the
+optional `7h — Incremental backup` (which also lands the §5d bootability-change
+flag, since that needs a prior manifest to diff), then `7i — Level-2 swap dealloc
++ desktop swap parity`. The core loop is done; 7h/7i are stretch.**
 
 ## Where we are
 
-Branch `cbdos` (off `main`), ~57 commits ahead, tree clean, **everything below
+Branch `cbdos` (off `main`), ~65 commits ahead, tree clean, **everything below
 qemu-verified on real FreeDOS**.
 
 - **Local cb-dos engine — DONE.** backup / restore / clone / browse across
@@ -104,6 +109,22 @@ qemu-verified on real FreeDOS**.
   its own. qemu-verified: local backup→restore→backup byte-identical manifest, and
   a networked PUT (4 members) assembling a `.cbk` whose manifest matches the local
   one.
+- **Net 7g — DONE.** **Boot-section deepening + Level-1 swap exclusion.** Two
+  parts. **(a)** Each DOS sysfile in the manifest `system` block now carries a
+  `hash` (CRC32 over its content, FAT-chain order) — a stable idempotency
+  fingerprint that round-trips a block-level restore (`cbmanifest.c` `chain_crc32`).
+  **(b)** New `crusty-backup/src/cbswap.{c,h}` allowlists swap/page files (exact
+  name + location + attribs: `386SPART.PAR` / `WIN386.SWP` / `PAGEFILE.SYS` /
+  `HIBERFIL.SYS` / `SWAPPER.DAT`; never DBLSPACE/DRVSPACE/STACVOL — those ARE the
+  FS) and marks their cluster chains; the shared FAT compaction (`backup_fat_partition`
+  + `netstream_fat_partition` via `build_swap_mask`/`swap_hit`) zeros that content
+  while keeping the allocation (file survives full-size, OS rebuilds swap on boot),
+  the manifest flags them `volatile`/`content:zeroed` (same `cbswap_is_swap()`
+  predicate so flags and payload agree), `/KEEPSWAP` opts out, every exclusion is
+  logged. qemu-verified local (restored swap files full-size + all-zero; IO.SYS
+  byte-identical; BK1==BK2 manifest byte-identical; `/KEEPSWAP` images verbatim)
+  **and** network (4-member PUT whose `.cbk` manifest is byte-identical to the
+  local one). *(FAT only; §6e desktop-compaction parity deferred to 7i.)*
 - **The `.cbk` container — FROZEN v1 and already the producer's chunk shape.**
   `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`, RBKC
   chunks / RBKI index / RBKF footer, big-endian). The desktop reads `.cbk` as a
@@ -117,7 +138,7 @@ qemu-verified on real FreeDOS**.
   (qemu-verified). So 7b is **wire framing + index over a producer/format that's
   already built**, not new container work.
 
-## What 7a–7f already give us (the closed loop)
+## What 7a–7g already give us (the closed loop)
 
 A vintage box boots cb-dos and backs up **and** restores over the network, no local
 folder either side:
@@ -125,38 +146,28 @@ folder either side:
   int13h** and streams gzip-member spans to `rb-cli serve`, which assembles
   `MYDISK.cbk`. **Resumable** (7d): kill it, re-run, it continues from the last
   committed span (§4 fingerprint guards a swapped card). Each FAT partition also
-  ships a **`manifest-N.json`** (7f) Raw member.
+  ships a **`manifest-N.json`** (7f/7g) Raw member, with **sysfile content hashes**
+  (7g §5d) and **swap files zeroed + flagged** (7g §6, `/KEEPSWAP` to opt out).
 - `CRUSTYBK RESTORE rb://<agent>:7341/MYDISK 82 /Y` — pulls the `.cbk`'s members back
   (GET) and rebuilds the disk over int13h, same-size.
 Both directions are qemu-verified byte-identical, and the round-trip is **idempotent**
-(7f: a re-backup of a freshly-restored disk yields a byte-identical manifest).
-**Block-level, baked in, crash-proof, bidirectional, file-aware.** What's left is the
-rest of the *state* layer (§5d/§6): deepening the boot fingerprint and swap exclusion.
+(7f/7g: a re-backup of a freshly-restored disk yields a byte-identical manifest,
+hashes and swap flags included).
+**Block-level, baked in, crash-proof, bidirectional, file-aware, boot-fingerprinted,
+swap-aware.** The core feature is **complete**; what remains (7h/7i) is optional.
 
-## 7g — boot section + swap exclusion (what "done" looks like) — §5d/§6
+## What's left — optional 7h / 7i (pick the top unchecked box in §9)
 
-7f laid the **file manifest** + the cheap `system` block (MBR boot-code CRC, the
-partition's reserved/boot-sectors CRC, and the root DOS sysfiles with
-size/mtime/attr/first_cluster/contiguity) and proved backup→restore→backup is a
-no-op. 7g deepens boot protection and adds swap handling — a **shared** compaction
-concern (desktop benefits too, §6e):
-- **Boot deepening (§5d):** add the sysfiles' **content hashes** to the `system`
-  block (7f records their metadata + contiguity but not a content CRC), and surface
-  a bootability-change flag when the prior backup's `system` block differs.
-- **Swap exclusion (§6):** identify swap/page files by a strict **allowlist**
-  (`386SPART.PAR`, `WIN386.SWP`, `pagefile.sys`, `hiberfil.sys`, `SWAPPER.DAT` — in
-  the expected location with the expected attribs; **never** DBLSPACE/DRVSPACE/
-  STACVOL), flag them `volatile:true` in the manifest, **exclude them from the change
-  counter always** (§6b), and **Level-1 zero their content in the payload** by
-  default (`--keep-swap` to opt back in, §6c — keep the allocation, emit zeros, log
-  every exclusion). The manifest already exists, so this is mostly a compaction-side
-  filter + manifest flags.
-
-After 7g: the optional **7h** (incremental — reuse the §4d fingerprint + §5 manifest
-to skip unchanged partitions; the manifest from 7f is the index), **7i** (Level-2
-swap dealloc; desktop reads `.cbk` directly), and the deferred **resize-over-the-wire**
-(a forward-only streaming peek-then-resize, the one gap 7e left). Pick the top
-unchecked box in §9.
+- **7h — incremental** (reuse the §4d fingerprint + §5 manifest to skip unchanged
+  partitions/files; the manifest is the index). This is also where the §5d
+  **bootability-change flag** lands — it needs a *prior* manifest to diff the
+  `system` block against, which is exactly 7h's prior-backup comparison.
+- **7i — Level-2 swap dealloc** (free the FAT chain + drop the dir entry so a
+  resize-down minimum shrinks; 7g only zeros content) **+ desktop swap parity**
+  (§6e — the Rust native-format compaction doesn't zero swap either; per CLAUDE.md's
+  shared-logic rule, swap exclusion is a candidate for the desktop path too).
+- The deferred **resize-over-the-wire** (a forward-only streaming peek-then-resize,
+  the one gap 7e left) also lives here.
 
 ## How we work
 
@@ -302,7 +313,10 @@ now auto-loads the vendored `DOSLFN.COM`. The `.cbk` + network paths don't need 
   forward-only socket path can't peek, so resize-over-the-wire is deferred),
   `cbdisk.{h,c}`, `cbcodec.{h,c}`.
 
-Start by reading the four docs, then plan and implement **7g** (boot section
-deepening + swap exclusion, §5d/§6) — 7f (manifest + idempotency) is done. Keep
-each box small (one commit or a small handful), verify on real FreeDOS in qemu,
-and tick §9 + refresh the resume as you go.
+The **core network feature is complete** through 7g (handshake → chunk PUT →
+block-level backup → resume → restore → manifest/idempotency → boot hashes + swap
+exclusion), all qemu-verified. What's left (7h incremental, 7i Level-2 dealloc +
+desktop swap parity) is **optional** — start by reading the four docs, then pick
+the top unchecked box in §9 if continuing. Keep each box small (one commit or a
+small handful), verify on real FreeDOS in qemu, and tick §9 + refresh the resume
+as you go.

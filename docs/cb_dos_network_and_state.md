@@ -731,16 +731,56 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
       manifest rides the folder / `.cbk` / network PUT as an ordinary Raw member.
       Also bundled DOSLFN on the boot media so the non-8.3 member names work on a
       bare DOS host (the FreeDOS kernel has no LFN API of its own).
-- [ ] **7g — Boot section + swap exclusion.** System-block fingerprint/round-trip
-      (§5d); Level-1 swap zeroing (§6c) in the **shared** compaction path.
+- [x] **7g — Boot section + swap exclusion. Done — qemu-verified (2026-06-25).**
+      Deepened the §5d `system` block with each DOS sysfile's **content hash**
+      (CRC32, FAT-chain order) -- a stable idempotency fingerprint that round-trips
+      a block-level restore. Added **Level-1 swap zeroing** (§6c): new
+      `cbswap.{c,h}` allowlists swap/page files (386SPART.PAR / WIN386.SWP /
+      PAGEFILE.SYS / HIBERFIL.SYS / SWAPPER.DAT; never DBLSPACE/DRVSPACE/STACVOL)
+      by name+location+attribs and marks their cluster chains; the shared
+      compaction (local + net) zeros that content while keeping the allocation, the
+      manifest flags them `volatile`/`content:zeroed`, and `/KEEPSWAP` opts out.
 - [ ] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
-      manifest to skip unchanged partitions/files.
+      manifest to skip unchanged partitions/files. The bootability-change flag
+      (diff a prior `system` block, §5d) lands here -- it needs the prior manifest.
 - [ ] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
 
 ---
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7g complete — boot section deepening + swap exclusion,
+  qemu-verified (local + network).** Two parts. **(a) Boot deepening (§5d):** each
+  DOS system file in the manifest `system` block now carries a `hash` (CRC32 over
+  its content, first `size` bytes in FAT chain order) alongside the
+  size/mtime/attr/first_cluster/contiguity 7f recorded -- a pure live read,
+  deterministic across a block-level restore (data + chain round-trip verbatim),
+  so it stays a stable idempotency fingerprint. **(b) Level-1 swap exclusion
+  (§6c):** new `cbswap.{c,h}` identifies swap/page files by a strict allowlist
+  (exact name + expected location + expected attribs -- `386SPART.PAR`,
+  `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`; DBLSPACE/DRVSPACE/
+  STACVOL deliberately absent, those ARE the filesystem) and marks their cluster
+  chains. The shared FAT compaction (local `backup_fat_partition` + networked
+  `netstream_fat_partition`) now zeros that content alongside free clusters -- the
+  allocation is kept (the file survives full-size, the OS reinitializes swap on
+  boot), gzip crushes the zeros. Every exclusion is logged (never silent). The
+  manifest flags the same files `volatile:true` (so the §5b change counter ignores
+  them) and, unless `--keep-swap`, `content:zeroed`, sharing the one
+  `cbswap_is_swap()` predicate so flags and payload never disagree; `/KEEPSWAP`
+  images swap verbatim. Skipped under `/DEFRAG` (the repacker relocates clusters).
+  **Verified on FreeDOS/qemu:** a FAT16 disk (IO.SYS/MSDOS.SYS/COMMAND.COM with
+  distinct content, a nested tree, an LFN file, a hidden 386SPART.PAR + a
+  WIN386.SWP) → `BACKUP C:\BK1 81` → `RESTORE C:\BK1 82 /Y` → `BACKUP C:\BK2 82`:
+  the restored target's swap files are **full-size but all-zero** (0 non-zero
+  bytes) while IO.SYS is byte-identical to source, and **BK1 == BK2 manifest
+  byte-identical** (sysfile hashes + swap flags round-trip). `BACKUP C:\BK3 81
+  /KEEPSWAP` images swap verbatim (no exclusions, manifest drops the two
+  `content:zeroed`, 42 bytes shorter). Network half: `BACKUP rb://…/MYDISK 81`
+  PUT (4 members) assembled a `.cbk` whose `manifest-0.json` is **byte-identical
+  to the local BK1 manifest** -- the shared compaction behaves the same over the
+  wire. Lib (2105) + cbk round-trip + clippy green. Next: optional **7h**
+  (incremental + the boot-change flag) / **7i** (Level-2 dealloc; desktop swap
+  parity per §6e).
 - 2026-06-25 — **Phase 7f complete — per-partition file manifest + idempotency,
   qemu-verified.** Backup now emits a `manifest-N.json` sidecar per FAT partition:
   a depth-first `files[]` list (path / size / mtime / attr / start_cluster, dirs
