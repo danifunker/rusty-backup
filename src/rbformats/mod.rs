@@ -172,6 +172,7 @@ pub mod dmg;
 pub mod export;
 pub mod gho;
 pub mod gho_crypto;
+pub mod gz_index;
 pub mod gzip;
 pub mod imz;
 pub mod interleave;
