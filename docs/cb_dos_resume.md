@@ -7,10 +7,11 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 23 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 25 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+7a8c246 feat(cb-dos): Phase 4d — NTFS backup/restore/clone via $Bitmap compaction
 13b32cf feat(cb-dos): Phase 4c-c — browse a live disk (ls/get/TUI over read_lba)
 c59cd83 feat(cb-dos): Phase 4c-b — TUI browse/mark/extract (single file, multi, folders)
 54322ab feat(cb-dos): Phase 4c-a — browse + extract single files from a backup (ls/get)
@@ -47,6 +48,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4c-a** — `ls` / `get` (DOS) | browse + extract single files from a backup `partition-N.gz` (FAT dir reader + LFN over `gzseek`), no scratch/no full restore; verified incl. LFN + nested + multi-cluster on FreeDOS/qemu |
 | **Phase 4c-b** — TUI browse (DOS) | F6 Browse: interactive file browser, mark files+folders, F2 extract (folders recurse); verified extracting a file + a folder tree byte-identical on FreeDOS/qemu |
 | **Phase 4c-c** — live-disk browse (DOS) | same `ls`/`get`/TUI-browse against a *mounted/attached* disk (no imaging first): `vol_read_at` dispatches gzseek **or** int13h `read_lba`; CLI `@HH` + MBR slot, TUI F6 on a FAT partition row; read-only on source; verified byte-identical on FAT32 + FAT16 (CLI + TUI) on FreeDOS/qemu |
+| **Phase 4d** — NTFS (DOS) | `backup`/`clone` image NTFS (type 0x07) via `$Bitmap` compaction (`cbntfs.{h,c}`); restore same-size on DOS (resize via desktop `resize_ntfs_in_place`); verified on FreeDOS/qemu — 63 MB random-filled NTFS → 0.4 MB gz, restore + clone `ntfsfix`-clean with files byte-identical, desktop restore cross-checked |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
@@ -71,8 +73,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
    `get` also writes a DOS file, so the same caution applies; don't redirect it on
    the same drive. Worth root-causing (likely a DTA/FILE-buffer aliasing).
 4. **Real-486 hardware** validation (everything so far is qemu/emulator).
-5. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
-   logical-partition** backup gaps — the remaining FS coverage on DOS.
+5. **Remaining FS coverage on DOS** — **exFAT** (also MBR type 0x07; the
+   allocation-bitmap parser is already proven in `disk_spike.c`, so this is
+   wiring it into `cbntfs`-style backup/clone, gated by the `EXFAT   ` OEM id),
+   **logical/extended partitions** (cb-dos is MBR-primary-only today), and
+   **ext2/3** (stretch). (NTFS landed in Phase 4d.)
+6. **Phase 5 — file-level repack/defrag** (boot-file aware).
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
 now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
@@ -101,11 +107,18 @@ subcommands for scripting), built from:
   (`shift_region_forward`/`_backward`, `compute_fat_sectors`,
   `max_fat_window`/`min_fat_window` cluster cap/floor, `set_clean_flags`,
   `reset_fsinfo`), and the arg helpers (`switch_val`/`eq_ci`/`round_up_512`/
-  `parse_parts`). The single source of truth — no more triplicated primitives.
-- `cmd_backup.c` — `backup` (image FAT disk → native folder, smart-compact +
-  gzip, `/PARTS`). `cmd_restore.c` — `restore` (folder → disk, `/SIZE` resize +
-  `/PARTS`, the metadata.json scanner + gzip stream). `cmd_clone.c` — `clone`
-  (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
+  `parse_parts`, `rd64`). The single source of truth — no more triplicated primitives.
+- `cbntfs.{h,c}` — the **NTFS `$Bitmap` reader** (no driver): `ntfs_parse` (BPB),
+  `ntfs_load_bitmap` (MFT #6 `$Bitmap` + fixup + `$DATA` run decode → RAM bitmap,
+  set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check vs exFAT/HPFS).
+  Lifted from the `disk_spike.c` probe. Used by `backup`/`clone` for NTFS compaction.
+- `cmd_backup.c` — `backup` (image FAT/NTFS disk → native folder, smart-compact +
+  gzip, `/PARTS`): FAT compacts from its FAT, NTFS (`backup_ntfs_partition`) from
+  the `$Bitmap` (full window, free clusters zeroed). `cmd_restore.c` — `restore`
+  (folder → disk, `/SIZE` resize + `/PARTS`, the metadata.json scanner + gzip
+  stream; **FS-agnostic** so NTFS restores same-size, resize gated on 512-byte FAT).
+  `cmd_clone.c` — `clone` (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`;
+  FAT resizes, NTFS clones same-size via `clone_ntfs_partition`). `cmd_inspect.c` —
   `inspect` (list BIOS drives + partitions). `cmd_browse.c` + `cbbrowse.h` —
   `ls` / `get` **and the shared browse engine** (`fatvol_t`, `cbk_open_vol`/
   `cbk_open_vol_live`/`cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a
