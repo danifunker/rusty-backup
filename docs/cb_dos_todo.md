@@ -69,10 +69,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[-]` dropped
 
 ## Later / optional
 
-- [ ] **`clone /DEFRAG`** — wire the cbdefrag planner into `clone` too (emit the
-  relocated image straight to the target disk instead of gzip; share the planner
-  via a write-sink). Same-size only at first (defrag + `/SIZE` resize is a later
-  combo). `backup /DEFRAG` shipped; this is the remaining "and maybe clone" half.
+- [x] **`clone /DEFRAG`. DONE (2026-06-25).** Wired the cbdefrag planner into
+  `clone`: refactored the emit to a **sink** (backup → compressed writer, clone →
+  target disk) + extracted a shared `defrag_plan_build`, then added
+  `defrag_clone_fat` (relocates straight onto the target, same-size, zero-fills the
+  free tail) and a `/DEFRAG` flag on `clone` (primary + logical FAT; declines →
+  plain clone). Verified on FreeDOS/qemu: a fragmented FAT16 cloned `/DEFRAG`
+  produces a target with files byte-identical and defragged (IO.SYS at cluster 2,
+  TAIL relocated, all contiguous). Defrag + `/SIZE` resize together is still a
+  future combo (defrag forces same-size).
 - [ ] **Desktop defrag parity** — the desktop backup could optionally repack FAT
   partitions the same way (it already has the FAT machinery). Not in the cb-dos
   scope; a separate GUI/CLI feature if wanted.

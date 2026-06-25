@@ -244,12 +244,33 @@ static void patch_dir(plan_t *P, uint8_t *dir, uint32_t len, const dfobj_t *self
 
 /* ----- emit --------------------------------------------------------------- */
 
-static int emit_bytes(cbw_t *w, const uint8_t *p, uint32_t len, progress_t *pr, uint64_t *emitted) {
+/* The relocated image is emitted as a sequential byte stream through a sink, so
+ * the same code serves both `backup` (sink = the compressed writer) and `clone`
+ * (sink = the target disk). Every chunk handed to a sink is a 512-byte multiple
+ * (reserved/FAT/root/cluster regions all are), so the disk sink writes directly. */
+typedef int (*defrag_sink_fn)(void *ctx, const uint8_t *data, uint32_t len);
+
+/* backup sink: the compressed (gzip/lz4) writer. */
+static int cbw_sink(void *ctx, const uint8_t *d, uint32_t len) {
+    return cbw_write((cbw_t *)ctx, d, (int)len);
+}
+
+/* clone sink: sequential sectors to the target disk. */
+typedef struct { const drive_info_t *di; int drive; uint64_t lba; } disk_sink_t;
+static int disk_sink(void *ctx, const uint8_t *d, uint32_t len) {
+    disk_sink_t *s = (disk_sink_t *)ctx;
+    if (store_region(s->di, s->drive, s->lba, len, d) != 0) return -1;
+    s->lba += len / 512;
+    return 0;
+}
+
+static int emit_bytes(defrag_sink_fn sink, void *ctx, const uint8_t *p, uint32_t len,
+                      progress_t *pr, uint64_t *emitted) {
     uint32_t off = 0;
     while (off < len) {
         uint32_t chunk = len - off;
         if (chunk > XFER_BYTES) chunk = XFER_BYTES;
-        if (cbw_write(w, p + off, (int)chunk) != 0) return -1;
+        if (sink(ctx, p + off, chunk) != 0) return -1;
         off += chunk;
         *emitted += chunk;
         progress_update(pr, *emitted);
@@ -257,8 +278,8 @@ static int emit_bytes(cbw_t *w, const uint8_t *p, uint32_t len, progress_t *pr, 
     return 0;
 }
 
-static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root_new,
-                       uint32_t root_cluster, uint32_t imaged_secs,
+static int defrag_emit(plan_t *P, defrag_sink_fn sink, void *ctx, const uint8_t *newfat,
+                       uint32_t root_new, uint32_t root_cluster, uint32_t imaged_secs,
                        const char *label, progress_t *pr) {
     const fatlay_t *L = P->L;
     uint64_t emitted = 0;
@@ -283,7 +304,7 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
                 }
             }
         }
-        int rc = emit_bytes(w, res, rb, pr, &emitted);
+        int rc = emit_bytes(sink, ctx, res, rb, pr, &emitted);
         free(res);
         if (rc != 0) return -1;
         (void)root_cluster;
@@ -291,7 +312,7 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
 
     /* 2. the new FAT, num_fats copies. */
     for (uint32_t c = 0; c < L->num_fats; c++)
-        if (emit_bytes(w, newfat, L->old_spf * L->bps, pr, &emitted) != 0) return -1;
+        if (emit_bytes(sink, ctx, newfat, L->old_spf * L->bps, pr, &emitted) != 0) return -1;
 
     /* 3. FAT12/16 fixed root region (FAT32's root is a data-area object). */
     if (!L->is_fat32) {
@@ -299,7 +320,7 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
         uint8_t *root = read_dir_region(P, 0, 1, &rl);
         if (!root) return -1;
         patch_dir(P, root, rl, NULL);
-        int rc = emit_bytes(w, root, rl, pr, &emitted);
+        int rc = emit_bytes(sink, ctx, root, rl, pr, &emitted);
         free(root);
         if (rc != 0) return -1;
     }
@@ -317,7 +338,7 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
             uint8_t *d = read_dir_region(P, o->old_first, 0, &dl);
             if (!d) { free(cb); return -1; }
             patch_dir(P, d, dl, o);
-            int rc = emit_bytes(w, d, dl, pr, &emitted);
+            int rc = emit_bytes(sink, ctx, d, dl, pr, &emitted);
             free(d);
             if (rc != 0) { free(cb); return -1; }
         } else {
@@ -325,7 +346,7 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
             for (uint32_t k = 0; k < o->ncl && cl >= 2 && cl < eoc; k++) {
                 uint64_t sec = (uint64_t)L->first_data_sec + (uint64_t)(cl - 2) * L->spc;
                 if (load_region(P->di, P->drive, P->start_lba + sec, csize, cb) != 0) { free(cb); return -1; }
-                if (emit_bytes(w, cb, csize, pr, &emitted) != 0) { free(cb); return -1; }
+                if (emit_bytes(sink, ctx, cb, csize, pr, &emitted) != 0) { free(cb); return -1; }
                 cl = fat_entry(P->oldfat, bits, cl);
             }
         }
@@ -335,9 +356,90 @@ static int defrag_emit(plan_t *P, cbw_t *w, const uint8_t *newfat, uint32_t root
     return 0;
 }
 
-/* ----- public entry point ------------------------------------------------- */
+/* ----- plan build (shared by backup + clone) ------------------------------ */
 
 static const char *BOOT_FILES[] = { "IO.SYS", "MSDOS.SYS", "IBMBIO.COM", "IBMDOS.COM", "KERNEL.SYS" };
+
+/* Build the relocation plan + new FAT for the FAT volume `P` points at (read-only
+ * on P->di/drive/start_lba). On success (0), P->objs / P->remap and *newfat_out
+ * are allocated for the caller to free after emit, and the root cluster, its new
+ * home, and the imaged sector count come back via the out-params. On decline (1)
+ * everything is freed and the reason printed; the caller images the volume as-is. */
+static int defrag_plan_build(plan_t *P, uint32_t *root_cluster_out, uint32_t *root_new_out,
+                             uint8_t **newfat_out, uint32_t *imaged_secs_out) {
+    const fatlay_t *L = P->L;
+    P->ncap = L->clusters + 2; P->next_cluster = 2;
+    P->remap = calloc(P->ncap, sizeof(uint32_t));
+    if (!P->remap) { printf("  defrag: out of memory -- imaging as-is\n"); return 1; }
+
+    uint8_t bpb[512];
+    uint32_t root_cluster = 0;
+    if (read_lba(P->di, P->drive, P->start_lba, 1, bpb) == 0 && L->is_fat32)
+        root_cluster = rd32(bpb + 44);
+
+    uint32_t rootlen = 0;
+    uint8_t *root = read_dir_region(P, root_cluster, !L->is_fat32, &rootlen);
+    if (!root) {
+        printf("  defrag declined: root read failed -- imaging as-is\n");
+        free(P->remap); P->remap = NULL; return 1;
+    }
+
+    uint32_t root_new = 0;
+    if (L->is_fat32) {
+        root_new = alloc_chain(P, root_cluster, 1, 0);
+        if (P->failed) goto decline;
+    }
+    for (unsigned i = 0; i < sizeof BOOT_FILES / sizeof BOOT_FILES[0]; i++) {
+        uint32_t fc = find_root_file(root, rootlen, BOOT_FILES[i]);
+        if (fc >= 2 && P->remap[fc] == 0) {
+            alloc_chain(P, fc, 0, 0);
+            if (P->failed) goto decline;
+        }
+    }
+    walk_dir(P, root, rootlen, L->is_fat32 ? root_new : 0, 0);
+    if (P->failed) goto decline;
+    free(root); root = NULL;
+
+    /* Provably clean? Any allocated-but-unreached cluster, or any bad cluster,
+     * means the FS is not in a state we can safely repack -- decline. */
+    for (uint32_t c = 2; c < L->clusters + 2; c++) {
+        if (is_bad(P->oldfat, L->fat_bits, c)) { P->reason = "bad clusters present"; P->failed = 1; break; }
+        if (fat_entry(P->oldfat, L->fat_bits, c) != 0 && P->remap[c] == 0) {
+            P->reason = "lost clusters present -- run CHKDSK first"; P->failed = 1; break;
+        }
+    }
+    if (P->failed) goto decline;
+
+    /* Build the new FAT: reserved entries 0/1 verbatim, then a contiguous chain
+     * per object. */
+    uint8_t *newfat = calloc(L->old_spf * L->bps, 1);
+    if (!newfat) { P->reason = "out of memory (FAT)"; goto decline; }
+    memcpy(newfat, P->oldfat, (L->fat_bits == 12) ? 3 : (L->fat_bits == 16) ? 4 : 8);
+    for (int i = 0; i < P->nobjs; i++) {
+        dfobj_t *o = &P->objs[i];
+        for (uint32_t k = 0; k < o->ncl; k++) {
+            uint32_t c = o->new_first + k;
+            fat_set(newfat, L->fat_bits, c, (k + 1 < o->ncl) ? (c + 1) : eoc_val(L->fat_bits));
+        }
+    }
+
+    uint32_t imaged_secs = L->first_data_sec + P->total_alloc * L->spc;
+    if (imaged_secs > L->old_total) imaged_secs = L->old_total;
+
+    *root_cluster_out = root_cluster;
+    *root_new_out = root_new;
+    *newfat_out = newfat;
+    *imaged_secs_out = imaged_secs;
+    return 0;
+
+decline:
+    if (root) free(root);
+    printf("  defrag declined: %s -- imaging as-is\n", P->reason ? P->reason : "unknown");
+    free(P->objs); free(P->remap); P->objs = NULL; P->remap = NULL;
+    return 1;
+}
+
+/* ----- public entry points ------------------------------------------------ */
 
 int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
                       const fatlay_t *L, uint8_t *fat, cbw_t *w,
@@ -345,77 +447,58 @@ int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
     plan_t P;
     memset(&P, 0, sizeof P);
     P.di = di; P.drive = drive; P.start_lba = start_lba; P.L = L; P.oldfat = fat;
-    P.ncap = L->clusters + 2; P.next_cluster = 2;
 
-    P.remap = calloc(P.ncap, sizeof(uint32_t));
-    if (!P.remap) { printf("  defrag: out of memory -- imaging as-is\n"); return 1; }
+    uint32_t root_cluster, root_new, imaged_secs;
+    uint8_t *newfat = NULL;
+    if (defrag_plan_build(&P, &root_cluster, &root_new, &newfat, &imaged_secs) != 0)
+        return 1;   /* declined -- caller images as-is */
 
-    uint8_t bpb[512];
-    uint32_t root_cluster = 0;
-    if (read_lba(di, drive, start_lba, 1, bpb) == 0 && L->is_fat32)
-        root_cluster = rd32(bpb + 44);
-
-    uint32_t rootlen = 0;
-    uint8_t *root = read_dir_region(&P, root_cluster, !L->is_fat32, &rootlen);
-    if (!root) { printf("  defrag declined: root read failed -- imaging as-is\n"); free(P.remap); return 1; }
-
-    uint32_t root_new = 0;
-    if (L->is_fat32) {
-        root_new = alloc_chain(&P, root_cluster, 1, 0);
-        if (P.failed) goto decline;
-    }
-    for (unsigned i = 0; i < sizeof BOOT_FILES / sizeof BOOT_FILES[0]; i++) {
-        uint32_t fc = find_root_file(root, rootlen, BOOT_FILES[i]);
-        if (fc >= 2 && P.remap[fc] == 0) {
-            alloc_chain(&P, fc, 0, 0);
-            if (P.failed) goto decline;
-        }
-    }
-    walk_dir(&P, root, rootlen, L->is_fat32 ? root_new : 0, 0);
-    if (P.failed) goto decline;
-    free(root); root = NULL;
-
-    /* Provably clean? Any allocated-but-unreached cluster, or any bad cluster,
-     * means the FS is not in a state we can safely repack -- decline. */
-    for (uint32_t c = 2; c < L->clusters + 2; c++) {
-        if (is_bad(fat, L->fat_bits, c)) { P.reason = "bad clusters present"; P.failed = 1; break; }
-        if (fat_entry(fat, L->fat_bits, c) != 0 && P.remap[c] == 0) {
-            P.reason = "lost clusters present -- run CHKDSK first"; P.failed = 1; break;
-        }
-    }
-    if (P.failed) goto decline;
-
-    /* Build the new FAT: reserved entries 0/1 verbatim, then a contiguous chain
-     * per object. */
-    uint32_t newfat_bytes = L->old_spf * L->bps;
-    uint8_t *newfat = calloc(newfat_bytes, 1);
-    if (!newfat) { P.reason = "out of memory (FAT)"; goto decline; }
-    memcpy(newfat, fat, (L->fat_bits == 12) ? 3 : (L->fat_bits == 16) ? 4 : 8);
-    for (int i = 0; i < P.nobjs; i++) {
-        dfobj_t *o = &P.objs[i];
-        for (uint32_t k = 0; k < o->ncl; k++) {
-            uint32_t c = o->new_first + k;
-            fat_set(newfat, L->fat_bits, c, (k + 1 < o->ncl) ? (c + 1) : eoc_val(L->fat_bits));
-        }
-    }
-
-    uint32_t imaged_secs = L->first_data_sec + P.total_alloc * L->spc;
-    if (imaged_secs > L->old_total) imaged_secs = L->old_total;
-
-    int rc = defrag_emit(&P, w, newfat, root_new, root_cluster, imaged_secs, label, pr);
-    free(newfat);
-    if (rc != 0) { free(P.objs); free(P.remap); return -1; }
+    int rc = defrag_emit(&P, cbw_sink, w, newfat, root_new, root_cluster, imaged_secs, label, pr);
+    free(newfat); free(P.objs); free(P.remap);
+    if (rc != 0) return -1;
 
     printf("  defrag: %d objects, %lu used clusters -> imaged %lu KiB\n",
            P.nobjs, (unsigned long)P.total_alloc,
            (unsigned long)((uint64_t)imaged_secs * L->bps / 1024));
     *out_imaged_secs = imaged_secs;
-    free(P.objs); free(P.remap);
     return 0;
+}
 
-decline:
-    if (root) free(root);
-    printf("  defrag declined: %s -- imaging as-is\n", P.reason ? P.reason : "unknown");
-    free(P.objs); free(P.remap);
-    return 1;
+int defrag_clone_fat(const drive_info_t *sdi, int sdrive, uint64_t start_lba,
+                     const fatlay_t *L, uint8_t *fat,
+                     const drive_info_t *tdi, int tdrive, uint64_t win_sectors,
+                     const char *label, progress_t *pr, uint32_t *out_imaged_secs) {
+    plan_t P;
+    memset(&P, 0, sizeof P);
+    P.di = sdi; P.drive = sdrive; P.start_lba = start_lba; P.L = L; P.oldfat = fat;
+
+    uint32_t root_cluster, root_new, imaged_secs;
+    uint8_t *newfat = NULL;
+    if (defrag_plan_build(&P, &root_cluster, &root_new, &newfat, &imaged_secs) != 0)
+        return 1;   /* declined -- caller clones as-is */
+
+    /* Emit the relocated image straight to the target at the same start_lba
+     * (defrag clone is same-size, so the MBR window is unchanged). */
+    disk_sink_t ds = { tdi, tdrive, start_lba };
+    int rc = defrag_emit(&P, disk_sink, &ds, newfat, root_new, root_cluster, imaged_secs, label, pr);
+    free(newfat); free(P.objs); free(P.remap);
+    if (rc != 0) return -1;
+
+    /* Zero the free tail of the target window [imaged_secs, win_sectors). */
+    if (win_sectors > imaged_secs) {
+        uint8_t z[XFER_BYTES];
+        memset(z, 0, sizeof z);
+        uint64_t s = imaged_secs;
+        while (s < win_sectors) {
+            uint32_t n = (win_sectors - s > XFER_SECTORS) ? XFER_SECTORS : (uint32_t)(win_sectors - s);
+            if (store_region(tdi, tdrive, start_lba + s, n * 512, z) != 0) return -1;
+            s += n;
+        }
+    }
+
+    printf("  defrag: %d objects, %lu used clusters -> %lu KiB (same-size clone)\n",
+           P.nobjs, (unsigned long)P.total_alloc,
+           (unsigned long)((uint64_t)imaged_secs * L->bps / 1024));
+    *out_imaged_secs = imaged_secs;
+    return 0;
 }

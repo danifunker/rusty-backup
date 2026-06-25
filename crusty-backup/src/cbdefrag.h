@@ -39,4 +39,15 @@ int defrag_backup_fat(const drive_info_t *di, int drive, uint64_t start_lba,
                       const fatlay_t *L, uint8_t *fat, cbw_t *w,
                       const char *label, progress_t *pr, uint32_t *out_imaged_secs);
 
+/* Defrag a FAT volume during a same-size disk-to-disk clone: read the source
+ * (`sdi`/`sdrive`/`start_lba`, read-only), relocate its files into contiguous
+ * runs, and write the result directly to the target (`tdi`/`tdrive`) at the same
+ * `start_lba`, zero-filling the free tail out to `win_sectors`. Same contract as
+ * defrag_backup_fat: 0 on success, 1 if declined (target untouched -- caller
+ * clones as-is), -1 on a hard error mid-emit. */
+int defrag_clone_fat(const drive_info_t *sdi, int sdrive, uint64_t start_lba,
+                     const fatlay_t *L, uint8_t *fat,
+                     const drive_info_t *tdi, int tdrive, uint64_t win_sectors,
+                     const char *label, progress_t *pr, uint32_t *out_imaged_secs);
+
 #endif /* CBDEFRAG_H */

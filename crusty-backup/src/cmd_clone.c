@@ -9,6 +9,7 @@
 
 #include "cbdisk.h"
 #include "cbntfs.h"
+#include "cbdefrag.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,16 +113,18 @@ int cmd_clone(int argc, char **argv) {
         printf("  /SIZE:ENTIRE     grow each FAT partition to fill the target disk\n");
         printf("  /SIZE:CUSTOM     resize to /CUSTOM:<bytes>\n");
         printf("  /PARTS:i,j       clone only these MBR slot indices\n");
+        printf("  /DEFRAG          repack each FAT volume contiguously (same-size, boot-aware)\n");
         return 2;
     }
     int sdrive = (int)strtol(argv[1], NULL, 16);
     int tdrive = (int)strtol(argv[2], NULL, 16);
-    int confirmed = 0, mode = SZ_ORIGINAL;
+    int confirmed = 0, mode = SZ_ORIGINAL, defrag = 0;
     uint64_t custom_bytes = 0;
     unsigned sel_mask = 0; int has_filter = 0;
     for (int i = 3; i < argc; i++) {
         const char *v;
         if (eq_ci(argv[i], "/Y")) confirmed = 1;
+        else if (eq_ci(argv[i], "/DEFRAG")) defrag = 1;
         else if ((v = switch_val(argv[i], "/SIZE:")) != NULL) {
             if (eq_ci(v, "ORIGINAL"))      mode = SZ_ORIGINAL;
             else if (eq_ci(v, "MINIMUM"))  mode = SZ_MINIMUM;
@@ -156,6 +159,10 @@ int cmd_clone(int argc, char **argv) {
     if (mode == SZ_CUSTOM)        printf("size policy: custom (%lu bytes)\n", (unsigned long)custom_bytes);
     else if (mode != SZ_ORIGINAL) printf("size policy: %s\n", mode == SZ_MINIMUM ? "minimum" : "entire");
     if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
+    if (defrag) {
+        printf("defrag: FAT volumes repacked contiguously (same-size, boot-aware)\n");
+        if (mode != SZ_ORIGINAL) printf("  (defrag clones same-size; /SIZE ignored for FAT volumes)\n");
+    }
 
     if (!confirmed) {
         printf("REFUSING to write without /Y (this ERASES drive 0x%02X)\n", tdrive);
@@ -224,8 +231,17 @@ int cmd_clone(int argc, char **argv) {
                     uint32_t imaged_secs = (last_used >= 2) ? L.first_data_sec + (last_used - 1) * L.spc : L.first_data_sec;
                     if (imaged_secs > L.old_total) imaged_secs = L.old_total;
                     sprintf(llbl, "logical %d (FAT%d)", lidx, L.fat_bits);
-                    printf("  logical %d (FAT%d) lba %lu: %lu KiB (same-size)\n", lidx, L.fat_bits,
-                           (unsigned long)logs[j].start_lba, (unsigned long)(logs[j].count * 512 / 1024));
+                    printf("  logical %d (FAT%d) lba %lu: %lu KiB (same-size)%s\n", lidx, L.fat_bits,
+                           (unsigned long)logs[j].start_lba, (unsigned long)(logs[j].count * 512 / 1024),
+                           defrag ? " defrag" : "");
+                    if (defrag) {
+                        progress_t pr; uint32_t ds;
+                        int dr = defrag_clone_fat(&sdi, sdrive, logs[j].start_lba, &L, fat, &tdi, tdrive,
+                                                  logs[j].count, llbl, &pr, &ds);
+                        if (dr < 0) { free(fat); xfer_free(); return 1; }
+                        if (dr == 0) { free(fat); cloned++; continue; }
+                        /* dr == 1: declined -- fall through to the plain clone */
+                    }
                     if (clone_partition(&sdi, sdrive, &tdi, tdrive, logs[j].start_lba, logs[j].count * 512ULL,
                                         &L, fat, imaged_secs, llbl) != 0) { free(fat); xfer_free(); return 1; }
                     free(fat);
@@ -323,6 +339,27 @@ int cmd_clone(int argc, char **argv) {
             if (P[j].start > p->start && P[j].start < limit_sec) limit_sec = P[j].start;
         uint64_t limit_window = (limit_sec > p->start) ? limit_sec - p->start : 0;
 
+        char flbl[40];
+        sprintf(flbl, "slot %d (FAT%d)", p->slot, L.fat_bits);
+
+        /* /DEFRAG: repack the volume contiguously straight onto the target,
+         * same-size (the MBR window is unchanged). Falls back to a plain clone if
+         * defrag declines (unclean FS) or the target can't hold the same size. */
+        if (defrag) {
+            uint64_t win = p->count;
+            if ((limit_window && win > limit_window) || p->start + win > tgt_sectors) {
+                printf("  slot %d: target too small for a same-size defrag clone -- cloning as-is\n", p->slot);
+            } else {
+                progress_t pr; uint32_t ds;
+                printf("  slot %d (FAT%d) lba %lu: defrag clone (same-size)\n",
+                       p->slot, L.fat_bits, (unsigned long)p->start);
+                int dr = defrag_clone_fat(&sdi, sdrive, p->start, &L, fat, &tdi, tdrive, win, flbl, &pr, &ds);
+                if (dr < 0) { free(fat); xfer_free(); return 1; }
+                if (dr == 0) { free(fat); p->window_sec = win; cloned++; continue; }
+                /* dr == 1: declined -- fall through to the plain clone path */
+            }
+        }
+
         uint64_t win;
         switch (mode) {
             case SZ_MINIMUM: win = imaged_secs; break;
@@ -351,8 +388,6 @@ int cmd_clone(int argc, char **argv) {
                p->slot, L.fat_bits, (unsigned long)p->start,
                (unsigned long)((uint64_t)imaged_secs * 512 / 1024),
                (unsigned long)(win * 512 / 1024));
-        char flbl[40];
-        sprintf(flbl, "slot %d (FAT%d)", p->slot, L.fat_bits);
         if (clone_partition(&sdi, sdrive, &tdi, tdrive, p->start, win * 512ULL,
                             &L, fat, imaged_secs, flbl) != 0) {
             free(fat); xfer_free(); return 1;
