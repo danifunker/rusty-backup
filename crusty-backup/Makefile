@@ -3,8 +3,9 @@
 # Requires the DJGPP cross-compiler. Default path matches the local install
 # (~/djgpp); override with `make DJGPP=/path/to/djgpp` or set CC directly.
 #
-#   make            # build all POC binaries into build/
-#   make size       # build + report .exe sizes (the Phase 0a measurement)
+#   make            # build the unified CRUSTYBK.EXE + diagnostics into build/
+#   make crustybk   # just the unified tool (TUI + backup/restore/clone/inspect)
+#   make size       # build + report .exe sizes
 #   make clean
 
 DJGPP ?= $(HOME)/djgpp
@@ -17,10 +18,31 @@ LDFLAGS ?= -s            # strip symbols (smaller .exe)
 
 BUILD := build
 
-POCS := $(BUILD)/crustybk.exe $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe
+ZLIB    := deps/zlib
+ZLIBINC := $(ZLIB)/inc
+ZLIBLIB := $(ZLIB)/lib
 
-all: $(POCS)
+# --- The unified cb-dos tool ----------------------------------------------
+# One executable: the text UI when run bare, plus backup / restore / clone /
+# inspect subcommands, all over the shared cbdisk engine. Needs the DJGPP zlib
+# static lib (gzip codec for backup/restore), cross-built separately and
+# gitignored -- run `sh deps/fetch-zlib.sh` once.
+CB_SRCS := src/crustybk.c src/cmd_backup.c src/cmd_restore.c src/cmd_clone.c \
+           src/cmd_inspect.c src/cbdisk.c
+CB_HDRS := src/cbdisk.h
 
+# Diagnostics POCs (no zlib): single-source, built by the generic rule below.
+DIAG := $(BUILD)/disk_spike.exe $(BUILD)/lfn_test.exe
+
+crustybk: $(BUILD)/crustybk.exe
+all: crustybk $(DIAG)
+
+$(BUILD)/crustybk.exe: $(CB_SRCS) $(CB_HDRS) | $(BUILD)
+	@test -f $(ZLIBLIB)/libz.a || { \
+	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
+	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $(CB_SRCS) -L$(ZLIBLIB) -lz
+
+# Generic single-source rule (the diagnostics).
 $(BUILD)/%.exe: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
@@ -28,8 +50,8 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 size: all
-	@echo "=== cb-dos POC .exe sizes ==="
-	@ls -l $(POCS) | awk '{printf "%8d bytes  %s\n", $$5, $$9}'
+	@echo "=== cb-dos .exe sizes ==="
+	@ls -l $(BUILD)/crustybk.exe $(DIAG) | awk '{printf "%8d bytes  %s\n", $$5, $$9}'
 
 # --- Networked client (WATT-32) -------------------------------------------
 # Not part of `all`: it needs the WATT-32 DJGPP package, fetched separately
@@ -47,32 +69,7 @@ $(BUILD)/nethello.exe: src/net_hello.c | $(BUILD)
 	  echo "WATT-32 not found -- run: sh net/fetch-watt32.sh"; exit 1; }
 	$(CC) $(CFLAGS) -I$(WATTINC) $(LDFLAGS) -o $@ $< -L$(WATTLIB) -lwatt
 
-# --- Backup engine (zlib) -------------------------------------------------
-# Not part of `all`: needs the DJGPP zlib static lib, cross-built separately
-# (gitignored). Run `sh deps/fetch-zlib.sh` once, then `make backup`. Writes
-# the desktop's native PerPartition folder to a DOS path -- see docs/cb_dos.md.
-ZLIB    := deps/zlib
-ZLIBINC := $(ZLIB)/inc
-ZLIBLIB := $(ZLIB)/lib
-
-backup: $(BUILD)/cbbackup.exe
-restore: $(BUILD)/cbrestore.exe
-
-# Direct disk-to-disk clone (Phase 4b). No zlib -- there is no intermediate
-# file, so it builds via the generic pattern rule above.
-clone: $(BUILD)/cbclone.exe
-
-$(BUILD)/cbbackup.exe: src/cbbackup.c | $(BUILD)
-	@test -f $(ZLIBLIB)/libz.a || { \
-	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
-	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $< -L$(ZLIBLIB) -lz
-
-$(BUILD)/cbrestore.exe: src/cbrestore.c | $(BUILD)
-	@test -f $(ZLIBLIB)/libz.a || { \
-	  echo "zlib not built -- run: sh deps/fetch-zlib.sh"; exit 1; }
-	$(CC) $(CFLAGS) -I$(ZLIBINC) $(LDFLAGS) -o $@ $< -L$(ZLIBLIB) -lz
-
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all size net backup restore clone clean
+.PHONY: all crustybk size net clean

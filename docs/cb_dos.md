@@ -613,6 +613,26 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Consolidated into one executable: `CRUSTYBK.EXE` (Stage 1 —
+  CLI).** Merged the three separate tools (CBBACKUP/CBRESTORE/CBCLONE) into a
+  single binary with subcommands over a shared engine, the design the spec always
+  intended ("a lightweight text UI **+ CLI**, both over a shared C engine"). New
+  `src/cbdisk.{h,c}` holds the int13h / geometry / FAT-parse / FAT-resize / MBR
+  primitives that were copied inline three times; `cmd_backup.c` / `cmd_restore.c`
+  / `cmd_clone.c` are the former tools' logic as `cmd_*(argc,argv)` functions;
+  `cmd_inspect.c` is a new drive/partition lister; `crustybk.c`'s `main()`
+  dispatches `backup|restore|clone|inspect` (or launches the TUI when run bare).
+  `CRUSTYBK <command> [args]` — e.g. `CRUSTYBK backup C:\BK 81`, `CRUSTYBK restore
+  C:\BK 81 /Y /SIZE:ENTIRE`, `CRUSTYBK clone 80 81 /Y`, `CRUSTYBK inspect`. One
+  exe is **smaller** than three (240 KB vs 473 KB summed — shared code isn't
+  triplicated) and is the single artifact the distribution plan assumed. `make
+  crustybk` (links zlib once); `make all` adds the diagnostics. **Verified on real
+  FreeDOS/qemu**: all four subcommands run from `CRUSTYBK.EXE` with identical
+  output to the old separate exes — inspect listed every drive, backup wrote a
+  valid folder, restore (ENTIRE) and clone (MINIMUM) round-tripped with files
+  bit-intact under mtools and the desktop. The old single-tool `.c` files are
+  deleted (history preserved). **Next: Stage 2** — wire the TUI (real drive
+  enumeration + the cmd_* engine) as the no-arg front-end.
 - 2026-06-24 — **Phase 4b — direct disk-to-disk clone on DOS.** New
   `crusty-backup/src/cbclone.c` (`CBCLONE.EXE`): clones a FAT disk straight onto
   a second disk with **no intermediate file** — read source via int13h,

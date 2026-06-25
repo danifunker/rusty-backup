@@ -1,0 +1,276 @@
+/* cmd_backup.c -- the `backup` command (Phase 2 + selective).
+ *
+ * Images a FAT disk read via int13h to the desktop's native PerPartition folder
+ * (metadata.json + mbr.bin + partition-N.gz). Each FAT partition is smart-
+ * compacted (image up to the last used cluster, zero the interior free clusters)
+ * and streamed through zlib gzwrite. The disk/FAT engine lives in cbdisk. */
+
+#include "cbdisk.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <zlib.h>
+
+static const char *part_type_name(uint8_t t) {
+    switch (t) {
+        case 0x01: return "FAT12";
+        case 0x04: return "FAT16 (<32MB)";
+        case 0x06: return "FAT16 (>32MB)";
+        case 0x0B: return "FAT32 (CHS)";
+        case 0x0C: return "FAT32 (LBA)";
+        case 0x0E: return "FAT16 (LBA)";
+        default:   return "FAT";
+    }
+}
+
+typedef struct {
+    int      index;
+    uint8_t  type_byte;
+    uint64_t start_lba;
+    uint64_t original_size;   /* partition window bytes (MBR count*512) */
+    uint64_t imaged_size;     /* bytes actually imaged */
+    uint64_t minimum_size;    /* == imaged_size here */
+    int      compacted;
+    char     gz_name[24];
+    char     crc_hex[9];
+} part_meta_t;
+
+/* Smart-compact + gzip a FAT partition into <dest>/partition-N.gz, fill `pm`. */
+static int backup_fat_partition(const drive_info_t *di, int drive,
+                                const char *dest, int index, uint8_t type_byte,
+                                uint64_t start_lba, uint64_t part_sectors,
+                                part_meta_t *pm) {
+    uint8_t vbr[512];
+    if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
+        printf("  part %d: VBR read failed\n", index);
+        return -1;
+    }
+    fatlay_t L;
+    parse_fatlay(vbr, &L);
+    if (!L.ok) { printf("  part %d: not a FAT BPB, skipping\n", index); return -1; }
+
+    uint8_t *fat = malloc(L.old_spf * L.bps);
+    if (!fat) { printf("  part %d: out of memory\n", index); return -1; }
+    if (load_region(di, drive, start_lba + L.reserved, L.old_spf * L.bps, fat) != 0) {
+        printf("  part %d: FAT load failed\n", index); free(fat); return -1;
+    }
+
+    uint32_t last_used = 0;
+    for (uint32_t n = 2; n < L.clusters + 2; n++)
+        if (fat_entry(fat, L.fat_bits, n) != 0) last_used = n;
+    uint32_t imaged_secs = (last_used >= 2)
+        ? L.first_data_sec + (last_used - 1) * L.spc : L.first_data_sec;
+    if (imaged_secs > L.old_total) imaged_secs = L.old_total;
+
+    pm->index = index;
+    pm->type_byte = type_byte;
+    pm->start_lba = start_lba;
+    pm->original_size = part_sectors * 512ULL;
+    pm->imaged_size = (uint64_t)imaged_secs * L.bps;
+    pm->minimum_size = pm->imaged_size;
+    pm->compacted = (imaged_secs < part_sectors) ? 1 : 0;
+    sprintf(pm->gz_name, "partition-%d.gz", index);
+
+    char path[160];
+    sprintf(path, "%s\\%s", dest, pm->gz_name);
+    gzFile gz = gzopen(path, "wb6");
+    if (!gz) { printf("  part %d: cannot create %s\n", index, path); free(fat); return -1; }
+
+    uint8_t buf[XFER_BYTES];
+    uint32_t s = 0;
+    int rc = 0;
+    while (s < imaged_secs) {
+        int n = (int)(imaged_secs - s);
+        if (n > XFER_SECTORS) n = XFER_SECTORS;
+        if (read_lba(di, drive, start_lba + s, n, buf) != 0) {
+            printf("  part %d: read error at sector %lu\n", index, (unsigned long)s);
+            rc = -1; break;
+        }
+        for (int j = 0; j < n; j++) {
+            uint32_t rel = s + j;
+            if (rel >= L.first_data_sec) {
+                uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
+                if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
+                    memset(buf + j * 512, 0, 512);
+            }
+        }
+        if (gzwrite(gz, buf, n * 512) != n * 512) {
+            printf("  part %d: gzwrite failed\n", index);
+            rc = -1; break;
+        }
+        s += n;
+    }
+    gzclose(gz);
+    free(fat);
+    if (rc != 0) return rc;
+
+    /* CRC32 over the compressed .gz file (the desktop's checksum). */
+    FILE *f = fopen(path, "rb");
+    uLong crc = crc32(0L, Z_NULL, 0);
+    if (f) {
+        uint8_t rb[4096]; size_t got;
+        while ((got = fread(rb, 1, sizeof rb, f)) > 0)
+            crc = crc32(crc, rb, (uInt)got);
+        fclose(f);
+    }
+    sprintf(pm->crc_hex, "%08lx", (unsigned long)crc);
+
+    char crcpath[180];
+    sprintf(crcpath, "%s\\%s.crc32", dest, pm->gz_name);
+    FILE *cf = fopen(crcpath, "wb");
+    if (cf) { fprintf(cf, "%s", pm->crc_hex); fclose(cf); }
+
+    printf("  part %d (%s): imaged %lu KiB -> %s, crc %s%s\n",
+           index, part_type_name(type_byte),
+           (unsigned long)(pm->imaged_size / 1024), pm->gz_name, pm->crc_hex,
+           pm->compacted ? " [compacted]" : "");
+    return 0;
+}
+
+static void write_metadata(const char *dest, const char *src_label,
+                           uint64_t disk_bytes, uint64_t first_lba,
+                           const drive_info_t *di,
+                           const part_meta_t *parts, int nparts) {
+    char path[160];
+    sprintf(path, "%s\\metadata.json", dest);
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("cannot write metadata.json\n"); return; }
+
+    char created[32];
+    time_t now = time(NULL);
+    struct tm *tm = gmtime(&now);
+    strftime(created, sizeof created, "%Y-%m-%dT%H:%M:%SZ", tm);
+
+    const char *aligntype =
+        (first_lba == 2048) ? "Modern 1MB boundaries" :
+        (first_lba == 63)   ? "DOS Traditional (255x63)" : "Custom";
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"version\": 1,\n");
+    fprintf(f, "  \"created\": \"%s\",\n", created);
+    fprintf(f, "  \"source_device\": \"%s\",\n", src_label);
+    fprintf(f, "  \"source_size_bytes\": %lu,\n", (unsigned long)disk_bytes);
+    fprintf(f, "  \"partition_table_type\": \"MBR\",\n");
+    fprintf(f, "  \"checksum_type\": \"crc32\",\n");
+    fprintf(f, "  \"compression_type\": \"gzip\",\n");
+    fprintf(f, "  \"split_size_mib\": null,\n");
+    fprintf(f, "  \"sector_by_sector\": false,\n");
+    fprintf(f, "  \"layout\": \"per-partition\",\n");
+    fprintf(f, "  \"alignment\": {\n");
+    fprintf(f, "    \"detected_type\": \"%s\",\n", aligntype);
+    fprintf(f, "    \"first_partition_lba\": %lu,\n", (unsigned long)first_lba);
+    fprintf(f, "    \"alignment_sectors\": %lu,\n", (unsigned long)first_lba);
+    fprintf(f, "    \"heads\": %u,\n", di->heads);
+    fprintf(f, "    \"sectors_per_track\": %u\n", di->spt);
+    fprintf(f, "  },\n");
+    fprintf(f, "  \"partitions\": [\n");
+    for (int i = 0; i < nparts; i++) {
+        const part_meta_t *p = &parts[i];
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"index\": %d,\n", p->index);
+        fprintf(f, "      \"type_name\": \"%s\",\n", part_type_name(p->type_byte));
+        fprintf(f, "      \"partition_type_byte\": %u,\n", p->type_byte);
+        fprintf(f, "      \"start_lba\": %lu,\n", (unsigned long)p->start_lba);
+        fprintf(f, "      \"original_size_bytes\": %lu,\n", (unsigned long)p->original_size);
+        fprintf(f, "      \"imaged_size_bytes\": %lu,\n", (unsigned long)p->imaged_size);
+        fprintf(f, "      \"compressed_files\": [\"%s\"],\n", p->gz_name);
+        fprintf(f, "      \"checksum\": \"%s\",\n", p->crc_hex);
+        fprintf(f, "      \"resized\": false,\n");
+        fprintf(f, "      \"compacted\": %s,\n", p->compacted ? "true" : "false");
+        fprintf(f, "      \"is_logical\": false,\n");
+        fprintf(f, "      \"minimum_size_bytes\": %lu\n", (unsigned long)p->minimum_size);
+        fprintf(f, "    }%s\n", (i + 1 < nparts) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+    fclose(f);
+    printf("wrote metadata.json (%d partition%s)\n", nparts, nparts == 1 ? "" : "s");
+}
+
+int cmd_backup(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc < 2) {
+        printf("usage: CRUSTYBK backup <dest-dir> [drive-hex] [/PARTS:i,j]\n");
+        printf("  e.g. CRUSTYBK backup A:\\BK 80           image every FAT partition\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0  image only MBR slot 0\n");
+        printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
+        printf("  numbers below and the metadata.json \"index\" values).\n");
+        return 2;
+    }
+
+    const char *dest = argv[1];
+    int drive = 0x80, drive_set = 0;
+    unsigned sel_mask = 0; int has_filter = 0;
+    for (int a = 2; a < argc; a++) {
+        const char *v = switch_val(argv[a], "/PARTS:");
+        if (v) {
+            if (parse_parts(v, &sel_mask) != 0) { printf("bad /PARTS list\n"); return 2; }
+            has_filter = 1;
+        } else if (!drive_set) {
+            drive = (int)strtol(argv[a], NULL, 16);
+            drive_set = 1;
+        }
+    }
+
+    if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
+
+    drive_info_t di;
+    drive_params(drive, &di);
+    if (!di.present) { printf("drive 0x%02X not present\n", drive); xfer_free(); return 1; }
+    di.ext = drive_has_ext(drive);
+    printf("source drive 0x%02X: %u cyl %u head %u spt, LBA-ext=%s\n",
+           drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
+    if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
+
+    uint8_t mbr[512];
+    if (read_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR read failed\n"); xfer_free(); return 1; }
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        printf("no MBR signature -- superfloppy not supported\n");
+        xfer_free(); return 1;
+    }
+
+    char mpath[160];
+    sprintf(mpath, "%s\\mbr.bin", dest);
+    FILE *mf = fopen(mpath, "wb");
+    if (mf) { fwrite(mbr, 1, 512, mf); fclose(mf); printf("wrote mbr.bin\n"); }
+    else { printf("cannot write mbr.bin (does %s exist?)\n", dest); xfer_free(); return 1; }
+
+    uint64_t disk_bytes = (uint64_t)di.cyls * di.heads * di.spt * 512;
+    uint64_t first_lba = 0;
+
+    part_meta_t parts[4];
+    int nparts = 0;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t *e = mbr + 446 + i * 16;
+        uint8_t type = e[4];
+        uint32_t lba = rd32(e + 8);
+        uint32_t cnt = rd32(e + 12);
+        if (type == 0 || cnt == 0) continue;
+        if (first_lba == 0) first_lba = lba;       /* disk-wide alignment hint */
+        uint64_t end = (uint64_t)lba + cnt;
+        if (end * 512 > disk_bytes) disk_bytes = end * 512;
+        if (has_filter && !(sel_mask & (1u << i))) {
+            printf("  part %d: not in /PARTS -- skipped\n", i);
+            continue;
+        }
+        if (!is_fat_part_type(type)) {
+            printf("  part %d: type 0x%02X not FAT -- skipped\n", i, type);
+            continue;
+        }
+        if (backup_fat_partition(&di, drive, dest, i, type, lba, cnt, &parts[nparts]) == 0)
+            nparts++;
+    }
+
+    if (nparts == 0) { printf("no FAT partitions imaged\n"); xfer_free(); return 1; }
+
+    char label[16];
+    sprintf(label, "0x%02X", drive);
+    write_metadata(dest, label, disk_bytes, first_lba, &di, parts, nparts);
+
+    printf("backup complete: %d partition%s in %s\n", nparts, nparts == 1 ? "" : "s", dest);
+    xfer_free();
+    return 0;
+}

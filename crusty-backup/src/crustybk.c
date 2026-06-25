@@ -27,7 +27,16 @@
 #include <dpmi.h>
 #include <sys/farptr.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "cbdisk.h"   /* eq_ci for the subcommand dispatch */
+
+/* The scriptable commands, each its own module over the shared cbdisk engine. */
+extern int cmd_backup(int argc, char **argv);
+extern int cmd_restore(int argc, char **argv);
+extern int cmd_clone(int argc, char **argv);
+extern int cmd_inspect(int argc, char **argv);
 
 #define CB_VERSION "0.1.0-poc"
 #define CB_URL     "github.com/danifunker/rusty-backup"
@@ -393,9 +402,9 @@ static int op_screen(int is_restore)
     }
 }
 
-/* ---- main -------------------------------------------------------------- */
+/* ---- text-UI entry ----------------------------------------------------- */
 
-int main(void)
+static int tui_main(void)
 {
     int sel = 0, key, running = 1, i, n;
 
@@ -473,6 +482,37 @@ int main(void)
     textattr(ATTR(C_LTGRAY, C_BLACK));
     clrscr();
     _setcursortype(_NORMALCURSOR);
-    cputs("cb-dos POC exited.\r\n");
+    cputs("cb-dos exited.\r\n");
     return 0;
+}
+
+/* ---- dispatcher: one exe, TUI by default, subcommands for scripting ----- */
+
+static void usage(void)
+{
+    printf("crusty-backup (cb-dos) v" CB_VERSION "\n");
+    printf("usage: CRUSTYBK [command] [args]\n");
+    printf("  (no command)   launch the text UI\n");
+    printf("  backup  <dest-dir> [drive-hex] [/PARTS:i,j]\n");
+    printf("  restore <folder> <drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
+    printf("  clone   <src-hex> <tgt-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
+    printf("  inspect [drive-hex]   list BIOS hard drives + partitions\n");
+    printf("  /SIZE modes: ORIGINAL (default), MINIMUM, ENTIRE, CUSTOM\n");
+}
+
+int main(int argc, char **argv)
+{
+    if (argc >= 2) {
+        const char *cmd = argv[1];
+        if (eq_ci(cmd, "backup"))  return cmd_backup(argc - 1, argv + 1);
+        if (eq_ci(cmd, "restore")) return cmd_restore(argc - 1, argv + 1);
+        if (eq_ci(cmd, "clone"))   return cmd_clone(argc - 1, argv + 1);
+        if (eq_ci(cmd, "inspect")) return cmd_inspect(argc - 1, argv + 1);
+        if (eq_ci(cmd, "help") || eq_ci(cmd, "/?") ||
+            eq_ci(cmd, "-h")   || eq_ci(cmd, "--help")) { usage(); return 0; }
+        printf("unknown command: %s\n\n", cmd);
+        usage();
+        return 2;
+    }
+    return tui_main();
 }

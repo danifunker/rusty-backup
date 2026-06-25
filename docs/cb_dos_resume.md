@@ -11,7 +11,8 @@ Branch **`cbdos`** (off `main`), 14 commits, all verified, tree clean (latest
 commit lands with this hand-off):
 
 ```
-(pending) feat(cb-dos): Phase 4b — direct disk-to-disk clone (cbclone)
+(pending) refactor(cb-dos): consolidate into one CRUSTYBK.EXE (cbdisk + cmd_* + dispatcher)
+93e5c2c feat(cb-dos): Phase 4b — direct disk-to-disk clone (cbclone)
 7a8830d docs(cb-dos): mark desktop --partitions off-by-one resolved in resume next-work
 37b9b70 fix(cli): make backup --partitions actually 1-based (first partition selectable)
 3109e50 feat(cb-dos): Phase 4 — per-partition selective backup/restore (/PARTS)
@@ -38,17 +39,18 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 3 resize** — `cbrestore /SIZE` | bidirectional FAT16/32 resize on DOS (entire/minimum/custom); grow+shrink verified on FreeDOS/qemu |
 | **Phase 4** — `/PARTS:i,j` selective | per-partition backup *and* restore (0-based MBR slot indices); verified on a 2-partition disk on FreeDOS/qemu |
 | **Phase 4b** — `cbclone` (DOS) | direct disk-to-disk clone, no staging file; compact + `/SIZE` resize + `/PARTS`; verified grow/shrink/subset on FreeDOS/qemu |
+| **One exe** — `CRUSTYBK.EXE` (Stage 1) | backup/restore/clone/inspect as subcommands over the shared `cbdisk` engine; TUI on bare invocation (still the Stage-2 mock); verified on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **`cbdisk.{h,c}` extraction (refactor — now well-motivated).** cbbackup,
-   cbrestore, and cbclone now carry **three copies** of the same int13h / FAT /
-   resize primitives (~400 lines each). Lift the shared engine into
-   `crusty-backup/src/cbdisk.{h,c}` and link all three. Re-verify each in qemu
-   after (the primitives are identical, so this is mechanical but touches proven
-   code). Do this before Phase 5 adds a fourth consumer.
+1. **Single-exe Stage 2 — wire the real TUI.** Stage 1 consolidated the CLI into
+   `CRUSTYBK.EXE` (cbdisk + cmd_*); bare invocation still launches the **mock**
+   `crustybk.c` TUI (dummy disk list). Replace it with real int13h drive/partition
+   enumeration and make F2/F3/F4 Backup/Restore/Clone gather params (incl. a text-
+   input dest path + size mode) and call `cmd_*()` on a cleared screen. *Recommended
+   next — it's the other half of the single-exe vision.*
 2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
@@ -57,12 +59,12 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 3. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
-4. **`cbbackup` mbr.bin corruption under stdout redirection (bug, low-priority).**
-   Redirecting `cbbackup`'s stdout to a file on the *same drive* it writes the
-   backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
+4. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+   Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
+   the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
    boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
-   quirk (gotcha #3), not a cbrestore bug — run `cbbackup` without `>` and it's
-   clean. Worth root-causing (likely a DTA / FILE-buffer aliasing in `cbbackup.c`).
+   quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
+   Worth root-causing (likely a DTA / FILE-buffer aliasing in `cmd_backup.c`).
 5. **Real-486 hardware** validation (everything so far is qemu/emulator).
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
@@ -84,21 +86,25 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
 - `src/cli/resolve.rs` — `RwCommit::Cbk` (edit-then-repack); `cli/backup_edit.rs`
   — `gzip` in the editable-codec whitelist.
 
-**DOS (C) — `crusty-backup/src/`:**
-- `cbbackup.c` (`CBBACKUP.EXE`) — backup engine **+ `/PARTS:i,j` selective**
-  (`pfx_ci`/`parse_parts`, slot bitmask). `cbrestore.c` (`CBRESTORE.EXE`)
-  — restore engine **+ on-DOS FAT resize + `/PARTS:i,j` selective** (`/SIZE:ORIGINAL|MINIMUM|ENTIRE|CUSTOM`,
-  `/CUSTOM:<bytes>`): `fat_resize` (bidirectional, the C port of
-  `resize_fat_in_place`), `shift_region_forward`/`_backward`, `compute_fat_sectors`,
-  `max_fat_window`/`min_fat_window` (cluster cap/floor), `set_clean_flags`,
-  `reset_fsinfo`, AH=48h `drive_total_sectors`. `cbclone.c` (`CBCLONE.EXE`) —
-  **direct disk-to-disk clone** (Phase 4b): cbbackup's read+compaction fused with
-  cbrestore's write+resize, **no zlib**, no staging file; same `/SIZE` + `/PARTS`
-  grammar (`CBCLONE <src-hex> <tgt-hex> /Y [...]`). `disk_spike.c` — disk/FS
-  spike. `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API
-  probe. (cbbackup/cbrestore/cbclone share ~400 lines of inline primitives — a
-  `cbdisk.{h,c}` lift is pending; see next-work #1.)
-- `Makefile` targets: `make backup` / `restore` / `clone` / `net` / `all` / `size`.
+**DOS (C) — `crusty-backup/src/`:** one tool, `CRUSTYBK.EXE` (TUI on bare run,
+subcommands for scripting), built from:
+- `cbdisk.{h,c}` — **the shared engine**: int13h r/w (LBA+CHS), geometry, AH=48h
+  `drive_total_sectors`, `parse_fatlay`/`fat_entry`/`is_fat_part_type`, the
+  bidirectional `fat_resize` (C port of `resize_fat_in_place`) + its helpers
+  (`shift_region_forward`/`_backward`, `compute_fat_sectors`,
+  `max_fat_window`/`min_fat_window` cluster cap/floor, `set_clean_flags`,
+  `reset_fsinfo`), and the arg helpers (`switch_val`/`eq_ci`/`round_up_512`/
+  `parse_parts`). The single source of truth — no more triplicated primitives.
+- `cmd_backup.c` — `backup` (image FAT disk → native folder, smart-compact +
+  gzip, `/PARTS`). `cmd_restore.c` — `restore` (folder → disk, `/SIZE` resize +
+  `/PARTS`, the metadata.json scanner + gzip stream). `cmd_clone.c` — `clone`
+  (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
+  `inspect` (list BIOS drives + partitions). Each exposes `int cmd_X(argc,argv)`.
+- `crustybk.c` — `main()` dispatches the subcommands or launches the text UI
+  (`tui_main`, still the Stage-2 mock list). `disk_spike.c` — disk/FS spike.
+  `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
+- `Makefile` targets: `make crustybk` (the tool; links zlib once) / `make all`
+  (+ diagnostics) / `make net` / `make size`.
 - `deps/fetch-zlib.sh`, `net/fetch-watt32.sh` — cross-built deps (gitignored).
 
 ## Build + unit test
@@ -106,7 +112,8 @@ now subtracts 1, so the flag is genuinely 1-based and matches `img@N`; commit
 ```bash
 cargo build --bin rb-cli          # desktop CLI
 cargo test --lib                  # 2086 tests; clippy --all-targets -D warnings via pre-commit
-make -C crusty-backup backup restore clone net all   # DOS .exes -> crusty-backup/build/
+make -C crusty-backup crustybk      # the unified CRUSTYBK.EXE -> crusty-backup/build/
+make -C crusty-backup all net       # + diagnostics (disk_spike/lfn_test) + nethello
 ```
 
 ## The qemu test rig (the scratch harnesses are EPHEMERAL — rebuild as below)
@@ -130,10 +137,10 @@ cleanly so `FDAPM POWEROFF` ends qemu):
 IMG=/tmp/base.img ; OFF=32256 ; AT="$IMG@@$OFF"
 cp ~/FD14FULL.img "$IMG"                                   # throwaway boot disk
 printf '@echo off\r\nSET PATH=\\FREEDOS\\BIN\r\nDOSLFN\r\nSET LFN=Y\r\n'\
-'C:\r\nmd C:\\BK\r\nCD \\CB\r\nCBBACKUP C:\\BK 81\r\nFDAPM POWEROFF\r\n' \
+'C:\r\nmd C:\\BK\r\nCD \\CB\r\nCRUSTYBK BACKUP C:\\BK 81\r\nFDAPM POWEROFF\r\n' \
   | mcopy -o -i "$AT" - ::/FDAUTO.BAT                      # autorun (LFN!)
 mmd -i "$AT" ::/CB 2>/dev/null
-mcopy -o -i "$AT" crusty-backup/build/cbbackup.exe ::/CB/CBBACKUP.EXE
+mcopy -o -i "$AT" crusty-backup/build/crustybk.exe ::/CB/CRUSTYBK.EXE
 mcopy -o -i "$AT" /tmp/CWSDPMI.EXE                  ::/CB/CWSDPMI.EXE
 # hda = boot disk; hdb (0x81) = the FAT disk to back up:
 qemu-system-i386 -m 64 -display none -no-reboot \
@@ -142,31 +149,34 @@ qemu-system-i386 -m 64 -display none -no-reboot \
 mcopy -s -n -i "$AT" ::/BK /tmp/out                        # pull the backup folder off
 ```
 
-A blank target for restore tests: `dd if=/dev/zero of=/tmp/tgt.img bs=1M count=48`,
-attach as `index=1` (0x81), and `CBRESTORE C:\BK 81 /Y`. Build an MBR FAT16 test
-disk with `mformat -i disk.img@@1048576 ...` after writing an MBR partition entry
-(type 0x06, start LBA 2048) — see the Phase-1 history in `cb_dos.md`.
+Everything runs through the one binary now: `CRUSTYBK backup|restore|clone|inspect`
+(case-insensitive; bare `CRUSTYBK` would open the TUI). A blank target for restore
+tests: `dd if=/dev/zero of=/tmp/tgt.img bs=1M count=48`, attach as `index=1`
+(0x81), and `CRUSTYBK RESTORE C:\BK 81 /Y`. Build an MBR FAT16 test disk with
+`mformat -i disk.img@@1048576 ...` after writing an MBR partition entry (type 0x06,
+start LBA 2048) — see the Phase-1 history in `cb_dos.md`.
 
 **Resize tests** (`/SIZE:{ORIGINAL|MINIMUM|ENTIRE|CUSTOM}`, `/CUSTOM:<bytes>`):
 attach several blank targets (`index=1..3` → `0x81..0x83`) of *different* sizes
 and resize into each, e.g.
-`CBRESTORE C:\BK 82 /Y /SIZE:ENTIRE` (grow to fill the disk),
-`CBRESTORE C:\BK 83 /Y /SIZE:CUSTOM /CUSTOM:33554432`. To exercise both the
+`CRUSTYBK RESTORE C:\BK 82 /Y /SIZE:ENTIRE` (grow to fill the disk),
+`CRUSTYBK RESTORE C:\BK 83 /Y /SIZE:CUSTOM /CUSTOM:33554432`. To exercise both the
 **grow** (forward-shift + FAT extend, capped at the FAT16 cluster ceiling) *and*
 **shrink** (backward-shift + FAT truncate, floored at a valid FAT16) paths, test
-with **both** producers: a `cbbackup` folder (gz keeps the original full-size BPB
-→ MINIMUM/CUSTOM actually shrink) and a desktop `rb-cli backup --format gzip`
-folder (gz is pre-minimized → ORIGINAL/ENTIRE grow it). Pull each target with
-`mcopy -i tgt.img@@1048576 ::/FILE out` and diff checksums; the desktop's
-`rb-cli ls tgt.img@1` is a good independent FAT-reader cross-check. **Don't
-redirect `cbbackup`** when making the folder (gotcha #3 corrupts `mbr.bin`).
+with **both** producers: a `CRUSTYBK BACKUP` folder (gz keeps the original
+full-size BPB → MINIMUM/CUSTOM actually shrink) and a desktop `rb-cli backup
+--format gzip` folder (gz is pre-minimized → ORIGINAL/ENTIRE grow it). Pull each
+target with `mcopy -i tgt.img@@1048576 ::/FILE out` and diff checksums; the
+desktop's `rb-cli ls tgt.img@1` is a good independent FAT-reader cross-check.
+**Don't redirect `CRUSTYBK BACKUP`** when making the folder (gotcha #3 corrupts
+`mbr.bin`).
 
-**Clone tests** (`cbclone`, no staging file): attach the **source** as one drive
-and a blank **target** as another (e.g. source `index=1`/`0x81`, target
-`index=2`/`0x82`), then `CBCLONE 81 82 /Y [/SIZE:mode] [/PARTS:i,j]`. cbclone
-writes nothing to DOS files, so **redirecting its stdout is safe** (unlike
-cbbackup) — `CBCLONE 81 82 /Y /SIZE:ENTIRE > C:\OUT.TXT`. Verify the target the
-same way (`mcopy ... tgt.img@@1048576`, `rb-cli ls`). It refuses `src == tgt`.
+**Clone tests** (`CRUSTYBK CLONE`, no staging file): attach the **source** as one
+drive and a blank **target** as another (e.g. source `index=1`/`0x81`, target
+`index=2`/`0x82`), then `CRUSTYBK CLONE 81 82 /Y [/SIZE:mode] [/PARTS:i,j]`. Clone
+writes nothing to DOS files, so **redirecting its stdout is safe** (unlike backup)
+— `CRUSTYBK CLONE 81 82 /Y /SIZE:ENTIRE > C:\OUT.TXT`. Verify the target the same
+way (`mcopy ... tgt.img@@1048576`, `rb-cli ls`). It refuses `src == tgt`.
 
 ## Gotchas learned the hard way (do not relearn these)
 
@@ -182,12 +192,12 @@ same way (`mcopy ... tgt.img@@1048576`, `rb-cli ls`). It refuses `src == tgt`.
 3. **FreeCOM redirection quirks.** `2>` / `2>&1` are mis-parsed (the `2` becomes a
    program argument — silently sent `NETHELLO` to *port 2*); `>>` append is
    unreliable. Use a single `>` and pass args explicitly. **Also:** redirecting
-   `cbbackup`'s stdout to a file on the *same drive* it writes the backup folder
-   to corrupts `mbr.bin` (the "wrote metadata.json" banner bleeds into the
-   boot-code area) → restores from that folder get a garbled MBR. Run `cbbackup`
-   **without** `>`; only redirect `cbrestore` (it writes nothing to DOS files, so
-   it's safe). Don't trust a folder for a byte-identical check if cbbackup was
-   redirected. Likely a `cbbackup.c` DTA/FILE-buffer aliasing bug to root-cause.
+   `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes the backup
+   folder to corrupts `mbr.bin` (the "wrote metadata.json" banner bleeds into the
+   boot-code area) → restores from that folder get a garbled MBR. Run the backup
+   subcommand **without** `>`; restore/clone/inspect write nothing to DOS files so
+   redirecting those is safe. Don't trust a folder for a byte-identical check if
+   backup was redirected. Likely a `cmd_backup.c` DTA/FILE-buffer aliasing bug.
 4. **int13h writes are immediate** (not DOS-file-cached), so a restore lands on
    disk even if the process were killed mid-run — handy for headless tests.
 5. **`.cbk` v1 is frozen** (`cbk.rs` doc-comment). The future DOS network producer
