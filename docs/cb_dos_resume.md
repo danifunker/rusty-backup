@@ -41,27 +41,37 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4** — `/PARTS:i,j` selective | per-partition backup *and* restore (0-based MBR slot indices); verified on a 2-partition disk on FreeDOS/qemu |
 | **Phase 4b** — `cbclone` (DOS) | direct disk-to-disk clone, no staging file; compact + `/SIZE` resize + `/PARTS`; verified grow/shrink/subset on FreeDOS/qemu |
 | **One exe** — `CRUSTYBK.EXE` | backup/restore/clone/inspect subcommands **+ a real text UI** (live int13h enum; F2/F3/F4 drive the cmd_* engine) over the shared `cbdisk` engine; both verified on FreeDOS/qemu |
+| **Phase 4c-a** — `ls` / `get` (DOS) | browse + extract single files from a backup `partition-N.gz` (FAT dir reader + LFN over `gzseek`), no scratch/no full restore; verified incl. LFN + nested + multi-cluster on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
+1. **Phase 4c-b — a TUI browse/extract screen.** 4c-a shipped `ls`/`get` (the FAT
+   directory reader + extractor in `cmd_browse.c`). Add a TUI flow: pick a backup
+   folder, browse its tree (navigate dirs, Space-mark files/folders), Enter to
+   extract the selection to a chosen DOS path — reusing `dir_iter`/`resolve_path`/
+   `extract_file`. *Recommended next — finishes the browse feature in the UI.*
+   (Later: point the same reader at a **live disk** by swapping the `gzseek`
+   backend for `read_lba`, so you can browse/extract from a disk too.)
+2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
    format already supports multiple chunks/member) and make the reader decompress
-   only the members a seek touches. No format change.
-2. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+   only the members a seek touches. No format change. (Also makes `get`'s backward
+   gzseeks cheap — today they rewind to the gz start.)
+3. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
-3. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+4. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
    Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
    the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
    boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
    quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
-   Worth root-causing (likely a DTA / FILE-buffer aliasing in `cmd_backup.c`).
-4. **Real-486 hardware** validation (everything so far is qemu/emulator).
-5. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
+   `get` also writes a DOS file, so the same caution applies; don't redirect it on
+   the same drive. Worth root-causing (likely a DTA/FILE-buffer aliasing).
+5. **Real-486 hardware** validation (everything so far is qemu/emulator).
+6. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
    logical-partition** backup gaps — the remaining FS coverage on DOS.
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
@@ -96,7 +106,10 @@ subcommands for scripting), built from:
   gzip, `/PARTS`). `cmd_restore.c` — `restore` (folder → disk, `/SIZE` resize +
   `/PARTS`, the metadata.json scanner + gzip stream). `cmd_clone.c` — `clone`
   (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
-  `inspect` (list BIOS drives + partitions). Each exposes `int cmd_X(argc,argv)`.
+  `inspect` (list BIOS drives + partitions). `cmd_browse.c` — `ls` / `get`:
+  browse + extract single files from a backup's `partition-N.gz` (a FAT12/16/32
+  directory reader with LFN reassembly + a file extractor over `gzseek` random
+  access — no scratch, no full restore). Each exposes `int cmd_X(argc,argv)`.
 - `crustybk.c` — `main()` dispatches the subcommands or launches the **text UI**
   (`tui_main`): `scan_disks` does live int13h enumeration; F2/F3/F4 gather params
   (`read_line`/`pick_size`/`confirm_erase`) and call `cmd_*()` on a plain screen.
@@ -176,6 +189,14 @@ drive and a blank **target** as another (e.g. source `index=1`/`0x81`, target
 writes nothing to DOS files, so **redirecting its stdout is safe** (unlike backup)
 — `CRUSTYBK CLONE 81 82 /Y /SIZE:ENTIRE > C:\OUT.TXT`. Verify the target the same
 way (`mcopy ... tgt.img@@1048576`, `rb-cli ls`). It refuses `src == tgt`.
+
+**Browse/extract tests** (`ls`/`get`, Phase 4c-a): stage a backup folder on a DOS
+drive (e.g. `C:\BK` with `partition-N.gz`). `CRUSTYBK ls C:\BK` lists the root,
+`CRUSTYBK ls C:\BK \DOCS` a subdir; `CRUSTYBK get C:\BK \DOCS\FILE.TXT C:\OUT.TXT`
+extracts one file. `ls` is safe to redirect; `get` writes a DOS file so **don't
+redirect `get`** on the same drive (gotcha #3). Verify by `mcopy`-ing the
+extracted file off and diffing checksums vs the source. N is the 0-based partition
+index (defaults to the first `partition-N.gz` present); paths use `\` or `/`.
 
 ## Gotchas learned the hard way (do not relearn these)
 

@@ -584,6 +584,20 @@ over the wire now.
       (incl. a 100 KB blob) under both mtools and the desktop's FAT reader.
       Note: three tools now carry the same inline disk/FAT/resize primitives — a
       `cbdisk.{h,c}` extraction is now well-motivated.
+- [x] **Phase 4c-a — Browse + extract single files from a backup (DOS). DONE
+      (2026-06-24).** `src/cmd_browse.c` adds `CRUSTYBK ls <folder> [N] [path]`
+      and `CRUSTYBK get <folder> [N] <path> <dest>` — a FAT12/16/32 directory
+      reader (8.3 + **LFN reassembly**) + file extractor that works straight out
+      of a compacted `partition-N.gz`, **no scratch + no full restore**. zlib
+      `gzseek` gives random access into the compressed partition (O(offset) per
+      seek; the whole first FAT is cached in RAM, directories + file data read on
+      demand). Verified on real FreeDOS/qemu: listed root / `\DOCS` / `\DOCS\DEEP`
+      (long names shown verbatim), and extracted three files — an 8.3 name, an
+      LFN-named file, and a 65 KB multi-cluster blob three dirs deep — each
+      **byte-identical** to the source. Works on both producer shapes (the reader
+      walks whatever BPB the gz carries). Next (4c-b): a TUI browse/mark screen on
+      top; later, the same reader can front a live disk (swap the gz backend for
+      int13h). The desktop already does this via `rb-cli ls`/`get`.
 - [ ] **Phase 5 — File-level repack/defrag** (Phase B), boot-file aware.
 - [ ] **Phase 6 (optional)** — LZ4 codec for slower machines (needs a matching
       desktop `Lz4` variant).
@@ -614,6 +628,26 @@ over the wire now.
 
 ## Progress log
 
+- 2026-06-24 — **Phase 4c-a — browse + extract single files from a backup, on
+  DOS.** New `src/cmd_browse.c` adds two subcommands to `CRUSTYBK.EXE`:
+  `ls <folder> [N] [path]` (list a directory inside `partition-N.gz`) and
+  `get <folder> [N] <path> <dest>` (extract one file to a DOS path) — file-level
+  recovery **without a full restore and with zero scratch space**. The enabler is
+  zlib `gzseek`: it gives random access into the compacted `partition-N.gz` (each
+  seek decompresses from the start, O(offset); backward seeks rewind — fine for
+  grabbing a file, the chunked `.cbk` lazy reader is the eventual fast path). A
+  `fatvol_t` parses the gz's BPB, caches the whole first FAT in RAM, and reads
+  directories + file clusters on demand; a `dir_iter` reassembles **long
+  filenames** from the LFN records, and `extract_file` follows the cluster chain
+  to a DOS file. Path descent handles nested subdirs (`\DOCS\DEEP\...`). N is the
+  0-based partition index (defaults to the first `partition-N.gz` present),
+  matching `/PARTS` / metadata `index`. **Verified on real FreeDOS/qemu** against
+  a desktop-gzip backup of a tree (HELLO.TXT, an LFN file, `\DOCS\INNER.TXT`,
+  `\DOCS\DEEP\BURIED.BIN`): `ls` listed each level with the long name verbatim
+  (not `LONGFI~1`), and `get` extracted an 8.3 file, the LFN file, and a 65 KB
+  multi-cluster blob three dirs deep — all **byte-identical** to source under
+  md5. Producer-agnostic (reads whatever BPB the gz holds). `make crustybk`.
+  **Next:** 4c-b (a TUI browse/mark/extract screen over the same reader).
 - 2026-06-24 — **Single-exe Stage 2 — the TUI is real.** Replaced the mock disk
   list in `crustybk.c` with live **int13h enumeration**: bare `CRUSTYBK` scans
   drives 0x80..0x87 (`scan_disks` — geometry, total sectors via AH=48h, MBR
