@@ -7,6 +7,7 @@
 
 #include "cbdisk.h"
 #include "cbcodec.h"
+#include "cbnet.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -150,16 +151,234 @@ typedef struct {
     uint64_t window_sec;
 } part_t;
 
+/* ---- networked restore: pull a `.cbk`'s members from an rb-cli serve daemon and
+ * write them to a disk over int13h, no intermediate folder (the consumer side of
+ * the wire — the mirror of `backup rb://...`). Same-size only for now (the target
+ * must be >= the original); resize-over-the-wire is a later box. The metadata
+ * scanner + part_t + EBR rebuild are reused from the local path above. ---- */
+
+/* Stream a Gz member already begun on `net` (gunzipped) to start_lba, zero-padding
+ * out to window_bytes. Mirrors restore_partition but the source is the socket. */
+static int netrestore_partition(const drive_info_t *di, int drive, cbnet_t *net,
+                                uint64_t start_lba, uint64_t window_bytes, const char *label) {
+    progress_t pr;
+    progress_begin(&pr, label, window_bytes);
+    uint8_t acc[XFER_BYTES];
+    int acc_len = 0;
+    uint64_t written = 0;
+    int rc = 0;
+    for (;;) {
+        int want = XFER_BYTES - acc_len;
+        int n = cbnet_get_member_read(net, acc + acc_len, want);
+        if (n < 0) { printf("  decompress/recv error\n"); rc = -1; break; }
+        if (n == 0 && acc_len == 0) break;
+        acc_len += n;
+        int full = acc_len / 512;
+        if (full > 0) {
+            if (write_lba(di, drive, start_lba + written / 512, full, acc) != 0) {
+                printf("  write error at lba %lu\n", (unsigned long)(start_lba + written / 512));
+                rc = -1; break;
+            }
+            written += (uint64_t)full * 512;
+            int rem = acc_len - full * 512;
+            if (rem) memmove(acc, acc + full * 512, rem);
+            acc_len = rem;
+            progress_update(&pr, written);
+        }
+        if (n == 0) break;
+    }
+    if (rc == 0 && acc_len > 0) {
+        memset(acc + acc_len, 0, 512 - acc_len);
+        if (write_lba(di, drive, start_lba + written / 512, 1, acc) == 0)
+            written += 512;
+    }
+    if (rc != 0) { progress_finish(&pr); return rc; }
+    if (written < window_bytes) {
+        memset(acc, 0, XFER_BYTES);
+        while (written < window_bytes) {
+            uint64_t left = window_bytes - written;
+            int secs = (left / 512 > XFER_SECTORS) ? XFER_SECTORS : (int)(left / 512);
+            if (secs < 1) break;
+            if (write_lba(di, drive, start_lba + written / 512, secs, acc) != 0) break;
+            written += (uint64_t)secs * 512;
+            progress_update(&pr, written);
+        }
+    }
+    progress_update(&pr, window_bytes);
+    progress_finish(&pr);
+    return 0;
+}
+
+/* Parse parts[] out of a metadata.json buffer (shared shape with cmd_restore's
+ * inline scan). Returns nparts. */
+static int scan_parts(const char *meta, part_t *parts, int max) {
+    int nparts = 0;
+    const char *cur = strstr(meta, "\"partitions\"");
+    if (!cur) cur = meta;
+    for (; nparts < max;) {
+        const char *idx = find_key(cur, "index");
+        if (!idx) break;
+        part_t *p = &parts[nparts];
+        memset(p, 0, sizeof *p);
+        p->index = (int)u64_at(idx, 0);
+        p->type_byte = (uint8_t)u64_after(idx, "partition_type_byte", 0);
+        p->start_lba = u64_after(idx, "start_lba", 0);
+        p->original = u64_after(idx, "original_size_bytes", 0);
+        p->imaged = u64_after(idx, "imaged_size_bytes", p->original);
+        p->minimum = u64_after(idx, "minimum_size_bytes", p->imaged);
+        p->is_logical = bool_after(idx, "is_logical", p->index >= 4);
+        str_after(idx, "compressed_files", p->gz, sizeof p->gz);
+        p->codec = codec_for_file(p->gz);
+        p->is_fat = (p->gz[0] != 0 && p->codec >= 0 && p->start_lba != 0 && p->original != 0);
+        const char *next = find_key(idx, "compacted");
+        cur = next ? next : (idx + 1);
+        nparts++;
+    }
+    return nparts;
+}
+
+/* Rebuild + write the EBR chain for any logical partitions (same-size). Shared
+ * shape with cmd_restore's inline block. */
+static void rebuild_ebr_chain(const drive_info_t *di, int drive, part_t *parts, int nparts,
+                              uint64_t ext_base, const uint8_t *mbr) {
+    uint64_t lstarts[24], lcounts[24]; uint8_t ltypes[24]; int nl = 0;
+    for (int k = 0; k < nparts; k++) {
+        part_t *p = &parts[k];
+        if (!(p->is_logical || p->index >= 4) || nl >= 24) continue;
+        lstarts[nl] = p->start_lba;
+        lcounts[nl] = p->window_sec;
+        ltypes[nl]  = p->type_byte;
+        nl++;
+    }
+    if (nl == 0) return;
+    for (int a = 1; a < nl; a++) {
+        uint64_t ss = lstarts[a], cc = lcounts[a]; uint8_t tt = ltypes[a];
+        int b = a - 1;
+        while (b >= 0 && lstarts[b] > ss) {
+            lstarts[b + 1] = lstarts[b]; lcounts[b + 1] = lcounts[b]; ltypes[b + 1] = ltypes[b];
+            b--;
+        }
+        lstarts[b + 1] = ss; lcounts[b + 1] = cc; ltypes[b + 1] = tt;
+    }
+    if (ext_base == 0)
+        for (int e = 0; e < 4; e++) {
+            const uint8_t *ent = mbr + 446 + e * 16;
+            if (is_extended_type(ent[4]) && rd32(ent + 12) != 0) { ext_base = rd32(ent + 8); break; }
+        }
+    if (ext_base == 0)
+        printf("  warning: logical partitions but no extended container -- EBR chain skipped\n");
+    else if (write_ebr_chain(di, drive, ext_base, lstarts, lcounts, ltypes, nl) == 0)
+        printf("wrote %d EBR sector%s (ext base lba %lu)\n", nl, nl == 1 ? "" : "s",
+               (unsigned long)ext_base);
+    else
+        printf("EBR chain write failed\n");
+}
+
+static int cmd_netrestore(const char *src, int drive, int confirmed,
+                          unsigned sel_mask, int has_filter, int resize_requested) {
+    char host[64], name[64];
+    unsigned short port;
+    if (cbnet_parse_url(src, host, sizeof host, &port, name, sizeof name) != 0) {
+        printf("bad rb:// source (use rb://HOST[:PORT]/NAME)\n");
+        return 2;
+    }
+    if (resize_requested)
+        printf("note: network restore is same-size for now (/SIZE ignored -- resize via folder/desktop)\n");
+
+    if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
+    drive_info_t di;
+    drive_params(drive, &di);
+    if (!di.present) { printf("target drive 0x%02X not present\n", drive); xfer_free(); return 1; }
+    di.ext = drive_has_ext(drive);
+    uint64_t disk_sectors = drive_total_sectors(&di, drive);
+    printf("target drive 0x%02X: %u cyl %u head %u spt, %lu sectors\n",
+           drive, di.cyls, di.heads, di.spt, (unsigned long)disk_sectors);
+    if (!confirmed) {
+        printf("REFUSING to write without /Y (this ERASES drive 0x%02X)\n", drive);
+        xfer_free(); return 1;
+    }
+
+    cbnet_t *net = cbnet_start_get(host, port, name);
+    if (!net) { xfer_free(); return 1; }
+
+    static char meta[16384];
+    int mn = cbnet_get_raw(net, "metadata.json", meta, sizeof meta - 1);
+    if (mn < 0) { printf("cannot fetch metadata.json\n"); cbnet_close(net); xfer_free(); return 1; }
+    meta[mn] = 0;
+
+    char ptype[16] = "";
+    str_after(meta, "partition_table_type", ptype, sizeof ptype);
+    if (strcmp(ptype, "MBR") != 0) {
+        printf("partition_table_type \"%s\" not supported (MBR only)\n", ptype);
+        cbnet_close(net); xfer_free(); return 1;
+    }
+    uint64_t ext_base = 0;
+    { const char *ec = strstr(meta, "\"extended_container\""); if (ec) ext_base = u64_after(ec, "start_lba", 0); }
+
+    static part_t parts[24];
+    int nparts = scan_parts(meta, parts, 24);
+    if (nparts == 0) { printf("no partitions in metadata\n"); cbnet_close(net); xfer_free(); return 1; }
+
+    uint8_t mbr[512];
+    int bn = cbnet_get_raw(net, "mbr.bin", mbr, sizeof mbr);
+    if (bn != 512) { printf("cannot fetch mbr.bin (%d)\n", bn); cbnet_close(net); xfer_free(); return 1; }
+
+    int restored = 0;
+    for (int k = 0; k < nparts; k++) {
+        part_t *p = &parts[k];
+        p->window_sec = p->original / 512;        /* same-size restore */
+        if (has_filter && (p->index < 0 || p->index >= 32 || !(sel_mask & (1u << p->index)))) {
+            printf("  partition %d: not in /PARTS -- skipped\n", p->index);
+            continue;
+        }
+        if (!p->is_fat || p->codec != CODEC_GZIP) {
+            if (p->gz[0])
+                printf("  partition %d: %s -- network restore is gzip members only\n", p->index, p->gz);
+            continue;
+        }
+        if (p->original / 512 + p->start_lba > disk_sectors) {
+            printf("  partition %d: target disk too small (needs lba %lu)\n",
+                   p->index, (unsigned long)(p->start_lba + p->original / 512));
+            cbnet_close(net); xfer_free(); return 1;
+        }
+        int s = cbnet_get_member_begin(net, p->gz);
+        if (s == -2) { printf("  member %s missing on agent -- skipped\n", p->gz); continue; }
+        if (s < 0) { printf("  cannot stream %s\n", p->gz); cbnet_close(net); xfer_free(); return 1; }
+        if (netrestore_partition(&di, drive, net, p->start_lba, p->original, p->gz) != 0) {
+            cbnet_get_member_end(net); cbnet_close(net); xfer_free(); return 1;
+        }
+        cbnet_get_member_end(net);
+        printf("  restored %s -> lba %lu (%lu KiB)\n", p->gz, (unsigned long)p->start_lba,
+               (unsigned long)(p->window_sec * 512 / 1024));
+        restored++;
+    }
+    cbnet_get_done(net);
+    cbnet_close(net);
+
+    if (restored == 0) { printf("no partitions restored\n"); xfer_free(); return 1; }
+
+    rebuild_ebr_chain(&di, drive, parts, nparts, ext_base, mbr);
+    if (write_lba(&di, drive, 0, 1, mbr) != 0) { printf("MBR write failed\n"); xfer_free(); return 1; }
+    printf("wrote MBR\n");
+    printf("network restore complete: %d partition%s written to drive 0x%02X\n",
+           restored, restored == 1 ? "" : "s", drive);
+    xfer_free();
+    return 0;
+}
+
 int cmd_restore(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc < 3) {
-        printf("usage: CRUSTYBK restore <folder> <target-drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
+        printf("usage: CRUSTYBK restore <src> <target-drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
+        printf("  <src> is a folder OR a network agent rb://HOST[:PORT]/NAME\n");
         printf("  /Y               confirms the destructive write to the target drive\n");
         printf("  /SIZE:ORIGINAL   restore at the recorded sizes (default)\n");
         printf("  /SIZE:MINIMUM    shrink each FAT partition to its used data\n");
         printf("  /SIZE:ENTIRE     grow each FAT partition to fill the disk\n");
         printf("  /SIZE:CUSTOM     resize to /CUSTOM:<bytes>\n");
         printf("  /PARTS:i,j       restore only these partition indices (metadata \"index\")\n");
+        printf("  rb:// pulls a NAME.cbk from the agent and writes it same-size\n");
+        printf("  (no local folder); gzip members + primaries/logicals, resize on desktop.\n");
         return 2;
     }
     const char *folder = argv[1];
@@ -187,6 +406,10 @@ int cmd_restore(int argc, char **argv) {
         }
     }
     if (mode == SZ_CUSTOM && custom_bytes == 0) { printf("/SIZE:CUSTOM needs /CUSTOM:<bytes>\n"); return 2; }
+
+    /* Network source: pull the .cbk's members from the agent (no local folder). */
+    if (strncmp(folder, "rb://", 5) == 0)
+        return cmd_netrestore(folder, drive, confirmed, sel_mask, has_filter, mode != SZ_ORIGINAL);
 
     char mpath[200];
     sprintf(mpath, "%s\\metadata.json", folder);

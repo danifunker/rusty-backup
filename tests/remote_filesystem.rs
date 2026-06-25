@@ -1697,6 +1697,114 @@ fn family_b_chunk_put_resumes_after_drop() {
     );
 }
 
+/// Family B GET (cb-dos / phase 7e — restore over the wire): a JSON-free client
+/// pulls a `.cbk`'s members back to rebuild a disk. Emulates the exact bytes
+/// `CRUSTYBK RESTORE rb://...` sends (handshake + `RBKG` + member-fetch requests)
+/// and asserts the daemon serves a `*.gz` member as its **raw gzip bytes** (the
+/// client inflates) and a Raw member **decompressed** (its original file bytes).
+#[test]
+fn family_b_get_serves_cbk_members_over_loopback() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use rusty_backup::rbformats::cbk::pack_folder_to_cbk;
+    use rusty_backup::remote::protocol::{
+        read_get_open_reply, read_member_status, write_get_request, write_member_request,
+        PROTOCOL_VERSION, RB_HELLO_MAGIC_BYTES,
+    };
+
+    // Build + pack a backup folder into a .cbk under the serve root.
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("MYDISK");
+    std::fs::create_dir(&folder).unwrap();
+    let meta_bytes = b"{\n  \"version\": 1,\n  \"partitions\": []\n}\n".to_vec();
+    let mbr_bytes = vec![0x55u8; 512];
+    std::fs::write(folder.join("metadata.json"), &meta_bytes).unwrap();
+    std::fs::write(folder.join("mbr.bin"), &mbr_bytes).unwrap();
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&vec![0u8; 60_000]).unwrap();
+    enc.write_all(b"partition bytes").unwrap();
+    let gz_bytes = enc.finish().unwrap();
+    std::fs::write(folder.join("partition-0.gz"), &gz_bytes).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    pack_folder_to_cbk(&folder, &root.join("MYDISK.cbk")).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // Read a BE length-delimited member stream ([u32 n][n bytes]… [u32 0]).
+    fn read_member(sock: &mut TcpStream) -> Vec<u8> {
+        assert!(read_member_status(sock).unwrap(), "member found");
+        let mut out = Vec::new();
+        loop {
+            let mut lb = [0u8; 4];
+            sock.read_exact(&mut lb).unwrap();
+            let n = u32::from_be_bytes(lb) as usize;
+            if n == 0 {
+                break;
+            }
+            let mut buf = vec![0u8; n];
+            sock.read_exact(&mut buf).unwrap();
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    let mut sock = TcpStream::connect(&addr).unwrap();
+    // handshake
+    let mut req = Vec::new();
+    req.extend_from_slice(&RB_HELLO_MAGIC_BYTES);
+    req.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    req.extend_from_slice(&0u16.to_be_bytes());
+    sock.write_all(&req).unwrap();
+    sock.flush().unwrap();
+    let mut reply = [0u8; 8];
+    sock.read_exact(&mut reply).unwrap();
+
+    // GET-open: the daemon advertises the members it holds.
+    write_get_request(&mut sock, "MYDISK").unwrap();
+    let names = read_get_open_reply(&mut sock)
+        .unwrap()
+        .expect("container opened");
+    assert!(names.iter().any(|n| n == "partition-0.gz"));
+    assert!(names.iter().any(|n| n == "metadata.json"));
+
+    // Raw members come back decompressed (their original file bytes).
+    write_member_request(&mut sock, "metadata.json").unwrap();
+    assert_eq!(read_member(&mut sock), meta_bytes, "metadata.json verbatim");
+    write_member_request(&mut sock, "mbr.bin").unwrap();
+    assert_eq!(read_member(&mut sock), mbr_bytes, "mbr.bin verbatim");
+
+    // A *.gz member comes back as its raw gzip bytes (the client inflates).
+    write_member_request(&mut sock, "partition-0.gz").unwrap();
+    let got_gz = read_member(&mut sock);
+    assert_eq!(got_gz, gz_bytes, "partition-0.gz served as raw gzip bytes");
+    // And those bytes really are the partition (gunzip → the original image).
+    let mut dec = flate2::read::MultiGzDecoder::new(&got_gz[..]);
+    let mut img = Vec::new();
+    dec.read_to_end(&mut img).unwrap();
+    assert_eq!(img.len(), 60_015, "gunzipped partition image length");
+
+    // A missing member is reported, not fatal.
+    write_member_request(&mut sock, "nope.gz").unwrap();
+    assert!(
+        !read_member_status(&mut sock).unwrap(),
+        "missing member -> status!=0"
+    );
+
+    // Done marker (empty name) closes cleanly.
+    write_member_request(&mut sock, "").unwrap();
+    drop(sock);
+}
+
 /// Remote per-partition MINIMUM-SIZE calc over the block tier: drive the
 /// `min_size_runner` worker with a `MinSizeSource::Remote { is_device: false }`
 /// against a served FAT image and prove it computes an in-place minimum well

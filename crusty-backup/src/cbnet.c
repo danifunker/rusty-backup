@@ -30,7 +30,7 @@ static const unsigned char RESUME_MAGIC[4] = {'R', 'B', 'K', 'R'};
 struct cbnet {
     int sock;
     int net_up; /* sock_init succeeded */
-    /* span buffers */
+    /* PUT: span buffers */
     unsigned char *inbuf;  /* uncompressed span accumulator (CBNET_SPAN) */
     uint32_t inlen;        /* bytes currently in inbuf */
     unsigned char *outbuf; /* compressed span */
@@ -44,7 +44,46 @@ struct cbnet {
         uint32_t committed;
     } resume[MAX_RESUME];
     int nresume;
+    /* GET (restore): a member byte stream the daemon frames as [u32 BE n][n]*
+     * terminated by [u32 0]; for a .gz member we inflate it (multi-member gzip). */
+    unsigned char *framebuf; /* current frame's bytes from the socket */
+    int framecap, framelen, framepos;
+    int member_eof;          /* read the [u32 0] frame terminator */
+    int member_inflate;      /* 1 = gz (inflate), 0 = raw passthrough */
+    z_stream inf;            /* inflate state for a .gz member */
+    int inf_active;          /* inflateInit2 done, inflateEnd pending */
 };
+
+int cbnet_parse_url(const char *url, char *host, int hostcap, unsigned short *port, char *name,
+                    int namecap) {
+    if (strncmp(url, "rb://", 5) != 0)
+        return -1;
+    const char *p = url + 5;
+    const char *slash = strchr(p, '/');
+    const char *colon = strchr(p, ':');
+    const char *hostend;
+    *port = 7341;
+    if (colon && (!slash || colon < slash)) {
+        hostend = colon;
+        *port = (unsigned short)atoi(colon + 1);
+    } else {
+        hostend = slash ? slash : p + strlen(p);
+    }
+    int hl = (int)(hostend - p);
+    if (hl <= 0 || hl >= hostcap)
+        return -1;
+    memcpy(host, p, hl);
+    host[hl] = 0;
+    if (slash && slash[1]) {
+        if ((int)strlen(slash + 1) >= namecap)
+            return -1;
+        strcpy(name, slash + 1);
+    } else {
+        strncpy(name, "MYDISK", namecap - 1);
+        name[namecap - 1] = 0;
+    }
+    return 0;
+}
 
 /* committed chunk count the daemon reported for `name`, or 0 if none. */
 static uint32_t resume_committed(const cbnet_t *n, const char *name) {
@@ -173,20 +212,14 @@ static int read_resume_map(cbnet_t *n) {
     return 0;
 }
 
-cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
-                     unsigned long fingerprint, int member_count) {
+/* Bring up WATT-32, connect to host:port, and do the Family-B handshake. NULL on
+ * failure (a message is printed). Shared by the PUT (backup) and GET (restore)
+ * entry points. */
+static cbnet_t *cbnet_connect(const char *host, unsigned short port) {
     cbnet_t *n = calloc(1, sizeof *n);
     if (!n)
         return NULL;
     n->sock = -1;
-    n->outcap = CBNET_SPAN + CBNET_SPAN / 16 + 1024; /* > deflateBound(SPAN) */
-    n->inbuf = malloc(CBNET_SPAN);
-    n->outbuf = malloc(n->outcap);
-    if (!n->inbuf || !n->outbuf) {
-        fprintf(stderr, "out of memory for span buffers\n");
-        cbnet_close(n);
-        return NULL;
-    }
 
     int rc = sock_init();
     if (rc != 0) {
@@ -219,7 +252,6 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
         return NULL;
     }
 
-    /* Family-B handshake. */
     unsigned char hello[8], reply[8];
     memcpy(hello, RB_MAGIC, 4);
     be16(hello + 4, RB_PROTO_VER);
@@ -232,6 +264,22 @@ cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name
     }
     if (!((((unsigned)reply[6] << 8) | reply[7]) & CAP_FAMILY_B))
         fprintf(stderr, "warning: agent does not advertise the backup stream (old daemon?)\n");
+    return n;
+}
+
+cbnet_t *cbnet_start(const char *host, unsigned short port, const char *cbk_name,
+                     unsigned long fingerprint, int member_count) {
+    cbnet_t *n = cbnet_connect(host, port);
+    if (!n)
+        return NULL;
+    n->outcap = CBNET_SPAN + CBNET_SPAN / 16 + 1024; /* > deflateBound(SPAN) */
+    n->inbuf = malloc(CBNET_SPAN);
+    n->outbuf = malloc(n->outcap);
+    if (!n->inbuf || !n->outbuf) {
+        fprintf(stderr, "out of memory for span buffers\n");
+        cbnet_close(n);
+        return NULL;
+    }
 
     /* PUT header: RBKP, name, fingerprint (u32), member_count (u16). */
     int nlen = (int)strlen(cbk_name);
@@ -347,12 +395,223 @@ int cbnet_finish(cbnet_t *n, unsigned long long *cbk_size) {
     return 0;
 }
 
+/* ----- GET: restore over the wire ----- */
+
+static const unsigned char GET_MAGIC[4] = {'R', 'B', 'K', 'G'};
+#define FRAME_INIT 65536
+
+/* Send a member-fetch request: u16 name_len (BE) + name. An empty name is the
+ * "done" marker. 0 / -1. */
+static int send_member_request(cbnet_t *n, const char *name) {
+    int nlen = name ? (int)strlen(name) : 0;
+    unsigned char nl[2];
+    be16(nl, (unsigned)nlen);
+    if (send_all(n->sock, nl, 2) != 0)
+        return -1;
+    if (nlen && send_all(n->sock, (const unsigned char *)name, nlen) != 0)
+        return -1;
+    return 0;
+}
+
+/* Read the next member-stream frame into framebuf. Sets member_eof on the [u32 0]
+ * terminator. 0 / -1. */
+static int fill_frame(cbnet_t *n) {
+    unsigned char hdr[4];
+    if (recv_all(n->sock, hdr, 4) != 0)
+        return -1;
+    uint32_t len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) | ((uint32_t)hdr[2] << 8) |
+                   hdr[3];
+    if (len == 0) {
+        n->member_eof = 1;
+        n->framelen = 0;
+        n->framepos = 0;
+        return 0;
+    }
+    if ((int)len > n->framecap) {
+        unsigned char *nb = realloc(n->framebuf, len);
+        if (!nb)
+            return -1;
+        n->framebuf = nb;
+        n->framecap = (int)len;
+    }
+    if (recv_all(n->sock, n->framebuf, (int)len) != 0)
+        return -1;
+    n->framelen = (int)len;
+    n->framepos = 0;
+    return 0;
+}
+
+cbnet_t *cbnet_start_get(const char *host, unsigned short port, const char *cbk_name) {
+    cbnet_t *n = cbnet_connect(host, port);
+    if (!n)
+        return NULL;
+    n->framebuf = malloc(FRAME_INIT);
+    if (!n->framebuf) {
+        fprintf(stderr, "out of memory\n");
+        cbnet_close(n);
+        return NULL;
+    }
+    n->framecap = FRAME_INIT;
+
+    /* GET request: RBKG + name. */
+    int nlen = (int)strlen(cbk_name);
+    unsigned char gh[6];
+    memcpy(gh, GET_MAGIC, 4);
+    be16(gh + 4, (unsigned)nlen);
+    if (send_all(n->sock, gh, 6) != 0 ||
+        send_all(n->sock, (const unsigned char *)cbk_name, nlen) != 0) {
+        fprintf(stderr, "sending GET request failed\n");
+        cbnet_close(n);
+        return NULL;
+    }
+    /* GET-open reply: status(1); on ok member_count(2) + names we don't need. */
+    unsigned char st;
+    if (recv_all(n->sock, &st, 1) != 0) {
+        fprintf(stderr, "no GET reply\n");
+        cbnet_close(n);
+        return NULL;
+    }
+    if (st != 0) {
+        fprintf(stderr, "agent has no container '%s'\n", cbk_name);
+        cbnet_close(n);
+        return NULL;
+    }
+    unsigned char cc[2];
+    if (recv_all(n->sock, cc, 2) != 0) {
+        cbnet_close(n);
+        return NULL;
+    }
+    int count = (cc[0] << 8) | cc[1];
+    for (int i = 0; i < count; i++) { /* skip the advertised member names */
+        unsigned char ml[2];
+        if (recv_all(n->sock, ml, 2) != 0) {
+            cbnet_close(n);
+            return NULL;
+        }
+        int ln = (ml[0] << 8) | ml[1];
+        while (ln > 0) {
+            unsigned char tmp[64];
+            int t = ln < (int)sizeof tmp ? ln : (int)sizeof tmp;
+            if (recv_all(n->sock, tmp, t) != 0) {
+                cbnet_close(n);
+                return NULL;
+            }
+            ln -= t;
+        }
+    }
+    return n;
+}
+
+/* Request a member and read its status byte. 0 found / 1 not-found / -1 error. */
+static int begin_member_stream(cbnet_t *n, const char *name) {
+    if (send_member_request(n, name) != 0)
+        return -1;
+    unsigned char st;
+    if (recv_all(n->sock, &st, 1) != 0)
+        return -1;
+    n->member_eof = 0;
+    n->framelen = 0;
+    n->framepos = 0;
+    return st == 0 ? 0 : 1;
+}
+
+int cbnet_get_raw(cbnet_t *n, const char *name, void *buf, int cap) {
+    int s = begin_member_stream(n, name);
+    if (s < 0)
+        return -1;
+    if (s == 1)
+        return -2; /* not found */
+    n->member_inflate = 0;
+    int got = 0;
+    unsigned char *out = (unsigned char *)buf;
+    while (!n->member_eof) {
+        if (fill_frame(n) != 0)
+            return -1;
+        if (n->member_eof)
+            break;
+        if (got + n->framelen > cap) {
+            fprintf(stderr, "member %s too large for buffer\n", name);
+            return -1;
+        }
+        memcpy(out + got, n->framebuf, n->framelen);
+        got += n->framelen;
+    }
+    return got;
+}
+
+int cbnet_get_member_begin(cbnet_t *n, const char *name) {
+    int s = begin_member_stream(n, name);
+    if (s < 0)
+        return -1;
+    if (s == 1)
+        return -2;
+    memset(&n->inf, 0, sizeof n->inf);
+    if (inflateInit2(&n->inf, 15 + 16) != Z_OK) /* 15+16 = gzip, multi-member */
+        return -1;
+    n->inf_active = 1;
+    n->member_inflate = 1;
+    return 0;
+}
+
+int cbnet_get_member_read(cbnet_t *n, void *buf, int len) {
+    if (!n->inf_active)
+        return -1;
+    n->inf.next_out = (Bytef *)buf;
+    n->inf.avail_out = (uInt)len;
+    while (n->inf.avail_out > 0) {
+        if (n->inf.avail_in == 0) {
+            if (n->member_eof)
+                break; /* no more compressed input */
+            if (fill_frame(n) != 0)
+                return -1;
+            if (n->member_eof)
+                break;
+            n->inf.next_in = n->framebuf;
+            n->inf.avail_in = (uInt)n->framelen;
+        }
+        int rc = inflate(&n->inf, Z_NO_FLUSH);
+        if (rc == Z_STREAM_END) {
+            /* End of one gzip member; a multi-member `.gz` continues with the
+             * next. Reset and keep going while input remains / more frames. */
+            if (n->inf.avail_in > 0 || !n->member_eof) {
+                if (inflateReset(&n->inf) != Z_OK)
+                    return -1;
+                continue;
+            }
+            break;
+        }
+        if (rc != Z_OK)
+            return -1;
+    }
+    return len - (int)n->inf.avail_out;
+}
+
+int cbnet_get_member_end(cbnet_t *n) {
+    /* Drain to the frame terminator if the caller stopped early. */
+    while (!n->member_eof)
+        if (fill_frame(n) != 0)
+            break;
+    if (n->inf_active) {
+        inflateEnd(&n->inf);
+        n->inf_active = 0;
+    }
+    n->member_inflate = 0;
+    return 0;
+}
+
+void cbnet_get_done(cbnet_t *n) {
+    send_member_request(n, NULL); /* empty-name "done" marker */
+}
+
 void cbnet_close(cbnet_t *n) {
     if (!n)
         return;
+    if (n->inf_active)
+        inflateEnd(&n->inf);
     if (n->sock >= 0)
         closesocket(n->sock);
     free(n->inbuf);
     free(n->outbuf);
+    free(n->framebuf);
     free(n);
 }

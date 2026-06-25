@@ -34,6 +34,11 @@
 
 typedef struct cbnet cbnet_t;
 
+/* Parse rb://HOST[:PORT]/NAME into host/port/name. 0 ok / -1 malformed. Defaults:
+ * port 7341, NAME = "MYDISK". Shared by `backup rb://` and `restore rb://`. */
+int cbnet_parse_url(const char *url, char *host, int hostcap, unsigned short *port, char *name,
+                    int namecap);
+
 /* Bring up WATT-32, connect to host:port, do the Family-B handshake, send the
  * PUT header (the container becomes `<cbk_name>.cbk` on the daemon), and read
  * back the daemon's resume map. `fingerprint` is the cheap §4 source fingerprint
@@ -67,6 +72,26 @@ int cbnet_part_end(cbnet_t *n);
 /* All members sent: read the daemon's result frame. 0 ok (sets *cbk_size), -1 on
  * a NAK / short read / non-zero status. */
 int cbnet_finish(cbnet_t *n, unsigned long long *cbk_size);
+
+/* ----- GET: restore over the wire (pull a `.cbk`'s members) ----- */
+
+/* Connect + handshake + send a GET request for `cbk_name` + read the member list.
+ * NULL on failure (no such container, or transport error). */
+cbnet_t *cbnet_start_get(const char *host, unsigned short port, const char *cbk_name);
+
+/* Fetch a small Raw member (metadata.json / mbr.bin) fully into `buf`. Returns
+ * the byte count, -2 if the member doesn't exist, or -1 on error. */
+int cbnet_get_raw(cbnet_t *n, const char *name, void *buf, int cap);
+
+/* Begin streaming a Gz member (a partition); the bytes are gunzipped as read.
+ * 0 ok / -2 not found / -1 error. Read it via cbnet_get_member_read until it
+ * returns 0 (EOF), then cbnet_get_member_end before the next member. */
+int cbnet_get_member_begin(cbnet_t *n, const char *name);
+int cbnet_get_member_read(cbnet_t *n, void *buf, int len); /* bytes / 0 EOF / -1 */
+int cbnet_get_member_end(cbnet_t *n);                      /* finish the member; 0 / -1 */
+
+/* Send the "done" marker (empty member request) so the daemon closes cleanly. */
+void cbnet_get_done(cbnet_t *n);
 
 /* Close the socket and free buffers. */
 void cbnet_close(cbnet_t *n);

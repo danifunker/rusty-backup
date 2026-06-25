@@ -32,9 +32,10 @@ use serde::{Deserialize, Serialize};
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_chunk_header, read_chunks, read_control, read_handshake, read_member_header,
-    read_put_header, write_binary_hello, write_control, write_put_ack, write_put_result,
-    write_resume_map, ChunkWriter, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
+    read_chunk_header, read_chunks, read_control, read_family_b_op, read_handshake,
+    read_member_header, read_member_request, write_binary_hello, write_control,
+    write_get_open_reply, write_member_stream, write_put_ack, write_put_result, write_resume_map,
+    ChunkWriter, FamilyBOp, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
     WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
     RB_HELLO_MAGIC,
 };
@@ -139,12 +140,12 @@ pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBu
 
 /// Handle a binary Family-B client (cb-dos / `CRUSTYBK.EXE`).
 ///
-/// **Phase 7b — chunk PUT.** The opening binary `Hello` has already been read;
-/// we reply with our version + capabilities, then read the next frame: either
-/// the peer hangs up (a bare hello-and-quit probe like `NETHELLO` → EOF, a clean
-/// close) or it streams a chunk PUT (`NETPUT` → a `.cbk` on the host). A PUT is
-/// assembled into the frozen `.cbk` container under the serve root via
-/// [`receive_put`].
+/// **Phases 7b–7e.** The opening binary `Hello` has already been read; we reply
+/// with our version + capabilities, then read the next frame: the peer hangs up
+/// (a bare hello-and-quit probe like `NETHELLO` → EOF, a clean close), streams a
+/// chunk **PUT** (`backup rb://…` → a `.cbk` on the host, [`receive_put`]), or
+/// issues a **GET** (`restore rb://…` → pull a `.cbk`'s members back to rebuild a
+/// disk, [`serve_get`]).
 fn handle_family_b(
     mut reader: BufReader<TcpStream>,
     mut writer: BufWriter<TcpStream>,
@@ -160,11 +161,67 @@ fn handle_family_b(
     write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F | CAP_FAMILY_B)
         .context("writing Family-B hello reply")?;
 
-    match read_put_header(&mut reader).context("reading Family-B PUT header")? {
+    match read_family_b_op(&mut reader).context("reading Family-B op")? {
         // Hello-only client (e.g. NETHELLO): clean disconnect, nothing to do.
         None => Ok(()),
-        Some(hdr) => receive_put(&mut reader, &mut writer, root, staging_dir, hdr),
+        Some(FamilyBOp::Put(hdr)) => receive_put(&mut reader, &mut writer, root, staging_dir, hdr),
+        Some(FamilyBOp::Get { name }) => serve_get(&mut reader, &mut writer, root, &name),
     }
+}
+
+/// Serve a GET (restore over the wire): open `<root>/<name>.cbk`, advertise its
+/// members, then stream whichever member the client asks for until it sends the
+/// done marker. A `partition-N.gz` member is served as its **raw gzip bytes** (the
+/// client inflates); a Raw member (`metadata.json`/`mbr.bin`) is served
+/// **decompressed** (its original file bytes). Read-only — no resume state.
+fn serve_get(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    root: &Path,
+    name: &str,
+) -> Result<()> {
+    let cbk = cbk_dest_path(root, name)?;
+    let members = match crate::rbformats::cbk::read_cbk_index(&cbk) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "rb-cli serve: GET {name:?} -> cannot open {}: {e:#}",
+                cbk.display()
+            );
+            write_get_open_reply(writer, None)?;
+            return Ok(());
+        }
+    };
+    let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+    eprintln!(
+        "rb-cli serve: GET {name:?} -> serving {} member(s) from {}",
+        names.len(),
+        cbk.display()
+    );
+    write_get_open_reply(writer, Some(&names))?;
+
+    while let Some(want) = read_member_request(reader)? {
+        match members.iter().find(|m| m.name == want) {
+            None => {
+                eprintln!("rb-cli serve: GET {name:?} member {want:?} not found");
+                write_member_stream(writer, false, std::io::empty())?;
+            }
+            Some(member) => {
+                // A `*.gz` member is sent verbatim (its chunk payloads ARE the gz);
+                // any other member is gunzipped to its original file bytes.
+                if want.to_ascii_lowercase().ends_with(".gz") {
+                    let src = crate::rbformats::cbk::CbkPayloadReader::open(&cbk, member)
+                        .with_context(|| format!("opening member {want}"))?;
+                    write_member_stream(writer, true, src)?;
+                } else {
+                    let src = crate::rbformats::cbk::cbk_member_content_reader(&cbk, member)
+                        .with_context(|| format!("opening member {want}"))?;
+                    write_member_stream(writer, true, src)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Durable resume state for an in-progress PUT (the ddrescue-mapfile analog,

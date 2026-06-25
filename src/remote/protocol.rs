@@ -453,6 +453,11 @@ pub fn write_binary_hello<W: Write>(w: &mut W, version: u16, capabilities: u16) 
 /// op, mirroring how the handshake magic disambiguates the connection itself.
 pub const PUT_MAGIC: u32 = 0x5242_4B50; // "RBKP"
 
+/// Magic leading a **GET** request (`b"RBKG"`) — restore over the wire (7e). The
+/// client pulls a `.cbk`'s members back to rebuild a disk; the daemon serves each
+/// member's bytes from the container it holds.
+pub const GET_MAGIC: u32 = 0x5242_4B47; // "RBKG"
+
 /// Magic leading each member descriptor inside a PUT (`b"RBKM"`).
 pub const MEMBER_MAGIC: u32 = 0x5242_4B4D; // "RBKM"
 
@@ -560,32 +565,137 @@ fn write_short_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     w.write_all(bytes)
 }
 
+/// A Family-B operation following the handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FamilyBOp {
+    /// `RBKP` — a chunk PUT (backup over the wire).
+    Put(PutHeader),
+    /// `RBKG` — a GET (restore over the wire): pull container `name`'s members.
+    Get { name: String },
+}
+
 /// Read the opening frame of a Family-B session after the handshake. Returns
 /// `Ok(None)` when the peer hung up first (a bare hello-then-disconnect, e.g.
-/// `NETHELLO`), `Ok(Some(header))` for a chunk PUT, or an error for an unknown
+/// `NETHELLO`), `Ok(Some(op))` for a PUT or GET, or an error for an unknown
 /// leading magic.
-pub fn read_put_header<R: Read>(r: &mut R) -> io::Result<Option<PutHeader>> {
+pub fn read_family_b_op<R: Read>(r: &mut R) -> io::Result<Option<FamilyBOp>> {
     let mut magic = [0u8; 4];
     match r.read_exact(&mut magic) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let m = u32::from_be_bytes(magic);
-    if m != PUT_MAGIC {
-        return Err(io::Error::new(
+    match u32::from_be_bytes(magic) {
+        PUT_MAGIC => {
+            let name = read_short_string(r)?;
+            let fingerprint = read_u32_be(r)?;
+            let member_count = read_u16_be(r)?;
+            Ok(Some(FamilyBOp::Put(PutHeader {
+                name,
+                fingerprint,
+                member_count,
+            })))
+        }
+        GET_MAGIC => {
+            let name = read_short_string(r)?;
+            Ok(Some(FamilyBOp::Get { name }))
+        }
+        m => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected Family-B op magic {m:#010x} (expected PUT {PUT_MAGIC:#010x})"),
-        ));
+            format!("unexpected Family-B op magic {m:#010x}"),
+        )),
     }
+}
+
+/// Write a GET request (client side): the `RBKG` magic + container base name.
+pub fn write_get_request<W: Write>(w: &mut W, name: &str) -> io::Result<()> {
+    w.write_all(&GET_MAGIC.to_be_bytes())?;
+    write_short_string(w, name)?;
+    w.flush()
+}
+
+/// Write the GET-open reply (daemon side): a status byte (0 = the container
+/// opened) then, on success, the member-name list so the client can confirm what
+/// it'll pull. Flushed.
+pub fn write_get_open_reply<W: Write>(w: &mut W, names: Option<&[String]>) -> io::Result<()> {
+    match names {
+        None => w.write_all(&[1u8])?, // error: no such container / unreadable
+        Some(names) => {
+            w.write_all(&[0u8])?;
+            let count = u16::try_from(names.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many members"))?;
+            w.write_all(&count.to_be_bytes())?;
+            for n in names {
+                write_short_string(w, n)?;
+            }
+        }
+    }
+    w.flush()
+}
+
+/// Read the GET-open reply (client side): `Ok(None)` on an error status, else the
+/// member-name list.
+pub fn read_get_open_reply<R: Read>(r: &mut R) -> io::Result<Option<Vec<String>>> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    if status[0] != 0 {
+        return Ok(None);
+    }
+    let count = read_u16_be(r)? as usize;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+        names.push(read_short_string(r)?);
+    }
+    Ok(Some(names))
+}
+
+/// Write a member-fetch request inside a GET (client side): the member name, or
+/// an empty name to signal "done, close".
+pub fn write_member_request<W: Write>(w: &mut W, name: &str) -> io::Result<()> {
+    write_short_string(w, name)?;
+    w.flush()
+}
+
+/// Read a member-fetch request (daemon side): `Ok(None)` when the client sent the
+/// empty-name "done" marker.
+pub fn read_member_request<R: Read>(r: &mut R) -> io::Result<Option<String>> {
     let name = read_short_string(r)?;
-    let fingerprint = read_u32_be(r)?;
-    let member_count = read_u16_be(r)?;
-    Ok(Some(PutHeader {
-        name,
-        fingerprint,
-        member_count,
-    }))
+    Ok(if name.is_empty() { None } else { Some(name) })
+}
+
+/// Stream a member's bytes (daemon side): a status byte (0 = found), then — on
+/// success — the bytes as big-endian length-delimited frames `[u32 n][n bytes]…`
+/// terminated by `[u32 0]`. Mirrors the PUT chunk framing's byte order so the DOS
+/// client reads everything big-endian.
+pub fn write_member_stream<W: Write, R: Read>(
+    w: &mut W,
+    found: bool,
+    mut src: R,
+) -> io::Result<()> {
+    if !found {
+        w.write_all(&[1u8])?;
+        return w.flush();
+    }
+    w.write_all(&[0u8])?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&(n as u32).to_be_bytes())?;
+        w.write_all(&buf[..n])?;
+    }
+    w.write_all(&0u32.to_be_bytes())?;
+    w.flush()
+}
+
+/// Read a member stream's status byte (client side); `Ok(true)` if the member was
+/// found and its frames follow.
+pub fn read_member_status<R: Read>(r: &mut R) -> io::Result<bool> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    Ok(status[0] == 0)
 }
 
 /// Write a chunk-PUT request header (client side).

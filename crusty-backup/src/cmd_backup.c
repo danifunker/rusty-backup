@@ -530,35 +530,6 @@ static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *
     return 0;
 }
 
-/* Parse rb://HOST[:PORT]/NAME. 0 ok / -1 malformed. Defaults: port 7341,
- * NAME = "MYDISK". */
-static int parse_rb_dest(const char *dest, char *host, int hostcap,
-                         unsigned short *port, char *name, int namecap) {
-    const char *p = dest + 5; /* skip "rb://" */
-    const char *slash = strchr(p, '/');
-    const char *colon = strchr(p, ':');
-    const char *hostend;
-    *port = 7341;
-    if (colon && (!slash || colon < slash)) {
-        hostend = colon;
-        *port = (unsigned short)atoi(colon + 1);
-    } else {
-        hostend = slash ? slash : p + strlen(p);
-    }
-    int hl = (int)(hostend - p);
-    if (hl <= 0 || hl >= hostcap) return -1;
-    memcpy(host, p, hl);
-    host[hl] = 0;
-    if (slash && slash[1]) {
-        if ((int)strlen(slash + 1) >= namecap) return -1;
-        strcpy(name, slash + 1);
-    } else {
-        strncpy(name, "MYDISK", namecap - 1);
-        name[namecap - 1] = 0;
-    }
-    return 0;
-}
-
 /* Networked backup: scan the MBR, stream the selected primary FAT/NTFS
  * partitions block-level to the agent, send mbr.bin + metadata.json, finish. */
 static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec,
@@ -726,7 +697,7 @@ int cmd_backup(int argc, char **argv) {
         if (defrag) { printf("network backup does not support /DEFRAG yet\n"); return 2; }
         char host[64], name[64];
         unsigned short port;
-        if (parse_rb_dest(dest, host, sizeof host, &port, name, sizeof name) != 0) {
+        if (cbnet_parse_url(dest, host, sizeof host, &port, name, sizeof name) != 0) {
             printf("bad rb:// destination (use rb://HOST[:PORT]/NAME)\n");
             return 2;
         }
