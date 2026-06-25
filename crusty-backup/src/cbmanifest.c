@@ -9,6 +9,7 @@
 
 #include "cbmanifest.h"
 #include "cbbrowse.h"
+#include "cbswap.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,8 +132,11 @@ static int chain_contiguous(fatvol_t *v, uint32_t first, uint32_t size) {
     return (count == need);
 }
 
-/* Emit one file/dir object. Caller manages the leading comma via *first. */
-static void emit_entry(mbuf_t *m, const char *path, const dirent_t *d, int *first) {
+/* Emit one file/dir object. Caller manages the leading comma via *first. A swap
+ * file (§6) is flagged `volatile` (so the change counter ignores it) and, unless
+ * --keep-swap, `content:zeroed` (the compaction emitted zeros for it). */
+static void emit_entry(mbuf_t *m, const char *path, const dirent_t *d, int *first,
+                       int is_swap, int keep_swap) {
     char iso[24];
     dos_dt_iso(d->dos_date, d->dos_time, iso);
     int is_dir = (d->attr & CBK_ATTR_DIR) != 0;
@@ -144,13 +148,17 @@ static void emit_entry(mbuf_t *m, const char *path, const dirent_t *d, int *firs
               (unsigned long)d->size, iso, (unsigned)d->attr,
               (unsigned long)d->first_cluster);
     if (is_dir) mb_puts(m, ", \"dir\": true");
+    if (is_swap) {
+        mb_puts(m, ", \"volatile\": true");
+        if (!keep_swap) mb_puts(m, ", \"content\": \"zeroed\"");
+    }
     mb_puts(m, "}");
 }
 
 /* Depth-first walk emitting every file + directory under `cluster`. `prefix` is
  * the parent's DOS path (no trailing separator; "" at the root). */
 static void walk_dir(fatvol_t *v, uint32_t cluster, int fixed_root,
-                     const char *prefix, mbuf_t *m, int *first, int depth) {
+                     const char *prefix, mbuf_t *m, int *first, int depth, int keep_swap) {
     if (depth > WALK_DEPTH_MAX || m->err) return;
     dirent_t *ents = malloc(sizeof(dirent_t) * WALK_DIR_MAX);
     if (!ents) { m->err = 1; return; }
@@ -164,9 +172,10 @@ static void walk_dir(fatvol_t *v, uint32_t cluster, int fixed_root,
         char *path = malloc(plen);
         if (!path) { m->err = 1; break; }
         sprintf(path, "%s\\%s", prefix, ents[i].name);
-        emit_entry(m, path, &ents[i], first);
+        int is_swap = cbswap_is_swap(ents[i].name, ents[i].attr, prefix);
+        emit_entry(m, path, &ents[i], first, is_swap, keep_swap);
         if ((ents[i].attr & CBK_ATTR_DIR) && ents[i].first_cluster >= 2)
-            walk_dir(v, ents[i].first_cluster, 0, path, m, first, depth + 1);
+            walk_dir(v, ents[i].first_cluster, 0, path, m, first, depth + 1, keep_swap);
         free(path);
     }
     free(ents);
@@ -220,7 +229,7 @@ static void emit_system(mbuf_t *m, fatvol_t *v, const drive_info_t *di, int driv
 }
 
 int manifest_build_fat(const drive_info_t *di, int drive, uint64_t start_lba,
-                       const uint8_t *mbr, char **out_buf, uint32_t *out_len) {
+                       const uint8_t *mbr, int keep_swap, char **out_buf, uint32_t *out_len) {
     fatvol_t v;
     if (cbk_open_vol_live(di, drive, start_lba, &v) != 0) return -1;
 
@@ -230,7 +239,7 @@ int manifest_build_fat(const drive_info_t *di, int drive, uint64_t start_lba,
     emit_system(&m, &v, di, drive, start_lba, mbr);
     mb_puts(&m, "  \"files\": [");
     int first = 1;
-    walk_dir(&v, v.root_cluster, !v.L.is_fat32, "", &m, &first, 0);
+    walk_dir(&v, v.root_cluster, !v.L.is_fat32, "", &m, &first, 0, keep_swap);
     mb_puts(&m, first ? "]\n}\n" : "\n  ]\n}\n");
 
     cbk_close_vol(&v);

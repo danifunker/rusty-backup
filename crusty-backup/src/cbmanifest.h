@@ -27,11 +27,14 @@
 
 /* Build the FAT partition at `start_lba` on BIOS `drive` into a JSON manifest.
  * The document is returned in a malloc'd buffer via *out_buf / *out_len (the
- * caller frees it). `mbr` is the 512-byte disk MBR (for the boot-code CRC). The
- * caller must already have called xfer_init() (the browse engine borrows the
- * shared transfer buffer for its int13h reads). Returns 0 on success, -1 on a
- * hard error (*out_buf untouched). */
+ * caller frees it). `mbr` is the 512-byte disk MBR (for the boot-code CRC).
+ * `keep_swap` (the --keep-swap flag) controls only the swap files' `content`
+ * field: when 0 they are flagged `content:zeroed` to match the zeroed payload,
+ * when nonzero that flag is omitted (they were imaged verbatim). The caller must
+ * already have called xfer_init() (the browse engine borrows the shared transfer
+ * buffer for its int13h reads). Returns 0 on success, -1 on a hard error
+ * (*out_buf untouched). */
 int manifest_build_fat(const drive_info_t *di, int drive, uint64_t start_lba,
-                       const uint8_t *mbr, char **out_buf, uint32_t *out_len);
+                       const uint8_t *mbr, int keep_swap, char **out_buf, uint32_t *out_len);
 
 #endif /* CBMANIFEST_H */

@@ -13,6 +13,7 @@
 #include "cbcodec.h"
 #include "cbnet.h"
 #include "cbmanifest.h"
+#include "cbswap.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +79,34 @@ static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
     if (cf) { fprintf(cf, "%s", pm->crc_hex); fclose(cf); }
 }
 
+/* Build the per-cluster "force zero" bitmap for Level-1 swap exclusion (§6c): a
+ * read-only walk of the live volume for allowlisted swap/page files, marking
+ * their cluster chains. Returns a malloc'd bitmap (bit i = cluster i; caller
+ * frees) when at least one swap file was found, else NULL (no mask: keep_swap,
+ * none present, or out of memory -- the imager then only zeros free clusters).
+ * Logs every exclusion (never silent, §6d). */
+static uint8_t *build_swap_mask(const drive_info_t *di, int drive, uint64_t start_lba,
+                                const fatlay_t *L, int index, int keep_swap) {
+    if (keep_swap) return NULL;
+    fatvol_t v;
+    if (cbk_open_vol_live(di, drive, start_lba, &v) != 0) return NULL;
+    uint8_t *bm = calloc((L->clusters + 2 + 7) / 8, 1);
+    cbswap_found_t found[8];
+    int nf = bm ? cbswap_collect(&v, bm, L->clusters, found, 8) : -1;
+    cbk_close_vol(&v);
+    if (nf <= 0) { free(bm); return NULL; }
+    for (int i = 0; i < nf; i++)
+        printf("  part %d: excluded %s (%lu KiB, zeroed)\n",
+               index, found[i].name, (unsigned long)(found[i].size / 1024));
+    return bm;
+}
+
+/* True if cluster `cl` is allocated to an excluded swap file (a force-zero hit).
+ * `bm` may be NULL (no swap mask) -- always false then. */
+static int swap_hit(const uint8_t *bm, uint32_t cl) {
+    return bm && (bm[cl >> 3] & (1u << (cl & 7)));
+}
+
 /* Smart-compact + gzip a FAT partition into <dest>/partition-N.gz, fill `pm`.
  * When `defrag` is set, the volume's files are first relocated into contiguous
  * runs (boot-file aware) via cbdefrag; if that path declines (an unclean FS, or
@@ -86,7 +115,7 @@ static void gz_crc_sidecar(const char *dest, part_meta_t *pm) {
 static int backup_fat_partition(const drive_info_t *di, int drive,
                                 const char *dest, int index, uint8_t type_byte,
                                 uint64_t start_lba, uint64_t part_sectors,
-                                int defrag, int codec, part_meta_t *pm) {
+                                int defrag, int keep_swap, int codec, part_meta_t *pm) {
     uint8_t vbr[512];
     if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
         printf("  part %d: VBR read failed\n", index);
@@ -135,6 +164,12 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
         /* dr == 1: declined; `w` is still empty -- fall through to plain compaction */
     }
 
+    /* Level-1 swap exclusion (§6c): zero swap files' content too, not just free
+     * clusters. Skipped under /DEFRAG (the repacker relocates clusters, so a
+     * by-cluster mask wouldn't line up) and under --keep-swap. */
+    uint8_t *swapbm = used_defrag ? NULL
+                                  : build_swap_mask(di, drive, start_lba, &L, index, keep_swap);
+
     if (!used_defrag) {
         progress_begin(&pr, lbl, (uint64_t)norm_imaged * 512);
         uint8_t buf[XFER_BYTES];
@@ -150,7 +185,8 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
                 uint32_t rel = s + j;
                 if (rel >= L.first_data_sec) {
                     uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
-                    if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
+                    if (cl < L.clusters + 2 &&
+                        (fat_entry(fat, L.fat_bits, cl) == 0 || swap_hit(swapbm, cl)))
                         memset(buf + j * 512, 0, 512);
                 }
             }
@@ -163,6 +199,7 @@ static int backup_fat_partition(const drive_info_t *di, int drive,
         }
         progress_finish(&pr);
     }
+    free(swapbm);
 
     if (cbw_close(w) != 0 && rc == 0) { printf("  part %d: compress finalize failed\n", index); rc = -1; }
     free(fat);
@@ -374,10 +411,11 @@ static void write_metadata(const char *dest, const char *src_label,
  * detection sidecar, not required for restore). FAT only -- NTFS has no on-DOS
  * directory reader. */
 static void emit_partition_manifest(const char *dest, int index, const drive_info_t *di,
-                                    int drive, uint64_t start_lba, const uint8_t *mbr) {
+                                    int drive, uint64_t start_lba, const uint8_t *mbr,
+                                    int keep_swap) {
     char *buf;
     uint32_t len;
-    if (manifest_build_fat(di, drive, start_lba, mbr, &buf, &len) != 0) {
+    if (manifest_build_fat(di, drive, start_lba, mbr, keep_swap, &buf, &len) != 0) {
         printf("  part %d: manifest skipped (could not read directory tree)\n", index);
         return;
     }
@@ -404,7 +442,7 @@ static void emit_partition_manifest(const char *dest, int index, const drive_inf
 static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *net,
                                    int index, uint8_t type_byte,
                                    uint64_t start_lba, uint64_t part_sectors,
-                                   part_meta_t *pm) {
+                                   int keep_swap, part_meta_t *pm) {
     uint8_t vbr[512];
     if (read_lba(di, drive, start_lba, 1, vbr) != 0) {
         printf("  part %d: VBR read failed\n", index); return -1;
@@ -438,6 +476,11 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
     uint32_t resume_sec = committed * (CBNET_SPAN / 512);
     if (resume_sec > norm_imaged) resume_sec = norm_imaged;
 
+    /* Level-1 swap exclusion (§6c): deterministic zeros, so resume is unaffected
+     * (a re-sent span re-zeros the same clusters) and the §4 FAT fingerprint is
+     * unchanged (allocation kept, only content zeroed). */
+    uint8_t *swapbm = build_swap_mask(di, drive, start_lba, &L, index, keep_swap);
+
     progress_t pr; char lbl[40];
     sprintf(lbl, "part %d (%s)", index, part_type_name(type_byte));
     progress_begin(&pr, lbl, (uint64_t)norm_imaged * 512);
@@ -455,7 +498,8 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
             uint32_t rel = s + j;
             if (rel >= L.first_data_sec) {
                 uint32_t cl = 2 + (rel - L.first_data_sec) / L.spc;
-                if (cl < L.clusters + 2 && fat_entry(fat, L.fat_bits, cl) == 0)
+                if (cl < L.clusters + 2 &&
+                    (fat_entry(fat, L.fat_bits, cl) == 0 || swap_hit(swapbm, cl)))
                     memset(buf + j * 512, 0, 512);
             }
         }
@@ -466,6 +510,7 @@ static int netstream_fat_partition(const drive_info_t *di, int drive, cbnet_t *n
         progress_update(&pr, (uint64_t)s * 512);
     }
     progress_finish(&pr);
+    free(swapbm);
     free(fat);
 
     if (cbnet_part_end(net) != 0 && rc == 0) {
@@ -559,8 +604,8 @@ static int netstream_ntfs_partition(const drive_info_t *di, int drive, cbnet_t *
 
 /* Networked backup: scan the MBR, stream the selected primary FAT/NTFS
  * partitions block-level to the agent, send mbr.bin + metadata.json, finish. */
-static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec,
-                         const char *host, unsigned short port, const char *name) {
+static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int keep_swap,
+                         int codec, const char *host, unsigned short port, const char *name) {
     if (codec != CODEC_GZIP) { printf("network backup is gzip-only for now\n"); return 2; }
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
 
@@ -656,7 +701,7 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec
     for (int k = 0; k < nsel; k++) {
         int ok = is_fat_part_type(sel[k].type)
             ? netstream_fat_partition(&di, drive, net, sel[k].idx, sel[k].type,
-                                      sel[k].lba, sel[k].cnt, &parts[nparts])
+                                      sel[k].lba, sel[k].cnt, keep_swap, &parts[nparts])
             : netstream_ntfs_partition(&di, drive, net, sel[k].idx, sel[k].type,
                                        sel[k].lba, sel[k].cnt, &parts[nparts]);
         if (ok != 0) {
@@ -674,7 +719,7 @@ static int cmd_netbackup(int drive, unsigned sel_mask, int has_filter, int codec
             char *mbuf;
             uint32_t mblen;
             int sent;
-            if (manifest_build_fat(&di, drive, sel[k].lba, mbr, &mbuf, &mblen) == 0) {
+            if (manifest_build_fat(&di, drive, sel[k].lba, mbr, keep_swap, &mbuf, &mblen) == 0) {
                 printf("  part %d: manifest %lu bytes -> %s\n",
                        sel[k].idx, (unsigned long)mblen, mn);
                 sent = cbnet_raw_member(net, mn, mbuf, mblen);
@@ -721,6 +766,7 @@ int cmd_backup(int argc, char **argv) {
         printf("       CRUSTYBK backup A:\\BK 80 /PARTS:0      image only MBR slot 0\n");
         printf("       CRUSTYBK backup A:\\BK 80 /DEFRAG       repack FAT files contiguously\n");
         printf("       CRUSTYBK backup A:\\BK 80 /CODEC:LZ4    LZ4 instead of gzip (faster, larger)\n");
+        printf("       CRUSTYBK backup A:\\BK 80 /KEEPSWAP    keep swap/page-file content (don't zero)\n");
         printf("  /PARTS indices are the 0-based MBR primary slots (the \"part N\"\n");
         printf("  numbers below and the metadata.json \"index\" values).\n");
         printf("  rb:// streams the disk block-level to the agent (no local folder);\n");
@@ -729,12 +775,15 @@ int cmd_backup(int argc, char **argv) {
         printf("  (boot files first) before imaging -- smaller image, defragged restore.\n");
         printf("  /CODEC:LZ4 trades ratio for speed on a slow CPU (default GZIP);\n");
         printf("  restore auto-detects the codec from metadata.\n");
+        printf("  By default swap/page files (WIN386.SWP, 386SPART.PAR, PAGEFILE.SYS,\n");
+        printf("  HIBERFIL.SYS, SWAPPER.DAT) are kept full-size but zeroed (they\n");
+        printf("  reinitialize on boot); /KEEPSWAP images their content verbatim.\n");
         return 2;
     }
 
     const char *dest = argv[1];
     int drive = 0x80, drive_set = 0;
-    unsigned sel_mask = 0; int has_filter = 0, defrag = 0, codec = CODEC_GZIP;
+    unsigned sel_mask = 0; int has_filter = 0, defrag = 0, keep_swap = 0, codec = CODEC_GZIP;
     for (int a = 2; a < argc; a++) {
         const char *v = switch_val(argv[a], "/PARTS:");
         const char *cv = switch_val(argv[a], "/CODEC:");
@@ -746,6 +795,8 @@ int cmd_backup(int argc, char **argv) {
             if (codec < 0) { printf("bad /CODEC (use GZIP or LZ4)\n"); return 2; }
         } else if (eq_ci(argv[a], "/DEFRAG")) {
             defrag = 1;
+        } else if (eq_ci(argv[a], "/KEEPSWAP")) {
+            keep_swap = 1;
         } else if (!drive_set) {
             drive = (int)strtol(argv[a], NULL, 16);
             drive_set = 1;
@@ -762,7 +813,7 @@ int cmd_backup(int argc, char **argv) {
             printf("bad rb:// destination (use rb://HOST[:PORT]/NAME)\n");
             return 2;
         }
-        return cmd_netbackup(drive, sel_mask, has_filter, codec, host, port, name);
+        return cmd_netbackup(drive, sel_mask, has_filter, keep_swap, codec, host, port, name);
     }
 
     if (xfer_init() < 0) { printf("DOS memory alloc failed\n"); return 1; }
@@ -775,6 +826,7 @@ int cmd_backup(int argc, char **argv) {
            drive, di.cyls, di.heads, di.spt, di.ext ? "yes" : "no");
     if (has_filter) printf("partition filter: /PARTS mask 0x%X\n", sel_mask);
     if (defrag) printf("defrag: FAT volumes will be repacked contiguously (boot-aware)\n");
+    if (keep_swap) printf("keep-swap: swap/page files imaged verbatim (not zeroed)\n");
     if (codec != CODEC_GZIP) printf("codec: %s (partition-N.%s)\n", codec_name(codec), codec_ext(codec));
 
     uint8_t mbr[512];
@@ -826,7 +878,7 @@ int cmd_backup(int argc, char **argv) {
                 int lok;
                 if (is_fat_part_type(logs[j].type))
                     lok = backup_fat_partition(&di, drive, dest, lidx, logs[j].type,
-                                               logs[j].start_lba, logs[j].count, defrag, codec, &parts[nparts]);
+                                               logs[j].start_lba, logs[j].count, defrag, keep_swap, codec, &parts[nparts]);
                 else if (logs[j].type == 0x07)
                     lok = backup_ntfs_partition(&di, drive, dest, lidx, logs[j].type,
                                                 logs[j].start_lba, logs[j].count, codec, &parts[nparts]);
@@ -838,7 +890,7 @@ int cmd_backup(int argc, char **argv) {
                     parts[nparts].is_logical = 1;
                     nparts++;
                     if (is_fat_part_type(logs[j].type))
-                        emit_partition_manifest(dest, lidx, &di, drive, logs[j].start_lba, mbr);
+                        emit_partition_manifest(dest, lidx, &di, drive, logs[j].start_lba, mbr, keep_swap);
                 }
             }
             continue;
@@ -850,7 +902,7 @@ int cmd_backup(int argc, char **argv) {
         }
         int ok;
         if (is_fat_part_type(type))
-            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, defrag, codec, &parts[nparts]);
+            ok = backup_fat_partition(&di, drive, dest, i, type, lba, cnt, defrag, keep_swap, codec, &parts[nparts]);
         else if (type == 0x07)
             ok = backup_ntfs_partition(&di, drive, dest, i, type, lba, cnt, codec, &parts[nparts]);
         else {
@@ -861,7 +913,7 @@ int cmd_backup(int argc, char **argv) {
             parts[nparts].is_logical = 0;
             nparts++;
             if (is_fat_part_type(type))
-                emit_partition_manifest(dest, i, &di, drive, lba, mbr);
+                emit_partition_manifest(dest, i, &di, drive, lba, mbr, keep_swap);
         }
     }
 
