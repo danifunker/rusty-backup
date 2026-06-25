@@ -7,10 +7,11 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 20 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 23 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+13b32cf feat(cb-dos): Phase 4c-c — browse a live disk (ls/get/TUI over read_lba)
 c59cd83 feat(cb-dos): Phase 4c-b — TUI browse/mark/extract (single file, multi, folders)
 54322ab feat(cb-dos): Phase 4c-a — browse + extract single files from a backup (ls/get)
 7a2c603 feat(cb-dos): Stage 2 — real TUI front-end (live enum, drives the cmd_* engine)
@@ -45,34 +46,32 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **One exe** — `CRUSTYBK.EXE` | backup/restore/clone/inspect subcommands **+ a real text UI** (live int13h enum; F2/F3/F4 drive the cmd_* engine) over the shared `cbdisk` engine; both verified on FreeDOS/qemu |
 | **Phase 4c-a** — `ls` / `get` (DOS) | browse + extract single files from a backup `partition-N.gz` (FAT dir reader + LFN over `gzseek`), no scratch/no full restore; verified incl. LFN + nested + multi-cluster on FreeDOS/qemu |
 | **Phase 4c-b** — TUI browse (DOS) | F6 Browse: interactive file browser, mark files+folders, F2 extract (folders recurse); verified extracting a file + a folder tree byte-identical on FreeDOS/qemu |
+| **Phase 4c-c** — live-disk browse (DOS) | same `ls`/`get`/TUI-browse against a *mounted/attached* disk (no imaging first): `vol_read_at` dispatches gzseek **or** int13h `read_lba`; CLI `@HH` + MBR slot, TUI F6 on a FAT partition row; read-only on source; verified byte-identical on FAT32 + FAT16 (CLI + TUI) on FreeDOS/qemu |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
 ## Next work (prioritized — pick up here)
 
-1. **Browse a *live disk* (not just a backup).** The browse engine (`cbbrowse.h`)
-   is parameterized only by how it reads bytes — front it with `read_lba` instead
-   of `gzseek` and the same `ls`/`get`/TUI-browse work against a mounted/attached
-   disk too (recover a file from a card without imaging it first). Small, high-
-   value. *Recommended next.*
-2. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
+1. **Lazy `.cbk` reader (perf).** Today `CbkTempReader` reconstructs the whole disk
    to a tempfile at open (fine for small backups, slow for multi-GB). Re-chunk the
    packer (`pack_folder_to_cbk`) into ~1–4 MB source-span gzip members (the v1
    format already supports multiple chunks/member) and make the reader decompress
    only the members a seek touches. No format change. (Also makes `get`'s backward
-   gzseeks cheap — today they rewind to the gz start.)
-3. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
+   gzseeks cheap — today they rewind to the gz start. The new live-disk backend is
+   already seek-cheap — `read_lba` is O(1) per seek — so it's a clean perf
+   reference for what the lazy `.cbk` reader should match.)
+2. **Net 7b** — the `.cbk` chunk **wire** protocol (the container is frozen, so
    this is mainly framing + the incremental `.idx` resume sidecar). See
    `cb_dos_network_and_state.md` §2c/§3 and §9 (7b–7i).
-4. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
+3. **`backup` mbr.bin corruption under stdout redirection (bug, low-priority).**
    Redirecting `CRUSTYBK BACKUP`'s stdout to a file on the *same drive* it writes
    the backup folder to bleeds its "wrote metadata.json" banner into `mbr.bin`'s
    boot-code area (corrupting restores from that folder). A FreeCOM/DOS file-handle
    quirk (gotcha #3), not a restore bug — run backup without `>` and it's clean.
    `get` also writes a DOS file, so the same caution applies; don't redirect it on
    the same drive. Worth root-causing (likely a DTA/FILE-buffer aliasing).
-5. **Real-486 hardware** validation (everything so far is qemu/emulator).
-6. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
+4. **Real-486 hardware** validation (everything so far is qemu/emulator).
+5. **Phase 5 — file-level repack/defrag** (boot-file aware), and the **NTFS /
    logical-partition** backup gaps — the remaining FS coverage on DOS.
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
@@ -109,15 +108,20 @@ subcommands for scripting), built from:
   (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`). `cmd_inspect.c` —
   `inspect` (list BIOS drives + partitions). `cmd_browse.c` + `cbbrowse.h` —
   `ls` / `get` **and the shared browse engine** (`fatvol_t`, `cbk_open_vol`/
-  `cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a FAT12/16/32 directory reader
-  with LFN reassembly + a file/tree extractor over `gzseek` random access (no
-  scratch, no full restore). Each command exposes `int cmd_X(argc,argv)`.
+  `cbk_open_vol_live`/`cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a
+  FAT12/16/32 directory reader with LFN reassembly + a file/tree extractor over a
+  single dispatched read primitive (`vol_read_at`) with **two backends** — a
+  backup `partition-N.gz` (`gzseek`) **or** a live FAT partition on a BIOS drive
+  (int13h `read_lba`); both finish through `vol_finish_open`. No scratch, no full
+  restore. CLI source is a backup folder or `@HH` (live drive 0xHH, `N`=MBR slot;
+  `open_browse_src`/`live_part_lba`). Each command exposes `int cmd_X(argc,argv)`.
 - `crustybk.c` — `main()` dispatches the subcommands or launches the **text UI**
   (`tui_main`): `scan_disks` does live int13h enumeration; F2/F3/F4 gather params
   (`read_line`/`pick_size`/`confirm_erase`) and call `cmd_*()` on a plain screen;
-  **F6 `do_browse`** opens an interactive file browser over `cbbrowse.h` (mark
-  files+folders, F2 extracts the selection, folders recurse). `disk_spike.c` —
-  disk/FS spike.
+  **F6 Browse** runs the shared `browse_loop` (mark files+folders, F2 extracts,
+  folders recurse) over `cbbrowse.h` — on a highlighted **FAT partition row** it
+  browses that partition **live** (`do_browse_live`), otherwise it prompts for a
+  backup folder (`do_browse_backup`). `disk_spike.c` — disk/FS spike.
   `net_hello.c` — WATT-32 handshake client. `lfn_test.c` — raw LFN-API probe.
 - `Makefile` targets: `make crustybk` (the tool; links zlib once) / `make all`
   (+ diagnostics) / `make net` / `make size`.
@@ -201,6 +205,20 @@ extracts one file. `ls` is safe to redirect; `get` writes a DOS file so **don't
 redirect `get`** on the same drive (gotcha #3). Verify by `mcopy`-ing the
 extracted file off and diffing checksums vs the source. N is the 0-based partition
 index (defaults to the first `partition-N.gz` present); paths use `\` or `/`.
+
+**Live-disk browse tests** (`ls`/`get` with `@HH`, Phase 4c-c): attach a FAT disk
+as a second drive (`index=1` → `0x81`) and point the *same* commands at it with
+the `@HH` source — `CRUSTYBK ls @81`, `CRUSTYBK ls @81 0 \DOCS`,
+`CRUSTYBK get @81 \DOCS\F.TXT C:\OUT.TXT` (`@HH` = BIOS drive 0xHH, the trailing
+`N` is the **MBR slot**, default first FAT slot). No imaging first — it reads the
+live volume over int13h. Build the source disk exactly like the clone/PARTS tests
+(own exact-size FS file → `dd` into a slot with a type-0x06 MBR entry; gotcha #7),
+attach it as `0x81`, run the commands writing output to **C:** (a different
+physical drive than the source, so `get` is safe), pull the output off the boot
+disk and diff. Source is **read-only** (no int13h writes). The **TUI** path:
+highlight the live FAT partition row in the menu and press **F6** (a backup folder
+is still reachable by pressing F6 on a disk row / when nothing FAT is selected).
+Verified on both FAT32 (root-cluster) and FAT16 (fixed-root) attached disks.
 
 ## Gotchas learned the hard way (do not relearn these)
 
