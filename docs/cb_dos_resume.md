@@ -7,10 +7,12 @@ Hand-off for continuing the crusty-backup / `.cbk` work. Read this first, then
 
 ## Where we are (2026-06-25)
 
-Branch **`cbdos`** (off `main`), 27 commits ahead of `main`, all verified, tree
+Branch **`cbdos`** (off `main`), 30 commits ahead of `main`, all verified, tree
 clean:
 
 ```
+dbcdfc7 feat(cb-dos): extended / logical partition backup, restore, and clone
+6ffe918 fix(restore): don't double-count logical partitions in the restore pre-flight
 e3284d6 feat(cb-dos): live progress (%, speed, ETA) for backup/restore/clone
 7a8c246 feat(cb-dos): Phase 4d — NTFS backup/restore/clone via $Bitmap compaction
 13b32cf feat(cb-dos): Phase 4c-c — browse a live disk (ls/get/TUI over read_lba)
@@ -51,6 +53,7 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 | **Phase 4c-c** — live-disk browse (DOS) | same `ls`/`get`/TUI-browse against a *mounted/attached* disk (no imaging first): `vol_read_at` dispatches gzseek **or** int13h `read_lba`; CLI `@HH` + MBR slot, TUI F6 on a FAT partition row; read-only on source; verified byte-identical on FAT32 + FAT16 (CLI + TUI) on FreeDOS/qemu |
 | **Phase 4d** — NTFS (DOS) | `backup`/`clone` image NTFS (type 0x07) via `$Bitmap` compaction (`cbntfs.{h,c}`); restore same-size on DOS (resize via desktop `resize_ntfs_in_place`); verified on FreeDOS/qemu — 63 MB random-filled NTFS → 0.4 MB gz, restore + clone `ntfsfix`-clean with files byte-identical, desktop restore cross-checked |
 | **Live progress** (DOS) | backup/restore/clone show a live `\r` line — percent, transferred/total MiB, MiB/s, ETA (`progress_t` in `cbdisk`, BIOS-tick timing, `isatty`-gated); shared engine so **CLI + TUI both** show it; screendump-verified mid-op on FreeDOS/qemu |
+| **Phase 4e** — extended/logical (DOS) | backup/restore/clone follow the **EBR chain** of an extended container (`walk_ebr_chain`/`write_ebr_chain` in `cbdisk`, ports of parse/build_ebr_chain); logicals (index 4+) imaged with `is_logical` + an `extended_container` block; same-size on DOS (resize via desktop); verified on FreeDOS/qemu — primary FAT16 + ext { FAT16, NTFS } round-trips byte-identical via cb-dos restore, cb-dos clone, **and** desktop restore (after fixing a desktop pre-flight double-count) |
 | **`.cbk`** container (frozen v1) | `cbk pack`/`unpack`; **native** inspect/ls/get/fsck/restore; **edit** (put/rm/mkdir via materialize→edit→repack) |
 | **CWSDPMI exit-hang** | root-caused (DAP buffer overrun) + fixed; tools exit cleanly |
 
@@ -78,8 +81,8 @@ ee3ac3e docs(cb-dos): mark net Phase 7a complete — handshake verified on FreeD
 5. **Remaining FS coverage on DOS** — **exFAT** (also MBR type 0x07; the
    allocation-bitmap parser is already proven in `disk_spike.c`, so this is
    wiring it into `cbntfs`-style backup/clone, gated by the `EXFAT   ` OEM id),
-   **logical/extended partitions** (cb-dos is MBR-primary-only today), and
-   **ext2/3** (stretch). (NTFS landed in Phase 4d.)
+   and **ext2/3** (stretch). (NTFS landed in Phase 4d; extended/logical
+   partitions in Phase 4e.)
 6. **Phase 5 — file-level repack/defrag** (boot-file aware).
 
 (Resolved 2026-06-24: the desktop `--partitions` off-by-one — `parse_indices`
@@ -109,21 +112,28 @@ subcommands for scripting), built from:
   (`shift_region_forward`/`_backward`, `compute_fat_sectors`,
   `max_fat_window`/`min_fat_window` cluster cap/floor, `set_clean_flags`,
   `reset_fsinfo`), and the arg helpers (`switch_val`/`eq_ci`/`round_up_512`/
-  `parse_parts`, `rd64`), and the **live transfer progress** meter (`progress_t` +
-  `progress_begin`/`progress_update`/`progress_finish`: `\r` line with %, MiB,
-  MiB/s, ETA from the BIOS tick counter, `isatty`-gated). The single source of
-  truth — no more triplicated primitives.
+  `parse_parts`, `rd64`), the **EBR chain** helpers (`walk_ebr_chain`/
+  `write_ebr_chain` + `is_extended_type` + `logical_t`, ports of the desktop's
+  parse/build_ebr_chain for extended/logical partitions), and the **live transfer
+  progress** meter (`progress_t` + `progress_begin`/`progress_update`/
+  `progress_finish`: `\r` line with %, MiB, MiB/s, ETA from the BIOS tick counter,
+  `isatty`-gated). The single source of truth — no more triplicated primitives.
 - `cbntfs.{h,c}` — the **NTFS `$Bitmap` reader** (no driver): `ntfs_parse` (BPB),
   `ntfs_load_bitmap` (MFT #6 `$Bitmap` + fixup + `$DATA` run decode → RAM bitmap,
   set bit = used), `ntfs_cluster_used`, `ntfs_is_ntfs` (OEM-id check vs exFAT/HPFS).
   Lifted from the `disk_spike.c` probe. Used by `backup`/`clone` for NTFS compaction.
 - `cmd_backup.c` — `backup` (image FAT/NTFS disk → native folder, smart-compact +
   gzip, `/PARTS`): FAT compacts from its FAT, NTFS (`backup_ntfs_partition`) from
-  the `$Bitmap` (full window, free clusters zeroed). `cmd_restore.c` — `restore`
-  (folder → disk, `/SIZE` resize + `/PARTS`, the metadata.json scanner + gzip
-  stream; **FS-agnostic** so NTFS restores same-size, resize gated on 512-byte FAT).
-  `cmd_clone.c` — `clone` (direct disk-to-disk, no staging file, `/SIZE` + `/PARTS`;
-  FAT resizes, NTFS clones same-size via `clone_ntfs_partition`). `cmd_inspect.c` —
+  the `$Bitmap` (full window, free clusters zeroed); **extended containers** are
+  walked and their **logical** volumes imaged (`is_logical`, index 4+, +
+  `extended_container` metadata). `cmd_restore.c` — `restore` (folder → disk,
+  `/SIZE` resize + `/PARTS`, the metadata.json scanner + gzip stream; **FS-agnostic**
+  so NTFS restores same-size; logicals same-size + the **EBR chain rebuilt** via
+  `write_ebr_chain`; resize gated on 512-byte FAT, primary growth clamped at the
+  extended container). `cmd_clone.c` — `clone` (direct disk-to-disk, no staging
+  file, `/SIZE` + `/PARTS`; FAT resizes, NTFS clones same-size via
+  `clone_ntfs_partition`; **logicals cloned same-size + EBRs copied verbatim**).
+  `cmd_inspect.c` —
   `inspect` (list BIOS drives + partitions). `cmd_browse.c` + `cbbrowse.h` —
   `ls` / `get` **and the shared browse engine** (`fatvol_t`, `cbk_open_vol`/
   `cbk_open_vol_live`/`cbk_list_dir`/`cbk_extract`/`cbk_extract_tree`): a
