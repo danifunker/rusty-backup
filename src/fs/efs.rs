@@ -1235,6 +1235,7 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
         amiga_date: None,
         dos_attributes: None,
         finder_flags: None,
+        prodos_file_type: None,
         mac_dates: None,
     }
 }
@@ -1695,6 +1696,7 @@ fn adopt_orphans_into_lost_found<R: Read + Write + Seek + Send>(
                 amiga_date: None,
                 dos_attributes: None,
                 finder_flags: None,
+                prodos_file_type: None,
                 mac_dates: None,
             };
             let lf = fs.create_directory(
@@ -1902,6 +1904,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
             amiga_date: None,
             dos_attributes: None,
             finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }
@@ -1999,6 +2002,7 @@ impl<R: Read + Seek + Send> Filesystem for EfsFilesystem<R> {
                                 amiga_date: None,
                                 dos_attributes: None,
                                 finder_flags: None,
+                                prodos_file_type: None,
                                 mac_dates: None,
                             };
                             if matches!(e.entry_type, EntryType::Directory) {

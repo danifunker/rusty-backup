@@ -257,8 +257,13 @@ pub struct WireEntry {
     pub path: String,
     pub kind: WireKind,
     pub size: u64,
-    pub type_code: Option<String>,
-    pub creator_code: Option<String>,
+    /// Raw 4-byte Mac OSType type/creator (byte-exact, like `FileEntry`), so a
+    /// remote browse renders high-bit codes correctly and a remote copy
+    /// preserves them. `None` on non-Mac entries.
+    pub type_code: Option<[u8; 4]>,
+    pub creator_code: Option<[u8; 4]>,
+    /// ProDOS 1-byte file type (ProDOS has no OSType). `None` elsewhere.
+    pub prodos_file_type: Option<u8>,
     pub symlink_target: Option<String>,
 }
 
@@ -286,8 +291,9 @@ impl WireEntry {
             path: e.path.clone(),
             kind,
             size: e.size,
-            type_code: e.type_code.clone(),
-            creator_code: e.creator_code.clone(),
+            type_code: e.type_code,
+            creator_code: e.creator_code,
+            prodos_file_type: e.prodos_file_type,
             symlink_target: e.symlink_target.clone(),
         }
     }

@@ -742,15 +742,19 @@ fn apply_chmeta(
         bail!("chmeta: pass at least one of type / creator");
     }
     let entry = super::ls::resolve_path(&mut *fs, &op.path)?;
+    // Default the un-overridden half to the file's current code (display form;
+    // `set_type_creator` is text-based).
+    let entry_type = entry.type_code_display();
+    let entry_creator = entry.creator_code_display();
     let new_type = op
         .type_code
         .as_deref()
-        .or(entry.type_code.as_deref())
+        .or(entry_type.as_deref())
         .unwrap_or("BINA");
     let new_creator = op
         .creator
         .as_deref()
-        .or(entry.creator_code.as_deref())
+        .or(entry_creator.as_deref())
         .unwrap_or("????");
     fs.set_type_creator(&entry, new_type, new_creator)
         .map_err(|e| anyhow!("set_type_creator: {e}"))?;

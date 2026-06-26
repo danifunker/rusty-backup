@@ -64,7 +64,8 @@ pub fn detect_content_type(entry: &FileEntry, data: &[u8]) -> FileContent {
 
     // Check HFS type code first (if present)
     if let Some(ref type_code) = entry.type_code {
-        if let Some(is_text) = hfs_file_types::classify(type_code) {
+        let type_str = rusty_backup::fs::hfs_common::decode_ostype(type_code);
+        if let Some(is_text) = hfs_file_types::classify(&type_str) {
             if !is_text {
                 return FileContent::Binary(data.to_vec());
             }
@@ -193,10 +194,10 @@ pub fn render_metadata_rows(ui: &mut egui::Ui, entry: &FileEntry, suppress_type_
         // dedicated editor row. For other filesystems there's nothing extra to
         // show, so this block is empty.
         if !suppress_type_creator {
-            if let Some(ref tc) = entry.type_code {
+            if let Some(tc) = entry.type_code_display() {
                 ui.label(format!("Type: {tc}"));
             }
-            if let Some(ref cc) = entry.creator_code {
+            if let Some(cc) = entry.creator_code_display() {
                 ui.label(format!("Creator: {cc}"));
             }
         }

@@ -66,6 +66,7 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             amiga_date: None,
             dos_attributes: None,
             finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }
@@ -919,7 +920,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         };
 
         let mut fe = FileEntry::new_file(validated_name, path, eof as u64, key_ptr as u64);
-        fe.type_code = Some(super::prodos_types::format_type_code(file_type));
+        fe.prodos_file_type = Some(file_type);
         fe.aux_type = Some(aux_type);
         fe.mode = Some(storage_type as u32);
         Ok(fe)
@@ -1526,7 +1527,7 @@ fn list_prodos_directory<R: Read + Seek>(
                 // Regular file: seedling (1), sapling (2), or tree (3).
                 let mut fe = FileEntry::new_file(name, path, eof as u64, key_pointer as u64);
                 fe.modified = modified;
-                fe.type_code = Some(super::prodos_types::format_type_code(file_type));
+                fe.prodos_file_type = Some(file_type);
                 fe.aux_type = Some(aux_type);
                 // Store storage type in `mode` so read_file can dispatch correctly.
                 fe.mode = Some(type_nibble as u32);
@@ -2089,7 +2090,7 @@ mod tests {
 
         assert_eq!(entry.name, "HELLO");
         assert_eq!(entry.size, 14);
-        assert!(entry.type_code.as_ref().unwrap().starts_with("$04"));
+        assert_eq!(entry.prodos_file_type, Some(0x04));
 
         // Verify we can read it back.
         let read_back = fs.read_file(&entry, usize::MAX).unwrap();

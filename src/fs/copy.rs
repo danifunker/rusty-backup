@@ -485,18 +485,12 @@ fn copy_file(
     // the type/creator create_file just wrote. See docs/bug_binhex_finder_flags.md.
     if opts.attrs == AttrPolicy::Preserve && dst_caps.type_creator {
         if let Some(flags) = src_entry.finder_flags.filter(|&f| f != 0) {
-            use crate::fs::hfs_common::encode_fourcc;
-            let type_code = options
-                .type_code
-                .as_deref()
-                .or(created.type_code.as_deref())
-                .map(encode_fourcc)
-                .unwrap_or([0; 4]);
+            // Re-supply the raw OSType create_file just wrote (byte-exact),
+            // since set_finder_info rewrites the whole FInfo.
+            let type_code = options.os_type.or(created.type_code).unwrap_or([0; 4]);
             let creator_code = options
-                .creator_code
-                .as_deref()
-                .or(created.creator_code.as_deref())
-                .map(encode_fourcc)
+                .os_creator
+                .or(created.creator_code)
                 .unwrap_or([0; 4]);
             let mut finfo = [0u8; 16];
             finfo[0..4].copy_from_slice(&type_code);
@@ -539,11 +533,23 @@ fn translate_metadata(
         return (o, d);
     }
 
-    // HFS/HFS+ type & creator, ProDOS file type.
+    // HFS/HFS+/MFS type & creator: pass the raw OSType bytes through
+    // `os_type`/`os_creator` so high-bit codes survive byte-exact.
     if src.type_code.is_some() || src.creator_code.is_some() {
         if dst_caps.type_creator {
-            o.type_code = src.type_code.clone();
-            o.creator_code = src.creator_code.clone();
+            o.os_type = src.type_code;
+            o.os_creator = src.creator_code;
+        } else {
+            d.type_creator = true;
+        }
+    }
+    // ProDOS file type (rendered `$XX`, re-parsed by the ProDOS create path) +
+    // its auxiliary type.
+    if src.prodos_file_type.is_some() {
+        if dst_caps.type_creator {
+            o.type_code = src
+                .prodos_file_type
+                .map(crate::fs::prodos_types::format_type_code);
             o.aux_type = src.aux_type;
         } else {
             d.type_creator = true;
@@ -943,8 +949,8 @@ mod tests {
     fn translate_drops_unsupported_axes() {
         // HFS-ish source file → FAT-ish dest: type/creator dropped.
         let mut src = FileEntry::new_file("doc.txt".into(), "/doc.txt".into(), 10, 0);
-        src.type_code = Some("TEXT".into());
-        src.creator_code = Some("ttxt".into());
+        src.type_code = Some(*b"TEXT");
+        src.creator_code = Some(*b"ttxt");
         src.resource_fork_size = Some(40);
         let dst = Capabilities::infer("FAT16");
         let (opts, dropped) = translate_metadata(

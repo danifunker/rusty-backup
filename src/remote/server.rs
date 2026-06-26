@@ -71,8 +71,11 @@ enum StagedEdit {
         blob: PathBuf,
         size: u64,
         force: bool,
-        type_code: Option<String>,
-        creator_code: Option<String>,
+        /// Raw 4-byte Mac OSType type/creator written verbatim on apply, so a
+        /// remote copy preserves high-bit codes. A host `StageUpload`'s text
+        /// `--type` is encoded to bytes when staged.
+        type_code: Option<[u8; 4]>,
+        creator_code: Option<[u8; 4]>,
     },
     Mkdir {
         parent: String,
@@ -907,8 +910,14 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                                     blob,
                                     size,
                                     force,
-                                    type_code,
-                                    creator_code,
+                                    // Host upload: encode the user-typed ASCII
+                                    // `--type`/`--creator` text to raw OSType bytes.
+                                    type_code: type_code
+                                        .as_deref()
+                                        .map(crate::fs::hfs_common::encode_fourcc),
+                                    creator_code: creator_code
+                                        .as_deref()
+                                        .map(crate::fs::hfs_common::encode_fourcc),
                                 });
                                 write_control(&mut writer, &Response::Ok)?;
                             }
@@ -1297,8 +1306,8 @@ fn apply_session(sess: &Session) -> Result<u64> {
                         .map_err(|e| anyhow!("delete existing {name}: {e}"))?;
                 }
                 let options = CreateFileOptions {
-                    type_code: type_code.clone(),
-                    creator_code: creator_code.clone(),
+                    os_type: *type_code,
+                    os_creator: *creator_code,
                     ..Default::default()
                 };
                 let mut blobf = std::fs::File::open(blob)
@@ -1334,6 +1343,10 @@ fn apply_session(sess: &Session) -> Result<u64> {
     Ok(count)
 }
 
+/// What [`stage_copy_local`] hands back: the staging blob path, the source
+/// file's size, and its raw OSType type/creator (preserved byte-exact).
+type StagedCopy = (PathBuf, u64, Option<[u8; 4]>, Option<[u8; 4]>);
+
 /// Stage an on-device copy: extract `src_path` from the source image into a
 /// staging blob in the session's staging dir, returning the blob + the source
 /// file's size and type/creator (preserved for HFS-style filesystems). The blob
@@ -1344,7 +1357,7 @@ fn stage_copy_local(
     src_partition: Option<u32>,
     src_path: &str,
     sess: &mut Session,
-) -> Result<(PathBuf, u64, Option<String>, Option<String>)> {
+) -> Result<StagedCopy> {
     let mut opened = open_image(root, src_rel, src_partition)?;
     let entry = resolve_path(&mut *opened.fs, src_path)?;
     if entry.is_directory() {
@@ -1358,12 +1371,7 @@ fn stage_copy_local(
         .fs
         .write_file_to(&entry, &mut f)
         .map_err(|e| anyhow!("reading {src_path}: {e}"))?;
-    Ok((
-        blob,
-        entry.size,
-        entry.type_code.clone(),
-        entry.creator_code.clone(),
-    ))
+    Ok((blob, entry.size, entry.type_code, entry.creator_code))
 }
 
 /// Largest single `ReadBlock` we honour — bounds one block-reader fetch so a
@@ -1594,6 +1602,7 @@ fn list_host_dir(root: &Path, rel: &str) -> Result<Vec<WireEntry>> {
             size,
             type_code: None,
             creator_code: None,
+            prodos_file_type: None,
             symlink_target: None,
         });
     }

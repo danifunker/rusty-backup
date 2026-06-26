@@ -228,16 +228,8 @@ pub fn resolved_prodos_type(queue: &EditQueue, entry: &FileEntry) -> (u8, u16) {
     }) {
         return (t, a);
     }
-    // 3) On-disk catalog values: parse "$XX ABC" out of entry.type_code
-    let t = entry
-        .type_code
-        .as_deref()
-        .and_then(|tc| {
-            tc.split_whitespace()
-                .next()
-                .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-        })
-        .unwrap_or(0);
+    // 3) On-disk catalog value: the ProDOS file type byte.
+    let t = entry.prodos_file_type.unwrap_or(0);
     let a = entry.aux_type.unwrap_or(0);
     (t, a)
 }
