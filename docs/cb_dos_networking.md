@@ -12,9 +12,14 @@ DOS networking is always two layers:
 
 1. **A packet driver** — a tiny TSR (`.COM`) *specific to your network card*. It
    talks to the NIC and exposes it on a software interrupt (we use `0x60`).
-   There is **no universal driver**; you supply the one for your card. The
-   card → driver map is in [`../crusty-backup/net/drivers/DRIVERS.TXT`](../crusty-backup/net/drivers/DRIVERS.TXT)
-   (and it ships on the CD as `\NET\DRIVERS\DRIVERS.TXT`).
+   There is **no universal driver**, but the media now **bundles the Crynwr GPL
+   collection** (~90 drivers): the **CD** carries the full set under
+   `\NET\DRIVERS`, and the **floppy** a common subset (NE2000, NE1000, PCNTPK,
+   RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT). The card → driver map is in
+   [`../crusty-backup/net/drivers/DRIVERS.TXT`](../crusty-backup/net/drivers/DRIVERS.TXT)
+   (also at `\NET\DRIVERS\DRIVERS.TXT`); if your card is not covered, drop its
+   `.COM` into `net/drivers/` (refresh the set with `net/fetch-drivers.sh`) and
+   rebuild.
 2. **mTCP** — the TCP/IP applications (`DHCP`, `FTP`, `FTPSRV`, `PING`, …) that
    run on top of the packet driver.
 

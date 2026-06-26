@@ -6,4 +6,5 @@ deps/dl/
 net/watt32/
 net/dl/
 net/mtcp/
-net/drivers/*.COM
+# net/drivers/*.com are now VENDORED (the Crynwr GPL collection, fetched by
+# net/fetch-drivers.sh and committed) so the CI-built media ships with drivers.

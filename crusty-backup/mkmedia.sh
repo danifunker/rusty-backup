@@ -104,8 +104,12 @@ docker run --rm \
         mmd -i /fd.img ::NET/DRIVERS 2>/dev/null || true
         sed "s/\$/\r/" /in/drivers/DRIVERS.TXT > /tmp/DRIVERS.TXT
         mcopy -o -i /fd.img /tmp/DRIVERS.TXT    ::NET/DRIVERS/DRIVERS.TXT
-        for c in /in/drivers/*.COM /in/drivers/*.com; do
-            [ -f "$c" ] && mcopy -o -i /fd.img "$c" ::NET/DRIVERS/ || true
+        # The full Crynwr set (~600 KB) only fits the CD; the floppy carries a
+        # curated set covering the common retro NICs + the cards the big
+        # emulators (QEMU / VirtualBox / 86Box / DOSBox-X) present. The CD has
+        # all of them under \NET\DRIVERS.
+        for d in ne2000 ne1000 pcntpk rtspkt 3c509 3c503 smc_wd e100bpkt; do
+            [ -f "/in/drivers/$d.com" ] && mcopy -o -i /fd.img "/in/drivers/$d.com" ::NET/DRIVERS/ || true
         done
 
         # Drop the FreeDOS installer (irrelevant to cb-dos, frees ~39 KB). The
@@ -126,25 +130,29 @@ docker run --rm \
         genisoimage -quiet -o /cbdos.iso -V CBDOS -b boot/cbdos.img -c boot/boot.cat /isoroot
         cp /cbdos.iso /fd.img.iso 2>/dev/null || true
     '
-# Stage a \NET directory for the CD (DOS networking via mTCP + your packet
-# driver), if mTCP has been fetched — `sh crusty-backup/net/fetch-mtcp.sh`. The
-# boot floppy is too small for it, so networking rides on the CD only. DOS text
-# files get CRLF line endings. See docs/cb_dos_networking.md.
+# Stage the CD's \NET directory. Unlike the floppy (which only has room for a
+# handful of common drivers), the CD carries the FULL packet-driver set plus the
+# WATT-32 config, and — when fetched — the mTCP FTP suite. DOS text files get
+# CRLF line endings. See docs/cb_dos_networking.md.
 NETDIR="$HERE/net"
 NETSTAGE="$DIST/.netstage"
-rm -rf "$NETSTAGE"; mkdir -p "$NETSTAGE"
+rm -rf "$NETSTAGE"; mkdir -p "$NETSTAGE/DRIVERS"
+# Full packet-driver collection (the floppy only gets the curated few above).
+for c in "$NETDIR"/drivers/*.com "$NETDIR"/drivers/*.COM; do [ -f "$c" ] && cp "$c" "$NETSTAGE/DRIVERS/"; done
+sed 's/$/\r/' "$NETDIR/drivers/DRIVERS.TXT" > "$NETSTAGE/DRIVERS/DRIVERS.TXT"
+[ -f "$NETDIR/drivers/CRYNWR-GPL.txt" ] && sed 's/$/\r/' "$NETDIR/drivers/CRYNWR-GPL.txt" > "$NETSTAGE/DRIVERS/CRYNWR-GPL.txt"
+# WATT-32 config for crustybk's networked backup, alongside the drivers.
+sed 's/$/\r/' "$WATTCFG" > "$NETSTAGE/WATTCP.CFG"
+drv=$(ls "$NETDIR"/drivers/*.com "$NETDIR"/drivers/*.COM 2>/dev/null | wc -l | tr -d ' ')
+# Optional mTCP FTP suite (move a finished backup file off the box over FTP).
 if ls "$NETDIR"/mtcp/*.EXE >/dev/null 2>&1; then
-    mkdir -p "$NETSTAGE/DRIVERS"
     cp "$NETDIR"/mtcp/*.EXE "$NETSTAGE/"
     [ -f "$NETDIR/mtcp/COPYING.TXT" ] && cp "$NETDIR/mtcp/COPYING.TXT" "$NETSTAGE/"
-    for c in "$NETDIR"/drivers/*.COM; do [ -f "$c" ] && cp "$c" "$NETSTAGE/DRIVERS/"; done
-    sed 's/$/\r/' "$NETDIR/drivers/DRIVERS.TXT" > "$NETSTAGE/DRIVERS/DRIVERS.TXT"
-    sed 's/$/\r/' "$NETDIR/MTCP.CFG"            > "$NETSTAGE/MTCP.CFG"
-    sed 's/$/\r/' "$NETDIR/NET.BAT"             > "$NETSTAGE/NET.BAT"
-    drv=$(ls "$NETDIR"/drivers/*.COM 2>/dev/null | wc -l | tr -d ' ')
-    echo "Including \\NET on the CD: mTCP + ${drv} packet driver(s)"
+    sed 's/$/\r/' "$NETDIR/MTCP.CFG" > "$NETSTAGE/MTCP.CFG"
+    sed 's/$/\r/' "$NETDIR/NET.BAT"  > "$NETSTAGE/NET.BAT"
+    echo "Including \\NET on the CD: ${drv} packet driver(s) + mTCP FTP suite"
 else
-    echo "No mTCP in net/mtcp/ — CD has no \\NET (run net/fetch-mtcp.sh to add DOS networking)."
+    echo "Including \\NET on the CD: ${drv} packet driver(s) (no mTCP — run net/fetch-mtcp.sh for the FTP suite)"
 fi
 
 # genisoimage wrote inside the container; redo the ISO with the dist mount bound

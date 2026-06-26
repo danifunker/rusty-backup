@@ -1,14 +1,21 @@
 ===================================================================
  cb-dos packet-driver library
 ===================================================================
-DOS TCP/IP (mTCP) needs a PACKET DRIVER for your network card. A packet
+Networked backup needs a PACKET DRIVER for your network card. A packet
 driver is a tiny TSR (.COM) specific to your NIC; it presents the card to
-mTCP on a software interrupt (we use 60h by convention).
+the TCP/IP stack on a software interrupt (we use 60h by convention).
+crustybk's own "backup rb://host/name" (WATT-32) and the mTCP FTP suite
+both use it.
 
-This directory is where you put the .COM packet driver(s) for the card(s)
-you use. Drop the file in, rebuild the media, and load it before NET.BAT:
+This media SHIPS the Crynwr packet-driver collection (GPLv2; ~90 drivers,
+see CRYNWR-GPL.txt). The CD carries the FULL set under \NET\DRIVERS; the
+boot floppy has room for only a common subset (NE2000, NE1000, PCNTPK,
+RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT). Load yours before a backup:
 
     \NET\DRIVERS\<driver> 0x60 [IRQ] [IO]
+
+If your card is not covered, drop its .COM driver into net/drivers/ (or,
+on the booted box, copy it to \NET\DRIVERS) and rebuild the media.
 
 ------- Common cards -> driver (and where to get it) --------------
 Card / chipset            Packet driver   Typical load line
