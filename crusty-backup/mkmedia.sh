@@ -19,11 +19,15 @@ BUILD="$HERE/build"
 DIST="$HERE/dist"
 AUTOEXEC="$HERE/media/cbdos-autoexec.bat"
 DOSLFN="$HERE/media/DOSLFN.COM"     # long-filename TSR (vendored; see media/DOSLFN-ATTRIBUTION.md)
+WATTCFG="$HERE/net/WATTCP.CFG"      # WATT-32 config for crustybk's networked backup
+NETDRV="$HERE/net/drivers"          # user packet-driver .COM(s) for the floppy's \NET\DRIVERS
 
-for e in crustybk disk_spike lfn_test; do
-    [ -f "$BUILD/$e.exe" ] || { echo "missing $BUILD/$e.exe (run make / cb-dos.Dockerfile first)"; exit 1; }
-done
-[ -f "$DOSLFN" ] || { echo "missing $DOSLFN (vendored long-filename TSR)"; exit 1; }
+# Only CRUSTYBK ships on the media now (the disk_spike / lfn_test POCs are dev
+# diagnostics — see the floppy staging below). It links WATT-32 + zlib + lz4 and
+# is the one that must exist.
+[ -f "$BUILD/crustybk.exe" ] || { echo "missing $BUILD/crustybk.exe (run make / cb-dos.Dockerfile first)"; exit 1; }
+[ -f "$DOSLFN" ]    || { echo "missing $DOSLFN (vendored long-filename TSR)"; exit 1; }
+[ -f "$WATTCFG" ]   || { echo "missing $WATTCFG (WATT-32 config for networked backup)"; exit 1; }
 
 mkdir -p "$DIST"
 cp "$FDBASE" "$DIST/cbdos-freedos.img"
@@ -41,25 +45,82 @@ if [ ! -f "$DL/CWSDPMI.EXE" ]; then
     ( cd "$DL" && unzip -o -j -q csdpmi7b.zip bin/CWSDPMI.EXE )
 fi
 
+# UPX (Ultimate Packer for eXecutables). CRUSTYBK links the WATT-32 TCP/IP stack
+# and is ~1 MB -- too big for a 1.44 MB floppy alongside FreeDOS -- so we pack it
+# (it self-extracts into RAM at launch). UPX is not in Debian's apt repos, so
+# grab the official static build matching the mtools container's arch (no
+# --platform on that container, so it runs at the host arch).
+UPX_VER="${UPX_VER:-4.2.4}"
+case "$(uname -m)" in
+    x86_64|amd64)  UPX_ARCH=amd64 ;;
+    arm64|aarch64) UPX_ARCH=arm64 ;;
+    *) echo "unsupported arch for UPX: $(uname -m)"; exit 1 ;;
+esac
+if [ ! -x "$DL/upx" ]; then
+    curl -fsSL -o "$DL/upx.tar.xz" \
+        "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-${UPX_ARCH}_linux.tar.xz"
+    tar -xf "$DL/upx.tar.xz" -C "$DL" "upx-${UPX_VER}-${UPX_ARCH}_linux/upx"
+    mv "$DL/upx-${UPX_VER}-${UPX_ARCH}_linux/upx" "$DL/upx"
+    rmdir "$DL/upx-${UPX_VER}-${UPX_ARCH}_linux" 2>/dev/null || true
+    chmod +x "$DL/upx"
+fi
+
 docker run --rm \
     -v "$DIST/cbdos-freedos.img":/fd.img \
     -v "$BUILD":/exe:ro \
     -v "$DL/CWSDPMI.EXE":/dpmi/CWSDPMI.EXE:ro \
     -v "$DOSLFN":/dpmi/DOSLFN.COM:ro \
     -v "$AUTOEXEC":/in/fdauto.bat:ro \
+    -v "$WATTCFG":/in/WATTCP.CFG:ro \
+    -v "$NETDRV":/in/drivers:ro \
+    -v "$DL/upx":/usr/local/bin/upx:ro \
     debian:bookworm-slim sh -c '
+        set -e
         apt-get update >/dev/null 2>&1
         apt-get install -y mtools genisoimage >/dev/null 2>&1
         export MTOOLS_SKIP_CHECK=1
         sed "s/\$/\r/" /in/fdauto.bat > /tmp/fdauto.bat   # CRLF for DOS
+
+        # CRUSTYBK statically links the WATT-32 TCP/IP stack (networked backup)
+        # and weighs ~1 MB -- too big for a 1.44 MB floppy alongside FreeDOS, so
+        # mcopy used to silently fail "Disk full" and ship a floppy with no
+        # backup tool. UPX packs it to ~600 KB; the stub unpacks it into RAM at
+        # launch, so networking is fully preserved. --best (NRV) decompresses far
+        # faster than --lzma on the 486-class CPUs cb-dos targets.
+        cp /exe/crustybk.exe /tmp/CRUSTYBK.EXE
+        upx --best -q /tmp/CRUSTYBK.EXE >/dev/null
+
         mcopy -o -i /fd.img /tmp/fdauto.bat     ::FDAUTO.BAT
         mcopy -o -i /fd.img /dpmi/CWSDPMI.EXE   ::CWSDPMI.EXE
         mcopy -o -i /fd.img /dpmi/DOSLFN.COM    ::DOSLFN.COM
-        mcopy -o -i /fd.img /exe/crustybk.exe   ::CRUSTYBK.EXE
-        mcopy -o -i /fd.img /exe/disk_spike.exe ::DISKSPK.EXE
-        mcopy -o -i /fd.img /exe/lfn_test.exe   ::LFNTEST.EXE
-        # Drop the FreeDOS installer (irrelevant to cb-dos, frees ~39 KB).
+        mcopy -o -i /fd.img /tmp/CRUSTYBK.EXE   ::CRUSTYBK.EXE
+
+        # Networking for "backup rb://...": WATT-32 reads WATTCP.CFG (DHCP by
+        # default) from the root next to CRUSTYBK.EXE; \NET\DRIVERS holds the
+        # packet driver(s) you drop into net/drivers/ for your NIC.
+        sed "s/\$/\r/" /in/WATTCP.CFG > /tmp/WATTCP.CFG
+        mcopy -o -i /fd.img /tmp/WATTCP.CFG     ::WATTCP.CFG
+        mmd -i /fd.img ::NET         2>/dev/null || true
+        mmd -i /fd.img ::NET/DRIVERS 2>/dev/null || true
+        sed "s/\$/\r/" /in/drivers/DRIVERS.TXT > /tmp/DRIVERS.TXT
+        mcopy -o -i /fd.img /tmp/DRIVERS.TXT    ::NET/DRIVERS/DRIVERS.TXT
+        for c in /in/drivers/*.COM /in/drivers/*.com; do
+            [ -f "$c" ] && mcopy -o -i /fd.img "$c" ::NET/DRIVERS/ || true
+        done
+
+        # Drop the FreeDOS installer (irrelevant to cb-dos, frees ~39 KB). The
+        # disk_spike / lfn_test POC diagnostics are intentionally NOT shipped --
+        # the room goes to CRUSTYBK + networking.
         mdel -i /fd.img ::SETUP.BAT 2>/dev/null || true
+
+        # Guard against the silent-disk-full regression: mtools mcopy can print
+        # "Disk full" yet still exit 0, so set -e alone is not enough -- assert
+        # the tool actually landed.
+        mdir -i /fd.img ::CRUSTYBK.EXE >/dev/null 2>&1 || {
+            echo "ERROR: CRUSTYBK.EXE is not on the floppy (out of space?). Aborting." >&2
+            exit 1
+        }
+
         # El-Torito CD that boots the same floppy (floppy emulation).
         mkdir -p /isoroot/boot && cp /fd.img /isoroot/boot/cbdos.img
         genisoimage -quiet -o /cbdos.iso -V CBDOS -b boot/cbdos.img -c boot/boot.cat /isoroot

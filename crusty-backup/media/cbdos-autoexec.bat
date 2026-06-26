@@ -18,9 +18,11 @@ REM Boot straight into the crusty-backup text UI.
 CRUSTYBK.EXE
 echo.
 echo   crusty-backup (cb-dos) -- the menu has exited.
-echo     CRUSTYBK   relaunch the backup/restore menu
-echo     DISKSPK    int13h disk dump (MBR + FAT/NTFS/exFAT) -- diagnostics
-echo     LFNTEST    long-filename write test -- diagnostics
+echo     CRUSTYBK                         relaunch the backup/restore menu
+echo     CRUSTYBK backup rb://host/name   back up over the network
+echo.
+echo   For a network backup, first load your NIC's packet driver on int 60h
+echo   (see \NET\DRIVERS\DRIVERS.TXT); IP is set in A:\WATTCP.CFG (DHCP).
 echo.
 echo   See docs/cb_dos.md in the rusty-backup repo.
 echo.

@@ -73,7 +73,16 @@ for `PKTD11.ZIP`), or the FreeDOS networking packages.
 
 ## Building media with networking
 
-The floppy is too small, so networking rides on the **CD only**:
+There are two networking lanes, and they ship differently:
+
+- **crustybk's own `backup rb://host/name`** (the WATT-32 stack baked into
+  `CRUSTYBK.EXE`) works from **both** the floppy and the CD. The floppy carries
+  `WATTCP.CFG` (DHCP by default) at its root and a `\NET\DRIVERS` directory; drop
+  your card's packet driver into `net/drivers/` and it lands there. (To fit the
+  ~1 MB networked `CRUSTYBK.EXE` on a 1.44 MB floppy, `mkmedia.sh` UPX-packs it —
+  it self-extracts into RAM at launch, so the stack is fully intact.)
+- **The mTCP FTP suite** (move a finished backup *file* off the box over FTP) is
+  larger and rides the **CD only**:
 
 ```sh
 sh crusty-backup/net/fetch-mtcp.sh                 # download mTCP (GPLv3), once
@@ -83,7 +92,8 @@ FDBASE=/path/to/x86BOOT.img sh crusty-backup/mkmedia.sh
 
 `mkmedia.sh` adds a `\NET` directory (mTCP apps + your packet drivers +
 `MTCP.CFG` + `NET.BAT`) to `cbdos.iso` when `net/mtcp/` is populated; without it
-the media builds exactly as before (no networking). Repo-side layout:
+the CD's mTCP lane is absent (the floppy's `\NET\DRIVERS` + `WATTCP.CFG` for
+`backup rb://` are always present). Repo-side layout:
 [`../crusty-backup/net/README.md`](../crusty-backup/net/README.md).
 
 ## Status / caveats

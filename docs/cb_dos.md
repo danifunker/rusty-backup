@@ -117,8 +117,12 @@ testing without real hardware. This setup is the gating step for the size POC.
 > `.github/workflows/release.yml`'s **`build-cb-dos`** job cross-builds the DOS
 > tools (DJGPP, `docker/cb-dos.Dockerfile`), fetches the FreeDOS 1.4 FloppyEdition
 > base, and runs **`crusty-backup/mkmedia.sh`**, which `mcopy`s `FDAUTO.BAT` +
-> `CWSDPMI.EXE` + `CRUSTYBK.EXE` (+ `DISKSPK`/`LFNTEST`) onto `cbdos-freedos.img`
-> and wraps it in an El-Torito `cbdos.iso`. The `release` job (`needs:
+> `CWSDPMI.EXE` + `DOSLFN.COM` + a UPX-packed `CRUSTYBK.EXE` + `WATTCP.CFG` +
+> `\NET\DRIVERS` onto `cbdos-freedos.img` and wraps it in an El-Torito
+> `cbdos.iso`. (`CRUSTYBK.EXE` links the WATT-32 stack and is ~1 MB; UPX packs it
+> to ~550 KB so it fits the 1.44 MB floppy — it self-extracts into RAM at launch.
+> The `disk_spike`/`lfn_test` POC diagnostics are no longer shipped on the media.)
+> The `release` job (`needs:
 > build-cb-dos`) ships both as `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`.
 > `appliance-media.yml` builds them on demand for iteration. The driver matrix
 > (IDE/CF vs +CD vs +USB) is still minimal (plain IDE/CF); the reference material
