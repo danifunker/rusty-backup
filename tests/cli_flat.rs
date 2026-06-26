@@ -8,11 +8,23 @@
 //! grammar-regression net for the documented verb set; if a flag
 //! moves they fail fast.
 
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn cli_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_rb-cli"))
+}
+
+/// Decompress a `tests/fixtures/*.zst` image into `dst`.
+fn decompress_fixture(name: &str, dst: &Path) {
+    let path = format!("tests/fixtures/{name}");
+    let compressed = std::fs::read(&path).expect("read fixture");
+    let mut decoder =
+        zstd::stream::read::Decoder::new(std::io::Cursor::new(compressed)).expect("zstd decoder");
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes).expect("decompress");
+    std::fs::write(dst, &bytes).expect("write fixture out");
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -206,8 +218,56 @@ fn show_fs_info_json_envelope_shape() {
     let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
     assert_eq!(v["schema_version"], 1);
     assert_eq!(v["status"]["error"], false);
-    assert_eq!(v["result"]["filesystem"], "hfs");
+    // `filesystem` now reports the driver's own type string (was a
+    // hardcoded "hfs" when fs-info was HFS-only).
+    assert_eq!(v["result"]["filesystem"], "HFS");
     assert_eq!(v["result"]["volume_name"], "JsonTest");
+}
+
+#[test]
+fn show_fs_info_fat_superfloppy_not_misdetected_as_hfs() {
+    // Regression: a flat FAT12 superfloppy (FAT boot sector at byte 0, no MBR)
+    // was misdetected as HFS because `show fs-info` hardcoded the HFS opener;
+    // it died with "opening HFS: ... bad MDB signature: 0x1557". fs-info now
+    // routes through the generic `open_filesystem` path (same as `ls` / the
+    // GUI inspect path), so it must report FAT.
+    //
+    // The fixture is the real-world repro: a cb-dos FreeDOS 1.44 MB boot
+    // floppy (label FD14-BOOT, ~1.3 MiB used / ~93 KiB free).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("freedos.img");
+    decompress_fixture("test_fat12_freedos_superfloppy.img.zst", &img);
+    let img_s = img.to_str().unwrap();
+
+    // Text form: the filesystem line names FAT, never HFS, and the command
+    // succeeds (run() panics on a non-zero exit, which is the bug's failure).
+    let out = run(&["show", "fs-info", img_s]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Filesystem:  FAT12"),
+        "expected FAT12, got:\n{text}"
+    );
+    assert!(
+        !text.contains("HFS"),
+        "a FAT superfloppy must not be reported as HFS:\n{text}"
+    );
+
+    // JSON form: structured payload reports the FAT type, the known label, and
+    // the used/free figures from the used-size fix (commit 96a446d).
+    let out = run(&["show", "fs-info", img_s, "--format", "json"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+    assert_eq!(v["status"]["error"], false);
+    assert_eq!(v["result"]["filesystem"], "FAT12");
+    assert_eq!(v["result"]["volume_name"], "FD14-BOOT");
+    let total = v["result"]["total_bytes"].as_u64().unwrap();
+    let used = v["result"]["used_bytes"].as_u64().unwrap();
+    let free = v["result"]["free_bytes"].as_u64().unwrap();
+    assert_eq!(total, 1474560, "1.44 MB floppy");
+    assert_eq!(total, used + free, "total must equal used + free");
+    // Real used/free of this disk image (not a total/2 placeholder).
+    assert_eq!(used, 1379328);
+    assert_eq!(free, 95232);
 }
 
 #[test]

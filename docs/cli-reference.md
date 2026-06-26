@@ -308,10 +308,10 @@ Usage: backup [OPTIONS] <SOURCE> <DEST>
 - `--format` — Output format. Defaults to `chd`, or the `[backup] format` value from the config file when set
 - `--checksum` — Checksum to record per file. Defaults to `sha256`, or the `[backup] checksum` value from the config file when set
 - `--sector-by-sector` — Skip filesystem-aware compaction; copy every sector verbatim
-- `--defrag` — Defragment FAT partitions: relocate each file's clusters into a contiguous run (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of crusty-backup's `/DEFRAG`.)
-- `--keep-swap` — Image a FAT volume's swap/page files verbatim instead of excluding them. By default these files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed — they reinitialize on boot and the codec crushes the zeros — so the image is smaller; `--keep-swap` images them as-is. FAT only; not applied to a `--sector-by-sector` copy. (The desktop sibling of crusty-backup's `/KEEPSWAP`.)
+- `--defrag` — Defragment FAT partitions: relocate each file's clusters contiguously (boot files first) before imaging. Same output size as ordinary compaction — the restored disk is just defragmented. Non-FAT filesystems are unaffected. (The desktop sibling of cb-dos `/DEFRAG`.)
 - `--partitions` — Per-partition filter — comma-separated 1-based indices to include (e.g. `1,3,4`; `1` is the first partition, matching the `img@N` selector). Default is "all partitions"
 - `--split-size` — Split each output stream after this many MiB (Zstd / Raw only)
+- `--keep-swap` — Image swap/page files verbatim instead of excluding them. By default a FAT volume's swap/page files (`386SPART.PAR`, `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) are kept full-size but their content is zeroed (they reinitialize on boot), which the codec crushes; `--keep-swap` images them as-is. (The desktop sibling of cb-dos `/KEEPSWAP`.)
 
 ### `batch`
 
@@ -1164,6 +1164,7 @@ Usage: put-binhex [OPTIONS] <IMAGE> <HOST_FILE>
 - `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`
 - `--rename` — Override the filename from the BinHex header
 - `--force` — Overwrite an existing entry at the destination path
+- `--clear-inited` — Clear the `hasBeenInited` Finder flag (0x0100) on the written file. Use when injecting an app onto a fresh disk so the Finder re-reads its `BNDL` and registers real icons (a file copied with `hasBeenInited` already set is treated as already-catalogued, so it shows a generic icon until a desktop rebuild). Mirrors what a MacBinary install does to byte 73
 
 ### `put-macbinary`
 
@@ -1385,7 +1386,7 @@ Usage: devices [OPTIONS]
 
 ### `show fs-info`
 
-Print filesystem-level metadata (volume name, sizes, counts)
+Print filesystem-level metadata (type, volume label, used / free space) for any filesystem the engine can open
 
 ```
 Usage: fs-info [OPTIONS] <IMAGE>
