@@ -885,11 +885,79 @@ jobs:
           tar -tzf "$TGZ"
           ls -lh "$TGZ"
 
+      - name: Build MiSTer Downloader database (custom-databases.md)
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          # MiSTer Downloader (Downloader_MiSTer) consumes a custom-database JSON
+          # that lists individual files -> SD paths with an md5 + size each; it
+          # does NOT unpack tarballs. So alongside the .tar.gz we publish the raw
+          # binary + daemon shim as standalone, UN-versioned release assets plus a
+          # `*.json.zip` database that points at them through GitHub's stable
+          # `releases/latest/download/<asset>` alias. Stable names + the `latest`
+          # alias = one fixed db_url the user adds once; every later release's
+          # fresh hashes line up because the user always fetches the newest DB.
+          set -e
+          mkdir -p dist-mister
+          cp target/armv7-unknown-linux-gnueabihf/release/rb-cli dist-mister/rb-cli-mini-armv7
+          cp "$GITHUB_WORKSPACE/mister/rb-daemon.sh"            dist-mister/rb-daemon.sh
+
+          BIN_MD5=$(md5sum dist-mister/rb-cli-mini-armv7 | cut -d' ' -f1)
+          BIN_SIZE=$(stat -c%s dist-mister/rb-cli-mini-armv7)
+          SH_MD5=$(md5sum dist-mister/rb-daemon.sh | cut -d' ' -f1)
+          SH_SIZE=$(stat -c%s dist-mister/rb-daemon.sh)
+          TS=$(date +%s)
+          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/latest/download"
+
+          # db_id is permanent once published - changing it strands old files on
+          # users' cards (Downloader can no longer clean them up). Keep it forever.
+          cat > dist-mister/rusty-backup.json <<JSON
+          {
+            "v": 1,
+            "db_id": "danifunker/rusty-backup",
+            "timestamp": ${TS},
+            "files": {
+              "Scripts/rb-cli": {
+                "hash": "${BIN_MD5}",
+                "size": ${BIN_SIZE},
+                "url": "${BASE}/rb-cli-mini-armv7",
+                "overwrite": true,
+                "reboot": false
+              },
+              "Scripts/rb-daemon.sh": {
+                "hash": "${SH_MD5}",
+                "size": ${SH_SIZE},
+                "url": "${BASE}/rb-daemon.sh",
+                "overwrite": true,
+                "reboot": false
+              }
+            },
+            "folders": {
+              "Scripts/": {}
+            }
+          }
+          JSON
+
+          # Downloader accepts a zipped DB as long as the name ends `.json.zip`;
+          # the JSON filename inside the zip is free-form.
+          ( cd dist-mister && zip -q rusty-backup.json.zip rusty-backup.json )
+
+          echo "----- generated MiSTer Downloader database -----"
+          cat dist-mister/rusty-backup.json
+          ls -lh dist-mister/
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
-          path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
+          # The versioned tarball is the human download; the un-versioned
+          # dist-mister/ files are what the Downloader database references via the
+          # `releases/latest/download/` alias. The release job flattens both out.
+          path: |
+            rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
+            dist-mister/rb-cli-mini-armv7
+            dist-mister/rb-daemon.sh
+            dist-mister/rusty-backup.json.zip
 
   # Turn the `appliance` choice input into a JSON arch list for the matrix
   # below. A manual dispatch honours none / i586 / i686 / both. A push to
@@ -1126,7 +1194,11 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release-files
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" \) -exec cp {} release-files/ \;
+          # `rusty-backup.json.zip` matches the *.zip glob; the raw MiSTer
+          # Downloader assets (no extension / *.sh) are named explicitly so they
+          # ship as standalone, un-versioned release assets the database can hit
+          # via `releases/latest/download/`.
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.AppImage" -o -name "*.AppImage.zsync" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "*.exe" -o -name "*.tar.gz" -o -name "*.iso" -o -name "*.img" -o -name "rb-cli-mini-armv7" -o -name "rb-daemon.sh" \) -exec cp {} release-files/ \;
           ls -lh release-files/
       
       # Build a download-picker table from the (fixed) build matrix. Links
@@ -1139,6 +1211,10 @@ jobs:
         run: |
           TAG="v${VER}"
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          # Stable, version-independent URL for the MiSTer Downloader database:
+          # the `latest` alias always resolves to the newest non-prerelease, so
+          # users add this db_url once and pick up every future build.
+          DB_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/rusty-backup.json.zip"
           # Warn (don't fail) if an expected asset is missing — surfaces a
           # matrix change without blocking the release.
           for f in \
@@ -1153,6 +1229,7 @@ jobs:
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
             "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
             "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
+            "rb-cli-mini-armv7" "rb-daemon.sh" "rusty-backup.json.zip" \
             "rusty-backup-appliance-i586-${VER}.iso" "rusty-backup-appliance-i686-${VER}.iso" \
             "rusty-backup-appliance-pxe-i586-${VER}.tar.gz" "rusty-backup-appliance-pxe-i686-${VER}.tar.gz" \
             "rusty-backup-grub-floppy-i586-${VER}.img" "rusty-backup-grub-floppy-i686-${VER}.img" \
@@ -1176,6 +1253,17 @@ jobs:
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
           <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+
+          ### Install on a MiSTer FPGA (one line, auto-updating)
+
+          MiSTer users don't need the tarball: add Rusty Backup to the **MiSTer Downloader** as a custom database and it installs (and keeps itself updated) from the Scripts/Update menu. Add this section to \`/media/fat/downloader.ini\` on the SD card:
+
+          \`\`\`ini
+          [danifunker/rusty-backup]
+          db_url = '${DB_URL}'
+          \`\`\`
+
+          Then run **Scripts > update** (or **Downloader**) on the MiSTer. It drops \`rb-cli\` and \`rb-daemon.sh\` into \`/media/fat/Scripts\`. Open **rb-daemon** from the Scripts menu to start the network daemon and enable it on boot. The \`db_url\` points at the \`latest\` release, so each future Downloader run picks up new builds automatically. (Prefer to do it by hand? The \`rb-cli-mini-...tar.gz\` above still works via its bundled \`install.sh\`.)
 
           ### Boot the vintage machine itself (Linux appliance)
 
