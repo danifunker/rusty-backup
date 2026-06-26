@@ -117,8 +117,8 @@ fn open_filesystem_autodetect_dispatches_to_mfs() {
     let entries = fs.list_directory(&root).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "Hello");
-    assert_eq!(entries[0].type_code.as_deref(), Some("TEXT"));
-    assert_eq!(entries[0].creator_code.as_deref(), Some("ttxt"));
+    assert_eq!(entries[0].type_code, Some(*b"TEXT"));
+    assert_eq!(entries[0].creator_code, Some(*b"ttxt"));
 
     let data = fs.read_file(&entries[0], 1024).unwrap();
     assert_eq!(&data, b"hi from mfs");

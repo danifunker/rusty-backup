@@ -308,6 +308,7 @@ fn wire_to_entry(w: WireEntry) -> FileEntry {
         size,
         type_code,
         creator_code,
+        prodos_file_type,
         symlink_target,
     } = w;
     let mut e = match kind {
@@ -320,6 +321,7 @@ fn wire_to_entry(w: WireEntry) -> FileEntry {
     };
     e.type_code = type_code;
     e.creator_code = creator_code;
+    e.prodos_file_type = prodos_file_type;
     e
 }
 
@@ -336,6 +338,7 @@ mod tests {
             size: 0,
             type_code: None,
             creator_code: None,
+            prodos_file_type: None,
             symlink_target: None,
         });
         assert!(dir.is_directory());
@@ -346,14 +349,15 @@ mod tests {
             path: "/DOC.TXT".into(),
             kind: WireKind::File,
             size: 1234,
-            type_code: Some("TEXT".into()),
-            creator_code: Some("ttxt".into()),
+            type_code: Some(*b"TEXT"),
+            creator_code: Some(*b"ttxt"),
+            prodos_file_type: None,
             symlink_target: None,
         });
         assert!(!file.is_directory());
         assert_eq!(file.size, 1234);
-        assert_eq!(file.type_code.as_deref(), Some("TEXT"));
-        assert_eq!(file.creator_code.as_deref(), Some("ttxt"));
+        assert_eq!(file.type_code, Some(*b"TEXT"));
+        assert_eq!(file.creator_code, Some(*b"ttxt"));
 
         let link = wire_to_entry(WireEntry {
             name: "LN".into(),
@@ -362,6 +366,7 @@ mod tests {
             size: 0,
             type_code: None,
             creator_code: None,
+            prodos_file_type: None,
             symlink_target: Some("/target".into()),
         });
         assert_eq!(link.symlink_target.as_deref(), Some("/target"));

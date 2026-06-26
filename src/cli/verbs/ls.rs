@@ -183,8 +183,13 @@ fn remote_ls(rref: &crate::remote::RemoteRef, partition: Option<u32>, path: &str
 #[cfg(feature = "remote")]
 fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
     let kind = if entry.is_dir() { "DIR " } else { "FILE" };
-    let t = entry.type_code.as_deref().unwrap_or("    ");
-    let cr = entry.creator_code.as_deref().unwrap_or("    ");
+    let t = crate::fs::entry::display_file_type(entry.type_code.as_ref(), entry.prodos_file_type);
+    let cr = entry
+        .creator_code
+        .as_ref()
+        .map(crate::fs::hfs_common::decode_ostype);
+    let t = t.as_deref().unwrap_or("    ");
+    let cr = cr.as_deref().unwrap_or("    ");
     out_stdout(format!(
         "{kind}  {:>10}  {t} {cr}  {}",
         entry.size, entry.name
@@ -193,8 +198,10 @@ fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
 
 fn print_entry(entry: &crate::fs::entry::FileEntry, display_name: &str) {
     let kind = if entry.is_directory() { "DIR " } else { "FILE" };
-    let t = entry.type_code.as_deref().unwrap_or("    ");
-    let cr = entry.creator_code.as_deref().unwrap_or("    ");
+    let t = entry.type_code_display();
+    let cr = entry.creator_code_display();
+    let t = t.as_deref().unwrap_or("    ");
+    let cr = cr.as_deref().unwrap_or("    ");
     out_stdout(format!(
         "{kind}  {:>10}  {t} {cr}  {display_name}",
         entry.size

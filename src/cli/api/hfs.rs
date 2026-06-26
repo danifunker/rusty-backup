@@ -360,8 +360,10 @@ pub(crate) fn cmd_ls(image: PathBuf, path: &str, partition: Option<u32>) -> Resu
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     for c in children {
         let kind = if c.is_directory() { "DIR " } else { "FILE" };
-        let t = c.type_code.as_deref().unwrap_or("    ");
-        let cr = c.creator_code.as_deref().unwrap_or("    ");
+        let t = c.type_code_display();
+        let cr = c.creator_code_display();
+        let t = t.as_deref().unwrap_or("    ");
+        let cr = cr.as_deref().unwrap_or("    ");
         println!("{kind}  {:>10}  {t} {cr}  {}", c.size, c.name);
     }
     Ok(())

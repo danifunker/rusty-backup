@@ -983,8 +983,8 @@ mod tests {
             let mut fs = HfsFilesystem::open(Cursor::new(&mut backing), 0).unwrap();
             let root = fs.root().unwrap();
             let opts = CreateFileOptions {
-                type_code: Some("TEXT".to_string()),
-                creator_code: Some("ttxt".to_string()),
+                os_type: Some(*b"TEXT"),
+                os_creator: Some(*b"ttxt"),
                 ..Default::default()
             };
             let payload = b"hello world".to_vec();
@@ -1047,8 +1047,8 @@ mod tests {
             let payload = b"hello world".to_vec();
             let mut data = payload.as_slice();
             let opts = CreateFileOptions {
-                type_code: Some("TEXT".to_string()),
-                creator_code: Some("ttxt".to_string()),
+                os_type: Some(*b"TEXT"),
+                os_creator: Some(*b"ttxt"),
                 ..Default::default()
             };
             let note = fs
@@ -1061,8 +1061,8 @@ mod tests {
             let big = vec![0x42u8; 6000];
             let mut data = big.as_slice();
             let opts = CreateFileOptions {
-                type_code: Some("BINA".to_string()),
-                creator_code: Some("hexd".to_string()),
+                os_type: Some(*b"BINA"),
+                os_creator: Some(*b"hexd"),
                 ..Default::default()
             };
             fs.create_file(&sub, "data.bin", &mut data, big.len() as u64, &opts)
@@ -1073,8 +1073,8 @@ mod tests {
             let payload = b"with rsrc".to_vec();
             let mut data = payload.as_slice();
             let opts = CreateFileOptions {
-                type_code: Some("APPL".to_string()),
-                creator_code: Some("MACS".to_string()),
+                os_type: Some(*b"APPL"),
+                os_creator: Some(*b"MACS"),
                 resource_fork: Some(ResourceForkSource::Data(rsrc.clone())),
                 ..Default::default()
             };
@@ -1169,15 +1169,15 @@ mod tests {
         assert_eq!(data_bin.size, 6000);
         let bytes = fs.read_file(&data_bin, 6000).unwrap();
         assert_eq!(bytes, vec![0x42u8; 6000]);
-        assert_eq!(data_bin.type_code.as_deref(), Some("BINA"));
-        assert_eq!(data_bin.creator_code.as_deref(), Some("hexd"));
+        assert_eq!(data_bin.type_code, Some(*b"BINA"));
+        assert_eq!(data_bin.creator_code, Some(*b"hexd"));
 
         // note.txt contents and type/creator.
         let note = find_child(&mut fs, &apps, "note.txt");
         let bytes = fs.read_file(&note, 32).unwrap();
         assert_eq!(bytes, b"hello world");
-        assert_eq!(note.type_code.as_deref(), Some("TEXT"));
-        assert_eq!(note.creator_code.as_deref(), Some("ttxt"));
+        assert_eq!(note.type_code, Some(*b"TEXT"));
+        assert_eq!(note.creator_code, Some(*b"ttxt"));
 
         // Resource-forked file.
         let app = find_child(&mut fs, &root, "App");

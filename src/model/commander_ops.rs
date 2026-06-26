@@ -21,7 +21,6 @@ use anyhow::{Context, Result};
 
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::fs::filesystem::Filesystem;
-use crate::fs::hfs_common::encode_fourcc;
 use crate::fs::resource_fork::ImportedResourceFork;
 use crate::model::browse_session::BrowseSession;
 use crate::model::edit_queue::{apply_edit, StagedEdit};
@@ -146,8 +145,8 @@ fn stage_copy_into(
                     prodos_type: None,
                     prodos_aux: entry.aux_type,
                     resource_fork,
-                    hfs_type_override: entry.type_code.as_deref().map(encode_fourcc),
-                    hfs_creator_override: entry.creator_code.as_deref().map(encode_fourcc),
+                    hfs_type_override: entry.type_code,
+                    hfs_creator_override: entry.creator_code,
                     dates: if keep_dates {
                         crate::model::edit_queue::PreservedDates::from_entry(entry)
                     } else {

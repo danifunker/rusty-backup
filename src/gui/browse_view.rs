@@ -1325,17 +1325,12 @@ impl BrowseView {
                 // ProDOS entries get an inline "$XX ABC" type badge so the user
                 // can see the file's type/aux without clicking into it.
                 let prodos_badge = if self.is_prodos_type() {
-                    entry.type_code.as_deref().map(|tc| tc.to_string())
+                    entry.type_code_display()
                 } else {
                     None
                 };
-                let hover_text = prodos_badge.as_ref().map(|_| {
-                    let tc = entry.type_code.as_deref().unwrap_or("");
-                    let tt = tc
-                        .split_whitespace()
-                        .next()
-                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-                        .unwrap_or(0);
+                let hover_text = prodos_badge.as_ref().map(|tc| {
+                    let tt = entry.prodos_file_type.unwrap_or(0);
                     let desc = rusty_backup::fs::prodos_types::type_description(tt);
                     let aux = entry.aux_type.unwrap_or(0);
                     if desc.is_empty() {
@@ -1642,11 +1637,7 @@ impl BrowseView {
                 // the user knows the file isn't corrupt — the type and
                 // aux round-trip via the CiderPress #TTAAAA suffix.
                 if self.is_prodos_type() {
-                    let tt = entry.type_code.as_deref().and_then(|tc| {
-                        tc.split_whitespace()
-                            .next()
-                            .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-                    });
+                    let tt = entry.prodos_file_type;
                     if let Some(tt) = tt {
                         if !rusty_backup::fs::prodos_types::is_known_type(tt) {
                             let aux = entry.aux_type.unwrap_or(0);
@@ -1922,15 +1913,7 @@ impl BrowseView {
             && entry.is_file()
             && self.prodos_export_mode == ProdosExportMode::WithTypeSuffix
         {
-            let tt = entry
-                .type_code
-                .as_deref()
-                .and_then(|tc| {
-                    tc.split_whitespace()
-                        .next()
-                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-                })
-                .unwrap_or(0x06);
+            let tt = entry.prodos_file_type.unwrap_or(0x06);
             let aux = entry.aux_type.unwrap_or(0);
             format!(
                 "{}{}",
@@ -5382,15 +5365,7 @@ fn extract_entry(
     // CiderPress `#TTAAAA` suffix so type and aux round-trip through host.
     let safe_name =
         if is_prodos && entry.is_file() && prodos_export_mode == ProdosExportMode::WithTypeSuffix {
-            let tt = entry
-                .type_code
-                .as_deref()
-                .and_then(|tc| {
-                    tc.split_whitespace()
-                        .next()
-                        .and_then(|s| u8::from_str_radix(s.trim_start_matches('$'), 16).ok())
-                })
-                .unwrap_or(0x06);
+            let tt = entry.prodos_file_type.unwrap_or(0x06);
             let aux = entry.aux_type.unwrap_or(0);
             format!(
                 "{}{}",
@@ -5416,16 +5391,8 @@ fn extract_entry(
                 let mut rsrc_buf = Vec::new();
                 fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
 
-                let type_code = entry
-                    .type_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
-                let creator_code = entry
-                    .creator_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
+                let type_code = entry.type_code.unwrap_or([0; 4]);
+                let creator_code = entry.creator_code.unwrap_or([0; 4]);
 
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
@@ -5452,16 +5419,8 @@ fn extract_entry(
                     fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
                 }
 
-                let type_code = entry
-                    .type_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
-                let creator_code = entry
-                    .creator_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
+                let type_code = entry.type_code.unwrap_or([0; 4]);
+                let creator_code = entry.creator_code.unwrap_or([0; 4]);
 
                 let bh = rusty_backup::fs::binhex::BinHexFile {
                     // Preserve the original Mac name inside the archive.
@@ -5494,16 +5453,8 @@ fn extract_entry(
                 }
 
                 if is_hfs && resource_fork_mode != ResourceForkMode::DataForkOnly {
-                    let type_code = entry
-                        .type_code
-                        .as_ref()
-                        .map(|s| fourcc_bytes(s))
-                        .unwrap_or([0; 4]);
-                    let creator_code = entry
-                        .creator_code
-                        .as_ref()
-                        .map(|s| fourcc_bytes(s))
-                        .unwrap_or([0; 4]);
+                    let type_code = entry.type_code.unwrap_or([0; 4]);
+                    let creator_code = entry.creator_code.unwrap_or([0; 4]);
                     let has_finfo = type_code != [0; 4] || creator_code != [0; 4];
 
                     let mut rsrc_buf = Vec::new();
@@ -5611,16 +5562,6 @@ fn extract_entry(
     Ok(())
 }
 
-/// Convert a 4-character type/creator string to a byte array.
-fn fourcc_bytes(s: &str) -> [u8; 4] {
-    let bytes = s.as_bytes();
-    let mut result = [b' '; 4];
-    for (i, &b) in bytes.iter().take(4).enumerate() {
-        result[i] = b;
-    }
-    result
-}
-
 /// Compact byte-count formatter for the Workflow E archive viewer
 /// window. Mirrors `archives_tab::human_size` rather than
 /// `partition::format_size` (which uses base-1000 GB/MB and is meant
@@ -5713,8 +5654,8 @@ fn walk_fs_to_input_nodes(
         // zero bytes (the StuffIt writer drops it on the floor).
         let _ = fs.write_resource_fork_to(entry, &mut rsrc);
 
-        let type_code = four_char_or_zero(entry.type_code.as_deref());
-        let creator_code = four_char_or_zero(entry.creator_code.as_deref());
+        let type_code = entry.type_code.unwrap_or([0; 4]);
+        let creator_code = entry.creator_code.unwrap_or([0; 4]);
 
         Ok(vec![StuffItInputNode::File(StuffItInput {
             name: entry.name.clone(),
@@ -5729,13 +5670,4 @@ fn walk_fs_to_input_nodes(
     } else {
         Ok(Vec::new())
     }
-}
-
-/// Best-effort decoder for the `FileEntry::type_code` / `creator_code`
-/// optional 4-char strings. Returns `[0, 0, 0, 0]` for any input that
-/// isn't exactly 4 bytes, which matches the StuffIt writer's "no
-/// type/creator" convention.
-fn four_char_or_zero(s: Option<&str>) -> [u8; 4] {
-    s.and_then(|s| <[u8; 4]>::try_from(s.as_bytes()).ok())
-        .unwrap_or([0; 4])
 }

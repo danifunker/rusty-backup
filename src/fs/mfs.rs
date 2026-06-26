@@ -214,36 +214,12 @@ impl MfsDirEntry {
         self.flags & 0x80 != 0
     }
 
-    /// Mac OSType — 4 ASCII chars from Finder info bytes 0..4. Non-printable
-    /// bytes are rendered as `.` so the display string stays sane.
-    fn type_code_str(&self) -> String {
-        ostype_to_string(&self.finder_info[0..4])
-    }
-
-    /// Mac creator code — 4 ASCII chars from Finder info bytes 4..8.
-    fn creator_code_str(&self) -> String {
-        ostype_to_string(&self.finder_info[4..8])
-    }
-
     /// Finder flags (`FInfo.fdFlags`) — the big-endian 2-byte field at offset 8
     /// of the 16-byte Finder info. Surfaced on `FileEntry` so copy /
     /// `get-binhex` round-trips preserve them.
     fn finder_flags(&self) -> u16 {
         u16::from_be_bytes([self.finder_info[8], self.finder_info[9]])
     }
-}
-
-fn ostype_to_string(b: &[u8]) -> String {
-    debug_assert_eq!(b.len(), 4);
-    b.iter()
-        .map(|&c| {
-            if (0x20..=0x7E).contains(&c) {
-                c as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
 }
 
 /// Live MFS reader. Holds the parsed MDB, the volume bitmap, and a
@@ -763,8 +739,8 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
                 de.data_logical_length as u64,
                 de.file_number as u64,
             );
-            fe.type_code = Some(de.type_code_str());
-            fe.creator_code = Some(de.creator_code_str());
+            fe.type_code = Some(de.finder_info[0..4].try_into().unwrap());
+            fe.creator_code = Some(de.finder_info[4..8].try_into().unwrap());
             fe.finder_flags = Some(de.finder_flags());
             if de.rsrc_logical_length > 0 {
                 fe.resource_fork_size = Some(de.rsrc_logical_length as u64);
@@ -818,7 +794,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         name: &str,
         data: &mut dyn std::io::Read,
         data_len: u64,
-        _options: &CreateFileOptions,
+        options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
         if parent.path != "/" {
             return Err(FilesystemError::Unsupported(
@@ -863,9 +839,34 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         self.mdb.next_file_number += 1;
         self.mdb.num_files += 1;
 
+        // Honor the caller's Mac type/creator: raw `os_type`/`os_creator` win
+        // (byte-exact, high-bit safe), then the lossy text `type_code`, then the
+        // extension dictionary. Written into the dir entry's Finder info so the
+        // codes actually persist on disk (and the returned entry matches).
+        let ext = name.rsplit('.').next().unwrap_or("");
+        let (dict_t, dict_c) =
+            super::hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]));
+        let type_code = options.os_type.unwrap_or_else(|| {
+            options
+                .type_code
+                .as_deref()
+                .map(super::hfs_common::encode_fourcc)
+                .unwrap_or(dict_t)
+        });
+        let creator_code = options.os_creator.unwrap_or_else(|| {
+            options
+                .creator_code
+                .as_deref()
+                .map(super::hfs_common::encode_fourcc)
+                .unwrap_or(dict_c)
+        });
+        let mut finder_info = [0u8; 16];
+        finder_info[0..4].copy_from_slice(&type_code);
+        finder_info[4..8].copy_from_slice(&creator_code);
+
         let entry = MfsDirEntry {
             flags: 0x80, // in use, not locked
-            finder_info: [0u8; 16],
+            finder_info,
             file_number,
             data_first_block: first_block,
             data_logical_length: bytes.len() as u32,
@@ -876,15 +877,16 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             name: name.to_string(),
         };
         self.entries.push(entry);
-        // Surface a freshly-built FileEntry for the caller.
+        // Surface a freshly-built FileEntry for the caller, reflecting the
+        // type/creator actually written.
         let mut fe = FileEntry::new_file(
             name.to_string(),
             format!("/{name}"),
             bytes.len() as u64,
             file_number as u64,
         );
-        fe.type_code = Some("    ".to_string());
-        fe.creator_code = Some("    ".to_string());
+        fe.type_code = Some(type_code);
+        fe.creator_code = Some(creator_code);
         Ok(fe)
     }
 
@@ -1210,8 +1212,8 @@ mod tests {
         assert_eq!(doc.resource_fork_size, Some(4));
         let hello = entries.iter().find(|e| e.name == "Hello").unwrap();
         assert_eq!(hello.resource_fork_size, None);
-        assert_eq!(hello.type_code.as_deref(), Some("TEXT"));
-        assert_eq!(hello.creator_code.as_deref(), Some("ttxt"));
+        assert_eq!(hello.type_code, Some(*b"TEXT"));
+        assert_eq!(hello.creator_code, Some(*b"ttxt"));
     }
 
     #[test]
@@ -1460,7 +1462,7 @@ mod tests {
         let root2 = fs2.root().unwrap();
         let entries = fs2.list_directory(&root2).unwrap();
         let hello2 = entries.iter().find(|e| e.name == "Hello").unwrap();
-        assert_eq!(hello2.type_code.as_deref(), Some("PICT"));
-        assert_eq!(hello2.creator_code.as_deref(), Some("8BIM"));
+        assert_eq!(hello2.type_code, Some(*b"PICT"));
+        assert_eq!(hello2.creator_code, Some(*b"8BIM"));
     }
 }

@@ -502,9 +502,9 @@ pub fn type_tag(e: &FileEntry) -> String {
             .clone()
             .unwrap_or_else(|| "(special)".to_string()),
         EntryType::File => {
-            if let Some(tc) = &e.type_code {
+            if let Some(tc) = e.type_code_display() {
                 if !tc.is_empty() {
-                    return tc.clone();
+                    return tc;
                 }
             }
             if let Some(attrs) = e.dos_attributes {
@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(type_tag(&dir("Folder")), "<DIR>");
 
         let mut hfs = file("Read Me", 10);
-        hfs.type_code = Some("TEXT".to_string());
+        hfs.type_code = Some(*b"TEXT");
         assert_eq!(type_tag(&hfs), "TEXT");
 
         let mut fat = file("IO.SYS", 10);
