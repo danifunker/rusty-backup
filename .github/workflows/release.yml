@@ -8,9 +8,10 @@ on:
   workflow_dispatch:
     # Manual "Run workflow" switches (this folds in the old standalone
     # appliance-media.yml — one pipeline, no drift). On a plain push these
-    # inputs are unset: push always builds the desktop + cb-dos set and never
-    # the slow appliance, exactly as before. A manual run can trim the build
-    # down to just the media you're iterating on.
+    # inputs are unset: push always builds the desktop + cb-dos set, and a push
+    # to main/master also builds the slow appliance (feature-branch pushes skip
+    # it). A manual run can trim the build down to just the media you're
+    # iterating on.
     inputs:
       desktop:
         description: "Build the desktop apps + CLIs + MiSTer binary"
@@ -641,10 +642,35 @@ jobs:
           sudo apt-get install -y cmake libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
 
       - name: Install cargo packaging tools
+        # `cargo install` from crates.io is flaky on the hosted runners
+        # (especially arm64): a transient download/build failure used to be
+        # swallowed by `|| true`, so the step went green while the binary was
+        # missing — then "Build RPM package" died with `no such command:
+        # generate-rpm`. Retry each install up to 3 times and fail loudly if a
+        # tool is genuinely unavailable, so the error surfaces here, not later.
         run: |
-          cargo install cargo-deb || true
-          cargo install cargo-generate-rpm || true
-          cargo install cargo-aur || true
+          install_tool() {
+            local crate="$1"
+            if command -v "$crate" >/dev/null 2>&1; then
+              echo "$crate already installed; skipping"
+              return 0
+            fi
+            for attempt in 1 2 3; do
+              echo "::group::Installing $crate (attempt $attempt/3)"
+              if cargo install "$crate"; then
+                echo "::endgroup::"
+                return 0
+              fi
+              echo "::endgroup::"
+              echo "Install of $crate failed (attempt $attempt/3)"
+              sleep 15
+            done
+            echo "::error::failed to install $crate after 3 attempts"
+            return 1
+          }
+          install_tool cargo-deb
+          install_tool cargo-generate-rpm
+          install_tool cargo-aur
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -866,8 +892,11 @@ jobs:
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
 
   # Turn the `appliance` choice input into a JSON arch list for the matrix
-  # below. A plain push resolves to [] (the full Buildroot build is ~1 h, so it
-  # never runs unattended); a manual dispatch honours none / i586 / i686 / both.
+  # below. A manual dispatch honours none / i586 / i686 / both. A push to
+  # main/master builds both arches automatically (the full Buildroot build is
+  # ~1 h, but main pushes are real releases and the job is continue-on-error,
+  # so it can't hold up the desktop downloads). A push to any other branch
+  # resolves to [] so feature-branch iteration stays fast.
   appliance-matrix:
     name: Resolve appliance arch list
     runs-on: ubuntu-latest
@@ -876,25 +905,31 @@ jobs:
     steps:
       - id: m
         run: |
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            echo 'arches=[]' >> "$GITHUB_OUTPUT"
-          else
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             case "${{ inputs.appliance }}" in
               both) echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
               none) echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
               *)    echo 'arches=["${{ inputs.appliance }}"]' >> "$GITHUB_OUTPUT" ;;
+            esac
+          else
+            case "${{ github.ref }}" in
+              refs/heads/main|refs/heads/master)
+                echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
+              *)
+                echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
             esac
           fi
 
   build-appliance:
     name: Build Linux appliance (${{ matrix.arch }})
     # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
-    # toolchain from scratch), so it's never built on a plain push — only a
-    # manual "Run workflow" with the `appliance` input set to i586/i686/both.
-    # appliance-matrix turns that choice into the matrix below; an empty list
-    # (push, or appliance=none) skips this job. i586 = broadest reach (Pentium /
-    # 5x86 / Vortex86 / ITX-Llama and up); i686 = a touch faster on Pentium-Pro+
-    # but won't run on a plain Pentium. (A true 486 is cb-dos, built below.)
+    # toolchain from scratch). It runs on a push to main/master (a real release)
+    # and on a manual "Run workflow" with the `appliance` input set to
+    # i586/i686/both; a push to a feature branch (or appliance=none) skips it.
+    # appliance-matrix turns that into the matrix below; an empty list skips
+    # this job. i586 = broadest reach (Pentium / 5x86 / Vortex86 / ITX-Llama and
+    # up); i686 = a touch faster on Pentium-Pro+ but won't run on a plain
+    # Pentium. (A true 486 is cb-dos, built below.)
     needs: [generate-version, appliance-matrix]
     if: needs.appliance-matrix.outputs.arches != '[]'
     runs-on: ubuntu-latest
@@ -1045,7 +1080,18 @@ jobs:
 
   release:
     name: Create Release
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    # `!cancelled()` lets this run even when a non-fatal `needs` job is skipped
+    # (build-appliance on appliance=none) or fails (continue-on-error appliance/
+    # cb-dos/mini-armv7) — those must NOT block the release. The explicit
+    # success checks keep the must-have desktop builds strictly required, so a
+    # real Windows/macOS/AppImage/packages failure still holds the release.
+    if: >-
+      !cancelled() &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      needs.build-windows.result == 'success' &&
+      needs.build-macos.result == 'success' &&
+      needs.build-linux-appimage.result == 'success' &&
+      needs.build-linux-packages.result == 'success'
     # The MiSTer armv7 build is in `needs:` so the release waits for its
     # artifact to upload before publishing — combined with
     # `continue-on-error: true` on the build job, a transient armv7 failure
@@ -1060,10 +1106,12 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-rb-cli-mini-armv7
-      # Temporarily disabled with the build-appliance job below: a skipped
-      # `needs` job would otherwise skip this whole release. Re-enable both
-      # together (uncomment here + restore the job's `if`).
-      # - build-appliance
+      # build-appliance is skipped on feature branches and on a manual
+      # appliance=none run. A skipped `needs` job would normally skip the whole
+      # release, so the release `if` below uses `!cancelled()` + explicit
+      # success checks on the must-have desktop builds, letting a skipped (or
+      # continue-on-error-failed) appliance pass through without blocking.
+      - build-appliance
       - build-cb-dos
     runs-on: ubuntu-latest
     steps:
