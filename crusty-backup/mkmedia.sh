@@ -109,7 +109,7 @@ docker run --rm \
         # emulators (QEMU / VirtualBox / 86Box / DOSBox-X) present, and the
         # ITX-Llama onboard Vortex86/RDC R6040 (r6040pd). The CD has all of
         # them under \NET\DRIVERS.
-        for d in ne2000 ne1000 pcntpk rtspkt 3c509 3c503 smc_wd e100bpkt r6040pd; do
+        for d in ne2000 ne1000 pcntpk rtspkt 3c509 3c503 smc_wd e100bpkt r6040pd 3c90xpd; do
             [ -f "/in/drivers/$d.com" ] && mcopy -o -i /fd.img "/in/drivers/$d.com" ::NET/DRIVERS/ || true
         done
 
@@ -142,6 +142,9 @@ rm -rf "$NETSTAGE"; mkdir -p "$NETSTAGE/DRIVERS"
 for c in "$NETDIR"/drivers/*.com "$NETDIR"/drivers/*.COM; do [ -f "$c" ] && cp "$c" "$NETSTAGE/DRIVERS/"; done
 sed 's/$/\r/' "$NETDIR/drivers/DRIVERS.TXT" > "$NETSTAGE/DRIVERS/DRIVERS.TXT"
 [ -f "$NETDIR/drivers/CRYNWR-GPL.txt" ] && sed 's/$/\r/' "$NETDIR/drivers/CRYNWR-GPL.txt" > "$NETSTAGE/DRIVERS/CRYNWR-GPL.txt"
+# Third-party driver licensing/attribution (Crynwr GPL + the 3Com proprietary
+# 3C90x driver) travels with the binaries.
+[ -f "$NETDIR/drivers/ATTRIBUTION.md" ] && sed 's/$/\r/' "$NETDIR/drivers/ATTRIBUTION.md" > "$NETSTAGE/DRIVERS/ATTRIB.TXT"
 # WATT-32 config for crustybk's networked backup, alongside the drivers.
 sed 's/$/\r/' "$WATTCFG" > "$NETSTAGE/WATTCP.CFG"
 drv=$(ls "$NETDIR"/drivers/*.com "$NETDIR"/drivers/*.COM 2>/dev/null | wc -l | tr -d ' ')

@@ -10,8 +10,8 @@ both use it.
 This media SHIPS the Crynwr packet-driver collection (GPLv2; ~90 drivers,
 see CRYNWR-GPL.txt). The CD carries the FULL set under \NET\DRIVERS; the
 boot floppy has room for only a common subset (NE2000, NE1000, PCNTPK,
-RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT, R6040PD). Load yours before a
-backup, e.g. the ITX-Llama's onboard NIC:  \NET\DRIVERS\R6040PD 0x60
+RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT, R6040PD, 3C90XPD). Load yours
+before a backup, e.g. the ITX-Llama's onboard NIC:  \NET\DRIVERS\R6040PD 0x60
 
     \NET\DRIVERS\<driver> 0x60 [IRQ] [IO]
 
@@ -47,3 +47,10 @@ PCI card, unsure          try the generic PCI drivers above, or the
 ------- No network card? --------------------------------------
 mTCP can run TCP/IP over a SERIAL cable using SLIP (no NIC needed) - see
 docs/cb_dos_networking.md. Slow, but works on any machine with a COM port.
+
+------- Licensing --------------------------------------------------
+Most drivers here are the Crynwr collection (GPL v2; see CRYNWR-GPL.txt).
+R6040PD is built on the Crynwr GPL skeleton. 3C90XPD is 3Com's PROPRIETARY
+driver ((C) 1999 3Com, all rights reserved) - it is NOT (A)GPL, bundled
+as an as-is hardware driver. Details + how to drop it: ATTRIBUTION.md
+(shipped as \NET\DRIVERS\ATTRIB.TXT).
