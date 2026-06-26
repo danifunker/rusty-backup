@@ -105,10 +105,11 @@ docker run --rm \
         sed "s/\$/\r/" /in/drivers/DRIVERS.TXT > /tmp/DRIVERS.TXT
         mcopy -o -i /fd.img /tmp/DRIVERS.TXT    ::NET/DRIVERS/DRIVERS.TXT
         # The full Crynwr set (~600 KB) only fits the CD; the floppy carries a
-        # curated set covering the common retro NICs + the cards the big
-        # emulators (QEMU / VirtualBox / 86Box / DOSBox-X) present. The CD has
-        # all of them under \NET\DRIVERS.
-        for d in ne2000 ne1000 pcntpk rtspkt 3c509 3c503 smc_wd e100bpkt; do
+        # curated set covering the common retro NICs, the cards the big
+        # emulators (QEMU / VirtualBox / 86Box / DOSBox-X) present, and the
+        # ITX-Llama onboard Vortex86/RDC R6040 (r6040pd). The CD has all of
+        # them under \NET\DRIVERS.
+        for d in ne2000 ne1000 pcntpk rtspkt 3c509 3c503 smc_wd e100bpkt r6040pd; do
             [ -f "/in/drivers/$d.com" ] && mcopy -o -i /fd.img "/in/drivers/$d.com" ::NET/DRIVERS/ || true
         done
 

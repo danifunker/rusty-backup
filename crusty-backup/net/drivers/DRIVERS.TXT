@@ -10,7 +10,8 @@ both use it.
 This media SHIPS the Crynwr packet-driver collection (GPLv2; ~90 drivers,
 see CRYNWR-GPL.txt). The CD carries the FULL set under \NET\DRIVERS; the
 boot floppy has room for only a common subset (NE2000, NE1000, PCNTPK,
-RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT). Load yours before a backup:
+RTSPKT, 3C509, 3C503, SMC_WD, E100BPKT, R6040PD). Load yours before a
+backup, e.g. the ITX-Llama's onboard NIC:  \NET\DRIVERS\R6040PD 0x60
 
     \NET\DRIVERS\<driver> 0x60 [IRQ] [IO]
 
@@ -30,7 +31,7 @@ DEC 21x4x "Tulip" (PCI)   DC21X4.COM      DC21X4 0x60
 Realtek RTL8139 (PCI)     RTSPKT.COM      RTSPKT 0x60
 Realtek RTL8169 (PCI)     R8169PD.COM     R8169PD 0x60
 SMC/WD 80x3 (ISA)         WD8003E.COM     WD8003E 0x60 <irq> <io>
-DM&P Vortex86 RDC R6040    (vendor DOS pkt driver from DM&P)
+DM&P Vortex86 RDC R6040    R6040PD.COM     R6040PD 0x60   (ITX-Llama)
 PCI card, unsure          try the generic PCI drivers above, or the
                           card vendor's DOS "packet driver" download
 
