@@ -20,9 +20,11 @@ FROM --platform=linux/amd64 debian:bookworm-slim
 
 # Prebuilt DJGPP (gcc 12.2.0) from the build-djgpp project + make. `unzip` is
 # needed by net/fetch-watt32.sh (the WATT-32 DJGPP package ships as a .zip);
-# curl/tar cover the zlib/lz4 source fetches.
+# curl/tar cover the zlib/lz4 source fetches. `libfl2` provides libfl.so.2,
+# which the DJGPP v3.4 binutils binaries (i586-pc-msdosdjgpp-ar) are linked
+# against — without it `ar` dies with "error while loading shared libraries".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bzip2 make unzip \
+        ca-certificates curl bzip2 make unzip libfl2 \
     && curl -fsSL \
         https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2 \
         -o /tmp/djgpp.tar.bz2 \
