@@ -164,14 +164,21 @@ native-tls) to `rustls-tls` so there's no openssl-sys dep.
 
 ### 4. `opticaldiscs` / `cd-da-reader` (drives feature)
 
-`opticaldiscs = { version = "0.4.2", features = ["drives"] }` and
-`cd-da-reader` (git fork). These touch real CD drives via system
-APIs (Linux: `libcdio` or `ioctl`). MiSTer has no optical drive
-attached, but the build still compiles them — and `libcdio` may or
-may not be present in the Buildroot rootfs.
+`opticaldiscs` (CHD/ISO/BIN-CUE disc-image browse + drive enum) and
+`cd-da-reader` (physical-drive ripping). The original worry here —
+"`libcdio` may not be present in the Buildroot rootfs" — turned out to
+be unfounded: `cd-da-reader` is `cc` + `libc` only (a self-compiled
+SG_IO `ioctl` shim, **no** system `libcdio` link), and `opticaldiscs`'s
+`drives` feature is pure Rust.
 
-**Resolution: gate behind `optical` feature.** Default on for host
-builds, off for `minimal-cli`. Same shape as `chd`.
+**Resolution (updated 2026-06-26): SHIPPED on armv7.** The real blocker
+was that `opticaldiscs` pinned `libchdman-rs 0.287.0-l7`, which publishes
+no armv7 prebuilt (only x86_64 / aarch64 / apple / windows). `opticaldiscs
+0.4.5` bumps that to `libchdman-rs 0.288.5` — the same version the `chd`
+feature uses, which *does* ship an `armv7-unknown-linux-gnueabihf-glibc2.31`
+prebuilt — so the two dedupe to one libchdman and the optical stack
+cross-compiles. The MiSTer job now builds with `optical` enabled; it stays
+gated behind the `optical` feature (default on for host builds).
 
 ---
 
@@ -351,11 +358,13 @@ Idea captured 2026-06-05 after the Wave-2 Archie engine close-out.
   / GCC 5.4 / glibc 2.23 — too old to have the C++11 `std::thread`
   polymorphic-`_State` symbols the prebuilt depends on, so we pin to
   a digest of the `:main` rolling tag rather than `v0.2.5`.
-- The MiSTer job now builds with `--no-default-features --features chd,pure-zstd`
+- The MiSTer job builds with `--no-default-features --features chd,pure-zstd,remote,optical`
   so the artifact includes CHD support via the libchdman-rs prebuilt (plus the
   pure-Rust zstd backend — exactly one zstd backend is required, and a cross
-  build can't link C libzstd) — the GUI and optical stacks stay out, but `.chd`
-  is in. The job is
+  build can't link C libzstd), the rb-daemon (`remote`), and the optical stack
+  (`optical` — CD/DVD ripping; requires opticaldiscs >= 0.4.5 so both it and
+  `chd` share the armv7 libchdman-rs 0.288.5 prebuilt). Only the GUI stays out.
+  The job is
   marked `continue-on-error: true` and is intentionally OUT of the
   `release` job's `needs:` list, so a transient cross-compile failure
   (or the timing window while upstream libchdman-rs armv7 prebuilt is

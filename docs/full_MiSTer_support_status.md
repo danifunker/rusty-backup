@@ -40,6 +40,12 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   (bare + Arculator-wrapped), Apple-II `.do` / `.po` / `.dsk` sector-order,
   gzip-wrapped Amiga `.adz` / `.hdz`.
 - **Raw / superfloppy** (partitionless) images are handled.
+- **Optical / CD-ROM:** rip a physical CD/DVD drive to ISO or BIN/CUE
+  (`optical rip`), list drives (`optical drives`), convert ISO <-> BIN/CUE <->
+  CD-CHD (`optical convert`), and browse/extract ISO9660 / Joliet / HFS disc
+  images. Built into the desktop release and — as of opticaldiscs 0.4.5 — the
+  MiSTer `rb-cli-mini` armv7 build, for devices with an attached drive (e.g.
+  the SuperStation One).
 
 Legend for the **Support** column:
 

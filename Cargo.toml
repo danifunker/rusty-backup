@@ -94,8 +94,13 @@ mock_gui = ["dep:eframe", "dep:egui"]
 # off for MiSTer cross-compiles. ADFS / QXL.WIN / .d88 / .adf / .hdf / .vhd /
 # .img / .zst all still work without it.
 chd = ["dep:libchdman-rs"]
-# Physical optical-drive I/O (rip / data-track read). MiSTer has no optical
-# drive; leaving this off also drops a libcdio Buildroot dep.
+# Physical optical-drive I/O (rip / data-track read) plus optical-image
+# convert/browse. Builds on armv7 (MiSTer) too: cd-da-reader is cc+libc
+# (a self-compiled SG_IO shim — NO system libcdio link), and opticaldiscs
+# (>=0.4.5) reuses the SAME libchdman-rs 0.288.5 prebuilt as the `chd` feature
+# — which ships an armv7-gnueabihf-glibc2.31 build — so the two dedupe to one
+# libchdman. At runtime it needs a drive present (e.g. /dev/sr0); harmless to
+# include when none is attached.
 optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
 # Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
 # ON BY DEFAULT, and every shipped build opts in: the desktop release via

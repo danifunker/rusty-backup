@@ -3,14 +3,15 @@
 //! `src/optical/`.
 //!
 //! Subcommands:
+//! - `drives` — list connected physical optical drives
 //! - `rip` — rip a physical disc to ISO or BIN/CUE
 //! - `convert` — re-encode an optical image (ISO ↔ BIN/CUE ↔ CHD)
 //! - `browse` — list files on an optical image (ISO9660 / Joliet / HFS)
 //! - `extract` — extract files from an optical image to a host folder
 //!
-//! The GUI's interactive drive picker has no terminal equivalent; pass
-//! `--device PATH` explicitly. `rb-cli show devices` can help locate
-//! the right path on the host.
+//! The GUI's interactive drive picker has no terminal equivalent; run
+//! `rb-cli optical drives` to find a drive path, then pass it as
+//! `--device PATH` to `rip`.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
@@ -29,6 +30,8 @@ use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 
 #[derive(Debug, Subcommand)]
 pub enum OpticalCommand {
+    /// List connected physical optical drives and their device paths.
+    Drives,
     /// Rip a physical CD/DVD drive to a disk image file.
     Rip(RipArgs),
     /// Re-encode an optical image into a different format.
@@ -41,11 +44,31 @@ pub enum OpticalCommand {
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
     match cmd {
+        OpticalCommand::Drives => run_drives_verb(),
         OpticalCommand::Rip(a) => run_rip_verb(a),
         OpticalCommand::Convert(a) => run_convert_verb(a),
         OpticalCommand::Browse(a) => run_browse_verb(a),
         OpticalCommand::Extract(a) => run_extract_verb(a),
     }
+}
+
+// ---------------- drives ----------------
+
+/// List physical optical drives, mirroring the GUI Optical tab's drive picker
+/// (`opticaldiscs::drives::list_drives`). Prints one drive per line to stdout as
+/// `<device-path>  <display-name>` so the path can be fed to `optical rip
+/// --device`. ASCII only (no glyphs) per the project's terminal-output rule.
+fn run_drives_verb() -> Result<()> {
+    let drives = opticaldiscs::drives::list_drives();
+    if drives.is_empty() {
+        log_stderr("No optical drives found.");
+        return Ok(());
+    }
+    log_stderr(format!("Found {} optical drive(s):", drives.len()));
+    for d in &drives {
+        println!("{}  {}", d.device_path.display(), d.display_name);
+    }
+    Ok(())
 }
 
 // ---------------- rip ----------------
