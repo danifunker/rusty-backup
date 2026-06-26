@@ -19,6 +19,7 @@ impl SettingsDialog {
         }
 
         let mut open = self.open;
+        let mut close_requested = false;
         egui::Window::new("Settings")
             .open(&mut open)
             .resizable(false)
@@ -94,13 +95,16 @@ impl SettingsDialog {
                             self.save_settings();
                         }
                         if ui.button("Cancel").clicked() {
-                            self.open = false;
+                            close_requested = true;
                         }
                     });
                 });
             });
 
-        self.open = open;
+        // Close if the titlebar X cleared `open`, or the Cancel button asked to.
+        // (Writing `self.open = open` alone would clobber a Cancel-driven close,
+        // which is the bug behind issue #43.)
+        self.open = open && !close_requested;
     }
 
     pub fn open_dialog(&mut self) {

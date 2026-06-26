@@ -1085,6 +1085,7 @@ impl InspectTab {
     fn show_expand_image_dialog(&mut self, ui: &mut egui::Ui, ctx: &mut TabContext) {
         let mut open = self.expand_image_dialog_open;
         let mut do_expand = false;
+        let mut cancel = false;
         let current_size = self.actual_disk_size_bytes().unwrap_or(0);
 
         egui::Window::new("Expand Image")
@@ -1131,12 +1132,15 @@ impl InspectTab {
                         do_expand = true;
                     }
                     if ui.button("Cancel").clicked() {
-                        do_expand = false;
+                        cancel = true;
                     }
                 });
             });
 
-        if !open {
+        // Close on the titlebar X (`!open`) or the Cancel button (`cancel`).
+        // Cancel previously only reset `do_expand`, which was already false, so
+        // the dialog never closed — same bug class as issue #43.
+        if !open || cancel {
             self.expand_image_dialog_open = false;
             return;
         }
