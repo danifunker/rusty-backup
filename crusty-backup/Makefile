@@ -38,8 +38,9 @@ WATTLIB := $(WATT32)/lib
 # -- run `sh deps/fetch-zlib.sh`, `sh deps/fetch-lz4.sh`, and
 # `sh net/fetch-watt32.sh` once.
 CB_SRCS := src/crustybk.c src/cmd_backup.c src/cmd_restore.c src/cmd_clone.c \
-           src/cmd_inspect.c src/cmd_browse.c src/cbdisk.c src/cbntfs.c \
-           src/cbdefrag.c src/cbcodec.c src/cbnet.c src/cbmanifest.c src/cbswap.c
+           src/cmd_inspect.c src/cmd_browse.c src/cmd_netdetect.c src/cbdisk.c \
+           src/cbntfs.c src/cbdefrag.c src/cbcodec.c src/cbnet.c \
+           src/cbmanifest.c src/cbswap.c
 CB_HDRS := src/cbdisk.h src/cbbrowse.h src/cbntfs.h src/cbdefrag.h src/cbcodec.h \
            src/cbnet.h src/cbmanifest.h src/cbswap.h
 

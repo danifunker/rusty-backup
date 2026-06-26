@@ -33,6 +33,7 @@ extern int cmd_backup(int argc, char **argv);
 extern int cmd_restore(int argc, char **argv);
 extern int cmd_clone(int argc, char **argv);
 extern int cmd_inspect(int argc, char **argv);
+extern int cmd_netdetect(int argc, char **argv);
 extern int cmd_ls(int argc, char **argv);
 extern int cmd_get(int argc, char **argv);
 
@@ -672,6 +673,7 @@ static void usage(void)
     printf("  restore <folder> <drive-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
     printf("  clone   <src-hex> <tgt-hex> /Y [/SIZE:mode] [/CUSTOM:bytes] [/PARTS:i,j]\n");
     printf("  inspect [drive-hex]   list BIOS hard drives + partitions\n");
+    printf("  netdetect             detect the PCI NIC; exit code picks the driver (for NET.BAT)\n");
     printf("  ls      <src> [N] [path]            list files in a backup or live disk\n");
     printf("  get     <src> [N] <path> <dest>     extract one file from a backup or live disk\n");
     printf("    <src> = a backup folder, or @HH for live BIOS drive 0xHH (N = MBR slot)\n");
@@ -686,6 +688,7 @@ int main(int argc, char **argv)
         if (eq_ci(cmd, "restore")) return cmd_restore(argc - 1, argv + 1);
         if (eq_ci(cmd, "clone"))   return cmd_clone(argc - 1, argv + 1);
         if (eq_ci(cmd, "inspect")) return cmd_inspect(argc - 1, argv + 1);
+        if (eq_ci(cmd, "netdetect")) return cmd_netdetect(argc - 1, argv + 1);
         if (eq_ci(cmd, "ls"))      return cmd_ls(argc - 1, argv + 1);
         if (eq_ci(cmd, "get"))     return cmd_get(argc - 1, argv + 1);
         if (eq_ci(cmd, "help") || eq_ci(cmd, "/?") ||
