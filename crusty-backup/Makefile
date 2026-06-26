@@ -13,7 +13,10 @@ DJGPP ?= $(HOME)/djgpp
 # A command-line `make CC=...` still wins over this.
 CC    := $(DJGPP)/bin/i586-pc-msdosdjgpp-gcc
 
-CFLAGS  ?= -Os -Wall -Wextra -fno-ident
+# -march=i486: cb-dos targets a 486 baseline. This gcc emits no cmov/fcmov (686)
+# at i486 (verified), so the .exe runs on a 486; -mtune=i586 only tweaks
+# scheduling. WATT-32 (built from source) + zlib/lz4 are compiled i486 too.
+CFLAGS  ?= -Os -Wall -Wextra -fno-ident -march=i486 -mtune=i586
 LDFLAGS ?= -s            # strip symbols (smaller .exe)
 
 BUILD := build

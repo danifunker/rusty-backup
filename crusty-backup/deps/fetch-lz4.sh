@@ -31,7 +31,7 @@ SRC=$(echo "$TMP"/lz4-*)/lib
 # The library sources live in lib/. lz4.c (block codec), lz4hc.c (high-compression
 # -- pulled in by lz4frame), lz4frame.c (the frame format), xxhash.c (frame
 # content checksum). Headers are self-contained; no autoconf.
-( cd "$SRC" && "$CC" -O2 -DXXH_NAMESPACE=LZ4_ -c \
+( cd "$SRC" && "$CC" -O2 -march=i486 -mtune=i586 -DXXH_NAMESPACE=LZ4_ -c \
     lz4.c lz4hc.c lz4frame.c xxhash.c && "$AR" rcs liblz4.a *.o )
 
 cp "$SRC/liblz4.a" "$OUT/lib/"

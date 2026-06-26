@@ -28,7 +28,7 @@ SRC=$(echo "$TMP"/zlib-*)
 
 # Compile the library .c files (the tarball's top level is exactly the lib
 # sources + headers — no autoconf needed; the shipped zconf.h is usable as-is).
-( cd "$SRC" && "$CC" -O2 -c \
+( cd "$SRC" && "$CC" -O2 -march=i486 -mtune=i586 -c \
     adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c gzread.c \
     gzwrite.c infback.c inffast.c inflate.c inftrees.c trees.c uncompr.c \
     zutil.c && "$AR" rcs libz.a *.o )

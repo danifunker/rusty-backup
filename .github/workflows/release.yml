@@ -6,6 +6,25 @@ on:
       - "*.md"
       - "docs/**"
   workflow_dispatch:
+    # Manual "Run workflow" switches (this folds in the old standalone
+    # appliance-media.yml — one pipeline, no drift). On a plain push these
+    # inputs are unset: push always builds the desktop + cb-dos set and never
+    # the slow appliance, exactly as before. A manual run can trim the build
+    # down to just the media you're iterating on.
+    inputs:
+      desktop:
+        description: "Build the desktop apps + CLIs + MiSTer binary"
+        type: boolean
+        default: true
+      appliance:
+        description: "Linux appliance CPU floor (Buildroot ISO/PXE/floppy)"
+        type: choice
+        options: [none, i586, i686, both]
+        default: both
+      cbdos:
+        description: "Build cb-dos media (FreeDOS floppy + CD)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -29,6 +48,8 @@ jobs:
 
   build-windows:
     name: Build Windows
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
     runs-on: windows-latest
     # Bake the release version for every cargo invocation in the job (Test and
@@ -153,6 +174,8 @@ jobs:
 
   build-macos:
     name: Build macOS
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
     # arm64 builds+tests on Apple-silicon; x64 builds+tests natively on a real
     # Intel runner (no Rosetta), so `cargo test` runs on each arch's hardware.
@@ -391,6 +414,8 @@ jobs:
 
   build-linux-appimage:
     name: Build Linux AppImage (Anylinux)
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
     container: ghcr.io/pkgforge-dev/archlinux:latest
@@ -585,6 +610,8 @@ jobs:
 
   build-linux-packages:
     name: Build Linux Packages
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
     runs-on: ${{ matrix.runs-on }}
     # See build-windows: keep APP_VERSION consistent across Test and Build.
@@ -726,6 +753,8 @@ jobs:
   # just without the MiSTer artifact for that one run.
   build-rb-cli-mini-armv7:
     name: Build rb-cli-mini (armv7 MiSTer)
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
     runs-on: ubuntu-latest
     # Don't fail the whole workflow if the cross-compile breaks. Combined
@@ -836,16 +865,38 @@ jobs:
           name: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}
           path: rb-cli-mini-armv7-linux-${{ needs.generate-version.outputs.version }}.tar.gz
 
+  # Turn the `appliance` choice input into a JSON arch list for the matrix
+  # below. A plain push resolves to [] (the full Buildroot build is ~1 h, so it
+  # never runs unattended); a manual dispatch honours none / i586 / i686 / both.
+  appliance-matrix:
+    name: Resolve appliance arch list
+    runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.m.outputs.arches }}
+    steps:
+      - id: m
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo 'arches=[]' >> "$GITHUB_OUTPUT"
+          else
+            case "${{ inputs.appliance }}" in
+              both) echo 'arches=["i586","i686"]' >> "$GITHUB_OUTPUT" ;;
+              none) echo 'arches=[]' >> "$GITHUB_OUTPUT" ;;
+              *)    echo 'arches=["${{ inputs.appliance }}"]' >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+
   build-appliance:
     name: Build Linux appliance (${{ matrix.arch }})
     # A full Buildroot build is ~1 h on a GitHub runner (it compiles its own
-    # toolchain from scratch). TEMPORARILY skipped on auto-releases so we can
-    # ship the desktop/CLI/MiSTer/cb-dos artifacts quickly; build the i586/i686
-    # appliance on demand via "Run workflow" (workflow_dispatch). To re-enable
-    # it on every main release, restore:
-    #   github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' ||
-    if: github.event_name == 'workflow_dispatch'
-    needs: generate-version
+    # toolchain from scratch), so it's never built on a plain push — only a
+    # manual "Run workflow" with the `appliance` input set to i586/i686/both.
+    # appliance-matrix turns that choice into the matrix below; an empty list
+    # (push, or appliance=none) skips this job. i586 = broadest reach (Pentium /
+    # 5x86 / Vortex86 / ITX-Llama and up); i686 = a touch faster on Pentium-Pro+
+    # but won't run on a plain Pentium. (A true 486 is cb-dos, built below.)
+    needs: [generate-version, appliance-matrix]
+    if: needs.appliance-matrix.outputs.arches != '[]'
     runs-on: ubuntu-latest
     # Non-fatal like the MiSTer job — a Buildroot hiccup lets the desktop release
     # ship. Cap the runtime so a wedged build can't burn the 6 h default.
@@ -854,10 +905,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # i586 = broadest reach (Pentium / 5x86 / Vortex86 / ITX-Llama and up);
-        # i686 = a touch faster on Pentium-Pro+ but won't run on a plain Pentium.
-        # (A true 486 is cb-dos, built by the separate build-cb-dos job.)
-        arch: [i586, i686]
+        arch: ${{ fromJson(needs.appliance-matrix.outputs.arches) }}
     env:
       VER: ${{ needs.generate-version.outputs.version }}
       ARCH: ${{ matrix.arch }}
@@ -951,7 +999,9 @@ jobs:
   build-cb-dos:
     name: Build cb-dos media (FreeDOS floppy + CD)
     # Cheap (~2-3 min: DJGPP build + a FreeDOS fetch), so run it on every push
-    # like the desktop builds — no gate. Only `release` (main-only) publishes.
+    # like the desktop builds. A manual run can untick "cbdos" to skip it; only
+    # `release` (main-only) publishes.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.cbdos }}
     needs: generate-version
     runs-on: ubuntu-latest
     # Non-fatal like the other deployable-media jobs: a FreeDOS-mirror or DJGPP

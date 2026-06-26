@@ -19,12 +19,14 @@
 FROM --platform=linux/amd64 debian:bookworm-slim
 
 # Prebuilt DJGPP (gcc 12.2.0) from the build-djgpp project + make. `unzip` is
-# needed by net/fetch-watt32.sh (the WATT-32 DJGPP package ships as a .zip);
-# curl/tar cover the zlib/lz4 source fetches. `libfl2` provides libfl.so.2,
-# which the DJGPP v3.4 binutils binaries (i586-pc-msdosdjgpp-ar) are linked
-# against — without it `ar` dies with "error while loading shared libraries".
+# `unzip` is still used by net/fetch-watt32.sh fallback + other fetches; `nasm`
+# assembles WATT-32's real-mode packet stub when building it from source (for a
+# 486-safe, cmov-free libwatt — see net/build-watt32-src.sh). curl/tar cover the
+# zlib/lz4 + WATT-32 source fetches. `libfl2` provides libfl.so.2, which the
+# DJGPP v3.4 binutils binaries (i586-pc-msdosdjgpp-ar) are linked against —
+# without it `ar` dies with "error while loading shared libraries".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bzip2 make unzip libfl2 \
+        ca-certificates curl bzip2 make unzip libfl2 nasm \
     && curl -fsSL \
         https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2 \
         -o /tmp/djgpp.tar.bz2 \
@@ -38,5 +40,6 @@ ENV DJGPP=/opt/djgpp \
 
 WORKDIR /src/crusty-backup
 # Fetch the cross-built deps (idempotent — each skips if already present), then
-# build. zlib/lz4 cross-compile under DJGPP; WATT-32 is a prebuilt DJGPP package.
-CMD ["sh", "-c", "sh deps/fetch-zlib.sh && sh deps/fetch-lz4.sh && sh net/fetch-watt32.sh && make size"]
+# build. zlib/lz4 cross-compile under DJGPP; WATT-32 is built from source for a
+# 486-safe (cmov-free) libwatt -- see net/build-watt32-src.sh.
+CMD ["sh", "-c", "sh deps/fetch-zlib.sh && sh deps/fetch-lz4.sh && sh net/build-watt32-src.sh && make size"]

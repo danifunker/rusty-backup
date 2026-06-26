@@ -73,12 +73,33 @@ docker run --rm \
     -v "$AUTOEXEC":/in/fdauto.bat:ro \
     -v "$WATTCFG":/in/WATTCP.CFG:ro \
     -v "$NETDRV":/in/drivers:ro \
+    -v "$HERE/media/cdrom":/in/cdrom:ro \
+    -v "$HERE/media/cbdos-fdconfig.sys":/in/fdconfig.sys:ro \
+    -v "$HERE/media/net.bat":/in/net.bat:ro \
+    -v "$HERE/media/netisa.bat":/in/netisa.bat:ro \
     -v "$DL/upx":/usr/local/bin/upx:ro \
     debian:bookworm-slim sh -c '
         set -e
         apt-get update >/dev/null 2>&1
         apt-get install -y mtools genisoimage >/dev/null 2>&1
         export MTOOLS_SKIP_CHECK=1
+
+        # Free space FIRST -- before staging the CD-ROM stacks -- or mcopy fills
+        # the floppy and silently drops files. SETUP.BAT is the FreeDOS installer
+        # launcher; SLICEREX.EXE is its package-slicer helper (the Jerome Shidel
+        # tool); cb-dos runs neither.
+        mdel -i /fd.img ::SETUP.BAT 2>/dev/null || true
+        mdel -i /fd.img ::FREEDOS/BIN/SLICEREX.EXE 2>/dev/null || true
+
+        # Boot the 386-optimised kernel (cb-dos is 486+ anyway). The stock
+        # bootable KERNEL.SYS is the 8086 build; swap in KERNL386.SYS under the
+        # same name (the boot sector loads "KERNEL.SYS") and drop the now-spare
+        # copy from BIN -- nets ~46 KB and a leaner/faster kernel.
+        if mcopy -o -i /fd.img ::/FREEDOS/BIN/KERNL386.SYS /tmp/k386.sys 2>/dev/null; then
+            mcopy -o -i /fd.img /tmp/k386.sys ::KERNEL.SYS
+            mdel -i /fd.img ::FREEDOS/BIN/KERNL386.SYS 2>/dev/null || true
+        fi
+
         sed "s/\$/\r/" /in/fdauto.bat > /tmp/fdauto.bat   # CRLF for DOS
 
         # CRUSTYBK statically links the WATT-32 TCP/IP stack (networked backup)
@@ -113,10 +134,26 @@ docker run --rm \
             [ -f "/in/drivers/$d.com" ] && mcopy -o -i /fd.img "/in/drivers/$d.com" ::NET/DRIVERS/ || true
         done
 
-        # Drop the FreeDOS installer (irrelevant to cb-dos, frees ~39 KB). The
-        # disk_spike / lfn_test POC diagnostics are intentionally NOT shipped --
-        # the room goes to CRUSTYBK + networking.
-        mdel -i /fd.img ::SETUP.BAT 2>/dev/null || true
+        # CD-ROM access (boot-menu options 1-3): IDE/ATAPI (OAKCDROM) + USB
+        # (USBASPI + USBCD1) device drivers at the root, plus the SHSUCDX
+        # MSCDEX-replacement redirector. FDCONFIG.SYS DEVICE=-loads the drivers;
+        # FDAUTO.BAT runs SHSUCDX to assign the CD a drive letter.
+        mcopy -o -i /fd.img /in/cdrom/oakcdrom.sys ::OAKCDROM.SYS
+        mcopy -o -i /fd.img /in/cdrom/usbaspi.exe  ::USBASPI.EXE
+        mcopy -o -i /fd.img /in/cdrom/usbcd1.sys   ::USBCD1.SYS
+        mcopy -o -i /fd.img /in/cdrom/shsucdx.com  ::SHSUCDX.COM
+
+        # Boot menu (network x CD-ROM) + the per-choice network helpers. The new
+        # FDCONFIG.SYS replaces the stock FreeDOS language menu.
+        sed "s/\$/\r/" /in/fdconfig.sys > /tmp/fdconfig.sys
+        mcopy -o -i /fd.img /tmp/fdconfig.sys ::FDCONFIG.SYS
+        sed "s/\$/\r/" /in/net.bat    > /tmp/net.bat
+        mcopy -o -i /fd.img /tmp/net.bat      ::NET.BAT
+        sed "s/\$/\r/" /in/netisa.bat > /tmp/netisa.bat
+        mcopy -o -i /fd.img /tmp/netisa.bat   ::NETISA.BAT
+
+        # (The disk_spike / lfn_test POC diagnostics are intentionally NOT
+        # shipped -- the room goes to CRUSTYBK + networking + CD-ROM access.)
 
         # Guard against the silent-disk-full regression: mtools mcopy can print
         # "Disk full" yet still exit 0, so set -e alone is not enough -- assert

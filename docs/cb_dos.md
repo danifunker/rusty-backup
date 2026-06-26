@@ -124,7 +124,9 @@ testing without real hardware. This setup is the gating step for the size POC.
 > The `disk_spike`/`lfn_test` POC diagnostics are no longer shipped on the media.)
 > The `release` job (`needs:
 > build-cb-dos`) ships both as `cbdos-freedos-<ver>.img` / `cbdos-<ver>.iso`.
-> `appliance-media.yml` builds them on demand for iteration. The driver matrix
+> For iteration, trigger the Release workflow manually (`gh workflow run Release
+> -f desktop=false -f appliance=none -f cbdos=true`) to build just the cb-dos
+> media without the desktop or appliance jobs. The driver matrix
 > (IDE/CF vs +CD vs +USB) is still minimal (plain IDE/CF); the reference material
 > below remains the plan for richer boot-menu driver profiles.
 
