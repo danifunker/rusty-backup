@@ -29,6 +29,13 @@ NETDRV="$HERE/net/drivers"          # user packet-driver .COM(s) for the floppy'
 [ -f "$DOSLFN" ]    || { echo "missing $DOSLFN (vendored long-filename TSR)"; exit 1; }
 [ -f "$WATTCFG" ]   || { echo "missing $WATTCFG (WATT-32 config for networked backup)"; exit 1; }
 
+# DOS driver binaries (NIC + CD-ROM) are committed zipped (vendor/dos-drivers.zip)
+# to keep loose binaries out of the git tree; extract them into net/drivers/ +
+# media/cdrom/ before staging. Idempotent (-o overwrites).
+if [ -f "$HERE/vendor/dos-drivers.zip" ]; then
+    unzip -o -q "$HERE/vendor/dos-drivers.zip" -d "$HERE"
+fi
+
 mkdir -p "$DIST"
 cp "$FDBASE" "$DIST/cbdos-freedos.img"
 

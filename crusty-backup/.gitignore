@@ -6,5 +6,9 @@ deps/dl/
 net/watt32/
 net/dl/
 net/mtcp/
-# net/drivers/*.com are now VENDORED (the Crynwr GPL collection, fetched by
-# net/fetch-drivers.sh and committed) so the CI-built media ships with drivers.
+# DOS driver binaries are committed ZIPPED in vendor/dos-drivers.zip (to keep
+# loose binaries out of the tree) and extracted into place by mkmedia.sh. Ignore
+# the extracted binaries; the .txt/.md docs beside them stay tracked.
+net/drivers/*.com
+media/cdrom/*.sys
+media/cdrom/*.com
