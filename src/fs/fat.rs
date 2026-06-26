@@ -178,7 +178,7 @@ impl<R: Read + Seek> FatFilesystem<R> {
             Some(label_str)
         };
 
-        Ok(Self {
+        let mut fs = Self {
             reader,
             bytes_per_sector,
             sectors_per_cluster,
@@ -194,7 +194,15 @@ impl<R: Read + Seek> FatFilesystem<R> {
             total_clusters,
             used_clusters: None,
             next_free_hint: 2,
-        })
+        };
+        // Cache the used-cluster count so used_size() / the browse free-space
+        // line are accurate (one FAT scan at open, the same way exFAT computes
+        // used_bytes). Best-effort: a read error just leaves it unknown and
+        // used_size() falls back to a rough estimate.
+        if let Ok(used) = fs.scan_used_clusters() {
+            fs.used_clusters = Some(used);
+        }
+        Ok(fs)
     }
 
     /// Absolute byte offset for a given sector number.
@@ -215,6 +223,24 @@ impl<R: Read + Seek> FatFilesystem<R> {
     /// Bytes per cluster.
     fn cluster_size(&self) -> u64 {
         self.bytes_per_sector * self.sectors_per_cluster
+    }
+
+    /// Scan the FAT once and return the number of in-use data clusters.
+    /// Read-only (so it works from `open`); cached into `used_clusters`.
+    fn scan_used_clusters(&mut self) -> Result<u64, FilesystemError> {
+        let fat_offset = self.sector_offset(self.reserved_sectors);
+        let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
+        self.reader.seek(SeekFrom::Start(fat_offset))?;
+        let mut fat_data = vec![0u8; fat_size];
+        self.reader.read_exact(&mut fat_data)?;
+        let total_entries = self.total_clusters as u32 + 2;
+        let mut free: u64 = 0;
+        for cluster in 2..total_entries {
+            if read_fat_entry(&fat_data, cluster, self.fat_type) == 0 {
+                free += 1;
+            }
+        }
+        Ok(self.total_clusters.saturating_sub(free))
     }
 
     /// Start of the data region, in bytes from partition start.
@@ -701,9 +727,18 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
     }
 
     fn used_size(&self) -> u64 {
-        // Rough estimate: total - (free clusters * cluster size)
-        // For accuracy we'd need to scan the FAT, but this is a reasonable approximation
-        self.total_size() / 2 // placeholder
+        match self.used_clusters {
+            // "used" = the whole volume minus free data space, so it includes
+            // the boot sector / FATs / root-directory system area (matching how
+            // DOS reports disk usage). `used_clusters` is cached at open.
+            Some(used) => {
+                let free = self.total_clusters.saturating_sub(used);
+                self.total_size()
+                    .saturating_sub(free.saturating_mul(self.cluster_size()))
+            }
+            // FAT couldn't be scanned at open — rough fallback.
+            None => self.total_size() / 2,
+        }
     }
 
     fn allocation_unit(&self) -> Option<u64> {
@@ -5037,6 +5072,55 @@ mod tests {
         let root = fs.root().expect("root");
         let entries = fs.list_directory(&root).expect("list root");
         assert!(entries.is_empty(), "blank volume root must be empty");
+    }
+
+    #[test]
+    fn used_size_reflects_occupancy_not_half_placeholder() {
+        // Regression: used_size() used to return total_size()/2, so a nearly
+        // empty 1.44 MB floppy reported "720 KiB used / 720 KiB free".
+        let total = 1_474_560u64;
+        let img = create_blank_fat(total, Some("VOL")).expect("format floppy");
+        let mut cur = std::io::Cursor::new(img);
+        let fs = FatFilesystem::open(&mut cur, 0).expect("open");
+        let used = fs.used_size();
+        let free = fs.total_size().saturating_sub(used);
+        assert_ne!(
+            used,
+            fs.total_size() / 2,
+            "must not be the total/2 placeholder"
+        );
+        // A freshly-formatted volume is almost entirely free.
+        assert!(
+            used < total / 8,
+            "blank FAT used {used} should be small vs {total}"
+        );
+        assert!(
+            free > total - total / 8,
+            "blank FAT should report most space free"
+        );
+
+        // After writing ~40 KiB, used must grow by at least that much.
+        let mut cur2 = std::io::Cursor::new(create_blank_fat(total, None).unwrap());
+        let mut fs2 = FatFilesystem::open(&mut cur2, 0).unwrap();
+        let payload = vec![0xABu8; 40 * 1024];
+        let root = fs2.root().unwrap();
+        fs2.create_file(
+            &root,
+            "BIG.BIN",
+            &mut &payload[..],
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs2.sync_metadata().unwrap();
+        cur2.set_position(0);
+        let fs2b = FatFilesystem::open(&mut cur2, 0).unwrap();
+        assert!(
+            fs2b.used_size() >= used + 40 * 1024,
+            "writing 40 KiB should grow used_size ({} -> {})",
+            used,
+            fs2b.used_size()
+        );
     }
 
     #[test]
