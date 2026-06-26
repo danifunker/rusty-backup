@@ -18,6 +18,14 @@ set -e
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 RB_CLI="$DIR/rb-cli"
 
+# When delivered by MiSTer Downloader (a custom database), the binary can arrive
+# without the executable bit set. install.sh chmods it, but the Downloader path
+# skips install.sh, so set it here too - this keeps the menu entry working with
+# no manual chmod regardless of how rb-cli got onto the card.
+if [ -f "$RB_CLI" ] && [ ! -x "$RB_CLI" ]; then
+    chmod +x "$RB_CLI" 2>/dev/null || true
+fi
+
 if [ ! -x "$RB_CLI" ]; then
     echo "rb-cli was not found next to rb-daemon.sh:"
     echo "  $RB_CLI"

@@ -149,6 +149,36 @@ without the `optical` feature" message):
 Full background and the feature matrix live in
 [`docs/mister_cli.md`](docs/mister_cli.md).
 
+#### Install via MiSTer Downloader (custom database)
+
+The easiest way to get Rusty Backup onto a MiSTer is the built-in
+**Downloader** (the same tool `update_all` drives). It installs and
+**keeps itself updated** from the Scripts menu — no SSH, no tarball, no
+cross toolchain. Add this section to `/media/fat/downloader.ini` on the
+SD card:
+
+```ini
+[danifunker/rusty-backup]
+db_url = 'https://github.com/danifunker/rusty-backup/releases/latest/download/rusty-backup.json.zip'
+```
+
+Then run **Scripts > update** (or **Downloader**) on the MiSTer. It
+drops `rb-cli` and `rb-daemon.sh` into `/media/fat/Scripts`. The
+`db_url` points at the `latest` release, so every later Downloader run
+picks up new builds automatically.
+
+This is a [MiSTer Downloader *custom database*](https://github.com/MiSTer-devel/Downloader_MiSTer/blob/main/docs/custom-databases.md):
+each release's CI publishes the slim armv7 binary and the daemon shim as
+standalone assets plus a generated `rusty-backup.json.zip` database that
+references them by md5 + size. Because Downloader places individual files
+(it doesn't unpack tarballs), the bare `rb-cli` may arrive without its
+executable bit — `rb-daemon.sh` re-applies it on first run, so the menu
+entry works regardless.
+
+Prefer to install by hand? The `rb-cli-mini-...tar.gz` from the
+[Releases page](https://github.com/danifunker/rusty-backup/releases) still
+ships its own `install.sh` (see below).
+
 #### Run this device as a network daemon (rb-daemon)
 
 The MiSTer build can run as a small **network daemon** so the desktop
