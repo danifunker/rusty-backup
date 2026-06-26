@@ -317,7 +317,13 @@ The app has five tabs:
   discs. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
   StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
-  (`.mar`, read + write), and BinHex (`.hqx`) wrappers around any of them.
+  (`.mar`, read + write), MacBinary I/II/III (`.bin`), MacZip (Info-ZIP's
+  Macintosh port — a `.zip` carrying `Mac3` Finder metadata and `XtraStuf.mac/`
+  resource forks), and BinHex (`.hqx`) wrappers around any of them. `.bin` and
+  `.zip` are content-detected, so a raw `.bin` disk image or a plain
+  disk-image-in-a-zip still opens as a disk image. A MacBinary whose data fork
+  is itself a StuffIt/Compact Pro archive is peeled through to the inner
+  entries.
   Pick an archive, browse the entry tree (name / type / creator / size /
   codec), tick the entries to keep, and extract to a folder in your choice
   of fork-preserving container — BinHex, MacBinary, AppleDouble, or raw
@@ -404,6 +410,9 @@ readable.
 | QCOW2 (QEMU)   | `.qcow2`        | Yes            | Yes (create / edit) | v2 + v3 |
 | VMDK (VMware)  | `.vmdk`         | Yes            | Yes (create / edit) | Flat and monolithic-sparse |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
+| Gzip stream    | `.gz`           | Yes            | Yes             | DEFLATE per-partition member; the codec shared with crusty-backup (`cb-dos`) so DOS-side backups restore + resize here unchanged. `--format gzip` |
+| LZ4 stream     | `.lz4`          | Yes            | Yes             | LZ4 frame per-partition member; the other codec shared with crusty-backup (`cb-dos` `/CODEC:LZ4`) — faster than gzip on a slow CPU at a lower ratio. Restored + resized exactly like a `.gz` member. `--format lz4` |
+| cb-dos container | `.cbk`        | Yes (native)   | Yes (`cbk pack`) | Single-file form of a backup folder (chunked gzip members + index). Opens like any disk image — `inspect`, `ls`/`get` (browse + extract), `fsck`, GUI Inspect, and `restore` all work directly, no extract step. Large partitions are split into ~4 MiB source-span gzip members (via the `partition-N.gz.idx` seek layout), so the lazy reader seeks per-chunk instead of decompressing from the start. `rb-cli cbk pack/unpack` convert to/from a folder. Frozen v1; the eventual cb-dos network transport's on-disk artifact |
 | CHD (MAME)     | `.chd`          | Yes            | Yes             | Native (MAME's CHD core is bundled — no external `chdman` needed) |
 | Norton Ghost   | `.gho`, `.ghs`  | Yes            | No              | File-aware FAT/NTFS browse, sector + spanned sets, Ghost 7.5, password-protected images decrypted automatically |
 | WinImage       | `.imz`          | Yes            | No              | Including password-protected archives |
@@ -452,9 +461,9 @@ inspect-tab Edit Mode.
 
 | Filesystem     | Browse | Edit | Shrink / expand | fsck | Notes |
 |----------------|:------:|:----:|:---------------:|:----:|-------|
-| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies |
-| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x |
-| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux |
+| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
+| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
+| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
 | exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. |
 | NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch clean-room formatter, validated to mount under ntfs-3g). Create blank volumes with `rb-cli new --fs ntfs` (selectable `--cluster-size` / `--sector-size`, 512 B–2 MiB clusters); the defragmenting clone inherits the source volume's cluster and sector size. |
 | ext2 / ext3 / ext4 | Yes | Yes | Yes             | —    | Early Linux installs onward |

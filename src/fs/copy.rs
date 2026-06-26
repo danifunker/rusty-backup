@@ -473,8 +473,36 @@ fn copy_file(
         .seek(SeekFrom::Start(0))
         .map_err(|e| anyhow!("rewinding spool for {}: {e}", src_entry.path))?;
 
-    dst.create_file(dst_parent, &name, &mut spool, len, &options)
+    let created = dst
+        .create_file(dst_parent, &name, &mut spool, len, &options)
         .map_err(|e| anyhow!("writing {name}: {e}"))?;
+
+    // Finder flags (hasBundle, hasCustomIcon, isInvisible, ...) don't ride in
+    // CreateFileOptions; stamp them after creation via set_finder_info — the
+    // same path put-binhex / put-macbinary use. Only on Mac destinations
+    // (type/creator capable) under Preserve, and only when the source carried
+    // non-zero flags. set_finder_info rewrites the whole FInfo, so re-supply
+    // the type/creator create_file just wrote. See docs/bug_binhex_finder_flags.md.
+    if opts.attrs == AttrPolicy::Preserve && dst_caps.type_creator {
+        if let Some(flags) = src_entry.finder_flags.filter(|&f| f != 0) {
+            // Re-supply the raw OSType create_file just wrote (byte-exact),
+            // since set_finder_info rewrites the whole FInfo.
+            let type_code = options.os_type.or(created.type_code).unwrap_or([0; 4]);
+            let creator_code = options
+                .os_creator
+                .or(created.creator_code)
+                .unwrap_or([0; 4]);
+            let mut finfo = [0u8; 16];
+            finfo[0..4].copy_from_slice(&type_code);
+            finfo[4..8].copy_from_slice(&creator_code);
+            finfo[8..10].copy_from_slice(&flags.to_be_bytes());
+            if let Err(e) = dst.set_finder_info(&created, finfo, [0u8; 16]) {
+                log(&format!(
+                    "Warning: could not set Finder flags on {name}: {e}"
+                ));
+            }
+        }
+    }
 
     stats.files += 1;
     stats.bytes = stats.bytes.saturating_add(len);
@@ -505,11 +533,23 @@ fn translate_metadata(
         return (o, d);
     }
 
-    // HFS/HFS+ type & creator, ProDOS file type.
+    // HFS/HFS+/MFS type & creator: pass the raw OSType bytes through
+    // `os_type`/`os_creator` so high-bit codes survive byte-exact.
     if src.type_code.is_some() || src.creator_code.is_some() {
         if dst_caps.type_creator {
-            o.type_code = src.type_code.clone();
-            o.creator_code = src.creator_code.clone();
+            o.os_type = src.type_code;
+            o.os_creator = src.creator_code;
+        } else {
+            d.type_creator = true;
+        }
+    }
+    // ProDOS file type (rendered `$XX`, re-parsed by the ProDOS create path) +
+    // its auxiliary type.
+    if src.prodos_file_type.is_some() {
+        if dst_caps.type_creator {
+            o.type_code = src
+                .prodos_file_type
+                .map(crate::fs::prodos_types::format_type_code);
             o.aux_type = src.aux_type;
         } else {
             d.type_creator = true;
@@ -774,6 +814,78 @@ fn list_children(src: &mut dyn Filesystem, dir: &FileEntry) -> Result<Vec<FileEn
 mod tests {
     use super::*;
 
+    /// Disk-to-disk copy of a Mac file must preserve its Finder flags
+    /// (`fdFlags`), so harvested apps keep their hasBundle/custom-icon bits.
+    /// Regression for docs/bug_binhex_finder_flags.md (the `cp` half).
+    #[test]
+    fn copy_preserves_finder_flags_hfs_to_hfs() {
+        use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+        use std::io::Cursor;
+
+        let mut src = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Src").unwrap()),
+            0,
+        )
+        .unwrap();
+        let sroot = src.root().unwrap();
+        let body = b"app";
+        let fe = src
+            .create_file(
+                &sroot,
+                "Game",
+                &mut Cursor::new(body.as_slice()),
+                body.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"APPL");
+        finfo[4..8].copy_from_slice(b"Po.P");
+        finfo[8..10].copy_from_slice(&0x2000u16.to_be_bytes()); // hasBundle
+        src.set_finder_info(&fe, finfo, [0u8; 16]).unwrap();
+
+        // Read back so the FileEntry carries finder_flags, as a real copy would.
+        let src_entry = src
+            .list_directory(&sroot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Game")
+            .unwrap();
+        assert_eq!(src_entry.finder_flags, Some(0x2000));
+
+        let mut dst = HfsFilesystem::open(
+            Cursor::new(create_blank_hfs(4 * 1024 * 1024, 512, "Dst").unwrap()),
+            0,
+        )
+        .unwrap();
+        let droot = dst.root().unwrap();
+
+        let mut stats = CopyStats::default();
+        copy_into(
+            &mut src,
+            &src_entry,
+            &mut dst,
+            &droot,
+            "Game",
+            &CopyOptions::default(),
+            &mut stats,
+            &|_| {},
+        )
+        .unwrap();
+
+        let copied = dst
+            .list_directory(&droot)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Game")
+            .unwrap();
+        assert_eq!(
+            copied.finder_flags,
+            Some(0x2000),
+            "fdFlags must survive disk-to-disk cp"
+        );
+    }
+
     #[test]
     fn caps_hfs_has_forks_and_type_creator() {
         let c = Capabilities::infer("HFS");
@@ -837,8 +949,8 @@ mod tests {
     fn translate_drops_unsupported_axes() {
         // HFS-ish source file → FAT-ish dest: type/creator dropped.
         let mut src = FileEntry::new_file("doc.txt".into(), "/doc.txt".into(), 10, 0);
-        src.type_code = Some("TEXT".into());
-        src.creator_code = Some("ttxt".into());
+        src.type_code = Some(*b"TEXT");
+        src.creator_code = Some(*b"ttxt");
         src.resource_fork_size = Some(40);
         let dst = Capabilities::infer("FAT16");
         let (opts, dropped) = translate_metadata(

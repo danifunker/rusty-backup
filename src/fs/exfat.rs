@@ -542,6 +542,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         // exFAT FileAttributes share FAT's bit layout; carry
                         // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
                         dos_attributes: Some(file_attrs & 0x27),
+                        finder_flags: None,
+                        prodos_file_type: None,
                         mac_dates: None,
                     }
                 } else {
@@ -568,6 +570,8 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
                         // exFAT FileAttributes share FAT's bit layout; carry
                         // RO/HID/SYS/ARC (drop the directory bit — that's entry_type).
                         dos_attributes: Some(file_attrs & 0x27),
+                        finder_flags: None,
+                        prodos_file_type: None,
                         mac_dates: None,
                     }
                 };
@@ -609,6 +613,8 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }

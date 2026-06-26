@@ -555,12 +555,16 @@ pub fn try_compact_partition_reader<R: Read + Seek + Send + 'static>(
             },
         );
     }
-    compact_partition_reader(reader, partition_offset, partition_type, None).ok_or_else(|| {
-        format!(
-            "unsupported: no compact reader for MBR type 0x{partition_type:02X} \
+    // Used for size estimation; swap content doesn't affect the packed size, so
+    // keep_swap=true (no need to walk for swap files here).
+    compact_partition_reader(reader, partition_offset, partition_type, None, true).ok_or_else(
+        || {
+            format!(
+                "unsupported: no compact reader for MBR type 0x{partition_type:02X} \
              at offset {partition_offset}"
-        )
-    })
+            )
+        },
+    )
 }
 
 /// Build the **layout-preserving** compact reader for an NTFS partition:
@@ -597,6 +601,42 @@ fn exfat_compact_reader<R: Read + Seek + Send + 'static>(
     Some((Box::new(lp), info))
 }
 
+/// Build the **defrag** compact reader for a FAT partition: like the FAT path of
+/// [`compact_partition_reader`] but each file's clusters are relocated into a
+/// contiguous run (boot files first), so the restored disk is defragmented. The
+/// output is the same *size* as plain compaction — only the cluster order
+/// changes. Returns `None` if the partition isn't a FAT volume, so the backup
+/// path falls back to ordinary compaction for non-FAT filesystems.
+pub fn defrag_fat_partition_reader<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    keep_swap: bool,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (reader, info) = if keep_swap {
+        CompactFatReader::new_defrag(reader, partition_offset).ok()?
+    } else {
+        CompactFatReader::new_excluding_swap(reader, partition_offset, true).ok()?
+    };
+    Some((Box::new(reader), info))
+}
+
+/// Build the plain FAT compact reader, honoring the `keep_swap` opt-out: when
+/// `false`, allowlisted swap/page files are Level-1 excluded (allocation kept,
+/// content zeroed; §6). The single place the FAT-compaction `keep_swap` choice
+/// is made for the non-defrag path.
+fn fat_compact_reader<R: Read + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    keep_swap: bool,
+) -> Option<(Box<dyn Read + Send>, CompactResult)> {
+    let (reader, info) = if keep_swap {
+        CompactFatReader::new(reader, partition_offset).ok()?
+    } else {
+        CompactFatReader::new_excluding_swap(reader, partition_offset, false).ok()?
+    };
+    Some((Box::new(reader), info))
+}
+
 /// Try to create a compacted reader for a partition.
 ///
 /// Returns `None` for unsupported filesystem types. On success, returns a
@@ -606,6 +646,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
+    keep_swap: bool,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
@@ -617,10 +658,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         0x00 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
-                "fat" => {
-                    let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
+                "fat" => fat_compact_reader(reader, partition_offset, keep_swap),
                 "ntfs" => ntfs_compact_reader(reader, partition_offset),
                 "exfat" => exfat_compact_reader(reader, partition_offset),
                 "ext" => {
@@ -653,8 +691,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
         }
         // FAT types
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-            Some((Box::new(reader), info))
+            fat_compact_reader(reader, partition_offset, keep_swap)
         }
         // NTFS / exFAT
         0x07 => {
@@ -692,10 +729,7 @@ pub fn compact_partition_reader<R: Read + Seek + Send + 'static>(
                     let (reader, info) = CompactJfsReader::new(reader, partition_offset).ok()?;
                     Some((Box::new(reader), info))
                 }
-                "fat" => {
-                    let (reader, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    Some((Box::new(reader), info))
-                }
+                "fat" => fat_compact_reader(reader, partition_offset, keep_swap),
                 _ => None,
             }
         }
@@ -781,6 +815,7 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
+    keep_swap: bool,
 ) -> Option<(Box<dyn Read + Send>, CompactResult)> {
     // APM and HFS/ext/btrfs/ProDOS go through the existing dispatcher —
     // those readers are already layout-preserving (compacted_size ==
@@ -791,6 +826,7 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
             partition_offset,
             partition_type,
             partition_type_string,
+            keep_swap,
         );
     }
     match partition_type {
@@ -800,6 +836,7 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
                 partition_offset,
                 partition_type,
                 partition_type_string,
+                keep_swap,
             );
         }
         _ => {}
@@ -811,10 +848,7 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
         0x00 => {
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
-                "fat" => {
-                    let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-                    (Box::new(r), info)
-                }
+                "fat" => fat_compact_reader(reader, partition_offset, keep_swap)?,
                 "ntfs" => ntfs_compact_reader(reader, partition_offset)?,
                 "exfat" => exfat_compact_reader(reader, partition_offset)?,
                 _ => {
@@ -823,13 +857,13 @@ pub fn packed_partition_reader_padded<R: Read + Seek + Send + 'static>(
                         partition_offset,
                         partition_type,
                         partition_type_string,
+                        keep_swap,
                     );
                 }
             }
         }
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => {
-            let (r, info) = CompactFatReader::new(reader, partition_offset).ok()?;
-            (Box::new(r), info)
+            fat_compact_reader(reader, partition_offset, keep_swap)?
         }
         0x07 => {
             let fs_type = detect_0x07_type(&mut reader, partition_offset);

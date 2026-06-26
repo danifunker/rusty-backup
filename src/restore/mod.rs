@@ -853,8 +853,20 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
         );
     }
 
-    // Step 5: Pre-flight check
-    let total_bytes: u64 = overrides.iter().map(|o| o.export_size).sum();
+    // Step 5: Pre-flight check. Logical partitions live *inside* the extended
+    // container, whose synthetic override (added by calculate_restore_layout)
+    // already spans their footprint — summing both double-counts and wrongly
+    // rejects valid same-size restores, so exclude logicals here.
+    let total_bytes: u64 = overrides
+        .iter()
+        .filter(|o| {
+            !metadata
+                .partitions
+                .iter()
+                .any(|pm| pm.index == o.index && pm.is_logical)
+        })
+        .map(|o| o.export_size)
+        .sum();
     if total_bytes > config.target_size {
         bail!(
             "Total partition size ({} bytes) exceeds target ({} bytes)",
@@ -2777,6 +2789,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2915,6 +2928,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -3084,6 +3098,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -3295,6 +3310,7 @@ mod tests {
         let cancel_check = || false;
         let chd_result = single_file_chd::run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,

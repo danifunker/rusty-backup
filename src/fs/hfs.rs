@@ -378,18 +378,6 @@ pub(crate) const CATALOG_FILE: i8 = 2;
 
 /// Decode a 4-byte Mac OS type/creator code to a string.
 /// Non-printable bytes are replaced with '.'.
-fn decode_fourcc(data: &[u8]) -> String {
-    data.iter()
-        .map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
-
 /// A parsed HFS catalog record.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -409,8 +397,10 @@ enum CatalogRecord {
         data_extents: [HfsExtDescriptor; 3],
         rsrc_size: u32,
         rsrc_extents: [HfsExtDescriptor; 3],
-        type_code: String,
-        creator_code: String,
+        /// Raw 4-byte Mac OSType type/creator, straight off disk (no lossy
+        /// display decode) so high-bit codes survive round-trips.
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
         /// Finder flags (FInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
         finder_flags: u16,
         /// Catalog dates `(create, modify, backup)` in Mac-epoch seconds.
@@ -571,8 +561,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
                         }
                         let rec = &node[rec_data_offset..];
                         // Finder Info (FInfo) at offset 4: fdType(4) + fdCreator(4) + fdFlags(2)
-                        let type_code = decode_fourcc(&rec[4..8]);
-                        let creator_code = decode_fourcc(&rec[8..12]);
+                        let type_code: [u8; 4] = rec[4..8].try_into().unwrap();
+                        let creator_code: [u8; 4] = rec[8..12].try_into().unwrap();
                         let finder_flags = BigEndian::read_u16(&rec[12..14]);
                         // File ID (filFlNum) at offset 20
                         let file_id = BigEndian::read_u32(&rec[20..24]);
@@ -2590,6 +2580,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }
@@ -2637,6 +2629,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, data_size as u64, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.finder_flags = Some(finder_flags);
                     fe.modified = hfs_common::format_mac_date(dates.1);
                     fe.mac_dates = Some(dates);
                     if rsrc_size > 0 {
@@ -2835,16 +2828,22 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             let ext = name.rsplit('.').next().unwrap_or("");
             let (dict_t, dict_c) =
                 hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]));
-            let type_code = options
-                .type_code
-                .as_deref()
-                .map(hfs_common::encode_fourcc)
-                .unwrap_or(dict_t);
-            let creator_code = options
-                .creator_code
-                .as_deref()
-                .map(hfs_common::encode_fourcc)
-                .unwrap_or(dict_c);
+            // Raw `os_type`/`os_creator` win (byte-exact, high-bit safe); else
+            // fall back to the lossy text `type_code`, then the extension dict.
+            let type_code = options.os_type.unwrap_or_else(|| {
+                options
+                    .type_code
+                    .as_deref()
+                    .map(hfs_common::encode_fourcc)
+                    .unwrap_or(dict_t)
+            });
+            let creator_code = options.os_creator.unwrap_or_else(|| {
+                options
+                    .creator_code
+                    .as_deref()
+                    .map(hfs_common::encode_fourcc)
+                    .unwrap_or(dict_c)
+            });
 
             // Allocate blocks and write data
             let (data_start, data_blocks) = self.write_data_to_blocks(data, data_len)?;
@@ -2910,11 +2909,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 format!("{}/{name}", parent.path)
             };
             let mut fe = FileEntry::new_file(name.to_string(), path, data_len, file_id as u64);
-            let tc_str = String::from_utf8_lossy(&type_code).to_string();
-            let cc_str = String::from_utf8_lossy(&creator_code).to_string();
             if type_code != [0; 4] {
-                fe.type_code = Some(tc_str);
-                fe.creator_code = Some(cc_str);
+                fe.type_code = Some(type_code);
+                fe.creator_code = Some(creator_code);
             }
             if rsrc_size > 0 {
                 fe.resource_fork_size = Some(rsrc_size as u64);
@@ -4577,7 +4574,7 @@ mod tests {
             .unwrap();
 
         assert!(fe.type_code.is_some());
-        assert_eq!(fe.type_code.as_deref(), Some("TEXT"));
+        assert_eq!(fe.type_code, Some(*b"TEXT"));
     }
 
     /// Helper: run fsck on an HfsFilesystem and panic if any errors are found.
@@ -5168,6 +5165,31 @@ mod tests {
         let rec = fs.locate_record_data(fe.location as u32).unwrap();
         assert_eq!(&fs.catalog_data[rec + 4..rec + 20], &finfo);
         assert_eq!(&fs.catalog_data[rec + 56..rec + 72], &fxinfo);
+
+        // The read path must surface fdFlags on FileEntry so get-binhex / cp
+        // preserve them (docs/bug_binhex_finder_flags.md).
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let entry = listed.iter().find(|e| e.name == "thing.bin").unwrap();
+        assert_eq!(entry.finder_flags, Some(0x4000));
+    }
+
+    /// Regression for the dropped-Finder-flags bug: a file with hasBundle
+    /// (0x2000) set must report `finder_flags == Some(0x2000)` on read, which
+    /// is the value get-binhex now encodes into the .hqx header.
+    #[test]
+    fn test_hfs_read_surfaces_has_bundle_flag() {
+        let (mut fs, fe) = make_fs_with_file();
+        let mut finfo = [0u8; 16];
+        finfo[0..4].copy_from_slice(b"APPL");
+        finfo[4..8].copy_from_slice(b"Po.P");
+        BigEndian::write_u16(&mut finfo[8..10], 0x2000); // fdFlags hasBundle
+        fs.set_finder_info(&fe, finfo, [0u8; 16]).unwrap();
+
+        let root = fs.root().unwrap();
+        let listed = fs.list_directory(&root).unwrap();
+        let entry = listed.iter().find(|e| e.name == "thing.bin").unwrap();
+        assert_eq!(entry.finder_flags, Some(0x2000));
     }
 
     #[test]

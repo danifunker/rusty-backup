@@ -38,15 +38,19 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     let entry = super::ls::resolve_path(&mut *fs, &args.path)?;
+    // Default the un-overridden half to the file's current code (display form;
+    // chmeta's `set_type_creator` API is text-based).
+    let entry_type = entry.type_code_display();
+    let entry_creator = entry.creator_code_display();
     let new_type = args
         .type_code
         .as_deref()
-        .or(entry.type_code.as_deref())
+        .or(entry_type.as_deref())
         .unwrap_or("BINA");
     let new_creator = args
         .creator
         .as_deref()
-        .or(entry.creator_code.as_deref())
+        .or(entry_creator.as_deref())
         .unwrap_or("????");
     fs.set_type_creator(&entry, new_type, new_creator)
         .map_err(|e| anyhow!("set_type_creator: {e}"))?;

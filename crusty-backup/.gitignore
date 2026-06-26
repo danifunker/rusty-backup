@@ -1,2 +1,14 @@
 build/
 *.exe
+deps/zlib/
+deps/lz4/
+deps/dl/
+net/watt32/
+net/dl/
+net/mtcp/
+# DOS driver binaries are committed ZIPPED in vendor/dos-drivers.zip (to keep
+# loose binaries out of the tree) and extracted into place by mkmedia.sh. Ignore
+# the extracted binaries; the .txt/.md docs beside them stay tracked.
+net/drivers/*.com
+media/cdrom/*.sys
+media/cdrom/*.com

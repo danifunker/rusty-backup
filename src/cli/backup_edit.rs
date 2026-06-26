@@ -247,10 +247,10 @@ fn load_and_select(
         );
     }
     match meta.compression_type.as_str() {
-        "zstd" | "none" | "raw" => {}
+        "zstd" | "gzip" | "lz4" | "none" | "raw" => {}
         other => bail!(
             "editing a '{other}'-compressed backup partition is not supported \
-             (supported: zstd, raw / none)"
+             (supported: zstd, gzip, lz4, raw / none)"
         ),
     }
 

@@ -6,8 +6,12 @@
 //!   Driver Descriptor Record's driver map (`ddBlock`/`ddSize`/`ddType`) and
 //!   each entry's boot fields (`pmBootSize`/`pmBootCksum`/`pmProcessor`/
 //!   `pmPad`) — useful for auditing `mac-scsi-bless` output.
-//! - `fs-info IMG[@N]` — filesystem-level info (volume name, sizes,
-//!   counts). HFS today; widens through `open_filesystem` in Phase B.
+//! - `fs-info IMG[@N]` — filesystem-level info (type, volume label,
+//!   used / free space) for **any** filesystem `open_filesystem` can
+//!   open — FAT/exFAT/NTFS/HFS/HFS+/ext/btrfs/ProDOS/... plus the
+//!   superfloppy magic-byte sniffer (FAT / HFS / HFV at byte 0). Routes
+//!   through the same `resolve_partition_streaming` + `open_filesystem`
+//!   path `ls` / `get` use, so detection matches the GUI exactly.
 //! - `chd-info IMG` — CHD metadata (codecs, hunk size, compression,
 //!   metadata records).
 //! - `devices` — host block-device enumeration via `src/os/`.
@@ -22,9 +26,10 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
-use crate::cli::logging::out_stdout;
+use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
 use crate::partition::apm::Apm;
+use crate::partition::format_size;
 
 #[derive(Debug, Subcommand)]
 pub enum ShowCommand {
@@ -36,7 +41,8 @@ pub enum ShowCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
         format: OutputFormat,
     },
-    /// Print filesystem-level metadata (volume name, sizes, counts).
+    /// Print filesystem-level metadata (type, volume label, used / free
+    /// space) for any filesystem the engine can open.
     FsInfo {
         image: ImageRef,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = false)]
@@ -233,38 +239,85 @@ struct PartmapRow {
 
 fn show_fs_info(image: ImageRef, format: OutputFormat) -> Result<()> {
     require_non_flat(format, "show fs-info")?;
-    if format == OutputFormat::Text {
-        return crate::cli::api::hfs::cmd_info(image.path, image.partition);
+
+    // Route through the same generic detection path `ls` / `get` use, rather
+    // than the old HFS-only opener. The previous code hardcoded
+    // `HfsFilesystem::open` at the resolved offset, so a FAT (or any non-HFS)
+    // superfloppy was misdetected as HFS and died with "bad MDB signature".
+    // `resolve_partition_streaming` + `open_filesystem` dispatch by partition
+    // type / superfloppy magic exactly as the GUI inspect path does.
+    let (reader, ctx) =
+        crate::cli::resolve::resolve_partition_streaming(&image.path, image.partition)?;
+    log_stderr(&ctx.label);
+    let fs = crate::fs::open_filesystem(
+        reader,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("opening filesystem: {e}"))?;
+
+    let volume_name = fs.volume_label().map(|s| s.to_string());
+    let filesystem = fs.fs_type().to_string();
+    let total_bytes = fs.total_size();
+    let used_bytes = fs.used_size();
+    let free_bytes = total_bytes.saturating_sub(used_bytes);
+    let allocation_unit = fs.allocation_unit();
+
+    match format {
+        OutputFormat::Text => {
+            out_stdout(format!("Filesystem:  {filesystem}"));
+            out_stdout(format!(
+                "Volume:      {}",
+                volume_name.as_deref().unwrap_or("(unnamed)")
+            ));
+            out_stdout(format!(
+                "Total:       {} ({total_bytes} bytes)",
+                format_size(total_bytes)
+            ));
+            out_stdout(format!(
+                "Used:        {} ({used_bytes} bytes)",
+                format_size(used_bytes)
+            ));
+            out_stdout(format!(
+                "Free:        {} ({free_bytes} bytes)",
+                format_size(free_bytes)
+            ));
+            if let Some(unit) = allocation_unit {
+                out_stdout(format!("Alloc unit:  {unit} bytes"));
+            }
+            Ok(())
+        }
+        OutputFormat::Json | OutputFormat::Yaml => {
+            let payload = FsInfoPayload {
+                filesystem,
+                volume_name,
+                total_bytes,
+                used_bytes,
+                free_bytes,
+                allocation_unit,
+            };
+            emit_envelope(format, &Envelope::ok(payload))
+        }
+        // csv / tsv rejected above by require_non_flat.
+        _ => unreachable!(),
     }
-    // Structured: open the FS and emit volume_summary.
-    let mut file = crate::cli::io::open_image_ro(&image.path)?;
-    let (offset, _label) = crate::cli::api::hfs::resolve_hfs_offset(&mut file, image.partition)?;
-    let fs = crate::fs::hfs::HfsFilesystem::open(file, offset)
-        .map_err(|e| anyhow::anyhow!("opening HFS: {e}"))?;
-    let s = fs.volume_summary();
-    let payload = FsInfoPayload {
-        filesystem: "hfs".to_string(),
-        volume_name: s.volume_name,
-        block_size: s.block_size,
-        total_blocks: s.total_blocks,
-        free_blocks: s.free_blocks,
-        used_bytes: s.used_bytes,
-        file_count: s.file_count,
-        folder_count: s.folder_count,
-    };
-    emit_envelope(format, &Envelope::ok(payload))
 }
 
 #[derive(Debug, Serialize)]
 struct FsInfoPayload {
+    /// Filesystem type as the driver reports it (e.g. `FAT12`, `exFAT`,
+    /// `HFS`). Was previously a hardcoded `"hfs"`.
     filesystem: String,
-    volume_name: String,
-    block_size: u32,
-    total_blocks: u16,
-    free_blocks: u16,
+    /// Volume label / name, when the filesystem carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_name: Option<String>,
+    total_bytes: u64,
     used_bytes: u64,
-    file_count: u32,
-    folder_count: u32,
+    free_bytes: u64,
+    /// Allocation unit (cluster / block) size in bytes, when fixed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocation_unit: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -58,6 +58,16 @@ pub enum CompressionType {
     Dvd,
     Vhd,
     Zstd,
+    /// gzip/DEFLATE → `partition-N.gz`. The shared codec with
+    /// **crusty-backup** (`cb-dos`): zstd is impractical under DJGPP and
+    /// raw loses compression, so the DOS tool emits gzip and the desktop
+    /// reuses its restore + resize path unchanged (see `docs/cb_dos.md` §3).
+    Gzip,
+    /// LZ4 frame format → `partition-N.lz4`. The other codec shared with
+    /// **crusty-backup** (`cb-dos` `/CODEC:LZ4`): much cheaper than gzip on a
+    /// slow 486 CPU at a lower ratio; gzip stays the default. Standard LZ4
+    /// frame, so DOS-written and desktop-written members interchange.
+    Lz4,
     None,
 }
 
@@ -68,6 +78,8 @@ impl CompressionType {
             CompressionType::Dvd => "chd-dvd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zstd",
+            CompressionType::Gzip => "gzip",
+            CompressionType::Lz4 => "lz4",
             CompressionType::None => "none",
         }
     }
@@ -77,6 +89,8 @@ impl CompressionType {
             CompressionType::Chd | CompressionType::Dvd => "chd",
             CompressionType::Vhd => "vhd",
             CompressionType::Zstd => "zst",
+            CompressionType::Gzip => "gz",
+            CompressionType::Lz4 => "lz4",
             CompressionType::None => "raw",
         }
     }
@@ -150,6 +164,22 @@ pub struct BackupConfig {
     /// `shrink_to_minimum=false` for that partition). Drives the new
     /// per-partition Defrag checkbox in the backup UI.
     pub defrag_partition_indices: Option<std::collections::HashSet<usize>>,
+    /// When `true`, **FAT** partitions are repacked so each file's clusters are
+    /// contiguous (boot files first), the desktop sibling of crusty-backup's
+    /// `backup /DEFRAG`. The image is the same size as ordinary compaction (only
+    /// the cluster order changes), so restore is unaffected and yields a
+    /// defragmented disk. Non-FAT filesystems fall back to ordinary compaction;
+    /// ignored when [`BackupConfig::sector_by_sector`] is on. Distinct from
+    /// [`BackupConfig::defrag_partition_indices`] (the HFS+/NTFS defrag-clone).
+    pub defrag_fat: bool,
+    /// When `false` (the default), allowlisted swap/page files (`386SPART.PAR`,
+    /// `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`) on a FAT
+    /// volume are **Level-1 excluded**: their allocation is kept (the file stays
+    /// full-size, the OS reinitializes swap on next boot) but their content is
+    /// imaged as zeros, which the codec crushes. `true` (`--keep-swap`) images
+    /// swap verbatim. The desktop sibling of cb-dos's default zeroing / `/KEEPSWAP`
+    /// (see `crusty-backup/src/cbswap.c`). FAT-only.
+    pub keep_swap: bool,
 }
 
 /// Shared progress state between background backup thread and the GUI.
@@ -1669,13 +1699,49 @@ fn run_backup_inner(
             let clone = factory
                 .open()
                 .context("failed to open source for compaction")?;
-            let (compact_reader, _) = fs::compact_partition_reader(
-                BufReader::new(clone),
-                part_offset,
-                part.partition_type_byte,
-                part.partition_type_string.as_deref(),
-            )
-            .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?;
+            // `--defrag` repacks FAT volumes file-by-file (boot-aware); non-FAT
+            // partitions return None and fall back to ordinary compaction. Same
+            // output size either way, so the precomputed `stream_size` still fits.
+            let compact_reader = if config.defrag_fat {
+                match fs::defrag_fat_partition_reader(
+                    BufReader::new(clone),
+                    part_offset,
+                    config.keep_swap,
+                ) {
+                    Some((r, _)) => {
+                        log(
+                            &progress,
+                            LogLevel::Info,
+                            format!("Defragmenting FAT partition {part_label}"),
+                        );
+                        r
+                    }
+                    None => {
+                        let clone2 = factory
+                            .open()
+                            .context("failed to open source for compaction")?;
+                        fs::compact_partition_reader(
+                            BufReader::new(clone2),
+                            part_offset,
+                            part.partition_type_byte,
+                            part.partition_type_string.as_deref(),
+                            config.keep_swap,
+                        )
+                        .map(|(r, _)| r)
+                        .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
+                    }
+                }
+            } else {
+                fs::compact_partition_reader(
+                    BufReader::new(clone),
+                    part_offset,
+                    part.partition_type_byte,
+                    part.partition_type_string.as_deref(),
+                    config.keep_swap,
+                )
+                .map(|(r, _)| r)
+                .ok_or_else(|| anyhow::anyhow!("compaction failed for {part_label}"))?
+            };
 
             // Trim the stream to stream_size.  For layout-preserving readers this
             // drops the zero-filled free tail; for packed readers stream_size equals
@@ -2028,6 +2094,7 @@ fn run_single_file_chd_path(
         };
 
     let inputs = single_file_chd::SingleFileChdInputs {
+        keep_swap: config.keep_swap,
         source_file: source.get_ref(),
         source_size,
         source_partition_table_bytes: mbr_bytes,

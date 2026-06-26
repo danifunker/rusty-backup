@@ -167,6 +167,8 @@ mod tests {
                 amiga_comment: None,
                 amiga_date: None,
                 dos_attributes: None,
+                finder_flags: None,
+                prodos_file_type: None,
                 mac_dates: None,
             })
         }
@@ -195,6 +197,8 @@ mod tests {
                         amiga_comment: None,
                         amiga_date: None,
                         dos_attributes: None,
+                        finder_flags: None,
+                        prodos_file_type: None,
                         mac_dates: None,
                     },
                     FileEntry {
@@ -218,6 +222,8 @@ mod tests {
                         amiga_comment: None,
                         amiga_date: None,
                         dos_attributes: None,
+                        finder_flags: None,
+                        prodos_file_type: None,
                         mac_dates: None,
                     },
                 ]),
@@ -242,6 +248,8 @@ mod tests {
                     amiga_comment: None,
                     amiga_date: None,
                     dos_attributes: None,
+                    finder_flags: None,
+                    prodos_file_type: None,
                     mac_dates: None,
                 }]),
                 _ => Ok(vec![]),

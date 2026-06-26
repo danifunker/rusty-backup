@@ -1170,6 +1170,8 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }

@@ -164,6 +164,7 @@ pub mod chd_edit {
         bail!("chd feature not built into this binary")
     }
 }
+pub mod cbk;
 pub mod compress;
 pub mod containers;
 pub mod dc42;
@@ -171,8 +172,11 @@ pub mod dmg;
 pub mod export;
 pub mod gho;
 pub mod gho_crypto;
+pub mod gz_index;
+pub mod gzip;
 pub mod imz;
 pub mod interleave;
+pub mod lz4;
 pub mod qcow2;
 #[cfg(test)]
 pub(crate) mod qemu_img_test;

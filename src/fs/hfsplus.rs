@@ -384,19 +384,6 @@ fn validate_hfsplus_create_name(name: &str) -> Result<(), FilesystemError> {
     }
     Ok(())
 }
-
-/// Decode a 4-byte Mac OS type/creator code to a string.
-fn decode_fourcc(data: &[u8]) -> String {
-    data.iter()
-        .map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect()
-}
 #[allow(dead_code)]
 const CATALOG_FOLDER_THREAD: i16 = 3;
 #[allow(dead_code)]
@@ -417,8 +404,10 @@ enum CatalogEntry {
         data_fork: ForkData,
         rsrc_size: u64,
         rsrc_fork: ForkData,
-        type_code: String,
-        creator_code: String,
+        /// Raw 4-byte Mac OSType type/creator, straight off disk (no lossy
+        /// display decode) so high-bit codes survive round-trips.
+        type_code: [u8; 4],
+        creator_code: [u8; 4],
         /// Finder flags (userInfo.fdFlags) — bit 0x8000 is `kIsAlias`.
         finder_flags: u16,
         /// HFS+ file hardlink target inode number (`bsdInfo.special` u32).
@@ -1406,8 +1395,8 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         }
                         let file_id = BigEndian::read_u32(&rec[8..12]);
                         // FileInfo at offset 48: fdType(4) + fdCreator(4) + fdFlags(2)
-                        let type_code = decode_fourcc(&rec[48..52]);
-                        let creator_code = decode_fourcc(&rec[52..56]);
+                        let type_code: [u8; 4] = rec[48..52].try_into().unwrap();
+                        let creator_code: [u8; 4] = rec[52..56].try_into().unwrap();
                         let finder_flags = BigEndian::read_u16(&rec[56..58]);
                         // BSD info at offset 32 (16 bytes); the `special` u32
                         // at byte 12 of that block (offset 44 of the record)
@@ -2784,6 +2773,8 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
             amiga_comment: None,
             amiga_date: None,
             dos_attributes: None,
+            finder_flags: None,
+            prodos_file_type: None,
             mac_dates: None,
         })
     }
@@ -2862,6 +2853,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     let mut fe = FileEntry::new_file(name, path, display_size, file_id as u64);
                     fe.type_code = Some(type_code);
                     fe.creator_code = Some(creator_code);
+                    fe.finder_flags = Some(finder_flags);
                     if display_rsrc > 0 {
                         fe.resource_fork_size = Some(display_rsrc);
                     }
@@ -2889,7 +2881,7 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
                     // on the alias having a resolved target. So we drop the
                     // eager resolution and let the preview path do the read
                     // when (and only when) the user actually clicks.
-                    let _ = (data_fork, rsrc_fork, finder_flags);
+                    let _ = (data_fork, rsrc_fork);
                     entries.push(fe);
                 }
             }
@@ -4120,8 +4112,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                 &mut empty,
                 0,
                 &CreateFileOptions {
-                    type_code: Some("hlnk".into()),
-                    creator_code: Some("hfs+".into()),
+                    os_type: Some(*b"hlnk"),
+                    os_creator: Some(*b"hfs+"),
                     ..Default::default()
                 },
             )?;
@@ -4224,8 +4216,8 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
                 &mut empty,
                 0,
                 &CreateFileOptions {
-                    type_code: Some("fdrp".into()),
-                    creator_code: Some("MACS".into()),
+                    os_type: Some(*b"fdrp"),
+                    os_creator: Some(*b"MACS"),
                     ..Default::default()
                 },
             )?;
@@ -4323,16 +4315,22 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         let ext = name.rsplit('.').next().unwrap_or("");
         let (dict_t, dict_c) =
             hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]));
-        let type_code = options
-            .type_code
-            .as_deref()
-            .map(hfs_common::encode_fourcc)
-            .unwrap_or(dict_t);
-        let creator_code = options
-            .creator_code
-            .as_deref()
-            .map(hfs_common::encode_fourcc)
-            .unwrap_or(dict_c);
+        // Raw `os_type`/`os_creator` win (byte-exact, high-bit safe); else
+        // fall back to the lossy text `type_code`, then the extension dict.
+        let type_code = options.os_type.unwrap_or_else(|| {
+            options
+                .type_code
+                .as_deref()
+                .map(hfs_common::encode_fourcc)
+                .unwrap_or(dict_t)
+        });
+        let creator_code = options.os_creator.unwrap_or_else(|| {
+            options
+                .creator_code
+                .as_deref()
+                .map(hfs_common::encode_fourcc)
+                .unwrap_or(dict_c)
+        });
 
         // Allocate blocks and write data
         let data_fork = self.write_data_to_blocks(data, data_len, file_id, HFSPLUS_FORK_DATA)?;
@@ -4405,11 +4403,9 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
             format!("{}/{name}", parent.path)
         };
         let mut fe = FileEntry::new_file(name.to_string(), path, data_len, file_id as u64);
-        let tc_str = String::from_utf8_lossy(&type_code).to_string();
-        let cc_str = String::from_utf8_lossy(&creator_code).to_string();
         if type_code != [0; 4] {
-            fe.type_code = Some(tc_str);
-            fe.creator_code = Some(cc_str);
+            fe.type_code = Some(type_code);
+            fe.creator_code = Some(creator_code);
         }
         if rsrc_fork.logical_size > 0 {
             fe.resource_fork_size = Some(rsrc_fork.logical_size);
@@ -7045,8 +7041,8 @@ mod tests {
                     &mut empty,
                     0,
                     &CreateFileOptions {
-                        type_code: Some("hlnk".into()),
-                        creator_code: Some("hfs+".into()),
+                        os_type: Some(*b"hlnk"),
+                        os_creator: Some(*b"hfs+"),
                         ..Default::default()
                     },
                 )
@@ -7189,8 +7185,8 @@ mod tests {
                     &mut empty,
                     0,
                     &CreateFileOptions {
-                        type_code: Some("hlnk".into()),
-                        creator_code: Some("hfs+".into()),
+                        os_type: Some(*b"hlnk"),
+                        os_creator: Some(*b"hfs+"),
                         ..Default::default()
                     },
                 )
@@ -7992,6 +7988,6 @@ mod tests {
 
         // "txt" extension should auto-detect to TEXT/ttxt
         assert!(fe.type_code.is_some());
-        assert_eq!(fe.type_code.as_deref(), Some("TEXT"));
+        assert_eq!(fe.type_code, Some(*b"TEXT"));
     }
 }

@@ -42,6 +42,14 @@ pub struct PutBinHexArgs {
     /// Overwrite an existing entry at the destination path.
     #[arg(long)]
     pub force: bool,
+
+    /// Clear the `hasBeenInited` Finder flag (0x0100) on the written file. Use
+    /// when injecting an app onto a fresh disk so the Finder re-reads its `BNDL`
+    /// and registers real icons (a file copied with `hasBeenInited` already set is
+    /// treated as already-catalogued, so it shows a generic icon until a desktop
+    /// rebuild). Mirrors what a MacBinary install does to byte 73.
+    #[arg(long = "clear-inited")]
+    pub clear_inited: bool,
 }
 
 #[derive(Debug, Args)]
@@ -64,18 +72,6 @@ pub struct GetBinHexArgs {
     /// metacharacters in a name are addressed verbatim with or without it.
     #[arg(short = 'L', long = "literal", alias = "no-glob")]
     pub literal: bool,
-}
-
-/// Convert a 4-char Finder code string into a padded 4-byte array.
-fn code_to_bytes(s: &str) -> [u8; 4] {
-    let bytes = s.as_bytes();
-    let mut out = [b' '; 4];
-    for (i, slot) in out.iter_mut().enumerate() {
-        if i < bytes.len() {
-            *slot = bytes[i];
-        }
-    }
-    out
 }
 
 pub fn run_put(args: PutBinHexArgs) -> Result<()> {
@@ -161,7 +157,14 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
     let mut finfo = [0u8; 16];
     finfo[0..4].copy_from_slice(&decoded.type_code);
     finfo[4..8].copy_from_slice(&decoded.creator_code);
-    BigEndian::write_u16(&mut finfo[8..10], decoded.flags);
+    // Optionally clear hasBeenInited so the Finder re-registers the app's BNDL
+    // (real icons) on a fresh disk instead of treating it as already-catalogued.
+    let out_flags = if args.clear_inited {
+        decoded.flags & !0x0100
+    } else {
+        decoded.flags
+    };
+    BigEndian::write_u16(&mut finfo[8..10], out_flags);
     let fxinfo = [0u8; 16];
     if let Err(e) = fs.set_finder_info(&created, finfo, fxinfo) {
         log_stderr(format!("warning: set_finder_info skipped: {e}"));
@@ -213,15 +216,24 @@ pub fn run_get(args: GetBinHexArgs) -> Result<()> {
     fs.write_resource_fork_to(&entry, &mut resource_fork)
         .map_err(|e| anyhow!("read resource fork: {e}"))?;
 
-    let type_code = code_to_bytes(entry.type_code.as_deref().unwrap_or("????"));
-    let creator_code = code_to_bytes(entry.creator_code.as_deref().unwrap_or("????"));
+    // Use the raw 4-byte Mac OSType verbatim so high-bit type/creator bytes —
+    // e.g. the MacRoman florin 0xC4 in Prince of Persia's `PoƒP` creator —
+    // survive into the .hqx. (Reconstructing them from the lossy display string
+    // mapped non-ASCII to `.`, corrupting the creator: generic icons, and PoP
+    // couldn't find its colour data so fell back to B&W.)
+    let type_code = entry.type_code.unwrap_or(*b"????");
+    let creator_code = entry.creator_code.unwrap_or(*b"????");
 
     let file = BinHexFile {
         name: entry.name.clone(),
         type_code,
         creator_code,
-        // FileEntry doesn't surface Finder flags today; default to 0.
-        flags: 0,
+        // Preserve the source's Finder flags verbatim (hasBundle 0x2000,
+        // hasCustomIcon 0x0400, isInvisible, ...). The previously hard-coded 0
+        // dropped them, so harvested apps lost their BNDL registration and
+        // showed generic icons (docs/bug_binhex_finder_flags.md). put-binhex
+        // reads the same word back, so the high byte round-trips intact.
+        flags: entry.finder_flags.unwrap_or(0),
         data_fork,
         resource_fork,
     };
@@ -240,17 +252,4 @@ pub fn run_get(args: GetBinHexArgs) -> Result<()> {
         args.dst.display(),
     ));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn code_to_bytes_pads_and_truncates() {
-        assert_eq!(&code_to_bytes("TEXT"), b"TEXT");
-        assert_eq!(&code_to_bytes("ab"), b"ab  ");
-        assert_eq!(&code_to_bytes("TOOLONG"), b"TOOL");
-        assert_eq!(&code_to_bytes(""), b"    ");
-    }
 }

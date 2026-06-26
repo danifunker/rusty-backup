@@ -8,7 +8,7 @@
 //! [`resolve_partition`] and get back the metadata `open_filesystem` /
 //! `open_editable_filesystem` need.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek};
 
@@ -17,13 +17,14 @@ use crate::cli::io::{open_image_ro, open_image_rw};
 use crate::model::source_reader;
 use crate::partition::{PartitionInfo, PartitionTable};
 use crate::rbformats::{BoxReadSeek, BoxRwSeek};
+use std::path::PathBuf; // used by RwCommit::Cbk regardless of the chd feature
 
 #[cfg(feature = "chd")]
 use crate::cli::logging::log_stderr;
 #[cfg(feature = "chd")]
 use crate::rbformats::chd_edit;
 #[cfg(feature = "chd")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Resolved partition context — what to pass to
 /// [`crate::fs::open_filesystem`] / [`crate::fs::open_editable_filesystem`].
@@ -100,6 +101,15 @@ pub enum RwCommit {
     /// flat — recompressed back over the archive + `metadata.json` rewritten on
     /// commit. See [`crate::cli::backup_edit`].
     BackupArchive(crate::cli::backup_edit::BackupArchiveCommit),
+    /// A partition inside a `.cbk` container: the container was materialized to
+    /// `temp_folder`, the partition edited via the inner backup-folder commit,
+    /// and on commit the inner commit runs (recompress + metadata) and the
+    /// folder is repacked over the original `.cbk` (write-to-temp + rename).
+    Cbk {
+        inner: Box<RwCommit>,
+        temp_folder: tempfile::TempDir,
+        cbk_path: PathBuf,
+    },
 }
 
 impl RwCommit {
@@ -122,6 +132,26 @@ impl RwCommit {
                 diff: Some(diff),
             } => flatten_chd_with_progress(&parent, &diff),
             RwCommit::BackupArchive(commit) => commit.commit(),
+            RwCommit::Cbk {
+                inner,
+                temp_folder,
+                cbk_path,
+            } => {
+                // Persist the partition edit into the materialized folder
+                // (recompress partition-N.gz + rewrite metadata.json), then
+                // repack the folder over the original .cbk atomically.
+                inner.commit()?;
+                let tmp_out = cbk_path.with_extension("cbk.tmp");
+                crate::rbformats::cbk::pack_folder_to_cbk(temp_folder.path(), &tmp_out)
+                    .with_context(|| format!("repacking {}", cbk_path.display()))?;
+                std::fs::rename(&tmp_out, &cbk_path).with_context(|| {
+                    format!(
+                        "replacing {} with the repacked container",
+                        cbk_path.display()
+                    )
+                })?;
+                Ok(())
+            }
         }
     }
 }
@@ -188,6 +218,29 @@ pub fn resolve_partition_rw_forced(
     selector: Option<u32>,
     fs_override: Option<&str>,
 ) -> Result<(BoxRwSeek, PartitionContext, RwCommit)> {
+    // A `.cbk` container: materialize it to a temp folder, edit the partition
+    // there via the backup-folder path, and repack over the original `.cbk` on
+    // commit (the "additional legwork" edit path — cb_dos_network_and_state.md
+    // §2e). Read access to a `.cbk` is native (source_reader); editing repacks.
+    if crate::rbformats::cbk::is_cbk(path) {
+        let temp = tempfile::Builder::new()
+            .prefix(".rb-cbk-edit-")
+            .tempdir()
+            .context("creating temp folder for .cbk edit")?;
+        crate::rbformats::cbk::materialize_cbk_to_folder(path, temp.path())
+            .with_context(|| format!("materializing {} for edit", path.display()))?;
+        let (handle, ctx, inner) = backup_edit::open_backup_partition_rw(temp.path(), selector)?;
+        return Ok((
+            handle,
+            ctx,
+            RwCommit::Cbk {
+                inner: Box::new(inner),
+                temp_folder: temp,
+                cbk_path: path.to_path_buf(),
+            },
+        ));
+    }
+
     // A backup folder stores each partition as a compressed file governed by
     // metadata.json, not as a partition inside one image — handle it before
     // the whole-image path (which would try to detect a partition table).

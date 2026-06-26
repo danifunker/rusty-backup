@@ -11,14 +11,22 @@
 # default command runs `make size`):
 #   docker run --rm --platform linux/amd64 -v "$PWD":/src rb-cb-dos
 #
-# Output: build/tui_poc.exe, build/disk_spike.exe, build/lfn_test.exe
-# (run them under DOSBox-X on the host — see crusty-backup/run-dosbox.sh).
+# Output: build/crustybk.exe (+ diagnostics). The default command fetches the
+# gitignored cross-built deps (zlib + lz4 + WATT-32 — CRUSTYBK links all three:
+# gzip, LZ4, and networked `backup rb://...`) then builds, so a fresh checkout
+# in CI builds without the deps pre-staged on the host.
 
 FROM --platform=linux/amd64 debian:bookworm-slim
 
-# Prebuilt DJGPP (gcc 12.2.0) from the build-djgpp project + make.
+# Prebuilt DJGPP (gcc 12.2.0) from the build-djgpp project + make. `unzip` is
+# `unzip` is still used by net/fetch-watt32.sh fallback + other fetches; `nasm`
+# assembles WATT-32's real-mode packet stub when building it from source (for a
+# 486-safe, cmov-free libwatt — see net/build-watt32-src.sh). curl/tar cover the
+# zlib/lz4 + WATT-32 source fetches. `libfl2` provides libfl.so.2, which the
+# DJGPP v3.4 binutils binaries (i586-pc-msdosdjgpp-ar) are linked against —
+# without it `ar` dies with "error while loading shared libraries".
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl bzip2 make \
+        ca-certificates curl bzip2 make unzip libfl2 nasm \
     && curl -fsSL \
         https://github.com/andrewwutw/build-djgpp/releases/download/v3.4/djgpp-linux64-gcc1220.tar.bz2 \
         -o /tmp/djgpp.tar.bz2 \
@@ -31,4 +39,7 @@ ENV DJGPP=/opt/djgpp \
     PATH="/opt/djgpp/bin:${PATH}"
 
 WORKDIR /src/crusty-backup
-CMD ["make", "size"]
+# Fetch the cross-built deps (idempotent — each skips if already present), then
+# build. zlib/lz4 cross-compile under DJGPP; WATT-32 is built from source for a
+# 486-safe (cmov-free) libwatt -- see net/build-watt32-src.sh.
+CMD ["sh", "-c", "sh deps/fetch-zlib.sh && sh deps/fetch-lz4.sh && sh net/build-watt32-src.sh && make size"]

@@ -214,6 +214,10 @@ pub enum Command {
     /// Restore a backup folder to a target image or device.
     Restore(verbs::restore::RestoreArgs),
 
+    /// Pack a backup folder into a single `.cbk` container, or unpack one
+    /// (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly.
+    Cbk(verbs::cbk::CbkArgs),
+
     /// Interactive backup/restore menu (the appliance UI): pick a disk, then
     /// Inspect / Backup / Restore. Needs an interactive terminal.
     Menu(verbs::menu::MenuArgs),
@@ -341,6 +345,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Serve(args) => verbs::serve::run(args),
         Command::Backup(args) => verbs::backup::run(args),
         Command::Restore(args) => verbs::restore::run(args),
+        Command::Cbk(args) => verbs::cbk::run(args),
         Command::Menu(args) => verbs::menu::run(args),
         Command::Write(args) => verbs::write::run(args),
         Command::Convert(args) => verbs::convert::run(args),

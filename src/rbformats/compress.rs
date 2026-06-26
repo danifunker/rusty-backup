@@ -15,7 +15,7 @@ use crate::backup::verify::RunningHasher;
 use crate::backup::CompressionType;
 
 use super::chd_options::ChdOptions;
-use super::{chd, raw, vhd, woz, woz_write, zstd};
+use super::{chd, gzip, lz4, raw, vhd, woz, woz_write, zstd};
 
 pub(crate) const CHUNK_SIZE: usize = 256 * 1024; // 256 KB I/O buffer
 
@@ -110,6 +110,29 @@ pub(crate) fn compress_partition_hashed(
         CompressionType::Zstd => {
             // zstd compresses zero blocks efficiently; no need to skip
             zstd::compress_zstd(
+                reader,
+                output_base,
+                split_size,
+                output_hasher,
+                progress_cb,
+                cancel_check,
+            )
+        }
+        CompressionType::Gzip => {
+            // gzip crushes the zeroed free-cluster runs; no need to skip
+            gzip::compress_gzip(
+                reader,
+                output_base,
+                split_size,
+                output_hasher,
+                progress_cb,
+                cancel_check,
+            )
+        }
+        CompressionType::Lz4 => {
+            // lz4 frame; crushes the zeroed free-cluster runs (lower ratio than
+            // gzip, but much cheaper on a slow CPU)
+            lz4::compress_lz4(
                 reader,
                 output_base,
                 split_size,
@@ -240,11 +263,64 @@ pub fn decompress_to_writer(
                 progress_cb(total_written);
             }
         }
+        "gzip" => {
+            // MultiGzDecoder so a file of several concatenated gzip members
+            // (the network `.cbk` chunk shape) decodes as well as a single
+            // cb-dos-streamed member.
+            let file = File::open(data_path)
+                .with_context(|| format!("failed to open {}", data_path.display()))?;
+            let mut decoder = flate2::read::MultiGzDecoder::new(BufReader::new(file));
+            loop {
+                if cancel_check() {
+                    bail!("export cancelled");
+                }
+                let remaining = limit - total_written;
+                if remaining == 0 {
+                    break;
+                }
+                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let n = decoder.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    break;
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .with_context(|| format!("write_all failed at offset {}", total_written))?;
+                total_written += n as u64;
+                progress_cb(total_written);
+            }
+        }
         "zstd" => {
             let file = File::open(data_path)
                 .with_context(|| format!("failed to open {}", data_path.display()))?;
             let mut decoder = super::zstd_compat::decoder(BufReader::new(file))
                 .context("failed to create zstd decoder")?;
+            loop {
+                if cancel_check() {
+                    bail!("export cancelled");
+                }
+                let remaining = limit - total_written;
+                if remaining == 0 {
+                    break;
+                }
+                let to_read = (remaining as usize).min(CHUNK_SIZE);
+                let n = decoder.read(&mut buf[..to_read])?;
+                if n == 0 {
+                    break;
+                }
+                writer
+                    .write_all(&buf[..n])
+                    .with_context(|| format!("write_all failed at offset {}", total_written))?;
+                total_written += n as u64;
+                progress_cb(total_written);
+            }
+        }
+        "lz4" => {
+            // LZ4 frame (the cb-dos `/CODEC:LZ4` member, or a desktop
+            // `--format lz4` backup).
+            let file = File::open(data_path)
+                .with_context(|| format!("failed to open {}", data_path.display()))?;
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(BufReader::new(file));
             loop {
                 if cancel_check() {
                     bail!("export cancelled");
@@ -357,6 +433,22 @@ pub fn compress_file_to_archive(
     let c_dyn = || cancel_check();
     match compression_type {
         "zstd" => zstd::compress_zstd(
+            &mut reader,
+            output_path_base,
+            None,
+            None,
+            &mut p_dyn,
+            &c_dyn,
+        ),
+        "gzip" => gzip::compress_gzip(
+            &mut reader,
+            output_path_base,
+            None,
+            None,
+            &mut p_dyn,
+            &c_dyn,
+        ),
+        "lz4" => lz4::compress_lz4(
             &mut reader,
             output_path_base,
             None,

@@ -27,12 +27,17 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::cli::verbs::ls::resolve_path;
 use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, Filesystem};
 use crate::remote::protocol::{
-    read_chunks, read_control, read_handshake, write_binary_hello, write_control, ChunkWriter,
-    Handshake, Request, Response, WireEntry, WireKind, CAP_FAMILY_F, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    read_chunk_header, read_chunks, read_control, read_family_b_op, read_handshake,
+    read_member_header, read_member_request, write_binary_hello, write_control,
+    write_get_open_reply, write_member_stream, write_put_ack, write_put_result, write_resume_map,
+    ChunkWriter, FamilyBOp, Handshake, PutHeader, Request, Response, ResumeEntry, WireEntry,
+    WireKind, CAP_FAMILY_B, CAP_FAMILY_F, MAX_PUT_CHUNK, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    RB_HELLO_MAGIC,
 };
 
 /// A block-tier handle: a host image file (or raw device) kept open for ranged
@@ -66,8 +71,11 @@ enum StagedEdit {
         blob: PathBuf,
         size: u64,
         force: bool,
-        type_code: Option<String>,
-        creator_code: Option<String>,
+        /// Raw 4-byte Mac OSType type/creator written verbatim on apply, so a
+        /// remote copy preserves high-bit codes. A host `StageUpload`'s text
+        /// `--type` is encoded to bytes when staged.
+        type_code: Option<[u8; 4]>,
+        creator_code: Option<[u8; 4]>,
     },
     Mkdir {
         parent: String,
@@ -135,27 +143,607 @@ pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBu
 
 /// Handle a binary Family-B client (cb-dos / `CRUSTYBK.EXE`).
 ///
-/// **Phase 7a — handshake only.** The opening binary `Hello` has already been
-/// read; here we reply with our version + capabilities and acknowledge the
-/// peer. The chunk / `.cbk` data protocol (7b onward) isn't implemented yet, so
-/// after the reply we log and close — a hello-world client confirms the
-/// transport + handshake and disconnects. The reader is retained (not yet read)
-/// so the signature is stable when the chunk loop lands.
+/// **Phases 7b–7e.** The opening binary `Hello` has already been read; we reply
+/// with our version + capabilities, then read the next frame: the peer hangs up
+/// (a bare hello-and-quit probe like `NETHELLO` → EOF, a clean close), streams a
+/// chunk **PUT** (`backup rb://…` → a `.cbk` on the host, [`receive_put`]), or
+/// issues a **GET** (`restore rb://…` → pull a `.cbk`'s members back to rebuild a
+/// disk, [`serve_get`]).
 fn handle_family_b(
-    _reader: BufReader<TcpStream>,
+    mut reader: BufReader<TcpStream>,
     mut writer: BufWriter<TcpStream>,
     client_version: u16,
     client_caps: u16,
+    root: &Path,
+    staging_dir: Option<&Path>,
 ) -> Result<()> {
     eprintln!(
-        "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x}); \
-         chunk protocol not yet implemented (7a handshake only)"
+        "rb-cli serve: Family-B client connected (version {client_version}, caps {client_caps:#06x})"
     );
-    // Advertise the capabilities we actually serve. Family B's data protocol
-    // isn't built, so we report CAP_FAMILY_F only for now; the CAP_FAMILY_B bit
-    // flips on when the chunk stream (7b) lands.
-    write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F)
+    // The chunk PUT protocol (7b) exists now, so advertise Family B alongside F.
+    write_binary_hello(&mut writer, PROTOCOL_VERSION, CAP_FAMILY_F | CAP_FAMILY_B)
         .context("writing Family-B hello reply")?;
+
+    match read_family_b_op(&mut reader).context("reading Family-B op")? {
+        // Hello-only client (e.g. NETHELLO): clean disconnect, nothing to do.
+        None => Ok(()),
+        Some(FamilyBOp::Put(hdr)) => receive_put(&mut reader, &mut writer, root, staging_dir, hdr),
+        Some(FamilyBOp::Get { name }) => serve_get(&mut reader, &mut writer, root, &name),
+    }
+}
+
+/// Serve a GET (restore over the wire): open `<root>/<name>.cbk`, advertise its
+/// members, then stream whichever member the client asks for until it sends the
+/// done marker. A `partition-N.gz` member is served as its **raw gzip bytes** (the
+/// client inflates); a Raw member (`metadata.json`/`mbr.bin`) is served
+/// **decompressed** (its original file bytes). Read-only — no resume state.
+fn serve_get(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    root: &Path,
+    name: &str,
+) -> Result<()> {
+    let cbk = cbk_dest_path(root, name)?;
+    let members = match crate::rbformats::cbk::read_cbk_index(&cbk) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "rb-cli serve: GET {name:?} -> cannot open {}: {e:#}",
+                cbk.display()
+            );
+            write_get_open_reply(writer, None)?;
+            return Ok(());
+        }
+    };
+    let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+    eprintln!(
+        "rb-cli serve: GET {name:?} -> serving {} member(s) from {}",
+        names.len(),
+        cbk.display()
+    );
+    write_get_open_reply(writer, Some(&names))?;
+
+    while let Some(want) = read_member_request(reader)? {
+        match members.iter().find(|m| m.name == want) {
+            None => {
+                eprintln!("rb-cli serve: GET {name:?} member {want:?} not found");
+                write_member_stream(writer, false, std::io::empty())?;
+            }
+            Some(member) => {
+                // A `*.gz` member is sent verbatim (its chunk payloads ARE the gz);
+                // any other member is gunzipped to its original file bytes.
+                if want.to_ascii_lowercase().ends_with(".gz") {
+                    let src = crate::rbformats::cbk::CbkPayloadReader::open(&cbk, member)
+                        .with_context(|| format!("opening member {want}"))?;
+                    write_member_stream(writer, true, src)?;
+                } else {
+                    let src = crate::rbformats::cbk::cbk_member_content_reader(&cbk, member)
+                        .with_context(|| format!("opening member {want}"))?;
+                    write_member_stream(writer, true, src)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Durable resume state for an in-progress PUT (the ddrescue-mapfile analog,
+/// §3). Lives as `journal.json` in the persistent staging dir; rewritten
+/// atomically after each chunk's bytes are fsynced (fsync-data-then-record), so
+/// a crash can never mark a chunk committed that isn't on disk. Only **Gz**
+/// members (partitions) are tracked — Raw members (`mbr.bin`/`metadata.json`)
+/// are tiny and re-sent fresh on every (re)connect.
+#[derive(Serialize, Deserialize, Default)]
+struct ResumeJournal {
+    /// The §4 source fingerprint this staging belongs to. A reconnect with a
+    /// different fingerprint means a swapped/edited card → discard and restart.
+    fingerprint: u32,
+    members: Vec<MemberProgress>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct MemberProgress {
+    name: String,
+    total_chunks: u32,
+    committed_chunks: u32,
+    committed_bytes: u64,
+}
+
+impl ResumeJournal {
+    fn get(&self, name: &str) -> Option<&MemberProgress> {
+        self.members.iter().find(|m| m.name == name)
+    }
+    fn upsert(&mut self, name: &str, total: u32, committed: u32, bytes: u64) {
+        if let Some(m) = self.members.iter_mut().find(|m| m.name == name) {
+            m.total_chunks = total;
+            m.committed_chunks = committed;
+            m.committed_bytes = bytes;
+        } else {
+            self.members.push(MemberProgress {
+                name: name.to_string(),
+                total_chunks: total,
+                committed_chunks: committed,
+                committed_bytes: bytes,
+            });
+        }
+    }
+}
+
+fn journal_path(staging: &Path) -> PathBuf {
+    staging.join("journal.json")
+}
+
+fn load_journal(staging: &Path) -> Option<ResumeJournal> {
+    let data = std::fs::read(journal_path(staging)).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Write the journal atomically (write `.tmp`, fsync, rename) so a crash leaves
+/// either the old or the new map, never a torn one.
+fn save_journal(staging: &Path, j: &ResumeJournal) -> Result<()> {
+    let p = journal_path(staging);
+    let tmp = staging.join("journal.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(j)?).context("writing resume journal")?;
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &p).context("committing resume journal")?;
+    Ok(())
+}
+
+/// The stable, persistent staging dir for a container `name` (so a reconnect
+/// finds the partial transfer). The name is already validated as a flat base.
+fn staging_path_for(staging_dir: Option<&Path>, name: &str) -> PathBuf {
+    let base = staging_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("rb-cbk-{name}"))
+}
+
+/// Open a staging member for append, first truncating to `committed_bytes` — so
+/// a half-written trailing chunk from a crash (bytes fsynced but the journal not
+/// yet updated) is discarded and the client re-sends it. Returns the file seeked
+/// to the (new) end.
+fn open_staging_for_append(path: &Path, committed_bytes: u64) -> Result<std::fs::File> {
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening staging member {}", path.display()))?;
+    f.set_len(committed_bytes).with_context(|| {
+        format!(
+            "truncating staging member {} to last commit",
+            path.display()
+        )
+    })?;
+    f.seek(SeekFrom::Start(committed_bytes))?;
+    Ok(f)
+}
+
+/// Receive a chunk PUT and assemble it into a frozen `.cbk` under the serve root,
+/// resumably (§3). A persistent per-container staging dir + `journal.json` is the
+/// durable assembly point: each Gz chunk's bytes are fsynced **before** the
+/// journal records it committed, and a reconnect (same `name` + fingerprint)
+/// truncates each member to its last committed chunk and tells the client where
+/// to resume. At finalize the daemon fills each partition's real checksum (it
+/// owns the bytes — the rebooted client can't recompute a CRC across a resume),
+/// packs with the frozen `pack_folder_to_cbk`, and drops the staging.
+fn receive_put(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    root: &Path,
+    staging_dir: Option<&Path>,
+    hdr: PutHeader,
+) -> Result<()> {
+    let dest = cbk_dest_path(root, &hdr.name)?;
+    let staging = staging_path_for(staging_dir, &hdr.name);
+
+    // Incremental whole-disk skip (Phase 7h, §5b): an opt-in client (`/INCREMENTAL`)
+    // whose §4 fingerprint equals the prior completed backup's is unchanged — tell
+    // it to skip the whole transfer; the prior `.cbk` stands. Opt-in, so a §4c
+    // fingerprint false-negative can never silently drop a real change. A partial
+    // staging in flight (a crash mid-transfer) blocks the skip — finish it first.
+    if hdr.incremental
+        && dest.exists()
+        && !staging.exists()
+        && read_prior_fingerprint(root, &hdr.name) == Some(hdr.fingerprint)
+    {
+        let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "rb-cli serve: PUT {:?} incremental — source unchanged (fingerprint {:#010x}); skipping, prior {} stands ({cbk_size} bytes)",
+            hdr.name,
+            hdr.fingerprint,
+            dest.display()
+        );
+        write_resume_map(writer, true, &[]).context("writing skip reply")?;
+        write_put_result(writer, 0, cbk_size)?;
+        return Ok(());
+    }
+
+    // Load durable state, or discard it on a fingerprint mismatch (the source
+    // disk changed since the partial transfer — splicing would corrupt §4b).
+    let mut journal = match load_journal(&staging) {
+        Some(j) if j.fingerprint == hdr.fingerprint => {
+            eprintln!(
+                "rb-cli serve: PUT {:?} resuming (fingerprint {:#010x} matches, {} member(s) in progress)",
+                hdr.name,
+                hdr.fingerprint,
+                j.members.len()
+            );
+            j
+        }
+        Some(_) => {
+            eprintln!(
+                "rb-cli serve: PUT {:?} fingerprint changed — discarding stale staging, starting fresh",
+                hdr.name
+            );
+            std::fs::remove_dir_all(&staging).ok();
+            ResumeJournal {
+                fingerprint: hdr.fingerprint,
+                members: Vec::new(),
+            }
+        }
+        None => ResumeJournal {
+            fingerprint: hdr.fingerprint,
+            members: Vec::new(),
+        },
+    };
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("creating PUT staging dir {}", staging.display()))?;
+
+    // Tell the client what's already committed (Gz members only).
+    let entries: Vec<ResumeEntry> = journal
+        .members
+        .iter()
+        .map(|m| ResumeEntry {
+            name: m.name.clone(),
+            committed_chunks: m.committed_chunks,
+        })
+        .collect();
+    write_resume_map(writer, false, &entries).context("writing resume map")?;
+
+    eprintln!(
+        "rb-cli serve: PUT {:?} ({} member{}) -> {}",
+        hdr.name,
+        hdr.member_count,
+        if hdr.member_count == 1 { "" } else { "s" },
+        dest.display()
+    );
+
+    // Test-only fault injection: drop the connection after N Gz chunks are
+    // durably committed, to exercise the resume path deterministically. Set
+    // `RB_SERVE_TEST_DROP_AFTER_CHUNKS=N`. Never set in production.
+    let drop_after: Option<u64> = std::env::var("RB_SERVE_TEST_DROP_AFTER_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut gz_committed: u64 = 0;
+
+    for mi in 0..hdr.member_count {
+        let m =
+            read_member_header(reader).with_context(|| format!("reading member {mi} header"))?;
+        validate_member_name(&m.name)?;
+        let path = staging.join(&m.name);
+        let is_gz = m.kind == 0;
+
+        // Resume applies to Gz (partition) members only; Raw members are re-sent
+        // fresh each session (cheap), so they always start from chunk 0.
+        let prior = if is_gz { journal.get(&m.name) } else { None };
+        let committed = prior.map(|p| p.committed_chunks).unwrap_or(0);
+        let committed_bytes = prior.map(|p| p.committed_bytes).unwrap_or(0);
+
+        let mut f = open_staging_for_append(&path, committed_bytes)?;
+        let mut written = committed_bytes;
+
+        for ci in committed..m.chunk_count {
+            let ch = read_chunk_header(reader)
+                .with_context(|| format!("reading {} chunk {ci} header", m.name))?;
+            if ch.len > MAX_PUT_CHUNK {
+                write_put_ack(writer, false).ok();
+                bail!(
+                    "PUT chunk on {} is {} bytes (over the {MAX_PUT_CHUNK}-byte limit)",
+                    m.name,
+                    ch.len
+                );
+            }
+            // Stream the payload into the staging file, hashing as we go.
+            let mut hasher = crc32fast::Hasher::new();
+            let mut remaining = ch.len as usize;
+            let mut buf = vec![0u8; 256 * 1024];
+            while remaining > 0 {
+                let want = remaining.min(buf.len());
+                reader
+                    .read_exact(&mut buf[..want])
+                    .with_context(|| format!("reading {} chunk payload", m.name))?;
+                hasher.update(&buf[..want]);
+                f.write_all(&buf[..want])
+                    .with_context(|| format!("writing staging member {}", m.name))?;
+                remaining -= want;
+            }
+            let got = hasher.finalize();
+            if got != ch.crc32 {
+                write_put_ack(writer, false).ok();
+                bail!(
+                    "PUT chunk CRC mismatch on {} (wire {:#010x} != computed {got:#010x})",
+                    m.name,
+                    ch.crc32
+                );
+            }
+            written += ch.len as u64;
+            // fsync the staged bytes, THEN record the commit, THEN ack — so the
+            // ack (and the resume cursor) only ever advance past durable data.
+            f.flush().ok();
+            f.sync_all()
+                .with_context(|| format!("fsync staging member {}", m.name))?;
+            if is_gz {
+                journal.upsert(&m.name, m.chunk_count, ci + 1, written);
+                save_journal(&staging, &journal)?;
+            }
+            write_put_ack(writer, true)?;
+            if is_gz {
+                gz_committed += 1;
+                if drop_after == Some(gz_committed) {
+                    eprintln!(
+                        "rb-cli serve: TEST drop after {gz_committed} committed chunk(s) — resume to continue"
+                    );
+                    bail!("test-induced drop after {gz_committed} committed chunks");
+                }
+            }
+        }
+    }
+
+    // All members complete. Fill the partition checksums (the daemon owns the
+    // bytes — authoritative across a resume), drop the journal so it isn't
+    // packed, then pack atomically and clear the staging.
+    fill_partition_checksums(&staging)?;
+
+    // Incremental change detection (§5b/§5d): if a prior NAME.cbk exists, diff
+    // the staged manifests against it and log what changed. Read it now, before
+    // the pack below renames over it. Best-effort — never fails the PUT.
+    if dest.exists() {
+        if let Err(e) = report_incremental(&staging, &dest, &hdr.name) {
+            eprintln!("rb-cli serve: incremental compare skipped ({e:#})");
+        }
+    }
+
+    std::fs::remove_file(journal_path(&staging)).ok();
+    std::fs::remove_file(staging.join("journal.json.tmp")).ok();
+
+    let tmp = dest.with_file_name(format!(
+        "{}.tmp",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    crate::rbformats::cbk::pack_folder_to_cbk(&staging, &tmp)
+        .with_context(|| format!("packing PUT into {}", tmp.display()))?;
+    if let Ok(f) = std::fs::File::open(&tmp) {
+        f.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &dest)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
+    std::fs::remove_dir_all(&staging).ok();
+    let cbk_size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+
+    // Record this completed backup's fingerprint so a later `/INCREMENTAL` PUT of
+    // an unchanged disk can skip (§5b). Best-effort — a missing/stale sidecar just
+    // costs a full backup, never correctness (the skip also requires `.cbk` to
+    // exist and is opt-in). Written after the `.cbk` so the two stay consistent.
+    write_fingerprint(root, &hdr.name, hdr.fingerprint);
+
+    eprintln!(
+        "rb-cli serve: PUT complete -> {} ({cbk_size} bytes)",
+        dest.display()
+    );
+    write_put_result(writer, 0, cbk_size)?;
+    Ok(())
+}
+
+/// The per-container fingerprint sidecar path (`<root>/<name>.fp`), next to the
+/// `.cbk`. Reuses `cbk_dest_path`'s name sanitization.
+fn fingerprint_sidecar_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let cbk = cbk_dest_path(root, name).ok()?;
+    Some(cbk.with_extension("fp"))
+}
+
+/// The fingerprint of the last completed backup for `name`, if recorded.
+fn read_prior_fingerprint(root: &Path, name: &str) -> Option<u32> {
+    let path = fingerprint_sidecar_path(root, name)?;
+    let bytes = std::fs::read(&path).ok()?;
+    (bytes.len() == 4).then(|| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Record the just-completed backup's fingerprint (best-effort, atomic).
+fn write_fingerprint(root: &Path, name: &str, fingerprint: u32) {
+    let Some(path) = fingerprint_sidecar_path(root, name) else {
+        return;
+    };
+    let tmp = path.with_extension("fp.tmp");
+    if std::fs::write(&tmp, fingerprint.to_be_bytes()).is_ok() {
+        std::fs::rename(&tmp, &path).ok();
+    }
+}
+
+/// `partition-N.gz` → `Some(N)`; anything else (`.gz.crc32`, `.idx`, `mbr.bin`,
+/// `metadata.json`) → `None`.
+fn partition_gz_index(name: &str) -> Option<usize> {
+    let stem = name.strip_prefix("partition-")?.strip_suffix(".gz")?;
+    stem.parse().ok()
+}
+
+/// CRC32 of a file's bytes, streamed.
+fn crc32_of_file(path: &Path) -> Result<u32> {
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize())
+}
+
+/// Fill each `partition-N.gz` member's real checksum into the staged
+/// `metadata.json`. The networked producer ships a placeholder (it can't compute
+/// the gz CRC across a resume — it never holds the whole compressed member), so
+/// the daemon, which does hold every byte, computes it here. Best-effort: a
+/// `metadata.json` that isn't a parseable backup manifest is left untouched (the
+/// checksum is informational — restore doesn't re-verify it).
+fn fill_partition_checksums(staging: &Path) -> Result<()> {
+    let meta_path = staging.join("metadata.json");
+    let Ok(data) = std::fs::read_to_string(&meta_path) else {
+        return Ok(());
+    };
+    let mut metadata: crate::backup::metadata::BackupMetadata = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rb-cli serve: metadata.json not a fillable manifest ({e}); leaving checksums as-is");
+            return Ok(());
+        }
+    };
+    let mut changed = false;
+    for entry in
+        std::fs::read_dir(staging).with_context(|| format!("reading {}", staging.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(idx) = partition_gz_index(&name) {
+            let crc = crc32_of_file(&entry.path())?;
+            if let Some(p) = metadata.partitions.iter_mut().find(|p| p.index == idx) {
+                p.checksum = format!("{crc:08x}");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&metadata)?)
+            .with_context(|| format!("rewriting {}", meta_path.display()))?;
+    }
+    Ok(())
+}
+
+/// `manifest-N.json` → `Some(N)`.
+fn manifest_partition_index(name: &str) -> Option<usize> {
+    name.strip_prefix("manifest-")?
+        .strip_suffix(".json")?
+        .parse()
+        .ok()
+}
+
+/// Compare the freshly staged `manifest-N.json` files against the same-named
+/// members in a prior `NAME.cbk`, returning the per-partition diff for every
+/// comparable partition (ascending index). The testable core of the §5b/§5d
+/// incremental detection; `report_incremental` formats + logs the result. Swap
+/// files (`volatile`) are excluded from the change counter (§6b).
+pub(crate) fn compare_to_prior_cbk(
+    staging: &Path,
+    prior_cbk: &Path,
+) -> Result<Vec<(usize, crate::remote::manifest::PartitionDiff)>> {
+    use crate::remote::manifest::{diff_partition, PartitionManifest};
+
+    let members = crate::rbformats::cbk::read_cbk_index(prior_cbk)?;
+
+    let mut staged: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(staging)? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if let Some(idx) = manifest_partition_index(&fname) {
+            staged.push((idx, entry.path()));
+        }
+    }
+    staged.sort_by_key(|(i, _)| *i);
+
+    let mut out = Vec::new();
+    for (idx, path) in &staged {
+        let member_name = format!("manifest-{idx}.json");
+        let Some(member) = members.iter().find(|m| m.name == member_name) else {
+            continue; // prior backup had no manifest for this partition
+        };
+        let new_bytes = std::fs::read(path)?;
+        let mut prior_bytes = Vec::new();
+        crate::rbformats::cbk::cbk_member_content_reader(prior_cbk, member)?
+            .read_to_end(&mut prior_bytes)?;
+
+        let (Ok(new_m), Ok(prior_m)) = (
+            PartitionManifest::parse(&new_bytes),
+            PartitionManifest::parse(&prior_bytes),
+        ) else {
+            continue;
+        };
+
+        let d = diff_partition(&prior_m, &new_m);
+        if d.comparable {
+            out.push((*idx, d));
+        }
+    }
+    Ok(out)
+}
+
+/// Incremental change detection (Phase 7h, §5b/§5d): log which partitions are
+/// unchanged + whether the boot chain changed, vs. a prior `NAME.cbk`.
+/// Best-effort and **log-only** — the new backup is always written in full; this
+/// surfaces what an eventual streaming-skip optimization could elide, plus the
+/// §5d bootability warning.
+fn report_incremental(staging: &Path, prior_cbk: &Path, name: &str) -> Result<()> {
+    let diffs = compare_to_prior_cbk(staging, prior_cbk)?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    eprintln!("rb-cli serve: incremental vs prior {name}.cbk:");
+    let mut all_unchanged = true;
+    for (idx, d) in &diffs {
+        if d.is_unchanged() {
+            eprintln!("  partition {idx}: unchanged");
+        } else {
+            all_unchanged = false;
+            let mut what = Vec::new();
+            if d.bootability_changed {
+                what.push("BOOTABILITY CHANGED (system block differs)".to_string());
+            }
+            if d.files_changed > 0 {
+                what.push(format!("{} file(s) changed", d.files_changed));
+            }
+            eprintln!("  partition {idx}: {}", what.join(", "));
+        }
+    }
+    if all_unchanged {
+        eprintln!("  => identical to prior backup (nothing changed)");
+    }
+    Ok(())
+}
+
+/// The destination `.cbk` path for a PUT, under the serve root. The container
+/// name is a flat base (a `.cbk` suffix is optional); anything with a path
+/// separator or traversal is refused so a client can't escape the root.
+fn cbk_dest_path(root: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() {
+        bail!("PUT container name is empty");
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") || name.contains('\0') {
+        bail!("PUT container name {name:?} is not a flat base name");
+    }
+    let file = if name.to_ascii_lowercase().ends_with(".cbk") {
+        name.to_string()
+    } else {
+        format!("{name}.cbk")
+    };
+    Ok(root.join(file))
+}
+
+/// Reject an unsafe member name (path separators / traversal / NUL) before it's
+/// used as a staging file name — mirrors the guard `materialize_cbk_to_folder`
+/// applies on the way out.
+fn validate_member_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.contains('\0')
+    {
+        bail!("PUT member name {name:?} is unsafe");
+    }
     Ok(())
 }
 
@@ -191,7 +779,7 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 );
                 return Ok(());
             }
-            return handle_family_b(reader, writer, version, capabilities);
+            return handle_family_b(reader, writer, version, capabilities, root, staging_dir);
         }
         // Peer hung up before sending anything — a clean end, not an error.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -322,8 +910,14 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                                     blob,
                                     size,
                                     force,
-                                    type_code,
-                                    creator_code,
+                                    // Host upload: encode the user-typed ASCII
+                                    // `--type`/`--creator` text to raw OSType bytes.
+                                    type_code: type_code
+                                        .as_deref()
+                                        .map(crate::fs::hfs_common::encode_fourcc),
+                                    creator_code: creator_code
+                                        .as_deref()
+                                        .map(crate::fs::hfs_common::encode_fourcc),
                                 });
                                 write_control(&mut writer, &Response::Ok)?;
                             }
@@ -712,8 +1306,8 @@ fn apply_session(sess: &Session) -> Result<u64> {
                         .map_err(|e| anyhow!("delete existing {name}: {e}"))?;
                 }
                 let options = CreateFileOptions {
-                    type_code: type_code.clone(),
-                    creator_code: creator_code.clone(),
+                    os_type: *type_code,
+                    os_creator: *creator_code,
                     ..Default::default()
                 };
                 let mut blobf = std::fs::File::open(blob)
@@ -749,6 +1343,10 @@ fn apply_session(sess: &Session) -> Result<u64> {
     Ok(count)
 }
 
+/// What [`stage_copy_local`] hands back: the staging blob path, the source
+/// file's size, and its raw OSType type/creator (preserved byte-exact).
+type StagedCopy = (PathBuf, u64, Option<[u8; 4]>, Option<[u8; 4]>);
+
 /// Stage an on-device copy: extract `src_path` from the source image into a
 /// staging blob in the session's staging dir, returning the blob + the source
 /// file's size and type/creator (preserved for HFS-style filesystems). The blob
@@ -759,7 +1357,7 @@ fn stage_copy_local(
     src_partition: Option<u32>,
     src_path: &str,
     sess: &mut Session,
-) -> Result<(PathBuf, u64, Option<String>, Option<String>)> {
+) -> Result<StagedCopy> {
     let mut opened = open_image(root, src_rel, src_partition)?;
     let entry = resolve_path(&mut *opened.fs, src_path)?;
     if entry.is_directory() {
@@ -773,12 +1371,7 @@ fn stage_copy_local(
         .fs
         .write_file_to(&entry, &mut f)
         .map_err(|e| anyhow!("reading {src_path}: {e}"))?;
-    Ok((
-        blob,
-        entry.size,
-        entry.type_code.clone(),
-        entry.creator_code.clone(),
-    ))
+    Ok((blob, entry.size, entry.type_code, entry.creator_code))
 }
 
 /// Largest single `ReadBlock` we honour — bounds one block-reader fetch so a
@@ -1009,6 +1602,7 @@ fn list_host_dir(root: &Path, rel: &str) -> Result<Vec<WireEntry>> {
             size,
             type_code: None,
             creator_code: None,
+            prodos_file_type: None,
             symlink_target: None,
         });
     }
@@ -1116,4 +1710,61 @@ fn list_dir(fs: &mut dyn Filesystem, path: &str) -> Result<Vec<WireEntry>> {
         .list_directory(&entry)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     Ok(children.iter().map(WireEntry::from_entry).collect())
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    const MANIFEST: &str = r#"{
+  "manifest_version": 1,
+  "filesystem": "fat16",
+  "system": {
+    "mbr_boot_code_crc": "aed2dfe7",
+    "boot_sectors_crc": "4b0f3e71",
+    "sysfiles": [
+      {"name": "IO.SYS", "size": 8192, "mtime": "2026-06-25T16:24:30", "attr": 32, "first_cluster": 2, "contiguous": true, "hash": "beac2c52"}
+    ]
+  },
+  "files": [
+    {"path": "\\IO.SYS", "size": 8192, "mtime": "2026-06-25T16:24:30", "attr": 32, "start_cluster": 2},
+    {"path": "\\REPORT.TXT", "size": 4096, "mtime": "2026-06-25T16:24:30", "attr": 32, "start_cluster": 40}
+  ]
+}
+"#;
+
+    /// Pack a one-partition manifest into a prior `.cbk`, then diff a staging dir
+    /// against it — identical staged manifest reads back "unchanged"; a modified
+    /// one is counted. Exercises the .cbk read + manifest-member matching glue.
+    #[test]
+    fn compare_to_prior_cbk_detects_unchanged_and_changed() {
+        let prior_folder = tempfile::tempdir().unwrap();
+        std::fs::write(prior_folder.path().join("manifest-0.json"), MANIFEST).unwrap();
+        // pack_folder_to_cbk requires a metadata.json to exist (packed as a member).
+        std::fs::write(prior_folder.path().join("metadata.json"), b"{}").unwrap();
+        std::fs::write(prior_folder.path().join("mbr.bin"), [0u8; 512]).unwrap();
+        let cbk = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        crate::rbformats::cbk::pack_folder_to_cbk(prior_folder.path(), &cbk).unwrap();
+
+        // Unchanged: staged manifest identical to the prior's.
+        let same = tempfile::tempdir().unwrap();
+        std::fs::write(same.path().join("manifest-0.json"), MANIFEST).unwrap();
+        let diffs = compare_to_prior_cbk(same.path(), &cbk).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].0, 0);
+        assert!(diffs[0].1.is_unchanged(), "{:?}", diffs[0].1);
+
+        // Changed: REPORT.TXT grows.
+        let changed = tempfile::tempdir().unwrap();
+        let modified = MANIFEST.replace(
+            r#""path": "\\REPORT.TXT", "size": 4096"#,
+            r#""path": "\\REPORT.TXT", "size": 9000"#,
+        );
+        std::fs::write(changed.path().join("manifest-0.json"), modified).unwrap();
+        let diffs = compare_to_prior_cbk(changed.path(), &cbk).unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert!(!diffs[0].1.is_unchanged());
+        assert_eq!(diffs[0].1.files_changed, 1);
+        assert!(!diffs[0].1.bootability_changed);
+    }
 }

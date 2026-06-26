@@ -81,6 +81,26 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         return run_remote(args, remote);
     }
 
+    // A `.cbk` container restores natively: materialize it into a temp folder and
+    // restore from that. The desktop's resize-on-restore path consumes the native
+    // PerPartition folder (cb_dos_network_and_state.md §2b option a). The TempDir
+    // guard is held until `run_restore` returns.
+    let mut args = args;
+    let _cbk_guard: Option<tempfile::TempDir> =
+        if args.backup_dir.is_file() && crate::rbformats::cbk::is_cbk(&args.backup_dir) {
+            let tmp = tempfile::TempDir::new().context("creating temp dir for .cbk restore")?;
+            crate::rbformats::cbk::materialize_cbk_to_folder(&args.backup_dir, tmp.path())
+                .context("materializing .cbk container")?;
+            log_stderr(format!(
+                "rb-cli restore: materialized {} (.cbk) to a temp folder",
+                args.backup_dir.display()
+            ));
+            args.backup_dir = tmp.path().to_path_buf();
+            Some(tmp)
+        } else {
+            None
+        };
+
     if args.device && !args.yes {
         bail!(
             "--device target requires --yes (this will overwrite {}).",

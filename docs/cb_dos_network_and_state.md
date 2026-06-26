@@ -238,6 +238,99 @@ Tradeoff: independent members reset the deflate dictionary each span — negligi
 ratio loss at MB granularity. Tune span up for ratio/fewer fsyncs, down for finer
 resume.
 
+### 2d. Frozen v1 on-disk format (shipped desktop-first, 2026-06-24)
+
+Implemented on the desktop ahead of the network transport — `src/rbformats/cbk.rs`
+(`pack_folder_to_cbk` / `materialize_cbk_to_folder`), `rb-cli cbk pack|unpack`, and
+`rb-cli restore <x>.cbk` (materializes a temp folder, then restores). **This
+freezes the format the DOS Family-B producer (7b) must emit.** All integers
+big-endian (the `RBK` convention).
+
+```text
+file = [chunk]* [index] [footer:16]
+
+chunk (24-byte header + payload):
+  magic       u32 = "RBKC" (0x5242_4B43)
+  version     u16 = 1
+  logical_id  u16              member index (into the index table)
+  src_offset  u64              uncompressed offset of this span in the member
+  len         u32              payload byte length
+  crc32       u32              CRC32 of the payload bytes
+  payload     [len]            one independent gzip member
+
+index:
+  magic        u32 = "RBKI" (0x5242_4B49)
+  version      u16 = 1
+  member_count u16
+  per member:  name_len u16, name (UTF-8, folder-relative),
+               kind u8  (0=Gz: payloads concatenated ARE the file, e.g.
+                         partition-N.gz; 1=Raw: file = gunzip(concat payloads),
+                         e.g. metadata.json / mbr.bin),
+               logical_id u16, chunk_count u32, chunk_count × chunk_offset u64
+
+footer (last 16 bytes): magic u32 = "RBKF" (0x5242_4B46), index_offset u64,
+                        index_len u32
+```
+
+A reader seeks EOF−16, reads the footer, jumps to the index — no full scan. The
+desktop packer emits **one chunk per member** (simplest valid chunking); the DOS
+producer will append **many** chunks per partition (each a ~1–4 MB-span gzip
+member) for the resume granularity §2c/§3 need. Both are valid `.cbk` this
+materializer reads. The network `.idx` sidecar (§2b/§3) layers *on top* of this:
+it is the same per-member chunk-offset list written incrementally for crash-safe
+resume, with the trailer index as the finalized form.
+
+### 2e. `.cbk` as a first-class image — native inspect/browse/restore (planned)
+
+**Decision (2026-06-24):** a `.cbk` must behave like any other disk image
+everywhere in the app — `inspect`, `ls`/`get` (browse + extract files), `fsck`,
+GUI Inspect/Restore — **with no user-visible "extract first" step**. Restore from
+`.cbk` is treated exactly like a folder restore. *Editing* a `.cbk` may do extra
+legwork (materialize → edit → repack) and is in scope but lower priority.
+
+The whole app reads disks through one abstraction — `Box<dyn ReadSeek>`
+(`ReadSeek: Read + Seek + Send`, `src/rbformats/mod.rs`) — and a partition is just
+a byte offset into that whole-disk reader (`open_filesystem(reader, offset, …)`).
+So native `.cbk` support = **present the container as a reconstructed whole disk**
+(table at sector 0, partitions at their `byte_offset()`, gaps zero) behind that
+trait, then hook it into the **one** open/detect dispatch every consumer funnels
+through.
+
+Phased plan (this is the work, in order):
+
+- **(i) `CbkReader: ReadSeek`** — open a `.cbk` as a seekable disk. v1
+  implementation reuses the existing compressed-image precedent
+  (`ZipDiskReader` / `GzipTempReader`): materialize the container to a temp
+  folder, reconstruct the disk into a **sparse temp file**
+  (`reconstruct_disk_from_backup`, `src/rbformats/mod.rs`), and delegate
+  `Read`/`Seek` to it. Transparent — the user never runs an extract step; the
+  temp disk is the app's business, exactly like opening a `.zip`-wrapped image
+  today. *(Future: a truly lazy reader that decompresses only the chunked
+  members a seek touches — the §2c/§2d span layout is designed for this; it's a
+  reader upgrade, no format change.)*
+- **(ii) Hook the dispatch** — add an `is_cbk_path` arm to `open_read_dispatch`
+  (`src/model/source_reader.rs`) and `.cbk` to `is_container_path`. That single
+  arm lights up **inspect**, the CLI `resolve` layer (`ls`/`get`/`fsck` via
+  `open_peeled_read`), and GUI Inspect automatically. Add a `.cbk` arm to
+  `BrowseSession::open_image` (`src/model/browse_session.rs`) for browse/extract.
+- **(iii) GUI picker + associations** — add `"cbk"` to `DISK_IMAGE_EXTS`
+  (`src/model/file_types.rs`; *not* `NON_ASSOCIATED_EXTS` — a `.cbk` should
+  double-click-open) + a regression test. The Inspect/Restore tabs then accept a
+  `.cbk` with no further change.
+- **(iv) Restore parity** — already done for the CLI (materialize-to-temp arm in
+  `restore.rs`); GUI restore picks up `.cbk` for free once it's in
+  `DISK_IMAGE_EXTS` and routed like a folder.
+- **(v) Edit — DONE (2026-06-24).** `resolve_partition_rw_forced` detects a
+  `.cbk`, materializes it to a temp folder, edits the partition via the existing
+  backup-folder RW path (`open_backup_partition_rw`), and on commit
+  (`RwCommit::Cbk`) recompresses `partition-N.gz` + rewrites `metadata.json` and
+  **repacks the folder over the original `.cbk`** (write-to-`.tmp` + rename).
+  `gzip` was added to the editable-codec whitelist (decompress/recompress
+  already handled it). So `rb-cli put/rm/mkdir/cp X.cbk@N …` all work; verified
+  `put` → `ls`/`get` → `restore` round-trips with both old and new files intact.
+  Like editing a `.zst` backup, the edit decompresses to full size and drops
+  cb-dos's smart compaction (the container grows) — correct, just larger.
+
 ---
 
 ## 3. Resume — the transfer map
@@ -477,12 +570,18 @@ the only gain over Level 1 is a smaller resize-down minimum. Defer.
 - **Record** `excluded:true, content:zeroed` in the manifest so restore recreates
   the file and the counter keeps ignoring it.
 
-### 6e. Feature-parity note
+### 6e. Feature-parity note — **shipped (2026-06-25)**
 
-The desktop's native-format compaction is bitmap-based and doesn't zero swap
-either. Per CLAUDE.md's GUI/CLI parity + shared-business-logic rules, swap
-exclusion is a candidate for the **shared** path (desktop benefits identically),
-not a cb-dos-only trick.
+Per CLAUDE.md's GUI/CLI parity + shared-business-logic rules, swap exclusion is
+**not** a cb-dos-only trick — the Rust desktop backup now does the same Level-1
+zeroing. `CompactFatReader::new_excluding_swap` (`src/fs/fat.rs`) runs the same
+strict allowlist over root / `\WINDOWS` / `\OS2\SYSTEM` and zeros the swap files'
+content while keeping their allocation; `keep_swap` threads through `BackupConfig`
+to an rb-cli `--keep-swap` flag and a GUI checkbox (default = exclude). It works
+in both plain and defrag compaction (the set is keyed by old cluster number, which
+survives the defrag remap — unlike cb-dos's by-position mask, which `/DEFRAG`
+skips). single-file-CHD is the one desktop format that still images swap verbatim
+(a documented follow-up).
 
 ---
 
@@ -533,43 +632,403 @@ DOS — the **combination** is the new part; the **primitives** are all proven.
 > the native format first. Networking only swaps the *destination* under a working
 > engine.
 
-- [~] **7a — Frame/socket hello-world.** **Engine + client written; runtime
-      check pending.**
+- [x] **7a — Frame/socket hello-world.** **Done — handshake round-trips
+      end-to-end (real FreeDOS in qemu over an NE2000 packet driver + SLiRP,
+      2026-06-24).**
       - **Host (done, headless-tested):** `rb-cli serve` now accepts a **binary
         Family-B handshake** alongside the JSON Family-F one on the same port —
         `read_handshake` peeks the 4-byte magic (`b"RBK0"`) to disambiguate, and
         `write_binary_hello` replies (`magic + version + caps`, big-endian).
         `src/remote/{protocol,server}.rs`; loopback test
         `family_b_binary_handshake_over_loopback`.
-      - **DOS client (done, compile-verified):** `crusty-backup/src/net_hello.c`
+      - **DOS client (done, runtime-verified):** `crusty-backup/src/net_hello.c`
         (`NETHELLO.EXE`) — **WATT-32** `sock_init` + BSD `socket`/`connect`/
         `send`/`recv`, sends the binary Hello to `<agent-ip>:7341`, prints the
         reply. Builds clean under DJGPP (`make -C crusty-backup net`).
-      - **Pending (user, hardware/emulator):** run `NETHELLO` in DOSBox-X/86Box
-        (SLiRP + port-forward to a host `rb-cli serve`) or on a real NIC; confirm
-        the handshake round-trips. Resolve the WATTCP.CFG/DHCP UX while there.
-- [ ] **7b — Chunk protocol + container.** Define `.cbk` chunk header + index;
-      stop-and-go single-member PUT DOS→host; byte-verify; write/read the index.
-- [ ] **7c — Whole-folder backup over wire.** Stream a full native folder as
-      members into `.cbk`; materialize the folder at finalize; desktop restores it
-      unchanged.
-- [ ] **7d — Resume.** fsync-before-record + truncate-to-last-committed +
-      `RESUME` handshake + fingerprint verify (§4). Kill mid-transfer, reconnect,
-      finish; verify end-to-end checksum.
-- [ ] **7e — Restore over wire.** Host serves members on `GET`; cb-dos restores
-      with resize; restored card boots.
-- [ ] **7f — Manifest + idempotency.** Emit the file manifest (§5); restore
-      replays mtime/attribs; prove backup→restore→backup is a no-op.
-- [ ] **7g — Boot section + swap exclusion.** System-block fingerprint/round-trip
-      (§5d); Level-1 swap zeroing (§6c) in the **shared** compaction path.
-- [ ] **7h (optional) — Incremental backup.** Reuse the §4d fingerprint + §5
-      manifest to skip unchanged partitions/files.
-- [ ] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
+      - **Runtime check (done, 2026-06-24, emulator):** booted the FreeDOS 1.4
+        image headless in **qemu-system-i386** (`-device ne2k_isa,iobase=0x300,
+        irq=3` + `-netdev user` SLiRP), loaded the Crynwr **`NE2000.COM`** packet
+        driver (`NE2000 0x60 3 0x300`), and ran `NETHELLO 10.0.2.2 7341` against a
+        host `rb-cli serve`. Handshake round-tripped: client printed *"Connected.
+        Agent protocol v2, capabilities 0x0001 [file]"* (exit 0), host logged
+        *"Family-B client connected (version 2, caps 0x0000)"*. **WATTCP.CFG UX:**
+        a one-line `my_ip = dhcp` is enough — SLiRP's DHCP leases the guest and
+        `10.0.2.2` reaches the host listener. **DOS gotcha:** FreeCOM doesn't honor
+        `2>`/`2>&1` (parses the `2` as an argv) — pass the port explicitly and use
+        single `>` redirects, or all output goes to stderr/console. CWSDPMI.EXE
+        must sit next to `NETHELLO.EXE` (real FreeDOS has no DPMI host).
+- [x] **7b — Chunk protocol + container. Done (2026-06-25).** The Family-B
+      **chunk-PUT** wire framing (the §2a/§2d chunk shape) + the host receiver.
+      `src/remote/protocol.rs`: `PutHeader`/`MemberHeader`/`ChunkHeader` +
+      `read_put_header`/`read_member_header`/`read_chunk_header` and the
+      stop-and-go ack/result. `src/remote/server.rs`: `handle_family_b` reads the
+      post-handshake frame (EOF = bare handshake → clean close; `RBKP` → PUT) and
+      `receive_put` streams each member's chunks to a temp folder (CRC re-checked,
+      fsync-before-ack) then assembles the frozen `.cbk` with the **existing
+      `pack_folder_to_cbk` writer** (atomic `.tmp` + rename) — no second format.
+      `CAP_FAMILY_B` advertised. Loopback test
+      `family_b_chunk_put_assembles_cbk_over_loopback` (multi-chunk members).
+      *(An interim standalone `NETPUT.EXE` that read a saved backup folder and
+      shipped its files was the first cut; it was the wrong shape — file-level and
+      it needed a spare local DOS disk to stage the folder — so it was replaced by
+      the integrated block-level producer in 7c. The host/protocol here are
+      unchanged and reused.)*
+- [x] **7c — Whole-disk backup over the wire (block-level, integrated). Done —
+      qemu-verified (2026-06-25).** Networked backup is **baked into
+      `CRUSTYBK BACKUP`**: a `rb://HOST[:PORT]/NAME` destination images the disk
+      **block-by-block over int13h** and streams it straight to the agent — *no
+      intermediate folder on the DOS box*, so a machine with no spare storage can
+      back itself up. Each partition is smart-compacted and compressed into
+      independent **1 MiB gzip-member spans** (`cbnet.c`'s span streamer, zlib
+      `deflateInit2` gzip), each shipped as a chunk `{src_offset, len, crc32}`
+      stop-and-go; `mbr.bin` + `metadata.json` ride as small Raw members
+      (metadata last, carrying the per-partition gz CRC accumulated mid-stream).
+      The host's `receive_put` concatenates the span chunks into a valid
+      multi-member `partition-N.gz` and packs the `.cbk` — unchanged from 7b.
+      `CRUSTYBK.EXE` now links WATT-32 (alongside zlib + lz4). **Verified on qemu**
+      (FreeDOS 1.4, NE2000 + SLiRP): `CRUSTYBK BACKUP rb://10.0.2.2:7341/MYDISK 81`
+      on a FAT16 disk → host `MYDISK.cbk`; a 3.5 MiB used-data disk streamed as
+      **4 gzip-member spans** that the host assembled into one multi-member `.gz`;
+      `rb-cli restore MYDISK.cbk` rebuilt a disk with files byte-identical to the
+      source. *(Primaries + FAT/NTFS, gzip only; extended/logical, `/DEFRAG`, and
+      LZ4 over the wire compose later. Materialize-at-finalize is the host's
+      `pack_folder_to_cbk`; desktop restore is unchanged — §2b option a.)*
+- [x] **7d — Resume. Done — qemu-verified (2026-06-25).** A killed transfer
+      resumes instead of restarting. The PUT header carries the §4 source
+      **fingerprint**; the daemon replies with a **resume map** (`RBKR`) of
+      per-member committed chunks. `receive_put` assembles into a *persistent*
+      per-container staging dir guarded by a durable `journal.json` — each Gz
+      chunk's bytes are **fsynced before** the journal records it committed (the
+      ddrescue-mapfile pattern), and a reconnect with a matching fingerprint
+      **truncates each member to its last committed chunk** and resumes (a
+      mismatched fingerprint discards the stale staging and starts fresh). The
+      producer (`cbnet`) skips committed spans by seeking the source to
+      `committed·CBNET_SPAN`, never recompressing. The daemon **owns the gz
+      checksum** (the rebooted client can't recompute a CRC across a resume) and
+      fills it at finalize. Loopback test `family_b_chunk_put_resumes_after_drop`;
+      qemu proof: a backup dropped after 2 committed spans (`RB_SERVE_TEST_DROP_
+      AFTER_CHUNKS=2`), reconnected, was told to resume at span 2, finished, and
+      `rb-cli restore` rebuilt a byte-identical disk.
+- [x] **7e — Restore over wire. Done — qemu-verified (2026-06-25).** Closes the
+      producer/consumer loop: `CRUSTYBK RESTORE rb://HOST/NAME 81 /Y` pulls a
+      `.cbk` back from the agent and rebuilds the disk over int13h, no local
+      folder. A **GET** op (`RBKG`) joins PUT under one post-handshake dispatcher
+      (`read_family_b_op`); the daemon (`serve_get`) advertises the container's
+      members and streams each on request — a `*.gz` member as its **raw gzip
+      bytes** (the client inflates), a Raw member **decompressed** — reusing the
+      native `.cbk` readers (`CbkPayloadReader` / `cbk_member_content_reader`), no
+      new format. cb-dos (`cbnet` GET client + `cmd_netrestore`) streams each
+      partition gz straight to the disk (manual multi-member `inflateReset`),
+      same-size: zero-pad to original, rebuild the EBR chain, write the MBR
+      verbatim. **Verified on qemu:** one boot backed disk 0x81 up over the wire
+      then restored it over the wire to a blank 0x82 — files byte-identical.
+      Loopback test `family_b_get_serves_cbk_members_over_loopback`. *(Same-size
+      only — target ≥ original; resize-over-the-wire is a follow-up, since the
+      socket is forward-only and the local peek-then-resize two-pass doesn't apply
+      yet. gzip members, FAT + NTFS, primaries + logicals.)*
+- [x] **7f — Manifest + idempotency. Done — qemu-verified (2026-06-25).** Emit a
+      per-FAT-partition `manifest-N.json` sidecar (§5a files[] + the §5d `system`
+      boot-fingerprint block) and prove backup→restore→backup is a no-op.
+      **Idempotency is structural, not replayed:** cb-dos restore is block-level
+      (`write_lba` only), so every dir entry — mtime, attribs, the archive bit —
+      round-trips verbatim inside the image; re-building the manifest from the
+      restored disk yields the byte-identical document, so the §5c int-21h
+      attribute replay a file-level tool would need is unnecessary here. The
+      manifest rides the folder / `.cbk` / network PUT as an ordinary Raw member.
+      Also bundled DOSLFN on the boot media so the non-8.3 member names work on a
+      bare DOS host (the FreeDOS kernel has no LFN API of its own).
+- [x] **7g — Boot section + swap exclusion. Done — qemu-verified (2026-06-25).**
+      Deepened the §5d `system` block with each DOS sysfile's **content hash**
+      (CRC32, FAT-chain order) -- a stable idempotency fingerprint that round-trips
+      a block-level restore. Added **Level-1 swap zeroing** (§6c): new
+      `cbswap.{c,h}` allowlists swap/page files (386SPART.PAR / WIN386.SWP /
+      PAGEFILE.SYS / HIBERFIL.SYS / SWAPPER.DAT; never DBLSPACE/DRVSPACE/STACVOL)
+      by name+location+attribs and marks their cluster chains; the shared
+      compaction (local + net) zeros that content while keeping the allocation, the
+      manifest flags them `volatile`/`content:zeroed`, and `/KEEPSWAP` opts out.
+- [x] **7h — Incremental backup. Done — qemu-verified (2026-06-25).** Two parts.
+      **7h(a):** host-side change detection + the §5d bootability-change flag — a
+      networked PUT over a prior `NAME.cbk` logs which partitions are unchanged /
+      changed and whether the boot chain differs (`src/remote/manifest.rs` diff +
+      `server.rs::compare_to_prior_cbk`). **7h(b):** **opt-in whole-disk skip**
+      (`/INCREMENTAL`) — if the §4 disk fingerprint matches the prior backup's
+      (recorded in a `<name>.fp` sidecar), the daemon replies *skip* in the RBKR
+      reply and cb-dos sends nothing; the prior `.cbk` stands. Opt-in, so a §4c
+      fingerprint false-negative can never silently drop a real change. *(Optional
+      refinement: per-partition skip — per-partition fingerprints → a partition
+      skip-map → copy unchanged partition members from the prior `.cbk` — for
+      multi-partition disks where only some partitions change.)*
+- [~] **7i (optional) — Level-2 swap deallocation; desktop reads `.cbk` directly.**
+      **Desktop swap parity DONE (§6e, 2026-06-25)** — the Rust backup now Level-1
+      excludes swap too (`--keep-swap` / GUI checkbox). Remaining: Level-2 dealloc
+      (free the chain so resize-down shrinks) + single-file-CHD swap exclusion.
 
 ---
 
 ## Progress log
 
+- 2026-06-25 — **Phase 7h(b) — opt-in incremental whole-disk skip, qemu-verified.**
+  The streaming-skip half of incremental: a networked backup of an unchanged disk
+  now **skips the whole transfer** instead of re-imaging it. Opt-in via
+  `/INCREMENTAL` (without it, every backup is full — safe by default), so a §4c
+  fingerprint false-negative can never silently drop a real change. **Wire:** the
+  PUT header gains a flags byte (bit0 = incremental requested) and the daemon's
+  RBKR resume-map reply gains a flags byte (bit0 = skip). On an incremental PUT,
+  if the daemon holds a prior `NAME.cbk` **and** a recorded fingerprint sidecar
+  (`<name>.fp`) equal to the new header fingerprint **and** no partial staging is
+  in flight, it replies skip=1 + the result frame and returns; cb-dos
+  (`cbnet_skip()` → `cbnet_finish`) sends no members and the prior `.cbk` stands.
+  The daemon writes `<name>.fp` on every completed PUT. Reuses the existing §4
+  disk-wide fingerprint as the gate (per-partition skip is a later refinement).
+  cb-dos: `cbnet_start(...,incremental)`, `cmd_netbackup` short-circuit,
+  `/INCREMENTAL` parsed in `cmd_backup` (rb:// only). **Verified on FreeDOS/qemu:**
+  three `/INCREMENTAL` backups of one disk — boot 1 (no prior) full PUT + writes
+  `MYDISK.fp`; boot 2 (unchanged) logs *"source unchanged … skipping, prior
+  MYDISK.cbk stands"* and streams **nothing**; boot 3 (after adding `SECOND.TXT`)
+  the fingerprint differs → full PUT. Protocol round-trip unit tests (PUT
+  incremental flag, RBKR skip flag) + family_b loopback + clippy
+  (incl. `--features remote`) green; cb-dos builds clean. **7h complete.**
+- 2026-06-25 — **Phase 7h(a) — host-side incremental change detection, qemu-verified.**
+  First slice of incremental (§5b/§5d): when a networked PUT arrives for a NAME that
+  already has a `NAME.cbk`, the daemon diffs the freshly staged `manifest-N.json`
+  against the prior backup's and logs which partitions are unchanged + whether the
+  boot chain changed — the cheap-gate / bootability-flag half, on which a later
+  streaming-skip optimization builds. Reuses the 7f/7g manifests, so **no wire or
+  cb-dos change**. New `src/remote/manifest.rs` parses + diffs a partition (§5b
+  rsync-tier: size+mtime+attr+start-cluster per file; the whole `system` block for
+  the §5d bootability flag); swap files (`volatile`) are excluded from the change
+  counter (§6b). `server.rs::compare_to_prior_cbk` (testable) reads the prior
+  members via the existing cbk readers; `report_incremental` logs at PUT finalize
+  before the pack renames over the prior `.cbk`. **Verified on FreeDOS/qemu:** three
+  sequential networked backups of one disk — first creates `MYDISK.cbk`; the second
+  (unchanged) logs *"partition 0: unchanged => identical to prior backup"*; a third
+  after adding `NEWFILE.TXT` logs *"partition 0: 1 file(s) changed"*. Unit tests
+  (identical / changed-file / changed-sysfile-hash / placeholder + a `.cbk`
+  round-trip glue test) + family_b loopback + clippy (incl. `--features remote`)
+  green. **Remaining for 7h:** the streaming-skip optimization (per-partition
+  fingerprints → daemon skip-map → cb-dos skips unchanged partitions → host copies
+  them from the prior `.cbk`).
+- 2026-06-25 — **Desktop swap parity (§6e / part of 7i) — shipped.** Brought 7g's
+  Level-1 swap exclusion to the Rust desktop backup (CLAUDE.md GUI/CLI parity).
+  `CompactFatReader::new_excluding_swap` (`src/fs/fat.rs`) runs the same strict
+  allowlist (386SPART.PAR / WIN386.SWP / PAGEFILE.SYS / HIBERFIL.SYS / SWAPPER.DAT,
+  mirroring `cbswap.c`) over root / `\WINDOWS` / `\OS2\SYSTEM`, collecting the swap
+  files' cluster chains; `load_cluster` emits zeros for them, keeping the
+  allocation. Keyed by **old cluster number**, so it works in both plain and defrag
+  compaction (cb-dos's by-position mask had to skip `/DEFRAG`; the desktop doesn't).
+  Threaded as `keep_swap: bool` through `BackupConfig` → `compact_partition_reader`
+  / `defrag_fat_partition_reader` / `packed_partition_reader_padded`, surfaced as an
+  rb-cli `--keep-swap` flag + a GUI "Keep swap/page-file content" checkbox (default
+  off = exclude). Unit test proves a packed image zeros WIN386.SWP full-size while a
+  normal file + plain `new` are byte-preserved; lib + clippy `-D warnings` green.
+  single-file-CHD still images swap verbatim (a documented follow-up); the
+  remaining 7i piece is Level-2 dealloc.
+- 2026-06-25 — **Phase 7g complete — boot section deepening + swap exclusion,
+  qemu-verified (local + network).** Two parts. **(a) Boot deepening (§5d):** each
+  DOS system file in the manifest `system` block now carries a `hash` (CRC32 over
+  its content, first `size` bytes in FAT chain order) alongside the
+  size/mtime/attr/first_cluster/contiguity 7f recorded -- a pure live read,
+  deterministic across a block-level restore (data + chain round-trip verbatim),
+  so it stays a stable idempotency fingerprint. **(b) Level-1 swap exclusion
+  (§6c):** new `cbswap.{c,h}` identifies swap/page files by a strict allowlist
+  (exact name + expected location + expected attribs -- `386SPART.PAR`,
+  `WIN386.SWP`, `PAGEFILE.SYS`, `HIBERFIL.SYS`, `SWAPPER.DAT`; DBLSPACE/DRVSPACE/
+  STACVOL deliberately absent, those ARE the filesystem) and marks their cluster
+  chains. The shared FAT compaction (local `backup_fat_partition` + networked
+  `netstream_fat_partition`) now zeros that content alongside free clusters -- the
+  allocation is kept (the file survives full-size, the OS reinitializes swap on
+  boot), gzip crushes the zeros. Every exclusion is logged (never silent). The
+  manifest flags the same files `volatile:true` (so the §5b change counter ignores
+  them) and, unless `--keep-swap`, `content:zeroed`, sharing the one
+  `cbswap_is_swap()` predicate so flags and payload never disagree; `/KEEPSWAP`
+  images swap verbatim. Skipped under `/DEFRAG` (the repacker relocates clusters).
+  **Verified on FreeDOS/qemu:** a FAT16 disk (IO.SYS/MSDOS.SYS/COMMAND.COM with
+  distinct content, a nested tree, an LFN file, a hidden 386SPART.PAR + a
+  WIN386.SWP) → `BACKUP C:\BK1 81` → `RESTORE C:\BK1 82 /Y` → `BACKUP C:\BK2 82`:
+  the restored target's swap files are **full-size but all-zero** (0 non-zero
+  bytes) while IO.SYS is byte-identical to source, and **BK1 == BK2 manifest
+  byte-identical** (sysfile hashes + swap flags round-trip). `BACKUP C:\BK3 81
+  /KEEPSWAP` images swap verbatim (no exclusions, manifest drops the two
+  `content:zeroed`, 42 bytes shorter). Network half: `BACKUP rb://…/MYDISK 81`
+  PUT (4 members) assembled a `.cbk` whose `manifest-0.json` is **byte-identical
+  to the local BK1 manifest** -- the shared compaction behaves the same over the
+  wire. Lib (2105) + cbk round-trip + clippy green. Next: optional **7h**
+  (incremental + the boot-change flag) / **7i** (Level-2 dealloc; desktop swap
+  parity per §6e).
+- 2026-06-25 — **Phase 7f complete — per-partition file manifest + idempotency,
+  qemu-verified.** Backup now emits a `manifest-N.json` sidecar per FAT partition:
+  a depth-first `files[]` list (path / size / mtime / attr / start_cluster, dirs
+  flagged) plus a `system` boot-fingerprint block (MBR boot-code CRC, the
+  partition's reserved/boot-sectors CRC, and the DOS sysfiles
+  IO.SYS/MSDOS.SYS/COMMAND.COM/… with size/mtime/attr/first_cluster/contiguity).
+  New `cbmanifest.{c,h}` walks the live source read-only via the `cbbrowse` FAT
+  reader (extended to carry the dir write-time + date); `cmd_backup` writes it
+  locally, `cmd_netbackup` ships it as a Raw member (the PUT member count grew by
+  one per FAT partition), so it rides the folder / `.cbk` / network PUT for free —
+  `pack_folder_to_cbk` and `receive_put` already carry arbitrary members. FAT
+  only (NTFS has no on-DOS directory reader). **Idempotency turned out to be
+  structural:** cb-dos restore is block-level (`write_lba`), so dir entries —
+  mtime, attribs, the archive bit — round-trip verbatim in the image; a same-size
+  backup→restore→backup is a no-op and re-building the manifest yields the
+  byte-identical document (the §5b gate), making the §5c int-21h attribute replay
+  unnecessary. **Also** bundled DOSLFN on the boot media (vendored adoxa/doslfn
+  v0.42 `doslfn.com` + attribution, shipped at the media root via `mkmedia.sh` and
+  auto-loaded in `cbdos-autoexec.bat`): the backup-folder names are not 8.3-clean
+  (`metadata.json` / `partition-N.gz` / `manifest-N.json`) and the FreeDOS kernel
+  has no LFN API, so a *local-folder* backup/restore on a bare DOS host needs the
+  LFN TSR (the `.cbk` + network paths don't — those names never become DOS
+  files). **Verified on qemu** (FreeDOS 1.4): a FAT32 disk (system files, nested
+  dirs, an LFN file) → `BACKUP 81` → `RESTORE 82 /Y` → `BACKUP 82` produced a
+  **byte-identical** `manifest-0.json` (vendored DOSLFN wrote every non-8.3 name
+  cleanly), and a `BACKUP rb://…/MYDISK 81` PUT (4 members) assembled a
+  `MYDISK.cbk` whose unpacked `manifest-0.json` is byte-identical to the local
+  one. Lib (2093) + cbk pack/unpack round-trip (now covers a manifest member) +
+  clippy green. Next: **7g** (boot section deepening + swap exclusion, §5d/§6).
+- 2026-06-25 — **Phase 7e complete — restore over the wire (loop closed),
+  qemu-verified.** A vintage box with a blank disk now pulls a `.cbk` back from
+  the agent and rebuilds the disk over the network — the mirror of `backup
+  rb://...`, no intermediate folder either side. **Wire**
+  (`src/remote/protocol.rs`): a **GET** op (`RBKG`) joins PUT under one
+  post-handshake dispatcher (`read_family_b_op`/`FamilyBOp`). GET-open advertises
+  the container's members; the client fetches each by name, streamed as
+  big-endian length-delimited frames; a `*.gz` member is served as its **raw gzip
+  bytes** (client inflates), a Raw member **decompressed**. **Host**
+  (`serve_get`) reuses the native `.cbk` readers (`read_cbk_index`,
+  `CbkPayloadReader`, `cbk_member_content_reader`) — read-only, no new format.
+  **DOS** (`cbnet.{h,c}` GET client + `cmd_restore.c`'s `cmd_netrestore`): cbnet
+  gained `cbnet_start_get` / `cbnet_get_raw` / a streaming `cbnet_get_member_*`
+  that inflates a multi-member gzip from the framed socket (manual
+  `inflateReset` across members); `restore rb://...` GETs metadata.json + mbr.bin,
+  then streams each partition gz straight to int13h **same-size** (zero-pad to
+  original), rebuilds the EBR chain, writes the MBR verbatim. Reuses the metadata
+  scanner + `part_t` + `write_ebr_chain`; the `rb://` parser moved to
+  `cbnet_parse_url` (shared by backup + restore). **Verified on qemu** (FreeDOS
+  1.4 + NE2000 + SLiRP): one boot ran `CRUSTYBK BACKUP rb://…/MYDISK 81` then
+  `CRUSTYBK RESTORE rb://…/MYDISK 82 /Y` — disk 0x81 backed up over the wire,
+  restored over the wire to a blank 0x82, files **byte-identical** (a byte-exact
+  restore of a bootable disk boots). Lib (2093) + the 4 family_b loopback tests
+  (incl. `family_b_get_serves_cbk_members_over_loopback`) + clippy green. Deferred:
+  resize-over-the-wire (the socket is forward-only; the local peek-then-resize
+  two-pass doesn't apply). Next: **7f** (manifest + idempotency, §5).
+- 2026-06-25 — **Phase 7d complete — resumable networked backup, qemu-verified.**
+  A killed transfer now resumes instead of restarting from zero. **Host**
+  (`src/remote/{protocol,server}.rs`): the PUT header gained the §4 source
+  fingerprint, and the daemon answers with a resume map (`RBKR`) of per-member
+  committed-chunk counts. `receive_put` was reworked from a throwaway temp dir
+  into a **persistent per-container staging dir + `journal.json`**: each Gz
+  chunk's bytes are fsynced, *then* the journal records it committed (atomic
+  rename), *then* the ack goes out — so the resume cursor only ever advances past
+  durable data (§3a). A reconnect loads the journal, and if the fingerprint
+  matches, truncates each member to `committed_bytes` (discarding a half-written
+  trailing chunk) and resumes; a mismatch discards the stale staging. The daemon
+  **owns each partition's gz checksum** — it fills `metadata.json` at finalize
+  (the rebooted client can't CRC a member it streamed across two sessions), packs
+  with `pack_folder_to_cbk`, and clears the staging. **DOS** (`cbnet.{h,c}` +
+  `cmd_backup.c`): `cmd_netbackup` computes the fingerprint (CRC over MBR + disk
+  size + each partition's boot sector + FAT — the allocation-map workhorse);
+  `cbnet` reads the resume map and skips committed spans by seeking the source to
+  `committed·CBNET_SPAN`; the producer dropped its gz-CRC accumulation (ships a
+  placeholder) and Raw members are re-sent fresh. A test-only
+  `RB_SERVE_TEST_DROP_AFTER_CHUNKS` knob makes the drop deterministic.
+  **Verified on qemu** (FreeDOS 1.4 + NE2000 + SLiRP): RUN 1 dropped after 2 of 4
+  committed spans (`journal.json` = `committed_chunks:2`), RUN 2 reconnected —
+  *"PUT resuming (fingerprint 0xd4be9d7d matches)"* — resumed at span 2 and
+  completed; `rb-cli restore` rebuilt a disk with both files byte-identical and
+  the agent-filled checksum (`2a6324cc`) equal to the real partition gz CRC. Lib
+  (2093) + loopback resume test + clippy green. Next: **7e** (restore over the
+  wire) or **7f** (manifest + idempotency).
+- 2026-06-25 — **Phase 7c complete — networked backup baked into `CRUSTYBK`,
+  block-level, qemu-verified.** Reworked the producer after the first 7b cut went
+  the wrong way: the interim standalone `NETPUT.EXE` read a *saved backup folder*
+  off a DOS disk and shipped its *files* — exactly the "folder-of-files on the
+  wire" §0 rules out (file-level, and it needed a spare local disk to stage the
+  folder first). Replaced it with the right shape: `CRUSTYBK BACKUP
+  rb://HOST[:PORT]/NAME` images the disk **block-by-block over int13h** and
+  streams it straight to the agent, no intermediate folder. New `cbnet.{h,c}`
+  (WATT-32 sockets + the chunk-PUT framing + a **zlib gzip span streamer**): each
+  partition is smart-compacted and compressed into independent **1 MiB
+  gzip-member spans**, each sent as a chunk `{src_offset, len, crc32}`
+  stop-and-go (memory bounded to one span); `mbr.bin` + `metadata.json` ride as
+  Raw members (metadata last, with the per-partition gz CRC accumulated during
+  the stream). `cmd_backup.c` detects the `rb://` dest, pre-scans the MBR for
+  selected primary FAT/NTFS partitions, and `build_metadata` is now shared by the
+  local-folder and networked paths so the JSON never drifts. `CRUSTYBK.EXE` links
+  WATT-32 now (the Makefile + `docker/cb-dos.Dockerfile` fetch it alongside
+  zlib/lz4). The host side (`receive_put`, `pack_folder_to_cbk`) is **unchanged**
+  — it already concatenates multi-chunk members and assembles the `.cbk`.
+  **Verified on qemu** (FreeDOS 1.4 + NE2000 + SLiRP, a live `rb-cli serve
+  --root`): a 3.5 MiB used-data FAT16 disk streamed as **4 gzip-member spans**,
+  the host assembled a valid multi-member `MYDISK.cbk`, and `rb-cli restore`
+  rebuilt a disk with `BIG.BIN`/`HELLO.TXT` byte-identical to the source. Lib
+  suite (2093) + the loopback test (now multi-chunk) green; clippy clean.
+  Deferred (compose later): extended/logical partitions, `/DEFRAG`, LZ4, and 7d's
+  per-span resume `.idx`. Next: **7d** (resume) or **7e** (restore over the wire).
+- 2026-06-25 — **Phase 7b complete — the chunk PUT round-trips on real FreeDOS
+  in qemu.** Built the Family-B **chunk-PUT** protocol (the §2a/§2d chunk shape on
+  the wire) and proved it end-to-end. **DOS producer:** `NETPUT.EXE`
+  (`crusty-backup/src/net_put.c`, `make net` — WATT-32, no zlib) enumerates a
+  `CRUSTYBK BACKUP` folder, does the 7a handshake, then streams it as one ordered
+  member stream: per member an `RBKM` descriptor `{kind, name, chunk_count}`, per
+  chunk a `{src_offset, len, crc32}` header + payload, **stop-and-go** (waits for
+  the daemon's ack per chunk). One chunk per member (cb-dos writes a single gzip
+  member per partition). **Host:** `src/remote/protocol.rs` gained the PUT framing
+  (`read_put_header`/`read_member_header`/`read_chunk_header` + the client-side
+  writers for the loopback test); `src/remote/server.rs`'s `handle_family_b` now
+  reads the post-handshake frame — EOF (a bare `NETHELLO`) closes cleanly, an
+  `RBKP` PUT goes to `receive_put`, which stages each member to a temp folder
+  (CRC re-checked, fsync-before-ack) and assembles the frozen `.cbk` via the
+  **existing `pack_folder_to_cbk`** (atomic `.tmp` + rename) — reuse, not a second
+  format. `CAP_FAMILY_B` now advertised. **Verified on qemu** (FreeDOS 1.4,
+  NE2000 + SLiRP): a FAT16 disk imaged on DOS → `NETPUT 10.0.2.2 7341 C:\BK
+  MYDISK` → host `MYDISK.cbk` **byte-identical** to a desktop `rb-cli cbk pack` of
+  the mcopy'd folder, and `rb-cli restore MYDISK.cbk` rebuilt a disk with both
+  files byte-identical to the source. Lib suite (2093) + the loopback test
+  `family_b_chunk_put_assembles_cbk_over_loopback` green; clippy clean. Next:
+  **7c** (whole-folder backup straight off the live disk over the wire) then
+  **7d** (resume: per-span chunks + fsync-before-record + the incremental `.idx`).
+- 2026-06-24 — **`.cbk` is now fully first-class — native read + edit (§2e).**
+  Two steps. (1) **Native read:** a `CbkTempReader` arm in `open_read_dispatch`
+  (`source_reader.rs`) + `is_container_path` + a `BrowseSession::open_image` arm
+  + `"cbk"` in `DISK_IMAGE_EXTS` — so `inspect`, `ls`/`get`, `fsck`, GUI Inspect,
+  and `restore` all treat a `.cbk` like a flat disk image (it reconstructs the
+  disk into a temp file behind the trait; no user-visible extract). (2) **Edit:**
+  `resolve_partition_rw_forced` materializes the `.cbk`, edits the partition via
+  the backup-folder RW path, and `RwCommit::Cbk` recompresses + repacks over the
+  original on commit; `gzip` added to the editable-codec whitelist. Verified:
+  `inspect`/`ls`/`get` read a cb-dos `.cbk` natively, and `put` → `ls`/`get` →
+  `restore` round-trips an edit with both files intact. Lib suite (2086) + clippy
+  green. The user's whole `.cbk` ask (read/inspect/browse/extract/restore like
+  native, edit with extra legwork) is delivered.
+- 2026-06-24 — **`.cbk` container frozen + shipped desktop-first (§2d).** Built
+  `src/rbformats/cbk.rs` (`pack_folder_to_cbk` / `materialize_cbk_to_folder`),
+  the `rb-cli cbk pack|unpack` verb, and taught `rb-cli restore` to read a `.cbk`
+  directly (materialize a temp folder, then restore — §2b option a). The on-disk
+  format is now **frozen at v1** (RBKC chunk headers = gzip members, RBKI trailer
+  index, RBKF footer; big-endian) so the future DOS Family-B producer (7b) emits
+  the same bytes. Verified: a cb-dos backup folder → `.cbk` (1255 B vs 1882 B
+  folder) → `rb-cli restore MYDISK.cbk` rebuilds a valid disk (FS mounts, file
+  intact), and `cbk unpack` round-trips every folder file byte-for-byte. Desktop
+  packer emits one chunk/member; the network producer will append many (per-span)
+  for resume — both valid. The §3 `.idx` sidecar layers on top (incremental form
+  of the same chunk-offset table). 3 unit tests; clippy clean. Bridges 7b: the
+  container exists, so 7b is now just the wire framing + incremental index.
+- 2026-06-24 — **Phase 7a complete — handshake round-trips on real FreeDOS.**
+  Closed the only open 7a item (the runtime check) on a headless Linux box, no
+  86Box/DOSBox-X GUI needed: **qemu-system-i386** booting the FreeDOS 1.4 image
+  with an emulated **NE2000** (`-device ne2k_isa,iobase=0x300,irq=3`) + **SLiRP**
+  usermode net (`-netdev user`). Pulled the Crynwr **`NE2000.COM`** out of the
+  FreeDOS image's own `crynwr.zip`, loaded it on int `0x60`, and ran
+  `NETHELLO 10.0.2.2 7341` against `rb-cli serve`. Both ends confirmed: client
+  *"Connected. Agent protocol v2, capabilities 0x0001 [file]"* (exit 0), host
+  *"Family-B client connected (version 2, caps 0x0000)"*. The binary `RBK0`
+  Family-B handshake is now proven over a true DOS TCP stack, not just the
+  loopback unit test. Two lessons worth keeping: (1) **FreeCOM mis-parses `2>` /
+  `2>&1`** — it treats the `2` as a program argument (which silently sent
+  `NETHELLO` to *port 2*), so pass the port explicitly and stick to single `>`
+  redirects; (2) **`my_ip = dhcp`** in WATTCP.CFG is the whole network config —
+  SLiRP's DHCP does the rest. CWSDPMI.EXE must travel next to the exe (real
+  FreeDOS provides no DPMI host; only the disk-spike's DOSBox-X faked one).
+  Next: **7b** (the `.cbk` chunk protocol + container). The transport is unblocked.
 - 2026-06-21 — **Phase 7a started (socket + handshake hello-world).** Resolved
   the long-open **TCP-stack question: WATT-32** (DJGPP-native BSD sockets,
   prebuilt `libwatt.a`, BSD/AGPL-compatible) over mTCP/Watcom (§1b). Host:

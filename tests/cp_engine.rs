@@ -154,8 +154,8 @@ fn hfs_to_hfs_preserves_fork_and_type_creator() {
     let mut d = open_ro(&dst);
     let droot = d.root().unwrap();
     let e = find(&mut *d, &droot, "Doc").expect("copied file");
-    assert_eq!(e.type_code.as_deref(), Some("TEXT"));
-    assert_eq!(e.creator_code.as_deref(), Some("ttxt"));
+    assert_eq!(e.type_code, Some(*b"TEXT"));
+    assert_eq!(e.creator_code, Some(*b"ttxt"));
     assert_eq!(e.resource_fork_size, Some(64));
     assert_eq!(d.read_file(&e, usize::MAX).unwrap(), data);
     let mut rbuf = Vec::new();

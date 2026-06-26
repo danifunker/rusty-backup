@@ -99,6 +99,11 @@ pub struct SingleFileChdInputs<'a> {
     /// passes `config.checksum` so backups stay consistent regardless
     /// of layout.
     pub checksum_type: super::ChecksumType,
+    /// `false` (default) Level-1 excludes a FAT volume's swap/page files
+    /// (zeroes their content, keeps the allocation); `true` (`--keep-swap`)
+    /// images them verbatim. Matches `BackupConfig::keep_swap` and the
+    /// per-partition formats. Ignored in `sector_by_sector` mode.
+    pub keep_swap: bool,
 }
 
 /// Per-partition byte range + checksum, returned to the caller for
@@ -362,6 +367,7 @@ pub fn run_export(
     let source_size = source_file.metadata()?.len();
 
     let run_inputs = SingleFileChdInputs {
+        keep_swap: true,
         source_file: &source_file,
         source_size,
         source_partition_table_bytes: inputs.source_partition_table_bytes,
@@ -595,6 +601,7 @@ fn build_partition_reader(
     source_file: &File,
     part: &PartitionInfo,
     sector_by_sector: bool,
+    keep_swap: bool,
     log_cb: &mut dyn FnMut(&str),
 ) -> Result<Box<dyn Read + Send>> {
     let part_offset = part.start_lba * 512;
@@ -616,6 +623,7 @@ fn build_partition_reader(
             part_offset,
             part.partition_type_byte,
             part.partition_type_string.as_deref(),
+            keep_swap,
         ) {
             // After padding, the stream must be exactly the partition
             // extent's length; an earlier regression let a packed
@@ -1779,6 +1787,7 @@ fn stage_partitions_to_zst(
                     inputs.source_file,
                     part,
                     inputs.sector_by_sector,
+                    inputs.keep_swap,
                     log_cb,
                 )?;
                 // Body is exactly `min(part.size_bytes, target_len)` bytes
@@ -1840,8 +1849,13 @@ fn stage_partitions_to_zst(
                 "Staging partition-{} ({} of {}): zstd-compressing partition body...",
                 plan.index, stage_idx, staged_count,
             ));
-            let body_reader =
-                build_partition_reader(inputs.source_file, part, inputs.sector_by_sector, log_cb)?;
+            let body_reader = build_partition_reader(
+                inputs.source_file,
+                part,
+                inputs.sector_by_sector,
+                inputs.keep_swap,
+                log_cb,
+            )?;
             let mut padded = TakeOrPad::new(body_reader, target_len);
             log_cb(&format!(
                 "  staging partition-{} -> {}.zst ({} bytes)",
@@ -2046,6 +2060,7 @@ mod tests {
 
         let output_base = tmp.path().join("disk");
         let inputs = SingleFileChdInputs {
+            keep_swap: true,
             source_file: &source_file,
             source_size,
             source_partition_table_bytes: &mbr_bytes,
@@ -2167,6 +2182,7 @@ mod tests {
         let cancel = || false;
         let result = run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2269,6 +2285,7 @@ mod tests {
         let cancel = || false;
         let result = run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2372,6 +2389,7 @@ mod tests {
 
         let result = run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2561,6 +2579,7 @@ mod tests {
         let cancel = || false;
         let result = run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -2687,6 +2706,7 @@ mod tests {
         };
         let output_base = backup_folder.join("mybackup");
         let inputs = SingleFileChdInputs {
+            keep_swap: true,
             source_file: &source_file,
             source_size,
             source_partition_table_bytes: &mbr_bytes,
@@ -3105,6 +3125,7 @@ mod tests {
 
         let output_base = tmp.path().join("disk");
         let inputs = SingleFileChdInputs {
+            keep_swap: true,
             source_file: &source_file,
             source_size,
             source_partition_table_bytes: &mbr_bytes,
@@ -3227,6 +3248,7 @@ mod tests {
 
         let result = run_via_staging(
             SingleFileChdInputs {
+                keep_swap: true,
                 source_file: &source_file,
                 source_size: total_bytes,
                 source_partition_table_bytes: &mbr_bytes,
@@ -3314,6 +3336,7 @@ mod tests {
             fs::DefragCloneShape::Flat,
         )];
         let inputs = SingleFileChdInputs {
+            keep_swap: true,
             source_file: &source_file,
             source_size,
             source_partition_table_bytes: &mbr,

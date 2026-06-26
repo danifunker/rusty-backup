@@ -1,0 +1,35 @@
+; cb-dos boot menu. %CONFIG% (PCI/ISA/NETNO/BARE) is read by FDAUTO.BAT to set
+; up networking; the CD-ROM drivers load here (CONFIG.SYS time) for every option
+; except BARE. Each CD option loads BOTH the IDE/ATAPI driver (OAKCDROM) and the
+; USB stack (USBASPI + USBCD1) so the CD is found on either bus; SHSUCDX in
+; FDAUTO.BAT then assigns it a drive letter.
+[menu]
+menucolor=7,1
+menudefault=PCI,15
+menuitem=PCI, 1. PCI / onboard network card  +  CD-ROM (IDE + USB)
+menuitem=ISA, 2. NE2000-compatible ISA network  +  CD-ROM (IDE + USB)
+menuitem=NETNO, 3. No network  +  CD-ROM (IDE + USB)
+menuitem=BARE, 4. No network, no CD-ROM (fastest boot)
+
+[PCI]
+device=\OAKCDROM.SYS /D:MSCD001
+device=\USBASPI.EXE
+device=\USBCD1.SYS /D:MSCD002
+
+[ISA]
+device=\OAKCDROM.SYS /D:MSCD001
+device=\USBASPI.EXE
+device=\USBCD1.SYS /D:MSCD002
+
+[NETNO]
+device=\OAKCDROM.SYS /D:MSCD001
+device=\USBASPI.EXE
+device=\USBCD1.SYS /D:MSCD002
+
+[BARE]
+
+[COMMON]
+lastdrive=Z
+buffers=20
+files=40
+shell=\FREEDOS\BIN\COMMAND.COM \FREEDOS\BIN /E:2048 /P=\FDAUTO.BAT

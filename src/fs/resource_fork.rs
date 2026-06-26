@@ -158,8 +158,10 @@ fn pad_to_128(len: usize) -> usize {
     (len + 127) & !127
 }
 
-/// CRC-16 used by MacBinary (CRC-CCITT with polynomial 0x1021).
-fn macbinary_crc16(data: &[u8]) -> u16 {
+/// CRC-16 used by MacBinary (CRC-16/XMODEM: CCITT polynomial 0x1021, init 0,
+/// no reflection, no final XOR). Computed over header bytes 0..124. Shared
+/// with `macarchive::macbinary`, the canonical full-fidelity parser.
+pub fn macbinary_crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &byte in data {
         crc ^= (byte as u16) << 8;

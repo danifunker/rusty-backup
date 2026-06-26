@@ -345,6 +345,25 @@ pub fn encode_fourcc(s: &str) -> [u8; 4] {
     out
 }
 
+/// Render a raw 4-byte Mac `OSType` (type/creator code) as a printable string
+/// for **display only** — non-printable / non-ASCII bytes become `.`.
+///
+/// This is intentionally lossy and must never be used to reconstruct the
+/// bytes (that is what corrupted high-bit creators like Prince of Persia's
+/// `PoƒP` = `50 6f C4 50`, mangling `0xC4` to `.`). For fidelity, carry the
+/// raw `[u8; 4]` instead (see `FileEntry::type_code` / `os_type`).
+pub fn decode_ostype(code: &[u8; 4]) -> String {
+    code.iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // B-tree key comparison
 // ---------------------------------------------------------------------------

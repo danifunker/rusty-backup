@@ -49,4 +49,5 @@ outputs/
 /crusty-backup/net/dl
 /crusty-backup/net/mtcp
 /crusty-backup/net/watt32
-/crusty-backup/net/drivers/*.COM
+# /crusty-backup/net/drivers/*.com are vendored now (Crynwr GPL set via
+# net/fetch-drivers.sh) so the CI release media ships with packet drivers.

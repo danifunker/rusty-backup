@@ -257,8 +257,13 @@ pub struct WireEntry {
     pub path: String,
     pub kind: WireKind,
     pub size: u64,
-    pub type_code: Option<String>,
-    pub creator_code: Option<String>,
+    /// Raw 4-byte Mac OSType type/creator (byte-exact, like `FileEntry`), so a
+    /// remote browse renders high-bit codes correctly and a remote copy
+    /// preserves them. `None` on non-Mac entries.
+    pub type_code: Option<[u8; 4]>,
+    pub creator_code: Option<[u8; 4]>,
+    /// ProDOS 1-byte file type (ProDOS has no OSType). `None` elsewhere.
+    pub prodos_file_type: Option<u8>,
     pub symlink_target: Option<String>,
 }
 
@@ -286,8 +291,9 @@ impl WireEntry {
             path: e.path.clone(),
             kind,
             size: e.size,
-            type_code: e.type_code.clone(),
-            creator_code: e.creator_code.clone(),
+            type_code: e.type_code,
+            creator_code: e.creator_code,
+            prodos_file_type: e.prodos_file_type,
             symlink_target: e.symlink_target.clone(),
         }
     }
@@ -435,6 +441,443 @@ pub fn write_binary_hello<W: Write>(w: &mut W, version: u16, capabilities: u16) 
 }
 
 // ---------------------------------------------------------------------------
+// Family-B chunk PUT (cb-dos backup → host `.cbk`) — phase 7b
+// ---------------------------------------------------------------------------
+//
+// After the binary handshake a Family-B client either disconnects (a bare
+// hello-and-quit probe like `NETHELLO` → EOF) or streams a **chunk PUT**: an
+// ordered sequence of logical members (`metadata.json`, `mbr.bin`,
+// `partition-N.gz`, …), each a run of chunks, that the daemon assembles into a
+// frozen `.cbk` container (`docs/cb_dos_network_and_state.md` §2). The on-wire
+// chunk shape mirrors §2a/§2d: a member is one or more spans, each span a
+// payload (a verbatim gzip member, or a raw file the host gzip-wraps when
+// packing) with a CRC32 the daemon re-checks. Stop-and-go: the daemon acks each
+// chunk after the bytes are durable, so the client never outruns the assembler.
+
+/// Magic leading a chunk-PUT request (`b"RBKP"`). Sent after the handshake; it
+/// lets the daemon tell a real PUT from a hello-only client (EOF) or a future
+/// op, mirroring how the handshake magic disambiguates the connection itself.
+pub const PUT_MAGIC: u32 = 0x5242_4B50; // "RBKP"
+
+/// Magic leading a **GET** request (`b"RBKG"`) — restore over the wire (7e). The
+/// client pulls a `.cbk`'s members back to rebuild a disk; the daemon serves each
+/// member's bytes from the container it holds.
+pub const GET_MAGIC: u32 = 0x5242_4B47; // "RBKG"
+
+/// Magic leading each member descriptor inside a PUT (`b"RBKM"`).
+pub const MEMBER_MAGIC: u32 = 0x5242_4B4D; // "RBKM"
+
+/// Per-chunk stop-and-go acknowledgement bytes (daemon → client).
+pub const PUT_ACK: u8 = 0x06; // ASCII ACK — chunk durable, send the next
+pub const PUT_NAK: u8 = 0x15; // ASCII NAK — CRC/format error, abort
+
+/// Largest single PUT chunk payload the daemon buffers/streams. A member is one
+/// or more chunks of at most this (the §2c span granularity); 4 MiB matches the
+/// bulk-stream cap.
+pub const MAX_PUT_CHUNK: u32 = MAX_CHUNK as u32;
+
+/// Cap on a wire string (container / member name). Folder-relative file names
+/// are short; this just bounds a hostile length prefix.
+const MAX_PUT_NAME: usize = 1024;
+
+/// A chunk-PUT request header: the container base name (→ `<name>.cbk` on the
+/// daemon), a cheap **source fingerprint** (§4 — geometry + ptable + allocation
+/// CRC; the daemon uses it to decide whether a reconnect may *resume* a prior
+/// partial transfer for the same `name`, or must start fresh), and how many
+/// logical members follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutHeader {
+    pub name: String,
+    pub fingerprint: u32,
+    pub member_count: u16,
+    /// The client requested an **incremental** backup (`/INCREMENTAL`): if the
+    /// daemon holds a prior `NAME.cbk` whose recorded fingerprint equals this
+    /// one, it may tell the client to skip the whole transfer (§5b whole-disk
+    /// identity gate; the skip bit in the resume-map reply). Opt-in, so a
+    /// fingerprint false-negative (§4c) never silently drops a real change.
+    pub incremental: bool,
+}
+
+/// PUT-header flag bits (the trailing flags byte). Bit 0 = incremental requested.
+pub const PUT_FLAG_INCREMENTAL: u8 = 0x01;
+/// Resume-map reply flag bits (the byte after `RBKR`). Bit 0 = skip the whole
+/// transfer — the prior `NAME.cbk` is unchanged and stands.
+pub const RESUME_FLAG_SKIP: u8 = 0x01;
+
+/// Magic leading the daemon's resume-map reply (`b"RBKR"`), sent right after the
+/// PUT header. It tells the client, per member it already holds bytes for, how
+/// many chunks are durably committed — so the client skips those and resumes at
+/// the source offset for the next chunk (§3). An empty map means a fresh start.
+pub const RESUME_MAGIC: u32 = 0x5242_4B52; // "RBKR"
+
+/// One entry in the resume map: a member's folder-relative name and how many of
+/// its chunks the daemon has durably committed (the client resumes at chunk
+/// `committed_chunks`, source offset `committed_chunks · span`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeEntry {
+    pub name: String,
+    pub committed_chunks: u32,
+}
+
+/// One member descriptor inside a PUT: its folder-relative file name, its kind
+/// (0 = a verbatim gzip member like `partition-N.gz`; 1 = a raw file the host
+/// gzip-wraps when packing, like `metadata.json`/`mbr.bin`), and the chunk
+/// count. `kind` is advisory — the daemon re-derives the real `.cbk` member kind
+/// from the file name when packing (matching the desktop packer) — but it's
+/// carried so a future streaming receiver can frame chunks without a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberHeader {
+    pub kind: u8,
+    pub name: String,
+    pub chunk_count: u32,
+}
+
+/// One chunk header inside a member: the uncompressed span offset, the payload
+/// byte length, and the CRC32 of the payload (the daemon re-checks it — §2c's
+/// "each member self-verifies"). The §2a/§2d magic + version + logical_id are
+/// implied by the enclosing member framing, so they're omitted on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHeader {
+    pub src_offset: u64,
+    pub len: u32,
+    pub crc32: u32,
+}
+
+fn read_u16_be<R: Read>(r: &mut R) -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    r.read_exact(&mut b)?;
+    Ok(u16::from_be_bytes(b))
+}
+fn read_u32_be<R: Read>(r: &mut R) -> io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+fn read_u64_be<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_be_bytes(b))
+}
+
+/// Read a `u16`-length-prefixed UTF-8 string (the wire form for names).
+fn read_short_string<R: Read>(r: &mut R) -> io::Result<String> {
+    let len = read_u16_be(r)? as usize;
+    if len > MAX_PUT_NAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PUT string exceeds length limit",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    String::from_utf8(buf)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PUT name not UTF-8"))
+}
+
+/// Write a `u16`-length-prefixed UTF-8 string.
+fn write_short_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    let bytes = s.as_bytes();
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "PUT name too long"))?;
+    w.write_all(&len.to_be_bytes())?;
+    w.write_all(bytes)
+}
+
+/// A Family-B operation following the handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FamilyBOp {
+    /// `RBKP` — a chunk PUT (backup over the wire).
+    Put(PutHeader),
+    /// `RBKG` — a GET (restore over the wire): pull container `name`'s members.
+    Get { name: String },
+}
+
+/// Read the opening frame of a Family-B session after the handshake. Returns
+/// `Ok(None)` when the peer hung up first (a bare hello-then-disconnect, e.g.
+/// `NETHELLO`), `Ok(Some(op))` for a PUT or GET, or an error for an unknown
+/// leading magic.
+pub fn read_family_b_op<R: Read>(r: &mut R) -> io::Result<Option<FamilyBOp>> {
+    let mut magic = [0u8; 4];
+    match r.read_exact(&mut magic) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    match u32::from_be_bytes(magic) {
+        PUT_MAGIC => {
+            let name = read_short_string(r)?;
+            let fingerprint = read_u32_be(r)?;
+            let member_count = read_u16_be(r)?;
+            let mut flags = [0u8; 1];
+            r.read_exact(&mut flags)?;
+            Ok(Some(FamilyBOp::Put(PutHeader {
+                name,
+                fingerprint,
+                member_count,
+                incremental: (flags[0] & PUT_FLAG_INCREMENTAL) != 0,
+            })))
+        }
+        GET_MAGIC => {
+            let name = read_short_string(r)?;
+            Ok(Some(FamilyBOp::Get { name }))
+        }
+        m => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected Family-B op magic {m:#010x}"),
+        )),
+    }
+}
+
+/// Write a GET request (client side): the `RBKG` magic + container base name.
+pub fn write_get_request<W: Write>(w: &mut W, name: &str) -> io::Result<()> {
+    w.write_all(&GET_MAGIC.to_be_bytes())?;
+    write_short_string(w, name)?;
+    w.flush()
+}
+
+/// Write the GET-open reply (daemon side): a status byte (0 = the container
+/// opened) then, on success, the member-name list so the client can confirm what
+/// it'll pull. Flushed.
+pub fn write_get_open_reply<W: Write>(w: &mut W, names: Option<&[String]>) -> io::Result<()> {
+    match names {
+        None => w.write_all(&[1u8])?, // error: no such container / unreadable
+        Some(names) => {
+            w.write_all(&[0u8])?;
+            let count = u16::try_from(names.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many members"))?;
+            w.write_all(&count.to_be_bytes())?;
+            for n in names {
+                write_short_string(w, n)?;
+            }
+        }
+    }
+    w.flush()
+}
+
+/// Read the GET-open reply (client side): `Ok(None)` on an error status, else the
+/// member-name list.
+pub fn read_get_open_reply<R: Read>(r: &mut R) -> io::Result<Option<Vec<String>>> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    if status[0] != 0 {
+        return Ok(None);
+    }
+    let count = read_u16_be(r)? as usize;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+        names.push(read_short_string(r)?);
+    }
+    Ok(Some(names))
+}
+
+/// Write a member-fetch request inside a GET (client side): the member name, or
+/// an empty name to signal "done, close".
+pub fn write_member_request<W: Write>(w: &mut W, name: &str) -> io::Result<()> {
+    write_short_string(w, name)?;
+    w.flush()
+}
+
+/// Read a member-fetch request (daemon side): `Ok(None)` when the client sent the
+/// empty-name "done" marker.
+pub fn read_member_request<R: Read>(r: &mut R) -> io::Result<Option<String>> {
+    let name = read_short_string(r)?;
+    Ok(if name.is_empty() { None } else { Some(name) })
+}
+
+/// Stream a member's bytes (daemon side): a status byte (0 = found), then — on
+/// success — the bytes as big-endian length-delimited frames `[u32 n][n bytes]…`
+/// terminated by `[u32 0]`. Mirrors the PUT chunk framing's byte order so the DOS
+/// client reads everything big-endian.
+pub fn write_member_stream<W: Write, R: Read>(
+    w: &mut W,
+    found: bool,
+    mut src: R,
+) -> io::Result<()> {
+    if !found {
+        w.write_all(&[1u8])?;
+        return w.flush();
+    }
+    w.write_all(&[0u8])?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&(n as u32).to_be_bytes())?;
+        w.write_all(&buf[..n])?;
+    }
+    w.write_all(&0u32.to_be_bytes())?;
+    w.flush()
+}
+
+/// Read a member stream's status byte (client side); `Ok(true)` if the member was
+/// found and its frames follow.
+pub fn read_member_status<R: Read>(r: &mut R) -> io::Result<bool> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    Ok(status[0] == 0)
+}
+
+/// Write a chunk-PUT request header (client side).
+pub fn write_put_header<W: Write>(
+    w: &mut W,
+    name: &str,
+    fingerprint: u32,
+    member_count: u16,
+    incremental: bool,
+) -> io::Result<()> {
+    w.write_all(&PUT_MAGIC.to_be_bytes())?;
+    write_short_string(w, name)?;
+    w.write_all(&fingerprint.to_be_bytes())?;
+    w.write_all(&member_count.to_be_bytes())?;
+    let flags = if incremental { PUT_FLAG_INCREMENTAL } else { 0 };
+    w.write_all(&[flags])?;
+    Ok(())
+}
+
+/// The daemon's resume-map reply: a `skip` flag (the whole transfer may be
+/// elided — the prior `NAME.cbk` is unchanged) plus the per-member resume
+/// entries (empty on a fresh start).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResumeReply {
+    pub skip: bool,
+    pub entries: Vec<ResumeEntry>,
+}
+
+/// Write the resume-map reply (daemon side): the `RBKR` magic, a flags byte
+/// (`skip`), an entry count, then each `{name, committed_chunks}`. Flushed.
+pub fn write_resume_map<W: Write>(
+    w: &mut W,
+    skip: bool,
+    entries: &[ResumeEntry],
+) -> io::Result<()> {
+    w.write_all(&RESUME_MAGIC.to_be_bytes())?;
+    let flags = if skip { RESUME_FLAG_SKIP } else { 0 };
+    w.write_all(&[flags])?;
+    let count = u16::try_from(entries.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many resume entries"))?;
+    w.write_all(&count.to_be_bytes())?;
+    for e in entries {
+        write_short_string(w, &e.name)?;
+        w.write_all(&e.committed_chunks.to_be_bytes())?;
+    }
+    w.flush()
+}
+
+/// Read the resume-map reply (client side).
+pub fn read_resume_map<R: Read>(r: &mut R) -> io::Result<ResumeReply> {
+    let magic = read_u32_be(r)?;
+    if magic != RESUME_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad resume-map magic {magic:#010x} (expected {RESUME_MAGIC:#010x})"),
+        ));
+    }
+    let mut flags = [0u8; 1];
+    r.read_exact(&mut flags)?;
+    let count = read_u16_be(r)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = read_short_string(r)?;
+        let committed_chunks = read_u32_be(r)?;
+        entries.push(ResumeEntry {
+            name,
+            committed_chunks,
+        });
+    }
+    Ok(ResumeReply {
+        skip: (flags[0] & RESUME_FLAG_SKIP) != 0,
+        entries,
+    })
+}
+
+/// Read one member descriptor (the `RBKM` magic + kind + name + chunk count).
+pub fn read_member_header<R: Read>(r: &mut R) -> io::Result<MemberHeader> {
+    let magic = read_u32_be(r)?;
+    if magic != MEMBER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad member magic {magic:#010x} (expected {MEMBER_MAGIC:#010x})"),
+        ));
+    }
+    let mut kind = [0u8; 1];
+    r.read_exact(&mut kind)?;
+    let name = read_short_string(r)?;
+    let chunk_count = read_u32_be(r)?;
+    Ok(MemberHeader {
+        kind: kind[0],
+        name,
+        chunk_count,
+    })
+}
+
+/// Write one member descriptor (client side).
+pub fn write_member_header<W: Write>(
+    w: &mut W,
+    kind: u8,
+    name: &str,
+    chunk_count: u32,
+) -> io::Result<()> {
+    w.write_all(&MEMBER_MAGIC.to_be_bytes())?;
+    w.write_all(&[kind])?;
+    write_short_string(w, name)?;
+    w.write_all(&chunk_count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Read one chunk header (`src_offset` + `len` + `crc32`). The payload follows
+/// immediately as `len` raw bytes.
+pub fn read_chunk_header<R: Read>(r: &mut R) -> io::Result<ChunkHeader> {
+    let src_offset = read_u64_be(r)?;
+    let len = read_u32_be(r)?;
+    let crc32 = read_u32_be(r)?;
+    Ok(ChunkHeader {
+        src_offset,
+        len,
+        crc32,
+    })
+}
+
+/// Write one chunk header (client side). The caller streams the `len`-byte
+/// payload right after.
+pub fn write_chunk_header<W: Write>(w: &mut W, hdr: &ChunkHeader) -> io::Result<()> {
+    w.write_all(&hdr.src_offset.to_be_bytes())?;
+    w.write_all(&hdr.len.to_be_bytes())?;
+    w.write_all(&hdr.crc32.to_be_bytes())?;
+    Ok(())
+}
+
+/// Send the per-chunk acknowledgement (daemon side); `true` → [`PUT_ACK`].
+pub fn write_put_ack<W: Write>(w: &mut W, ok: bool) -> io::Result<()> {
+    w.write_all(&[if ok { PUT_ACK } else { PUT_NAK }])?;
+    w.flush()
+}
+
+/// Read a per-chunk acknowledgement (client side); `Ok(true)` on [`PUT_ACK`].
+pub fn read_put_ack<R: Read>(r: &mut R) -> io::Result<bool> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0] == PUT_ACK)
+}
+
+/// Send the final PUT result (daemon side): a status byte (0 = ok) and the
+/// written container's byte size.
+pub fn write_put_result<W: Write>(w: &mut W, status: u8, cbk_size: u64) -> io::Result<()> {
+    w.write_all(&[status])?;
+    w.write_all(&cbk_size.to_be_bytes())?;
+    w.flush()
+}
+
+/// Read the final PUT result (client side): `(status, cbk_size)`.
+pub fn read_put_result<R: Read>(r: &mut R) -> io::Result<(u8, u64)> {
+    let mut status = [0u8; 1];
+    r.read_exact(&mut status)?;
+    let cbk_size = read_u64_be(r)?;
+    Ok((status[0], cbk_size))
+}
+
+// ---------------------------------------------------------------------------
 // Framing — bulk chunk stream
 // ---------------------------------------------------------------------------
 
@@ -557,6 +1000,47 @@ impl RemoteRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PUT header's incremental flag round-trips (7h): write → read_family_b_op.
+    #[test]
+    fn put_header_incremental_flag_round_trips() {
+        for incremental in [false, true] {
+            let mut buf = Vec::new();
+            write_put_header(&mut buf, "MYDISK", 0xDEAD_BEEF, 3, incremental).unwrap();
+            let op = read_family_b_op(&mut &buf[..]).unwrap().unwrap();
+            match op {
+                FamilyBOp::Put(h) => {
+                    assert_eq!(h.name, "MYDISK");
+                    assert_eq!(h.fingerprint, 0xDEAD_BEEF);
+                    assert_eq!(h.member_count, 3);
+                    assert_eq!(h.incremental, incremental);
+                }
+                _ => panic!("expected a PUT op"),
+            }
+        }
+    }
+
+    /// The resume-map reply's skip flag + entries round-trip (7h).
+    #[test]
+    fn resume_map_skip_flag_round_trips() {
+        // skip set, no entries (the whole-disk skip reply).
+        let mut buf = Vec::new();
+        write_resume_map(&mut buf, true, &[]).unwrap();
+        let reply = read_resume_map(&mut &buf[..]).unwrap();
+        assert!(reply.skip);
+        assert!(reply.entries.is_empty());
+
+        // skip clear, with entries (the normal resume reply).
+        let entries = vec![ResumeEntry {
+            name: "partition-0.gz".into(),
+            committed_chunks: 2,
+        }];
+        let mut buf = Vec::new();
+        write_resume_map(&mut buf, false, &entries).unwrap();
+        let reply = read_resume_map(&mut &buf[..]).unwrap();
+        assert!(!reply.skip);
+        assert_eq!(reply.entries, entries);
+    }
 
     #[test]
     fn parses_host_port_path() {

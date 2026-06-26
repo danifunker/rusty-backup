@@ -292,8 +292,10 @@ fn run_action(disk: &DiskDevice, action: Action) -> Result<()> {
                         format: Some(BackupFormat::Zstd),
                         checksum: None,
                         sector_by_sector: false,
+                        defrag: false,
                         partitions: None,
                         split_size_mib: None,
+                        keep_swap: false,
                     });
                     report(r, "backup");
                 }

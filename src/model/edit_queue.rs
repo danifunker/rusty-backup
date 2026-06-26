@@ -203,26 +203,23 @@ pub fn apply_edit(
                     opts.resource_fork = Some(ResourceForkSource::Data(imp.data.clone()));
                 }
                 // Type/creator from container overrides auto-detect, but not
-                // explicit ProDOS overrides.
-                if opts.type_code.is_none() {
-                    if let Some(tc) = imp.type_code {
-                        opts.type_code = Some(String::from_utf8_lossy(&tc).to_string());
-                    }
+                // explicit ProDOS overrides. Carried as raw `os_type` bytes so
+                // high-bit OSTypes survive (no lossy text round-trip).
+                if opts.os_type.is_none() {
+                    opts.os_type = imp.type_code;
                 }
-                if opts.creator_code.is_none() {
-                    if let Some(cc) = imp.creator_code {
-                        opts.creator_code = Some(String::from_utf8_lossy(&cc).to_string());
-                    }
+                if opts.os_creator.is_none() {
+                    opts.os_creator = imp.creator_code;
                 }
             }
 
             // Per-staged-file HFS overrides (from the inline editor) win over
             // both AppleDouble FInfo and the dictionary.
             if let Some(tc) = hfs_type_override {
-                opts.type_code = Some(String::from_utf8_lossy(tc).to_string());
+                opts.os_type = Some(*tc);
             }
             if let Some(cc) = hfs_creator_override {
-                opts.creator_code = Some(String::from_utf8_lossy(cc).to_string());
+                opts.os_creator = Some(*cc);
             }
 
             // For MacBinary imports, use the extracted data fork instead of
@@ -598,16 +595,8 @@ impl EditQueue {
         }) {
             return (t, c);
         }
-        let t = entry
-            .type_code
-            .as_deref()
-            .map(crate::fs::hfs_common::encode_fourcc)
-            .unwrap_or([0; 4]);
-        let c = entry
-            .creator_code
-            .as_deref()
-            .map(crate::fs::hfs_common::encode_fourcc)
-            .unwrap_or([0; 4]);
+        let t = entry.type_code.unwrap_or([0; 4]);
+        let c = entry.creator_code.unwrap_or([0; 4]);
         (t, c)
     }
 
@@ -956,8 +945,8 @@ mod tests {
     #[test]
     fn resolved_hfs_type_creator_reflects_staged_set() {
         let mut e = FileEntry::new_file("doc".into(), "/doc".into(), 0, 0);
-        e.type_code = Some("TEXT".into());
-        e.creator_code = Some("ttxt".into());
+        e.type_code = Some(*b"TEXT");
+        e.creator_code = Some(*b"ttxt");
 
         let mut q = EditQueue::new();
         // Before staging: the on-disk values.

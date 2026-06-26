@@ -44,119 +44,19 @@ pub struct PutMacBinaryArgs {
     pub force: bool,
 }
 
-/// Parsed MacBinary header. We don't enforce a CRC check on MacBinary II
-/// (some legacy archives have garbage there but are otherwise valid);
-/// instead we rely on the structural sanity checks at byte offsets 0,
-/// 74, 82 and the length fields landing inside the file.
-#[derive(Debug)]
-struct MacBinaryHeader {
-    filename: String,
-    type_code: [u8; 4],
-    creator_code: [u8; 4],
-    /// Full 16-bit fdFlags. MacBinary I only sets the high byte at +73;
-    /// MacBinary II adds the low byte at +101.
-    finder_flags: u16,
-    /// fdLocation `(v, h)` — Pascal Point convention (vertical first).
-    finder_location: (i16, i16),
-    /// fdFldr — the window/folder ID the Finder displays the file in.
-    finder_folder: i16,
-    data_length: u32,
-    rsrc_length: u32,
-    /// Mac epoch (seconds since 1904-01-01).
-    create_date: u32,
-    modify_date: u32,
-    /// Bytes 121..123: secondary header length + version byte (129 = II,
-    /// 130 = III, 0 = I).
-    version: u8,
-}
-
-fn parse_macbinary_header(bytes: &[u8]) -> Result<MacBinaryHeader> {
-    if bytes.len() < 128 {
-        bail!("MacBinary: file too short ({} bytes)", bytes.len());
-    }
-    // Structural sanity. byte 0 is the "old version" byte (must be 0);
-    // bytes 74 and 82 are reserved (must be 0).
-    if bytes[0] != 0 || bytes[74] != 0 || bytes[82] != 0 {
-        bail!(
-            "MacBinary: header sanity bytes wrong (b0={:#x}, b74={:#x}, b82={:#x})",
-            bytes[0],
-            bytes[74],
-            bytes[82]
-        );
-    }
-    let name_len = bytes[1] as usize;
-    if name_len == 0 || name_len > 63 {
-        bail!("MacBinary: bad filename length {name_len}");
-    }
-    let filename = crate::fs::hfs::mac_roman_to_utf8(&bytes[2..2 + name_len]);
-
-    let mut type_code = [0u8; 4];
-    type_code.copy_from_slice(&bytes[65..69]);
-    let mut creator_code = [0u8; 4];
-    creator_code.copy_from_slice(&bytes[69..73]);
-
-    let finder_flags_hi = bytes[73] as u16;
-    let finder_flags_lo = bytes[101] as u16;
-    let version = bytes[122];
-    let finder_flags = (finder_flags_hi << 8) | if version >= 129 { finder_flags_lo } else { 0 };
-
-    let loc_v = BigEndian::read_i16(&bytes[75..77]);
-    let loc_h = BigEndian::read_i16(&bytes[77..79]);
-    let finder_folder = BigEndian::read_i16(&bytes[79..81]);
-    let data_length = BigEndian::read_u32(&bytes[83..87]);
-    let rsrc_length = BigEndian::read_u32(&bytes[87..91]);
-    let create_date = BigEndian::read_u32(&bytes[91..95]);
-    let modify_date = BigEndian::read_u32(&bytes[95..99]);
-
-    Ok(MacBinaryHeader {
-        filename,
-        type_code,
-        creator_code,
-        finder_flags,
-        finder_location: (loc_v, loc_h),
-        finder_folder,
-        data_length,
-        rsrc_length,
-        create_date,
-        modify_date,
-        version,
-    })
-}
-
-/// Round up to the next 128-byte boundary. MacBinary pads every section
-/// (secondary header, data fork, resource fork, comment).
-fn pad128(n: usize) -> usize {
-    n.div_ceil(128) * 128
-}
-
 pub fn run(args: PutMacBinaryArgs) -> Result<()> {
     let bytes = std::fs::read(&args.host_file)
         .with_context(|| format!("reading {}", args.host_file.display()))?;
-    let hdr = parse_macbinary_header(&bytes)?;
-
-    // Slice out the secondary header (almost always 0), data fork, and
-    // resource fork. Each is padded to a 128-byte boundary.
-    let sec_hdr_len = BigEndian::read_u16(&bytes[120..122]) as usize;
-    let mut off = 128 + pad128(sec_hdr_len);
-    let data_end = off + hdr.data_length as usize;
-    if data_end > bytes.len() {
-        bail!(
-            "MacBinary: data fork extends past file ({} > {})",
-            data_end,
-            bytes.len()
-        );
-    }
-    let data_fork = bytes[off..data_end].to_vec();
-    off += pad128(hdr.data_length as usize);
-    let rsrc_end = off + hdr.rsrc_length as usize;
-    if rsrc_end > bytes.len() {
-        bail!(
-            "MacBinary: resource fork extends past file ({} > {})",
-            rsrc_end,
-            bytes.len()
-        );
-    }
-    let rsrc_fork = bytes[off..rsrc_end].to_vec();
+    // One canonical full-fidelity parser (src/macarchive/macbinary.rs) handles
+    // I/II/III and returns both forks already sliced. It is lenient (no CRC
+    // enforcement) — put-macbinary is an explicit "this is a MacBinary file"
+    // command, so we don't gate it behind the stricter is_macbinary heuristic.
+    let hdr = crate::macarchive::macbinary::parse(&bytes)
+        .with_context(|| format!("parsing {}", args.host_file.display()))?;
+    let data_fork = hdr.data_fork.clone();
+    let rsrc_fork = hdr.resource_fork.clone();
+    let data_length = data_fork.len() as u64;
+    let rsrc_length = rsrc_fork.len();
 
     let target_name = args.rename.clone().unwrap_or_else(|| hdr.filename.clone());
     if target_name.is_empty() {
@@ -211,7 +111,7 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "????".to_string());
 
-    let resource_fork = if hdr.rsrc_length > 0 {
+    let resource_fork = if rsrc_length > 0 {
         Some(ResourceForkSource::Data(rsrc_fork))
     } else {
         None
@@ -224,14 +124,8 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
     };
 
     let mut reader: &[u8] = &data_fork;
-    fs.create_file(
-        &parent,
-        &target_name,
-        &mut reader,
-        hdr.data_length as u64,
-        &options,
-    )
-    .map_err(|e| anyhow!("create_file: {e}"))?;
+    fs.create_file(&parent, &target_name, &mut reader, data_length, &options)
+        .map_err(|e| anyhow!("create_file: {e}"))?;
 
     // Look up the entry we just created so we can apply the rest of the
     // Finder info + dates. `resolve_path` invalidates between calls but
@@ -275,83 +169,50 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
     commit.commit()?;
 
     log_stderr(format!(
-        "put-macbinary: {} ({} data, {} rsrc, type={} creator={} fdFlags=0x{:04x}, MacBinary v{})",
+        "put-macbinary: {} ({} data, {} rsrc, type={} creator={} fdFlags=0x{:04x}, {})",
         target_name,
-        hdr.data_length,
-        hdr.rsrc_length,
+        data_length,
+        rsrc_length,
         type_str,
         creator_str,
         hdr.finder_flags,
-        if hdr.version >= 129 { 2 } else { 1 },
+        hdr.version.label(),
     ));
     Ok(())
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
 
-    /// Build a minimal MacBinary II archive for parser tests.
-    fn build_archive(
-        filename: &[u8],
-        type_code: [u8; 4],
-        creator: [u8; 4],
-        finder_flags: u16,
-        data: &[u8],
-        rsrc: &[u8],
-    ) -> Vec<u8> {
+    // MacBinary parsing is exercised in src/macarchive/macbinary.rs; this verb
+    // is now a thin wrapper around `macbinary::parse`.
+
+    #[test]
+    fn delegates_to_canonical_parser() {
+        // Spot-check that the shared parser is reachable and round-trips a
+        // type/creator + flags through, the way `run` consumes it.
         let mut hdr = [0u8; 128];
-        hdr[1] = filename.len() as u8;
-        hdr[2..2 + filename.len()].copy_from_slice(filename);
-        hdr[65..69].copy_from_slice(&type_code);
-        hdr[69..73].copy_from_slice(&creator);
-        hdr[73] = (finder_flags >> 8) as u8;
-        hdr[101] = (finder_flags & 0xFF) as u8;
-        BigEndian::write_i16(&mut hdr[75..77], 100); // fdLocation.v
-        BigEndian::write_i16(&mut hdr[77..79], 200); // fdLocation.h
-        BigEndian::write_i16(&mut hdr[79..81], -1); // fdFldr (Finder default)
-        BigEndian::write_u32(&mut hdr[83..87], data.len() as u32);
-        BigEndian::write_u32(&mut hdr[87..91], rsrc.len() as u32);
-        BigEndian::write_u32(&mut hdr[91..95], 0xAAAAAAAA); // create
-        BigEndian::write_u32(&mut hdr[95..99], 0xBBBBBBBB); // modify
-        hdr[122] = 129; // MacBinary II
+        hdr[1] = 1;
+        hdr[2] = b'x';
+        hdr[65..69].copy_from_slice(b"TEXT");
+        hdr[69..73].copy_from_slice(b"ttxt");
+        hdr[73] = 0x20; // fdFlags high byte (hasBundle)
+        byteorder::BigEndian::write_u32(&mut hdr[83..87], 1);
+        hdr[122] = 129;
         hdr[123] = 129;
-
-        let mut out = hdr.to_vec();
-        out.extend_from_slice(data);
-        while out.len() % 128 != 0 {
-            out.push(0);
+        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        byteorder::BigEndian::write_u16(&mut hdr[124..126], crc);
+        let mut buf = hdr.to_vec();
+        buf.push(b'D'); // 1-byte data fork
+        while buf.len() % 128 != 0 {
+            buf.push(0);
         }
-        out.extend_from_slice(rsrc);
-        while out.len() % 128 != 0 {
-            out.push(0);
-        }
-        out
-    }
-
-    #[test]
-    fn parse_macbinary_extracts_fields() {
-        let data = b"hello mac";
-        let rsrc = b"RSRC";
-        let archive = build_archive(b"Greet", *b"TEXT", *b"ttxt", 0x4000, data, rsrc);
-        let hdr = parse_macbinary_header(&archive).unwrap();
-        assert_eq!(hdr.filename, "Greet");
-        assert_eq!(&hdr.type_code, b"TEXT");
-        assert_eq!(&hdr.creator_code, b"ttxt");
-        assert_eq!(hdr.finder_flags, 0x4000);
-        assert_eq!(hdr.finder_location, (100, 200));
-        assert_eq!(hdr.finder_folder, -1);
-        assert_eq!(hdr.data_length, data.len() as u32);
-        assert_eq!(hdr.rsrc_length, rsrc.len() as u32);
-        assert_eq!(hdr.create_date, 0xAAAAAAAA);
-        assert_eq!(hdr.modify_date, 0xBBBBBBBB);
-        assert_eq!(hdr.version, 129);
-    }
-
-    #[test]
-    fn parse_macbinary_rejects_bad_sanity_bytes() {
-        let mut archive = build_archive(b"x", *b"TEXT", *b"ttxt", 0, b"", b"");
-        archive[74] = 0x55;
-        assert!(parse_macbinary_header(&archive).is_err());
+        let f = crate::macarchive::macbinary::parse(&buf).unwrap();
+        assert_eq!(f.filename, "x");
+        assert_eq!(&f.type_code, b"TEXT");
+        assert_eq!(f.finder_flags, 0x2000);
+        assert_eq!(f.data_fork, b"D");
     }
 }

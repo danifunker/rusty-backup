@@ -91,6 +91,27 @@ pub fn open_bytes(raw: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
             Ok((raw, archive))
         }
         Some(MacArchiveKind::Mar) => super::mar::parse(&raw),
+        Some(MacArchiveKind::MacZip) => super::maczip::parse(&raw),
+        Some(MacArchiveKind::MacBinary) => {
+            let mb = super::macbinary::parse(&raw)?;
+            // Peel: a MacBinary's data fork is frequently itself an archive we
+            // can go deeper on (e.g. a MacBinary III wrapping a StuffIt 5
+            // archive). Mirror the BinHex-over-SIT behavior so the entries the
+            // user sees are the inner archive's, not one opaque blob.
+            match detect_mac_archive(&mb.data_fork) {
+                Some(MacArchiveKind::Sit)
+                | Some(MacArchiveKind::Sit5)
+                | Some(MacArchiveKind::Sea) => parse_sit_family(mb.data_fork),
+                Some(MacArchiveKind::CompactPro) => {
+                    let archive = super::compactpro::parse(&mb.data_fork)?;
+                    Ok((mb.data_fork, archive))
+                }
+                // Plain Mac file (app, document, wrapped disk image): one entry.
+                // A wrapped disk image is surfaced via detect_mountable_image on
+                // the single entry's data fork, exactly like other archives.
+                _ => Ok(synth_from_macbinary(mb)),
+            }
+        }
         Some(MacArchiveKind::Sit) | Some(MacArchiveKind::Sit5) | Some(MacArchiveKind::Sea) => {
             parse_sit_family(raw)
         }
@@ -125,22 +146,66 @@ fn parse_sit_family(bytes: Vec<u8>) -> Result<(Vec<u8>, StuffItArchive)> {
 /// method = 0 (store) so [`stuffit::decompress_fork`] returns them
 /// verbatim. Keeps the Archives tab / Extract All path unchanged.
 fn synth_single_file_archive(bh: binhex::BinHexFile) -> (Vec<u8>, StuffItArchive) {
-    let data_len = bh.data_fork.len() as u32;
-    let rsrc_len = bh.resource_fork.len() as u32;
-    let data_crc = stuffit::crc16_arc(&bh.data_fork);
-    let rsrc_crc = stuffit::crc16_arc(&bh.resource_fork);
-    let mut buf = Vec::with_capacity(bh.data_fork.len() + bh.resource_fork.len());
-    buf.extend_from_slice(&bh.data_fork);
-    buf.extend_from_slice(&bh.resource_fork);
+    synth_single_entry(
+        bh.name,
+        bh.type_code,
+        bh.creator_code,
+        bh.flags,
+        0,
+        0,
+        &bh.data_fork,
+        &bh.resource_fork,
+    )
+}
+
+/// Manufacture a one-entry archive from a parsed MacBinary file. MacBinary
+/// holds exactly one Mac file's two forks plus Finder info, so it slots into
+/// the family the same way a single-file BinHex does — but it also carries
+/// real create/modify dates, which are preserved here.
+fn synth_from_macbinary(mb: super::macbinary::MacBinaryFile) -> (Vec<u8>, StuffItArchive) {
+    synth_single_entry(
+        mb.filename,
+        mb.type_code,
+        mb.creator_code,
+        mb.finder_flags,
+        mb.create_date,
+        mb.modify_date,
+        &mb.data_fork,
+        &mb.resource_fork,
+    )
+}
+
+/// Shared single-entry archive builder: lays the data fork then the resource
+/// fork back-to-back in the returned buffer and points a method-0 (store)
+/// entry at them, so [`stuffit::decompress_fork`] returns each verbatim. Used
+/// by the loose-BinHex and MacBinary single-file paths.
+#[allow(clippy::too_many_arguments)]
+fn synth_single_entry(
+    name: String,
+    type_code: [u8; 4],
+    creator_code: [u8; 4],
+    finder_flags: u16,
+    create_date: u32,
+    mod_date: u32,
+    data_fork: &[u8],
+    resource_fork: &[u8],
+) -> (Vec<u8>, StuffItArchive) {
+    let data_len = data_fork.len() as u32;
+    let rsrc_len = resource_fork.len() as u32;
+    let data_crc = stuffit::crc16_arc(data_fork);
+    let rsrc_crc = stuffit::crc16_arc(resource_fork);
+    let mut buf = Vec::with_capacity(data_fork.len() + resource_fork.len());
+    buf.extend_from_slice(data_fork);
+    buf.extend_from_slice(resource_fork);
     let entry = stuffit::StuffItEntry {
-        path: vec![bh.name.clone()],
-        name: bh.name,
+        path: vec![name.clone()],
+        name,
         is_dir: false,
-        type_code: bh.type_code,
-        creator_code: bh.creator_code,
-        finder_flags: bh.flags,
-        create_date: 0,
-        mod_date: 0,
+        type_code,
+        creator_code,
+        finder_flags,
+        create_date,
+        mod_date,
         data: Some(stuffit::ForkInfo {
             method: 0,
             codec: stuffit::ForkCodec::StuffIt,
@@ -636,6 +701,93 @@ mod tests {
             std::fs::read(dir.path().join("Doc.rsrc.1")).unwrap(),
             b"DOC-RSRC",
             "Doc resource fork must be preserved at a non-colliding path"
+        );
+    }
+
+    /// Build a MacBinary II archive (valid CRC) for the open_bytes tests.
+    fn build_macbinary_ii(name: &[u8], flags: u16, data: &[u8], rsrc: &[u8]) -> Vec<u8> {
+        use byteorder::{BigEndian, ByteOrder};
+        let mut hdr = [0u8; 128];
+        hdr[1] = name.len() as u8;
+        hdr[2..2 + name.len()].copy_from_slice(name);
+        hdr[65..69].copy_from_slice(b"APPL");
+        hdr[69..73].copy_from_slice(b"Po.P");
+        hdr[73] = (flags >> 8) as u8;
+        hdr[101] = (flags & 0xFF) as u8;
+        BigEndian::write_u32(&mut hdr[83..87], data.len() as u32);
+        BigEndian::write_u32(&mut hdr[87..91], rsrc.len() as u32);
+        BigEndian::write_u32(&mut hdr[91..95], 0x1111_1111); // create
+        BigEndian::write_u32(&mut hdr[95..99], 0x2222_2222); // modify
+        hdr[122] = 129;
+        hdr[123] = 129;
+        let crc = crate::fs::resource_fork::macbinary_crc16(&hdr[0..124]);
+        BigEndian::write_u16(&mut hdr[124..126], crc);
+        let mut out = hdr.to_vec();
+        out.extend_from_slice(data);
+        while out.len() % 128 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(rsrc);
+        while out.len() % 128 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    /// A plain MacBinary file (no inner archive) synthesizes a one-entry
+    /// archive whose forks decompress verbatim and whose Finder flags + dates
+    /// are preserved. Proves Phase 2 of docs/native_mac_archives.md.
+    #[test]
+    fn open_bytes_synthesizes_single_entry_from_macbinary() {
+        let mb = build_macbinary_ii(b"Prince", 0x2000, b"data-fork-bytes", b"RSRCDATA");
+        let (buf, archive) = open_bytes(mb).expect("MacBinary should open");
+        assert_eq!(archive.entries.len(), 1);
+        let e = &archive.entries[0];
+        assert_eq!(e.name, "Prince");
+        assert_eq!(&e.type_code, b"APPL");
+        assert_eq!(&e.creator_code, b"Po.P");
+        assert_eq!(e.finder_flags, 0x2000, "hasBundle preserved");
+        assert_eq!(e.create_date, 0x1111_1111);
+        assert_eq!(e.mod_date, 0x2222_2222);
+        let data = stuffit::decompress_fork(&buf, e.data.as_ref().unwrap()).unwrap();
+        assert_eq!(data, b"data-fork-bytes");
+        let rsrc = stuffit::decompress_fork(&buf, e.rsrc.as_ref().unwrap()).unwrap();
+        assert_eq!(rsrc, b"RSRCDATA");
+    }
+
+    /// A MacBinary whose data fork is itself a StuffIt archive peels through to
+    /// the inner archive's entries (Phase 3 peel), rather than surfacing one
+    /// opaque blob.
+    #[test]
+    fn open_bytes_peels_macbinary_over_sit() {
+        use super::super::stuffit::{
+            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
+        };
+        let mk = |name: &str, body: &[u8]| StuffItInput {
+            name: name.into(),
+            type_code: [0; 4],
+            creator_code: [0; 4],
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: body.to_vec(),
+            resource_fork: Vec::new(),
+        };
+        let inner = build_archive_tree(
+            &[
+                StuffItInputNode::File(mk("inner1.txt", b"AAA")),
+                StuffItInputNode::File(mk("inner2.txt", b"BBB")),
+            ],
+            WriteMethod::Store,
+        )
+        .expect("build inner SIT");
+        let mb = build_macbinary_ii(b"Bundle.sit.bin", 0, &inner, b"");
+        let (_buf, archive) = open_bytes(mb).expect("MacBinary-over-SIT should open");
+        let names: std::collections::HashSet<&str> =
+            archive.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains("inner1.txt") && names.contains("inner2.txt"),
+            "should expand to inner SIT entries, got {names:?}"
         );
     }
 

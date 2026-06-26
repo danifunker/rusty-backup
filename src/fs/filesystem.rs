@@ -225,10 +225,20 @@ pub struct CreateFileOptions {
     /// Unix group ID (default 0). Ignored on FAT/exFAT/NTFS.
     pub gid: Option<u32>,
     /// HFS/HFS+ type code (e.g. "TEXT") or ProDOS type as "$XX" (e.g. "$04").
-    /// Auto-detected from extension if not set.
+    /// Auto-detected from extension if not set. This is the caller-typed text
+    /// form; for byte-exact Mac type/creator preservation (high-bit `OSType`s)
+    /// use [`os_type`](CreateFileOptions::os_type) instead.
     pub type_code: Option<String>,
     /// HFS/HFS+ creator code (e.g. "MSWD"). Auto-detected from extension if not set.
     pub creator_code: Option<String>,
+    /// Raw 4-byte Mac `OSType` file type. When set, HFS/HFS+/MFS `create_file`
+    /// writes these bytes into the Finder info verbatim, taking precedence over
+    /// the lossy `type_code` text. Used by fidelity-preserving copies
+    /// (`cp`, `get-binhex`, archive replay) so a high-bit creator like Prince
+    /// of Persia's `PoƒP` (`0xC4`) survives. `None` outside the Mac family.
+    pub os_type: Option<[u8; 4]>,
+    /// Raw 4-byte Mac `OSType` creator. See [`os_type`](CreateFileOptions::os_type).
+    pub os_creator: Option<[u8; 4]>,
     /// ProDOS auxiliary type (16-bit). Semantics depend on the file type:
     /// $0801 for Applesoft BASIC load address, $2000 for typical BIN,
     /// record length for random-access TXT, etc. Auto-detected from

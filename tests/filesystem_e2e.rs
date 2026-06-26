@@ -967,7 +967,7 @@ fn test_exfat_compaction_round_trip() {
 fn ntfs_smart_compaction_is_layout_preserving() {
     let img = load_fixture("test_ntfs.img.zst");
     let (mut r, info) =
-        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None, true)
             .expect("NTFS compact reader");
     assert_eq!(
         info.compacted_size, info.original_size,
@@ -990,7 +990,7 @@ fn ntfs_smart_compaction_is_layout_preserving() {
 fn exfat_smart_compaction_is_layout_preserving() {
     let img = load_fixture("test_exfat.img.zst");
     let (mut r, info) =
-        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None)
+        rusty_backup::fs::compact_partition_reader(Cursor::new(img.clone()), 0, 0x07, None, true)
             .expect("exFAT compact reader");
     assert_eq!(
         info.compacted_size, info.original_size,
@@ -1048,8 +1048,8 @@ fn ntfs_compaction_preserves_nonresident_file() {
     // Smart-compact via the dispatch the backup uses, then reconstruct the
     // stream the way restore does (zero-pad to original_size — a no-op for the
     // layout-preserving reader, which already emits the full length).
-    let (mut r, info) =
-        compact_partition_reader(Cursor::new(modified), 0, 0x07, None).expect("compact reader");
+    let (mut r, info) = compact_partition_reader(Cursor::new(modified), 0, 0x07, None, true)
+        .expect("compact reader");
     let mut packed = Vec::new();
     r.read_to_end(&mut packed).unwrap();
     packed.resize(info.original_size as usize, 0);
@@ -1816,21 +1816,20 @@ fn test_prodos_type_codes_populated() {
         .find(|e| e.name == "FINDER.DATA")
         .expect("FINDER.DATA present");
     let tc = finder
-        .type_code
-        .as_ref()
-        .expect("type_code should be set for ProDOS files");
+        .type_code_display()
+        .expect("type should be set for ProDOS files");
     // FINDER.DATA is stored with ProDOS type $C9 (FND) on IIgs volumes.
-    assert_eq!(tc, "$C9 FND", "type_code for FINDER.DATA was {tc}");
+    assert_eq!(tc, "$C9 FND", "type for FINDER.DATA was {tc}");
 
     // Sanity-check a second entry: ANTETRIS/ANTETRIS is an S16 application
     // ($B3) on this fixture.
     let antetris_dir = entries.iter().find(|e| e.name == "ANTETRIS").unwrap();
     let game_files = fs.list_directory(antetris_dir).unwrap();
     let antetris_bin = game_files.iter().find(|e| e.name == "ANTETRIS").unwrap();
-    let tc = antetris_bin.type_code.as_ref().unwrap();
+    let tc = antetris_bin.type_code_display().unwrap();
     assert!(
         tc.starts_with('$') && tc.contains(' '),
-        "type_code should be formatted as '$XX ABC', got {tc}"
+        "type should be formatted as '$XX ABC', got {tc}"
     );
 }
 
@@ -1859,7 +1858,7 @@ fn test_prodos_create_file_auto_types_from_extension() {
             )
             .unwrap();
         assert_eq!(
-            txt_entry.type_code.as_deref(),
+            txt_entry.type_code_display().as_deref(),
             Some("$04 TXT"),
             "auto-detected type for .txt should be $04 TXT"
         );
@@ -1875,7 +1874,7 @@ fn test_prodos_create_file_auto_types_from_extension() {
                 &CreateFileOptions::default(),
             )
             .unwrap();
-        assert_eq!(bas_entry.type_code.as_deref(), Some("$FC BAS"));
+        assert_eq!(bas_entry.type_code_display().as_deref(), Some("$FC BAS"));
 
         fs.sync_metadata().unwrap();
     }
@@ -2038,7 +2037,7 @@ fn test_prodos_set_prodos_type_round_trip() {
                 &opts,
             )
             .unwrap();
-        assert_eq!(created.type_code.as_deref(), Some("$06 BIN"));
+        assert_eq!(created.type_code_display().as_deref(), Some("$06 BIN"));
         assert_eq!(created.aux_type, Some(0x0000));
 
         // Change to $04 TXT with aux $1234.
@@ -2052,7 +2051,7 @@ fn test_prodos_set_prodos_type_round_trip() {
     let entries = fs.list_directory(&root).unwrap();
     let rbtype = entries.iter().find(|e| e.name == "RBTYPE").unwrap();
     assert_eq!(
-        rbtype.type_code.as_deref(),
+        rbtype.type_code_display().as_deref(),
         Some("$04 TXT"),
         "set_prodos_type should have flipped type byte"
     );
