@@ -160,6 +160,7 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
 fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
     let mut last_op = String::new();
     let mut last_pct: i32 = -1;
+    let mut tracker = crate::model::rate_tracker::RateTracker::default();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, op, cur, total, finished, error) = match progress.lock() {
@@ -179,6 +180,9 @@ fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
         for LogMessage { level, message } in logs {
             log_stderr(format!("[{level:?}] {message}"));
         }
+        // Sample every tick (the stage label resets the window between phases),
+        // even though we only print every 5%, so the rate/ETA is warm by then.
+        tracker.record(cur, &op);
         if op != last_op {
             log_stderr(format!("status: {op}"));
             last_op = op;
@@ -188,9 +192,10 @@ fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
             let pct = ((cur as f64 / total as f64) * 100.0) as i32;
             if pct / 5 != last_pct / 5 {
                 log_stderr(format!(
-                    "  progress: {pct:>3}% ({}/{})",
+                    "  progress: {pct:>3}% ({}/{}){}",
                     format_size(cur),
-                    format_size(total)
+                    format_size(total),
+                    tracker.suffix(cur, total),
                 ));
                 last_pct = pct;
             }
@@ -279,6 +284,7 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
 fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
     let mut last_op = String::new();
     let mut last_pct: i32 = -1;
+    let mut tracker = crate::model::rate_tracker::RateTracker::default();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, op, cur, total, finished, error) = match progress.lock() {
@@ -298,6 +304,9 @@ fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
         for LogMessage { level, message } in logs {
             log_stderr(format!("[{level:?}] {message}"));
         }
+        // Sample every tick (the stage label resets the window between phases),
+        // even though we only print every 5%, so the rate/ETA is warm by then.
+        tracker.record(cur, &op);
         if op != last_op {
             log_stderr(format!("status: {op}"));
             last_op = op;
@@ -307,9 +316,10 @@ fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
             let pct = ((cur as f64 / total as f64) * 100.0) as i32;
             if pct / 5 != last_pct / 5 {
                 log_stderr(format!(
-                    "  progress: {pct:>3}% ({}/{})",
+                    "  progress: {pct:>3}% ({}/{}){}",
                     format_size(cur),
-                    format_size(total)
+                    format_size(total),
+                    tracker.suffix(cur, total),
                 ));
                 last_pct = pct;
             }

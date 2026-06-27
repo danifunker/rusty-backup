@@ -27,6 +27,7 @@ pub mod min_size_runner;
 pub mod optical_devices;
 pub mod partition_editor;
 pub mod physical_write_runner;
+pub mod rate_tracker;
 // The remote file-browser core depends on `crate::remote`, which is itself
 // behind the `remote` feature.
 #[cfg(feature = "remote")]
