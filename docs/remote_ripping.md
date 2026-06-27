@@ -311,18 +311,26 @@ P1.1 (the local refactor) is independent and can land first on its own.
   the picker) + `list_rip_devices`; `picker_label` / `cli_device_arg` /
   `into_target` helpers. Unit test (local label/arg/target) + loopback test
   (`remote_rip_device_enumeration_over_loopback`) green.
-- [ ] **P3.2 — GUI.** Replace the local-only combo with the unified pulldown;
-  "Add remote daemon…" dialog (reuse `connect_shared` + the existing host:port
-  dialog); `OpticalTarget` wiring. *Encode path (`rip_to_chd_worker`)
-  unchanged.*
+- [x] **P3.2 — GUI.** *(done 2026-06-27, compile-validated; runtime UI pending a
+  user check)* `optical_tab` now holds a unified `rip_devices: Vec<RipDevice>` +
+  `remote_daemons`; the drive combo lists local + remote drives by `picker_label`;
+  an "Add remote daemon…" modal connects on a worker thread
+  (`ConnectStatus`/`poll_add_remote`, non-freezing) and unlocks the Physical-drive
+  mode. Rip dispatches via `RipDevice::to_target()`; `start_rip_to_chd` /
+  `rip_to_chd_worker` take an `OpticalTarget` (encode still local). Remote drives
+  are rip-only — `get_browsable_path` returns `None` for them (disc-info/browse
+  open the device locally).
 - [x] **P3.3 — CLI.** *(done 2026-06-27)* `optical drives --remote host:port`
   (repeatable) lists local + each daemon's drives via the picker core, printing a
   feedable `<device-arg>` (`rb://host:port/dev/sr0` for remote rows).
   `optical rip --device rb://…` landed in P1.7.
-- [ ] **P3.4 — polish.** Capability-gate remote drives on `CAP_FAMILY_O`;
-  location-aware eject button label.
-- [ ] **P3.5 — optional.** Persist known remotes in `config.json` so they
-  reappear across sessions.
+- [x] **P3.4 — polish.** *(done 2026-06-27)* Capability gating falls out of
+  `append_remote_rip_devices` (a daemon without `optical` errors on
+  `list_optical_drives` → contributes no drives). Location-aware eject is
+  automatic via `OpticalSource::eject` (local shells out locally; remote sends
+  `EjectOptical` to the daemon); the GUI eject checkbox gained a hover note.
+- [ ] **P3.5 — optional (deferred).** Persist known remotes in `config.json` so
+  they reappear across sessions. Not blocking; pick up if desired.
 
 ### Done criteria (cross-cutting)
 - [ ] README "Inspect/optical" + `docs/full_MiSTer_support_status.md` note remote

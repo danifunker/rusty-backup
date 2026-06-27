@@ -58,6 +58,19 @@ impl RipDevice {
         }
     }
 
+    /// The [`OpticalTarget`] a rip reads from (borrowing — clones the cheap
+    /// device path / `Arc` connection handle, leaving the device in its list).
+    pub fn to_target(&self) -> OpticalTarget {
+        match &self.location {
+            DeviceLocation::Local => OpticalTarget::Local(self.device_path.clone()),
+            #[cfg(feature = "remote")]
+            DeviceLocation::Remote { conn, .. } => OpticalTarget::Remote {
+                conn: conn.clone(),
+                device_path: self.device_path.clone(),
+            },
+        }
+    }
+
     /// Consume into the [`OpticalTarget`] a rip reads from.
     pub fn into_target(self) -> OpticalTarget {
         match self.location {
@@ -67,6 +80,19 @@ impl RipDevice {
                 conn,
                 device_path: self.device_path,
             },
+        }
+    }
+
+    /// Is this drive on a remote daemon? (Local-only features like disc-info
+    /// auto-detection and Browse Contents are skipped for remote drives.)
+    pub fn is_remote(&self) -> bool {
+        #[cfg(feature = "remote")]
+        {
+            matches!(self.location, DeviceLocation::Remote { .. })
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            false
         }
     }
 }
