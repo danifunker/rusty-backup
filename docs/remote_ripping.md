@@ -287,9 +287,14 @@ P1.1 (the local refactor) is independent and can land first on its own.
   `optical rip --device rb://…` works (pulled the CLI URL-parse forward from
   P3.3); GUI/CLI local call sites build `OpticalTarget::Local`. Builds clean in
   optical+remote / optical-only / default(GUI); 14 optical unit tests green.
-- [ ] **P1.8 — validate.** Desktop ↔ a daemon on a Linux box (or loopback) with
-  a real drive: ISO + BIN/CUE rip byte-identical to a local rip of the same
-  disc; TOC matches.
+- [~] **P1.8 — validate.** *(plumbing verified 2026-06-27)* `tests/remote_optical.rs`:
+  loopback client↔daemon test green — the `optical`-built daemon handles
+  `ListOpticalDrives` (round-trips, doesn't disclaim the feature), and
+  `OpenOptical` of a bogus device errors cleanly **and** releases the
+  process-global busy guard (a second open fails at open, not with "busy").
+  Remaining: the byte-identical rip-a-real-disc validation (desktop ↔ a daemon on
+  a Linux box with an actual drive) needs hardware — user's SuperStation / a
+  networked box.
 
 ### Phase 2 — CHD compression on the desktop
 - [ ] **P2.1 — remote → CHD.** Feed `RemoteCdReader` through the existing
