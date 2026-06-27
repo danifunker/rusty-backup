@@ -253,16 +253,25 @@ P1.1 (the local refactor) is independent and can land first on its own.
   `device_path` for now — the `OpticalTarget` switch is deferred to P1.7 where the
   remote dispatch needs it (avoids a `remote`-feature-gated enum variant with no
   consumer yet). Verified: optical unit tests green, no behavior change.
-- [ ] **P1.2 — wire DTOs.** `WireToc` / `WireTrack` / `WireSectorMode` /
-  `WireRetryConfig` / `WireOpticalDrive` + `From` conversions in `protocol.rs`;
-  add a serde round-trip unit test.
-- [ ] **P1.3 — protocol surface.** `CAP_FAMILY_O = 1 << 2`; the six optical
-  `Request` variants + their `Response`s in `protocol.rs`.
-- [ ] **P1.4 — daemon handlers.** `OpticalHandle` + dispatch arms in `server.rs`
-  (`ListOpticalDrives` / `OpenOptical` / `ReadToc` / `ReadOpticalSectors` /
-  `EjectOptical` / `CloseOptical`); one-session "drive busy" guard; advertise
-  `CAP_FAMILY_O` in `Hello`. *Requires the elevated daemon (root) to open
-  `/dev/sr0` `O_RDWR`.*
+- [x] **P1.2 — wire DTOs.** *(done 2026-06-27)* `WireToc` / `WireTrack` /
+  `WireSectorMode` / `WireRetryConfig` / `WireOpticalDrive` in `protocol.rs`
+  (always under `remote`); `From` conversions to/from the `cd-da-reader` types
+  gated behind `optical` (in a `optical_conv` submodule). Serde round-trip +
+  conversion unit tests green.
+- [x] **P1.3 — protocol surface.** *(done 2026-06-27)* `CAP_FAMILY_O = 1 << 2`;
+  the six optical `Request` variants (`ListOpticalDrives` / `OpenOptical` /
+  `ReadToc` / `ReadOpticalSectors` / `EjectOptical` / `CloseOptical`) + the
+  `OpticalOpened` / `Toc` / `OpticalDrives` responses (sector data reuses
+  `FileBegin` + chunk stream).
+- [x] **P1.4 — daemon handlers.** *(done 2026-06-27)* `server.rs`
+  `optical_server` module: a per-connection `OpticalState` that wraps a
+  `LocalCdReader` (reusing the P1.1 read/eject ops) + a **process-global**
+  `AtomicBool` busy guard (released on session drop / connection teardown, since
+  `cd-da-reader` holds a global handle); dispatch arms for all six verbs
+  (`not(optical)` builds reply "built without the optical feature"); `Hello`
+  advertises `CAP_FAMILY_O` under `optical`. Builds clean in optical /
+  remote-only configs. *Requires the elevated daemon (root) to open `/dev/sr0`
+  `O_RDWR`.*
 - [ ] **P1.5 — client methods.** `RemoteSession::{list_optical_drives,
   open_optical, read_toc, read_optical_sectors, eject_optical, close_optical}`
   in `client.rs`.

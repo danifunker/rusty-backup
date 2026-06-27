@@ -62,6 +62,11 @@ pub const CAP_FAMILY_F: u16 = 1 << 0;
 /// 7a — [`read_handshake`] / [`write_binary_hello`]); the chunk/`.cbk` data
 /// protocol is not, so this bit is advertised only once that lands (7b).
 pub const CAP_FAMILY_B: u16 = 1 << 1;
+/// Family O — optical-drive proxy: rip a remote CD/DVD where the daemon issues
+/// the SCSI reads and the desktop does all the encoding (see
+/// `docs/remote_ripping.md`). Advertised only when the daemon was built with the
+/// `optical` feature.
+pub const CAP_FAMILY_O: u16 = 1 << 2;
 
 /// Largest control-frame body we'll accept — guards against a hostile or
 /// corrupt length prefix. Control frames are small JSON; 8 MiB is generous.
@@ -204,6 +209,36 @@ pub enum Request {
         force: bool,
     },
 
+    // --- optical tier (Family O): proxy a physical CD/DVD drive so the ---
+    // --- desktop rips + encodes while the daemon only issues SCSI reads. ---
+    /// List the daemon machine's physical optical drives (reply:
+    /// `OpticalDrives`). The remote arm of the unified rip-device picker.
+    ListOpticalDrives,
+    /// Open one of the daemon's optical drives for ripping (reply:
+    /// `OpticalOpened{handle}`). `retry` is applied daemon-side, next to the
+    /// (often flaky) drive. The daemon serves ONE optical session at a time — a
+    /// second open returns `Error` ("optical drive busy") because `cd-da-reader`
+    /// holds a process-global drive handle.
+    OpenOptical {
+        path: String,
+        retry: WireRetryConfig,
+    },
+    /// Read the open disc's table of contents (reply: `Toc`).
+    ReadToc { handle: u64 },
+    /// Read `count` sectors from `lba` in `mode` (reply: `FileBegin{size:
+    /// count * sector_size}`, then a chunk stream of that many bytes). Retry /
+    /// backoff is applied daemon-side per the `OpenOptical` policy.
+    ReadOpticalSectors {
+        handle: u64,
+        lba: u32,
+        count: u32,
+        mode: WireSectorMode,
+    },
+    /// Eject the disc from the open optical drive (reply: `Ok`).
+    EjectOptical { handle: u64 },
+    /// Close an open optical handle, freeing the drive for the next session.
+    CloseOptical { handle: u64 },
+
     /// Polite disconnect.
     Bye,
 }
@@ -241,6 +276,12 @@ pub enum Response {
     BlockOpened { handle: u64, size: u64 },
     /// `ListDevices` result: the daemon machine's physical disks.
     Devices { devices: Vec<WireDevice> },
+    /// `OpenOptical` result: the optical session handle.
+    OpticalOpened { handle: u64 },
+    /// `ReadToc` result: the disc's table of contents.
+    Toc { toc: WireToc },
+    /// `ListOpticalDrives` result: the daemon machine's optical drives.
+    OpticalDrives { drives: Vec<WireOpticalDrive> },
     /// Generic success (e.g. `Close`).
     Ok,
     /// Operation failed with a human-readable message.
@@ -336,6 +377,174 @@ impl WireDevice {
             is_system: d.is_system,
             bus: d.bus_protocol.clone(),
             media: d.media_name.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optical tier DTOs (serde mirrors of the `cd-da-reader` types)
+//
+// Defined unconditionally under the `remote` feature so the protocol enums
+// always compile; the `From`/`Into` conversions to the real `cd-da-reader`
+// types are gated behind `optical` (only the desktop client and an
+// optical-built daemon link that crate).
+// ---------------------------------------------------------------------------
+
+/// Sector read mode — serde mirror of `cd_da_reader::SectorReadMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireSectorMode {
+    Audio,
+    DataCooked,
+    DataRaw,
+}
+
+impl WireSectorMode {
+    /// Bytes per sector (2048 cooked, 2352 raw/audio).
+    pub fn sector_size(self) -> u32 {
+        match self {
+            WireSectorMode::DataCooked => 2048,
+            WireSectorMode::Audio | WireSectorMode::DataRaw => 2352,
+        }
+    }
+}
+
+/// One TOC track — serde mirror of `cd_da_reader::Track`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTrack {
+    pub number: u8,
+    pub start_lba: u32,
+    pub start_msf: (u8, u8, u8),
+    pub is_audio: bool,
+}
+
+/// Disc table of contents — serde mirror of `cd_da_reader::Toc`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireToc {
+    pub first_track: u8,
+    pub last_track: u8,
+    pub tracks: Vec<WireTrack>,
+    pub leadout_lba: u32,
+}
+
+/// Read-retry policy sent at `OpenOptical` and applied daemon-side — serde
+/// mirror of `cd_da_reader::RetryConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireRetryConfig {
+    pub max_attempts: u8,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub reduce_chunk_on_retry: bool,
+    pub min_sectors_per_read: u32,
+}
+
+/// A physical optical drive on the daemon machine — the remote arm of the
+/// unified rip-device picker (`ListOpticalDrives`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireOpticalDrive {
+    pub device_path: String,
+    pub display_name: String,
+    pub has_audio_cd: bool,
+}
+
+#[cfg(feature = "optical")]
+mod optical_conv {
+    use super::{WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, WireTrack};
+
+    impl From<&cd_da_reader::Track> for WireTrack {
+        fn from(t: &cd_da_reader::Track) -> Self {
+            Self {
+                number: t.number,
+                start_lba: t.start_lba,
+                start_msf: t.start_msf,
+                is_audio: t.is_audio,
+            }
+        }
+    }
+
+    impl From<&WireTrack> for cd_da_reader::Track {
+        fn from(t: &WireTrack) -> Self {
+            cd_da_reader::Track {
+                number: t.number,
+                start_lba: t.start_lba,
+                start_msf: t.start_msf,
+                is_audio: t.is_audio,
+            }
+        }
+    }
+
+    impl From<&cd_da_reader::Toc> for WireToc {
+        fn from(toc: &cd_da_reader::Toc) -> Self {
+            Self {
+                first_track: toc.first_track,
+                last_track: toc.last_track,
+                tracks: toc.tracks.iter().map(WireTrack::from).collect(),
+                leadout_lba: toc.leadout_lba,
+            }
+        }
+    }
+
+    impl From<&WireToc> for cd_da_reader::Toc {
+        fn from(toc: &WireToc) -> Self {
+            cd_da_reader::Toc {
+                first_track: toc.first_track,
+                last_track: toc.last_track,
+                tracks: toc.tracks.iter().map(cd_da_reader::Track::from).collect(),
+                leadout_lba: toc.leadout_lba,
+            }
+        }
+    }
+
+    impl From<cd_da_reader::SectorReadMode> for WireSectorMode {
+        fn from(m: cd_da_reader::SectorReadMode) -> Self {
+            match m {
+                cd_da_reader::SectorReadMode::Audio => WireSectorMode::Audio,
+                cd_da_reader::SectorReadMode::DataCooked => WireSectorMode::DataCooked,
+                cd_da_reader::SectorReadMode::DataRaw => WireSectorMode::DataRaw,
+            }
+        }
+    }
+
+    impl From<WireSectorMode> for cd_da_reader::SectorReadMode {
+        fn from(m: WireSectorMode) -> Self {
+            match m {
+                WireSectorMode::Audio => cd_da_reader::SectorReadMode::Audio,
+                WireSectorMode::DataCooked => cd_da_reader::SectorReadMode::DataCooked,
+                WireSectorMode::DataRaw => cd_da_reader::SectorReadMode::DataRaw,
+            }
+        }
+    }
+
+    impl From<&cd_da_reader::RetryConfig> for WireRetryConfig {
+        fn from(c: &cd_da_reader::RetryConfig) -> Self {
+            Self {
+                max_attempts: c.max_attempts,
+                initial_backoff_ms: c.initial_backoff_ms,
+                max_backoff_ms: c.max_backoff_ms,
+                reduce_chunk_on_retry: c.reduce_chunk_on_retry,
+                min_sectors_per_read: c.min_sectors_per_read,
+            }
+        }
+    }
+
+    impl From<&WireRetryConfig> for cd_da_reader::RetryConfig {
+        fn from(c: &WireRetryConfig) -> Self {
+            cd_da_reader::RetryConfig {
+                max_attempts: c.max_attempts,
+                initial_backoff_ms: c.initial_backoff_ms,
+                max_backoff_ms: c.max_backoff_ms,
+                reduce_chunk_on_retry: c.reduce_chunk_on_retry,
+                min_sectors_per_read: c.min_sectors_per_read,
+            }
+        }
+    }
+
+    impl From<&cd_da_reader::DriveInfo> for WireOpticalDrive {
+        fn from(d: &cd_da_reader::DriveInfo) -> Self {
+            Self {
+                device_path: d.path.clone(),
+                display_name: d.display_name.clone().unwrap_or_else(|| d.path.clone()),
+                has_audio_cd: d.has_audio_cd,
+            }
         }
     }
 }
@@ -1018,6 +1227,113 @@ mod tests {
                 _ => panic!("expected a PUT op"),
             }
         }
+    }
+
+    fn sample_toc() -> WireToc {
+        WireToc {
+            first_track: 1,
+            last_track: 2,
+            tracks: vec![
+                WireTrack {
+                    number: 1,
+                    start_lba: 0,
+                    start_msf: (0, 2, 0),
+                    is_audio: false,
+                },
+                WireTrack {
+                    number: 2,
+                    start_lba: 15000,
+                    start_msf: (3, 22, 0),
+                    is_audio: true,
+                },
+            ],
+            leadout_lba: 45000,
+        }
+    }
+
+    /// Optical-tier requests/responses + DTOs round-trip through serde_json.
+    /// (`Request`/`Response` don't derive `PartialEq`, so compare Debug strings.)
+    #[test]
+    fn optical_protocol_round_trips() {
+        let reqs = vec![
+            Request::ListOpticalDrives,
+            Request::OpenOptical {
+                path: "/dev/sr0".into(),
+                retry: WireRetryConfig {
+                    max_attempts: 4,
+                    initial_backoff_ms: 20,
+                    max_backoff_ms: 300,
+                    reduce_chunk_on_retry: true,
+                    min_sectors_per_read: 1,
+                },
+            },
+            Request::ReadToc { handle: 7 },
+            Request::ReadOpticalSectors {
+                handle: 7,
+                lba: 16,
+                count: 128,
+                mode: WireSectorMode::DataRaw,
+            },
+            Request::EjectOptical { handle: 7 },
+            Request::CloseOptical { handle: 7 },
+        ];
+        for r in &reqs {
+            let s = serde_json::to_string(r).unwrap();
+            let back: Request = serde_json::from_str(&s).unwrap();
+            assert_eq!(format!("{r:?}"), format!("{back:?}"));
+        }
+
+        let resps = vec![
+            Response::OpticalOpened { handle: 7 },
+            Response::Toc { toc: sample_toc() },
+            Response::OpticalDrives {
+                drives: vec![WireOpticalDrive {
+                    device_path: "/dev/sr0".into(),
+                    display_name: "TSSTcorp CD/DVDW".into(),
+                    has_audio_cd: false,
+                }],
+            },
+        ];
+        for r in &resps {
+            let s = serde_json::to_string(r).unwrap();
+            let back: Response = serde_json::from_str(&s).unwrap();
+            assert_eq!(format!("{r:?}"), format!("{back:?}"));
+        }
+
+        assert_eq!(WireSectorMode::DataCooked.sector_size(), 2048);
+        assert_eq!(WireSectorMode::DataRaw.sector_size(), 2352);
+        assert_eq!(WireSectorMode::Audio.sector_size(), 2352);
+    }
+
+    /// The DTOs convert to the real `cd-da-reader` types and back losslessly.
+    #[cfg(feature = "optical")]
+    #[test]
+    fn optical_dtos_convert_to_cd_da_reader() {
+        let wire = sample_toc();
+        let native: cd_da_reader::Toc = (&wire).into();
+        let back: WireToc = (&native).into();
+        assert_eq!(format!("{wire:?}"), format!("{back:?}"));
+
+        for m in [
+            WireSectorMode::Audio,
+            WireSectorMode::DataCooked,
+            WireSectorMode::DataRaw,
+        ] {
+            let native: cd_da_reader::SectorReadMode = m.into();
+            let back: WireSectorMode = native.into();
+            assert_eq!(m, back);
+        }
+
+        let retry = WireRetryConfig {
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 200,
+            reduce_chunk_on_retry: false,
+            min_sectors_per_read: 2,
+        };
+        let native: cd_da_reader::RetryConfig = (&retry).into();
+        let back: WireRetryConfig = (&native).into();
+        assert_eq!(format!("{retry:?}"), format!("{back:?}"));
     }
 
     /// The resume-map reply's skip flag + entries round-trip (7h).

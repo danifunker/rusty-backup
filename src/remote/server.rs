@@ -760,6 +760,11 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
     let mut block_handles: HashMap<u64, BlockHandle> = HashMap::new();
     let mut sessions: HashMap<u64, Session> = HashMap::new();
     let mut next_session: u64 = 1;
+    // Optical tier: at most one drive session per connection (and, via a
+    // process-global guard inside `optical_server`, one per daemon — cd-da-reader
+    // keeps a global drive handle).
+    #[cfg(feature = "optical")]
+    let mut optical = optical_server::OpticalState::default();
 
     // The opening frame disambiguates a JSON-free Family-B client (cb-dos —
     // leads with the binary magic) from a JSON Family-F client (desktop). A
@@ -807,11 +812,15 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                     )?;
                     return Ok(());
                 }
+                #[cfg(feature = "optical")]
+                let capabilities = CAP_FAMILY_F | crate::remote::protocol::CAP_FAMILY_O;
+                #[cfg(not(feature = "optical"))]
+                let capabilities = CAP_FAMILY_F;
                 write_control(
                     &mut writer,
                     &Response::Hello {
                         version: PROTOCOL_VERSION,
-                        capabilities: CAP_FAMILY_F,
+                        capabilities,
                         platform: std::env::consts::OS.to_string(),
                     },
                 )?;
@@ -1183,6 +1192,82 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 None => reply_err(&mut writer, format!("no such session {session}"))?,
             },
 
+            // --- optical tier (Family O): proxy a physical CD/DVD drive ---
+            Request::ListOpticalDrives => {
+                #[cfg(feature = "optical")]
+                optical.list_drives(&mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                reply_err(
+                    &mut writer,
+                    "daemon built without the optical feature".to_string(),
+                )?;
+            }
+            Request::OpenOptical { path, retry } => {
+                #[cfg(feature = "optical")]
+                optical.open(&path, &retry, &mut next_handle, &mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = (&path, &retry);
+                    reply_err(
+                        &mut writer,
+                        "daemon built without the optical feature".to_string(),
+                    )?;
+                }
+            }
+            Request::ReadToc { handle } => {
+                #[cfg(feature = "optical")]
+                optical.read_toc(handle, &mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = handle;
+                    reply_err(
+                        &mut writer,
+                        "daemon built without the optical feature".to_string(),
+                    )?;
+                }
+            }
+            Request::ReadOpticalSectors {
+                handle,
+                lba,
+                count,
+                mode,
+            } => {
+                #[cfg(feature = "optical")]
+                optical.read_sectors(handle, lba, count, mode, &mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = (handle, lba, count, mode);
+                    reply_err(
+                        &mut writer,
+                        "daemon built without the optical feature".to_string(),
+                    )?;
+                }
+            }
+            Request::EjectOptical { handle } => {
+                #[cfg(feature = "optical")]
+                optical.eject(handle, &mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = handle;
+                    reply_err(
+                        &mut writer,
+                        "daemon built without the optical feature".to_string(),
+                    )?;
+                }
+            }
+            Request::CloseOptical { handle } => {
+                #[cfg(feature = "optical")]
+                optical.close(handle, &mut writer)?;
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = handle;
+                    reply_err(
+                        &mut writer,
+                        "daemon built without the optical feature".to_string(),
+                    )?;
+                }
+            }
+
             Request::Bye => return Ok(()),
         }
     }
@@ -1192,6 +1277,163 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
 fn reply_err<W: std::io::Write>(writer: &mut W, message: String) -> Result<()> {
     write_control(writer, &Response::Error { message })?;
     Ok(())
+}
+
+/// Optical-drive proxy (Family O). Wraps a [`crate::optical::source::LocalCdReader`]
+/// on the daemon so a desktop client rips a remote drive while the daemon only
+/// issues SCSI reads — all encoding stays on the desktop. See
+/// `docs/remote_ripping.md`.
+#[cfg(feature = "optical")]
+mod optical_server {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use anyhow::Result;
+
+    use super::reply_err;
+    use crate::optical::source::{LocalCdReader, OpticalSource};
+    use crate::remote::protocol::{
+        write_control, ChunkWriter, Response, WireOpticalDrive, WireRetryConfig, WireSectorMode,
+        WireToc,
+    };
+
+    /// At most one optical session exists per process: `cd-da-reader` keeps a
+    /// global drive handle, so a second open (even on another connection) would
+    /// clobber the first. The guard is released on drop — including connection
+    /// teardown, since the per-connection `OpticalState` owns the session.
+    static BUSY: AtomicBool = AtomicBool::new(false);
+
+    struct OpticalSession {
+        reader: LocalCdReader,
+        handle: u64,
+    }
+
+    impl Drop for OpticalSession {
+        fn drop(&mut self) {
+            BUSY.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Per-connection optical state: at most one open session.
+    #[derive(Default)]
+    pub struct OpticalState {
+        session: Option<OpticalSession>,
+    }
+
+    impl OpticalState {
+        pub fn list_drives<W: std::io::Write>(&self, writer: &mut W) -> Result<()> {
+            match cd_da_reader::CdReader::list_drives() {
+                Ok(drives) => {
+                    let drives = drives.iter().map(WireOpticalDrive::from).collect();
+                    write_control(writer, &Response::OpticalDrives { drives })?;
+                }
+                Err(e) => reply_err(writer, format!("list optical drives: {e}"))?,
+            }
+            Ok(())
+        }
+
+        pub fn open<W: std::io::Write>(
+            &mut self,
+            path: &str,
+            retry: &WireRetryConfig,
+            next_handle: &mut u64,
+            writer: &mut W,
+        ) -> Result<()> {
+            // Acquire the process-global slot before touching the drive.
+            if BUSY
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return reply_err(
+                    writer,
+                    "optical drive busy (another rip is in progress)".to_string(),
+                );
+            }
+            match LocalCdReader::with_retry(path, retry.into()) {
+                Ok(reader) => {
+                    let handle = *next_handle;
+                    *next_handle += 1;
+                    self.session = Some(OpticalSession { reader, handle });
+                    write_control(writer, &Response::OpticalOpened { handle })?;
+                }
+                Err(e) => {
+                    BUSY.store(false, Ordering::SeqCst);
+                    reply_err(writer, format!("open optical drive {path}: {e:#}"))?;
+                }
+            }
+            Ok(())
+        }
+
+        fn session(&self, handle: u64) -> Option<&OpticalSession> {
+            self.session.as_ref().filter(|s| s.handle == handle)
+        }
+
+        pub fn read_toc<W: std::io::Write>(&self, handle: u64, writer: &mut W) -> Result<()> {
+            let Some(s) = self.session(handle) else {
+                return reply_err(writer, format!("no such optical handle {handle}"));
+            };
+            match s.reader.read_toc() {
+                Ok(toc) => write_control(
+                    writer,
+                    &Response::Toc {
+                        toc: WireToc::from(&toc),
+                    },
+                )?,
+                Err(e) => reply_err(writer, format!("read TOC: {e:#}"))?,
+            }
+            Ok(())
+        }
+
+        pub fn read_sectors<W: std::io::Write>(
+            &self,
+            handle: u64,
+            lba: u32,
+            count: u32,
+            mode: WireSectorMode,
+            writer: &mut W,
+        ) -> Result<()> {
+            let Some(s) = self.session(handle) else {
+                return reply_err(writer, format!("no such optical handle {handle}"));
+            };
+            match s.reader.read_data_sectors(lba, count, mode.into()) {
+                Ok(data) => {
+                    // Commit to the stream: FileBegin{actual len} then the bytes.
+                    write_control(
+                        writer,
+                        &Response::FileBegin {
+                            size: data.len() as u64,
+                        },
+                    )?;
+                    let mut cw = ChunkWriter::new(&mut *writer);
+                    cw.write_all(&data)?;
+                    cw.finish()?;
+                }
+                Err(e) => reply_err(writer, format!("read sectors at LBA {lba}: {e:#}"))?,
+            }
+            Ok(())
+        }
+
+        pub fn eject<W: std::io::Write>(&self, handle: u64, writer: &mut W) -> Result<()> {
+            let Some(s) = self.session(handle) else {
+                return reply_err(writer, format!("no such optical handle {handle}"));
+            };
+            match s.reader.eject() {
+                Ok(()) => write_control(writer, &Response::Ok)?,
+                Err(e) => reply_err(writer, format!("eject: {e:#}"))?,
+            }
+            Ok(())
+        }
+
+        pub fn close<W: std::io::Write>(&mut self, handle: u64, writer: &mut W) -> Result<()> {
+            if self.session.as_ref().map(|s| s.handle) == Some(handle) {
+                self.session = None; // drops the session -> releases the global slot
+                write_control(writer, &Response::Ok)?;
+            } else {
+                reply_err(writer, format!("no such optical handle {handle}"))?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Read a chunk stream from the client into a staging blob file.
