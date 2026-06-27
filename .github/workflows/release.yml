@@ -822,7 +822,7 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Build rb-cli-mini for MiSTer armv7 (CHD on, GUI / optical off)
+      - name: Build rb-cli-mini for MiSTer armv7 (CHD + optical on, GUI off)
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
           # libchdman-rs's build.rs falls back to $HOME/.cache/libchdman-rs

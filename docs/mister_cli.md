@@ -257,7 +257,8 @@ Strip the binary for size:
 
 ```sh
 arm-linux-gnueabihf-strip target/.../rb-cli
-# Expect ~5-8 MB stripped (vs. ~30-40 MB unstripped Rust release).
+# Expect ~15 MB stripped with chd + optical (libchdman's static C++ CHD core
+# dominates; it was ~5-8 MB before CHD/optical were added to the mini build).
 ```
 
 ---
