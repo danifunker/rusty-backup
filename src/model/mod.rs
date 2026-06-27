@@ -23,6 +23,8 @@ pub mod file_types;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod min_size_runner;
+#[cfg(feature = "optical")]
+pub mod optical_devices;
 pub mod partition_editor;
 pub mod physical_write_runner;
 // The remote file-browser core depends on `crate::remote`, which is itself

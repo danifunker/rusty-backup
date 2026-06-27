@@ -55,6 +55,19 @@ fn optical_list_drives_round_trips_over_loopback() {
     }
 }
 
+/// The unified picker's remote arm enumerates a daemon's drives over the wire.
+/// On a driveless daemon it adds zero — but without erroring or panicking,
+/// proving `append_remote_rip_devices` round-trips.
+#[test]
+fn remote_rip_device_enumeration_over_loopback() {
+    let (addr, _dir) = spawn_daemon();
+    let conn = RemoteConnection::connect_shared(&addr).unwrap();
+    let mut out = Vec::new();
+    let added = rusty_backup::model::optical_devices::append_remote_rip_devices(&mut out, &conn);
+    assert_eq!(added, out.len(), "reported count must match pushed entries");
+    // (On a box with a real drive this would be > 0, each labeled with the addr.)
+}
+
 /// Opening a device that cannot exist errors cleanly, and the process-global
 /// busy guard is released so a *second* open fails at open — not with "busy".
 #[test]

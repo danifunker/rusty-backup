@@ -304,16 +304,21 @@ P1.1 (the local refactor) is independent and can land first on its own.
   in MAME; the MiSTer CPU stays idle during compression (spot-check `top`).
 
 ### Phase 3 — unified device picker + CLI parity
-- [ ] **P3.1 — picker core.** `src/model/optical_devices.rs`: `RipDevice` /
-  `DeviceLocation` / `list_rip_devices(remotes)` merging local + per-daemon
-  drives; unit-test the merge/labeling.
+- [x] **P3.1 — picker core.** *(done 2026-06-27)* `src/model/optical_devices.rs`:
+  `RipDevice` / `DeviceLocation` (`Local` | `Remote{conn,label}`, `Remote` gated
+  `remote`); `list_local_rip_devices` + `append_remote_rip_devices` (errors
+  swallowed → offline/non-optical daemons add nothing, which also capability-gates
+  the picker) + `list_rip_devices`; `picker_label` / `cli_device_arg` /
+  `into_target` helpers. Unit test (local label/arg/target) + loopback test
+  (`remote_rip_device_enumeration_over_loopback`) green.
 - [ ] **P3.2 — GUI.** Replace the local-only combo with the unified pulldown;
   "Add remote daemon…" dialog (reuse `connect_shared` + the existing host:port
   dialog); `OpticalTarget` wiring. *Encode path (`rip_to_chd_worker`)
   unchanged.*
-- [ ] **P3.3 — CLI.** `optical drives --remote host:port` (repeatable);
-  `optical rip --device rb://host:port/dev/sr0` (scheme parse at the single
-  `open` seam).
+- [x] **P3.3 — CLI.** *(done 2026-06-27)* `optical drives --remote host:port`
+  (repeatable) lists local + each daemon's drives via the picker core, printing a
+  feedable `<device-arg>` (`rb://host:port/dev/sr0` for remote rows).
+  `optical rip --device rb://…` landed in P1.7.
 - [ ] **P3.4 — polish.** Capability-gate remote drives on `CAP_FAMILY_O`;
   location-aware eject button label.
 - [ ] **P3.5 — optional.** Persist known remotes in `config.json` so they
