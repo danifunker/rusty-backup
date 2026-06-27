@@ -59,6 +59,9 @@ pub struct OpticalTab {
     add_remote_addr: String,
     add_remote_error: Option<String>,
     add_remote_status: Option<Arc<Mutex<ConnectStatus>>>,
+    /// MRU of daemon addresses (newest first), mirrored to `config.json` — the
+    /// "Add remote daemon" dialog's quick-pick list.
+    recent_daemons: Vec<String>,
     image_file_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
     disc_info_error: Option<String>,
@@ -90,6 +93,7 @@ impl Default for OpticalTab {
             add_remote_addr: String::new(),
             add_remote_error: None,
             add_remote_status: None,
+            recent_daemons: UpdateConfig::load().recent_daemon_addrs,
             image_file_path: None,
             disc_info: None,
             disc_info_error: None,
@@ -174,6 +178,7 @@ impl OpticalTab {
                     .lock()
                     .map(|c| c.addr().to_string())
                     .unwrap_or_default();
+                self.remember_daemon_addr(&label);
                 self.remote_daemons.push(conn);
                 self.refresh_drives();
                 self.add_remote_open = false;
@@ -186,6 +191,21 @@ impl OpticalTab {
             }
             None => {}
         }
+    }
+
+    /// Record a successfully-connected daemon address in the MRU list (in-memory
+    /// + persisted to `config.json`), newest first.
+    fn remember_daemon_addr(&mut self, addr: &str) {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            return;
+        }
+        self.recent_daemons.retain(|a| a != addr);
+        self.recent_daemons.insert(0, addr.to_string());
+        self.recent_daemons.truncate(8);
+        let mut cfg = UpdateConfig::load();
+        cfg.remember_daemon(addr);
+        let _ = cfg.save();
     }
 
     /// Spawn the connect for the address in the dialog on a worker thread.
@@ -249,6 +269,23 @@ impl OpticalTab {
                 }
                 if let Some(err) = &self.add_remote_error {
                     ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                }
+
+                if !self.recent_daemons.is_empty() {
+                    ui.separator();
+                    ui.label("Recent:");
+                    // Clone to avoid borrowing `self` while the click handler
+                    // calls `&mut self` methods.
+                    let recents = self.recent_daemons.clone();
+                    for addr in recents {
+                        if ui
+                            .add_enabled(!connecting, egui::Button::new(&addr).small())
+                            .clicked()
+                        {
+                            self.add_remote_addr = addr.clone();
+                            self.start_add_remote();
+                        }
+                    }
                 }
             });
         // Honor the window's [x] close button.

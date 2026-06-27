@@ -333,8 +333,13 @@ P1.1 (the local refactor) is independent and can land first on its own.
   `list_optical_drives` → contributes no drives). Location-aware eject is
   automatic via `OpticalSource::eject` (local shells out locally; remote sends
   `EjectOptical` to the daemon); the GUI eject checkbox gained a hover note.
-- [ ] **P3.5 — optional (deferred).** Persist known remotes in `config.json` so
-  they reappear across sessions. Not blocking; pick up if desired.
+- [x] **P3.5 — MRU of daemon addresses.** *(done 2026-06-27, GUI-only)*
+  `UpdateConfig.recent_daemon_addrs` (in `config.json`) + `remember_daemon()`
+  (dedup, newest-first, capped at 8). On a successful connect the Optical tab
+  records the address; the "Add remote daemon" dialog shows a "Recent:" quick-pick
+  list (one click re-connects). Persists across sessions; unit-tested. Note:
+  it's a pick list, not auto-reconnect — avoids blocking startup on an offline
+  daemon.
 
 ### Done criteria (cross-cutting)
 - [x] **README + `docs/full_MiSTer_support_status.md` note remote ripping.**
