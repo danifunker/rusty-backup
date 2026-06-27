@@ -822,7 +822,7 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Build rb-cli-mini for MiSTer armv7 (CHD on, GUI / optical off)
+      - name: Build rb-cli-mini for MiSTer armv7 (CHD + optical on, GUI off)
         env:
           RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
           # libchdman-rs's build.rs falls back to $HOME/.cache/libchdman-rs
@@ -840,12 +840,17 @@ jobs:
           # libchdman-rs armv7 prebuilt.
           # `remote` = the rb-cli serve daemon + rb:// (pure std::net + serde_json,
           # no C / no extra crate), so the MiSTer can host its images on the LAN.
+          # `optical` = CD/DVD ripping (`optical rip` / `drives` / `convert`).
+          # cd-da-reader is cc+libc (an SG_IO shim, no system libcdio); opticaldiscs
+          # (>=0.4.5) reuses the SAME libchdman-rs 0.288.5 prebuilt as `chd` (deduped
+          # to one copy), which ships an armv7 build. Lets a device with a CD drive
+          # (e.g. SuperStation One) rip discs.
           cross build \
             --bin rb-cli \
             --release \
             --target armv7-unknown-linux-gnueabihf \
             --no-default-features \
-            --features chd,pure-zstd,remote
+            --features chd,pure-zstd,remote,optical
 
       - name: Strip binary
         run: |

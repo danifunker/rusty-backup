@@ -84,24 +84,27 @@ Open CLI follow-ups (and everything else still to do) are tracked in
 `rb-cli-mini` is the **MiSTer-specific** build of `rb-cli`: a slim
 variant cross-compiled for the FPGA's Intel Cyclone V / Cortex-A9 SoC
 (`armv7-unknown-linux-gnueabihf`, glibc 2.31 baseline from the
-Buildroot rootfs). It excludes the GUI (eframe / egui / rfd), the
-optical-disc stack (opticaldiscs / cd-da-reader), and the update
-checker's reqwest client — but **keeps CHD support** via the upstream
-`libchdman-rs` armv7 prebuilt, so `.chd` images work inline on the
-device.
+Buildroot rootfs). It excludes the GUI (eframe / egui / rfd) and the
+update checker's reqwest client — but **keeps CHD support** via the
+upstream `libchdman-rs` armv7 prebuilt (so `.chd` images work inline on
+the device) **and the optical-disc stack** (opticaldiscs / cd-da-reader),
+so devices with a CD/DVD drive (e.g. the SuperStation One) can rip discs
+on-device.
 
 The desktop release builds use the full feature set; only the MiSTer
-artifact runs `--no-default-features --features chd,pure-zstd,remote` (CHD
-via the C prebuilt; zstd via the pure-Rust bit-exact backend, since a cross
-build won't link C libzstd; `remote` for the network daemon — see
-[rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below).
+artifact runs `--no-default-features --features chd,pure-zstd,remote,optical`
+(CHD via the C prebuilt; zstd via the pure-Rust bit-exact backend, since a
+cross build won't link C libzstd; `remote` for the network daemon — see
+[rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below; `optical`
+for CD/DVD ripping — cd-da-reader is cc+libc with no system libcdio link, and
+opticaldiscs reuses the same libchdman-rs 0.288.5 prebuilt as `chd`).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features --features chd,pure-zstd,remote
+            --no-default-features --features chd,pure-zstd,remote,optical
 
 # Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
 # do the local rename here too so the on-MiSTer filename matches the
@@ -138,11 +141,12 @@ What's in the MiSTer build:
   and disks on the LAN so the desktop app can browse/back up/restore them
   over `rb://`. Installs from the Scripts menu; see
   [below](#run-this-device-as-a-network-daemon-rb-daemon).
+- **Optical-disc ripping** (`optical drives` to find the drive, then
+  `optical rip --device /dev/sr0 --format iso|bincue`), plus `optical
+  convert` (ISO ↔ BIN/CUE ↔ CD-CHD) and `optical browse` / `extract`. For
+  devices with a CD/DVD drive such as the SuperStation One.
 
-What's excluded (operations exit with a clear "this binary was built
-without the `optical` feature" message):
-- `optical` verb (rip / disc browse / extract via the OS optical-drive
-  layer — the MiSTer has no optical drive attached).
+What's excluded:
 - GUI windows and the update-checker self-replace UI (only meaningful
   for the desktop binary).
 

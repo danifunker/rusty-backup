@@ -248,7 +248,7 @@ pub enum Command {
         cmd: verbs::show::ShowCommand,
     },
 
-    /// Optical-media verbs (rip / convert / browse / extract).
+    /// Optical-media verbs (drives / rip / convert / browse / extract).
     #[cfg(feature = "optical")]
     Optical {
         #[command(subcommand)]
