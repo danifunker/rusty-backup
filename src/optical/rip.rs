@@ -19,11 +19,71 @@ pub enum RipFormat {
     BinCue,
 }
 
+/// Where a rip reads its sectors from.
+///
+/// `Local` is a physically-attached drive; `Remote` is a drive on another
+/// machine's `rb-cli serve` daemon, reached over an open connection — the daemon
+/// issues the SCSI reads and this side does all the encoding. See
+/// `docs/remote_ripping.md`.
+#[derive(Clone)]
+pub enum OpticalTarget {
+    /// A locally-attached drive by device path (e.g. `/dev/sr0`, `\\.\E:`).
+    Local(String),
+    /// A drive on a remote daemon, by its device path on that machine.
+    #[cfg(feature = "remote")]
+    Remote {
+        conn: Arc<Mutex<crate::remote::connection::RemoteConnection>>,
+        device_path: String,
+    },
+}
+
+impl OpticalTarget {
+    /// Resolve a `--device` argument string: an `rb://host:port/dev/sr0` URL
+    /// opens a remote connection; anything else is a local device path.
+    pub fn resolve(device: &str) -> Result<Self> {
+        #[cfg(feature = "remote")]
+        if let Some(rref) = crate::remote::protocol::RemoteRef::parse(device) {
+            let conn = crate::remote::connection::RemoteConnection::connect_shared(&rref.addr())
+                .with_context(|| format!("connecting to {}", rref.addr()))?;
+            return Ok(OpticalTarget::Remote {
+                conn,
+                device_path: rref.path,
+            });
+        }
+        #[cfg(not(feature = "remote"))]
+        if device.starts_with("rb://") || device.starts_with("rb:/") {
+            bail!("remote ripping needs the `remote` feature; this binary was built without it");
+        }
+        Ok(OpticalTarget::Local(device.to_string()))
+    }
+
+    /// Human-readable label for logs / progress.
+    pub fn display(&self) -> String {
+        match self {
+            OpticalTarget::Local(p) => p.clone(),
+            #[cfg(feature = "remote")]
+            OpticalTarget::Remote { conn, device_path } => {
+                let addr = conn
+                    .lock()
+                    .map(|c| c.addr().to_string())
+                    .unwrap_or_default();
+                format!("rb://{addr}{device_path}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for OpticalTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpticalTarget({})", self.display())
+    }
+}
+
 /// Configuration for a disc rip operation.
 #[derive(Debug, Clone)]
 pub struct RipConfig {
-    /// Device path (e.g. "/dev/sr0", "disk6", r"\\.\E:").
-    pub device_path: PathBuf,
+    /// Where to read the disc from (a local drive or a remote daemon's drive).
+    pub device: OpticalTarget,
     /// Output path: .iso file for Iso format, .cue file for BinCue (derives .bin).
     pub output_path: PathBuf,
     /// Output format.
@@ -137,13 +197,20 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     Ok(())
 }
 
-/// Build the [`OpticalSource`] for this rip. Today every rip is local; the
-/// remote branch (a network-proxied drive) lands in a later phase — see
-/// `docs/remote_ripping.md`.
+/// Build the [`OpticalSource`] for this rip — a local drive or a network proxy
+/// to a remote daemon's drive (see `docs/remote_ripping.md`).
 fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
-    let device_str = config.device_path.to_string_lossy();
-    let reader = LocalCdReader::open(&device_str)?;
-    Ok(Box::new(reader))
+    match &config.device {
+        OpticalTarget::Local(path) => Ok(Box::new(LocalCdReader::open(path)?)),
+        #[cfg(feature = "remote")]
+        OpticalTarget::Remote { conn, device_path } => {
+            Ok(Box::new(crate::optical::source::RemoteCdReader::open(
+                conn.clone(),
+                device_path,
+                cd_da_reader::RetryConfig::default(),
+            )?))
+        }
+    }
 }
 
 /// Sectors to read per chunk for READ CD commands.
@@ -456,13 +523,14 @@ mod tests {
     #[test]
     fn test_rip_config_construction() {
         let config = RipConfig {
-            device_path: PathBuf::from("/dev/sr0"),
+            device: OpticalTarget::Local("/dev/sr0".to_string()),
             output_path: PathBuf::from("/tmp/disc.iso"),
             format: RipFormat::Iso,
             eject_after: false,
         };
         assert_eq!(config.format, RipFormat::Iso);
         assert!(!config.eject_after);
+        assert_eq!(config.device.display(), "/dev/sr0");
     }
 
     #[test]

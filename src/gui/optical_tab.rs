@@ -8,7 +8,7 @@ use opticaldiscs::formats::DiscFormat;
 use rusty_backup::backup::LogLevel as BackupLogLevel;
 use rusty_backup::optical::browse_view::OpticalDiscBrowseView;
 use rusty_backup::optical::convert::ConvertProgress;
-use rusty_backup::optical::rip::{RipConfig, RipFormat, RipProgress};
+use rusty_backup::optical::rip::{OpticalTarget, RipConfig, RipFormat, RipProgress};
 use rusty_backup::rbformats::chd_options::{
     codec_label, parse_codec_string, ChdOptions, ChdProfile,
 };
@@ -592,7 +592,7 @@ impl OpticalTab {
         };
 
         let config = RipConfig {
-            device_path: drive.device_path.clone(),
+            device: OpticalTarget::Local(drive.device_path.to_string_lossy().into_owned()),
             output_path,
             format,
             eject_after: self.eject_after,
@@ -600,7 +600,7 @@ impl OpticalTab {
 
         log.info(format!(
             "Starting rip: {} -> {}",
-            config.device_path.display(),
+            config.device.display(),
             config.output_path.display()
         ));
 
@@ -865,7 +865,7 @@ fn rip_to_chd_worker(
     let temp_bin = parent.join(".rusty-backup-rip-temp.bin");
 
     let rip_config = RipConfig {
-        device_path: device_path.to_path_buf(),
+        device: OpticalTarget::Local(device_path.to_string_lossy().into_owned()),
         output_path: temp_cue.clone(),
         format: RipFormat::BinCue,
         eject_after,

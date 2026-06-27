@@ -11,7 +11,8 @@ use std::path::Path;
 
 use crate::remote::protocol::{
     read_chunks, read_control, write_control, ChunkWriter, Request, Response, WireEntry,
-    CAP_FAMILY_F, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RB_HELLO_MAGIC,
+    WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc, CAP_FAMILY_F, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RB_HELLO_MAGIC,
 };
 
 /// Result of opening a remote image: a handle + the filesystem's display
@@ -460,6 +461,87 @@ impl RemoteSession {
     pub fn close_session(&mut self, session: u64) -> Result<()> {
         write_control(&mut self.writer, &Request::CloseSession { session })?;
         self.expect_ok("CloseSession")
+    }
+
+    // --- optical tier (Family O): drive a remote CD/DVD; the daemon issues ---
+    // --- the SCSI reads, this client does all the encoding. ---
+
+    /// List the daemon machine's physical optical drives.
+    pub fn list_optical_drives(&mut self) -> Result<Vec<WireOpticalDrive>> {
+        write_control(&mut self.writer, &Request::ListOpticalDrives)?;
+        match self.read_response()? {
+            Response::OpticalDrives { drives } => Ok(drives),
+            Response::Error { message } => bail!("list optical drives: {message}"),
+            other => bail!("unexpected reply to ListOpticalDrives: {other:?}"),
+        }
+    }
+
+    /// Open one of the daemon's optical drives for ripping. Returns the handle.
+    /// `retry` is applied daemon-side, next to the drive.
+    pub fn open_optical(&mut self, path: &str, retry: WireRetryConfig) -> Result<u64> {
+        write_control(
+            &mut self.writer,
+            &Request::OpenOptical {
+                path: path.to_string(),
+                retry,
+            },
+        )?;
+        match self.read_response()? {
+            Response::OpticalOpened { handle } => Ok(handle),
+            Response::Error { message } => bail!("open optical drive {path}: {message}"),
+            other => bail!("unexpected reply to OpenOptical: {other:?}"),
+        }
+    }
+
+    /// Read the open disc's table of contents.
+    pub fn read_toc(&mut self, handle: u64) -> Result<WireToc> {
+        write_control(&mut self.writer, &Request::ReadToc { handle })?;
+        match self.read_response()? {
+            Response::Toc { toc } => Ok(toc),
+            Response::Error { message } => bail!("read TOC: {message}"),
+            other => bail!("unexpected reply to ReadToc: {other:?}"),
+        }
+    }
+
+    /// Read `count` sectors from `lba` in `mode`; returns the raw sector bytes.
+    pub fn read_optical_sectors(
+        &mut self,
+        handle: u64,
+        lba: u32,
+        count: u32,
+        mode: WireSectorMode,
+    ) -> Result<Vec<u8>> {
+        write_control(
+            &mut self.writer,
+            &Request::ReadOpticalSectors {
+                handle,
+                lba,
+                count,
+                mode,
+            },
+        )?;
+        match self.read_response()? {
+            Response::FileBegin { .. } => {
+                let mut buf = Vec::new();
+                read_chunks(&mut self.reader, &mut buf)
+                    .map_err(|e| anyhow!("reading sectors at LBA {lba}: {e}"))?;
+                Ok(buf)
+            }
+            Response::Error { message } => bail!("read sectors at LBA {lba}: {message}"),
+            other => bail!("unexpected reply to ReadOpticalSectors: {other:?}"),
+        }
+    }
+
+    /// Eject the disc from the open optical drive.
+    pub fn eject_optical(&mut self, handle: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::EjectOptical { handle })?;
+        self.expect_ok("EjectOptical")
+    }
+
+    /// Close an open optical handle, freeing the drive for the next session.
+    pub fn close_optical(&mut self, handle: u64) -> Result<()> {
+        write_control(&mut self.writer, &Request::CloseOptical { handle })?;
+        self.expect_ok("CloseOptical")
     }
 
     fn expect_ok(&mut self, what: &str) -> Result<()> {

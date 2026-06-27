@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use crate::remote::client::{OpenedImage, RemoteSession};
-use crate::remote::protocol::WireEntry;
+use crate::remote::protocol::{
+    WireEntry, WireOpticalDrive, WireRetryConfig, WireSectorMode, WireToc,
+};
 
 /// One live daemon connection, brokering many open-image handles on a single
 /// [`RemoteSession`].
@@ -157,6 +159,44 @@ impl RemoteConnection {
     /// Close an open block handle on the daemon.
     pub fn close_block(&mut self, handle: u64) -> Result<()> {
         self.session.close_block(handle)
+    }
+
+    // --- optical tier (Family O): drive a remote CD/DVD for ripping ---------
+
+    /// List the daemon machine's physical optical drives.
+    pub fn list_optical_drives(&mut self) -> Result<Vec<WireOpticalDrive>> {
+        self.session.list_optical_drives()
+    }
+
+    /// Open one of the daemon's optical drives for ripping; returns the handle.
+    pub fn open_optical(&mut self, path: &str, retry: WireRetryConfig) -> Result<u64> {
+        self.session.open_optical(path, retry)
+    }
+
+    /// Read the open disc's table of contents.
+    pub fn read_toc(&mut self, handle: u64) -> Result<WireToc> {
+        self.session.read_toc(handle)
+    }
+
+    /// Read `count` sectors from `lba` in `mode`; returns the raw sector bytes.
+    pub fn read_optical_sectors(
+        &mut self,
+        handle: u64,
+        lba: u32,
+        count: u32,
+        mode: WireSectorMode,
+    ) -> Result<Vec<u8>> {
+        self.session.read_optical_sectors(handle, lba, count, mode)
+    }
+
+    /// Eject the disc from the open optical drive.
+    pub fn eject_optical(&mut self, handle: u64) -> Result<()> {
+        self.session.eject_optical(handle)
+    }
+
+    /// Close an open optical handle, freeing the drive for the next session.
+    pub fn close_optical(&mut self, handle: u64) -> Result<()> {
+        self.session.close_optical(handle)
     }
 
     /// How many open-image handles this connection currently holds (diagnostics

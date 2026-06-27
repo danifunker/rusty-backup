@@ -23,7 +23,7 @@ use crate::backup::LogMessage;
 use crate::cli::logging::log_stderr;
 use crate::optical::{
     convert::{bincue_to_iso, chd_to_bincue, chd_to_iso, iso_to_bincue, to_chd, ConvertProgress},
-    rip::{run_rip, RipConfig, RipFormat, RipProgress},
+    rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
 };
 use crate::partition::format_size;
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
@@ -92,7 +92,10 @@ impl From<RipFmt> for RipFormat {
 
 #[derive(Debug, Args)]
 pub struct RipArgs {
-    /// Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`.
+    /// Source drive: a local path (e.g. `/dev/sr0`, `disk6`, `\\.\E:`) or a
+    /// remote daemon's drive as `rb://host:port/dev/sr0` (the daemon issues the
+    /// SCSI reads; this side does the encoding). `rb-cli optical drives` lists
+    /// local drives.
     #[arg(long)]
     pub device: PathBuf,
 
@@ -116,7 +119,7 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
         args.format
     ));
     let config = RipConfig {
-        device_path: args.device,
+        device: OpticalTarget::resolve(&args.device.to_string_lossy())?,
         output_path: args.output,
         format: args.format.into(),
         eject_after: args.eject,

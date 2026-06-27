@@ -272,16 +272,21 @@ P1.1 (the local refactor) is independent and can land first on its own.
   advertises `CAP_FAMILY_O` under `optical`. Builds clean in optical /
   remote-only configs. *Requires the elevated daemon (root) to open `/dev/sr0`
   `O_RDWR`.*
-- [ ] **P1.5 — client methods.** `RemoteSession::{list_optical_drives,
+- [x] **P1.5 — client methods.** *(done 2026-06-27)* `RemoteSession::{list_optical_drives,
   open_optical, read_toc, read_optical_sectors, eject_optical, close_optical}`
-  in `client.rs`.
-- [ ] **P1.6 — `RemoteCdReader`.** Implements `OpticalSource` over the client
-  (handle lifecycle + `Drop` closes the daemon handle; retry sent at open).
-- [ ] **P1.7 — wire it up.** Introduce `OpticalTarget` (`Local` |
-  `Remote{conn, device_path}`, the `Remote` arm `#[cfg(feature = "remote")]`),
-  switch `RipConfig.device_path` → `RipConfig.device`, and branch
-  `open_optical_source` on it; `--format iso` and `--format bincue` work
-  end-to-end over a connection.
+  in `client.rs` (return the Wire DTOs, so no `optical` gate), delegated through
+  `RemoteConnection` in `connection.rs`.
+- [x] **P1.6 — `RemoteCdReader`.** *(done 2026-06-27)* `source.rs` (gated
+  `remote`) implements `OpticalSource` over an `Arc<Mutex<RemoteConnection>>`;
+  retry sent at open, `Drop` calls `close_optical` to free the daemon's slot.
+- [x] **P1.7 — wire it up.** *(done 2026-06-27)* `OpticalTarget` (`Local` |
+  `Remote{conn, device_path}`, `Remote` arm `#[cfg(feature = "remote")]`) with a
+  manual `Debug` (hides the conn) + `resolve()` that parses an
+  `rb://host:port/dev/sr0` device arg into a remote connection; `RipConfig.device`
+  replaces `device_path`; `open_optical_source` branches Local/Remote. CLI
+  `optical rip --device rb://…` works (pulled the CLI URL-parse forward from
+  P3.3); GUI/CLI local call sites build `OpticalTarget::Local`. Builds clean in
+  optical+remote / optical-only / default(GUI); 14 optical unit tests green.
 - [ ] **P1.8 — validate.** Desktop ↔ a daemon on a Linux box (or loopback) with
   a real drive: ISO + BIN/CUE rip byte-identical to a local rip of the same
   disc; TOC matches.

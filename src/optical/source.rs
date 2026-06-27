@@ -72,6 +72,79 @@ impl OpticalSource for LocalCdReader {
     }
 }
 
+/// [`OpticalSource`] that proxies every drive op to a remote daemon over an open
+/// [`crate::remote::connection::RemoteConnection`]. The daemon owns the physical
+/// drive and runs the retry/backoff loop; this side only requests the TOC +
+/// sector ranges and does all the encoding. See `docs/remote_ripping.md`.
+#[cfg(feature = "remote")]
+mod remote_source {
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    use anyhow::{anyhow, Context, Result};
+    use cd_da_reader::{RetryConfig, SectorReadMode, Toc};
+
+    use super::OpticalSource;
+    use crate::remote::connection::RemoteConnection;
+    use crate::remote::protocol::{WireRetryConfig, WireSectorMode};
+
+    pub struct RemoteCdReader {
+        conn: Arc<Mutex<RemoteConnection>>,
+        handle: u64,
+    }
+
+    impl RemoteCdReader {
+        /// Open `device_path` on the daemon behind `conn`. `retry` is sent to the
+        /// daemon and applied there (next to the drive).
+        pub fn open(
+            conn: Arc<Mutex<RemoteConnection>>,
+            device_path: &str,
+            retry: RetryConfig,
+        ) -> Result<Self> {
+            let handle = conn
+                .lock()
+                .map_err(|_| anyhow!("remote connection lock poisoned"))?
+                .open_optical(device_path, WireRetryConfig::from(&retry))
+                .with_context(|| format!("opening remote optical drive {device_path}"))?;
+            Ok(Self { conn, handle })
+        }
+
+        fn lock(&self) -> Result<MutexGuard<'_, RemoteConnection>> {
+            self.conn
+                .lock()
+                .map_err(|_| anyhow!("remote connection lock poisoned"))
+        }
+    }
+
+    impl OpticalSource for RemoteCdReader {
+        fn read_toc(&self) -> Result<Toc> {
+            let wire = self.lock()?.read_toc(self.handle)?;
+            Ok(Toc::from(&wire))
+        }
+
+        fn read_data_sectors(&self, lba: u32, count: u32, mode: SectorReadMode) -> Result<Vec<u8>> {
+            self.lock()?
+                .read_optical_sectors(self.handle, lba, count, WireSectorMode::from(mode))
+        }
+
+        fn eject(&self) -> Result<()> {
+            self.lock()?.eject_optical(self.handle)
+        }
+    }
+
+    impl Drop for RemoteCdReader {
+        fn drop(&mut self) {
+            // Best-effort: free the daemon's optical slot. Ignore errors — the
+            // socket may be gone, and the daemon reaps the session on disconnect.
+            if let Ok(mut conn) = self.conn.lock() {
+                let _ = conn.close_optical(self.handle);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
+pub use remote_source::RemoteCdReader;
+
 /// Eject the disc from the drive at `path` (OS-specific shell-out).
 fn eject_disc(path: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
