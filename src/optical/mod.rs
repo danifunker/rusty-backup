@@ -4,6 +4,8 @@
 pub mod browse_view;
 pub mod convert;
 pub mod rip;
+pub mod source;
 
 pub use convert::ConvertProgress;
 pub use rip::{run_rip, RipConfig, RipFormat, RipProgress};
+pub use source::{LocalCdReader, OpticalSource};
