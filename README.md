@@ -145,6 +145,12 @@ What's in the MiSTer build:
   `optical rip --device /dev/sr0 --format iso|bincue`), plus `optical
   convert` (ISO ↔ BIN/CUE ↔ CD-CHD) and `optical browse` / `extract`. For
   devices with a CD/DVD drive such as the SuperStation One.
+- **Remote ripping off-device:** run `rb-daemon` here and drive this drive
+  from the desktop app / CLI — the device only issues SCSI reads while the
+  desktop does the heavy CHD encoding, so the armv7 CPU isn't taxed.
+  `optical rip --device rb://this-device:7341/dev/sr0`, or the desktop
+  Optical tab's "Add remote daemon..." button. See
+  [`docs/remote_ripping.md`](docs/remote_ripping.md).
 
 What's excluded:
 - GUI windows and the update-checker self-replace UI (only meaningful

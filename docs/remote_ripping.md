@@ -297,11 +297,15 @@ P1.1 (the local refactor) is independent and can land first on its own.
   networked box.
 
 ### Phase 2 — CHD compression on the desktop
-- [ ] **P2.1 — remote → CHD.** Feed `RemoteCdReader` through the existing
-  `rip_to_chd_worker` (temp `.bin`/`.cue` materialized locally, `convert::to_chd`
-  runs on the desktop). No protocol change.
-- [ ] **P2.2 — validate.** Remote-ripped CD-CHD opens in `chdman info` and loads
-  in MAME; the MiSTer CPU stays idle during compression (spot-check `top`).
+- [x] **P2.1 — remote → CHD.** *(done 2026-06-27 with P3.2)* `rip_to_chd_worker`
+  takes an `OpticalTarget`, so a remote rip → local temp `.bin`/`.cue` →
+  `convert::to_chd` runs entirely on the desktop. No protocol change — the encode
+  was always caller-side, so a remote source "just works". Reachable from the GUI
+  (CHD output + a remote drive) and the CLI two-step (`optical rip --device
+  rb://… --format bincue` then `optical convert disc.cue disc.chd`).
+- [~] **P2.2 — validate.** Needs hardware: confirm a remote-ripped CD-CHD opens
+  in `chdman info` / loads in MAME and the device CPU stays idle during
+  compression (spot-check `top`). User's device.
 
 ### Phase 3 — unified device picker + CLI parity
 - [x] **P3.1 — picker core.** *(done 2026-06-27)* `src/model/optical_devices.rs`:
@@ -333,11 +337,16 @@ P1.1 (the local refactor) is independent and can land first on its own.
   they reappear across sessions. Not blocking; pick up if desired.
 
 ### Done criteria (cross-cutting)
-- [ ] README "Inspect/optical" + `docs/full_MiSTer_support_status.md` note remote
-  ripping (per the CLAUDE.md doc-sync rule).
-- [ ] CLI/GUI parity confirmed (same drives, same formats, both surfaces).
-- [ ] `DISK_IMAGE_EXTS` / picker filters unaffected (no new container types) —
-  confirm nothing to update.
+- [x] **README + `docs/full_MiSTer_support_status.md` note remote ripping.**
+  *(done 2026-06-27)* README MiSTer build list gained a "Remote ripping
+  off-device" bullet; the support-status intro gained a "Remote optical ripping"
+  capability line.
+- [x] **CLI/GUI parity.** Both surfaces list local + remote drives and rip
+  iso/bincue/chd from either; remote addressed identically (`rb://…` device arg
+  vs the GUI's "Add remote daemon").
+- [x] **`DISK_IMAGE_EXTS` / picker filters unaffected.** Remote ripping adds no
+  new container/file types (it reuses the optical formats), so nothing to update
+  there.
 
 > When actively working a phase, mirror its open items into the session task
 > list (`TaskCreate`) for in-flight tracking; this doc stays the durable record.

@@ -46,6 +46,12 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   images. Built into the desktop release and — as of opticaldiscs 0.4.5 — the
   MiSTer `rb-cli-mini` armv7 build, for devices with an attached drive (e.g.
   the SuperStation One).
+- **Remote optical ripping:** the desktop app / CLI can drive a *remote*
+  daemon's optical drive over the rb-daemon — the device (e.g. a MiSTer) only
+  issues SCSI reads while the desktop does all the encoding (CHD compression
+  never taxes the armv7 CPU). `optical drives --remote host:port` to discover;
+  `optical rip --device rb://host:port/dev/sr0`, or the GUI Optical tab's
+  "Add remote daemon..." button. See `docs/remote_ripping.md`.
 
 Legend for the **Support** column:
 
