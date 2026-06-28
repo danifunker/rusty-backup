@@ -16,7 +16,7 @@ use super::super::hfs::{
     mac_roman_to_utf8, HfsExtDescriptor, HfsMasterDirectoryBlock, CATALOG_DIR, CATALOG_FILE,
 };
 use super::super::hfs_common::{btree_record_range, BTreeHeader};
-use super::mdb::validate_hfs_name;
+use super::mdb::{unusual_hfs_name, validate_hfs_name};
 use super::{hfs_issue, HfsFsckCode, CATALOG_DIR_THREAD, CATALOG_FILE_THREAD};
 
 /// Parsed catalog key for consistency checking.
@@ -205,6 +205,11 @@ pub(super) fn check_catalog_consistency(
                             HfsFsckCode::InvalidCatalogName,
                             format!("directory CNID {}: {}", dir_id, problem),
                         ));
+                    } else if let Some(note) = unusual_hfs_name(&key.name) {
+                        warnings.push(hfs_issue(
+                            HfsFsckCode::UnusualCatalogName,
+                            format!("directory CNID {}: {}", dir_id, note),
+                        ));
                     }
                 }
                 *directories_checked += 1;
@@ -239,6 +244,11 @@ pub(super) fn check_catalog_consistency(
                     errors.push(hfs_issue(
                         HfsFsckCode::InvalidCatalogName,
                         format!("file CNID {}: {}", file_id, problem),
+                    ));
+                } else if let Some(note) = unusual_hfs_name(&key.name) {
+                    warnings.push(hfs_issue(
+                        HfsFsckCode::UnusualCatalogName,
+                        format!("file CNID {}: {}", file_id, note),
                     ));
                 }
                 // Gap 1: LEOF > PEOF — logical size must not exceed physical size

@@ -12,8 +12,14 @@ use super::super::fsck::FsckIssue;
 use super::super::hfs::HfsMasterDirectoryBlock;
 use super::{hfs_issue, HfsFsckCode};
 
-/// Validate an HFS catalog name (Mac Roman bytes).
-/// Returns `Some(problem)` if invalid, `None` if ok.
+/// Validate an HFS catalog name (Mac Roman bytes) for *structural* validity.
+///
+/// Returns `Some(problem)` only for genuinely invalid names: empty, longer than
+/// the 31-byte HFS limit, or containing a colon (0x3A, the path separator that
+/// classic Mac OS forbids). Null and other control bytes are deliberately NOT
+/// rejected — classic HFS permits any byte except the colon, and real disks
+/// carry such names (a leading null forces a file to the top of the sort, an
+/// old Finder trick). Those surface separately via [`unusual_hfs_name`].
 pub(super) fn validate_hfs_name(name: &[u8]) -> Option<String> {
     if name.is_empty() {
         return Some("name is empty".into());
@@ -24,11 +30,19 @@ pub(super) fn validate_hfs_name(name: &[u8]) -> Option<String> {
             name.len()
         ));
     }
-    if name.contains(&0x00) {
-        return Some("name contains null byte".into());
-    }
     if name.contains(&0x3A) {
         return Some("name contains colon (HFS path separator)".into());
+    }
+    None
+}
+
+/// A structurally-valid catalog name that is unusual enough to surface as a
+/// *warning* (not an error). Returns `Some(note)` when the name embeds a null
+/// byte — valid on classic HFS, but worth flagging since most tooling assumes
+/// C-string names.
+pub(super) fn unusual_hfs_name(name: &[u8]) -> Option<String> {
+    if name.contains(&0x00) {
+        return Some("name contains a null byte (valid on classic HFS, but unusual)".into());
     }
     None
 }

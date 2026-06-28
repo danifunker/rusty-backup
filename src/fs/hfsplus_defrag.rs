@@ -417,7 +417,6 @@ fn allocate_fork(
 
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
-use unicode_normalization::UnicodeNormalization;
 
 use super::filesystem::FilesystemError;
 use super::hfs_common;
@@ -1561,8 +1560,7 @@ fn build_file_body(
 
 /// Build a thread record (`type(2)+reserved(2)+parentID(4)+name`).
 fn build_thread_record(record_type: i16, parent_cnid: u32, name: &str) -> Vec<u8> {
-    let nfd: String = name.nfd().collect();
-    let utf16: Vec<u16> = nfd.encode_utf16().collect();
+    let utf16: Vec<u16> = crate::fs::hfs_unicode::decompose_str(name);
     let mut rec = Vec::with_capacity(10 + utf16.len() * 2);
     let mut b2 = [0u8; 2];
     let mut b4 = [0u8; 4];

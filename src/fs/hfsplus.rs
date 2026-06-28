@@ -2,7 +2,6 @@ use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
-use unicode_normalization::UnicodeNormalization;
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
@@ -374,8 +373,7 @@ fn validate_hfsplus_create_name(name: &str) -> Result<(), FilesystemError> {
                 .into(),
         ));
     }
-    let nfd: String = name.nfd().collect();
-    let utf16_len = nfd.encode_utf16().count();
+    let utf16_len = super::hfs_unicode::decompose_str(name).len();
     if utf16_len > 255 {
         return Err(FilesystemError::InvalidData(format!(
             "filename is too long ({utf16_len} UTF-16 units); HFS+ allows up to 255 — \
@@ -1666,8 +1664,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     /// Build HFS+ catalog key bytes: key_len(2) + parent_id(4) + name_length(2) + name(UTF-16BE NFD).
     pub(crate) fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let key_len = 4 + 2 + utf16.len() * 2;
         let mut key = Vec::with_capacity(2 + key_len);
         let mut buf = [0u8; 2];
@@ -2139,8 +2136,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// Caller is expected to have already NFD-normalized `name` if needed; we
     /// re-normalize defensively so on-disk keys stay canonical.
     pub(crate) fn build_inline_attr_record(cnid: u32, name: &str, value: &[u8]) -> Vec<u8> {
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let key_body_len = 12 + utf16.len() * 2;
         let data_section_len = 4 + 8 + 4 + value.len();
         let mut rec = vec![0u8; 2 + key_body_len + data_section_len];
@@ -2287,10 +2283,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         if node_size == 0 {
             return Ok(0);
         }
-        let target_utf16: Option<Vec<u16>> = name.map(|n| {
-            let nfd: String = n.nfd().collect();
-            nfd.encode_utf16().collect()
-        });
+        let target_utf16: Option<Vec<u16>> = name.map(super::hfs_unicode::decompose_str);
 
         let mut victims: Vec<(u32, usize)> = Vec::new();
         hfs_common::walk_leaf_records::<(), _>(
@@ -2704,8 +2697,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         // Let me re-read: Thread key: key_len(2) + parent_id(4, =CNID) + name_len(2, =0)
 
         // Record data: type(2) + reserved(2) + parentID(4) + name_len(2) + name(UTF-16BE)
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let mut rec = Vec::with_capacity(10 + utf16.len() * 2);
         let mut buf2 = [0u8; 2];
         let mut buf4 = [0u8; 4];
@@ -5246,8 +5238,7 @@ fn build_blank_hfsplus_front(
     }
 
     // --- Catalog B-tree (header + leaf with root + thread) ---
-    let nfd_name: String = name.nfd().collect();
-    let name_utf16: Vec<u16> = nfd_name.encode_utf16().collect();
+    let name_utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
     {
         let off = catalog_start as usize * block_size as usize;
         let key_compare = if case_sensitive {

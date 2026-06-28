@@ -315,6 +315,23 @@ pub enum ResourceForkSource {
 /// to flush changes to disk. This enables batching multiple edits into a single atomic
 /// write.
 pub trait EditableFilesystem: Filesystem {
+    /// Enter "bulk" editing mode for a batch of operations whose atomicity the
+    /// *caller* guarantees as a whole (e.g. an importer that discards every
+    /// change if any single op fails). Implementations may use this to skip
+    /// per-operation rollback bookkeeping — for filesystems that snapshot the
+    /// whole metadata on each edit (classic HFS clones its multi-megabyte
+    /// catalog per `create_file`), that bookkeeping dominates a large import.
+    ///
+    /// Contract: while in bulk mode a *failed* edit may leave in-memory state
+    /// inconsistent, so the caller MUST abandon the volume (not sync/commit) on
+    /// any error. Always pair with [`end_bulk`](Self::end_bulk). The default is
+    /// a no-op, so filesystems whose edits are already cheap need do nothing.
+    fn begin_bulk(&mut self) {}
+
+    /// Leave bulk editing mode (see [`begin_bulk`](Self::begin_bulk)). Default
+    /// is a no-op.
+    fn end_bulk(&mut self) {}
+
     /// Create a file in the given parent directory.
     ///
     /// `data` is a reader providing the file contents; `data_len` is the total size.

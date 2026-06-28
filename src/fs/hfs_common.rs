@@ -7,7 +7,6 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::sync::OnceLock;
-use unicode_normalization::UnicodeNormalization;
 
 use super::filesystem::FilesystemError;
 
@@ -368,43 +367,26 @@ pub fn decode_ostype(code: &[u8; 4]) -> String {
 // B-tree key comparison
 // ---------------------------------------------------------------------------
 
-/// Code points that Apple's `FastUnicodeCompare` treats as **ignorable**
-/// during case-folded comparison — they're skipped entirely, as if absent.
-///
-/// Source: Apple's `FastUnicodeCompare.c` `gLowerCaseTable`. The table
-/// maps zero-width / format / variation-selector ranges to 0x0000 (the
-/// algorithm's "skip" sentinel). Latin-letter casing is covered by
-/// `char::to_uppercase` below.
-///
-/// **Note**: U+0000 (NUL) is NOT in this list. Apple's table maps NUL to
-/// 0xFFFF — i.e. NUL is the highest-sorting character, not ignorable.
-/// That's how the on-disk `"\0\0\0\0HFS+ Private Data"` directory ends
-/// up sorting *last* among its parent's children rather than first.
-/// `fold_hfsplus_name_for_compare` rewrites NUL → U+FFFF before the
-/// final uppercase pass to match.
-fn is_hfsplus_ignored(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x00AD
-            | 0x034F
-            | 0x070F
-            | 0x180B..=0x180E
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x206A..=0x206F
-            | 0xFE00..=0xFE0F
-            | 0xFEFF
-    )
-}
-
-fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<char> {
-    let s = String::from_utf16_lossy(name);
-    let nfd: String = s.nfd().collect();
-    nfd.chars()
-        .filter(|c| !is_hfsplus_ignored(*c))
-        .map(|c| if c == '\0' { '\u{FFFF}' } else { c })
-        .flat_map(|c| c.to_uppercase())
-        .collect()
+/// Normalize an HFS+ catalog name into Apple's `FastUnicodeCompare` form:
+/// canonically decompose each UTF-16 unit (Apple's TN1150 decomposition, NOT
+/// Rust NFD — the two differ in the ranges Apple excludes), then case-fold each
+/// resulting unit through Apple's table, dropping units that fold to 0
+/// (Apple's "ignored" set: zero-width / format / variation selectors). NUL
+/// folds to 0xFFFF, so a leading-NUL name like the `HFS+ Private Data`
+/// directory sorts *last*. Comparing the folded `u16` sequences lexicographically
+/// reproduces a real Mac OS volume's ordering exactly (see [`hfs_unicode`]).
+fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(name.len());
+    let mut buf = [0u16; 3];
+    for &unit in name {
+        for &d in super::hfs_unicode::decompose(unit, &mut buf) {
+            let folded = super::hfs_unicode::case_fold(d);
+            if folded != 0 {
+                out.push(folded);
+            }
+        }
+    }
+    out
 }
 
 /// Compare two HFS+ catalog keys (case-insensitive by default).
@@ -435,35 +417,51 @@ pub fn compare_hfsplus_keys(
     folded_a.cmp(&folded_b)
 }
 
-#[allow(dead_code)]
-/// Mac Roman case-insensitive uppercase table (bytes 0x00-0xFF).
-/// Characters that have uppercase equivalents are mapped; all others map to themselves.
-static MAC_ROMAN_UPPER: [u8; 256] = {
-    let mut table = [0u8; 256];
-    let mut i = 0u16;
-    while i < 256 {
-        table[i as usize] = i as u8;
-        i += 1;
-    }
-    // ASCII lowercase → uppercase
-    let mut c = b'a';
-    while c <= b'z' {
-        table[c as usize] = c - 32;
-        c += 1;
-    }
-    // Mac Roman specific mappings (lowercase → uppercase)
-    table[0x87] = 0x83; // á → É? No: 0x87=á, uppercase is 0xE7=Á... Let me use the standard HFS approach
-                        // HFS uses a simpler approach: the Finder's case folding table.
-                        // For correctness, we uppercase ASCII and leave high bytes as-is for comparison.
-                        // The HFS spec defines a specific case-folding table, but for practical purposes
-                        // the critical case is ASCII letters. High-byte Mac Roman diacritics are compared as-is.
-    table
-};
-
-#[allow(dead_code)]
-/// Compare two HFS (classic) catalog keys (case-insensitive Mac Roman).
+/// Mac Roman catalog-name collation order (byte -> sort rank), as used by
+/// classic Mac OS HFS.
 ///
-/// Keys are: parent_cnid (u32) + name (Mac Roman bytes).
+/// Classic HFS compares catalog names with the File Manager's `_RelString`
+/// trap (`CMKeyCmp` in Apple's source: `OS/HFS/CMMAINT.a`), i.e. the system
+/// string comparison — **case-insensitive, diacritical-sensitive**, with a
+/// specific Mac Roman ordering. This is NOT a plain ASCII uppercase: lowercase
+/// folds onto its uppercase *rank*, accented letters sort right after their
+/// base letter (so "Bézier" < "Bind"), and punctuation / quotes / spaces
+/// (incl. high-byte curly quotes 0xD2-0xD5, en/em dashes, and the non-breaking
+/// space 0xCA, which sorts as a space) get their own early ranks rather than
+/// landing after 'Z' by raw byte value.
+///
+/// The table is the well-known `hfs_charorder` reproduction (hfsutils
+/// `libhfs/data.c`); the Linux kernel's `caseorder` (`fs/hfs/string.c`) is a
+/// second, independent copy — they use different absolute values but induce an
+/// identical ordering, and this table reproduces real Apple-formatted volumes
+/// fsck-clean (verified against a MacPack boot disk). The previous table only
+/// folded ASCII and left high bytes raw, which mis-sorted any name with an
+/// accent or curly quote.
+static HFS_CHARORDER: [u8; 256] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x22, 0x23, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+    0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+    0x47, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
+    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaa, 0xab, 0xac, 0xad, 0xae,
+    0x54, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
+    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3,
+    0x4c, 0x50, 0x5c, 0x62, 0x7d, 0x81, 0x9a, 0x55, 0x4a, 0x56, 0x4c, 0x4e, 0x50, 0x5c, 0x62, 0x64,
+    0x65, 0x66, 0x6f, 0x70, 0x71, 0x72, 0x7d, 0x89, 0x8a, 0x8b, 0x81, 0x83, 0x9c, 0x9d, 0x9e, 0x9a,
+    0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0x95, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0x52, 0x85,
+    0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0x57, 0x8c, 0xcc, 0x52, 0x85,
+    0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0x26, 0x27, 0xd4, 0x20, 0x4a, 0x4e, 0x83, 0x87, 0x87,
+    0xd5, 0xd6, 0x24, 0x25, 0x2d, 0x2e, 0xd7, 0xd8, 0xa7, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+];
+
+/// Compare two HFS (classic) catalog keys the way the Mac OS File Manager does.
+///
+/// Keys are: parent_cnid (u32) + name (Mac Roman bytes). Parent IDs compare
+/// numerically; names compare through [`HFS_CHARORDER`] byte-by-byte, with the
+/// shorter name sorting first on a common prefix (matching hfsutils
+/// `d_relstring` / the Linux kernel `hfs_strcmp`).
 pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u8]) -> Ordering {
     match parent_a.cmp(&parent_b) {
         Ordering::Equal => {}
@@ -471,8 +469,8 @@ pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u
     }
     let len = name_a.len().min(name_b.len());
     for i in 0..len {
-        let a = MAC_ROMAN_UPPER[name_a[i] as usize];
-        let b = MAC_ROMAN_UPPER[name_b[i] as usize];
+        let a = HFS_CHARORDER[name_a[i] as usize];
+        let b = HFS_CHARORDER[name_b[i] as usize];
         match a.cmp(&b) {
             Ordering::Equal => {}
             other => return other,
@@ -1083,48 +1081,83 @@ where
     }
     records.insert(insert_pos, new_record.to_vec());
 
-    // Greedy partition by bytes. Per-node usage: 14 (descriptor) + sum(rec_lens)
-    // + 2 * count + 2 (free pointer). Single record larger than node payload
-    // is a structural impossibility (HFS+ catalog key+record max is well under
-    // node_size); reject up front rather than loop forever.
+    // Per-node usage: 14 (descriptor) + sum(rec_lens) + 2 * count + 2 (free
+    // pointer); `payload` accounts for the fixed overhead. A single record
+    // larger than the payload is a structural impossibility (HFS/HFS+ key+record
+    // max is well under node_size) — reject up front rather than loop forever.
     let payload = node_size.saturating_sub(16);
-    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut cur: Vec<Vec<u8>> = Vec::new();
-    let mut cur_bytes: usize = 0;
-    for rec in records.into_iter() {
-        let cost = rec.len() + 2;
-        if cost > payload {
+    for rec in &records {
+        if rec.len() + 2 > payload {
             return Err(FilesystemError::InvalidData(format!(
                 "btree_split_leaf_with_insert: record of {} bytes exceeds node payload {}",
                 rec.len(),
                 payload
             )));
         }
-        if cur_bytes + cost > payload {
-            chunks.push(std::mem::take(&mut cur));
+    }
+
+    // Greedy "pack-left-full" partition by bytes. `cuts` holds the record index
+    // at which each chunk after the first begins (chunk count = cuts.len() + 1).
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut cur_bytes: usize = 0;
+    for (i, rec) in records.iter().enumerate() {
+        let cost = rec.len() + 2;
+        if i > 0 && cur_bytes + cost > payload {
+            cuts.push(i);
             cur_bytes = 0;
         }
         cur_bytes += cost;
-        cur.push(rec);
     }
-    if !cur.is_empty() {
-        chunks.push(cur);
+    // Caller's contract: "I tried inserting and it failed, allocate me a new
+    // node." `btree_insert_record`'s free-space check is 2 bytes more
+    // conservative than the actual packing limit, so the merged set can fit a
+    // single node by 1–2 bytes. We still must produce ≥ 1 new node — force a
+    // 2-way split at the midpoint when greedy yielded a single chunk.
+    if cuts.is_empty() {
+        cuts.push(
+            (records.len() / 2)
+                .max(1)
+                .min(records.len().saturating_sub(1)),
+        );
     }
-    // Caller's contract: "I tried inserting and it failed, allocate me a
-    // new node." `btree_insert_record`'s free-space check is 2 bytes more
-    // conservative than the actual packing limit (it deducts the new
-    // offset slot from `free` AND adds it to `total_needed`), so the
-    // merged record set can occasionally fit in a single node by 1–2
-    // bytes. We still must produce ≥ 1 new node here — force a midpoint
-    // 2-way split if the greedy packer collapsed everything into one
-    // chunk. Both halves trivially fit since the whole set fits a node.
-    if chunks.len() < 2 {
-        let mut all = chunks.pop().unwrap_or_default();
-        let mid = all.len() / 2;
-        let right = all.split_off(mid.max(1));
-        chunks.push(all);
-        chunks.push(right);
+
+    // Density tuning. Greedy pack-left is ideal for *sequential* (append)
+    // inserts — the left node stays full — but for a *random* insert into the
+    // middle of a full leaf it splits off only the overflow (often a single
+    // record), leaving a trail of ~1-record leaves; a catalog built that way
+    // runs ~2x larger than Mac OS writes. When the new record landed in the
+    // middle and the whole set fits two nodes, re-split at the most balanced
+    // *valid* point instead, so both leaves keep room to fill (random inserts
+    // then converge to ~69% full, matching a real Mac volume). Sequential growth
+    // keeps the dense greedy path.
+    let is_append = insert_pos == old_num;
+    if cuts.len() == 1 && !is_append {
+        let total: usize = records.iter().map(|r| r.len() + 2).sum();
+        let mut prefix = 0usize;
+        let mut best_k = cuts[0];
+        let mut best_diff = usize::MAX;
+        for k in 1..records.len() {
+            prefix += records[k - 1].len() + 2;
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_k = k;
+                }
+            }
+        }
+        cuts[0] = best_k;
     }
+
+    // Materialize chunks by draining `records` at the cut points (front to back).
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cuts.len() + 1);
+    let mut prev = 0usize;
+    for &cut in &cuts {
+        chunks.push(records.drain(0..cut - prev).collect());
+        prev = cut;
+    }
+    chunks.push(records);
 
     // Allocate new nodes (one per extra chunk beyond the first, which reuses old_idx).
     let new_count = chunks.len() - 1;
@@ -1363,6 +1396,24 @@ fn split_index_node(
         let fpos = node_size - 2 * (count + 1);
         BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
         BigEndian::write_u16(&mut node[10..12], count as u16);
+    }
+
+    // Splice the new node into this level's fLink/bLink sibling chain:
+    //   node_idx <-> new_idx <-> old_next
+    // An HFS B-tree keeps every level as a doubly-linked node list (Inside
+    // Macintosh: Files), and rusty-backup's catalog fsck verifies it. Leaving
+    // these links unset is what produced the IndexSiblingLinkBroken failures
+    // once the catalog grew an index level. `init_node` zeroed new_idx's
+    // descriptor, and the record rebuilds above only touch the record area, so
+    // node_idx's descriptor still holds its original forward sibling here.
+    let old_next = BigEndian::read_u32(&catalog_data[old_offset..old_offset + 4]);
+    BigEndian::write_u32(&mut catalog_data[old_offset..old_offset + 4], new_idx); // node_idx.fLink = new
+    BigEndian::write_u32(&mut catalog_data[new_offset + 4..new_offset + 8], node_idx); // new.bLink = node_idx
+    BigEndian::write_u32(&mut catalog_data[new_offset..new_offset + 4], old_next); // new.fLink = old_next
+    if old_next != 0 {
+        let next_off = old_next as usize * node_size;
+        BigEndian::write_u32(&mut catalog_data[next_off + 4..next_off + 8], new_idx);
+        // old_next.bLink = new
     }
 
     // The separator key is just the key portion (key_len byte + key data) of the
@@ -1921,6 +1972,57 @@ mod tests {
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
     }
 
+    /// HFS+ case-folds to LOWERCASE (Apple `FastUnicodeCompare` / TN1150), so a
+    /// character between the uppercase and lowercase ASCII blocks — notably the
+    /// underscore `_` (0x5F) — sorts BEFORE letters, not after the uppercased
+    /// ones. These exact pairs come from a real Mac OS 9.2.2 HFS+ volume that
+    /// the previous uppercase fold flagged as `KeyOutOfOrder`.
+    #[test]
+    fn test_compare_hfsplus_keys_underscore_collation() {
+        let k = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        for (a, b) in [
+            ("as_OpenURL", "asVers.htm"),
+            ("wr_single_pixel.gif", "wrApp.gif"),
+            ("high_priority.gif", "highest_priority.gif"),
+            ("not_valid.gif", "note.gif"),
+        ] {
+            assert_eq!(
+                compare_hfsplus_keys(2, &k(a), 2, &k(b), false),
+                Ordering::Less,
+                "{a:?} must sort before {b:?} (lowercase fold)"
+            );
+        }
+        // Still case-insensitive.
+        assert_eq!(
+            compare_hfsplus_keys(2, &k("README"), 2, &k("readme"), false),
+            Ordering::Equal
+        );
+    }
+
+    /// Apple's TN1150 tables differ from Rust's `to_lowercase` + NFD on exotic
+    /// code points; these cases pin the table-faithful behavior.
+    #[test]
+    fn test_hfsplus_unicode_tables_match_apple() {
+        use super::super::hfs_unicode::decompose_str;
+        let k = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+
+        // ß (0xDF) folds 1:1 — it is NOT expanded to "ss" (as `to_uppercase`
+        // would), so "straße" and "strasse" are different names.
+        assert_ne!(
+            compare_hfsplus_keys(2, &k("stra\u{df}e"), 2, &k("strasse"), false),
+            Ordering::Equal
+        );
+
+        // Apple does NOT decompose the OHM sign U+2126 (TN1150 excludes
+        // U+2000..U+2FFF), unlike Unicode NFD which maps it to Greek capital
+        // Omega U+03A9.
+        assert_eq!(decompose_str("\u{2126}"), vec![0x2126]);
+        // It DOES canonically decompose precomposed Latin and Hangul.
+        assert_eq!(decompose_str("\u{e9}"), vec![0x0065, 0x0301]); // é
+        assert_eq!(decompose_str("\u{ac00}"), vec![0x1100, 0x1161]); // 가
+        assert_eq!(decompose_str("\u{d4db}"), vec![0x1111, 0x1171, 0x11b6]); // 3-jamo Hangul
+    }
+
     #[test]
     fn test_compare_hfsplus_keys_case_sensitive() {
         let a: Vec<u16> = "Hello".encode_utf16().collect();
@@ -1931,9 +2033,11 @@ mod tests {
 
     #[test]
     fn test_compare_hfsplus_keys_nfd() {
-        // é (U+00E9, precomposed) vs e + combining acute (U+0065 U+0301)
+        // é (U+00E9, precomposed) vs e + combining acute (U+0065 U+0301).
+        // Apple's decomposition folds the precomposed form to the decomposed
+        // one, so the two keys must compare equal.
         let a: Vec<u16> = "é".encode_utf16().collect();
-        let b: Vec<u16> = "é".nfd().collect::<String>().encode_utf16().collect();
+        let b: Vec<u16> = vec![0x0065, 0x0301];
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
     }
 
@@ -1993,6 +2097,34 @@ mod tests {
     fn test_compare_hfs_keys_case_insensitive() {
         assert_eq!(compare_hfs_keys(2, b"Hello", 2, b"hello"), Ordering::Equal);
         assert_eq!(compare_hfs_keys(2, b"abc", 2, b"ABD"), Ordering::Less);
+    }
+
+    /// Mac Roman collation must match classic Mac OS (`_RelString`), not raw
+    /// byte order — the cases below were lifted straight from a real
+    /// Apple-formatted MacPack disk that rusty-backup's old (ASCII-only) table
+    /// flagged as `KeysOutOfOrder`. é/â/ü etc. sort next to their base letter,
+    /// curly quotes / dashes / the non-breaking space sort as punctuation, and
+    /// the comparison stays case-insensitive but diacritical-sensitive.
+    #[test]
+    fn test_compare_hfs_keys_mac_roman_collation() {
+        // Accented letter sorts right after its base letter (é after e),
+        // so "Bézier" < "Bind" (é < i), not after 'Z' as a raw 0x8e would.
+        let bezier = b"B\x8ezier Text"; // 0x8e = é
+        assert_eq!(compare_hfs_keys(2, bezier, 2, b"Bind"), Ordering::Less);
+        // Leading curly double-quote (0xD2) sorts as punctuation, before 'E'.
+        let curly = b"\xd2Extension List\xd3 Docs";
+        assert_eq!(
+            compare_hfs_keys(2, curly, 2, b"Extension List 1.0.2"),
+            Ordering::Less
+        );
+        // Non-breaking space (0xCA) collates like a normal space, before 'b'.
+        let nbsp = b"\xcaRead Me\xca";
+        assert_eq!(compare_hfs_keys(2, nbsp, 2, b"bas.rl"), Ordering::Less);
+        // Diacritical-sensitive: base < accented < next base ('A' < 'Ä' < 'B').
+        assert_eq!(compare_hfs_keys(2, b"A", 2, b"\x80"), Ordering::Less); // 0x80 = Ä
+        assert_eq!(compare_hfs_keys(2, b"\x80", 2, b"B"), Ordering::Less);
+        // Case-insensitive across the high range too: Ä (0x80) == ä (0x8a).
+        assert_eq!(compare_hfs_keys(2, b"\x80", 2, b"\x8a"), Ordering::Equal);
     }
 
     #[test]

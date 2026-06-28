@@ -80,6 +80,11 @@ pub(super) enum HfsFsckCode {
     InvalidCnidRange,
     ReservedFieldNonZero,
     InvalidCatalogName,
+    /// Warning: a structurally valid name that is nonetheless unusual (e.g.
+    /// embeds null/control bytes). Classic Mac OS permits any byte except the
+    /// colon, and real disks carry such names (leading nulls to force sort
+    /// order), so this is informational, not an error.
+    UnusualCatalogName,
     ThreadNameNotEmpty,
     // Extents overflow B-tree structure
     ExtentsBtreeStructure,
@@ -108,6 +113,7 @@ fn is_repairable(code: HfsFsckCode) -> bool {
             | HfsFsckCode::LeoFExceedsPeoF
             | HfsFsckCode::InvalidCnidRange
             | HfsFsckCode::InvalidCatalogName
+            | HfsFsckCode::UnusualCatalogName
             | HfsFsckCode::OffsetTableNotMonotonic
             | HfsFsckCode::OffsetTableOutOfBounds
             | HfsFsckCode::MissingParent
