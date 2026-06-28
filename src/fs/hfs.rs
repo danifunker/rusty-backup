@@ -4711,9 +4711,10 @@ mod tests {
     /// fsck-clean. The greedy "pack-left-full" split used to split off only the
     /// overflow on a middle insert, leaving a trail of ~1-record leaves: a
     /// random import packed ~1.6 records/node, roughly half what classic Mac OS
-    /// writes (a real MacPack disk sits near 3.0). The append-aware balanced
-    /// split lifts that well above 2.0 while leaving sequential growth fully
-    /// packed (4 records/leaf).
+    /// writes (a real MacPack disk sits near 3.0). The B*-style sibling rotation
+    /// (redistribute into a neighbour before splitting, at both the leaf and the
+    /// index level) lifts random-order packing to ~3.0 records/node while
+    /// leaving sequential growth fully packed (4 records/leaf).
     #[test]
     fn test_hfs_random_insert_packs_densely_and_fsck_clean() {
         use super::hfs_common::BTreeHeader;
@@ -4755,13 +4756,13 @@ mod tests {
         fs.mdb.next_catalog_id = 16 + n;
         fs.update_parent_valence(root_id, count as i32).unwrap();
 
-        // Density: well above the ~1.6 the old split produced (and below the
-        // ~3.2 of a fully-packed sequential build).
+        // Density: well above the ~1.6 the old split produced, and now close to
+        // the ~3.2 of a fully-packed sequential build thanks to sibling rotation.
         let h = BTreeHeader::read(fs.catalog_data());
         let used = h.total_nodes - h.free_nodes;
         let rec_per_node = count as f64 / used as f64;
         assert!(
-            rec_per_node > 2.2,
+            rec_per_node > 2.8,
             "random-order packing too sparse: {count} records in {used} nodes ({rec_per_node:.2}/node)"
         );
 
@@ -4923,6 +4924,119 @@ mod tests {
                 fs.find_catalog_record_by_name(root_id, name.as_bytes())
                     .is_some(),
                 "record {name} not findable after bulk insert"
+            );
+        }
+    }
+
+    /// Per-`put`-shaped regression (PROMPT-hfs-catalog-incremental-put-packing):
+    /// 20k records inserted ONE AT A TIME in non-sequential (shuffled) key
+    /// order, spread across many parent directories — exactly the shape of a
+    /// `rb-cli put`-driven image build — must pack the catalog nearly as tightly
+    /// as a sequential bulk import and stay fsck-clean to the volume's real
+    /// limit. Before the B*-style sibling rotation (leaf + index), a shuffled
+    /// per-record build left leaves at the classic ~69% B-tree occupancy and the
+    /// index far worse, exhausting the node budget ~2x sooner ("disk full: no
+    /// free B-tree nodes") and leaving `IndexSiblingLinkBroken` at the ceiling.
+    #[test]
+    fn test_hfs_incremental_shuffled_multidir_packs_dense_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsFilesystem<Cursor<Vec<u8>>>;
+        let block_size = 32 * 1024u32;
+        // ~6 MiB catalog (12,288 nodes @ 512). With the rotation fix 20k records
+        // pack into well under that; the pre-fix ~1.6 rec/node packing would have
+        // needed far more leaf nodes alone and exhausted it.
+        let img = create_blank_hfs_sized(
+            128 * 1024 * 1024,
+            block_size,
+            "PutShuffle",
+            0,
+            6 * 1024 * 1024,
+        )
+        .expect("create blank volume");
+        let mut fs = Fs::open(Cursor::new(img), 0).unwrap();
+
+        // Real directories so threads / valence / counts stay fsck-correct.
+        const DIRS: u32 = 200;
+        let root = fs.root().unwrap();
+        let mut dir_ids = Vec::with_capacity(DIRS as usize);
+        for d in 0..DIRS {
+            let name = format!("dir{d:03}");
+            let de = fs
+                .create_directory(&root, &name, &Default::default())
+                .unwrap();
+            dir_ids.push(de.location as u32);
+        }
+        let base_cnid = fs.mdb.next_catalog_id;
+
+        // 20k files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32, so names are unique and land mid-leaf, not appended),
+        // sprayed across the directories.
+        let n: u32 = 20_000;
+        let mut per_dir = vec![0i32; DIRS as usize];
+        for i in 0..n {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let d = (hash % DIRS) as usize;
+            let name = format!("f{hash:08x}");
+            let mut kr = Fs::build_catalog_key(dir_ids[d], name.as_bytes());
+            kr.extend_from_slice(&Fs::build_file_record(
+                base_cnid + i,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0u8; 4],
+                &[0u8; 4],
+                block_size,
+            ));
+            fs.insert_catalog_record(&kr)
+                .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
+            per_dir[d] += 1;
+        }
+        // Mirror the bookkeeping the create path would have maintained so fsck's
+        // cross-checks (file_count, next_catalog_id, per-dir valence) pass.
+        fs.mdb.file_count += n;
+        fs.mdb.next_catalog_id = base_cnid + n;
+        for (d, &cnt) in per_dir.iter().enumerate() {
+            fs.update_parent_valence(dir_ids[d], cnt).unwrap();
+        }
+
+        // Density: the whole catalog (leaves + index) averages well above the
+        // pre-fix ~1.6 rec/node — proof the incremental build packed tight and
+        // didn't run away into a sparse, over-deep tree.
+        let h = BTreeHeader::read(fs.catalog_data());
+        let used = h.total_nodes - h.free_nodes;
+        let rec_per_node = h.leaf_records as f64 / used as f64;
+        assert!(
+            rec_per_node > 2.6,
+            "shuffled multi-dir packing too sparse: {} records in {used} nodes ({rec_per_node:.2}/node)",
+            h.leaf_records
+        );
+
+        // No IndexSiblingLinkBroken or other structural damage at the ceiling.
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after 20k shuffled multi-dir put: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Records remain findable by index descent across the keyspace.
+        for i in [0u32, 7, 9_999, n - 1] {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = dir_ids[(hash % DIRS) as usize];
+            let name = format!("f{hash:08x}");
+            assert!(
+                fs.find_catalog_record_by_name(parent, name.as_bytes())
+                    .is_some(),
+                "record {name} not findable after shuffled multi-dir insert"
             );
         }
     }

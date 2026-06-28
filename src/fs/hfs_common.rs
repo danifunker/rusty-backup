@@ -1232,6 +1232,346 @@ where
     Ok(results)
 }
 
+/// Overwrite the record area of node `idx` with `recs` (in key order),
+/// preserving the node descriptor (sibling links, kind, height). Mirrors the
+/// rebuild step of [`btree_insert_record`] but takes a ready-made record list —
+/// used by the sibling-rotation path, which rewrites both nodes of a pair at
+/// once. The caller guarantees `recs` fits within the node payload.
+fn btree_write_node_records(data: &mut [u8], node_size: usize, idx: u32, recs: &[Vec<u8>]) {
+    let off = idx as usize * node_size;
+    let node = &mut data[off..off + node_size];
+    let mut write_pos = 14usize;
+    for (i, rec) in recs.iter().enumerate() {
+        node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
+        let opos = node_size - 2 * (i + 1);
+        BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
+        write_pos += rec.len();
+    }
+    let fpos = node_size - 2 * (recs.len() + 1);
+    BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
+    if write_pos < fpos {
+        node[write_pos..fpos].fill(0);
+    }
+    BigEndian::write_u16(&mut node[10..12], recs.len() as u16);
+}
+
+/// True when index node `parent_idx` holds a record whose trailing 4-byte
+/// child pointer equals `child` — i.e. `child` is a direct child of that index
+/// node, so the two share `parent_idx` as a parent.
+fn index_node_has_child(data: &[u8], node_size: usize, parent_idx: u32, child: u32) -> bool {
+    if parent_idx == 0 {
+        return false;
+    }
+    let off = parent_idx as usize * node_size;
+    if off + node_size > data.len() {
+        return false;
+    }
+    let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+    for i in 0..num {
+        let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+        if e < s + 4 || e > node_size {
+            continue;
+        }
+        if BigEndian::read_u32(&data[off + e - 4..off + e]) == child {
+            return true;
+        }
+    }
+    false
+}
+
+/// In index node `parent_idx`, rewrite (in place) the separator key of the
+/// record pointing at `child` so it equals `new_first_key` (a record's key
+/// portion: the `key_len` byte plus key bytes). Catalog index keys are a fixed
+/// 0x25-length normalized key, so the record length never changes and the
+/// offset table / sibling records are untouched.
+///
+/// Returns `true` only when the separator was found *and* the in-place rewrite
+/// was valid (the existing key portion is the same length as the normalized
+/// key). Returns `false` — writing nothing — when `child` isn't a direct child
+/// of `parent_idx`, or when the existing separator is a different length (a
+/// real variable-length HFS+ index key, which can't be patched in place). The
+/// caller uses the `false` result to abandon a rotation and split instead, so a
+/// non-classic index is never left with a stale separator.
+#[must_use]
+fn btree_update_index_separator(
+    data: &mut [u8],
+    node_size: usize,
+    parent_idx: u32,
+    child: u32,
+    new_first_key: &[u8],
+) -> bool {
+    let off = parent_idx as usize * node_size;
+    if off + node_size > data.len() {
+        return false;
+    }
+    let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+    for i in 0..num {
+        let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+        if e < s + 4 || e > node_size {
+            continue;
+        }
+        if BigEndian::read_u32(&data[off + e - 4..off + e]) == child {
+            let norm = normalize_catalog_index_key(new_first_key);
+            let key_bytes = e - s - 4;
+            if norm.len() != key_bytes {
+                return false;
+            }
+            data[off + s..off + s + key_bytes].copy_from_slice(&norm);
+            return true;
+        }
+    }
+    false
+}
+
+/// Try to absorb `new_record` into a full leaf by redistributing records with
+/// an adjacent sibling that shares the same parent index node and still has
+/// room — a B*-tree rotation — instead of splitting.
+///
+/// A plain 50/50 leaf split leaves non-sequential inserts (the per-`put`
+/// workload, where keys land mid-leaf rather than appending) at the classic
+/// ~69% B-tree occupancy, so a catalog grown one record at a time exhausts its
+/// node budget ~1.4-2.7x sooner than a bulk/sequential build and can hit the
+/// file's node ceiling far below the volume's real capacity. Rotating into a
+/// neighbour before splitting lifts random-insert occupancy to ~88%, so the
+/// incremental path packs nearly as tightly as the sequential one.
+///
+/// Returns `true` when the record was absorbed: no node is allocated and the
+/// tree shape is unchanged — only the two nodes' records and one parent
+/// separator key move. Returns `false` when no sibling can take the overflow
+/// and the caller must fall back to [`btree_split_leaf_with_insert`].
+///
+/// Safety of the in-place separator update: we only ever rewrite the separator
+/// of the pair's *right* node, and only when the pair's *left* node keeps its
+/// original first key (guarded below). The right node is never the parent's
+/// first child (a right sibling sorts after `leaf_idx`; a left sibling sharing
+/// the parent means `leaf_idx` isn't first), so the parent's minimum key — and
+/// the grandparent invariant that mirrors it — is never disturbed.
+fn btree_try_rotate_leaf<F>(
+    data: &mut [u8],
+    node_size: usize,
+    leaf_idx: u32,
+    parent_idx: u32,
+    new_record: &[u8],
+    cmp: &F,
+) -> bool
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let payload = node_size.saturating_sub(16);
+    let cost = |r: &Vec<u8>| r.len() + 2;
+    let first_key = |r: &[u8]| -> Vec<u8> {
+        let kl = r[0] as usize;
+        r[..(1 + kl).min(r.len())].to_vec()
+    };
+    let read_records = |data: &[u8], idx: u32| -> Vec<Vec<u8>> {
+        let off = idx as usize * node_size;
+        let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+        let mut v = Vec::with_capacity(num);
+        for i in 0..num {
+            let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+            v.push(data[off + s..off + e].to_vec());
+        }
+        v
+    };
+
+    let loff = leaf_idx as usize * node_size;
+    let rsib = BigEndian::read_u32(&data[loff..loff + 4]);
+    let lsib = BigEndian::read_u32(&data[loff + 4..loff + 8]);
+    let leaf_recs = read_records(data, leaf_idx);
+
+    // Prefer the right sibling, then the left. For each candidate, pool the two
+    // siblings' records plus `new_record` in key order, then redistribute them
+    // balanced across the pair so both nodes keep headroom.
+    for (sib_is_right, sib) in [(true, rsib), (false, lsib)] {
+        if sib == 0 || !index_node_has_child(data, node_size, parent_idx, sib) {
+            continue;
+        }
+        let sib_recs = read_records(data, sib);
+        let (left_idx, right_idx, left_recs, right_recs) = if sib_is_right {
+            (leaf_idx, sib, &leaf_recs, &sib_recs)
+        } else {
+            (sib, leaf_idx, &sib_recs, &leaf_recs)
+        };
+        let Some(left_first) = left_recs.first() else {
+            continue;
+        };
+        // Build the merged, key-ordered record set across the pair.
+        let mut pool: Vec<Vec<u8>> = left_recs.iter().chain(right_recs.iter()).cloned().collect();
+        let mut p = pool.len();
+        for (i, r) in pool.iter().enumerate() {
+            if cmp(r, new_record) == Ordering::Greater {
+                p = i;
+                break;
+            }
+        }
+        pool.insert(p, new_record.to_vec());
+        // Skip if the left node's minimum would change — its parent separator
+        // (which we don't touch) would then be stale. Happens only when the new
+        // record sorts before the whole pair; rare, and a normal split handles
+        // it correctly.
+        if cmp(&pool[0], left_first) != Ordering::Equal {
+            continue;
+        }
+        let total: usize = pool.iter().map(cost).sum();
+        if total > 2 * payload {
+            continue; // neighbour is too full to absorb the overflow
+        }
+        // Balanced split point: both halves within payload, closest to total/2.
+        let mut prefix = 0usize;
+        let mut best_p = 0usize;
+        let mut best_diff = usize::MAX;
+        for cut in 1..pool.len() {
+            prefix += cost(&pool[cut - 1]);
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_p = cut;
+                }
+            }
+        }
+        if best_p == 0 {
+            continue;
+        }
+        let left: Vec<Vec<u8>> = pool[..best_p].to_vec();
+        let right: Vec<Vec<u8>> = pool[best_p..].to_vec();
+        let right_first = first_key(&right[0]);
+        // Patch the parent separator first: if it can't be updated in place
+        // (a variable-length, non-normalized index key — i.e. a real HFS+
+        // catalog), abandon the rotation untouched and let the caller split,
+        // rather than leave the moved records behind a stale separator.
+        if !btree_update_index_separator(data, node_size, parent_idx, right_idx, &right_first) {
+            continue;
+        }
+        btree_write_node_records(data, node_size, left_idx, &left);
+        btree_write_node_records(data, node_size, right_idx, &right);
+        return true;
+    }
+    false
+}
+
+/// Split a full index node while inserting `new_record` (a normalized index
+/// record: a 0x25-length key followed by a 4-byte child pointer), append-aware.
+///
+/// The previous index split was a fixed 50/50 of the existing records, then the
+/// new record went into one half. For *sequential* separator inserts — which is
+/// what every leaf split produces when files arrive in key order (a bulk
+/// `untar`, or `put`ting a sorted batch) — that froze each non-rightmost index
+/// node at ~50%, doubling the index node count and adding a whole tree level.
+/// Packing the left node full on an append (and rebalancing only a genuine
+/// middle insert), exactly as the leaf split does, keeps the index dense.
+///
+/// Returns `(new_node_idx, separator_key)` to install in the grandparent. Index
+/// records are uniform and small, so a 2-way split always suffices (an overflow
+/// is at most one record over a node).
+fn btree_split_index_with_insert<F>(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    header: &mut BTreeHeader,
+    new_record: &[u8],
+    compare_fn: &F,
+) -> Result<(u32, Vec<u8>), FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let old_offset = node_idx as usize * node_size;
+    let old_num = BigEndian::read_u16(&catalog_data[old_offset + 10..old_offset + 12]) as usize;
+    let old_height = catalog_data[old_offset + 9];
+
+    // Existing records merged with new_record, in key order.
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(old_num + 1);
+    for i in 0..old_num {
+        let (s, e) = btree_record_range(
+            &catalog_data[old_offset..old_offset + node_size],
+            node_size,
+            i,
+        );
+        records.push(catalog_data[old_offset + s..old_offset + e].to_vec());
+    }
+    let mut insert_pos = records.len();
+    for (i, rec) in records.iter().enumerate() {
+        if compare_fn(rec, new_record) == Ordering::Greater {
+            insert_pos = i;
+            break;
+        }
+    }
+    records.insert(insert_pos, new_record.to_vec());
+
+    let payload = node_size.saturating_sub(16);
+    let cost = |r: &Vec<u8>| r.len() + 2;
+    let total: usize = records.iter().map(cost).sum();
+
+    // Greedy pack-left (dense for appends). `cut` = count kept in the old node.
+    let mut cut = {
+        let mut acc = 0usize;
+        let mut k = 1usize;
+        for (i, r) in records.iter().enumerate() {
+            let c = cost(r);
+            if i > 0 && acc + c > payload {
+                break;
+            }
+            acc += c;
+            k = i + 1;
+        }
+        k.clamp(1, records.len() - 1)
+    };
+    // A genuine middle insert rebalances so both halves keep room (matches the
+    // leaf split's density tuning); a tail append keeps the dense pack-left.
+    let is_append = insert_pos == old_num;
+    if !is_append {
+        let mut prefix = 0usize;
+        let mut best = cut;
+        let mut best_diff = usize::MAX;
+        for k in 1..records.len() {
+            prefix += cost(&records[k - 1]);
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best = k;
+                }
+            }
+        }
+        cut = best;
+    }
+
+    let new_idx = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
+    header.free_nodes -= 1;
+    init_node(
+        catalog_data,
+        node_size,
+        new_idx,
+        BTREE_INDEX_NODE,
+        old_height,
+    );
+
+    let left: Vec<Vec<u8>> = records[..cut].to_vec();
+    let right: Vec<Vec<u8>> = records[cut..].to_vec();
+    btree_write_node_records(catalog_data, node_size, node_idx, &left);
+    btree_write_node_records(catalog_data, node_size, new_idx, &right);
+
+    // Splice the index-level sibling chain: node_idx <-> new_idx <-> old_next.
+    // `btree_write_node_records` preserved node_idx's old forward link.
+    let old_next = BigEndian::read_u32(&catalog_data[old_offset..old_offset + 4]);
+    let new_offset = new_idx as usize * node_size;
+    BigEndian::write_u32(&mut catalog_data[old_offset..old_offset + 4], new_idx);
+    BigEndian::write_u32(&mut catalog_data[new_offset + 4..new_offset + 8], node_idx);
+    BigEndian::write_u32(&mut catalog_data[new_offset..new_offset + 4], old_next);
+    if old_next != 0 {
+        let next_off = old_next as usize * node_size;
+        BigEndian::write_u32(&mut catalog_data[next_off + 4..next_off + 8], new_idx);
+    }
+
+    // Separator = first key (key_len byte + key) of the new node.
+    let first = &right[0];
+    let kl = first[0] as usize;
+    let split_key = first[..(1 + kl).min(first.len())].to_vec();
+    Ok((new_idx, split_key))
+}
+
 /// Insert a separator key into a parent index node, pointing to child_node.
 ///
 /// For index nodes, each record is: key_bytes + child_node_ptr (4 bytes BE).
@@ -1269,20 +1609,43 @@ where
     match btree_insert_record(node, node_size, &index_record, compare_fn) {
         Ok(_) => Ok(()),
         Err(_) => {
-            // Index node is full — split it
-            let (new_idx, new_split_key) =
-                split_index_node(catalog_data, node_size, index_node_idx, header)?;
+            // Index node is full. Before allocating a node, try a B*-style
+            // rotation into an index sibling that shares this node's parent and
+            // has room — the same density win applied at the leaf level, so a
+            // deep or sequential catalog doesn't accumulate half-full index
+            // nodes (and the extra level they imply). The root has no parent and
+            // grows instead; `btree_try_rotate_leaf` is record-agnostic and
+            // updates the parent separator in place, so it serves index nodes
+            // just as it does leaves.
+            if let Some(&(_, parent_idx)) = parent_chain
+                .iter()
+                .find(|&&(nidx, _)| nidx == index_node_idx)
+            {
+                if parent_idx != 0
+                    && btree_try_rotate_leaf(
+                        catalog_data,
+                        node_size,
+                        index_node_idx,
+                        parent_idx,
+                        &index_record,
+                        compare_fn,
+                    )
+                {
+                    return Ok(());
+                }
+            }
 
-            // Insert the record into whichever half it belongs
-            // Compare split_key with new_split_key to decide
-            let target = if compare_fn(split_key, &new_split_key) == Ordering::Less {
-                index_node_idx
-            } else {
-                new_idx
-            };
-            let t_offset = target as usize * node_size;
-            let t_node = &mut catalog_data[t_offset..t_offset + node_size];
-            btree_insert_record(t_node, node_size, &index_record, compare_fn)?;
+            // No sibling could help — split (append-aware), placing the new
+            // record in the appropriate half, then install the new node's
+            // separator in the parent.
+            let (new_idx, new_split_key) = btree_split_index_with_insert(
+                catalog_data,
+                node_size,
+                index_node_idx,
+                header,
+                &index_record,
+                compare_fn,
+            )?;
 
             // Now insert new_split_key into this index node's parent
             // Find our parent from the chain
@@ -1327,107 +1690,6 @@ where
             Ok(())
         }
     }
-}
-
-/// Split an index node, similar to leaf splitting but for index records.
-fn split_index_node(
-    catalog_data: &mut [u8],
-    node_size: usize,
-    node_idx: u32,
-    header: &mut BTreeHeader,
-) -> Result<(u32, Vec<u8>), FilesystemError> {
-    let new_idx = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
-    header.free_nodes -= 1;
-
-    let old_offset = node_idx as usize * node_size;
-    let new_offset = new_idx as usize * node_size;
-
-    let old_num = BigEndian::read_u16(&catalog_data[old_offset + 10..old_offset + 12]) as usize;
-    let old_height = catalog_data[old_offset + 9];
-    let split_point = old_num / 2;
-
-    init_node(
-        catalog_data,
-        node_size,
-        new_idx,
-        BTREE_INDEX_NODE,
-        old_height,
-    );
-
-    // Collect records
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(old_num);
-    for i in 0..old_num {
-        let (start, end) = btree_record_range(
-            &catalog_data[old_offset..old_offset + node_size],
-            node_size,
-            i,
-        );
-        records.push(catalog_data[old_offset + start..old_offset + end].to_vec());
-    }
-
-    // Rebuild old node with first half
-    {
-        let node = &mut catalog_data[old_offset..old_offset + node_size];
-        BigEndian::write_u16(&mut node[10..12], 0);
-        BigEndian::write_u16(&mut node[node_size - 2..node_size], 14);
-        let mut write_pos = 14usize;
-        for (i, rec) in records[..split_point].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        let fpos = node_size - 2 * (split_point + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], split_point as u16);
-    }
-
-    // Build new node with second half
-    {
-        let node = &mut catalog_data[new_offset..new_offset + node_size];
-        let count = old_num - split_point;
-        let mut write_pos = 14usize;
-        for (i, rec) in records[split_point..].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        let fpos = node_size - 2 * (count + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], count as u16);
-    }
-
-    // Splice the new node into this level's fLink/bLink sibling chain:
-    //   node_idx <-> new_idx <-> old_next
-    // An HFS B-tree keeps every level as a doubly-linked node list (Inside
-    // Macintosh: Files), and rusty-backup's catalog fsck verifies it. Leaving
-    // these links unset is what produced the IndexSiblingLinkBroken failures
-    // once the catalog grew an index level. `init_node` zeroed new_idx's
-    // descriptor, and the record rebuilds above only touch the record area, so
-    // node_idx's descriptor still holds its original forward sibling here.
-    let old_next = BigEndian::read_u32(&catalog_data[old_offset..old_offset + 4]);
-    BigEndian::write_u32(&mut catalog_data[old_offset..old_offset + 4], new_idx); // node_idx.fLink = new
-    BigEndian::write_u32(&mut catalog_data[new_offset + 4..new_offset + 8], node_idx); // new.bLink = node_idx
-    BigEndian::write_u32(&mut catalog_data[new_offset..new_offset + 4], old_next); // new.fLink = old_next
-    if old_next != 0 {
-        let next_off = old_next as usize * node_size;
-        BigEndian::write_u32(&mut catalog_data[next_off + 4..next_off + 8], new_idx);
-        // old_next.bLink = new
-    }
-
-    // The separator key is just the key portion (key_len byte + key data) of the
-    // first record of the new node, without pad or child pointer.
-    let full_rec = &records[split_point];
-    let split_key = if !full_rec.is_empty() {
-        let kl = full_rec[0] as usize;
-        let key_end = (1 + kl).min(full_rec.len());
-        full_rec[..key_end].to_vec()
-    } else {
-        full_rec.clone()
-    };
-
-    Ok((new_idx, split_key))
 }
 
 /// Grow the B-tree root: create a new root node at height+1 with two children.
@@ -1718,6 +1980,26 @@ where
         }
         Err(_) => {
             let mut h = BTreeHeader::read(data);
+            // Before allocating a node, try a B*-style rotation into an adjacent
+            // sibling that shares this leaf's parent and still has room. This
+            // keeps the catalog densely packed for non-sequential (per-`put`)
+            // inserts; only when no sibling can help do we split. Needs a parent
+            // index node, so skip it while the root is still the lone leaf.
+            if h.depth > 1 {
+                if let Some(&(_, parent_idx)) =
+                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                {
+                    if parent_idx != 0
+                        && btree_try_rotate_leaf(
+                            data, node_size, leaf_idx, parent_idx, key_record, cmp,
+                        )
+                    {
+                        h.leaf_records += 1;
+                        h.write(data);
+                        return Ok(());
+                    }
+                }
+            }
             let splits =
                 btree_split_leaf_with_insert(data, node_size, leaf_idx, &mut h, key_record, cmp)?;
             h.leaf_records += 1;
