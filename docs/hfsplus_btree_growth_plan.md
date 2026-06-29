@@ -183,6 +183,11 @@ to today (lock this with a golden test).
 > has shipped with. The design below is retained for if a real workload needs it;
 > the riskiest parts are the map-node bitmap extension and the extents-overflow
 > spill, neither validated against real macOS here.
+>
+> **Full follow-on plan:** [`docs/todo_hfsplus_fork_growth.md`](todo_hfsplus_fork_growth.md)
+> — phased implementation (contiguous tail growth → overflow spill → map nodes),
+> risks, in-repo tests, and a **macOS `fsck_hfs` validation recipe** (the real
+> acceptance bar, since HFS+ is still fully supported on macOS).
 
 Today `btree_alloc_node` returns `DiskFull` when the fork's nodes are exhausted.
 Add a grow step (catalog first, then extents/attributes) invoked from the live
