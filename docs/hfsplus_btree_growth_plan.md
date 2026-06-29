@@ -1,6 +1,8 @@
 # HFS+ catalog B-tree growth & variable-length keys — implementation plan
 
-**Status:** complete (P1–P5 landed; §4b grow-on-full intentionally deferred).
+**Status:** complete (P1–P5 landed; §4b grow-on-full now also landed — see
+[`docs/todo_hfsplus_fork_growth.md`](todo_hfsplus_fork_growth.md), Phases A/B/C
+shipped and `fsck_hfs`-validated on macOS).
 - **P1 (key-format descriptor / variable-length index keys, §4a) — landed.** The
   shared B-tree helpers in `hfs_common.rs` are now key-format-aware
   (`BTreeKeyFormat`), the HFS+ catalog/attributes inserts and the defrag builders
@@ -171,7 +173,14 @@ Back-compat: classic HFS passes a `BTreeKeyFormat { big_keys:false,
 variable_index_keys:false, max_key_len:37 }` and the behaviour is byte-identical
 to today (lock this with a golden test).
 
-### 4b. B-tree file growth on full — DEFERRED
+### 4b. B-tree file growth on full — DONE (2026-06-29)
+
+> **Landed (2026-06-29).** Implemented as `grow_btree_fork` (Phases A/B/C) and
+> validated `fsck_hfs`-clean on macOS — see
+> [`docs/todo_hfsplus_fork_growth.md`](todo_hfsplus_fork_growth.md) for the full
+> writeup, including the two foundational blank-builder bugs (Invalid BTH length,
+> empty-tree representation) that a real Mac surfaced. The historical deferral
+> note below is retained for context.
 
 > **Deferred (2026-06-28).** Implemented sizing (4c) instead and mirrored classic
 > HFS, which has **no** grow-on-full path at all — it relies entirely on

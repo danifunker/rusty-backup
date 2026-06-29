@@ -22,7 +22,9 @@ use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
-use crate::cli::parse::{split_mac_path, ZeroReader};
+#[cfg(feature = "remote")]
+use crate::cli::parse::split_mac_path;
+use crate::cli::parse::ZeroReader;
 use crate::cli::resolve::{resolve_partition_rw, resolve_partition_rw_forced, FsDispatchOverride};
 use crate::fs::filesystem::CreateFileOptions;
 
@@ -34,7 +36,9 @@ pub struct PutArgs {
     /// Host file to copy. Required when not using `--zero` or `--boot`.
     pub host_file: Option<PathBuf>,
 
-    /// Destination path inside the filesystem (cp-like positional).
+    /// Destination path inside the filesystem (cp-like positional). A literal
+    /// `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also
+    /// works (so `/` is plain data).
     pub dst: Option<String>,
 
     /// Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the
@@ -121,15 +125,15 @@ pub fn run(args: PutArgs) -> Result<()> {
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
     };
 
-    let (parent_path, name) = split_mac_path(&dst)?;
-    if name.is_empty() {
-        bail!("destination path has no filename");
-    }
-
     // Remote destination: `rb-cli put rb://host:port/img@N HOST /DEST`. Upload
-    // the host file into the daemon's staging area and apply it.
+    // the host file into the daemon's staging area and apply it. Remote
+    // addressing is slash-only (the daemon resolves the path itself).
     #[cfg(feature = "remote")]
     if let Some(rref) = crate::remote::RemoteRef::parse(&args.image.path.to_string_lossy()) {
+        let (parent_path, name) = split_mac_path(&dst)?;
+        if name.is_empty() {
+            bail!("destination path has no filename");
+        }
         return remote_put(
             &rref,
             args.image.partition,
@@ -158,9 +162,14 @@ pub fn run(args: PutArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    // Resolve parent + leaf with the shared escape / colon grammar so a file
+    // whose name contains a literal `/` can be written.
+    let (parent, name) = super::ls::resolve_parent(&mut *fs, &dst)?;
+    if name.is_empty() {
+        bail!("destination path has no filename");
+    }
     if !parent.is_directory() {
-        bail!("parent is not a directory: {parent_path}");
+        bail!("parent is not a directory: {dst}");
     }
 
     // Duplicate check so we can honor --force consistently.

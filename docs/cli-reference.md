@@ -19,6 +19,28 @@ Usage: rb-cli [OPTIONS] <COMMAND>
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
 
+## Path grammar (in-image paths)
+
+Verbs that take a path *inside* an image (`ls`, `get`, `get-binhex`, `put`,
+`put-binhex`, `mkdir`, `rm`, `cp`, `locate`) address it with one of two
+grammars:
+
+- **Slash** (default, every filesystem): `/` is the separator. A literal `/`
+  inside a single name — legal on classic-Mac HFS / HFS+ volumes, e.g.
+  `Oxyd b/w` — is written `\/`; a literal backslash is written `\\`. So
+  `rb-cli get-binhex IMG "/Games/Oxyd 3.6/Oxyd b\/w" out.hqx` extracts the
+  single file `Oxyd b/w` from the folder `Oxyd 3.6`.
+- **Colon** (HFS / HFS+ only): because classic Mac OS reserves `:` as its path
+  separator, `:` can never appear in a name, so you may instead write the path
+  with `:` separators — the native Mac convention — and then `/` is ordinary
+  data needing no escape: `rb-cli get-binhex IMG ":Games:Oxyd 3.6:Oxyd b/w"
+  out.hqx`. A colon-grammar path is always literal (it never globs).
+
+On every other filesystem `:` is an ordinary filename byte and only the slash
+grammar applies. Glob patterns (`*`, `?`, `[`, `{`) use the slash grammar; pass
+`--literal` (or use the colon grammar) to address a name containing those
+characters verbatim.
+
 ## Verbs
 
 ### `api`
@@ -643,7 +665,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters
+- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)
 - `<DST>` — Destination path on the host. Single-match: the literal target file. Multi-match or directory source: a directory under which matched entries are laid out (created if it doesn't exist)
 
 **Options**
@@ -677,7 +699,7 @@ Usage: get-binhex [OPTIONS] <IMAGE> <SRC> <DST>
 **Options**
 
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
-- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+)
 
 ### `grow`
 
@@ -739,7 +761,7 @@ Usage: locate [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path inside the filesystem (Mac path conventions; `/` is the separator — `:` is rejected for the same reason as the other verbs)
+- `<PATH>` — Path inside the filesystem. `/` is the separator; a literal `/` in a name is written `\/`. You may instead use `:` as the separator (the native classic-Mac convention), in which case `/` is plain data — e.g. `:System Folder:Oxyd b/w`
 
 **Options**
 
@@ -827,7 +849,7 @@ Usage: mkdir [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B)
+- `<PATH>` — Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B). A literal `/` in the new name is written `\/`; on HFS / HFS+ a `:`-separated path also works
 
 **Options**
 
@@ -847,12 +869,14 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
+- `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume instead of the default case-insensitive HFS+. Ignored for other filesystems
+- `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up to whole 4096-byte nodes). Set this *small* to make the catalog easy to outgrow and exercise the fork grow-on-full path. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
@@ -924,7 +948,7 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 
 ### `optical`
 
-Optical-media verbs (rip / convert / browse / extract)
+Optical-media verbs (drives / rip / convert / browse / extract)
 
 ```
 Usage: optical <COMMAND>
@@ -959,6 +983,18 @@ Usage: convert --format <FORMAT> <SOURCE> <DEST>
 
 - `--format` — Output format
 
+### `optical drives`
+
+List connected physical optical drives and their device paths
+
+```
+Usage: drives [OPTIONS]
+```
+
+**Options**
+
+- `--remote` — Also query these daemons for their optical drives (repeatable), e.g. `--remote mister.local:7341`. Remote rows print an `rb://...` device arg you can pass straight to `optical rip --device`
+
 ### `optical extract`
 
 Extract files from an optical disc image into a host folder
@@ -986,7 +1022,7 @@ Usage: rip [OPTIONS] --device <DEVICE> --output <OUTPUT>
 
 **Options**
 
-- `--device` — Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`
+- `--device` — Source drive: a local path (e.g. `/dev/sr0`, `disk6`, `\\.\E:`) or a remote daemon's drive as `rb://host:port/dev/sr0` (the daemon issues the SCSI reads; this side does the encoding). `rb-cli optical drives` lists local drives
 - `--output` — Output path: `.iso` for `--format iso`, `.cue` for `--format bincue`
 - `--format` — 
 - `--eject` — Eject the disc after a successful rip
@@ -1130,7 +1166,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
 - `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
-- `<DST>` — Destination path inside the filesystem (cp-like positional)
+- `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**
 
@@ -1161,7 +1197,7 @@ Usage: put-binhex [OPTIONS] <IMAGE> <HOST_FILE>
 
 **Options**
 
-- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`
+- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`. A literal `/` in a directory name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data). Defaults to `/`
 - `--rename` — Override the filename from the BinHex header
 - `--force` — Overwrite an existing entry at the destination path
 - `--clear-inited` — Clear the `hasBeenInited` Finder flag (0x0100) on the written file. Use when injecting an app onto a fresh disk so the Finder re-reads its `BNDL` and registers real icons (a file copied with `hasBeenInited` already set is treated as already-catalogued, so it shows a generic icon until a desktop rebuild). Mirrors what a MacBinary install does to byte 73
@@ -1271,7 +1307,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters
+- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)
 
 **Options**
 

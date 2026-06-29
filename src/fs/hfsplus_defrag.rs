@@ -421,8 +421,8 @@ use std::cmp::Ordering;
 use super::filesystem::FilesystemError;
 use super::hfs_common;
 use super::hfsplus::{
-    write_blank_btree_header_node, write_empty_leaf_node, ExtentDescriptor, ForkData,
-    HfsPlusFilesystem, XattrKind, XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
+    write_blank_btree_header_node, ExtentDescriptor, ForkData, HfsPlusFilesystem, XattrKind,
+    XattrRecord, HFSPLUS_VOLUME_UNMOUNTED_BIT,
 };
 
 thread_local! {
@@ -1393,16 +1393,18 @@ fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8)
         "btree size must be node-aligned"
     );
     let total_nodes = (total_bytes / NODE_SIZE) as u32;
-    // Layout: 0 = header, 1 = empty leaf, 2..2+map_nodes = map nodes
-    // (BTNodeKind=2), then free nodes for B-tree growth. Map nodes are
-    // required whenever the catalog exceeds the header bitmap's capacity
-    // (~30,720 nodes at NODE_SIZE=4096, i.e. ~120 MiB catalog file).
-    // OS 9 volumes with 100k+ catalog records routinely need map nodes.
+    // Layout: 0 = header, 2..2+map_nodes = map nodes (BTNodeKind=2), then free
+    // nodes. Node 1 is left free; the first `btree_insert_full` bootstraps it
+    // into the root leaf (matching `write_blank_btree_header_node`'s canonical
+    // empty-tree shape: depth 0 / root 0, no leaf node until the first insert).
+    // Map nodes are required whenever the catalog exceeds the header bitmap's
+    // capacity (~30,720 nodes at NODE_SIZE=4096, i.e. ~120 MiB catalog file);
+    // OS 9 volumes with 100k+ catalog records routinely need them.
     let map_nodes = hfs_common::map_nodes_required(total_nodes, NODE_SIZE);
-    let used_nodes = 2 + map_nodes;
+    let used_nodes = 1 + map_nodes; // header + map nodes; node 1 is free
     assert!(
         total_nodes >= used_nodes + 2,
-        "need at least {} nodes (header + leaf + {} map nodes + 2 free), got {}",
+        "need at least {} nodes (header + {} map nodes + 2 free), got {}",
         used_nodes + 2,
         map_nodes,
         total_nodes,
@@ -1417,17 +1419,16 @@ fn init_btree_buffer(total_bytes: usize, max_key_len: u16, key_compare_type: u8)
         max_key_len,
         key_compare_type,
     );
-    write_empty_leaf_node(&mut buf[NODE_SIZE..2 * NODE_SIZE]);
 
     if map_nodes > 0 {
         // Header.fLink points at the first map node so `btree_bitmap_segments`
         // walks the chain when allocating from the global node space.
         BigEndian::write_u32(&mut buf[0..4], 2);
         // Mark each map node as allocated in the header's bitmap (record 2,
-        // at offset 270 — matches `write_blank_btree_header_node`). With
-        // NODE_SIZE=4096 the header bitmap covers ~30,720 bits; map nodes
-        // sit at indices 2..2+map_nodes, comfortably inside that range.
-        let bitmap_rec_offset = 270usize;
+        // at offset 248 — matches `write_blank_btree_header_node`'s canonical
+        // TN1150 layout). With NODE_SIZE=4096 the header bitmap covers ~30,720
+        // bits; map nodes sit at indices 2..2+map_nodes, comfortably inside.
+        let bitmap_rec_offset = 248usize;
         let header_bitmap_len = NODE_SIZE - 256; // = 3840 bytes
         for i in 0..map_nodes {
             let bit = 2 + i;
@@ -2847,6 +2848,13 @@ mod tests {
             "all files copied"
         );
         assert_eq!(report.dirs_copied as usize, DIRS, "all dirs copied");
+
+        // Emit the defrag-clone output so a Mac can fsck_hfs it — the canonical
+        // B-tree header layout fix makes this production path fsck_hfs-clean,
+        // not just clean per our own checker.
+        if let Ok(path) = std::env::var("RB_EMIT_DEFRAG_IMAGE") {
+            std::fs::write(&path, &out).unwrap();
+        }
 
         // The defrag-built target catalog must itself be multi-level...
         let cur = Cursor::new(out);

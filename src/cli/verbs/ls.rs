@@ -24,6 +24,11 @@ pub struct LsArgs {
     /// patterns containing `*`, `?`, `[`, or `{` walk the volume and
     /// emit one line per match. Pass `--literal` to address a path
     /// verbatim when its name contains those characters.
+    ///
+    /// A literal `/` inside a name (classic-Mac volumes allow it) is written
+    /// `\/` (and a literal `\` as `\\`). On HFS / HFS+ you may instead use `:`
+    /// as the separator — the native Mac convention — so `/` is just data:
+    /// `:System Folder:Oxyd b/w`.
     #[arg(default_value = "/")]
     pub path: String,
 
@@ -114,8 +119,11 @@ pub fn run(args: LsArgs) -> Result<()> {
     };
 
     // `--literal` forces the exact-path branch even when the name contains
-    // glob metacharacters.
-    let use_glob = !args.literal && (has_glob_chars(&args.path) || !args.exclude.is_empty());
+    // glob metacharacters. A colon-grammar path (HFS / HFS+ with `:`) is always
+    // an exact path — it addresses a literal `/`-bearing name — so it never globs.
+    let use_glob = !args.literal
+        && !colon_mode(&*fs, &args.path)
+        && (has_glob_chars(&args.path) || !args.exclude.is_empty());
 
     if use_glob {
         // Glob path — walk the volume.
@@ -212,25 +220,119 @@ fn has_glob_chars(s: &str) -> bool {
     s.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'))
 }
 
+/// True when `path` should be parsed with the colon grammar: only on a
+/// filesystem that reserves `:` (HFS / HFS+) and only when the path actually
+/// uses a `:` (so a plain `/`-path on HFS keeps working, with `\/` available
+/// for a slash inside a name).
+pub fn colon_mode(fs: &dyn Filesystem, path: &str) -> bool {
+    fs.uses_colon_paths() && path.contains(':')
+}
+
 /// Walk `path` inside a generic filesystem, one component at a time.
+///
+/// The path is tokenised with [`crate::cli::parse::split_image_path`], so a
+/// literal `/` inside a name can be addressed as `\/` (slash grammar) or by
+/// using `:` separators on HFS / HFS+ (colon grammar). See that function.
 pub fn resolve_path(fs: &mut dyn Filesystem, path: &str) -> Result<crate::fs::entry::FileEntry> {
+    let colon = colon_mode(fs, path);
+    let components = crate::cli::parse::split_image_path(path, colon);
+    resolve_components(fs, &components)
+}
+
+/// Walk a path given as already-decoded components (no further splitting).
+pub fn resolve_components(
+    fs: &mut dyn Filesystem,
+    components: &[String],
+) -> Result<crate::fs::entry::FileEntry> {
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
-    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Ok(current);
-    }
-    for component in trimmed.split('/') {
-        if component.is_empty() {
-            continue;
-        }
+    for component in components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
         let next = children
             .into_iter()
-            .find(|c| c.name == component)
+            .find(|c| &c.name == component)
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }
     Ok(current)
+}
+
+/// Resolve the parent directory of `path` and return `(parent_entry, basename)`,
+/// decoding with the same escape / colon rules as [`resolve_path`]. Used by the
+/// write verbs (`put`, `mkdir`, `rm`) so the leaf name they create / delete is
+/// the decoded component (e.g. a literal `Oxyd b/w`).
+pub fn resolve_parent(
+    fs: &mut dyn Filesystem,
+    path: &str,
+) -> Result<(crate::fs::entry::FileEntry, String)> {
+    let colon = colon_mode(fs, path);
+    let (parent_components, name) = crate::cli::parse::split_image_parent(path, colon);
+    let parent = resolve_components(fs, &parent_components)?;
+    Ok((parent, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+    use crate::fs::hfs::{create_blank_hfs, HfsFilesystem};
+    use std::io::Cursor;
+
+    /// Build a blank HFS volume holding `/Oxyd 3.6/Oxyd b/w` — a folder with a
+    /// child file whose name contains a literal `/` (legal on classic-Mac
+    /// volumes). Returns the opened filesystem.
+    fn hfs_with_slash_named_file() -> HfsFilesystem<Cursor<Vec<u8>>> {
+        let img = create_blank_hfs(8 * 1024 * 1024, 4096, "Test").unwrap();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let folder = fs
+            .create_directory(&root, "Oxyd 3.6", &CreateDirectoryOptions::default())
+            .unwrap();
+        let data = b"app";
+        let mut reader: &[u8] = data;
+        fs.create_file(
+            &folder,
+            "Oxyd b/w",
+            &mut reader,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        fs
+    }
+
+    #[test]
+    fn resolve_slash_name_via_backslash_escape() {
+        let mut fs = hfs_with_slash_named_file();
+        let entry = resolve_path(&mut fs, r"/Oxyd 3.6/Oxyd b\/w").unwrap();
+        assert_eq!(entry.name, "Oxyd b/w");
+        assert!(!entry.is_directory());
+    }
+
+    #[test]
+    fn resolve_slash_name_via_colon_grammar() {
+        let mut fs = hfs_with_slash_named_file();
+        let entry = resolve_path(&mut fs, ":Oxyd 3.6:Oxyd b/w").unwrap();
+        assert_eq!(entry.name, "Oxyd b/w");
+        assert!(!entry.is_directory());
+    }
+
+    #[test]
+    fn unescaped_slash_name_mis_splits_and_is_not_found() {
+        // Without an escape or colon grammar, the `/` is a separator: the path
+        // resolves through a (nonexistent) folder `Oxyd b`, so it isn't found.
+        let mut fs = hfs_with_slash_named_file();
+        assert!(resolve_path(&mut fs, "/Oxyd 3.6/Oxyd b/w").is_err());
+    }
+
+    #[test]
+    fn resolve_parent_returns_decoded_slash_basename() {
+        let mut fs = hfs_with_slash_named_file();
+        let (parent, name) = resolve_parent(&mut fs, r"/Oxyd 3.6/Oxyd b\/w").unwrap();
+        assert!(parent.is_directory());
+        assert_eq!(parent.name, "Oxyd 3.6");
+        assert_eq!(name, "Oxyd b/w");
+    }
 }

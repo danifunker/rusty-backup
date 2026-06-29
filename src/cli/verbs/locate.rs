@@ -37,8 +37,10 @@ pub struct LocateArgs {
     /// Image reference (`path` or `path@N` for the 1-based partition index).
     pub image: ImageRef,
 
-    /// Path inside the filesystem (Mac path conventions; `/` is the
-    /// separator — `:` is rejected for the same reason as the other verbs).
+    /// Path inside the filesystem. `/` is the separator; a literal `/` in a
+    /// name is written `\/`. You may instead use `:` as the separator (the
+    /// native classic-Mac convention), in which case `/` is plain data —
+    /// e.g. `:System Folder:Oxyd b/w`.
     pub path: String,
 
     /// Output format. `json` is the default because the load-bearing
@@ -167,21 +169,18 @@ fn resolve_hfs_path<R: std::io::Read + std::io::Seek + Send>(
     path: &str,
 ) -> Result<FileEntry> {
     use crate::fs::filesystem::Filesystem;
+    // HFS reserves `:`, so a `:` in the path is always a separator (colon
+    // grammar) and `/` is plain data; a plain `/`-path uses `\/` for a literal
+    // slash. See `crate::cli::parse::split_image_path`.
+    let components = crate::cli::parse::split_image_path(path, path.contains(':'));
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
-    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Ok(current);
-    }
-    for component in trimmed.split('/') {
-        if component.is_empty() {
-            continue;
-        }
+    for component in &components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
         let next = children
             .into_iter()
-            .find(|c| c.name == component)
+            .find(|c| &c.name == component)
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }

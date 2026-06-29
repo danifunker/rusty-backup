@@ -7,7 +7,6 @@ use clap::Args;
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
-use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::{resolve_partition_rw_forced, FsDispatchOverride};
 
 #[derive(Debug, Args)]
@@ -18,7 +17,8 @@ pub struct RmArgs {
     /// Path or glob pattern inside the filesystem. Patterns containing
     /// `*`, `?`, `[`, or `{` walk the volume and delete every match.
     /// Pass `--literal` to delete a single path verbatim when its name
-    /// contains those characters.
+    /// contains those characters. A literal `/` in a name is written `\/`
+    /// (or use a `:`-separated path on HFS / HFS+, which also forces literal).
     pub path: String,
 
     /// Recursively delete directories (matches will include directories
@@ -76,9 +76,10 @@ pub fn run(args: RmArgs) -> Result<()> {
         _ => true,
     };
 
-    // `--literal` forces the exact single-path delete even for names that
-    // contain glob metacharacters.
-    if !args.literal && (has_glob_chars(&args.path) || !args.exclude.is_empty()) {
+    // `--literal` (or a colon-grammar path on HFS / HFS+) forces the exact
+    // single-path delete even for names that contain glob metacharacters.
+    let colon = super::ls::colon_mode(&*fs, &args.path);
+    if !args.literal && !colon && (has_glob_chars(&args.path) || !args.exclude.is_empty()) {
         // Glob path — collect everything, sort deepest-first so we delete
         // children before parents, then apply.
         let includes = compile_patterns(&args.path, case_insensitive)?;
@@ -119,12 +120,12 @@ pub fn run(args: RmArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Literal-path single delete.
-    let (parent_path, name) = split_mac_path(&args.path)?;
+    // Literal-path single delete. Resolve parent + leaf with the shared escape
+    // / colon grammar so a name containing a literal `/` is addressable.
+    let (parent, name) = super::ls::resolve_parent(&mut *fs, &args.path)?;
     if name.is_empty() {
         bail!("path has no basename");
     }
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
     let children = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?;

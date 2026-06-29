@@ -154,6 +154,20 @@ pub trait Filesystem: Send {
         }
         Ok(())
     }
+
+    /// True when this filesystem reserves `:` as its native path separator
+    /// (classic Mac HFS / HFS+), so `:` can never appear in a catalog name.
+    ///
+    /// When this is `true`, rb-cli accepts an in-image path written with `:`
+    /// separators (e.g. `:System Folder:Apple Menu Items`), which lets a literal
+    /// `/` be an ordinary filename byte — the only way to address a name like
+    /// `Oxyd b/w` unambiguously, since classic-Mac volumes allow `/` in names.
+    ///
+    /// Default `false`: `/` is the only separator, and a literal `/` inside a
+    /// component must be written `\/` (with `\\` for a literal backslash).
+    fn uses_colon_paths(&self) -> bool {
+        false
+    }
 }
 
 /// Aggregate fragmentation counts for a volume's user data forks.

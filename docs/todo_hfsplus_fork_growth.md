@@ -1,6 +1,38 @@
 # HFS+ B-tree fork grow-on-full (§4b) — implementation + macOS validation plan
 
-**Status:** TODO / not started. This is the one deferred step of
+**Status: DONE — Phases A, B, and C all shipped and `fsck_hfs`-validated on
+macOS.** The catalog / extents-overflow / attributes B-trees now grow their
+backing fork when they run out of nodes via `HfsPlusFilesystem::grow_btree_fork`
+(`src/fs/hfsplus.rs`), with a clean-`DiskFull` + retry-once at each of the three
+insert methods. Phase A is contiguous tail growth; Phase B spills the 9th+ extent
+into the extents-overflow B-tree (overflow-aware `write_fork_data_with_overflow`);
+Phase C appends map nodes past the `(node_size-256)*8` ≈ 30,720-node header cap.
+
+**Two foundational bugs surfaced and fixed along the way** (every HFS+ image
+rusty-backup *built from scratch* tripped them, but only a real Mac caught them —
+which is exactly why this work was deferred until a Mac was available):
+
+1. **Invalid BTH length.** `write_blank_btree_header_node` laid the BTHeaderRec
+   (record 0) out as 128 bytes (record 1 at offset 142); Apple requires it to be
+   exactly 106 bytes (record 1 at 120, bitmap at 248). `fsck_hfs` rejected every
+   blank with "Invalid BTH length". Fixing it to the canonical 120/248 layout
+   also resolved the §5 header-vs-map-node capacity discrepancy — the bitmap now
+   addresses exactly `(node_size-256)*8` nodes, matching `map_nodes_required`.
+2. **Empty-tree representation + trailing block.** An empty B-tree was written as
+   depth-1 with an empty root leaf (Apple uses depth-0 / no leaf), and the
+   allocation bitmap didn't reserve the trailing block holding the alternate
+   volume header. Both made `fsck_hfs` report "Invalid node structure" /
+   "Invalid volume free block count". `btree_insert_full` now bootstraps the root
+   leaf on the first insert into a depth-0 tree.
+
+Validated on macOS via `rb-cli new --fs hfsplus` (Phase 0) + `rb-cli batch`
+(real `create_file` puts past the 8-extent limit) and the in-repo grow tests'
+emitted images (`RB_EMIT_GROW_IMAGE` / `_SPILL_` / `_MAPC_` / `_DEFRAG_`), each
+`fsck_hfs -f -n` "appears to be OK" and mountable.
+
+---
+
+This is the one deferred step of
 [`docs/hfsplus_btree_growth_plan.md`](hfsplus_btree_growth_plan.md) (§4b). P1–P5
 (variable-length index keys, blank catalog sizing, extents/attributes splitting,
 defrag re-verification, and density rotation) all shipped; this doc is the
