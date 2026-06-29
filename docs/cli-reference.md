@@ -847,12 +847,14 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
 - `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
 - `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
+- `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume instead of the default case-insensitive HFS+. Ignored for other filesystems
+- `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up to whole 4096-byte nodes). Set this *small* to make the catalog easy to outgrow and exercise the fork grow-on-full path. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
 - `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
@@ -924,7 +926,7 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 
 ### `optical`
 
-Optical-media verbs (rip / convert / browse / extract)
+Optical-media verbs (drives / rip / convert / browse / extract)
 
 ```
 Usage: optical <COMMAND>
@@ -959,6 +961,18 @@ Usage: convert --format <FORMAT> <SOURCE> <DEST>
 
 - `--format` — Output format
 
+### `optical drives`
+
+List connected physical optical drives and their device paths
+
+```
+Usage: drives [OPTIONS]
+```
+
+**Options**
+
+- `--remote` — Also query these daemons for their optical drives (repeatable), e.g. `--remote mister.local:7341`. Remote rows print an `rb://...` device arg you can pass straight to `optical rip --device`
+
 ### `optical extract`
 
 Extract files from an optical disc image into a host folder
@@ -986,7 +1000,7 @@ Usage: rip [OPTIONS] --device <DEVICE> --output <OUTPUT>
 
 **Options**
 
-- `--device` — Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`
+- `--device` — Source drive: a local path (e.g. `/dev/sr0`, `disk6`, `\\.\E:`) or a remote daemon's drive as `rb://host:port/dev/sr0` (the daemon issues the SCSI reads; this side does the encoding). `rb-cli optical drives` lists local drives
 - `--output` — Output path: `.iso` for `--format iso`, `.cue` for `--format bincue`
 - `--format` — 
 - `--eject` — Eject the disc after a successful rip

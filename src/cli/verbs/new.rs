@@ -15,6 +15,10 @@ use crate::fs::ntfs_format::{create_ntfs, NtfsFormatParams, NtfsGeometry};
 pub enum FsKind {
     /// Classic HFS (Mac OS Standard).
     Hfs,
+    /// HFS+ / HFSX (Mac OS Extended). A bare single volume, no partition
+    /// map. Use --case-sensitive for HFSX and --min-catalog to floor the
+    /// catalog B-tree size.
+    Hfsplus,
     /// BasiliskII HFV — a flat classic-HFS volume, no partition table.
     /// Same on-disk bytes as `hfs`, but capped at 2047 MB and with the
     /// allocation block size auto-floored so the result is mountable by
@@ -36,7 +40,7 @@ pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Filesystem to format. One of: hfs, hfv, fat, efs, affs, ntfs.
+    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -69,6 +73,18 @@ pub struct NewArgs {
     /// Ignored for other filesystems.
     #[arg(long = "extents-size")]
     pub extents_size: Option<String>,
+
+    /// HFS+ only: format a case-sensitive (HFSX) volume instead of the
+    /// default case-insensitive HFS+. Ignored for other filesystems.
+    #[arg(long = "case-sensitive")]
+    pub case_sensitive: bool,
+
+    /// HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up
+    /// to whole 4096-byte nodes). Set this *small* to make the catalog easy
+    /// to outgrow and exercise the fork grow-on-full path. Ignored for other
+    /// filesystems.
+    #[arg(long = "min-catalog")]
+    pub min_catalog: Option<String>,
 
     /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
     /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
@@ -113,6 +129,9 @@ pub fn run(args: NewArgs) -> Result<()> {
     if (cluster_bytes.is_some() || args.sector_size.is_some()) && args.fs != FsKind::Ntfs {
         anyhow::bail!("--cluster-size / --sector-size are only valid with --fs ntfs");
     }
+    if (args.case_sensitive || args.min_catalog.is_some()) && args.fs != FsKind::Hfsplus {
+        anyhow::bail!("--case-sensitive / --min-catalog are only valid with --fs hfsplus");
+    }
     match args.fs {
         FsKind::Hfs => {
             let catalog_bytes = args
@@ -134,6 +153,22 @@ pub fn run(args: NewArgs) -> Result<()> {
                 args.block_size,
                 catalog_bytes,
                 extents_bytes,
+            )
+        }
+        FsKind::Hfsplus => {
+            let min_catalog = args
+                .min_catalog
+                .as_deref()
+                .map(|s| parse_size(s).context("parsing --min-catalog"))
+                .transpose()?
+                .map(|v| v.min(u32::MAX as u64) as u32);
+            crate::cli::api::hfs::cmd_new_hfsplus_sized(
+                args.image,
+                &args.size,
+                &args.name,
+                args.block_size,
+                args.case_sensitive,
+                min_catalog,
             )
         }
         FsKind::Hfv => {

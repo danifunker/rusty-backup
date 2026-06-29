@@ -2128,13 +2128,36 @@ pub fn btree_insert_full<F>(
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    let header = BTreeHeader::read(data);
+    let mut header = BTreeHeader::read(data);
     let node_size = header.node_size as usize;
     if node_size == 0 {
         return Err(super::filesystem::FilesystemError::InvalidData(
             "B-tree has zero node_size".into(),
         ));
     }
+
+    // Bootstrap an empty (depth-0) tree: a fresh extents-overflow / attributes
+    // B-tree carries only its header node until the first record arrives
+    // (matching Apple's newfs_hfs, which lays out empty trees as
+    // depth=0/root=0 with no leaf). Allocate and initialise the root leaf so
+    // the normal insert path below has somewhere to land.
+    if header.depth == 0 || header.root_node == 0 {
+        let leaf = btree_alloc_node(data, node_size, header.total_nodes)?;
+        let off = leaf as usize * node_size;
+        let node = &mut data[off..off + node_size];
+        node.fill(0);
+        node[8] = 0xFF; // kind = -1 (leaf)
+        node[9] = 1; // height = 1
+        BigEndian::write_u16(&mut node[10..12], 0); // numRecords = 0
+        BigEndian::write_u16(&mut node[node_size - 2..node_size], 14); // free-space offset
+        header.depth = 1;
+        header.root_node = leaf;
+        header.first_leaf_node = leaf;
+        header.last_leaf_node = leaf;
+        header.free_nodes = header.free_nodes.saturating_sub(1);
+        header.write(data);
+    }
+
     let (leaf_idx, parent_chain) = btree_find_insert_leaf(data, &header, key_record, cmp);
 
     let off = leaf_idx as usize * node_size;
@@ -2167,6 +2190,24 @@ where
                         return Ok(());
                     }
                 }
+            }
+            // A single-record insert into a previously-valid leaf splits at
+            // most 2-way (one new leaf), and the separator can cascade up,
+            // splitting one node per level plus a possible new root — at most
+            // `depth + 1` new nodes total. If the tree can't cover that exact
+            // worst case, bail *before* touching anything (the
+            // `btree_insert_record` above failed without mutating the full leaf,
+            // and a failed rotation leaves the tree unchanged), so a caller that
+            // grows the fork and retries can't end up with a half-applied split
+            // — which would duplicate the record. This makes DiskFull from here
+            // a clean no-op (see the grow-on-full retry in
+            // `HfsPlusFilesystem::insert_catalog_record` et al.). The bound is
+            // exact, not padded, so classic HFS (which has no grow path) still
+            // fills its pre-sized catalog right up to genuine capacity.
+            if h.free_nodes < h.depth as u32 + 1 {
+                return Err(super::filesystem::FilesystemError::DiskFull(
+                    "no free B-tree nodes".into(),
+                ));
             }
             let splits = btree_split_leaf_with_insert(
                 data, node_size, leaf_idx, &mut h, key_record, kf, cmp,

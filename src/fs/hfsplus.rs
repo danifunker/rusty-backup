@@ -8,8 +8,8 @@ use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
 use super::hfs_common::{
-    self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, btree_free_node,
-    btree_remove_record, BTreeHeader, BTreeKeyFormat,
+    self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, bitmap_test_bit_be,
+    btree_free_node, btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -17,11 +17,42 @@ const HFS_PLUS_SIGNATURE: u16 = 0x482B;
 const HFSX_SIGNATURE: u16 = 0x4858;
 
 /// HFS+ reserved CNIDs (Inside Macintosh: Files / TN1150).
-#[allow(dead_code)]
 const HFSPLUS_EXTENTS_FILE_ID: u32 = 3;
 const HFSPLUS_CATALOG_FILE_ID: u32 = 4;
 const HFSPLUS_ALLOCATION_FILE_ID: u32 = 6;
 const HFSPLUS_ATTRIBUTES_FILE_ID: u32 = 8;
+
+/// Which special-file B-tree a grow-on-full operation targets. Each is
+/// backed by a `ForkData` in the volume header and an in-memory tree buffer
+/// (`catalog_data` / `extents_overflow_data` / `attributes_data`).
+/// See `grow_btree_fork` and `docs/todo_hfsplus_fork_growth.md` §4b.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BTreeFork {
+    Catalog,
+    Extents,
+    Attributes,
+}
+
+impl BTreeFork {
+    /// Reserved CNID of the special file backing this B-tree — the key under
+    /// which its own overflow extents are recorded in the extents-overflow
+    /// B-tree (Phase B).
+    fn file_id(self) -> u32 {
+        match self {
+            BTreeFork::Catalog => HFSPLUS_CATALOG_FILE_ID,
+            BTreeFork::Extents => HFSPLUS_EXTENTS_FILE_ID,
+            BTreeFork::Attributes => HFSPLUS_ATTRIBUTES_FILE_ID,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BTreeFork::Catalog => "catalog",
+            BTreeFork::Extents => "extents-overflow",
+            BTreeFork::Attributes => "attributes",
+        }
+    }
+}
 
 /// Volume attribute bit (`vh.attributes`) set when the volume carries a
 /// journal. We refuse to enter edit mode on these volumes until journal
@@ -1812,15 +1843,33 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// index keys. This is the same path classic HFS's `insert_catalog_record`
     /// uses; the previous hand-rolled split dance here packed less densely because
     /// it never rotated.
-    fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
+    fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError>
+    where
+        R: std::io::Write,
+    {
         let cs = self.case_sensitive();
-        let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
-        hfs_common::btree_insert_full(
-            &mut self.catalog_data,
-            key_record,
-            &BTreeKeyFormat::HFSPLUS_CATALOG,
-            &cmp,
-        )?;
+        // Insert; if the catalog runs out of free B-tree nodes, grow the fork
+        // and retry once (docs/todo_hfsplus_fork_growth.md §4b). `btree_insert_full`
+        // returns a *clean* DiskFull (no partial split) when it can't cover the
+        // worst-case cascade, so the retry can't duplicate the record. A second
+        // DiskFull means the volume itself is full — propagate it.
+        let mut grown = false;
+        loop {
+            let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+            match hfs_common::btree_insert_full(
+                &mut self.catalog_data,
+                key_record,
+                &BTreeKeyFormat::HFSPLUS_CATALOG,
+                &cmp,
+            ) {
+                Ok(()) => break,
+                Err(FilesystemError::DiskFull(_)) if !grown => {
+                    self.grow_btree_fork(BTreeFork::Catalog)?;
+                    grown = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
         Ok(())
     }
@@ -1929,22 +1978,38 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
     /// forced the classic 1-byte/0x25 shape, which is why this path was pinned to
     /// a single leaf level (docs/hfsplus_btree_growth_plan.md §4a/P3).
     fn insert_extents_overflow_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        let data = self.extents_overflow_data.as_mut().ok_or_else(|| {
-            FilesystemError::Unsupported(
-                "volume has no extents-overflow B-tree — fragmented files cannot be created".into(),
-            )
-        })?;
-        if BTreeHeader::read(data).node_size == 0 {
-            return Err(FilesystemError::InvalidData(
-                "extents-overflow B-tree has zero node_size".into(),
-            ));
+        {
+            let data = self.extents_overflow_data.as_ref().ok_or_else(|| {
+                FilesystemError::Unsupported(
+                    "volume has no extents-overflow B-tree — fragmented files cannot be created"
+                        .into(),
+                )
+            })?;
+            if BTreeHeader::read(data).node_size == 0 {
+                return Err(FilesystemError::InvalidData(
+                    "extents-overflow B-tree has zero node_size".into(),
+                ));
+            }
         }
-        hfs_common::btree_insert_full(
-            data,
-            key_record,
-            &BTreeKeyFormat::HFSPLUS_EXTENTS,
-            &Self::extents_compare,
-        )
+        // Insert; grow the extents-overflow fork and retry once on a clean
+        // node-exhaustion DiskFull (see `insert_catalog_record`).
+        let mut grown = false;
+        loop {
+            let data = self.extents_overflow_data.as_mut().unwrap();
+            match hfs_common::btree_insert_full(
+                data,
+                key_record,
+                &BTreeKeyFormat::HFSPLUS_EXTENTS,
+                &Self::extents_compare,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(FilesystemError::DiskFull(_)) if !grown => {
+                    self.grow_btree_fork(BTreeFork::Extents)?;
+                    grown = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
@@ -2101,12 +2166,28 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         // The attributes B-tree, like the catalog, uses 2-byte big keys and
         // variable-length index separators, so it threads HFSPLUS_ATTRIBUTES
         // through the shared insert (which also rotates before splitting).
-        hfs_common::btree_insert_full(
-            data,
-            key_record,
-            &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
-            &Self::attr_compare,
-        )
+        // Insert; grow the attributes fork and retry once on a clean
+        // node-exhaustion DiskFull (see `insert_catalog_record`).
+        let mut grown = false;
+        loop {
+            let data = self
+                .attributes_data
+                .as_mut()
+                .expect("ensure_attributes_loaded populated the buffer");
+            match hfs_common::btree_insert_full(
+                data,
+                key_record,
+                &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+                &Self::attr_compare,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(FilesystemError::DiskFull(_)) if !grown => {
+                    self.grow_btree_fork(BTreeFork::Attributes)?;
+                    grown = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Remove every attribute record matching `(cnid, name)`. Returns the
@@ -2242,25 +2323,33 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         if self.vh.attributes_file.logical_size == 0 {
             return Ok(());
         }
-        let Some(ref data) = self.attributes_data else {
+        if self.attributes_data.is_none() {
             return Ok(());
-        };
-        write_fork_data(
+        }
+        write_fork_data_with_overflow(
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
             &self.vh.attributes_file,
-            data,
+            HFSPLUS_ATTRIBUTES_FILE_ID,
+            0,
+            self.extents_overflow_data.as_deref(),
+            self.attributes_data.as_deref().unwrap(),
         )
     }
 
-    /// Write the catalog B-tree data back to disk through the catalog_file fork extents.
+    /// Write the catalog B-tree data back to disk through the catalog_file
+    /// fork extents — including any overflow extents past the 8 inline slots
+    /// that §4b growth may have added.
     fn write_catalog(&mut self) -> Result<(), FilesystemError> {
-        write_fork_data(
+        write_fork_data_with_overflow(
             &mut self.reader,
             self.partition_offset,
             self.vh.block_size,
             &self.vh.catalog_file,
+            HFSPLUS_CATALOG_FILE_ID,
+            0,
+            self.extents_overflow_data.as_deref(),
             &self.catalog_data,
         )
     }
@@ -2391,6 +2480,290 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             }
             self.free_blocks(ext.start_block, ext.block_count);
         }
+    }
+
+    // --- B-tree fork grow-on-full (docs/todo_hfsplus_fork_growth.md §4b) ---
+
+    /// Mutable handle to the in-memory tree buffer for `kind`. Errors if the
+    /// volume has no such B-tree (e.g. growing the extents-overflow tree on a
+    /// volume that never built one).
+    fn tree_buf_mut(&mut self, kind: BTreeFork) -> Result<&mut Vec<u8>, FilesystemError> {
+        match kind {
+            BTreeFork::Catalog => Ok(&mut self.catalog_data),
+            BTreeFork::Extents => self.extents_overflow_data.as_mut().ok_or_else(|| {
+                FilesystemError::Unsupported("volume has no extents-overflow B-tree".into())
+            }),
+            BTreeFork::Attributes => self.attributes_data.as_mut().ok_or_else(|| {
+                FilesystemError::Unsupported("volume has no attributes B-tree".into())
+            }),
+        }
+    }
+
+    /// The volume-header `ForkData` backing `kind`.
+    fn fork_mut(&mut self, kind: BTreeFork) -> &mut ForkData {
+        match kind {
+            BTreeFork::Catalog => &mut self.vh.catalog_file,
+            BTreeFork::Extents => &mut self.vh.extents_file,
+            BTreeFork::Attributes => &mut self.vh.attributes_file,
+        }
+    }
+
+    /// First volume block immediately *after* the fork's last inline extent —
+    /// the candidate start for a contiguous tail growth. Returns 0 (never a
+    /// valid data block) when the fork has no extents. Overflow extents are
+    /// intentionally not consulted: if the true tail lies in an overflow
+    /// extent, `allocate_contiguous_after` simply finds the candidate block
+    /// busy and the caller falls back to the general allocator — correct, just
+    /// not optimally contiguous.
+    fn fork_last_inline_block(&self, kind: BTreeFork) -> u32 {
+        let fork = match kind {
+            BTreeFork::Catalog => &self.vh.catalog_file,
+            BTreeFork::Extents => &self.vh.extents_file,
+            BTreeFork::Attributes => &self.vh.attributes_file,
+        };
+        let mut last = 0u32;
+        for e in &fork.extents {
+            if e.block_count == 0 {
+                break;
+            }
+            last = e.start_block + e.block_count;
+        }
+        last
+    }
+
+    /// Try to claim `blocks` free volume blocks *immediately following*
+    /// `after_block`, so the fork's last extent simply gets longer (extent
+    /// count unchanged — the fragmentation-free common case). Returns the new
+    /// extent on success, or `None` if `after_block` is 0, the run would run
+    /// past the volume, or any block in it is already allocated. Updates the
+    /// bitmap, `free_blocks`, and `next_allocation` exactly like
+    /// `allocate_extents`.
+    fn allocate_contiguous_after(
+        &mut self,
+        after_block: u32,
+        blocks: u32,
+    ) -> Option<ExtentDescriptor> {
+        if blocks == 0 || after_block == 0 {
+            return None;
+        }
+        self.ensure_bitmap().ok()?;
+        if after_block.checked_add(blocks)? > self.vh.total_blocks {
+            return None;
+        }
+        if self.vh.free_blocks < blocks {
+            return None;
+        }
+        let bitmap = self.bitmap.as_mut()?;
+        for i in 0..blocks {
+            if bitmap_test_bit_be(bitmap, after_block + i) {
+                return None; // tail is not free — caller falls back
+            }
+        }
+        for i in 0..blocks {
+            bitmap_set_bit_be(bitmap, after_block + i);
+        }
+        self.vh.free_blocks -= blocks;
+        self.vh.next_allocation = (after_block + blocks).max(self.vh.next_allocation);
+        Some(ExtentDescriptor {
+            start_block: after_block,
+            block_count: blocks,
+        })
+    }
+
+    /// Attach freshly-allocated `new_extents` to the fork backing `kind`,
+    /// merging the first one into the fork's last inline extent when they are
+    /// physically contiguous (so a contiguous tail grow keeps the extent count
+    /// unchanged), dropping the rest into free inline slots, and spilling any
+    /// remainder past the 8 inline slots into the extents-overflow B-tree
+    /// (Phase B). Bumps the fork's `total_blocks` / `logical_size`.
+    fn attach_extents_to_fork(
+        &mut self,
+        kind: BTreeFork,
+        new_extents: &[ExtentDescriptor],
+    ) -> Result<(), FilesystemError> {
+        let block_size = self.vh.block_size as u64;
+        let fork = self.fork_mut(kind);
+        let mut added_blocks = 0u32;
+        let mut overflow: Vec<ExtentDescriptor> = Vec::new();
+        for ext in new_extents {
+            if ext.block_count == 0 {
+                continue;
+            }
+            added_blocks += ext.block_count;
+            // Index of the last non-empty inline slot, if any.
+            let last_idx = (0..8)
+                .take_while(|&i| fork.extents[i].block_count != 0)
+                .last();
+            let mut placed = false;
+            if let Some(i) = last_idx {
+                let le = fork.extents[i];
+                if le.start_block + le.block_count == ext.start_block {
+                    fork.extents[i].block_count += ext.block_count;
+                    placed = true;
+                }
+            }
+            if !placed {
+                if let Some(i) = (0..8).find(|&i| fork.extents[i].block_count == 0) {
+                    fork.extents[i] = *ext;
+                    placed = true;
+                }
+            }
+            if !placed {
+                overflow.push(*ext);
+            }
+        }
+        fork.total_blocks += added_blocks;
+        fork.logical_size += added_blocks as u64 * block_size;
+        if !overflow.is_empty() {
+            self.spill_fork_extents_to_overflow(kind, &overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Phase B: record fork `extents` that overflowed the 8 inline slots into
+    /// the extents-overflow B-tree, keyed by the special file's reserved CNID
+    /// (fork type 0). These append after the fork's existing inline + overflow
+    /// blocks, so their file-relative start is `inline_blocks +
+    /// existing_overflow_blocks`. The write side (`write_fork_data_with_overflow`)
+    /// and read side (`read_fork_with_overflow`) both consult these records.
+    fn spill_fork_extents_to_overflow(
+        &mut self,
+        kind: BTreeFork,
+        extents: &[ExtentDescriptor],
+    ) -> Result<(), FilesystemError> {
+        // The extents-overflow file cannot store its *own* overflow extents
+        // (it would have to contain a record describing where it lives) — HFS+
+        // limits it to 8 inline extents. In practice it stays tiny, so this is
+        // a hard error if it ever happens, and the recursion guard that keeps
+        // a catalog/attributes spill (which grows the extents fork) from
+        // re-entering here for the extents fork itself.
+        if kind == BTreeFork::Extents {
+            return Err(FilesystemError::DiskFull(
+                "extents-overflow B-tree fork exceeded its 8 inline extents".into(),
+            ));
+        }
+        let file_id = kind.file_id();
+        let fork = match kind {
+            BTreeFork::Catalog => &self.vh.catalog_file,
+            BTreeFork::Attributes => &self.vh.attributes_file,
+            BTreeFork::Extents => unreachable!(),
+        };
+        let inline_blocks: u32 = fork.extents.iter().map(|e| e.block_count).sum();
+        let existing_overflow: u32 = match self.extents_overflow_data.as_deref() {
+            Some(ed) => collect_hfsplus_overflow_extents(ed, file_id, 0, inline_blocks)
+                .iter()
+                .map(|e| e.block_count)
+                .sum(),
+            None => 0,
+        };
+        let mut file_rel = inline_blocks + existing_overflow;
+        // HFS+ extents-overflow records hold up to 8 extent descriptors each.
+        for chunk in extents.chunks(8) {
+            let rec = Self::build_extents_overflow_record(file_id, 0, file_rel, chunk);
+            self.insert_extents_overflow_record(&rec)?;
+            file_rel += chunk.iter().map(|e| e.block_count).sum::<u32>();
+        }
+        Ok(())
+    }
+
+    /// Grow the B-tree fork backing `kind` by at least one clump of nodes so a
+    /// subsequent `btree_insert_full` has free nodes to allocate. Allocates
+    /// volume blocks (preferring a contiguous tail extension), attaches them to
+    /// the fork, extends the in-memory tree buffer, and publishes the new nodes
+    /// to the tree header (`total_nodes` / `free_nodes`). The node-allocation
+    /// bitmap bits for the new nodes already read as 0 (free) inside the header
+    /// node's capacity; past that, a map node is appended to the bitmap chain
+    /// (§4b Phase C).
+    fn grow_btree_fork(&mut self, kind: BTreeFork) -> Result<(), FilesystemError> {
+        let block_size = self.vh.block_size;
+
+        let (node_size, total_nodes) = {
+            let buf = self.tree_buf_mut(kind)?;
+            let h = BTreeHeader::read(buf);
+            (h.node_size as usize, h.total_nodes)
+        };
+        if node_size == 0 || node_size < 256 {
+            return Err(FilesystemError::InvalidData(format!(
+                "{} B-tree has invalid node_size {node_size}",
+                kind.label()
+            )));
+        }
+        let blocks_per_node = (node_size as u32 / block_size).max(1);
+
+        // Grow by at least 8 nodes, rounded up to the fork's clump, to amortise
+        // the work and keep per-`put` workloads from re-entering grow on every
+        // insert (which would fragment the fork and defeat the contiguous-tail
+        // strategy).
+        let clump_nodes = (self.vh.data_clump_size as usize)
+            .div_ceil(node_size)
+            .max(1) as u32;
+        let grow_nodes = clump_nodes.max(8);
+
+        // The header node's bitmap addresses (node_size - 256) * 8 node bits;
+        // each map node (BTNodeKind=2) chained off the header adds
+        // map_node_bitmap_bytes*8 more. When a grow would push the node count
+        // past the current addressable range, we must append one map node so
+        // the new node indices have bitmap bits (§4b Phase C). A single map
+        // node covers far more nodes than one grow adds, so at most one new map
+        // node is ever needed per grow.
+        let header_cap = ((node_size - 256) * 8) as u32;
+        let per_map = (hfs_common::map_node_bitmap_bytes(node_size) * 8) as u32;
+        let existing_map = {
+            let buf = self.tree_buf_mut(kind)?;
+            (hfs_common::btree_bitmap_segments(buf, node_size).len() as u32).saturating_sub(1)
+        };
+        let current_capacity = header_cap + existing_map * per_map;
+        let need_map = total_nodes + grow_nodes > current_capacity;
+        if need_map && per_map == 0 {
+            return Err(FilesystemError::DiskFull(format!(
+                "{} B-tree node bitmap full and node size too small for map nodes",
+                kind.label()
+            )));
+        }
+        let add_slots = grow_nodes + u32::from(need_map);
+        let grow_blocks = add_slots * blocks_per_node;
+
+        // Allocate volume blocks, preferring a contiguous tail extension so the
+        // fork's last extent just gets longer.
+        let last_block = self.fork_last_inline_block(kind);
+        let new_extents = match self.allocate_contiguous_after(last_block, grow_blocks) {
+            Some(e) => vec![e],
+            None => self.allocate_extents(grow_blocks)?,
+        };
+
+        self.attach_extents_to_fork(kind, &new_extents)?;
+
+        // Extend the in-memory tree buffer and publish the new nodes. The added
+        // bytes are zero, so the new node-bitmap bits read as free and
+        // `btree_alloc_node` will hand them out.
+        {
+            let buf = self.tree_buf_mut(kind)?;
+            buf.resize(buf.len() + add_slots as usize * node_size, 0);
+
+            if need_map {
+                // The new map node takes the first new slot; the free data
+                // nodes follow it. Its own index is still inside the *existing*
+                // bitmap capacity (one grow adds far fewer nodes than the
+                // header/last-map-node segment can address), so we can mark it
+                // used after linking it into the chain.
+                let map_idx = total_nodes;
+                let tail = btree_map_chain_tail(buf, node_size); // 0 => link via header node 0
+                hfs_common::init_map_node(buf, node_size, map_idx, tail, 0);
+                let linker_off = tail as usize * node_size; // node 0 is the header
+                BigEndian::write_u32(&mut buf[linker_off..linker_off + 4], map_idx);
+                hfs_common::btree_bitmap_set(buf, node_size, map_idx);
+            }
+
+            let mut h = BTreeHeader::read(buf);
+            h.total_nodes += add_slots;
+            h.free_nodes += grow_nodes; // the map node is allocated, not free
+            h.write(buf);
+        }
+        self.vh.write_count = self.vh.write_count.wrapping_add(1);
+        if kind == BTreeFork::Catalog {
+            self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        }
+        Ok(())
     }
 
     /// Write file data to allocated blocks. Returns the ForkData describing
@@ -3367,6 +3740,90 @@ fn write_fork_data<R: Write + Seek>(
         written += to_write;
     }
     Ok(())
+}
+
+/// Write a special-file B-tree fork that may have grown past its 8 inline
+/// extents (§4b Phase B). Writes the inline extents first, then continues
+/// into the fork's overflow extents pulled from the extents-overflow B-tree
+/// — the write-side mirror of [`read_fork_with_overflow`]. Without this, a
+/// grown catalog/attributes fork would be silently truncated on disk to its
+/// first 8 extents even though it looks complete in memory.
+#[allow(clippy::too_many_arguments)]
+fn write_fork_data_with_overflow<R: Write + Seek>(
+    writer: &mut R,
+    partition_offset: u64,
+    block_size: u32,
+    fork: &ForkData,
+    file_id: u32,
+    fork_type: u8,
+    extents_overflow_data: Option<&[u8]>,
+    data: &[u8],
+) -> Result<(), FilesystemError> {
+    let mut written = 0usize;
+    let write_extent = |writer: &mut R, ext: &ExtentDescriptor, written: &mut usize| {
+        if ext.block_count == 0 || *written >= data.len() {
+            return Ok(false);
+        }
+        let offset = partition_offset + ext.start_block as u64 * block_size as u64;
+        let extent_len = ext.block_count as u64 * block_size as u64;
+        let to_write = extent_len.min((data.len() - *written) as u64) as usize;
+        writer.seek(SeekFrom::Start(offset))?;
+        writer.write_all(&data[*written..*written + to_write])?;
+        *written += to_write;
+        Ok::<bool, FilesystemError>(true)
+    };
+
+    for ext in &fork.extents {
+        if ext.is_empty() {
+            break;
+        }
+        if !write_extent(writer, ext, &mut written)? {
+            return Ok(());
+        }
+    }
+    if written >= data.len() {
+        return Ok(());
+    }
+    // Inline extents didn't cover the whole fork — continue into overflow.
+    let Some(ext_data) = extents_overflow_data else {
+        return Err(FilesystemError::InvalidData(format!(
+            "special file {file_id} fork {fork_type:#x}: {} bytes to write but only \
+             inline extents and no extents-overflow B-tree",
+            data.len()
+        )));
+    };
+    let inline_blocks: u32 = fork.extents.iter().map(|e| e.block_count).sum();
+    for ext in collect_hfsplus_overflow_extents(ext_data, file_id, fork_type, inline_blocks) {
+        if !write_extent(writer, &ext, &mut written)? {
+            break;
+        }
+    }
+    if written < data.len() {
+        return Err(FilesystemError::InvalidData(format!(
+            "special file {file_id} fork {fork_type:#x}: extents cover {written} of {} bytes",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Index of the last node in a B-tree's map-node chain (`header.fLink` →
+/// mapNode → … → 0), or 0 when the chain is empty (so the caller links the
+/// first map node via the header node at index 0). Cycle-guarded.
+fn btree_map_chain_tail(buf: &[u8], node_size: usize) -> u32 {
+    let mut next = BigEndian::read_u32(&buf[0..4]); // header.fLink
+    let mut last = 0u32;
+    let mut guard = 0;
+    while next != 0 && guard < 1_000_000 {
+        last = next;
+        let off = next as usize * node_size;
+        if off + 4 > buf.len() {
+            break;
+        }
+        next = BigEndian::read_u32(&buf[off..off + 4]);
+        guard += 1;
+    }
+    last
 }
 
 /// Decode a UTF-16BE byte slice to a String.
@@ -5079,13 +5536,14 @@ fn build_blank_hfsplus_front(
     //
     // `to_nodes` rounds a byte budget up to whole nodes and clamps to
     // [4, header-bitmap capacity]. The blank's node-allocation bitmap lives
-    // entirely in the header node's record 2 (bytes 270..node_size-8 — see
-    // `write_blank_btree_header_node`), which addresses `(node_size - 278) * 8`
+    // entirely in the header node's record 2 (bytes 248..node_size-8 — see
+    // `write_blank_btree_header_node`), which addresses `(node_size - 256) * 8`
     // nodes without dedicated map nodes; cap there. Volumes whose 0.5% catalog
-    // would exceed this (~117 MiB at 4096, i.e. hundreds of GiB of volume) are
+    // would exceed this (~123 MiB at 4096, i.e. hundreds of GiB of volume) are
     // far larger than this tool targets, and the defrag/clone path — which does
-    // build map nodes — covers them.
-    let max_btree_nodes: u32 = ((node_size - 278) * 8) as u32;
+    // build map nodes — covers them. (The §4b live-grow path appends map nodes
+    // incrementally past this cap; see `grow_btree_fork`.)
+    let max_btree_nodes: u32 = ((node_size - 256) * 8) as u32;
     let to_nodes = |bytes: u64| -> u32 {
         bytes
             .div_ceil(node_size as u64)
@@ -5119,19 +5577,36 @@ fn build_blank_hfsplus_front(
     let front_size = reserved_blocks as usize * block_size as usize;
     let mut front = vec![0u8; front_size];
 
+    // The alternate volume header occupies the last 1024 bytes of the volume.
+    // Apple always marks the trailing allocation block(s) it touches as used
+    // (one block for block_size >= 1024, two for 512-byte blocks) and excludes
+    // them from the free-block count. Without this, fsck_hfs reports
+    // "Invalid volume free block count" / bitmap under-allocation.
+    let alt_vh_start_block: u32 = ((image_size as u64 - 1024) / bs) as u32;
+    let trailing_blocks: u32 = total_blocks - alt_vh_start_block;
+
     // --- Allocation bitmap ---
     {
         let bitmap_off = bitmap_start as usize * block_size as usize;
         let bitmap = &mut front[bitmap_off..bitmap_off + (bitmap_bytes as usize).max(1)];
-        for blk in 0..reserved_blocks {
+        let mut mark = |blk: u32| {
             // MSB-first big-endian: bit position (7 - blk%8) of byte (blk/8).
             let byte_idx = (blk / 8) as usize;
             let bit_pos = 7 - (blk % 8);
             bitmap[byte_idx] |= 1 << bit_pos;
+        };
+        for blk in 0..reserved_blocks {
+            mark(blk);
+        }
+        for blk in alt_vh_start_block..total_blocks {
+            mark(blk);
         }
     }
 
-    // --- Extents-overflow B-tree (header + empty leaf) ---
+    // --- Extents-overflow B-tree (empty: header node only) ---
+    // An empty tree is depth-0 / root-0 with no leaf node, exactly as Apple's
+    // newfs_hfs lays it out (see `write_blank_btree_header_node`). The first
+    // fragmented-file insert bootstraps a root leaf via `btree_insert_full`.
     {
         let off = extents_start as usize * block_size as usize;
         write_blank_btree_header_node(
@@ -5139,12 +5614,10 @@ fn build_blank_hfsplus_front(
             node_size,
             /* leaf_records= */ 0,
             /* total_nodes= */ extents_node_count,
-            /* free_nodes= */ extents_node_count - 2, // header + empty leaf used
+            /* free_nodes= */ extents_node_count - 1, // only the header node is used
             /* max_key_len= */ 10,
             /* key_compare_type= */ 0, // unused for extents
         );
-        let leaf_off = off + node_size;
-        write_empty_leaf_node(&mut front[leaf_off..leaf_off + node_size]);
     }
 
     // --- Catalog B-tree (header + leaf with root + thread) ---
@@ -5195,7 +5668,7 @@ fn build_blank_hfsplus_front(
         folder_count: 0,
         block_size,
         total_blocks,
-        free_blocks: total_blocks - reserved_blocks,
+        free_blocks: total_blocks - reserved_blocks - trailing_blocks,
         next_allocation: reserved_blocks,
         rsrc_clump_size: block_size,
         data_clump_size: block_size,
@@ -5289,12 +5762,24 @@ pub(crate) fn write_blank_btree_header_node(
     BigEndian::write_u16(&mut node[10..12], 3); // 3 records
 
     // Record 0: BTHeaderRec at offset 14 (106 bytes).
+    //
+    // An *empty* tree (no leaf records, e.g. a fresh extents-overflow or
+    // attributes B-tree) is represented exactly as Apple's `newfs_hfs` does:
+    // treeDepth = 0, rootNode = 0, firstLeafNode = lastLeafNode = 0, and no
+    // leaf node allocated — only the header node is in use. A populated blank
+    // (the catalog, with its root folder + thread records) has a single
+    // root *leaf* at node 1. `fsck_hfs` rejects a depth-1 tree whose root is
+    // an empty leaf ("Invalid node structure"), which is why the empty case
+    // must collapse to depth 0. `btree_insert_full` bootstraps the first leaf
+    // on the initial insert into a depth-0 tree.
+    let empty = leaf_records == 0;
+    let (depth, root_first_last): (u16, u32) = if empty { (0, 0) } else { (1, 1) };
     let hr = 14usize;
-    BigEndian::write_u16(&mut node[hr..hr + 2], 1); // depth = 1
-    BigEndian::write_u32(&mut node[hr + 2..hr + 6], 1); // root = 1
+    BigEndian::write_u16(&mut node[hr..hr + 2], depth);
+    BigEndian::write_u32(&mut node[hr + 2..hr + 6], root_first_last); // root
     BigEndian::write_u32(&mut node[hr + 6..hr + 10], leaf_records);
-    BigEndian::write_u32(&mut node[hr + 10..hr + 14], 1); // first leaf
-    BigEndian::write_u32(&mut node[hr + 14..hr + 18], 1); // last leaf
+    BigEndian::write_u32(&mut node[hr + 10..hr + 14], root_first_last); // first leaf
+    BigEndian::write_u32(&mut node[hr + 14..hr + 18], root_first_last); // last leaf
     BigEndian::write_u16(&mut node[hr + 18..hr + 20], node_size as u16);
     BigEndian::write_u16(&mut node[hr + 20..hr + 22], max_key_len);
     BigEndian::write_u32(&mut node[hr + 22..hr + 26], total_nodes);
@@ -5303,11 +5788,18 @@ pub(crate) fn write_blank_btree_header_node(
     node[hr + 36] = 0; // kBTHFSTreeType
     node[hr + 37] = key_compare_type;
 
-    // Record 1: 128-byte user data at offset 142 (after 14+106=120, but
-    // 128-aligned for clarity → start at 142 to match make_editable_hfsplus_image).
-    let user_off: u16 = 142;
-    let bitmap_off: u16 = 270;
-    let free_off: u16 = (node_size as u16).saturating_sub(8); // some headroom
+    // Canonical TN1150 B-tree header node layout. The BTHeaderRec (record 0)
+    // is *exactly* 106 bytes — Apple's `fsck_hfs` rejects any other length
+    // ("Invalid BTH length"). So record 1 (the 128-byte reserved user-data
+    // record) starts at 14 + 106 = 120, and record 2 (the node-allocation
+    // bitmap) starts at 120 + 128 = 248, filling the node to the offset
+    // table. The bitmap therefore addresses (node_size - 256) * 8 nodes,
+    // which is exactly what `hfs_common::map_nodes_required` assumes — so the
+    // header-vs-map-node boundary is consistent (see the discrepancy noted in
+    // docs/todo_hfsplus_fork_growth.md §5, resolved by using 248 here).
+    let user_off: u16 = 120;
+    let bitmap_off: u16 = 248;
+    let free_off: u16 = (node_size as u16).saturating_sub(8); // fills to offset table
 
     let ot_end = node_size;
     BigEndian::write_u16(&mut node[ot_end - 2..ot_end], 14); // record 0
@@ -5315,11 +5807,16 @@ pub(crate) fn write_blank_btree_header_node(
     BigEndian::write_u16(&mut node[ot_end - 6..ot_end - 4], bitmap_off);
     BigEndian::write_u16(&mut node[ot_end - 8..ot_end - 6], free_off);
 
-    // Mark nodes 0 and 1 allocated in the bitmap.
-    node[bitmap_off as usize] = 0b11000000;
+    // Mark allocated nodes in the bitmap: node 0 (header) always; node 1
+    // (the root leaf) only for a populated tree. An empty tree's node 1 is
+    // free and zero-filled, matching Apple.
+    node[bitmap_off as usize] = if empty { 0b10000000 } else { 0b11000000 };
 }
 
-/// Write an empty leaf node (kind=-1, height=1, 0 records).
+/// Write an empty leaf node (kind=-1, height=1, 0 records). Only used by test
+/// fixtures now — the production blank/defrag builders represent an empty tree
+/// as depth 0 with no leaf node (the first insert bootstraps the root leaf).
+#[cfg(test)]
 pub(crate) fn write_empty_leaf_node(node: &mut [u8]) {
     node.fill(0);
     node[8] = 0xFF; // kind = -1
@@ -6352,9 +6849,11 @@ mod tests {
         // 32 MiB / 4096 = 8192 blocks. The catalog is now volume-scaled
         // (~0.5%, docs/hfsplus_btree_growth_plan.md §4c): 32 MiB / 200 =
         // 167,772 bytes -> 41 nodes @ 4096. Reserved = 1 (boot/VH) + 1 (bitmap)
-        // + 4 (extents, default) + 41 (catalog) = 47. Free = 8145.
+        // + 4 (extents, default) + 41 (catalog) = 47 at the front, plus the
+        // trailing allocation block holding the alternate volume header (Apple
+        // reserves it; required for an fsck_hfs-clean free-block count).
         assert_eq!(fs.vh.total_blocks, 8192);
-        assert_eq!(fs.vh.free_blocks, 8192 - 47);
+        assert_eq!(fs.vh.free_blocks, 8192 - 47 - 1);
         // Edit-mode prep should succeed (unmounted bit set, no journal).
         fs.prepare_for_edit().expect("blank must accept edit prep");
     }
@@ -8106,6 +8605,291 @@ mod tests {
                 .map(|e| &e.message)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_grows_map_nodes_past_cap_phase_c() {
+        // §4b Phase C (docs/todo_hfsplus_fork_growth.md): once a B-tree fork
+        // grows past the header node's bitmap capacity ((node_size-256)*8 =
+        // 30,720 nodes @ 4096), a map node (BTNodeKind=2) must be appended to
+        // the node-allocation bitmap chain so the new node indices are
+        // addressable. Pre-size the catalog just under the cap, then grow a few
+        // times to cross it — exercising the map-node append without needing
+        // the millions of records a from-scratch fill would take.
+        use super::hfs_common::{btree_bitmap_segments, BTreeHeader};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let node_size = 4096usize;
+        let header_cap = ((node_size - 256) * 8) as u32; // 30,720
+
+        // Catalog pinned to ~16 nodes below the cap; 180 MiB volume holds it.
+        let min_catalog = (header_cap - 16) * node_size as u32;
+        let img =
+            create_blank_hfsplus_sized(180 * 1024 * 1024, 4096, "MapCap", false, min_catalog, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let start = BTreeHeader::read(fs.catalog_data()).total_nodes;
+        assert!(
+            start <= header_cap && start > header_cap - 64,
+            "blank catalog {start} not near cap"
+        );
+        // No map node yet — the whole bitmap lives in the header node.
+        assert_eq!(
+            btree_bitmap_segments(fs.catalog_data(), node_size).len(),
+            1,
+            "fresh near-cap catalog should have no map nodes"
+        );
+
+        // Grow until we cross the header bitmap cap.
+        let mut guard = 0;
+        while BTreeHeader::read(fs.catalog_data()).total_nodes <= header_cap {
+            fs.grow_btree_fork(BTreeFork::Catalog).unwrap();
+            guard += 1;
+            assert!(guard < 64, "too many grows to cross the cap");
+        }
+        let h = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            h.total_nodes > header_cap,
+            "did not cross the cap: {}",
+            h.total_nodes
+        );
+        // A map-node segment must now exist in the bitmap chain.
+        let segs = btree_bitmap_segments(fs.catalog_data(), node_size);
+        assert!(
+            segs.len() >= 2,
+            "expected a map-node segment after crossing the cap, got {} segment(s)",
+            segs.len()
+        );
+
+        // fsck-clean with the map node in place.
+        fs.sync_metadata().unwrap();
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck after map-node grow: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Reopen re-reads the grown fork and the map chain.
+        let img = fs.reader.get_ref().clone();
+        if let Ok(path) = std::env::var("RB_EMIT_MAPC_IMAGE") {
+            std::fs::write(&path, &img).unwrap();
+        }
+        let fs2 = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        assert_eq!(
+            BTreeHeader::read(fs2.catalog_data()).total_nodes,
+            h.total_nodes,
+            "reopen lost grown nodes"
+        );
+        assert!(
+            btree_bitmap_segments(fs2.catalog_data(), node_size).len() >= 2,
+            "reopen lost the map node"
+        );
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_grow_spills_to_overflow_phase_b() {
+        // §4b Phase B (docs/todo_hfsplus_fork_growth.md): real `create_file`
+        // calls interleave a data-block allocation with each catalog grow, so
+        // contiguous tail growth fails and the catalog fork fragments. Once it
+        // exhausts its 8 inline extents, further growth spills into the
+        // extents-overflow B-tree (keyed by the catalog's reserved CNID 4) and
+        // is persisted by the overflow-aware write path. The volume stays
+        // readable + fsck-clean, and a reopen re-reads the > 8-extent fork.
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        let img = create_blank_hfsplus_sized(16 * 1024 * 1024, 4096, "SpillVol", false, 0, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+        let root = fs.root().unwrap();
+        let mut dirs = Vec::new();
+        for d in 0..20 {
+            dirs.push(
+                fs.create_directory(&root, &format!("d{d}"), &Default::default())
+                    .unwrap(),
+            );
+        }
+        const N: u32 = 1200;
+        for i in 0..N {
+            let d = &dirs[(i % 20) as usize];
+            let mut data = std::io::Cursor::new(vec![b'x']);
+            fs.create_file(
+                d,
+                &format!("f{i:05}.txt"),
+                &mut data,
+                1,
+                &Default::default(),
+            )
+            .unwrap_or_else(|e| panic!("create_file #{i} (grow+spill should cover it): {e}"));
+        }
+
+        // The catalog fork saturated its 8 inline extents and spilled the rest
+        // into the extents-overflow B-tree.
+        let inline: u32 = fs
+            .vh
+            .catalog_file
+            .extents
+            .iter()
+            .map(|e| e.block_count)
+            .sum();
+        let inline_count = fs
+            .vh
+            .catalog_file
+            .extents
+            .iter()
+            .filter(|e| e.block_count != 0)
+            .count();
+        assert_eq!(
+            inline_count, 8,
+            "catalog should have filled all 8 inline extents"
+        );
+        assert!(
+            fs.vh.catalog_file.total_blocks > inline,
+            "catalog total_blocks {} should exceed inline-extent blocks {inline} (overflow used)",
+            fs.vh.catalog_file.total_blocks
+        );
+
+        fs.sync_metadata().unwrap();
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck after overflow spill: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Reopen re-reads the > 8-extent catalog fork (inline + overflow) and
+        // every file is still enumerable.
+        let img = fs.reader.get_ref().clone();
+        if let Ok(path) = std::env::var("RB_EMIT_SPILL_IMAGE") {
+            std::fs::write(&path, &img).unwrap();
+        }
+        let mut fs2 = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        let r2 = fs2.root().unwrap();
+        let mut total = 0;
+        for de in fs2.list_directory(&r2).unwrap() {
+            if de.is_directory() {
+                total += fs2.list_directory(&de).unwrap().len();
+            }
+        }
+        assert_eq!(total as u32, N, "reopen lost files: {total} != {N}");
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_grows_fork_on_full_phase_a() {
+        // §4b Phase A (docs/todo_hfsplus_fork_growth.md): a volume whose catalog
+        // fork is *too small* for its eventual record count grows the fork in
+        // place through live inserts — no spurious DiskFull while the volume has
+        // free blocks — and stays fsck-clean. Contiguous tail growth keeps the
+        // catalog fork at a single extent. A reopen re-reads the grown fork.
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        // 16 MiB volume, minimal (volume-scaled, ~21-node) catalog. Inserting
+        // far more records than that forces many grows.
+        let img = create_blank_hfsplus_sized(16 * 1024 * 1024, 4096, "GrowVol", false, 0, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        let start_nodes = BTreeHeader::read(fs.catalog_data()).total_nodes;
+
+        const DIRS: u32 = 20;
+        let root = fs.root().unwrap();
+        let mut dir_ids = Vec::with_capacity(DIRS as usize);
+        for d in 0..DIRS {
+            let de = fs
+                .create_directory(&root, &format!("dir{d:03}"), &Default::default())
+                .unwrap();
+            dir_ids.push(de.location as u32);
+        }
+        let base_cnid = fs.vh.next_catalog_id;
+
+        let n: u32 = 6_000;
+        let mut per_dir = vec![0i32; DIRS as usize];
+        let empty_fork = ForkData::empty();
+        for i in 0..n {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let d = (hash % DIRS) as usize;
+            let name = format!("f{hash:08x}");
+            let mut kr = Fs::build_catalog_key(dir_ids[d], &name);
+            if !kr.len().is_multiple_of(2) {
+                kr.push(0);
+            }
+            kr.extend_from_slice(&Fs::build_file_record(
+                base_cnid + i,
+                &empty_fork,
+                &empty_fork,
+                &[0u8; 4],
+                &[0u8; 4],
+            ));
+            fs.insert_catalog_record(&kr)
+                .unwrap_or_else(|e| panic!("insert #{i} into dir{d} (grow should cover it): {e}"));
+            per_dir[d] += 1;
+        }
+        fs.vh.file_count += n;
+        fs.vh.next_catalog_id = base_cnid + n;
+        for (d, &cnt) in per_dir.iter().enumerate() {
+            fs.update_parent_valence(dir_ids[d], cnt).unwrap();
+        }
+
+        // The fork grew (each grow adds >= 8 nodes; >= 2 grows expected here).
+        let end_nodes = BTreeHeader::read(fs.catalog_data()).total_nodes;
+        assert!(
+            end_nodes >= start_nodes + 16,
+            "catalog total_nodes only went {start_nodes} -> {end_nodes}; expected >= 2 grows"
+        );
+        // Contiguous tail growth keeps the catalog fork at a single extent.
+        let cat_extents = fs
+            .vh
+            .catalog_file
+            .extents
+            .iter()
+            .filter(|e| e.block_count != 0)
+            .count();
+        assert_eq!(
+            cat_extents, 1,
+            "contiguous tail growth should keep the catalog fork at 1 extent, got {cat_extents}"
+        );
+
+        // Persist the grown fork, bitmap, and VH, then fsck the result.
+        fs.sync_metadata().unwrap();
+
+        // fsck-clean after all the grows.
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after grow: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Reopen re-reads the grown fork (proves the fork extents + header
+        // persisted) and every record is still findable.
+        let img = fs.reader.get_ref().clone();
+        // Optionally emit the grown image so a Mac can fsck_hfs it (the real
+        // §4b acceptance test): set RB_EMIT_GROW_IMAGE=/path.
+        if let Ok(path) = std::env::var("RB_EMIT_GROW_IMAGE") {
+            std::fs::write(&path, &img).unwrap();
+        }
+        let mut fs2 = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        let reopened_nodes = BTreeHeader::read(fs2.catalog_data()).total_nodes;
+        assert_eq!(reopened_nodes, end_nodes, "reopen lost grown nodes");
+        let r2 = fs2.root().unwrap();
+        let dirs = fs2.list_directory(&r2).unwrap();
+        assert_eq!(dirs.len(), DIRS as usize, "reopen lost directories");
     }
 
     #[test]

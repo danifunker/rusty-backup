@@ -322,6 +322,73 @@ pub(crate) fn cmd_new_sized(
     Ok(())
 }
 
+/// Create a fresh blank **HFS+ / HFSX** volume (a bare single volume, no
+/// partition map) at `image`. `case_sensitive` selects HFSX; `min_catalog`
+/// is a *floor* on the catalog B-tree size in bytes — set it small to make
+/// the catalog easy to outgrow (exercises the §4b fork-grow path with a few
+/// thousand `put`s instead of hundreds of thousands).
+pub(crate) fn cmd_new_hfsplus_sized(
+    image: PathBuf,
+    size_arg: &str,
+    name: &str,
+    block_size: Option<u32>,
+    case_sensitive: bool,
+    min_catalog: Option<u32>,
+) -> Result<()> {
+    let size = parse_size(size_arg)?;
+    // HFS+ pins its node size at 4096, so the allocation block size must be a
+    // power of two in [512, 4096]. Default to 4096 (Apple's default for any
+    // non-trivial volume); the volume must hold at least 64 blocks.
+    let block_size = match block_size {
+        Some(bs) => {
+            if !bs.is_power_of_two() || !(512..=4096).contains(&bs) {
+                bail!("HFS+ block-size must be a power of two in [512, 4096] (got {bs})");
+            }
+            bs
+        }
+        None => 4096,
+    };
+    if size < block_size as u64 * 64 {
+        bail!(
+            "size {size} is too small for an HFS+ volume (need at least {} bytes \
+             for 64 allocation blocks of {block_size})",
+            block_size as u64 * 64
+        );
+    }
+
+    let bytes = crate::fs::hfsplus::create_blank_hfsplus_sized(
+        size,
+        block_size,
+        name,
+        case_sensitive,
+        min_catalog.unwrap_or(0),
+        0,
+    );
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&image)
+        .with_context(|| format!("opening {} for write", image.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing {}", image.display()))?;
+    file.flush().ok();
+
+    println!(
+        "Created {} volume {} ({} bytes, block_size={}{})",
+        if case_sensitive { "HFSX" } else { "HFS+" },
+        image.display(),
+        bytes.len(),
+        block_size,
+        match min_catalog {
+            Some(c) => format!(", min-catalog={c}"),
+            None => String::new(),
+        }
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // info / ls
 // ---------------------------------------------------------------------------
