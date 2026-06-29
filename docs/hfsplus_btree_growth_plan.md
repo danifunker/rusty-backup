@@ -24,7 +24,13 @@
   buffer-level multi-level tests (fixed- and variable-index-key) plus a real-path
   integration test: a 520-block fragmented file's 64 overflow records split the
   extents tree and read back byte-for-byte.
-- **P4–P5** remain. Safe to revise freely.
+- **P4 (defrag/clone re-verification) — landed.** A 64 MiB source with a
+  multi-level catalog (300 files / 10 dirs) clones via `stream_defragmented_hfsplus`
+  to a target whose defrag-built catalog is itself multi-level, fsck-clean, and
+  round-trips byte-for-byte — confirming the variable-length index keys behave
+  through the clone path (`btree_insert_full` + `HFSPLUS_CATALOG`), not just the
+  live-edit path.
+- **P5** remains. Safe to revise freely.
 
 **Relationship to shipped work:** the classic-HFS catalog scaling work is done —
 bulk import (`PROMPT-hfs-catalog-btree-scaling.md`) and the incremental per-`put`
@@ -234,9 +240,11 @@ correctness work isn't gated on it.
    reads back byte-for-byte (`test_hfsplus_extents_overflow_grows_multilevel`,
    `test_hfsplus_attributes_grows_multilevel`,
    `test_hfsplus_fragmented_file_splits_extents_overflow_btree_real_path`).
-4. **P4 — defrag/clone re-verification.** Confirm `hfsplus_defrag` produces
-   fsck-clean multi-level catalogs through the new helpers (add a large-volume
-   clone round-trip test).
+4. **P4 — defrag/clone re-verification. [DONE]** `hfsplus_defrag` builds its
+   target catalog through `btree_insert_full` + `HFSPLUS_CATALOG` (P1), so a
+   large-volume clone now rebuilds a multi-level catalog that is fsck-clean and
+   round-trips (`stream_clone_of_multilevel_catalog_is_fsck_clean`: 300 files / 10
+   dirs, source and target catalog depth ≥ 2).
 5. **P5 — density rotation for HFS+ (4d).** Gate: shuffled multi-dir inserts pack
    ≳ 80% leaf occupancy, matching the classic-HFS result.
 
