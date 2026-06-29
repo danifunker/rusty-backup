@@ -17,7 +17,14 @@
   remaining gap (a *foreign*, under-sized catalog filled past capacity via live
   `put`s) matches a pre-existing classic-HFS limitation. Revisit if a real
   workload needs it.
-- **P3–P5** remain. Safe to revise freely.
+- **P3 (extents-overflow + attributes through the descriptor, depth-1 removed) —
+  landed.** `insert_extents_overflow_record` now splits + grows the root like the
+  catalog/attributes inserts (`HFSPLUS_EXTENTS`, fixed 10-byte index keys); the
+  attributes path was already wired in P1 (`HFSPLUS_ATTRIBUTES`). Covered by two
+  buffer-level multi-level tests (fixed- and variable-index-key) plus a real-path
+  integration test: a 520-block fragmented file's 64 overflow records split the
+  extents tree and read back byte-for-byte.
+- **P4–P5** remain. Safe to revise freely.
 
 **Relationship to shipped work:** the classic-HFS catalog scaling work is done —
 bulk import (`PROMPT-hfs-catalog-btree-scaling.md`) and the incremental per-`put`
@@ -218,9 +225,15 @@ correctness work isn't gated on it.
    has no grow path either; the blank auto-sizes and the clone path over-sizes its
    target, so live growth is only needed for a foreign under-sized catalog (a
    pre-existing classic-HFS limitation).
-3. **P3 — extents-overflow + attributes** through the same descriptor; remove the
-   depth-1 restriction at `hfsplus.rs:2009`. Gate: create many fragmented files
-   and many xattrs; fsck clean.
+3. **P3 — extents-overflow + attributes through the same descriptor. [DONE]**
+   Removed the depth-1 restriction on `insert_extents_overflow_record` (it now
+   splits + grows via `HFSPLUS_EXTENTS`); attributes already routed through
+   `HFSPLUS_ATTRIBUTES` in P1. Gate met: buffer-level extents and attributes trees
+   grow to depth ≥ 2 with strictly-ascending leaves and every record findable, and
+   a real fragmented-file create splits the extents tree (64 overflow records) and
+   reads back byte-for-byte (`test_hfsplus_extents_overflow_grows_multilevel`,
+   `test_hfsplus_attributes_grows_multilevel`,
+   `test_hfsplus_fragmented_file_splits_extents_overflow_btree_real_path`).
 4. **P4 — defrag/clone re-verification.** Confirm `hfsplus_defrag` produces
    fsck-clean multi-level catalogs through the new helpers (add a large-volume
    clone round-trip test).

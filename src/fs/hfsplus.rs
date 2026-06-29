@@ -2014,11 +2014,16 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
-    /// Insert a record into the extents-overflow B-tree leaf chain. Depth-1
-    /// only — splits and root growth are not yet wired up because the
-    /// existing HFS+ B-tree growth helpers normalize keys assuming the
-    /// 1-byte HFS-classic format. A full split path lands when modern HFS+
-    /// volumes need it (Phase 5+ work).
+    /// Insert a record into the extents-overflow B-tree, splitting the leaf and
+    /// growing the root when the target leaf is full — mirroring
+    /// `insert_catalog_record` / `insert_xattr_record`.
+    ///
+    /// The extents-overflow tree uses 2-byte ("big") keys with *fixed*-length
+    /// index separators (`kBTBigKeysMask` set, `kBTVariableIndexKeysMask` clear),
+    /// padded to the 10-byte `maxKeyLength`. `BTreeKeyFormat::HFSPLUS_EXTENTS`
+    /// drives that; before P1's key-format descriptor the shared growth helpers
+    /// forced the classic 1-byte/0x25 shape, which is why this path was pinned to
+    /// a single leaf level (docs/hfsplus_btree_growth_plan.md §4a/P3).
     fn insert_extents_overflow_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
         let data = self.extents_overflow_data.as_mut().ok_or_else(|| {
             FilesystemError::Unsupported(
@@ -2032,20 +2037,78 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 "extents-overflow B-tree has zero node_size".into(),
             ));
         }
-        let (leaf_idx, _chain) =
+        let kf = &BTreeKeyFormat::HFSPLUS_EXTENTS;
+        let (leaf_idx, parent_chain) =
             hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::extents_compare);
         let offset = leaf_idx as usize * node_size;
         let node = &mut data[offset..offset + node_size];
-        btree_insert_record(node, node_size, key_record, &Self::extents_compare).map_err(|e| {
-            FilesystemError::InvalidData(format!(
-                "extents-overflow leaf {leaf_idx} cannot fit new record: {e} \
-                 (split-on-overflow not yet implemented for HFS+ extents-overflow)"
-            ))
-        })?;
-        let mut h = BTreeHeader::read(data);
-        h.leaf_records += 1;
-        h.write(data);
-        Ok(())
+        match btree_insert_record(node, node_size, key_record, &Self::extents_compare) {
+            Ok(_) => {
+                let mut h = BTreeHeader::read(data);
+                h.leaf_records += 1;
+                h.write(data);
+                Ok(())
+            }
+            Err(_) => {
+                let mut h = BTreeHeader::read(data);
+                let splits = btree_split_leaf_with_insert(
+                    data,
+                    node_size,
+                    leaf_idx,
+                    &mut h,
+                    key_record,
+                    kf,
+                    &Self::extents_compare,
+                )?;
+                h.leaf_records += 1;
+                let first = &splits[0];
+                if h.depth == 1 {
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
+                } else if let Some(&(_, parent_idx)) =
+                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                {
+                    btree_insert_into_index(
+                        data,
+                        node_size,
+                        parent_idx,
+                        first.0,
+                        &first.1,
+                        &mut h,
+                        kf,
+                        &Self::extents_compare,
+                        &parent_chain,
+                    )?;
+                } else {
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
+                }
+                for split in &splits[1..] {
+                    let header_now = BTreeHeader::read(data);
+                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
+                        data,
+                        &header_now,
+                        &split.1,
+                        &Self::extents_compare,
+                    );
+                    let parent_for_sep = fresh_chain
+                        .last()
+                        .map(|&(_, p)| p)
+                        .unwrap_or(header_now.root_node);
+                    btree_insert_into_index(
+                        data,
+                        node_size,
+                        parent_for_sep,
+                        split.0,
+                        &split.1,
+                        &mut h,
+                        kf,
+                        &Self::extents_compare,
+                        &fresh_chain,
+                    )?;
+                }
+                h.write(data);
+                Ok(())
+            }
+        }
     }
 
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
@@ -8271,6 +8334,242 @@ mod tests {
                 .take(8)
                 .map(|e| &e.message)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_hfsplus_extents_overflow_grows_multilevel() {
+        // P3 (docs/hfsplus_btree_growth_plan.md): the extents-overflow B-tree —
+        // 2-byte ("big") keys with *fixed* 10-byte index separators — must split
+        // past a single leaf level. It was pinned depth-1 because the shared
+        // helpers forced the classic key shape; it now threads
+        // `BTreeKeyFormat::HFSPLUS_EXTENTS`. Driven through the same
+        // `btree_insert_full` machinery `insert_extents_overflow_record` uses.
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            /* max_key_len= */ 10,
+            /* key_compare_type= */ 0,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_EXTENTS;
+        // 600 overflow records keyed by distinct shuffled fileIDs (the multiplier
+        // is odd, so it's a bijection mod 2^32 — distinct i give distinct keys
+        // that land mid-leaf, not appended).
+        const N: u32 = 600;
+        let mut ids: Vec<u32> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let file_id = i.wrapping_mul(2_654_435_761);
+            let rec = Fs::build_extents_overflow_record(file_id, 0, 8, &[]);
+            btree_insert_full(&mut buf, &rec, &kf, &Fs::extents_compare)
+                .unwrap_or_else(|e| panic!("extents insert #{i} (file {file_id}): {e}"));
+            ids.push(file_id);
+        }
+
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 2,
+            "extents-overflow tree stayed depth {} — split past a leaf level failed",
+            header.depth
+        );
+        assert_eq!(header.leaf_records, N);
+
+        let mut recs: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, r| {
+                recs.push(r.to_vec());
+                None
+            },
+        );
+        assert_eq!(recs.len(), N as usize, "leaf walk lost records");
+        for w in recs.windows(2) {
+            assert_eq!(
+                Fs::extents_compare(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "extents-overflow leaves out of order — bad separator"
+            );
+        }
+
+        // The extents key portion is always the fixed 12 bytes (2-byte len + 10).
+        fn ext_key(rec: &[u8]) -> &[u8] {
+            &rec[..12.min(rec.len())]
+        }
+        let ext_cmp = |a: &[u8], b: &[u8]| Fs::extents_compare(a, b);
+        for &file_id in &ids {
+            let search = Fs::build_extents_overflow_record(file_id, 0, 8, &[]);
+            let (found, _) = btree_find_record(&buf, &header, &search, &ext_key, &ext_cmp);
+            assert!(
+                found.is_some(),
+                "extents record for file {file_id} not findable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hfsplus_attributes_grows_multilevel() {
+        // P3: the attributes B-tree — 2-byte keys with *variable*-length index
+        // separators — splits past one leaf level via
+        // `BTreeKeyFormat::HFSPLUS_ATTRIBUTES`, the same path `insert_xattr_record`
+        // uses. (P1 wired the descriptor in; this proves the attribute key layout,
+        // distinct from the catalog's, routes correctly at every level.)
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            /* max_key_len= */ 264,
+            /* key_compare_type= */ 0,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
+        const N: u32 = 600;
+        let value = [0xABu8; 8];
+        let mut cnids: Vec<u32> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let cnid = i.wrapping_mul(2_654_435_761);
+            let rec = Fs::build_inline_attr_record(cnid, "xattr", &value);
+            btree_insert_full(&mut buf, &rec, &kf, &Fs::attr_compare)
+                .unwrap_or_else(|e| panic!("attr insert #{i} (cnid {cnid}): {e}"));
+            cnids.push(cnid);
+        }
+
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 2,
+            "attributes tree stayed depth {} — split past a leaf level failed",
+            header.depth
+        );
+        assert_eq!(header.leaf_records, N);
+
+        let mut recs: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, r| {
+                recs.push(r.to_vec());
+                None
+            },
+        );
+        assert_eq!(recs.len(), N as usize, "leaf walk lost records");
+        for w in recs.windows(2) {
+            assert_eq!(
+                Fs::attr_compare(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "attributes leaves out of order — bad separator"
+            );
+        }
+
+        fn attr_key(rec: &[u8]) -> &[u8] {
+            let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+            &rec[..(2 + kl).min(rec.len())]
+        }
+        let attr_cmp = |a: &[u8], b: &[u8]| Fs::attr_compare(a, b);
+        for &cnid in &cnids {
+            let search = Fs::build_inline_attr_record(cnid, "xattr", &value);
+            let (found, _) = btree_find_record(&buf, &header, &search, &attr_key, &attr_cmp);
+            assert!(found.is_some(), "attr record for cnid {cnid} not findable");
+        }
+    }
+
+    #[test]
+    fn test_hfsplus_fragmented_file_splits_extents_overflow_btree_real_path() {
+        // P3 real-path integration: a heavily fragmented file produces enough
+        // extents-overflow records to split that B-tree past a single leaf level
+        // through the real `insert_extents_overflow_record`, and the file reads
+        // back byte-for-byte through the resulting multi-level tree. (Read-back,
+        // not fsck, because the all-used-then-free-singletons bitmap trick used to
+        // force fragmentation leaves the bitmap deliberately over-allocated; the
+        // point here is the overflow B-tree's split + read path, which P3 enabled.)
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        // Extents-overflow tree pinned to 256 KiB (64 nodes @ 4096) so it has room
+        // to split — the 4-node default could not.
+        let img = create_blank_hfsplus_sized(32 << 20, 4096, "Frag", false, 0, 256 << 10);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Force maximal fragmentation: mark every block used, then free isolated
+        // single blocks (every other block) in the user region. A file of N blocks
+        // must then use N one-block extents: 8 inline + (N-8) overflow extents =
+        // ceil((N-8)/8) overflow records. 520 blocks -> 64 overflow records, well
+        // past one 4096-byte extents leaf (~52 records), so the tree must split.
+        fs.ensure_bitmap().unwrap();
+        let block_size = fs.vh.block_size as usize;
+        let n_blocks: u32 = 520;
+        let first_free = fs.vh.next_allocation;
+        {
+            let bitmap = fs.bitmap.as_mut().unwrap();
+            for b in bitmap.iter_mut() {
+                *b = 0xFF;
+            }
+            let mut blk = first_free + 1;
+            for _ in 0..n_blocks {
+                bitmap_clear_bit_be(bitmap, blk);
+                blk += 2; // a used block between each free one -> singletons
+            }
+        }
+        fs.vh.free_blocks = n_blocks;
+
+        let payload: Vec<u8> = (0..(n_blocks as usize * block_size))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut reader = std::io::Cursor::new(payload.clone());
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "frag.bin",
+                &mut reader,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("fragmented file create should succeed via a splitting overflow B-tree");
+
+        // The extents-overflow tree must have grown past a single leaf level.
+        let depth =
+            super::hfs_common::BTreeHeader::read(fs.extents_overflow_data.as_ref().unwrap()).depth;
+        assert!(
+            depth >= 2,
+            "extents-overflow tree depth {depth} < 2 — 64 overflow records did not split it"
+        );
+
+        // The data fork is the expected single-block-extent shape...
+        let cnid = entry.location as u32;
+        let (data_fork, _rsrc) = fs.find_file_by_id(cnid).unwrap();
+        assert_eq!(data_fork.total_blocks, n_blocks);
+
+        // ...and reads back byte-for-byte through the multi-level overflow tree.
+        let got = fs.read_file(&entry, payload.len() + 1).unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(
+            got, payload,
+            "fragmented read-back mismatch through split overflow tree"
         );
     }
 }
