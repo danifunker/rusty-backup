@@ -650,7 +650,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&record);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         // Root thread record.
         let thread = build_thread_record(CATALOG_FOLDER_THREAD, /* parent=1 */ 1, label);
@@ -659,7 +664,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
         let _ = (folder_meta, record);
     }
 
@@ -718,7 +728,12 @@ pub fn build_target_metadata(
                     key_record.push(0);
                 }
                 key_record.extend_from_slice(&body);
-                hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+                hfs_common::btree_insert_full(
+                    &mut catalog,
+                    &key_record,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+                    &cmp,
+                )?;
 
                 let thread = build_thread_record(CATALOG_FOLDER_THREAD, target_parent, &d.name);
                 let mut tk = build_catalog_key(target_cnid, "");
@@ -726,7 +741,12 @@ pub fn build_target_metadata(
                     tk.push(0);
                 }
                 tk.extend_from_slice(&thread);
-                hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+                hfs_common::btree_insert_full(
+                    &mut catalog,
+                    &tk,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+                    &cmp,
+                )?;
 
                 *child_count.entry(target_parent).or_default() += 1;
                 queue.push_back(d.cnid);
@@ -768,7 +788,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &f.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -776,7 +801,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
 
@@ -822,7 +852,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -830,7 +865,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
         *file_link_counts.entry(h.inode_num).or_default() += 1;
@@ -855,7 +895,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -863,7 +908,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
         *dir_link_counts.entry(h.inode_num).or_default() += 1;
@@ -1634,6 +1684,7 @@ fn emit_xattrs_for_cnid(
                 hfs_common::btree_insert_full(
                     attr_buf,
                     &rec,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
                     &HfsPlusFilesystem::<std::io::Cursor<Vec<u8>>>::attr_compare,
                 )?;
             }

@@ -943,7 +943,12 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     /// sibling links — surfacing as the spurious "disk full: no free B-tree
     /// nodes" / `IndexSiblingLinkBroken` failure at ~7.4k catalog records.
     fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        hfs_common::btree_insert_full(&mut self.catalog_data, key_record, &Self::catalog_compare)
+        hfs_common::btree_insert_full(
+            &mut self.catalog_data,
+            key_record,
+            &hfs_common::BTreeKeyFormat::CLASSIC_CATALOG,
+            &Self::catalog_compare,
+        )
     }
 
     /// Remove a catalog record from a leaf node.

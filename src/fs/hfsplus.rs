@@ -10,7 +10,7 @@ use super::filesystem::{
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, btree_free_node,
     btree_grow_root, btree_insert_into_index, btree_insert_record, btree_remove_record,
-    btree_split_leaf_with_insert, BTreeHeader,
+    btree_split_leaf_with_insert, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1809,6 +1809,10 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
         let node_size = header.node_size as usize;
         let cs = self.case_sensitive();
         let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
+        // The HFS+ catalog uses 2-byte ("big") keys and variable-length index
+        // separators — unlike the classic 1-byte / fixed-0x25 catalog — so the
+        // shared split/grow machinery must be told the key format.
+        let kf = &BTreeKeyFormat::HFSPLUS_CATALOG;
 
         // Find the correct leaf node
         let (leaf_idx, parent_chain) =
@@ -1838,6 +1842,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                     leaf_idx,
                     &mut h,
                     key_record,
+                    kf,
                     &cmp,
                 )?;
 
@@ -1857,6 +1862,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         leaf_idx,
                         first.0,
                         &first.1,
+                        kf,
                     )?;
                 } else if let Some(&(_, parent_idx)) =
                     parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
@@ -1868,6 +1874,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         first.0,
                         &first.1,
                         &mut h,
+                        kf,
                         &cmp,
                         &parent_chain,
                     )?;
@@ -1879,6 +1886,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         leaf_idx,
                         first.0,
                         &first.1,
+                        kf,
                     )?;
                 }
                 for split in &splits[1..] {
@@ -1900,6 +1908,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
                         split.0,
                         &split.1,
                         &mut h,
+                        kf,
                         &cmp,
                         &fresh_chain,
                     )?;
@@ -2190,6 +2199,9 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 node_size,
             )));
         }
+        // The attributes B-tree, like the catalog, uses 2-byte big keys and
+        // variable-length index separators.
+        let kf = &BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
         let (leaf_idx, parent_chain) =
             hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::attr_compare);
         let off = leaf_idx as usize * node_size;
@@ -2209,12 +2221,13 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                     leaf_idx,
                     &mut h,
                     key_record,
+                    kf,
                     &Self::attr_compare,
                 )?;
                 h.leaf_records += 1;
                 let first = &splits[0];
                 if h.depth == 1 {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
                 } else if let Some(&(_, parent_idx)) =
                     parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
                 {
@@ -2225,11 +2238,12 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                         first.0,
                         &first.1,
                         &mut h,
+                        kf,
                         &Self::attr_compare,
                         &parent_chain,
                     )?;
                 } else {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
                 }
                 for split in &splits[1..] {
                     let header_now = BTreeHeader::read(data);
@@ -2250,6 +2264,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                         split.0,
                         &split.1,
                         &mut h,
+                        kf,
                         &Self::attr_compare,
                         &fresh_chain,
                     )?;
@@ -7980,5 +7995,127 @@ mod tests {
         // "txt" extension should auto-detect to TEXT/ttxt
         assert!(fe.type_code.is_some());
         assert_eq!(fe.type_code, Some(*b"TEXT"));
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_variable_index_keys_grow_multilevel() {
+        // P1 (docs/hfsplus_btree_growth_plan.md §4a): the HFS+ catalog B-tree
+        // must grow past a single index level without corrupting. The shared
+        // split/grow helpers used to force the classic 1-byte-length, fixed-0x25
+        // index-key shape onto HFS+ records, so the first leaf split produced a
+        // malformed separator (it read the high byte of the 2-byte key length as
+        // the whole length) and descent misrouted — the "leaves must be strictly
+        // ascending" / mis-routed-descent corruption. With
+        // `BTreeKeyFormat::HFSPLUS_CATALOG` the separator is the child's
+        // variable-length 2-byte key, verbatim.
+        //
+        // Driven at the catalog-buffer level through the exact shared
+        // `btree_insert_full` path `insert_catalog_record` uses. node_size is
+        // 512 (vs the production 4096) so a few thousand multi-parent records
+        // reach depth >= 3 in a < 1 MiB buffer; the machinery is node-size
+        // agnostic. The volume-level fsck gate lands in P2 once blank catalogs
+        // are sized to hold the records (today a blank catalog is only 4 nodes).
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        // A single-node bitmap (512-byte node) covers ~1872 nodes, so stay under
+        // that — no map nodes needed, matching a real blank-built tree.
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            /* leaf_records= */ 0,
+            total_nodes,
+            /* free_nodes= */ total_nodes - 2,
+            /* max_key_len= */ 516,
+            KEY_COMPARE_CASE_FOLDING,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+
+        // ~2500 files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32 — unique names that land mid-leaf, not appended) sprayed
+        // across 50 parent directories, so inserts exercise every leaf and
+        // index split, not just tail appends.
+        const DIRS: u32 = 50;
+        const N: u32 = 2500;
+        let mut inserted: Vec<(u32, String)> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = 16 + (hash % DIRS); // arbitrary distinct parent CNIDs
+            let name = format!("f{hash:08x}");
+            let mut rec = Fs::build_catalog_key(parent, &name);
+            // Append filler so records have a realistic size (the compare only
+            // reads the leading key portion; the body is irrelevant here).
+            rec.extend_from_slice(&[0u8; 40]);
+            btree_insert_full(&mut buf, &rec, &kf, &cmp)
+                .unwrap_or_else(|e| panic!("insert #{i} (parent {parent}, {name}): {e}"));
+            inserted.push((parent, name));
+        }
+
+        // The tree must have grown past a single index level.
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 3,
+            "catalog did not reach depth >= 3 (got {}); test needs a deeper tree to \
+             exercise index-node splits",
+            header.depth
+        );
+        assert_eq!(
+            header.leaf_records, N,
+            "leaf_records header count drifted from inserts"
+        );
+
+        // (a) Every leaf key, walked in sibling-chain order, is strictly
+        // ascending — the direct symptom of a malformed separator was
+        // out-of-order leaves.
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, rec| {
+                let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+                keys.push(rec[..(2 + kl).min(rec.len())].to_vec());
+                None
+            },
+        );
+        assert_eq!(
+            keys.len(),
+            N as usize,
+            "leaf walk recovered {} of {N} records — chain is broken or has cycles",
+            keys.len()
+        );
+        for w in keys.windows(2) {
+            assert_eq!(
+                cmp(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "catalog leaves are not strictly ascending — separator/descent corruption"
+            );
+        }
+
+        // (b) Every inserted record is findable by a root-to-leaf descent, i.e.
+        // every index separator routes correctly at every level. (A nested `fn`
+        // rather than a closure so it satisfies the `for<'a> Fn(&'a [u8]) ->
+        // &'a [u8]` bound `btree_find_record` requires.)
+        fn key_extract(rec: &[u8]) -> &[u8] {
+            let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+            &rec[..(2 + kl).min(rec.len())]
+        }
+        for (parent, name) in &inserted {
+            let search = Fs::build_catalog_key(*parent, name);
+            let (found, _chain) = btree_find_record(&buf, &header, &search, &key_extract, &cmp);
+            assert!(
+                found.is_some(),
+                "record (parent {parent}, {name}) not findable by descent — misrouted index"
+            );
+        }
     }
 }

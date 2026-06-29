@@ -514,6 +514,158 @@ pub fn normalize_catalog_index_key(key: &[u8]) -> Vec<u8> {
     result
 }
 
+/// `kBTBigKeysMask` — the B-tree's key-length prefix is a 2-byte (`u16`) field.
+/// Set on every HFS+ tree (catalog, extents-overflow, attributes); clear on
+/// classic HFS, whose key length is a single byte.
+pub const KBT_BIG_KEYS_MASK: u32 = 0x0000_0002;
+/// `kBTVariableIndexKeysMask` — index records carry the child's variable-length
+/// key verbatim. Set on the HFS+ catalog and attributes trees; clear on the
+/// extents-overflow tree and classic HFS, whose index keys are padded to a
+/// fixed `max_key_len`.
+pub const KBT_VARIABLE_INDEX_KEYS_MASK: u32 = 0x0000_0004;
+
+/// Describes how a B-tree encodes its keys, so the shared split / grow / rotate
+/// machinery below can serve both the classic-HFS 1-byte-key catalog and the
+/// HFS+ 2-byte ("big key") trees without forking the algorithm.
+///
+/// The classic path threads [`BTreeKeyFormat::CLASSIC_CATALOG`] and is
+/// byte-identical to the pre-descriptor code (the fixed 0x25 index key produced
+/// by [`normalize_catalog_index_key`]); HFS+ threads the matching `HFSPLUS_*`
+/// constant, which is what unlocks variable-length index keys so an HFS+ catalog
+/// can split past a single leaf level without corrupting.
+///
+/// Derived from the BTHeaderRec `attributes` bitfield + `maxKeyLength`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BTreeKeyFormat {
+    /// `kBTBigKeysMask`: key-length prefix is 2 bytes (HFS+) vs 1 byte (classic).
+    pub big_keys: bool,
+    /// `kBTVariableIndexKeysMask`: index records store the child's
+    /// variable-length key verbatim. When clear, index keys are padded to
+    /// `max_key_len`.
+    pub variable_index_keys: bool,
+    /// Maximum key length — the fixed index-key width when `variable_index_keys`
+    /// is clear (classic catalog: 0x25; HFS+ extents-overflow: 10).
+    pub max_key_len: u16,
+}
+
+impl BTreeKeyFormat {
+    /// Classic HFS catalog: 1-byte key length, fixed 0x25-byte index keys.
+    pub const CLASSIC_CATALOG: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: false,
+        variable_index_keys: false,
+        max_key_len: HFS_CAT_MAX_KEY_LEN as u16,
+    };
+
+    /// HFS+/HFSX catalog: 2-byte key length, variable-length index keys
+    /// (`kHFSPlusCatalogKeyMaximumLength` = 516).
+    pub const HFSPLUS_CATALOG: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: true,
+        max_key_len: 516,
+    };
+
+    /// HFS+ extents-overflow: 2-byte key length, fixed 10-byte index keys
+    /// (`kHFSPlusExtentKeyMaximumLength` = 10).
+    pub const HFSPLUS_EXTENTS: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: false,
+        max_key_len: 10,
+    };
+
+    /// HFS+ attributes: 2-byte key length, variable-length index keys
+    /// (`kHFSPlusAttrKeyMaximumLength` = 264).
+    pub const HFSPLUS_ATTRIBUTES: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: true,
+        max_key_len: 264,
+    };
+
+    /// Build a descriptor from a BTHeaderRec `attributes` bitfield and
+    /// `maxKeyLength`. The `attributes` field on hand-built volumes can be 0
+    /// (no flags) even for HFS+ trees, so callers that know the tree's identity
+    /// should prefer the `HFSPLUS_*` / `CLASSIC_CATALOG` constants; this helper
+    /// is for code paths that only have the raw header bytes.
+    pub fn from_header(attributes: u32, max_key_len: u16) -> Self {
+        BTreeKeyFormat {
+            big_keys: attributes & KBT_BIG_KEYS_MASK != 0,
+            variable_index_keys: attributes & KBT_VARIABLE_INDEX_KEYS_MASK != 0,
+            max_key_len,
+        }
+    }
+
+    /// The BTHeaderRec `attributes` bits implied by this format.
+    pub fn header_attributes(&self) -> u32 {
+        let mut a = 0;
+        if self.big_keys {
+            a |= KBT_BIG_KEYS_MASK;
+        }
+        if self.variable_index_keys {
+            a |= KBT_VARIABLE_INDEX_KEYS_MASK;
+        }
+        a
+    }
+
+    /// Bytes occupied by the key-length prefix (1 classic, 2 big-key).
+    #[inline]
+    pub fn len_prefix(&self) -> usize {
+        if self.big_keys {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Read the key length stored at the front of `record`.
+    #[inline]
+    pub fn key_len(&self, record: &[u8]) -> usize {
+        if self.big_keys {
+            if record.len() < 2 {
+                0
+            } else {
+                BigEndian::read_u16(&record[0..2]) as usize
+            }
+        } else if record.is_empty() {
+            0
+        } else {
+            record[0] as usize
+        }
+    }
+
+    /// The key portion of a record — the length prefix plus `key_len` key
+    /// bytes. This is exactly the slice an index separator must carry, and what
+    /// the split helpers extract from a leaf/child's first record.
+    pub fn key_portion(&self, record: &[u8]) -> Vec<u8> {
+        let end = (self.len_prefix() + self.key_len(record)).min(record.len());
+        record[..end].to_vec()
+    }
+
+    /// Build the key bytes of an index record (length prefix + key) from a
+    /// child node's first-key portion.
+    ///
+    /// - Classic HFS: the fixed 0x25 normalized key, identical to
+    ///   [`normalize_catalog_index_key`].
+    /// - HFS+ variable-index-key trees (catalog, attributes): the key portion
+    ///   verbatim (2-byte length + key bytes).
+    /// - HFS+ fixed-index-key trees (extents-overflow): the key bytes padded to
+    ///   `max_key_len`, length field forced to `max_key_len`.
+    pub fn make_index_key(&self, first_key: &[u8]) -> Vec<u8> {
+        if !self.big_keys {
+            return normalize_catalog_index_key(first_key);
+        }
+        if self.variable_index_keys {
+            return first_key.to_vec();
+        }
+        let max = self.max_key_len as usize;
+        let copy = self.key_len(first_key).min(max);
+        let mut result = vec![0u8; 2 + max];
+        BigEndian::write_u16(&mut result[0..2], max as u16);
+        if first_key.len() >= 2 + copy {
+            result[2..2 + copy].copy_from_slice(&first_key[2..2 + copy]);
+        }
+        result
+    }
+}
+
 /// Read the B-tree header record from catalog_data (node 0, record 0 at offset 14).
 /// Returns (depth, root_node, leaf_records, first_leaf, last_leaf, node_size,
 ///          max_key_len, total_nodes, free_nodes).
@@ -1053,6 +1205,7 @@ pub fn btree_split_leaf_with_insert<F>(
     node_idx: u32,
     header: &mut BTreeHeader,
     new_record: &[u8],
+    kf: &BTreeKeyFormat,
     compare_fn: &F,
 ) -> Result<Vec<(u32, Vec<u8>)>, FilesystemError>
 where
@@ -1220,13 +1373,13 @@ where
         header.last_leaf_node = last_idx;
     }
 
-    // Collect separator keys: first record of each new chunk.
+    // Collect separator keys: first record of each new chunk. The key portion
+    // (length prefix + key bytes) is format-dependent — 1-byte length for
+    // classic HFS, 2-byte for HFS+ — so read it through `kf` rather than
+    // assuming `first[0]` is the whole length.
     let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(new_count);
     for (i, idx) in new_indices.iter().enumerate() {
-        let first = &chunks[i + 1][0];
-        let key_len = first[0] as usize;
-        let key_end = 1 + key_len;
-        let split_key = first[..key_end.min(first.len())].to_vec();
+        let split_key = kf.key_portion(&chunks[i + 1][0]);
         results.push((*idx, split_key));
     }
     Ok(results)
@@ -1299,6 +1452,7 @@ fn btree_update_index_separator(
     parent_idx: u32,
     child: u32,
     new_first_key: &[u8],
+    kf: &BTreeKeyFormat,
 ) -> bool {
     let off = parent_idx as usize * node_size;
     if off + node_size > data.len() {
@@ -1311,12 +1465,20 @@ fn btree_update_index_separator(
             continue;
         }
         if BigEndian::read_u32(&data[off + e - 4..off + e]) == child {
-            let norm = normalize_catalog_index_key(new_first_key);
+            // The replacement separator must occupy the same number of bytes as
+            // the existing one — only then is an in-place patch valid (the
+            // offset table and sibling records stay put). Classic HFS index keys
+            // are a fixed 0x25 length so this always holds; an HFS+ variable key
+            // matches only when the new first key has the same length as the old
+            // separator. When it differs we return `false` and the caller
+            // abandons the rotation and splits instead, so a stale separator is
+            // never left behind.
+            let new_key = kf.make_index_key(new_first_key);
             let key_bytes = e - s - 4;
-            if norm.len() != key_bytes {
+            if new_key.len() != key_bytes {
                 return false;
             }
-            data[off + s..off + s + key_bytes].copy_from_slice(&norm);
+            data[off + s..off + s + key_bytes].copy_from_slice(&new_key);
             return true;
         }
     }
@@ -1352,6 +1514,7 @@ fn btree_try_rotate_leaf<F>(
     leaf_idx: u32,
     parent_idx: u32,
     new_record: &[u8],
+    kf: &BTreeKeyFormat,
     cmp: &F,
 ) -> bool
 where
@@ -1359,10 +1522,7 @@ where
 {
     let payload = node_size.saturating_sub(16);
     let cost = |r: &Vec<u8>| r.len() + 2;
-    let first_key = |r: &[u8]| -> Vec<u8> {
-        let kl = r[0] as usize;
-        r[..(1 + kl).min(r.len())].to_vec()
-    };
+    let first_key = |r: &[u8]| -> Vec<u8> { kf.key_portion(r) };
     let read_records = |data: &[u8], idx: u32| -> Vec<Vec<u8>> {
         let off = idx as usize * node_size;
         let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
@@ -1441,7 +1601,7 @@ where
         // (a variable-length, non-normalized index key — i.e. a real HFS+
         // catalog), abandon the rotation untouched and let the caller split,
         // rather than leave the moved records behind a stale separator.
-        if !btree_update_index_separator(data, node_size, parent_idx, right_idx, &right_first) {
+        if !btree_update_index_separator(data, node_size, parent_idx, right_idx, &right_first, kf) {
             continue;
         }
         btree_write_node_records(data, node_size, left_idx, &left);
@@ -1471,6 +1631,7 @@ fn btree_split_index_with_insert<F>(
     node_idx: u32,
     header: &mut BTreeHeader,
     new_record: &[u8],
+    kf: &BTreeKeyFormat,
     compare_fn: &F,
 ) -> Result<(u32, Vec<u8>), FilesystemError>
 where
@@ -1565,10 +1726,8 @@ where
         BigEndian::write_u32(&mut catalog_data[next_off + 4..next_off + 8], new_idx);
     }
 
-    // Separator = first key (key_len byte + key) of the new node.
-    let first = &right[0];
-    let kl = first[0] as usize;
-    let split_key = first[..(1 + kl).min(first.len())].to_vec();
+    // Separator = first key portion (length prefix + key bytes) of the new node.
+    let split_key = kf.key_portion(&right[0]);
     Ok((new_idx, split_key))
 }
 
@@ -1587,17 +1746,20 @@ pub fn btree_insert_into_index<F>(
     child_node: u32,
     split_key: &[u8],
     header: &mut BTreeHeader,
+    kf: &BTreeKeyFormat,
     compare_fn: &F,
     parent_chain: &[(u32, u32)], // [(node_idx, parent_idx), ...]
 ) -> Result<(), FilesystemError>
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    // Build index record: normalized_key + child_pointer
-    // Mac OS forces all catalog index keys to length 0x25, zero-padded.
-    // With key_len=0x25, HFS_RECKEYSKIP = (1+37+1)&~1 = 38, so data starts
-    // at offset 38 (even), and the full record is always 42 bytes.
-    let mut index_record = normalize_catalog_index_key(split_key);
+    // Build the index record: index key + child_pointer. For classic HFS the
+    // index key is the fixed 0x25-length normalized key (record always 42
+    // bytes); for an HFS+ variable-index-key tree it is the child's first key
+    // verbatim (2-byte length + key bytes). `make_index_key` picks the right
+    // shape per `kf`. Catalog/attributes keys are even-length, so the trailing
+    // child pointer always lands on an even offset.
+    let mut index_record = kf.make_index_key(split_key);
     let mut ptr = [0u8; 4];
     BigEndian::write_u32(&mut ptr, child_node);
     index_record.extend_from_slice(&ptr);
@@ -1628,6 +1790,7 @@ where
                         index_node_idx,
                         parent_idx,
                         &index_record,
+                        kf,
                         compare_fn,
                     )
                 {
@@ -1644,6 +1807,7 @@ where
                 index_node_idx,
                 header,
                 &index_record,
+                kf,
                 compare_fn,
             )?;
 
@@ -1662,6 +1826,7 @@ where
                         index_node_idx,
                         new_idx,
                         &new_split_key,
+                        kf,
                     )?;
                 } else {
                     // Recurse to parent index node
@@ -1672,6 +1837,7 @@ where
                         new_idx,
                         &new_split_key,
                         header,
+                        kf,
                         compare_fn,
                         parent_chain,
                     )?;
@@ -1685,6 +1851,7 @@ where
                     index_node_idx,
                     new_idx,
                     &new_split_key,
+                    kf,
                 )?;
             }
             Ok(())
@@ -1700,6 +1867,7 @@ pub fn btree_grow_root(
     old_root: u32,
     new_sibling: u32,
     split_key: &[u8],
+    kf: &BTreeKeyFormat,
 ) -> Result<(), FilesystemError> {
     let new_root = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
     header.free_nodes -= 1;
@@ -1721,26 +1889,25 @@ pub fn btree_grow_root(
     // 1. First child (old_root): use the first key of old_root + pointer to old_root
     // 2. Second child (new_sibling): split_key + pointer to new_sibling
 
-    // Get first key of old_root (just the key portion, not the full record)
-    let (first_rec_start, _first_rec_end) = btree_record_range(
+    // Get the first key portion of old_root (length prefix + key bytes, read
+    // through `kf` so the 1-byte vs 2-byte length is handled correctly).
+    let (first_rec_start, first_rec_end) = btree_record_range(
         &catalog_data[old_root_offset..old_root_offset + node_size],
         node_size,
         0,
     );
-    let key_len = catalog_data[old_root_offset + first_rec_start] as usize;
-    let key_end = first_rec_start + 1 + key_len;
-    let first_key =
-        catalog_data[old_root_offset + first_rec_start..old_root_offset + key_end].to_vec();
+    let first_key = kf.key_portion(
+        &catalog_data[old_root_offset + first_rec_start..old_root_offset + first_rec_end],
+    );
 
-    // Record 1: normalized first_key + old_root pointer
-    // Mac OS forces all catalog index keys to 0x25 length.
-    let mut rec1 = normalize_catalog_index_key(&first_key);
+    // Record 1: index key for first_key + old_root pointer.
+    let mut rec1 = kf.make_index_key(&first_key);
     let mut ptr1 = [0u8; 4];
     BigEndian::write_u32(&mut ptr1, old_root);
     rec1.extend_from_slice(&ptr1);
 
-    // Record 2: normalized split_key + new_sibling pointer
-    let mut rec2 = normalize_catalog_index_key(split_key);
+    // Record 2: index key for split_key + new_sibling pointer.
+    let mut rec2 = kf.make_index_key(split_key);
     let mut ptr2 = [0u8; 4];
     BigEndian::write_u32(&mut ptr2, new_sibling);
     rec2.extend_from_slice(&ptr2);
@@ -1955,6 +2122,7 @@ where
 pub fn btree_insert_full<F>(
     data: &mut [u8],
     key_record: &[u8],
+    kf: &BTreeKeyFormat,
     cmp: &F,
 ) -> Result<(), super::filesystem::FilesystemError>
 where
@@ -1991,7 +2159,7 @@ where
                 {
                     if parent_idx != 0
                         && btree_try_rotate_leaf(
-                            data, node_size, leaf_idx, parent_idx, key_record, cmp,
+                            data, node_size, leaf_idx, parent_idx, key_record, kf, cmp,
                         )
                     {
                         h.leaf_records += 1;
@@ -2000,8 +2168,9 @@ where
                     }
                 }
             }
-            let splits =
-                btree_split_leaf_with_insert(data, node_size, leaf_idx, &mut h, key_record, cmp)?;
+            let splits = btree_split_leaf_with_insert(
+                data, node_size, leaf_idx, &mut h, key_record, kf, cmp,
+            )?;
             h.leaf_records += 1;
             // First new node's separator goes via either grow_root (depth==1)
             // or insert_into_index. Any additional separators (N-way splits
@@ -2009,7 +2178,7 @@ where
             // root depth is already > 1 once the first separator installed.
             let first = &splits[0];
             if h.depth == 1 {
-                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
             } else if let Some(&(_, parent_idx)) =
                 parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
             {
@@ -2020,11 +2189,12 @@ where
                     first.0,
                     &first.1,
                     &mut h,
+                    kf,
                     cmp,
                     &parent_chain,
                 )?;
             } else {
-                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
             }
             for split in &splits[1..] {
                 // After the first separator installed, the leaf's parent is
@@ -2048,6 +2218,7 @@ where
                     split.0,
                     &split.1,
                     &mut h,
+                    kf,
                     cmp,
                     &fresh_chain,
                 )?;
@@ -2558,9 +2729,16 @@ mod tests {
         let mut new_rec = vec![0u8; 45];
         new_rec[0] = 5;
         let mut header = BTreeHeader::read(&data);
-        let splits =
-            btree_split_leaf_with_insert(&mut data, node_size, 1, &mut header, &new_rec, &compare)
-                .unwrap();
+        let splits = btree_split_leaf_with_insert(
+            &mut data,
+            node_size,
+            1,
+            &mut header,
+            &new_rec,
+            &BTreeKeyFormat::CLASSIC_CATALOG,
+            &compare,
+        )
+        .unwrap();
         assert_eq!(splits.len(), 1, "30-byte records: 2-way split is enough");
         let new_idx = splits[0].0;
         assert_eq!(new_idx, 2);
