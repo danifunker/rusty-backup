@@ -5166,8 +5166,41 @@ pub fn create_blank_hfsplus(
     name: &str,
     case_sensitive: bool,
 ) -> Vec<u8> {
-    let (front, vh_bytes, image_size) =
-        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+    create_blank_hfsplus_sized(size_bytes, block_size, name, case_sensitive, 0, 0)
+}
+
+/// Volume-scaled default catalog B-tree size, in bytes, for a fresh HFS+
+/// volume. Mirrors classic HFS's `default_btree_sizes`: ~0.5% of the volume so
+/// a blank holds thousands of records before exhausting its node budget (HFS+
+/// has no grow-on-full path — docs/hfsplus_btree_growth_plan.md §4c). The
+/// `build_blank_hfsplus_front` caller clamps the result to whole nodes in
+/// `[4, header-bitmap capacity]`.
+pub fn default_hfsplus_catalog_bytes(volume_bytes: u64) -> u64 {
+    volume_bytes / 200
+}
+
+/// Variant of [`create_blank_hfsplus`] that lets the caller request minimum
+/// catalog and extents-overflow B-tree sizes (in bytes) — e.g. a clone target
+/// that must hold every record from a fragmented source, or a test that needs a
+/// deep catalog without a multi-GiB volume. Each minimum is rounded up to whole
+/// nodes and raised to the 4-node floor; the catalog also never drops below the
+/// volume-scaled [`default_hfsplus_catalog_bytes`].
+pub fn create_blank_hfsplus_sized(
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+    min_catalog_bytes: u32,
+    min_extents_bytes: u32,
+) -> Vec<u8> {
+    let (front, vh_bytes, image_size) = build_blank_hfsplus_front(
+        size_bytes,
+        block_size,
+        name,
+        case_sensitive,
+        min_catalog_bytes,
+        min_extents_bytes,
+    );
     let mut img = vec![0u8; image_size];
     img[..front.len()].copy_from_slice(&front);
     let alt = image_size - 1024;
@@ -5184,6 +5217,8 @@ fn build_blank_hfsplus_front(
     block_size: u32,
     name: &str,
     case_sensitive: bool,
+    min_catalog_bytes: u32,
+    min_extents_bytes: u32,
 ) -> (Vec<u8>, [u8; 512], usize) {
     assert!(
         block_size.is_power_of_two() && (512..=4096).contains(&block_size),
@@ -5200,16 +5235,42 @@ fn build_blank_hfsplus_front(
     let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
     let _ = nodes_per_block;
 
-    let btree_node_count: u32 = 4;
-    let btree_blocks: u32 = btree_node_count * blocks_per_node;
+    // Size the catalog B-tree from the volume (docs/hfsplus_btree_growth_plan.md
+    // §4c): HFS+ has no grow-on-full path, so a blank that reserved only the
+    // legacy 4 nodes exhausted after ~24 files. Scale it to ~0.5% of the volume
+    // (mirroring classic HFS's `default_btree_sizes`) so a fresh volume holds
+    // thousands of records, honouring an explicit `min_catalog_bytes` floor from
+    // sized/clone callers. The extents-overflow tree keeps the 4-node default
+    // unless a caller asks for more (its own scaling is P3 work).
+    //
+    // `to_nodes` rounds a byte budget up to whole nodes and clamps to
+    // [4, header-bitmap capacity]. The blank's node-allocation bitmap lives
+    // entirely in the header node's record 2 (bytes 270..node_size-8 — see
+    // `write_blank_btree_header_node`), which addresses `(node_size - 278) * 8`
+    // nodes without dedicated map nodes; cap there. Volumes whose 0.5% catalog
+    // would exceed this (~117 MiB at 4096, i.e. hundreds of GiB of volume) are
+    // far larger than this tool targets, and the defrag/clone path — which does
+    // build map nodes — covers them.
+    let max_btree_nodes: u32 = ((node_size - 278) * 8) as u32;
+    let to_nodes = |bytes: u64| -> u32 {
+        bytes
+            .div_ceil(node_size as u64)
+            .clamp(4, max_btree_nodes as u64) as u32
+    };
+    let catalog_node_count =
+        to_nodes(default_hfsplus_catalog_bytes(size_bytes).max(min_catalog_bytes as u64));
+    let extents_node_count = to_nodes(min_extents_bytes as u64);
+
+    let catalog_btree_blocks: u32 = catalog_node_count * blocks_per_node;
+    let extents_btree_blocks: u32 = extents_node_count * blocks_per_node;
 
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
     let bitmap_start: u32 = 1;
     let extents_start: u32 = bitmap_start + bitmap_blocks;
-    let catalog_start: u32 = extents_start + btree_blocks;
-    let reserved_blocks: u32 = catalog_start + btree_blocks;
+    let catalog_start: u32 = extents_start + extents_btree_blocks;
+    let reserved_blocks: u32 = catalog_start + catalog_btree_blocks;
     assert!(
         reserved_blocks + 1 < total_blocks,
         "image too small for reserved region: need {} blocks, have {total_blocks}",
@@ -5243,8 +5304,8 @@ fn build_blank_hfsplus_front(
             &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 0,
-            /* total_nodes= */ btree_node_count,
-            /* free_nodes= */ btree_node_count - 2, // header + empty leaf used
+            /* total_nodes= */ extents_node_count,
+            /* free_nodes= */ extents_node_count - 2, // header + empty leaf used
             /* max_key_len= */ 10,
             /* key_compare_type= */ 0, // unused for extents
         );
@@ -5265,8 +5326,8 @@ fn build_blank_hfsplus_front(
             &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 2,
-            btree_node_count,
-            btree_node_count - 2,
+            catalog_node_count,
+            catalog_node_count - 2,
             /* max_key_len= */ 516, // HFS+ catalog max key
             key_compare,
         );
@@ -5315,16 +5376,16 @@ fn build_blank_hfsplus_front(
             extents: extent_array(bitmap_start, bitmap_blocks),
         },
         extents_file: ForkData {
-            logical_size: btree_blocks as u64 * bs,
+            logical_size: extents_btree_blocks as u64 * bs,
             clump_size: 0,
-            total_blocks: btree_blocks,
-            extents: extent_array(extents_start, btree_blocks),
+            total_blocks: extents_btree_blocks,
+            extents: extent_array(extents_start, extents_btree_blocks),
         },
         catalog_file: ForkData {
-            logical_size: btree_blocks as u64 * bs,
+            logical_size: catalog_btree_blocks as u64 * bs,
             clump_size: 0,
-            total_blocks: btree_blocks,
-            extents: extent_array(catalog_start, btree_blocks),
+            total_blocks: catalog_btree_blocks,
+            extents: extent_array(catalog_start, catalog_btree_blocks),
         },
         attributes_file: ForkData::empty(),
         startup_file: ForkData::empty(),
@@ -5354,7 +5415,7 @@ pub fn write_blank_hfsplus_into<W: Write + Seek>(
     case_sensitive: bool,
 ) -> std::io::Result<()> {
     let (front, vh_bytes, _image_size) =
-        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive, 0, 0);
     target.seek(SeekFrom::Start(0))?;
     target.write_all(&front)?;
     target.seek(SeekFrom::Start(size_bytes - 1024))?;
@@ -6454,10 +6515,12 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
         assert!(entries.is_empty(), "freshly built blank must list empty");
 
-        // 32 MiB / 4096 = 8192 blocks; reserved = 1 (VH) + 1 (bitmap) + 4
-        // (extents) + 4 (catalog) = 10. Free = 8182.
+        // 32 MiB / 4096 = 8192 blocks. The catalog is now volume-scaled
+        // (~0.5%, docs/hfsplus_btree_growth_plan.md §4c): 32 MiB / 200 =
+        // 167,772 bytes -> 41 nodes @ 4096. Reserved = 1 (boot/VH) + 1 (bitmap)
+        // + 4 (extents, default) + 41 (catalog) = 47. Free = 8145.
         assert_eq!(fs.vh.total_blocks, 8192);
-        assert_eq!(fs.vh.free_blocks, 8192 - 10);
+        assert_eq!(fs.vh.free_blocks, 8192 - 47);
         // Edit-mode prep should succeed (unmounted bit set, no journal).
         fs.prepare_for_edit().expect("blank must accept edit prep");
     }
@@ -8117,5 +8180,97 @@ mod tests {
                 "record (parent {parent}, {name}) not findable by descent — misrouted index"
             );
         }
+    }
+
+    #[test]
+    fn test_hfsplus_blank_sized_catalog_20k_inserts_fsck_clean() {
+        // P2 (docs/hfsplus_btree_growth_plan.md §4c): a fresh HFS+ volume sized
+        // to hold the records accepts >= 20k incremental catalog inserts across
+        // many parent dirs and stays fsck-clean — the volume-level gate P1
+        // deferred. A blank catalog used to be a fixed 4 nodes (exhausting after
+        // ~24 files); it is now volume-scaled, and `create_blank_hfsplus_sized`
+        // lets this test pin a large catalog into a modest 64 MiB image instead
+        // of needing a multi-GiB volume to scale into.
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        // 64 MiB volume; catalog pinned to 16 MiB (~4096 nodes @ 4096) — ample
+        // headroom for 20k file records at the byte-split's ~69% leaf occupancy.
+        let img =
+            create_blank_hfsplus_sized(64 * 1024 * 1024, 4096, "PutShuffle", false, 16 << 20, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Real directories so threads / valence / folder_count stay fsck-correct.
+        const DIRS: u32 = 50;
+        let root = fs.root().unwrap();
+        let mut dir_ids = Vec::with_capacity(DIRS as usize);
+        for d in 0..DIRS {
+            let de = fs
+                .create_directory(&root, &format!("dir{d:03}"), &Default::default())
+                .unwrap();
+            dir_ids.push(de.location as u32);
+        }
+        let base_cnid = fs.vh.next_catalog_id;
+
+        // 20k files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32 — unique names landing mid-leaf, not appended), sprayed across
+        // the directories. Insert the catalog records directly: `create_file`
+        // snapshots the whole catalog per call for rollback, which would make a
+        // 20k-record build O(N * catalog_size). fsck doesn't require per-file
+        // thread records (only flags orphaned threads), so — like the classic
+        // HFS scaling test — we insert just the file records and fix up counts.
+        let n: u32 = 20_000;
+        let mut per_dir = vec![0i32; DIRS as usize];
+        let empty_fork = ForkData::empty();
+        for i in 0..n {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let d = (hash % DIRS) as usize;
+            let name = format!("f{hash:08x}");
+            let mut kr = Fs::build_catalog_key(dir_ids[d], &name);
+            if !kr.len().is_multiple_of(2) {
+                kr.push(0);
+            }
+            kr.extend_from_slice(&Fs::build_file_record(
+                base_cnid + i,
+                &empty_fork,
+                &empty_fork,
+                &[0u8; 4],
+                &[0u8; 4],
+            ));
+            fs.insert_catalog_record(&kr)
+                .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
+            per_dir[d] += 1;
+        }
+        // Mirror the bookkeeping the create path maintains so fsck's cross-checks
+        // (file_count, next_catalog_id, per-dir valence) pass.
+        fs.vh.file_count += n;
+        fs.vh.next_catalog_id = base_cnid + n;
+        for (d, &cnt) in per_dir.iter().enumerate() {
+            fs.update_parent_valence(dir_ids[d], cnt).unwrap();
+        }
+
+        // The catalog must have grown several index levels...
+        let h = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            h.depth >= 3,
+            "catalog depth {} < 3 after 20k inserts",
+            h.depth
+        );
+        // ...without a premature DiskFull (every insert above succeeded).
+
+        // No IndexSiblingLinkBroken / order / count damage at scale.
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after 20k inserts: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
     }
 }

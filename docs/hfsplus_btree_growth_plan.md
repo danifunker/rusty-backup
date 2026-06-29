@@ -1,11 +1,23 @@
 # HFS+ catalog B-tree growth & variable-length keys — implementation plan
 
-**Status:** in progress. **P1 (key-format descriptor / variable-length index
-keys, §4a) landed** — the shared B-tree helpers in `hfs_common.rs` are now
-key-format-aware (`BTreeKeyFormat`), the HFS+ catalog/attributes inserts and the
-defrag builders thread the matching descriptor, and classic HFS is byte-identical
-(`CLASSIC_CATALOG` delegates to the legacy `normalize_catalog_index_key`). P2–P5
-below remain. Safe to revise freely.
+**Status:** in progress.
+- **P1 (key-format descriptor / variable-length index keys, §4a) — landed.** The
+  shared B-tree helpers in `hfs_common.rs` are now key-format-aware
+  (`BTreeKeyFormat`), the HFS+ catalog/attributes inserts and the defrag builders
+  thread the matching descriptor, and classic HFS is byte-identical
+  (`CLASSIC_CATALOG` delegates to the legacy `normalize_catalog_index_key`).
+- **P2 blank sizing (§4c) — landed.** `build_blank_hfsplus_front` sizes the
+  catalog from the volume (~0.5%, mirroring classic `default_btree_sizes`), and
+  `create_blank_hfsplus_sized` lets clone/test callers pin a larger catalog. The
+  volume-level gate is met: 20k shuffled multi-dir inserts into a sized blank,
+  catalog depth ≥ 3, `hfsplus_fsck` clean.
+- **P2 grow-on-full (§4b) — deferred** (see §4b note). Classic HFS itself has no
+  grow-on-full path and relies solely on pre-sizing; we mirror that. The blank
+  auto-sizes and the clone path already over-sizes its target catalog, so the
+  remaining gap (a *foreign*, under-sized catalog filled past capacity via live
+  `put`s) matches a pre-existing classic-HFS limitation. Revisit if a real
+  workload needs it.
+- **P3–P5** remain. Safe to revise freely.
 
 **Relationship to shipped work:** the classic-HFS catalog scaling work is done —
 bulk import (`PROMPT-hfs-catalog-btree-scaling.md`) and the incremental per-`put`
@@ -137,7 +149,18 @@ Back-compat: classic HFS passes a `BTreeKeyFormat { big_keys:false,
 variable_index_keys:false, max_key_len:37 }` and the behaviour is byte-identical
 to today (lock this with a golden test).
 
-### 4b. B-tree file growth on full
+### 4b. B-tree file growth on full — DEFERRED
+
+> **Deferred (2026-06-28).** Implemented sizing (4c) instead and mirrored classic
+> HFS, which has **no** grow-on-full path at all — it relies entirely on
+> pre-sizing the catalog (`default_btree_sizes` / `create_blank_hfs_sized`). The
+> HFS+ blank now auto-sizes the catalog from the volume and the clone/defrag path
+> already over-sizes its target (3× source pad + volume-scaled floor), so the only
+> remaining gap is a *foreign* volume whose catalog was built small elsewhere and
+> then filled past capacity through live `put`s — the same limitation classic HFS
+> has shipped with. The design below is retained for if a real workload needs it;
+> the riskiest parts are the map-node bitmap extension and the extents-overflow
+> spill, neither validated against real macOS here.
 
 Today `btree_alloc_node` returns `DiskFull` when the fork's nodes are exhausted.
 Add a grow step (catalog first, then extents/attributes) invoked from the live
@@ -186,8 +209,15 @@ correctness work isn't gated on it.
    *volume-level* fsck gate moves to P2 — a blank catalog is only 4 nodes today,
    so it can't reach depth ≥ 3 until 4c sizing / 4b growth land. Classic HFS
    output unchanged (the existing classic scaling/fsck tests still pass).
-2. **P2 — catalog growth (4b) + blank sizing (4c).** Gate: insert ≥ 20k files
-   into an HFS+ volume sized to hold them; fsck clean; no premature `DiskFull`.
+2. **P2 — blank sizing (4c) [DONE] + catalog growth (4b) [DEFERRED].** Gate met
+   via sizing: `create_blank_hfsplus_sized` + the volume-scaled blank default let
+   a 64 MiB volume with a 16 MiB catalog take 20k shuffled multi-dir inserts to
+   depth ≥ 3, fsck clean, no premature `DiskFull`
+   (`test_hfsplus_blank_sized_catalog_20k_inserts_fsck_clean`). 4b (grow the fork
+   on `free_nodes == 0`) is deferred — classic HFS relies on pre-sizing alone and
+   has no grow path either; the blank auto-sizes and the clone path over-sizes its
+   target, so live growth is only needed for a foreign under-sized catalog (a
+   pre-existing classic-HFS limitation).
 3. **P3 — extents-overflow + attributes** through the same descriptor; remove the
    depth-1 restriction at `hfsplus.rs:2009`. Gate: create many fragmented files
    and many xattrs; fsck clean.
