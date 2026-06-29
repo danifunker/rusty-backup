@@ -1,6 +1,6 @@
 # HFS+ catalog B-tree growth & variable-length keys — implementation plan
 
-**Status:** in progress.
+**Status:** complete (P1–P5 landed; §4b grow-on-full intentionally deferred).
 - **P1 (key-format descriptor / variable-length index keys, §4a) — landed.** The
   shared B-tree helpers in `hfs_common.rs` are now key-format-aware
   (`BTreeKeyFormat`), the HFS+ catalog/attributes inserts and the defrag builders
