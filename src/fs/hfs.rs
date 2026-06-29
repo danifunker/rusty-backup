@@ -2747,6 +2747,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         validate_hfs_create_name(name).map(|_| ())
     }
 
+    fn uses_colon_paths(&self) -> bool {
+        true
+    }
+
     fn total_size(&self) -> u64 {
         self.mdb.total_blocks as u64 * self.mdb.block_size as u64
     }

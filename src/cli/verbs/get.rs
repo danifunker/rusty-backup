@@ -31,7 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use std::path::{Path, PathBuf};
 
-use crate::cli::copy_paths::{base_name_of, compute_glob_root, has_glob_chars, strip_root_prefix};
+use crate::cli::copy_paths::{compute_glob_root, has_glob_chars, strip_root_prefix};
 use crate::cli::glob::{collect_matches, compile_patterns};
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
@@ -47,7 +47,8 @@ pub struct GetArgs {
     /// Source path or glob inside the filesystem. Patterns containing
     /// `*`, `?`, `[`, or `{` walk the volume and extract every match.
     /// Pass `--literal` to extract a single path verbatim when its name
-    /// contains those characters.
+    /// contains those characters. A literal `/` in a name is written `\/`
+    /// (or use a `:`-separated path on HFS / HFS+, which also forces literal).
     pub src: String,
 
     /// Destination path on the host. Single-match: the literal target
@@ -170,9 +171,10 @@ pub fn run(args: GetArgs) -> Result<()> {
     // Decide the dispatch shape. Globs and exclude lists always go
     // through the glob walker; a literal source goes through resolve_path
     // and is treated as a single file or a recursive directory dump.
-    // `--literal` forces the resolve_path branch even for names that contain
-    // glob metacharacters.
-    if !args.literal && (has_glob_chars(&args.src) || !args.exclude.is_empty()) {
+    // `--literal` (or a colon-grammar path on HFS / HFS+) forces the
+    // resolve_path branch even for names that contain glob metacharacters.
+    let colon = super::ls::colon_mode(&*fs, &args.src);
+    if !args.literal && !colon && (has_glob_chars(&args.src) || !args.exclude.is_empty()) {
         return run_glob(
             &mut *fs,
             &args.src,
@@ -197,8 +199,10 @@ pub fn run(args: GetArgs) -> Result<()> {
         // Directory dump: lay the tree under DST/<source-basename>/...,
         // matching cp/rsync convention. Implemented as a recursive walk
         // over the live FS — no need to spin up the glob matcher for a
-        // single-rooted recursion.
-        let base_name = base_name_of(&args.src);
+        // single-rooted recursion. Decode the basename with the same escape /
+        // colon rules used to resolve it, so a `\/`-bearing source folder lands
+        // under its real name on the host.
+        let base_name = crate::cli::parse::split_image_parent(&args.src, colon).1;
         let target_root = if base_name.is_empty() {
             args.dst.clone()
         } else {

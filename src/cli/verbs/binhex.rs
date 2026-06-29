@@ -17,7 +17,6 @@ use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
-use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::{resolve_partition_rw, resolve_partition_streaming_with_password};
 use crate::fs::binhex::{self, BinHexFile};
 use crate::fs::filesystem::{CreateFileOptions, ResourceForkSource};
@@ -31,7 +30,9 @@ pub struct PutBinHexArgs {
     pub host_file: PathBuf,
 
     /// Destination directory inside the filesystem (`/` for root). The
-    /// filename comes from the BinHex header. Defaults to `/`.
+    /// filename comes from the BinHex header. Defaults to `/`. A literal `/`
+    /// in a directory name is written `\/`; on HFS / HFS+ a `:`-separated path
+    /// also works (so `/` is plain data). Defaults to `/`.
     #[arg(long = "dst-dir", default_value = "/")]
     pub dst_dir: String,
 
@@ -70,6 +71,8 @@ pub struct GetBinHexArgs {
     /// Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always
     /// treats the source as an exact literal path (it never globs), so glob
     /// metacharacters in a name are addressed verbatim with or without it.
+    /// A literal `/` in a name is written `\/` (or use a `:`-separated path on
+    /// HFS / HFS+).
     #[arg(short = 'L', long = "literal", alias = "no-glob")]
     pub literal: bool,
 }
@@ -95,18 +98,12 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let (parent_path, _) = split_mac_path(&format!(
-        "{}/x",
-        args.dst_dir.trim_end_matches('/').trim_start_matches('/'),
-    ))?;
-    let parent_path = if parent_path == "/" {
-        "/".to_string()
-    } else {
-        parent_path
-    };
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    // `--dst-dir` is the destination *directory* (the filename comes from the
+    // BinHex header), resolved with the shared escape / colon grammar so a
+    // donor folder named with a literal `/` is addressable.
+    let parent = super::ls::resolve_path(&mut *fs, &args.dst_dir)?;
     if !parent.is_directory() {
-        bail!("parent is not a directory: {parent_path}");
+        bail!("destination is not a directory: {}", args.dst_dir);
     }
 
     let existing = fs
@@ -118,7 +115,7 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
         if !args.force {
             bail!(
                 "{}/{} already exists (pass --force to overwrite)",
-                parent_path.trim_end_matches('/'),
+                args.dst_dir.trim_end_matches('/'),
                 target_name
             );
         }

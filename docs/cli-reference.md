@@ -19,6 +19,28 @@ Usage: rb-cli [OPTIONS] <COMMAND>
 - `--log-file` — Mirror full trace-level log output to PATH regardless of `--log-level`. Useful on Windows cmd where redirection is awkward
 - `--config` — Path to a config file. Overrides the platform default location. See `rb-cli config path` for what that location is
 
+## Path grammar (in-image paths)
+
+Verbs that take a path *inside* an image (`ls`, `get`, `get-binhex`, `put`,
+`put-binhex`, `mkdir`, `rm`, `cp`, `locate`) address it with one of two
+grammars:
+
+- **Slash** (default, every filesystem): `/` is the separator. A literal `/`
+  inside a single name — legal on classic-Mac HFS / HFS+ volumes, e.g.
+  `Oxyd b/w` — is written `\/`; a literal backslash is written `\\`. So
+  `rb-cli get-binhex IMG "/Games/Oxyd 3.6/Oxyd b\/w" out.hqx` extracts the
+  single file `Oxyd b/w` from the folder `Oxyd 3.6`.
+- **Colon** (HFS / HFS+ only): because classic Mac OS reserves `:` as its path
+  separator, `:` can never appear in a name, so you may instead write the path
+  with `:` separators — the native Mac convention — and then `/` is ordinary
+  data needing no escape: `rb-cli get-binhex IMG ":Games:Oxyd 3.6:Oxyd b/w"
+  out.hqx`. A colon-grammar path is always literal (it never globs).
+
+On every other filesystem `:` is an ordinary filename byte and only the slash
+grammar applies. Glob patterns (`*`, `?`, `[`, `{`) use the slash grammar; pass
+`--literal` (or use the colon grammar) to address a name containing those
+characters verbatim.
+
 ## Verbs
 
 ### `api`
@@ -643,7 +665,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters
+- `<SRC>` — Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)
 - `<DST>` — Destination path on the host. Single-match: the literal target file. Multi-match or directory source: a directory under which matched entries are laid out (created if it doesn't exist)
 
 **Options**
@@ -677,7 +699,7 @@ Usage: get-binhex [OPTIONS] <IMAGE> <SRC> <DST>
 **Options**
 
 - `--password` — Password for encrypted containers (currently: WinImage IMZ)
-- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+)
 
 ### `grow`
 
@@ -739,7 +761,7 @@ Usage: locate [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path inside the filesystem (Mac path conventions; `/` is the separator — `:` is rejected for the same reason as the other verbs)
+- `<PATH>` — Path inside the filesystem. `/` is the separator; a literal `/` in a name is written `\/`. You may instead use `:` as the separator (the native classic-Mac convention), in which case `/` is plain data — e.g. `:System Folder:Oxyd b/w`
 
 **Options**
 
@@ -827,7 +849,7 @@ Usage: mkdir [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B)
+- `<PATH>` — Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B). A literal `/` in the new name is written `\/`; on HFS / HFS+ a `:`-separated path also works
 
 **Options**
 
@@ -1144,7 +1166,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
 - `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
-- `<DST>` — Destination path inside the filesystem (cp-like positional)
+- `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
 
 **Options**
 
@@ -1175,7 +1197,7 @@ Usage: put-binhex [OPTIONS] <IMAGE> <HOST_FILE>
 
 **Options**
 
-- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`
+- `--dst-dir` — Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`. A literal `/` in a directory name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data). Defaults to `/`
 - `--rename` — Override the filename from the BinHex header
 - `--force` — Overwrite an existing entry at the destination path
 - `--clear-inited` — Clear the `hasBeenInited` Finder flag (0x0100) on the written file. Use when injecting an app onto a fresh disk so the Finder re-reads its `BNDL` and registers real icons (a file copied with `hasBeenInited` already set is treated as already-catalogued, so it shows a generic icon until a desktop rebuild). Mirrors what a MacBinary install does to byte 73
@@ -1285,7 +1307,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 **Arguments**
 
 - `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
-- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters
+- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)
 
 **Options**
 

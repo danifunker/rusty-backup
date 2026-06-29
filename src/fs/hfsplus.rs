@@ -3170,6 +3170,10 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         validate_hfsplus_create_name(name)
     }
 
+    fn uses_colon_paths(&self) -> bool {
+        true
+    }
+
     fn total_size(&self) -> u64 {
         self.vh.total_blocks as u64 * self.vh.block_size as u64
     }

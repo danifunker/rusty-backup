@@ -37,6 +37,8 @@ fn main() -> std::io::Result<()> {
     writeln!(md, "## Global options\n").unwrap();
     render_args(&mut md, &cmd, &[]);
 
+    md.push_str(PATH_GRAMMAR);
+
     writeln!(md, "## Verbs\n").unwrap();
     let mut sub_path = Vec::new();
     render_subcommands(&mut md, &cmd, &mut sub_path);
@@ -45,6 +47,35 @@ fn main() -> std::io::Result<()> {
     eprintln!("Wrote {} ({} bytes)", out_path, md.len());
     Ok(())
 }
+
+/// Static section documenting how in-image paths are tokenised. Lives in the
+/// generator (not a per-arg help string) because it applies uniformly to every
+/// path-taking verb (`ls`, `get`, `get-binhex`, `put`, `put-binhex`, `mkdir`,
+/// `rm`, `cp`, `locate`).
+const PATH_GRAMMAR: &str = "\
+## Path grammar (in-image paths)
+
+Verbs that take a path *inside* an image (`ls`, `get`, `get-binhex`, `put`,
+`put-binhex`, `mkdir`, `rm`, `cp`, `locate`) address it with one of two
+grammars:
+
+- **Slash** (default, every filesystem): `/` is the separator. A literal `/`
+  inside a single name — legal on classic-Mac HFS / HFS+ volumes, e.g.
+  `Oxyd b/w` — is written `\\/`; a literal backslash is written `\\\\`. So
+  `rb-cli get-binhex IMG \"/Games/Oxyd 3.6/Oxyd b\\/w\" out.hqx` extracts the
+  single file `Oxyd b/w` from the folder `Oxyd 3.6`.
+- **Colon** (HFS / HFS+ only): because classic Mac OS reserves `:` as its path
+  separator, `:` can never appear in a name, so you may instead write the path
+  with `:` separators — the native Mac convention — and then `/` is ordinary
+  data needing no escape: `rb-cli get-binhex IMG \":Games:Oxyd 3.6:Oxyd b/w\"
+  out.hqx`. A colon-grammar path is always literal (it never globs).
+
+On every other filesystem `:` is an ordinary filename byte and only the slash
+grammar applies. Glob patterns (`*`, `?`, `[`, `{`) use the slash grammar; pass
+`--literal` (or use the colon grammar) to address a name containing those
+characters verbatim.
+
+";
 
 fn render_subcommands(out: &mut String, cmd: &Command, path: &mut Vec<String>) {
     let mut subs: Vec<&Command> = cmd.get_subcommands().collect();

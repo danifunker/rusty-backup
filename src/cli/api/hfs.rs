@@ -600,21 +600,18 @@ pub fn resolve_path<R: Read + Seek + Send>(
     fs: &mut HfsFilesystem<R>,
     path: &str,
 ) -> Result<crate::fs::entry::FileEntry> {
+    // HFS reserves `:`, so a `:` in the path is always a separator (colon
+    // grammar) and `/` is plain data; a plain `/`-path uses `\/` for a literal
+    // slash. See `crate::cli::parse::split_image_path`.
+    let components = crate::cli::parse::split_image_path(path, path.contains(':'));
     let mut current = fs.root().map_err(|e| anyhow!("root: {e}"))?;
-    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Ok(current);
-    }
-    for component in trimmed.split('/') {
-        if component.is_empty() {
-            continue;
-        }
+    for component in &components {
         let children = fs
             .list_directory(&current)
             .map_err(|e| anyhow!("list_directory: {e}"))?;
         let next = children
             .into_iter()
-            .find(|c| c.name == component)
+            .find(|c| &c.name == component)
             .ok_or_else(|| anyhow!("path component not found: {component}"))?;
         current = next;
     }

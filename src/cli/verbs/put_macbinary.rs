@@ -18,7 +18,6 @@ use std::path::PathBuf;
 
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::log_stderr;
-use crate::cli::parse::split_mac_path;
 use crate::cli::resolve::resolve_partition_rw;
 use crate::fs::filesystem::{CreateFileOptions, ResourceForkSource};
 
@@ -73,18 +72,11 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let (parent_path, _) = split_mac_path(&format!(
-        "{}/x",
-        args.dst_dir.trim_end_matches('/').trim_start_matches('/'),
-    ))?;
-    let parent_path = if parent_path == "/" {
-        "/".to_string()
-    } else {
-        parent_path
-    };
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    // `--dst-dir` is the destination *directory* (the filename comes from the
+    // MacBinary header), resolved with the shared escape / colon grammar.
+    let parent = super::ls::resolve_path(&mut *fs, &args.dst_dir)?;
     if !parent.is_directory() {
-        bail!("parent is not a directory: {parent_path}");
+        bail!("destination is not a directory: {}", args.dst_dir);
     }
 
     let existing = fs
@@ -96,7 +88,7 @@ pub fn run(args: PutMacBinaryArgs) -> Result<()> {
         if !args.force {
             bail!(
                 "{}/{} already exists (pass --force to overwrite)",
-                parent_path.trim_end_matches('/'),
+                args.dst_dir.trim_end_matches('/'),
                 target_name
             );
         }
