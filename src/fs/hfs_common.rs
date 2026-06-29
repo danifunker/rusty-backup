@@ -7,7 +7,6 @@
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::sync::OnceLock;
-use unicode_normalization::UnicodeNormalization;
 
 use super::filesystem::FilesystemError;
 
@@ -368,43 +367,26 @@ pub fn decode_ostype(code: &[u8; 4]) -> String {
 // B-tree key comparison
 // ---------------------------------------------------------------------------
 
-/// Code points that Apple's `FastUnicodeCompare` treats as **ignorable**
-/// during case-folded comparison — they're skipped entirely, as if absent.
-///
-/// Source: Apple's `FastUnicodeCompare.c` `gLowerCaseTable`. The table
-/// maps zero-width / format / variation-selector ranges to 0x0000 (the
-/// algorithm's "skip" sentinel). Latin-letter casing is covered by
-/// `char::to_uppercase` below.
-///
-/// **Note**: U+0000 (NUL) is NOT in this list. Apple's table maps NUL to
-/// 0xFFFF — i.e. NUL is the highest-sorting character, not ignorable.
-/// That's how the on-disk `"\0\0\0\0HFS+ Private Data"` directory ends
-/// up sorting *last* among its parent's children rather than first.
-/// `fold_hfsplus_name_for_compare` rewrites NUL → U+FFFF before the
-/// final uppercase pass to match.
-fn is_hfsplus_ignored(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x00AD
-            | 0x034F
-            | 0x070F
-            | 0x180B..=0x180E
-            | 0x200B..=0x200F
-            | 0x202A..=0x202E
-            | 0x206A..=0x206F
-            | 0xFE00..=0xFE0F
-            | 0xFEFF
-    )
-}
-
-fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<char> {
-    let s = String::from_utf16_lossy(name);
-    let nfd: String = s.nfd().collect();
-    nfd.chars()
-        .filter(|c| !is_hfsplus_ignored(*c))
-        .map(|c| if c == '\0' { '\u{FFFF}' } else { c })
-        .flat_map(|c| c.to_uppercase())
-        .collect()
+/// Normalize an HFS+ catalog name into Apple's `FastUnicodeCompare` form:
+/// canonically decompose each UTF-16 unit (Apple's TN1150 decomposition, NOT
+/// Rust NFD — the two differ in the ranges Apple excludes), then case-fold each
+/// resulting unit through Apple's table, dropping units that fold to 0
+/// (Apple's "ignored" set: zero-width / format / variation selectors). NUL
+/// folds to 0xFFFF, so a leading-NUL name like the `HFS+ Private Data`
+/// directory sorts *last*. Comparing the folded `u16` sequences lexicographically
+/// reproduces a real Mac OS volume's ordering exactly (see [`hfs_unicode`]).
+fn fold_hfsplus_name_for_compare(name: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(name.len());
+    let mut buf = [0u16; 3];
+    for &unit in name {
+        for &d in super::hfs_unicode::decompose(unit, &mut buf) {
+            let folded = super::hfs_unicode::case_fold(d);
+            if folded != 0 {
+                out.push(folded);
+            }
+        }
+    }
+    out
 }
 
 /// Compare two HFS+ catalog keys (case-insensitive by default).
@@ -435,35 +417,51 @@ pub fn compare_hfsplus_keys(
     folded_a.cmp(&folded_b)
 }
 
-#[allow(dead_code)]
-/// Mac Roman case-insensitive uppercase table (bytes 0x00-0xFF).
-/// Characters that have uppercase equivalents are mapped; all others map to themselves.
-static MAC_ROMAN_UPPER: [u8; 256] = {
-    let mut table = [0u8; 256];
-    let mut i = 0u16;
-    while i < 256 {
-        table[i as usize] = i as u8;
-        i += 1;
-    }
-    // ASCII lowercase → uppercase
-    let mut c = b'a';
-    while c <= b'z' {
-        table[c as usize] = c - 32;
-        c += 1;
-    }
-    // Mac Roman specific mappings (lowercase → uppercase)
-    table[0x87] = 0x83; // á → É? No: 0x87=á, uppercase is 0xE7=Á... Let me use the standard HFS approach
-                        // HFS uses a simpler approach: the Finder's case folding table.
-                        // For correctness, we uppercase ASCII and leave high bytes as-is for comparison.
-                        // The HFS spec defines a specific case-folding table, but for practical purposes
-                        // the critical case is ASCII letters. High-byte Mac Roman diacritics are compared as-is.
-    table
-};
-
-#[allow(dead_code)]
-/// Compare two HFS (classic) catalog keys (case-insensitive Mac Roman).
+/// Mac Roman catalog-name collation order (byte -> sort rank), as used by
+/// classic Mac OS HFS.
 ///
-/// Keys are: parent_cnid (u32) + name (Mac Roman bytes).
+/// Classic HFS compares catalog names with the File Manager's `_RelString`
+/// trap (`CMKeyCmp` in Apple's source: `OS/HFS/CMMAINT.a`), i.e. the system
+/// string comparison — **case-insensitive, diacritical-sensitive**, with a
+/// specific Mac Roman ordering. This is NOT a plain ASCII uppercase: lowercase
+/// folds onto its uppercase *rank*, accented letters sort right after their
+/// base letter (so "Bézier" < "Bind"), and punctuation / quotes / spaces
+/// (incl. high-byte curly quotes 0xD2-0xD5, en/em dashes, and the non-breaking
+/// space 0xCA, which sorts as a space) get their own early ranks rather than
+/// landing after 'Z' by raw byte value.
+///
+/// The table is the well-known `hfs_charorder` reproduction (hfsutils
+/// `libhfs/data.c`); the Linux kernel's `caseorder` (`fs/hfs/string.c`) is a
+/// second, independent copy — they use different absolute values but induce an
+/// identical ordering, and this table reproduces real Apple-formatted volumes
+/// fsck-clean (verified against a MacPack boot disk). The previous table only
+/// folded ASCII and left high bytes raw, which mis-sorted any name with an
+/// accent or curly quote.
+static HFS_CHARORDER: [u8; 256] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x22, 0x23, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+    0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+    0x47, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
+    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaa, 0xab, 0xac, 0xad, 0xae,
+    0x54, 0x48, 0x58, 0x5a, 0x5e, 0x60, 0x67, 0x69, 0x6b, 0x6d, 0x73, 0x75, 0x77, 0x79, 0x7b, 0x7f,
+    0x8d, 0x8f, 0x91, 0x93, 0x96, 0x98, 0x9f, 0xa1, 0xa3, 0xa5, 0xa8, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3,
+    0x4c, 0x50, 0x5c, 0x62, 0x7d, 0x81, 0x9a, 0x55, 0x4a, 0x56, 0x4c, 0x4e, 0x50, 0x5c, 0x62, 0x64,
+    0x65, 0x66, 0x6f, 0x70, 0x71, 0x72, 0x7d, 0x89, 0x8a, 0x8b, 0x81, 0x83, 0x9c, 0x9d, 0x9e, 0x9a,
+    0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0x95, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0x52, 0x85,
+    0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0x57, 0x8c, 0xcc, 0x52, 0x85,
+    0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0x26, 0x27, 0xd4, 0x20, 0x4a, 0x4e, 0x83, 0x87, 0x87,
+    0xd5, 0xd6, 0x24, 0x25, 0x2d, 0x2e, 0xd7, 0xd8, 0xa7, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+    0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef,
+    0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+];
+
+/// Compare two HFS (classic) catalog keys the way the Mac OS File Manager does.
+///
+/// Keys are: parent_cnid (u32) + name (Mac Roman bytes). Parent IDs compare
+/// numerically; names compare through [`HFS_CHARORDER`] byte-by-byte, with the
+/// shorter name sorting first on a common prefix (matching hfsutils
+/// `d_relstring` / the Linux kernel `hfs_strcmp`).
 pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u8]) -> Ordering {
     match parent_a.cmp(&parent_b) {
         Ordering::Equal => {}
@@ -471,8 +469,8 @@ pub fn compare_hfs_keys(parent_a: u32, name_a: &[u8], parent_b: u32, name_b: &[u
     }
     let len = name_a.len().min(name_b.len());
     for i in 0..len {
-        let a = MAC_ROMAN_UPPER[name_a[i] as usize];
-        let b = MAC_ROMAN_UPPER[name_b[i] as usize];
+        let a = HFS_CHARORDER[name_a[i] as usize];
+        let b = HFS_CHARORDER[name_b[i] as usize];
         match a.cmp(&b) {
             Ordering::Equal => {}
             other => return other,
@@ -514,6 +512,158 @@ pub fn normalize_catalog_index_key(key: &[u8]) -> Vec<u8> {
         result[1..1 + copy_len].copy_from_slice(&key[1..1 + copy_len]);
     }
     result
+}
+
+/// `kBTBigKeysMask` — the B-tree's key-length prefix is a 2-byte (`u16`) field.
+/// Set on every HFS+ tree (catalog, extents-overflow, attributes); clear on
+/// classic HFS, whose key length is a single byte.
+pub const KBT_BIG_KEYS_MASK: u32 = 0x0000_0002;
+/// `kBTVariableIndexKeysMask` — index records carry the child's variable-length
+/// key verbatim. Set on the HFS+ catalog and attributes trees; clear on the
+/// extents-overflow tree and classic HFS, whose index keys are padded to a
+/// fixed `max_key_len`.
+pub const KBT_VARIABLE_INDEX_KEYS_MASK: u32 = 0x0000_0004;
+
+/// Describes how a B-tree encodes its keys, so the shared split / grow / rotate
+/// machinery below can serve both the classic-HFS 1-byte-key catalog and the
+/// HFS+ 2-byte ("big key") trees without forking the algorithm.
+///
+/// The classic path threads [`BTreeKeyFormat::CLASSIC_CATALOG`] and is
+/// byte-identical to the pre-descriptor code (the fixed 0x25 index key produced
+/// by [`normalize_catalog_index_key`]); HFS+ threads the matching `HFSPLUS_*`
+/// constant, which is what unlocks variable-length index keys so an HFS+ catalog
+/// can split past a single leaf level without corrupting.
+///
+/// Derived from the BTHeaderRec `attributes` bitfield + `maxKeyLength`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BTreeKeyFormat {
+    /// `kBTBigKeysMask`: key-length prefix is 2 bytes (HFS+) vs 1 byte (classic).
+    pub big_keys: bool,
+    /// `kBTVariableIndexKeysMask`: index records store the child's
+    /// variable-length key verbatim. When clear, index keys are padded to
+    /// `max_key_len`.
+    pub variable_index_keys: bool,
+    /// Maximum key length — the fixed index-key width when `variable_index_keys`
+    /// is clear (classic catalog: 0x25; HFS+ extents-overflow: 10).
+    pub max_key_len: u16,
+}
+
+impl BTreeKeyFormat {
+    /// Classic HFS catalog: 1-byte key length, fixed 0x25-byte index keys.
+    pub const CLASSIC_CATALOG: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: false,
+        variable_index_keys: false,
+        max_key_len: HFS_CAT_MAX_KEY_LEN as u16,
+    };
+
+    /// HFS+/HFSX catalog: 2-byte key length, variable-length index keys
+    /// (`kHFSPlusCatalogKeyMaximumLength` = 516).
+    pub const HFSPLUS_CATALOG: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: true,
+        max_key_len: 516,
+    };
+
+    /// HFS+ extents-overflow: 2-byte key length, fixed 10-byte index keys
+    /// (`kHFSPlusExtentKeyMaximumLength` = 10).
+    pub const HFSPLUS_EXTENTS: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: false,
+        max_key_len: 10,
+    };
+
+    /// HFS+ attributes: 2-byte key length, variable-length index keys
+    /// (`kHFSPlusAttrKeyMaximumLength` = 264).
+    pub const HFSPLUS_ATTRIBUTES: BTreeKeyFormat = BTreeKeyFormat {
+        big_keys: true,
+        variable_index_keys: true,
+        max_key_len: 264,
+    };
+
+    /// Build a descriptor from a BTHeaderRec `attributes` bitfield and
+    /// `maxKeyLength`. The `attributes` field on hand-built volumes can be 0
+    /// (no flags) even for HFS+ trees, so callers that know the tree's identity
+    /// should prefer the `HFSPLUS_*` / `CLASSIC_CATALOG` constants; this helper
+    /// is for code paths that only have the raw header bytes.
+    pub fn from_header(attributes: u32, max_key_len: u16) -> Self {
+        BTreeKeyFormat {
+            big_keys: attributes & KBT_BIG_KEYS_MASK != 0,
+            variable_index_keys: attributes & KBT_VARIABLE_INDEX_KEYS_MASK != 0,
+            max_key_len,
+        }
+    }
+
+    /// The BTHeaderRec `attributes` bits implied by this format.
+    pub fn header_attributes(&self) -> u32 {
+        let mut a = 0;
+        if self.big_keys {
+            a |= KBT_BIG_KEYS_MASK;
+        }
+        if self.variable_index_keys {
+            a |= KBT_VARIABLE_INDEX_KEYS_MASK;
+        }
+        a
+    }
+
+    /// Bytes occupied by the key-length prefix (1 classic, 2 big-key).
+    #[inline]
+    pub fn len_prefix(&self) -> usize {
+        if self.big_keys {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Read the key length stored at the front of `record`.
+    #[inline]
+    pub fn key_len(&self, record: &[u8]) -> usize {
+        if self.big_keys {
+            if record.len() < 2 {
+                0
+            } else {
+                BigEndian::read_u16(&record[0..2]) as usize
+            }
+        } else if record.is_empty() {
+            0
+        } else {
+            record[0] as usize
+        }
+    }
+
+    /// The key portion of a record — the length prefix plus `key_len` key
+    /// bytes. This is exactly the slice an index separator must carry, and what
+    /// the split helpers extract from a leaf/child's first record.
+    pub fn key_portion(&self, record: &[u8]) -> Vec<u8> {
+        let end = (self.len_prefix() + self.key_len(record)).min(record.len());
+        record[..end].to_vec()
+    }
+
+    /// Build the key bytes of an index record (length prefix + key) from a
+    /// child node's first-key portion.
+    ///
+    /// - Classic HFS: the fixed 0x25 normalized key, identical to
+    ///   [`normalize_catalog_index_key`].
+    /// - HFS+ variable-index-key trees (catalog, attributes): the key portion
+    ///   verbatim (2-byte length + key bytes).
+    /// - HFS+ fixed-index-key trees (extents-overflow): the key bytes padded to
+    ///   `max_key_len`, length field forced to `max_key_len`.
+    pub fn make_index_key(&self, first_key: &[u8]) -> Vec<u8> {
+        if !self.big_keys {
+            return normalize_catalog_index_key(first_key);
+        }
+        if self.variable_index_keys {
+            return first_key.to_vec();
+        }
+        let max = self.max_key_len as usize;
+        let copy = self.key_len(first_key).min(max);
+        let mut result = vec![0u8; 2 + max];
+        BigEndian::write_u16(&mut result[0..2], max as u16);
+        if first_key.len() >= 2 + copy {
+            result[2..2 + copy].copy_from_slice(&first_key[2..2 + copy]);
+        }
+        result
+    }
 }
 
 /// Read the B-tree header record from catalog_data (node 0, record 0 at offset 14).
@@ -1055,6 +1205,7 @@ pub fn btree_split_leaf_with_insert<F>(
     node_idx: u32,
     header: &mut BTreeHeader,
     new_record: &[u8],
+    kf: &BTreeKeyFormat,
     compare_fn: &F,
 ) -> Result<Vec<(u32, Vec<u8>)>, FilesystemError>
 where
@@ -1083,48 +1234,83 @@ where
     }
     records.insert(insert_pos, new_record.to_vec());
 
-    // Greedy partition by bytes. Per-node usage: 14 (descriptor) + sum(rec_lens)
-    // + 2 * count + 2 (free pointer). Single record larger than node payload
-    // is a structural impossibility (HFS+ catalog key+record max is well under
-    // node_size); reject up front rather than loop forever.
+    // Per-node usage: 14 (descriptor) + sum(rec_lens) + 2 * count + 2 (free
+    // pointer); `payload` accounts for the fixed overhead. A single record
+    // larger than the payload is a structural impossibility (HFS/HFS+ key+record
+    // max is well under node_size) — reject up front rather than loop forever.
     let payload = node_size.saturating_sub(16);
-    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut cur: Vec<Vec<u8>> = Vec::new();
-    let mut cur_bytes: usize = 0;
-    for rec in records.into_iter() {
-        let cost = rec.len() + 2;
-        if cost > payload {
+    for rec in &records {
+        if rec.len() + 2 > payload {
             return Err(FilesystemError::InvalidData(format!(
                 "btree_split_leaf_with_insert: record of {} bytes exceeds node payload {}",
                 rec.len(),
                 payload
             )));
         }
-        if cur_bytes + cost > payload {
-            chunks.push(std::mem::take(&mut cur));
+    }
+
+    // Greedy "pack-left-full" partition by bytes. `cuts` holds the record index
+    // at which each chunk after the first begins (chunk count = cuts.len() + 1).
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut cur_bytes: usize = 0;
+    for (i, rec) in records.iter().enumerate() {
+        let cost = rec.len() + 2;
+        if i > 0 && cur_bytes + cost > payload {
+            cuts.push(i);
             cur_bytes = 0;
         }
         cur_bytes += cost;
-        cur.push(rec);
     }
-    if !cur.is_empty() {
-        chunks.push(cur);
+    // Caller's contract: "I tried inserting and it failed, allocate me a new
+    // node." `btree_insert_record`'s free-space check is 2 bytes more
+    // conservative than the actual packing limit, so the merged set can fit a
+    // single node by 1–2 bytes. We still must produce ≥ 1 new node — force a
+    // 2-way split at the midpoint when greedy yielded a single chunk.
+    if cuts.is_empty() {
+        cuts.push(
+            (records.len() / 2)
+                .max(1)
+                .min(records.len().saturating_sub(1)),
+        );
     }
-    // Caller's contract: "I tried inserting and it failed, allocate me a
-    // new node." `btree_insert_record`'s free-space check is 2 bytes more
-    // conservative than the actual packing limit (it deducts the new
-    // offset slot from `free` AND adds it to `total_needed`), so the
-    // merged record set can occasionally fit in a single node by 1–2
-    // bytes. We still must produce ≥ 1 new node here — force a midpoint
-    // 2-way split if the greedy packer collapsed everything into one
-    // chunk. Both halves trivially fit since the whole set fits a node.
-    if chunks.len() < 2 {
-        let mut all = chunks.pop().unwrap_or_default();
-        let mid = all.len() / 2;
-        let right = all.split_off(mid.max(1));
-        chunks.push(all);
-        chunks.push(right);
+
+    // Density tuning. Greedy pack-left is ideal for *sequential* (append)
+    // inserts — the left node stays full — but for a *random* insert into the
+    // middle of a full leaf it splits off only the overflow (often a single
+    // record), leaving a trail of ~1-record leaves; a catalog built that way
+    // runs ~2x larger than Mac OS writes. When the new record landed in the
+    // middle and the whole set fits two nodes, re-split at the most balanced
+    // *valid* point instead, so both leaves keep room to fill (random inserts
+    // then converge to ~69% full, matching a real Mac volume). Sequential growth
+    // keeps the dense greedy path.
+    let is_append = insert_pos == old_num;
+    if cuts.len() == 1 && !is_append {
+        let total: usize = records.iter().map(|r| r.len() + 2).sum();
+        let mut prefix = 0usize;
+        let mut best_k = cuts[0];
+        let mut best_diff = usize::MAX;
+        for k in 1..records.len() {
+            prefix += records[k - 1].len() + 2;
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_k = k;
+                }
+            }
+        }
+        cuts[0] = best_k;
     }
+
+    // Materialize chunks by draining `records` at the cut points (front to back).
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cuts.len() + 1);
+    let mut prev = 0usize;
+    for &cut in &cuts {
+        chunks.push(records.drain(0..cut - prev).collect());
+        prev = cut;
+    }
+    chunks.push(records);
 
     // Allocate new nodes (one per extra chunk beyond the first, which reuses old_idx).
     let new_count = chunks.len() - 1;
@@ -1187,16 +1373,362 @@ where
         header.last_leaf_node = last_idx;
     }
 
-    // Collect separator keys: first record of each new chunk.
+    // Collect separator keys: first record of each new chunk. The key portion
+    // (length prefix + key bytes) is format-dependent — 1-byte length for
+    // classic HFS, 2-byte for HFS+ — so read it through `kf` rather than
+    // assuming `first[0]` is the whole length.
     let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(new_count);
     for (i, idx) in new_indices.iter().enumerate() {
-        let first = &chunks[i + 1][0];
-        let key_len = first[0] as usize;
-        let key_end = 1 + key_len;
-        let split_key = first[..key_end.min(first.len())].to_vec();
+        let split_key = kf.key_portion(&chunks[i + 1][0]);
         results.push((*idx, split_key));
     }
     Ok(results)
+}
+
+/// Overwrite the record area of node `idx` with `recs` (in key order),
+/// preserving the node descriptor (sibling links, kind, height). Mirrors the
+/// rebuild step of [`btree_insert_record`] but takes a ready-made record list —
+/// used by the sibling-rotation path, which rewrites both nodes of a pair at
+/// once. The caller guarantees `recs` fits within the node payload.
+fn btree_write_node_records(data: &mut [u8], node_size: usize, idx: u32, recs: &[Vec<u8>]) {
+    let off = idx as usize * node_size;
+    let node = &mut data[off..off + node_size];
+    let mut write_pos = 14usize;
+    for (i, rec) in recs.iter().enumerate() {
+        node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
+        let opos = node_size - 2 * (i + 1);
+        BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
+        write_pos += rec.len();
+    }
+    let fpos = node_size - 2 * (recs.len() + 1);
+    BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
+    if write_pos < fpos {
+        node[write_pos..fpos].fill(0);
+    }
+    BigEndian::write_u16(&mut node[10..12], recs.len() as u16);
+}
+
+/// True when index node `parent_idx` holds a record whose trailing 4-byte
+/// child pointer equals `child` — i.e. `child` is a direct child of that index
+/// node, so the two share `parent_idx` as a parent.
+fn index_node_has_child(data: &[u8], node_size: usize, parent_idx: u32, child: u32) -> bool {
+    if parent_idx == 0 {
+        return false;
+    }
+    let off = parent_idx as usize * node_size;
+    if off + node_size > data.len() {
+        return false;
+    }
+    let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+    for i in 0..num {
+        let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+        if e < s + 4 || e > node_size {
+            continue;
+        }
+        if BigEndian::read_u32(&data[off + e - 4..off + e]) == child {
+            return true;
+        }
+    }
+    false
+}
+
+/// In index node `parent_idx`, rewrite (in place) the separator key of the
+/// record pointing at `child` so it equals `new_first_key` (a record's key
+/// portion: the `key_len` byte plus key bytes). Catalog index keys are a fixed
+/// 0x25-length normalized key, so the record length never changes and the
+/// offset table / sibling records are untouched.
+///
+/// Returns `true` only when the separator was found *and* the in-place rewrite
+/// was valid (the existing key portion is the same length as the normalized
+/// key). Returns `false` — writing nothing — when `child` isn't a direct child
+/// of `parent_idx`, or when the existing separator is a different length (a
+/// real variable-length HFS+ index key, which can't be patched in place). The
+/// caller uses the `false` result to abandon a rotation and split instead, so a
+/// non-classic index is never left with a stale separator.
+#[must_use]
+fn btree_update_index_separator(
+    data: &mut [u8],
+    node_size: usize,
+    parent_idx: u32,
+    child: u32,
+    new_first_key: &[u8],
+    kf: &BTreeKeyFormat,
+) -> bool {
+    let off = parent_idx as usize * node_size;
+    if off + node_size > data.len() {
+        return false;
+    }
+    let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+    for i in 0..num {
+        let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+        if e < s + 4 || e > node_size {
+            continue;
+        }
+        if BigEndian::read_u32(&data[off + e - 4..off + e]) == child {
+            // The replacement separator must occupy the same number of bytes as
+            // the existing one — only then is an in-place patch valid (the
+            // offset table and sibling records stay put). Classic HFS index keys
+            // are a fixed 0x25 length so this always holds; an HFS+ variable key
+            // matches only when the new first key has the same length as the old
+            // separator. When it differs we return `false` and the caller
+            // abandons the rotation and splits instead, so a stale separator is
+            // never left behind.
+            let new_key = kf.make_index_key(new_first_key);
+            let key_bytes = e - s - 4;
+            if new_key.len() != key_bytes {
+                return false;
+            }
+            data[off + s..off + s + key_bytes].copy_from_slice(&new_key);
+            return true;
+        }
+    }
+    false
+}
+
+/// Try to absorb `new_record` into a full leaf by redistributing records with
+/// an adjacent sibling that shares the same parent index node and still has
+/// room — a B*-tree rotation — instead of splitting.
+///
+/// A plain 50/50 leaf split leaves non-sequential inserts (the per-`put`
+/// workload, where keys land mid-leaf rather than appending) at the classic
+/// ~69% B-tree occupancy, so a catalog grown one record at a time exhausts its
+/// node budget ~1.4-2.7x sooner than a bulk/sequential build and can hit the
+/// file's node ceiling far below the volume's real capacity. Rotating into a
+/// neighbour before splitting lifts random-insert occupancy to ~88%, so the
+/// incremental path packs nearly as tightly as the sequential one.
+///
+/// Returns `true` when the record was absorbed: no node is allocated and the
+/// tree shape is unchanged — only the two nodes' records and one parent
+/// separator key move. Returns `false` when no sibling can take the overflow
+/// and the caller must fall back to [`btree_split_leaf_with_insert`].
+///
+/// Safety of the in-place separator update: we only ever rewrite the separator
+/// of the pair's *right* node, and only when the pair's *left* node keeps its
+/// original first key (guarded below). The right node is never the parent's
+/// first child (a right sibling sorts after `leaf_idx`; a left sibling sharing
+/// the parent means `leaf_idx` isn't first), so the parent's minimum key — and
+/// the grandparent invariant that mirrors it — is never disturbed.
+fn btree_try_rotate_leaf<F>(
+    data: &mut [u8],
+    node_size: usize,
+    leaf_idx: u32,
+    parent_idx: u32,
+    new_record: &[u8],
+    kf: &BTreeKeyFormat,
+    cmp: &F,
+) -> bool
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let payload = node_size.saturating_sub(16);
+    let cost = |r: &Vec<u8>| r.len() + 2;
+    let first_key = |r: &[u8]| -> Vec<u8> { kf.key_portion(r) };
+    let read_records = |data: &[u8], idx: u32| -> Vec<Vec<u8>> {
+        let off = idx as usize * node_size;
+        let num = BigEndian::read_u16(&data[off + 10..off + 12]) as usize;
+        let mut v = Vec::with_capacity(num);
+        for i in 0..num {
+            let (s, e) = btree_record_range(&data[off..off + node_size], node_size, i);
+            v.push(data[off + s..off + e].to_vec());
+        }
+        v
+    };
+
+    let loff = leaf_idx as usize * node_size;
+    let rsib = BigEndian::read_u32(&data[loff..loff + 4]);
+    let lsib = BigEndian::read_u32(&data[loff + 4..loff + 8]);
+    let leaf_recs = read_records(data, leaf_idx);
+
+    // Prefer the right sibling, then the left. For each candidate, pool the two
+    // siblings' records plus `new_record` in key order, then redistribute them
+    // balanced across the pair so both nodes keep headroom.
+    for (sib_is_right, sib) in [(true, rsib), (false, lsib)] {
+        if sib == 0 || !index_node_has_child(data, node_size, parent_idx, sib) {
+            continue;
+        }
+        let sib_recs = read_records(data, sib);
+        let (left_idx, right_idx, left_recs, right_recs) = if sib_is_right {
+            (leaf_idx, sib, &leaf_recs, &sib_recs)
+        } else {
+            (sib, leaf_idx, &sib_recs, &leaf_recs)
+        };
+        let Some(left_first) = left_recs.first() else {
+            continue;
+        };
+        // Build the merged, key-ordered record set across the pair.
+        let mut pool: Vec<Vec<u8>> = left_recs.iter().chain(right_recs.iter()).cloned().collect();
+        let mut p = pool.len();
+        for (i, r) in pool.iter().enumerate() {
+            if cmp(r, new_record) == Ordering::Greater {
+                p = i;
+                break;
+            }
+        }
+        pool.insert(p, new_record.to_vec());
+        // Skip if the left node's minimum would change — its parent separator
+        // (which we don't touch) would then be stale. Happens only when the new
+        // record sorts before the whole pair; rare, and a normal split handles
+        // it correctly.
+        if cmp(&pool[0], left_first) != Ordering::Equal {
+            continue;
+        }
+        let total: usize = pool.iter().map(cost).sum();
+        if total > 2 * payload {
+            continue; // neighbour is too full to absorb the overflow
+        }
+        // Balanced split point: both halves within payload, closest to total/2.
+        let mut prefix = 0usize;
+        let mut best_p = 0usize;
+        let mut best_diff = usize::MAX;
+        for cut in 1..pool.len() {
+            prefix += cost(&pool[cut - 1]);
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_p = cut;
+                }
+            }
+        }
+        if best_p == 0 {
+            continue;
+        }
+        let left: Vec<Vec<u8>> = pool[..best_p].to_vec();
+        let right: Vec<Vec<u8>> = pool[best_p..].to_vec();
+        let right_first = first_key(&right[0]);
+        // Patch the parent separator first: if it can't be updated in place
+        // (a variable-length, non-normalized index key — i.e. a real HFS+
+        // catalog), abandon the rotation untouched and let the caller split,
+        // rather than leave the moved records behind a stale separator.
+        if !btree_update_index_separator(data, node_size, parent_idx, right_idx, &right_first, kf) {
+            continue;
+        }
+        btree_write_node_records(data, node_size, left_idx, &left);
+        btree_write_node_records(data, node_size, right_idx, &right);
+        return true;
+    }
+    false
+}
+
+/// Split a full index node while inserting `new_record` (a normalized index
+/// record: a 0x25-length key followed by a 4-byte child pointer), append-aware.
+///
+/// The previous index split was a fixed 50/50 of the existing records, then the
+/// new record went into one half. For *sequential* separator inserts — which is
+/// what every leaf split produces when files arrive in key order (a bulk
+/// `untar`, or `put`ting a sorted batch) — that froze each non-rightmost index
+/// node at ~50%, doubling the index node count and adding a whole tree level.
+/// Packing the left node full on an append (and rebalancing only a genuine
+/// middle insert), exactly as the leaf split does, keeps the index dense.
+///
+/// Returns `(new_node_idx, separator_key)` to install in the grandparent. Index
+/// records are uniform and small, so a 2-way split always suffices (an overflow
+/// is at most one record over a node).
+fn btree_split_index_with_insert<F>(
+    catalog_data: &mut [u8],
+    node_size: usize,
+    node_idx: u32,
+    header: &mut BTreeHeader,
+    new_record: &[u8],
+    kf: &BTreeKeyFormat,
+    compare_fn: &F,
+) -> Result<(u32, Vec<u8>), FilesystemError>
+where
+    F: Fn(&[u8], &[u8]) -> Ordering,
+{
+    let old_offset = node_idx as usize * node_size;
+    let old_num = BigEndian::read_u16(&catalog_data[old_offset + 10..old_offset + 12]) as usize;
+    let old_height = catalog_data[old_offset + 9];
+
+    // Existing records merged with new_record, in key order.
+    let mut records: Vec<Vec<u8>> = Vec::with_capacity(old_num + 1);
+    for i in 0..old_num {
+        let (s, e) = btree_record_range(
+            &catalog_data[old_offset..old_offset + node_size],
+            node_size,
+            i,
+        );
+        records.push(catalog_data[old_offset + s..old_offset + e].to_vec());
+    }
+    let mut insert_pos = records.len();
+    for (i, rec) in records.iter().enumerate() {
+        if compare_fn(rec, new_record) == Ordering::Greater {
+            insert_pos = i;
+            break;
+        }
+    }
+    records.insert(insert_pos, new_record.to_vec());
+
+    let payload = node_size.saturating_sub(16);
+    let cost = |r: &Vec<u8>| r.len() + 2;
+    let total: usize = records.iter().map(cost).sum();
+
+    // Greedy pack-left (dense for appends). `cut` = count kept in the old node.
+    let mut cut = {
+        let mut acc = 0usize;
+        let mut k = 1usize;
+        for (i, r) in records.iter().enumerate() {
+            let c = cost(r);
+            if i > 0 && acc + c > payload {
+                break;
+            }
+            acc += c;
+            k = i + 1;
+        }
+        k.clamp(1, records.len() - 1)
+    };
+    // A genuine middle insert rebalances so both halves keep room (matches the
+    // leaf split's density tuning); a tail append keeps the dense pack-left.
+    let is_append = insert_pos == old_num;
+    if !is_append {
+        let mut prefix = 0usize;
+        let mut best = cut;
+        let mut best_diff = usize::MAX;
+        for k in 1..records.len() {
+            prefix += cost(&records[k - 1]);
+            let right = total - prefix;
+            if prefix <= payload && right <= payload {
+                let diff = prefix.abs_diff(total / 2);
+                if diff < best_diff {
+                    best_diff = diff;
+                    best = k;
+                }
+            }
+        }
+        cut = best;
+    }
+
+    let new_idx = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
+    header.free_nodes -= 1;
+    init_node(
+        catalog_data,
+        node_size,
+        new_idx,
+        BTREE_INDEX_NODE,
+        old_height,
+    );
+
+    let left: Vec<Vec<u8>> = records[..cut].to_vec();
+    let right: Vec<Vec<u8>> = records[cut..].to_vec();
+    btree_write_node_records(catalog_data, node_size, node_idx, &left);
+    btree_write_node_records(catalog_data, node_size, new_idx, &right);
+
+    // Splice the index-level sibling chain: node_idx <-> new_idx <-> old_next.
+    // `btree_write_node_records` preserved node_idx's old forward link.
+    let old_next = BigEndian::read_u32(&catalog_data[old_offset..old_offset + 4]);
+    let new_offset = new_idx as usize * node_size;
+    BigEndian::write_u32(&mut catalog_data[old_offset..old_offset + 4], new_idx);
+    BigEndian::write_u32(&mut catalog_data[new_offset + 4..new_offset + 8], node_idx);
+    BigEndian::write_u32(&mut catalog_data[new_offset..new_offset + 4], old_next);
+    if old_next != 0 {
+        let next_off = old_next as usize * node_size;
+        BigEndian::write_u32(&mut catalog_data[next_off + 4..next_off + 8], new_idx);
+    }
+
+    // Separator = first key portion (length prefix + key bytes) of the new node.
+    let split_key = kf.key_portion(&right[0]);
+    Ok((new_idx, split_key))
 }
 
 /// Insert a separator key into a parent index node, pointing to child_node.
@@ -1214,17 +1746,20 @@ pub fn btree_insert_into_index<F>(
     child_node: u32,
     split_key: &[u8],
     header: &mut BTreeHeader,
+    kf: &BTreeKeyFormat,
     compare_fn: &F,
     parent_chain: &[(u32, u32)], // [(node_idx, parent_idx), ...]
 ) -> Result<(), FilesystemError>
 where
     F: Fn(&[u8], &[u8]) -> Ordering,
 {
-    // Build index record: normalized_key + child_pointer
-    // Mac OS forces all catalog index keys to length 0x25, zero-padded.
-    // With key_len=0x25, HFS_RECKEYSKIP = (1+37+1)&~1 = 38, so data starts
-    // at offset 38 (even), and the full record is always 42 bytes.
-    let mut index_record = normalize_catalog_index_key(split_key);
+    // Build the index record: index key + child_pointer. For classic HFS the
+    // index key is the fixed 0x25-length normalized key (record always 42
+    // bytes); for an HFS+ variable-index-key tree it is the child's first key
+    // verbatim (2-byte length + key bytes). `make_index_key` picks the right
+    // shape per `kf`. Catalog/attributes keys are even-length, so the trailing
+    // child pointer always lands on an even offset.
+    let mut index_record = kf.make_index_key(split_key);
     let mut ptr = [0u8; 4];
     BigEndian::write_u32(&mut ptr, child_node);
     index_record.extend_from_slice(&ptr);
@@ -1236,20 +1771,45 @@ where
     match btree_insert_record(node, node_size, &index_record, compare_fn) {
         Ok(_) => Ok(()),
         Err(_) => {
-            // Index node is full — split it
-            let (new_idx, new_split_key) =
-                split_index_node(catalog_data, node_size, index_node_idx, header)?;
+            // Index node is full. Before allocating a node, try a B*-style
+            // rotation into an index sibling that shares this node's parent and
+            // has room — the same density win applied at the leaf level, so a
+            // deep or sequential catalog doesn't accumulate half-full index
+            // nodes (and the extra level they imply). The root has no parent and
+            // grows instead; `btree_try_rotate_leaf` is record-agnostic and
+            // updates the parent separator in place, so it serves index nodes
+            // just as it does leaves.
+            if let Some(&(_, parent_idx)) = parent_chain
+                .iter()
+                .find(|&&(nidx, _)| nidx == index_node_idx)
+            {
+                if parent_idx != 0
+                    && btree_try_rotate_leaf(
+                        catalog_data,
+                        node_size,
+                        index_node_idx,
+                        parent_idx,
+                        &index_record,
+                        kf,
+                        compare_fn,
+                    )
+                {
+                    return Ok(());
+                }
+            }
 
-            // Insert the record into whichever half it belongs
-            // Compare split_key with new_split_key to decide
-            let target = if compare_fn(split_key, &new_split_key) == Ordering::Less {
-                index_node_idx
-            } else {
-                new_idx
-            };
-            let t_offset = target as usize * node_size;
-            let t_node = &mut catalog_data[t_offset..t_offset + node_size];
-            btree_insert_record(t_node, node_size, &index_record, compare_fn)?;
+            // No sibling could help — split (append-aware), placing the new
+            // record in the appropriate half, then install the new node's
+            // separator in the parent.
+            let (new_idx, new_split_key) = btree_split_index_with_insert(
+                catalog_data,
+                node_size,
+                index_node_idx,
+                header,
+                &index_record,
+                kf,
+                compare_fn,
+            )?;
 
             // Now insert new_split_key into this index node's parent
             // Find our parent from the chain
@@ -1266,6 +1826,7 @@ where
                         index_node_idx,
                         new_idx,
                         &new_split_key,
+                        kf,
                     )?;
                 } else {
                     // Recurse to parent index node
@@ -1276,6 +1837,7 @@ where
                         new_idx,
                         &new_split_key,
                         header,
+                        kf,
                         compare_fn,
                         parent_chain,
                     )?;
@@ -1289,94 +1851,12 @@ where
                     index_node_idx,
                     new_idx,
                     &new_split_key,
+                    kf,
                 )?;
             }
             Ok(())
         }
     }
-}
-
-/// Split an index node, similar to leaf splitting but for index records.
-fn split_index_node(
-    catalog_data: &mut [u8],
-    node_size: usize,
-    node_idx: u32,
-    header: &mut BTreeHeader,
-) -> Result<(u32, Vec<u8>), FilesystemError> {
-    let new_idx = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
-    header.free_nodes -= 1;
-
-    let old_offset = node_idx as usize * node_size;
-    let new_offset = new_idx as usize * node_size;
-
-    let old_num = BigEndian::read_u16(&catalog_data[old_offset + 10..old_offset + 12]) as usize;
-    let old_height = catalog_data[old_offset + 9];
-    let split_point = old_num / 2;
-
-    init_node(
-        catalog_data,
-        node_size,
-        new_idx,
-        BTREE_INDEX_NODE,
-        old_height,
-    );
-
-    // Collect records
-    let mut records: Vec<Vec<u8>> = Vec::with_capacity(old_num);
-    for i in 0..old_num {
-        let (start, end) = btree_record_range(
-            &catalog_data[old_offset..old_offset + node_size],
-            node_size,
-            i,
-        );
-        records.push(catalog_data[old_offset + start..old_offset + end].to_vec());
-    }
-
-    // Rebuild old node with first half
-    {
-        let node = &mut catalog_data[old_offset..old_offset + node_size];
-        BigEndian::write_u16(&mut node[10..12], 0);
-        BigEndian::write_u16(&mut node[node_size - 2..node_size], 14);
-        let mut write_pos = 14usize;
-        for (i, rec) in records[..split_point].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        let fpos = node_size - 2 * (split_point + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], split_point as u16);
-    }
-
-    // Build new node with second half
-    {
-        let node = &mut catalog_data[new_offset..new_offset + node_size];
-        let count = old_num - split_point;
-        let mut write_pos = 14usize;
-        for (i, rec) in records[split_point..].iter().enumerate() {
-            node[write_pos..write_pos + rec.len()].copy_from_slice(rec);
-            let opos = node_size - 2 * (i + 1);
-            BigEndian::write_u16(&mut node[opos..opos + 2], write_pos as u16);
-            write_pos += rec.len();
-        }
-        let fpos = node_size - 2 * (count + 1);
-        BigEndian::write_u16(&mut node[fpos..fpos + 2], write_pos as u16);
-        BigEndian::write_u16(&mut node[10..12], count as u16);
-    }
-
-    // The separator key is just the key portion (key_len byte + key data) of the
-    // first record of the new node, without pad or child pointer.
-    let full_rec = &records[split_point];
-    let split_key = if !full_rec.is_empty() {
-        let kl = full_rec[0] as usize;
-        let key_end = (1 + kl).min(full_rec.len());
-        full_rec[..key_end].to_vec()
-    } else {
-        full_rec.clone()
-    };
-
-    Ok((new_idx, split_key))
 }
 
 /// Grow the B-tree root: create a new root node at height+1 with two children.
@@ -1387,6 +1867,7 @@ pub fn btree_grow_root(
     old_root: u32,
     new_sibling: u32,
     split_key: &[u8],
+    kf: &BTreeKeyFormat,
 ) -> Result<(), FilesystemError> {
     let new_root = btree_alloc_node(catalog_data, node_size, header.total_nodes)?;
     header.free_nodes -= 1;
@@ -1408,26 +1889,25 @@ pub fn btree_grow_root(
     // 1. First child (old_root): use the first key of old_root + pointer to old_root
     // 2. Second child (new_sibling): split_key + pointer to new_sibling
 
-    // Get first key of old_root (just the key portion, not the full record)
-    let (first_rec_start, _first_rec_end) = btree_record_range(
+    // Get the first key portion of old_root (length prefix + key bytes, read
+    // through `kf` so the 1-byte vs 2-byte length is handled correctly).
+    let (first_rec_start, first_rec_end) = btree_record_range(
         &catalog_data[old_root_offset..old_root_offset + node_size],
         node_size,
         0,
     );
-    let key_len = catalog_data[old_root_offset + first_rec_start] as usize;
-    let key_end = first_rec_start + 1 + key_len;
-    let first_key =
-        catalog_data[old_root_offset + first_rec_start..old_root_offset + key_end].to_vec();
+    let first_key = kf.key_portion(
+        &catalog_data[old_root_offset + first_rec_start..old_root_offset + first_rec_end],
+    );
 
-    // Record 1: normalized first_key + old_root pointer
-    // Mac OS forces all catalog index keys to 0x25 length.
-    let mut rec1 = normalize_catalog_index_key(&first_key);
+    // Record 1: index key for first_key + old_root pointer.
+    let mut rec1 = kf.make_index_key(&first_key);
     let mut ptr1 = [0u8; 4];
     BigEndian::write_u32(&mut ptr1, old_root);
     rec1.extend_from_slice(&ptr1);
 
-    // Record 2: normalized split_key + new_sibling pointer
-    let mut rec2 = normalize_catalog_index_key(split_key);
+    // Record 2: index key for split_key + new_sibling pointer.
+    let mut rec2 = kf.make_index_key(split_key);
     let mut ptr2 = [0u8; 4];
     BigEndian::write_u32(&mut ptr2, new_sibling);
     rec2.extend_from_slice(&ptr2);
@@ -1642,6 +2122,7 @@ where
 pub fn btree_insert_full<F>(
     data: &mut [u8],
     key_record: &[u8],
+    kf: &BTreeKeyFormat,
     cmp: &F,
 ) -> Result<(), super::filesystem::FilesystemError>
 where
@@ -1667,8 +2148,29 @@ where
         }
         Err(_) => {
             let mut h = BTreeHeader::read(data);
-            let splits =
-                btree_split_leaf_with_insert(data, node_size, leaf_idx, &mut h, key_record, cmp)?;
+            // Before allocating a node, try a B*-style rotation into an adjacent
+            // sibling that shares this leaf's parent and still has room. This
+            // keeps the catalog densely packed for non-sequential (per-`put`)
+            // inserts; only when no sibling can help do we split. Needs a parent
+            // index node, so skip it while the root is still the lone leaf.
+            if h.depth > 1 {
+                if let Some(&(_, parent_idx)) =
+                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
+                {
+                    if parent_idx != 0
+                        && btree_try_rotate_leaf(
+                            data, node_size, leaf_idx, parent_idx, key_record, kf, cmp,
+                        )
+                    {
+                        h.leaf_records += 1;
+                        h.write(data);
+                        return Ok(());
+                    }
+                }
+            }
+            let splits = btree_split_leaf_with_insert(
+                data, node_size, leaf_idx, &mut h, key_record, kf, cmp,
+            )?;
             h.leaf_records += 1;
             // First new node's separator goes via either grow_root (depth==1)
             // or insert_into_index. Any additional separators (N-way splits
@@ -1676,7 +2178,7 @@ where
             // root depth is already > 1 once the first separator installed.
             let first = &splits[0];
             if h.depth == 1 {
-                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
             } else if let Some(&(_, parent_idx)) =
                 parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
             {
@@ -1687,11 +2189,12 @@ where
                     first.0,
                     &first.1,
                     &mut h,
+                    kf,
                     cmp,
                     &parent_chain,
                 )?;
             } else {
-                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
+                btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
             }
             for split in &splits[1..] {
                 // After the first separator installed, the leaf's parent is
@@ -1715,6 +2218,7 @@ where
                     split.0,
                     &split.1,
                     &mut h,
+                    kf,
                     cmp,
                     &fresh_chain,
                 )?;
@@ -1921,6 +2425,57 @@ mod tests {
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
     }
 
+    /// HFS+ case-folds to LOWERCASE (Apple `FastUnicodeCompare` / TN1150), so a
+    /// character between the uppercase and lowercase ASCII blocks — notably the
+    /// underscore `_` (0x5F) — sorts BEFORE letters, not after the uppercased
+    /// ones. These exact pairs come from a real Mac OS 9.2.2 HFS+ volume that
+    /// the previous uppercase fold flagged as `KeyOutOfOrder`.
+    #[test]
+    fn test_compare_hfsplus_keys_underscore_collation() {
+        let k = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+        for (a, b) in [
+            ("as_OpenURL", "asVers.htm"),
+            ("wr_single_pixel.gif", "wrApp.gif"),
+            ("high_priority.gif", "highest_priority.gif"),
+            ("not_valid.gif", "note.gif"),
+        ] {
+            assert_eq!(
+                compare_hfsplus_keys(2, &k(a), 2, &k(b), false),
+                Ordering::Less,
+                "{a:?} must sort before {b:?} (lowercase fold)"
+            );
+        }
+        // Still case-insensitive.
+        assert_eq!(
+            compare_hfsplus_keys(2, &k("README"), 2, &k("readme"), false),
+            Ordering::Equal
+        );
+    }
+
+    /// Apple's TN1150 tables differ from Rust's `to_lowercase` + NFD on exotic
+    /// code points; these cases pin the table-faithful behavior.
+    #[test]
+    fn test_hfsplus_unicode_tables_match_apple() {
+        use super::super::hfs_unicode::decompose_str;
+        let k = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
+
+        // ß (0xDF) folds 1:1 — it is NOT expanded to "ss" (as `to_uppercase`
+        // would), so "straße" and "strasse" are different names.
+        assert_ne!(
+            compare_hfsplus_keys(2, &k("stra\u{df}e"), 2, &k("strasse"), false),
+            Ordering::Equal
+        );
+
+        // Apple does NOT decompose the OHM sign U+2126 (TN1150 excludes
+        // U+2000..U+2FFF), unlike Unicode NFD which maps it to Greek capital
+        // Omega U+03A9.
+        assert_eq!(decompose_str("\u{2126}"), vec![0x2126]);
+        // It DOES canonically decompose precomposed Latin and Hangul.
+        assert_eq!(decompose_str("\u{e9}"), vec![0x0065, 0x0301]); // é
+        assert_eq!(decompose_str("\u{ac00}"), vec![0x1100, 0x1161]); // 가
+        assert_eq!(decompose_str("\u{d4db}"), vec![0x1111, 0x1171, 0x11b6]); // 3-jamo Hangul
+    }
+
     #[test]
     fn test_compare_hfsplus_keys_case_sensitive() {
         let a: Vec<u16> = "Hello".encode_utf16().collect();
@@ -1931,9 +2486,11 @@ mod tests {
 
     #[test]
     fn test_compare_hfsplus_keys_nfd() {
-        // é (U+00E9, precomposed) vs e + combining acute (U+0065 U+0301)
+        // é (U+00E9, precomposed) vs e + combining acute (U+0065 U+0301).
+        // Apple's decomposition folds the precomposed form to the decomposed
+        // one, so the two keys must compare equal.
         let a: Vec<u16> = "é".encode_utf16().collect();
-        let b: Vec<u16> = "é".nfd().collect::<String>().encode_utf16().collect();
+        let b: Vec<u16> = vec![0x0065, 0x0301];
         assert_eq!(compare_hfsplus_keys(2, &a, 2, &b, false), Ordering::Equal);
     }
 
@@ -1993,6 +2550,34 @@ mod tests {
     fn test_compare_hfs_keys_case_insensitive() {
         assert_eq!(compare_hfs_keys(2, b"Hello", 2, b"hello"), Ordering::Equal);
         assert_eq!(compare_hfs_keys(2, b"abc", 2, b"ABD"), Ordering::Less);
+    }
+
+    /// Mac Roman collation must match classic Mac OS (`_RelString`), not raw
+    /// byte order — the cases below were lifted straight from a real
+    /// Apple-formatted MacPack disk that rusty-backup's old (ASCII-only) table
+    /// flagged as `KeysOutOfOrder`. é/â/ü etc. sort next to their base letter,
+    /// curly quotes / dashes / the non-breaking space sort as punctuation, and
+    /// the comparison stays case-insensitive but diacritical-sensitive.
+    #[test]
+    fn test_compare_hfs_keys_mac_roman_collation() {
+        // Accented letter sorts right after its base letter (é after e),
+        // so "Bézier" < "Bind" (é < i), not after 'Z' as a raw 0x8e would.
+        let bezier = b"B\x8ezier Text"; // 0x8e = é
+        assert_eq!(compare_hfs_keys(2, bezier, 2, b"Bind"), Ordering::Less);
+        // Leading curly double-quote (0xD2) sorts as punctuation, before 'E'.
+        let curly = b"\xd2Extension List\xd3 Docs";
+        assert_eq!(
+            compare_hfs_keys(2, curly, 2, b"Extension List 1.0.2"),
+            Ordering::Less
+        );
+        // Non-breaking space (0xCA) collates like a normal space, before 'b'.
+        let nbsp = b"\xcaRead Me\xca";
+        assert_eq!(compare_hfs_keys(2, nbsp, 2, b"bas.rl"), Ordering::Less);
+        // Diacritical-sensitive: base < accented < next base ('A' < 'Ä' < 'B').
+        assert_eq!(compare_hfs_keys(2, b"A", 2, b"\x80"), Ordering::Less); // 0x80 = Ä
+        assert_eq!(compare_hfs_keys(2, b"\x80", 2, b"B"), Ordering::Less);
+        // Case-insensitive across the high range too: Ä (0x80) == ä (0x8a).
+        assert_eq!(compare_hfs_keys(2, b"\x80", 2, b"\x8a"), Ordering::Equal);
     }
 
     #[test]
@@ -2144,9 +2729,16 @@ mod tests {
         let mut new_rec = vec![0u8; 45];
         new_rec[0] = 5;
         let mut header = BTreeHeader::read(&data);
-        let splits =
-            btree_split_leaf_with_insert(&mut data, node_size, 1, &mut header, &new_rec, &compare)
-                .unwrap();
+        let splits = btree_split_leaf_with_insert(
+            &mut data,
+            node_size,
+            1,
+            &mut header,
+            &new_rec,
+            &BTreeKeyFormat::CLASSIC_CATALOG,
+            &compare,
+        )
+        .unwrap();
         assert_eq!(splits.len(), 1, "30-byte records: 2-way split is enough");
         let new_idx = splits[0].0;
         assert_eq!(new_idx, 2);

@@ -8,7 +8,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_find_clear_run_be, bitmap_set_bit_be, btree_free_node,
-    btree_insert_record, btree_remove_record, BTreeHeader,
+    btree_remove_record, BTreeHeader,
 };
 use super::CompactResult;
 
@@ -425,6 +425,17 @@ pub struct HfsFilesystem<R: Read + Seek> {
     /// Volume (create, modify, backup) dates staged by `set_volume_dates`.
     /// When Some, overrides the automatic `hfs_now()` stamp in `sync_metadata`.
     pending_volume_dates: Option<(u32, u32, u32)>,
+    /// When set (via `begin_bulk` / `end_bulk`), per-operation rollback
+    /// snapshots are skipped: `snapshot()` returns `None`. The caller takes
+    /// responsibility for batch-level atomicity (discarding all changes if any
+    /// operation fails). Used by `tar_import` so a large import doesn't clone
+    /// the whole multi-megabyte catalog on every single `create_file`.
+    bulk_mode: bool,
+    /// Cache for `ensure_catalog_initialized`: once both B-trees are confirmed
+    /// live, this short-circuits the check. Without it every edit re-reads the
+    /// (multi-megabyte) extents-overflow fork from disk just to test whether
+    /// it's blank — death by a thousand reads on a large import.
+    btrees_initialized: bool,
 }
 
 impl<R: Read + Seek> HfsFilesystem<R> {
@@ -459,6 +470,8 @@ impl<R: Read + Seek> HfsFilesystem<R> {
             bitmap: None,
             pending_boot_blocks: None,
             pending_volume_dates: None,
+            bulk_mode: false,
+            btrees_initialized: false,
         })
     }
 
@@ -803,35 +816,60 @@ impl<R: Read + Seek> HfsFilesystem<R> {
 
     /// Find a catalog record by (parent_id, name).
     /// Returns Some((node_idx, rec_idx, absolute_offset_in_catalog_data)) if found.
+    ///
+    /// Descends the B-tree index to the single leaf that would hold the key and
+    /// scans only that leaf — O(log n), not a walk of the whole leaf chain. In
+    /// a consistent catalog a key lives in exactly one leaf (the one the search
+    /// path reaches), so this is exact. It matters at scale: `create_file` /
+    /// `create_directory` / `rename` call this for duplicate detection on every
+    /// entry, so a linear walk here made bulk imports (`untar`) O(n^2). The
+    /// index is kept consistent by the incremental inserter
+    /// ([`hfs_common::btree_insert_full`]); on a structurally broken catalog
+    /// (pre-fsck) prefer repairing first — editing assumes a healthy tree.
     fn find_catalog_record_by_name(
         &self,
         parent_id: u32,
         name: &[u8],
     ) -> Option<(u32, usize, usize)> {
         let search_key = Self::build_catalog_key(parent_id, name);
-        let node_size = BigEndian::read_u16(&self.catalog_data[32..34]) as usize;
-        let first_leaf = BigEndian::read_u32(&self.catalog_data[24..28]);
+        let header = BTreeHeader::read(&self.catalog_data);
+        let node_size = header.node_size as usize;
+        if node_size == 0 || self.catalog_data.len() < node_size {
+            return None;
+        }
 
-        hfs_common::walk_leaf_records(
+        let (leaf_idx, _) = hfs_common::btree_find_insert_leaf(
             &self.catalog_data,
-            first_leaf,
-            node_size,
-            |node_idx, rec_idx, abs_off, rec| {
-                if rec.len() < 7 {
-                    return None;
-                }
-                let key_len = rec[0] as usize;
-                let key_end = 1 + key_len;
-                if key_end > rec.len() {
-                    return None;
-                }
-                if Self::catalog_compare(&rec[..key_end], &search_key) == Ordering::Equal {
-                    Some((node_idx, rec_idx, abs_off))
-                } else {
-                    None
-                }
-            },
-        )
+            &header,
+            &search_key,
+            &Self::catalog_compare,
+        );
+
+        let off = leaf_idx as usize * node_size;
+        if off + node_size > self.catalog_data.len() {
+            return None;
+        }
+        let node = &self.catalog_data[off..off + node_size];
+        let num_records = BigEndian::read_u16(&node[10..12]) as usize;
+        for rec_idx in 0..num_records {
+            let (start, end) = hfs_common::btree_record_range(node, node_size, rec_idx);
+            if start >= end || end > node_size {
+                continue;
+            }
+            let rec = &node[start..end];
+            if rec.len() < 7 {
+                continue;
+            }
+            let key_len = rec[0] as usize;
+            let key_end = 1 + key_len;
+            if key_end > rec.len() {
+                continue;
+            }
+            if Self::catalog_compare(&rec[..key_end], &search_key) == Ordering::Equal {
+                return Some((leaf_idx, rec_idx, off + start));
+            }
+        }
+        None
     }
 
     /// Find a thread record by CNID (thread key: parent_id=cnid, name="").
@@ -888,62 +926,29 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Insert a catalog record into the B-tree, handling splits and growth.
+    ///
+    /// Delegates to the shared incremental inserter
+    /// ([`hfs_common::btree_insert_full`]) — the same find-leaf /
+    /// split-with-insert / grow-root-or-insert-into-parent machinery that HFS+
+    /// and the streamed defrag builder use. It maintains the index nodes
+    /// incrementally (O(log n) per insert) rather than rebuilding the entire
+    /// index after every leaf split.
+    ///
+    /// The previous per-split `rebuild_index_nodes` approach was O(n) per split
+    /// (O(n^2) over a bulk import like `untar`) and, worse, corrupted the tree
+    /// once it grew past the header node's 2048-bit allocation bitmap: the
+    /// rebuild's free-all-index-nodes pass was capped at that bitmap, so index
+    /// nodes living in map-node-covered segments leaked. That drained the free
+    /// nodes until a rebuild ran out mid-flight and left the index with broken
+    /// sibling links — surfacing as the spurious "disk full: no free B-tree
+    /// nodes" / `IndexSiblingLinkBroken` failure at ~7.4k catalog records.
     fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        let header = BTreeHeader::read(&self.catalog_data);
-        let node_size = header.node_size as usize;
-
-        // Find the correct leaf node
-        let (leaf_idx, _parent_chain) = hfs_common::btree_find_insert_leaf(
-            &self.catalog_data,
-            &header,
+        hfs_common::btree_insert_full(
+            &mut self.catalog_data,
             key_record,
+            &hfs_common::BTreeKeyFormat::CLASSIC_CATALOG,
             &Self::catalog_compare,
-        );
-
-        // Try to insert into the leaf
-        let offset = leaf_idx as usize * node_size;
-        let node = &mut self.catalog_data[offset..offset + node_size];
-        match btree_insert_record(node, node_size, key_record, &Self::catalog_compare) {
-            Ok(_) => {
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                h.leaf_records += 1;
-                h.write(&mut self.catalog_data);
-                Ok(())
-            }
-            Err(_) => {
-                // Leaf full — split-and-insert atomically. The merged
-                // partition uses a byte-based split point, which is robust
-                // to uneven catalog record sizes (split-then-insert with a
-                // count-based split could leave the target half too packed
-                // for the new record).
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                let _ = hfs_common::btree_split_leaf_with_insert(
-                    &mut self.catalog_data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    &Self::catalog_compare,
-                )?;
-
-                h.leaf_records += 1;
-                h.write(&mut self.catalog_data);
-
-                // Full index rebuild replaces incremental parent chain insertion
-                let mut dummy_report = super::fsck::RepairReport {
-                    fixes_applied: Vec::new(),
-                    fixes_failed: Vec::new(),
-                    unrepairable_count: 0,
-                };
-                super::hfs_fsck::rebuild_index_nodes(
-                    &mut self.catalog_data,
-                    node_size,
-                    &mut dummy_report,
-                );
-
-                Ok(())
-            }
-        }
+        )
     }
 
     /// Remove a catalog record from a leaf node.
@@ -1021,19 +1026,36 @@ impl<R: Read + Seek> HfsFilesystem<R> {
     }
 
     /// Capture a snapshot of all mutable in-memory state for rollback.
-    fn snapshot(&self) -> (Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock) {
-        (
+    ///
+    /// Returns `None` in bulk mode (see [`HfsFilesystem::bulk_mode`]): the
+    /// clone of the whole catalog is the dominant per-operation cost during a
+    /// large import, and the caller guarantees batch-level atomicity there.
+    /// `restore_snapshot(None)` is then a no-op, so the existing
+    /// `let snap = self.snapshot(); ... restore_snapshot(snap)` call sites need
+    /// no changes.
+    fn snapshot(&self) -> Option<(Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock)> {
+        if self.bulk_mode {
+            return None;
+        }
+        Some((
             self.catalog_data.clone(),
             self.bitmap.clone(),
             self.mdb.clone(),
-        )
+        ))
     }
 
-    /// Restore in-memory state from a previously captured snapshot.
-    fn restore_snapshot(&mut self, snap: (Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock)) {
-        self.catalog_data = snap.0;
-        self.bitmap = snap.1;
-        self.mdb = snap.2;
+    /// Restore in-memory state from a previously captured snapshot. A `None`
+    /// snapshot (bulk mode) restores nothing — the caller owns rollback.
+    fn restore_snapshot(
+        &mut self,
+        snap: Option<(Vec<u8>, Option<Vec<u8>>, HfsMasterDirectoryBlock)>,
+    ) {
+        let Some((catalog_data, bitmap, mdb)) = snap else {
+            return;
+        };
+        self.catalog_data = catalog_data;
+        self.bitmap = bitmap;
+        self.mdb = mdb;
     }
 
     pub(crate) fn mdb(&self) -> &HfsMasterDirectoryBlock {
@@ -1910,6 +1932,12 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
     /// them to disk. Subsequent edits can then use the normal insert paths
     /// instead of panicking on an empty B-tree header.
     fn ensure_catalog_initialized(&mut self) -> Result<(), FilesystemError> {
+        // Once confirmed live, never re-check: the extents read below hits disk
+        // and would otherwise repeat on every single edit (e.g. per file in a
+        // large `untar`).
+        if self.btrees_initialized {
+            return Ok(());
+        }
         let catalog_blank = is_catalog_uninitialized(&self.catalog_data);
         // Read the extents B-tree bytes so we can detect a blank one.
         let extents_data = if self.mdb.extents_file_size > 0 {
@@ -1929,9 +1957,12 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
             .map(is_catalog_uninitialized)
             .unwrap_or(false);
         if !catalog_blank && !extents_blank {
+            self.btrees_initialized = true;
             return Ok(());
         }
-        self.initialize_empty_btrees(catalog_blank, extents_blank)
+        self.initialize_empty_btrees(catalog_blank, extents_blank)?;
+        self.btrees_initialized = true;
+        Ok(())
     }
 
     fn initialize_empty_btrees(
@@ -2021,12 +2052,17 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
 /// Classic Mac OS expects HFS B-tree node size = 512 bytes. While the on-disk
 /// format technically allows larger node sizes, Apple's reference tools and
 /// CiderPress2 both hard-code 512, and an emulated Quadra produced "error
-/// type -127" when fed a catalog with 1024-byte nodes. Always use 512.
+/// type -127" when fed a catalog with 1024-byte nodes. Always use 512 — this
+/// is a hard mountability constraint, not a sizing convenience, so do *not* be
+/// tempted to scale it up for large catalogs.
 ///
-/// The header node's bitmap covers `(512 - 256) * 8 = 2048` nodes; trees that
-/// need more nodes require additional MAP nodes (NodeType=2) chained off the
-/// header — not yet implemented here. Callers should size their B-tree files
-/// to ≤ 1 MB (2048 nodes × 512 bytes) until that's wired up.
+/// The header node's bitmap covers only `(512 - 256) * 8 = 2048` nodes, but
+/// that is no longer a ceiling: B-tree files larger than 2048 nodes chain MAP
+/// nodes (NodeType=2) off the header to extend the allocation bitmap (see
+/// [`hfs_map_nodes_required`] / [`hfs_common::init_map_node`] and the
+/// segment-aware bitmap helpers). Catalogs of tens of thousands of nodes are
+/// fully supported at node_size=512; the index is maintained incrementally so
+/// there is no per-split rebuild to choke on the larger node count.
 fn pick_btree_node_size(_target_bytes: u64) -> u16 {
     512
 }
@@ -2795,6 +2831,14 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
 const CATALOG_DIR_THREAD: i8 = 3;
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
+    fn begin_bulk(&mut self) {
+        self.bulk_mode = true;
+    }
+
+    fn end_bulk(&mut self) {
+        self.bulk_mode = false;
+    }
+
     fn create_file(
         &mut self,
         parent: &FileEntry,
@@ -2893,9 +2937,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
             // No file thread record: classic HFS file threads are optional
             // (Inside Macintosh: Files), and Finder / CiderPress2 don't emit
             // them. Skipping them roughly halves catalog size for file-heavy
-            // volumes and lets dense sources (~5000 entries) fit within the
-            // 2048-node header-bitmap cap. File CNID lookups fall back to a
-            // leaf scan in `locate_record_data` / `find_file_record_offset_by_cnid`.
+            // volumes (map nodes now lift the old 2048-node header-bitmap limit,
+            // so this is a size/compat choice, not a hard cap workaround). File
+            // CNID lookups fall back to a leaf scan in `locate_record_data` /
+            // `find_file_record_offset_by_cnid`.
 
             // Update parent valence
             self.update_parent_valence(parent_id, 1)?;
@@ -4665,6 +4710,497 @@ mod tests {
         assert_fsck_clean(&mut fs);
         fs.delete_entry(&root, &fe).unwrap();
         assert_fsck_clean(&mut fs);
+    }
+
+    /// Random-order bulk inserts must pack the catalog densely *and* stay
+    /// fsck-clean. The greedy "pack-left-full" split used to split off only the
+    /// overflow on a middle insert, leaving a trail of ~1-record leaves: a
+    /// random import packed ~1.6 records/node, roughly half what classic Mac OS
+    /// writes (a real MacPack disk sits near 3.0). The B*-style sibling rotation
+    /// (redistribute into a neighbour before splitting, at both the leaf and the
+    /// index level) lifts random-order packing to ~3.0 records/node while
+    /// leaving sequential growth fully packed (4 records/leaf).
+    #[test]
+    fn test_hfs_random_insert_packs_densely_and_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsFilesystem<Cursor<Vec<u8>>>;
+        let block_size = 32 * 1024u32;
+        let img = create_blank_hfs_sized(64 * 1024 * 1024, block_size, "Pack", 0, 16 * 1024 * 1024)
+            .unwrap();
+        let mut fs = Fs::open(Cursor::new(img), 0).unwrap();
+        let root_id = fs.root().unwrap().location as u32;
+
+        // Pseudo-random insertion order (multiplicative hash), de-duplicated.
+        let n = 16000u32;
+        let mut seen = std::collections::HashSet::new();
+        let order: Vec<u32> = (0..n)
+            .map(|i| i.wrapping_mul(2654435761) % n)
+            .filter(|x| seen.insert(*x))
+            .collect();
+        let count = order.len() as u32;
+        fs.begin_bulk();
+        for &i in &order {
+            let name = format!("f{:05}", i);
+            let mut kr = Fs::build_catalog_key(root_id, name.as_bytes());
+            kr.extend_from_slice(&Fs::build_file_record(
+                16 + i,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0u8; 4],
+                &[0u8; 4],
+                block_size,
+            ));
+            fs.insert_catalog_record(&kr).unwrap();
+        }
+        fs.end_bulk();
+        fs.mdb.file_count = count;
+        fs.mdb.next_catalog_id = 16 + n;
+        fs.update_parent_valence(root_id, count as i32).unwrap();
+
+        // Density: well above the ~1.6 the old split produced, and now close to
+        // the ~3.2 of a fully-packed sequential build thanks to sibling rotation.
+        let h = BTreeHeader::read(fs.catalog_data());
+        let used = h.total_nodes - h.free_nodes;
+        let rec_per_node = count as f64 / used as f64;
+        assert!(
+            rec_per_node > 2.8,
+            "random-order packing too sparse: {count} records in {used} nodes ({rec_per_node:.2}/node)"
+        );
+
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors after random import: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Bulk mode (`begin_bulk` / `end_bulk`) skips the per-operation catalog
+    /// snapshot for speed — the dominant per-file cost on a large import once
+    /// the duplicate check is index-based. A successful batch must still leave
+    /// a fsck-clean volume identical to the per-op path (on the success path no
+    /// rollback ever happens, so the only difference is the skipped clone).
+    /// This is the path `tar_import` drives.
+    #[test]
+    fn test_hfs_bulk_mode_import_fsck_clean() {
+        let block_size = 32 * 1024u32;
+        let img = create_blank_hfs_sized(
+            64 * 1024 * 1024,
+            block_size,
+            "BulkImport",
+            0,
+            8 * 1024 * 1024,
+        )
+        .expect("create blank volume");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let root_id = root.location as u32;
+        let options = CreateFileOptions::default();
+
+        fs.begin_bulk();
+        for i in 0..9000 {
+            let name = format!("f{:05}.txt", i);
+            let mut empty = Cursor::new(Vec::new());
+            fs.create_file(&root, &name, &mut empty, 0, &options)
+                .unwrap_or_else(|e| panic!("bulk create_file #{i}: {e}"));
+        }
+        fs.end_bulk();
+
+        assert_eq!(fs.mdb.file_count, 9000);
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "bulk-mode import left fsck errors: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+        // Records inserted under skipped snapshots are still correct/findable.
+        assert!(fs
+            .find_catalog_record_by_name(root_id, b"f04500.txt")
+            .is_some());
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 9000);
+
+        // After end_bulk, normal snapshotting resumes: a duplicate create is
+        // rejected and rolls back cleanly, leaving the volume fsck-clean.
+        let mut empty = Cursor::new(Vec::new());
+        assert!(fs
+            .create_file(&root, "f00000.txt", &mut empty, 0, &options)
+            .is_err());
+        assert_fsck_clean(&mut fs);
+    }
+
+    /// Regression for the classic-HFS catalog B-tree scaling bug
+    /// (PROMPT-hfs-catalog-btree-scaling): importing many files used to die at
+    /// ~7.4k records with "disk full: no free B-tree nodes" and fsck reported
+    /// widespread `IndexSiblingLinkBroken`. Two writer defects combined — the
+    /// per-split index rebuild leaked index nodes past the 2048-node header
+    /// bitmap (exhausting free nodes), and the incremental index split never
+    /// maintained fLink/bLink sibling links. Drive the B-tree well past that
+    /// boundary on a production-shaped volume (node_size 512) and assert it is
+    /// fsck-clean.
+    ///
+    /// Uses the low-level inserter directly so the test stays fast (the
+    /// higher-level `create_file` does an O(n) duplicate scan per call); the
+    /// end-to-end path is covered by
+    /// `test_hfs_create_file_multilevel_index_fsck_clean`.
+    #[test]
+    fn test_hfs_catalog_scales_past_header_bitmap_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsFilesystem<Cursor<Vec<u8>>>;
+        let block_size = 32 * 1024u32;
+        // Empty files cost no data blocks, so a 64 MiB volume with a generous
+        // 10 MiB catalog (20,480 nodes @ 512) holds the records and forces the
+        // catalog past the header bitmap's 2048-node window into map nodes.
+        let img = create_blank_hfs_sized(
+            64 * 1024 * 1024,
+            block_size,
+            "Scale20k",
+            0,
+            10 * 1024 * 1024,
+        )
+        .expect("create blank volume");
+        let mut fs = Fs::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let root_id = root.location as u32;
+
+        let n: u32 = 22_000;
+        for i in 0..n {
+            let name = format!("f{:05}.txt", i);
+            let mut key_record = Fs::build_catalog_key(root_id, name.as_bytes());
+            let file_rec =
+                Fs::build_file_record(16 + i, 0, 0, 0, 0, 0, 0, &[0u8; 4], &[0u8; 4], block_size);
+            key_record.extend_from_slice(&file_rec);
+            fs.insert_catalog_record(&key_record)
+                .unwrap_or_else(|e| panic!("insert #{i} ({name}): {e}"));
+        }
+
+        // Mirror the MDB bookkeeping the create path maintains so fsck's
+        // cross-checks (file_count, next_catalog_id, root valence) pass.
+        fs.mdb.file_count = n;
+        fs.mdb.next_catalog_id = 16 + n;
+        fs.update_parent_valence(root_id, n as i32).unwrap();
+
+        // Confirm the catalog really grew a multi-level index beyond the single
+        // header bitmap — otherwise the test wouldn't exercise the bug at all.
+        let header = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            header.depth >= 3,
+            "expected a multi-level index, depth = {}",
+            header.depth
+        );
+        let used = header.total_nodes - header.free_nodes;
+        assert!(
+            used > 2048,
+            "expected > 2048 catalog nodes in use, got {used}"
+        );
+
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after {n}-record import: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // After all those splits, records must still be findable by descending
+        // the index (locates the correct leaf), including across the old
+        // failure point (~7386) and the map-node boundary.
+        for i in [0u32, 1, 7386, 12345, n - 1] {
+            let name = format!("f{:05}.txt", i);
+            assert!(
+                fs.find_catalog_record_by_name(root_id, name.as_bytes())
+                    .is_some(),
+                "record {name} not findable after bulk insert"
+            );
+        }
+    }
+
+    /// Per-`put`-shaped regression (PROMPT-hfs-catalog-incremental-put-packing):
+    /// 20k records inserted ONE AT A TIME in non-sequential (shuffled) key
+    /// order, spread across many parent directories — exactly the shape of a
+    /// `rb-cli put`-driven image build — must pack the catalog nearly as tightly
+    /// as a sequential bulk import and stay fsck-clean to the volume's real
+    /// limit. Before the B*-style sibling rotation (leaf + index), a shuffled
+    /// per-record build left leaves at the classic ~69% B-tree occupancy and the
+    /// index far worse, exhausting the node budget ~2x sooner ("disk full: no
+    /// free B-tree nodes") and leaving `IndexSiblingLinkBroken` at the ceiling.
+    #[test]
+    fn test_hfs_incremental_shuffled_multidir_packs_dense_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsFilesystem<Cursor<Vec<u8>>>;
+        let block_size = 32 * 1024u32;
+        // ~6 MiB catalog (12,288 nodes @ 512). With the rotation fix 20k records
+        // pack into well under that; the pre-fix ~1.6 rec/node packing would have
+        // needed far more leaf nodes alone and exhausted it.
+        let img = create_blank_hfs_sized(
+            128 * 1024 * 1024,
+            block_size,
+            "PutShuffle",
+            0,
+            6 * 1024 * 1024,
+        )
+        .expect("create blank volume");
+        let mut fs = Fs::open(Cursor::new(img), 0).unwrap();
+
+        // Real directories so threads / valence / counts stay fsck-correct.
+        const DIRS: u32 = 200;
+        let root = fs.root().unwrap();
+        let mut dir_ids = Vec::with_capacity(DIRS as usize);
+        for d in 0..DIRS {
+            let name = format!("dir{d:03}");
+            let de = fs
+                .create_directory(&root, &name, &Default::default())
+                .unwrap();
+            dir_ids.push(de.location as u32);
+        }
+        let base_cnid = fs.mdb.next_catalog_id;
+
+        // 20k files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32, so names are unique and land mid-leaf, not appended),
+        // sprayed across the directories.
+        let n: u32 = 20_000;
+        let mut per_dir = vec![0i32; DIRS as usize];
+        for i in 0..n {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let d = (hash % DIRS) as usize;
+            let name = format!("f{hash:08x}");
+            let mut kr = Fs::build_catalog_key(dir_ids[d], name.as_bytes());
+            kr.extend_from_slice(&Fs::build_file_record(
+                base_cnid + i,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &[0u8; 4],
+                &[0u8; 4],
+                block_size,
+            ));
+            fs.insert_catalog_record(&kr)
+                .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
+            per_dir[d] += 1;
+        }
+        // Mirror the bookkeeping the create path would have maintained so fsck's
+        // cross-checks (file_count, next_catalog_id, per-dir valence) pass.
+        fs.mdb.file_count += n;
+        fs.mdb.next_catalog_id = base_cnid + n;
+        for (d, &cnt) in per_dir.iter().enumerate() {
+            fs.update_parent_valence(dir_ids[d], cnt).unwrap();
+        }
+
+        // Density: the whole catalog (leaves + index) averages well above the
+        // pre-fix ~1.6 rec/node — proof the incremental build packed tight and
+        // didn't run away into a sparse, over-deep tree.
+        let h = BTreeHeader::read(fs.catalog_data());
+        let used = h.total_nodes - h.free_nodes;
+        let rec_per_node = h.leaf_records as f64 / used as f64;
+        assert!(
+            rec_per_node > 2.6,
+            "shuffled multi-dir packing too sparse: {} records in {used} nodes ({rec_per_node:.2}/node)",
+            h.leaf_records
+        );
+
+        // No IndexSiblingLinkBroken or other structural damage at the ceiling.
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after 20k shuffled multi-dir put: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+
+        // Records remain findable by index descent across the keyspace.
+        for i in [0u32, 7, 9_999, n - 1] {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = dir_ids[(hash % DIRS) as usize];
+            let name = format!("f{hash:08x}");
+            assert!(
+                fs.find_catalog_record_by_name(parent, name.as_bytes())
+                    .is_some(),
+                "record {name} not findable after shuffled multi-dir insert"
+            );
+        }
+    }
+
+    /// The delete / fsck-repair path rebuilds the catalog index wholesale via
+    /// `rebuild_index_nodes`. Its free-all-index-nodes pass used to be capped
+    /// at the 2048-bit header bitmap, leaking every index node beyond it; once
+    /// a catalog crosses that line a rebuild must still round-trip fsck-clean.
+    #[test]
+    fn test_rebuild_index_nodes_past_header_bitmap_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsFilesystem<Cursor<Vec<u8>>>;
+        let block_size = 32 * 1024u32;
+        let img =
+            create_blank_hfs_sized(64 * 1024 * 1024, block_size, "Rebuild", 0, 10 * 1024 * 1024)
+                .expect("create blank volume");
+        let mut fs = Fs::open(Cursor::new(img), 0).unwrap();
+        let root_id = fs.root().unwrap().location as u32;
+
+        let n: u32 = 12_000;
+        for i in 0..n {
+            let name = format!("f{:05}.txt", i);
+            let mut key_record = Fs::build_catalog_key(root_id, name.as_bytes());
+            let file_rec =
+                Fs::build_file_record(16 + i, 0, 0, 0, 0, 0, 0, &[0u8; 4], &[0u8; 4], block_size);
+            key_record.extend_from_slice(&file_rec);
+            fs.insert_catalog_record(&key_record).unwrap();
+        }
+        fs.mdb.file_count = n;
+        fs.mdb.next_catalog_id = 16 + n;
+        fs.update_parent_valence(root_id, n as i32).unwrap();
+
+        let node_size = BTreeHeader::read(fs.catalog_data()).node_size as usize;
+        let used_before = {
+            let h = BTreeHeader::read(fs.catalog_data());
+            h.total_nodes - h.free_nodes
+        };
+        assert!(
+            used_before > 2048,
+            "test needs > 2048 nodes, got {used_before}"
+        );
+
+        // Force a full index rebuild and require it to succeed without leaking.
+        let mut report = crate::fs::fsck::RepairReport {
+            fixes_applied: Vec::new(),
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        };
+        crate::fs::hfs_fsck::rebuild_index_nodes(&mut fs.catalog_data, node_size, &mut report);
+        assert!(
+            report.fixes_failed.is_empty(),
+            "rebuild reported failures: {:?}",
+            report.fixes_failed
+        );
+
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck after rebuild: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// End-to-end guard through the real `create_file` API: enough files to
+    /// grow a multi-level catalog index must stay fsck-clean. ~2000 files at
+    /// node_size 512 yields ~500 leaves and tens of index nodes — enough to
+    /// split index nodes, the exact spot the incremental inserter used to
+    /// leave sibling links broken.
+    #[test]
+    fn test_hfs_create_file_multilevel_index_fsck_clean() {
+        use super::hfs_common::BTreeHeader;
+        let block_size = 32 * 1024u32;
+        let img =
+            create_blank_hfs_sized(32 * 1024 * 1024, block_size, "MultiIdx", 0, 4 * 1024 * 1024)
+                .expect("create blank volume");
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        for i in 0..2000 {
+            let name = format!("f{:05}.txt", i);
+            let mut empty = Cursor::new(Vec::new());
+            fs.create_file(&root, &name, &mut empty, 0, &options)
+                .unwrap_or_else(|e| panic!("create_file #{i}: {e}"));
+        }
+        let header = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            header.depth >= 2,
+            "expected an index level, depth = {}",
+            header.depth
+        );
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck errors: {:?}",
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fs.mdb.file_count, 2000);
+    }
+
+    /// Lock in lossless round-tripping of filenames carrying raw control bytes
+    /// (e.g. 0x7F / DEL, as in the Macintosh Garden "IPNetRouter<DEL><DEL>"
+    /// title that triggered the related JSON-escaping bug downstream). Mac
+    /// Roman maps bytes < 0x80 straight through, so create then list must
+    /// preserve them byte-for-byte.
+    #[test]
+    fn test_hfs_control_char_filename_roundtrip() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        let name = "IPNetRouter\u{7f}\u{7f}_154_68k";
+        let mut data = Cursor::new(b"x".to_vec());
+        fs.create_file(&root, name, &mut data, 1, &options)
+            .expect("create_file with raw 0x7F bytes in the name");
+        let entries = fs.list_directory(&root).unwrap();
+        assert!(
+            entries.iter().any(|e| e.name == name),
+            "0x7F-laden name not preserved; got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_fsck_clean(&mut fs);
+    }
+
+    /// A null byte in a catalog name is valid on classic HFS (only the colon is
+    /// forbidden) — a leading null is an old Finder trick to sort a file to the
+    /// top. Real Apple disks carry such names (3 on the MacPack boot volume), so
+    /// fsck must treat them as an informational *warning*, not an error.
+    #[test]
+    fn test_hfs_null_byte_name_is_warning_not_error() {
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let options = CreateFileOptions::default();
+        let mut data = Cursor::new(b"x".to_vec());
+        fs.create_file(&root, "\u{0}Sorts First", &mut data, 1, &options)
+            .expect("create_file with a leading null byte in the name");
+        let result = fs.fsck().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "a null-byte name must not be a fsck error: {:?}",
+            result.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "UnusualCatalogName"),
+            "expected an UnusualCatalogName warning for the null-byte name"
+        );
     }
 
     #[test]

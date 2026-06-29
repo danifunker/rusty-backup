@@ -2,16 +2,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use opticaldiscs::detect::DiscImageInfo;
-use opticaldiscs::drives::OpticalDrive;
 use opticaldiscs::formats::DiscFormat;
 
 use rusty_backup::backup::LogLevel as BackupLogLevel;
+use rusty_backup::model::optical_devices::{list_rip_devices, RipDevice};
 use rusty_backup::optical::browse_view::OpticalDiscBrowseView;
 use rusty_backup::optical::convert::ConvertProgress;
-use rusty_backup::optical::rip::{RipConfig, RipFormat, RipProgress};
+use rusty_backup::optical::rip::{OpticalTarget, RipConfig, RipFormat, RipProgress};
 use rusty_backup::rbformats::chd_options::{
     codec_label, parse_codec_string, ChdOptions, ChdProfile,
 };
+use rusty_backup::remote::RemoteConnection;
 use rusty_backup::update::UpdateConfig;
 
 use super::chd_options_ui::{ChdOptionsControl, ChdOptionsMode};
@@ -37,11 +38,30 @@ enum OutputFormat {
     Chd,
 }
 
+/// Background state for the "Add remote daemon" connect — runs off the UI
+/// thread so an unreachable host can't freeze egui.
+#[derive(Default)]
+struct ConnectStatus {
+    done: bool,
+    result: Option<std::result::Result<Arc<Mutex<RemoteConnection>>, String>>,
+}
+
 /// State for the Optical disc tab.
 pub struct OpticalTab {
     source_mode: SourceMode,
-    drives: Vec<OpticalDrive>,
+    /// Unified drive list: local drives + every connected daemon's drives.
+    rip_devices: Vec<RipDevice>,
     selected_drive_idx: Option<usize>,
+    /// Connected remote daemons, re-queried when the drive list refreshes.
+    remote_daemons: Vec<Arc<Mutex<RemoteConnection>>>,
+    /// "Add remote daemon" dialog state.
+    add_remote_open: bool,
+    add_remote_addr: String,
+    add_remote_error: Option<String>,
+    add_remote_status: Option<Arc<Mutex<ConnectStatus>>>,
+    /// MRU of daemon addresses (newest first), mirrored to `config.json` — the
+    /// "Add remote daemon" dialog's quick-pick list.
+    recent_daemons: Vec<String>,
     image_file_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
     disc_info_error: Option<String>,
@@ -66,8 +86,14 @@ impl Default for OpticalTab {
     fn default() -> Self {
         Self {
             source_mode: SourceMode::ImageFile,
-            drives: Vec::new(),
+            rip_devices: Vec::new(),
             selected_drive_idx: None,
+            remote_daemons: Vec::new(),
+            add_remote_open: false,
+            add_remote_addr: String::new(),
+            add_remote_error: None,
+            add_remote_status: None,
+            recent_daemons: UpdateConfig::load().recent_daemon_addrs,
             image_file_path: None,
             disc_info: None,
             disc_info_error: None,
@@ -125,11 +151,147 @@ impl OpticalTab {
     }
 
     pub fn refresh_drives(&mut self) {
-        self.drives = opticaldiscs::drives::list_drives();
+        self.rip_devices = list_rip_devices(&self.remote_daemons);
     }
 
     pub fn drive_count(&self) -> usize {
-        self.drives.len()
+        self.rip_devices.len()
+    }
+
+    /// Poll the background "Add remote daemon" connect; on success add the
+    /// daemon and refresh the unified drive list.
+    fn poll_add_remote(&mut self, log: &mut LogPanel) {
+        let Some(status) = &self.add_remote_status else {
+            return;
+        };
+        let finished = status.lock().map(|s| s.done).unwrap_or(false);
+        if !finished {
+            return;
+        }
+        let result = self
+            .add_remote_status
+            .take()
+            .and_then(|s| s.lock().ok().and_then(|mut s| s.result.take()));
+        match result {
+            Some(Ok(conn)) => {
+                let label = conn
+                    .lock()
+                    .map(|c| c.addr().to_string())
+                    .unwrap_or_default();
+                self.remember_daemon_addr(&label);
+                self.remote_daemons.push(conn);
+                self.refresh_drives();
+                self.add_remote_open = false;
+                self.add_remote_addr.clear();
+                self.add_remote_error = None;
+                log.info(format!("Connected to remote daemon {label}"));
+            }
+            Some(Err(e)) => {
+                self.add_remote_error = Some(e);
+            }
+            None => {}
+        }
+    }
+
+    /// Record a successfully-connected daemon address in the MRU list (in-memory
+    /// + persisted to `config.json`), newest first.
+    fn remember_daemon_addr(&mut self, addr: &str) {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            return;
+        }
+        self.recent_daemons.retain(|a| a != addr);
+        self.recent_daemons.insert(0, addr.to_string());
+        self.recent_daemons.truncate(8);
+        let mut cfg = UpdateConfig::load();
+        cfg.remember_daemon(addr);
+        let _ = cfg.save();
+    }
+
+    /// Spawn the connect for the address in the dialog on a worker thread.
+    fn start_add_remote(&mut self) {
+        let addr = self.add_remote_addr.trim().to_string();
+        if addr.is_empty() {
+            self.add_remote_error = Some("Enter a host:port".to_string());
+            return;
+        }
+        self.add_remote_error = None;
+        let status = Arc::new(Mutex::new(ConnectStatus::default()));
+        self.add_remote_status = Some(Arc::clone(&status));
+        std::thread::spawn(move || {
+            let result = RemoteConnection::connect_shared(&addr).map_err(|e| format!("{e:#}"));
+            if let Ok(mut s) = status.lock() {
+                s.result = Some(result);
+                s.done = true;
+            }
+        });
+    }
+
+    /// The "Add remote daemon" modal: a host:port field that connects on a
+    /// worker thread (see [`Self::start_add_remote`] / [`Self::poll_add_remote`]).
+    fn show_add_remote_dialog(&mut self, ctx: &egui::Context) {
+        if !self.add_remote_open {
+            return;
+        }
+        let connecting = self.add_remote_status.is_some();
+        let mut open = self.add_remote_open;
+        egui::Window::new("Add remote daemon")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Daemon address (host:port):");
+                let resp = ui.add_enabled(
+                    !connecting,
+                    egui::TextEdit::singleline(&mut self.add_remote_addr)
+                        .hint_text("mister.local:7341"),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!connecting, egui::Button::new("Connect"))
+                        .clicked()
+                        || (submit && !connecting)
+                    {
+                        self.start_add_remote();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.add_remote_open = false;
+                        self.add_remote_status = None;
+                        self.add_remote_error = None;
+                    }
+                });
+                if connecting {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Connecting...");
+                    });
+                }
+                if let Some(err) = &self.add_remote_error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                }
+
+                if !self.recent_daemons.is_empty() {
+                    ui.separator();
+                    ui.label("Recent:");
+                    // Clone to avoid borrowing `self` while the click handler
+                    // calls `&mut self` methods.
+                    let recents = self.recent_daemons.clone();
+                    for addr in recents {
+                        if ui
+                            .add_enabled(!connecting, egui::Button::new(&addr).small())
+                            .clicked()
+                        {
+                            self.add_remote_addr = addr.clone();
+                            self.start_add_remote();
+                        }
+                    }
+                }
+            });
+        // Honor the window's [x] close button.
+        if !open {
+            self.add_remote_open = false;
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -138,6 +300,8 @@ impl OpticalTab {
 
     pub fn show(&mut self, ui: &mut egui::Ui, log: &mut LogPanel, progress: &mut ProgressState) {
         self.poll_progress(log, progress);
+        self.poll_add_remote(log);
+        self.show_add_remote_dialog(ui.ctx());
 
         ui.heading("Optical Disc");
         ui.add_space(8.0);
@@ -153,7 +317,11 @@ impl OpticalTab {
                 // Keep the option visible (so users know it exists) but gray it
                 // out until they elevate via the top-bar "Show Physical Devices"
                 // button. Image-file convert stays available unelevated.
-                let phys_enabled = super::physical_devices_available();
+                // A local drive needs elevation (SCSI pass-through); a remote
+                // drive is opened by the daemon, so adding one also unlocks the
+                // mode.
+                let phys_enabled =
+                    super::physical_devices_available() || !self.remote_daemons.is_empty();
                 ui.add_enabled_ui(phys_enabled, |ui| {
                     ui.radio_value(
                         &mut self.source_mode,
@@ -161,11 +329,15 @@ impl OpticalTab {
                         "Physical drive",
                     )
                     .on_disabled_hover_text(
-                        "Click \"Show Physical Devices\" (top bar) to enable — \
-                         ripping a physical disc requires administrator rights.",
+                        "Click \"Show Physical Devices\" (top bar) for a local drive, \
+                         or \"Add remote daemon...\" for a networked one.",
                     );
                 });
                 ui.radio_value(&mut self.source_mode, SourceMode::ImageFile, "Image file");
+                if ui.button("Add remote daemon...").clicked() {
+                    self.add_remote_open = true;
+                    self.add_remote_error = None;
+                }
             });
 
             match self.source_mode {
@@ -175,24 +347,19 @@ impl OpticalTab {
 
                         let current_label = self
                             .selected_drive_idx
-                            .and_then(|idx| self.drives.get(idx))
-                            .map(|d| d.display_name.clone())
+                            .and_then(|idx| self.rip_devices.get(idx))
+                            .map(|d| d.picker_label())
                             .unwrap_or_else(|| "Select a drive...".into());
 
                         egui::ComboBox::from_id_salt("optical_drive")
                             .selected_text(&current_label)
-                            .width(300.0)
+                            .width(360.0)
                             .show_ui(ui, |ui| {
-                                for (i, drive) in self.drives.iter().enumerate() {
-                                    let label = format!(
-                                        "{} ({})",
-                                        drive.display_name,
-                                        drive.device_path.display()
-                                    );
+                                for (i, drive) in self.rip_devices.iter().enumerate() {
                                     ui.selectable_value(
                                         &mut self.selected_drive_idx,
                                         Some(i),
-                                        &label,
+                                        drive.picker_label(),
                                     );
                                 }
                             });
@@ -201,7 +368,7 @@ impl OpticalTab {
                             self.refresh_drives();
                             log.info(format!(
                                 "Refreshed: {} optical drive(s) found",
-                                self.drives.len()
+                                self.rip_devices.len()
                             ));
                         }
                     });
@@ -439,7 +606,11 @@ impl OpticalTab {
             if self.action == Action::Rip {
                 ui.horizontal(|ui| {
                     ui.add_space(60.0);
-                    ui.checkbox(&mut self.eject_after, "Eject after ripping");
+                    ui.checkbox(&mut self.eject_after, "Eject after ripping")
+                        .on_hover_text(
+                            "Ejects the source drive on its own machine — the \
+                             remote daemon's drive for a remote source.",
+                        );
                 });
             }
         });
@@ -488,18 +659,25 @@ impl OpticalTab {
 
     fn has_valid_source(&self) -> bool {
         match self.source_mode {
-            SourceMode::PhysicalDrive => self.selected_drive_idx.is_some(),
+            SourceMode::PhysicalDrive => self
+                .selected_drive_idx
+                .and_then(|idx| self.rip_devices.get(idx))
+                .is_some(),
             SourceMode::ImageFile => self.image_file_path.is_some(),
         }
     }
 
+    /// The path the browse view / disc-info detector opens. Only local sources
+    /// are browsable — a remote drive is rip-only here (browsing a remote disc
+    /// is the remote Inspect tab's job), so it yields `None`.
     fn get_browsable_path(&self) -> Option<PathBuf> {
         match self.source_mode {
             SourceMode::ImageFile => self.image_file_path.clone(),
             SourceMode::PhysicalDrive => self
                 .selected_drive_idx
-                .and_then(|idx| self.drives.get(idx))
-                .map(|d| d.device_path.clone()),
+                .and_then(|idx| self.rip_devices.get(idx))
+                .filter(|d| !d.is_remote())
+                .map(|d| PathBuf::from(&d.device_path)),
         }
     }
 
@@ -563,8 +741,13 @@ impl OpticalTab {
     }
 
     fn start_rip(&mut self, log: &mut LogPanel) {
-        let drive = match self.selected_drive_idx.and_then(|idx| self.drives.get(idx)) {
-            Some(d) => d,
+        // Resolve the target up front (owned) so the &mut self calls below don't
+        // conflict with a borrow of `rip_devices`.
+        let target = match self
+            .selected_drive_idx
+            .and_then(|idx| self.rip_devices.get(idx))
+        {
+            Some(d) => d.to_target(),
             None => {
                 log.error("No drive selected");
                 return;
@@ -581,7 +764,7 @@ impl OpticalTab {
 
         // CHD rip: rip to temp BIN/CUE, then convert to CHD
         if self.output_format == OutputFormat::Chd {
-            self.start_rip_to_chd(drive.device_path.clone(), output_path, log);
+            self.start_rip_to_chd(target, output_path, log);
             return;
         }
 
@@ -592,7 +775,7 @@ impl OpticalTab {
         };
 
         let config = RipConfig {
-            device_path: drive.device_path.clone(),
+            device: target,
             output_path,
             format,
             eject_after: self.eject_after,
@@ -600,7 +783,7 @@ impl OpticalTab {
 
         log.info(format!(
             "Starting rip: {} -> {}",
-            config.device_path.display(),
+            config.device.display(),
             config.output_path.display()
         ));
 
@@ -620,7 +803,7 @@ impl OpticalTab {
     }
 
     /// Rip to CHD: rip to temporary BIN/CUE, convert to CHD, clean up temps.
-    fn start_rip_to_chd(&mut self, device_path: PathBuf, chd_path: PathBuf, log: &mut LogPanel) {
+    fn start_rip_to_chd(&mut self, target: OpticalTarget, chd_path: PathBuf, log: &mut LogPanel) {
         let eject_after = self.eject_after;
         if self.chd_cd_control.mode == ChdOptionsMode::Custom {
             self.persist_chd_options(&self.chd_cd_control.custom);
@@ -629,7 +812,7 @@ impl OpticalTab {
 
         log.info(format!(
             "Starting rip to CHD: {} -> {}",
-            device_path.display(),
+            target.display(),
             chd_path.display()
         ));
 
@@ -639,13 +822,8 @@ impl OpticalTab {
 
         std::thread::spawn(move || {
             let _wake = rusty_backup::os::wakelock::acquire("Rusty Backup: optical rip to CHD");
-            let result = rip_to_chd_worker(
-                &device_path,
-                &chd_path,
-                eject_after,
-                chd_options,
-                &progress_arc,
-            );
+            let result =
+                rip_to_chd_worker(target, &chd_path, eject_after, chd_options, &progress_arc);
             if let Err(e) = result {
                 if let Ok(mut p) = progress_arc.lock() {
                     if !p.finished {
@@ -846,9 +1024,10 @@ fn run_conversion(
     }
 }
 
-/// Background worker: rip disc to temp BIN/CUE, convert to CHD, clean up.
+/// Background worker: rip disc (local or remote) to temp BIN/CUE, convert to
+/// CHD locally, clean up. The encode always runs here on the desktop.
 fn rip_to_chd_worker(
-    device_path: &std::path::Path,
+    target: OpticalTarget,
     chd_path: &std::path::Path,
     eject_after: bool,
     chd_options: ChdOptions,
@@ -865,7 +1044,7 @@ fn rip_to_chd_worker(
     let temp_bin = parent.join(".rusty-backup-rip-temp.bin");
 
     let rip_config = RipConfig {
-        device_path: device_path.to_path_buf(),
+        device: target,
         output_path: temp_cue.clone(),
         format: RipFormat::BinCue,
         eject_after,

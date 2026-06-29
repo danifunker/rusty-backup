@@ -30,6 +30,7 @@ pub mod hfs_boot;
 pub mod hfs_clone;
 pub mod hfs_common;
 pub mod hfs_fsck;
+pub mod hfs_unicode;
 pub mod hfsplus;
 pub mod hfsplus_clone;
 pub mod hfsplus_defrag;

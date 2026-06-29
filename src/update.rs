@@ -25,6 +25,11 @@ pub struct UpdateConfig {
     /// so a self-update that adds an extension registers it without a reinstall.
     #[serde(default)]
     pub assoc_registered_version: Option<String>,
+    /// Most-recently-used rb-daemon addresses (`host:port`), newest first. Drives
+    /// the GUI Optical tab's "Add remote daemon" quick-pick list. Capped to a
+    /// handful of entries.
+    #[serde(default)]
+    pub recent_daemon_addrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -90,6 +95,7 @@ impl Default for UpdateConfig {
             last_chd_hunk_size: None,
             file_associations_enabled: false,
             assoc_registered_version: None,
+            recent_daemon_addrs: Vec::new(),
         }
     }
 }
@@ -161,6 +167,18 @@ impl UpdateConfig {
         let content = fs::read_to_string(path.into())?;
         let config: UpdateConfig = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Record a successfully-used rb-daemon address in the MRU list (dedup,
+    /// newest first, capped). No-op for a blank address.
+    pub fn remember_daemon(&mut self, addr: &str) {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            return;
+        }
+        self.recent_daemon_addrs.retain(|a| a != addr);
+        self.recent_daemon_addrs.insert(0, addr.to_string());
+        self.recent_daemon_addrs.truncate(8);
     }
 }
 
@@ -363,4 +381,28 @@ pub fn restart_app() -> ! {
         let _ = std::process::Command::new(exe).spawn();
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_daemon_is_mru_deduped_capped() {
+        let mut cfg = UpdateConfig::default();
+        cfg.remember_daemon("a:1");
+        cfg.remember_daemon("b:2");
+        // Re-using an address moves it to the front (no duplicate).
+        cfg.remember_daemon("a:1");
+        assert_eq!(cfg.recent_daemon_addrs, vec!["a:1", "b:2"]);
+        // Blank / whitespace is ignored.
+        cfg.remember_daemon("   ");
+        assert_eq!(cfg.recent_daemon_addrs.len(), 2);
+        // Capped at 8, newest first.
+        for i in 0..10 {
+            cfg.remember_daemon(&format!("h:{i}"));
+        }
+        assert_eq!(cfg.recent_daemon_addrs.len(), 8);
+        assert_eq!(cfg.recent_daemon_addrs[0], "h:9");
+    }
 }

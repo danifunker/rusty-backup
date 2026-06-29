@@ -417,7 +417,6 @@ fn allocate_fork(
 
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
-use unicode_normalization::UnicodeNormalization;
 
 use super::filesystem::FilesystemError;
 use super::hfs_common;
@@ -651,7 +650,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&record);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         // Root thread record.
         let thread = build_thread_record(CATALOG_FOLDER_THREAD, /* parent=1 */ 1, label);
@@ -660,7 +664,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
         let _ = (folder_meta, record);
     }
 
@@ -719,7 +728,12 @@ pub fn build_target_metadata(
                     key_record.push(0);
                 }
                 key_record.extend_from_slice(&body);
-                hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+                hfs_common::btree_insert_full(
+                    &mut catalog,
+                    &key_record,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+                    &cmp,
+                )?;
 
                 let thread = build_thread_record(CATALOG_FOLDER_THREAD, target_parent, &d.name);
                 let mut tk = build_catalog_key(target_cnid, "");
@@ -727,7 +741,12 @@ pub fn build_target_metadata(
                     tk.push(0);
                 }
                 tk.extend_from_slice(&thread);
-                hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+                hfs_common::btree_insert_full(
+                    &mut catalog,
+                    &tk,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+                    &cmp,
+                )?;
 
                 *child_count.entry(target_parent).or_default() += 1;
                 queue.push_back(d.cnid);
@@ -769,7 +788,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &f.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -777,7 +801,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
 
@@ -823,7 +852,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -831,7 +865,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
         *file_link_counts.entry(h.inode_num).or_default() += 1;
@@ -856,7 +895,12 @@ pub fn build_target_metadata(
             key_record.push(0);
         }
         key_record.extend_from_slice(&body);
-        hfs_common::btree_insert_full(&mut catalog, &key_record, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &key_record,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         let thread = build_thread_record(CATALOG_FILE_THREAD, target_parent, &h.name);
         let mut tk = build_catalog_key(target_cnid, "");
@@ -864,7 +908,12 @@ pub fn build_target_metadata(
             tk.push(0);
         }
         tk.extend_from_slice(&thread);
-        hfs_common::btree_insert_full(&mut catalog, &tk, &cmp)?;
+        hfs_common::btree_insert_full(
+            &mut catalog,
+            &tk,
+            &hfs_common::BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
 
         *child_count.entry(target_parent).or_default() += 1;
         *dir_link_counts.entry(h.inode_num).or_default() += 1;
@@ -1561,8 +1610,7 @@ fn build_file_body(
 
 /// Build a thread record (`type(2)+reserved(2)+parentID(4)+name`).
 fn build_thread_record(record_type: i16, parent_cnid: u32, name: &str) -> Vec<u8> {
-    let nfd: String = name.nfd().collect();
-    let utf16: Vec<u16> = nfd.encode_utf16().collect();
+    let utf16: Vec<u16> = crate::fs::hfs_unicode::decompose_str(name);
     let mut rec = Vec::with_capacity(10 + utf16.len() * 2);
     let mut b2 = [0u8; 2];
     let mut b4 = [0u8; 4];
@@ -1636,6 +1684,7 @@ fn emit_xattrs_for_cnid(
                 hfs_common::btree_insert_full(
                     attr_buf,
                     &rec,
+                    &hfs_common::BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
                     &HfsPlusFilesystem::<std::io::Cursor<Vec<u8>>>::attr_compare,
                 )?;
             }
@@ -2730,6 +2779,116 @@ mod tests {
                 .iter()
                 .map(|e| (&e.code, &e.message))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// P4 (docs/hfsplus_btree_growth_plan.md): the streamed defrag builder builds
+    /// its target catalog with `hfs_common::btree_insert_full` +
+    /// `BTreeKeyFormat::HFSPLUS_CATALOG` (wired in P1). Confirm that on a source
+    /// large enough for a *multi-level* catalog the clone re-builds an equally
+    /// multi-level catalog that is fsck-clean and round-trips — i.e. the
+    /// variable-length index keys behave correctly through the clone path, not
+    /// just the live-edit path.
+    #[test]
+    fn stream_clone_of_multilevel_catalog_is_fsck_clean() {
+        use super::super::hfs_common::BTreeHeader;
+
+        // 64 MiB source (auto-sized catalog) with 300 files across 10 dirs —
+        // ~620 catalog records, comfortably past a single leaf node.
+        const DIRS: usize = 10;
+        const PER_DIR: usize = 30;
+        let mut src_img = create_blank_hfsplus(64 * 1024 * 1024, 4096, "Big", false);
+        {
+            let cur = Cursor::new(&mut src_img);
+            let mut fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+            fs.prepare_for_edit().unwrap();
+            let root = fs.root().unwrap();
+            for d in 0..DIRS {
+                let dir = fs
+                    .create_directory(
+                        &root,
+                        &format!("d{d:02}"),
+                        &CreateDirectoryOptions::default(),
+                    )
+                    .unwrap();
+                for f in 0..PER_DIR {
+                    let body = format!("contents of d{d:02}/f{f:03}\n");
+                    let mut data = Cursor::new(body.into_bytes());
+                    let len = data.get_ref().len() as u64;
+                    fs.create_file(
+                        &dir,
+                        &format!("f{f:03}.txt"),
+                        &mut data,
+                        len,
+                        &CreateFileOptions::default(),
+                    )
+                    .unwrap();
+                }
+            }
+            fs.sync_metadata().unwrap();
+            // Sanity: the source catalog really is multi-level.
+            let depth = BTreeHeader::read(fs.catalog_data()).depth;
+            assert!(
+                depth >= 2,
+                "source catalog depth {depth} < 2 — test needs a deeper tree"
+            );
+        }
+
+        // Clone via the streamed defrag path.
+        let cur = Cursor::new(&mut src_img);
+        let mut src_fs = HfsPlusFilesystem::open(cur, 0).unwrap();
+        let target_size: u64 = 32 * 1024 * 1024;
+        let mut out: Vec<u8> = Vec::with_capacity(target_size as usize);
+        let report = stream_defragmented_hfsplus(&mut src_fs, target_size, &mut out, None)
+            .expect("multi-level clone should succeed");
+        assert_eq!(
+            report.files_copied as usize,
+            DIRS * PER_DIR,
+            "all files copied"
+        );
+        assert_eq!(report.dirs_copied as usize, DIRS, "all dirs copied");
+
+        // The defrag-built target catalog must itself be multi-level...
+        let cur = Cursor::new(out);
+        let mut tgt = HfsPlusFilesystem::open(cur, 0).expect("target opens");
+        let tgt_depth = BTreeHeader::read(tgt.catalog_data()).depth;
+        assert!(
+            tgt_depth >= 2,
+            "cloned catalog collapsed to depth {tgt_depth} — multi-level rebuild failed"
+        );
+
+        // ...fsck-clean...
+        let fsck = tgt.fsck().expect("HFS+ fsck").expect("fsck runs");
+        assert!(
+            fsck.is_clean(),
+            "cloned multi-level catalog not fsck-clean: {:?}",
+            fsck.errors
+                .iter()
+                .take(8)
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+
+        // ...and round-trips: every dir/file present, contents intact (spot-check).
+        let root = tgt.root().unwrap();
+        let dirs = tgt.list_directory(&root).unwrap();
+        assert_eq!(
+            dirs.iter().filter(|e| e.name.starts_with('d')).count(),
+            DIRS,
+            "directory count drifted after clone"
+        );
+        let d05 = dirs.iter().find(|e| e.name == "d05").unwrap().clone();
+        let d05_kids = tgt.list_directory(&d05).unwrap();
+        assert_eq!(d05_kids.len(), PER_DIR, "d05 child count drifted");
+        let f017 = d05_kids
+            .iter()
+            .find(|e| e.name == "f017.txt")
+            .unwrap()
+            .clone();
+        let bytes = tgt.read_file(&f017, usize::MAX).unwrap();
+        assert_eq!(
+            bytes, b"contents of d05/f017\n",
+            "cloned file contents differ"
         );
     }
 }

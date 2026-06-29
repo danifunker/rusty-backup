@@ -23,7 +23,7 @@ use crate::backup::LogMessage;
 use crate::cli::logging::log_stderr;
 use crate::optical::{
     convert::{bincue_to_iso, chd_to_bincue, chd_to_iso, iso_to_bincue, to_chd, ConvertProgress},
-    rip::{run_rip, RipConfig, RipFormat, RipProgress},
+    rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
 };
 use crate::partition::format_size;
 use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
@@ -31,7 +31,7 @@ use crate::rbformats::chd_options::{ChdOptions, ChdProfile};
 #[derive(Debug, Subcommand)]
 pub enum OpticalCommand {
     /// List connected physical optical drives and their device paths.
-    Drives,
+    Drives(DrivesArgs),
     /// Rip a physical CD/DVD drive to a disk image file.
     Rip(RipArgs),
     /// Re-encode an optical image into a different format.
@@ -44,7 +44,7 @@ pub enum OpticalCommand {
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
     match cmd {
-        OpticalCommand::Drives => run_drives_verb(),
+        OpticalCommand::Drives(a) => run_drives_verb(a),
         OpticalCommand::Rip(a) => run_rip_verb(a),
         OpticalCommand::Convert(a) => run_convert_verb(a),
         OpticalCommand::Browse(a) => run_browse_verb(a),
@@ -54,19 +54,42 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
 
 // ---------------- drives ----------------
 
-/// List physical optical drives, mirroring the GUI Optical tab's drive picker
-/// (`opticaldiscs::drives::list_drives`). Prints one drive per line to stdout as
-/// `<device-path>  <display-name>` so the path can be fed to `optical rip
-/// --device`. ASCII only (no glyphs) per the project's terminal-output rule.
-fn run_drives_verb() -> Result<()> {
-    let drives = opticaldiscs::drives::list_drives();
-    if drives.is_empty() {
+#[derive(Debug, Args)]
+pub struct DrivesArgs {
+    /// Also query these daemons for their optical drives (repeatable), e.g.
+    /// `--remote mister.local:7341`. Remote rows print an `rb://...` device arg
+    /// you can pass straight to `optical rip --device`.
+    #[arg(long = "remote", value_name = "HOST:PORT")]
+    pub remotes: Vec<String>,
+}
+
+/// List optical drives via the unified picker core: local drives, plus the
+/// drives of each `--remote` daemon. Prints one drive per line to stdout as
+/// `<device-arg>  <display-name>` — `<device-arg>` is a local path or an
+/// `rb://host:port/dev/sr0` URL, feedable straight to `optical rip --device`.
+/// ASCII only (no glyphs) per the project's terminal-output rule.
+fn run_drives_verb(args: DrivesArgs) -> Result<()> {
+    // `devices` is only mutated by the remote arm below.
+    #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
+    let mut devices = crate::model::optical_devices::list_local_rip_devices();
+    #[cfg(feature = "remote")]
+    for addr in &args.remotes {
+        let conn = crate::remote::connection::RemoteConnection::connect_shared(addr)
+            .with_context(|| format!("connecting to {addr}"))?;
+        crate::model::optical_devices::append_remote_rip_devices(&mut devices, &conn);
+    }
+    #[cfg(not(feature = "remote"))]
+    if !args.remotes.is_empty() {
+        bail!("--remote needs the `remote` feature; this binary was built without it");
+    }
+
+    if devices.is_empty() {
         log_stderr("No optical drives found.");
         return Ok(());
     }
-    log_stderr(format!("Found {} optical drive(s):", drives.len()));
-    for d in &drives {
-        println!("{}  {}", d.device_path.display(), d.display_name);
+    log_stderr(format!("Found {} optical drive(s):", devices.len()));
+    for d in &devices {
+        println!("{}  {}", d.cli_device_arg(), d.display_name);
     }
     Ok(())
 }
@@ -92,7 +115,10 @@ impl From<RipFmt> for RipFormat {
 
 #[derive(Debug, Args)]
 pub struct RipArgs {
-    /// Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`.
+    /// Source drive: a local path (e.g. `/dev/sr0`, `disk6`, `\\.\E:`) or a
+    /// remote daemon's drive as `rb://host:port/dev/sr0` (the daemon issues the
+    /// SCSI reads; this side does the encoding). `rb-cli optical drives` lists
+    /// local drives.
     #[arg(long)]
     pub device: PathBuf,
 
@@ -116,7 +142,7 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
         args.format
     ));
     let config = RipConfig {
-        device_path: args.device,
+        device: OpticalTarget::resolve(&args.device.to_string_lossy())?,
         output_path: args.output,
         format: args.format.into(),
         eject_after: args.eject,
@@ -134,6 +160,7 @@ fn run_rip_verb(args: RipArgs) -> Result<()> {
 fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
     let mut last_op = String::new();
     let mut last_pct: i32 = -1;
+    let mut tracker = crate::model::rate_tracker::RateTracker::default();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, op, cur, total, finished, error) = match progress.lock() {
@@ -153,6 +180,9 @@ fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
         for LogMessage { level, message } in logs {
             log_stderr(format!("[{level:?}] {message}"));
         }
+        // Sample every tick (the stage label resets the window between phases),
+        // even though we only print every 5%, so the rate/ETA is warm by then.
+        tracker.record(cur, &op);
         if op != last_op {
             log_stderr(format!("status: {op}"));
             last_op = op;
@@ -162,9 +192,10 @@ fn drain_rip(progress: Arc<Mutex<RipProgress>>) -> Result<()> {
             let pct = ((cur as f64 / total as f64) * 100.0) as i32;
             if pct / 5 != last_pct / 5 {
                 log_stderr(format!(
-                    "  progress: {pct:>3}% ({}/{})",
+                    "  progress: {pct:>3}% ({}/{}){}",
                     format_size(cur),
-                    format_size(total)
+                    format_size(total),
+                    tracker.suffix(cur, total),
                 ));
                 last_pct = pct;
             }
@@ -253,6 +284,7 @@ fn run_convert_verb(args: ConvertArgs) -> Result<()> {
 fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
     let mut last_op = String::new();
     let mut last_pct: i32 = -1;
+    let mut tracker = crate::model::rate_tracker::RateTracker::default();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         let (logs, op, cur, total, finished, error) = match progress.lock() {
@@ -272,6 +304,9 @@ fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
         for LogMessage { level, message } in logs {
             log_stderr(format!("[{level:?}] {message}"));
         }
+        // Sample every tick (the stage label resets the window between phases),
+        // even though we only print every 5%, so the rate/ETA is warm by then.
+        tracker.record(cur, &op);
         if op != last_op {
             log_stderr(format!("status: {op}"));
             last_op = op;
@@ -281,9 +316,10 @@ fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
             let pct = ((cur as f64 / total as f64) * 100.0) as i32;
             if pct / 5 != last_pct / 5 {
                 log_stderr(format!(
-                    "  progress: {pct:>3}% ({}/{})",
+                    "  progress: {pct:>3}% ({}/{}){}",
                     format_size(cur),
-                    format_size(total)
+                    format_size(total),
+                    tracker.suffix(cur, total),
                 ));
                 last_pct = pct;
             }

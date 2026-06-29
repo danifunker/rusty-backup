@@ -152,7 +152,6 @@ chrono = "0.4"
 tempfile = "3"
 image = "0.25"
 dirs = "6"
-unicode-normalization = "0.1"
 # Baseline is the pure-Rust backend (miniz_oxide) so the slim/cross builds need
 # no C zlib. The desktop `native-zlib` feature adds `flate2/zlib-ng`, which
 # flate2 prioritizes over the Rust backend when both are enabled.

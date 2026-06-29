@@ -2,7 +2,6 @@ use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
-use unicode_normalization::UnicodeNormalization;
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
@@ -10,8 +9,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, btree_free_node,
-    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_remove_record,
-    btree_split_leaf_with_insert, BTreeHeader,
+    btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -374,8 +372,7 @@ fn validate_hfsplus_create_name(name: &str) -> Result<(), FilesystemError> {
                 .into(),
         ));
     }
-    let nfd: String = name.nfd().collect();
-    let utf16_len = nfd.encode_utf16().count();
+    let utf16_len = super::hfs_unicode::decompose_str(name).len();
     if utf16_len > 255 {
         return Err(FilesystemError::InvalidData(format!(
             "filename is too long ({utf16_len} UTF-16 units); HFS+ allows up to 255 — \
@@ -1666,8 +1663,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 
     /// Build HFS+ catalog key bytes: key_len(2) + parent_id(4) + name_length(2) + name(UTF-16BE NFD).
     pub(crate) fn build_catalog_key(parent_cnid: u32, name: &str) -> Vec<u8> {
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let key_len = 4 + 2 + utf16.len() * 2;
         let mut key = Vec::with_capacity(2 + key_len);
         let mut buf = [0u8; 2];
@@ -1807,112 +1803,26 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Insert a catalog record into the B-tree, handling splits and growth.
+    ///
+    /// Delegates to the shared `btree_insert_full`, which — for a non-sequential
+    /// (per-`put`) insert into a full leaf — first tries a B*-style rotation into
+    /// an adjacent sibling before splitting, lifting random-insert leaf occupancy
+    /// from the ~69% a plain split leaves to ~88% (docs/hfsplus_btree_growth_plan.md
+    /// §4d). `BTreeKeyFormat::HFSPLUS_CATALOG` drives the 2-byte / variable-length
+    /// index keys. This is the same path classic HFS's `insert_catalog_record`
+    /// uses; the previous hand-rolled split dance here packed less densely because
+    /// it never rotated.
     fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        let header = BTreeHeader::read(&self.catalog_data);
-        let node_size = header.node_size as usize;
         let cs = self.case_sensitive();
         let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
-
-        // Find the correct leaf node
-        let (leaf_idx, parent_chain) =
-            hfs_common::btree_find_insert_leaf(&self.catalog_data, &header, key_record, &cmp);
-
-        // Try to insert into the leaf
-        let offset = leaf_idx as usize * node_size;
-        let node = &mut self.catalog_data[offset..offset + node_size];
-        match btree_insert_record(node, node_size, key_record, &cmp) {
-            Ok(_) => {
-                // Update header leaf_records
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                h.leaf_records += 1;
-                h.write(&mut self.catalog_data);
-                self.catalog_header.leaf_records = h.leaf_records;
-                Ok(())
-            }
-            Err(_) => {
-                // Leaf full — atomic split+insert. Byte-based split point
-                // tolerates uneven record sizes; avoids the
-                // split-then-insert failure mode where the target half
-                // can't accept the new record.
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                let splits = btree_split_leaf_with_insert(
-                    &mut self.catalog_data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    &cmp,
-                )?;
-
-                h.leaf_records += 1;
-
-                // Install the first separator into the existing parent (or
-                // grow the root). Any additional separators come from N-way
-                // splits and are routed through `btree_insert_into_index`
-                // against a freshly-resolved parent — once the tree depth
-                // grows past 1 the root-grow branch never re-fires.
-                let first = &splits[0];
-                if h.depth == 1 {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        first.0,
-                        &first.1,
-                    )?;
-                } else if let Some(&(_, parent_idx)) =
-                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        &mut self.catalog_data,
-                        node_size,
-                        parent_idx,
-                        first.0,
-                        &first.1,
-                        &mut h,
-                        &cmp,
-                        &parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        first.0,
-                        &first.1,
-                    )?;
-                }
-                for split in &splits[1..] {
-                    let header_now = BTreeHeader::read(&self.catalog_data);
-                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
-                        &self.catalog_data,
-                        &header_now,
-                        &split.1,
-                        &cmp,
-                    );
-                    let parent_for_sep = fresh_chain
-                        .last()
-                        .map(|&(_, p)| p)
-                        .unwrap_or(header_now.root_node);
-                    btree_insert_into_index(
-                        &mut self.catalog_data,
-                        node_size,
-                        parent_for_sep,
-                        split.0,
-                        &split.1,
-                        &mut h,
-                        &cmp,
-                        &fresh_chain,
-                    )?;
-                }
-
-                h.write(&mut self.catalog_data);
-                self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
-                Ok(())
-            }
-        }
+        hfs_common::btree_insert_full(
+            &mut self.catalog_data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
+        self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        Ok(())
     }
 
     /// Remove a catalog record by (node_idx, rec_idx).
@@ -2008,38 +1918,33 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
-    /// Insert a record into the extents-overflow B-tree leaf chain. Depth-1
-    /// only — splits and root growth are not yet wired up because the
-    /// existing HFS+ B-tree growth helpers normalize keys assuming the
-    /// 1-byte HFS-classic format. A full split path lands when modern HFS+
-    /// volumes need it (Phase 5+ work).
+    /// Insert a record into the extents-overflow B-tree, splitting the leaf and
+    /// growing the root when the target leaf is full — mirroring
+    /// `insert_catalog_record` / `insert_xattr_record`.
+    ///
+    /// The extents-overflow tree uses 2-byte ("big") keys with *fixed*-length
+    /// index separators (`kBTBigKeysMask` set, `kBTVariableIndexKeysMask` clear),
+    /// padded to the 10-byte `maxKeyLength`. `BTreeKeyFormat::HFSPLUS_EXTENTS`
+    /// drives that; before P1's key-format descriptor the shared growth helpers
+    /// forced the classic 1-byte/0x25 shape, which is why this path was pinned to
+    /// a single leaf level (docs/hfsplus_btree_growth_plan.md §4a/P3).
     fn insert_extents_overflow_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
         let data = self.extents_overflow_data.as_mut().ok_or_else(|| {
             FilesystemError::Unsupported(
                 "volume has no extents-overflow B-tree — fragmented files cannot be created".into(),
             )
         })?;
-        let header = BTreeHeader::read(data);
-        let node_size = header.node_size as usize;
-        if node_size == 0 {
+        if BTreeHeader::read(data).node_size == 0 {
             return Err(FilesystemError::InvalidData(
                 "extents-overflow B-tree has zero node_size".into(),
             ));
         }
-        let (leaf_idx, _chain) =
-            hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::extents_compare);
-        let offset = leaf_idx as usize * node_size;
-        let node = &mut data[offset..offset + node_size];
-        btree_insert_record(node, node_size, key_record, &Self::extents_compare).map_err(|e| {
-            FilesystemError::InvalidData(format!(
-                "extents-overflow leaf {leaf_idx} cannot fit new record: {e} \
-                 (split-on-overflow not yet implemented for HFS+ extents-overflow)"
-            ))
-        })?;
-        let mut h = BTreeHeader::read(data);
-        h.leaf_records += 1;
-        h.write(data);
-        Ok(())
+        hfs_common::btree_insert_full(
+            data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_EXTENTS,
+            &Self::extents_compare,
+        )
     }
 
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
@@ -2139,8 +2044,7 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     /// Caller is expected to have already NFD-normalized `name` if needed; we
     /// re-normalize defensively so on-disk keys stay canonical.
     pub(crate) fn build_inline_attr_record(cnid: u32, name: &str, value: &[u8]) -> Vec<u8> {
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let key_body_len = 12 + utf16.len() * 2;
         let data_section_len = 4 + 8 + 4 + value.len();
         let mut rec = vec![0u8; 2 + key_body_len + data_section_len];
@@ -2194,74 +2098,15 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 node_size,
             )));
         }
-        let (leaf_idx, parent_chain) =
-            hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::attr_compare);
-        let off = leaf_idx as usize * node_size;
-        let node = &mut data[off..off + node_size];
-        match btree_insert_record(node, node_size, key_record, &Self::attr_compare) {
-            Ok(_) => {
-                let mut h = BTreeHeader::read(data);
-                h.leaf_records += 1;
-                h.write(data);
-                Ok(())
-            }
-            Err(_) => {
-                let mut h = BTreeHeader::read(data);
-                let splits = btree_split_leaf_with_insert(
-                    data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    &Self::attr_compare,
-                )?;
-                h.leaf_records += 1;
-                let first = &splits[0];
-                if h.depth == 1 {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
-                } else if let Some(&(_, parent_idx)) =
-                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_idx,
-                        first.0,
-                        &first.1,
-                        &mut h,
-                        &Self::attr_compare,
-                        &parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1)?;
-                }
-                for split in &splits[1..] {
-                    let header_now = BTreeHeader::read(data);
-                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
-                        data,
-                        &header_now,
-                        &split.1,
-                        &Self::attr_compare,
-                    );
-                    let parent_for_sep = fresh_chain
-                        .last()
-                        .map(|&(_, p)| p)
-                        .unwrap_or(header_now.root_node);
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_for_sep,
-                        split.0,
-                        &split.1,
-                        &mut h,
-                        &Self::attr_compare,
-                        &fresh_chain,
-                    )?;
-                }
-                h.write(data);
-                Ok(())
-            }
-        }
+        // The attributes B-tree, like the catalog, uses 2-byte big keys and
+        // variable-length index separators, so it threads HFSPLUS_ATTRIBUTES
+        // through the shared insert (which also rotates before splitting).
+        hfs_common::btree_insert_full(
+            data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+            &Self::attr_compare,
+        )
     }
 
     /// Remove every attribute record matching `(cnid, name)`. Returns the
@@ -2287,10 +2132,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         if node_size == 0 {
             return Ok(0);
         }
-        let target_utf16: Option<Vec<u16>> = name.map(|n| {
-            let nfd: String = n.nfd().collect();
-            nfd.encode_utf16().collect()
-        });
+        let target_utf16: Option<Vec<u16>> = name.map(super::hfs_unicode::decompose_str);
 
         let mut victims: Vec<(u32, usize)> = Vec::new();
         hfs_common::walk_leaf_records::<(), _>(
@@ -2704,8 +2546,7 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
         // Let me re-read: Thread key: key_len(2) + parent_id(4, =CNID) + name_len(2, =0)
 
         // Record data: type(2) + reserved(2) + parentID(4) + name_len(2) + name(UTF-16BE)
-        let nfd: String = name.nfd().collect();
-        let utf16: Vec<u16> = nfd.encode_utf16().collect();
+        let utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
         let mut rec = Vec::with_capacity(10 + utf16.len() * 2);
         let mut buf2 = [0u8; 2];
         let mut buf4 = [0u8; 4];
@@ -5159,8 +5000,41 @@ pub fn create_blank_hfsplus(
     name: &str,
     case_sensitive: bool,
 ) -> Vec<u8> {
-    let (front, vh_bytes, image_size) =
-        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+    create_blank_hfsplus_sized(size_bytes, block_size, name, case_sensitive, 0, 0)
+}
+
+/// Volume-scaled default catalog B-tree size, in bytes, for a fresh HFS+
+/// volume. Mirrors classic HFS's `default_btree_sizes`: ~0.5% of the volume so
+/// a blank holds thousands of records before exhausting its node budget (HFS+
+/// has no grow-on-full path — docs/hfsplus_btree_growth_plan.md §4c). The
+/// `build_blank_hfsplus_front` caller clamps the result to whole nodes in
+/// `[4, header-bitmap capacity]`.
+pub fn default_hfsplus_catalog_bytes(volume_bytes: u64) -> u64 {
+    volume_bytes / 200
+}
+
+/// Variant of [`create_blank_hfsplus`] that lets the caller request minimum
+/// catalog and extents-overflow B-tree sizes (in bytes) — e.g. a clone target
+/// that must hold every record from a fragmented source, or a test that needs a
+/// deep catalog without a multi-GiB volume. Each minimum is rounded up to whole
+/// nodes and raised to the 4-node floor; the catalog also never drops below the
+/// volume-scaled [`default_hfsplus_catalog_bytes`].
+pub fn create_blank_hfsplus_sized(
+    size_bytes: u64,
+    block_size: u32,
+    name: &str,
+    case_sensitive: bool,
+    min_catalog_bytes: u32,
+    min_extents_bytes: u32,
+) -> Vec<u8> {
+    let (front, vh_bytes, image_size) = build_blank_hfsplus_front(
+        size_bytes,
+        block_size,
+        name,
+        case_sensitive,
+        min_catalog_bytes,
+        min_extents_bytes,
+    );
     let mut img = vec![0u8; image_size];
     img[..front.len()].copy_from_slice(&front);
     let alt = image_size - 1024;
@@ -5177,6 +5051,8 @@ fn build_blank_hfsplus_front(
     block_size: u32,
     name: &str,
     case_sensitive: bool,
+    min_catalog_bytes: u32,
+    min_extents_bytes: u32,
 ) -> (Vec<u8>, [u8; 512], usize) {
     assert!(
         block_size.is_power_of_two() && (512..=4096).contains(&block_size),
@@ -5193,16 +5069,42 @@ fn build_blank_hfsplus_front(
     let blocks_per_node: u32 = (block_size / node_size as u32).max(1);
     let _ = nodes_per_block;
 
-    let btree_node_count: u32 = 4;
-    let btree_blocks: u32 = btree_node_count * blocks_per_node;
+    // Size the catalog B-tree from the volume (docs/hfsplus_btree_growth_plan.md
+    // §4c): HFS+ has no grow-on-full path, so a blank that reserved only the
+    // legacy 4 nodes exhausted after ~24 files. Scale it to ~0.5% of the volume
+    // (mirroring classic HFS's `default_btree_sizes`) so a fresh volume holds
+    // thousands of records, honouring an explicit `min_catalog_bytes` floor from
+    // sized/clone callers. The extents-overflow tree keeps the 4-node default
+    // unless a caller asks for more (its own scaling is P3 work).
+    //
+    // `to_nodes` rounds a byte budget up to whole nodes and clamps to
+    // [4, header-bitmap capacity]. The blank's node-allocation bitmap lives
+    // entirely in the header node's record 2 (bytes 270..node_size-8 — see
+    // `write_blank_btree_header_node`), which addresses `(node_size - 278) * 8`
+    // nodes without dedicated map nodes; cap there. Volumes whose 0.5% catalog
+    // would exceed this (~117 MiB at 4096, i.e. hundreds of GiB of volume) are
+    // far larger than this tool targets, and the defrag/clone path — which does
+    // build map nodes — covers them.
+    let max_btree_nodes: u32 = ((node_size - 278) * 8) as u32;
+    let to_nodes = |bytes: u64| -> u32 {
+        bytes
+            .div_ceil(node_size as u64)
+            .clamp(4, max_btree_nodes as u64) as u32
+    };
+    let catalog_node_count =
+        to_nodes(default_hfsplus_catalog_bytes(size_bytes).max(min_catalog_bytes as u64));
+    let extents_node_count = to_nodes(min_extents_bytes as u64);
+
+    let catalog_btree_blocks: u32 = catalog_node_count * blocks_per_node;
+    let extents_btree_blocks: u32 = extents_node_count * blocks_per_node;
 
     let bitmap_bytes = total_blocks.div_ceil(8) as u64;
     let bitmap_blocks = bitmap_bytes.div_ceil(bs) as u32;
 
     let bitmap_start: u32 = 1;
     let extents_start: u32 = bitmap_start + bitmap_blocks;
-    let catalog_start: u32 = extents_start + btree_blocks;
-    let reserved_blocks: u32 = catalog_start + btree_blocks;
+    let catalog_start: u32 = extents_start + extents_btree_blocks;
+    let reserved_blocks: u32 = catalog_start + catalog_btree_blocks;
     assert!(
         reserved_blocks + 1 < total_blocks,
         "image too small for reserved region: need {} blocks, have {total_blocks}",
@@ -5236,8 +5138,8 @@ fn build_blank_hfsplus_front(
             &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 0,
-            /* total_nodes= */ btree_node_count,
-            /* free_nodes= */ btree_node_count - 2, // header + empty leaf used
+            /* total_nodes= */ extents_node_count,
+            /* free_nodes= */ extents_node_count - 2, // header + empty leaf used
             /* max_key_len= */ 10,
             /* key_compare_type= */ 0, // unused for extents
         );
@@ -5246,8 +5148,7 @@ fn build_blank_hfsplus_front(
     }
 
     // --- Catalog B-tree (header + leaf with root + thread) ---
-    let nfd_name: String = name.nfd().collect();
-    let name_utf16: Vec<u16> = nfd_name.encode_utf16().collect();
+    let name_utf16: Vec<u16> = super::hfs_unicode::decompose_str(name);
     {
         let off = catalog_start as usize * block_size as usize;
         let key_compare = if case_sensitive {
@@ -5259,8 +5160,8 @@ fn build_blank_hfsplus_front(
             &mut front[off..off + node_size],
             node_size,
             /* leaf_records= */ 2,
-            btree_node_count,
-            btree_node_count - 2,
+            catalog_node_count,
+            catalog_node_count - 2,
             /* max_key_len= */ 516, // HFS+ catalog max key
             key_compare,
         );
@@ -5309,16 +5210,16 @@ fn build_blank_hfsplus_front(
             extents: extent_array(bitmap_start, bitmap_blocks),
         },
         extents_file: ForkData {
-            logical_size: btree_blocks as u64 * bs,
+            logical_size: extents_btree_blocks as u64 * bs,
             clump_size: 0,
-            total_blocks: btree_blocks,
-            extents: extent_array(extents_start, btree_blocks),
+            total_blocks: extents_btree_blocks,
+            extents: extent_array(extents_start, extents_btree_blocks),
         },
         catalog_file: ForkData {
-            logical_size: btree_blocks as u64 * bs,
+            logical_size: catalog_btree_blocks as u64 * bs,
             clump_size: 0,
-            total_blocks: btree_blocks,
-            extents: extent_array(catalog_start, btree_blocks),
+            total_blocks: catalog_btree_blocks,
+            extents: extent_array(catalog_start, catalog_btree_blocks),
         },
         attributes_file: ForkData::empty(),
         startup_file: ForkData::empty(),
@@ -5348,7 +5249,7 @@ pub fn write_blank_hfsplus_into<W: Write + Seek>(
     case_sensitive: bool,
 ) -> std::io::Result<()> {
     let (front, vh_bytes, _image_size) =
-        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive);
+        build_blank_hfsplus_front(size_bytes, block_size, name, case_sensitive, 0, 0);
     target.seek(SeekFrom::Start(0))?;
     target.write_all(&front)?;
     target.seek(SeekFrom::Start(size_bytes - 1024))?;
@@ -6448,10 +6349,12 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
         assert!(entries.is_empty(), "freshly built blank must list empty");
 
-        // 32 MiB / 4096 = 8192 blocks; reserved = 1 (VH) + 1 (bitmap) + 4
-        // (extents) + 4 (catalog) = 10. Free = 8182.
+        // 32 MiB / 4096 = 8192 blocks. The catalog is now volume-scaled
+        // (~0.5%, docs/hfsplus_btree_growth_plan.md §4c): 32 MiB / 200 =
+        // 167,772 bytes -> 41 nodes @ 4096. Reserved = 1 (boot/VH) + 1 (bitmap)
+        // + 4 (extents, default) + 41 (catalog) = 47. Free = 8145.
         assert_eq!(fs.vh.total_blocks, 8192);
-        assert_eq!(fs.vh.free_blocks, 8192 - 10);
+        assert_eq!(fs.vh.free_blocks, 8192 - 47);
         // Edit-mode prep should succeed (unmounted bit set, no journal).
         fs.prepare_for_edit().expect("blank must accept edit prep");
     }
@@ -7989,5 +7892,524 @@ mod tests {
         // "txt" extension should auto-detect to TEXT/ttxt
         assert!(fe.type_code.is_some());
         assert_eq!(fe.type_code, Some(*b"TEXT"));
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_variable_index_keys_grow_multilevel() {
+        // P1 (docs/hfsplus_btree_growth_plan.md §4a): the HFS+ catalog B-tree
+        // must grow past a single index level without corrupting. The shared
+        // split/grow helpers used to force the classic 1-byte-length, fixed-0x25
+        // index-key shape onto HFS+ records, so the first leaf split produced a
+        // malformed separator (it read the high byte of the 2-byte key length as
+        // the whole length) and descent misrouted — the "leaves must be strictly
+        // ascending" / mis-routed-descent corruption. With
+        // `BTreeKeyFormat::HFSPLUS_CATALOG` the separator is the child's
+        // variable-length 2-byte key, verbatim.
+        //
+        // Driven at the catalog-buffer level through the exact shared
+        // `btree_insert_full` path `insert_catalog_record` uses. node_size is
+        // 512 (vs the production 4096) so a few thousand multi-parent records
+        // reach depth >= 3 in a < 1 MiB buffer; the machinery is node-size
+        // agnostic. The volume-level fsck gate lands in P2 once blank catalogs
+        // are sized to hold the records (today a blank catalog is only 4 nodes).
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        // A single-node bitmap (512-byte node) covers ~1872 nodes, so stay under
+        // that — no map nodes needed, matching a real blank-built tree.
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            /* leaf_records= */ 0,
+            total_nodes,
+            /* free_nodes= */ total_nodes - 2,
+            /* max_key_len= */ 516,
+            KEY_COMPARE_CASE_FOLDING,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+
+        // ~2500 files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32 — unique names that land mid-leaf, not appended) sprayed
+        // across 50 parent directories, so inserts exercise every leaf and
+        // index split, not just tail appends.
+        const DIRS: u32 = 50;
+        const N: u32 = 2500;
+        let mut inserted: Vec<(u32, String)> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = 16 + (hash % DIRS); // arbitrary distinct parent CNIDs
+            let name = format!("f{hash:08x}");
+            let mut rec = Fs::build_catalog_key(parent, &name);
+            // Append filler so records have a realistic size (the compare only
+            // reads the leading key portion; the body is irrelevant here).
+            rec.extend_from_slice(&[0u8; 40]);
+            btree_insert_full(&mut buf, &rec, &kf, &cmp)
+                .unwrap_or_else(|e| panic!("insert #{i} (parent {parent}, {name}): {e}"));
+            inserted.push((parent, name));
+        }
+
+        // The tree must have grown past a single index level.
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 3,
+            "catalog did not reach depth >= 3 (got {}); test needs a deeper tree to \
+             exercise index-node splits",
+            header.depth
+        );
+        assert_eq!(
+            header.leaf_records, N,
+            "leaf_records header count drifted from inserts"
+        );
+
+        // (a) Every leaf key, walked in sibling-chain order, is strictly
+        // ascending — the direct symptom of a malformed separator was
+        // out-of-order leaves.
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, rec| {
+                let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+                keys.push(rec[..(2 + kl).min(rec.len())].to_vec());
+                None
+            },
+        );
+        assert_eq!(
+            keys.len(),
+            N as usize,
+            "leaf walk recovered {} of {N} records — chain is broken or has cycles",
+            keys.len()
+        );
+        for w in keys.windows(2) {
+            assert_eq!(
+                cmp(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "catalog leaves are not strictly ascending — separator/descent corruption"
+            );
+        }
+
+        // (b) Every inserted record is findable by a root-to-leaf descent, i.e.
+        // every index separator routes correctly at every level. (A nested `fn`
+        // rather than a closure so it satisfies the `for<'a> Fn(&'a [u8]) ->
+        // &'a [u8]` bound `btree_find_record` requires.)
+        fn key_extract(rec: &[u8]) -> &[u8] {
+            let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+            &rec[..(2 + kl).min(rec.len())]
+        }
+        for (parent, name) in &inserted {
+            let search = Fs::build_catalog_key(*parent, name);
+            let (found, _chain) = btree_find_record(&buf, &header, &search, &key_extract, &cmp);
+            assert!(
+                found.is_some(),
+                "record (parent {parent}, {name}) not findable by descent — misrouted index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hfsplus_blank_sized_catalog_20k_inserts_fsck_clean() {
+        // P2 (docs/hfsplus_btree_growth_plan.md §4c): a fresh HFS+ volume sized
+        // to hold the records accepts >= 20k incremental catalog inserts across
+        // many parent dirs and stays fsck-clean — the volume-level gate P1
+        // deferred. A blank catalog used to be a fixed 4 nodes (exhausting after
+        // ~24 files); it is now volume-scaled, and `create_blank_hfsplus_sized`
+        // lets this test pin a large catalog into a modest 64 MiB image instead
+        // of needing a multi-GiB volume to scale into.
+        use super::hfs_common::BTreeHeader;
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        // 64 MiB volume; catalog pinned to 16 MiB (~4096 nodes @ 4096) — ample
+        // headroom for 20k file records at the byte-split's ~69% leaf occupancy.
+        let img =
+            create_blank_hfsplus_sized(64 * 1024 * 1024, 4096, "PutShuffle", false, 16 << 20, 0);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Real directories so threads / valence / folder_count stay fsck-correct.
+        const DIRS: u32 = 50;
+        let root = fs.root().unwrap();
+        let mut dir_ids = Vec::with_capacity(DIRS as usize);
+        for d in 0..DIRS {
+            let de = fs
+                .create_directory(&root, &format!("dir{d:03}"), &Default::default())
+                .unwrap();
+            dir_ids.push(de.location as u32);
+        }
+        let base_cnid = fs.vh.next_catalog_id;
+
+        // 20k files in shuffled key order (multiplicative hash is a bijection
+        // mod 2^32 — unique names landing mid-leaf, not appended), sprayed across
+        // the directories. Insert the catalog records directly: `create_file`
+        // snapshots the whole catalog per call for rollback, which would make a
+        // 20k-record build O(N * catalog_size). fsck doesn't require per-file
+        // thread records (only flags orphaned threads), so — like the classic
+        // HFS scaling test — we insert just the file records and fix up counts.
+        let n: u32 = 20_000;
+        let mut per_dir = vec![0i32; DIRS as usize];
+        let empty_fork = ForkData::empty();
+        for i in 0..n {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let d = (hash % DIRS) as usize;
+            let name = format!("f{hash:08x}");
+            let mut kr = Fs::build_catalog_key(dir_ids[d], &name);
+            if !kr.len().is_multiple_of(2) {
+                kr.push(0);
+            }
+            kr.extend_from_slice(&Fs::build_file_record(
+                base_cnid + i,
+                &empty_fork,
+                &empty_fork,
+                &[0u8; 4],
+                &[0u8; 4],
+            ));
+            fs.insert_catalog_record(&kr)
+                .unwrap_or_else(|e| panic!("insert #{i} into dir{d}: {e}"));
+            per_dir[d] += 1;
+        }
+        // Mirror the bookkeeping the create path maintains so fsck's cross-checks
+        // (file_count, next_catalog_id, per-dir valence) pass.
+        fs.vh.file_count += n;
+        fs.vh.next_catalog_id = base_cnid + n;
+        for (d, &cnt) in per_dir.iter().enumerate() {
+            fs.update_parent_valence(dir_ids[d], cnt).unwrap();
+        }
+
+        // The catalog must have grown several index levels...
+        let h = BTreeHeader::read(fs.catalog_data());
+        assert!(
+            h.depth >= 3,
+            "catalog depth {} < 3 after 20k inserts",
+            h.depth
+        );
+        // ...without a premature DiskFull (every insert above succeeded).
+
+        // No IndexSiblingLinkBroken / order / count damage at scale.
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "fsck found {} errors after 20k inserts: {:?}",
+            result.errors.len(),
+            result
+                .errors
+                .iter()
+                .take(8)
+                .map(|e| &e.message)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_hfsplus_extents_overflow_grows_multilevel() {
+        // P3 (docs/hfsplus_btree_growth_plan.md): the extents-overflow B-tree —
+        // 2-byte ("big") keys with *fixed* 10-byte index separators — must split
+        // past a single leaf level. It was pinned depth-1 because the shared
+        // helpers forced the classic key shape; it now threads
+        // `BTreeKeyFormat::HFSPLUS_EXTENTS`. Driven through the same
+        // `btree_insert_full` machinery `insert_extents_overflow_record` uses.
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            /* max_key_len= */ 10,
+            /* key_compare_type= */ 0,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_EXTENTS;
+        // 600 overflow records keyed by distinct shuffled fileIDs (the multiplier
+        // is odd, so it's a bijection mod 2^32 — distinct i give distinct keys
+        // that land mid-leaf, not appended).
+        const N: u32 = 600;
+        let mut ids: Vec<u32> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let file_id = i.wrapping_mul(2_654_435_761);
+            let rec = Fs::build_extents_overflow_record(file_id, 0, 8, &[]);
+            btree_insert_full(&mut buf, &rec, &kf, &Fs::extents_compare)
+                .unwrap_or_else(|e| panic!("extents insert #{i} (file {file_id}): {e}"));
+            ids.push(file_id);
+        }
+
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 2,
+            "extents-overflow tree stayed depth {} — split past a leaf level failed",
+            header.depth
+        );
+        assert_eq!(header.leaf_records, N);
+
+        let mut recs: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, r| {
+                recs.push(r.to_vec());
+                None
+            },
+        );
+        assert_eq!(recs.len(), N as usize, "leaf walk lost records");
+        for w in recs.windows(2) {
+            assert_eq!(
+                Fs::extents_compare(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "extents-overflow leaves out of order — bad separator"
+            );
+        }
+
+        // The extents key portion is always the fixed 12 bytes (2-byte len + 10).
+        fn ext_key(rec: &[u8]) -> &[u8] {
+            &rec[..12.min(rec.len())]
+        }
+        let ext_cmp = |a: &[u8], b: &[u8]| Fs::extents_compare(a, b);
+        for &file_id in &ids {
+            let search = Fs::build_extents_overflow_record(file_id, 0, 8, &[]);
+            let (found, _) = btree_find_record(&buf, &header, &search, &ext_key, &ext_cmp);
+            assert!(
+                found.is_some(),
+                "extents record for file {file_id} not findable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hfsplus_attributes_grows_multilevel() {
+        // P3: the attributes B-tree — 2-byte keys with *variable*-length index
+        // separators — splits past one leaf level via
+        // `BTreeKeyFormat::HFSPLUS_ATTRIBUTES`, the same path `insert_xattr_record`
+        // uses. (P1 wired the descriptor in; this proves the attribute key layout,
+        // distinct from the catalog's, routes correctly at every level.)
+        use super::hfs_common::{
+            btree_find_record, btree_insert_full, BTreeHeader, BTreeKeyFormat,
+        };
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            /* max_key_len= */ 264,
+            /* key_compare_type= */ 0,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
+        const N: u32 = 600;
+        let value = [0xABu8; 8];
+        let mut cnids: Vec<u32> = Vec::with_capacity(N as usize);
+        for i in 0..N {
+            let cnid = i.wrapping_mul(2_654_435_761);
+            let rec = Fs::build_inline_attr_record(cnid, "xattr", &value);
+            btree_insert_full(&mut buf, &rec, &kf, &Fs::attr_compare)
+                .unwrap_or_else(|e| panic!("attr insert #{i} (cnid {cnid}): {e}"));
+            cnids.push(cnid);
+        }
+
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 2,
+            "attributes tree stayed depth {} — split past a leaf level failed",
+            header.depth
+        );
+        assert_eq!(header.leaf_records, N);
+
+        let mut recs: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
+        super::hfs_common::walk_leaf_records::<(), _>(
+            &buf,
+            header.first_leaf_node,
+            node_size,
+            |_n, _r, _o, r| {
+                recs.push(r.to_vec());
+                None
+            },
+        );
+        assert_eq!(recs.len(), N as usize, "leaf walk lost records");
+        for w in recs.windows(2) {
+            assert_eq!(
+                Fs::attr_compare(&w[0], &w[1]),
+                std::cmp::Ordering::Less,
+                "attributes leaves out of order — bad separator"
+            );
+        }
+
+        fn attr_key(rec: &[u8]) -> &[u8] {
+            let kl = BigEndian::read_u16(&rec[0..2]) as usize;
+            &rec[..(2 + kl).min(rec.len())]
+        }
+        let attr_cmp = |a: &[u8], b: &[u8]| Fs::attr_compare(a, b);
+        for &cnid in &cnids {
+            let search = Fs::build_inline_attr_record(cnid, "xattr", &value);
+            let (found, _) = btree_find_record(&buf, &header, &search, &attr_key, &attr_cmp);
+            assert!(found.is_some(), "attr record for cnid {cnid} not findable");
+        }
+    }
+
+    #[test]
+    fn test_hfsplus_fragmented_file_splits_extents_overflow_btree_real_path() {
+        // P3 real-path integration: a heavily fragmented file produces enough
+        // extents-overflow records to split that B-tree past a single leaf level
+        // through the real `insert_extents_overflow_record`, and the file reads
+        // back byte-for-byte through the resulting multi-level tree. (Read-back,
+        // not fsck, because the all-used-then-free-singletons bitmap trick used to
+        // force fragmentation leaves the bitmap deliberately over-allocated; the
+        // point here is the overflow B-tree's split + read path, which P3 enabled.)
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+        // Extents-overflow tree pinned to 256 KiB (64 nodes @ 4096) so it has room
+        // to split — the 4-node default could not.
+        let img = create_blank_hfsplus_sized(32 << 20, 4096, "Frag", false, 0, 256 << 10);
+        let mut fs = Fs::open(std::io::Cursor::new(img), 0).unwrap();
+        fs.prepare_for_edit().unwrap();
+
+        // Force maximal fragmentation: mark every block used, then free isolated
+        // single blocks (every other block) in the user region. A file of N blocks
+        // must then use N one-block extents: 8 inline + (N-8) overflow extents =
+        // ceil((N-8)/8) overflow records. 520 blocks -> 64 overflow records, well
+        // past one 4096-byte extents leaf (~52 records), so the tree must split.
+        fs.ensure_bitmap().unwrap();
+        let block_size = fs.vh.block_size as usize;
+        let n_blocks: u32 = 520;
+        let first_free = fs.vh.next_allocation;
+        {
+            let bitmap = fs.bitmap.as_mut().unwrap();
+            for b in bitmap.iter_mut() {
+                *b = 0xFF;
+            }
+            let mut blk = first_free + 1;
+            for _ in 0..n_blocks {
+                bitmap_clear_bit_be(bitmap, blk);
+                blk += 2; // a used block between each free one -> singletons
+            }
+        }
+        fs.vh.free_blocks = n_blocks;
+
+        let payload: Vec<u8> = (0..(n_blocks as usize * block_size))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut reader = std::io::Cursor::new(payload.clone());
+        let root = fs.root().unwrap();
+        let entry = fs
+            .create_file(
+                &root,
+                "frag.bin",
+                &mut reader,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("fragmented file create should succeed via a splitting overflow B-tree");
+
+        // The extents-overflow tree must have grown past a single leaf level.
+        let depth =
+            super::hfs_common::BTreeHeader::read(fs.extents_overflow_data.as_ref().unwrap()).depth;
+        assert!(
+            depth >= 2,
+            "extents-overflow tree depth {depth} < 2 — 64 overflow records did not split it"
+        );
+
+        // The data fork is the expected single-block-extent shape...
+        let cnid = entry.location as u32;
+        let (data_fork, _rsrc) = fs.find_file_by_id(cnid).unwrap();
+        assert_eq!(data_fork.total_blocks, n_blocks);
+
+        // ...and reads back byte-for-byte through the multi-level overflow tree.
+        let got = fs.read_file(&entry, payload.len() + 1).unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(
+            got, payload,
+            "fragmented read-back mismatch through split overflow tree"
+        );
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_shuffled_inserts_pack_densely() {
+        // P5 (docs/hfsplus_btree_growth_plan.md §4d): with the B*-style rotation
+        // now on the HFS+ catalog insert path (insert_catalog_record ->
+        // btree_insert_full), shuffled multi-dir inserts must pack leaves to
+        // ~80%+ occupancy, matching the classic-HFS result — not the ~69% a plain
+        // split leaves. Measured through the same btree_insert_full the live path
+        // uses, with the HFSPLUS_CATALOG (variable-key) format.
+        use super::hfs_common::{btree_insert_full, BTreeHeader, BTreeKeyFormat};
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            516,
+            KEY_COMPARE_CASE_FOLDING,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        const DIRS: u32 = 40;
+        const N: u32 = 3000;
+        for i in 0..N {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = 16 + (hash % DIRS);
+            let name = format!("f{hash:08x}");
+            let mut rec = Fs::build_catalog_key(parent, &name);
+            rec.extend_from_slice(&[0u8; 40]);
+            btree_insert_full(&mut buf, &rec, &kf, &cmp)
+                .unwrap_or_else(|e| panic!("insert #{i}: {e}"));
+        }
+
+        // Average leaf occupancy across the whole leaf chain.
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 3,
+            "need a multi-level tree to judge packing"
+        );
+        let mut used_total = 0usize;
+        let mut leaves = 0usize;
+        let mut node = header.first_leaf_node;
+        let mut seen = std::collections::HashSet::new();
+        while node != 0 && seen.insert(node) {
+            let off = node as usize * node_size;
+            let num = BigEndian::read_u16(&buf[off + 10..off + 12]) as usize;
+            // Records occupy 14..free_off; the offset table holds num+1 u16s.
+            let free_off_pos = off + node_size - 2 * (num + 1);
+            let free_off = BigEndian::read_u16(&buf[free_off_pos..free_off_pos + 2]) as usize;
+            used_total += free_off + 2 * (num + 1);
+            leaves += 1;
+            node = BigEndian::read_u32(&buf[off..off + 4]); // forward link
+        }
+        // ~0.84 with the rotation (was ~0.69 with plain split), matching classic.
+        let occupancy = used_total as f64 / (leaves * node_size) as f64;
+        assert!(
+            occupancy >= 0.80,
+            "shuffled multi-dir leaf occupancy {occupancy:.3} (<0.80) over {leaves} leaves — \
+             the rotation is not packing densely"
+        );
     }
 }

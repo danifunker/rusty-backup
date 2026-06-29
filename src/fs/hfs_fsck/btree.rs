@@ -1151,13 +1151,20 @@ pub(crate) fn rebuild_index_nodes(
     use super::super::hfs_common::{btree_alloc_node, btree_free_node, init_node};
 
     let header = BTreeHeader::read(catalog_data);
-    let (_bmp_off, bmp_size) = btree_node_bitmap_range(catalog_data, node_size);
     let max_nodes = catalog_data.len() / node_size;
 
-    // Free all existing index nodes
+    // Free all existing index nodes across the whole node range — not just the
+    // header node's bitmap window. Once a tree grows past the header bitmap's
+    // capacity ((node_size - 256) * 8 = 2048 nodes at node_size=512), its index
+    // nodes live in map-node-covered bitmap segments too. Capping this loop at
+    // the header bitmap (the old behaviour) left those index nodes allocated
+    // forever: every rebuild leaked them, draining free_nodes until a rebuild
+    // ran out of nodes mid-flight and left the index with broken sibling links
+    // ("no free B-tree nodes" / IndexSiblingLinkBroken past ~7.4k records).
+    // `btree_bitmap_test` / `btree_free_node` are segment-aware and walk the
+    // map-node chain transparently; bits with no backing segment read as free.
     let mut freed = 0u32;
-    let bmp_max_bit = (bmp_size as u32) * 8;
-    for node_idx in 1..(max_nodes as u32).min(bmp_max_bit) {
+    for node_idx in 1..max_nodes as u32 {
         if !btree_bitmap_test(catalog_data, node_size, node_idx) {
             continue;
         }

@@ -4,6 +4,10 @@
 pub mod browse_view;
 pub mod convert;
 pub mod rip;
+pub mod source;
 
 pub use convert::ConvertProgress;
-pub use rip::{run_rip, RipConfig, RipFormat, RipProgress};
+pub use rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress};
+#[cfg(feature = "remote")]
+pub use source::RemoteCdReader;
+pub use source::{LocalCdReader, OpticalSource};

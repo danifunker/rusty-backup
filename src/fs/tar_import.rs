@@ -13,7 +13,7 @@
 //! `EditableFilesystem` mutation, callers MUST call `sync_metadata()` (and,
 //! for a container, `commit`) after import returns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path};
@@ -158,7 +158,27 @@ pub fn import_tar_from_path(
 }
 
 /// Import an (already-decompressed, or plain) tar stream into `dest`.
+///
+/// Brackets the work in [`EditableFilesystem::begin_bulk`] /
+/// [`end_bulk`](EditableFilesystem::end_bulk). The importer aborts on the first
+/// hard error (every create is `?`-propagated) and callers discard the volume
+/// on `Err`, so per-operation rollback is redundant here; bulk mode lets HFS
+/// skip cloning its whole catalog on every entry. `end_bulk` runs even on
+/// error so the filesystem is never left stuck in bulk mode.
 pub fn import_tar<R: Read>(
+    efs: &mut dyn EditableFilesystem,
+    dest: &FileEntry,
+    archive: R,
+    opts: &TarImportOptions,
+    progress: &dyn Fn(&TarImportStats),
+) -> Result<TarImportStats> {
+    efs.begin_bulk();
+    let result = import_tar_inner(efs, dest, archive, opts, progress);
+    efs.end_bulk();
+    result
+}
+
+fn import_tar_inner<R: Read>(
     efs: &mut dyn EditableFilesystem,
     dest: &FileEntry,
     archive: R,
@@ -170,6 +190,11 @@ pub fn import_tar<R: Read>(
     // archive-relative dir path -> the image FileEntry for that dir.
     let mut dir_cache: HashMap<String, FileEntry> = HashMap::new();
     dir_cache.insert(String::new(), dest.clone());
+    // image dir path -> set of child names known to exist, so the per-entry
+    // conflict check is O(1) instead of listing the (growing) directory every
+    // time — otherwise a large single-directory import is O(n^2). Seeded lazily
+    // from the on-disk listing the first time we touch a directory.
+    let mut dir_children: HashMap<String, HashSet<String>> = HashMap::new();
 
     for entry in ar.entries().context("reading tar entries")? {
         let mut entry = entry.context("reading tar entry")?;
@@ -208,8 +233,20 @@ pub fn import_tar<R: Read>(
         let name = &leaf[0];
         let parent = ensure_dir(efs, &mut dir_cache, parent_comps, &mut stats)?;
 
-        // Conflict handling.
-        if let Some(existing) = find_child(efs, &parent, name)? {
+        // Conflict handling. Seed this directory's existing-names set once
+        // (from the on-disk listing — empty for a directory we just created),
+        // then consult/update it per entry so the check is O(1).
+        let parent_key = parent.path.clone();
+        if !dir_children.contains_key(&parent_key) {
+            let existing: HashSet<String> = efs
+                .list_directory(&parent)
+                .map_err(|e| anyhow!("list_directory {}: {e}", parent.path))?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            dir_children.insert(parent_key.clone(), existing);
+        }
+        if dir_children[&parent_key].contains(name) {
             match opts.conflict {
                 ImportConflict::Error => bail!(
                     "{} already exists in the image (pass --force or --skip-existing)",
@@ -221,8 +258,14 @@ pub fn import_tar<R: Read>(
                     continue;
                 }
                 ImportConflict::Overwrite => {
-                    efs.delete_entry(&parent, &existing)
-                        .map_err(|e| anyhow!("overwrite delete {}: {e}", raw_path.display()))?;
+                    if let Some(existing) = find_child(efs, &parent, name)? {
+                        efs.delete_entry(&parent, &existing)
+                            .map_err(|e| anyhow!("overwrite delete {}: {e}", raw_path.display()))?;
+                    }
+                    dir_children
+                        .get_mut(&parent_key)
+                        .expect("seeded above")
+                        .remove(name);
                     stats.overwritten += 1;
                 }
             }
@@ -236,7 +279,13 @@ pub fn import_tar<R: Read>(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             match efs.create_symlink(&parent, name, &target, &Default::default()) {
-                Ok(_) => stats.symlinks += 1,
+                Ok(_) => {
+                    stats.symlinks += 1;
+                    dir_children
+                        .get_mut(&parent_key)
+                        .expect("seeded above")
+                        .insert(name.clone());
+                }
                 Err(ref e) if is_unsupported(e) => stats.symlinks_skipped += 1,
                 Err(e) => return Err(anyhow!("create_symlink {}: {e}", raw_path.display())),
             }
@@ -249,6 +298,10 @@ pub fn import_tar<R: Read>(
             let new_entry = efs
                 .create_file(&parent, name, &mut entry, size, &Default::default())
                 .map_err(|e| anyhow!("create_file {}: {e}", raw_path.display()))?;
+            dir_children
+                .get_mut(&parent_key)
+                .expect("seeded above")
+                .insert(name.clone());
             stats.files += 1;
             stats.total_bytes += size;
             if opts.apply_permissions {

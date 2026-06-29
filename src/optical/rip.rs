@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use cd_da_reader::{CdReader, RetryConfig, SectorReadMode};
+use cd_da_reader::SectorReadMode;
 
 use crate::backup::{LogLevel, LogMessage};
+use crate::optical::source::{LocalCdReader, OpticalSource};
 
 /// Output format for disc ripping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,11 +19,71 @@ pub enum RipFormat {
     BinCue,
 }
 
+/// Where a rip reads its sectors from.
+///
+/// `Local` is a physically-attached drive; `Remote` is a drive on another
+/// machine's `rb-cli serve` daemon, reached over an open connection — the daemon
+/// issues the SCSI reads and this side does all the encoding. See
+/// `docs/remote_ripping.md`.
+#[derive(Clone)]
+pub enum OpticalTarget {
+    /// A locally-attached drive by device path (e.g. `/dev/sr0`, `\\.\E:`).
+    Local(String),
+    /// A drive on a remote daemon, by its device path on that machine.
+    #[cfg(feature = "remote")]
+    Remote {
+        conn: Arc<Mutex<crate::remote::connection::RemoteConnection>>,
+        device_path: String,
+    },
+}
+
+impl OpticalTarget {
+    /// Resolve a `--device` argument string: an `rb://host:port/dev/sr0` URL
+    /// opens a remote connection; anything else is a local device path.
+    pub fn resolve(device: &str) -> Result<Self> {
+        #[cfg(feature = "remote")]
+        if let Some(rref) = crate::remote::protocol::RemoteRef::parse(device) {
+            let conn = crate::remote::connection::RemoteConnection::connect_shared(&rref.addr())
+                .with_context(|| format!("connecting to {}", rref.addr()))?;
+            return Ok(OpticalTarget::Remote {
+                conn,
+                device_path: rref.path,
+            });
+        }
+        #[cfg(not(feature = "remote"))]
+        if device.starts_with("rb://") || device.starts_with("rb:/") {
+            bail!("remote ripping needs the `remote` feature; this binary was built without it");
+        }
+        Ok(OpticalTarget::Local(device.to_string()))
+    }
+
+    /// Human-readable label for logs / progress.
+    pub fn display(&self) -> String {
+        match self {
+            OpticalTarget::Local(p) => p.clone(),
+            #[cfg(feature = "remote")]
+            OpticalTarget::Remote { conn, device_path } => {
+                let addr = conn
+                    .lock()
+                    .map(|c| c.addr().to_string())
+                    .unwrap_or_default();
+                format!("rb://{addr}{device_path}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for OpticalTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpticalTarget({})", self.display())
+    }
+}
+
 /// Configuration for a disc rip operation.
 #[derive(Debug, Clone)]
 pub struct RipConfig {
-    /// Device path (e.g. "/dev/sr0", "disk6", r"\\.\E:").
-    pub device_path: PathBuf,
+    /// Where to read the disc from (a local drive or a remote daemon's drive).
+    pub device: OpticalTarget,
     /// Output path: .iso file for Iso format, .cue file for BinCue (derives .bin).
     pub output_path: PathBuf,
     /// Output format.
@@ -94,9 +155,21 @@ fn set_progress(progress: &Arc<Mutex<RipProgress>>, current_bytes: u64, current_
 
 /// Main rip orchestrator. Runs on a background thread.
 pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<()> {
+    set_operation(&progress, "Opening drive...");
+    let source = match open_optical_source(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            if let Ok(mut p) = progress.lock() {
+                p.error = Some(format!("{e:#}"));
+                p.finished = true;
+            }
+            return Err(e);
+        }
+    };
+
     let result = match config.format {
-        RipFormat::Iso => rip_iso(&config, &progress),
-        RipFormat::BinCue => rip_bin_cue(&config, &progress),
+        RipFormat::Iso => rip_iso(&config, source.as_ref(), &progress),
+        RipFormat::BinCue => rip_bin_cue(&config, source.as_ref(), &progress),
     };
 
     if let Err(ref e) = result {
@@ -108,7 +181,7 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     }
 
     if config.eject_after {
-        if let Err(e) = eject_disc(&config.device_path) {
+        if let Err(e) = source.eject() {
             log(
                 &progress,
                 LogLevel::Warning,
@@ -124,19 +197,34 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     Ok(())
 }
 
+/// Build the [`OpticalSource`] for this rip — a local drive or a network proxy
+/// to a remote daemon's drive (see `docs/remote_ripping.md`).
+fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
+    match &config.device {
+        OpticalTarget::Local(path) => Ok(Box::new(LocalCdReader::open(path)?)),
+        #[cfg(feature = "remote")]
+        OpticalTarget::Remote { conn, device_path } => {
+            Ok(Box::new(crate::optical::source::RemoteCdReader::open(
+                conn.clone(),
+                device_path,
+                cd_da_reader::RetryConfig::default(),
+            )?))
+        }
+    }
+}
+
 /// Sectors to read per chunk for READ CD commands.
 const SECTORS_PER_CHUNK: u32 = 128;
 
-fn rip_iso(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result<()> {
-    let device_str = config.device_path.to_string_lossy();
-    set_operation(progress, "Opening drive...");
-    let reader = CdReader::open(&device_str)
-        .with_context(|| format!("Failed to open drive: {device_str}"))?;
-
+fn rip_iso(
+    config: &RipConfig,
+    source: &dyn OpticalSource,
+    progress: &Arc<Mutex<RipProgress>>,
+) -> Result<()> {
     set_operation(progress, "Reading TOC...");
-    let toc = reader
+    let toc = source
         .read_toc()
-        .with_context(|| "Failed to read table of contents")?;
+        .context("Failed to read table of contents")?;
 
     log(
         progress,
@@ -179,7 +267,6 @@ fn rip_iso(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result<()>
     let mut out = File::create(&config.output_path)
         .with_context(|| format!("Failed to create {}", config.output_path.display()))?;
 
-    let retry_cfg = RetryConfig::default();
     let mut bytes_written: u64 = 0;
     let mut sectors_done: u64 = 0;
     let mut lba = start_lba;
@@ -191,8 +278,8 @@ fn rip_iso(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result<()>
         }
 
         let count = remaining.min(SECTORS_PER_CHUNK);
-        let data = reader
-            .read_data_sectors(lba, count, SectorReadMode::DataCooked, &retry_cfg)
+        let data = source
+            .read_data_sectors(lba, count, SectorReadMode::DataCooked)
             .with_context(|| format!("Read error at LBA {lba}"))?;
 
         out.write_all(&data)
@@ -220,16 +307,15 @@ fn rip_iso(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result<()>
     Ok(())
 }
 
-fn rip_bin_cue(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result<()> {
-    let device_str = config.device_path.to_string_lossy();
-    set_operation(progress, "Opening drive...");
-    let reader = CdReader::open(&device_str)
-        .with_context(|| format!("Failed to open drive: {device_str}"))?;
-
+fn rip_bin_cue(
+    config: &RipConfig,
+    source: &dyn OpticalSource,
+    progress: &Arc<Mutex<RipProgress>>,
+) -> Result<()> {
     set_operation(progress, "Reading TOC...");
-    let toc = reader
+    let toc = source
         .read_toc()
-        .with_context(|| "Failed to read table of contents")?;
+        .context("Failed to read table of contents")?;
 
     log(
         progress,
@@ -263,7 +349,6 @@ fn rip_bin_cue(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result
     let mut bin_file = File::create(&bin_path)
         .with_context(|| format!("Failed to create {}", bin_path.display()))?;
 
-    let retry_cfg = RetryConfig::default();
     let mut bytes_written: u64 = 0;
     let mut sectors_done: u64 = 0;
 
@@ -304,8 +389,8 @@ fn rip_bin_cue(config: &RipConfig, progress: &Arc<Mutex<RipProgress>>) -> Result
             }
 
             let count = track_remaining.min(SECTORS_PER_CHUNK);
-            let data = reader
-                .read_data_sectors(lba, count, mode, &retry_cfg)
+            let data = source
+                .read_data_sectors(lba, count, mode)
                 .with_context(|| format!("Read error at LBA {lba} (track {})", track.number))?;
 
             bin_file
@@ -374,51 +459,6 @@ fn lba_to_msf(lba: u32) -> (u8, u8, u8) {
     (minutes, seconds, frames)
 }
 
-/// Eject the disc from the drive.
-fn eject_disc(path: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::process::Command::new("eject")
-            .arg(path)
-            .status()
-            .context("Failed to run eject command")?;
-        if !status.success() {
-            bail!("eject command failed with status {status}");
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let path_str = path.to_string_lossy();
-        let status = std::process::Command::new("diskutil")
-            .args(["eject", &path_str])
-            .status()
-            .context("Failed to run diskutil eject")?;
-        if !status.success() {
-            bail!("diskutil eject failed with status {status}");
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let path_str = path.to_string_lossy();
-        // Use PowerShell to eject. The path should be like "D:" or "E:"
-        let drive_letter = path_str.trim_start_matches(r"\\.\").trim_end_matches(':');
-        let ps_script = format!(
-            "(New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{drive_letter}:').InvokeVerb('Eject')"
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps_script])
-            .status()
-            .context("Failed to run PowerShell eject")?;
-        if !status.success() {
-            bail!("PowerShell eject failed with status {status}");
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,13 +523,14 @@ mod tests {
     #[test]
     fn test_rip_config_construction() {
         let config = RipConfig {
-            device_path: PathBuf::from("/dev/sr0"),
+            device: OpticalTarget::Local("/dev/sr0".to_string()),
             output_path: PathBuf::from("/tmp/disc.iso"),
             format: RipFormat::Iso,
             eject_after: false,
         };
         assert_eq!(config.format, RipFormat::Iso);
         assert!(!config.eject_after);
+        assert_eq!(config.device.display(), "/dev/sr0");
     }
 
     #[test]
