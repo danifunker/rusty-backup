@@ -9,8 +9,7 @@ use super::filesystem::{
 };
 use super::hfs_common::{
     self, bitmap_clear_bit_be, bitmap_collect_clear_runs_be, bitmap_set_bit_be, btree_free_node,
-    btree_grow_root, btree_insert_into_index, btree_insert_record, btree_remove_record,
-    btree_split_leaf_with_insert, BTreeHeader, BTreeKeyFormat,
+    btree_remove_record, BTreeHeader, BTreeKeyFormat,
 };
 use super::CompactResult;
 
@@ -1804,121 +1803,26 @@ impl<R: Read + Seek> HfsPlusFilesystem<R> {
     }
 
     /// Insert a catalog record into the B-tree, handling splits and growth.
+    ///
+    /// Delegates to the shared `btree_insert_full`, which — for a non-sequential
+    /// (per-`put`) insert into a full leaf — first tries a B*-style rotation into
+    /// an adjacent sibling before splitting, lifting random-insert leaf occupancy
+    /// from the ~69% a plain split leaves to ~88% (docs/hfsplus_btree_growth_plan.md
+    /// §4d). `BTreeKeyFormat::HFSPLUS_CATALOG` drives the 2-byte / variable-length
+    /// index keys. This is the same path classic HFS's `insert_catalog_record`
+    /// uses; the previous hand-rolled split dance here packed less densely because
+    /// it never rotated.
     fn insert_catalog_record(&mut self, key_record: &[u8]) -> Result<(), FilesystemError> {
-        let header = BTreeHeader::read(&self.catalog_data);
-        let node_size = header.node_size as usize;
         let cs = self.case_sensitive();
         let cmp = |a: &[u8], b: &[u8]| Self::catalog_compare(a, b, cs);
-        // The HFS+ catalog uses 2-byte ("big") keys and variable-length index
-        // separators — unlike the classic 1-byte / fixed-0x25 catalog — so the
-        // shared split/grow machinery must be told the key format.
-        let kf = &BTreeKeyFormat::HFSPLUS_CATALOG;
-
-        // Find the correct leaf node
-        let (leaf_idx, parent_chain) =
-            hfs_common::btree_find_insert_leaf(&self.catalog_data, &header, key_record, &cmp);
-
-        // Try to insert into the leaf
-        let offset = leaf_idx as usize * node_size;
-        let node = &mut self.catalog_data[offset..offset + node_size];
-        match btree_insert_record(node, node_size, key_record, &cmp) {
-            Ok(_) => {
-                // Update header leaf_records
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                h.leaf_records += 1;
-                h.write(&mut self.catalog_data);
-                self.catalog_header.leaf_records = h.leaf_records;
-                Ok(())
-            }
-            Err(_) => {
-                // Leaf full — atomic split+insert. Byte-based split point
-                // tolerates uneven record sizes; avoids the
-                // split-then-insert failure mode where the target half
-                // can't accept the new record.
-                let mut h = BTreeHeader::read(&self.catalog_data);
-                let splits = btree_split_leaf_with_insert(
-                    &mut self.catalog_data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    kf,
-                    &cmp,
-                )?;
-
-                h.leaf_records += 1;
-
-                // Install the first separator into the existing parent (or
-                // grow the root). Any additional separators come from N-way
-                // splits and are routed through `btree_insert_into_index`
-                // against a freshly-resolved parent — once the tree depth
-                // grows past 1 the root-grow branch never re-fires.
-                let first = &splits[0];
-                if h.depth == 1 {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        first.0,
-                        &first.1,
-                        kf,
-                    )?;
-                } else if let Some(&(_, parent_idx)) =
-                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        &mut self.catalog_data,
-                        node_size,
-                        parent_idx,
-                        first.0,
-                        &first.1,
-                        &mut h,
-                        kf,
-                        &cmp,
-                        &parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(
-                        &mut self.catalog_data,
-                        node_size,
-                        &mut h,
-                        leaf_idx,
-                        first.0,
-                        &first.1,
-                        kf,
-                    )?;
-                }
-                for split in &splits[1..] {
-                    let header_now = BTreeHeader::read(&self.catalog_data);
-                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
-                        &self.catalog_data,
-                        &header_now,
-                        &split.1,
-                        &cmp,
-                    );
-                    let parent_for_sep = fresh_chain
-                        .last()
-                        .map(|&(_, p)| p)
-                        .unwrap_or(header_now.root_node);
-                    btree_insert_into_index(
-                        &mut self.catalog_data,
-                        node_size,
-                        parent_for_sep,
-                        split.0,
-                        &split.1,
-                        &mut h,
-                        kf,
-                        &cmp,
-                        &fresh_chain,
-                    )?;
-                }
-
-                h.write(&mut self.catalog_data);
-                self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
-                Ok(())
-            }
-        }
+        hfs_common::btree_insert_full(
+            &mut self.catalog_data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_CATALOG,
+            &cmp,
+        )?;
+        self.catalog_header = BTreeHeaderRecord::parse(&self.catalog_data[14..14 + 106]);
+        Ok(())
     }
 
     /// Remove a catalog record by (node_idx, rec_idx).
@@ -2030,85 +1934,17 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
                 "volume has no extents-overflow B-tree — fragmented files cannot be created".into(),
             )
         })?;
-        let header = BTreeHeader::read(data);
-        let node_size = header.node_size as usize;
-        if node_size == 0 {
+        if BTreeHeader::read(data).node_size == 0 {
             return Err(FilesystemError::InvalidData(
                 "extents-overflow B-tree has zero node_size".into(),
             ));
         }
-        let kf = &BTreeKeyFormat::HFSPLUS_EXTENTS;
-        let (leaf_idx, parent_chain) =
-            hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::extents_compare);
-        let offset = leaf_idx as usize * node_size;
-        let node = &mut data[offset..offset + node_size];
-        match btree_insert_record(node, node_size, key_record, &Self::extents_compare) {
-            Ok(_) => {
-                let mut h = BTreeHeader::read(data);
-                h.leaf_records += 1;
-                h.write(data);
-                Ok(())
-            }
-            Err(_) => {
-                let mut h = BTreeHeader::read(data);
-                let splits = btree_split_leaf_with_insert(
-                    data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    kf,
-                    &Self::extents_compare,
-                )?;
-                h.leaf_records += 1;
-                let first = &splits[0];
-                if h.depth == 1 {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
-                } else if let Some(&(_, parent_idx)) =
-                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_idx,
-                        first.0,
-                        &first.1,
-                        &mut h,
-                        kf,
-                        &Self::extents_compare,
-                        &parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
-                }
-                for split in &splits[1..] {
-                    let header_now = BTreeHeader::read(data);
-                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
-                        data,
-                        &header_now,
-                        &split.1,
-                        &Self::extents_compare,
-                    );
-                    let parent_for_sep = fresh_chain
-                        .last()
-                        .map(|&(_, p)| p)
-                        .unwrap_or(header_now.root_node);
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_for_sep,
-                        split.0,
-                        &split.1,
-                        &mut h,
-                        kf,
-                        &Self::extents_compare,
-                        &fresh_chain,
-                    )?;
-                }
-                h.write(data);
-                Ok(())
-            }
-        }
+        hfs_common::btree_insert_full(
+            data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_EXTENTS,
+            &Self::extents_compare,
+        )
     }
 
     /// Remove every overflow record belonging to `(file_id, fork_type)`.
@@ -2263,79 +2099,14 @@ impl<R: Read + Write + Seek> HfsPlusFilesystem<R> {
             )));
         }
         // The attributes B-tree, like the catalog, uses 2-byte big keys and
-        // variable-length index separators.
-        let kf = &BTreeKeyFormat::HFSPLUS_ATTRIBUTES;
-        let (leaf_idx, parent_chain) =
-            hfs_common::btree_find_insert_leaf(data, &header, key_record, &Self::attr_compare);
-        let off = leaf_idx as usize * node_size;
-        let node = &mut data[off..off + node_size];
-        match btree_insert_record(node, node_size, key_record, &Self::attr_compare) {
-            Ok(_) => {
-                let mut h = BTreeHeader::read(data);
-                h.leaf_records += 1;
-                h.write(data);
-                Ok(())
-            }
-            Err(_) => {
-                let mut h = BTreeHeader::read(data);
-                let splits = btree_split_leaf_with_insert(
-                    data,
-                    node_size,
-                    leaf_idx,
-                    &mut h,
-                    key_record,
-                    kf,
-                    &Self::attr_compare,
-                )?;
-                h.leaf_records += 1;
-                let first = &splits[0];
-                if h.depth == 1 {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
-                } else if let Some(&(_, parent_idx)) =
-                    parent_chain.iter().find(|&&(nidx, _)| nidx == leaf_idx)
-                {
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_idx,
-                        first.0,
-                        &first.1,
-                        &mut h,
-                        kf,
-                        &Self::attr_compare,
-                        &parent_chain,
-                    )?;
-                } else {
-                    btree_grow_root(data, node_size, &mut h, leaf_idx, first.0, &first.1, kf)?;
-                }
-                for split in &splits[1..] {
-                    let header_now = BTreeHeader::read(data);
-                    let (_, fresh_chain) = hfs_common::btree_find_insert_leaf(
-                        data,
-                        &header_now,
-                        &split.1,
-                        &Self::attr_compare,
-                    );
-                    let parent_for_sep = fresh_chain
-                        .last()
-                        .map(|&(_, p)| p)
-                        .unwrap_or(header_now.root_node);
-                    btree_insert_into_index(
-                        data,
-                        node_size,
-                        parent_for_sep,
-                        split.0,
-                        &split.1,
-                        &mut h,
-                        kf,
-                        &Self::attr_compare,
-                        &fresh_chain,
-                    )?;
-                }
-                h.write(data);
-                Ok(())
-            }
-        }
+        // variable-length index separators, so it threads HFSPLUS_ATTRIBUTES
+        // through the shared insert (which also rotates before splitting).
+        hfs_common::btree_insert_full(
+            data,
+            key_record,
+            &BTreeKeyFormat::HFSPLUS_ATTRIBUTES,
+            &Self::attr_compare,
+        )
     }
 
     /// Remove every attribute record matching `(cnid, name)`. Returns the
@@ -8570,6 +8341,75 @@ mod tests {
         assert_eq!(
             got, payload,
             "fragmented read-back mismatch through split overflow tree"
+        );
+    }
+
+    #[test]
+    fn test_hfsplus_catalog_shuffled_inserts_pack_densely() {
+        // P5 (docs/hfsplus_btree_growth_plan.md §4d): with the B*-style rotation
+        // now on the HFS+ catalog insert path (insert_catalog_record ->
+        // btree_insert_full), shuffled multi-dir inserts must pack leaves to
+        // ~80%+ occupancy, matching the classic-HFS result — not the ~69% a plain
+        // split leaves. Measured through the same btree_insert_full the live path
+        // uses, with the HFSPLUS_CATALOG (variable-key) format.
+        use super::hfs_common::{btree_insert_full, BTreeHeader, BTreeKeyFormat};
+        use byteorder::{BigEndian, ByteOrder};
+        type Fs = HfsPlusFilesystem<std::io::Cursor<Vec<u8>>>;
+
+        let node_size = 512usize;
+        let total_nodes = 1800u32;
+        let mut buf = vec![0u8; total_nodes as usize * node_size];
+        write_blank_btree_header_node(
+            &mut buf[0..node_size],
+            node_size,
+            0,
+            total_nodes,
+            total_nodes - 2,
+            516,
+            KEY_COMPARE_CASE_FOLDING,
+        );
+        write_empty_leaf_node(&mut buf[node_size..2 * node_size]);
+
+        let kf = BTreeKeyFormat::HFSPLUS_CATALOG;
+        let cmp = |a: &[u8], b: &[u8]| Fs::catalog_compare(a, b, false);
+        const DIRS: u32 = 40;
+        const N: u32 = 3000;
+        for i in 0..N {
+            let hash = i.wrapping_mul(2_654_435_761);
+            let parent = 16 + (hash % DIRS);
+            let name = format!("f{hash:08x}");
+            let mut rec = Fs::build_catalog_key(parent, &name);
+            rec.extend_from_slice(&[0u8; 40]);
+            btree_insert_full(&mut buf, &rec, &kf, &cmp)
+                .unwrap_or_else(|e| panic!("insert #{i}: {e}"));
+        }
+
+        // Average leaf occupancy across the whole leaf chain.
+        let header = BTreeHeader::read(&buf);
+        assert!(
+            header.depth >= 3,
+            "need a multi-level tree to judge packing"
+        );
+        let mut used_total = 0usize;
+        let mut leaves = 0usize;
+        let mut node = header.first_leaf_node;
+        let mut seen = std::collections::HashSet::new();
+        while node != 0 && seen.insert(node) {
+            let off = node as usize * node_size;
+            let num = BigEndian::read_u16(&buf[off + 10..off + 12]) as usize;
+            // Records occupy 14..free_off; the offset table holds num+1 u16s.
+            let free_off_pos = off + node_size - 2 * (num + 1);
+            let free_off = BigEndian::read_u16(&buf[free_off_pos..free_off_pos + 2]) as usize;
+            used_total += free_off + 2 * (num + 1);
+            leaves += 1;
+            node = BigEndian::read_u32(&buf[off..off + 4]); // forward link
+        }
+        // ~0.84 with the rotation (was ~0.69 with plain split), matching classic.
+        let occupancy = used_total as f64 / (leaves * node_size) as f64;
+        assert!(
+            occupancy >= 0.80,
+            "shuffled multi-dir leaf occupancy {occupancy:.3} (<0.80) over {leaves} leaves — \
+             the rotation is not packing densely"
         );
     }
 }

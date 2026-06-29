@@ -30,7 +30,16 @@
   round-trips byte-for-byte — confirming the variable-length index keys behave
   through the clone path (`btree_insert_full` + `HFSPLUS_CATALOG`), not just the
   live-edit path.
-- **P5** remains. Safe to revise freely.
+- **P5 (density rotation for HFS+, §4d) — landed.** The three HFS+ live insert
+  paths (`insert_catalog_record`, `insert_xattr_record`,
+  `insert_extents_overflow_record`) now delegate to `hfs_common::btree_insert_full`
+  — the same shared insert classic HFS uses — which tries a B*-style sibling
+  rotation before splitting. Shuffled multi-dir catalog inserts pack to ~0.84 leaf
+  occupancy (was ~0.69 with plain split). This also deleted ~250 lines of
+  hand-copied split/grow dance from `hfsplus.rs`.
+
+**All five phases (P1–P4 + P5) are complete; only the optional §4b grow-on-full
+remains deferred.**
 
 **Relationship to shipped work:** the classic-HFS catalog scaling work is done —
 bulk import (`PROMPT-hfs-catalog-btree-scaling.md`) and the incremental per-`put`
@@ -245,8 +254,14 @@ correctness work isn't gated on it.
    large-volume clone now rebuilds a multi-level catalog that is fsck-clean and
    round-trips (`stream_clone_of_multilevel_catalog_is_fsck_clean`: 300 files / 10
    dirs, source and target catalog depth ≥ 2).
-5. **P5 — density rotation for HFS+ (4d).** Gate: shuffled multi-dir inserts pack
-   ≳ 80% leaf occupancy, matching the classic-HFS result.
+5. **P5 — density rotation for HFS+ (4d). [DONE]** The HFS+ live inserts now go
+   through `btree_insert_full` (which rotates into a sibling before splitting),
+   exactly as classic HFS does. Gate met: shuffled multi-dir inserts pack ~0.84
+   leaf occupancy (`test_hfsplus_catalog_shuffled_inserts_pack_densely`), up from
+   ~0.69. `btree_try_rotate_leaf`'s separator update already handled variable
+   keys (in-place when the new separator matches the old length — always true for
+   the fixed-length and same-length-name cases — else it abandons the rotation and
+   splits), so no further index-key work was needed.
 
 ## 6. Risks / gotchas
 
