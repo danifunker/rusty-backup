@@ -1832,14 +1832,17 @@ impl<R: Read + Write + Seek> HfsFilesystem<R> {
         rec[8..12].copy_from_slice(creator_code);
         // filFlNum at offset 20
         BigEndian::write_u32(&mut rec[20..24], file_id);
-        // filStBlk at offset 24 (first alloc block of data fork)
-        BigEndian::write_u16(&mut rec[24..26], data_start);
+        // filStBlk at offset 24 stays 0: it's the File Manager's in-memory
+        // "first allocation block" cache, NOT persisted on disk — the real
+        // fork location lives in filExtRec (offset 74). `fsck_hfs` flags a
+        // non-zero on-disk filStBlk as "Reserved fields in the catalog record
+        // have incorrect data" (E_CatalogFlagsNotZero). See `data_start` used
+        // for the extent record below.
         // filLgLen at offset 26 (data fork logical size)
         BigEndian::write_u32(&mut rec[26..30], data_size);
         // filPyLen at offset 30 (data fork physical size)
         BigEndian::write_u32(&mut rec[30..34], data_blocks as u32 * block_size);
-        // filRStBlk at offset 34
-        BigEndian::write_u16(&mut rec[34..36], rsrc_start);
+        // filRStBlk at offset 34 stays 0 for the same reason as filStBlk.
         // filRLgLen at offset 36 (rsrc fork logical size)
         BigEndian::write_u32(&mut rec[36..40], rsrc_size);
         // filRPyLen at offset 40 (rsrc fork physical size)
@@ -3239,12 +3242,12 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
                 ));
             }
 
-            // Update rsrc fork fields in file record:
-            // filRStBlk at offset 34
-            BigEndian::write_u16(
-                &mut self.catalog_data[frec_start + 34..frec_start + 36],
-                rsrc_start,
-            );
+            // Update rsrc fork fields in file record. filRStBlk (offset 34)
+            // stays 0 — it's the File Manager's in-memory cache, not persisted;
+            // a non-zero on-disk value makes fsck_hfs report "Reserved fields
+            // in the catalog record have incorrect data". The real location is
+            // the rsrc extent record at offset 86 (written below).
+            self.catalog_data[frec_start + 34..frec_start + 36].fill(0);
             // filRLgLen at offset 36
             BigEndian::write_u32(
                 &mut self.catalog_data[frec_start + 36..frec_start + 40],
@@ -4378,6 +4381,70 @@ mod tests {
         // Read back
         let read_back = fs.read_file(&fe, 1024).unwrap();
         assert_eq!(&read_back, test_data);
+    }
+
+    /// `filStBlk` (offset 24) and `filRStBlk` (offset 34) of an HFS file record
+    /// are the File Manager's in-memory "first allocation block" cache and MUST
+    /// be zero on disk — the real fork location lives in the extent record at
+    /// offset 74 / 86. A non-zero on-disk value makes Apple's `fsck_hfs` (incl.
+    /// Mac OS X 10.4 Tiger, which fully supports HFS Standard) report
+    /// "Reserved fields in the catalog record have incorrect data"
+    /// (E_CatalogFlagsNotZero). Validated fsck_hfs-clean + mountable on Tiger.
+    #[test]
+    fn test_hfs_file_record_first_alloc_block_fields_are_zero() {
+        use super::super::filesystem::ResourceForkSource;
+        use super::hfs_common::walk_leaf_records;
+
+        let img = make_editable_hfs_image();
+        let mut fs = HfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+
+        // A file with BOTH a data fork and a resource fork, so both filStBlk
+        // and filRStBlk are exercised.
+        let data = b"data fork contents that span a block";
+        let options = CreateFileOptions {
+            resource_fork: Some(ResourceForkSource::Data(b"resource fork bytes".to_vec())),
+            ..Default::default()
+        };
+        fs.create_file(
+            &root,
+            "forked.bin",
+            &mut Cursor::new(data.as_slice()),
+            data.len() as u64,
+            &options,
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+
+        let node_size = BigEndian::read_u16(&fs.catalog_data[32..34]) as usize;
+        let first_leaf = BigEndian::read_u32(&fs.catalog_data[24..28]);
+        let found = walk_leaf_records::<bool, _>(
+            &fs.catalog_data,
+            first_leaf,
+            node_size,
+            |_n, _i, _off, rec| {
+                let klen = rec[0] as usize;
+                let mut ds = 1 + klen;
+                if !ds.is_multiple_of(2) {
+                    ds += 1;
+                }
+                let body = &rec[ds..];
+                if body.first() != Some(&2) {
+                    return None; // not a file record
+                }
+                let fil_st_blk = BigEndian::read_u16(&body[24..26]);
+                let fil_rst_blk = BigEndian::read_u16(&body[34..36]);
+                let data_ext_start = BigEndian::read_u16(&body[74..76]);
+                let rsrc_ext_start = BigEndian::read_u16(&body[86..88]);
+                assert_eq!(fil_st_blk, 0, "filStBlk (offset 24) must be 0 on disk");
+                assert_eq!(fil_rst_blk, 0, "filRStBlk (offset 34) must be 0 on disk");
+                // The real fork locations are still recorded in the extents.
+                assert_ne!(data_ext_start, 0, "data fork extent should be allocated");
+                assert_ne!(rsrc_ext_start, 0, "rsrc fork extent should be allocated");
+                Some(true)
+            },
+        );
+        assert_eq!(found, Some(true), "file record not found in catalog");
     }
 
     /// Catalog dates surface on `FileEntry::mac_dates` (and the modify value on
