@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::fs::archive_fs::ArchiveFilesystem;
+use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::Filesystem;
 use crate::model::commander_source;
 use crate::model::file_types::{DISK_IMAGE_EXTS, MAC_ARCHIVE_EXTS};
@@ -46,6 +47,30 @@ pub fn classify(name: &str) -> Option<DescendKind> {
         return Some(DescendKind::DiskImage);
     }
     None
+}
+
+/// Classify a `FileEntry` as descendable. Tries the filename first, then falls
+/// back to the Mac Finder type code — so a disk image with an unusual name
+/// (e.g. `MacBottom MFS.image`, type `dImg`) is still recognized. Entries from a
+/// Mac archive / HFS volume carry a type code; host files generally don't, so
+/// they rely on the extension.
+pub fn classify_entry(entry: &FileEntry) -> Option<DescendKind> {
+    if let Some(kind) = classify(&entry.name) {
+        return Some(kind);
+    }
+    if entry.type_code.is_some_and(|tc| is_disk_image_ostype(&tc)) {
+        return Some(DescendKind::DiskImage);
+    }
+    None
+}
+
+/// True for a Mac OSType that denotes a disk image: `dImg`/`dimg` (Disk Copy),
+/// and the NDIF read-only/read-write types.
+fn is_disk_image_ostype(tc: &[u8; 4]) -> bool {
+    matches!(
+        tc,
+        b"dImg" | b"dimg" | b"rohd" | b"rdxw" | b"rwhd" | b"rkhd" | b"DDim"
+    )
 }
 
 /// Write `bytes` to a fresh temp file named `file_name`, returning the guard
@@ -132,6 +157,22 @@ mod tests {
         assert_eq!(classify("Disk.2mg"), Some(DescendKind::DiskImage));
         assert_eq!(classify("notes.txt"), None);
         assert_eq!(classify("noext"), None);
+    }
+
+    #[test]
+    fn classify_entry_uses_type_code_for_odd_names() {
+        // A Disk Copy image with a non-image extension is recognized by its
+        // Finder type code ('dImg'), not its name.
+        let mut e = FileEntry::new_file("MacBottom MFS.image".into(), "/x".into(), 0, 0);
+        assert_eq!(classify(&e.name), None);
+        e.type_code = Some(*b"dImg");
+        assert_eq!(classify_entry(&e), Some(DescendKind::DiskImage));
+        // NDIF type code too.
+        e.type_code = Some(*b"rohd");
+        assert_eq!(classify_entry(&e), Some(DescendKind::DiskImage));
+        // A plain text file stays non-descendable.
+        e.type_code = Some(*b"TEXT");
+        assert_eq!(classify_entry(&e), None);
     }
 
     #[test]

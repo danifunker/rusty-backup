@@ -94,11 +94,19 @@ impl WrapperTree {
     }
 
     /// Expand a wrapper node, opening its mount from `bytes` on first use.
-    /// `file_name` drives archive-vs-image routing. Returns an optional note
-    /// (e.g. a multi-volume image showing only its first volume).
-    pub fn expand_wrapper(&mut self, node_id: &str, file_name: &str, bytes: Vec<u8>) -> Result<()> {
+    /// `kind` selects archive-vs-image handling (the caller classifies the
+    /// entry, which is more reliable than the file name for odd extensions).
+    /// Returns an optional note (e.g. a multi-volume image showing only its
+    /// first volume).
+    pub fn expand_wrapper(
+        &mut self,
+        node_id: &str,
+        file_name: &str,
+        kind: DescendKind,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
         if !self.mounts.contains_key(node_id) {
-            let (mount, note) = open_mount(bytes, file_name)?;
+            let (mount, note) = open_mount(bytes, file_name, kind)?;
             self.mounts.insert(node_id.to_string(), mount);
             if let Some(n) = note {
                 self.notes.insert(node_id.to_string(), n);
@@ -183,7 +191,7 @@ impl WrapperTree {
     ) {
         for e in entries {
             let node_id = Self::child_id(id_prefix, &e.name);
-            let is_wrapper = !e.is_directory() && classify_row(&e.name);
+            let is_wrapper = !e.is_directory() && commander_descend::classify_entry(&e).is_some();
             let expandable = e.is_directory() || is_wrapper;
             let expanded = expandable && self.expanded.contains(&node_id);
             rows.push(TreeRow {
@@ -220,17 +228,14 @@ fn sorted(mut entries: Vec<FileEntry>) -> Vec<FileEntry> {
     entries
 }
 
-/// Whether a name is a descendable wrapper (archive or disk image).
-fn classify_row(name: &str) -> bool {
-    commander_descend::classify(name).is_some()
-}
-
 /// Open a wrapper's bytes as a mount. Archives open directly; images open their
 /// first browsable volume (with a note when more than one exists — a richer
 /// per-volume tree is a follow-up).
-fn open_mount(bytes: Vec<u8>, file_name: &str) -> Result<(Mount, Option<String>)> {
-    let kind = commander_descend::classify(file_name)
-        .ok_or_else(|| anyhow::anyhow!("'{file_name}' is not a recognized wrapper"))?;
+fn open_mount(
+    bytes: Vec<u8>,
+    file_name: &str,
+    kind: DescendKind,
+) -> Result<(Mount, Option<String>)> {
     let (temp, path) = commander_descend::materialize(&bytes, file_name)?;
     match kind {
         DescendKind::Archive => {
@@ -296,7 +301,7 @@ mod tests {
         assert!(tree.is_idle());
 
         // Expanding the base wrapper shows its top-level rows (folder first).
-        tree.expand_wrapper("/a.sit", "a.sit", archive_bytes())
+        tree.expand_wrapper("/a.sit", "a.sit", DescendKind::Archive, archive_bytes())
             .unwrap();
         let rows = tree.subtree_rows("/a.sit", 1);
         let names: Vec<_> = rows.iter().map(|r| r.entry.name.as_str()).collect();
@@ -324,7 +329,7 @@ mod tests {
     #[test]
     fn reads_a_file_from_the_mount() {
         let mut tree = WrapperTree::new();
-        tree.expand_wrapper("/a.sit", "a.sit", archive_bytes())
+        tree.expand_wrapper("/a.sit", "a.sit", DescendKind::Archive, archive_bytes())
             .unwrap();
         let rows = tree.subtree_rows("/a.sit", 1);
         let top = rows.iter().find(|r| r.entry.name == "top.txt").unwrap();

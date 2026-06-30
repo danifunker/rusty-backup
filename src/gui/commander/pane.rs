@@ -31,7 +31,7 @@ use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
-use rusty_backup::model::commander_descend::classify;
+use rusty_backup::model::commander_descend::{classify_entry, DescendKind};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
@@ -343,11 +343,12 @@ impl CommanderPane {
             if is_wrapper {
                 // Nested wrapper: read its bytes out of the enclosing mount.
                 let row = self.tree_index.get(node_id)?.clone();
+                let kind = classify_entry(&row.entry)?;
                 let bytes = match self.wrapper_tree.read_wrapper_bytes(&row) {
                     Ok(b) => b,
                     Err(e) => return Some(format!("[{side}] cannot read '{name}': {e:#}")),
                 };
-                if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, bytes) {
+                if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
                     return Some(format!("[{side}] cannot open '{name}': {e:#}"));
                 }
             } else {
@@ -362,6 +363,7 @@ impl CommanderPane {
                 .iter()
                 .find(|e| e.path == node_id)
                 .cloned()?;
+            let kind = classify_entry(&entry)?;
             let bytes = if self.listing.is_host() {
                 match std::fs::read(&entry.path) {
                     Ok(b) => b,
@@ -377,7 +379,7 @@ impl CommanderPane {
                 }
                 buf
             };
-            if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, bytes) {
+            if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
                 return Some(format!("[{side}] cannot open '{name}': {e:#}"));
             }
         }
@@ -2517,7 +2519,7 @@ impl CommanderPane {
                     } else {
                         RowKind::Normal
                     };
-                    let is_wrapper = allow_wrap && !e.is_directory() && classify(&e.name).is_some();
+                    let is_wrapper = allow_wrap && !e.is_directory() && classify_entry(e).is_some();
                     DisplayRow {
                         is_image: remote_host
                             && !e.is_directory()
@@ -2584,9 +2586,9 @@ impl CommanderPane {
 /// usual per-filesystem tag.
 fn wrapper_or_type_tag(e: &FileEntry, is_wrapper: bool) -> String {
     if is_wrapper {
-        match classify(&e.name) {
-            Some(rusty_backup::model::commander_descend::DescendKind::Archive) => "<ARC>".into(),
-            Some(rusty_backup::model::commander_descend::DescendKind::DiskImage) => "<IMG>".into(),
+        match classify_entry(e) {
+            Some(DescendKind::Archive) => "<ARC>".into(),
+            Some(DescendKind::DiskImage) => "<IMG>".into(),
             None => type_tag(e),
         }
     } else {

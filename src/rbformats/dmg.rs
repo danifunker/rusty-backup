@@ -230,21 +230,23 @@ pub(crate) fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>
             out.extend_from_slice(&input[pos..pos + copy_len]);
             pos += len;
         } else if b & 0x40 != 0 {
-            // Long match: length = (b - 0x40) + 4, distance = next 2 bytes (BE)
+            // Long match: length = (b - 0x40) + 4. The two offset bytes (BE)
+            // store distance-1, so the back-distance is offset + 1.
             let len = (b as usize - 0x40) + 4;
             if pos + 2 > input.len() {
                 bail!("ADC: long match overflows input");
             }
-            let distance = ((input[pos] as usize) << 8) | (input[pos + 1] as usize);
+            let distance = (((input[pos] as usize) << 8) | (input[pos + 1] as usize)) + 1;
             pos += 2;
             copy_match(&mut out, distance, len, output_size);
         } else {
-            // Short match: length = (b >> 2) + 3, distance = ((b & 3) << 8) + next byte
+            // Short match: length = (b >> 2) + 3. The 10-bit offset stores
+            // distance-1, so the back-distance is offset + 1.
             let len = ((b >> 2) as usize) + 3;
             if pos + 1 > input.len() {
                 bail!("ADC: short match overflows input");
             }
-            let distance = (((b & 3) as usize) << 8) | (input[pos] as usize);
+            let distance = ((((b & 3) as usize) << 8) | (input[pos] as usize)) + 1;
             pos += 1;
             copy_match(&mut out, distance, len, output_size);
         }
@@ -682,11 +684,12 @@ mod tests {
     #[test]
     fn test_decompress_adc_short_match() {
         // First: 2 literal bytes (0x81, 0xAB, 0xCD)
-        // Then: short match with len=3, distance=2
-        //   b = ((3-3) << 2) | (distance >> 8) = 0x00
-        //   b1 = distance & 0xFF = 0x02
+        // Then: short match with len=3, back-distance=2. The offset field stores
+        //   distance-1 = 1, so:
+        //   b = ((3-3) << 2) | (offset >> 8) = 0x00
+        //   b1 = offset & 0xFF = 0x01
         // Copies 3 bytes from 2 back: AB CD AB
-        let input = vec![0x81, 0xAB, 0xCD, 0x00, 0x02];
+        let input = vec![0x81, 0xAB, 0xCD, 0x00, 0x01];
         let out = decompress_adc(&input, 5).unwrap();
         assert_eq!(out, vec![0xAB, 0xCD, 0xAB, 0xCD, 0xAB]);
     }
@@ -695,10 +698,10 @@ mod tests {
     fn test_decompress_adc_long_match() {
         // First: 4 literal bytes
         let mut input = vec![0x83, 0x01, 0x02, 0x03, 0x04];
-        // Long match: len=4, distance=4
+        // Long match: len=4, back-distance=4. The offset field stores
+        //   distance-1 = 3 (big-endian):
         //   b = 0x40 | (4-4) = 0x40
-        //   distance = 0x0004 (big-endian)
-        input.extend_from_slice(&[0x40, 0x00, 0x04]);
+        input.extend_from_slice(&[0x40, 0x00, 0x03]);
         let out = decompress_adc(&input, 8).unwrap();
         assert_eq!(out, vec![0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04]);
     }
