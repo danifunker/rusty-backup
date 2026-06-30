@@ -5,6 +5,7 @@ pub mod affs_fsck;
 pub mod alto;
 pub mod andos;
 pub mod apple_dos;
+pub mod archive_fs;
 pub mod atari_dos;
 pub mod binhex;
 pub mod btrfs;
