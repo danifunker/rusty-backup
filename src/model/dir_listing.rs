@@ -54,16 +54,6 @@ struct Frame {
     entries: Vec<FileEntry>,
 }
 
-/// A saved parent context, pushed when the user descends into a wrapper file
-/// (an archive or a nested disk image) and restored on `up()` at the inner
-/// root. Holds the parent's whole listing state so ascending lands exactly
-/// where the user left off. See [`DirListing::descend_into`].
-struct Layer {
-    source: ListingSource,
-    stack: Vec<Frame>,
-    host_mode: bool,
-}
-
 /// A single rendered row. `Parent` is the synthetic `..` row; `Entry` borrows
 /// one of the current directory's (sorted) children.
 pub enum Row<'a> {
@@ -95,13 +85,6 @@ pub struct DirListing {
     selected: Vec<String>,
     /// Anchor row for Shift-range selection.
     anchor: Option<String>,
-    /// Saved parent contexts for wrapper descent (innermost last). Empty at the
-    /// top level; one entry per archive / nested image we've descended into.
-    parents: Vec<Layer>,
-    /// Display names of the wrappers descended through (parallel to `parents`),
-    /// for the pane's breadcrumb. `descent[i]` is the wrapper that produced
-    /// `parents[i]`'s child layer.
-    descent: Vec<String>,
 }
 
 impl DirListing {
@@ -136,52 +119,13 @@ impl DirListing {
         Ok(())
     }
 
-    /// Reset to a fresh source, clearing the stack, descent layers, and
-    /// selection. Loading a brand-new source drops any wrapper descent.
+    /// Reset to a fresh source, clearing the stack and selection.
     fn reset(&mut self, source: ListingSource, host_mode: bool) {
         self.source = source;
         self.host_mode = host_mode;
         self.stack.clear();
-        self.parents.clear();
-        self.descent.clear();
         self.selected.clear();
         self.anchor = None;
-    }
-
-    /// Descend into a wrapper file (an archive or a nested disk image) whose
-    /// contents `fs` exposes. The current listing context is pushed as a parent
-    /// layer; `up()` at the inner root restores it. `label` is the wrapper's
-    /// display name for the breadcrumb. Reads the inner root immediately.
-    pub fn descend_into(
-        &mut self,
-        mut fs: Box<dyn Filesystem>,
-        label: String,
-    ) -> Result<(), FilesystemError> {
-        let root = fs.root()?;
-        let entries = fs.list_directory(&root)?;
-        let saved = Layer {
-            source: std::mem::take(&mut self.source),
-            stack: std::mem::take(&mut self.stack),
-            host_mode: self.host_mode,
-        };
-        self.parents.push(saved);
-        self.descent.push(label);
-        self.source = ListingSource::Image(fs);
-        self.host_mode = false;
-        self.selected.clear();
-        self.anchor = None;
-        self.push_dir(root, entries);
-        Ok(())
-    }
-
-    /// How many wrapper layers deep the listing currently is (0 at top level).
-    pub fn descent_depth(&self) -> usize {
-        self.parents.len()
-    }
-
-    /// Display names of the wrappers descended through, outermost first.
-    pub fn descent_labels(&self) -> &[String] {
-        &self.descent
     }
 
     /// True once a source has been loaded.
@@ -209,11 +153,10 @@ impl DirListing {
         self.stack.len() <= 1
     }
 
-    /// Whether a `..` row should be shown: always for host panes, when below
-    /// the current volume root, or when inside a wrapper (so the user can
-    /// ascend back out of an archive / nested image).
+    /// Whether a `..` row should be shown: always for host panes, otherwise
+    /// only when below the volume root.
     pub fn show_parent(&self) -> bool {
-        self.host_mode || self.stack.len() > 1 || !self.parents.is_empty()
+        self.host_mode || self.stack.len() > 1
     }
 
     pub fn sort_column(&self) -> SortColumn {
@@ -270,16 +213,6 @@ impl DirListing {
     pub fn up(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
-            self.clear_selection();
-            return;
-        }
-        // At the current layer's root: if we descended into a wrapper, ascend
-        // back out to the parent context exactly where we left it.
-        if let Some(layer) = self.parents.pop() {
-            self.descent.pop();
-            self.source = layer.source;
-            self.stack = layer.stack;
-            self.host_mode = layer.host_mode;
             self.clear_selection();
             return;
         }
@@ -868,66 +801,6 @@ mod tests {
         let root = base.path().to_string_lossy().to_string();
         l.navigate_to(&root).unwrap();
         assert_eq!(l.cwd_path(), root);
-    }
-
-    #[test]
-    fn descend_into_archive_then_ascend_restores_parent() {
-        use crate::fs::archive_fs::ArchiveFilesystem;
-        use crate::macarchive::stuffit::{
-            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
-        };
-
-        // A host folder containing one file we'll "descend" past, plus the
-        // archive bytes we descend into.
-        let base = tempfile::tempdir().unwrap();
-        std::fs::write(base.path().join("outer.txt"), b"top").unwrap();
-
-        let tree = vec![StuffItInputNode::File(StuffItInput {
-            name: "inside.txt".into(),
-            type_code: *b"TEXT",
-            creator_code: *b"ttxt",
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            data_fork: b"nested".to_vec(),
-            resource_fork: Vec::new(),
-        })];
-        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
-        let archive = Box::new(ArchiveFilesystem::open_bytes(bytes, Some("a.sit".into())).unwrap());
-
-        let mut l = DirListing::new();
-        l.load_host_root(base.path().to_path_buf()).unwrap();
-        assert_eq!(l.descent_depth(), 0);
-        assert!(l.is_host());
-
-        // Descend into the archive: listing now shows the archive's contents.
-        l.descend_into(archive, "a.sit".into()).unwrap();
-        assert_eq!(l.descent_depth(), 1);
-        assert_eq!(l.descent_labels(), &["a.sit".to_string()]);
-        assert!(!l.is_host());
-        assert!(l.show_parent()); // `..` ascends back out of the archive
-        assert!(row_names(&l).iter().any(|n| n == "inside.txt"));
-
-        // Reading a file uses the inner (archive) source.
-        let inside = l
-            .entries()
-            .iter()
-            .find(|e| e.name == "inside.txt")
-            .cloned()
-            .unwrap();
-        let mut buf = Vec::new();
-        l.fs_mut()
-            .unwrap()
-            .write_file_to(&inside, &mut buf)
-            .unwrap();
-        assert_eq!(buf, b"nested");
-
-        // Up at the archive root pops back to the host folder, unchanged.
-        l.up();
-        assert_eq!(l.descent_depth(), 0);
-        assert!(l.is_host());
-        assert_eq!(l.cwd_path(), base.path().to_string_lossy());
-        assert!(row_names(&l).iter().any(|n| n == "outer.txt"));
     }
 
     #[test]

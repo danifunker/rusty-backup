@@ -20,6 +20,7 @@
 //!
 //! [`BrowseSession::spawn_open`]: rusty_backup::model::browse_session::BrowseSession::spawn_open
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -30,18 +31,23 @@ use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
-use rusty_backup::model::commander_descend::{self, classify, DescendKind};
+use rusty_backup::model::commander_descend::classify;
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::status::BlockCacheScan;
+use rusty_backup::model::wrapper_tree::{TreeRow, WrapperTree};
 use rusty_backup::partition::{format_size, PartitionInfo};
 
 use super::Side;
 
 const ROW_H: f32 = 20.0;
+/// Per-depth indent for tree rows, and the width reserved for the `+`/`-`
+/// disclosure toggle (names align whether or not a row has one).
+const TREE_INDENT: f32 = 14.0;
+const TOGGLE_W: f32 = 16.0;
 const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 180, 90);
 const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
 /// Tint for an existing entry with staged metadata edits (type/dates/perms).
@@ -95,9 +101,6 @@ struct RowActions {
     open_image: Option<String>,
     /// A row in this pane was clicked/navigated this frame (focus signal).
     focused: bool,
-    /// Descend into this entry (an archive / nested image) as if it were a
-    /// directory, viewing its contents in place (by name).
-    descend: Option<String>,
 }
 
 pub(crate) struct CommanderPane {
@@ -172,28 +175,20 @@ pub(crate) struct CommanderPane {
     pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
     /// The open "Connect to remote..." dialog, if any.
     connect_dialog: Option<ConnectDialog>,
-    /// Temp-file guards for materialized wrapper contents, one per descent
-    /// layer in `listing` (parallel to its descent stack). `None` for a layer
-    /// whose wrapper was a host file opened in place (no materialization). A
-    /// guard is dropped — freeing the temp file — when its layer is popped.
-    descent_temps: Vec<Option<tempfile::TempDir>>,
-    /// Open "choose a volume" picker for descending into a nested multi-volume
-    /// disk image.
-    nested_picker: Option<NestedPicker>,
-}
-
-/// Modal state for picking which volume of a nested multi-partition disk image
-/// to descend into. Holds the materialized image (temp guard + path) and the
-/// browsable partitions found inside it.
-struct NestedPicker {
-    /// Display name of the wrapper file (for the prompt + breadcrumb).
-    label: String,
-    /// Path to the (possibly temp) image file the partitions live in.
-    path: PathBuf,
-    /// Temp guard keeping `path` alive; `None` if it's a host file in place.
-    temp: Option<tempfile::TempDir>,
-    /// Browsable partitions with their raw-table index.
-    parts: Vec<(usize, PartitionInfo)>,
+    /// Inline `+`/`-` expansion of wrapper rows (archives / nested images): the
+    /// mounted wrapper filesystems and which nodes are expanded.
+    wrapper_tree: WrapperTree,
+    /// Selected node ids *inside* expanded wrappers (kept separate from the base
+    /// listing's name-based selection; the two are mutually exclusive so copy
+    /// has one unambiguous source context).
+    tree_selected: Vec<String>,
+    /// Per-frame map of visible tree node id -> its row (mount + entry), rebuilt
+    /// by `build_display_rows`. Resolves a selected/clicked node to the
+    /// filesystem and entry to read it from.
+    tree_index: HashMap<String, TreeRow>,
+    /// The base cwd as of last frame; wrapper expansion is per-directory, so a
+    /// change here (navigate / switch / close) collapses every wrapper.
+    last_cwd: String,
 }
 
 /// Display cache for a remote pane (addr + what it's browsing). The live engine
@@ -289,17 +284,106 @@ impl CommanderPane {
             remote: None,
             pending_remote: None,
             connect_dialog: None,
-            descent_temps: Vec::new(),
-            nested_picker: None,
+            wrapper_tree: WrapperTree::new(),
+            tree_selected: Vec::new(),
+            tree_index: HashMap::new(),
+            last_cwd: String::new(),
         }
     }
 
-    /// True when the listing is currently inside a descended wrapper (archive /
-    /// nested image). Such layers are read-only — edit actions act on the
-    /// pane's own session/queue, which target the top-level source, not the
-    /// wrapper, so they must be gated off here.
-    fn is_descended(&self) -> bool {
-        self.listing.descent_depth() > 0
+    /// True when the active selection is inside an expanded wrapper. In that
+    /// state the pane's copy source is the mounted wrapper filesystem rather
+    /// than the base listing — `selected_entries` / `fs_mut` / `is_host_pane` /
+    /// `session` all switch to the wrapper context so the existing copy
+    /// dispatch pulls files straight out.
+    fn tree_active(&self) -> bool {
+        !self.tree_selected.is_empty()
+    }
+
+    /// The mount key and selected entries for the active tree selection, all
+    /// sharing the first selected row's mount (a selection can't span mounts).
+    fn tree_selection(&self) -> Option<(String, Vec<FileEntry>)> {
+        let first = self.tree_selected.first()?;
+        let mount = self.tree_index.get(first)?.mount.clone();
+        let entries = self
+            .tree_selected
+            .iter()
+            .filter_map(|id| self.tree_index.get(id))
+            .filter(|r| r.mount == mount)
+            .map(|r| r.entry.clone())
+            .collect();
+        Some((mount, entries))
+    }
+
+    /// Clear the tree selection (e.g. when the base listing is clicked).
+    fn clear_tree_selection(&mut self) {
+        self.tree_selected.clear();
+    }
+
+    /// Expand or collapse a wrapper / inner-folder node. Opening a wrapper
+    /// materializes + mounts its contents (reading the wrapper's bytes from the
+    /// host, the base filesystem, or the enclosing mount). Returns a status
+    /// line on error or a note (e.g. a multi-volume image).
+    fn toggle_wrapper(
+        &mut self,
+        node_id: &str,
+        name: &str,
+        is_tree: bool,
+        is_wrapper: bool,
+        expanded: bool,
+    ) -> Option<String> {
+        let side = self.side.label();
+        if expanded {
+            self.wrapper_tree.collapse(node_id);
+            // Drop any selection that was inside the collapsed subtree.
+            self.tree_selected.retain(|id| !id.starts_with(node_id));
+            return None;
+        }
+        if is_tree {
+            if is_wrapper {
+                // Nested wrapper: read its bytes out of the enclosing mount.
+                let row = self.tree_index.get(node_id)?.clone();
+                let bytes = match self.wrapper_tree.read_wrapper_bytes(&row) {
+                    Ok(b) => b,
+                    Err(e) => return Some(format!("[{side}] cannot read '{name}': {e:#}")),
+                };
+                if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, bytes) {
+                    return Some(format!("[{side}] cannot open '{name}': {e:#}"));
+                }
+            } else {
+                // Plain folder inside a mount — just reveal its children.
+                self.wrapper_tree.expand_folder(node_id);
+            }
+        } else {
+            // Base wrapper: its bytes come from the host file or the base fs.
+            let entry = self
+                .listing
+                .entries()
+                .iter()
+                .find(|e| e.path == node_id)
+                .cloned()?;
+            let bytes = if self.listing.is_host() {
+                match std::fs::read(&entry.path) {
+                    Ok(b) => b,
+                    Err(e) => return Some(format!("[{side}] cannot read '{name}': {e}")),
+                }
+            } else {
+                let Some(fs) = self.listing.fs_mut() else {
+                    return Some(format!("[{side}] source is not open"));
+                };
+                let mut buf = Vec::new();
+                if let Err(e) = fs.write_file_to(&entry, &mut buf) {
+                    return Some(format!("[{side}] cannot read '{name}': {e}"));
+                }
+                buf
+            };
+            if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, bytes) {
+                return Some(format!("[{side}] cannot open '{name}': {e:#}"));
+            }
+        }
+        self.wrapper_tree
+            .note(node_id)
+            .map(|n| format!("[{side}] {name}: {n}"))
     }
 
     /// Number of staged (unapplied) edits on this pane.
@@ -314,6 +398,15 @@ impl CommanderPane {
 
     /// Render the pane. Returns status + any cross-pane request for the overlay.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) -> PaneResponse {
+        // Wrapper expansion is scoped to the current directory: any change of
+        // base cwd (navigate / source / partition switch / close) collapses
+        // every expanded wrapper and drops its mounts + tree selection.
+        let cwd_now = self.listing.cwd_path().to_string();
+        if cwd_now != self.last_cwd {
+            self.last_cwd = cwd_now;
+            self.wrapper_tree.clear();
+            self.tree_selected.clear();
+        }
         let mut status = self.poll_open(ui.ctx());
         if let Some(s) = self.poll_apply(ui.ctx()) {
             status = Some(s);
@@ -323,17 +416,6 @@ impl CommanderPane {
         }
         if let Some(s) = self.poll_remote(ui.ctx()) {
             status = Some(s);
-        }
-        // Keep the descent temp-guard stack in sync with the listing's depth. A
-        // fresh source / partition load resets the listing to depth 0 without
-        // touching our guards; trim any orphans here so each materialized temp
-        // file lives exactly as long as its descent layer, and drop a stale
-        // volume picker once we're back at the top level.
-        if self.descent_temps.len() > self.listing.descent_depth() {
-            self.descent_temps.truncate(self.listing.descent_depth());
-            if self.listing.descent_depth() == 0 {
-                self.nested_picker = None;
-            }
         }
         let mut copy_to_other = false;
         let mut export_to_host = false;
@@ -412,12 +494,6 @@ impl CommanderPane {
                     status = Some(self.spawn_open_image(path, None, opened_from));
                 }
             }
-            // Descend into a wrapper file (archive / nested image) in place.
-            if let Some(name) = actions.descend {
-                if let Some(s) = self.descend_into_entry(&name) {
-                    status = Some(s);
-                }
-            }
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -437,9 +513,6 @@ impl CommanderPane {
             status = Some(s);
         }
         if let Some(s) = self.render_rename_dialog(ui.ctx()) {
-            status = Some(s);
-        }
-        if let Some(s) = self.render_nested_picker(ui.ctx()) {
             status = Some(s);
         }
         self.render_edits_popup(ui.ctx());
@@ -1038,17 +1111,16 @@ impl CommanderPane {
             && self.pending_apply.is_none()
             && self.pending_open.is_none()
             && self.resolved_backup.is_none()
-            // A descended wrapper layer (inside an archive / nested image) is
-            // read-only; you can copy *out* of it but not *into* it.
-            && !self.is_descended()
             // A remote pane can be browsed and copied *out of*, but not yet
             // copied *into* (the local→remote write path is a later increment).
             && self.remote.is_none()
     }
 
     /// True when this pane lists a host-OS folder rather than a disk image.
+    /// When a wrapper selection is active the effective source is the mounted
+    /// wrapper filesystem (not the host), so report `false`.
     pub(crate) fn is_host_pane(&self) -> bool {
-        self.listing.is_host()
+        !self.tree_active() && self.listing.is_host()
     }
 
     /// True when this pane lists a (read-only) backup folder's contents — native
@@ -1064,6 +1136,11 @@ impl CommanderPane {
     /// read-only on a worker thread for an image->host extraction). `None` for a
     /// host pane or before a source is opened.
     pub(crate) fn session(&self) -> Option<BrowseSession> {
+        // A wrapper mount has no BrowseSession; force the session-less
+        // image->host extraction path.
+        if self.tree_active() {
+            return None;
+        }
         self.session.clone()
     }
 
@@ -1076,6 +1153,12 @@ impl CommanderPane {
     /// the active pane. Mirrors the row right-click delete: an image pane toggles
     /// a staged delete (Apply writes through); a host pane queues a confirm.
     pub(crate) fn delete_selection(&mut self) -> String {
+        if self.tree_active() {
+            return format!(
+                "[{}] wrapper contents are read-only (copy out, don't edit).",
+                self.side.label()
+            );
+        }
         if self.is_backup_pane() {
             return format!("[{}] backup panes are read-only.", self.side.label());
         }
@@ -1093,13 +1176,17 @@ impl CommanderPane {
         }
     }
 
-    /// True when at least one row is selected.
+    /// True when at least one row is selected (base listing or a wrapper).
     pub(crate) fn has_selection(&self) -> bool {
-        !self.listing.selection().is_empty()
+        self.tree_active() || !self.listing.selection().is_empty()
     }
 
-    /// The selected entries (owned clones) in the current directory.
+    /// The selected entries (owned clones) — from the active wrapper mount when
+    /// a tree selection is live, otherwise the base current directory.
     pub(crate) fn selected_entries(&self) -> Vec<FileEntry> {
+        if let Some((_, entries)) = self.tree_selection() {
+            return entries;
+        }
         self.listing
             .selected_entries()
             .into_iter()
@@ -1113,7 +1200,11 @@ impl CommanderPane {
     }
 
     /// Mutable access to the open filesystem (to extract files for a copy).
+    /// Returns the active wrapper mount when a tree selection is live.
     pub(crate) fn fs_mut(&mut self) -> Option<&mut (dyn Filesystem + 'static)> {
+        if let Some((mount, _)) = self.tree_selection() {
+            return self.wrapper_tree.mount_fs(&mount);
+        }
         self.listing.fs_mut()
     }
 
@@ -1429,8 +1520,6 @@ impl CommanderPane {
         self.cache_store.clear();
         self.selected_part = None;
         self.listing = DirListing::new();
-        self.descent_temps.clear();
-        self.nested_picker = None;
         self.session = None;
         self.queue.clear();
         self.pending_open = None;
@@ -1498,10 +1587,6 @@ impl CommanderPane {
                 }
             };
             ui.monospace(prefix);
-            // Breadcrumb of any descended wrappers: `Archive.sit > inner.img >`.
-            for label in self.listing.descent_labels() {
-                ui.monospace(format!("{label} >"));
-            }
             let path = self.listing.cwd_path();
             ui.monospace(if path.is_empty() { "/" } else { path });
         });
@@ -1522,139 +1607,6 @@ impl CommanderPane {
                     &p.type_name,
                 )
         })
-    }
-
-    /// Descend into the entry named `name` (a Mac archive or a nested disk
-    /// image) so its contents browse in place. Materializes the wrapper bytes
-    /// to a temp file when they come from a parent layer (host files open in
-    /// place), then opens the archive or image partition(s). For a multi-volume
-    /// image, opens the volume picker instead of descending immediately.
-    /// Returns a status line on error / outcome, `None` on a clean descend.
-    fn descend_into_entry(&mut self, name: &str) -> Option<String> {
-        let entry = self
-            .listing
-            .entries()
-            .iter()
-            .find(|e| e.name == name)
-            .cloned()?;
-        let kind = classify(&entry.name)?;
-
-        // Resolve the wrapper to a path on disk: host files open in place; a
-        // file inside an image / archive layer is materialized to a temp file.
-        let (path, temp): (PathBuf, Option<tempfile::TempDir>) = if self.listing.is_host() {
-            (PathBuf::from(&entry.path), None)
-        } else {
-            let bytes = {
-                let Some(fs) = self.listing.fs_mut() else {
-                    return Some(format!("[{}] cannot read '{name}'", self.side.label()));
-                };
-                let mut buf = Vec::new();
-                if let Err(e) = fs.write_file_to(&entry, &mut buf) {
-                    return Some(format!("[{}] cannot read '{name}': {e}", self.side.label()));
-                }
-                buf
-            };
-            match commander_descend::materialize(&bytes, &entry.name) {
-                Ok((guard, p)) => (p, Some(guard)),
-                Err(e) => return Some(format!("[{}] {e}", self.side.label())),
-            }
-        };
-
-        match kind {
-            DescendKind::Archive => {
-                match commander_descend::open_archive(&path, Some(entry.name.clone())) {
-                    Ok(fs) => self.push_descend_layer(fs, entry.name.clone(), temp),
-                    Err(e) => Some(format!("[{}] cannot open '{name}': {e}", self.side.label())),
-                }
-            }
-            DescendKind::DiskImage => match commander_descend::browsable_partitions(&path) {
-                Ok(parts) if parts.is_empty() => Some(format!(
-                    "[{}] '{name}' has no browsable volumes",
-                    self.side.label()
-                )),
-                Ok(parts) if parts.len() == 1 => {
-                    match commander_descend::open_image_partition(&path, &parts[0].1) {
-                        Ok(fs) => self.push_descend_layer(fs, entry.name.clone(), temp),
-                        Err(e) => {
-                            Some(format!("[{}] cannot open '{name}': {e}", self.side.label()))
-                        }
-                    }
-                }
-                Ok(parts) => {
-                    // Multiple volumes — let the user choose which to descend into.
-                    self.nested_picker = Some(NestedPicker {
-                        label: entry.name.clone(),
-                        path,
-                        temp,
-                        parts,
-                    });
-                    None
-                }
-                Err(e) => Some(format!("[{}] cannot read '{name}': {e}", self.side.label())),
-            },
-        }
-    }
-
-    /// Push an opened wrapper `fs` as a new descent layer, pairing it with its
-    /// temp guard so the temp file lives exactly as long as the layer.
-    fn push_descend_layer(
-        &mut self,
-        fs: Box<dyn Filesystem>,
-        label: String,
-        temp: Option<tempfile::TempDir>,
-    ) -> Option<String> {
-        match self.listing.descend_into(fs, label.clone()) {
-            Ok(()) => {
-                self.descent_temps.push(temp);
-                Some(format!("[{}] opened '{label}'", self.side.label()))
-            }
-            Err(e) => Some(format!(
-                "[{}] cannot open '{label}': {e}",
-                self.side.label()
-            )),
-        }
-    }
-
-    /// Modal volume picker for descending into a nested multi-partition disk
-    /// image. Returns a status line on a pick / error; `None` while open.
-    fn render_nested_picker(&mut self, ctx: &egui::Context) -> Option<String> {
-        let picker = self.nested_picker.take()?;
-        let mut chosen: Option<usize> = None;
-        let mut cancel = false;
-        egui::Window::new("Choose a volume")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                ui.label(format!("'{}' contains multiple volumes:", picker.label));
-                ui.add_space(6.0);
-                for (i, (_, p)) in picker.parts.iter().enumerate() {
-                    if ui.button(partition_label(p)).clicked() {
-                        chosen = Some(i);
-                    }
-                }
-                ui.add_space(6.0);
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-
-        if let Some(i) = chosen {
-            let part = picker.parts[i].1.clone();
-            match commander_descend::open_image_partition(&picker.path, &part) {
-                Ok(fs) => {
-                    let label = format!("{} [{}]", picker.label, part.type_name);
-                    return self.push_descend_layer(fs, label, picker.temp);
-                }
-                Err(e) => return Some(format!("[{}] cannot open volume: {e}", self.side.label())),
-            }
-        }
-        if !cancel {
-            // Still open — put it back (temp guard preserved). On cancel we drop
-            // `picker`, freeing its temp file.
-            self.nested_picker = Some(picker);
-        }
-        None
     }
 
     /// Probe a freshly-picked file and start browsing its first real partition.
@@ -2108,9 +2060,8 @@ impl CommanderPane {
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
-        // delete or rename (both would mutate the backup). A descended wrapper
-        // layer (inside an archive / nested image) is likewise read-only.
-        let read_only = self.resolved_backup.is_some() || self.is_descended();
+        // delete or rename (both would mutate the backup).
+        let read_only = self.resolved_backup.is_some();
         // On a remote *host* pane, a file can be opened as a disk image.
         let remote_host = self.is_remote_host();
 
@@ -2128,7 +2079,12 @@ impl CommanderPane {
         let mut m_cancel_rename: Option<String> = None;
         let mut m_info: Option<String> = None;
         let mut m_open_image: Option<String> = None;
-        let mut m_descend: Option<String> = None;
+        // node_id, name, is_tree, is_wrapper, currently-expanded.
+        let mut m_toggle: Option<(String, String, bool, bool, bool)> = None;
+        // node_id, ctrl-held — selecting a row inside an expanded wrapper.
+        let mut tree_click: Option<(String, bool)> = None;
+        // node_id of a right-clicked tree row (selects it if not selected).
+        let mut tree_rclick: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -2140,7 +2096,13 @@ impl CommanderPane {
                         egui::vec2(ui.available_width(), ROW_H),
                         egui::Sense::click(),
                     );
-                    let selected = !row.is_parent() && self.listing.is_selected(&row.name);
+                    let selected = if row.is_parent() {
+                        false
+                    } else if row.is_tree {
+                        self.tree_selected.contains(&row.node_id)
+                    } else {
+                        self.listing.is_selected(&row.name)
+                    };
                     if selected {
                         ui.painter().rect_filled(
                             rect,
@@ -2156,29 +2118,55 @@ impl CommanderPane {
                     }
                     paint_row(ui, rect, row);
 
+                    // The `+`/`-` disclosure occupies a fixed slot at the row's
+                    // indent; a click there toggles expansion instead of
+                    // selecting / navigating.
+                    let toggle_x0 = cols(rect).name_l + (row.depth as f32) * TREE_INDENT;
+                    let hit_toggle = |resp: &egui::Response| -> bool {
+                        row.expandable
+                            && resp
+                                .interact_pointer_pos()
+                                .is_some_and(|p| p.x >= toggle_x0 && p.x < toggle_x0 + TOGGLE_W)
+                    };
+                    let toggle_req = || {
+                        (
+                            row.node_id.clone(),
+                            row.name.clone(),
+                            row.is_tree,
+                            row.is_wrapper,
+                            row.expanded,
+                        )
+                    };
+
                     if resp.double_clicked() {
-                        if row.is_parent() {
+                        if hit_toggle(&resp) {
+                            m_toggle = Some(toggle_req());
+                        } else if row.is_parent() {
                             to_up = true;
+                        } else if row.is_tree {
+                            // Inside a wrapper: double-click expands a
+                            // folder/wrapper, or selects a file.
+                            if row.expandable {
+                                m_toggle = Some(toggle_req());
+                            } else {
+                                tree_click = Some((row.node_id.clone(), false));
+                            }
                         } else if row.is_dir {
                             to_enter = Some(row.name.clone());
-                        } else if row.descendable.is_some() {
-                            // Double-click a wrapper (archive / nested image) to
-                            // browse its contents in place, like entering a dir.
-                            m_descend = Some(row.name.clone());
+                        } else if row.is_wrapper {
+                            // Double-click a wrapper expands it in place.
+                            m_toggle = Some(toggle_req());
                         } else if remote_host {
-                            // On a remote host pane, double-click a file opens it
-                            // as a disk image (browse inside it).
                             m_open_image = Some(row.name.clone());
                         } else {
-                            // Double-click a file -> open its File Info window.
                             m_info = Some(row.name.clone());
                         }
                     } else if resp.clicked() {
-                        // A single click on ".." does nothing — navigate up on
-                        // double-click, consistent with folders (which enter on
-                        // double-click). A single click navigating immediately
-                        // also pre-empted any double-click on the row.
-                        if !row.is_parent() {
+                        if hit_toggle(&resp) {
+                            m_toggle = Some(toggle_req());
+                        } else if row.is_tree {
+                            tree_click = Some((row.node_id.clone(), mods.command));
+                        } else if !row.is_parent() {
                             click = Some((row.name.clone(), mods.command, mods.shift));
                         }
                     }
@@ -2188,16 +2176,12 @@ impl CommanderPane {
                         let menu = resp.context_menu(|ui| {
                             // On a remote host pane, offer to open a file as an
                             // image (browse inside it).
-                            if remote_host && !row.is_dir && ui.button("Open Image").clicked() {
-                                m_open_image = Some(row.name.clone());
-                                ui.close();
-                            }
-                            // Descend into a wrapper (archive / nested image) to
-                            // view and copy out its contents without extracting.
-                            if row.descendable.is_some()
-                                && ui.button("Open contents (view inside)").clicked()
+                            if remote_host
+                                && !row.is_dir
+                                && !row.is_tree
+                                && ui.button("Open Image").clicked()
                             {
-                                m_descend = Some(row.name.clone());
+                                m_open_image = Some(row.name.clone());
                                 ui.close();
                             }
                             // Copy applies to real / pending-delete rows, not a
@@ -2229,51 +2213,60 @@ impl CommanderPane {
                             // File Info / Details: metadata + preview, with the
                             // editable-metadata subset on image panes. Needs
                             // real data, so a not-yet-applied add is excluded.
-                            if !matches!(row.kind, RowKind::PendingAdd)
+                            if !row.is_tree
+                                && !matches!(row.kind, RowKind::PendingAdd)
                                 && ui.button("File Info / Details...").clicked()
                             {
                                 m_info = Some(row.name.clone());
                                 ui.close();
                             }
-                            // Rename a single entry in place. A row with a
-                            // rename already staged offers to cancel it instead.
-                            // Suppressed on a read-only backup pane.
-                            if !read_only {
-                                if matches!(row.kind, RowKind::PendingRename)
-                                    && ui.button("Cancel rename").clicked()
-                                {
-                                    m_cancel_rename = Some(row.name.clone());
-                                    ui.close();
-                                } else if matches!(row.kind, RowKind::Normal)
-                                    && ui.button("Rename...").clicked()
-                                {
-                                    m_rename = Some(row.name.clone());
-                                    ui.close();
+                            // Edit actions are base-listing only — a wrapper's
+                            // contents are read-only (copy out, don't mutate).
+                            if !row.is_tree {
+                                // Rename a single entry in place. A row with a
+                                // rename already staged offers to cancel it
+                                // instead. Suppressed on a read-only backup pane.
+                                if !read_only {
+                                    if matches!(row.kind, RowKind::PendingRename)
+                                        && ui.button("Cancel rename").clicked()
+                                    {
+                                        m_cancel_rename = Some(row.name.clone());
+                                        ui.close();
+                                    } else if matches!(row.kind, RowKind::Normal)
+                                        && ui.button("Rename...").clicked()
+                                    {
+                                        m_rename = Some(row.name.clone());
+                                        ui.close();
+                                    }
                                 }
-                            }
-                            // Delete (immediate on host, staged on image).
-                            // Suppressed on a read-only backup pane.
-                            if read_only {
-                                // browse / copy-out only
-                            } else if host_pane {
-                                if ui.button("Delete (immediate)").clicked() {
-                                    m_host_delete = true;
-                                    ui.close();
-                                }
-                            } else {
-                                let label = match row.kind {
-                                    RowKind::PendingDelete => "Undelete",
-                                    RowKind::PendingAdd => "Remove from staging",
-                                    _ => "Delete",
-                                };
-                                if ui.button(label).clicked() {
-                                    m_delete = true;
-                                    ui.close();
+                                // Delete (immediate on host, staged on image).
+                                // Suppressed on a read-only backup pane.
+                                if read_only {
+                                    // browse / copy-out only
+                                } else if host_pane {
+                                    if ui.button("Delete (immediate)").clicked() {
+                                        m_host_delete = true;
+                                        ui.close();
+                                    }
+                                } else {
+                                    let label = match row.kind {
+                                        RowKind::PendingDelete => "Undelete",
+                                        RowKind::PendingAdd => "Remove from staging",
+                                        _ => "Delete",
+                                    };
+                                    if ui.button(label).clicked() {
+                                        m_delete = true;
+                                        ui.close();
+                                    }
                                 }
                             }
                         });
                         if menu.is_some() {
-                            ctx_rclick = Some(row.name.clone());
+                            if row.is_tree {
+                                tree_rclick = Some(row.node_id.clone());
+                            } else {
+                                ctx_rclick = Some(row.name.clone());
+                            }
                         }
                     }
                 }
@@ -2289,18 +2282,18 @@ impl CommanderPane {
             });
 
         // Any row interaction marks this pane "active" for the middle Delete.
-        let focused =
-            click.is_some() || ctx_rclick.is_some() || to_enter.is_some() || to_up || bg_deselect;
+        let focused = click.is_some()
+            || ctx_rclick.is_some()
+            || to_enter.is_some()
+            || to_up
+            || bg_deselect
+            || tree_click.is_some()
+            || tree_rclick.is_some()
+            || m_toggle.is_some();
 
         let mut status = None;
         if to_up {
-            // If `up` ascends out of a wrapper layer, drop that layer's temp
-            // guard (freeing its materialized file).
-            let before = self.listing.descent_depth();
             self.listing.up();
-            if self.listing.descent_depth() < before {
-                self.descent_temps.pop();
-            }
         }
         if let Some(name) = to_enter {
             if let Err(e) = self.listing.enter(&name) {
@@ -2309,8 +2302,11 @@ impl CommanderPane {
         }
         if bg_deselect {
             self.listing.clear_selection();
+            self.clear_tree_selection();
         }
         if let Some((name, command, shift)) = click {
+            // A base-listing click takes over the selection from any wrapper.
+            self.clear_tree_selection();
             if shift {
                 self.listing.shift_click(&name);
             } else if command {
@@ -2319,10 +2315,38 @@ impl CommanderPane {
                 self.listing.click(&name);
             }
         }
-        // A right-click on an unselected row acts on just that row.
+        // A click on a row inside an expanded wrapper takes over from the base
+        // selection (the two selection contexts are mutually exclusive).
+        if let Some((node_id, ctrl)) = tree_click {
+            self.listing.clear_selection();
+            if ctrl {
+                if let Some(pos) = self.tree_selected.iter().position(|n| *n == node_id) {
+                    self.tree_selected.remove(pos);
+                } else {
+                    self.tree_selected.push(node_id);
+                }
+            } else {
+                self.tree_selected = vec![node_id];
+            }
+        }
+        // A right-click on an unselected base row acts on just that row.
         if let Some(name) = &ctx_rclick {
             if !self.listing.is_selected(name) {
+                self.clear_tree_selection();
                 self.listing.click(name);
+            }
+        }
+        // A right-click on an unselected wrapper row acts on just that row.
+        if let Some(node_id) = &tree_rclick {
+            if !self.tree_selected.contains(node_id) {
+                self.listing.clear_selection();
+                self.tree_selected = vec![node_id.clone()];
+            }
+        }
+        // Expand / collapse a wrapper or inner folder.
+        if let Some((node_id, name, is_tree, is_wrapper, expanded)) = m_toggle {
+            if let Some(s) = self.toggle_wrapper(&node_id, &name, is_tree, is_wrapper, expanded) {
+                status = Some(s);
             }
         }
         if m_delete {
@@ -2375,7 +2399,6 @@ impl CommanderPane {
             detail: m_info,
             open_image: m_open_image,
             focused,
-            descend: m_descend,
         }
     }
 }
@@ -2417,9 +2440,18 @@ struct DisplayRow {
     /// A file in a remote-host listing whose name looks like a disk image we can
     /// open — tinted so the user knows it's openable (double-click / Open Image).
     is_image: bool,
-    /// A local file that is a descendable wrapper (Mac archive or disk image):
-    /// double-click / "Open contents" browses inside it. `None` otherwise.
-    descendable: Option<DescendKind>,
+    /// Stable tree node id (base-row path, or a wrapper subtree id). Used as the
+    /// expand + selection key.
+    node_id: String,
+    /// Indent level: 0 for base rows, >=1 for rows inside an expanded wrapper.
+    depth: usize,
+    /// Has a `+`/`-` disclosure toggle (a wrapper, or a folder inside a wrapper).
+    expandable: bool,
+    expanded: bool,
+    /// True for rows produced from inside an expanded wrapper (vs. base rows).
+    is_tree: bool,
+    /// True for a wrapper row (archive / disk image) — `<ARC>` / `<IMG>` tag.
+    is_wrapper: bool,
 }
 
 impl DisplayRow {
@@ -2443,15 +2475,18 @@ impl CommanderPane {
     /// Build the rendered rows, merging the staged-edit overlay: real entries
     /// flagged pending-delete where the queue has a delete for them, and the
     /// queue's pending adds for this directory appended as green rows.
-    fn build_display_rows(&self) -> Vec<DisplayRow> {
+    fn build_display_rows(&mut self) -> Vec<DisplayRow> {
         let cwd_path = self.listing.cwd_path().to_string();
         // On a remote-host pane, flag files that look like disk images.
         let remote_host = self.is_remote_host();
-        // Descend (view-inside) is a local-only affordance: remote panes route
-        // disk images through "Open Image" instead, and reading wrapper bytes
-        // out of a remote listing isn't wired.
-        let allow_descend = !remote_host;
-        let mut rows: Vec<DisplayRow> = self
+        // Wrappers are descendable only on local panes (remote routes disk
+        // images through "Open Image"; reading wrapper bytes over the wire
+        // isn't wired).
+        let allow_wrap = !remote_host;
+        // Base rows (parent + current dir entries + pending adds). Collected
+        // first (immutable borrow of listing/queue), then wrapper subtrees are
+        // spliced in below (which needs `&mut self.wrapper_tree`).
+        let mut base: Vec<DisplayRow> = self
             .listing
             .current_rows()
             .into_iter()
@@ -2466,7 +2501,12 @@ impl CommanderPane {
                     rename_to: None,
                     meta_changed: false,
                     is_image: false,
-                    descendable: None,
+                    node_id: String::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                    is_tree: false,
+                    is_wrapper: false,
                 },
                 Row::Entry(e) => {
                     let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
@@ -2477,11 +2517,7 @@ impl CommanderPane {
                     } else {
                         RowKind::Normal
                     };
-                    let descendable = if allow_descend && !e.is_directory() {
-                        classify(&e.name)
-                    } else {
-                        None
-                    };
+                    let is_wrapper = allow_wrap && !e.is_directory() && classify(&e.name).is_some();
                     DisplayRow {
                         is_image: remote_host
                             && !e.is_directory()
@@ -2490,24 +2526,23 @@ impl CommanderPane {
                         is_dir: e.is_directory(),
                         size: e.size,
                         modified: e.modified.clone().unwrap_or_default(),
-                        // Tag descendable wrappers in the Type column so the user
-                        // sees they can be opened in place (ASCII, no glyphs).
-                        type_tag: match descendable {
-                            Some(DescendKind::Archive) => "<ARC>".to_string(),
-                            Some(DescendKind::DiskImage) => "<IMG>".to_string(),
-                            None => type_tag(e),
-                        },
+                        type_tag: wrapper_or_type_tag(e, is_wrapper),
                         kind,
                         rename_to,
                         meta_changed: self.queue.has_pending_metadata(&e.path),
-                        descendable,
+                        node_id: e.path.clone(),
+                        depth: 0,
+                        expandable: is_wrapper,
+                        expanded: is_wrapper && self.wrapper_tree.is_expanded(&e.path),
+                        is_tree: false,
+                        is_wrapper,
                     }
                 }
             })
             .collect();
 
         for e in self.queue.pending_adds_for(&cwd_path) {
-            rows.push(DisplayRow {
+            base.push(DisplayRow {
                 name: e.name.clone(),
                 is_dir: e.is_directory(),
                 size: e.size,
@@ -2517,10 +2552,66 @@ impl CommanderPane {
                 rename_to: None,
                 meta_changed: false,
                 is_image: false,
-                descendable: None,
+                node_id: e.path.clone(),
+                depth: 0,
+                expandable: false,
+                expanded: false,
+                is_tree: false,
+                is_wrapper: false,
             });
         }
+
+        // Splice each expanded base wrapper's contents in beneath it, and
+        // rebuild the node->row index for click / selection / copy resolution.
+        self.tree_index.clear();
+        let mut rows = Vec::with_capacity(base.len());
+        for row in base {
+            let expand_here = row.expanded && row.expandable && !row.is_tree;
+            let node_id = row.node_id.clone();
+            rows.push(row);
+            if expand_here {
+                for tr in self.wrapper_tree.subtree_rows(&node_id, 1) {
+                    self.tree_index.insert(tr.node_id.clone(), tr.clone());
+                    rows.push(tree_row_to_display(&tr));
+                }
+            }
+        }
         rows
+    }
+}
+
+/// Type-column text for a base entry: `<ARC>` / `<IMG>` for a wrapper, else the
+/// usual per-filesystem tag.
+fn wrapper_or_type_tag(e: &FileEntry, is_wrapper: bool) -> String {
+    if is_wrapper {
+        match classify(&e.name) {
+            Some(rusty_backup::model::commander_descend::DescendKind::Archive) => "<ARC>".into(),
+            Some(rusty_backup::model::commander_descend::DescendKind::DiskImage) => "<IMG>".into(),
+            None => type_tag(e),
+        }
+    } else {
+        type_tag(e)
+    }
+}
+
+/// Convert a wrapper-tree row into a `DisplayRow`.
+fn tree_row_to_display(tr: &TreeRow) -> DisplayRow {
+    DisplayRow {
+        name: tr.entry.name.clone(),
+        is_dir: tr.entry.is_directory(),
+        size: tr.entry.size,
+        modified: tr.entry.modified.clone().unwrap_or_default(),
+        type_tag: wrapper_or_type_tag(&tr.entry, tr.is_wrapper),
+        kind: RowKind::Normal,
+        rename_to: None,
+        meta_changed: false,
+        is_image: false,
+        node_id: tr.node_id.clone(),
+        depth: tr.depth,
+        expandable: tr.expandable,
+        expanded: tr.expanded,
+        is_tree: true,
+        is_wrapper: tr.is_wrapper,
     }
 }
 
@@ -2613,8 +2704,23 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
         egui::pos2(c.name_l, rect.top()),
         egui::pos2(c.name_r, rect.bottom()),
     );
-    ui.painter_at(name_cell).text(
-        egui::pos2(c.name_l, mid),
+    // Indent by tree depth and reserve a fixed toggle slot so names align
+    // whether or not a row has a `+`/`-`. Draw the disclosure marker (ASCII —
+    // no Unicode glyphs) for expandable rows.
+    let indent_x = c.name_l + (row.depth as f32) * TREE_INDENT;
+    let name_x = indent_x + TOGGLE_W;
+    let painter = ui.painter_at(name_cell);
+    if row.expandable {
+        painter.text(
+            egui::pos2(indent_x, mid),
+            egui::Align2::LEFT_CENTER,
+            if row.expanded { "-" } else { "+" },
+            font.clone(),
+            ui.visuals().weak_text_color(),
+        );
+    }
+    painter.text(
+        egui::pos2(name_x, mid),
         egui::Align2::LEFT_CENTER,
         display_name,
         font.clone(),
