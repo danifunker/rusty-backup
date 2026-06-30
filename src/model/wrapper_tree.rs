@@ -14,12 +14,48 @@
 //! (read from the host or a parent layer) and renders the rows.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::fs::entry::FileEntry;
 use crate::fs::filesystem::Filesystem;
 use crate::model::commander_descend::{self, DescendKind};
+
+/// Where a wrapper's content comes from when expanding it.
+pub enum WrapperSource {
+    /// The wrapper file on disk. Used for host base rows, and *required* for
+    /// multi-file optical formats (bin + cue, mdf + mds) so the sibling data
+    /// file next to it is found.
+    Path(PathBuf),
+    /// The wrapper's bytes, pulled out of a parent layer (archive / image).
+    Bytes(Vec<u8>),
+}
+
+impl WrapperSource {
+    /// Materialize the whole wrapper into a byte buffer (reads the file for the
+    /// `Path` variant). Used by formats opened from memory (archives).
+    fn into_bytes(self) -> Result<Vec<u8>> {
+        match self {
+            WrapperSource::Path(p) => {
+                std::fs::read(&p).map_err(|e| anyhow::anyhow!("read {}: {e}", p.display()))
+            }
+            WrapperSource::Bytes(b) => Ok(b),
+        }
+    }
+
+    /// Resolve to an on-disk path (with a temp-dir guard when the content came
+    /// from memory). Used by formats opened by path (disk images, optical).
+    fn into_path(self, file_name: &str) -> Result<(Option<tempfile::TempDir>, PathBuf)> {
+        match self {
+            WrapperSource::Path(p) => Ok((None, p)),
+            WrapperSource::Bytes(b) => {
+                let (temp, path) = commander_descend::materialize(&b, file_name)?;
+                Ok((Some(temp), path))
+            }
+        }
+    }
+}
 
 /// Separator used to build a node id from its ancestor chain. Control char so
 /// it can't collide with a real filename component.
@@ -104,10 +140,10 @@ impl WrapperTree {
         node_id: &str,
         file_name: &str,
         kind: DescendKind,
-        bytes: Vec<u8>,
+        source: WrapperSource,
     ) -> Result<()> {
         if !self.mounts.contains_key(node_id) {
-            let (mount, note) = open_mount(bytes, file_name, kind)?;
+            let (mount, note) = open_mount(source, file_name, kind)?;
             self.mounts.insert(node_id.to_string(), mount);
             if let Some(n) = note {
                 self.notes.insert(node_id.to_string(), n);
@@ -233,13 +269,14 @@ fn sorted(mut entries: Vec<FileEntry>) -> Vec<FileEntry> {
 /// first browsable volume (with a note when more than one exists — a richer
 /// per-volume tree is a follow-up).
 fn open_mount(
-    bytes: Vec<u8>,
+    source: WrapperSource,
     file_name: &str,
     kind: DescendKind,
 ) -> Result<(Mount, Option<String>)> {
     match kind {
         DescendKind::Archive => {
-            // Archives are read from the owned buffer — no temp file needed.
+            // Archives are read into a buffer — no temp file needed.
+            let bytes = source.into_bytes()?;
             let fs = commander_descend::open_archive_bytes(
                 bytes,
                 file_name,
@@ -249,7 +286,7 @@ fn open_mount(
         }
         DescendKind::DiskImage => {
             // Images open by path (the partition probe + readers seek a file).
-            let (temp, path) = commander_descend::materialize(&bytes, file_name)?;
+            let (temp, path) = source.into_path(file_name)?;
             let parts = commander_descend::browsable_partitions(&path)?;
             let (_, first) = parts
                 .first()
@@ -262,13 +299,14 @@ fn open_mount(
                     parts.len()
                 )
             });
-            Ok((
-                Mount {
-                    fs,
-                    _temp: Some(temp),
-                },
-                note,
-            ))
+            Ok((Mount { fs, _temp: temp }, note))
+        }
+        DescendKind::Optical => {
+            // Optical formats open by path; bin/cue and mdf/mds need the sibling
+            // data file, which the `Path` source preserves.
+            let (temp, path) = source.into_path(file_name)?;
+            let fs = commander_descend::open_optical(&path, Some(file_name.to_string()))?;
+            Ok((Mount { fs, _temp: temp }, None))
         }
     }
 }
@@ -314,8 +352,13 @@ mod tests {
         assert!(tree.is_idle());
 
         // Expanding the base wrapper shows its top-level rows (folder first).
-        tree.expand_wrapper("/a.sit", "a.sit", DescendKind::Archive, archive_bytes())
-            .unwrap();
+        tree.expand_wrapper(
+            "/a.sit",
+            "a.sit",
+            DescendKind::Archive,
+            WrapperSource::Bytes(archive_bytes()),
+        )
+        .unwrap();
         let rows = tree.subtree_rows("/a.sit", 1);
         let names: Vec<_> = rows.iter().map(|r| r.entry.name.as_str()).collect();
         assert_eq!(names, vec!["Sub", "top.txt"]);
@@ -342,8 +385,13 @@ mod tests {
     #[test]
     fn reads_a_file_from_the_mount() {
         let mut tree = WrapperTree::new();
-        tree.expand_wrapper("/a.sit", "a.sit", DescendKind::Archive, archive_bytes())
-            .unwrap();
+        tree.expand_wrapper(
+            "/a.sit",
+            "a.sit",
+            DescendKind::Archive,
+            WrapperSource::Bytes(archive_bytes()),
+        )
+        .unwrap();
         let rows = tree.subtree_rows("/a.sit", 1);
         let top = rows.iter().find(|r| r.entry.name == "top.txt").unwrap();
         let fs = tree.mount_fs(&top.mount).unwrap();

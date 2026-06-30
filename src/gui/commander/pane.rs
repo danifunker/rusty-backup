@@ -38,7 +38,7 @@ use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
 use rusty_backup::model::remote_browser::{BrowseMode, BrowseTarget, RemoteBrowser};
 use rusty_backup::model::status::BlockCacheScan;
-use rusty_backup::model::wrapper_tree::{TreeRow, WrapperTree};
+use rusty_backup::model::wrapper_tree::{TreeRow, WrapperSource, WrapperTree};
 use rusty_backup::partition::{format_size, PartitionInfo};
 
 use super::Side;
@@ -347,7 +347,11 @@ impl CommanderPane {
                     Ok(b) => b,
                     Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
                 };
-                if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
+                let source = WrapperSource::Bytes(bytes);
+                if let Err(e) = self
+                    .wrapper_tree
+                    .expand_wrapper(node_id, name, kind, source)
+                {
                     return self.wrapper_open_failed(name, format!("{e:#}"));
                 }
             } else {
@@ -363,11 +367,12 @@ impl CommanderPane {
                 .find(|e| e.path == node_id)
                 .cloned()?;
             let kind = classify_entry(&entry)?;
-            let bytes = if self.listing.is_host() {
-                match std::fs::read(&entry.path) {
-                    Ok(b) => b,
-                    Err(e) => return self.wrapper_open_failed(name, e.to_string()),
-                }
+            // A host file opens by its real path — cheaper than reading it all,
+            // and required for multi-file optical formats (bin/cue, mdf/mds)
+            // whose sibling data file sits next to it. A wrapper inside an image
+            // pane must be read out of that filesystem first.
+            let source = if self.listing.is_host() {
+                WrapperSource::Path(PathBuf::from(&entry.path))
             } else {
                 let Some(fs) = self.listing.fs_mut() else {
                     return self.wrapper_open_failed(name, "source is not open".into());
@@ -376,9 +381,12 @@ impl CommanderPane {
                 if let Err(e) = fs.write_file_to(&entry, &mut buf) {
                     return self.wrapper_open_failed(name, e.to_string());
                 }
-                buf
+                WrapperSource::Bytes(buf)
             };
-            if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
+            if let Err(e) = self
+                .wrapper_tree
+                .expand_wrapper(node_id, name, kind, source)
+            {
                 return self.wrapper_open_failed(name, format!("{e:#}"));
             }
         }
@@ -2612,6 +2620,7 @@ fn wrapper_or_type_tag(e: &FileEntry, is_wrapper: bool) -> String {
         match classify_entry(e) {
             Some(DescendKind::Archive) => "<ARC>".into(),
             Some(DescendKind::DiskImage) => "<IMG>".into(),
+            Some(DescendKind::Optical) => "<CD>".into(),
             None => type_tag(e),
         }
     } else {

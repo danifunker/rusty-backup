@@ -27,11 +27,19 @@ use crate::partition::PartitionInfo;
 /// What kind of wrapper a descendable row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescendKind {
-    /// A classic-Mac archive (StuffIt / Compact Pro / MacBinary / BinHex).
+    /// A classic-Mac archive (StuffIt / Compact Pro / MacBinary / BinHex) or a
+    /// host archive (ZIP / tar).
     Archive,
     /// A disk-image container (DiskCopy 4.2, 2MG, raw, CHD, …).
     DiskImage,
+    /// An optical disc image (ISO 9660, bin/cue, MDF/MDS, NRG, CCD).
+    Optical,
 }
+
+/// Extensions that name an optical disc image we can browse via `opticaldiscs`.
+/// `.mds` / `.cue` are the descriptors of two-file formats whose data file sits
+/// alongside; the rest are self-contained.
+const OPTICAL_EXTS: &[&str] = &["iso", "cue", "mdf", "mds", "nrg", "ccd", "cdr", "toast"];
 
 /// Classify a filename as descendable, by extension only (no I/O). The actual
 /// open confirms by content; this just decides whether to offer the affordance.
@@ -52,6 +60,11 @@ pub fn classify(name: &str) -> Option<DescendKind> {
     let ext = name.rsplit_once('.').map(|(_, e)| e)?;
     if MAC_ARCHIVE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) || lower.ends_with(".bin") {
         return Some(DescendKind::Archive);
+    }
+    // Optical before disk-image: `.iso` lives in both sets, but an ISO is an
+    // optical filesystem, not a partitioned disk.
+    if OPTICAL_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
+        return Some(DescendKind::Optical);
     }
     if DISK_IMAGE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
         return Some(DescendKind::DiskImage);
@@ -194,6 +207,22 @@ pub fn open_image_partition(path: &Path, part: &PartitionInfo) -> Result<Box<dyn
     commander_source::session_for(path, part)
         .open()
         .map_err(|e| anyhow::anyhow!("open partition {}: {e}", part.type_name))
+}
+
+/// Open an optical disc image (ISO 9660 / bin-cue / MDF-MDS / NRG / CCD) as a
+/// read-only filesystem. For two-file formats (bin/cue, mdf/mds) the sibling
+/// data file must sit next to `path`.
+#[cfg(feature = "optical")]
+pub fn open_optical(path: &Path, label: Option<String>) -> Result<Box<dyn Filesystem>> {
+    let fs = crate::fs::optical_fs::OpticalFilesystem::open(path, label)
+        .map_err(|e| anyhow::anyhow!("open optical image {}: {e}", path.display()))?;
+    Ok(Box::new(fs))
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn Filesystem>> {
+    anyhow::bail!("this build was compiled without optical-disc support")
 }
 
 #[cfg(test)]

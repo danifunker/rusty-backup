@@ -53,6 +53,8 @@ pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
 mod ntfs_tables;
+#[cfg(feature = "optical")]
+pub mod optical_fs;
 pub mod os9;
 pub mod patch;
 pub mod pfs3;
