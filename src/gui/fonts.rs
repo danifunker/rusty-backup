@@ -60,4 +60,34 @@ mod tests {
             );
         }
     }
+
+    /// The Mac Roman repertoire surfaces in egui two ways: filesystem/archive
+    /// filenames (browse view, Archives tab) and the type/creator OSType codes
+    /// the Archives tab renders via `fs::hfs::format_ostype`. egui's default
+    /// font doesn't cover the symbol/punctuation half of Mac Roman, so the
+    /// bundled Noto fallback must — or those names/codes tofu. Guards against a
+    /// future font swap silently dropping coverage.
+    ///
+    /// The lone exception is the Apple-logo glyph (Mac Roman `0xF0` → U+F8FF),
+    /// a private-use code point no standard font carries; it tofus regardless
+    /// and is out of scope here.
+    #[test]
+    fn bundled_font_covers_mac_roman_symbols() {
+        let font = FontRef::try_from_slice(NOTO_CJK_JP).expect("bundled CJK font must parse");
+        // The non-ASCII Mac Roman glyphs that show up in real names / OSType
+        // codes: bullet, trademark, registered, florin, accents, math symbols.
+        for ch in [
+            '\u{2022}', '\u{2122}', '\u{00AE}', '\u{0192}', '\u{00A9}', '\u{00B0}', '\u{00A2}',
+            '\u{00A3}', '\u{00A7}', '\u{00B6}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{00E9}',
+            '\u{00FC}', '\u{00F1}', '\u{2206}', '\u{03A9}', '\u{220F}', '\u{222B}', '\u{25CA}',
+            '\u{FB01}',
+        ] {
+            assert_ne!(
+                font.glyph_id(ch).0,
+                0,
+                "bundled font is missing a glyph for U+{:04X} '{ch}' — OSType codes / Mac names would tofu",
+                ch as u32
+            );
+        }
+    }
 }

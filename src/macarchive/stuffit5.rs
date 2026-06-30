@@ -204,7 +204,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
 
         let datastart = cur.pos as u64;
 
-        let name = crate::fs::hfs::mac_roman_to_utf8(&namedata);
+        let name = crate::fs::hfs::decode_mac_filename(&namedata);
         let parent = dirs.get(&diroffs).cloned().unwrap_or_default();
         let mut path = parent.clone();
         path.push(name.clone());

@@ -363,8 +363,8 @@ impl ArchivesTab {
                                     }
                                 }
                                 ui.label(e.display_path());
-                                let tc = String::from_utf8_lossy(&e.type_code);
-                                let cc = String::from_utf8_lossy(&e.creator_code);
+                                let tc = rusty_backup::fs::hfs::format_ostype(&e.type_code);
+                                let cc = rusty_backup::fs::hfs::format_ostype(&e.creator_code);
                                 ui.label(format!("{tc} / {cc}"));
                                 let (size, method) = e
                                     .data
