@@ -123,16 +123,25 @@ impl WrapperTree {
         self.mounts.get_mut(mount_key).map(|m| m.fs.as_mut())
     }
 
-    /// Read the wrapper bytes of a nested wrapper row so the pane can hand them
-    /// back to [`expand_wrapper`]. Reads the data fork from the owning mount.
+    /// Read the openable bytes of a nested wrapper row so the pane can hand them
+    /// back to [`expand_wrapper`]. Reads the data fork from the owning mount; if
+    /// the entry is an NDIF disk image (its resource fork carries a `bcem` block
+    /// map), reconstruct the raw image from both forks so the result opens like
+    /// any flat disk.
     pub fn read_wrapper_bytes(&mut self, row: &TreeRow) -> Result<Vec<u8>> {
         let fs = self
             .mount_fs(&row.mount)
             .ok_or_else(|| anyhow::anyhow!("wrapper mount not open"))?;
-        let mut buf = Vec::new();
-        fs.write_file_to(&row.entry, &mut buf)
+        let mut data = Vec::new();
+        fs.write_file_to(&row.entry, &mut data)
             .map_err(|e| anyhow::anyhow!("read '{}': {e}", row.entry.name))?;
-        Ok(buf)
+        let mut rsrc = Vec::new();
+        let _ = fs.write_resource_fork_to(&row.entry, &mut rsrc);
+        if let Some(bcem) = crate::rbformats::ndif::extract_bcem(&rsrc) {
+            return crate::rbformats::ndif::reconstruct(&data, &bcem)
+                .map_err(|e| anyhow::anyhow!("NDIF '{}': {e:#}", row.entry.name));
+        }
+        Ok(data)
     }
 
     /// Walk the expanded subtree rooted at base wrapper `wrapper_id` (already

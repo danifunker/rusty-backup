@@ -177,6 +177,7 @@ pub mod gzip;
 pub mod imz;
 pub mod interleave;
 pub mod lz4;
+pub mod ndif;
 pub mod qcow2;
 #[cfg(test)]
 pub(crate) mod qemu_img_test;

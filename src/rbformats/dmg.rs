@@ -208,8 +208,10 @@ fn extract_blkx_data(xml: &str) -> Vec<Vec<u8>> {
 // ADC decompression
 // ---------------------------------------------------------------------------
 
-/// Decompress ADC (Apple Data Compression) — a simple LZ77 variant.
-fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+/// Decompress ADC (Apple Data Compression) — a simple LZ77 variant. Shared with
+/// the NDIF reader ([`super::ndif`]), which uses the same codec for its
+/// compressed chunks.
+pub(crate) fn decompress_adc(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(output_size);
     let mut pos = 0;
 
