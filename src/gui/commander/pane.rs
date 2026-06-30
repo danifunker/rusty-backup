@@ -30,6 +30,7 @@ use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
+use rusty_backup::model::commander_descend::{self, classify, DescendKind};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
@@ -94,6 +95,9 @@ struct RowActions {
     open_image: Option<String>,
     /// A row in this pane was clicked/navigated this frame (focus signal).
     focused: bool,
+    /// Descend into this entry (an archive / nested image) as if it were a
+    /// directory, viewing its contents in place (by name).
+    descend: Option<String>,
 }
 
 pub(crate) struct CommanderPane {
@@ -168,6 +172,28 @@ pub(crate) struct CommanderPane {
     pending_remote: Option<Arc<Mutex<RemoteTransition>>>,
     /// The open "Connect to remote..." dialog, if any.
     connect_dialog: Option<ConnectDialog>,
+    /// Temp-file guards for materialized wrapper contents, one per descent
+    /// layer in `listing` (parallel to its descent stack). `None` for a layer
+    /// whose wrapper was a host file opened in place (no materialization). A
+    /// guard is dropped — freeing the temp file — when its layer is popped.
+    descent_temps: Vec<Option<tempfile::TempDir>>,
+    /// Open "choose a volume" picker for descending into a nested multi-volume
+    /// disk image.
+    nested_picker: Option<NestedPicker>,
+}
+
+/// Modal state for picking which volume of a nested multi-partition disk image
+/// to descend into. Holds the materialized image (temp guard + path) and the
+/// browsable partitions found inside it.
+struct NestedPicker {
+    /// Display name of the wrapper file (for the prompt + breadcrumb).
+    label: String,
+    /// Path to the (possibly temp) image file the partitions live in.
+    path: PathBuf,
+    /// Temp guard keeping `path` alive; `None` if it's a host file in place.
+    temp: Option<tempfile::TempDir>,
+    /// Browsable partitions with their raw-table index.
+    parts: Vec<(usize, PartitionInfo)>,
 }
 
 /// Display cache for a remote pane (addr + what it's browsing). The live engine
@@ -263,7 +289,17 @@ impl CommanderPane {
             remote: None,
             pending_remote: None,
             connect_dialog: None,
+            descent_temps: Vec::new(),
+            nested_picker: None,
         }
+    }
+
+    /// True when the listing is currently inside a descended wrapper (archive /
+    /// nested image). Such layers are read-only — edit actions act on the
+    /// pane's own session/queue, which target the top-level source, not the
+    /// wrapper, so they must be gated off here.
+    fn is_descended(&self) -> bool {
+        self.listing.descent_depth() > 0
     }
 
     /// Number of staged (unapplied) edits on this pane.
@@ -287,6 +323,17 @@ impl CommanderPane {
         }
         if let Some(s) = self.poll_remote(ui.ctx()) {
             status = Some(s);
+        }
+        // Keep the descent temp-guard stack in sync with the listing's depth. A
+        // fresh source / partition load resets the listing to depth 0 without
+        // touching our guards; trim any orphans here so each materialized temp
+        // file lives exactly as long as its descent layer, and drop a stale
+        // volume picker once we're back at the top level.
+        if self.descent_temps.len() > self.listing.descent_depth() {
+            self.descent_temps.truncate(self.listing.descent_depth());
+            if self.listing.descent_depth() == 0 {
+                self.nested_picker = None;
+            }
         }
         let mut copy_to_other = false;
         let mut export_to_host = false;
@@ -365,6 +412,12 @@ impl CommanderPane {
                     status = Some(self.spawn_open_image(path, None, opened_from));
                 }
             }
+            // Descend into a wrapper file (archive / nested image) in place.
+            if let Some(name) = actions.descend {
+                if let Some(s) = self.descend_into_entry(&name) {
+                    status = Some(s);
+                }
+            }
         } else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Open a disk image or container to browse it here.");
@@ -384,6 +437,9 @@ impl CommanderPane {
             status = Some(s);
         }
         if let Some(s) = self.render_rename_dialog(ui.ctx()) {
+            status = Some(s);
+        }
+        if let Some(s) = self.render_nested_picker(ui.ctx()) {
             status = Some(s);
         }
         self.render_edits_popup(ui.ctx());
@@ -982,6 +1038,9 @@ impl CommanderPane {
             && self.pending_apply.is_none()
             && self.pending_open.is_none()
             && self.resolved_backup.is_none()
+            // A descended wrapper layer (inside an archive / nested image) is
+            // read-only; you can copy *out* of it but not *into* it.
+            && !self.is_descended()
             // A remote pane can be browsed and copied *out of*, but not yet
             // copied *into* (the local→remote write path is a later increment).
             && self.remote.is_none()
@@ -1370,6 +1429,8 @@ impl CommanderPane {
         self.cache_store.clear();
         self.selected_part = None;
         self.listing = DirListing::new();
+        self.descent_temps.clear();
+        self.nested_picker = None;
         self.session = None;
         self.queue.clear();
         self.pending_open = None;
@@ -1437,6 +1498,10 @@ impl CommanderPane {
                 }
             };
             ui.monospace(prefix);
+            // Breadcrumb of any descended wrappers: `Archive.sit > inner.img >`.
+            for label in self.listing.descent_labels() {
+                ui.monospace(format!("{label} >"));
+            }
             let path = self.listing.cwd_path();
             ui.monospace(if path.is_empty() { "/" } else { path });
         });
@@ -1457,6 +1522,139 @@ impl CommanderPane {
                     &p.type_name,
                 )
         })
+    }
+
+    /// Descend into the entry named `name` (a Mac archive or a nested disk
+    /// image) so its contents browse in place. Materializes the wrapper bytes
+    /// to a temp file when they come from a parent layer (host files open in
+    /// place), then opens the archive or image partition(s). For a multi-volume
+    /// image, opens the volume picker instead of descending immediately.
+    /// Returns a status line on error / outcome, `None` on a clean descend.
+    fn descend_into_entry(&mut self, name: &str) -> Option<String> {
+        let entry = self
+            .listing
+            .entries()
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()?;
+        let kind = classify(&entry.name)?;
+
+        // Resolve the wrapper to a path on disk: host files open in place; a
+        // file inside an image / archive layer is materialized to a temp file.
+        let (path, temp): (PathBuf, Option<tempfile::TempDir>) = if self.listing.is_host() {
+            (PathBuf::from(&entry.path), None)
+        } else {
+            let bytes = {
+                let Some(fs) = self.listing.fs_mut() else {
+                    return Some(format!("[{}] cannot read '{name}'", self.side.label()));
+                };
+                let mut buf = Vec::new();
+                if let Err(e) = fs.write_file_to(&entry, &mut buf) {
+                    return Some(format!("[{}] cannot read '{name}': {e}", self.side.label()));
+                }
+                buf
+            };
+            match commander_descend::materialize(&bytes, &entry.name) {
+                Ok((guard, p)) => (p, Some(guard)),
+                Err(e) => return Some(format!("[{}] {e}", self.side.label())),
+            }
+        };
+
+        match kind {
+            DescendKind::Archive => {
+                match commander_descend::open_archive(&path, Some(entry.name.clone())) {
+                    Ok(fs) => self.push_descend_layer(fs, entry.name.clone(), temp),
+                    Err(e) => Some(format!("[{}] cannot open '{name}': {e}", self.side.label())),
+                }
+            }
+            DescendKind::DiskImage => match commander_descend::browsable_partitions(&path) {
+                Ok(parts) if parts.is_empty() => Some(format!(
+                    "[{}] '{name}' has no browsable volumes",
+                    self.side.label()
+                )),
+                Ok(parts) if parts.len() == 1 => {
+                    match commander_descend::open_image_partition(&path, &parts[0].1) {
+                        Ok(fs) => self.push_descend_layer(fs, entry.name.clone(), temp),
+                        Err(e) => {
+                            Some(format!("[{}] cannot open '{name}': {e}", self.side.label()))
+                        }
+                    }
+                }
+                Ok(parts) => {
+                    // Multiple volumes — let the user choose which to descend into.
+                    self.nested_picker = Some(NestedPicker {
+                        label: entry.name.clone(),
+                        path,
+                        temp,
+                        parts,
+                    });
+                    None
+                }
+                Err(e) => Some(format!("[{}] cannot read '{name}': {e}", self.side.label())),
+            },
+        }
+    }
+
+    /// Push an opened wrapper `fs` as a new descent layer, pairing it with its
+    /// temp guard so the temp file lives exactly as long as the layer.
+    fn push_descend_layer(
+        &mut self,
+        fs: Box<dyn Filesystem>,
+        label: String,
+        temp: Option<tempfile::TempDir>,
+    ) -> Option<String> {
+        match self.listing.descend_into(fs, label.clone()) {
+            Ok(()) => {
+                self.descent_temps.push(temp);
+                Some(format!("[{}] opened '{label}'", self.side.label()))
+            }
+            Err(e) => Some(format!(
+                "[{}] cannot open '{label}': {e}",
+                self.side.label()
+            )),
+        }
+    }
+
+    /// Modal volume picker for descending into a nested multi-partition disk
+    /// image. Returns a status line on a pick / error; `None` while open.
+    fn render_nested_picker(&mut self, ctx: &egui::Context) -> Option<String> {
+        let picker = self.nested_picker.take()?;
+        let mut chosen: Option<usize> = None;
+        let mut cancel = false;
+        egui::Window::new("Choose a volume")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.label(format!("'{}' contains multiple volumes:", picker.label));
+                ui.add_space(6.0);
+                for (i, (_, p)) in picker.parts.iter().enumerate() {
+                    if ui.button(partition_label(p)).clicked() {
+                        chosen = Some(i);
+                    }
+                }
+                ui.add_space(6.0);
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+
+        if let Some(i) = chosen {
+            let part = picker.parts[i].1.clone();
+            match commander_descend::open_image_partition(&picker.path, &part) {
+                Ok(fs) => {
+                    let label = format!("{} [{}]", picker.label, part.type_name);
+                    return self.push_descend_layer(fs, label, picker.temp);
+                }
+                Err(e) => return Some(format!("[{}] cannot open volume: {e}", self.side.label())),
+            }
+        }
+        if !cancel {
+            // Still open — put it back (temp guard preserved). On cancel we drop
+            // `picker`, freeing its temp file.
+            self.nested_picker = Some(picker);
+        }
+        None
     }
 
     /// Probe a freshly-picked file and start browsing its first real partition.
@@ -1910,8 +2108,9 @@ impl CommanderPane {
         // (Delete / Undelete / Remove-from-staging go on the queue).
         let host_pane = self.listing.is_host();
         // A read-only backup pane offers browse / copy-out actions only — no
-        // delete or rename (both would mutate the backup).
-        let read_only = self.resolved_backup.is_some();
+        // delete or rename (both would mutate the backup). A descended wrapper
+        // layer (inside an archive / nested image) is likewise read-only.
+        let read_only = self.resolved_backup.is_some() || self.is_descended();
         // On a remote *host* pane, a file can be opened as a disk image.
         let remote_host = self.is_remote_host();
 
@@ -1929,6 +2128,7 @@ impl CommanderPane {
         let mut m_cancel_rename: Option<String> = None;
         let mut m_info: Option<String> = None;
         let mut m_open_image: Option<String> = None;
+        let mut m_descend: Option<String> = None;
 
         egui::ScrollArea::vertical()
             .id_salt(("commander_rows", self.side.idx()))
@@ -1961,6 +2161,10 @@ impl CommanderPane {
                             to_up = true;
                         } else if row.is_dir {
                             to_enter = Some(row.name.clone());
+                        } else if row.descendable.is_some() {
+                            // Double-click a wrapper (archive / nested image) to
+                            // browse its contents in place, like entering a dir.
+                            m_descend = Some(row.name.clone());
                         } else if remote_host {
                             // On a remote host pane, double-click a file opens it
                             // as a disk image (browse inside it).
@@ -1986,6 +2190,14 @@ impl CommanderPane {
                             // image (browse inside it).
                             if remote_host && !row.is_dir && ui.button("Open Image").clicked() {
                                 m_open_image = Some(row.name.clone());
+                                ui.close();
+                            }
+                            // Descend into a wrapper (archive / nested image) to
+                            // view and copy out its contents without extracting.
+                            if row.descendable.is_some()
+                                && ui.button("Open contents (view inside)").clicked()
+                            {
+                                m_descend = Some(row.name.clone());
                                 ui.close();
                             }
                             // Copy applies to real / pending-delete rows, not a
@@ -2082,7 +2294,13 @@ impl CommanderPane {
 
         let mut status = None;
         if to_up {
+            // If `up` ascends out of a wrapper layer, drop that layer's temp
+            // guard (freeing its materialized file).
+            let before = self.listing.descent_depth();
             self.listing.up();
+            if self.listing.descent_depth() < before {
+                self.descent_temps.pop();
+            }
         }
         if let Some(name) = to_enter {
             if let Err(e) = self.listing.enter(&name) {
@@ -2157,6 +2375,7 @@ impl CommanderPane {
             detail: m_info,
             open_image: m_open_image,
             focused,
+            descend: m_descend,
         }
     }
 }
@@ -2198,6 +2417,9 @@ struct DisplayRow {
     /// A file in a remote-host listing whose name looks like a disk image we can
     /// open — tinted so the user knows it's openable (double-click / Open Image).
     is_image: bool,
+    /// A local file that is a descendable wrapper (Mac archive or disk image):
+    /// double-click / "Open contents" browses inside it. `None` otherwise.
+    descendable: Option<DescendKind>,
 }
 
 impl DisplayRow {
@@ -2225,6 +2447,10 @@ impl CommanderPane {
         let cwd_path = self.listing.cwd_path().to_string();
         // On a remote-host pane, flag files that look like disk images.
         let remote_host = self.is_remote_host();
+        // Descend (view-inside) is a local-only affordance: remote panes route
+        // disk images through "Open Image" instead, and reading wrapper bytes
+        // out of a remote listing isn't wired.
+        let allow_descend = !remote_host;
         let mut rows: Vec<DisplayRow> = self
             .listing
             .current_rows()
@@ -2240,6 +2466,7 @@ impl CommanderPane {
                     rename_to: None,
                     meta_changed: false,
                     is_image: false,
+                    descendable: None,
                 },
                 Row::Entry(e) => {
                     let rename_to = self.queue.pending_rename_for(&e.path).map(str::to_string);
@@ -2250,6 +2477,11 @@ impl CommanderPane {
                     } else {
                         RowKind::Normal
                     };
+                    let descendable = if allow_descend && !e.is_directory() {
+                        classify(&e.name)
+                    } else {
+                        None
+                    };
                     DisplayRow {
                         is_image: remote_host
                             && !e.is_directory()
@@ -2258,10 +2490,17 @@ impl CommanderPane {
                         is_dir: e.is_directory(),
                         size: e.size,
                         modified: e.modified.clone().unwrap_or_default(),
-                        type_tag: type_tag(e),
+                        // Tag descendable wrappers in the Type column so the user
+                        // sees they can be opened in place (ASCII, no glyphs).
+                        type_tag: match descendable {
+                            Some(DescendKind::Archive) => "<ARC>".to_string(),
+                            Some(DescendKind::DiskImage) => "<IMG>".to_string(),
+                            None => type_tag(e),
+                        },
                         kind,
                         rename_to,
                         meta_changed: self.queue.has_pending_metadata(&e.path),
+                        descendable,
                     }
                 }
             })
@@ -2278,6 +2517,7 @@ impl CommanderPane {
                 rename_to: None,
                 meta_changed: false,
                 is_image: false,
+                descendable: None,
             });
         }
         rows

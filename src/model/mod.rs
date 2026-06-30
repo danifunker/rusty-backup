@@ -13,6 +13,7 @@ pub mod cache_runner;
 #[cfg(feature = "chd")]
 pub mod chd_expand_runner;
 pub mod checksum;
+pub mod commander_descend;
 pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
