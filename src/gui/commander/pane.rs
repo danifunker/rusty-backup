@@ -2013,7 +2013,14 @@ impl CommanderPane {
         pt.text(
             egui::pos2(c.size_r, mid),
             egui::Align2::RIGHT_CENTER,
-            format!("Size{}", caret(SortColumn::Size)),
+            format!("Data{}", caret(SortColumn::Size)),
+            font.clone(),
+            color,
+        );
+        pt.text(
+            egui::pos2(c.rsrc_r, mid),
+            egui::Align2::RIGHT_CENTER,
+            "Rsrc",
             font.clone(),
             color,
         );
@@ -2431,6 +2438,8 @@ struct DisplayRow {
     name: String,
     is_dir: bool,
     size: u64,
+    /// Resource-fork size in bytes (0 = none). Mac filesystems / archives only.
+    rsrc_size: u64,
     modified: String,
     type_tag: String,
     kind: RowKind,
@@ -2497,6 +2506,7 @@ impl CommanderPane {
                     name: "..".to_string(),
                     is_dir: true,
                     size: 0,
+                    rsrc_size: 0,
                     modified: String::new(),
                     type_tag: String::new(),
                     kind: RowKind::Parent,
@@ -2527,6 +2537,7 @@ impl CommanderPane {
                         name: e.name.clone(),
                         is_dir: e.is_directory(),
                         size: e.size,
+                        rsrc_size: e.resource_fork_size.unwrap_or(0),
                         modified: e.modified.clone().unwrap_or_default(),
                         type_tag: wrapper_or_type_tag(e, is_wrapper),
                         kind,
@@ -2548,6 +2559,7 @@ impl CommanderPane {
                 name: e.name.clone(),
                 is_dir: e.is_directory(),
                 size: e.size,
+                rsrc_size: e.resource_fork_size.unwrap_or(0),
                 modified: String::new(),
                 type_tag: type_tag(&e),
                 kind: RowKind::PendingAdd,
@@ -2602,6 +2614,7 @@ fn tree_row_to_display(tr: &TreeRow) -> DisplayRow {
         name: tr.entry.name.clone(),
         is_dir: tr.entry.is_directory(),
         size: tr.entry.size,
+        rsrc_size: tr.entry.resource_fork_size.unwrap_or(0),
         modified: tr.entry.modified.clone().unwrap_or_default(),
         type_tag: wrapper_or_type_tag(&tr.entry, tr.is_wrapper),
         kind: RowKind::Normal,
@@ -2634,6 +2647,8 @@ struct Cols {
     name_r: f32,
     size_l: f32,
     size_r: f32,
+    /// Right edge of the resource-fork size column (right-aligned values).
+    rsrc_r: f32,
     mod_l: f32,
     type_l: f32,
 }
@@ -2643,19 +2658,22 @@ fn cols(rect: egui::Rect) -> Cols {
     let gap = 10.0;
     let type_w = 56.0;
     let mod_w = 134.0;
-    let size_w = 80.0;
+    let size_w = 76.0;
+    let rsrc_w = 76.0;
     let name_l = rect.left() + pad;
-    let name_w = (rect.width() - type_w - mod_w - size_w - 4.0 * gap).max(60.0);
+    let name_w = (rect.width() - type_w - mod_w - size_w - rsrc_w - 5.0 * gap).max(60.0);
     let name_r = name_l + name_w;
     let size_l = name_r + gap;
     let size_r = size_l + size_w;
-    let mod_l = size_r + gap;
+    let rsrc_r = size_r + gap + rsrc_w;
+    let mod_l = rsrc_r + gap;
     let type_l = mod_l + mod_w + gap;
     Cols {
         name_l,
         name_r,
         size_l,
         size_r,
+        rsrc_r,
         mod_l,
         type_l,
     }
@@ -2737,6 +2755,17 @@ fn paint_row(ui: &egui::Ui, rect: egui::Rect, row: &DisplayRow) {
             font.clone(),
             color,
         );
+        // Resource-fork size, only when the file actually has one (Mac
+        // filesystems / archives); blank elsewhere so the column stays quiet.
+        if row.rsrc_size > 0 {
+            ui.painter().text(
+                egui::pos2(c.rsrc_r, mid),
+                egui::Align2::RIGHT_CENTER,
+                format_size(row.rsrc_size),
+                font.clone(),
+                ui.visuals().weak_text_color(),
+            );
+        }
     }
     ui.painter().text(
         egui::pos2(c.mod_l, mid),
