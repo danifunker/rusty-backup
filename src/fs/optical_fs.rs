@@ -68,7 +68,9 @@ impl OpticalFilesystem {
 }
 
 /// Translate an opticaldiscs entry into ours (the path strings share the same
-/// `/`-rooted convention).
+/// `/`-rooted convention). Carries the HFS-on-CD metadata opticaldiscs exposes:
+/// resource-fork size and Finder type/creator/flags. (opticaldiscs' browse API
+/// has no date field, so the Modified column stays blank for optical discs.)
 fn translate(e: &OptEntry) -> FileEntry {
     let mut fe = match e.entry_type {
         OptType::Directory => FileEntry::new_directory(e.name.clone(), e.path.clone(), e.location),
@@ -86,10 +88,10 @@ fn translate(e: &OptEntry) -> FileEntry {
             }
         }
     };
-    // Optical filesystems carry no fork; mark size on files only.
-    if !fe.is_directory() {
-        fe.size = e.size;
-    }
+    fe.resource_fork_size = e.resource_fork_size;
+    fe.type_code = e.type_code;
+    fe.creator_code = e.creator_code;
+    fe.finder_flags = e.finder_flags;
     fe
 }
 
@@ -143,6 +145,32 @@ impl Filesystem for OpticalFilesystem {
             .map_err(|e| FilesystemError::Parse(format!("read '{}': {e}", entry.path)))?;
         writer.write_all(&data)?;
         Ok(data.len() as u64)
+    }
+
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let oe = self.opt_entry(&entry.path)?;
+        match self
+            .inner
+            .read_resource_fork(&oe)
+            .map_err(|e| FilesystemError::Parse(format!("read rsrc '{}': {e}", entry.path)))?
+        {
+            Some(data) => {
+                writer.write_all(&data)?;
+                Ok(data.len() as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        self.by_path
+            .get(&entry.path)
+            .and_then(|e| e.resource_fork_size)
+            .unwrap_or(0)
     }
 
     fn volume_label(&self) -> Option<&str> {
