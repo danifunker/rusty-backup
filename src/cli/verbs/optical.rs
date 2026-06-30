@@ -393,9 +393,9 @@ fn walk_tree(
                     out.push_str(&format!(" (rsrc: {})", format_size(rs)));
                 }
             }
-            if let Some(tc) = &child.type_code {
+            if let Some(tc) = child.type_code_string() {
                 out.push_str(&format!("  {tc}"));
-                if let Some(cc) = &child.creator_code {
+                if let Some(cc) = child.creator_code_string() {
                     out.push_str(&format!("/{cc}"));
                 }
             }
@@ -528,8 +528,8 @@ fn extract(
                     .read_resource_fork(entry)
                     .map_err(|e| anyhow::anyhow!("read_resource_fork: {e}"))?
                     .unwrap_or_default();
-                let type_code = fourcc(entry.type_code.as_deref());
-                let creator_code = fourcc(entry.creator_code.as_deref());
+                let type_code = entry.type_code.unwrap_or([0; 4]);
+                let creator_code = entry.creator_code.unwrap_or([0; 4]);
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
                     &type_code,
@@ -550,8 +550,8 @@ fn extract(
                 f.write_all(&data)?;
                 f.flush()?;
                 if has_rsrc && mode != M::DataForkOnly {
-                    let type_code = fourcc(entry.type_code.as_deref());
-                    let creator_code = fourcc(entry.creator_code.as_deref());
+                    let type_code = entry.type_code.unwrap_or([0; 4]);
+                    let creator_code = entry.creator_code.unwrap_or([0; 4]);
                     let rsrc = fs
                         .read_resource_fork(entry)
                         .map_err(|e| anyhow::anyhow!("read_resource_fork: {e}"))?
@@ -595,16 +595,6 @@ fn extract(
         }
     }
     Ok(())
-}
-
-fn fourcc(s: Option<&str>) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    if let Some(code) = s {
-        let bytes = code.as_bytes();
-        let n = bytes.len().min(4);
-        out[..n].copy_from_slice(&bytes[..n]);
-    }
-    out
 }
 
 fn parse_resource_fork_mode(s: &str) -> Option<CliResourceForkMode> {

@@ -364,10 +364,10 @@ impl OpticalDiscBrowseView {
                 ui.label(egui::RichText::new(&entry.name).strong());
                 ui.horizontal(|ui| {
                     ui.label(format!("Size: {}", entry.size_string()));
-                    if let Some(ref tc) = entry.type_code {
+                    if let Some(tc) = entry.type_code_string() {
                         ui.label(format!("Type: {tc}"));
                     }
-                    if let Some(ref cc) = entry.creator_code {
+                    if let Some(cc) = entry.creator_code_string() {
                         ui.label(format!("Creator: {cc}"));
                     }
                     if let Some(rsrc) = entry.resource_fork_size {
@@ -684,9 +684,9 @@ fn walk_optical_tree(
                     out.push_str(&format!(" (rsrc: {})", format_size(rsrc)));
                 }
             }
-            if let Some(ref tc) = child.type_code {
+            if let Some(tc) = child.type_code_string() {
                 out.push_str(&format!("  {tc}"));
-                if let Some(ref cc) = child.creator_code {
+                if let Some(cc) = child.creator_code_string() {
                     out.push_str(&format!("/{cc}"));
                 }
             }
@@ -768,16 +768,8 @@ fn extract_entry(
                 let data = fs.read_file(entry)?;
                 let rsrc_data = fs.read_resource_fork(entry)?.unwrap_or_default();
 
-                let type_code = entry
-                    .type_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
-                let creator_code = entry
-                    .creator_code
-                    .as_ref()
-                    .map(|s| fourcc_bytes(s))
-                    .unwrap_or([0; 4]);
+                let type_code = entry.type_code.unwrap_or([0; 4]);
+                let creator_code = entry.creator_code.unwrap_or([0; 4]);
 
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
@@ -809,16 +801,8 @@ fn extract_entry(
 
                 // Handle resource fork
                 if has_rsrc && resource_fork_mode != ResourceForkMode::DataForkOnly {
-                    let type_code = entry
-                        .type_code
-                        .as_ref()
-                        .map(|s| fourcc_bytes(s))
-                        .unwrap_or([0; 4]);
-                    let creator_code = entry
-                        .creator_code
-                        .as_ref()
-                        .map(|s| fourcc_bytes(s))
-                        .unwrap_or([0; 4]);
+                    let type_code = entry.type_code.unwrap_or([0; 4]);
+                    let creator_code = entry.creator_code.unwrap_or([0; 4]);
 
                     let rsrc_data = fs.read_resource_fork(entry)?.unwrap_or_default();
 
@@ -871,16 +855,6 @@ fn extract_entry(
     }
 
     Ok(())
-}
-
-/// Convert a 4-character type/creator string to a byte array.
-fn fourcc_bytes(s: &str) -> [u8; 4] {
-    let bytes = s.as_bytes();
-    let mut result = [b' '; 4];
-    for (i, &b) in bytes.iter().take(4).enumerate() {
-        result[i] = b;
-    }
-    result
 }
 
 /// Human-friendly size string.

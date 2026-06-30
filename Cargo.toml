@@ -97,7 +97,7 @@ chd = ["dep:libchdman-rs"]
 # Physical optical-drive I/O (rip / data-track read) plus optical-image
 # convert/browse. Builds on armv7 (MiSTer) too: cd-da-reader is cc+libc
 # (a self-compiled SG_IO shim — NO system libcdio link), and opticaldiscs
-# (>=0.4.5) reuses the SAME libchdman-rs 0.288.5 prebuilt as the `chd` feature
+# (>=0.4.5) reuses the SAME libchdman-rs 0.288.8 prebuilt as the `chd` feature
 # — which ships an armv7-gnueabihf-glibc2.31 build — so the two dedupe to one
 # libchdman. At runtime it needs a drive present (e.g. /dev/sr0); harmless to
 # include when none is attached.
@@ -116,13 +116,13 @@ remote = []
 eframe = { version = "0.34", features = ["glow"], optional = true }
 egui = { version = "0.34", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.288.5", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.288.8", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 webbrowser = { version = "1.0", optional = true }
-opticaldiscs = { version = "0.4.2", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.5", features = ["drives"], optional = true }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1", optional = true }
 
 # Always-on dependencies — used by rb-cli (mini included).
