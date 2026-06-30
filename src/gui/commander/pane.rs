@@ -332,7 +332,6 @@ impl CommanderPane {
         is_wrapper: bool,
         expanded: bool,
     ) -> Option<String> {
-        let side = self.side.label();
         if expanded {
             self.wrapper_tree.collapse(node_id);
             // Drop any selection that was inside the collapsed subtree.
@@ -346,10 +345,10 @@ impl CommanderPane {
                 let kind = classify_entry(&row.entry)?;
                 let bytes = match self.wrapper_tree.read_wrapper_bytes(&row) {
                     Ok(b) => b,
-                    Err(e) => return Some(format!("[{side}] cannot read '{name}': {e:#}")),
+                    Err(e) => return self.wrapper_open_failed(name, format!("{e:#}")),
                 };
                 if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
-                    return Some(format!("[{side}] cannot open '{name}': {e:#}"));
+                    return self.wrapper_open_failed(name, format!("{e:#}"));
                 }
             } else {
                 // Plain folder inside a mount — just reveal its children.
@@ -367,25 +366,37 @@ impl CommanderPane {
             let bytes = if self.listing.is_host() {
                 match std::fs::read(&entry.path) {
                     Ok(b) => b,
-                    Err(e) => return Some(format!("[{side}] cannot read '{name}': {e}")),
+                    Err(e) => return self.wrapper_open_failed(name, e.to_string()),
                 }
             } else {
                 let Some(fs) = self.listing.fs_mut() else {
-                    return Some(format!("[{side}] source is not open"));
+                    return self.wrapper_open_failed(name, "source is not open".into());
                 };
                 let mut buf = Vec::new();
                 if let Err(e) = fs.write_file_to(&entry, &mut buf) {
-                    return Some(format!("[{side}] cannot read '{name}': {e}"));
+                    return self.wrapper_open_failed(name, e.to_string());
                 }
                 buf
             };
             if let Err(e) = self.wrapper_tree.expand_wrapper(node_id, name, kind, bytes) {
-                return Some(format!("[{side}] cannot open '{name}': {e:#}"));
+                return self.wrapper_open_failed(name, format!("{e:#}"));
             }
         }
+        let side = self.side.label();
         self.wrapper_tree
             .note(node_id)
             .map(|n| format!("[{side}] {name}: {n}"))
+    }
+
+    /// Record a failed wrapper expansion in the session log (where the full
+    /// detail belongs) and return a short, one-line status — a long error chain
+    /// in the status bar otherwise overflows it and makes the pane unusable. The
+    /// row simply stays collapsed.
+    fn wrapper_open_failed(&mut self, name: &str, detail: String) -> Option<String> {
+        let side = self.side.label();
+        self.log_events
+            .push(format!("[{side}] couldn't open '{name}': {detail}"));
+        Some(format!("[{side}] couldn't open '{name}' (see Log)"))
     }
 
     /// Number of staged (unapplied) edits on this pane.

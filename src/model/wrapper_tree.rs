@@ -25,11 +25,12 @@ use crate::model::commander_descend::{self, DescendKind};
 /// it can't collide with a real filename component.
 const SEP: char = '\u{1}';
 
-/// One opened wrapper: its filesystem plus the temp file backing it (kept alive
-/// for the mount's lifetime).
+/// One opened wrapper: its filesystem plus, for image mounts, the temp file
+/// backing it (kept alive for the mount's lifetime). Archives are read from an
+/// owned byte buffer and need no temp file.
 struct Mount {
     fs: Box<dyn Filesystem>,
-    _temp: tempfile::TempDir,
+    _temp: Option<tempfile::TempDir>,
 }
 
 /// One visible row produced by the tree walk (a descendant of an expanded
@@ -236,13 +237,19 @@ fn open_mount(
     file_name: &str,
     kind: DescendKind,
 ) -> Result<(Mount, Option<String>)> {
-    let (temp, path) = commander_descend::materialize(&bytes, file_name)?;
     match kind {
         DescendKind::Archive => {
-            let fs = commander_descend::open_archive(&path, Some(file_name.to_string()))?;
-            Ok((Mount { fs, _temp: temp }, None))
+            // Archives are read from the owned buffer — no temp file needed.
+            let fs = commander_descend::open_archive_bytes(
+                bytes,
+                file_name,
+                Some(file_name.to_string()),
+            )?;
+            Ok((Mount { fs, _temp: None }, None))
         }
         DescendKind::DiskImage => {
+            // Images open by path (the partition probe + readers seek a file).
+            let (temp, path) = commander_descend::materialize(&bytes, file_name)?;
             let parts = commander_descend::browsable_partitions(&path)?;
             let (_, first) = parts
                 .first()
@@ -255,7 +262,13 @@ fn open_mount(
                     parts.len()
                 )
             });
-            Ok((Mount { fs, _temp: temp }, note))
+            Ok((
+                Mount {
+                    fs,
+                    _temp: Some(temp),
+                },
+                note,
+            ))
         }
     }
 }

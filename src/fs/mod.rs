@@ -47,6 +47,7 @@ pub mod layout_preserving;
 pub mod mac_alias;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
+pub mod mem_archive;
 pub mod mfs;
 pub mod ntfs;
 pub mod ntfs_clone;

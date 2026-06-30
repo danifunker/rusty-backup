@@ -37,10 +37,20 @@ pub enum DescendKind {
 /// open confirms by content; this just decides whether to offer the affordance.
 /// Mac-archive extensions win over disk-image ones (a `.sit.hqx` is an archive).
 pub fn classify(name: &str) -> Option<DescendKind> {
-    let ext = name.rsplit_once('.').map(|(_, e)| e)?;
-    if MAC_ARCHIVE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext))
-        || name.to_ascii_lowercase().ends_with(".bin")
+    let lower = name.to_ascii_lowercase();
+    // Host archives (ZIP / tar family) — checked before the disk-image
+    // extensions so a `.zip` browses its files rather than being treated as a
+    // zip-wrapped disk image.
+    if lower.ends_with(".zip")
+        || lower.ends_with(".tar")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tar.zst")
     {
+        return Some(DescendKind::Archive);
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e)?;
+    if MAC_ARCHIVE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) || lower.ends_with(".bin") {
         return Some(DescendKind::Archive);
     }
     if DISK_IMAGE_EXTS.iter().any(|a| a.eq_ignore_ascii_case(ext)) {
@@ -110,10 +120,52 @@ fn sanitize_temp_name(name: &str) -> String {
 /// Open an archive file (by path) as a read-only filesystem. `label` is the
 /// wrapper's display name for the breadcrumb / volume label.
 pub fn open_archive(path: &Path, label: Option<String>) -> Result<Box<dyn Filesystem>> {
-    let fs = ArchiveFilesystem::open_path(path)
-        .map_err(|e| anyhow::anyhow!("open archive {}: {e}", path.display()))?;
-    let _ = label; // label currently taken from the path's file name inside open_path
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    open_archive_bytes(bytes, name, label)
+}
+
+/// Open archive bytes as a read-only filesystem, routing by content + name to
+/// the right reader: ZIP and tar (plain / `.tgz` / `.tar.gz` / `.tar.zst`) via
+/// [`crate::fs::mem_archive`], otherwise a classic-Mac archive (StuffIt /
+/// Compact Pro / MacBinary / BinHex) via [`ArchiveFilesystem`].
+pub fn open_archive_bytes(
+    bytes: Vec<u8>,
+    file_name: &str,
+    label: Option<String>,
+) -> Result<Box<dyn Filesystem>> {
+    use crate::fs::mem_archive;
+    let lower = file_name.to_ascii_lowercase();
+
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || lower.ends_with(".zip")
+    {
+        let fs = mem_archive::open_zip(&bytes, label)
+            .map_err(|e| anyhow::anyhow!("open zip '{file_name}': {e}"))?;
+        return Ok(Box::new(fs));
+    }
+    if lower.ends_with(".tar")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tar.zst")
+        || looks_like_tar(&bytes)
+    {
+        let fs = mem_archive::open_tar(bytes, label)
+            .map_err(|e| anyhow::anyhow!("open tar '{file_name}': {e}"))?;
+        return Ok(Box::new(fs));
+    }
+    let fs = ArchiveFilesystem::open_bytes(bytes, label)
+        .map_err(|e| anyhow::anyhow!("open archive '{file_name}': {e}"))?;
     Ok(Box::new(fs))
+}
+
+/// A plain (uncompressed) tar has the `ustar` magic at byte 257.
+fn looks_like_tar(bytes: &[u8]) -> bool {
+    bytes.len() >= 262 && &bytes[257..262] == b"ustar"
 }
 
 /// The browsable partitions of a nested disk image at `path`, paired with their
@@ -157,6 +209,13 @@ mod tests {
         assert_eq!(classify("Disk.2mg"), Some(DescendKind::DiskImage));
         assert_eq!(classify("notes.txt"), None);
         assert_eq!(classify("noext"), None);
+        // Host archives (browse files), including `.zip` which must win over the
+        // disk-image-extension routing.
+        assert_eq!(classify("Stuff.zip"), Some(DescendKind::Archive));
+        assert_eq!(classify("src.tar"), Some(DescendKind::Archive));
+        assert_eq!(classify("backup.tgz"), Some(DescendKind::Archive));
+        assert_eq!(classify("backup.tar.gz"), Some(DescendKind::Archive));
+        assert_eq!(classify("backup.tar.zst"), Some(DescendKind::Archive));
     }
 
     #[test]
