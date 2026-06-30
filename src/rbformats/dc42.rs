@@ -22,6 +22,10 @@ const DC42_DISK_400K: u8 = 0;
 const DC42_DISK_800K: u8 = 1;
 const DC42_DISK_720K: u8 = 2;
 const DC42_DISK_1440K: u8 = 3;
+/// Non-standard disk-format byte used by Apple Twiggy / FileWare images (the
+/// pre-release Macintosh prototype 5.25" 871 KB GCR format). DiskCopy never
+/// wrote this for real hardware; it shows up only in Twiggy-recovery images.
+pub const DC42_DISK_TWIGGY: u8 = 0x54;
 
 // format_byte values (offset 81).
 const DC42_FMT_SINGLE_SIDED: u8 = 0x02; // 400K Mac single-sided
@@ -54,8 +58,31 @@ impl Dc42Header {
             1 => "800K GCR",
             2 => "720K MFM",
             3 => "1440K MFM",
+            DC42_DISK_TWIGGY => "Twiggy GCR",
             _ => "Unknown",
         }
+    }
+
+    /// True for an Apple Twiggy / FileWare image. These wrap an MFS volume but
+    /// store sectors in a non-linear physical layout (zone-based variable
+    /// sectors-per-track) that we do not de-interleave, so the volume inside is
+    /// not readable. Keyed off the non-standard disk-format byte, with the
+    /// "Twiggy" image-name marker as a fallback signal.
+    pub fn is_twiggy(&self) -> bool {
+        self.disk_format == DC42_DISK_TWIGGY || self.disk_name.contains("Twiggy")
+    }
+
+    /// User-facing diagnostic explaining why a Twiggy image can't be opened.
+    /// Shared by every open path so the wording stays consistent.
+    pub fn twiggy_unsupported_message(&self) -> String {
+        format!(
+            "This is an Apple Twiggy / FileWare disk image (DiskCopy 4.2, \
+             disk-format 0x{:02X}, name \"{}\") - a pre-release Macintosh prototype 5.25\" \
+             871 KB GCR format. It wraps an MFS volume, but Twiggy stores sectors in a \
+             non-linear physical layout that rusty-backup does not decode, so the volume \
+             inside cannot be read. Normal 400K/800K MFS and HFS DiskCopy images are supported.",
+            self.disk_format, self.disk_name
+        )
     }
 }
 
@@ -225,6 +252,34 @@ mod tests {
         assert_eq!(hdr.data_size, 1474560);
         assert_eq!(hdr.tag_size, 0);
         assert_eq!(hdr.format_name(), "1440K MFM");
+    }
+
+    #[test]
+    fn test_twiggy_detected_by_disk_format() {
+        let mut header_bytes = make_dc42_header("-not a Macintosh disk-", 871424, 20424);
+        header_bytes[80] = DC42_DISK_TWIGGY; // 0x54
+        let mut cursor = Cursor::new(&header_bytes);
+        let hdr = parse_dc42_header(&mut cursor).expect("should parse");
+        assert!(hdr.is_twiggy());
+        assert_eq!(hdr.format_name(), "Twiggy GCR");
+        assert!(hdr.twiggy_unsupported_message().contains("Twiggy"));
+    }
+
+    #[test]
+    fn test_twiggy_detected_by_name_marker() {
+        // Some imagers leave the standard disk-format byte but tag the name.
+        let header_bytes = make_dc42_header("BLUV0.10 Twiggy Image", 871424, 20424);
+        let mut cursor = Cursor::new(&header_bytes);
+        let hdr = parse_dc42_header(&mut cursor).expect("should parse");
+        assert!(hdr.is_twiggy());
+    }
+
+    #[test]
+    fn test_normal_dc42_is_not_twiggy() {
+        let header_bytes = make_dc42_header("Test Disk", 819200, 19200);
+        let mut cursor = Cursor::new(&header_bytes);
+        let hdr = parse_dc42_header(&mut cursor).expect("should parse");
+        assert!(!hdr.is_twiggy());
     }
 
     #[test]

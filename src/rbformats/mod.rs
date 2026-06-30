@@ -1558,6 +1558,19 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         // Re-open since DMG detection may have consumed the file handle.
         if let Some(p) = path {
             if let Ok(mut f) = File::open(p) {
+                // Twiggy probe first: these images carry a valid DC42 header but
+                // often have trailing bytes that fail the strict size check in
+                // `detect_dc42`, so probe the header directly. A Twiggy image
+                // can't be read (non-linear sector layout) — surface a clear
+                // diagnostic instead of letting it fall through to a cryptic
+                // "Invalid MBR" once the unreadable data fork hits partitioning.
+                if let Some(hdr) = dc42::parse_dc42_header(&mut f) {
+                    if hdr.is_twiggy() {
+                        anyhow::bail!("{}", hdr.twiggy_unsupported_message());
+                    }
+                }
+            }
+            if let Ok(mut f) = File::open(p) {
                 if let Some(hdr) = dc42::detect_dc42(&mut f, file_size) {
                     return Ok(ImageFormat::DiskCopy42(hdr));
                 }

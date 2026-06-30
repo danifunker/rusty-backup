@@ -1038,6 +1038,19 @@ fn open_read_dispatch(
             .with_context(|| format!("open ZIP disk image {}", path.display()))?;
         Ok(Box::new(zip))
     } else {
+        // Twiggy diagnostic: an Apple Twiggy / FileWare .dc42 wraps an MFS
+        // volume but stores sectors in a non-linear physical layout we don't
+        // de-interleave, so it can't be read. Catch it here and explain, rather
+        // than handing the unreadable bytes to partition detection where it
+        // surfaces as a cryptic "Invalid MBR". (Normal DC42 unwrapping in the
+        // CLI is a separate, pre-existing gap; this only short-circuits Twiggy.)
+        if let Ok(mut probe) = File::open(path) {
+            if let Some(hdr) = crate::rbformats::dc42::parse_dc42_header(&mut probe) {
+                if hdr.is_twiggy() {
+                    anyhow::bail!("{}", hdr.twiggy_unsupported_message());
+                }
+            }
+        }
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
