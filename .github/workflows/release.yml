@@ -1074,15 +1074,15 @@ jobs:
           name: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: rb-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
-  # `rb-cli` for Windows on ARM (aarch64-pc-windows-msvc), cross-compiled on the
-  # x64 Windows runner (its Visual Studio carries the ARM64 MSVC libs). CLI only:
-  # a full ARM64 desktop build can't link because the `chd`/`optical` core
-  # (libchdman-rs) publishes no aarch64-pc-windows-msvc prebuilt — only
-  # x86_64 / i686 Windows — so the GUI lane is shipped from the same pure-Rust
-  # slim feature set as the PowerPC/RISC-V builds. Build-only: an ARM64 exe can't
-  # execute on the x64 runner, so the test legs stay on the x64/x86 Windows jobs.
-  build-rb-cli-win-arm64:
-    name: Build rb-cli (Windows ARM64)
+  # Full desktop app + `rb-cli` for Windows on ARM64 (aarch64-pc-windows-msvc),
+  # cross-compiled on the x64 Windows runner (its Visual Studio carries the ARM64
+  # MSVC libs). First-class GUI build: libchdman-rs 0.288.8 publishes an
+  # aarch64-pc-windows-msvc prebuilt, so the `chd`/`optical` core links and the
+  # app ships the same default feature set as the x64/x86 Windows builds.
+  # Build-only (continue-on-error): an ARM64 exe can't execute on the x64 runner,
+  # so the test legs stay on the x64/x86 Windows jobs.
+  build-windows-arm64:
+    name: Build Windows ARM64 (GUI + rb-cli)
     # Skipped only when a manual run unticks "desktop"; every push builds it.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
@@ -1118,8 +1118,26 @@ jobs:
           path: target
           key: ${{ runner.os }}-aarch64-pc-windows-msvc-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build rb-cli (pure-Rust slim — no GUI / CHD / optical)
-        run: cargo build --release --bin rb-cli --no-default-features --features pure-zstd,remote --target aarch64-pc-windows-msvc
+      # Default features (GUI + chd + optical + native-zstd/zlib + remote) — one
+      # build produces both rusty-backup.exe and rb-cli.exe, like build-windows.
+      - name: Build (GUI + rb-cli, default features)
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      - name: Package app
+        shell: bash
+        run: |
+          cd target/aarch64-pc-windows-msvc/release
+          if [ -f "../../../assets/icons/icon.ico" ]; then
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe ../../../assets/icons/icon.ico
+          else
+            7z a ../../../Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip rusty-backup.exe
+          fi
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
 
       - name: Stage CLI binary
         shell: bash
@@ -1134,6 +1152,121 @@ jobs:
         with:
           name: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}
           path: rb-cli-windows-arm64-${{ needs.generate-version.outputs.version }}.zip
+
+  # Full desktop GUI for Linux RISC-V 64 (riscv64gc-unknown-linux-gnu),
+  # cross-compiled on x64. There is no GitHub-hosted riscv64 runner, so unlike
+  # the x64/arm64 AppImage jobs this can't build/package natively: we cross-link
+  # the default feature set (GUI + CHD + optical) against a riscv64 GTK/GL sysroot
+  # pulled in via dpkg multiarch (ubuntu-ports), then ship a plain dynamically-
+  # linked tarball — NOT a self-contained AppImage; it uses the user's system
+  # GTK3 at runtime. libchdman-rs 0.288.8 publishes the riscv64gc prebuilt that
+  # makes the CHD core link. continue-on-error: best-effort, can't block release.
+  build-gui-linux-riscv64:
+    name: Build Linux RISC-V 64 GUI (rusty-backup)
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
+    needs: generate-version
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      # libchdman is C++; link through g++ so libstdc++ is pulled in.
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-g++
+      # cc-rs (cd-da-reader's C shim) — the riscv64gc triple doesn't auto-map to
+      # the riscv64-linux-gnu-* cross tools, so point it at them explicitly.
+      CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+      CXX_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-g++
+      # gtk-sys/glib-sys (system-deps) must read the riscv64 multiarch .pc files
+      # and accept a cross build.
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_LIBDIR: /usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      PKG_CONFIG_SYSROOT_DIR: /
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv64gc-unknown-linux-gnu
+
+      - name: Add riscv64 as a foreign dpkg architecture (ubuntu-ports)
+        run: |
+          set -euxo pipefail
+          # riscv64 lives in ubuntu-ports, not the amd64 archive. Pin every
+          # existing source to amd64 so `apt-get update` doesn't 404 trying to
+          # fetch riscv64 indexes from archive.ubuntu.com / PPAs, then add one
+          # riscv64-only ports source.
+          sudo dpkg --add-architecture riscv64
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+            grep -q '^Architectures:' "$f" || sudo sed -i '/^Types:/a Architectures: amd64' "$f"
+          done
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+            [ -f "$f" ] || continue
+            sudo sed -i -E 's|^deb (http)|deb [arch=amd64] \1|; s|^deb-src (http)|deb-src [arch=amd64] \1|' "$f"
+          done
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: http://ports.ubuntu.com/ubuntu-ports' \
+            'Suites: noble noble-updates noble-backports noble-security' \
+            'Components: main universe' \
+            'Architectures: riscv64' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
+          sudo apt-get update
+
+      - name: Install riscv64 cross toolchain + GTK/GL sysroot
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y \
+            g++-riscv64-linux-gnu binutils-riscv64-linux-gnu file \
+            libgtk-3-dev:riscv64 libglib2.0-dev:riscv64 \
+            libgl1-mesa-dev:riscv64 libegl1-mesa-dev:riscv64 \
+            libxkbcommon-dev:riscv64 libxkbcommon-x11-dev:riscv64 \
+            libx11-dev:riscv64 libxcb1-dev:riscv64 libxcursor-dev:riscv64 \
+            libxi-dev:riscv64 libxrandr-dev:riscv64 libwayland-dev:riscv64
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-riscv64gc-gui-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (default features = GUI + CHD + optical)
+        run: cargo build --release --target riscv64gc-unknown-linux-gnu
+
+      - name: Strip + verify ELF
+        run: |
+          set -e
+          ELF=target/riscv64gc-unknown-linux-gnu/release/rusty-backup
+          riscv64-linux-gnu-strip "$ELF"
+          file "$ELF"
+          ls -lh "$ELF"
+          riscv64-linux-gnu-objdump -p "$ELF" | grep -E 'NEEDED|GLIBC_' || true
+
+      - name: Package app
+        run: |
+          TGZ="Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz"
+          tar -C target/riscv64gc-unknown-linux-gnu/release -czf "$TGZ" rusty-backup
+          ls -lh "$TGZ"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}
+          path: Rusty-Backup-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz
 
   # Turn the `appliance` choice input into a JSON arch list for the matrix
   # below. A manual dispatch honours none / i586 / i686 / both. A push to
@@ -1350,11 +1483,13 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-rb-cli-mini-armv7
-      # CLI-only cross-builds for extra CPU arches (PowerPC BE 32/64, RISC-V 64,
-      # Windows ARM64). continue-on-error like mini-armv7: listed here so the
-      # release waits for their tarballs/zips, but a failure can't block it.
+      # Cross-builds for extra CPU arches: PowerPC BE 32/64 (rb-cli only), plus
+      # full GUI + rb-cli for Windows ARM64 and Linux RISC-V 64. continue-on-error
+      # like mini-armv7: listed here so the release waits for their tarballs/zips,
+      # but a failure can't block the desktop release.
       - build-rb-cli-extra-arch
-      - build-rb-cli-win-arm64
+      - build-windows-arm64
+      - build-gui-linux-riscv64
       # build-appliance is skipped on feature branches and on a manual
       # appliance=none run. A skipped `needs` job would normally skip the whole
       # release, so the release `if` below uses `!cancelled()` + explicit
@@ -1406,6 +1541,7 @@ jobs:
             "Rusty-Backup-linux-x64-${VER}.rpm" "Rusty-Backup-linux-x64-${VER}.pkg.tar.zst" \
             "Rusty-Backup-linux-arm64-${VER}.AppImage" "Rusty-Backup-linux-arm64-${VER}.deb" \
             "Rusty-Backup-linux-arm64-${VER}.rpm" "Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst" \
+            "Rusty-Backup-windows-arm64-${VER}.zip" "Rusty-Backup-linux-riscv64-${VER}.tar.gz" \
             "rb-cli-windows-x64-${VER}.zip" "rb-cli-windows-x86-${VER}.zip" \
             "rb-cli-macos-arm64-${VER}.zip" "rb-cli-macos-x64-${VER}.zip" \
             "rb-cli-linux-x64-${VER}.tar.gz" "rb-cli-linux-arm64-${VER}.tar.gz" \
@@ -1429,13 +1565,15 @@ jobs:
           |---|---|---|---|
           | **Windows 11 / 10** | x64 (64-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x64-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x64-${VER}.zip) |
           | **Windows 10** | x86 (32-bit) | [Installer](${BASE}/Rusty-Backup-Setup-windows-x86-${VER}.exe) · [Portable zip](${BASE}/Rusty-Backup-windows-x86-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-x86-${VER}.zip) |
+          | **Windows 11** | ARM64 (AArch64) | [Portable zip](${BASE}/Rusty-Backup-windows-arm64-${VER}.zip) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
           | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/Rusty-Backup-macos-arm64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-arm64-${VER}.zip) |
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/Rusty-Backup-macos-x64-${VER}.dmg) | [rb-cli](${BASE}/rb-cli-macos-x64-${VER}.zip) |
           | **Linux** (glibc >= 2.39) | x64 | [AppImage](${BASE}/Rusty-Backup-linux-x64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-x64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-x64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-x64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-x64-${VER}.tar.gz) |
           | **Linux** (glibc >= 2.39) | arm64 | [AppImage](${BASE}/Rusty-Backup-linux-arm64-${VER}.AppImage) · [deb](${BASE}/Rusty-Backup-linux-arm64-${VER}.deb) · [rpm](${BASE}/Rusty-Backup-linux-arm64-${VER}.rpm) · [pkg](${BASE}/Rusty-Backup-linux-arm64-${VER}.pkg.tar.zst) | [rb-cli](${BASE}/rb-cli-linux-arm64-${VER}.tar.gz) |
+          | **Linux** (glibc >= 2.39) | RISC-V 64-bit (\`riscv64gc\`) | [tar.gz](${BASE}/Rusty-Backup-linux-riscv64-${VER}.tar.gz) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
-          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **Windows ARM64 / RISC-V 64:** cross-compiled, build-only legs — the Windows ARM64 app is a portable zip and the RISC-V 64 app is a plain dynamically-linked tarball that uses your system GTK3 (not a self-contained AppImage like x64/arm64). · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
 
           ### Command-line (\`rb-cli\`) for other CPU architectures
 
@@ -1445,10 +1583,8 @@ jobs:
           |---|---|---|
           | **Linux** (glibc >= 2.39) | PowerPC 64-bit, big-endian (G5 / POWER) | [rb-cli](${BASE}/rb-cli-linux-ppc64-${VER}.tar.gz) |
           | **Linux** (glibc >= 2.39) | PowerPC 32-bit, big-endian (G3 / G4) | [rb-cli](${BASE}/rb-cli-linux-ppc32-${VER}.tar.gz) |
-          | **Linux** (glibc >= 2.39) | RISC-V 64-bit (\`riscv64gc\`) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
-          | **Windows 11** | ARM64 (AArch64) | [rb-cli](${BASE}/rb-cli-windows-arm64-${VER}.zip) |
 
-          <sub>The Linux builds use the same **glibc 2.39** (Ubuntu 24.04) baseline as the x64/arm64 \`rb-cli\`. **Windows ARM64 is the CLI only** — a full ARM64 desktop app can't be built yet because the CHD core (\`libchdman-rs\`) publishes no \`aarch64-pc-windows-msvc\` prebuilt. Each download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+          <sub>These PowerPC builds use the same **glibc 2.39** (Ubuntu 24.04) baseline as the x64/arm64 \`rb-cli\`, and each download contains a single \`rb-cli\` executable. (Windows ARM64 and RISC-V 64 now ship a full desktop app — see the main table above.)</sub>
 
           ### Install on a MiSTer FPGA (one line, auto-updating)
 
