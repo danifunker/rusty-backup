@@ -67,7 +67,7 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "native-zlib", "native-zstd", "remote"]
+default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "remote"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
 # pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
 # in a GUI build.
@@ -97,11 +97,19 @@ chd = ["dep:libchdman-rs"]
 # Physical optical-drive I/O (rip / data-track read) plus optical-image
 # convert/browse. Builds on armv7 (MiSTer) too: cd-da-reader is cc+libc
 # (a self-compiled SG_IO shim — NO system libcdio link), and opticaldiscs
-# (>=0.4.5) reuses the SAME libchdman-rs 0.288.8 prebuilt as the `chd` feature
+# (>=0.4.5) reuses the SAME libchdman-rs 0.288.9 prebuilt as the `chd` feature
 # — which ships an armv7-gnueabihf-glibc2.31 build — so the two dedupe to one
 # libchdman. At runtime it needs a drive present (e.g. /dev/sr0); harmless to
 # include when none is attached.
 optical = ["dep:opticaldiscs", "dep:cd-da-reader"]
+# In-app CD-DA playback on the Optical tab: preview an audio track straight from
+# a CHD or BIN/CUE image. rodio pulls in cpal, which links ALSA (libasound) on
+# Linux, WASAPI on Windows and CoreAudio on macOS — so this is a DESKTOP-only
+# feature. It force-enables `gui` (the player is UI), `optical` (disc reading)
+# and `chd` (a CHD is extracted to a temp BIN before playback). Left OUT of the
+# slim/cross builds (rb-cli-mini, armv7/MiSTer, i486/i586) so no ALSA cross-
+# compile is needed there. The Linux desktop GUI CI legs install libasound.
+audio = ["dep:rodio", "gui", "optical", "chd"]
 # Network daemon + client (`rb-cli serve` and `rb://host:port/img@N` refs).
 # ON BY DEFAULT, and every shipped build opts in: the desktop release via
 # `default`, and the slim/cross pipelines (armv7 MiSTer, i486/i586 appliance)
@@ -116,14 +124,18 @@ remote = []
 eframe = { version = "0.34", features = ["glow"], optional = true }
 egui = { version = "0.34", optional = true }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"], optional = true }
-libchdman-rs = { version = "0.288.8", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.288.9", features = ["prebuilt"], optional = true }
 # rustls-tls keeps reqwest off openssl-sys so the gui-feature build doesn't drag
 # in OpenSSL native libs; the cross/armv7 path doesn't need reqwest at all
 # (it's behind `gui`).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 webbrowser = { version = "1.0", optional = true }
 opticaldiscs = { version = "0.6", features = ["drives"], optional = true }
-cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1", optional = true }
+cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-based-backend", optional = true }
+# In-app CD-DA playback (Optical tab). Pinned <0.20 for the
+# OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.
+# Only the `audio` feature (desktop) links this; cpal -> ALSA/WASAPI/CoreAudio.
+rodio = { version = "0.19", optional = true }
 
 # Always-on dependencies — used by rb-cli (mini included).
 anyhow = "1"

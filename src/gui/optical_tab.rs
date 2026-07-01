@@ -80,6 +80,10 @@ pub struct OpticalTab {
     prev_image_path: Option<PathBuf>,
     /// CHD info popup text. `Some` while the popup is open.
     chd_info_text: Option<String>,
+    /// In-app CD-DA player (Optical tab only). Loaded when the selected source
+    /// is a local CHD / BIN-CUE image with audio tracks.
+    #[cfg(feature = "audio")]
+    audio: super::optical_audio::OpticalAudioPlayer,
 }
 
 impl Default for OpticalTab {
@@ -132,6 +136,8 @@ impl Default for OpticalTab {
             prev_drive_idx: None,
             prev_image_path: None,
             chd_info_text: None,
+            #[cfg(feature = "audio")]
+            audio: super::optical_audio::OpticalAudioPlayer::default(),
         }
     }
 }
@@ -414,6 +420,13 @@ impl OpticalTab {
                 self.prev_drive_idx = self.selected_drive_idx;
                 self.prev_image_path = self.image_file_path.clone();
                 self.detect_disc_info(log);
+                // Load CD-DA tracks for the in-app player. Only local CHD /
+                // BIN-CUE image files are supported; other sources clear it.
+                #[cfg(feature = "audio")]
+                match self.get_browsable_path() {
+                    Some(path) => self.audio.set_disc(&path),
+                    None => self.audio.clear(),
+                }
                 if was_browsing && self.disc_info.is_some() {
                     if let Some(path) = self.get_browsable_path() {
                         self.browse_view.open(&path);
@@ -469,6 +482,10 @@ impl OpticalTab {
                 }
             });
         }
+
+        // In-app CD-DA player (no-op unless the disc has audio tracks).
+        #[cfg(feature = "audio")]
+        self.audio.ui(ui);
 
         // CHD Info popup
         if let Some(text) = self.chd_info_text.clone() {
@@ -689,6 +706,8 @@ impl OpticalTab {
         self.selected_drive_idx = None;
         self.prev_drive_idx = None;
         self.prev_image_path = None;
+        #[cfg(feature = "audio")]
+        self.audio.clear();
     }
 
     fn detect_disc_info(&mut self, log: &mut LogPanel) {

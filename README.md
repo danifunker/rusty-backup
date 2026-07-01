@@ -96,8 +96,8 @@ artifact runs `--no-default-features --features chd,pure-zstd,remote,optical`
 (CHD via the C prebuilt; zstd via the pure-Rust bit-exact backend, since a
 cross build won't link C libzstd; `remote` for the network daemon — see
 [rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below; `optical`
-for CD/DVD ripping — cd-da-reader is cc+libc with no system libcdio link, and
-opticaldiscs reuses the same libchdman-rs 0.288.5 prebuilt as `chd`).
+for CD/DVD ripping — cd-da-reader links no system libcdio, and
+opticaldiscs reuses the same libchdman-rs 0.288.9 prebuilt as `chd`).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
@@ -578,6 +578,12 @@ images, partition table sidecars) for restore — see `docs/clonezilla.md`.
   CHD core, so `.chd` files are first-class — no external `chdman` required
   for read, write, browse, or in-place expand (Phase 6c of the disk-expansion
   workflow re-encodes the CHD with a new logical size).
+- **Optical CD-DA preview** (desktop GUI only): the Optical tab plays audio
+  tracks straight from a CHD or BIN/CUE image — select the disc, open "Audio
+  Tracks", and play/stop any track with a live position readout. Playback is
+  desktop-only (rodio, linking ALSA on Linux / WASAPI on Windows / CoreAudio on
+  macOS); the slim `rb-cli-mini` MiSTer build still rips and converts optical
+  images but ships no player.
 - **Browsing compressed backups**: native `.zst` backups stream-decompress
   lazily on open, so browsing a multi-gigabyte zstd backup is fast. `.chd`
   backups currently require building a full seekable cache on open, which

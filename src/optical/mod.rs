@@ -2,6 +2,10 @@
 // build enables `optical` without `gui`, so gate it to keep that build green.
 #[cfg(feature = "gui")]
 pub mod browse_view;
+// CD-DA playback for the Optical tab's in-app audio player. `audio` implies
+// `chd` + `optical`, so the libchdman_rs / cd-da-reader imports always resolve.
+#[cfg(feature = "audio")]
+pub mod cd_audio;
 pub mod convert;
 pub mod rip;
 pub mod source;

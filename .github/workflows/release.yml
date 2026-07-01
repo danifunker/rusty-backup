@@ -450,6 +450,7 @@ jobs:
             cmake \
             rust \
             gtk3 \
+            alsa-lib \
             openssl \
             pkgconf \
             wget \
@@ -639,7 +640,7 @@ jobs:
         if: ${{ !contains(matrix.runs-on, 'self-hosted') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libgtk-3-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
+          sudo apt-get install -y cmake libgtk-3-dev libasound2-dev libssl-dev pkg-config dpkg-dev liblzma-dev rpm libarchive-tools zstd
 
       - name: Install cargo packaging tools
         # `cargo install` from crates.io is flaky on the hosted runners
@@ -1076,7 +1077,7 @@ jobs:
 
   # Full desktop app + `rb-cli` for Windows on ARM64 (aarch64-pc-windows-msvc),
   # cross-compiled on the x64 Windows runner (its Visual Studio carries the ARM64
-  # MSVC libs). First-class GUI build: libchdman-rs 0.288.8 publishes an
+  # MSVC libs). First-class GUI build: libchdman-rs 0.288.9 publishes an
   # aarch64-pc-windows-msvc prebuilt, so the `chd`/`optical` core links and the
   # app ships the same default feature set as the x64/x86 Windows builds.
   # Build-only (continue-on-error): an ARM64 exe can't execute on the x64 runner,
@@ -1159,7 +1160,7 @@ jobs:
   # the default feature set (GUI + CHD + optical) against a riscv64 GTK/GL sysroot
   # pulled in via dpkg multiarch (ubuntu-ports), then ship a plain dynamically-
   # linked tarball — NOT a self-contained AppImage; it uses the user's system
-  # GTK3 at runtime. libchdman-rs 0.288.8 publishes the riscv64gc prebuilt that
+  # GTK3 at runtime. libchdman-rs 0.288.9 publishes the riscv64gc prebuilt that
   # makes the CHD core link. continue-on-error: best-effort, can't block release.
   build-gui-linux-riscv64:
     name: Build Linux RISC-V 64 GUI (rusty-backup)
@@ -1221,6 +1222,7 @@ jobs:
           sudo apt-get install -y \
             g++-riscv64-linux-gnu binutils-riscv64-linux-gnu file \
             libgtk-3-dev:riscv64 libglib2.0-dev:riscv64 \
+            libasound2-dev:riscv64 \
             libgl1-mesa-dev:riscv64 libegl1-mesa-dev:riscv64 \
             libxkbcommon-dev:riscv64 libxkbcommon-x11-dev:riscv64 \
             libx11-dev:riscv64 libxcb1-dev:riscv64 libxcursor-dev:riscv64 \
@@ -1244,7 +1246,7 @@ jobs:
           path: target
           key: ${{ runner.os }}-riscv64gc-gui-cargo-build-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build (default features = GUI + CHD + optical)
+      - name: Build (default features = GUI + CHD + optical + audio)
         run: cargo build --release --target riscv64gc-unknown-linux-gnu
 
       - name: Strip + verify ELF

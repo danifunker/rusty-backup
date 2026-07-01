@@ -14,6 +14,8 @@ pub mod fonts;
 mod inspect_tab;
 mod journal_view;
 mod metadata_editor;
+#[cfg(feature = "audio")]
+mod optical_audio;
 mod optical_tab;
 mod partition_bar;
 mod physical_disk_export;
