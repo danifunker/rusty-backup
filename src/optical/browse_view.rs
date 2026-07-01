@@ -550,7 +550,6 @@ impl OpticalDiscBrowseView {
         let entry = entry.clone();
         let disc_path = self.disc_path.clone().unwrap();
         let resource_fork_mode = self.resource_fork_mode;
-        let is_hfs = self.is_hfs_type();
 
         let progress = Arc::new(Mutex::new(ExtractionProgress {
             current_bytes: 0,
@@ -582,14 +581,7 @@ impl OpticalDiscBrowseView {
 
                 // Open a fresh filesystem for extraction
                 let mut fs = open_disc_filesystem(&info)?;
-                extract_entry(
-                    &mut *fs,
-                    &entry,
-                    &dest,
-                    resource_fork_mode,
-                    is_hfs,
-                    &progress,
-                )?;
+                extract_entry(&mut *fs, &entry, &dest, resource_fork_mode, &progress)?;
 
                 Ok(())
             })();
@@ -743,7 +735,6 @@ fn extract_entry(
     entry: &FileEntry,
     dest: &Path,
     resource_fork_mode: ResourceForkMode,
-    is_hfs: bool,
     progress: &Arc<Mutex<ExtractionProgress>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Check for cancellation
@@ -761,7 +752,11 @@ fn extract_entry(
                 p.current_file = entry.path.clone();
             }
 
-            let has_rsrc = is_hfs && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
+            // A non-zero resource-fork size only appears on fork-capable
+            // filesystems (HFS / HFS+); ISO 9660 reports `None`. This covers
+            // every fork filesystem opticaldiscs supports without re-checking
+            // the filesystem type.
+            let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
 
             if has_rsrc && resource_fork_mode == ResourceForkMode::MacBinary {
                 // MacBinary: single .bin file containing both forks
@@ -849,7 +844,7 @@ fn extract_entry(
 
             let children = fs.list_directory(entry)?;
             for child in &children {
-                extract_entry(fs, child, &dir_path, resource_fork_mode, is_hfs, progress)?;
+                extract_entry(fs, child, &dir_path, resource_fork_mode, progress)?;
             }
         }
     }
