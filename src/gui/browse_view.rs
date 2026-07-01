@@ -5393,11 +5393,21 @@ fn extract_entry(
 
                 let type_code = entry.type_code.unwrap_or([0; 4]);
                 let creator_code = entry.creator_code.unwrap_or([0; 4]);
+                // HFS/HFS+ catalog dates are raw Mac-1904 seconds — the exact
+                // MacBinary encoding — so carry them straight through.
+                let dates = entry
+                    .mac_dates
+                    .map(|(created, modified, _backup)| resource_fork::MacFileDates {
+                        created,
+                        modified,
+                    })
+                    .unwrap_or_default();
 
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
                     &type_code,
                     &creator_code,
+                    dates,
                     &data,
                     &rsrc_buf,
                 );
@@ -5456,6 +5466,15 @@ fn extract_entry(
                     let type_code = entry.type_code.unwrap_or([0; 4]);
                     let creator_code = entry.creator_code.unwrap_or([0; 4]);
                     let has_finfo = type_code != [0; 4] || creator_code != [0; 4];
+                    // HFS/HFS+ catalog dates are raw Mac-1904 seconds; carry them
+                    // into the AppleDouble File Dates Info entry when present.
+                    let dates = entry
+                        .mac_dates
+                        .map(|(created, modified, _backup)| resource_fork::MacFileDates {
+                            created,
+                            modified,
+                        })
+                        .unwrap_or_default();
 
                     let mut rsrc_buf = Vec::new();
                     if has_rsrc {
@@ -5481,6 +5500,7 @@ fn extract_entry(
                                 let ad = resource_fork::build_appledouble(
                                     &type_code,
                                     &creator_code,
+                                    dates,
                                     &rsrc_buf,
                                 );
                                 let ad_path = dest.join(format!("._{safe_name}"));

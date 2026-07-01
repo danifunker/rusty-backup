@@ -123,8 +123,8 @@ fn run_list(args: ListArgs) -> Result<()> {
             .filter(|f| f.uncompressed_len > 0)
             .map(|f| format!("rsrc {} ({})", f.uncompressed_len, f.method_name()))
             .unwrap_or_default();
-        let type_str = String::from_utf8_lossy(&e.type_code);
-        let creator_str = String::from_utf8_lossy(&e.creator_code);
+        let type_str = crate::fs::hfs::format_ostype(&e.type_code);
+        let creator_str = crate::fs::hfs::format_ostype(&e.creator_code);
         println!(
             "FILE  {:<40} {:>4} {:>4}  {}  {}",
             e.display_path(),

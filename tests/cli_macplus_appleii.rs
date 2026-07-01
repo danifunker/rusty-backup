@@ -66,13 +66,12 @@ fn write_mfs_volume(path: &Path) {
     mdb[36] = vname.len() as u8;
     mdb[37..37 + vname.len()].copy_from_slice(vname);
 
-    // Volume map: block 2 -> 1 (end of chain).
-    // 12-bit packing per src/fs/mfs.rs::map_get: for even block 2,
-    // bit_off = 24, byte_off = 3. map_bytes[3] = value >> 4 = 0;
-    // map_bytes[4] high nibble = value & 0x0F.
-    let map_start = 1024 + 36 + 1 + vname.len();
-    disk[map_start + 3] = 0;
-    disk[map_start + 4] = 0x10;
+    // Volume map: block 2 -> 1 (end of chain). The map is at the fixed offset
+    // 1024 + 64 and entry index 0 is block 2, so block 2 (even) occupies the
+    // first entry: byte 0 = value >> 4 = 0; byte 1 high nibble = value & 0x0F.
+    let map_start = 1024 + 64;
+    disk[map_start] = 0;
+    disk[map_start + 1] = 0x10;
 
     // Directory entry at sector 3 for "Hello".
     let dir_off = 3 * SECTOR;

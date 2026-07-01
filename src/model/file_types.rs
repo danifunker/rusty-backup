@@ -22,7 +22,7 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
     "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk",
+    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk", "dart",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -210,6 +210,18 @@ mod tests {
                 "missing Alto/Pilot pack extension {must}"
             );
         }
+    }
+
+    #[test]
+    fn dart_container_present() {
+        // DART (compressed Apple/Lisa disk image, `src/rbformats/dart.rs`) must
+        // stay a picker-visible disk image. `.image` is deliberately absent (too
+        // generic — Lisa/DiskCopy `.image` files are content-detected instead).
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"dart"),
+            "dart disk-image extension dropped"
+        );
+        assert!(!DISK_IMAGE_EXTS.contains(&"image"), "image is too generic");
     }
 
     #[test]

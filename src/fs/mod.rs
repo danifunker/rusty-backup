@@ -5,6 +5,7 @@ pub mod affs_fsck;
 pub mod alto;
 pub mod andos;
 pub mod apple_dos;
+pub mod archive_fs;
 pub mod atari_dos;
 pub mod binhex;
 pub mod btrfs;
@@ -43,14 +44,18 @@ pub mod human68k_clone;
 pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
+pub mod lisa;
 pub mod mac_alias;
 pub mod mac_scsi_bless;
 pub mod make_bootable;
+pub mod mem_archive;
 pub mod mfs;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
 mod ntfs_tables;
+#[cfg(feature = "optical")]
+pub mod optical_fs;
 pub mod os9;
 pub mod patch;
 pub mod pfs3;
@@ -1977,6 +1982,10 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // Apple Lisa File System: the tag-bearing DiskCopy 4.2 / DART container
+        // is opened as a whole (the driver parses the header + 12-byte sector
+        // tags itself), so `partition_offset` is ignored. Read-only.
+        "lisafs" => Ok(Box::new(lisa::LisaFilesystem::open(reader)?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "APM partition type '{}' not supported for browsing",
             type_str
@@ -2160,6 +2169,8 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             // Custom bootblock Amiga disk with no filesystem — browsable via
             // the synthetic carve view (whole-disk + recoverable text/JSON).
             | "Amiga-NDOS"
+            // Apple Lisa File System (tag-bearing DiskCopy 4.2 / DART container).
+            | "lisafs"
     )
 }
 
@@ -2201,6 +2212,7 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "Amiga-NDOS"
             | "Alto BFS"
             | "Pilot/Cedar"
+            | "lisafs"
             | "Unknown"
     )
 }
@@ -2616,6 +2628,7 @@ mod tests {
             "Amiga-NDOS",
             "Alto BFS",
             "Pilot/Cedar",
+            "lisafs",
         ] {
             assert!(
                 is_browsable_superfloppy(0, hint),

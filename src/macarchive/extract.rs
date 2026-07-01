@@ -47,6 +47,10 @@ impl ForkFormat {
 pub struct ExtractStats {
     pub files: usize,
     pub skipped: usize,
+    /// Number of entry names that contained a character illegal in a host path
+    /// component (most often `/`, which is legal in a Mac filename) and were
+    /// rewritten by [`sanitize_filename`] during extraction.
+    pub names_sanitized: usize,
 }
 
 /// Read an archive file and parse it, transparently BinHex-decoding a
@@ -310,11 +314,25 @@ pub fn extract_filtered(
         if e.is_dir {
             // Always create directory markers — a subsequent kept file
             // might land underneath them.
+            if let Some(s) = sanitized_if_changed(&e.name) {
+                log(format!(
+                    "Warning: \"{}\" -> \"{}\" (character invalid on this filesystem)",
+                    e.name, s
+                ));
+                stats.names_sanitized += 1;
+            }
             std::fs::create_dir_all(&target)?;
             continue;
         }
         if !keep(idx) {
             continue;
+        }
+        if let Some(s) = sanitized_if_changed(&e.name) {
+            log(format!(
+                "Warning: \"{}\" -> \"{}\" (character invalid on this filesystem)",
+                e.name, s
+            ));
+            stats.names_sanitized += 1;
         }
         progress(done, total, &e.name);
         done += 1;
@@ -371,6 +389,15 @@ pub fn extract_filtered(
 
         write_entry(&target, e, &data, &rsrc, format, raw_rsrc_path.as_deref())?;
         stats.files += 1;
+    }
+
+    if stats.names_sanitized > 0 {
+        log(format!(
+            "{} name(s) contain characters this filesystem can't store and were changed. \
+             To keep the original names, leave the archive compressed, or extract into an \
+             HFS/HFS+ disk image where these characters are legal.",
+            stats.names_sanitized
+        ));
     }
 
     Ok(stats)
@@ -446,6 +473,7 @@ pub fn write_entry(
                 &entry.name,
                 &entry.type_code,
                 &entry.creator_code,
+                resource_fork::MacFileDates::default(),
                 data,
                 rsrc,
             );
@@ -454,8 +482,12 @@ pub fn write_entry(
         ForkFormat::AppleDouble => {
             std::fs::write(target, data)?;
             if !rsrc.is_empty() || entry.type_code != [0; 4] || entry.creator_code != [0; 4] {
-                let ad =
-                    resource_fork::build_appledouble(&entry.type_code, &entry.creator_code, rsrc);
+                let ad = resource_fork::build_appledouble(
+                    &entry.type_code,
+                    &entry.creator_code,
+                    resource_fork::MacFileDates::default(),
+                    rsrc,
+                );
                 std::fs::write(sidecar_path(target, "._"), ad)?;
             }
         }
@@ -475,6 +507,14 @@ pub fn write_entry(
 /// Destination path for an entry's data fork: `dest` joined with the entry's
 /// path components, each [`sanitize_filename`]d. Shared by the extraction loop
 /// and the up-front data-path reservation so both agree on every name.
+/// If `name` contains a character illegal in a host path component, returns its
+/// sanitized form; otherwise `None`. Lets the extractor warn the user that the
+/// on-disk name differs from the Mac original (e.g. a Mac filename with a `/`).
+fn sanitized_if_changed(name: &str) -> Option<String> {
+    let s = sanitize_filename(name);
+    (s != name).then_some(s)
+}
+
 fn entry_target(dest: &Path, entry: &StuffItEntry) -> PathBuf {
     let mut rel = PathBuf::new();
     for comp in &entry.path {
@@ -645,6 +685,53 @@ mod tests {
             "file2 should be skipped"
         );
         assert!(dir.path().join("subdir/file3.txt").exists());
+    }
+
+    /// A Mac filename containing `/` (legal on HFS, illegal as a host path
+    /// component) is sanitized to `_`, counted in `names_sanitized`, and a
+    /// per-file warning plus a closing recommendation are logged.
+    #[test]
+    fn extract_warns_and_counts_host_illegal_names() {
+        use super::super::stuffit::{
+            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
+        };
+        let tree = vec![StuffItInputNode::File(StuffItInput {
+            name: "Read/Write Me".into(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"hi".to_vec(),
+            resource_fork: Vec::new(),
+        })];
+        let arc_bytes = build_archive_tree(&tree, WriteMethod::Store).expect("build");
+        let (bytes, archive) = open_bytes(arc_bytes).expect("open");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut logs: Vec<String> = Vec::new();
+        let stats = extract_all(
+            &bytes,
+            &archive,
+            dir.path(),
+            ForkFormat::Raw,
+            |_, _, _| {},
+            |m| logs.push(m),
+        )
+        .expect("extract");
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.names_sanitized, 1);
+        assert!(dir.path().join("Read_Write Me").exists());
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("Read/Write Me") && l.contains("Read_Write Me")),
+            "per-file warning logged"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("HFS/HFS+ disk image")),
+            "closing recommendation logged"
+        );
     }
 
     /// Raw extraction must not lose a resource fork when a sibling entry is

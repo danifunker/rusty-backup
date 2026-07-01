@@ -51,9 +51,11 @@ fn build_synthetic_mfs() -> Vec<u8> {
     mdb[36] = vname.len() as u8;
     mdb[37..37 + vname.len()].copy_from_slice(vname);
 
-    // Volume map — block 2 -> 1 (end of chain), rest free.
-    // Block 2 is even -> bytes [map_start..map_start+1] hold hi=0x00, lo nibble=0x1 in next byte's high nibble.
-    let map_start = 1024 + 36 + 1 + vname.len();
+    // Volume map — block 2 -> 1 (end of chain), rest free. The map is at the
+    // fixed offset 1024 + 64, and entry index 0 is block 2, so block 2's entry
+    // is the first map entry. Block 2 is even -> hi byte = value>>4, next byte's
+    // high nibble = value & 0x0F.
+    let map_start = 1024 + 64;
     let value: u16 = 1;
     disk[map_start] = (value >> 4) as u8;
     disk[map_start + 1] = ((value & 0x0F) as u8) << 4;

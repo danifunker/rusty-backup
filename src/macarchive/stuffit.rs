@@ -215,7 +215,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         if namelen > 31 {
             namelen = 31;
         }
-        let name = crate::fs::hfs::mac_roman_to_utf8(&h[3..3 + namelen]);
+        let name = crate::fs::hfs::decode_mac_filename(&h[3..3 + namelen]);
 
         let data_start = (base + pos + ENTRY_HEADER_LEN) as u64;
 

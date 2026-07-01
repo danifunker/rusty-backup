@@ -122,7 +122,7 @@ libchdman-rs = { version = "0.288.8", features = ["prebuilt"], optional = true }
 # (it's behind `gui`).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 webbrowser = { version = "1.0", optional = true }
-opticaldiscs = { version = "0.5", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.6", features = ["drives"], optional = true }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "add-data-support-0-4-1", optional = true }
 
 # Always-on dependencies — used by rb-cli (mini included).

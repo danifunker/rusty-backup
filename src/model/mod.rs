@@ -13,6 +13,7 @@ pub mod cache_runner;
 #[cfg(feature = "chd")]
 pub mod chd_expand_runner;
 pub mod checksum;
+pub mod commander_descend;
 pub mod commander_ops;
 pub mod commander_source;
 pub mod container_edit;
@@ -28,6 +29,7 @@ pub mod optical_devices;
 pub mod partition_editor;
 pub mod physical_write_runner;
 pub mod rate_tracker;
+pub mod wrapper_tree;
 // The remote file-browser core depends on `crate::remote`, which is itself
 // behind the `remote` feature.
 #[cfg(feature = "remote")]

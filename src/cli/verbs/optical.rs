@@ -464,13 +464,11 @@ pub struct ExtractArgs {
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
     use opticaldiscs::browse::open_disc_filesystem;
     use opticaldiscs::detect::DiscImageInfo;
-    use opticaldiscs::formats::FilesystemType;
 
     std::fs::create_dir_all(&args.to).with_context(|| format!("creating {}", args.to.display()))?;
 
     let info = DiscImageInfo::open(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let is_hfs = matches!(info.filesystem, FilesystemType::Hfs);
     let mut fs =
         open_disc_filesystem(&info).map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
     let root = fs
@@ -498,7 +496,7 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         .list_directory(&root)
         .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
     {
-        extract(&mut *fs, &child, &args.to, mode, is_hfs, &mut count)?;
+        extract(&mut *fs, &child, &args.to, mode, &mut count)?;
     }
     log_stderr(format!("extracted {count} entry/entries"));
     Ok(())
@@ -509,7 +507,6 @@ fn extract(
     entry: &opticaldiscs::browse::entry::FileEntry,
     dest: &Path,
     mode: crate::fs::resource_fork::ResourceForkMode,
-    is_hfs: bool,
     count: &mut u64,
 ) -> Result<()> {
     use crate::fs::resource_fork::{self, ResourceForkMode as M};
@@ -519,7 +516,11 @@ fn extract(
     let safe_name = resource_fork::sanitize_filename(&entry.name);
     match entry.entry_type {
         EntryType::File => {
-            let has_rsrc = is_hfs && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
+            // A non-zero resource-fork size only appears on fork-capable
+            // filesystems (HFS / HFS+); ISO 9660 reports `None`. Keying off it
+            // covers every current and future fork filesystem opticaldiscs
+            // supports without re-checking the filesystem type.
+            let has_rsrc = entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
             if has_rsrc && mode == M::MacBinary {
                 let data = fs
                     .read_file(entry)
@@ -530,10 +531,12 @@ fn extract(
                     .unwrap_or_default();
                 let type_code = entry.type_code.unwrap_or([0; 4]);
                 let creator_code = entry.creator_code.unwrap_or([0; 4]);
+                let dates = crate::optical::mac_dates_from(&entry.timestamps);
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
                     &type_code,
                     &creator_code,
+                    dates,
                     &data,
                     &rsrc,
                 );
@@ -552,6 +555,7 @@ fn extract(
                 if has_rsrc && mode != M::DataForkOnly {
                     let type_code = entry.type_code.unwrap_or([0; 4]);
                     let creator_code = entry.creator_code.unwrap_or([0; 4]);
+                    let dates = crate::optical::mac_dates_from(&entry.timestamps);
                     let rsrc = fs
                         .read_resource_fork(entry)
                         .map_err(|e| anyhow::anyhow!("read_resource_fork: {e}"))?
@@ -564,8 +568,12 @@ fn extract(
                             rf.flush()?;
                         }
                         M::AppleDouble => {
-                            let ad =
-                                resource_fork::build_appledouble(&type_code, &creator_code, &rsrc);
+                            let ad = resource_fork::build_appledouble(
+                                &type_code,
+                                &creator_code,
+                                dates,
+                                &rsrc,
+                            );
                             let ap = dest.join(format!("._{safe_name}"));
                             let mut af = BufWriter::new(std::fs::File::create(&ap)?);
                             af.write_all(&ad)?;
@@ -590,7 +598,7 @@ fn extract(
                 .list_directory(entry)
                 .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
             for child in &children {
-                extract(fs, child, &dir_path, mode, is_hfs, count)?;
+                extract(fs, child, &dir_path, mode, count)?;
             }
         }
     }

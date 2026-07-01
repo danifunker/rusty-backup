@@ -19,7 +19,7 @@ use byteorder::{BigEndian, ByteOrder};
 use std::sync::OnceLock;
 
 use super::stuffit::{ForkCodec, ForkInfo, StuffItArchive, StuffItEntry};
-use crate::fs::hfs::mac_roman_to_utf8;
+use crate::fs::hfs::decode_mac_filename;
 
 /// Bytes of file metadata that follow a file entry's name (volume, offset,
 /// type/creator, two dates, finder flags, crc, flags, four lengths).
@@ -127,7 +127,7 @@ fn parse_directory(
         let namebytes = bytes
             .get(*pos..*pos + nl)
             .ok_or_else(|| anyhow::anyhow!("Compact Pro: name runs past end of archive"))?;
-        let name = mac_roman_to_utf8(namebytes);
+        let name = decode_mac_filename(namebytes);
         *pos += nl;
 
         let mut path = parent.to_vec();

@@ -41,7 +41,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::fs::hfs::{mac_roman_to_utf8, utf8_to_mac_roman};
+use crate::fs::hfs::{decode_mac_filename, utf8_to_mac_roman};
 
 use super::stuffit::{
     crc16_arc, ForkCodec, ForkInfo, StuffItArchive, StuffItEntry, StuffItInputNode,
@@ -242,7 +242,7 @@ fn parse_record(
 /// Read the name P-string out of a record header (Mac-Roman → UTF-8).
 fn read_name(hdr: &[u8]) -> String {
     let len = (hdr[NAME_OFF] as usize).min(NAME_MAX);
-    mac_roman_to_utf8(&hdr[NAME_OFF + 1..NAME_OFF + 1 + len])
+    decode_mac_filename(&hdr[NAME_OFF + 1..NAME_OFF + 1 + len])
 }
 
 /// Read one fork/comment block: `size` payload bytes, a 4-byte big-endian

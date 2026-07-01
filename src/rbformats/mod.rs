@@ -167,6 +167,7 @@ pub mod chd_edit {
 pub mod cbk;
 pub mod compress;
 pub mod containers;
+pub mod dart;
 pub mod dc42;
 pub mod dmg;
 pub mod export;
@@ -177,6 +178,8 @@ pub mod gzip;
 pub mod imz;
 pub mod interleave;
 pub mod lz4;
+pub mod lzhuf;
+pub mod ndif;
 pub mod qcow2;
 #[cfg(test)]
 pub(crate) mod qemu_img_test;
@@ -1273,6 +1276,13 @@ pub enum ImageFormat {
     DosOrder,
     /// DiskCopy 4.2 — classic Mac/Apple IIgs floppy image with 84-byte header.
     DiskCopy42(dc42::Dc42Header),
+    /// Apple Twiggy / FileWare DiskCopy 4.2 — the pre-release Macintosh 5.25"
+    /// 871 KB GCR format, de-interleaved into a flat MFS/HFS volume in memory.
+    TwiggyDc42(dc42::Dc42Header),
+    /// DART (Disk Archive/Retrieval Tool) — compressed Apple disk image,
+    /// decoded fully into memory. A Lisa disk (with sector tags) is re-wrapped
+    /// as DiskCopy 4.2 *with* tags; every other disk yields its block data.
+    Dart,
     /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
     Woz(woz::WozReader),
     /// QCOW2 (v2 or v3, uncompressed) — opened on-demand by path via
@@ -1333,6 +1343,13 @@ impl ImageFormat {
                     hdr.data_size
                 )
             }
+            ImageFormat::TwiggyDc42(ref hdr) => {
+                format!(
+                    "Apple Twiggy DiskCopy 4.2 \"{}\" (de-interleaved to {} bytes)",
+                    hdr.disk_name, hdr.data_size
+                )
+            }
+            ImageFormat::Dart => "DART (compressed disk image)".to_string(),
             ImageFormat::Woz(ref reader) => {
                 format!(
                     "WOZ {} ({} bytes decoded)",
@@ -1558,8 +1575,47 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         // Re-open since DMG detection may have consumed the file handle.
         if let Some(p) = path {
             if let Ok(mut f) = File::open(p) {
+                // Twiggy probe first: these images carry a valid DC42 header but
+                // often have trailing bytes that fail the strict size check in
+                // `detect_dc42`, so probe the header directly. A Twiggy image
+                // can't be read (non-linear sector layout) — surface a clear
+                // diagnostic instead of letting it fall through to a cryptic
+                // "Invalid MBR" once the unreadable data fork hits partitioning.
+                if let Some(hdr) = dc42::parse_dc42_header(&mut f) {
+                    if hdr.is_twiggy() {
+                        // De-interleaved into a flat MFS/HFS volume in
+                        // `wrap_image_reader`; a layout we can't recognize
+                        // bails there with the diagnostic.
+                        return Ok(ImageFormat::TwiggyDc42(hdr));
+                    }
+                }
+            }
+            if let Ok(mut f) = File::open(p) {
                 if let Some(hdr) = dc42::detect_dc42(&mut f, file_size) {
+                    // A Lisa disk keeps its 12-byte-per-sector tags, which the
+                    // data-fork unwrap would discard. Pass the whole DC42 through
+                    // as Raw so the tag-dependent Lisa filesystem (which parses
+                    // the DC42 header itself) sees data + tags.
+                    if let Ok(mut f2) = File::open(p) {
+                        if crate::fs::lisa::looks_like_lisa(&mut f2) {
+                            return Ok(ImageFormat::Raw);
+                        }
+                    }
                     return Ok(ImageFormat::DiskCopy42(hdr));
+                }
+            }
+        }
+    }
+
+    // 5b. DART (compressed Apple disk image) — no magic number, so content-detect
+    //     by validating the header + per-chunk lengths against the file size.
+    if let Some(p) = path {
+        let head_len = 148.min(file_size as usize);
+        if head_len >= 84 {
+            if let Ok(mut f) = File::open(p) {
+                let mut head = vec![0u8; head_len];
+                if f.read_exact(&mut head).is_ok() && dart::is_dart(&head, file_size) {
+                    return Ok(ImageFormat::Dart);
                 }
             }
         }
@@ -1683,6 +1739,31 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             drop(file);
             let size = reader.len();
             Ok((Box::new(reader), size))
+        }
+        ImageFormat::Dart => {
+            // Decode the whole DART file into memory (floppies are <= ~1.5 MB):
+            // a Lisa disk becomes a DiskCopy 4.2 stream *with* tags, everything
+            // else its block data. Either way it's a flat, seekable image.
+            let mut raw = Vec::new();
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            reader.read_to_end(&mut raw)?;
+            let image = dart::decode_dart_to_image(&raw)
+                .map_err(|e| anyhow::anyhow!("decode DART: {e}"))?;
+            let size = image.len() as u64;
+            Ok((Box::new(std::io::Cursor::new(image)), size))
+        }
+        ImageFormat::TwiggyDc42(hdr) => {
+            // Read the whole Twiggy image (< ~1 MB) and de-interleave its two
+            // sides into a flat MFS/HFS volume the superfloppy path can mount.
+            let mut raw = Vec::new();
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            reader.read_to_end(&mut raw)?;
+            let image = dc42::deinterleave_twiggy(&raw)
+                .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
+            let size = image.len() as u64;
+            Ok((Box::new(std::io::Cursor::new(image)), size))
         }
         ImageFormat::VhdDynamic { path, logical_size } => {
             // Re-open by path so the reader owns its own File handle.
