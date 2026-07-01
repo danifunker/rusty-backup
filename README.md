@@ -460,7 +460,7 @@ readable.
 | BasiliskII HFV | `.hfv`          | Yes            | Yes             | Flat classic-HFS volume (≤ 2047 MB) for 68k Mac emulators |
 | Apple 2MG      | `.2mg`          | Yes            | No              | Apple II / IIgs disk images |
 | Apple II DSK   | `.dsk`, `.do`, `.po` | Yes       | No              | DOS-order, ProDOS-order, and auto-detect sector orderings |
-| Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images |
+| Disk Copy 4.2  | `.dc42`, `.image` | Yes          | No              | Classic Mac floppy images. Apple Twiggy / FileWare 871 KB prototype images (the recovered MacPaint 0.5 / early Finder disks, disk-format byte `0x54`) are auto-detected and de-interleaved into their MFS/HFS volume — the two sides are stored sequentially, so the volume is recovered by rotating the sector array onto its Master Directory Block. |
 | Apple DMG      | `.dmg`          | Yes (raw/UDRW) | No              | Uncompressed DMGs only |
 | WOZ            | `.woz`          | Yes            | Yes (export)    | Apple II 5.25" and 3.5"; WOZ2 writer regenerates a clean image |
 | DART           | `.dart`, `.image`, extensionless | Yes (decode) | No | Apple's Disk Archive/Retrieval Tool — the compressed disk image contemporary with DiskCopy 4.2. Content-detected (no magic number). Fast (word-RLE), best (LZHUF), and uncompressed chunks all handled; LZHUF validated byte-exact against a real Apple image. Preserves the 12-byte sector tags, so **Lisa** DART disks open as Lisa volumes; Mac / Apple II / MS-DOS DART disks decode to their block data and route to the normal filesystem detection. |

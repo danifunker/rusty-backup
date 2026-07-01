@@ -1276,6 +1276,9 @@ pub enum ImageFormat {
     DosOrder,
     /// DiskCopy 4.2 — classic Mac/Apple IIgs floppy image with 84-byte header.
     DiskCopy42(dc42::Dc42Header),
+    /// Apple Twiggy / FileWare DiskCopy 4.2 — the pre-release Macintosh 5.25"
+    /// 871 KB GCR format, de-interleaved into a flat MFS/HFS volume in memory.
+    TwiggyDc42(dc42::Dc42Header),
     /// DART (Disk Archive/Retrieval Tool) — compressed Apple disk image,
     /// decoded fully into memory. A Lisa disk (with sector tags) is re-wrapped
     /// as DiskCopy 4.2 *with* tags; every other disk yields its block data.
@@ -1338,6 +1341,12 @@ impl ImageFormat {
                     hdr.disk_name,
                     hdr.format_name(),
                     hdr.data_size
+                )
+            }
+            ImageFormat::TwiggyDc42(ref hdr) => {
+                format!(
+                    "Apple Twiggy DiskCopy 4.2 \"{}\" (de-interleaved to {} bytes)",
+                    hdr.disk_name, hdr.data_size
                 )
             }
             ImageFormat::Dart => "DART (compressed disk image)".to_string(),
@@ -1574,7 +1583,10 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 // "Invalid MBR" once the unreadable data fork hits partitioning.
                 if let Some(hdr) = dc42::parse_dc42_header(&mut f) {
                     if hdr.is_twiggy() {
-                        anyhow::bail!("{}", hdr.twiggy_unsupported_message());
+                        // De-interleaved into a flat MFS/HFS volume in
+                        // `wrap_image_reader`; a layout we can't recognize
+                        // bails there with the diagnostic.
+                        return Ok(ImageFormat::TwiggyDc42(hdr));
                     }
                 }
             }
@@ -1738,6 +1750,18 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             reader.read_to_end(&mut raw)?;
             let image = dart::decode_dart_to_image(&raw)
                 .map_err(|e| anyhow::anyhow!("decode DART: {e}"))?;
+            let size = image.len() as u64;
+            Ok((Box::new(std::io::Cursor::new(image)), size))
+        }
+        ImageFormat::TwiggyDc42(hdr) => {
+            // Read the whole Twiggy image (< ~1 MB) and de-interleave its two
+            // sides into a flat MFS/HFS volume the superfloppy path can mount.
+            let mut raw = Vec::new();
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(0))?;
+            reader.read_to_end(&mut raw)?;
+            let image = dc42::deinterleave_twiggy(&raw)
+                .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
             let size = image.len() as u64;
             Ok((Box::new(std::io::Cursor::new(image)), size))
         }

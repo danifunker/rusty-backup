@@ -1044,16 +1044,21 @@ fn open_read_dispatch(
         // everything else its block data.
         Ok(Box::new(std::io::Cursor::new(image)))
     } else {
-        // Twiggy diagnostic: an Apple Twiggy / FileWare .dc42 wraps an MFS
-        // volume but stores sectors in a non-linear physical layout we don't
-        // de-interleave, so it can't be read. Catch it here and explain, rather
-        // than handing the unreadable bytes to partition detection where it
-        // surfaces as a cryptic "Invalid MBR". (Normal DC42 unwrapping in the
-        // CLI is a separate, pre-existing gap; this only short-circuits Twiggy.)
+        // Apple Twiggy / FileWare .dc42: the two sides are stored sequentially,
+        // so the MFS/HFS volume is the data region rotated by one side.
+        // De-interleave it into a flat image here rather than handing the
+        // rotated bytes to partition detection where it surfaces as a cryptic
+        // "Invalid MBR". A layout we can't recognize bails with the diagnostic.
+        // (Normal DC42 unwrapping in the CLI is a separate, pre-existing gap;
+        // this only handles Twiggy.)
         if let Ok(mut probe) = File::open(path) {
             if let Some(hdr) = crate::rbformats::dc42::parse_dc42_header(&mut probe) {
                 if hdr.is_twiggy() {
-                    anyhow::bail!("{}", hdr.twiggy_unsupported_message());
+                    let raw = std::fs::read(path)
+                        .with_context(|| format!("read Twiggy image {}", path.display()))?;
+                    let image = crate::rbformats::dc42::deinterleave_twiggy(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("{}", hdr.twiggy_unsupported_message()))?;
+                    return Ok(Box::new(std::io::Cursor::new(image)));
                 }
             }
         }
