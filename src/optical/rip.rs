@@ -552,7 +552,11 @@ mod tests {
         assert_eq!(SectorReadMode::DataCooked.sector_size(), 2048);
         assert_eq!(SectorReadMode::DataRaw.sector_size(), 2352);
 
-        assert_eq!(SectorReadMode::DataCooked.cdb_byte1(), 0x04);
+        // Expected Sector Type is the type value shifted left by 2, so Mode 1
+        // (data) is `010b << 2 = 0x08`. (`0x04` = `001b << 2` would wrongly mean
+        // CD-DA — cd-da-reader corrected this in the file-based-backend branch.)
+        assert_eq!(SectorReadMode::DataCooked.cdb_byte1(), 0x08);
+        assert_eq!(SectorReadMode::DataRaw.cdb_byte1(), 0x08);
         assert_eq!(SectorReadMode::DataCooked.cdb_byte9(), 0x10);
         assert_eq!(SectorReadMode::DataRaw.cdb_byte9(), 0xF8);
     }
