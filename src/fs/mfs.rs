@@ -150,10 +150,14 @@ impl MfsMdb {
         }
         let volume_name = super::hfs::mac_roman_to_utf8(&buf[37..37 + name_len]);
 
-        // Volume map starts right after the volume name Pascal string,
-        // still inside the MDB sector. The bit-packed map continues into
-        // subsequent sectors when num_alloc_blocks * 12 bits overflows.
-        let map_offset = MDB_OFFSET + 36 + 1 + name_len as u64;
+        // The volume allocation block map begins at a *fixed* offset 64 within
+        // the MDB block (the volume-name field is fixed-width: 1 length byte +
+        // 27 reserved chars = bytes 36..63, map at 64). The bit-packed map
+        // continues into subsequent sectors when num_alloc_blocks * 12 bits
+        // overflows. (An earlier version placed it right after the actual name,
+        // which only coincides with 64 for a full 27-char name and corrupted
+        // every real disk with a shorter name.)
+        let map_offset = MDB_OFFSET + 64;
 
         // Sanity: alloc_block_size must be a positive multiple of 512.
         if alloc_block_size == 0 || alloc_block_size % 512 != 0 {
@@ -287,14 +291,16 @@ impl<R: Read + Seek + Send> MfsFilesystem<R> {
         if block < 2 {
             return 0;
         }
-        let bit_off = block as usize * 12;
+        // Map entry index 0 corresponds to allocation block 2, so the entry for
+        // block N lives at bit (N - 2) * 12. Entries are 12-bit, high-order
+        // first; two pack into three bytes.
+        let bit_off = (block as usize - 2) * 12;
         let byte_off = bit_off / 8;
         if byte_off + 1 >= self.map_bytes.len() {
             return 0;
         }
-        // 12-bit big-endian-style packing. Two 12-bit entries fit in 3 bytes:
-        //   even-indexed entry N: bits [byte N*3/2 high nibble, byte N*3/2+1 high nibble]
-        //   actually MFS uses straight bit-packing — high-order first.
+        // Entry-index parity equals block parity (index = block - 2), so the
+        // nibble alignment can still key off `block`.
         if block.is_multiple_of(2) {
             // even block: high nibble of byte_off (which is block*12/8) is the LOW
             // 4 bits of the entry, byte_off+1 high 8 bits... Actually it's
@@ -497,7 +503,8 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
             "map_set out-of-range block {block}"
         );
         let value = value & 0x0FFF;
-        let bit_off = block as usize * 12;
+        // Entry for block N is at bit (N - 2) * 12 (index 0 == block 2).
+        let bit_off = (block as usize - 2) * 12;
         let byte_off = bit_off / 8;
         if block.is_multiple_of(2) {
             self.map_bytes[byte_off] = (value >> 4) as u8;
@@ -1068,13 +1075,14 @@ mod tests {
         mdb[37..37 + vname.len()].copy_from_slice(vname);
 
         // --- Volume map ---
-        // Map starts at byte 1024 + 36 + 1 + 6 = 1067. 8 alloc blocks × 12 bits = 96 bits = 12 bytes.
-        // Blocks 0 & 1 reserved. Layout:
+        // Map starts at the fixed offset 1024 + 64 = 1088. 8 alloc blocks × 12
+        // bits = 96 bits = 12 bytes. Blocks 0 & 1 reserved; entry index 0 is
+        // block 2. Layout:
         //   Block 2 → 1 (end of chain for "Hello")
         //   Block 3 → 1 (end of chain for "Doc" data fork)
         //   Block 4 → 1 (end of chain for "Doc" rsrc fork)
         //   Blocks 5..9 → 0 (free)
-        let map_start = 1024 + 36 + 1 + vname.len();
+        let map_start = 1024 + 64;
         let mut map = vec![0u8; 12];
         write_map_entry(&mut map, 2, 1);
         write_map_entry(&mut map, 3, 1);
@@ -1173,7 +1181,7 @@ mod tests {
     /// Mirrors the high-nibble-first packing used by `map_get`.
     fn write_map_entry(map: &mut [u8], block: u16, value: u16) {
         let value = value & 0x0FFF;
-        let bit_off = block as usize * 12;
+        let bit_off = (block as usize - 2) * 12;
         let byte_off = bit_off / 8;
         if block.is_multiple_of(2) {
             map[byte_off] = (value >> 4) as u8;
