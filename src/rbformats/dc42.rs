@@ -202,6 +202,44 @@ pub fn encode_dc42(name: &str, data: &[u8]) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Encode a flat sector buffer plus its 12-byte-per-sector tag region as a
+/// DiskCopy 4.2 file. Used to re-wrap a decoded DART image (or any de-container-
+/// ized `(data, tags)` pair) so the tag-dependent Lisa filesystem can read it
+/// through the normal image pipeline. `disk_format` is inferred from the data
+/// size (400K/800K GCR); other sizes are marked `0xFF` ("other").
+pub fn encode_dc42_with_tags(name: &str, data: &[u8], tags: &[u8]) -> Vec<u8> {
+    let disk_format = match data.len() {
+        409_600 => DC42_DISK_400K,
+        819_200 => DC42_DISK_800K,
+        _ => 0xFF,
+    };
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len().clamp(1, 63);
+    let effective_name: &[u8] = if name_bytes.is_empty() {
+        b"Lisa"
+    } else {
+        &name_bytes[..name_len]
+    };
+    let effective_len = effective_name.len();
+
+    let mut header = [0u8; 84];
+    header[0] = effective_len as u8;
+    header[1..1 + effective_len].copy_from_slice(effective_name);
+    header[64..68].copy_from_slice(&(data.len() as u32).to_be_bytes());
+    header[68..72].copy_from_slice(&(tags.len() as u32).to_be_bytes());
+    header[72..76].copy_from_slice(&dc42_checksum(data).to_be_bytes());
+    header[76..80].copy_from_slice(&dc42_checksum(tags).to_be_bytes());
+    header[80] = disk_format;
+    header[81] = DC42_FMT_SINGLE_SIDED;
+    header[82..84].copy_from_slice(&DC42_PRIVATE_MAGIC.to_be_bytes());
+
+    let mut out = Vec::with_capacity(84 + data.len() + tags.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(data);
+    out.extend_from_slice(tags);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -765,11 +765,13 @@ fn extract_entry(
 
                 let type_code = entry.type_code.unwrap_or([0; 4]);
                 let creator_code = entry.creator_code.unwrap_or([0; 4]);
+                let dates = crate::optical::mac_dates_from(&entry.timestamps);
 
                 let mb = resource_fork::build_macbinary(
                     &safe_name,
                     &type_code,
                     &creator_code,
+                    dates,
                     &data,
                     &rsrc_data,
                 );
@@ -798,6 +800,7 @@ fn extract_entry(
                 if has_rsrc && resource_fork_mode != ResourceForkMode::DataForkOnly {
                     let type_code = entry.type_code.unwrap_or([0; 4]);
                     let creator_code = entry.creator_code.unwrap_or([0; 4]);
+                    let dates = crate::optical::mac_dates_from(&entry.timestamps);
 
                     let rsrc_data = fs.read_resource_fork(entry)?.unwrap_or_default();
 
@@ -812,6 +815,7 @@ fn extract_entry(
                             let ad = resource_fork::build_appledouble(
                                 &type_code,
                                 &creator_code,
+                                dates,
                                 &rsrc_data,
                             );
                             let ad_path = dest.join(format!("._{safe_name}"));

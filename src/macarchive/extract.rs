@@ -473,6 +473,7 @@ pub fn write_entry(
                 &entry.name,
                 &entry.type_code,
                 &entry.creator_code,
+                resource_fork::MacFileDates::default(),
                 data,
                 rsrc,
             );
@@ -481,8 +482,12 @@ pub fn write_entry(
         ForkFormat::AppleDouble => {
             std::fs::write(target, data)?;
             if !rsrc.is_empty() || entry.type_code != [0; 4] || entry.creator_code != [0; 4] {
-                let ad =
-                    resource_fork::build_appledouble(&entry.type_code, &entry.creator_code, rsrc);
+                let ad = resource_fork::build_appledouble(
+                    &entry.type_code,
+                    &entry.creator_code,
+                    resource_fork::MacFileDates::default(),
+                    rsrc,
+                );
                 std::fs::write(sidecar_path(target, "._"), ad)?;
             }
         }

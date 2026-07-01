@@ -226,6 +226,14 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     if first_sector[0] == 0x78 && crate::fs::alto::zdisk::is_zdisk(first_sector) {
         return Some("Pilot/Cedar".to_string());
     }
+    // Apple Lisa disk: a DiskCopy 4.2 image that still carries its 12-byte
+    // sector tags (or a DART image re-wrapped as one). The tags are a sideband a
+    // flat sector stream can't carry, so the Lisa filesystem parses the whole
+    // DC42 container itself — route it through the "lisafs" hint. `looks_like_lisa`
+    // returns quickly for anything that isn't a tag-bearing DC42.
+    if crate::fs::lisa::looks_like_lisa(reader) {
+        return Some("lisafs".to_string());
+    }
     // Salto Alto-emulator cooked `.dsk`: no magic, recognized by the exact
     // Diablo-31 image size plus a page-number prefix on record 1 that reads as
     // its VDA (1 big-endian, or 0x0100 little-endian — Salto images come in
@@ -1018,6 +1026,9 @@ impl PartitionTable {
                 // hint through `partition_type_string` so the dispatcher opens
                 // the carve view instead of the AFFS parser.
                 let is_amiga_ndos = fs_hint == "Amiga-NDOS";
+                // Apple Lisa: the tag-bearing DC42/DART container is opened as a
+                // whole by the Lisa driver, so route the hint through the string.
+                let is_lisa = fs_hint == "lisafs";
                 let display_name = if is_amiga_dos {
                     let variant = fs_hint.as_bytes()[4] - b'0';
                     let raw = u32::from_be_bytes([b'D', b'O', b'S', variant]);
@@ -1026,6 +1037,8 @@ impl PartitionTable {
                     "Human68k (FAT)".to_string()
                 } else if is_amiga_ndos {
                     "Amiga NDOS (no filesystem)".to_string()
+                } else if is_lisa {
+                    "Apple Lisa File System".to_string()
                 } else {
                     fs_hint.clone()
                 };
@@ -1039,7 +1052,11 @@ impl PartitionTable {
                     bootable: false,
                     is_logical: false,
                     is_extended_container: false,
-                    partition_type_string: if is_amiga_dos || is_human68k || is_amiga_ndos {
+                    partition_type_string: if is_amiga_dos
+                        || is_human68k
+                        || is_amiga_ndos
+                        || is_lisa
+                    {
                         Some(fs_hint.clone())
                     } else {
                         None

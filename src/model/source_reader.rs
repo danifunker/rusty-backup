@@ -1037,6 +1037,12 @@ fn open_read_dispatch(
         let zip = ZipDiskReader::open_with(path, password, inside)
             .with_context(|| format!("open ZIP disk image {}", path.display()))?;
         Ok(Box::new(zip))
+    } else if let Some(image) = try_decode_dart(path)? {
+        // DART (compressed Apple disk image): no reliable extension (the Lisa
+        // OS 3.0 disks are extensionless), so content-detect and decode into a
+        // flat image stream — a Lisa disk becomes DiskCopy 4.2 *with* tags,
+        // everything else its block data.
+        Ok(Box::new(std::io::Cursor::new(image)))
     } else {
         // Twiggy diagnostic: an Apple Twiggy / FileWare .dc42 wraps an MFS
         // volume but stores sectors in a non-linear physical layout we don't
@@ -1054,6 +1060,25 @@ fn open_read_dispatch(
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
+}
+
+/// Content-detect a DART image and, if so, decode it into a flat image stream.
+/// Returns `Ok(None)` for non-DART files. DART has no magic number, so the
+/// header plus per-chunk lengths must exactly account for the file size.
+fn try_decode_dart(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if file_size < 84 {
+        return Ok(None);
+    }
+    let mut head = vec![0u8; 148.min(file_size as usize)];
+    let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if probe.read_exact(&mut head).is_err() || !crate::rbformats::dart::is_dart(&head, file_size) {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).with_context(|| format!("read DART {}", path.display()))?;
+    let image = crate::rbformats::dart::decode_dart_to_image(&bytes)
+        .map_err(|e| anyhow::anyhow!("decode DART {}: {e}", path.display()))?;
+    Ok(Some(image))
 }
 
 /// Open `path` as a flat, seekable disk-image stream with **any** container or

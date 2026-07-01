@@ -45,17 +45,66 @@ impl ResourceForkMode {
     ];
 }
 
+/// Mac file dates as raw seconds since the classic Mac epoch (1904-01-01) —
+/// the exact encoding MacBinary stores in its header and HFS/HFS+ record on
+/// disk. A field of `0` means "unknown": MacBinary writes a zero date and
+/// AppleDouble omits the File Dates Info entry, so callers with no dates get
+/// byte-identical output to the pre-dates behavior.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacFileDates {
+    /// Creation time, seconds since 1904-01-01.
+    pub created: u32,
+    /// Modification time, seconds since 1904-01-01.
+    pub modified: u32,
+}
+
+/// Seconds between the classic Mac epoch (1904-01-01) and the Unix epoch.
+const MAC_EPOCH_UNIX_OFFSET: i64 = 2_082_844_800;
+/// Unix seconds at the AppleDouble "File Dates Info" epoch (2000-01-01 GMT).
+const APPLEDOUBLE_EPOCH_UNIX: i64 = 946_684_800;
+/// Apple's "unknown date" sentinel for AppleSingle/AppleDouble date fields.
+const APPLEDOUBLE_DATE_UNKNOWN: i32 = i32::MIN;
+
+/// Convert a Mac-epoch (1904) second count to the AppleDouble "File Dates Info"
+/// encoding: signed seconds relative to 2000-01-01 GMT. `0` (unknown) maps to
+/// Apple's `0x80000000` sentinel; out-of-range values clamp into `i32`.
+fn mac1904_to_appledouble(mac_secs: u32) -> i32 {
+    if mac_secs == 0 {
+        return APPLEDOUBLE_DATE_UNKNOWN;
+    }
+    let secs_2000 = mac_secs as i64 - MAC_EPOCH_UNIX_OFFSET - APPLEDOUBLE_EPOCH_UNIX;
+    // Keep off i32::MIN so a real date can't collide with the "unknown" sentinel.
+    secs_2000.clamp(i32::MIN as i64 + 1, i32::MAX as i64) as i32
+}
+
 /// Build an AppleDouble (version 2) sidecar file.
 ///
-/// Contains Finder info (type/creator codes) and resource fork data.
+/// Contains Finder info (type/creator codes), file dates (when known), and
+/// resource fork data.
 /// Format: magic(4) + version(4) + filler(16) + num_entries(2) + entries...
-pub fn build_appledouble(type_code: &[u8; 4], creator_code: &[u8; 4], rsrc_data: &[u8]) -> Vec<u8> {
-    // AppleDouble header: 26 bytes
-    // Entry 1: Finder Info (id=9), 32 bytes
-    // Entry 2: Resource Fork (id=2), variable
-    let finder_offset: u32 = 26 + 2 * 12; // header + 2 entry descriptors
+pub fn build_appledouble(
+    type_code: &[u8; 4],
+    creator_code: &[u8; 4],
+    dates: MacFileDates,
+    rsrc_data: &[u8],
+) -> Vec<u8> {
+    // Entries, in on-disk order: Finder Info (id 9, 32B), then — only when we
+    // have real dates — File Dates Info (id 8, 16B), then Resource Fork
+    // (id 2, variable). Omitting the dates entry when unknown keeps the output
+    // byte-identical to the pre-dates two-entry layout.
+    let has_dates = dates.created != 0 || dates.modified != 0;
+    let num_entries: u16 = if has_dates { 3 } else { 2 };
+    let header_len = 26 + num_entries as usize * 12; // 26-byte header + descriptors
+
+    let finder_offset = header_len as u32;
     let finder_len: u32 = 32;
-    let rsrc_offset: u32 = finder_offset + finder_len;
+    let dates_offset = finder_offset + finder_len; // meaningful only when has_dates
+    let dates_len: u32 = 16;
+    let rsrc_offset = if has_dates {
+        dates_offset + dates_len
+    } else {
+        finder_offset + finder_len
+    };
     let rsrc_len: u32 = rsrc_data.len() as u32;
 
     let total = rsrc_offset as usize + rsrc_data.len();
@@ -67,23 +116,41 @@ pub fn build_appledouble(type_code: &[u8; 4], creator_code: &[u8; 4], rsrc_data:
     BigEndian::write_u32(&mut buf[4..8], 0x00020000);
     // Filler: 16 bytes of zeros (already zero)
     // Number of entries
-    BigEndian::write_u16(&mut buf[24..26], 2);
+    BigEndian::write_u16(&mut buf[24..26], num_entries);
 
-    // Entry 1 descriptor: Finder Info
-    BigEndian::write_u32(&mut buf[26..30], 9); // entry ID = Finder Info
-    BigEndian::write_u32(&mut buf[30..34], finder_offset);
-    BigEndian::write_u32(&mut buf[34..38], finder_len);
-
-    // Entry 2 descriptor: Resource Fork
-    BigEndian::write_u32(&mut buf[38..42], 2); // entry ID = Resource Fork
-    BigEndian::write_u32(&mut buf[42..46], rsrc_offset);
-    BigEndian::write_u32(&mut buf[46..50], rsrc_len);
+    // Entry descriptors: 12 bytes each (id, offset, length), starting at 26.
+    let mut d = 26;
+    let mut write_desc = |buf: &mut [u8], id: u32, off: u32, len: u32| {
+        BigEndian::write_u32(&mut buf[d..d + 4], id);
+        BigEndian::write_u32(&mut buf[d + 4..d + 8], off);
+        BigEndian::write_u32(&mut buf[d + 8..d + 12], len);
+        d += 12;
+    };
+    write_desc(&mut buf, 9, finder_offset, finder_len); // Finder Info
+    if has_dates {
+        write_desc(&mut buf, 8, dates_offset, dates_len); // File Dates Info
+    }
+    write_desc(&mut buf, 2, rsrc_offset, rsrc_len); // Resource Fork
 
     // Finder Info data (32 bytes): fdType(4) + fdCreator(4) + fdFlags(2) + fdLocation(4) + fdFldr(2) + extended(16)
     let fi_start = finder_offset as usize;
     buf[fi_start..fi_start + 4].copy_from_slice(type_code);
     buf[fi_start + 4..fi_start + 8].copy_from_slice(creator_code);
     // Rest is zeros
+
+    // File Dates Info (16 bytes): create/modify/backup/access, signed seconds
+    // relative to 2000-01-01 GMT. We only know create/modify; the rest are the
+    // "unknown" sentinel.
+    if has_dates {
+        let di = dates_offset as usize;
+        BigEndian::write_i32(&mut buf[di..di + 4], mac1904_to_appledouble(dates.created));
+        BigEndian::write_i32(
+            &mut buf[di + 4..di + 8],
+            mac1904_to_appledouble(dates.modified),
+        );
+        BigEndian::write_i32(&mut buf[di + 8..di + 12], APPLEDOUBLE_DATE_UNKNOWN);
+        BigEndian::write_i32(&mut buf[di + 12..di + 16], APPLEDOUBLE_DATE_UNKNOWN);
+    }
 
     // Resource fork data
     buf[rsrc_offset as usize..].copy_from_slice(rsrc_data);
@@ -99,6 +166,7 @@ pub fn build_macbinary(
     filename: &str,
     type_code: &[u8; 4],
     creator_code: &[u8; 4],
+    dates: MacFileDates,
     data_fork: &[u8],
     rsrc_data: &[u8],
 ) -> Vec<u8> {
@@ -122,6 +190,13 @@ pub fn build_macbinary(
     BigEndian::write_u32(&mut buf[83..87], data_fork.len() as u32);
     // Resource fork length at 87-90
     BigEndian::write_u32(&mut buf[87..91], rsrc_data.len() as u32);
+
+    // Creation date at 91-94, modification date at 95-98: u32 secs since 1904,
+    // exactly what HFS/HFS+ record — so the raw on-disc timestamps drop in with
+    // no conversion. Both stay zero ("unknown") when `dates` is defaulted. These
+    // sit inside the CRC'd header region, so they must be written before the CRC.
+    BigEndian::write_u32(&mut buf[91..95], dates.created);
+    BigEndian::write_u32(&mut buf[95..99], dates.modified);
 
     // MacBinary version: byte 122 = 130 (MacBinary III)
     buf[122] = 130;
@@ -488,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_build_appledouble_header() {
-        let ad = build_appledouble(b"TEXT", b"ttxt", &[0xDE, 0xAD]);
+        let ad = build_appledouble(b"TEXT", b"ttxt", MacFileDates::default(), &[0xDE, 0xAD]);
         // Magic
         assert_eq!(BigEndian::read_u32(&ad[0..4]), 0x00051607);
         // Version 2
@@ -508,7 +583,14 @@ mod tests {
 
     #[test]
     fn test_build_macbinary() {
-        let mb = build_macbinary("test.txt", b"TEXT", b"ttxt", b"hello", &[1, 2, 3]);
+        let mb = build_macbinary(
+            "test.txt",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            b"hello",
+            &[1, 2, 3],
+        );
         // Filename length
         assert_eq!(mb[1], 8);
         assert_eq!(&mb[2..10], b"test.txt");
@@ -554,7 +636,7 @@ mod tests {
     #[test]
     fn test_parse_appledouble_roundtrip() {
         let rsrc = vec![0xCA, 0xFE, 0xBA, 0xBE];
-        let ad = build_appledouble(b"TEXT", b"ttxt", &rsrc);
+        let ad = build_appledouble(b"TEXT", b"ttxt", MacFileDates::default(), &rsrc);
         let parsed = parse_appledouble(&ad).expect("should parse");
         assert_eq!(parsed.data, rsrc);
         assert_eq!(parsed.type_code, Some(*b"TEXT"));
@@ -571,7 +653,14 @@ mod tests {
     fn test_parse_macbinary_roundtrip() {
         let data_fork = b"hello world";
         let rsrc = vec![1, 2, 3, 4, 5];
-        let mb = build_macbinary("test.txt", b"TEXT", b"ttxt", data_fork, &rsrc);
+        let mb = build_macbinary(
+            "test.txt",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            data_fork,
+            &rsrc,
+        );
         let parsed = parse_macbinary(&mb).expect("should parse");
         assert_eq!(parsed.data, rsrc);
         assert_eq!(parsed.data_fork.as_deref(), Some(data_fork.as_slice()));
@@ -593,7 +682,7 @@ mod tests {
     fn test_parse_appledouble_finfo_only() {
         // Sidecar built for a file with type/creator but no resource fork
         // (e.g. a classic Mac bookmark or .txt file). Must round-trip.
-        let ad = build_appledouble(b"MOSS", b"sigl", &[]);
+        let ad = build_appledouble(b"MOSS", b"sigl", MacFileDates::default(), &[]);
         let parsed = parse_appledouble(&ad).expect("FInfo-only sidecar should parse");
         assert!(parsed.data.is_empty());
         assert_eq!(parsed.type_code, Some(*b"MOSS"));
@@ -603,14 +692,71 @@ mod tests {
     #[test]
     fn test_parse_appledouble_empty_finder_info_rejected() {
         // Sidecar with no rsrc and no FInfo carries no information.
-        let ad = build_appledouble(&[0; 4], &[0; 4], &[]);
+        let ad = build_appledouble(&[0; 4], &[0; 4], MacFileDates::default(), &[]);
         assert!(parse_appledouble(&ad).is_none());
     }
 
     #[test]
     fn test_parse_macbinary_no_rsrc() {
         // Build a MacBinary with no resource fork
-        let mb = build_macbinary("test.txt", b"TEXT", b"ttxt", b"data", &[]);
+        let mb = build_macbinary(
+            "test.txt",
+            b"TEXT",
+            b"ttxt",
+            MacFileDates::default(),
+            b"data",
+            &[],
+        );
         assert!(parse_macbinary(&mb).is_none());
+    }
+
+    #[test]
+    fn test_build_macbinary_dates() {
+        let dates = MacFileDates {
+            created: 0x1234_5678,
+            modified: 0x2345_6789,
+        };
+        let mb = build_macbinary("f", b"TEXT", b"ttxt", dates, b"x", &[9]);
+        // Raw Mac-1904 seconds land at header offsets 91 (create) and 95 (modify).
+        assert_eq!(BigEndian::read_u32(&mb[91..95]), 0x1234_5678);
+        assert_eq!(BigEndian::read_u32(&mb[95..99]), 0x2345_6789);
+        // Dates are inside the CRC'd header region, so the container still parses.
+        assert!(parse_macbinary(&mb).is_some());
+    }
+
+    #[test]
+    fn test_build_appledouble_dates() {
+        // `created` maps to 100s after the 2000 epoch; `modified` stays unknown.
+        let created = (MAC_EPOCH_UNIX_OFFSET + APPLEDOUBLE_EPOCH_UNIX + 100) as u32;
+        let dates = MacFileDates {
+            created,
+            modified: 0,
+        };
+        let ad = build_appledouble(b"TEXT", b"ttxt", dates, &[0xAA]);
+        // Real dates add a third entry (Finder Info, File Dates Info, Resource Fork).
+        assert_eq!(BigEndian::read_u16(&ad[24..26]), 3);
+        // Second descriptor is the File Dates Info entry (id 8).
+        assert_eq!(BigEndian::read_u32(&ad[38..42]), 8);
+        let dates_off = BigEndian::read_u32(&ad[42..46]) as usize;
+        assert_eq!(BigEndian::read_i32(&ad[dates_off..dates_off + 4]), 100);
+        // Unknown modify/backup/access all become the sentinel.
+        assert_eq!(
+            BigEndian::read_i32(&ad[dates_off + 4..dates_off + 8]),
+            i32::MIN
+        );
+        // Finder info + resource fork still round-trip through the parser.
+        let parsed = parse_appledouble(&ad).expect("parse");
+        assert_eq!(parsed.type_code, Some(*b"TEXT"));
+        assert_eq!(parsed.data, vec![0xAA]);
+    }
+
+    #[test]
+    fn test_build_appledouble_no_dates_layout_unchanged() {
+        // Default (unknown) dates keep the classic two-entry layout so callers
+        // without timestamps emit byte-identical sidecars.
+        let ad = build_appledouble(b"TEXT", b"ttxt", MacFileDates::default(), &[0xAA]);
+        assert_eq!(BigEndian::read_u16(&ad[24..26]), 2);
+        // Second descriptor is the resource fork (id 2), not a dates entry.
+        assert_eq!(BigEndian::read_u32(&ad[38..42]), 2);
     }
 }
