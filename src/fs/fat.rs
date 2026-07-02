@@ -5136,12 +5136,16 @@ mod tests {
     // FAT32 selection requires a volume > 2 GiB (see compute_fat_blank_layout),
     // and create_blank_fat materializes the whole image as a Vec — a >2 GiB
     // allocation that a 32-bit address space can't satisfy. Gate to 64-bit.
+    // One test covers the whole FAT32 blank path: format just over the 2 GiB
+    // FAT16->FAT32 boundary (the minimum that selects FAT32, so we allocate ~2
+    // GiB instead of 4), verify type/label/empty-root, then create + read back a
+    // file. (Was two separate 4 GiB tests — 8 GiB of allocation for one path.)
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn create_blank_fat_picks_fat32_for_large_volumes() {
-        // 4 GiB → FAT32 territory.
-        let img =
-            create_blank_fat(4u64 * 1024 * 1024 * 1024, Some("BIGFAT32")).expect("format 4G FAT32");
+    fn create_blank_fat32_round_trips_and_supports_create_file() {
+        // Just over 2 GiB -> the smallest volume create_blank_fat formats as FAT32.
+        let size = 2u64 * 1024 * 1024 * 1024 + 512;
+        let img = create_blank_fat(size, Some("BIGFAT32")).expect("format FAT32");
         let mut cur = std::io::Cursor::new(img);
         let mut fs = FatFilesystem::open(&mut cur, 0).expect("open");
         assert_eq!(fs.fat_type, FatType::Fat32);
@@ -5149,17 +5153,7 @@ mod tests {
         let root = fs.root().expect("root");
         let entries = fs.list_directory(&root).expect("list root");
         assert!(entries.is_empty(), "fresh FAT32 root must be empty");
-    }
 
-    // See note on create_blank_fat_picks_fat32_for_large_volumes: a >2 GiB
-    // in-RAM image can't be allocated on a 32-bit target. Gate to 64-bit.
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn create_blank_fat_fat32_supports_create_file() {
-        let img = create_blank_fat(4u64 * 1024 * 1024 * 1024, Some("F32RW")).expect("format FAT32");
-        let mut cur = std::io::Cursor::new(img);
-        let mut fs = FatFilesystem::open(&mut cur, 0).expect("open");
-        let root = fs.root().expect("root");
         let mut data = std::io::Cursor::new(b"fat32 hello".to_vec());
         let f = fs
             .create_file(&root, "h.txt", &mut data, 11, &CreateFileOptions::default())

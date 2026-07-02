@@ -355,7 +355,7 @@ fn ls_and_rm_support_glob_patterns() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GlobTest",
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GlobTest",
     ]);
 
     let a = dir.path().join("a.txt");
@@ -399,7 +399,7 @@ fn get_glob_extracts_each_match_under_destination() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GetGlob",
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetGlob",
     ]);
 
     // Populate three files. Distinct content per file so we can spot
@@ -438,7 +438,7 @@ fn get_recursive_extracts_subdir_tree() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "GetRecur",
+        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetRecur",
     ]);
 
     // Populate /Apps/ with one direct file + one nested dir + nested file.

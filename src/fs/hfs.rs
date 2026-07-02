@@ -4123,16 +4123,11 @@ mod tests {
         assert!(utf8_to_mac_roman(text).is_err());
     }
 
-    // Allocates a ~512 MB in-memory image, which can't fit in the constrained
-    // address space of 32-bit targets (the parallel test runner aborts the
-    // process on the failed allocation). The overflow logic under test is
-    // pointer-width-independent, so restricting to 64-bit hosts loses nothing.
-    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_resize_hfs_rejects_u16_overflow() {
-        // Build a minimal 500 MB HFS-like image with 8192-byte blocks. The u16
-        // ceiling at this block size is 65535 * 8192 = ~512 MB, so a 2047 MB
-        // resize request must bail (not silently truncate via `as u16`).
+        // Build a minimal HFS MDB with 8192-byte blocks. The u16 ceiling at this
+        // block size is 65535 * 8192 = ~512 MB, so a 2047 MB resize request must
+        // bail (not silently truncate via `as u16`).
         let mut sector = [0u8; 512];
         BigEndian::write_u16(&mut sector[0..2], HFS_SIGNATURE);
         BigEndian::write_u16(&mut sector[14..16], 3); // vbm_st
@@ -4141,9 +4136,12 @@ mod tests {
         BigEndian::write_u16(&mut sector[28..30], 19); // drAlBlSt
         BigEndian::write_u16(&mut sector[34..36], 31423); // drFreeBks
 
-        // Pad image to ~512 MB so the seek to the (would-be) backup MDB is valid
-        // for the old size; the resize should bail before writing anyway.
-        let mut img = vec![0u8; 512 * 1024 * 1024];
+        // resize_hfs_in_place reads only the MDB at offset 1024 and bails on the
+        // u16 block-count check *before* it seeks to the (would-be) backup MDB
+        // near the end, so the image just needs to hold the MDB sector — no
+        // multi-hundred-MB pad. (This also lets the test run on 32-bit targets,
+        // which couldn't allocate the old 512 MB buffer.)
+        let mut img = vec![0u8; 2048];
         img[1024..1024 + 512].copy_from_slice(&sector);
 
         let mut cursor = Cursor::new(img);

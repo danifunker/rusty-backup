@@ -3540,8 +3540,8 @@ mod tests {
         use std::io::Cursor;
 
         const SECTOR_SIZE: u64 = 512;
-        // Source HFS+ volume: 32 MiB, packed into a 2 MiB clone target.
-        const SRC_BYTES: u64 = 32 * 1024 * 1024;
+        // Source HFS+ volume: 8 MiB, packed into a 2 MiB clone target.
+        const SRC_BYTES: u64 = 8 * 1024 * 1024;
         const CLONE_BYTES: u64 = 2 * 1024 * 1024;
         // Partition window the restore picks ("Original" choice) — twice the
         // clone size so the zero-fill branch has a real tail to flush.

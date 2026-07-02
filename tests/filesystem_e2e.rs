@@ -1446,7 +1446,7 @@ fn test_hfv_flat_hfs_detect_open_fsck_edit() {
     use rusty_backup::partition::PartitionTable;
 
     // A blank classic-HFS volume IS a valid HFV (boot blocks @0, MDB @1024).
-    let img = create_blank_hfs(8 * 1024 * 1024, 4096, "HfvTest").expect("create_blank_hfs");
+    let img = create_blank_hfs(2 * 1024 * 1024, 4096, "HfvTest").expect("create_blank_hfs");
 
     // 1. Superfloppy detection.
     let mut cur = Cursor::new(img.clone());
@@ -1523,7 +1523,7 @@ fn test_expand_runner_writes_flat_hfv() {
     let out_path = tmp.path().join("bigger.hfv");
 
     // Source: an 8 MiB HFV with one file.
-    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExpandSrc").unwrap();
+    let mut img = create_blank_hfs(2 * 1024 * 1024, 4096, "ExpandSrc").unwrap();
     {
         let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
         let root = efs.root().unwrap();
@@ -1601,7 +1601,7 @@ fn test_expand_runner_wraps_non_apm_source_in_apm() {
     let out_path = tmp.path().join("wrapped.hda");
 
     // Source: a bare HFS image with one file. No partition table.
-    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "RawHFS").unwrap();
+    let mut img = create_blank_hfs(2 * 1024 * 1024, 4096, "RawHFS").unwrap();
     {
         let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
         let root = efs.root().unwrap();
@@ -1685,7 +1685,7 @@ fn test_export_runner_per_partition_hfv() {
     std::fs::create_dir(&out_dir).unwrap();
 
     // Source: an 8 MiB flat HFS image (a superfloppy) with one file.
-    let mut img = create_blank_hfs(8 * 1024 * 1024, 4096, "ExportSrc").unwrap();
+    let mut img = create_blank_hfs(2 * 1024 * 1024, 4096, "ExportSrc").unwrap();
     {
         let mut efs = HfsFilesystem::open(Cursor::new(&mut img), 0).unwrap();
         let root = efs.root().unwrap();
