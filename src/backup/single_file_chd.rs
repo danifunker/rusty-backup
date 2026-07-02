@@ -2018,109 +2018,6 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_round_trip_single_partition_chd() {
-        // Layout: 4 MiB disk = 8192 sectors. MBR at sector 0; partition
-        // covers sectors 1..=4095 (≈ 2 MiB), tail sectors are zero.
-        const TOTAL_SECTORS: u32 = 8192;
-        const PART_SECTORS: u32 = 4095;
-        const SECTOR_SIZE: u64 = 512;
-        let total_bytes = (TOTAL_SECTORS as u64) * SECTOR_SIZE;
-        let part_bytes = (PART_SECTORS as u64) * SECTOR_SIZE;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let source_path = tmp.path().join("source.img");
-
-        // Build the source: MBR then a recognizable byte pattern in the
-        // partition (LBA-derived) then zeros.
-        let mut data = vec![0u8; total_bytes as usize];
-        data[..512].copy_from_slice(&build_test_mbr(PART_SECTORS));
-        for i in 0..(part_bytes as usize) {
-            // Each byte = (i mod 251). 251 is prime so the pattern is
-            // distinguishable from any zero-fill artefacts.
-            data[512 + i] = ((i % 251) as u8).wrapping_add(1);
-        }
-        std::fs::write(&source_path, &data).unwrap();
-
-        let source_file = File::open(&source_path).unwrap();
-        let source_size = source_file.metadata().unwrap().len();
-        assert_eq!(source_size, total_bytes);
-
-        // Parse our synthetic MBR using the production parser to make sure
-        // we mimic the table shape `run_backup` will hand us.
-        let mut br = BufReader::new(source_file.try_clone().unwrap());
-        let table = PartitionTable::detect(&mut br).expect("detect MBR");
-        let partitions = table.partitions();
-        assert_eq!(partitions.len(), 1);
-
-        let mbr_bytes = {
-            let mut buf = [0u8; 512];
-            buf.copy_from_slice(&data[..512]);
-            buf
-        };
-
-        let output_base = tmp.path().join("disk");
-        let inputs = SingleFileChdInputs {
-            keep_swap: true,
-            source_file: &source_file,
-            source_size,
-            source_partition_table_bytes: &mbr_bytes,
-            partition_table: &table,
-            partitions: &partitions,
-            partition_filter: None,
-            sector_by_sector: false,
-            chd_options: None,
-            is_dvd: false,
-            output_base: &output_base,
-            resize_targets: None,
-            hfsplus_clone_targets: None,
-            alignment_sectors: 0,
-            checksum_type: crate::backup::ChecksumType::Sha256,
-        };
-
-        let mut log_buf: Vec<String> = Vec::new();
-        let mut log_cb = |s: &str| log_buf.push(s.to_string());
-        let mut progress_seen: u64 = 0;
-        let mut progress_cb = |n: u64| progress_seen = progress_seen.max(n);
-        let cancel_check = || false;
-
-        let result = run_via_staging(
-            inputs,
-            &mut progress_cb,
-            &cancel_check,
-            &mut log_cb,
-            &mut |_, _| {},
-            &mut |_| {},
-            None,
-        )
-        .expect("single-file CHD backup");
-        assert_eq!(result.container_filename, "disk.chd");
-        assert_eq!(result.container_logical_size, total_bytes);
-        assert_eq!(result.partition_ranges.len(), 1);
-        assert_eq!(result.partition_ranges[0].partition_index, 0);
-        assert_eq!(result.partition_ranges[0].offset_in_disk, 512);
-        assert_eq!(result.partition_ranges[0].length, part_bytes);
-        assert!(progress_seen > 0, "progress callback never fired");
-
-        // Reopen the CHD and confirm bytes match the source disk.
-        let chd_path = tmp.path().join("disk.chd");
-        let mut reader = ChdReader::open(&chd_path).expect("reopen CHD");
-        let mut readback = vec![0u8; total_bytes as usize];
-        reader.read_exact(&mut readback).expect("read full CHD");
-        assert_eq!(
-            readback, data,
-            "single-file CHD must round-trip the synthesised disk image byte-for-byte",
-        );
-
-        // Spot-check: log output mentions raw passthrough for our 0x83
-        // partition (no compact reader matches Linux type byte).
-        let joined = log_buf.join("\n");
-        assert!(
-            joined.contains("raw passthrough") || joined.contains("compact reader"),
-            "log must explain how partition was read; got: {joined}",
-        );
-    }
-
-    #[test]
     fn is_supported_accepts_mbr() {
         let mbr_bytes = build_test_mbr(64);
         let mut br = std::io::Cursor::new(mbr_bytes.to_vec());
@@ -2218,128 +2115,6 @@ mod tests {
         assert!(
             matches!(detected, PartitionTable::Gpt { .. }),
             "round-tripped CHD should still parse as GPT, got: {}",
-            detected.type_name(),
-        );
-    }
-
-    /// Tiny APM source (DDR + 2 partition map entries + an HFS-shaped data
-    /// partition) — confirms the head region is copied verbatim and the
-    /// partition data lands at its declared offset in the CHD.
-    #[test]
-    fn end_to_end_round_trip_apm() {
-        const TOTAL_BLOCKS: u64 = 8192;
-        const SECTOR: u64 = 512;
-        let total_bytes = TOTAL_BLOCKS * SECTOR;
-
-        let mut data = vec![0u8; total_bytes as usize];
-        // DDR at block 0.
-        const DDR_SIG: u16 = 0x4552; // 'ER'
-        data[0..2].copy_from_slice(&DDR_SIG.to_be_bytes());
-        data[2..4].copy_from_slice(&512u16.to_be_bytes());
-        data[4..8].copy_from_slice(&(TOTAL_BLOCKS as u32).to_be_bytes());
-
-        // Two APM entries at blocks 1 and 2.
-        const ENTRY_SIG: u16 = 0x504D; // 'PM'
-        let entries = [
-            ("Apple", "Apple_partition_map", 1u32, 2u32),
-            ("MacOS", "Apple_HFS", 64u32, 4096u32),
-        ];
-        for (i, (name, ptype, start, count)) in entries.iter().enumerate() {
-            let off = (1 + i) * 512;
-            data[off..off + 2].copy_from_slice(&ENTRY_SIG.to_be_bytes());
-            data[off + 4..off + 8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
-            data[off + 8..off + 12].copy_from_slice(&start.to_be_bytes());
-            data[off + 12..off + 16].copy_from_slice(&count.to_be_bytes());
-            // Name: 32-byte C string at offset 16
-            let nb = name.as_bytes();
-            data[off + 16..off + 16 + nb.len()].copy_from_slice(nb);
-            // Type: 32-byte C string at offset 48
-            let tb = ptype.as_bytes();
-            data[off + 48..off + 48 + tb.len()].copy_from_slice(tb);
-            data[off + 84..off + 88].copy_from_slice(&count.to_be_bytes());
-            data[off + 88..off + 92].copy_from_slice(&0x33u32.to_be_bytes());
-        }
-
-        // Pattern bytes in the data partition (block 64 .. 64+4096).
-        let part_offset = 64usize * 512;
-        let part_len = 4096usize * 512;
-        for i in 0..part_len {
-            data[part_offset + i] = ((i % 251) as u8).wrapping_add(2);
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let source_path = tmp.path().join("source.img");
-        std::fs::write(&source_path, &data).unwrap();
-        let source_file = File::open(&source_path).unwrap();
-
-        let mut br = BufReader::new(source_file.try_clone().unwrap());
-        let table = PartitionTable::detect(&mut br).expect("detect APM");
-        assert!(matches!(table, PartitionTable::Apm(_)));
-        let partitions = table.partitions();
-
-        let output_base = tmp.path().join("disk");
-        let mbr_bytes: [u8; 512] = data[..512].try_into().unwrap();
-        let mut log_buf: Vec<String> = Vec::new();
-        let mut log_cb = |s: &str| log_buf.push(s.to_string());
-        let mut progress_cb = |_: u64| {};
-        let cancel = || false;
-        let result = run_via_staging(
-            SingleFileChdInputs {
-                keep_swap: true,
-                source_file: &source_file,
-                source_size: total_bytes,
-                source_partition_table_bytes: &mbr_bytes,
-                partition_table: &table,
-                partitions: &partitions,
-                partition_filter: None,
-                sector_by_sector: true, // exercises raw passthrough for HFS-typed partition
-                chd_options: None,
-                is_dvd: false,
-                output_base: &output_base,
-                resize_targets: None,
-                hfsplus_clone_targets: None,
-                alignment_sectors: 0,
-                checksum_type: crate::backup::ChecksumType::Sha256,
-            },
-            &mut progress_cb,
-            &cancel,
-            &mut log_cb,
-            &mut |_, _| {},
-            &mut |_| {},
-            None,
-        )
-        .expect("APM single-file CHD backup");
-        assert_eq!(result.container_logical_size, total_bytes);
-
-        // Reopen + verify the head region (DDR + APM entries) round-trips
-        // and the data partition still has its pattern at the declared
-        // offset.
-        let chd_path = tmp.path().join("disk.chd");
-        let mut reader = ChdReader::open(&chd_path).unwrap();
-        let mut readback = vec![0u8; total_bytes as usize];
-        reader.read_exact(&mut readback).unwrap();
-        // log_buf retained for in-test diagnostics if this regresses.
-        let _ = &log_buf;
-
-        // First two blocks must equal source verbatim.
-        assert_eq!(
-            &readback[..1024],
-            &data[..1024],
-            "DDR + first APM entry mismatch"
-        );
-        // Partition data must equal source.
-        assert_eq!(
-            &readback[part_offset..part_offset + part_len],
-            &data[part_offset..part_offset + part_len],
-            "APM partition body mismatch",
-        );
-
-        // And the table re-parses as APM.
-        let mut br2 = BufReader::new(std::io::Cursor::new(readback));
-        let detected = PartitionTable::detect(&mut br2).expect("detect after round-trip");
-        assert!(
-            matches!(detected, PartitionTable::Apm(_)),
-            "round-tripped CHD should still parse as APM, got {}",
             detected.type_name(),
         );
     }
@@ -3176,6 +2951,14 @@ mod tests {
             "run_via_staging must round-trip the source disk byte-for-byte",
         );
 
+        // Log explains how the partition was read: our 0x83 partition has no
+        // compact reader, so it must fall back to raw passthrough.
+        let joined = log_buf.join("\n");
+        assert!(
+            joined.contains("raw passthrough") || joined.contains("compact reader"),
+            "log must explain how partition was read; got: {joined}",
+        );
+
         // Staging dir must be gone — tempfile::TempDir's drop runs on
         // success. Glob for any leftover ".rb-chd-staging-*" sibling.
         let parent = output_base.parent().unwrap();
@@ -3281,16 +3064,12 @@ mod tests {
         let mut readback = vec![0u8; extent];
         reader.read_exact(&mut readback).unwrap();
 
-        // DDR signature + first APM entry signature survive through the
-        // head segment. (The DDR's block_count is rewritten to the
-        // shrunken envelope and the entries' map_entries / sizes get
-        // patched, so a byte-for-byte compare against source would
-        // fail by design — that's verified later via `re-detect APM`.)
-        assert_eq!(&readback[0..2], &data[0..2], "DDR signature mismatch");
+        // No-op backup (envelope == source size), so the head region — DDR +
+        // both APM entries — round-trips verbatim; nothing is patched.
         assert_eq!(
-            &readback[512..514],
-            &data[512..514],
-            "first APM entry signature mismatch",
+            &readback[..1024],
+            &data[..1024],
+            "DDR + first APM entry mismatch",
         );
         // Partition body survives at its declared offset.
         assert_eq!(
