@@ -199,63 +199,52 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_generate_backup_name_fallback() {
-        let name = generate_backup_name(Path::new("/dev/disk2"), None, None);
-        assert!(name.starts_with("disk2-"));
-        // Format: disk2-YYYY-MM-DD-HHMM (21 chars: disk2-2026-01-01-0000)
-        assert!(name.len() >= 21);
-    }
-
-    #[test]
-    fn test_generate_backup_name_from_image() {
-        let name = generate_backup_name(Path::new("/home/user/my-disk.img"), None, None);
-        assert!(name.starts_with("my-disk-"));
-    }
-
-    #[test]
-    fn test_generate_backup_name_with_size_and_label() {
-        let name = generate_backup_name(
-            Path::new("/dev/disk2"),
-            Some(8_000_000_000),
-            Some("LLAMADOS"),
-        );
-        assert!(name.starts_with("8GB-LLAMADOS-"));
-    }
-
-    #[test]
-    fn test_generate_backup_name_size_only() {
-        // When size is provided but no label, fallback to disk name
-        let name = generate_backup_name(Path::new("/dev/disk2"), Some(512_000_000), None);
-        assert!(name.starts_with("512MB-disk2-"));
-    }
-
-    #[test]
-    fn test_generate_backup_name_label_only() {
-        let name = generate_backup_name(Path::new("/dev/disk2"), None, Some("MYDISK"));
-        assert!(name.starts_with("MYDISK-"));
-    }
-
-    #[test]
-    fn test_sanitize_filename() {
-        let name = generate_backup_name(
-            Path::new("/dev/disk2"),
-            Some(8_000_000_000),
-            Some("MY DISK: Label*"),
-        );
-        // Spaces and special chars should be replaced with hyphens
-        assert!(name.starts_with("8GB-MY-DISK-Label-"));
-    }
-
-    #[test]
-    fn test_sanitize_filename_no_trailing_hyphens() {
-        let name = generate_backup_name(
+    fn test_generate_backup_name_shapes() {
+        // (path, size, label) -> expected filename prefix.
+        let cases: &[(&str, Option<u64>, Option<&str>, &str)] = &[
+            ("/dev/disk2", None, None, "disk2-"),
+            ("/home/user/my-disk.img", None, None, "my-disk-"),
+            (
+                "/dev/disk2",
+                Some(8_000_000_000),
+                Some("LLAMADOS"),
+                "8GB-LLAMADOS-",
+            ),
+            // Size but no label falls back to the disk name.
+            ("/dev/disk2", Some(512_000_000), None, "512MB-disk2-"),
+            ("/dev/disk2", None, Some("MYDISK"), "MYDISK-"),
+            // Spaces / special chars are sanitized to hyphens.
+            (
+                "/dev/disk2",
+                Some(8_000_000_000),
+                Some("MY DISK: Label*"),
+                "8GB-MY-DISK-Label-",
+            ),
+            // Leading/trailing space-hyphens are trimmed.
+            (
+                "/dev/disk2",
+                Some(8_000_000_000),
+                Some("  Label  "),
+                "8GB-Label-",
+            ),
+        ];
+        for (path, size, label, prefix) in cases {
+            let name = generate_backup_name(Path::new(path), *size, *label);
+            assert!(
+                name.starts_with(prefix),
+                "{name:?} should start with {prefix:?}"
+            );
+        }
+        // Fallback carries the full date suffix (disk2-YYYY-MM-DD-HHMM).
+        let fallback = generate_backup_name(Path::new("/dev/disk2"), None, None);
+        assert!(fallback.len() >= 21, "fallback name too short: {fallback}");
+        // Trimming must not leave a doubled hyphen.
+        let trimmed = generate_backup_name(
             Path::new("/dev/disk2"),
             Some(8_000_000_000),
             Some("  Label  "),
         );
-        // Leading/trailing hyphens from spaces should be trimmed
-        assert!(name.starts_with("8GB-Label-"));
-        assert!(!name.starts_with("8GB--"));
+        assert!(!trimmed.starts_with("8GB--"), "doubled hyphen: {trimmed}");
     }
 
     #[test]

@@ -173,42 +173,48 @@ mod tests {
     }
 
     #[test]
-    fn common_formats_present() {
-        for must in ["img", "raw", "vhd", "chd", "adf", "hdf", "dmg", "hda"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn x68000_hdd_extensions_present() {
-        // Sharp X68000 SASI/SCSI HDD images — `.hda` (BlueSCSI),
-        // `.hdf`, and `.hds`. The Human68k engine opens all three; pin
-        // them so the picker keeps surfacing X68000 hard-disk images.
-        for must in ["hda", "hdf", "hds"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing X68000 HDD extension {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn alto_pack_extensions_present() {
-        // Xerox Alto disk packs: the PARC Disk Image (`.pdi`) and the period
-        // CopyDisk stream containers (`.bfs` / `.copydisk` / `.altodisk`), plus
-        // the Dwarf Draco 6085 Pilot image (`.zdisk` / `.zdelta`). The
-        // BrowseSession Alto branch opens all of them; pin them so the picker
-        // keeps surfacing Alto / Pilot packs.
-        for must in [
-            "pdi", "bfs", "copydisk", "altodisk", "zdisk", "zdelta", "dsk300", "dsk80", "dsk44",
-        ] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing Alto/Pilot pack extension {must}"
-            );
+    fn os_association_families_present() {
+        // Regression pin: each row is a family of extensions that MUST stay in
+        // association_exts() so the OS file picker / double-click routing keeps
+        // surfacing that format. Dropping one has to be a deliberate table edit.
+        let families: &[(&str, &[&str])] = &[
+            // Common disk / backup formats.
+            (
+                "common",
+                &["img", "raw", "vhd", "chd", "adf", "hdf", "dmg", "hda"],
+            ),
+            // Sharp X68000 SASI/SCSI HDD images (Human68k engine).
+            ("x68000 hdd", &["hda", "hdf", "hds"]),
+            // Xerox Alto / Pilot disk packs (BrowseSession Alto branch).
+            (
+                "alto/pilot pack",
+                &[
+                    "pdi", "bfs", "copydisk", "altodisk", "zdisk", "zdelta", "dsk300", "dsk80",
+                    "dsk44",
+                ],
+            ),
+            // X68000 / PC-98 / FM-7 floppy containers (d88/xdf/hdm/dim).
+            ("floppy container", &["d88", "xdf", "hdm", "dim"]),
+            // Commodore CBM DOS floppy images (C64/C128/C16/VIC-20/PET cores).
+            (
+                "cbm disk",
+                &["d64", "d71", "d81", "g64", "g71", "d80", "d82"],
+            ),
+            // Atari 8-bit ATR/XFD (Atari800 core).
+            ("atari disk", &["atr", "xfd"]),
+            // Acorn DFS single-sided (BBCMicro/AcornElectron cores).
+            ("acorn dfs", &["ssd"]),
+            // CoCo Disk BASIC / RS-DOS (CoCo2/CoCo3 cores).
+            ("coco disk", &["dsk", "jvc", "vdk"]),
+        ];
+        let exts = association_exts();
+        for (family, must) in families {
+            for e in *must {
+                assert!(
+                    exts.contains(&e.to_string()),
+                    "{family}: missing extension {e}"
+                );
+            }
         }
     }
 
@@ -283,71 +289,6 @@ mod tests {
             assert!(
                 MAC_ARCHIVE_EXTS.contains(&must),
                 "missing Mac archive extension {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn floppy_container_family_present() {
-        // X68000 / PC-98 / FM-7 floppy containers — engine support
-        // (`rbformats::containers::{d88,xdf,hdm,dim}`) and the GUI
-        // `Convert Floppy Container...` dialog all assume the pickers
-        // surface these. Regression-pin them here so a future cleanup
-        // pass that prunes the disk-image list has to do it deliberately.
-        for must in ["d88", "xdf", "hdm", "dim"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing floppy-container extension {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn cbm_disk_family_present() {
-        // Commodore CBM DOS floppy images (`src/fs/cbm.rs`) for the
-        // C64/C128/C16/VIC-20/PET MiSTer cores. Pin the picker extensions
-        // so a future cleanup of the disk-image list can't silently drop
-        // them and break double-click open / the file picker filter.
-        for must in ["d64", "d71", "d81", "g64", "g71", "d80", "d82"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing CBM disk extension {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn atari_disk_family_present() {
-        // Atari 8-bit ATR / XFD disk images (`src/fs/atari_dos.rs`) for the
-        // Atari800 MiSTer core.
-        for must in ["atr", "xfd"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing Atari disk extension {must}"
-            );
-        }
-    }
-
-    #[test]
-    fn acorn_dfs_family_present() {
-        // Acorn DFS single-sided floppy images (`src/fs/dfs.rs`) for the
-        // BBCMicro / AcornElectron MiSTer cores. `.ssd` is the flat
-        // single-sided dump.
-        assert!(
-            association_exts().contains(&"ssd".to_string()),
-            "missing Acorn DFS extension ssd"
-        );
-    }
-
-    #[test]
-    fn coco_disk_family_present() {
-        // CoCo Disk BASIC (RS-DOS) disk images (`src/fs/rsdos.rs`) for the
-        // CoCo2 / CoCo3 MiSTer cores. `.dsk` is the common raw dump; `.jvc`
-        // and `.vdk` are CoCo-specific container extensions.
-        for must in ["dsk", "jvc", "vdk"] {
-            assert!(
-                association_exts().contains(&must.to_string()),
-                "missing CoCo disk extension {must}"
             );
         }
     }

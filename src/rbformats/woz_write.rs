@@ -1032,28 +1032,13 @@ mod tests {
     }
 
     #[test]
-    fn track_35_round_trip_zone0_12_sectors() {
-        assert_track_35_round_trip(0, 0, FORMAT_35_DSDD, 12);
-    }
-
-    #[test]
-    fn track_35_round_trip_zone1_11_sectors() {
-        assert_track_35_round_trip(16, 0, FORMAT_35_DSDD, 11);
-    }
-
-    #[test]
-    fn track_35_round_trip_zone2_10_sectors() {
-        assert_track_35_round_trip(32, 1, FORMAT_35_DSDD, 10);
-    }
-
-    #[test]
-    fn track_35_round_trip_zone3_9_sectors() {
-        assert_track_35_round_trip(48, 0, FORMAT_35_DSDD, 9);
-    }
-
-    #[test]
-    fn track_35_round_trip_zone4_8_sectors() {
-        assert_track_35_round_trip(64, 1, FORMAT_35_DSDD, 8);
+    fn track_35_round_trip_all_zones() {
+        // (track, side, sectors-per-track) across the five 3.5" DSDD speed zones.
+        for (track, side, num_sectors) in
+            [(0, 0, 12), (16, 0, 11), (32, 1, 10), (48, 0, 9), (64, 1, 8)]
+        {
+            assert_track_35_round_trip(track, side, FORMAT_35_DSDD, num_sectors);
+        }
     }
 
     #[test]

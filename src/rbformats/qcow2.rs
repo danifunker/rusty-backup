@@ -1086,58 +1086,29 @@ mod tests {
     }
 
     #[test]
-    fn rejects_encryption() {
+    fn rejects_unsupported_header_features() {
         let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        img[32..36].copy_from_slice(&1u32.to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("encrypted"));
-    }
-
-    #[test]
-    fn rejects_snapshots() {
-        let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        img[60..64].copy_from_slice(&3u32.to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("snapshot"));
-    }
-
-    #[test]
-    fn rejects_unknown_incompat_bit() {
-        let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        // Set bit 5 — outside the known mask, must abort.
-        img[72..80].copy_from_slice(&(1u64 << 5).to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("unknown incompatible_features"));
-    }
-
-    #[test]
-    fn rejects_external_data_file() {
-        let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        img[72..80].copy_from_slice(&(1u64 << 2).to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("external data file"));
-    }
-
-    #[test]
-    fn rejects_extended_l2() {
-        let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        img[72..80].copy_from_slice(&(1u64 << 4).to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("extended L2"));
-    }
-
-    #[test]
-    fn rejects_backing_file() {
-        let cluster_bits = 9;
-        let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
-        img[8..16].copy_from_slice(&0xDEAD_BEEFu64.to_be_bytes());
-        let err = open_expecting_err(img);
-        assert!(err.to_string().contains("backing file"));
+        // (byte offset, field width, big-endian value, expected error substring).
+        // The 4-byte fields are crypt_method@32 / nb_snapshots@60; the 8-byte
+        // fields are incompatible_features@72 / backing_file_offset@8.
+        let cases: &[(usize, usize, u64, &str)] = &[
+            (32, 4, 1, "encrypted"),
+            (60, 4, 3, "snapshot"),
+            (72, 8, 1 << 5, "unknown incompatible_features"),
+            (72, 8, 1 << 2, "external data file"),
+            (72, 8, 1 << 4, "extended L2"),
+            (8, 8, 0xDEAD_BEEF, "backing file"),
+        ];
+        for (off, width, value, msg) in cases {
+            let mut img = build_minimal_qcow2(3, cluster_bits, 1u64 << cluster_bits, &[], &[]);
+            let be = value.to_be_bytes();
+            img[*off..*off + *width].copy_from_slice(&be[8 - *width..]);
+            let err = open_expecting_err(img);
+            assert!(
+                err.to_string().contains(*msg),
+                "expected {msg:?}, got: {err}"
+            );
+        }
     }
 
     #[test]

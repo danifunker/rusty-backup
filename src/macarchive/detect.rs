@@ -280,73 +280,37 @@ mod tests {
     }
 
     #[test]
-    fn detects_standalone_sit() {
-        assert_eq!(
-            detect_mac_archive(&synth_sit_header()),
-            Some(MacArchiveKind::Sit)
-        );
-    }
-
-    #[test]
-    fn detects_standalone_sit5() {
-        assert_eq!(
-            detect_mac_archive(&synth_sit5_header()),
-            Some(MacArchiveKind::Sit5)
-        );
-    }
-
-    #[test]
-    fn detects_standalone_sea() {
-        // The SEA scan finds SIT! anywhere in the buffer; the synthetic
-        // one plants it at offset 100. is_stuffit at offset 0 wouldn't
-        // match (header at 0 would be plain Sit), so this routes
-        // through the Sea branch.
-        assert_eq!(
-            detect_mac_archive(&synth_sea_blob()),
-            Some(MacArchiveKind::Sea)
-        );
-    }
-
-    #[test]
-    fn detects_binhex_single_file() {
-        // Plain data fork, no SIT/SEA inside.
-        let hqx = wrap_binhex("Document.txt", b"hello world".to_vec());
-        assert_eq!(
-            detect_mac_archive(&hqx),
-            Some(MacArchiveKind::BinHexSingleFile)
-        );
-    }
-
-    #[test]
-    fn detects_binhex_over_sit() {
-        // BinHex wrapping a SIT payload.
-        let hqx = wrap_binhex("Bundle.sit", synth_sit_header());
-        assert_eq!(
-            detect_mac_archive(&hqx),
-            Some(MacArchiveKind::BinHexOverSit)
-        );
-    }
-
-    #[test]
-    fn detects_binhex_over_sit5() {
-        // BinHex wrapping a SIT5 payload — still classified as
-        // BinHexOverSit since the modal flow is the same regardless of
-        // SIT vs SIT5 inside.
-        let hqx = wrap_binhex("Bundle.sit", synth_sit5_header());
-        assert_eq!(
-            detect_mac_archive(&hqx),
-            Some(MacArchiveKind::BinHexOverSit)
-        );
-    }
-
-    #[test]
-    fn detects_binhex_over_sea() {
-        // BinHex wrapping a SEA payload.
-        let hqx = wrap_binhex("Installer.sea", synth_sea_blob());
-        assert_eq!(
-            detect_mac_archive(&hqx),
-            Some(MacArchiveKind::BinHexOverSea)
-        );
+    fn detects_mac_archive_kinds() {
+        // (built input bytes, expected classification). Covers standalone
+        // SIT/SIT5/SEA plus BinHex wrapping each payload type.
+        let cases: Vec<(Vec<u8>, MacArchiveKind)> = vec![
+            (synth_sit_header(), MacArchiveKind::Sit),
+            (synth_sit5_header(), MacArchiveKind::Sit5),
+            // SEA: SIT! planted mid-buffer (offset 100), not at 0, so it
+            // routes through the Sea branch rather than plain Sit.
+            (synth_sea_blob(), MacArchiveKind::Sea),
+            // BinHex, plain data fork (no SIT/SEA inside).
+            (
+                wrap_binhex("Document.txt", b"hello world".to_vec()),
+                MacArchiveKind::BinHexSingleFile,
+            ),
+            (
+                wrap_binhex("Bundle.sit", synth_sit_header()),
+                MacArchiveKind::BinHexOverSit,
+            ),
+            // SIT5-inside still classifies as BinHexOverSit (same modal flow).
+            (
+                wrap_binhex("Bundle.sit", synth_sit5_header()),
+                MacArchiveKind::BinHexOverSit,
+            ),
+            (
+                wrap_binhex("Installer.sea", synth_sea_blob()),
+                MacArchiveKind::BinHexOverSea,
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(detect_mac_archive(&input), Some(expected));
+        }
     }
 
     #[test]

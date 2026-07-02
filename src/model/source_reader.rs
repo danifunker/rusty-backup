@@ -1423,16 +1423,13 @@ mod tests {
     }
 
     #[test]
-    fn is_gho_path_rejects_non_gho() {
+    fn is_gho_path_requires_extension_and_fe_ef_magic() {
         let dir = tempfile::tempdir().unwrap();
+        // Wrong extension -> rejected regardless of content.
         let plain = dir.path().join("not_gho.bin");
         std::fs::write(&plain, b"hello world").unwrap();
         assert!(!is_gho_path(&plain));
-    }
-
-    #[test]
-    fn is_gho_path_accepts_fe_ef_magic() {
-        let dir = tempfile::tempdir().unwrap();
+        // .gho + FE EF magic -> accepted.
         let path = dir.path().join("fake.gho");
         let mut f = File::create(&path).unwrap();
         f.write_all(&[0xFE, 0xEF, 0x01]).unwrap();

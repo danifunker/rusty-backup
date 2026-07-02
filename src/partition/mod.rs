@@ -1301,107 +1301,78 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_superfloppy_ntfs() {
-        // Build a minimal NTFS boot sector. The OEM ID "NTFS    " at offset 3
-        // is the discriminator; the bootstrap code (and the 0xAA55 signature)
-        // would otherwise be misread as an MBR with junk partition entries.
-        let mut data = vec![0u8; 1024 * 1024];
-        data[0] = 0xEB;
-        data[1] = 0x52;
-        data[2] = 0x90;
-        data[3..11].copy_from_slice(b"NTFS    ");
-        // Realistic bootstrap bytes in the would-be partition table area.
-        for (i, slot) in data[446..510].iter_mut().enumerate() {
-            *slot = 0x4E + ((446 + i) as u8 % 13);
+    fn detect_superfloppy_by_fs_signature() {
+        // Each FS signature planted at its magic offset must be detected as a
+        // bare (partition-table = None) volume of that type — the bare-FS probe
+        // fires before the MBR parse. FAT12's fuller BPB + geometry asserts stay
+        // in test_detect_superfloppy_fat12. `build` returns a fresh image so the
+        // per-FS buffer size (btrfs needs 0x10000+, HFS is an 800K floppy) can
+        // differ.
+        // (expected fs type, builder that returns a fresh synthetic image).
+        type Case = (&'static str, fn() -> Vec<u8>);
+        let cases: &[Case] = &[
+            ("NTFS", || {
+                // OEM ID "NTFS    " at offset 3 discriminates from a junk MBR.
+                let mut d = vec![0u8; 1024 * 1024];
+                d[0] = 0xEB;
+                d[1] = 0x52;
+                d[2] = 0x90;
+                d[3..11].copy_from_slice(b"NTFS    ");
+                for (i, s) in d[446..510].iter_mut().enumerate() {
+                    *s = 0x4E + ((446 + i) as u8 % 13);
+                }
+                d[510] = 0x55;
+                d[511] = 0xAA;
+                d
+            }),
+            ("exFAT", || {
+                let mut d = vec![0u8; 1024 * 1024];
+                d[0] = 0xEB;
+                d[1] = 0x76;
+                d[2] = 0x90;
+                d[3..11].copy_from_slice(b"EXFAT   ");
+                for (i, s) in d[446..510].iter_mut().enumerate() {
+                    *s = 0x4E + ((446 + i) as u8 % 13);
+                }
+                d[510] = 0x55;
+                d[511] = 0xAA;
+                d
+            }),
+            ("XFS", || {
+                // "XFSB" at byte 0; no 0xAA55 signature.
+                let mut d = vec![0u8; 1024 * 1024];
+                d[0..4].copy_from_slice(b"XFSB");
+                d
+            }),
+            ("ext", || {
+                // ext2/3/4 magic 0xEF53 (LE) at 0x38 of the superblock at 1024.
+                let mut d = vec![0u8; 1024 * 1024];
+                d[1024 + 0x38] = 0x53;
+                d[1024 + 0x39] = 0xEF;
+                d
+            }),
+            ("btrfs", || {
+                // "_BHRfS_M" at 0x40 of the superblock at 0x10000.
+                let mut d = vec![0u8; 0x10000 + 4096];
+                d[0x10000 + 0x40..0x10000 + 0x48].copy_from_slice(b"_BHRfS_M");
+                d
+            }),
+            ("HFS", || {
+                // MDB signature 0x4244 at offset 1024; no JMP / MBR signature.
+                let mut d = vec![0u8; 819200];
+                d[1024] = 0x42;
+                d[1025] = 0x44;
+                d
+            }),
+        ];
+        for (expected, build) in cases {
+            let mut cursor = Cursor::new(build());
+            let table = PartitionTable::detect(&mut cursor).unwrap();
+            assert_eq!(table.type_name(), "None", "{expected}: expected bare FS");
+            let parts = table.partitions();
+            assert_eq!(parts.len(), 1, "{expected}: one synthetic partition");
+            assert_eq!(&parts[0].type_name, expected, "{expected}: wrong fs type");
         }
-        data[510] = 0x55;
-        data[511] = 0xAA;
-
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "NTFS");
-    }
-
-    #[test]
-    fn test_detect_superfloppy_exfat() {
-        // exFAT boot sector: OEM ID "EXFAT   " at offset 3.
-        let mut data = vec![0u8; 1024 * 1024];
-        data[0] = 0xEB;
-        data[1] = 0x76;
-        data[2] = 0x90;
-        data[3..11].copy_from_slice(b"EXFAT   ");
-        for (i, slot) in data[446..510].iter_mut().enumerate() {
-            *slot = 0x4E + ((446 + i) as u8 % 13);
-        }
-        data[510] = 0x55;
-        data[511] = 0xAA;
-
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "exFAT");
-    }
-
-    #[test]
-    fn test_detect_superfloppy_xfs() {
-        // XFS superblock magic "XFSB" at byte 0 of the partition.
-        let mut data = vec![0u8; 1024 * 1024];
-        data[0..4].copy_from_slice(b"XFSB");
-        // No 0xAA55 signature; bare-FS probe must fire before MBR parse.
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "XFS");
-    }
-
-    #[test]
-    fn test_detect_superfloppy_ext() {
-        // ext2/3/4: magic 0xEF53 (LE) at byte 0x38 of the superblock at offset 1024.
-        let mut data = vec![0u8; 1024 * 1024];
-        data[1024 + 0x38] = 0x53;
-        data[1024 + 0x39] = 0xEF;
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "ext");
-    }
-
-    #[test]
-    fn test_detect_superfloppy_btrfs() {
-        // btrfs: magic "_BHRfS_M" at offset 0x40 of the superblock at offset 0x10000.
-        let mut data = vec![0u8; 0x10000 + 4096];
-        data[0x10000 + 0x40..0x10000 + 0x48].copy_from_slice(b"_BHRfS_M");
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "btrfs");
-    }
-
-    #[test]
-    fn test_detect_superfloppy_hfs() {
-        // Build a minimal HFS floppy: signature 0x4244 at offset 1024
-        let mut data = vec![0u8; 819200]; // 800K floppy
-                                          // No JMP instruction at byte 0, no MBR signature
-        data[1024] = 0x42;
-        data[1025] = 0x44;
-
-        let mut cursor = Cursor::new(data);
-        let table = PartitionTable::detect(&mut cursor).unwrap();
-        assert_eq!(table.type_name(), "None");
-        let parts = table.partitions();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].type_name, "HFS");
     }
 
     #[test]
