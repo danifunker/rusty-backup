@@ -318,6 +318,31 @@ jobs:
             codesign --force --deep --sign - "${BUNDLE_NAME}"
           fi
 
+          # Free disk before building the DMG. The intel runner
+          # (macos-26-intel) has tight disk, and hdiutil needs room to stage a
+          # copy of the .app plus the compressed image; the x64 leg was failing
+          # here with "hdiutil: create failed - No space left on device".
+          #
+          # NOTE: a full `cargo clean` would delete target/.../release/rb-cli,
+          # which the later "Sign CLI binary" / "Package CLI for notarization"
+          # steps still need. So drop only the build intermediates (the multi-GB
+          # bulk) and keep both final binaries: rusty-backup is already copied
+          # into the .app above, and rb-cli stays at the release/ root.
+          echo "== Disk before cleanup =="; df -h .
+          du -sh "target/${{ matrix.target }}/release" 2>/dev/null || true
+          # Only the intel runner is disk-constrained. Guard the cleanup to it so
+          # arm64's build cache (which works fine) is left intact — deleting deps/
+          # would otherwise strip intermediates from the saved cache and force a
+          # full rebuild next run.
+          if [ "${{ matrix.arch }}" = "x64" ]; then
+            rm -rf \
+              "target/${{ matrix.target }}/release/deps" \
+              "target/${{ matrix.target }}/release/build" \
+              "target/${{ matrix.target }}/release/incremental" \
+              "target/${{ matrix.target }}/release/.fingerprint"
+            echo "== Disk after cleanup =="; df -h .
+          fi
+
           # Create DMG (stage the app alongside an /Applications symlink so
           # users can drag-install)
           DMG_STAGING="dmg-staging"
@@ -326,6 +351,7 @@ jobs:
           cp -R "${BUNDLE_NAME}" "${DMG_STAGING}/"
           ln -s /Applications "${DMG_STAGING}/Applications"
           hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          echo "== Disk after DMG =="; df -h .
 
           # Sign the DMG as well if certificate is available
           if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_TEAM_ID" ]; then
