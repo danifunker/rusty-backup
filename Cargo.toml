@@ -135,7 +135,11 @@ cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch
 # In-app CD-DA playback (Optical tab). Pinned <0.20 for the
 # OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.
 # Only the `audio` feature (desktop) links this; cpal -> ALSA/WASAPI/CoreAudio.
-rodio = { version = "0.19", optional = true }
+# default-features=false drops rodio's file decoders (symphonia/claxon/lewton/
+# hound — mp3/flac/vorbis/wav) which we never touch: we feed raw CD-DA PCM via
+# SamplesBuffer straight to the cpal-backed Sink. cpal is a non-optional rodio
+# dep, so the output path stays. Keeps the build (and macOS DMG) lean.
+rodio = { version = "0.19", optional = true, default-features = false }
 
 # Always-on dependencies — used by rb-cli (mini included).
 anyhow = "1"
