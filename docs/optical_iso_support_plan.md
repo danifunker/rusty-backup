@@ -3,7 +3,7 @@
 Tracking doc for making rusty-backup open every disc in
 [`problematic_isos.json`](../problematic_isos.json) (114 discs).
 
-**Status: 100 / 114 open (Phases 1 + 2 + 4 landed); 14 need work.**
+**Status: 109 / 114 open (Phases 1 + 2 + 3 + 4 landed); 5 need work.**
 
 Progress log:
 - **Phase 0 done** — path override active in `Cargo.toml`; rb-cli builds against
@@ -32,6 +32,16 @@ Progress log:
   > host (macOS APFS) aborts on the first name that collides only by case
   > ("Is a directory", os error 21). Pre-existing; the extractor should skip /
   > rename-and-continue rather than bail. Browsing and single-file reads are fine.
+- **Phase 3 done** — NeXT / OpenStep / Rhapsody. Same `UfsFilesystem`, generalised
+  with a `base_offset`: a NeXT `dlV` disk label wraps one or more FFS partitions,
+  so the reader scans block-aligned offsets for UFS1 superblocks and picks the
+  partition whose root inode has the most entries (NeXTSTEP has one; Rhapsody has
+  a small boot volume + the real root at base 655360). NeXT keeps **big-endian**
+  on-disk FFS even on Intel (Rhapsody is little-endian) — auto-detected. Also
+  added special-inode handling: device/FIFO/socket inodes surface as empty files
+  and are never block-read (fixes an extract-time read-past-EOF on `/dev`). All 9
+  discs browse; `/bin/gdb` (indirect blocks, big-endian) extracts byte-identical
+  (sha256) to a reference decoder. 109/114, no regressions.
 
 > The `reason` / `pycdlib_errors` fields in `problematic_isos.json` come from a
 > Python cataloguing tool (`pycdlib`), **not** from rusty-backup. pycdlib is a
@@ -58,8 +68,8 @@ Progress log:
   check), Joliet (UCS-2 SVD — `iso9660.rs:320`+), Rock Ridge/SUSP
   (`browse/rockridge.rs`, incl. symlinks), HFS, HFS+, and SGI EFS.** Our branch
   has since added **High Sierra** (Phase 4), **raw-2352 autodetect** in a bare
-  `.iso` (Phase 1), and **UFS1** (Phase 2). Still NOT parsed: UDF (enum only),
-  NeXT, VMS ODS-2, XFS. Everything is normalised to 2048-byte cooked sectors.
+  `.iso` (Phase 1), **UFS1** (Phase 2), and **NeXT** (Phase 3, UFS1 in a
+  `dlV` disk label). Still NOT parsed: UDF (enum only), VMS ODS-2, XFS. Everything is normalised to 2048-byte cooked sectors.
   > NOTE: an earlier draft of this plan (based on the cached 0.5.0 crate source)
   > wrongly listed Joliet and Rock Ridge as unsupported. The linked build is
   > 0.6.0, which has both — verified empirically (see Hybrid discs below).
@@ -176,12 +186,19 @@ step — publishing the crate and removing the override.
 - Follow-up (rusty-backup extractor, not the reader): case-collision on
       case-insensitive hosts — see the progress-log note above.
 
-### Phase 3 — NeXT / NeXTSTEP / OpenStep / Rhapsody (opticaldiscs-rs) — 10 discs
-- [ ] New `opticaldiscs` `browse/next.rs`: NeXT disklabel (`dlV3`) parse → locate
-      the NeXT FS (4.3BSD FFS variant with NeXT extensions), sharing the Phase 2
-      UFS core. Two discs (`nextstep33_risc`, `Openstep-…-User`) have the label at
-      a non-zero offset / big-endian — handle both.
-- **Verify:** browse `NeXT Step 3.1 Intel.iso`; extract an app bundle file.
+### Phase 3 — NeXT / NeXTSTEP / OpenStep / Rhapsody (opticaldiscs-rs) — 9 discs ✅ DONE
+- [x] Extended `UfsFilesystem` with a `base_offset` instead of a separate module:
+      detect the `dlV` label, scan block-aligned offsets for UFS1 superblocks, and
+      pick the partition whose root inode has the most entries (handles NeXTSTEP's
+      single partition and Rhapsody's boot-vol + real-root-at-655360 split).
+- [x] Endianness auto-detected: NeXTSTEP/OpenStep FFS is **big-endian even on
+      Intel**; Rhapsody is little-endian. Both the `8000…`-header discs
+      (`nextstep33_risc`, `Openstep-…-User`, label at block 4) browse.
+- [x] Special-inode handling (device/FIFO/socket → empty file, never block-read)
+      fixes an extract-time read-past-EOF on `/dev`.
+- [x] **Verified:** all 9 browse; `/bin/gdb` (indirect blocks, big-endian)
+      extracts byte-identical (sha256) to a reference decoder; full NeXT disc
+      extracts cleanly (4793 files). 109/114, no regressions.
 
 ### Phase 4 — High Sierra Format (opticaldiscs-rs) — 9 discs ✅ DONE
 - [x] `PrimaryVolumeDescriptor::parse` detects `CDROM` at byte 9 →
@@ -483,6 +500,18 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [x] Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso
 - [x] Disk01.iso
 
+### NeXT — 10 discs (OK 10 / FAIL 0)
+- [x] NEXTSTEP 3.2 (M68K)(x86).iso
+- [x] NeXT Step 3.1 Intel dev.iso
+- [x] NeXT Step 3.1 Intel.iso
+- [x] Openstep-4.2-Intel-Developer.iso
+- [x] Openstep-4.2-Intel-User.iso
+- [x] Rhapsody Intel.iso
+- [x] nebula.iso
+- [x] nextstep33_risc.iso
+- [x] nextstep_3.3_intel.iso
+- [x] rhapsody_dr2_x86.iso
+
 ### Raw 2352 — 6 discs (OK 5 / FAIL 1)
 - [ ] AdobePageMill.iso
 - [x] Fallout 2.iso
@@ -490,18 +519,6 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [x] Photostyler 1.1a SE.iso
 - [x] RESKIT2000.ISO
 - [x] sunos_4.1.4_install.iso
-
-### NeXT — 10 discs (OK 1 / FAIL 9)
-- [ ] NEXTSTEP 3.2 (M68K)(x86).iso
-- [ ] NeXT Step 3.1 Intel dev.iso
-- [ ] NeXT Step 3.1 Intel.iso
-- [ ] Openstep-4.2-Intel-Developer.iso
-- [ ] Openstep-4.2-Intel-User.iso
-- [ ] Rhapsody Intel.iso
-- [x] nebula.iso
-- [ ] nextstep33_risc.iso
-- [ ] nextstep_3.3_intel.iso
-- [ ] rhapsody_dr2_x86.iso
 
 ### VMS ODS-2 — 2 discs (OK 0 / FAIL 2)
 - [ ] OpenVMS552.iso
