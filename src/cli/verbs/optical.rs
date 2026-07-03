@@ -459,6 +459,25 @@ pub struct ExtractArgs {
     /// the config file when set.
     #[arg(long = "resource-forks", value_enum)]
     pub resource_forks: Option<CliResourceForkMode>,
+
+    /// What to do when two names on a **case-sensitive** disc (UFS, NeXT,
+    /// Rock Ridge, …) collide only by case on a **case-insensitive**
+    /// destination (e.g. macOS). Defaults to `rename`, or `[optical]
+    /// on-collision` from the config. Ignored when the destination is
+    /// case-sensitive — everything extracts verbatim there.
+    #[arg(long = "on-collision", value_enum)]
+    pub on_collision: Option<CliCaseCollisionMode>,
+}
+
+/// How to resolve case-insensitive filename collisions during extraction.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliCaseCollisionMode {
+    /// Disambiguate by appending `~N` to later colliding names (nothing lost).
+    Rename,
+    /// Skip later colliding entries (log a warning).
+    Skip,
+    /// Treat a collision as a hard error (the old strict behaviour).
+    Fail,
 }
 
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
@@ -490,30 +509,187 @@ fn run_extract_verb(args: ExtractArgs) -> Result<()> {
         rf_mode
     ));
 
-    let mode = rf_mode.into();
-    let mut count = 0u64;
+    let collision = args
+        .on_collision
+        .map(CaseCollisionMode::from)
+        .or_else(|| {
+            crate::cli::logging::loaded_config()
+                .and_then(|c| c.get("optical", "on-collision"))
+                .and_then(parse_collision_mode)
+        })
+        .unwrap_or(CaseCollisionMode::Rename);
+
+    // Only disambiguate when the destination genuinely can't tell the names
+    // apart; on a case-sensitive host everything extracts verbatim.
+    let case_insensitive_dest = dest_is_case_insensitive(&args.to);
+
+    let mut ctx = ExtractCtx {
+        fork_mode: rf_mode.into(),
+        collision,
+        case_insensitive_dest,
+        count: 0,
+        skipped: 0,
+        errors: 0,
+    };
+
+    let mut used = std::collections::HashSet::new();
     for child in fs
         .list_directory(&root)
         .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?
     {
-        extract(&mut *fs, &child, &args.to, mode, &mut count)?;
+        extract(&mut *fs, &child, &args.to, &mut ctx, &mut used);
     }
-    log_stderr(format!("extracted {count} entry/entries"));
+
+    let mut summary = format!("extracted {} entry/entries", ctx.count);
+    if ctx.skipped > 0 {
+        summary.push_str(&format!(", skipped {}", ctx.skipped));
+    }
+    if ctx.errors > 0 {
+        summary.push_str(&format!(", {} error(s)", ctx.errors));
+    }
+    log_stderr(summary);
+
+    // Only a total failure (nothing extracted, at least one error) is fatal.
+    if ctx.count == 0 && ctx.errors > 0 {
+        anyhow::bail!(
+            "extraction failed: {} error(s), 0 files written",
+            ctx.errors
+        );
+    }
     Ok(())
 }
 
+/// How to resolve case-insensitive filename collisions (core enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseCollisionMode {
+    Rename,
+    Skip,
+    Fail,
+}
+
+impl From<CliCaseCollisionMode> for CaseCollisionMode {
+    fn from(m: CliCaseCollisionMode) -> Self {
+        match m {
+            CliCaseCollisionMode::Rename => CaseCollisionMode::Rename,
+            CliCaseCollisionMode::Skip => CaseCollisionMode::Skip,
+            CliCaseCollisionMode::Fail => CaseCollisionMode::Fail,
+        }
+    }
+}
+
+fn parse_collision_mode(s: &str) -> Option<CaseCollisionMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rename" => Some(CaseCollisionMode::Rename),
+        "skip" => Some(CaseCollisionMode::Skip),
+        "fail" => Some(CaseCollisionMode::Fail),
+        _ => None,
+    }
+}
+
+/// Probe whether `dir` lives on a case-insensitive filesystem by creating a
+/// mixed-case marker and checking if its lowercased path resolves to it.
+fn dest_is_case_insensitive(dir: &Path) -> bool {
+    let upper = dir.join(".rb_case_probe_Aa");
+    if std::fs::File::create(&upper).is_err() {
+        return false; // can't tell — assume case-sensitive (extract verbatim)
+    }
+    let lower = dir.join(".rb_case_probe_aa");
+    let insensitive = lower.exists();
+    let _ = std::fs::remove_file(&upper);
+    insensitive
+}
+
+/// Mutable state threaded through the recursive extraction.
+struct ExtractCtx {
+    fork_mode: crate::fs::resource_fork::ResourceForkMode,
+    collision: CaseCollisionMode,
+    case_insensitive_dest: bool,
+    count: u64,
+    skipped: u64,
+    errors: u64,
+}
+
+impl ExtractCtx {
+    /// Resolve the on-disk name for `name` within a directory whose already-used
+    /// (lowercased) names are in `used`. Returns `None` when the entry should be
+    /// skipped. Records skip/error bookkeeping.
+    fn resolve_name(
+        &mut self,
+        name: &str,
+        used: &mut std::collections::HashSet<String>,
+    ) -> Option<String> {
+        if !self.case_insensitive_dest {
+            return Some(name.to_string());
+        }
+        let key = name.to_lowercase();
+        if !used.contains(&key) {
+            used.insert(key);
+            return Some(name.to_string());
+        }
+        // Collision on a case-insensitive destination.
+        match self.collision {
+            CaseCollisionMode::Fail => {
+                log_stderr(format!(
+                    "warning: name collision (case-insensitive destination): {name} - skipping (use --on-collision rename to keep both)"
+                ));
+                self.errors += 1;
+                None
+            }
+            CaseCollisionMode::Skip => {
+                log_stderr(format!("warning: skipping case-collision: {name}"));
+                self.skipped += 1;
+                None
+            }
+            CaseCollisionMode::Rename => {
+                for n in 1..10_000u32 {
+                    let candidate = format!("{name}~{n}");
+                    let ckey = candidate.to_lowercase();
+                    if !used.contains(&ckey) {
+                        used.insert(ckey);
+                        log_stderr(format!("info: case-collision: {name} -> {candidate}"));
+                        return Some(candidate);
+                    }
+                }
+                self.skipped += 1;
+                None
+            }
+        }
+    }
+}
+
+/// Extract one entry, recording success / skip / error into `ctx` and never
+/// aborting the whole run on a single failure. `used` holds the lowercased names
+/// already written into `dest` (for case-insensitive collision handling).
 fn extract(
     fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
     entry: &opticaldiscs::browse::entry::FileEntry,
     dest: &Path,
-    mode: crate::fs::resource_fork::ResourceForkMode,
-    count: &mut u64,
+    ctx: &mut ExtractCtx,
+    used: &mut std::collections::HashSet<String>,
+) {
+    if let Err(e) = extract_one(fs, entry, dest, ctx, used) {
+        log_stderr(format!("warning: skipping {}: {e}", entry.path));
+        ctx.errors += 1;
+    }
+}
+
+fn extract_one(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    entry: &opticaldiscs::browse::entry::FileEntry,
+    dest: &Path,
+    ctx: &mut ExtractCtx,
+    used: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
     use crate::fs::resource_fork::{self, ResourceForkMode as M};
     use opticaldiscs::browse::entry::EntryType;
     use std::io::{BufWriter, Write};
 
-    let safe_name = resource_fork::sanitize_filename(&entry.name);
+    let sanitized = resource_fork::sanitize_filename(&entry.name);
+    let safe_name = match ctx.resolve_name(&sanitized, used) {
+        Some(n) => n,
+        None => return Ok(()), // skipped per collision policy
+    };
+    let mode = ctx.fork_mode;
     match entry.entry_type {
         EntryType::File => {
             // A non-zero resource-fork size only appears on fork-capable
@@ -589,7 +765,7 @@ fn extract(
                     }
                 }
             }
-            *count += 1;
+            ctx.count += 1;
         }
         EntryType::Directory => {
             let dir_path = dest.join(&safe_name);
@@ -597,8 +773,10 @@ fn extract(
             let children = fs
                 .list_directory(entry)
                 .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
+            // Each directory gets its own name-collision namespace.
+            let mut child_used = std::collections::HashSet::new();
             for child in &children {
-                extract(fs, child, &dir_path, mode, count)?;
+                extract(fs, child, &dir_path, ctx, &mut child_used);
             }
         }
     }

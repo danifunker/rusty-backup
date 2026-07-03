@@ -1011,6 +1011,7 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 
 - `--to` — Destination folder (created if absent)
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
+- `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
 
 ### `optical rip`
 

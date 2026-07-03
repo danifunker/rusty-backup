@@ -27,11 +27,14 @@ Progress log:
   a 5.5 MB file (indirect blocks) extracts **byte-identical** to an independent
   reference decoder (sha256 match). 4 unit tests; full 114-scan = 100 OK / 14
   FAIL, no regressions.
-  > Known follow-up (rusty-backup, not the reader): `rb-cli optical extract` of a
-  > **case-sensitive** volume (UFS/EFS/Rock Ridge) onto a **case-insensitive**
-  > host (macOS APFS) aborts on the first name that collides only by case
-  > ("Is a directory", os error 21). Pre-existing; the extractor should skip /
-  > rename-and-continue rather than bail. Browsing and single-file reads are fine.
+  > Extractor robustness (**fixed**): `rb-cli optical extract` of a
+  > **case-sensitive** volume (UFS/EFS/NeXT/Rock Ridge) onto a **case-insensitive**
+  > host (macOS APFS) used to abort on the first name that collides only by case.
+  > Now the extractor probes the destination's case-sensitivity and, when
+  > insensitive, applies `--on-collision` (`rename` default / `skip` / `fail`);
+  > it also continues past per-entry errors and reports an extracted/skipped/error
+  > summary. Verified: DECevent extracts fully (`INSTCTRL` -> `INSTCTRL~1`),
+  > byte-exact.
 - **Phase 3 done** — NeXT / OpenStep / Rhapsody. Same `UfsFilesystem`, generalised
   with a `base_offset`: a NeXT `dlV` disk label wraps one or more FFS partitions,
   so the reader scans block-aligned offsets for UFS1 superblocks and picks the
