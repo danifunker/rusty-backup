@@ -213,10 +213,34 @@ step — publishing the crate and removing the override.
 - [x] **Verified:** all 9 browse (bkshlf87, MSPL10, both Programmer's Library,
       wordbkshlf, 3× OS/2 Developer Connection, k-nt1091). 87/114, no regressions.
 
-### Phase 5 — VMS ODS-2 / Files-11 (opticaldiscs-rs) — 2 discs
-- [ ] New `opticaldiscs` `browse/ods2.rs`: ODS-2 home block + file headers
-      (`INDEXF.SYS`). Lower priority (2 discs), but self-contained.
-- **Verify:** browse `OpenVMS552.iso` (VAX) — note VMS versioned filenames (`;N`).
+### Phase 5 — VMS ODS-2 / Files-11 (opticaldiscs-rs) — 2 discs  ⏳ SPEC READY
+New `browse/ods2.rs`. Prototyped end-to-end against `OpenVMS552.iso` (Python) —
+the full traversal is validated; below is the ready-to-port spec. All fields are
+little-endian; block = 512 bytes (LBN addressing).
+- [ ] **Home block** at LBN 1 (byte 512). Offsets: `hm2$w_struclev` @12 (0x0201 =
+      ODS-2.1), `hm2$w_cluster` @14, `hm2$l_ibmaplbn` @24 (u32), `hm2$w_ibmapsize`
+      @32 (u16), `hm2$l_maxfiles` @28. Confirm `DECFILE11` at byte offset 496.
+- [ ] **File header** for file number N (1-based) at LBN
+      `ibmaplbn + ibmapsize + (N-1)` (index file unfragmented — true on these
+      discs). Header (512 B): `fh2$b_idoffset`@0, `fh2$b_mpoffset`@1,
+      `fh2$b_acoffset`@2 (all in **16-bit words**); FAT record-attributes at @16
+      → `fh2$…efblk` @16+8 and `ffbyte` @16+12 give EOF (**longword words are
+      swapped**: `efblk = (u16@24 << 16) | u16@26`; `size = (efblk-1)*512 +
+      ffbyte`). Filename (ASCII, e.g. `SYS0.DIR;1`) in the ident area at
+      `idoffset*2`.
+- [ ] **Retrieval pointers** in the map area `[mpoffset*2 .. acoffset*2)`; first
+      word's top 2 bits select the format: **1** = `cnt=(w0&0xFF)+1`,
+      `lbn=((w0>>8&0x3F)<<16)|u16` (4 B); **2** = `cnt=(w0&0x3FFF)+1`,
+      `lbn=u32` (6 B); **3** = `cnt=(((w0&0x3FFF)<<16)|u16)+1`, `lbn=u32` (8 B).
+      Concatenate extents → file data; truncate to `size`.
+- [ ] **Directory file** records (don't span blocks; `dir$w_size==0xFFFF` → skip
+      to next block): `dir$w_size`@0 (record len − 2), `verlimit`@2, `flags`@4,
+      `namecount`@5, name@6 (full `NAME.TYP`). Value area (word-aligned after
+      name) = one-or-more `{version u16, FID: num u16, seq u16, rvn/nmx u16}`;
+      the FID `num` is the file number to resolve. Recurse into `*.DIR`.
+- [ ] Register `FilesystemType::Ods2`; MFD (`[000000]`) is file #4, root of the tree.
+- **Verify:** browse `OpenVMS552.iso` + `VMS 552h4 VAX.iso`; byte-compare an
+      extracted file (sha256) against the reference decoder; show `;version`.
 
 ### Phase 6 — Long tail / investigate — 2 discs
 - [ ] `disk01.iso` — first bytes `SCO CD-ROM/TAPE`; SCO custom cdrom/tape label
