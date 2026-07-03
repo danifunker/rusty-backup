@@ -51,3 +51,7 @@ outputs/
 /crusty-backup/net/watt32
 # /crusty-backup/net/drivers/*.com are vendored now (Crynwr GPL set via
 # net/fetch-drivers.sh) so the CI release media ships with packet drivers.
+
+# Corpus-derived summaries (regenerated; keep only problematic_isos.json)
+problematic_isos.tsv
+problematic_isos.csv
