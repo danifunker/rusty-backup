@@ -3,17 +3,23 @@
 Tracking doc for making rusty-backup open every disc in
 [`problematic_isos.json`](../problematic_isos.json) (114 discs).
 
-**Status: 78 / 114 open (Phase 1 raw-2352 landed); 36 need work.**
+**Status: 87 / 114 open (Phases 1 + 4 landed); 27 need work.**
 
 Progress log:
 - **Phase 0 done** — path override active in `Cargo.toml`; rb-cli builds against
   local `../opticaldiscs-rs`.
 - **Phase 1 done** — raw-2352 autodetect in `IsoSectorReader` (opticaldiscs
   `sector_reader.rs`); +6 discs (Photostyler, Fallout 2, Lindows, nebula,
-  sunos_4.1.4, RESKIT2000). 3 unit tests added; full 114-scan = 78 OK / 36 FAIL,
-  no regressions. Only `AdobePageMill.iso` remains in the raw bucket — it's an
-  anomalous dump (raw sync on sector 0 only) wrapping an APM/HFS volume; deferred
-  to HFS handling, and it was already failing pre-change (no regression).
+  sunos_4.1.4, RESKIT2000). 3 unit tests added; no regressions. Only
+  `AdobePageMill.iso` remains in the raw bucket — anomalous dump (raw sync on
+  sector 0 only) wrapping an APM/HFS volume; deferred to HFS handling.
+- **Phase 4 done** — High Sierra Format. `PrimaryVolumeDescriptor::parse`
+  detects the `CDROM` id at byte 9 and reads HSF field offsets (root record
+  @180); the shared browser threads a `high_sierra` flag so directory records
+  read file-flags at offset 24 (not 25). New `FilesystemType::HighSierra`.
+  +9 discs (bkshlf87, MSPL10, both Programmer's Library, wordbkshlf, 3× OS/2
+  Developer Connection, k-nt1091). Synthetic end-to-end unit test; full 114-scan
+  = 87 OK / 27 FAIL, no regressions.
 
 > The `reason` / `pycdlib_errors` fields in `problematic_isos.json` come from a
 > Python cataloguing tool (`pycdlib`), **not** from rusty-backup. pycdlib is a
@@ -38,11 +44,10 @@ Progress log:
 - `opticaldiscs` **v0.6.0** parses: **ISO9660 (lenient — reads LE fields only,
   no endian cross-check, no set-terminator requirement, no file-structure-version
   check), Joliet (UCS-2 SVD — `iso9660.rs:320`+), Rock Ridge/SUSP
-  (`browse/rockridge.rs`, incl. symlinks), HFS, HFS+, and SGI EFS.** It does NOT
-  parse: UDF (enum only), High Sierra, UFS/FFS, NeXT, VMS ODS-2, XFS. It
-  normalises everything to 2048-byte cooked sectors; raw-2352 layout is only
-  recognised when declared by a `.cue` sheet, never auto-detected in a bare
-  `.iso`.
+  (`browse/rockridge.rs`, incl. symlinks), HFS, HFS+, and SGI EFS.** Our branch
+  has since added **High Sierra** (Phase 4) and **raw-2352 autodetect** in a bare
+  `.iso` (Phase 1). Still NOT parsed: UDF (enum only), UFS/FFS, NeXT, VMS ODS-2,
+  XFS. Everything is normalised to 2048-byte cooked sectors.
   > NOTE: an earlier draft of this plan (based on the cached 0.5.0 crate source)
   > wrongly listed Joliet and Rock Ridge as unsupported. The linked build is
   > 0.6.0, which has both — verified empirically (see Hybrid discs below).
@@ -101,9 +106,9 @@ has three kinds; all but one are already handled:
 | **ISO9660 + HFS** ("Mac/PC" dual-fork hybrid) | **0** | Not present. Scanning all 114 for a coexisting Apple Partition Map / HFS *and* a sector-16 `CD001` found none. The 6 Apple discs are **HFS-only** (Mac CDs), which already browse (with resource forks + type/creator). So there is no dual-filesystem disc where we silently expose one side and drop the other. |
 
 Notes / caveats:
-- **High Sierra is not a hybrid** — it is a standalone pre-ISO9660 format (Phase 4).
-  One disc (`k-nt1091`) carries both an HSF descriptor and a stray `CD001`
-  marker, but its primary is HSF and it fails today; it stays in Phase 4.
+- **High Sierra is not a hybrid** — it is a standalone pre-ISO9660 format
+  (Phase 4, now done). One disc (`k-nt1091`) carries both an HSF descriptor and a
+  stray `CD001` marker; its primary is HSF and it now browses via the HSF path.
 - **Joliet-vs-primary preference:** when both trees exist opticaldiscs presents
   the Joliet tree. That is the right default for name fidelity, but it means the
   DOS-side 8.3 tree is not separately exposed. Only relevant if a disc has
@@ -159,12 +164,18 @@ step — publishing the crate and removing the override.
       a non-zero offset / big-endian — handle both.
 - **Verify:** browse `NeXT Step 3.1 Intel.iso`; extract an app bundle file.
 
-### Phase 4 — High Sierra Format (opticaldiscs-rs) — 9 discs
-- [ ] Extend the `opticaldiscs` descriptor parser (sibling of `iso9660.rs`) to
-      recognise the High Sierra `CDROM` signature and HSF volume-descriptor +
-      directory-record offsets (differ from ISO9660). Early MS/IBM CDs: Bookshelf,
-      Programmer's Library, MSPL, OS/2 Developer Connection.
-- **Verify:** browse `bkshlf87.iso` and `MSPL10.iso`.
+### Phase 4 — High Sierra Format (opticaldiscs-rs) — 9 discs ✅ DONE
+- [x] `PrimaryVolumeDescriptor::parse` detects `CDROM` at byte 9 →
+      `parse_high_sierra` reads HSF offsets (volume id @48, root record @180);
+      new `high_sierra` flag on the PVD. New `FilesystemType::HighSierra`
+      (browsable), dispatched to the ISO9660 browser in `browse/mod.rs`.
+- [x] `DirectoryRecord::parse` takes `high_sierra`: file-flags at offset 24 and
+      the 6-byte HSF recording date (ISO9660 uses 25 / 7 bytes). Threaded through
+      `Iso9660Filesystem` + `detect_rock_ridge_root`.
+- [x] Synthetic `high_sierra_end_to_end` unit test (detection, dir/file
+      classification via flags@24, root@180, file read); 150 crate tests green.
+- [x] **Verified:** all 9 browse (bkshlf87, MSPL10, both Programmer's Library,
+      wordbkshlf, 3× OS/2 Developer Connection, k-nt1091). 87/114, no regressions.
 
 ### Phase 5 — VMS ODS-2 / Files-11 (opticaldiscs-rs) — 2 discs
 - [ ] New `opticaldiscs` `browse/ods2.rs`: ODS-2 home block + file headers
@@ -427,6 +438,25 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [x] The Microsoft Office.iso
 - [x] oracle.iso
 
+### High Sierra — 9 discs (OK 9 / FAIL 0)
+- [x] MSPL10.iso
+- [x] Microsoft Programming's Library.ver.Version 1.1a.English.iso
+- [x] Microsoft-Programers-Library-v1.3.iso
+- [x] The Developer Connection OS2 v8-1995 disk-1.iso
+- [x] The Developer Connection OS2 v8-1995 disk-2.iso
+- [x] The Developer Connection OS2 v8-1995 disk-3.iso
+- [x] bkshlf87.iso
+- [x] k-nt1091.iso
+- [x] wordbkshlf.iso
+
+### Raw 2352 — 6 discs (OK 5 / FAIL 1)
+- [ ] AdobePageMill.iso
+- [x] Fallout 2.iso
+- [x] Lindows_1.1.1.iso
+- [x] Photostyler 1.1a SE.iso
+- [x] RESKIT2000.ISO
+- [x] sunos_4.1.4_install.iso
+
 ### BSD/Sun UFS — 13 discs (OK 0 / FAIL 13)
 - [ ] DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso
 - [ ] DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso
@@ -453,25 +483,6 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [ ] nextstep33_risc.iso
 - [ ] nextstep_3.3_intel.iso
 - [ ] rhapsody_dr2_x86.iso
-
-### High Sierra — 9 discs (OK 0 / FAIL 9)
-- [ ] MSPL10.iso
-- [ ] Microsoft Programming's Library.ver.Version 1.1a.English.iso
-- [ ] Microsoft-Programers-Library-v1.3.iso
-- [ ] The Developer Connection OS2 v8-1995 disk-1.iso
-- [ ] The Developer Connection OS2 v8-1995 disk-2.iso
-- [ ] The Developer Connection OS2 v8-1995 disk-3.iso
-- [ ] bkshlf87.iso
-- [ ] k-nt1091.iso
-- [ ] wordbkshlf.iso
-
-### Raw 2352 — 6 discs (OK 5 / FAIL 1)
-- [ ] AdobePageMill.iso
-- [x] Fallout 2.iso
-- [x] Lindows_1.1.1.iso
-- [x] Photostyler 1.1a SE.iso
-- [x] RESKIT2000.ISO
-- [x] sunos_4.1.4_install.iso
 
 ### VMS ODS-2 — 2 discs (OK 0 / FAIL 2)
 - [ ] OpenVMS552.iso
