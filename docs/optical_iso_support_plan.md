@@ -254,11 +254,20 @@ little-endian; block = 512 bytes (LBN addressing).
 - **Verify:** browse `OpenVMS552.iso` + `VMS 552h4 VAX.iso`; byte-compare an
       extracted file (sha256) against the reference decoder; show `;version`.
 
-### Phase 6 — Long tail / investigate — 2 discs
-- [ ] `disk01.iso` — first bytes `SCO CD-ROM/TAPE`; SCO custom cdrom/tape label
-      (likely cpio/tar payload). Investigate; may be out of scope.
-- [ ] `Banyan VINES 8.50.iso` — no recognisable signature (all-zero head);
-      needs manual inspection.
+### Phase 6 — Long tail / investigate — 3 discs (investigated; out of scope)
+Each is a single obscure disc that is **not a standard recoverable filesystem** —
+either proprietary or a corrupt/unusual dump. Documented here and left unsupported
+(the reader returns a clean "Unsupported filesystem"); not worth a parser.
+- [ ] `AdobePageMill.iso` — a **malformed APM/HFS dump**: the Apple Partition Map
+      structures sit at non-block-aligned offsets (`ER`@16, `PM`@528, HFS `BD`@23584)
+      and sectors 1+ are zero-filled. Not a raw-2352 image (only sector 0 carries a
+      sync header) and not a valid APM origin. Corrupt source — skip.
+- [ ] `disk01.iso` (26 MB) — SCO **"SCO CD-ROM/TAPE"** custom boot/emulation
+      container; cpio (`07070`) and gzip (`1f 8b`) fragments appear at odd offsets.
+      Proprietary SCO format, one disc — out of scope.
+- [ ] `Banyan VINES 8.50.iso` — proprietary Banyan format (512 B of zeros, then a
+      non-filesystem structure; no ISO/APM/UFS/ODS-2 signature at the start).
+      Would need clean-room reverse engineering of one obscure disc — out of scope.
 
 ### Phase 7 — Ship (publish + remove the override)
 No code moves — the parsers were written in `opticaldiscs-rs` all along. This is
