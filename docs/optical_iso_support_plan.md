@@ -3,7 +3,7 @@
 Tracking doc for making rusty-backup open every disc in
 [`problematic_isos.json`](../problematic_isos.json) (114 discs).
 
-**Status: 87 / 114 open (Phases 1 + 4 landed); 27 need work.**
+**Status: 100 / 114 open (Phases 1 + 2 + 4 landed); 14 need work.**
 
 Progress log:
 - **Phase 0 done** — path override active in `Cargo.toml`; rb-cli builds against
@@ -18,8 +18,20 @@ Progress log:
   @180); the shared browser threads a `high_sierra` flag so directory records
   read file-flags at offset 24 (not 25). New `FilesystemType::HighSierra`.
   +9 discs (bkshlf87, MSPL10, both Programmer's Library, wordbkshlf, 3× OS/2
-  Developer Connection, k-nt1091). Synthetic end-to-end unit test; full 114-scan
-  = 87 OK / 27 FAIL, no regressions.
+  Developer Connection, k-nt1091). Synthetic end-to-end unit test; no regressions.
+- **Phase 2 done** — BSD/Sun UFS. New `opticaldiscs/src/browse/ufs.rs`
+  (`UfsFilesystem`): UFS1 superblock (endianness auto-detected via magic),
+  cylinder-group inode math (`cgimin`), direct + single/double/triple-indirect
+  block reading, and the pre-4.4 (OFSFMT) directory format (u16 namlen, no
+  d_type). New `FilesystemType::Ufs`. All 13 Digital UNIX / Tru64 discs browse;
+  a 5.5 MB file (indirect blocks) extracts **byte-identical** to an independent
+  reference decoder (sha256 match). 4 unit tests; full 114-scan = 100 OK / 14
+  FAIL, no regressions.
+  > Known follow-up (rusty-backup, not the reader): `rb-cli optical extract` of a
+  > **case-sensitive** volume (UFS/EFS/Rock Ridge) onto a **case-insensitive**
+  > host (macOS APFS) aborts on the first name that collides only by case
+  > ("Is a directory", os error 21). Pre-existing; the extractor should skip /
+  > rename-and-continue rather than bail. Browsing and single-file reads are fine.
 
 > The `reason` / `pycdlib_errors` fields in `problematic_isos.json` come from a
 > Python cataloguing tool (`pycdlib`), **not** from rusty-backup. pycdlib is a
@@ -45,9 +57,9 @@ Progress log:
   no endian cross-check, no set-terminator requirement, no file-structure-version
   check), Joliet (UCS-2 SVD — `iso9660.rs:320`+), Rock Ridge/SUSP
   (`browse/rockridge.rs`, incl. symlinks), HFS, HFS+, and SGI EFS.** Our branch
-  has since added **High Sierra** (Phase 4) and **raw-2352 autodetect** in a bare
-  `.iso` (Phase 1). Still NOT parsed: UDF (enum only), UFS/FFS, NeXT, VMS ODS-2,
-  XFS. Everything is normalised to 2048-byte cooked sectors.
+  has since added **High Sierra** (Phase 4), **raw-2352 autodetect** in a bare
+  `.iso` (Phase 1), and **UFS1** (Phase 2). Still NOT parsed: UDF (enum only),
+  NeXT, VMS ODS-2, XFS. Everything is normalised to 2048-byte cooked sectors.
   > NOTE: an earlier draft of this plan (based on the cached 0.5.0 crate source)
   > wrongly listed Joliet and Rock Ridge as unsupported. The linked build is
   > 0.6.0, which has both — verified empirically (see Hybrid discs below).
@@ -149,13 +161,20 @@ step — publishing the crate and removing the override.
 - Note: `AdobePageMill.iso` is *not* uniform raw-2352 (sync on sector 0 only,
   APM/HFS inside) — deferred to the HFS path, tracked in the ledger.
 
-### Phase 2 — BSD/Sun UFS (opticaldiscs-rs) — 13 discs
-- [ ] New `opticaldiscs` `browse/ufs.rs` `Filesystem` impl (use rusty-backup's
-      `src/fs/ufs.rs` as a reference). Handle Digital UNIX / Tru64 (DEC Alpha,
-      little-endian UFS1) and SunOS/Solaris (SPARC, big-endian UFS1) — endianness
-      + superblock-location are the likely gaps. Wire into `detect.rs` + `browse/mod.rs`.
-- **Verify:** browse + extract a file from `Digital UNIX 3.2B.iso` and a
-      SPARC UFS disc; byte-compare an extracted file against a known-good mount.
+### Phase 2 — BSD/Sun UFS (opticaldiscs-rs) — 13 discs ✅ DONE
+- [x] New `browse/ufs.rs` `UfsFilesystem`: UFS1 superblock (offset 8192,
+      endianness auto-detected from magic), `cgimin` cylinder-group inode math,
+      direct + single/double/triple-indirect block reading, OFSFMT directory
+      parsing (u16 namlen / no d_type — the Tru64 case). New `FilesystemType::Ufs`;
+      wired into `detect.rs` + `browse/mod.rs`. UFS2 detected but rejected (none
+      in corpus). Symlink targets resolved (inline + block).
+- [x] All 13 Digital UNIX / Tru64 discs browse. (SunOS/Solaris CDs turned out to
+      be ISO9660+Rock Ridge, already handled — the UFS bucket is all Tru64, LE.)
+- [x] **Verified byte-exact:** a 5.5 MB file with indirect blocks (`DIABASE220`)
+      extracts to the same sha256 as an independent reference decoder. 4 unit
+      tests (dirent parse LE/BE/new-format, `cgimin`). 100/114, no regressions.
+- Follow-up (rusty-backup extractor, not the reader): case-collision on
+      case-insensitive hosts — see the progress-log note above.
 
 ### Phase 3 — NeXT / NeXTSTEP / OpenStep / Rhapsody (opticaldiscs-rs) — 10 discs
 - [ ] New `opticaldiscs` `browse/next.rs`: NeXT disklabel (`dlV3`) parse → locate
@@ -449,6 +468,21 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [x] k-nt1091.iso
 - [x] wordbkshlf.iso
 
+### BSD/Sun UFS — 13 discs (OK 13 / FAIL 0)
+- [x] DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso
+- [x] DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso
+- [x] DIGITAL UNIX - V4.0B - Documentation.iso
+- [x] DIGITAL UNIX - V4.0B - Operating System.iso
+- [x] DIGITAL UNIX - V4.0D - Associated Products - Volume 1.iso
+- [x] DIGITAL UNIX - V4.0D - Associated Products - Volume 2.iso
+- [x] DIGITAL UNIX - V4.0D - Operating System - Volume 1.iso
+- [x] DIGITAL UNIX - V4.0E - Operating System.iso
+- [x] Digital UNIX 3.2B.iso
+- [x] Digital UNIX v3.2C Online Documentation (AG-QDWBB-XE)(Digital Equipment Corporation)(August 1995).iso
+- [x] Digital UNIX v3.2G (Includes v3.2C) (AG-PS3NR-XE)(Digital Equipment Corporation)(July 1996).iso
+- [x] Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso
+- [x] Disk01.iso
+
 ### Raw 2352 — 6 discs (OK 5 / FAIL 1)
 - [ ] AdobePageMill.iso
 - [x] Fallout 2.iso
@@ -456,21 +490,6 @@ Per the doc-sync checklist, any new picker extension (e.g. `.udf`) lands in
 - [x] Photostyler 1.1a SE.iso
 - [x] RESKIT2000.ISO
 - [x] sunos_4.1.4_install.iso
-
-### BSD/Sun UFS — 13 discs (OK 0 / FAIL 13)
-- [ ] DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso
-- [ ] DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso
-- [ ] DIGITAL UNIX - V4.0B - Documentation.iso
-- [ ] DIGITAL UNIX - V4.0B - Operating System.iso
-- [ ] DIGITAL UNIX - V4.0D - Associated Products - Volume 1.iso
-- [ ] DIGITAL UNIX - V4.0D - Associated Products - Volume 2.iso
-- [ ] DIGITAL UNIX - V4.0D - Operating System - Volume 1.iso
-- [ ] DIGITAL UNIX - V4.0E - Operating System.iso
-- [ ] Digital UNIX 3.2B.iso
-- [ ] Digital UNIX v3.2C Online Documentation (AG-QDWBB-XE)(Digital Equipment Corporation)(August 1995).iso
-- [ ] Digital UNIX v3.2G (Includes v3.2C) (AG-PS3NR-XE)(Digital Equipment Corporation)(July 1996).iso
-- [ ] Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso
-- [ ] Disk01.iso
 
 ### NeXT — 10 discs (OK 1 / FAIL 9)
 - [ ] NEXTSTEP 3.2 (M68K)(x86).iso
