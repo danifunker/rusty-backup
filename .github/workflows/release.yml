@@ -334,38 +334,37 @@ jobs:
             codesign --force --deep --sign - "${BUNDLE_NAME}"
           fi
 
-          # Free disk before building the DMG. hdiutil needs room to stage a
-          # copy of the .app plus the compressed image; historically the x64 leg
-          # failed here with "hdiutil: create failed - No space left on device".
-          # Kept as a defensive headroom step on the x64 cross-compile leg.
-          #
-          # NOTE: a full `cargo clean` would delete target/.../release/rb-cli,
-          # which the later "Sign CLI binary" / "Package CLI for notarization"
-          # steps still need. So drop only the build intermediates (the multi-GB
-          # bulk) and keep both final binaries: rusty-backup is already copied
-          # into the .app above, and rb-cli stays at the release/ root.
-          echo "== Disk before cleanup =="; df -h .
-          du -sh "target/${{ matrix.target }}/release" 2>/dev/null || true
-          # Guard the cleanup to the x64 leg so the arm64 leg's build cache is
-          # left intact — deleting deps/ would otherwise strip intermediates from
-          # the saved cache and force a full rebuild next run.
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            rm -rf \
-              "target/${{ matrix.target }}/release/deps" \
-              "target/${{ matrix.target }}/release/build" \
-              "target/${{ matrix.target }}/release/incremental" \
-              "target/${{ matrix.target }}/release/.fingerprint"
-            echo "== Disk after cleanup =="; df -h .
-          fi
-
-          # Create DMG (stage the app alongside an /Applications symlink so
-          # users can drag-install)
+          # Stage the app alongside an /Applications symlink so users can
+          # drag-install.
           DMG_STAGING="dmg-staging"
           rm -rf "${DMG_STAGING}"
           mkdir -p "${DMG_STAGING}"
           cp -R "${BUNDLE_NAME}" "${DMG_STAGING}/"
           ln -s /Applications "${DMG_STAGING}/Applications"
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+
+          # Build the DMG with an EXPLICIT size instead of letting
+          # `hdiutil create -srcfolder ... -format UDZO` auto-size the scratch
+          # image. That auto-sizing under-estimates and then ENOSPCs *inside the
+          # temporary image* while copying the large rusty-backup GUI binary in:
+          #   hdiutil: create failed - No space left on device
+          #   could not access /Volumes/Rusty Backup/.../rusty-backup - No space left...
+          # (the host volume had ~95 GB free — it was never the runner disk).
+          # The bigger x64 binary tips past the under-estimate that arm64 slips
+          # under, so only the x64 leg failed. Fix: size from the staging folder
+          # + generous headroom, make a read/write HFS+ image, then convert to
+          # the compressed UDZO we ship. The slack compresses away in UDZO, so
+          # the final .dmg is unaffected.
+          DMG_FILE="Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          RW_DMG="rw-staging.dmg"
+          STAGE_KB=$(du -sk "${DMG_STAGING}" | cut -f1)
+          # +40% and a 200 MB floor of headroom for the HFS+ catalog/bitmap.
+          SIZE_KB=$(( STAGE_KB * 14 / 10 + 204800 ))
+          echo "Staging ${STAGE_KB} KB -> read/write image ${SIZE_KB} KB"
+          rm -f "${RW_DMG}" "${DMG_FILE}"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" \
+            -fs HFS+ -format UDRW -size "${SIZE_KB}k" -ov "${RW_DMG}"
+          hdiutil convert "${RW_DMG}" -format UDZO -ov -o "${DMG_FILE}"
+          rm -f "${RW_DMG}"
           echo "== Disk after DMG =="; df -h .
 
           # Sign the DMG as well if certificate is available
