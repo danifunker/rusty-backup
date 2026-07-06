@@ -1,0 +1,1826 @@
+[
+  {
+    "product_slug": "microsoft-creative-writer",
+    "release_slug": "2x",
+    "archive_filename": "Microsoft Creative Writer 2.0 (1996) (ISO).7z",
+    "iso_filename": "MSCW200__CD.iso",
+    "image_path": "Microsoft Creative Writer 2.0 (1996) (ISO)/MSCW200__CD.iso",
+    "size_bytes": 493121536,
+    "image_sha256": "5d57d05c8d6eb892fe79622cf488bd16b4f8bfc467b0312cee9bbc934edb3c7d",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-creative-writer/2x/Microsoft Creative Writer 2.0 (1996) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-creative-writer/2x/Microsoft Creative Writer 2.0 (1996) (ISO).7z/Microsoft Creative Writer 2.0 (1996) (ISO)/MSCW200__CD.iso",
+    "extracted_present": true,
+    "reason": "invalid-input",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidInput('Failed adding duplicate name to parent')"
+    ]
+  },
+  {
+    "product_slug": "borland-c",
+    "release_slug": "40",
+    "archive_filename": "Borland C++ 4.0 (CD).7z",
+    "iso_filename": "BORLANDC40.ISO",
+    "image_path": "Borland C++ 4.0 (CD)/BORLANDC40.ISO",
+    "size_bytes": 169127936,
+    "image_sha256": "0ec33439c5675c0d687c40b90f5fa002dc5b284b903ecff5be5f186e9f01aa69",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/borland-c/40/Borland C++ 4.0 (CD).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/borland-c/40/Borland C++ 4.0 (CD).7z/Borland C++ 4.0 (CD)/BORLANDC40.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "borland-c",
+    "release_slug": "40",
+    "archive_filename": "Borland C++ 4.5 (CD).7z",
+    "iso_filename": "BORLANDC_45.ISO",
+    "image_path": "Borland C++ 4.5 (CD)/BORLANDC_45.ISO",
+    "size_bytes": 234960896,
+    "image_sha256": "2578ce1b5b0c6b98556fa0d975bed412b71a923005117a993928f09c68e40e8c",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/borland-c/40/Borland C++ 4.5 (CD).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/borland-c/40/Borland C++ 4.5 (CD).7z/Borland C++ 4.5 (CD)/BORLANDC_45.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "lan-server",
+    "release_slug": "4x",
+    "archive_filename": "IBM OS2 LAN Server 4.0 Advanced (1994) (ISO).7z",
+    "iso_filename": "LS40ADVANCE.iso",
+    "image_path": "IBM OS2 LAN Server 4.0 Advanced (1994) (ISO)/LS40ADVANCE.iso",
+    "size_bytes": 93847552,
+    "image_sha256": "b2cf6fe521c1aeb32d58e7284c96a9892d01817cfc544ca7bcb8048fd488c289",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/lan-server/4x/IBM OS2 LAN Server 4.0 Advanced (1994) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/lan-server/4x/IBM OS2 LAN Server 4.0 Advanced (1994) (ISO).7z/IBM OS2 LAN Server 4.0 Advanced (1994) (ISO)/LS40ADVANCE.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "mavis-beacon-teaches",
+    "release_slug": "4x",
+    "archive_filename": "Mavis Beacon Teaches Typing 4.1.7z",
+    "iso_filename": "Mavis Beacon Teaches Typing 4.1.ISO",
+    "image_path": "Mavis Beacon Teaches Typing 4.1.ISO",
+    "size_bytes": 53782528,
+    "image_sha256": "cb9e6058c69619f0cc3ea89bae39fb1dbbd2cb96d8fa7c3a426a786112cdd3b2",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/mavis-beacon-teaches/4x/Mavis Beacon Teaches Typing 4.1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/mavis-beacon-teaches/4x/Mavis Beacon Teaches Typing 4.1.7z/Mavis Beacon Teaches Typing 4.1.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-500-nations",
+    "release_slug": "1",
+    "archive_filename": "Microsoft 500 Nations.7z",
+    "iso_filename": "Microsoft 500 Nations.iso",
+    "image_path": "Microsoft 500 Nations.iso",
+    "size_bytes": 651067392,
+    "image_sha256": "230d15d8f9fc8c1d966730d275cd743dda6e69c688689738b8160c855a8526c4",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-500-nations/1/Microsoft 500 Nations.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-500-nations/1/Microsoft 500 Nations.7z/Microsoft 500 Nations.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-ancient-lands",
+    "release_slug": "10",
+    "archive_filename": "Microsoft Ancient Lands.7z",
+    "iso_filename": "Microsoft Ancient Lands.iso",
+    "image_path": "Microsoft Ancient Lands.iso",
+    "size_bytes": 593881088,
+    "image_sha256": "a2ca4029110e309d44d5cfb286eadc6b1ed93d4719a99160a117ab70ad45e9a6",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-ancient-lands/10/Microsoft Ancient Lands.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-ancient-lands/10/Microsoft Ancient Lands.7z/Microsoft Ancient Lands.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "4x",
+    "archive_filename": "Microsoft Office Developers Kit 1.0 (3-29-1994) (ISO).7z",
+    "iso_filename": "Microsoft Office Developers Kit 1.0.iso",
+    "image_path": "Microsoft Office Developers Kit 1.0 (3-29-1994) (ISO)/Microsoft Office Developers Kit 1.0.iso",
+    "size_bytes": 318535680,
+    "image_sha256": "fa46364b6ceb657d8c08567b369deaf8d5c83677893f2dc2fcdc97c0f2ae2940",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/4x/Microsoft Office Developers Kit 1.0 (3-29-1994) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/4x/Microsoft Office Developers Kit 1.0 (3-29-1994) (ISO).7z/Microsoft Office Developers Kit 1.0 (3-29-1994) (ISO)/Microsoft Office Developers Kit 1.0.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "4x",
+    "archive_filename": "Microsoft Office Developers Kit 1.0A (6-8-1994) (ISO).7z",
+    "iso_filename": "Microsoft Office Developers Kit 1.0A.iso",
+    "image_path": "Microsoft Office Developers Kit 1.0A (6-8-1994) (ISO)/Microsoft Office Developers Kit 1.0A.iso",
+    "size_bytes": 323244032,
+    "image_sha256": "f8b5b0155a5549a2ab4832c94007608367fc3e7e2458cb3673d8711d630829bf",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/4x/Microsoft Office Developers Kit 1.0A (6-8-1994) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/4x/Microsoft Office Developers Kit 1.0A (6-8-1994) (ISO).7z/Microsoft Office Developers Kit 1.0A (6-8-1994) (ISO)/Microsoft Office Developers Kit 1.0A.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "95",
+    "archive_filename": "Microsoft Office 95 Standard (ISO).7z",
+    "iso_filename": "OFFS95_US01.iso",
+    "image_path": "Microsoft Office 95 Standard (ISO)/OFFS95_US01.iso",
+    "size_bytes": 438030336,
+    "image_sha256": "974c883a620f1d843ebd748064da8b716e6d24114aa38979b3d1b2132a4c721f",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/95/Microsoft Office 95 Standard (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/95/Microsoft Office 95 Standard (ISO).7z/Microsoft Office 95 Standard (ISO)/OFFS95_US01.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "mindscape-home-office-assistant",
+    "release_slug": "1x",
+    "archive_filename": "Mindscape Home Office Assistant (1996) (ISO).7z",
+    "iso_filename": "HOA_96.iso",
+    "image_path": "Mindscape Home Office Assistant (1996) (ISO)/HOA_96.iso",
+    "size_bytes": 437288960,
+    "image_sha256": "ecf6fa26acd737adc596fc01c63f453ff731b44fb7db79aa6cc6043f1f75230e",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/mindscape-home-office-assistant/1x/Mindscape Home Office Assistant (1996) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/mindscape-home-office-assistant/1x/Mindscape Home Office Assistant (1996) (ISO).7z/Mindscape Home Office Assistant (1996) (ISO)/HOA_96.iso",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian path table records do not agree')"
+    ]
+  },
+  {
+    "product_slug": "xenix",
+    "release_slug": "openserver-5x",
+    "archive_filename": "SCO OpenServer 5.0.4.7z",
+    "iso_filename": "SCO_OPENSERVER_5.ISO",
+    "image_path": "SCO OpenServer 5.0.4/SCO_OPENSERVER_5.ISO",
+    "size_bytes": 407822336,
+    "image_sha256": "178edeb02f0273d1f1030a28df2095a11fd016a1ff9e7321ab135bcbecf88b49",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/xenix/openserver-5x/SCO OpenServer 5.0.4.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/xenix/openserver-5x/SCO OpenServer 5.0.4.7z/SCO OpenServer 5.0.4/SCO_OPENSERVER_5.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-endian-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian set size disagree')"
+    ]
+  },
+  {
+    "product_slug": "easy-chefs-one-million-recipes",
+    "release_slug": "45",
+    "archive_filename": "Easy Chefs One Million Recipes 4.5 (ISO).7z",
+    "iso_filename": "EASYCHEF45.iso",
+    "image_path": "Easy Chefs One Million Recipes 4.5 (ISO)/EASYCHEF45.iso",
+    "size_bytes": 494204928,
+    "image_sha256": "fb8aaa78747c6a387b9d42fff1c768b622f73ea5338ae2c60598b259240f0a39",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/easy-chefs-one-million-recipes/45/Easy Chefs One Million Recipes 4.5 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/easy-chefs-one-million-recipes/45/Easy Chefs One Million Recipes 4.5 (ISO).7z/Easy Chefs One Million Recipes 4.5 (ISO)/EASYCHEF45.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: File structure version expected to be 1",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('File structure version expected to be 1')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-visual-bas",
+    "release_slug": "50",
+    "archive_filename": "Microsoft Visual Basic 5.0 Professional.7z",
+    "iso_filename": "Visual Basic 5 Pro.iso",
+    "image_path": "Microsoft Visual Basic 5.0 Professional/Visual Basic 5 Pro.iso",
+    "size_bytes": 459579392,
+    "image_sha256": "e02c1e2458af8e2514eca8ea9a26c518d03a941072c602aa8208966e6677c575",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-visual-bas/50/Microsoft Visual Basic 5.0 Professional.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-visual-bas/50/Microsoft Visual Basic 5.0 Professional.7z/Microsoft Visual Basic 5.0 Professional/Visual Basic 5 Pro.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (150569) and big-endian (1",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (150569) and big-endian (150563) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-visual-bas",
+    "release_slug": "50",
+    "archive_filename": "Microsoft Visual Basic 5.0 Enterprise (ISO).7z",
+    "iso_filename": "VB50ENT.ISO",
+    "image_path": "Microsoft Visual Basic 5.0 Enterprise (ISO)/VB50ENT.ISO",
+    "size_bytes": 550064128,
+    "image_sha256": "7cb7f3e481b40f4d587fa56fa2eb3559462473b12840da6e810b23fab47cfcfa",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-visual-bas/50/Microsoft Visual Basic 5.0 Enterprise (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-visual-bas/50/Microsoft Visual Basic 5.0 Enterprise (ISO).7z/Microsoft Visual Basic 5.0 Enterprise (ISO)/VB50ENT.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (173331) and big-endian (1",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (173331) and big-endian (173325) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "packard-bell-navigator",
+    "release_slug": "39",
+    "archive_filename": "Packard Bell Navigator 3.9.7z",
+    "iso_filename": "pbnav39.ISO",
+    "image_path": "Packard Bell Navigator 3.9/pbnav39.ISO",
+    "size_bytes": 435159040,
+    "image_sha256": "ecc718d02d2b98684cbf67c170569ecfc40e277b430a8d08b5c52c27eedc02e5",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/packard-bell-navigator/39/Packard Bell Navigator 3.9.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/packard-bell-navigator/39/Packard Bell Navigator 3.9.7z/Packard Bell Navigator 3.9/pbnav39.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (192626) and big-endian (1",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (192626) and big-endian (172792) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "amipro",
+    "release_slug": "3x",
+    "archive_filename": "Ami Pro 3.1 (1994) (ISO).7z",
+    "iso_filename": "AMIPRO31.iso",
+    "image_path": "Ami Pro 3.1 (1994) (ISO)/AMIPRO31.iso",
+    "size_bytes": 253321216,
+    "image_sha256": "87c47f1ff1134a682ea8bd9ae957c4bf652c9f34b0af5b090a9dd44d4d37cd2a",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/amipro/3x/Ami Pro 3.1 (1994) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/amipro/3x/Ami Pro 3.1 (1994) (ISO).7z/Ami Pro 3.1 (1994) (ISO)/AMIPRO31.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (2750) and big-endian (274",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (2750) and big-endian (2748) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "ibm-visualage-cpp",
+    "release_slug": "3x",
+    "archive_filename": "IBM VisualAge CPP 3.53 for Windows (ISO).7z",
+    "iso_filename": "IBM_VisualAgeCPP_3.53FP3_Win32.iso",
+    "image_path": "IBM VisualAge for CPP 3.53 for Windows (ISO)/IBM_VisualAgeCPP_3.53FP3_Win32.iso",
+    "size_bytes": 628707328,
+    "image_sha256": "b29e36b1c998d0c24061d2eb3702cd5076a897a29b33c517bd0a06ca15116aa3",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/ibm-visualage-cpp/3x/IBM VisualAge CPP 3.53 for Windows (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/ibm-visualage-cpp/3x/IBM VisualAge CPP 3.53 for Windows (ISO).7z/IBM VisualAge for CPP 3.53 for Windows (ISO)/IBM_VisualAgeCPP_3.53FP3_Win32.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (44960) and big-endian (38",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (44960) and big-endian (38495) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "fallout",
+    "release_slug": "10",
+    "archive_filename": "Fallout.7z",
+    "iso_filename": "Fallout.ISO",
+    "image_path": "Fallout.ISO",
+    "size_bytes": 631554048,
+    "image_sha256": "6d87e111f398619ea53a8c759199323e9c618f1e2f2c5b4fae4817e190966dba",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/fallout/10/Fallout.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/fallout/10/Fallout.7z/Fallout.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (46760) and big-endian (46",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (46760) and big-endian (46754) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "packard-bell-navigator",
+    "release_slug": "36",
+    "archive_filename": "Packard Bell Navigator 3.6.7z",
+    "iso_filename": "PB_NAVIGATOR.iso",
+    "image_path": "Packard Bell Navigator 3.6 (CD)/PB_NAVIGATOR.iso",
+    "size_bytes": 512012288,
+    "image_sha256": "e4320ca362ab2e739b9a2a5337082e3edf8490bc3fbbf0836dcf122c59327fc4",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/packard-bell-navigator/36/Packard Bell Navigator 3.6.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/packard-bell-navigator/36/Packard Bell Navigator 3.6.7z/Packard Bell Navigator 3.6 (CD)/PB_NAVIGATOR.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Little-endian (94583) and big-endian (12",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian (94583) and big-endian (126) extent location disagree')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-access",
+    "release_slug": "97",
+    "archive_filename": "Microsoft Access 97 (ISO).7z",
+    "iso_filename": "Access 97.ISO",
+    "image_path": "Microsoft Access 97 (ISO)/Access 97.ISO",
+    "size_bytes": 244490240,
+    "image_sha256": "7cac2e5c4f892fc8706b4347b68d482f74b980f018cb6d8fe4e41bd7f0874bf1",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-access/97/Microsoft Access 97 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-access/97/Microsoft Access 97 (ISO).7z/Microsoft Access 97 (ISO)/Access 97.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-other: Multiple occurrences of PVD did not agre",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Multiple occurrences of PVD did not agree!')"
+    ]
+  },
+  {
+    "product_slug": "sun-solaris",
+    "release_slug": "2x",
+    "archive_filename": "Sun Solaris 2.4 [Sun SPARC].7z",
+    "iso_filename": "solaris_2.4_sparc.iso",
+    "image_path": "Sun Solaris 2.4 [Sun SPARC]/solaris_2.4_sparc.iso",
+    "size_bytes": 455819264,
+    "image_sha256": "c23fe150a9963e5dacbfc988fa700c5f2c7506d36ad0b40910e77444709d1fa4",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/sun-solaris/2x/Sun Solaris 2.4 [Sun SPARC].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/sun-solaris/2x/Sun Solaris 2.4 [Sun SPARC].7z/Sun Solaris 2.4 [Sun SPARC]/solaris_2.4_sparc.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: No room in continuation block to track e",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('No room in continuation block to track entry')"
+    ]
+  },
+  {
+    "product_slug": "sun-solaris",
+    "release_slug": "2x",
+    "archive_filename": "Sun Solaris 2.5.1.1197 [Sun SPARC].7z",
+    "iso_filename": "solaris_2.5.1_1197.iso",
+    "image_path": "Sun Solaris 2.5.1.1197 [Sun SPARC]/solaris_2.5.1_1197.iso",
+    "size_bytes": 452157440,
+    "image_sha256": "18da51043271d0aa69d6fc098b84156673ef4f0728dace4a9e679f79d70d2422",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/sun-solaris/2x/Sun Solaris 2.5.1.1197 [Sun SPARC].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/sun-solaris/2x/Sun Solaris 2.5.1.1197 [Sun SPARC].7z/Sun Solaris 2.5.1.1197 [Sun SPARC]/solaris_2.5.1_1197.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: No room in continuation block to track e",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('No room in continuation block to track entry')"
+    ]
+  },
+  {
+    "product_slug": "xenix",
+    "release_slug": "openserver-5x",
+    "archive_filename": "SCO OpenServer 5.0.6.7z",
+    "iso_filename": "SCO OPEN Server 5.0.6 Enterprise.iso",
+    "image_path": "SCO OpenServer 5.0.6/SCO OPEN Server 5.0.6 Enterprise.iso",
+    "size_bytes": 398483456,
+    "image_sha256": "2d75ab0fe2d7b0c490122f355ce14b17f96f2bc7633f408821e6b9b56f0265f0",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/xenix/openserver-5x/SCO OpenServer 5.0.6.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/xenix/openserver-5x/SCO OpenServer 5.0.6.7z/SCO OpenServer 5.0.6/SCO OPEN Server 5.0.6 Enterprise.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: No room in continuation block to track e",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('No room in continuation block to track entry')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32g",
+    "archive_filename": "Digital UNIX 3.2G - Alpha System Firmware Update 3.6 [DEC Alpha] (ISO).7z",
+    "iso_filename": "Alpha Systems Firmware Update v3.6 (AG-PTMWT-BE)(Digital Equipment Corporation)(June 1996).iso",
+    "image_path": "Digital UNIX 3.2G - Alpha System Firmware Update 3.6 [DEC Alpha] (ISO)/Alpha Systems Firmware Update v3.6 (AG-PTMWT-BE)(Digital Equipment Corporation)(June 1996).iso",
+    "size_bytes": 461721600,
+    "image_sha256": "639385538d9a213e4838f9edb8e6a84f5f8eded4d0d3296ed1237b986532dddd",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32g/Digital UNIX 3.2G - Alpha System Firmware Update 3.6 [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32g/Digital UNIX 3.2G - Alpha System Firmware Update 3.6 [DEC Alpha] (ISO).7z/Digital UNIX 3.2G - Alpha System Firmware Update 3.6 [DEC Alpha] (ISO)/Alpha Systems Firmware Update v3.6 (AG-PTMWT-BE)(Digital Equipment Corporation)(June 1996).iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Record Bit not allowed with Extended Att",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Record Bit not allowed with Extended Attributes')"
+    ]
+  },
+  {
+    "product_slug": "lindows",
+    "release_slug": "40x",
+    "archive_filename": "Lindows 4.0.302 (6-22-2003).7z",
+    "iso_filename": "LindowsOS_v.4.0.302.iso",
+    "image_path": "LindowsOS_v.4.0.302.iso",
+    "size_bytes": 475572224,
+    "image_sha256": "9ccc5cb70848bafbe81a2163223ac6dcb8e2733ae7fd3fcdc2ba1b2acf337d04",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/lindows/40x/Lindows 4.0.302 (6-22-2003).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/lindows/40x/Lindows 4.0.302 (6-22-2003).7z/LindowsOS_v.4.0.302.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Unknown SUSP record",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Unknown SUSP record')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.51 (14.062_W4) (CP 1) (2000-11) (ISO).7z",
+    "iso_filename": "MCP1_en_D1.iso",
+    "image_path": "IBM OS2 Warp 4.51 (14.062_W4) (CP 1) (2000-11) (ISO)/MCP1_en_D1.iso",
+    "size_bytes": 193282048,
+    "image_sha256": "2fb7611426dc1078bfa314a9e04f85dc2a987991457f4d2b25e2dce84e111103",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.51 (14.062_W4) (CP 1) (2000-11) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.51 (14.062_W4) (CP 1) (2000-11) (ISO).7z/IBM OS2 Warp 4.51 (14.062_W4) (CP 1) (2000-11) (ISO)/MCP1_en_D1.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.52 (14.086_W4) (CP 2) (2001-11) (ISO).7z",
+    "iso_filename": "ibm_warpclient_cp2_v4_52_boot.iso",
+    "image_path": "IBM OS2 Warp 4.52 (14.086_W4) (CP 2) (2001-11) (ISO)/ibm_warpclient_cp2_v4_52_boot.iso",
+    "size_bytes": 552286208,
+    "image_sha256": "c0492f457e4af08f5824bb14e5378d5c9af57239544175060dad727810c8758d",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 (14.086_W4) (CP 2) (2001-11) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 (14.086_W4) (CP 2) (2001-11) (ISO).7z/IBM OS2 Warp 4.52 (14.086_W4) (CP 2) (2001-11) (ISO)/ibm_warpclient_cp2_v4_52_boot.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.52 (14.089_W4) (CP 2 Refresh) (2002-04) (ISO).7z",
+    "iso_filename": "mcp2-refresh-boot-en.iso",
+    "image_path": "IBM OS2 Warp 4.52 (14.089_W4) (CP 2 Refresh) (2002-04) (ISO)/mcp2-refresh-boot-en.iso",
+    "size_bytes": 552286208,
+    "image_sha256": "de96396b8ad5e7f9a618df498a6d1f585235c8230b4eef2f66baf5c0bea8ded2",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 (14.089_W4) (CP 2 Refresh) (2002-04) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 (14.089_W4) (CP 2 Refresh) (2002-04) (ISO).7z/IBM OS2 Warp 4.52 (14.089_W4) (CP 2 Refresh) (2002-04) (ISO)/mcp2-refresh-boot-en.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.52 Server For e-Business (4.52.14.086_UNI).7z",
+    "iso_filename": "ibm_warpserver_cp2_v4_52_boot.iso",
+    "image_path": "ibm_warpserver_cp2_v4_52_boot.iso",
+    "size_bytes": 551868416,
+    "image_sha256": "fe42b4f4a9f287c505b1aa5635179dda9c226f36c1f4b70d8c04010639cf9326",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.086_UNI).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.086_UNI).7z/ibm_warpserver_cp2_v4_52_boot.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_UNI).7z",
+    "iso_filename": "WSEB_CP2-BootCD.iso",
+    "image_path": "WSEB_CP2-BootCD.iso",
+    "size_bytes": 551872512,
+    "image_sha256": "5af0b7206d70e43b0e5a7bcefcfe47f12b195e766032284382e0e721d32be1f1",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_UNI).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_UNI).7z/WSEB_CP2-BootCD.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-452",
+    "archive_filename": "IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_W4).7z",
+    "iso_filename": "os2warpcd2-boot.iso",
+    "image_path": "os2warpcd2-boot.iso",
+    "size_bytes": 552290304,
+    "image_sha256": "9b5345e2a595b9fe203c26cab3841cde9733ced59415b80d25efa418d18980a3",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_W4).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-452/IBM OS2 Warp 4.52 Server For e-Business (4.52.14.089_W4).7z/os2warpcd2-boot.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: Valid ISO9660 filesystems must have at l",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one Volume Descriptor Set Terminator')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-2000",
+    "release_slug": "pre-beta",
+    "archive_filename": "Microsoft Windows 2000 (__NT 5.0__ 5.00.1515.1 Professional).7z",
+    "iso_filename": "5.00.1515.1_x86fre_Workstation_en-us-NTWKS50A.iso",
+    "image_path": "Microsoft Windows 2000 (''NT 5.0'' 5.00.1515.1 Professional)/5.00.1515.1_x86fre_Workstation_en-us-NTWKS50A.iso",
+    "size_bytes": 174297088,
+    "image_sha256": "ffe3ac3d0e2f1e44a7fcd7814dddceb830ed367149386086d1f849da28d0bd52",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-2000/pre-beta/Microsoft Windows 2000 (__NT 5.0__ 5.00.1515.1 Professional).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-2000/pre-beta/Microsoft Windows 2000 (__NT 5.0__ 5.00.1515.1 Professional).7z/Microsoft Windows 2000 (''NT 5.0'' 5.00.1515.1 Professional)/5.00.1515.1_x86fre_Workstation_en-us-NTWKS50A.iso",
+    "extracted_present": true,
+    "reason": "iso9660-other: data in 2nd unused field not zero",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('data in 2nd unused field not zero')"
+    ]
+  },
+  {
+    "product_slug": "ad-ps",
+    "release_slug": "5x",
+    "archive_filename": "Adobe Photoshop 5.0 (ISO).7z",
+    "iso_filename": "PSHOP5.ISO",
+    "image_path": "Adobe Photoshop 5.0 (ISO)/PSHOP5.ISO",
+    "size_bytes": 645230592,
+    "image_sha256": "a5d39e5feba94cc7b42570b7c7874b77cf56f34da0ff1f7b24c2fd6f8315f078",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/ad-ps/5x/Adobe Photoshop 5.0 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/ad-ps/5x/Adobe Photoshop 5.0 (ISO).7z/Adobe Photoshop 5.0 (ISO)/PSHOP5.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "netware",
+    "release_slug": "5x",
+    "archive_filename": "Novell Netware 5.1.7z",
+    "iso_filename": "Netware.5.1.ISO",
+    "image_path": "Novell Netware 5.1/Netware.5.1.ISO",
+    "size_bytes": 571846656,
+    "image_sha256": "ca589a4b0a810a1fc8272220d548761fc9b16555e74af9eaf28774e0c9a904fe",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/netware/5x/Novell Netware 5.1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/netware/5x/Novell Netware 5.1.7z/Novell Netware 5.1/Netware.5.1.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "netware",
+    "release_slug": "6x",
+    "archive_filename": "Novell Netware 6.7z",
+    "iso_filename": "Netware.6.0.ISO",
+    "image_path": "Novell Netware 6/Netware.6.0.ISO",
+    "size_bytes": 651567104,
+    "image_sha256": "d725af0fdc9daef11c01e2544dc088d5397ca6046e24d5c8e241e678c573bc65",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/netware/6x/Novell Netware 6.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/netware/6x/Novell Netware 6.7z/Novell Netware 6/Netware.6.0.ISO",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "os-2-warp-4",
+    "release_slug": "os-2-warp-40",
+    "archive_filename": "IBM OS2 Warp 4.0 (CD).7z",
+    "iso_filename": "IBM_OS2_Warp_4.iso",
+    "image_path": "IBM OS2 Warp 4.0 (CD)/IBM_OS2_Warp_4.iso",
+    "size_bytes": 564224000,
+    "image_sha256": "b366f540b616bd430c6991231f9067d903c27ef0d4f3ec76333fa8c0492119b3",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-warp-4/os-2-warp-40/IBM OS2 Warp 4.0 (CD).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-warp-4/os-2-warp-40/IBM OS2 Warp 4.0 (CD).7z/IBM OS2 Warp 4.0 (CD)/IBM_OS2_Warp_4.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "watcom-c-c",
+    "release_slug": "110b",
+    "archive_filename": "Watcom CPP 11.0 B (CD).7z",
+    "iso_filename": "WATCOM_C11B.iso",
+    "image_path": "WATCOM_C11B.iso",
+    "size_bytes": 649111552,
+    "image_sha256": "d21920b8e3494bcc1c7b19f6196e7adc742b53c7495818563b4c0045a2a844a0",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/watcom-c-c/110b/Watcom CPP 11.0 B (CD).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/watcom-c-c/110b/Watcom CPP 11.0 B (CD).7z/WATCOM_C11B.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-2000",
+    "release_slug": "beta-3",
+    "archive_filename": "Microsoft Windows 2000 (__NT 5.0__ 5.00.1946.1 Professional B3).7z",
+    "iso_filename": "usa_1946_win2000.prol_beta3-rc0.iso",
+    "image_path": "Microsoft Windows 2000 (''NT 5.0'' 5.00.1946.1 Professional B3)/usa_1946_win2000.prol_beta3-rc0.iso",
+    "size_bytes": 374638592,
+    "image_sha256": "b917d2543a5db6cf85d24ba13afa7da02ca2d4955c2e7b3ce9084d94ae114d5c",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-2000/beta-3/Microsoft Windows 2000 (__NT 5.0__ 5.00.1946.1 Professional B3).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-2000/beta-3/Microsoft Windows 2000 (__NT 5.0__ 5.00.1946.1 Professional B3).7z/Microsoft Windows 2000 (''NT 5.0'' 5.00.1946.1 Professional B3)/usa_1946_win2000.prol_beta3-rc0.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-2000",
+    "release_slug": "rc-2",
+    "archive_filename": "Microsoft Windows 2000 (__NT 5.0__ 5.00.2128.1 Professional RC2).7z",
+    "iso_filename": "W2PIS_EN.iso",
+    "image_path": "Microsoft Windows 2000 (''NT 5.0'' 5.00.2128.1 Professional RC2)/W2PIS_EN.iso",
+    "size_bytes": 406167552,
+    "image_sha256": "2cb310f2385da0681dec879311d5e02c0a24280182df40c033d2d8e9d09b346b",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-2000/rc-2/Microsoft Windows 2000 (__NT 5.0__ 5.00.2128.1 Professional RC2).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-2000/rc-2/Microsoft Windows 2000 (__NT 5.0__ 5.00.2128.1 Professional RC2).7z/Microsoft Windows 2000 (''NT 5.0'' 5.00.2128.1 Professional RC2)/W2PIS_EN.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-2000",
+    "release_slug": "rc-2",
+    "archive_filename": "Microsoft Windows 2000 Professional (__NT 5.0__ 5.00.2128.1 RC2) [AXP].7z",
+    "iso_filename": "Microsoft Windows 2000 Professional (''NT 5.0'' 5.00.2128.1 RC2) [AXP].iso",
+    "image_path": "Microsoft Windows 2000 Professional (''NT 5.0'' 5.00.2128.1 RC2) [AXP].iso",
+    "size_bytes": 402374656,
+    "image_sha256": "9ad1e71650cc11e4e7a108bd78642b6ffe926566087570c4172382a245ad2a83",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-2000/rc-2/Microsoft Windows 2000 Professional (__NT 5.0__ 5.00.2128.1 RC2) [AXP].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-2000/rc-2/Microsoft Windows 2000 Professional (__NT 5.0__ 5.00.2128.1 RC2) [AXP].7z/Microsoft Windows 2000 Professional (''NT 5.0'' 5.00.2128.1 RC2) [AXP].iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-3x",
+    "release_slug": "35",
+    "archive_filename": "Microsoft Windows NT 3.5 (__Daytona__ 3.50.756 Server RC).7z",
+    "iso_filename": "daytona_756__x86fre.wks.iso",
+    "image_path": "Microsoft Windows NT 3.5 (''Daytona'' 3.50.756 Server RC)/daytona_756__x86fre.wks.iso",
+    "size_bytes": 194162688,
+    "image_sha256": "18d9b8b99d909683ed411e9adab080f1d259bffa0aa9f089b8d68ecd90aa5557",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-3x/35/Microsoft Windows NT 3.5 (__Daytona__ 3.50.756 Server RC).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-3x/35/Microsoft Windows NT 3.5 (__Daytona__ 3.50.756 Server RC).7z/Microsoft Windows NT 3.5 (''Daytona'' 3.50.756 Server RC)/daytona_756__x86fre.wks.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-3x",
+    "release_slug": "35",
+    "archive_filename": "Microsoft Windows NT 3.5 Server (3.50.800.1).7z",
+    "iso_filename": "en_winnt_3.5.srv.iso",
+    "image_path": "Microsoft Windows NT 3.5 Server (3.50.800.1)/en_winnt_3.5.srv.iso",
+    "size_bytes": 369180672,
+    "image_sha256": "b414ba25351ee58b78a57f8c093f9b82a5e03ad8485c83e056e7777cfae6f732",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-3x/35/Microsoft Windows NT 3.5 Server (3.50.800.1).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-3x/35/Microsoft Windows NT 3.5 Server (3.50.800.1).7z/Microsoft Windows NT 3.5 Server (3.50.800.1)/en_winnt_3.5.srv.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-3x",
+    "release_slug": "351",
+    "archive_filename": "Microsoft Windows NT 3.51 Server (3.51.1057.1).7z",
+    "iso_filename": "en_winnt_3.51.srv.iso",
+    "image_path": "Microsoft Windows NT 3.51 Server (3.51.1057.1)/en_winnt_3.51.srv.iso",
+    "size_bytes": 356990976,
+    "image_sha256": "8762b2ff4bfed8d9c5ed2355fc83a78632295b0d38562488ef4d1f6d24e2f246",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-3x/351/Microsoft Windows NT 3.51 Server (3.51.1057.1).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-3x/351/Microsoft Windows NT 3.51 Server (3.51.1057.1).7z/Microsoft Windows NT 3.51 Server (3.51.1057.1)/en_winnt_3.51.srv.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-xp",
+    "release_slug": "beta-1",
+    "archive_filename": "Microsoft Windows XP (__Whistler__ 5.1.2276.1 Professional B1).7z",
+    "iso_filename": "usa_2276.1__x86fre.pro_whistler.iso",
+    "image_path": "Microsoft Windows XP (''Whistler'' 5.1.2276.1 Professional B1)/usa_2276.1__x86fre.pro_whistler.iso",
+    "size_bytes": 356038656,
+    "image_sha256": "62a6991914efb603107d1736b60d441c49570449523316b413275ce5eaec36bb",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-xp/beta-1/Microsoft Windows XP (__Whistler__ 5.1.2276.1 Professional B1).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-xp/beta-1/Microsoft Windows XP (__Whistler__ 5.1.2276.1 Professional B1).7z/Microsoft Windows XP (''Whistler'' 5.1.2276.1 Professional B1)/usa_2276.1__x86fre.pro_whistler.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "windows-xp",
+    "release_slug": "early-whistler",
+    "archive_filename": "Microsoft Windows XP (__Whistler__ 5.0.2202.0 Professional Beta).7z",
+    "iso_filename": "usa_2202__x86fre.pro_whistler.iso",
+    "image_path": "Microsoft Windows XP (\"Whistler\" 5.0.2202.0 Professional Beta)/usa_2202__x86fre.pro_whistler.iso",
+    "size_bytes": 360292352,
+    "image_sha256": "fd2584349e962ac3e46148b7c3028d45df9443858e297377ded4da8b378d46b3",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-xp/early-whistler/Microsoft Windows XP (__Whistler__ 5.0.2202.0 Professional Beta).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-xp/early-whistler/Microsoft Windows XP (__Whistler__ 5.0.2202.0 Professional Beta).7z/Microsoft Windows XP (\"Whistler\" 5.0.2202.0 Professional Beta)/usa_2202__x86fre.pro_whistler.iso",
+    "extracted_present": true,
+    "reason": "iso9660-seqnum-mismatch",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Little-endian and big-endian seqnum disagree')"
+    ]
+  },
+  {
+    "product_slug": "adobe-illustrator",
+    "release_slug": "55",
+    "archive_filename": "Adobe Illustrator 5.5 Deluxe for Macintosh (CD).7z",
+    "iso_filename": "Adobe Illustrator 5.5 Deluxe for Mac.iso",
+    "image_path": "Adobe Illustrator 5.5 Deluxe for Macintosh (CD)/Adobe Illustrator 5.5 Deluxe for Mac.iso",
+    "size_bytes": 399667200,
+    "image_sha256": "0d4b91f6bc002814fb3b5ffacc5a50a2aca2802c3be9e0b92f180ce46707aaab",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/adobe-illustrator/55/Adobe Illustrator 5.5 Deluxe for Macintosh (CD).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/adobe-illustrator/55/Adobe Illustrator 5.5 Deluxe for Macintosh (CD).7z/Adobe Illustrator 5.5 Deluxe for Macintosh (CD)/Adobe Illustrator 5.5 Deluxe for Mac.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "aldus-photostyler",
+    "release_slug": "1x",
+    "archive_filename": "Aldus Photostyler SE 1.1a.7z",
+    "iso_filename": "Photostyler 1.1a SE.iso",
+    "image_path": "Aldus Photostyler SE 1.1a/Photostyler 1.1a SE.iso",
+    "size_bytes": 85203552,
+    "image_sha256": "f8c6bca9ae2681d4cc9a1daf2f8b0b62c8fac5c1b87345b0ac11700e0c771cb6",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/aldus-photostyler/1x/Aldus Photostyler SE 1.1a.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/aldus-photostyler/1x/Aldus Photostyler SE 1.1a.7z/Aldus Photostyler SE 1.1a/Photostyler 1.1a SE.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "banyan-vines",
+    "release_slug": "8x",
+    "archive_filename": "Banyan VINES NOS 8.5 (ISO).7z",
+    "iso_filename": "Banyan VINES 8.50.iso",
+    "image_path": "Banyan VINES NOS 8.5 (ISO)/Banyan VINES 8.50.iso",
+    "size_bytes": 76199936,
+    "image_sha256": "2f29a5fbfce6a9176a249b821115d900a5b1a350aecbcd870b2357a97e8b32de",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/banyan-vines/8x/Banyan VINES NOS 8.5 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/banyan-vines/8x/Banyan VINES NOS 8.5 (ISO).7z/Banyan VINES NOS 8.5 (ISO)/Banyan VINES 8.50.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "bookshelf",
+    "release_slug": "87",
+    "archive_filename": "Microsoft Bookshelf 87 (ISO).7z",
+    "iso_filename": "bkshlf87.iso",
+    "image_path": "Microsoft Bookshelf 87 (ISO)/bkshlf87.iso",
+    "size_bytes": 333496320,
+    "image_sha256": "c866d530850e34e2a88f1064b78a528ae4cc57e4694261a38aae527696f6099b",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/bookshelf/87/Microsoft Bookshelf 87 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/bookshelf/87/Microsoft Bookshelf 87 (ISO).7z/Microsoft Bookshelf 87 (ISO)/bkshlf87.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32b",
+    "archive_filename": "Digital UNIX 3.2B - Operating System [DEC Alpha] (ISO).7z",
+    "iso_filename": "Digital UNIX 3.2B.iso",
+    "image_path": "Digital UNIX 3.2B - Operating System [DEC Alpha] (ISO)/Digital UNIX 3.2B.iso",
+    "size_bytes": 655667200,
+    "image_sha256": "72bdcb48d2b63f104604a5dba768b546b457acd9585c276a707c69a089a25060",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32b/Digital UNIX 3.2B - Operating System [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32b/Digital UNIX 3.2B - Operating System [DEC Alpha] (ISO).7z/Digital UNIX 3.2B - Operating System [DEC Alpha] (ISO)/Digital UNIX 3.2B.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32g",
+    "archive_filename": "Digital UNIX 3.2G - Complementary Products [DEC Alpha] (ISO).7z",
+    "iso_filename": "Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "image_path": "Digital UNIX 3.2G - Complementary Products [DEC Alpha] (ISO)/Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "size_bytes": 155717632,
+    "image_sha256": "bb9d1017dff472b7c3e3701f1ff61ae5be2d42aefda028713d3ef56230db8602",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32g/Digital UNIX 3.2G - Complementary Products [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32g/Digital UNIX 3.2G - Complementary Products [DEC Alpha] (ISO).7z/Digital UNIX 3.2G - Complementary Products [DEC Alpha] (ISO)/Digital UNIX v3.2G Complementary Products (Includes TruCluster Software) (AG-Q3JRG-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32g",
+    "archive_filename": "Digital UNIX 3.2G - DECevent Utility 2.2 [DEC Alpha] (ISO).7z",
+    "iso_filename": "DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso",
+    "image_path": "Digital UNIX 3.2G - DECevent Utility 2.2 [DEC Alpha] (ISO)/DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso",
+    "size_bytes": 52121600,
+    "image_sha256": "8194def66d1b6f855b308d887a250fb7b3df2ad93852f5974242693287ef796c",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32g/Digital UNIX 3.2G - DECevent Utility 2.2 [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32g/Digital UNIX 3.2G - DECevent Utility 2.2 [DEC Alpha] (ISO).7z/Digital UNIX 3.2G - DECevent Utility 2.2 [DEC Alpha] (ISO)/DECevent Utility v2.2 for Digital UNIX (AG-QAA7C-RE)(Digital Equipment Corporation)(August 1996).iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32g",
+    "archive_filename": "Digital UNIX 3.2G - Documentation [DEC Alpha] (ISO).7z",
+    "iso_filename": "Digital UNIX v3.2C Online Documentation (AG-QDWBB-XE)(Digital Equipment Corporation)(August 1995).iso",
+    "image_path": "Digital UNIX 3.2G - Documentation [DEC Alpha] (ISO)/Digital UNIX v3.2C Online Documentation (AG-QDWBB-XE)(Digital Equipment Corporation)(August 1995).iso",
+    "size_bytes": 655667200,
+    "image_sha256": "e4f10bc46de35d53512f5f2e7a26c34da8633a218c3064456f80cbce726d823e",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32g/Digital UNIX 3.2G - Documentation [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32g/Digital UNIX 3.2G - Documentation [DEC Alpha] (ISO).7z/Digital UNIX 3.2G - Documentation [DEC Alpha] (ISO)/Digital UNIX v3.2C Online Documentation (AG-QDWBB-XE)(Digital Equipment Corporation)(August 1995).iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "32g",
+    "archive_filename": "Digital UNIX 3.2G - Operating System [DEC Alpha] (ISO).7z",
+    "iso_filename": "Digital UNIX v3.2G (Includes v3.2C) (AG-PS3NR-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "image_path": "Digital UNIX 3.2G - Operating System [DEC Alpha] (ISO)/Digital UNIX v3.2G (Includes v3.2C) (AG-PS3NR-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "size_bytes": 656281600,
+    "image_sha256": "bdf6e8429530ddb188685992cd939c2c0264f3836b408f02e85a6b8793ecb367",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/32g/Digital UNIX 3.2G - Operating System [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/32g/Digital UNIX 3.2G - Operating System [DEC Alpha] (ISO).7z/Digital UNIX 3.2G - Operating System [DEC Alpha] (ISO)/Digital UNIX v3.2G (Includes v3.2C) (AG-PS3NR-XE)(Digital Equipment Corporation)(July 1996).iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40b",
+    "archive_filename": "Digital UNIX 4.0B - Associated Products - Volume 2 [DEC Alpha] (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso",
+    "image_path": "DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso",
+    "size_bytes": 156024832,
+    "image_sha256": "543e37be91ac2e9c48741758e198bf2f39645ce3e6b932c776c278dbc8120a51",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40b/Digital UNIX 4.0B - Associated Products - Volume 2 [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40b/Digital UNIX 4.0B - Associated Products - Volume 2 [DEC Alpha] (ISO).7z/DIGITAL UNIX - V4.0B - Associated Products - Volume 2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40b",
+    "archive_filename": "Digital UNIX 4.0B - Documentation [DEC Alpha] (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0B - Documentation.iso",
+    "image_path": "DIGITAL UNIX - V4.0B - Documentation.iso",
+    "size_bytes": 656588800,
+    "image_sha256": "89e946f5abad23189d0f8d6277da58ea569755aeac8ba1f68275a389f7a6b696",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40b/Digital UNIX 4.0B - Documentation [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40b/Digital UNIX 4.0B - Documentation [DEC Alpha] (ISO).7z/DIGITAL UNIX - V4.0B - Documentation.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40b",
+    "archive_filename": "Digital UNIX 4.0B - Operating System [DEC Alpha] (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0B - Operating System.iso",
+    "image_path": "DIGITAL UNIX - V4.0B - Operating System.iso",
+    "size_bytes": 656588800,
+    "image_sha256": "811357475929b1d6dfd28310908a89ec7b4c255c0086148503d6ea4aa7686181",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40b/Digital UNIX 4.0B - Operating System [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40b/Digital UNIX 4.0B - Operating System [DEC Alpha] (ISO).7z/DIGITAL UNIX - V4.0B - Operating System.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40d",
+    "archive_filename": "Digital UNIX 4.0D - Associated Products - Volume 1 (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0D - Associated Products - Volume 1.iso",
+    "image_path": "DIGITAL UNIX - V4.0D - Associated Products - Volume 1.iso",
+    "size_bytes": 656277504,
+    "image_sha256": "bab9d5b516ac13da3b574a88522c3a10d61492809b3653c064c86a9e1eca59ec",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40d/Digital UNIX 4.0D - Associated Products - Volume 1 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40d/Digital UNIX 4.0D - Associated Products - Volume 1 (ISO).7z/DIGITAL UNIX - V4.0D - Associated Products - Volume 1.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40d",
+    "archive_filename": "Digital UNIX 4.0D - Associated Products - Volume 2 (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0D - Associated Products - Volume 2.iso",
+    "image_path": "DIGITAL UNIX - V4.0D - Associated Products - Volume 2.iso",
+    "size_bytes": 328290304,
+    "image_sha256": "4548a8c332780e08a7aceb1dfa8a67d8e1dc1bd57591c9504464fb6d4f729c75",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40d/Digital UNIX 4.0D - Associated Products - Volume 2 (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40d/Digital UNIX 4.0D - Associated Products - Volume 2 (ISO).7z/DIGITAL UNIX - V4.0D - Associated Products - Volume 2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40d",
+    "archive_filename": "Digital UNIX 4.0D - Operating System (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0D - Operating System - Volume 1.iso",
+    "image_path": "DIGITAL UNIX - V4.0D - Operating System - Volume 1.iso",
+    "size_bytes": 655972352,
+    "image_sha256": "92b1752360168cc6eb6c7259a1ee4eb8275d64bad3f45350282e52fac9ec80f0",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40d/Digital UNIX 4.0D - Operating System (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40d/Digital UNIX 4.0D - Operating System (ISO).7z/DIGITAL UNIX - V4.0D - Operating System - Volume 1.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "digital-unix",
+    "release_slug": "40e",
+    "archive_filename": "Digital UNIX 4.0E - Operating System [DEC Alpha] (ISO).7z",
+    "iso_filename": "DIGITAL UNIX - V4.0E - Operating System.iso",
+    "image_path": "DIGITAL UNIX - V4.0E - Operating System.iso",
+    "size_bytes": 655974400,
+    "image_sha256": "2fa4a7569bf5cd10facae4214a2348efb5337c0395e2e14c0f788f211178c9a6",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/digital-unix/40e/Digital UNIX 4.0E - Operating System [DEC Alpha] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/digital-unix/40e/Digital UNIX 4.0E - Operating System [DEC Alpha] (ISO).7z/DIGITAL UNIX - V4.0E - Operating System.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "fallout",
+    "release_slug": "20",
+    "archive_filename": "Fallout 2.7z",
+    "iso_filename": "Fallout 2.iso",
+    "image_path": "Fallout 2.iso",
+    "size_bytes": 702699984,
+    "image_sha256": "bcafaa24db4e4b623d36ac2748b42d7567e6bbd6e37524428d410e17d07996e2",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/fallout/20/Fallout 2.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/fallout/20/Fallout 2.7z/Fallout 2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "65",
+    "archive_filename": "IRIX 6.5 Foundation 1.7z",
+    "iso_filename": "IRIX-6.5-Foundation1.iso",
+    "image_path": "IRIX-6.5-Foundation1.iso",
+    "size_bytes": 574840832,
+    "image_sha256": "bf9776fedf9bb2ef58949f6d9b9c2b1bea5c083dc8861527482788f3be9ecc01",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/65/IRIX 6.5 Foundation 1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/65/IRIX 6.5 Foundation 1.7z/IRIX-6.5-Foundation1.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "65",
+    "archive_filename": "IRIX 6.5 Foundation 2.7z",
+    "iso_filename": "IRIX-6.5-Foundation2.iso",
+    "image_path": "IRIX-6.5-Foundation2.iso",
+    "size_bytes": 270622720,
+    "image_sha256": "cb321c58d624a0e43ebbd7774c45685c4371c29ae3fb4bb5da64ed253ac492ee",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/65/IRIX 6.5 Foundation 2.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/65/IRIX 6.5 Foundation 2.7z/IRIX-6.5-Foundation2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "65",
+    "archive_filename": "IRIX Development Foundation 1.2 for IRIX 6.5.7z",
+    "iso_filename": "IRIX_Development_Foundation_1.2.iso",
+    "image_path": "IRIX_Development_Foundation_1.2.iso",
+    "size_bytes": 169435136,
+    "image_sha256": "1d029ca7273d1e692fa217778b75377dba39a2e515b18f72feed32cdc6bf5c88",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/65/IRIX Development Foundation 1.2 for IRIX 6.5.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/65/IRIX Development Foundation 1.2 for IRIX 6.5.7z/IRIX_Development_Foundation_1.2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6521",
+    "archive_filename": "IRIX 6.5.21 Overlay 1 of 4.7z",
+    "iso_filename": "IRIX 6.5.21 Overlay 1 of 4.iso",
+    "image_path": "IRIX 6.5.21 Overlay 1 of 4.iso",
+    "size_bytes": 658776064,
+    "image_sha256": "f49ac34609cb981c8dc562dc33f3c35cadad60527ca4cbe273833c69abc5cc03",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6521/IRIX 6.5.21 Overlay 1 of 4.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6521/IRIX 6.5.21 Overlay 1 of 4.7z/IRIX 6.5.21 Overlay 1 of 4.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6521",
+    "archive_filename": "IRIX 6.5.21 Overlay 2 of 4.7z",
+    "iso_filename": "IRIX 6.5.21 Overlay 2 of 4.iso",
+    "image_path": "IRIX 6.5.21 Overlay 2 of 4.iso",
+    "size_bytes": 669392896,
+    "image_sha256": "b36ceb2dd4c9f095c1b8c448de2ed218e36990078c5c25e4963a67e73171e39a",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6521/IRIX 6.5.21 Overlay 2 of 4.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6521/IRIX 6.5.21 Overlay 2 of 4.7z/IRIX 6.5.21 Overlay 2 of 4.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6521",
+    "archive_filename": "IRIX 6.5.21 Overlay 3 of 4.7z",
+    "iso_filename": "IRIX 6.5.21 Overlay 3 of 4.iso",
+    "image_path": "IRIX 6.5.21 Overlay 3 of 4.iso",
+    "size_bytes": 433135616,
+    "image_sha256": "562a0babd716515cda2b9e66ff725a224cfb32eb8bda48aaa49fd6f463355e44",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6521/IRIX 6.5.21 Overlay 3 of 4.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6521/IRIX 6.5.21 Overlay 3 of 4.7z/IRIX 6.5.21 Overlay 3 of 4.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6521",
+    "archive_filename": "IRIX 6.5.21 Overlay 4 of 4.7z",
+    "iso_filename": "IRIX 6.5.21 Overlay 4 of 4.iso",
+    "image_path": "IRIX 6.5.21 Overlay 4 of 4.iso",
+    "size_bytes": 417292288,
+    "image_sha256": "76337025e3d50c0a0d864699ca2d3ad5d928dd9ec943be1eb040990e3c549109",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6521/IRIX 6.5.21 Overlay 4 of 4.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6521/IRIX 6.5.21 Overlay 4 of 4.7z/IRIX 6.5.21 Overlay 4 of 4.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6522",
+    "archive_filename": "IRIX 6.5.22 Applications November-2003.7z",
+    "iso_filename": "IRIX 6.5.22 Applications November-2003.iso",
+    "image_path": "IRIX 6.5.22 Applications November-2003.iso",
+    "size_bytes": 645668864,
+    "image_sha256": "86c8436199f8487a716c17587c67b99f2fe164f51e07144e16761bbae0adca10",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6522/IRIX 6.5.22 Applications November-2003.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6522/IRIX 6.5.22 Applications November-2003.7z/IRIX 6.5.22 Applications November-2003.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6522",
+    "archive_filename": "IRIX 6.5.22 Overlay 1 of 3.7z",
+    "iso_filename": "IRIX 6.5.22 Overlay 1 of 3.iso",
+    "image_path": "IRIX 6.5.22 Overlay 1 of 3.iso",
+    "size_bytes": 681861120,
+    "image_sha256": "c36d43431569902a9bdf868cb9f98ea44519a9a99e2bb68dbf1be76be0eec299",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6522/IRIX 6.5.22 Overlay 1 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6522/IRIX 6.5.22 Overlay 1 of 3.7z/IRIX 6.5.22 Overlay 1 of 3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6522",
+    "archive_filename": "IRIX 6.5.22 Overlay 2 of 3.7z",
+    "iso_filename": "IRIX 6.5.22 Overlay 2 of 3.iso",
+    "image_path": "IRIX 6.5.22 Overlay 2 of 3.iso",
+    "size_bytes": 437952512,
+    "image_sha256": "9064b95ef1c4589c9799a58bbcd7b9f99577d6516555ddc8ed02b703655b58cc",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6522/IRIX 6.5.22 Overlay 2 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6522/IRIX 6.5.22 Overlay 2 of 3.7z/IRIX 6.5.22 Overlay 2 of 3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "6522",
+    "archive_filename": "IRIX 6.5.22 Overlay 3 of 3.7z",
+    "iso_filename": "IRIX 6.5.22 Overlay 3 of 3.iso",
+    "image_path": "IRIX 6.5.22 Overlay 3 of 3.iso",
+    "size_bytes": 413851648,
+    "image_sha256": "d2899e9aac3f6f62a446d881ccc2f214afc181c195272ab0e658ca974528557f",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/6522/IRIX 6.5.22 Overlay 3 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/6522/IRIX 6.5.22 Overlay 3 of 3.7z/IRIX 6.5.22 Overlay 3 of 3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "659",
+    "archive_filename": "IRIX 6.5.9 Applications August-2000.7z",
+    "iso_filename": "IRIX_6.5.9_Applications_August-2000.iso",
+    "image_path": "IRIX_6.5.9_Applications_August-2000.iso",
+    "size_bytes": 671498240,
+    "image_sha256": "7bb4c9a2ec6b62afafa1bad82a13318a59c492b162f534cf066d74aa983e5529",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/659/IRIX 6.5.9 Applications August-2000.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/659/IRIX 6.5.9 Applications August-2000.7z/IRIX_6.5.9_Applications_August-2000.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "659",
+    "archive_filename": "IRIX 6.5.9 Overlay 1 of 3.7z",
+    "iso_filename": "irix-6.5.9-1of3.iso",
+    "image_path": "irix-6.5.9-1of3.iso",
+    "size_bytes": 456261632,
+    "image_sha256": "5b9b2693456c6913fd95f3e13c55abab2f18eac190a71ebed15f7c10cfb4de90",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/659/IRIX 6.5.9 Overlay 1 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/659/IRIX 6.5.9 Overlay 1 of 3.7z/irix-6.5.9-1of3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "659",
+    "archive_filename": "IRIX 6.5.9 Overlay 2 of 3.7z",
+    "iso_filename": "irix-6.5.9-2of3.iso",
+    "image_path": "irix-6.5.9-2of3.iso",
+    "size_bytes": 468107264,
+    "image_sha256": "aa8a105d709c14b3a28ebb45683f7b80abeba851bf200d966fb21429cf861431",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/659/IRIX 6.5.9 Overlay 2 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/659/IRIX 6.5.9 Overlay 2 of 3.7z/irix-6.5.9-2of3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "659",
+    "archive_filename": "IRIX 6.5.9 Overlay 3 of 3.7z",
+    "iso_filename": "irix-6.5.9-3of3.iso",
+    "image_path": "irix-6.5.9-3of3.iso",
+    "size_bytes": 641073152,
+    "image_sha256": "c0d09301696b1816bdc8da4b741296f27efd38d0622ab28394099f73df39e529",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/659/IRIX 6.5.9 Overlay 3 of 3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/659/IRIX 6.5.9 Overlay 3 of 3.7z/irix-6.5.9-3of3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "patches",
+    "archive_filename": "Compiler Execution Environment 7.3.7z",
+    "iso_filename": "Compiler_Execution_Environment_7.3.iso",
+    "image_path": "Compiler_Execution_Environment_7.3.iso",
+    "size_bytes": 174825472,
+    "image_sha256": "01a00292f5ed4a91446bbba2733d9cbdd7b360a326ca270719e2fa981016b5ed",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/patches/Compiler Execution Environment 7.3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/patches/Compiler Execution Environment 7.3.7z/Compiler_Execution_Environment_7.3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "patches",
+    "archive_filename": "Developer Tools Maintenance Release 7.2.1.3m.7z",
+    "iso_filename": "Developer_Tools_Maintenance_Release_7.2.1.3m.iso",
+    "image_path": "Developer_Tools_Maintenance_Release_7.2.1.3m.iso",
+    "size_bytes": 127164416,
+    "image_sha256": "d87a4177ad045df3a4602d43cbfd7a29e631c964d47f1735179507432dbfd265",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/patches/Developer Tools Maintenance Release 7.2.1.3m.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/patches/Developer Tools Maintenance Release 7.2.1.3m.7z/Developer_Tools_Maintenance_Release_7.2.1.3m.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "patches",
+    "archive_filename": "MIPSpro CPP Compiler 7.3.7z",
+    "iso_filename": "MIPSpro_C++_Compiler_7.3.iso",
+    "image_path": "MIPSpro_C++_Compiler_7.3.iso",
+    "size_bytes": 36691968,
+    "image_sha256": "c3d6610b0202263ff7752e14e90288de304281bfab850d9bb63da7986908498c",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/patches/MIPSpro CPP Compiler 7.3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/patches/MIPSpro CPP Compiler 7.3.7z/MIPSpro_C++_Compiler_7.3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "patches",
+    "archive_filename": "ONC3-NFS Version-3 for IRIX 6.2 Trough 6.5 05-99.7z",
+    "iso_filename": "oncnfsv3.iso",
+    "image_path": "oncnfsv3.iso",
+    "size_bytes": 82698240,
+    "image_sha256": "c366c5ddc47344ca22d84c260752b4ccaade284c8519386672b390ae583cd5b4",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/patches/ONC3-NFS Version-3 for IRIX 6.2 Trough 6.5 05-99.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/patches/ONC3-NFS Version-3 for IRIX 6.2 Trough 6.5 05-99.7z/oncnfsv3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "irix",
+    "release_slug": "patches",
+    "archive_filename": "ProDev Developers Suite 05-99.7z",
+    "iso_filename": "ProDev-Developers-Suite-May-1999.iso",
+    "image_path": "ProDev-Developers-Suite-May-1999.iso",
+    "size_bytes": 537485312,
+    "image_sha256": "da039f4b969ee40471f185a6b2d4963d366c280eb123b51a0c27d6ef863d09a2",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/irix/patches/ProDev Developers Suite 05-99.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/irix/patches/ProDev Developers Suite 05-99.7z/ProDev-Developers-Suite-May-1999.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "lindows",
+    "release_slug": "1-x",
+    "archive_filename": "LindowsOS 1.1.1.7z",
+    "iso_filename": "Lindows_1.1.1.iso",
+    "image_path": "LindowsOS 1.1.1/Lindows_1.1.1.iso",
+    "size_bytes": 417188352,
+    "image_sha256": "476878d79acdcf477426175db1ffba7396d6dcdaaa30b5948623b64d7d408041",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/lindows/1-x/LindowsOS 1.1.1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/lindows/1-x/LindowsOS 1.1.1.7z/LindowsOS 1.1.1/Lindows_1.1.1.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "mac-os-7",
+    "release_slug": "75",
+    "archive_filename": "Apple Mac OS 7.5 (__Mozart__ 7.5.B2C2) (1994) (beta) (ISO).7z",
+    "iso_filename": "Mozart Beta Seed.iso",
+    "image_path": "Apple Mac OS 7.5 (''Mozart'' 7.5.B2C2) (1994) (beta) (ISO)/Mozart Beta Seed.iso",
+    "size_bytes": 525201408,
+    "image_sha256": "6be728faffb67a4641b23bdc9add13eafa20e920167199f91877ad4c858d3737",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/mac-os-7/75/Apple Mac OS 7.5 (__Mozart__ 7.5.B2C2) (1994) (beta) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/mac-os-7/75/Apple Mac OS 7.5 (__Mozart__ 7.5.B2C2) (1994) (beta) (ISO).7z/Apple Mac OS 7.5 (''Mozart'' 7.5.B2C2) (1994) (beta) (ISO)/Mozart Beta Seed.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "mac-os-x",
+    "release_slug": "rhapsody",
+    "archive_filename": "Apple __Rhapsody__ (Grail1Z4 x86 Developer Release 1).7z",
+    "iso_filename": "Rhapsody Intel.iso",
+    "image_path": "Apple ''Rhapsody'' (Grail1Z4 x86 Developer Release 1)/Rhapsody Intel.iso",
+    "size_bytes": 630087680,
+    "image_sha256": "ff62377d020f044112683bfea8d7cb29d1867ccba6b838bdbd07b13c3a975495",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/mac-os-x/rhapsody/Apple __Rhapsody__ (Grail1Z4 x86 Developer Release 1).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/mac-os-x/rhapsody/Apple __Rhapsody__ (Grail1Z4 x86 Developer Release 1).7z/Apple ''Rhapsody'' (Grail1Z4 x86 Developer Release 1)/Rhapsody Intel.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "mac-os-x",
+    "release_slug": "rhapsody",
+    "archive_filename": "Apple __Rhapsody__ (Titan1U x86 Developer Release 2).7z",
+    "iso_filename": "rhapsody_dr2_x86.iso",
+    "image_path": "Apple ''Rhapsody'' (Titan1U x86 Developer Release 2)/rhapsody_dr2_x86.iso",
+    "size_bytes": 630083584,
+    "image_sha256": "f80930ebcbe151dbe5df150a8f500e2dacc1be298241a9705ac68a9b6016b0cf",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/mac-os-x/rhapsody/Apple __Rhapsody__ (Titan1U x86 Developer Release 2).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/mac-os-x/rhapsody/Apple __Rhapsody__ (Titan1U x86 Developer Release 2).7z/Apple ''Rhapsody'' (Titan1U x86 Developer Release 2)/rhapsody_dr2_x86.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "3x",
+    "archive_filename": "Microsoft Office 3.0 for Macintosh (ISO).7z",
+    "iso_filename": "The Microsoft Office.iso",
+    "image_path": "Microsoft Office 3.0 for Macintosh (ISO)/The Microsoft Office.iso",
+    "size_bytes": 245639168,
+    "image_sha256": "506e2532c2d0b444464374f4ea5ae0342fed8177fd27091bad219def3428f003",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/3x/Microsoft Office 3.0 for Macintosh (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/3x/Microsoft Office 3.0 for Macintosh (ISO).7z/Microsoft Office 3.0 for Macintosh (ISO)/The Microsoft Office.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "42",
+    "archive_filename": "Microsoft Office 4.2.1 for Macintosh (ISO).7z",
+    "iso_filename": "MSO421.ISO",
+    "image_path": "Microsoft Office 4.2.1 for Macintosh (ISO)/MSO421.ISO",
+    "size_bytes": 121585664,
+    "image_sha256": "1f885616ad12bb02bfc35e28d4d69c93444558e43f3848a322a4a629643a9e58",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/42/Microsoft Office 4.2.1 for Macintosh (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/42/Microsoft Office 4.2.1 for Macintosh (ISO).7z/Microsoft Office 4.2.1 for Macintosh (ISO)/MSO421.ISO",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-office",
+    "release_slug": "42",
+    "archive_filename": "Microsoft Office 4.2.1a for Macintosh (ISO).7z",
+    "iso_filename": "Office421a.iso",
+    "image_path": "Microsoft Office 4.2.1a for Macintosh (ISO)/Office421a.iso",
+    "size_bytes": 119353344,
+    "image_sha256": "d17b9fc79a276a3d6a7ac723896e6a03963990b5f1caf4b55bbe215a5f181631",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-office/42/Microsoft Office 4.2.1a for Macintosh (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-office/42/Microsoft Office 4.2.1a for Macintosh (ISO).7z/Microsoft Office 4.2.1a for Macintosh (ISO)/Office421a.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-programmers-library",
+    "release_slug": "10",
+    "archive_filename": "Microsoft Programmers Library 1.0 (August 1988) (ISO).7z",
+    "iso_filename": "MSPL10.iso",
+    "image_path": "Microsoft Programmers Library 1.0 (August 1988) (ISO)/MSPL10.iso",
+    "size_bytes": 552960000,
+    "image_sha256": "1fdc2186cc0aa3bda5f6b6c3a6ef53840159d87f005572823f4c9e6a9e64da80",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-programmers-library/10/Microsoft Programmers Library 1.0 (August 1988) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-programmers-library/10/Microsoft Programmers Library 1.0 (August 1988) (ISO).7z/Microsoft Programmers Library 1.0 (August 1988) (ISO)/MSPL10.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-programmers-library",
+    "release_slug": "11",
+    "archive_filename": "Microsoft Programmers Library 1.1a (June 1989) (ISO).7z",
+    "iso_filename": "Microsoft Programming's Library.ver.Version 1.1a.English.iso",
+    "image_path": "Microsoft Programmers Library 1.1a (June 1989) (ISO)/Microsoft Programming's Library.ver.Version 1.1a.English.iso",
+    "size_bytes": 333303808,
+    "image_sha256": "05ffb6fb77be7480ad2b85dd13cad4526b1eb21f7a45690a832e1fc02bed1dfe",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-programmers-library/11/Microsoft Programmers Library 1.1a (June 1989) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-programmers-library/11/Microsoft Programmers Library 1.1a (June 1989) (ISO).7z/Microsoft Programmers Library 1.1a (June 1989) (ISO)/Microsoft Programming's Library.ver.Version 1.1a.English.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-programmers-library",
+    "release_slug": "13",
+    "archive_filename": "Microsoft Programmers Library 1.3 (March 1991) (ISO).7z",
+    "iso_filename": "Microsoft-Programers-Library-v1.3.iso",
+    "image_path": "Microsoft Programmers Library 1.3 (March 1991) (ISO)/Microsoft-Programers-Library-v1.3.iso",
+    "size_bytes": 600610816,
+    "image_sha256": "910dd5eaf809c4c78d0a87e6c126a36d1cb3d54dff18a72edba8a55ac48c6933",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-programmers-library/13/Microsoft Programmers Library 1.3 (March 1991) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-programmers-library/13/Microsoft Programmers Library 1.3 (March 1991) (ISO).7z/Microsoft Programmers Library 1.3 (March 1991) (ISO)/Microsoft-Programers-Library-v1.3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "microsoft-word",
+    "release_slug": "2x-windows",
+    "archive_filename": "Microsoft Word 2.0c for Windows and Bookshelf [Gateway 2000 OEM] (ISO).7z",
+    "iso_filename": "wordbkshlf.iso",
+    "image_path": "Microsoft Word 2.0c for Windows and Bookshelf [Gateway 2000 OEM] (ISO)/wordbkshlf.iso",
+    "size_bytes": 680456192,
+    "image_sha256": "8208429eba167621e199a866e45fc327b4ec4da47226a1fe105bfe8249c8a9e5",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/microsoft-word/2x-windows/Microsoft Word 2.0c for Windows and Bookshelf [Gateway 2000 OEM] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/microsoft-word/2x-windows/Microsoft Word 2.0c for Windows and Bookshelf [Gateway 2000 OEM] (ISO).7z/Microsoft Word 2.0c for Windows and Bookshelf [Gateway 2000 OEM] (ISO)/wordbkshlf.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NeXT NEXTSTEP 3.1.7z",
+    "iso_filename": "NeXT Step 3.1 Intel dev.iso",
+    "image_path": "NeXT NEXTSTEP 3.1/NeXT Step 3.1 Intel dev.iso",
+    "size_bytes": 181133312,
+    "image_sha256": "a8adf7254891e4cc3386dee0c3f3654c20c472abaf5c26090f21f968bf97323b",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NeXT NEXTSTEP 3.1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NeXT NEXTSTEP 3.1.7z/NeXT NEXTSTEP 3.1/NeXT Step 3.1 Intel dev.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NeXT NEXTSTEP 3.1.7z",
+    "iso_filename": "NeXT Step 3.1 Intel.iso",
+    "image_path": "NeXT NEXTSTEP 3.1/NeXT Step 3.1 Intel.iso",
+    "size_bytes": 323739648,
+    "image_sha256": "75d6d7935122bdaaba392b19d2dd982a78516aae57fa8a5fc7d16a39677ea6fc",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NeXT NEXTSTEP 3.1.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NeXT NEXTSTEP 3.1.7z/NeXT NEXTSTEP 3.1/NeXT Step 3.1 Intel.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NeXT NEXTSTEP 3.3.7z",
+    "iso_filename": "nextstep_3.3_intel.iso",
+    "image_path": "NeXT NEXTSTEP 3.3/nextstep_3.3_intel.iso",
+    "size_bytes": 373768192,
+    "image_sha256": "3525538bdbab5b56c5a6fd4abb1570f1ee28ac7942b447ae6be76ed8643d4013",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NeXT NEXTSTEP 3.3.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NeXT NEXTSTEP 3.3.7z/NeXT NEXTSTEP 3.3/nextstep_3.3_intel.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NeXT NeXTSTEP 3.2 (CD) [M68K][x86].7z",
+    "iso_filename": "NEXTSTEP 3.2 (M68K)(x86).iso",
+    "image_path": "NeXT NeXTSTEP 3.2 (CD) [M68K][x86]/NEXTSTEP 3.2 (M68K)(x86).iso",
+    "size_bytes": 315047936,
+    "image_sha256": "5c091635340632ce1a609eccfeb94b2bc8404ea49659fdaa4f1d92525747b1ac",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NeXT NeXTSTEP 3.2 (CD) [M68K][x86].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NeXT NeXTSTEP 3.2 (CD) [M68K][x86].7z/NeXT NeXTSTEP 3.2 (CD) [M68K][x86]/NEXTSTEP 3.2 (M68K)(x86).iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NeXT NeXTSTEP 3.3.4.17 [Sun SPARC_ HP PARISC].7z",
+    "iso_filename": "nextstep33_risc.iso",
+    "image_path": "NeXT NeXTSTEP 3.3.4.17 [Sun SPARC, HP PARISC]/nextstep33_risc.iso",
+    "size_bytes": 369573888,
+    "image_sha256": "19dae66e6623a034508097117036371f22b4a3d220a44baead904c343a1f09ea",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NeXT NeXTSTEP 3.3.4.17 [Sun SPARC_ HP PARISC].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NeXT NeXTSTEP 3.3.4.17 [Sun SPARC_ HP PARISC].7z/NeXT NeXTSTEP 3.3.4.17 [Sun SPARC, HP PARISC]/nextstep33_risc.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "3x",
+    "archive_filename": "NextStep Nebula 1.0 Intel (August 1993) (ISO).7z",
+    "iso_filename": "nebula.iso",
+    "image_path": "NextStep Nebula 1.0 Intel (August 1993) (ISO)/nebula.iso",
+    "size_bytes": 614224800,
+    "image_sha256": "69f3c5581a5496b1799d3b777b537f13fdb29870580808889386cd3b9f479ef5",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/3x/NextStep Nebula 1.0 Intel (August 1993) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/3x/NextStep Nebula 1.0 Intel (August 1993) (ISO).7z/NextStep Nebula 1.0 Intel (August 1993) (ISO)/nebula.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "4x",
+    "archive_filename": "OPENSTEP 4.2 Enterprise.7z",
+    "iso_filename": "Openstep-4.2-Intel-Developer.iso",
+    "image_path": "OPENSTEP 4.2 Enterprise/Openstep-4.2-Intel-Developer.iso",
+    "size_bytes": 470536192,
+    "image_sha256": "968bf8ed84d764fdd12e2f9b92f4875dce62a468fb115262a1729b4bdf62c2b0",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/4x/OPENSTEP 4.2 Enterprise.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/4x/OPENSTEP 4.2 Enterprise.7z/OPENSTEP 4.2 Enterprise/Openstep-4.2-Intel-Developer.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "nextstep",
+    "release_slug": "4x",
+    "archive_filename": "OPENSTEP 4.2 Enterprise.7z",
+    "iso_filename": "Openstep-4.2-Intel-User.iso",
+    "image_path": "OPENSTEP 4.2 Enterprise/Openstep-4.2-Intel-User.iso",
+    "size_bytes": 512180224,
+    "image_sha256": "b2b38021a6e169a1a614e5e7700655e1b77d35e3f7d1062aa3f760242a6b7d3d",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/nextstep/4x/OPENSTEP 4.2 Enterprise.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/nextstep/4x/OPENSTEP 4.2 Enterprise.7z/OPENSTEP 4.2 Enterprise/Openstep-4.2-Intel-User.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "oracle-server",
+    "release_slug": "7",
+    "archive_filename": "Oracle 7 for DEC Alpha AXP OSF1 (7.0.16.4.1) (1994) (ISO) [AXP].7z",
+    "iso_filename": "Disk01.iso",
+    "image_path": "Oracle 7 for DEC Alpha AXP OSF1 (7.0.16.4.1) (1994) (ISO) [AXP]/Disk01.iso",
+    "size_bytes": 681881600,
+    "image_sha256": "eb95527b21e5ba61f402ba37de69d3954341c8aae1d7d94bf3a965936e356ac3",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/oracle-server/7/Oracle 7 for DEC Alpha AXP OSF1 (7.0.16.4.1) (1994) (ISO) [AXP].7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/oracle-server/7/Oracle 7 for DEC Alpha AXP OSF1 (7.0.16.4.1) (1994) (ISO) [AXP].7z/Oracle 7 for DEC Alpha AXP OSF1 (7.0.16.4.1) (1994) (ISO) [AXP]/Disk01.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "oracle-server",
+    "release_slug": "7",
+    "archive_filename": "Oracle 7 for Macintosh and AUX (1994) (ISO).7z",
+    "iso_filename": "oracle.iso",
+    "image_path": "Oracle 7 for Macintosh and AUX (1994) (ISO)/oracle.iso",
+    "size_bytes": 248936448,
+    "image_sha256": "43baf62d2beca1a408725953a7a687b674f1cf1ed8136e96aef7a94e8bd9dfe6",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/oracle-server/7/Oracle 7 for Macintosh and AUX (1994) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/oracle-server/7/Oracle 7 for Macintosh and AUX (1994) (ISO).7z/Oracle 7 for Macintosh and AUX (1994) (ISO)/oracle.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "os-2-developer-conne",
+    "release_slug": "vol-8",
+    "archive_filename": "IBM OS2 Developer Connection Volume 8.7z",
+    "iso_filename": "The Developer Connection OS2 v8-1995 disk-1.iso",
+    "image_path": "The Developer Connection OS2 v8-1995 disk-1.iso",
+    "size_bytes": 526454784,
+    "image_sha256": "ed338db350338981a0244b4b78378c5374e7d71b30360d83d75017ebbb3c1e55",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z/The Developer Connection OS2 v8-1995 disk-1.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "os-2-developer-conne",
+    "release_slug": "vol-8",
+    "archive_filename": "IBM OS2 Developer Connection Volume 8.7z",
+    "iso_filename": "The Developer Connection OS2 v8-1995 disk-2.iso",
+    "image_path": "The Developer Connection OS2 v8-1995 disk-2.iso",
+    "size_bytes": 589598720,
+    "image_sha256": "d1609f0c83e1336d5fbad1015f1aab80d86946dc202e7cc78c4f8bfd9647d1da",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z/The Developer Connection OS2 v8-1995 disk-2.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "os-2-developer-conne",
+    "release_slug": "vol-8",
+    "archive_filename": "IBM OS2 Developer Connection Volume 8.7z",
+    "iso_filename": "The Developer Connection OS2 v8-1995 disk-3.iso",
+    "image_path": "The Developer Connection OS2 v8-1995 disk-3.iso",
+    "size_bytes": 624551936,
+    "image_sha256": "d95d04e75871a475c6915cae91f508123a9e8d7927a7ad167f57c8359a52e2f4",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/os-2-developer-conne/vol-8/IBM OS2 Developer Connection Volume 8.7z/The Developer Connection OS2 v8-1995 disk-3.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "pagemill",
+    "release_slug": "30",
+    "archive_filename": "Adobe PageMill 3.0 for Macintosh (ISO).7z",
+    "iso_filename": "AdobePageMill.iso",
+    "image_path": "Adobe PageMill 3.0 for Macintosh (ISO)/AdobePageMill.iso",
+    "size_bytes": 373699440,
+    "image_sha256": "95df89c96cfe4a0485acbea3f91a9935c72f1ca92998a4215de4e691937f7ae5",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/pagemill/30/Adobe PageMill 3.0 for Macintosh (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/pagemill/30/Adobe PageMill 3.0 for Macintosh (ISO).7z/Adobe PageMill 3.0 for Macintosh (ISO)/AdobePageMill.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "sunos",
+    "release_slug": "4x",
+    "archive_filename": "SunOS 4.1.4 (CD) [Sun SPARC] (alt).7z",
+    "iso_filename": "sunos_4.1.4_install.iso",
+    "image_path": "SunOS 4.1.4 (CD) [Sun SPARC] (alt)/sunos_4.1.4_install.iso",
+    "size_bytes": 378178080,
+    "image_sha256": "6088d836cf582128cdd69661c4b62399fbd6f4db9b817188b2d1509cebbb5f48",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/sunos/4x/SunOS 4.1.4 (CD) [Sun SPARC] (alt).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/sunos/4x/SunOS 4.1.4 (CD) [Sun SPARC] (alt).7z/SunOS 4.1.4 (CD) [Sun SPARC] (alt)/sunos_4.1.4_install.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "vms",
+    "release_slug": "55x",
+    "archive_filename": "DEC VMS 5.5-2 (Nov 1991) [VAX] (ISO).7z",
+    "iso_filename": "OpenVMS552.iso",
+    "image_path": "DEC VMS 5.5-2 (Nov 1991) [VAX] (ISO)/OpenVMS552.iso",
+    "size_bytes": 205361152,
+    "image_sha256": "a207feb243ffb008769704e6bce12abd5019334ee009a4d4b23a222918d128ea",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/vms/55x/DEC VMS 5.5-2 (Nov 1991) [VAX] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/vms/55x/DEC VMS 5.5-2 (Nov 1991) [VAX] (ISO).7z/DEC VMS 5.5-2 (Nov 1991) [VAX] (ISO)/OpenVMS552.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "vms",
+    "release_slug": "55x",
+    "archive_filename": "DEC VMS 5.5-2H4 (Jul 1993) [VAX] (ISO).7z",
+    "iso_filename": "VMS 552h4 VAX.iso",
+    "image_path": "DEC VMS 5.5-2H4 (Jul 1993) [VAX] (ISO)/VMS 552h4 VAX.iso",
+    "size_bytes": 205508764,
+    "image_sha256": "88331ffe1439ecb593a74ea0ad48c639e4372bba48f7228b5da5d6e0c715ae56",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/vms/55x/DEC VMS 5.5-2H4 (Jul 1993) [VAX] (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/vms/55x/DEC VMS 5.5-2H4 (Jul 1993) [VAX] (ISO).7z/DEC VMS 5.5-2H4 (Jul 1993) [VAX] (ISO)/VMS 552h4 VAX.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "windows-nt-3x",
+    "release_slug": "nt-os-2",
+    "archive_filename": "Microsoft Windows NT 3.1 (10-16-1991) October 1991(ISO).7z",
+    "iso_filename": "k-nt1091.iso",
+    "image_path": "Microsoft Windows NT 3.1 (10-16-1991) October 1991(ISO)/k-nt1091.iso",
+    "size_bytes": 131612672,
+    "image_sha256": "d6326c4b567a1f15b321696dcfc1183f03c77d110cb8827f50fb71ecdeb15fc6",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-nt-3x/nt-os-2/Microsoft Windows NT 3.1 (10-16-1991) October 1991(ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-nt-3x/nt-os-2/Microsoft Windows NT 3.1 (10-16-1991) October 1991(ISO).7z/Microsoft Windows NT 3.1 (10-16-1991) October 1991(ISO)/k-nt1091.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "windows-resource-kit",
+    "release_slug": "2000",
+    "archive_filename": "Microsoft Windows NT 2000 Resource Kit.7z",
+    "iso_filename": "RESKIT2000.ISO",
+    "image_path": "RESKIT2000.ISO",
+    "size_bytes": 447362160,
+    "image_sha256": "122d58002880c962d9ab68d11b6d051a85fe70aec1531b03c8510189a8e37a34",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/windows-resource-kit/2000/Microsoft Windows NT 2000 Resource Kit.7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/windows-resource-kit/2000/Microsoft Windows NT 2000 Resource Kit.7z/RESKIT2000.ISO",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  },
+  {
+    "product_slug": "xenix",
+    "release_slug": "sysv-386-v3x",
+    "archive_filename": "SCO UNIX System V-386 4.2 (r3.2.4l) (1993) (ISO).7z",
+    "iso_filename": "disk01.iso",
+    "image_path": "SCO UNIX System V-386 4.2 (r3.2.4l) (1993) (ISO)/disk01.iso",
+    "size_bytes": 26112000,
+    "image_sha256": "50f53269bda18d493974a7c0c774c6ed7f029bcf4825c3d1039ff2c042f7d5b5",
+    "archive_nas_path": "/Volumes/Software/winworld-pc/archives/xenix/sysv-386-v3x/SCO UNIX System V-386 4.2 (r3.2.4l) (1993) (ISO).7z",
+    "extracted_iso_path": "/Volumes/Software/winworld-pc/extracted/xenix/sysv-386-v3x/SCO UNIX System V-386 4.2 (r3.2.4l) (1993) (ISO).7z/SCO UNIX System V-386 4.2 (r3.2.4l) (1993) (ISO)/disk01.iso",
+    "extracted_present": true,
+    "reason": "no-iso9660-pvd (HFS/hybrid?)",
+    "pycdlib_errors": [
+      "open failed: PyCdlibInvalidISO('Valid ISO9660 filesystems must have at least one PVD')"
+    ]
+  }
+]

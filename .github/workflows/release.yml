@@ -26,6 +26,14 @@ on:
         description: "Build cb-dos media (FreeDOS floppy + CD)"
         type: boolean
         default: true
+      runner_image:
+        # macOS runner image for the build-macos legs. Pinned (not
+        # `macos-latest`) so a run is deterministic during GitHub's
+        # macos-15 -> macos-26 migration, where `macos-latest` resolves to
+        # either image unpredictably. Override here to test another image.
+        description: "macOS runner image (default macos-26; override with macos-latest/macos-15)"
+        required: false
+        default: macos-26
 
 permissions:
   contents: write
@@ -178,9 +186,15 @@ jobs:
     # Skipped only when a manual run unticks "desktop"; every push builds it.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
     needs: generate-version
-    # arm64 builds+tests on Apple-silicon; x64 builds+tests natively on a real
-    # Intel runner (no Rosetta), so `cargo test` runs on each arch's hardware.
-    runs-on: ${{ matrix.runs-on }}
+    # Both arches build on the same Apple-silicon runner: arm64 natively, x64
+    # cross-compiled (macOS ships a universal SDK, so an arm64 host emits the
+    # x86_64 slice). This drops the separate `macos-*-intel` runner, whose
+    # `actions/cache` step routinely hung on Intel's slow I/O (the recent flaky
+    # x64 build failures). The arm64 leg runs the test suite on its own
+    # hardware; the x64 leg is build-only (no native x86_64 execution here).
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    # Guard against a hung `actions/cache` sitting for the default 6 hours.
+    timeout-minutes: 60
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
       # See build-windows: keep APP_VERSION consistent across Test and Build.
@@ -190,10 +204,8 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             arch: arm64
-            runs-on: macos-latest
           - target: x86_64-apple-darwin
             arch: x64
-            runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v6
 
@@ -220,10 +232,14 @@ jobs:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      # Tests run upfront on this leg's native hardware. Failure fails the job,
-      # which blocks the release (the release job needs every build job).
-      # --release shares compilation with the Build step below.
+      # Tests run upfront on the arm64 leg's native hardware. Failure fails the
+      # job, which blocks the release (the release job needs every build job).
+      # --release shares compilation with the Build step below. The x64 leg is
+      # cross-compiled on this arm64 runner, so its x86_64 test binaries can't
+      # execute natively — it skips the suite and only builds. arm64 already
+      # exercises the same (little-endian, 64-bit) logic on real hardware.
       - name: Test
+        if: ${{ matrix.arch == 'arm64' }}
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Build
@@ -318,39 +334,37 @@ jobs:
             codesign --force --deep --sign - "${BUNDLE_NAME}"
           fi
 
-          # Free disk before building the DMG. The intel runner
-          # (macos-26-intel) has tight disk, and hdiutil needs room to stage a
-          # copy of the .app plus the compressed image; the x64 leg was failing
-          # here with "hdiutil: create failed - No space left on device".
-          #
-          # NOTE: a full `cargo clean` would delete target/.../release/rb-cli,
-          # which the later "Sign CLI binary" / "Package CLI for notarization"
-          # steps still need. So drop only the build intermediates (the multi-GB
-          # bulk) and keep both final binaries: rusty-backup is already copied
-          # into the .app above, and rb-cli stays at the release/ root.
-          echo "== Disk before cleanup =="; df -h .
-          du -sh "target/${{ matrix.target }}/release" 2>/dev/null || true
-          # Only the intel runner is disk-constrained. Guard the cleanup to it so
-          # arm64's build cache (which works fine) is left intact — deleting deps/
-          # would otherwise strip intermediates from the saved cache and force a
-          # full rebuild next run.
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            rm -rf \
-              "target/${{ matrix.target }}/release/deps" \
-              "target/${{ matrix.target }}/release/build" \
-              "target/${{ matrix.target }}/release/incremental" \
-              "target/${{ matrix.target }}/release/.fingerprint"
-            echo "== Disk after cleanup =="; df -h .
-          fi
-
-          # Create DMG (stage the app alongside an /Applications symlink so
-          # users can drag-install)
+          # Stage the app alongside an /Applications symlink so users can
+          # drag-install.
           DMG_STAGING="dmg-staging"
           rm -rf "${DMG_STAGING}"
           mkdir -p "${DMG_STAGING}"
           cp -R "${BUNDLE_NAME}" "${DMG_STAGING}/"
           ln -s /Applications "${DMG_STAGING}/Applications"
-          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" -ov -format UDZO "Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+
+          # Build the DMG with an EXPLICIT size instead of letting
+          # `hdiutil create -srcfolder ... -format UDZO` auto-size the scratch
+          # image. That auto-sizing under-estimates and then ENOSPCs *inside the
+          # temporary image* while copying the large rusty-backup GUI binary in:
+          #   hdiutil: create failed - No space left on device
+          #   could not access /Volumes/Rusty Backup/.../rusty-backup - No space left...
+          # (the host volume had ~95 GB free — it was never the runner disk).
+          # The bigger x64 binary tips past the under-estimate that arm64 slips
+          # under, so only the x64 leg failed. Fix: size from the staging folder
+          # + generous headroom, make a read/write HFS+ image, then convert to
+          # the compressed UDZO we ship. The slack compresses away in UDZO, so
+          # the final .dmg is unaffected.
+          DMG_FILE="Rusty-Backup-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg"
+          RW_DMG="rw-staging.dmg"
+          STAGE_KB=$(du -sk "${DMG_STAGING}" | cut -f1)
+          # +40% and a 200 MB floor of headroom for the HFS+ catalog/bitmap.
+          SIZE_KB=$(( STAGE_KB * 14 / 10 + 204800 ))
+          echo "Staging ${STAGE_KB} KB -> read/write image ${SIZE_KB} KB"
+          rm -f "${RW_DMG}" "${DMG_FILE}"
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${DMG_STAGING}" \
+            -fs HFS+ -format UDRW -size "${SIZE_KB}k" -ov "${RW_DMG}"
+          hdiutil convert "${RW_DMG}" -format UDZO -ov -o "${DMG_FILE}"
+          rm -f "${RW_DMG}"
           echo "== Disk after DMG =="; df -h .
 
           # Sign the DMG as well if certificate is available
