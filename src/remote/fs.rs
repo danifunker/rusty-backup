@@ -146,6 +146,19 @@ impl Filesystem for RemoteFilesystem {
             .map_err(wire_err)
     }
 
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        // The daemon reads the fork off its open image and streams it back, so a
+        // remote export preserves Mac resource forks. Empty stream (0) when the
+        // file has none.
+        lock_conn(&self.conn)?
+            .read_resource_fork(self.handle, &entry.path, writer)
+            .map_err(wire_err)
+    }
+
     fn volume_label(&self) -> Option<&str> {
         self.volume_label.as_deref()
     }
@@ -310,6 +323,7 @@ fn wire_to_entry(w: WireEntry) -> FileEntry {
         creator_code,
         prodos_file_type,
         symlink_target,
+        resource_fork_size,
     } = w;
     let mut e = match kind {
         WireKind::Dir => FileEntry::new_directory(name, path, 0),
@@ -322,6 +336,7 @@ fn wire_to_entry(w: WireEntry) -> FileEntry {
     e.type_code = type_code;
     e.creator_code = creator_code;
     e.prodos_file_type = prodos_file_type;
+    e.resource_fork_size = resource_fork_size;
     e
 }
 
@@ -340,6 +355,7 @@ mod tests {
             creator_code: None,
             prodos_file_type: None,
             symlink_target: None,
+            resource_fork_size: None,
         });
         assert!(dir.is_directory());
         assert_eq!(dir.path, "/SUB");
@@ -353,11 +369,13 @@ mod tests {
             creator_code: Some(*b"ttxt"),
             prodos_file_type: None,
             symlink_target: None,
+            resource_fork_size: Some(567),
         });
         assert!(!file.is_directory());
         assert_eq!(file.size, 1234);
         assert_eq!(file.type_code, Some(*b"TEXT"));
         assert_eq!(file.creator_code, Some(*b"ttxt"));
+        assert_eq!(file.resource_fork_size, Some(567), "rsrc size round-trips");
 
         let link = wire_to_entry(WireEntry {
             name: "LN".into(),
@@ -368,6 +386,7 @@ mod tests {
             creator_code: None,
             prodos_file_type: None,
             symlink_target: Some("/target".into()),
+            resource_fork_size: None,
         });
         assert_eq!(link.symlink_target.as_deref(), Some("/target"));
     }

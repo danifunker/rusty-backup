@@ -25,6 +25,7 @@ pub mod exfat_clone;
 pub mod ext;
 pub mod fat;
 pub mod filesystem;
+pub mod fork_export;
 pub mod fsck;
 pub mod hfs;
 pub mod hfs_boot;

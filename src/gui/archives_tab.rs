@@ -72,6 +72,9 @@ struct ExtractStatus {
 }
 
 pub struct ArchivesTab {
+    /// MRU of opened archive paths (newest first), mirrored to `config.json` —
+    /// the "Recent:" quick-pick row.
+    recent_files: Vec<String>,
     archive_path: Option<PathBuf>,
     prev_path: Option<PathBuf>,
     loaded: Option<Loaded>,
@@ -87,6 +90,7 @@ pub struct ArchivesTab {
 impl Default for ArchivesTab {
     fn default() -> Self {
         Self {
+            recent_files: super::load_recent(rusty_backup::update::RecentMode::Archives),
             archive_path: None,
             prev_path: None,
             loaded: None,
@@ -135,7 +139,23 @@ impl ArchivesTab {
     /// change). Used when the Inspect tab redirects a picked Mac-archive file
     /// here instead of trying to parse it as a disk image.
     pub fn open_path(&mut self, path: PathBuf) {
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Archives, &path);
         self.archive_path = Some(path);
+    }
+
+    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
+    /// the persisted lists; the mirror otherwise only reloads at construction).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
+    }
+
+    /// Unload the current archive (the "Close" button). Leaves the recent list
+    /// intact so the user can re-open.
+    pub fn close(&mut self) {
+        self.archive_path = None;
+        self.prev_path = None;
+        self.loaded = None;
+        self.load_error = None;
     }
 
     /// Spawn the background extractor. When `selected_only` is true,
@@ -279,8 +299,19 @@ impl ArchivesTab {
                     .add_filter("All Files", &["*"])
                     .pick_file()
                 {
-                    self.archive_path = Some(path);
+                    self.open_path(path);
                 }
+            }
+            if self.archive_path.is_some()
+                && ui
+                    .add_enabled(!running, egui::Button::new("Close"))
+                    .on_hover_text("Unload the current archive")
+                    .clicked()
+            {
+                self.close();
+            }
+            if let Some(path) = super::recent_combo(ui, "archives_recent", &self.recent_files, 0) {
+                self.open_path(path);
             }
         });
 

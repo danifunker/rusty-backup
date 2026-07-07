@@ -89,6 +89,17 @@ impl RemoteConnection {
         self.session.read_file(handle, path, sink)
     }
 
+    /// Stream one file's resource-fork bytes (from inside an opened image) into
+    /// `sink`. Returns 0 for a file with no resource fork.
+    pub fn read_resource_fork(
+        &mut self,
+        handle: u64,
+        path: &str,
+        sink: &mut dyn Write,
+    ) -> Result<u64> {
+        self.session.read_resource_fork(handle, path, sink)
+    }
+
     // --- host filesystem (the file browser) --------------------------------
 
     /// Classify a host path on the daemon: `(exists, is_dir)`.

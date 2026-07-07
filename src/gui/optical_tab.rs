@@ -62,6 +62,9 @@ pub struct OpticalTab {
     /// MRU of daemon addresses (newest first), mirrored to `config.json` — the
     /// "Add remote daemon" dialog's quick-pick list.
     recent_daemons: Vec<String>,
+    /// MRU of opened disc-image paths (newest first), mirrored to `config.json`
+    /// — the image-file "Recent:" quick-pick row.
+    recent_files: Vec<String>,
     image_file_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
     disc_info_error: Option<String>,
@@ -98,6 +101,7 @@ impl Default for OpticalTab {
             add_remote_error: None,
             add_remote_status: None,
             recent_daemons: UpdateConfig::load().recent_daemon_addrs,
+            recent_files: super::load_recent(rusty_backup::update::RecentMode::Optical),
             image_file_path: None,
             disc_info: None,
             disc_info_error: None,
@@ -162,6 +166,28 @@ impl OpticalTab {
 
     pub fn drive_count(&self) -> usize {
         self.rip_devices.len()
+    }
+
+    /// True while a disc's contents are being browsed. The drag-and-drop router
+    /// checks this so dropping a file mid-browse doesn't clobber the open disc.
+    pub fn is_browsing(&self) -> bool {
+        self.browse_view.is_active()
+    }
+
+    /// Open `path` as the image-file source (used by the drag-and-drop router
+    /// when the Optical tab is active). Sets the source mode to Image file and
+    /// points at the dropped path; `show()` auto-detects the disc on the next
+    /// frame via the `image_file_path != prev_image_path` check.
+    pub fn open_image(&mut self, path: PathBuf) {
+        self.source_mode = SourceMode::ImageFile;
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Optical, &path);
+        self.image_file_path = Some(path);
+    }
+
+    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
+    /// the persisted lists; the mirror otherwise only reloads at construction).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
     }
 
     /// Poll the background "Add remote daemon" connect; on success add the
@@ -399,8 +425,13 @@ impl OpticalTab {
                                 .add_filter("All Files", &["*"])
                                 .pick_file()
                             {
-                                self.image_file_path = Some(path);
+                                self.open_image(path);
                             }
+                        }
+                        if let Some(path) =
+                            super::recent_combo(ui, "optical_recent", &self.recent_files, 5)
+                        {
+                            self.open_image(path);
                         }
                     });
                 }

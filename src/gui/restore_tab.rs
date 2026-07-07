@@ -105,6 +105,10 @@ pub struct RestoreTab {
     // Mode
     restore_mode: RestoreMode,
 
+    /// MRU of opened backup-folder paths (newest first), mirrored to
+    /// `config.json` — the "Recent:" quick-pick row.
+    recent_files: Vec<String>,
+
     // Source (Full Disk + Single Partition)
     backup_folder: Option<PathBuf>,
     backup_metadata: Option<BackupMetadata>,
@@ -188,6 +192,7 @@ impl Default for RestoreTab {
     fn default() -> Self {
         Self {
             restore_mode: RestoreMode::FullDisk,
+            recent_files: super::load_recent(rusty_backup::update::RecentMode::Restore),
             backup_folder: None,
             backup_metadata: None,
             clonezilla_image: None,
@@ -245,6 +250,40 @@ impl RestoreTab {
             // Force reload on next show
             self.prev_backup_folder = None;
         }
+    }
+
+    /// Open a dropped path (drag-and-drop router). A directory is treated as a
+    /// backup folder (full-disk restore); a file is treated as a single-
+    /// partition source image. Mirrors the tab's two `Browse...` handlers so
+    /// drag-and-drop behaves the same as the picker.
+    pub fn open_dropped(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.restore_mode = RestoreMode::FullDisk;
+            self.load_backup(&path);
+        } else {
+            self.restore_mode = RestoreMode::SinglePartition;
+            match super::prepare_disk_image_path(&path, true) {
+                Ok((materialized, guard)) => {
+                    self.sp_image_file = Some(materialized);
+                    self.sp_amiga_tempdir = guard;
+                }
+                Err(e) => {
+                    log::error!("Failed to decompress {}: {}", path.display(), e);
+                    self.sp_image_file = Some(path);
+                    self.sp_amiga_tempdir = None;
+                }
+            }
+            self.backup_folder = None;
+            self.backup_metadata = None;
+            self.sp_source_partition_idx = None;
+            self.prev_backup_folder = None;
+        }
+    }
+
+    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
+    /// the persisted lists; the mirror otherwise only reloads at construction).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
     }
 
     pub fn clear_backup(&mut self) {
@@ -330,6 +369,11 @@ impl RestoreTab {
                 }
             });
         });
+        if controls_enabled {
+            if let Some(path) = super::recent_combo(ui, "restore_recent", &self.recent_files, 0) {
+                self.open_dropped(path);
+            }
+        }
 
         // Auto-load metadata when folder changes
         if !self.restore_running {
@@ -1121,6 +1165,10 @@ impl RestoreTab {
             Some(f) => f.clone(),
             None => return,
         };
+        // Single choke point for backup-folder opens across all three restore
+        // modes (they each call this on a folder change): record in the Restore
+        // recent-backups MRU.
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Restore, &folder);
 
         let metadata_path = folder.join("metadata.json");
         if metadata_path.exists() {

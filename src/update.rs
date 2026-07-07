@@ -30,6 +30,88 @@ pub struct UpdateConfig {
     /// handful of entries.
     #[serde(default)]
     pub recent_daemon_addrs: Vec<String>,
+    /// Per-mode recent-files history for the GUI "Recent" quick-pick lists
+    /// (Inspect, Restore, Optical, Archives, Commander). Each list is
+    /// newest-first, deduped, and capped; see [`RecentFiles`].
+    #[serde(default)]
+    pub recent_files: RecentFiles,
+}
+
+/// Per-mode most-recently-used file/folder history for the GUI's "Recent"
+/// pickers. Each mode keeps its own list so, e.g., disc images opened on the
+/// Optical tab don't clutter the Inspect tab's history. Lists are newest-first,
+/// deduped, and capped to [`RecentFiles::CAP`]; paths are stored as display
+/// strings. Every field is `#[serde(default)]` so a config.json written by an
+/// older build (no `recent_files` key, or missing a mode) still parses.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub struct RecentFiles {
+    #[serde(default)]
+    pub inspect: Vec<String>,
+    #[serde(default)]
+    pub restore: Vec<String>,
+    #[serde(default)]
+    pub optical: Vec<String>,
+    #[serde(default)]
+    pub archives: Vec<String>,
+    #[serde(default)]
+    pub commander: Vec<String>,
+    #[serde(default)]
+    pub backup: Vec<String>,
+}
+
+impl RecentFiles {
+    /// Maximum entries retained per mode.
+    pub const CAP: usize = 10;
+
+    /// The (newest-first) recent list for `mode`.
+    pub fn list(&self, mode: RecentMode) -> &[String] {
+        match mode {
+            RecentMode::Inspect => &self.inspect,
+            RecentMode::Restore => &self.restore,
+            RecentMode::Optical => &self.optical,
+            RecentMode::Archives => &self.archives,
+            RecentMode::Commander => &self.commander,
+            RecentMode::Backup => &self.backup,
+        }
+    }
+
+    fn list_mut(&mut self, mode: RecentMode) -> &mut Vec<String> {
+        match mode {
+            RecentMode::Inspect => &mut self.inspect,
+            RecentMode::Restore => &mut self.restore,
+            RecentMode::Optical => &mut self.optical,
+            RecentMode::Archives => &mut self.archives,
+            RecentMode::Commander => &mut self.commander,
+            RecentMode::Backup => &mut self.backup,
+        }
+    }
+
+    /// Total remembered entries across every mode. Drives the Settings "Clear
+    /// Recent Files" affordance (count shown, button disabled when zero).
+    pub fn total(&self) -> usize {
+        self.inspect.len()
+            + self.restore.len()
+            + self.optical.len()
+            + self.archives.len()
+            + self.commander.len()
+            + self.backup.len()
+    }
+
+    /// Forget every mode's recent list.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Which GUI mode a recent-files list belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentMode {
+    Inspect,
+    Restore,
+    Optical,
+    Archives,
+    Commander,
+    Backup,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -96,6 +178,7 @@ impl Default for UpdateConfig {
             file_associations_enabled: false,
             assoc_registered_version: None,
             recent_daemon_addrs: Vec::new(),
+            recent_files: RecentFiles::default(),
         }
     }
 }
@@ -179,6 +262,20 @@ impl UpdateConfig {
         self.recent_daemon_addrs.retain(|a| a != addr);
         self.recent_daemon_addrs.insert(0, addr.to_string());
         self.recent_daemon_addrs.truncate(8);
+    }
+
+    /// Record a successfully-opened path in the per-mode recent-files MRU
+    /// (dedup, newest first, capped to [`RecentFiles::CAP`]). No-op for a blank
+    /// path.
+    pub fn remember_file(&mut self, mode: RecentMode, path: &str) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let list = self.recent_files.list_mut(mode);
+        list.retain(|p| p != path);
+        list.insert(0, path.to_string());
+        list.truncate(RecentFiles::CAP);
     }
 }
 
@@ -404,5 +501,55 @@ mod tests {
         }
         assert_eq!(cfg.recent_daemon_addrs.len(), 8);
         assert_eq!(cfg.recent_daemon_addrs[0], "h:9");
+    }
+
+    #[test]
+    fn remember_file_is_per_mode_mru_deduped_capped() {
+        let mut cfg = UpdateConfig::default();
+        cfg.remember_file(RecentMode::Inspect, "/a.img");
+        cfg.remember_file(RecentMode::Inspect, "/b.img");
+        // Re-using a path moves it to the front (no duplicate).
+        cfg.remember_file(RecentMode::Inspect, "/a.img");
+        assert_eq!(
+            cfg.recent_files.list(RecentMode::Inspect),
+            ["/a.img", "/b.img"]
+        );
+        // Lists are per-mode: Optical is independent of Inspect.
+        cfg.remember_file(RecentMode::Optical, "/disc.iso");
+        assert_eq!(cfg.recent_files.list(RecentMode::Optical), ["/disc.iso"]);
+        assert_eq!(cfg.recent_files.list(RecentMode::Inspect).len(), 2);
+        // Blank / whitespace is ignored.
+        cfg.remember_file(RecentMode::Inspect, "   ");
+        assert_eq!(cfg.recent_files.list(RecentMode::Inspect).len(), 2);
+        // Capped at CAP, newest first.
+        for i in 0..(RecentFiles::CAP + 5) {
+            cfg.remember_file(RecentMode::Inspect, &format!("/f{i}.img"));
+        }
+        assert_eq!(
+            cfg.recent_files.list(RecentMode::Inspect).len(),
+            RecentFiles::CAP
+        );
+        assert_eq!(
+            cfg.recent_files.list(RecentMode::Inspect)[0],
+            format!("/f{}.img", RecentFiles::CAP + 4)
+        );
+    }
+
+    #[test]
+    fn recent_files_total_and_clear() {
+        let mut cfg = UpdateConfig::default();
+        assert_eq!(cfg.recent_files.total(), 0);
+        cfg.remember_file(RecentMode::Inspect, "/a.img");
+        cfg.remember_file(RecentMode::Inspect, "/b.img");
+        cfg.remember_file(RecentMode::Optical, "/disc.iso");
+        cfg.remember_file(RecentMode::Commander, "/c.hda");
+        // total() sums across every mode.
+        assert_eq!(cfg.recent_files.total(), 4);
+        // clear() forgets every mode at once.
+        cfg.recent_files.clear();
+        assert_eq!(cfg.recent_files.total(), 0);
+        assert!(cfg.recent_files.list(RecentMode::Inspect).is_empty());
+        assert!(cfg.recent_files.list(RecentMode::Optical).is_empty());
+        assert!(cfg.recent_files.list(RecentMode::Commander).is_empty());
     }
 }

@@ -91,6 +91,10 @@ pub enum Request {
     ListDir { handle: u64, path: String },
     /// Stream one file's bytes (reply: `FileBegin`, then a chunk stream).
     ReadFile { handle: u64, path: String },
+    /// Stream one file's **resource fork** bytes (reply: `FileBegin` with the
+    /// resource-fork size, then a chunk stream). Empty stream for a file with no
+    /// resource fork. Lets a remote export preserve Mac forks.
+    ReadResourceFork { handle: u64, path: String },
     /// Drop an opened-image handle.
     Close { handle: u64 },
 
@@ -306,6 +310,11 @@ pub struct WireEntry {
     /// ProDOS 1-byte file type (ProDOS has no OSType). `None` elsewhere.
     pub prodos_file_type: Option<u8>,
     pub symlink_target: Option<String>,
+    /// Resource-fork size in bytes, so a remote browse shows the RSRC column.
+    /// `#[serde(default)]` keeps older peers (which never send it) parseable.
+    /// `None`/`Some(0)` means no resource fork.
+    #[serde(default)]
+    pub resource_fork_size: Option<u64>,
 }
 
 /// Entry kind over the wire — mirrors [`crate::fs::entry::EntryType`].
@@ -336,6 +345,7 @@ impl WireEntry {
             creator_code: e.creator_code,
             prodos_file_type: e.prodos_file_type,
             symlink_target: e.symlink_target.clone(),
+            resource_fork_size: e.resource_fork_size,
         }
     }
 

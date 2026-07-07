@@ -4,13 +4,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusty_backup::clonezilla::block_cache::PartcloneBlockCache;
 use rusty_backup::fs::entry::{EntryType, FileEntry};
 use rusty_backup::fs::filesystem::Filesystem;
+use rusty_backup::fs::fork_export;
 use rusty_backup::fs::resource_fork::{self, ResourceForkMode};
 use rusty_backup::fs::zstd_stream::ZstdStreamCache;
 use rusty_backup::macarchive::detect::{detect_mac_archive, MacArchiveKind};
@@ -1958,7 +1958,6 @@ impl BrowseView {
     fn launch_extraction(&mut self, entry: FileEntry, dest: PathBuf) {
         let session = self.session.clone();
         let resource_fork_mode = self.resource_fork_mode;
-        let is_hfs = self.is_hfs_type();
         let is_prodos = self.is_prodos_type();
         let prodos_export_mode = self.prodos_export_mode;
 
@@ -1984,7 +1983,6 @@ impl BrowseView {
                 &entry,
                 &dest,
                 resource_fork_mode,
-                is_hfs,
                 is_prodos,
                 prodos_export_mode,
                 &progress,
@@ -5277,7 +5275,6 @@ fn run_extraction(
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
-    is_hfs: bool,
     is_prodos: bool,
     prodos_export_mode: ProdosExportMode,
     progress: &Arc<Mutex<ExtractionProgress>>,
@@ -5300,7 +5297,6 @@ fn run_extraction(
         entry,
         dest,
         resource_fork_mode,
-        is_hfs,
         is_prodos,
         prodos_export_mode,
         progress,
@@ -5348,7 +5344,6 @@ fn extract_entry(
     entry: &FileEntry,
     dest: &std::path::Path,
     resource_fork_mode: ResourceForkMode,
-    is_hfs: bool,
     is_prodos: bool,
     prodos_export_mode: ProdosExportMode,
     progress: &Arc<Mutex<ExtractionProgress>>,
@@ -5383,151 +5378,18 @@ fn extract_entry(
                 p.current_file = entry.path.clone();
             }
 
-            let has_rsrc = is_hfs && entry.resource_fork_size.map(|s| s > 0).unwrap_or(false);
-
-            if has_rsrc && resource_fork_mode == ResourceForkMode::MacBinary {
-                // MacBinary: single .bin file containing both forks
-                let data = fs.read_file(entry, usize::MAX)?;
-                let mut rsrc_buf = Vec::new();
-                fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
-
-                let type_code = entry.type_code.unwrap_or([0; 4]);
-                let creator_code = entry.creator_code.unwrap_or([0; 4]);
-                // HFS/HFS+ catalog dates are raw Mac-1904 seconds — the exact
-                // MacBinary encoding — so carry them straight through.
-                let dates = entry
-                    .mac_dates
-                    .map(|(created, modified, _backup)| resource_fork::MacFileDates {
-                        created,
-                        modified,
-                    })
-                    .unwrap_or_default();
-
-                let mb = resource_fork::build_macbinary(
-                    &safe_name,
-                    &type_code,
-                    &creator_code,
-                    dates,
-                    &data,
-                    &rsrc_buf,
-                );
-                let out_path = dest.join(format!("{safe_name}.bin"));
-                let mut f = BufWriter::new(File::create(&out_path)?);
-                f.write_all(&mb)?;
-                f.flush()?;
-
-                if let Ok(mut p) = progress.lock() {
-                    p.current_bytes += data.len() as u64 + rsrc_buf.len() as u64;
-                    p.files_extracted += 1;
-                }
-            } else if resource_fork_mode == ResourceForkMode::BinHex {
-                // BinHex: single .hqx text file with both forks + Finder info.
-                // Always applicable to a file, even with no resource fork.
-                let data = fs.read_file(entry, usize::MAX)?;
-                let mut rsrc_buf = Vec::new();
-                if has_rsrc {
-                    fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
-                }
-
-                let type_code = entry.type_code.unwrap_or([0; 4]);
-                let creator_code = entry.creator_code.unwrap_or([0; 4]);
-
-                let bh = rusty_backup::fs::binhex::BinHexFile {
-                    // Preserve the original Mac name inside the archive.
-                    name: entry.name.clone(),
-                    type_code,
-                    creator_code,
-                    flags: 0,
-                    data_fork: data,
-                    resource_fork: rsrc_buf,
-                };
-                let text = rusty_backup::fs::binhex::build_binhex(&bh);
-                let out_path = dest.join(format!("{safe_name}.hqx"));
-                let mut f = BufWriter::new(File::create(&out_path)?);
-                f.write_all(text.as_bytes())?;
-                f.flush()?;
-
-                if let Ok(mut p) = progress.lock() {
-                    p.current_bytes += bh.data_fork.len() as u64 + bh.resource_fork.len() as u64;
-                    p.files_extracted += 1;
-                }
-            } else {
-                // Write data fork
-                let out_path = dest.join(&safe_name);
-                let mut f = BufWriter::new(File::create(&out_path)?);
-                let written = fs.write_file_to(entry, &mut f)?;
-                f.flush()?;
-
-                if let Ok(mut p) = progress.lock() {
-                    p.current_bytes += written;
-                }
-
-                if is_hfs && resource_fork_mode != ResourceForkMode::DataForkOnly {
-                    let type_code = entry.type_code.unwrap_or([0; 4]);
-                    let creator_code = entry.creator_code.unwrap_or([0; 4]);
-                    let has_finfo = type_code != [0; 4] || creator_code != [0; 4];
-                    // HFS/HFS+ catalog dates are raw Mac-1904 seconds; carry them
-                    // into the AppleDouble File Dates Info entry when present.
-                    let dates = entry
-                        .mac_dates
-                        .map(|(created, modified, _backup)| resource_fork::MacFileDates {
-                            created,
-                            modified,
-                        })
-                        .unwrap_or_default();
-
-                    let mut rsrc_buf = Vec::new();
-                    if has_rsrc {
-                        fs.write_resource_fork_to(entry, &mut rsrc_buf)?;
-                    }
-
-                    if has_rsrc || has_finfo {
-                        // Per-mode `has_rsrc` gates are explicit on purpose:
-                        // the Native + SeparateRsrc paths only emit when a
-                        // resource fork is present, while AppleDouble always
-                        // emits (it carries Finder Info too).
-                        #[allow(clippy::collapsible_match)]
-                        match resource_fork_mode {
-                            ResourceForkMode::Native => {
-                                if has_rsrc {
-                                    let rsrc_path = out_path.join("..namedfork/rsrc");
-                                    let mut rf = BufWriter::new(File::create(&rsrc_path)?);
-                                    rf.write_all(&rsrc_buf)?;
-                                    rf.flush()?;
-                                }
-                            }
-                            ResourceForkMode::AppleDouble => {
-                                let ad = resource_fork::build_appledouble(
-                                    &type_code,
-                                    &creator_code,
-                                    dates,
-                                    &rsrc_buf,
-                                );
-                                let ad_path = dest.join(format!("._{safe_name}"));
-                                let mut af = BufWriter::new(File::create(&ad_path)?);
-                                af.write_all(&ad)?;
-                                af.flush()?;
-                            }
-                            ResourceForkMode::SeparateRsrc => {
-                                if has_rsrc {
-                                    let rsrc_path = dest.join(format!("{safe_name}.rsrc"));
-                                    let mut rf = BufWriter::new(File::create(&rsrc_path)?);
-                                    rf.write_all(&rsrc_buf)?;
-                                    rf.flush()?;
-                                }
-                            }
-                            _ => {}
-                        }
-
-                        if let Ok(mut p) = progress.lock() {
-                            p.current_bytes += rsrc_buf.len() as u64;
-                        }
-                    }
-                }
-
-                if let Ok(mut p) = progress.lock() {
-                    p.files_extracted += 1;
-                }
+            // All fork formats (MacBinary / BinHex / AppleDouble / Native /
+            // SeparateRsrc / DataForkOnly) go through the shared per-file
+            // exporter so the browse view and Commander produce identical output.
+            // `safe_name` carries any ProDOS `#TTAAAA` suffix computed above.
+            let written =
+                fork_export::export_file_with_fork(fs, entry, dest, &safe_name, resource_fork_mode)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("{e:#}").into()
+                    })?;
+            if let Ok(mut p) = progress.lock() {
+                p.current_bytes += written;
+                p.files_extracted += 1;
             }
         }
         EntryType::Directory => {
@@ -5541,7 +5403,6 @@ fn extract_entry(
                     child,
                     &dir_path,
                     resource_fork_mode,
-                    is_hfs,
                     is_prodos,
                     prodos_export_mode,
                     progress,

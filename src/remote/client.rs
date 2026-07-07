@@ -138,6 +138,30 @@ impl RemoteSession {
         }
     }
 
+    /// Stream a single file's **resource fork** bytes into `sink`, returning the
+    /// byte count (0 for a file with no resource fork). Lets a remote export
+    /// preserve Mac forks.
+    pub fn read_resource_fork(
+        &mut self,
+        handle: u64,
+        path: &str,
+        sink: &mut dyn Write,
+    ) -> Result<u64> {
+        write_control(
+            &mut self.writer,
+            &Request::ReadResourceFork {
+                handle,
+                path: path.to_string(),
+            },
+        )?;
+        match self.read_response()? {
+            Response::FileBegin { .. } => read_chunks(&mut self.reader, sink)
+                .map_err(|e| anyhow!("reading resource fork of {path}: {e}")),
+            Response::Error { message } => bail!("read resource fork of {path}: {message}"),
+            other => bail!("unexpected reply to ReadResourceFork: {other:?}"),
+        }
+    }
+
     /// Drop an opened-image handle on the daemon (the read-side `Close`). The
     /// daemon's handle table is per-connection, so closing a handle frees its
     /// open image without affecting other handles on the same session.

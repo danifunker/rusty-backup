@@ -9,8 +9,8 @@ use std::net::TcpListener;
 use std::sync::Arc;
 
 use rusty_backup::cli::resolve::resolve_partition_rw;
-use rusty_backup::fs::filesystem::{CreateFileOptions, Filesystem};
-use rusty_backup::fs::{fat, open_editable_filesystem};
+use rusty_backup::fs::filesystem::{CreateFileOptions, Filesystem, ResourceForkSource};
+use rusty_backup::fs::{fat, hfs, open_editable_filesystem};
 use rusty_backup::remote::{serve_on, RemoteConnection, RemoteFilesystem, RemoteHostFilesystem};
 
 /// Build an 8 MiB FAT image at `path` with a single file `file_name` full of
@@ -134,6 +134,163 @@ fn remote_filesystem_browses_and_reads_over_loopback() {
     let mut got = Vec::new();
     host_fs.write_file_to(notes, &mut got).unwrap();
     assert_eq!(got, note, "host-file read must be byte-exact");
+}
+
+/// Build a bare classic-HFS image (superfloppy, no partition table) with one
+/// file carrying both a data fork and a resource fork.
+fn make_hfs_image_with_fork(
+    path: &std::path::Path,
+    vol: &str,
+    file_name: &str,
+    data: &[u8],
+    rsrc: &[u8],
+) {
+    std::fs::write(
+        path,
+        hfs::create_blank_hfs(4 * 1024 * 1024, 512, vol).unwrap(),
+    )
+    .unwrap();
+    let (file, ctx, commit) = resolve_partition_rw(path, None).unwrap();
+    let mut efs =
+        open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
+            .unwrap();
+    let parent = efs.root().unwrap();
+    let opts = CreateFileOptions {
+        resource_fork: Some(ResourceForkSource::Data(rsrc.to_vec())),
+        ..Default::default()
+    };
+    let mut d = data;
+    efs.create_file(&parent, file_name, &mut d, data.len() as u64, &opts)
+        .unwrap();
+    efs.sync_metadata().unwrap();
+    drop(efs);
+    commit.commit().unwrap();
+}
+
+/// End-to-end for the two resource-fork fixes: a remote browse carries the RSRC
+/// **size** over the wire (the `WireEntry` field), and the new `ReadResourceFork`
+/// op streams the fork **bytes** back byte-exact — what Commander's fork-preserving
+/// export needs on the remote side.
+#[test]
+fn family_f_reads_resource_fork_and_size_over_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("mac.img");
+    let data = b"data fork contents for the forked file";
+    let rsrc = b"RESOURCE FORK BYTES sent across the wire";
+    make_hfs_image_with_fork(&img, "MACVOL", "FORKED.BIN", data, rsrc);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    let (mut rfs, root_entry, _children) = RemoteFilesystem::open(&addr, "/mac.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let forked = listed
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("FORKED.BIN"))
+        .expect("forked file present in remote listing");
+
+    // Fix 1: the resource-fork SIZE travels over the wire (was dropped before).
+    assert_eq!(
+        forked.resource_fork_size,
+        Some(rsrc.len() as u64),
+        "resource-fork size must survive the wire round trip"
+    );
+
+    // Fix 2: the resource-fork BYTES stream back byte-exact via ReadResourceFork.
+    let mut got_rsrc = Vec::new();
+    rfs.write_resource_fork_to(forked, &mut got_rsrc).unwrap();
+    assert_eq!(
+        got_rsrc, rsrc,
+        "resource fork bytes byte-exact over the wire"
+    );
+
+    // The data fork still reads back correctly alongside it.
+    let mut got_data = Vec::new();
+    rfs.write_file_to(forked, &mut got_data).unwrap();
+    assert_eq!(got_data, data, "data fork byte-exact over the wire");
+}
+
+/// End-to-end for the Family F **write** path that Commander's local→remote copy
+/// drives: stage a file upload plus a directory into a remote FAT image, apply,
+/// and confirm both land (browsed back over the read path). Mirrors
+/// `commander_ops::remote_apply`'s `OpenSession` → `StageUpload` / `StageMkdir`
+/// → `Apply` sequence, so it guards the transport Commander now depends on.
+#[test]
+fn family_f_write_stages_file_and_dir_into_remote_image() {
+    use rusty_backup::remote::RemoteSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    // A remote FAT image to copy INTO (starts with one seed file).
+    make_fat_image(&root.join("dest.img"), "DESTVOL", "SEED.BIN", 0x01, 512);
+
+    // Uploads land in a staging dir on the daemon before Apply commits them.
+    let staging_tmp = tempfile::tempdir().unwrap();
+    let staging = staging_tmp.path().to_path_buf();
+
+    // A local host file to upload — the blob a staged copy would reference.
+    let host_tmp = tempfile::tempdir().unwrap();
+    let host_file = host_tmp.path().join("payload.bin");
+    let payload = vec![0xABu8; 3000];
+    std::fs::write(&host_file, &payload).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    let serve_staging = staging.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, Some(serve_staging));
+    });
+
+    // --- drive the Family F write path (exactly what remote_apply does) ---
+    {
+        let mut session = RemoteSession::connect(&addr).unwrap();
+        let sid = session.open_session("/dest.img", None).unwrap();
+        session.stage_mkdir(sid, "/", "SUBDIR").unwrap();
+        session
+            .stage_upload(
+                sid,
+                "/",
+                "COPIED.BIN",
+                &host_file,
+                false,
+                Some("TEXT".to_string()),
+                Some("ttxt".to_string()),
+            )
+            .unwrap();
+        let n = session.apply(sid).unwrap();
+        assert_eq!(n, 2, "two staged edits applied (mkdir + upload)");
+        session.close_session(sid).unwrap();
+    }
+
+    // --- verify over the read path: a FRESH open (new daemon handle) sees the
+    // committed write, which is why the pane re-opens the image after apply ---
+    let (mut rfs, root_entry, _children) =
+        RemoteFilesystem::open(&addr, "/dest.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("COPIED.BIN")),
+        "uploaded file present after apply: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.eq_ignore_ascii_case("SUBDIR")),
+        "created directory present after apply: {names:?}"
+    );
+
+    // The uploaded file's bytes are byte-exact.
+    let copied = listed
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("COPIED.BIN"))
+        .unwrap();
+    let mut got = Vec::new();
+    rfs.write_file_to(copied, &mut got).unwrap();
+    assert_eq!(got, payload, "uploaded bytes are byte-exact");
 }
 
 /// Proves the core of "switch images without reconnecting": two images opened
