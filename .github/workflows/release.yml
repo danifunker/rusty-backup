@@ -1279,12 +1279,31 @@ jobs:
       - name: Install riscv64 cross toolchain + GTK/GL sysroot
         run: |
           set -euxo pipefail
-          # python3-packaging is Architecture: all / Multi-Arch: foreign. The
-          # release libglib2.0-dev-bin depends on it; without the native copy
-          # present apt tries to pull python3-packaging:riscv64 (which drags the
-          # whole riscv64 python stack and isn't installable). Installing the
-          # native one lets it satisfy the foreign dep directly.
-          sudo apt-get install -y python3-packaging
+          # The release libglib2.0-dev-bin depends on python3-packaging, which
+          # is Architecture: all but NOT Multi-Arch: foreign, so the cross
+          # libglib2.0-dev-bin:riscv64 can't be satisfied by the native copy and
+          # apt demands an (uninstallable) python3-packaging:riscv64. A Rust
+          # cross-build never runs glib's python dev tools (glib-mkenums,
+          # gdbus-codegen), so stand in a riscv64 stub that Provides it.
+          sudo apt-get install -y equivs
+          cat > /tmp/glib-py-stub.ctl <<'CTL'
+          Section: misc
+          Priority: optional
+          Standards-Version: 3.9.2
+          Package: glib-py-packaging-stub
+          Version: 1.0
+          Architecture: riscv64
+          Provides: python3-packaging
+          Description: Stub satisfying libglib2.0-dev-bin's python3-packaging dep
+           python3-packaging (Architecture: all, not Multi-Arch: foreign) can't
+           satisfy the cross libglib2.0-dev-bin:riscv64 dependency. A Rust
+           cross-build never runs glib's python dev tools, so this empty
+           Provides package is a safe stand-in.
+          CTL
+          # heredoc is indented for YAML; strip the leading whitespace back off.
+          sed -i 's/^          //' /tmp/glib-py-stub.ctl
+          ( cd /tmp && equivs-build --arch riscv64 glib-py-stub.ctl )
+          sudo dpkg -i /tmp/glib-py-packaging-stub_1.0_riscv64.deb
           sudo apt-get install -y \
             g++-riscv64-linux-gnu binutils-riscv64-linux-gnu file \
             libgtk-3-dev:riscv64 libglib2.0-dev:riscv64 \
