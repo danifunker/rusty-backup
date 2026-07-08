@@ -22,6 +22,7 @@ pub mod efs_resize;
 pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
+pub mod exfat_fsck;
 pub mod ext;
 pub mod fat;
 pub mod fat_fsck;
@@ -2311,17 +2312,15 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// bytes are shared across ext / btrfs / xfs / ufs / jfs), so the button gate
 /// consults this in addition to [`is_checkable_type`]. Every driver named here
 /// returns `Some` from `Filesystem::fsck()`: EFS (`efs_fsck`), UFS (`ufs_fsck`),
-/// XFS (R1–R8), JFS (check-only), HFS/HFS+, and FAT12/16/32 (the superfloppy
-/// path, where the probed name is `"FAT12"` / `"FAT16"` / `"FAT32"` and there
-/// is no partition-type byte to consult).
+/// XFS (R1–R8), JFS (check-only), HFS/HFS+, FAT12/16/32, and exFAT.
 ///
-/// exFAT is explicitly excluded — its name contains "FAT" but it has no fsck
-/// driver yet.
+/// The FAT family and exFAT reach the button through the *name* path: FAT has
+/// several partition-type bytes but exFAT shares `0x07` with NTFS/HPFS, so the
+/// byte alone can't distinguish them — the resolved `type_name` (`"FAT16"`,
+/// `"exFAT"`, …) does. Both `"FAT"` and `"EXFAT"` contain "FAT", so a single
+/// token covers them; NTFS (no fsck yet) does not contain it and stays off.
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
-    if n.contains("EXFAT") {
-        return false;
-    }
     ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT"]
         .iter()
         .any(|tok| n.contains(tok))
@@ -2722,13 +2721,14 @@ mod tests {
         // Linux (0x83) and SGI (dvh) partitions, plus HFS+.
         for name in [
             "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+", "FAT12",
-            "FAT16", "FAT32",
+            "FAT16", "FAT32", "exFAT",
         ] {
             assert!(is_checkable_fs_name(name), "{name} should be checkable");
         }
-        // Filesystems without an fsck() driver stay off the button. exFAT is the
-        // tricky one — its name contains "FAT" but must not be enabled.
-        for name in ["ext", "btrfs", "ReiserFS", "NTFS", "exFAT", "ProDOS"] {
+        // Filesystems without an fsck() driver stay off the button. NTFS is the
+        // tricky one — it shares exFAT's 0x07 byte but has no fsck yet, and its
+        // name does not contain "FAT" so the name gate leaves it off.
+        for name in ["ext", "btrfs", "ReiserFS", "NTFS", "ProDOS"] {
             assert!(
                 !is_checkable_fs_name(name),
                 "{name} has no fsck; must not enable the button"

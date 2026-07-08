@@ -122,3 +122,23 @@ byte-verified against the system `fsck_msdos` on real fixtures.
 FAT does not use the `<name>_issue` helper / internal-enum pattern above; it
 builds `FsckIssue` values directly and pairs each repairable one with its fix in
 the shared `analyze()` pass.
+
+## Check phases (exFAT example)
+
+`src/fs/exfat_fsck.rs` follows the same `analyze()`-shared-by-check-and-repair
+shape as FAT, but the central structure is exFAT's **allocation bitmap** rather
+than a FAT:
+
+| Pass | What it checks |
+|------|---------------|
+| Boot region | Main boot checksum (sector 11), backup region (sectors 12-23) vs main, VolumeDirty flag |
+| Allocation | Directory tree walked; each file/dir traced contiguously or through the FAT per its NoFatChain flag; plus the root chain, bitmap file, and up-case table |
+| Bitmap | Traced allocation reconciled against the on-disk bitmap (`BitmapUsedButFree`, `BitmapLeaked`); cross-links / out-of-range refs surfaced |
+| Up-case | Table checksum vs its directory entry (surfaced) |
+
+Repair rebuilds the allocation bitmap from the traced allocation (the exFAT
+analogue of CBM VALIDATE's BAM rewrite), then leaves the boot regions fully
+consistent — recompute PercentInUse, clear VolumeDirty, recompute the main
+checksum, and copy the main region over the backup. Verified against the system
+`fsck_exfat` (which needs a loopback device, so the oracle test attaches the
+image with `hdiutil`).
