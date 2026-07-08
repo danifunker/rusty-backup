@@ -1246,10 +1246,17 @@ jobs:
             [ -f "$f" ] || continue
             sudo sed -i -E 's|^deb (http)|deb [arch=amd64] \1|; s|^deb-src (http)|deb-src [arch=amd64] \1|' "$f"
           done
+          # Release pocket ONLY (no -updates/-security/-backports). The ports
+          # mirror propagates SRUs to riscv64 out of step with amd64, so a
+          # security update to e.g. libglib2.0-dev can land its new package
+          # split (libglib2.0-dev-bin-linux) before the matching riscv64
+          # binaries exist, leaving apt with "held broken packages". The
+          # release snapshot is internally consistent, which is all a
+          # throwaway cross sysroot needs.
           printf '%s\n' \
             'Types: deb' \
             'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-            'Suites: noble noble-updates noble-backports noble-security' \
+            'Suites: noble' \
             'Components: main universe' \
             'Architectures: riscv64' \
             'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
