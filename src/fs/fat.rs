@@ -3661,7 +3661,15 @@ pub fn resize_fat_in_place(
     };
 
     // --- 3. Calculate new layout ---
-    let new_spf = compute_fat_sectors(
+    // On shrink, we must keep the FAT (and thus the data region) at the old
+    // sectors-per-FAT: shortening the FAT would move the root directory + data
+    // region backward on disk, but this in-place resize deliberately doesn't
+    // shift the data (that would require walking every cluster chain to check
+    // nothing collides). Leaving the FAT at its old length just wastes a few
+    // FAT sectors at the tail — all data stays exactly where it was, and the
+    // FAT still describes the (smaller) cluster count correctly. We only grow
+    // the FAT when a resize genuinely needs more entries.
+    let min_spf = compute_fat_sectors(
         new_total_sectors,
         reserved_sectors,
         num_fats,
@@ -3670,6 +3678,7 @@ pub fn resize_fat_in_place(
         fat_bits,
         bytes_per_sector,
     );
+    let new_spf = min_spf.max(old_spf);
     let new_data_start = reserved_sectors + num_fats * new_spf + root_dir_sectors;
     let new_data_sectors = new_total_sectors.saturating_sub(new_data_start);
     let new_clusters = new_data_sectors / spc;
