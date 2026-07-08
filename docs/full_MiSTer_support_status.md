@@ -13,9 +13,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
   altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read + write + resize), QDOS Microdrive (detect-only scaffold),
-  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
-  bidirectionally cross-validated against the `c1541` / Python `d64`
-  reference), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
+  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write + fsck;
+  add/delete bidirectionally cross-validated against the `c1541` / Python `d64`
+  reference, fsck = VALIDATE with the BAM rewrite byte-verified against
+  `c1541 validate`), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
   RS-DOS / CoCo Disk BASIC (read + write, raw 35- / 40-track `.dsk` / `.jvc`;
   cross-validated against an independent clean-room reader/writer derived
   from the toolshed `libdecb` semantics),

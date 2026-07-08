@@ -54,6 +54,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats};
 
 /// CBM 256-byte logical sector.
 pub const SECTOR_BYTES: usize = 256;
@@ -611,6 +612,291 @@ impl<R: Read + Seek + Send> CbmFilesystem<R> {
         }
         Ok(data)
     }
+
+    /// Read the BAM into memory. Read-only, so both the write path (allocate /
+    /// free) and the read-only fsck checker can consult the on-disk allocation.
+    fn read_bam(&mut self) -> Result<Bam, FilesystemError> {
+        let variant = self.variant;
+        let tracks = variant.tracks();
+        let mut free = vec![0u8; tracks as usize];
+        let mut bits = vec![[0u8; 5]; tracks as usize];
+
+        match variant {
+            CbmVariant::D64 | CbmVariant::D64_40 | CbmVariant::D71 => {
+                let b18 = self.read_sector(18, 0)?;
+                // Tracks 1..=35 (or 1..=40 for D64_40) at offset 4 + (t-1)*4.
+                let first_block_tracks = if variant == CbmVariant::D71 {
+                    35
+                } else {
+                    tracks
+                };
+                for t in 1..=first_block_tracks {
+                    let o = 4 + (t as usize - 1) * 4;
+                    free[t as usize - 1] = b18[o];
+                    let nb = Bam::bitmap_bytes(variant, t);
+                    bits[t as usize - 1][..nb].copy_from_slice(&b18[o + 1..o + 1 + nb]);
+                }
+                if variant == CbmVariant::D71 {
+                    // Tracks 36..=70: free counts in T18S0[0xDD..], bitmaps
+                    // in T53S0 (3 bytes per track).
+                    let b53 = self.read_sector(53, 0)?;
+                    for t in 36..=70u8 {
+                        free[t as usize - 1] = b18[0xDD + (t as usize - 36)];
+                        let o = (t as usize - 36) * 3;
+                        bits[t as usize - 1][..3].copy_from_slice(&b53[o..o + 3]);
+                    }
+                }
+            }
+            CbmVariant::D81 => {
+                // Two BAM sectors: T40S1 (tracks 1..=40), T40S2 (41..=80),
+                // 6 bytes per track at offset 0x10.
+                let b1 = self.read_sector(40, 1)?;
+                let b2 = self.read_sector(40, 2)?;
+                for t in 1..=80u8 {
+                    let (blk, base_t) = if t <= 40 { (&b1, 1u8) } else { (&b2, 41u8) };
+                    let o = 0x10 + (t - base_t) as usize * 6;
+                    free[t as usize - 1] = blk[o];
+                    bits[t as usize - 1][..5].copy_from_slice(&blk[o + 1..o + 6]);
+                }
+            }
+            CbmVariant::D80 | CbmVariant::D82 => {
+                // Chained BAM sectors on track 38 (38/0, 38/3, [38/6, 38/9]).
+                // 50 track-entries per sector, 5 bytes each (free + 4 bitmap
+                // bytes) starting at offset 6.
+                let bam_blocks: Vec<[u8; SECTOR_BYTES]> = (0..variant.num_bam_sectors())
+                    .map(|i| self.read_sector(38, (i * 3) as u8))
+                    .collect::<Result<_, _>>()?;
+                for t in 1..=tracks {
+                    let idx = (t as usize - 1) / 50;
+                    let low = idx * 50 + 1;
+                    let o = 6 + (t as usize - low) * 5;
+                    let blk = &bam_blocks[idx];
+                    free[t as usize - 1] = blk[o];
+                    bits[t as usize - 1][..4].copy_from_slice(&blk[o + 1..o + 5]);
+                }
+            }
+        }
+        Ok(Bam {
+            variant,
+            free,
+            bits,
+        })
+    }
+
+    /// Header + BAM sectors that are always allocated, independent of any
+    /// file. The directory sectors themselves come from the directory chain.
+    fn reserved_sectors(&self) -> Vec<(u8, u8)> {
+        match self.variant {
+            CbmVariant::D64 | CbmVariant::D64_40 => vec![(18, 0)],
+            CbmVariant::D71 => {
+                // T18S0 is the primary BAM/header. The 1571's second-side BAM
+                // lives on track 53, which CBM DOS reserves in its entirety —
+                // a clean disk shows free-count 0 there and never allocates
+                // file data onto it (matching `alloc_track_order` / `total_free`
+                // both skipping track 53).
+                let mut v = vec![(18, 0)];
+                for s in 0..self.variant.sectors_in_track(53) {
+                    v.push((53, s));
+                }
+                v
+            }
+            CbmVariant::D81 => vec![(40, 0), (40, 1), (40, 2)],
+            CbmVariant::D80 | CbmVariant::D82 => {
+                let mut v = vec![(39, 0)];
+                for i in 0..self.variant.num_bam_sectors() {
+                    v.push((38, (i * 3) as u8));
+                }
+                v
+            }
+        }
+    }
+
+    /// True when the volume holds a live REL file. REL files carry
+    /// side-sector index blocks that this checker does not trace, so BAM
+    /// reconciliation is withheld on such volumes (see [`Self::run_fsck`]).
+    fn has_rel_files(&self) -> bool {
+        self.entries.iter().any(|e| e.file_type == CbmFileType::Rel)
+    }
+
+    /// Recompute the correct BAM by tracing the directory chain and every
+    /// live file's data chain — the same allocation model CBM DOS VALIDATE
+    /// uses: blocks reachable from the directory or a directory entry are
+    /// allocated, everything else is free. Cross-validated byte-for-byte
+    /// against `c1541 validate` output (tests/fs_e2e_suite/cbm_fsck.rs).
+    fn recompute_bam(&mut self) -> Result<Bam, FilesystemError> {
+        let variant = self.variant;
+        let tracks = variant.tracks();
+        // Start with every valid sector free (bit set = free).
+        let mut free = vec![0u8; tracks as usize];
+        let mut bits = vec![[0u8; 5]; tracks as usize];
+        for t in 1..=tracks {
+            let spt = variant.sectors_in_track(t);
+            free[t as usize - 1] = spt;
+            for s in 0..spt {
+                bits[(t - 1) as usize][(s / 8) as usize] |= 1 << (s % 8);
+            }
+        }
+        let mut bam = Bam {
+            variant,
+            free,
+            bits,
+        };
+
+        // Reserved header + BAM sectors.
+        for (t, s) in self.reserved_sectors() {
+            bam.set(t, s, false);
+        }
+
+        // Directory chain (each sector links to the next via bytes 0..1).
+        let (mut t, mut s) = self.dir_start()?;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_DIR_SECTORS {
+            if t == 0 || t > tracks || s >= variant.sectors_in_track(t) {
+                break;
+            }
+            if !seen.insert((t, s)) {
+                break;
+            }
+            bam.set(t, s, false);
+            let buf = self.read_sector(t, s)?;
+            t = buf[0];
+            s = buf[1];
+        }
+
+        // Each live file's data chain.
+        let starts: Vec<(u8, u8)> = self
+            .entries
+            .iter()
+            .map(|e| (e.first_track, e.first_sector))
+            .collect();
+        for (mut ft, mut fss) in starts {
+            let mut fseen = HashSet::new();
+            for _ in 0..MAX_FILE_BLOCKS {
+                if ft == 0 || ft > tracks || fss >= variant.sectors_in_track(ft) {
+                    break;
+                }
+                if !fseen.insert((ft, fss)) {
+                    break;
+                }
+                bam.set(ft, fss, false);
+                let buf = self.read_sector(ft, fss)?;
+                ft = buf[0];
+                fss = buf[1];
+            }
+        }
+
+        Ok(bam)
+    }
+
+    /// Check the on-disk BAM against the allocation implied by the directory
+    /// and file chains — the read side of CBM DOS VALIDATE. Flags blocks the
+    /// BAM marks free but a chain references (`BamBlockUsedButFree`), blocks
+    /// the BAM marks allocated but nothing references (`BamBlockLeaked`), and
+    /// per-track free-count bytes that disagree with the bitmap
+    /// (`BamFreeCountMismatch`). All three are repairable by rewriting the BAM.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let mut errors: Vec<FsckIssue> = Vec::new();
+        let warnings: Vec<FsckIssue> = Vec::new();
+        let variant = self.variant;
+        let tracks = variant.tracks();
+        let files = self.entries.len() as u32;
+
+        // REL volumes carry untraced side-sector blocks; withhold BAM
+        // reconciliation rather than risk a false leak/repair.
+        if self.has_rel_files() {
+            return Ok(FsckResult {
+                errors,
+                warnings: vec![FsckIssue {
+                    code: "RelFilesPresent".into(),
+                    message: "volume contains REL files; BAM reconciliation skipped \
+                              (side-sector tracing not implemented)"
+                        .into(),
+                    repairable: false,
+                    debug: false,
+                }],
+                stats: FsckStats {
+                    files_checked: files,
+                    directories_checked: 0,
+                    extra: vec![("variant".into(), format!("{variant:?}"))],
+                },
+                repairable: false,
+                orphaned_entries: Vec::new(),
+            });
+        }
+
+        let on_disk = self.read_bam()?;
+        let correct = self.recompute_bam()?;
+
+        let mut used_but_free = 0u32;
+        let mut leaked = 0u32;
+        let mut freecount_bad = 0u32;
+        for t in 1..=tracks {
+            let spt = variant.sectors_in_track(t);
+            for s in 0..spt {
+                let disk_free = on_disk.is_free(t, s);
+                let should_free = correct.is_free(t, s);
+                match (disk_free, should_free) {
+                    (true, false) => {
+                        used_but_free += 1;
+                        errors.push(FsckIssue {
+                            code: "BamBlockUsedButFree".into(),
+                            message: format!(
+                                "T{t}S{s} is referenced by a file/directory chain but \
+                                 the BAM marks it free"
+                            ),
+                            repairable: true,
+                            debug: false,
+                        });
+                    }
+                    (false, true) => {
+                        leaked += 1;
+                        errors.push(FsckIssue {
+                            code: "BamBlockLeaked".into(),
+                            message: format!(
+                                "T{t}S{s} is marked allocated in the BAM but no chain \
+                                 references it (leaked block)"
+                            ),
+                            repairable: true,
+                            debug: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            // Per-track free-count byte vs. the (corrected) bitmap.
+            if on_disk.free[(t - 1) as usize] != correct.free[(t - 1) as usize] {
+                freecount_bad += 1;
+                errors.push(FsckIssue {
+                    code: "BamFreeCountMismatch".into(),
+                    message: format!(
+                        "track {t} free-count byte is {} but the bitmap accounts for {}",
+                        on_disk.free[(t - 1) as usize],
+                        correct.free[(t - 1) as usize]
+                    ),
+                    repairable: true,
+                    debug: false,
+                });
+            }
+        }
+
+        let repairable = !errors.is_empty();
+        Ok(FsckResult {
+            errors,
+            warnings,
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    ("blocks_used_but_free".into(), used_but_free.to_string()),
+                    ("blocks_leaked".into(), leaked.to_string()),
+                    ("freecount_mismatches".into(), freecount_bad.to_string()),
+                    ("blocks_free".into(), correct.total_free().to_string()),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for CbmFilesystem<R> {
@@ -679,6 +965,10 @@ impl<R: Read + Seek + Send> Filesystem for CbmFilesystem<R> {
             .iter()
             .map(|e| e.size_blocks as u64 * SECTOR_BYTES as u64)
             .sum()
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
     }
 }
 
@@ -753,75 +1043,6 @@ impl<R: Read + Write + Seek + Send> CbmFilesystem<R> {
         self.reader.seek(SeekFrom::Start(off))?;
         self.reader.write_all(data)?;
         Ok(())
-    }
-
-    /// Read the BAM into memory.
-    fn read_bam(&mut self) -> Result<Bam, FilesystemError> {
-        let variant = self.variant;
-        let tracks = variant.tracks();
-        let mut free = vec![0u8; tracks as usize];
-        let mut bits = vec![[0u8; 5]; tracks as usize];
-
-        match variant {
-            CbmVariant::D64 | CbmVariant::D64_40 | CbmVariant::D71 => {
-                let b18 = self.read_sector(18, 0)?;
-                // Tracks 1..=35 (or 1..=40 for D64_40) at offset 4 + (t-1)*4.
-                let first_block_tracks = if variant == CbmVariant::D71 {
-                    35
-                } else {
-                    tracks
-                };
-                for t in 1..=first_block_tracks {
-                    let o = 4 + (t as usize - 1) * 4;
-                    free[t as usize - 1] = b18[o];
-                    let nb = Bam::bitmap_bytes(variant, t);
-                    bits[t as usize - 1][..nb].copy_from_slice(&b18[o + 1..o + 1 + nb]);
-                }
-                if variant == CbmVariant::D71 {
-                    // Tracks 36..=70: free counts in T18S0[0xDD..], bitmaps
-                    // in T53S0 (3 bytes per track).
-                    let b53 = self.read_sector(53, 0)?;
-                    for t in 36..=70u8 {
-                        free[t as usize - 1] = b18[0xDD + (t as usize - 36)];
-                        let o = (t as usize - 36) * 3;
-                        bits[t as usize - 1][..3].copy_from_slice(&b53[o..o + 3]);
-                    }
-                }
-            }
-            CbmVariant::D81 => {
-                // Two BAM sectors: T40S1 (tracks 1..=40), T40S2 (41..=80),
-                // 6 bytes per track at offset 0x10.
-                let b1 = self.read_sector(40, 1)?;
-                let b2 = self.read_sector(40, 2)?;
-                for t in 1..=80u8 {
-                    let (blk, base_t) = if t <= 40 { (&b1, 1u8) } else { (&b2, 41u8) };
-                    let o = 0x10 + (t - base_t) as usize * 6;
-                    free[t as usize - 1] = blk[o];
-                    bits[t as usize - 1][..5].copy_from_slice(&blk[o + 1..o + 6]);
-                }
-            }
-            CbmVariant::D80 | CbmVariant::D82 => {
-                // Chained BAM sectors on track 38 (38/0, 38/3, [38/6, 38/9]).
-                // 50 track-entries per sector, 5 bytes each (free + 4 bitmap
-                // bytes) starting at offset 6.
-                let bam_blocks: Vec<[u8; SECTOR_BYTES]> = (0..variant.num_bam_sectors())
-                    .map(|i| self.read_sector(38, (i * 3) as u8))
-                    .collect::<Result<_, _>>()?;
-                for t in 1..=tracks {
-                    let idx = (t as usize - 1) / 50;
-                    let low = idx * 50 + 1;
-                    let o = 6 + (t as usize - low) * 5;
-                    let blk = &bam_blocks[idx];
-                    free[t as usize - 1] = blk[o];
-                    bits[t as usize - 1][..4].copy_from_slice(&blk[o + 1..o + 5]);
-                }
-            }
-        }
-        Ok(Bam {
-            variant,
-            free,
-            bits,
-        })
     }
 
     /// Write the BAM back to its sector(s).
@@ -1267,6 +1488,43 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CbmFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         let bam = self.read_bam()?;
         Ok(bam.total_free() * SECTOR_BYTES as u64)
+    }
+
+    /// Repair BAM inconsistencies by rewriting the Block Availability Map from
+    /// the allocation implied by the directory and file chains — the write side
+    /// of CBM DOS VALIDATE. The rewritten BAM is byte-identical to what
+    /// `c1541 validate` produces (see tests/fs_e2e_suite/cbm_fsck.rs).
+    ///
+    /// Only the BAM is touched; file data and directory entries are left
+    /// untouched. REL volumes are refused (their side-sector blocks are not
+    /// traced, so a rewrite could free live index blocks).
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        if self.has_rel_files() {
+            return Err(FilesystemError::Unsupported(
+                "BAM repair is not supported on volumes containing REL files \
+                 (side-sector tracing not implemented)"
+                    .into(),
+            ));
+        }
+
+        // Count what we're about to correct so the report is specific.
+        let report = self.run_fsck()?;
+        let mut fixes_applied: Vec<String> = Vec::new();
+        for issue in &report.errors {
+            fixes_applied.push(format!("{}: {}", issue.code, issue.message));
+        }
+
+        if !fixes_applied.is_empty() {
+            let correct = self.recompute_bam()?;
+            self.write_bam(&correct)?;
+            self.reader.flush()?;
+        }
+
+        Ok(super::fsck::RepairReport {
+            fixes_applied,
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 

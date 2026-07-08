@@ -90,7 +90,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
-| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Auto | Yes | Yes | Yes | — (fixed geometry) | No | Commodore C64 / 128 / VIC-20 / C16 / PET |
+| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Commodore C64 / 128 / VIC-20 / C16 / PET. fsck = VALIDATE (BAM reconciliation), rewrite byte-verified vs `c1541 validate` |
 | Atari DOS 2 (2.0S / 2.5) | Auto | Yes | Yes | No | — (fixed geometry) | No | Atari 8-bit (400/800/XL/XE) |
 | RS-DOS / Disk BASIC | Auto | Yes | Yes | Yes | — (fixed geometry) | No | Tandy CoCo 1 / 2 / 3 |
 | OS-9 / NitrOS-9 RBF | Auto | Yes | Yes | No | — (fixed geometry) | No | Tandy CoCo, Dragon, 6809 systems |

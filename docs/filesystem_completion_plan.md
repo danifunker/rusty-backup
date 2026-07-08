@@ -53,7 +53,7 @@ missing capability on a driver that already round-trips.
 | SFS | Yes | Yes (single-leaf) | No | **fsck + multi-leaf edit** |
 | ProDOS | No | Yes | validate | **create + check/repair** |
 | Apple DOS 3.3 | No | Yes | No | **create + fsck** |
-| CBM DOS | Yes | Yes | No | **fsck** |
+| CBM DOS | Yes | Yes | **Yes** | — **fsck done** (VALIDATE; byte-verified vs `c1541 validate`) |
 | Atari DOS 2 | test-only | Yes | No | **create + fsck** |
 | RS-DOS | Yes | Yes | No | **fsck** |
 | OS-9 / RBF | No | Yes | No | **create + fsck** |
@@ -77,7 +77,7 @@ established (see `hfs_fsck/`, `efs_fsck.rs`, `affs_fsck.rs`, `ufs_fsck` in
 | **Most-used first** | FAT, exFAT, NTFS, ext | M each | Promote the existing `validate` gate to a real check + repair (FAT chains / cross-links; exFAT bitmap+upcase; NTFS `$MFT`/`$Bitmap`; ext group descriptors + inode bitmaps). Highest user impact. |
 | **JFS repair** | JFS | M | `fsck()` exists (check-only); add the `repair()` branch the code comments already scope. |
 | **Amiga** | PFS3, SFS | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). |
-| **Retro long-tail** | CBM, Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. |
+| **Retro long-tail** | ~~CBM~~ (done), Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. **CBM shipped** as the template: recompute the BAM from the directory + file chains (the VALIDATE model), diff against the on-disk BAM, rewrite; byte-verified against `c1541 validate` fixtures for all five variants. |
 
 ### 1c. Add create-blank (`rb-cli new --fs …`)
 
