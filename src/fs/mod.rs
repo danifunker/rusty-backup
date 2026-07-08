@@ -57,6 +57,7 @@ pub mod mfs;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
+pub mod ntfs_fsck;
 mod ntfs_tables;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
@@ -2319,10 +2320,11 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// several partition-type bytes but exFAT shares `0x07` with NTFS/HPFS, so the
 /// byte alone can't distinguish them — the resolved `type_name` (`"FAT16"`,
 /// `"exFAT"`, …) does. Both `"FAT"` and `"EXFAT"` contain "FAT", so a single
-/// token covers them; NTFS (no fsck yet) does not contain it and stays off.
+/// token covers them. NTFS also shares `0x07` and needs its own token here
+/// (its resolved name is `"NTFS"` / `"NTFS 3.1"`).
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
-    ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT"]
+    ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS"]
         .iter()
         .any(|tok| n.contains(tok))
 }
@@ -2719,17 +2721,15 @@ mod tests {
     #[test]
     fn checkable_fs_name_covers_probed_unix_families() {
         // The resolved family names the inspect grid shows for content-probed
-        // Linux (0x83) and SGI (dvh) partitions, plus HFS+.
+        // Linux (0x83) and SGI (dvh) partitions, plus HFS+ and NTFS.
         for name in [
             "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+", "FAT12",
-            "FAT16", "FAT32", "exFAT", "ext2", "ext3", "ext4",
+            "FAT16", "FAT32", "exFAT", "ext2", "ext3", "ext4", "NTFS", "NTFS 3.1",
         ] {
             assert!(is_checkable_fs_name(name), "{name} should be checkable");
         }
-        // Filesystems without an fsck() driver stay off the button. NTFS is the
-        // tricky one — it shares exFAT's 0x07 byte but has no fsck yet, and its
-        // name does not contain "FAT" so the name gate leaves it off.
-        for name in ["btrfs", "ReiserFS", "NTFS", "ProDOS"] {
+        // Filesystems without an fsck() driver stay off the button.
+        for name in ["btrfs", "ReiserFS", "ProDOS"] {
             assert!(
                 !is_checkable_fs_name(name),
                 "{name} has no fsck; must not enable the button"

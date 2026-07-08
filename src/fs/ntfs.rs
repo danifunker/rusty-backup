@@ -1145,6 +1145,152 @@ impl<R: Read + Seek> NtfsFilesystem<R> {
             Some(FileEntry::new_file(name, path, real_size, file_mft_ref))
         }
     }
+
+    // ---- fsck helpers (see ntfs_fsck.rs) ----
+
+    /// Geometry snapshot the fsck module needs.
+    pub(crate) fn fsck_geometry(&self) -> NtfsGeom {
+        NtfsGeom {
+            partition_offset: self.partition_offset,
+            bytes_per_sector: self.bytes_per_sector,
+            cluster_size: self.cluster_size,
+            total_sectors: self.total_sectors,
+            total_clusters: (self.total_sectors * self.bytes_per_sector) / self.cluster_size,
+            mft_cluster: self.mft_cluster,
+            mft_record_size: self.mft_record_size,
+        }
+    }
+
+    /// Read MFT record `n` if the record's IN_USE flag is set, apply fixups.
+    /// Returns `None` for records the fixup layer / magic check rejects — those
+    /// are treated as "not in use" for reconciliation.
+    pub(crate) fn fsck_read_in_use_record(
+        &mut self,
+        n: u64,
+    ) -> Result<Option<Vec<u8>>, FilesystemError> {
+        let record = match self.read_mft_record(n) {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
+        if record.len() < 0x18 {
+            return Ok(None);
+        }
+        let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
+        if flags & MFT_RECORD_IN_USE == 0 {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    /// Decode every non-resident attribute in an MFT record into a list of
+    /// (LCN, length_in_clusters). Sparse runs (LCN 0) are skipped — they own
+    /// no on-disk clusters.
+    pub(crate) fn fsck_record_clusters(&self, record: &[u8]) -> Vec<(u64, u64)> {
+        let attrs = parse_mft_attributes(record, self.mft_record_size);
+        let mut out = Vec::new();
+        for a in &attrs {
+            if a.resident {
+                continue;
+            }
+            for run in &a.data_runs {
+                if run.cluster_offset > 0 && run.length > 0 {
+                    out.push((run.cluster_offset as u64, run.length));
+                }
+            }
+        }
+        out
+    }
+
+    /// True when the record has a non-null `$ATTRIBUTE_LIST` (0x20) attribute.
+    /// v1 fsck surfaces these as "not fully traced" rather than following the
+    /// list into extension records.
+    pub(crate) fn fsck_record_has_attribute_list(&self, record: &[u8]) -> bool {
+        parse_mft_attributes(record, self.mft_record_size)
+            .iter()
+            .any(|a| a.attr_type == ATTR_ATTRIBUTE_LIST)
+    }
+
+    /// Read `$Bitmap`'s $DATA (MFT record 6) — the volume allocation bitmap.
+    pub(crate) fn fsck_read_volume_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let record = self.read_mft_record(MFT_RECORD_BITMAP)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for a in &attrs {
+            if a.attr_type == ATTR_DATA {
+                return self.read_attribute_data(a, None);
+            }
+        }
+        Err(FilesystemError::Parse(
+            "$Bitmap $DATA attribute not found".into(),
+        ))
+    }
+
+    /// Data runs of `$Bitmap`'s $DATA (for in-place rewrite).
+    pub(crate) fn fsck_bitmap_data_runs(&mut self) -> Result<Vec<DataRun>, FilesystemError> {
+        let record = self.read_mft_record(MFT_RECORD_BITMAP)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for a in &attrs {
+            if a.attr_type == ATTR_DATA && !a.resident {
+                return Ok(a.data_runs.clone());
+            }
+        }
+        Err(FilesystemError::Parse(
+            "$Bitmap $DATA must be non-resident".into(),
+        ))
+    }
+
+    /// Raw first 4 MFT records (the four `$MFTMirr` mirrors).
+    pub(crate) fn fsck_read_first_mft_records(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let n = self.mft_record_size as u64 * 4;
+        let mut buf = vec![0u8; n as usize];
+        if self.mft_data_runs.is_empty() {
+            let off = self.cluster_offset(self.mft_cluster);
+            self.reader.seek(SeekFrom::Start(off))?;
+            self.reader.read_exact(&mut buf)?;
+        } else {
+            self.read_mft_bytes(0, &mut buf)?;
+        }
+        Ok(buf)
+    }
+
+    /// Absolute byte offset (in the underlying reader) of `$MFTMirr`'s first
+    /// record. `$MFTMirr` mirrors the first 4 MFT records at this LCN.
+    pub(crate) fn fsck_mftmirr_offset(&self) -> u64 {
+        self.cluster_offset(self.mft_mirror_cluster)
+    }
+
+    /// Read `n` raw bytes at absolute offset `off` in the underlying reader.
+    pub(crate) fn fsck_read_raw(&mut self, off: u64, n: usize) -> Result<Vec<u8>, FilesystemError> {
+        let mut buf = vec![0u8; n];
+        self.reader.seek(SeekFrom::Start(off))?;
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read the `$Volume` record (MFT #3) and return the `$VOLUME_INFORMATION`
+    /// attribute's flags word (0 when absent). Bit 0 is `VolumeDirty`.
+    pub(crate) fn fsck_volume_flags(&mut self) -> Result<u16, FilesystemError> {
+        let record = self.read_mft_record(MFT_RECORD_VOLUME)?;
+        let attrs = parse_mft_attributes(&record, self.mft_record_size);
+        for a in &attrs {
+            if a.attr_type == ATTR_VOLUME_INFORMATION && a.resident && a.value.len() >= 12 {
+                return Ok(u16::from_le_bytes([a.value[10], a.value[11]]));
+            }
+        }
+        Ok(0)
+    }
+}
+
+/// Geometry snapshot handed to the fsck module. Kept `Copy` so `analyze()` can
+/// stash it in its result without borrowing the filesystem.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NtfsGeom {
+    pub(crate) partition_offset: u64,
+    pub(crate) bytes_per_sector: u64,
+    pub(crate) cluster_size: u64,
+    pub(crate) total_sectors: u64,
+    pub(crate) total_clusters: u64,
+    pub(crate) mft_cluster: u64,
+    pub(crate) mft_record_size: u32,
 }
 
 impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
@@ -1310,6 +1456,10 @@ impl<R: Read + Seek + Send> Filesystem for NtfsFilesystem<R> {
             entries,
             self.cluster_size,
         ))
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::ntfs_fsck::fsck_ntfs(self))
     }
 }
 
@@ -2614,6 +2764,29 @@ impl<R: Read + Write + Seek> NtfsFilesystem<R> {
 
         Ok(false)
     }
+
+    // ---- fsck repair helpers (see ntfs_fsck.rs) ----
+
+    /// Write `bytes` at absolute offset `off` (boot region / mirror patches).
+    pub(crate) fn fsck_write_raw(&mut self, off: u64, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(off))?;
+        self.reader.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Overwrite `$Bitmap`'s $DATA in place through its data runs. Caller
+    /// supplies the full computed bitmap; a shorter slice pads the tail with
+    /// the on-disk bytes so we only touch the reconciled range.
+    pub(crate) fn fsck_write_volume_bitmap(&mut self, bytes: &[u8]) -> Result<(), FilesystemError> {
+        let runs = self.fsck_bitmap_data_runs()?;
+        self.write_data_to_runs(&runs, bytes)
+    }
+
+    /// Flush the underlying writer once at the end of a repair pass.
+    pub(crate) fn fsck_flush_writer(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
 }
 
 /// Extract the UTF-16LE name from an index entry's $FILE_NAME content.
@@ -2923,6 +3096,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         let free_clusters = self.count_free_volume_clusters()?;
         Ok(free_clusters * self.cluster_size)
+    }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::ntfs_fsck::repair_ntfs(self)
     }
 }
 

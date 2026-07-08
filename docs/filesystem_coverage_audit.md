@@ -38,7 +38,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 |---|---|---|---|---|---|---|---|
 | FAT12 / FAT16 / FAT32 | Auto | Yes | Yes | Yes | Yes (in-place + defrag) | Yes (check + repair) | DOS, Windows 3.x/9x, MSX, universal |
 | exFAT | Auto | Yes | Yes | Yes | Yes (in-place + defrag clone) | Yes (check + repair) | Modern removable media, large SD/CF |
-| NTFS | Auto | Yes | Yes | Yes | Yes (in-place + defrag clone) | validate | Windows NT / 2000 / XP+ |
+| NTFS | Auto | Yes | Yes | Yes | Yes (in-place + defrag clone) | Yes (check + repair) | Windows NT / 2000 / XP+ |
 
 ### Classic Mac & Apple
 

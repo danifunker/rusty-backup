@@ -161,3 +161,39 @@ rewrites the bitmaps + free counts from the computed state.
 and descriptors carry crc checksums this pass doesn't yet recompute, so it
 reports the issues but declines to rewrite (run `e2fsck`). Verified against
 `e2fsck -fn` from e2fsprogs (`brew install e2fsprogs`).
+
+## Check phases (NTFS example)
+
+`src/fs/ntfs_fsck.rs` reconciles NTFS's **allocation bitmap** (`$Bitmap`, MFT
+record 6) against the actual allocation walked from the MFT — the NTFS analogue
+of exFAT's directory-tree bitmap reconciliation, but simpler in shape: on NTFS
+every metadata file (`$MFT`, `$LogFile`, `$Boot`, `$Bitmap` itself, index
+allocations) is a normal MFT record whose non-resident `$DATA` /
+`$INDEX_ALLOCATION` runs describe its clusters, so a straight walk of every
+in-use record produces the complete allocation with no special-casing of a
+fixed on-disk layout.
+
+The in-use cluster set is computed from:
+
+| Source | Clusters marked in use |
+|--------|-----------------------|
+| MFT walk (records `0..mft_record_capacity()`) | every non-resident data-run cluster on every record whose header IN_USE flag is set; sparse runs (LCN 0) are skipped, and $ATTRIBUTE_LIST-spilled fragments are surfaced as a warning rather than mis-traced |
+
+Compared against `$Bitmap`, divergence flags `BitmapUsedButFree` (record claims
+a cluster the bitmap marks free) and `BitmapLeaked` (bitmap marks a cluster
+allocated that nothing references). Alongside the bitmap the checker also
+verifies:
+
+- **$MFTMirr** — the mirror of the first 4 MFT records at `mft_mirror_cluster`;
+  divergence → `MftMirrorMismatch`.
+- **Backup boot sector** — the last sector of the volume must match the VBR;
+  divergence → `BackupBootMismatch`.
+- **VolumeDirty flag** — bit 0 of `$Volume`'s `$VOLUME_INFORMATION.flags`;
+  warned when set (the bit `chkdsk` sets/reads).
+
+Repair rebuilds `$Bitmap` from the walked allocation, resyncs `$MFTMirr` from
+the current first-4 MFT records, rewrites the backup boot sector from sector 0,
+and clears VolumeDirty. All are non-destructive metadata rewrites — no MFT
+record rewrites, no cross-link resolution (those are surfaced-only). Verified
+against Windows `chkdsk` via a Mount-DiskImage'd fixed-VHD wrap of the image
+(the oracle test is `#[cfg(windows)]` and skips gracefully without admin).
