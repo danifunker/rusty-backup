@@ -1246,21 +1246,34 @@ jobs:
             [ -f "$f" ] || continue
             sudo sed -i -E 's|^deb (http)|deb [arch=amd64] \1|; s|^deb-src (http)|deb-src [arch=amd64] \1|' "$f"
           done
-          # Release pocket ONLY (no -updates/-security/-backports). The ports
-          # mirror propagates SRUs to riscv64 out of step with amd64, so a
-          # security update to e.g. libglib2.0-dev can land its new package
-          # split (libglib2.0-dev-bin-linux) before the matching riscv64
-          # binaries exist, leaving apt with "held broken packages". The
-          # release snapshot is internally consistent, which is all a
-          # throwaway cross sysroot needs.
+          # Keep every pocket (noble + -updates/-security/-backports): libc6 is
+          # Multi-Arch: same, so libc6:riscv64 must EXACTLY match the runner's
+          # already-installed libc6:amd64, which comes from -security/-updates.
+          # Dropping those pockets makes libc6:riscv64 uninstallable and every
+          # sysroot lib collapses with "libc6:riscv64 ... not installable".
           printf '%s\n' \
             'Types: deb' \
             'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-            'Suites: noble' \
+            'Suites: noble noble-updates noble-backports noble-security' \
             'Components: main universe' \
             'Architectures: riscv64' \
             'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
             | sudo tee /etc/apt/sources.list.d/riscv64-ports.sources >/dev/null
+          # ...but the ports mirror propagates SRUs to riscv64 out of step with
+          # amd64. A libglib2.0 security update (2.80.0-6ubuntu3.8) landed a new
+          # package split (libglib2.0-dev-bin-linux) whose riscv64 binary didn't
+          # exist yet, so apt hit "held broken packages" on libglib2.0-dev.
+          # Forbid the glib packages from the SRU pockets so they resolve from
+          # the internally-consistent release snapshot; libc6 etc. stay current.
+          printf '%s\n' \
+            'Package: libglib2.0*' \
+            'Pin: release a=noble-updates' \
+            'Pin-Priority: -10' \
+            '' \
+            'Package: libglib2.0*' \
+            'Pin: release a=noble-security' \
+            'Pin-Priority: -10' \
+            | sudo tee /etc/apt/preferences.d/riscv64-glib-release.pref >/dev/null
           sudo apt-get update
 
       - name: Install riscv64 cross toolchain + GTK/GL sysroot
