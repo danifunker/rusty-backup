@@ -142,3 +142,22 @@ consistent — recompute PercentInUse, clear VolumeDirty, recompute the main
 checksum, and copy the main region over the backup. Verified against the system
 `fsck_exfat` (which needs a loopback device, so the oracle test attaches the
 image with `hdiutil`).
+
+## Check phases (ext2/3/4 example)
+
+`src/fs/ext_fsck.rs` is an e2fsck Pass-5-style reconciliation. It computes the
+in-use set independently of the on-disk bitmaps:
+
+| Source | Blocks / inodes marked in use |
+|--------|------------------------------|
+| Metadata (from the group descriptors) | superblock + primary GDT per `sparse_super` backup group; every group's block bitmap, inode bitmap, inode table |
+| Inode walk | every in-use inode (`< s_first_ino` reserved, or `mode != 0`), traced through extents / indirect blocks — data **and** the metadata blocks describing them; the resize inode covers reserved-GDT, the journal inode its blocks |
+
+It then flags block-bitmap / inode-bitmap divergence, wrong free-block /
+free-inode counts (superblock + per group), and multiply-claimed blocks. Repair
+rewrites the bitmaps + free counts from the computed state.
+
+**Repair is withheld on `metadata_csum` / `uninit_bg` volumes** — their bitmaps
+and descriptors carry crc checksums this pass doesn't yet recompute, so it
+reports the issues but declines to rewrite (run `e2fsck`). Verified against
+`e2fsck -fn` from e2fsprogs (`brew install e2fsprogs`).

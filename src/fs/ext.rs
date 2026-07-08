@@ -90,6 +90,47 @@ struct GroupDescriptor {
     flags: u16,
 }
 
+/// Geometry snapshot for the fsck module (`ext_fsck`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtGeom {
+    pub(crate) partition_offset: u64,
+    pub(crate) block_size: u64,
+    pub(crate) total_blocks: u64,
+    pub(crate) blocks_per_group: u32,
+    pub(crate) first_data_block: u32,
+    pub(crate) inodes_count: u32,
+    pub(crate) inodes_per_group: u32,
+    pub(crate) inode_size: u16,
+    pub(crate) first_ino: u32,
+    pub(crate) group_count: u32,
+    pub(crate) desc_size: u16,
+    pub(crate) sparse_super: bool,
+    /// True when the volume carries per-metadata checksums (metadata_csum or the
+    /// older uninit_bg/GDT_CSUM). Repair is withheld for these — rewriting a
+    /// bitmap / descriptor without recomputing its crc would corrupt the volume.
+    pub(crate) checksummed: bool,
+    pub(crate) free_blocks: u64,
+    pub(crate) free_inodes: u32,
+}
+
+/// A block group's descriptor fields the checker needs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtGroup {
+    pub(crate) block_bitmap: u64,
+    pub(crate) inode_bitmap: u64,
+    pub(crate) inode_table: u64,
+    pub(crate) free_blocks: u32,
+    pub(crate) free_inodes: u32,
+}
+
+/// The inode fields the checker needs to decide in-use status and trace blocks.
+pub(crate) struct FsckInode {
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) flags: u32,
+    pub(crate) block: [u8; 60],
+}
+
 #[derive(Debug)]
 struct InodeData {
     mode: u32,
@@ -674,6 +715,212 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let gd = &self.group_descriptors[group];
         self.read_block(gd.block_bitmap)
     }
+
+    /// Read a group's inode bitmap block.
+    pub(crate) fn read_inode_bitmap(&mut self, group: usize) -> Result<Vec<u8>, FilesystemError> {
+        let gd = &self.group_descriptors[group];
+        self.read_block(gd.inode_bitmap)
+    }
+
+    /// Snapshot the geometry + group descriptors the fsck module needs.
+    pub(crate) fn fsck_geometry(&mut self) -> Result<(ExtGeom, Vec<ExtGroup>), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + SUPERBLOCK_OFFSET))?;
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        self.reader.read_exact(&mut sb)?;
+
+        let inodes_count = le32(&sb, 0x00);
+        let free_blocks_lo = le32(&sb, 0x0C) as u64;
+        let free_inodes = le32(&sb, 0x10);
+        let blocks_per_group = le32(&sb, 0x20);
+        let first_ino = match le32(&sb, 0x54) {
+            0 => 11,
+            v => v,
+        };
+        let ro_compat = le32(&sb, 0x64);
+        let incompat = le32(&sb, 0x60);
+        let sparse_super = ro_compat & 0x0001 != 0;
+        // metadata_csum (0x400) or the older uninit_bg/GDT_CSUM (0x10).
+        let checksummed = ro_compat & 0x0410 != 0;
+        let is_64bit = incompat & 0x0080 != 0;
+        let free_blocks = if is_64bit {
+            ((le32(&sb, 0x158) as u64) << 32) | free_blocks_lo
+        } else {
+            free_blocks_lo
+        };
+
+        let geom = ExtGeom {
+            partition_offset: self.partition_offset,
+            block_size: self.block_size,
+            total_blocks: self.total_blocks,
+            blocks_per_group,
+            first_data_block: self.first_data_block,
+            inodes_count,
+            inodes_per_group: self.inodes_per_group,
+            inode_size: self.inode_size,
+            first_ino,
+            group_count: self.group_count,
+            desc_size: self.desc_size,
+            sparse_super,
+            checksummed,
+            free_blocks,
+            free_inodes,
+        };
+        let groups = self
+            .group_descriptors
+            .iter()
+            .map(|g| ExtGroup {
+                block_bitmap: g.block_bitmap,
+                inode_bitmap: g.inode_bitmap,
+                inode_table: g.inode_table,
+                free_blocks: g.free_blocks,
+                free_inodes: g.free_inodes,
+            })
+            .collect();
+        Ok((geom, groups))
+    }
+
+    /// Read the fsck-relevant fields of inode `inum` (1-based).
+    pub(crate) fn fsck_read_inode(&mut self, inum: u32) -> Result<FsckInode, FilesystemError> {
+        let ino = self.read_inode(inum)?;
+        Ok(FsckInode {
+            mode: ino.mode,
+            size: ino.size,
+            flags: ino.flags,
+            block: ino.block,
+        })
+    }
+
+    /// All physical blocks an inode occupies — data blocks *and* the metadata
+    /// blocks that describe them (indirect pointer blocks, extent-tree index
+    /// nodes). Returns empty for inodes that don't reference blocks (free,
+    /// device / fifo / socket, inline data, fast symlinks).
+    pub(crate) fn fsck_owned_blocks(
+        &mut self,
+        ino: &FsckInode,
+    ) -> Result<Vec<u64>, FilesystemError> {
+        const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+        const S_IFMT: u32 = 0xF000;
+        const S_IFREG: u32 = 0x8000;
+        const S_IFDIR: u32 = 0x4000;
+        const S_IFLNK: u32 = 0xA000;
+
+        if ino.flags & EXT4_INLINE_DATA_FL != 0 {
+            return Ok(Vec::new());
+        }
+        match ino.mode & S_IFMT {
+            S_IFREG | S_IFDIR => {}
+            S_IFLNK => {
+                // Fast symlink: target is stored inline in i_block, not blocks.
+                if ino.size < 60 && ino.flags & EXT4_EXTENTS_FL == 0 {
+                    return Ok(Vec::new());
+                }
+            }
+            _ => return Ok(Vec::new()),
+        }
+
+        let mut out = Vec::new();
+        let uses_extents =
+            ino.flags & EXT4_EXTENTS_FL != 0 || (self.has_extents && is_extent_header(&ino.block));
+        if uses_extents {
+            self.fsck_extent_blocks(&ino.block, &mut out)?;
+        } else {
+            self.fsck_indirect_blocks(ino, &mut out)?;
+        }
+        out.retain(|&b| b >= 1 && b < self.total_blocks);
+        Ok(out)
+    }
+
+    fn fsck_extent_blocks(
+        &mut self,
+        node: &[u8],
+        out: &mut Vec<u64>,
+    ) -> Result<(), FilesystemError> {
+        let header = parse_extent_header(node)?;
+        if header.depth == 0 {
+            out.extend(parse_extent_leaves(node, header.entries));
+        } else {
+            for idx in parse_extent_indices(node, header.entries) {
+                out.push(idx.child_block); // the index node is metadata
+                let child = self.read_block(idx.child_block)?;
+                self.fsck_extent_blocks(&child, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fsck_indirect_blocks(
+        &mut self,
+        ino: &FsckInode,
+        out: &mut Vec<u64>,
+    ) -> Result<(), FilesystemError> {
+        let ppb = self.block_size as usize / 4;
+        // 12 direct.
+        for i in 0..12 {
+            let b = le32(&ino.block, i * 4) as u64;
+            if b != 0 {
+                out.push(b);
+            }
+        }
+        // Single indirect: the pointer block + its targets.
+        let si = le32(&ino.block, 48) as u64;
+        if si != 0 {
+            out.push(si);
+            let d = self.read_block(si)?;
+            for i in 0..ppb {
+                let b = le32(&d, i * 4) as u64;
+                if b != 0 {
+                    out.push(b);
+                }
+            }
+        }
+        // Double indirect.
+        let di = le32(&ino.block, 52) as u64;
+        if di != 0 {
+            out.push(di);
+            let d1 = self.read_block(di)?;
+            for i in 0..ppb {
+                let b2 = le32(&d1, i * 4) as u64;
+                if b2 != 0 {
+                    out.push(b2);
+                    let d2 = self.read_block(b2)?;
+                    for j in 0..ppb {
+                        let b = le32(&d2, j * 4) as u64;
+                        if b != 0 {
+                            out.push(b);
+                        }
+                    }
+                }
+            }
+        }
+        // Triple indirect.
+        let ti = le32(&ino.block, 56) as u64;
+        if ti != 0 {
+            out.push(ti);
+            let d1 = self.read_block(ti)?;
+            for i in 0..ppb {
+                let b2 = le32(&d1, i * 4) as u64;
+                if b2 != 0 {
+                    out.push(b2);
+                    let d2 = self.read_block(b2)?;
+                    for j in 0..ppb {
+                        let b3 = le32(&d2, j * 4) as u64;
+                        if b3 != 0 {
+                            out.push(b3);
+                            let d3 = self.read_block(b3)?;
+                            for k in 0..ppb {
+                                let b = le32(&d3, k * 4) as u64;
+                                if b != 0 {
+                                    out.push(b);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
@@ -754,6 +1001,10 @@ impl<R: Read + Seek + Send> Filesystem for ExtFilesystem<R> {
 
     fn fs_type(&self) -> &str {
         self.ext_version.name()
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::ext_fsck::fsck_ext(self))
     }
 
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
@@ -840,6 +1091,41 @@ fn dir_entry_actual_len(name_len: usize) -> usize {
 }
 
 impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
+    // ---- fsck repair helpers ----
+
+    /// Write `bytes` at an absolute offset (superblock / GDT free-count patches).
+    pub(crate) fn write_raw(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Overwrite a group's block bitmap block.
+    pub(crate) fn write_block_bitmap(
+        &mut self,
+        group: usize,
+        data: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let bb = self.group_descriptors[group].block_bitmap;
+        self.write_block(bb, data)
+    }
+
+    /// Overwrite a group's inode bitmap block.
+    pub(crate) fn write_inode_bitmap(
+        &mut self,
+        group: usize,
+        data: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let ib = self.group_descriptors[group].inode_bitmap;
+        self.write_block(ib, data)
+    }
+
+    /// Flush the underlying writer once at the end of a repair pass.
+    pub(crate) fn flush_writer(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
     // ---- Low-level write helpers ----
 
     /// Write a full block to disk.
@@ -1659,6 +1945,10 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 // ---- EditableFilesystem implementation ----
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::ext_fsck::repair_ext(self)
+    }
+
     fn create_file(
         &mut self,
         parent: &FileEntry,

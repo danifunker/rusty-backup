@@ -45,7 +45,7 @@ missing capability on a driver that already round-trips.
 | FAT12/16/32 | Yes | Yes | **Yes** | — **fsck done** (FAT chains: loops, bad/lost/cross-linked clusters, size-vs-chain; FAT-mirror consistency; repair is FAT-only, byte-verified vs `fsck_msdos`) |
 | exFAT | Yes | Yes | **Yes** | — **fsck done** (allocation-bitmap reconciliation vs the directory tree; boot checksum + backup + VolumeDirty; repair rebuilds the bitmap + resyncs boot, byte-verified vs `fsck_exfat`) |
 | NTFS | Yes | Yes | validate | **check/repair** |
-| ext2/3/4 | No | Yes | validate | **create + check/repair** |
+| ext2/3/4 | No | Yes | **Yes** | **create** (fsck done: block+inode bitmap + free-count reconciliation vs computed allocation, byte-verified vs `e2fsck`; repair withheld on metadata_csum) |
 | UFS / FFS | No | Yes | **repair** | **create** |
 | XFS (v4/v5) | No | Yes (v4) | **repair** | **create + v5 edit** (shrink = known limitation) |
 | MFS | No | Yes | No | **create + fsck** |
@@ -74,7 +74,7 @@ established (see `hfs_fsck/`, `efs_fsck.rs`, `affs_fsck.rs`, `ufs_fsck` in
 
 | Target | Filesystems | Effort | Notes |
 |---|---|---|---|
-| **Most-used first** | ~~FAT~~ (done), ~~exFAT~~ (done), NTFS, ext | M each | Promote the existing `validate` gate to a real check + repair (~~FAT chains / cross-links~~; ~~exFAT bitmap~~; NTFS `$MFT`/`$Bitmap`; ext group descriptors + inode bitmaps). Highest user impact. **FAT shipped** (`fat_fsck.rs`): FAT-table walk over the directory tree flags chain loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain, lost cluster chains, an undersized FAT, and FAT-mirror divergence; repair is FAT-only, byte-verified against `fsck_msdos`. **exFAT shipped** (`exfat_fsck.rs`): allocation-bitmap reconciliation against the traced directory tree (contiguous + FAT-chained), boot checksum + backup-region consistency + VolumeDirty; repair rebuilds the bitmap and resyncs the boot regions, byte-verified against `fsck_exfat`. |
+| **Most-used first** | ~~FAT~~ (done), ~~exFAT~~ (done), NTFS, ~~ext~~ (done) | M each | Promote the existing `validate` gate to a real check + repair (~~FAT chains / cross-links~~; ~~exFAT bitmap~~; NTFS `$MFT`/`$Bitmap`; ~~ext group descriptors + inode bitmaps~~). Highest user impact. **FAT shipped** (`fat_fsck.rs`): FAT-table walk over the directory tree flags chain loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain, lost cluster chains, an undersized FAT, and FAT-mirror divergence; repair is FAT-only, byte-verified against `fsck_msdos`. **exFAT shipped** (`exfat_fsck.rs`): allocation-bitmap reconciliation against the traced directory tree (contiguous + FAT-chained), boot checksum + backup-region consistency + VolumeDirty; repair rebuilds the bitmap and resyncs the boot regions, byte-verified against `fsck_exfat`. **ext shipped** (`ext_fsck.rs`): block + inode bitmap + free-count reconciliation against the computed allocation (metadata from group descriptors + inode-owned blocks incl. reserved inodes / journal / reserved-GDT), byte-verified against `e2fsck`; repair withheld on metadata_csum volumes. Only **NTFS** remains in this tier. |
 | **JFS repair** | JFS | M | `fsck()` exists (check-only); add the `repair()` branch the code comments already scope. |
 | **Amiga** | PFS3, SFS | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). |
 | **Retro long-tail** | ~~CBM~~ (done), Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. **CBM shipped** as the template: recompute the BAM from the directory + file chains (the VALIDATE model), diff against the on-disk BAM, rewrite; byte-verified against `c1541 validate` fixtures for all five variants. |
@@ -143,8 +143,8 @@ The order that buys the most capability per unit effort:
 
 1. **fsck for FAT / exFAT / NTFS / ext** — promote the four most-used
    filesystems from `validate` to real check + repair. Biggest user impact.
-   **FAT + exFAT done** (`src/fs/fat_fsck.rs`, `src/fs/exfat_fsck.rs`); NTFS /
-   ext remain.
+   **FAT + exFAT + ext done** (`src/fs/fat_fsck.rs`, `exfat_fsck.rs`,
+   `ext_fsck.rs`); only **NTFS** remains.
 2. **create-blank for ext + UFS** — completes the two Unix workhorses (both are
    already read + edit; UFS already fscks/repairs).
 3. **Amiga PFS3 + SFS fsck** — brings the Amiga trio to parity with AFFS.
