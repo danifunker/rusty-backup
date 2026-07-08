@@ -1735,6 +1735,14 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // UFS/FFS edit mirrors the read dispatch above (0x00 arm of
+                // open_filesystem). The EditableFilesystem impl is fixture-
+                // tested (create/rename/delete + fsck-clean); this arm is what
+                // makes it reachable.
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -1786,6 +1794,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
