@@ -63,7 +63,7 @@ pub enum FatType {
 }
 
 impl FatType {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             FatType::Fat12 => "FAT12",
             FatType::Fat16 => "FAT16",
@@ -82,6 +82,23 @@ const ATTR_DIRECTORY: u8 = 0x10;
 #[allow(dead_code)]
 const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_LONG_NAME: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
+
+/// Immutable geometry snapshot handed to the fsck module (`fat_fsck`) so the
+/// checker can reason about clusters, FAT layout, and the valid data-cluster
+/// range without reaching into private fields. All values are derived from the
+/// BPB at open time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FatGeom {
+    pub(crate) fat_type: FatType,
+    pub(crate) num_fats: u8,
+    pub(crate) root_cluster: u32,
+    pub(crate) total_clusters: u64,
+    /// Bytes per cluster (`bytes_per_sector * sectors_per_cluster`).
+    pub(crate) cluster_size: u64,
+    /// Highest addressable data cluster (inclusive). Data clusters are numbered
+    /// `2..=max_data_cluster`; anything outside that is reserved / out of range.
+    pub(crate) max_data_cluster: u32,
+}
 
 impl<R: Read + Seek> FatFilesystem<R> {
     /// Open a FAT filesystem at the given offset within a reader.
@@ -223,6 +240,42 @@ impl<R: Read + Seek> FatFilesystem<R> {
     /// Bytes per cluster.
     fn cluster_size(&self) -> u64 {
         self.bytes_per_sector * self.sectors_per_cluster
+    }
+
+    /// Snapshot the geometry the fsck module needs. Read-only, so it works
+    /// through the `Filesystem::fsck` path (no `Write` bound required).
+    pub(crate) fn fsck_geometry(&self) -> FatGeom {
+        FatGeom {
+            fat_type: self.fat_type,
+            num_fats: self.num_fats,
+            root_cluster: self.root_cluster,
+            total_clusters: self.total_clusters,
+            cluster_size: self.cluster_size(),
+            // Clusters are numbered from 2; the last valid one is total+1.
+            max_data_cluster: (self.total_clusters + 1) as u32,
+        }
+    }
+
+    /// Read the 512-byte boot sector / BPB. Used by `fat_fsck` to recover the
+    /// media descriptor byte for the FAT[0] identifier check.
+    pub(crate) fn read_bpb(&mut self) -> Result<[u8; 512], FilesystemError> {
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut bpb = [0u8; 512];
+        self.reader.read_exact(&mut bpb)?;
+        Ok(bpb)
+    }
+
+    /// Read FAT copy `idx` (0-based) into memory. Read-only counterpart of
+    /// [`read_fat_table`](Self::read_fat_table) that also reaches the mirror
+    /// copies for the FAT-consistency check. Returns the raw FAT bytes.
+    pub(crate) fn read_fat_copy(&mut self, idx: u8) -> Result<Vec<u8>, FilesystemError> {
+        let fat_size = (self.sectors_per_fat * self.bytes_per_sector) as usize;
+        let base = self.sector_offset(self.reserved_sectors)
+            + idx as u64 * self.sectors_per_fat * self.bytes_per_sector;
+        self.reader.seek(SeekFrom::Start(base))?;
+        let mut buf = vec![0u8; fat_size];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     /// Scan the FAT once and return the number of in-use data clusters.
@@ -718,6 +771,10 @@ impl<R: Read + Seek + Send> Filesystem for FatFilesystem<R> {
         self.fat_type.name()
     }
 
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::fat_fsck::fsck_fat(self))
+    }
+
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         validate_fat_name(name)
     }
@@ -946,7 +1003,11 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
     }
 
     /// Write a FAT entry for a given cluster on disk (updates all FAT copies).
-    fn write_fat_entry_disk(&mut self, cluster: u32, value: u32) -> Result<(), FilesystemError> {
+    pub(crate) fn write_fat_entry_disk(
+        &mut self,
+        cluster: u32,
+        value: u32,
+    ) -> Result<(), FilesystemError> {
         let fat_start = self.sector_offset(self.reserved_sectors);
         let fat_size = self.sectors_per_fat * self.bytes_per_sector;
 
@@ -980,6 +1041,22 @@ impl<R: Read + Write + Seek> FatFilesystem<R> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Overwrite FAT copy `idx` (0-based) with `bytes` verbatim. Used by
+    /// `fat_fsck`'s repair to resynchronise mirror FATs from the primary.
+    pub(crate) fn write_fat_copy(&mut self, idx: u8, bytes: &[u8]) -> Result<(), FilesystemError> {
+        let base = self.sector_offset(self.reserved_sectors)
+            + idx as u64 * self.sectors_per_fat * self.bytes_per_sector;
+        self.reader.seek(SeekFrom::Start(base))?;
+        self.reader.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Flush the underlying writer. Called once at the end of a repair pass.
+    pub(crate) fn flush_fat(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
         Ok(())
     }
 
@@ -1625,6 +1702,10 @@ fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::fat_fsck::repair_fat(self)
+    }
+
     fn create_file(
         &mut self,
         parent: &FileEntry,
@@ -2735,7 +2816,7 @@ impl<R: Read + Seek> Read for CompactFatReader<R> {
 // ---------------------------------------------------------------------------
 
 /// Read a FAT entry value for the given cluster number.
-fn read_fat_entry(fat_data: &[u8], cluster: u32, fat_type: FatType) -> u32 {
+pub(crate) fn read_fat_entry(fat_data: &[u8], cluster: u32, fat_type: FatType) -> u32 {
     match fat_type {
         FatType::Fat12 => {
             let byte_off = (cluster as usize * 3) / 2;
@@ -2820,7 +2901,7 @@ fn write_fat_entry(fat_data: &mut [u8], cluster: u32, value: u32, fat_type: FatT
     }
 }
 
-fn is_end_of_chain(entry: u32, fat_type: FatType) -> bool {
+pub(crate) fn is_end_of_chain(entry: u32, fat_type: FatType) -> bool {
     match fat_type {
         FatType::Fat12 => entry >= 0x0FF8,
         FatType::Fat16 => entry >= 0xFFF8,
@@ -2828,7 +2909,7 @@ fn is_end_of_chain(entry: u32, fat_type: FatType) -> bool {
     }
 }
 
-fn is_bad_cluster(entry: u32, fat_type: FatType) -> bool {
+pub(crate) fn is_bad_cluster(entry: u32, fat_type: FatType) -> bool {
     match fat_type {
         FatType::Fat12 => entry == 0x0FF7,
         FatType::Fat16 => entry == 0xFFF7,
@@ -2836,7 +2917,7 @@ fn is_bad_cluster(entry: u32, fat_type: FatType) -> bool {
     }
 }
 
-fn end_of_chain_marker(fat_type: FatType) -> u32 {
+pub(crate) fn end_of_chain_marker(fat_type: FatType) -> u32 {
     match fat_type {
         FatType::Fat12 => 0x0FFF,
         FatType::Fat16 => 0xFFFF,
@@ -4381,73 +4462,128 @@ pub fn compute_fat_blank_layout_with_sector_size(
     }
     let total_sectors = total_sectors_u64 as u32;
 
-    let (fat_type, sectors_per_cluster, root_entry_count) = if size_bytes <= 32 * 1024 * 1024 {
-        let spc: u32 = match size_bytes {
-            0..=2_097_152 => 1,
-            2_097_153..=8_388_608 => 2,
-            8_388_609..=16_777_216 => 4,
-            _ => 8,
-        };
-        (FatType::Fat12, spc, 224u16)
-    } else if size_bytes <= 2u64 * 1024 * 1024 * 1024 {
-        let mut spc: u32 = 1;
-        while (total_sectors / spc) > 65500 && spc < 64 {
-            spc *= 2;
+    let num_fats: u8 = 2;
+
+    // Size the FAT table for a candidate (type, root-dir, cluster-size) and
+    // return the settled `(sectors_per_fat, cluster_count)`. `FatFilesystem::open`
+    // derives the FAT type purely from the cluster count, so the caller uses this
+    // to pick the type that is *self-consistent* with the FAT it sizes — the whole
+    // point of this function. (An undersized FAT was the pre-fix bug: a FAT12
+    // label whose cluster count actually implied FAT16, with the FAT sized for
+    // 12-bit entries.)
+    let size_fat = |fat_type: FatType, root_entry_count: u16, spc: u32| -> Result<(u32, u32)> {
+        let reserved: u32 = if fat_type == FatType::Fat32 { 32 } else { 1 };
+        let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector);
+        let mut spf: u32 = 1;
+        loop {
+            let data_start = reserved + num_fats as u32 * spf + root_dir_sectors;
+            if data_start >= total_sectors {
+                return Err(anyhow::anyhow!(
+                    "FAT geometry overflowed (data_start={data_start} >= total_sectors={total_sectors})"
+                ));
+            }
+            let clusters = (total_sectors - data_start) / spc;
+            let fat_bytes_needed = match fat_type {
+                FatType::Fat12 => ((clusters + 2) as u64 * 3).div_ceil(2) as u32,
+                FatType::Fat16 => (clusters + 2) * 2,
+                FatType::Fat32 => (clusters + 2) * 4,
+            };
+            let needed_spf = fat_bytes_needed.div_ceil(bytes_per_sector);
+            if needed_spf <= spf {
+                return Ok((spf, clusters));
+            }
+            spf = needed_spf;
         }
-        (FatType::Fat16, spc, 512u16)
-    } else {
+    };
+
+    // --- FAT32: capacity above 2 GiB. Distinct BPB shape (32 reserved sectors,
+    //     no fixed root directory, FSInfo + backup boot). ---
+    if size_bytes > 2u64 * 1024 * 1024 * 1024 {
         let spc: u32 = match size_bytes {
             0..=8_589_934_592 => 8,
             8_589_934_593..=17_179_869_184 => 16,
             17_179_869_185..=34_359_738_368 => 32,
             _ => 64,
         };
-        (FatType::Fat32, spc, 0u16)
-    };
-
-    let (reserved_sectors, fsinfo_sector, backup_boot_sector): (u16, u16, u16) = match fat_type {
-        FatType::Fat12 | FatType::Fat16 => (1, 0, 0),
-        FatType::Fat32 => (32, 1, 6),
-    };
-    let num_fats: u8 = 2;
-    let root_dir_sectors = (root_entry_count as u32 * 32).div_ceil(bytes_per_sector);
-
-    let mut sectors_per_fat: u32 = 1;
-    loop {
-        let data_start =
-            reserved_sectors as u32 + (num_fats as u32 * sectors_per_fat) + root_dir_sectors;
-        if data_start >= total_sectors {
-            return Err(anyhow::anyhow!(
-                "FAT geometry overflowed (data_start={data_start} >= total_sectors={total_sectors})"
-            ));
-        }
-        let data_sectors = total_sectors - data_start;
-        let total_clusters = data_sectors / sectors_per_cluster;
-        let fat_bytes_needed = match fat_type {
-            FatType::Fat12 => ((total_clusters + 2) as u64 * 3).div_ceil(2) as u32,
-            FatType::Fat16 => (total_clusters + 2) * 2,
-            FatType::Fat32 => (total_clusters + 2) * 4,
-        };
-        let needed_spf = fat_bytes_needed.div_ceil(bytes_per_sector);
-        if needed_spf <= sectors_per_fat {
-            break;
-        }
-        sectors_per_fat = needed_spf;
+        let (sectors_per_fat, _clusters) = size_fat(FatType::Fat32, 0, spc)?;
+        return Ok(FatBlankLayout {
+            fat_type: FatType::Fat32,
+            bytes_per_sector,
+            sectors_per_cluster: spc,
+            reserved_sectors: 32,
+            num_fats,
+            root_entry_count: 0,
+            root_dir_sectors: 0,
+            sectors_per_fat,
+            fsinfo_sector: 1,
+            backup_boot_sector: 6,
+            total_sectors,
+        });
     }
 
-    Ok(FatBlankLayout {
-        fat_type,
-        bytes_per_sector,
-        sectors_per_cluster,
-        reserved_sectors,
-        num_fats,
-        root_entry_count,
-        root_dir_sectors,
-        sectors_per_fat,
-        fsinfo_sector,
-        backup_boot_sector,
-        total_sectors,
-    })
+    // --- FAT12 / FAT16: identical BPB shape (1 reserved sector, fixed root
+    //     directory). The type is whatever the cluster count resolves to under
+    //     `open`'s thresholds (<4085 = FAT12), and the FAT is sized precisely for
+    //     that type. Cluster size is chosen by capacity; it is only bumped to
+    //     escape the narrow FAT12/16 boundary "dead zone" where neither type is
+    //     self-consistent (unreachable for the size table below, but kept as a
+    //     guard). ---
+    let mut spc: u32 = match size_bytes {
+        0..=2_097_152 => 1,
+        2_097_153..=8_388_608 => 2,
+        8_388_609..=16_777_216 => 4,
+        16_777_217..=33_554_432 => 8,
+        _ => {
+            // 32 MiB .. 2 GiB: keep the cluster count under the FAT16 ceiling.
+            let mut s: u32 = 1;
+            while (total_sectors / s) > 65_500 && s < 64 {
+                s *= 2;
+            }
+            s
+        }
+    };
+
+    let make =
+        |fat_type: FatType, root_entry_count: u16, spc: u32, sectors_per_fat: u32| FatBlankLayout {
+            fat_type,
+            bytes_per_sector,
+            sectors_per_cluster: spc,
+            reserved_sectors: 1,
+            num_fats,
+            root_entry_count,
+            root_dir_sectors: (root_entry_count as u32 * 32).div_ceil(bytes_per_sector),
+            sectors_per_fat,
+            fsinfo_sector: 0,
+            backup_boot_sector: 0,
+            total_sectors,
+        };
+
+    loop {
+        // Try FAT16 first: its 16-bit entries make the largest FAT, hence the
+        // lowest cluster count, so if *this* already reaches the FAT16 range the
+        // volume is unambiguously FAT16.
+        let (spf16, cl16) = size_fat(FatType::Fat16, 512, spc)?;
+        if cl16 >= 4085 {
+            return Ok(make(FatType::Fat16, 512, spc, spf16));
+        }
+
+        // FAT16 sizing lands below the FAT12 ceiling; size for FAT12 (224 root
+        // entries, the floppy convention) and confirm it stays below it.
+        let (spf12, cl12) = size_fat(FatType::Fat12, 224, spc)?;
+        if cl12 < 4085 {
+            return Ok(make(FatType::Fat12, 224, spc, spf12));
+        }
+
+        // Dead zone: FAT12 sizing reaches the ceiling while FAT16 sizing stays
+        // below it. Doubling the cluster size drops both counts clear of the
+        // boundary; one step always suffices for real geometries.
+        if spc >= 64 {
+            // Truly unreachable; fall back to FAT16 sized for FAT16 so the FAT is
+            // never undersized.
+            return Ok(make(FatType::Fat16, 512, spc, spf16));
+        }
+        spc *= 2;
+    }
 }
 
 /// Write a blank FAT image's metadata (BPB, FATs, FSInfo, backup boot,

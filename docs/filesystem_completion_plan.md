@@ -42,7 +42,7 @@ missing capability on a driver that already round-trips.
 | Filesystem | Create | Edit | Check/Repair | Missing → target |
 |---|:---:|:---:|:---:|---|
 | **HFS / HFS+ / EFS / AFFS** | Yes | Yes | Yes | — **complete** (the template) |
-| FAT12/16/32 | Yes | Yes | validate | **check/repair** |
+| FAT12/16/32 | Yes | Yes | **Yes** | — **fsck done** (FAT chains: loops, bad/lost/cross-linked clusters, size-vs-chain; FAT-mirror consistency; repair is FAT-only, byte-verified vs `fsck_msdos`) |
 | exFAT | Yes | Yes | validate | **check/repair** |
 | NTFS | Yes | Yes | validate | **check/repair** |
 | ext2/3/4 | No | Yes | validate | **create + check/repair** |
@@ -74,7 +74,7 @@ established (see `hfs_fsck/`, `efs_fsck.rs`, `affs_fsck.rs`, `ufs_fsck` in
 
 | Target | Filesystems | Effort | Notes |
 |---|---|---|---|
-| **Most-used first** | FAT, exFAT, NTFS, ext | M each | Promote the existing `validate` gate to a real check + repair (FAT chains / cross-links; exFAT bitmap+upcase; NTFS `$MFT`/`$Bitmap`; ext group descriptors + inode bitmaps). Highest user impact. |
+| **Most-used first** | ~~FAT~~ (done), exFAT, NTFS, ext | M each | Promote the existing `validate` gate to a real check + repair (~~FAT chains / cross-links~~; exFAT bitmap+upcase; NTFS `$MFT`/`$Bitmap`; ext group descriptors + inode bitmaps). Highest user impact. **FAT shipped** (`fat_fsck.rs`): FAT-table walk over the directory tree flags chain loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain, lost cluster chains, an undersized FAT, and FAT-mirror divergence; repair is FAT-only (truncate, free lost, resync mirrors, fix FAT[0] id), byte-verified against `fsck_msdos` on real fixtures. |
 | **JFS repair** | JFS | M | `fsck()` exists (check-only); add the `repair()` branch the code comments already scope. |
 | **Amiga** | PFS3, SFS | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). |
 | **Retro long-tail** | ~~CBM~~ (done), Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. **CBM shipped** as the template: recompute the BAM from the directory + file chains (the VALIDATE model), diff against the on-disk BAM, rewrite; byte-verified against `c1541 validate` fixtures for all five variants. |
@@ -143,6 +143,7 @@ The order that buys the most capability per unit effort:
 
 1. **fsck for FAT / exFAT / NTFS / ext** — promote the four most-used
    filesystems from `validate` to real check + repair. Biggest user impact.
+   **FAT done** (`src/fs/fat_fsck.rs`); exFAT / NTFS / ext remain.
 2. **create-blank for ext + UFS** — completes the two Unix workhorses (both are
    already read + edit; UFS already fscks/repairs).
 3. **Amiga PFS3 + SFS fsck** — brings the Amiga trio to parity with AFFS.
@@ -164,3 +165,21 @@ As each item lands, move the affected row in the
 [coverage audit](filesystem_coverage_audit.md) and the README Filesystems table,
 and re-grade any [MiSTer core](full_MiSTer_support_status.md) that depended on
 it — per the CLAUDE.md pre-commit documentation-sync checklist.
+
+## Adjacent bugs found + fixed while doing this work
+
+- **`create_blank_fat` mis-sized the FAT for FAT12-labelled volumes above ~2 MB
+  — FIXED.** The formatter's type picker used raw size thresholds
+  (`<= 32 MiB -> FAT12`) that ignored the 4084-cluster FAT12 ceiling, so e.g. an
+  8 MiB volume was labelled FAT12 with 8160 clusters while its FAT was sized for
+  12-bit entries (24 sectors). `FatFilesystem::open` then re-derived FAT16 from
+  the cluster count and read 16-bit entries out of a FAT that only held ~6144 of
+  them — the tail clusters were unaddressable. `fsck_msdos` rejected such images;
+  our reader silently tolerated them (out-of-range entries read as free).
+  `compute_fat_blank_layout_with_sector_size` now derives the FAT type from the
+  cluster count (matching `open`) and sizes the FAT precisely for it — an 8 MiB
+  volume is a proper FAT16 (spf 32, not 24). Guarded by
+  `fat_fsck::tests::create_blank_fat_is_geometrically_valid_across_sizes` and the
+  `fsck_msdos` oracle across 2 MiB–128 MiB. The new FAT fsck also *detects* the
+  undersized condition (`FatTooSmallForClusters`) for images formatted by older
+  builds or other broken tools.

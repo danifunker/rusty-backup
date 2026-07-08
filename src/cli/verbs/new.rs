@@ -24,7 +24,8 @@ pub enum FsKind {
     /// allocation block size auto-floored so the result is mountable by
     /// BasiliskII / SheepShaver and classic Mac OS.
     Hfv,
-    /// FAT12 (≤ 32 MiB) or FAT16 (≤ 2 GiB), auto-selected by size.
+    /// FAT12 / FAT16 / FAT32, auto-selected: FAT32 above 2 GiB, otherwise
+    /// FAT12 or FAT16 by cluster count (small volumes are FAT12).
     Fat,
     /// IRIX EFS (single cylinder group).
     Efs,

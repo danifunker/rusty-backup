@@ -24,6 +24,7 @@ pub mod exfat;
 pub mod exfat_clone;
 pub mod ext;
 pub mod fat;
+pub mod fat_fsck;
 pub mod filesystem;
 pub mod fork_export;
 pub mod fsck;
@@ -2276,14 +2277,26 @@ pub fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> 
 }
 
 /// True for a partition type that supports filesystem checking (fsck): classic
-/// HFS (`0xAF` or APM `Apple_HFS`) and the AmigaDOS OFS/FFS variants.
+/// HFS (`0xAF` or APM `Apple_HFS`), the FAT12/16/32 type bytes, and the
+/// AmigaDOS OFS/FFS variants.
 ///
 /// This only covers the cases identifiable from the partition-type byte / APM
 /// string alone. The Unix filesystems whose family is only known after a
 /// content probe (SGI EFS, UFS/FFS, XFS, JFS, and HFS+) are matched by
 /// [`is_checkable_fs_name`] against the resolved `type_name` instead.
+///
+/// Note `0x07` (exFAT / NTFS / HPFS) is deliberately excluded — neither exFAT
+/// nor NTFS has an fsck driver yet, and their shared type byte can't tell them
+/// apart anyway.
 pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
+        return true;
+    }
+    // FAT12/16/32 partition types (same set as `fs_name_for`'s FAT arm).
+    if matches!(
+        ptype,
+        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+    ) {
         return true;
     }
     type_str.map(is_amiga_dos_type).unwrap_or(false)
@@ -2298,10 +2311,18 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// bytes are shared across ext / btrfs / xfs / ufs / jfs), so the button gate
 /// consults this in addition to [`is_checkable_type`]. Every driver named here
 /// returns `Some` from `Filesystem::fsck()`: EFS (`efs_fsck`), UFS (`ufs_fsck`),
-/// XFS (R1–R8), JFS (check-only), and HFS/HFS+.
+/// XFS (R1–R8), JFS (check-only), HFS/HFS+, and FAT12/16/32 (the superfloppy
+/// path, where the probed name is `"FAT12"` / `"FAT16"` / `"FAT32"` and there
+/// is no partition-type byte to consult).
+///
+/// exFAT is explicitly excluded — its name contains "FAT" but it has no fsck
+/// driver yet.
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
-    ["HFS", "EFS", "UFS", "XFS", "JFS"]
+    if n.contains("EXFAT") {
+        return false;
+    }
+    ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT"]
         .iter()
         .any(|tok| n.contains(tok))
 }
@@ -2689,7 +2710,9 @@ mod tests {
         assert!(is_checkable_type(0xAF, None));
         assert!(is_checkable_type(0, Some("Apple_HFS")));
         assert!(is_checkable_type(0, Some("DOS\\3")));
-        assert!(!is_checkable_type(0x0B, None)); // FAT not checkable
+        assert!(is_checkable_type(0x0B, None)); // FAT32 now checkable
+        assert!(is_checkable_type(0x06, None)); // FAT16 now checkable
+        assert!(!is_checkable_type(0x07, None)); // exFAT/NTFS: no fsck driver
         assert!(!is_checkable_type(0, Some("Apple_Driver_IOKit")));
     }
 
@@ -2698,12 +2721,14 @@ mod tests {
         // The resolved family names the inspect grid shows for content-probed
         // Linux (0x83) and SGI (dvh) partitions, plus HFS+.
         for name in [
-            "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+",
+            "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+", "FAT12",
+            "FAT16", "FAT32",
         ] {
             assert!(is_checkable_fs_name(name), "{name} should be checkable");
         }
-        // Filesystems without an fsck() driver stay off the button.
-        for name in ["ext", "btrfs", "ReiserFS", "FAT", "NTFS", "exFAT", "ProDOS"] {
+        // Filesystems without an fsck() driver stay off the button. exFAT is the
+        // tricky one — its name contains "FAT" but must not be enabled.
+        for name in ["ext", "btrfs", "ReiserFS", "NTFS", "exFAT", "ProDOS"] {
             assert!(
                 !is_checkable_fs_name(name),
                 "{name} has no fsck; must not enable the button"

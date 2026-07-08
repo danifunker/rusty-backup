@@ -598,14 +598,19 @@ fn build_blank_fs(
     }
 }
 
-/// Best-guess FAT type byte from volume size (mirrors `create_blank_fat`).
+/// MBR partition type byte for the FAT `create_blank_fat` actually produces at
+/// this size. Derived from the real layout (not a size heuristic) so the wrapper
+/// byte always matches the on-disk FAT type — the formatter picks FAT12/16 by
+/// cluster count, so a size-only guess can disagree with it.
 fn fat_type_byte_for(size_bytes: u64) -> u8 {
-    if size_bytes <= 32 * 1024 * 1024 {
-        0x01 // FAT12
-    } else if size_bytes <= 2u64 * 1024 * 1024 * 1024 {
-        0x06 // FAT16 BIG (CHS-LBA mix; the parser accepts all FAT16 variants)
-    } else {
-        0x0C // FAT32 LBA
+    use crate::fs::fat::FatType;
+    match crate::fs::fat::compute_fat_blank_layout(size_bytes).map(|l| l.fat_type) {
+        Ok(FatType::Fat12) => 0x01, // FAT12
+        Ok(FatType::Fat16) => 0x06, // FAT16 BIG (parser accepts all FAT16 variants)
+        Ok(FatType::Fat32) => 0x0C, // FAT32 LBA
+        // Below the 64 KiB floor compute_fat_blank_layout errors; FAT12 is the
+        // only sane type at that size and create_blank_fat would fail anyway.
+        Err(_) => 0x01,
     }
 }
 

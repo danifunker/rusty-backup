@@ -95,3 +95,30 @@ Some errors cannot be automatically fixed:
   Fundamental structural damage that makes the B-tree unreadable.
 
 The GUI shows a warning after repair listing how many issues remain unrepairable.
+
+## Check phases (FAT example)
+
+`src/fs/fat_fsck.rs` is an allocation-level checker rather than a B-tree one. It
+reads the primary FAT once into memory, enumerates the directory tree through the
+public `Filesystem` interface, and traces every file/dir cluster chain into an
+ownership map:
+
+| Pass | What it checks |
+|------|---------------|
+| 0 - Geometry | FAT large enough to hold an entry per data cluster (`FatTooSmallForClusters`) |
+| 1 - Header | FAT[0] media identifier; FAT[1] clean-shutdown / hard-error flags (warnings) |
+| 2 - Chains | Loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain |
+| 3 - Lost clusters | Allocated clusters no chain references, grouped into chains |
+| 4 - FAT mirrors | Secondary FAT copies vs. the primary |
+
+A single `analyze()` pass produces both the `FsckResult` (for `fsck_fat`) and a
+concrete fix list (for `repair_fat`), so check and repair never diverge. Repair
+touches **only the FAT table** — free lost chains, truncate over-long / looped /
+broken chains, resync mirrors, rewrite FAT[0]. Faults needing a directory-entry
+rewrite (cross-links, size-exceeds-chain, a start pointer into free/bad space)
+are surfaced for diagnosis but not auto-repaired. Detection and repair are
+byte-verified against the system `fsck_msdos` on real fixtures.
+
+FAT does not use the `<name>_issue` helper / internal-enum pattern above; it
+builds `FsckIssue` values directly and pairs each repairable one with its fix in
+the shared `analyze()` pass.
