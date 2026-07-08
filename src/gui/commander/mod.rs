@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::fork_export::{export_file_with_fork, safe_name};
+use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
 use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus};
 use rusty_backup::partition::format_size;
@@ -126,6 +128,10 @@ pub struct CommanderMode {
     /// timestamps on the destination (HFS catalog dates / Amiga datestamp)
     /// instead of stamping the current time. Defaults on.
     keep_dates: bool,
+    /// How resource forks are preserved when copying/exporting an image file to
+    /// a host folder (MacBinary / BinHex / AppleDouble / … via
+    /// [`export_file_with_fork`]). Ignored for host->host copies.
+    export_fork_mode: ResourceForkMode,
     /// The pane the user last interacted with — the middle-column Delete acts
     /// on it. Updated from each pane's `focused` response.
     active: Side,
@@ -158,10 +164,31 @@ impl CommanderMode {
             checksums: None,
             detail: None,
             keep_dates: true,
+            export_fork_mode: ResourceForkMode::MacBinary,
             active: Side::Left,
             session_log: Vec::new(),
             show_log: false,
         }
+    }
+
+    /// Open a drag-and-dropped path in the active pane (the drag-and-drop router
+    /// in `RustyBackupApp::update` calls this while the Commander overlay is up).
+    /// A directory opens as a host folder, a file as an image source.
+    pub fn open_dropped_path(&mut self, path: PathBuf) {
+        let msg = match self.active {
+            Side::Left => self.left.open_dropped(path),
+            Side::Right => self.right.open_dropped(path),
+        };
+        if !msg.is_empty() {
+            self.status = msg;
+        }
+    }
+
+    /// Drop both panes' in-memory recent-files mirrors (the Settings dialog
+    /// cleared the persisted lists).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.left.clear_recent_files();
+        self.right.clear_recent_files();
     }
 
     /// Upper bound on retained session-log entries (rolling; oldest drop first).
@@ -221,11 +248,13 @@ impl CommanderMode {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let full_h = ui.available_height();
             let full_w = ui.available_width();
-            let mid_w = 132.0;
+            // Wide enough for the middle column's widest control (the "Export
+            // forks as:" combo) without overflowing into the panes.
+            let mid_w = 168.0;
             // Reserve room for the two separators + the item spacing between the
             // five horizontal items, so the right pane isn't clipped off-edge.
             let gaps = ui.spacing().item_spacing.x * 4.0 + 16.0;
-            let pane_w = ((full_w - mid_w - gaps) / 2.0).max(180.0);
+            let pane_w = ((full_w - mid_w - gaps) / 2.0).max(220.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(pane_w, full_h),
@@ -344,41 +373,58 @@ impl CommanderMode {
         let l_can = idle && self.left.has_selection() && self.right.can_receive();
         let r_can = idle && self.right.has_selection() && self.left.can_receive();
 
+        // Copy into a remote *host* folder isn't supported yet (only remote disk
+        // images) — surface that in the hover so the greyed button reads as
+        // "not yet" rather than "broken".
+        const REMOTE_HOST_HINT: &str =
+            "Copying into a remote host folder isn't supported yet — only remote disk images";
+        let l_copy_hover = if self.right.is_remote_host_dest() {
+            REMOTE_HOST_HINT
+        } else {
+            "Copy the left pane's selection into the right pane"
+        };
+        let r_copy_hover = if self.left.is_remote_host_dest() {
+            REMOTE_HOST_HINT
+        } else {
+            "Copy the right pane's selection into the left pane"
+        };
+
         // Pictured buttons (procedurally painted — no font glyphs, no assets):
         // stacked floppies + arrow for copy, a floppy with a red X for delete,
         // and "101=011?" for the (disabled) compare.
-        if icon_button(
-            ui,
-            sz,
-            l_can,
-            "Copy the left pane's selection into the right pane",
-            |p, r, c| draw_copy_icon(p, r, c, true),
-        )
+        if icon_button(ui, sz, l_can, l_copy_hover, |p, r, c| {
+            draw_copy_icon(p, r, c, true)
+        })
         .clicked()
         {
             status = Some(self.copy(Side::Left));
         }
         ui.add_space(6.0);
-        if icon_button(
-            ui,
-            sz,
-            r_can,
-            "Copy the right pane's selection into the left pane",
-            |p, r, c| draw_copy_icon(p, r, c, false),
-        )
+        if icon_button(ui, sz, r_can, r_copy_hover, |p, r, c| {
+            draw_copy_icon(p, r, c, false)
+        })
         .clicked()
         {
             status = Some(self.copy(Side::Right));
         }
         ui.add_space(12.0);
-        // Delete acts on the active pane (the one last clicked in). Disabled
-        // when that pane is a read-only backup.
+        // Delete acts on the active pane (the one last clicked in). Disabled when
+        // that pane is read-only (backup or archive) or a remote image (the
+        // remote write path carries copies only for now, not deletes).
         let active = self.active;
-        let (active_has_sel, active_backup) = match active {
-            Side::Left => (self.left.has_selection(), self.left.is_backup_pane()),
-            Side::Right => (self.right.has_selection(), self.right.is_backup_pane()),
+        let (active_has_sel, active_readonly, active_remote) = match active {
+            Side::Left => (
+                self.left.has_selection(),
+                self.left.is_backup_pane() || self.left.is_archive_pane(),
+                self.left.is_remote(),
+            ),
+            Side::Right => (
+                self.right.has_selection(),
+                self.right.is_backup_pane() || self.right.is_archive_pane(),
+                self.right.is_remote(),
+            ),
         };
-        let del_enabled = idle && active_has_sel && !active_backup;
+        let del_enabled = idle && active_has_sel && !active_readonly && !active_remote;
         let del_hover = format!("Delete the selected item(s) in the {} pane", active.label());
         if icon_button(ui, sz, del_enabled, &del_hover, draw_delete_icon).clicked() {
             status = Some(match active {
@@ -401,6 +447,25 @@ impl CommanderMode {
                  destination (HFS catalog dates / Amiga datestamp) instead of \
                  stamping the current time. Image-to-image copies only.",
             );
+        ui.add_space(8.0);
+        // Resource-fork format for image->host copies / exports. When copying a
+        // Mac file out to a host folder, its resource fork is preserved in the
+        // chosen container (MacBinary / BinHex / AppleDouble / …).
+        ui.label("Export forks as:");
+        egui::ComboBox::from_id_salt("commander_fork_mode")
+            .selected_text(self.export_fork_mode.label())
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for mode in ResourceForkMode::ALL {
+                    ui.selectable_value(&mut self.export_fork_mode, mode, mode.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "How to preserve a Mac file's resource fork when copying it out to \
+                 a host folder (image->host copies and Export). Host->host copies \
+                 keep bytes as-is.",
+            );
         status
     }
 
@@ -411,6 +476,7 @@ impl CommanderMode {
     /// - image -> host / host -> host: an immediate threaded host write.
     fn copy(&mut self, from: Side) -> String {
         let keep_dates = self.keep_dates;
+        let fork_mode = self.export_fork_mode;
         let (src, dest) = match from {
             Side::Left => (&mut self.left, &mut self.right),
             Side::Right => (&mut self.right, &mut self.left),
@@ -476,7 +542,7 @@ impl CommanderMode {
                     let Some(src_fs) = src.fs_mut() else {
                         return "Source volume is not open.".to_string();
                     };
-                    return match extract_entries_to_host(src_fs, &entries, &dest_dir) {
+                    return match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
                         Ok(n) => {
                             dest.reload_listing();
                             format!("Copied {n} item(s) to the {other} folder.")
@@ -491,6 +557,7 @@ impl CommanderMode {
                     session,
                     entries,
                     dest_dir,
+                    fork_mode,
                 };
                 self.pending_host_copy =
                     Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
@@ -516,9 +583,10 @@ impl CommanderMode {
         if self.pending_host_copy.is_some() {
             return "A copy is already in progress; wait for it to finish.".to_string();
         }
+        let fork_mode = self.export_fork_mode;
         let src = match from {
-            Side::Left => &self.left,
-            Side::Right => &self.right,
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
         };
         let entries = src.selected_entries();
         if entries.is_empty() {
@@ -528,17 +596,33 @@ impl CommanderMode {
             return "Export cancelled.".to_string();
         };
 
-        let job = if src.is_host_pane() {
-            HostCopyJob::HostToHost { entries, dest_dir }
-        } else {
-            let Some(session) = src.session() else {
+        if src.is_host_pane() {
+            let job = HostCopyJob::HostToHost { entries, dest_dir };
+            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
+            return format!(
+                "Exporting the {} pane selection to the host folder...",
+                from.label()
+            );
+        }
+        // A remote image pane has no local BrowseSession, so extract over the
+        // wire synchronously (same path the cross-pane remote copy uses).
+        if src.session().is_none() {
+            let Some(src_fs) = src.fs_mut() else {
                 return "Source volume is not open.".to_string();
             };
-            HostCopyJob::ImageToHost {
-                session,
-                entries,
-                dest_dir,
-            }
+            return match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
+                Ok(n) => format!("Exported {n} item(s) to {}.", dest_dir.display()),
+                Err(e) => format!("Export failed: {e}"),
+            };
+        }
+        let Some(session) = src.session() else {
+            return "Source volume is not open.".to_string();
+        };
+        let job = HostCopyJob::ImageToHost {
+            session,
+            entries,
+            dest_dir,
+            fork_mode,
         };
         self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
         format!(
@@ -727,8 +811,8 @@ impl CommanderMode {
             Side::Right => &mut self.right,
         };
         // A writable image volume gets the metadata editors; host folders and
-        // read-only backups show the metadata without them.
-        let editable = !pane.is_host_pane() && !pane.is_backup_pane();
+        // read-only backups / archives show the metadata without them.
+        let editable = !pane.is_host_pane() && !pane.is_backup_pane() && !pane.is_archive_pane();
         let fs_type = pane.fs_type().to_string();
         let Some((entry, bytes)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
             return format!("[{}] could not open File Info for '{name}'.", from.label());
@@ -939,21 +1023,20 @@ fn extract_entries_to_host(
     src_fs: &mut dyn rusty_backup::fs::filesystem::Filesystem,
     entries: &[FileEntry],
     dest_dir: &std::path::Path,
+    fork_mode: ResourceForkMode,
 ) -> std::io::Result<usize> {
     let mut count = 0;
     for e in entries {
-        let target = dest_dir.join(&e.name);
         if e.is_directory() {
+            let target = dest_dir.join(&e.name);
             std::fs::create_dir_all(&target)?;
             let children = src_fs
                 .list_directory(e)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
-            count += extract_entries_to_host(src_fs, &children, &target)?;
+            count += extract_entries_to_host(src_fs, &children, &target, fork_mode)?;
         } else {
-            let mut f = std::fs::File::create(&target)?;
-            src_fs
-                .write_file_to(e, &mut f)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            export_file_with_fork(src_fs, e, dest_dir, &safe_name(e), fork_mode)
+                .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
             count += 1;
         }
     }

@@ -26,6 +26,10 @@ use super::progress::ProgressState;
 
 /// State for the Backup tab.
 pub struct BackupTab {
+    /// In-memory mirror of the Backup mode's recent-image MRU (config.json),
+    /// seeded at construction and refreshed on each image open; drives the
+    /// "Recent..." quick-pick beside the source dropdown.
+    recent_files: Vec<String>,
     selected_device_idx: Option<usize>,
     image_file_path: Option<PathBuf>,
     /// Holds the decompressed `.adz` / `.hdz` payload alive for the
@@ -177,6 +181,7 @@ impl VhdPartitionConfig {
 impl Default for BackupTab {
     fn default() -> Self {
         Self {
+            recent_files: super::load_recent(rusty_backup::update::RecentMode::Backup),
             selected_device_idx: None,
             image_file_path: None,
             amiga_tempdir: None,
@@ -330,6 +335,10 @@ impl BackupTab {
                                 .pick_file()
                             {
                                 self.selected_device_idx = None;
+                                self.recent_files = super::push_recent(
+                                    rusty_backup::update::RecentMode::Backup,
+                                    &path,
+                                );
                                 // Backup decodes floppy containers to a flat
                                 // image (true): it needs a raw sector stream to
                                 // compress.
@@ -368,6 +377,11 @@ impl BackupTab {
                             }
                         }
                     });
+                if let Some(path) = super::recent_combo(ui, "backup_recent", &self.recent_files, 5)
+                {
+                    self.open_image(path);
+                    self.update_backup_name(ctx);
+                }
             });
             #[cfg(feature = "remote")]
             if self.remote_active()
@@ -2043,6 +2057,34 @@ impl BackupTab {
     /// clear every piece of derived partition state. Mirrors the per-source
     /// reset in `load_partition_preview` plus the selection itself, returning
     /// the tab to its "Select a device or image..." state.
+    /// Open `path` as the image-file backup source (drag-and-drop router).
+    /// Mirrors the "Open Image File..." picker: floppy containers are decoded to
+    /// a flat image (Backup needs a raw sector stream to compress). `show()`
+    /// loads the partition preview on the next frame via the
+    /// `image_file_path != prev_image_path` check, and drops any active remote
+    /// source so the two don't fight.
+    pub fn open_image(&mut self, path: PathBuf) {
+        self.selected_device_idx = None;
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Backup, &path);
+        match super::prepare_disk_image_path(&path, true) {
+            Ok((materialized, guard)) => {
+                self.image_file_path = Some(materialized);
+                self.amiga_tempdir = guard;
+            }
+            Err(e) => {
+                log::error!("Failed to decompress {}: {}", path.display(), e);
+                self.image_file_path = Some(path);
+                self.amiga_tempdir = None;
+            }
+        }
+    }
+
+    /// Drop this tab's in-memory recent-files mirror (the Settings dialog clears
+    /// the persisted lists; the mirror otherwise only reloads at construction).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
+    }
+
     fn close_source(&mut self) {
         self.selected_device_idx = None;
         self.image_file_path = None;

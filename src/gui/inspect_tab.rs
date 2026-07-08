@@ -67,6 +67,10 @@ fn is_mac_archive_path(path: &std::path::Path) -> bool {
 }
 
 pub struct InspectTab {
+    /// In-memory mirror of the Inspect mode's recent-image MRU (config.json).
+    /// Seeded at construction, refreshed on each image open; drives the source
+    /// picker's "Recent" group.
+    recent_files: Vec<String>,
     /// Index into the device list, or None if "Open Image File..." is selected
     selected_device_idx: Option<usize>,
     /// Path to an image file (when using file picker instead of device)
@@ -258,6 +262,7 @@ pub struct InspectTab {
 impl Default for InspectTab {
     fn default() -> Self {
         Self {
+            recent_files: super::load_recent(rusty_backup::update::RecentMode::Inspect),
             selected_device_idx: None,
             image_file_path: None,
             amiga_tempdir: None,
@@ -385,9 +390,20 @@ impl InspectTab {
     pub fn load_image_with_tempdir(&mut self, path: PathBuf, guard: Option<tempfile::TempDir>) {
         self.selected_device_idx = None;
         self.backup_folder_path = None;
+        // Record in the Inspect recent-image MRU. Single choke point for every
+        // image open (picker, recent quick-pick, drag-and-drop, argv, and the
+        // Archives-tab "Mount in new Inspect tab" hand-off).
+        self.recent_files = super::push_recent(rusty_backup::update::RecentMode::Inspect, &path);
         self.image_file_path = Some(path);
         self.amiga_tempdir = guard;
         self.clear_results();
+    }
+
+    /// Drop this tab's in-memory recent-files mirror. Called when the Settings
+    /// dialog clears the persisted lists (config is the source of truth; the
+    /// mirror otherwise only reloads at construction).
+    pub(crate) fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
     }
 
     /// Sniff `path` to decide whether it is a floppy container (XDF / HDM
@@ -484,6 +500,12 @@ impl InspectTab {
             // Shared source picker (R1): same ComboBox widget the Commander
             // panes use. It owns the rfd dialogs + image filter/materialize and
             // emits a SourceEvent; we map that onto our source state here.
+            //
+            // Plain fixed width. A wider box just spreads the short device /
+            // action rows across the whole window (the "awkward" full-width look);
+            // egui truncates a long selected label to fit, and the open popup
+            // still extends per-row to show full names. Recents render as a
+            // "Recent" group at the TOP of this same dropdown (PickerState.recent).
             let cfg = super::source_picker::PickerConfig {
                 show_devices: true,
                 show_image: true,
@@ -493,6 +515,9 @@ impl InspectTab {
                 materialize_image: true,
                 include_mac_archives: true,
                 width: 400.0,
+                // Fixed 5-row "Recent" group: constant popup height as files are
+                // opened, so egui's cached-popup-size bug never bites here.
+                recent_slots: 5,
             };
             let state = super::source_picker::PickerState {
                 selected_device_idx: self.selected_device_idx,
@@ -500,10 +525,32 @@ impl InspectTab {
                 host_active: false,
                 backup_active: self.backup_folder_path.is_some(),
                 devices: ctx.devices,
+                recent: &self.recent_files,
             };
             if let Some(ev) =
                 super::source_picker::show(ui, "inspect_source", &cfg, &current_label, &state)
             {
+                use super::source_picker::SourceEvent;
+                // A "Recent" pick is a raw path; materialize it and treat it as
+                // an image open, exactly like re-picking the file (Inspect only
+                // records images into its recent list).
+                let ev = if let SourceEvent::Recent(path) = ev {
+                    match super::prepare_disk_image_path(&path, false) {
+                        Ok((materialized, guard)) => SourceEvent::Image {
+                            path: materialized,
+                            tempdir: guard,
+                        },
+                        Err(e) => {
+                            log::error!("Failed to decompress {}: {}", path.display(), e);
+                            SourceEvent::Image {
+                                path,
+                                tempdir: None,
+                            }
+                        }
+                    }
+                } else {
+                    ev
+                };
                 // "Connect to Remote..." opens the inline remote panel; any other
                 // source ends a remote session and switches to that local source.
                 if matches!(ev, super::source_picker::SourceEvent::Remote) {
@@ -2759,6 +2806,9 @@ impl InspectTab {
             // "Connect to Remote..." is intercepted at the call site (it pops a
             // window rather than changing the source); never reaches here.
             SourceEvent::Remote => {}
+            // A recent pick is translated to `Image` at the call site before
+            // reaching here (materialized), so this arm is unreachable.
+            SourceEvent::Recent(_) => {}
         }
     }
 

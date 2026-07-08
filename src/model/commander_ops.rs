@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::fs::filesystem::Filesystem;
-use crate::fs::resource_fork::ImportedResourceFork;
+use crate::fs::fork_export::{export_file_with_fork, safe_name};
+use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
 use crate::model::edit_queue::{apply_edit, StagedEdit};
 
@@ -238,11 +239,13 @@ fn host_children(path: &str) -> Vec<FileEntry> {
 
 /// An immediate (unstaged) host-write copy, run on a worker thread.
 pub enum HostCopyJob {
-    /// Extract image-volume `entries` into the host directory `dest_dir`.
+    /// Extract image-volume `entries` into the host directory `dest_dir`,
+    /// preserving resource forks per `fork_mode`.
     ImageToHost {
         session: BrowseSession,
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
+        fork_mode: ResourceForkMode,
     },
     /// Copy host `entries` into the host directory `dest_dir`.
     HostToHost {
@@ -284,9 +287,10 @@ fn run_host_copy(job: HostCopyJob) -> Result<usize> {
             session,
             entries,
             dest_dir,
+            fork_mode,
         } => {
             let mut fs = session.open().context("opening source image")?;
-            copy_image_entries_to_host(fs.as_mut(), &entries, &dest_dir)
+            copy_image_entries_to_host(fs.as_mut(), &entries, &dest_dir, fork_mode)
         }
         HostCopyJob::HostToHost { entries, dest_dir } => {
             copy_host_entries_to_host(&entries, &dest_dir)
@@ -294,11 +298,14 @@ fn run_host_copy(job: HostCopyJob) -> Result<usize> {
     }
 }
 
-/// Extract image `entries` (data fork) into `dest_dir`, recursing directories.
+/// Extract image `entries` into `dest_dir`, recursing directories and
+/// preserving resource forks per `fork_mode` (via the shared
+/// [`export_file_with_fork`]).
 fn copy_image_entries_to_host(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
     dest_dir: &Path,
+    fork_mode: ResourceForkMode,
 ) -> Result<usize> {
     let mut count = 0;
     for entry in entries {
@@ -308,12 +315,9 @@ fn copy_image_entries_to_host(
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}'", entry.name))?;
-            count += copy_image_entries_to_host(fs, &children, &sub)?;
+            count += copy_image_entries_to_host(fs, &children, &sub, fork_mode)?;
         } else if entry.is_file() {
-            let out = dest_dir.join(&entry.name);
-            let mut f = std::fs::File::create(&out)
-                .with_context(|| format!("creating {}", out.display()))?;
-            fs.write_file_to(entry, &mut f)
+            export_file_with_fork(fs, entry, dest_dir, &safe_name(entry), fork_mode)
                 .with_context(|| format!("extracting '{}'", entry.name))?;
             count += 1;
         }
@@ -377,6 +381,113 @@ pub fn spawn_apply(session: BrowseSession, edits: Vec<StagedEdit>) -> Arc<Mutex<
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
         let result = apply_edits(&session, &edits);
+        if let Ok(mut g) = status_thread.lock() {
+            if let Err(e) = result {
+                g.error = Some(format!("{e:#}"));
+            }
+            g.finished = true;
+        }
+    });
+    status
+}
+
+/// A 4-byte HFS OSType as the string the daemon's `StageUpload` carries. Lossy
+/// for high-bit bytes, matching the CLI `put` path's text round-trip.
+#[cfg(feature = "remote")]
+fn os4_to_string(code: &[u8; 4]) -> String {
+    String::from_utf8_lossy(code).into_owned()
+}
+
+/// Apply a remote destination pane's staged **copy** edits over the Family-F
+/// write path (`OpenSession` → `StageUpload` / `StageMkdir` → `Apply`).
+///
+/// A remote pane has no local [`BrowseSession`]: the daemon holds the image open
+/// and resolves the partition server-side, so this connects a fresh
+/// `RemoteSession` bound to the same `(image_path, partition)` the pane is
+/// browsing. Only `AddFile` / `CreateDirectory` are carried — the protocol has
+/// no delete / rename / metadata verbs yet, and `StageUpload` sends the data
+/// fork plus HFS type/creator only (no resource fork, no exact source dates).
+/// The caller rejects a queue containing any other edit before spawning; this
+/// re-checks defensively and, on any staging error, closes the session so
+/// nothing is half-applied (Apply is what commits).
+#[cfg(feature = "remote")]
+fn remote_apply(
+    addr: &str,
+    image_path: &str,
+    partition: Option<u32>,
+    edits: &[StagedEdit],
+) -> Result<()> {
+    use crate::remote::RemoteSession;
+    let mut session = RemoteSession::connect(addr).context("connecting to the daemon")?;
+    let sid = session
+        .open_session(image_path, partition)
+        .context("opening a remote write session")?;
+    let staged = (|| -> Result<()> {
+        for edit in edits {
+            match edit {
+                StagedEdit::AddFile {
+                    parent,
+                    name,
+                    host_path,
+                    resource_fork,
+                    hfs_type_override,
+                    hfs_creator_override,
+                    ..
+                } => {
+                    let type_code = hfs_type_override
+                        .as_ref()
+                        .or_else(|| resource_fork.as_ref().and_then(|r| r.type_code.as_ref()))
+                        .map(os4_to_string);
+                    let creator_code = hfs_creator_override
+                        .as_ref()
+                        .or_else(|| resource_fork.as_ref().and_then(|r| r.creator_code.as_ref()))
+                        .map(os4_to_string);
+                    session
+                        .stage_upload(
+                            sid,
+                            &parent.path,
+                            name,
+                            host_path,
+                            false,
+                            type_code,
+                            creator_code,
+                        )
+                        .with_context(|| format!("uploading {name}"))?;
+                }
+                StagedEdit::CreateDirectory { parent, name } => {
+                    session
+                        .stage_mkdir(sid, &parent.path, name)
+                        .with_context(|| format!("creating directory {name}"))?;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "remote copy carries files and folders only; other edits \
+                         (delete / rename / metadata) can't be applied over the wire yet"
+                    ));
+                }
+            }
+        }
+        session.apply(sid).context("applying the remote edits")?;
+        Ok(())
+    })();
+    // Always release the session + staging blobs, even on error.
+    let _ = session.close_session(sid);
+    staged
+}
+
+/// Run [`remote_apply`] on a worker thread, reusing [`ApplyStatus`] so the pane
+/// polls it exactly like a local apply.
+#[cfg(feature = "remote")]
+pub fn spawn_remote_apply(
+    addr: String,
+    image_path: String,
+    partition: Option<u32>,
+    edits: Vec<StagedEdit>,
+) -> Arc<Mutex<ApplyStatus>> {
+    let status = Arc::new(Mutex::new(ApplyStatus::default()));
+    let status_thread = Arc::clone(&status);
+    thread::spawn(move || {
+        let result = remote_apply(&addr, &image_path, partition, &edits);
         if let Ok(mut g) = status_thread.lock() {
             if let Err(e) = result {
                 g.error = Some(format!("{e:#}"));
@@ -728,7 +839,13 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
 
         let out = tempfile::tempdir().unwrap();
-        let n = copy_image_entries_to_host(fs.as_mut(), &entries, out.path()).expect("extract");
+        let n = copy_image_entries_to_host(
+            fs.as_mut(),
+            &entries,
+            out.path(),
+            ResourceForkMode::DataForkOnly,
+        )
+        .expect("extract");
         assert_eq!(n, 2);
         assert_eq!(std::fs::read(out.path().join("A.TXT")).unwrap(), b"hello");
         assert_eq!(

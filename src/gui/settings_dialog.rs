@@ -7,6 +7,14 @@ pub struct SettingsDialog {
     update_check_enabled: bool,
     update_repo_url: String,
     status_message: Option<String>,
+    /// Total recent-file entries across all modes, shown on the "Clear Recent
+    /// Files" button. Refreshed when the dialog opens and zeroed after a clear.
+    recent_count: usize,
+    /// Set when the user clears the recent lists, so the app can also drop the
+    /// in-memory mirrors each tab / Commander pane holds (config alone is the
+    /// source of truth, but those mirrors only reload at construction). Consumed
+    /// via [`Self::take_clear_recents`].
+    clear_recents_requested: bool,
     /// Windows only: register Rusty Backup as a handler for disk-image files.
     #[cfg(windows)]
     file_associations_enabled: bool,
@@ -78,6 +86,28 @@ impl SettingsDialog {
                         ui.add_space(10.0);
                     }
 
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.heading("Recent Files");
+                    ui.add_space(10.0);
+                    ui.label(
+                        "Forget the recently-opened file lists shown in the Inspect, \
+                         Restore, Optical, Archives, and Commander source pickers.",
+                    );
+                    ui.add_space(5.0);
+                    let clear_label = if self.recent_count > 0 {
+                        format!("Clear Recent Files ({})", self.recent_count)
+                    } else {
+                        "Clear Recent Files".to_string()
+                    };
+                    if ui
+                        .add_enabled(self.recent_count > 0, egui::Button::new(clear_label))
+                        .clicked()
+                    {
+                        self.clear_recent_files();
+                    }
+                    ui.add_space(10.0);
+
                     if let Some(ref msg) = self.status_message {
                         ui.colored_label(
                             if msg.starts_with("Error") {
@@ -111,12 +141,43 @@ impl SettingsDialog {
         let config = UpdateConfig::load();
         self.update_check_enabled = config.update_check.enabled;
         self.update_repo_url = config.update_check.repository_url;
+        self.recent_count = config.recent_files.total();
+        self.clear_recents_requested = false;
         #[cfg(windows)]
         {
             self.file_associations_enabled = config.file_associations_enabled;
         }
         self.status_message = None;
         self.open = true;
+    }
+
+    /// Forget every mode's recent-files list: clear + persist config now, and
+    /// flag the app to drop the tabs' in-memory mirrors (see
+    /// [`Self::take_clear_recents`]).
+    fn clear_recent_files(&mut self) {
+        let mut config = UpdateConfig::load();
+        let count = config.recent_files.total();
+        config.recent_files.clear();
+        match config.save() {
+            Ok(_) => {
+                self.recent_count = 0;
+                self.clear_recents_requested = true;
+                self.status_message = Some(if count == 1 {
+                    "Cleared 1 recent file.".to_string()
+                } else {
+                    format!("Cleared {count} recent files.")
+                });
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Error clearing recent files: {e}"));
+            }
+        }
+    }
+
+    /// True once (then resets) after the user clears recents, so the app can
+    /// wipe the in-memory mirrors each tab / Commander pane holds.
+    pub fn take_clear_recents(&mut self) -> bool {
+        std::mem::take(&mut self.clear_recents_requested)
     }
 
     fn save_settings(&mut self) {

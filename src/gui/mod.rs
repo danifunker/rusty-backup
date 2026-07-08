@@ -40,7 +40,7 @@ use settings_dialog::SettingsDialog;
 use std::path::PathBuf;
 
 use rusty_backup::device::{self, DiskDevice};
-use rusty_backup::update::{check_for_updates, UpdateConfig, UpdateInfo};
+use rusty_backup::update::{check_for_updates, RecentMode, UpdateConfig, UpdateInfo};
 
 #[cfg(target_os = "linux")]
 use elevation_dialog::{ElevationAction, ElevationDialog};
@@ -98,6 +98,108 @@ fn physical_devices_available() -> bool {
     {
         true
     }
+}
+
+/// Record `path` in the per-mode recent-files MRU (persisted in config.json)
+/// and return the updated newest-first list for `mode`. Mirrors the Optical
+/// tab's `remember_daemon_addr` write-through: config.json is the source of
+/// truth and each tab keeps an in-memory mirror it refreshes from this return
+/// value. Loading + saving on every open is cheap (a small JSON file) and keeps
+/// the history durable across runs without an eframe `save()` hook.
+pub(crate) fn push_recent(mode: RecentMode, path: &std::path::Path) -> Vec<String> {
+    let mut cfg = UpdateConfig::load();
+    cfg.remember_file(mode, &path.display().to_string());
+    let list = cfg.recent_files.list(mode).to_vec();
+    let _ = cfg.save();
+    list
+}
+
+/// The persisted recent-files list for `mode` (newest first). Used to seed a
+/// tab's in-memory mirror at construction.
+pub(crate) fn load_recent(mode: RecentMode) -> Vec<String> {
+    UpdateConfig::load().recent_files.list(mode).to_vec()
+}
+
+/// A merged recent list for Commander: the newest 3 entries from each mode's
+/// list (deduped, category order Inspect→Restore→Optical→Archives→Commander).
+/// Commander opens any of them (image / backup folder), so one combined
+/// quick-pick beats five separate ones.
+pub(crate) fn load_recent_merged() -> Vec<String> {
+    let cfg = UpdateConfig::load();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for mode in [
+        RecentMode::Inspect,
+        RecentMode::Restore,
+        RecentMode::Optical,
+        RecentMode::Archives,
+        RecentMode::Commander,
+        RecentMode::Backup,
+    ] {
+        for p in cfg.recent_files.list(mode).iter().take(3) {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A dedicated "Recent" dropdown (its own popup, so it never gets clipped inside
+/// the source-picker combo). Lists each entry's basename with the full path on
+/// hover; returns the picked path. Renders nothing for an empty list. `id_salt`
+/// keys the ComboBox (callers that draw more than one per frame must differ).
+///
+/// `slots`: when non-zero, always draw exactly that many rows — the newest
+/// entries fill them and the rest are dimmed placeholders — so the popup's
+/// height never changes as the list grows, dodging egui's cached-popup-size bug
+/// (see [`source_picker`]'s `recent_slots`). `0` draws one row per entry
+/// (variable height). Either way the whole combo is hidden when there are no
+/// recents, so an empty list never shows a dropdown of blanks.
+pub(crate) fn recent_combo(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    recent: &[String],
+    slots: usize,
+) -> Option<PathBuf> {
+    if recent.is_empty() {
+        return None;
+    }
+    let mut chosen = None;
+    let row = |ui: &mut egui::Ui, chosen: &mut Option<PathBuf>, p: &str| {
+        let label = std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string());
+        if ui.selectable_label(false, label).on_hover_text(p).clicked() {
+            *chosen = Some(PathBuf::from(p));
+        }
+    };
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text("Recent...")
+        .width(240.0)
+        .height(400.0)
+        .show_ui(ui, |ui| {
+            if slots > 0 {
+                for slot in 0..slots {
+                    match recent.get(slot) {
+                        Some(p) => row(ui, &mut chosen, p),
+                        // Placeholder keeps the row count (and popup height) fixed.
+                        None => {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::selectable(false, egui::RichText::new("-").weak()),
+                            );
+                        }
+                    }
+                }
+            } else {
+                for p in recent {
+                    row(ui, &mut chosen, p);
+                }
+            }
+        });
+    chosen
 }
 
 fn file_dialog() -> rfd::FileDialog {
@@ -733,22 +835,45 @@ impl eframe::App for RustyBackupApp {
             self.open_in_inspect(path);
         }
 
-        // Drag-and-drop: if the user dragged one or more files onto the
-        // app window, take the first one with a real filesystem path and
-        // open it in the Inspect tab. `with_drag_and_drop(true)` is set
-        // on the viewport in main.rs so eframe surfaces these events.
+        // Drag-and-drop: route the first dropped file with a real filesystem
+        // path to the *currently active* mode. `with_drag_and_drop(true)` is set
+        // on the viewport in main.rs so eframe surfaces these events. This
+        // reads (does not consume) `dropped_files`, exactly like the per-volume
+        // browse handlers, so a drop into a loaded volume still reaches that
+        // volume's own edit handler where applicable.
         //
-        // Only steal the drop to open a NEW source when nothing is loaded.
-        // Once a source is loaded, drops belong to the filesystem browser's
-        // own handler (BrowseView::handle_dropped_files), which adds the
-        // dropped file into the open volume while in edit mode — re-opening
-        // the drop as a new image here would clobber the loaded source and
-        // make drag-to-add impossible.
-        if !self.inspect_tab.has_loaded_source() {
-            let dropped: Option<PathBuf> =
-                ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-            if let Some(path) = dropped {
-                self.open_in_inspect(path);
+        // Historically this always opened in Inspect, which made drag-and-drop
+        // useless for the Optical / Archives / Restore tabs and Commander.
+        let dropped: Option<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+        if let Some(path) = dropped {
+            if let Some(cmd) = self.commander.as_mut() {
+                // Commander overlay takes over the frame; hand the drop to the
+                // active pane (opens it as an image / host folder there).
+                cmd.open_dropped_path(path);
+            } else {
+                match self.active_tab {
+                    // Inspect: only steal the drop to open a NEW source when
+                    // nothing is loaded. Once a source is loaded the drop belongs
+                    // to BrowseView::handle_dropped_files (drag-to-add into the
+                    // open volume while in edit mode) — re-opening here would
+                    // clobber the loaded source and make drag-to-add impossible.
+                    Tab::Inspect => {
+                        if !self.inspect_tab.has_loaded_source() {
+                            self.open_in_inspect(path);
+                        }
+                    }
+                    // Optical: don't clobber an open disc browse (optical
+                    // browsing has no drag-to-add of its own).
+                    Tab::Optical => {
+                        if !self.optical_tab.is_browsing() {
+                            self.optical_tab.open_image(path);
+                        }
+                    }
+                    Tab::Archives => self.archives_tab.open_path(path),
+                    Tab::Restore => self.restore_tab.open_dropped(path),
+                    Tab::Backup => self.backup_tab.open_image(path),
+                }
             }
         }
 
@@ -1116,5 +1241,19 @@ impl eframe::App for RustyBackupApp {
 
         // Show settings dialog if open
         self.settings_dialog.show(ctx);
+
+        // The Settings "Clear Recent Files" button clears + persists the config
+        // itself; here we also drop the in-memory mirrors each tab / Commander
+        // pane holds (they only reload from config at construction otherwise).
+        if self.settings_dialog.take_clear_recents() {
+            self.inspect_tab.clear_recent_files();
+            self.restore_tab.clear_recent_files();
+            self.optical_tab.clear_recent_files();
+            self.archives_tab.clear_recent_files();
+            self.backup_tab.clear_recent_files();
+            if let Some(cmd) = self.commander.as_mut() {
+                cmd.clear_recent_files();
+            }
+        }
     }
 }

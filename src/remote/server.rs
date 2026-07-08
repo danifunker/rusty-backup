@@ -877,6 +877,27 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                 },
             },
 
+            Request::ReadResourceFork { handle, path } => match handles.get_mut(&handle) {
+                None => reply_err(&mut writer, format!("no such handle {handle}"))?,
+                Some(fs) => match resolve_path(&mut **fs, &path) {
+                    Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+                    Ok(entry) if entry.is_directory() => {
+                        reply_err(&mut writer, format!("{path} is a directory"))?
+                    }
+                    Ok(entry) => {
+                        // Same commit-to-the-stream contract as ReadFile. Size is
+                        // the resource-fork size (0 = no fork → an empty stream).
+                        let size = entry.resource_fork_size.unwrap_or(0);
+                        write_control(&mut writer, &Response::FileBegin { size })?;
+                        let mut cw = ChunkWriter::new(&mut writer);
+                        if let Err(e) = fs.write_resource_fork_to(&entry, &mut cw) {
+                            return Err(anyhow!("write_resource_fork_to({path}): {e}"));
+                        }
+                        cw.finish()?;
+                    }
+                },
+            },
+
             Request::Close { handle } => {
                 handles.remove(&handle);
                 write_control(&mut writer, &Response::Ok)?;
@@ -1846,6 +1867,7 @@ fn list_host_dir(root: &Path, rel: &str) -> Result<Vec<WireEntry>> {
             creator_code: None,
             prodos_file_type: None,
             symlink_target: None,
+            resource_fork_size: None,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
