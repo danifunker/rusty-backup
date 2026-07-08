@@ -138,6 +138,10 @@ pub(crate) struct CommanderPane {
     cache_store: commander_source::PartcloneCacheStore,
     /// Phase text shown next to the spinner while `pending_open` is live.
     open_phase: String,
+    /// Rate / ETA estimator for the open-progress bar when the underlying open
+    /// is a synthetic carve scan (large ISO or full-disk scan). Reset on each
+    /// open so a fresh scan doesn't inherit the previous window.
+    open_rate: super::super::progress::RateTracker,
     /// Volume metadata captured on open, for the source-bar readout.
     volume_label: String,
     fs_type: String,
@@ -278,6 +282,7 @@ impl CommanderPane {
             pending_scan: None,
             cache_store: commander_source::PartcloneCacheStore::new(),
             open_phase: String::new(),
+            open_rate: super::super::progress::RateTracker::default(),
             volume_label: String::new(),
             fs_type: String::new(),
             total_size: 0,
@@ -481,17 +486,56 @@ impl CommanderPane {
                 ui.spinner();
                 ui.label("Scanning Clonezilla metadata (first open of this partition)...");
             });
-        } else if self.pending_open.is_some() {
+        } else if let Some(arc) = self.pending_open.clone() {
+            // Match the main browse view: when the underlying open is a
+            // synthetic carve scan (large ISO / full-disk scan), render a real
+            // progress bar with % + rate + ETA; otherwise just a spinner +
+            // phase text (metadata reads have no byte counter to bind to).
+            let snap = arc
+                .lock()
+                .ok()
+                .map(|g| (g.phase.clone(), g.scan_done, g.scan_total));
             ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.spinner();
-                ui.label(if self.open_phase.is_empty() {
-                    "Opening...".to_string()
-                } else {
-                    self.open_phase.clone()
-                });
-            });
+            match snap {
+                Some((phase, done, total)) if total > 0 => {
+                    self.open_rate.record(done, "Opening");
+                    let frac = (done as f32 / total as f32).clamp(0.0, 1.0);
+                    let suffix = self.open_rate.suffix(done, total);
+                    let text = format!(
+                        "{} / {} ({:.0}%){}",
+                        rusty_backup::partition::format_size(done),
+                        rusty_backup::partition::format_size(total),
+                        frac * 100.0,
+                        suffix,
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                        ui.label(if phase.is_empty() { "Opening" } else { &phase });
+                    });
+                    ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
+                    ui.ctx().request_repaint();
+                }
+                Some((phase, _, _)) => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                        ui.label(if phase.is_empty() {
+                            "Opening...".to_string()
+                        } else {
+                            phase
+                        });
+                    });
+                    ui.ctx().request_repaint();
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                        ui.label("Opening...");
+                    });
+                }
+            }
         } else if self.pending_remote.is_some() {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
@@ -1205,6 +1249,12 @@ impl CommanderPane {
             return None;
         }
         self.session.clone()
+    }
+
+    /// A clone of the pending-apply status handle for the progress modal.
+    /// `None` when nothing is in flight on this pane.
+    pub(crate) fn pending_apply_status(&self) -> Option<Arc<Mutex<commander_ops::ApplyStatus>>> {
+        self.pending_apply.clone()
     }
 
     /// Re-read the current directory listing (after an immediate host write).
@@ -1986,6 +2036,7 @@ impl CommanderPane {
             }
             None => commander_source::session_for(&path, &part),
         };
+        self.open_rate = super::super::progress::RateTracker::default();
         self.pending_open = Some(session.spawn_open());
         self.session = Some(session);
         self.open_phase = "Opening...".to_string();
@@ -2021,6 +2072,7 @@ impl CommanderPane {
         self.cache_store.insert(part_index, Arc::clone(&cache));
         let session = commander_source::session_for_partclone_cache(cache, partition_type);
         self.open_phase = "Opening...".to_string();
+        self.open_rate = super::super::progress::RateTracker::default();
         self.pending_open = Some(session.spawn_open());
         self.session = Some(session);
         Some(format!(
