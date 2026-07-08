@@ -314,10 +314,16 @@ items are logged for follow-up.
    repairs: AFFS, EFS, HFS, HFS+, UFS (replica SB / bitmap / orphan), XFS (R1–R8).
 7. **AIX JFS1 and Reiser4 are detected then rejected** — magic recognized,
    read not implemented.
-8. **fsck reach exceeds the Inspect-tab "Check" button.** That button
-   (`is_checkable_type`) enables only classic HFS + AmigaDOS, but browse-view
-   and `rb-cli fsck` call `fs.fsck()` directly, so AFFS, EFS, HFS, HFS+, JFS,
-   UFS, and XFS all actually run.
+8. **fsck reach exceeded the Inspect-tab "Check" button — FIXED.** The button
+   gate (`is_checkable_type`) enabled only classic HFS + AmigaDOS, but
+   browse-view and `rb-cli fsck` call `fs.fsck()` directly, so AFFS, EFS, HFS,
+   HFS+, JFS, UFS, and XFS all actually run. The gate now also consults
+   `is_checkable_fs_name(type_name)` — the resolved family the inspect grid
+   shows after content-probing — so the Unix filesystems (SGI EFS, UFS/FFS,
+   XFS, JFS) and HFS+ get the "Check" button too. The button lives inside the
+   `partition_is_browsable` block, and fsck reuses the same `open_filesystem`
+   factory as Browse, so routing is guaranteed to match. Guarded by
+   `checkable_fs_name_covers_probed_unix_families`.
 
 ---
 

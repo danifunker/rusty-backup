@@ -10,7 +10,8 @@ use rusty_backup::backup::metadata::BackupMetadata;
 // Partition-capability gates — shared across all UIs, defined in the engine.
 use rusty_backup::clonezilla::metadata::ClonezillaImage;
 use rusty_backup::fs::{
-    is_checkable_type, is_classic_hfs, is_superfloppy_hfs, partition_is_browsable,
+    is_checkable_fs_name, is_checkable_type, is_classic_hfs, is_superfloppy_hfs,
+    partition_is_browsable,
 };
 use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_source::{self, ClonezillaOpen, PartcloneLookup};
@@ -4161,6 +4162,7 @@ impl InspectTab {
                                 ));
                             }
                             if (is_checkable_type(ptype, part.partition_type_string.as_deref())
+                                || is_checkable_fs_name(&part.type_name)
                                 || is_superfloppy_hfs(part.partition_type_byte, &part.type_name))
                                 && ui.small_button("Check").clicked()
                             {

@@ -2277,11 +2277,33 @@ pub fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> 
 
 /// True for a partition type that supports filesystem checking (fsck): classic
 /// HFS (`0xAF` or APM `Apple_HFS`) and the AmigaDOS OFS/FFS variants.
+///
+/// This only covers the cases identifiable from the partition-type byte / APM
+/// string alone. The Unix filesystems whose family is only known after a
+/// content probe (SGI EFS, UFS/FFS, XFS, JFS, and HFS+) are matched by
+/// [`is_checkable_fs_name`] against the resolved `type_name` instead.
 pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
         return true;
     }
     type_str.map(is_amiga_dos_type).unwrap_or(false)
+}
+
+/// True when a *resolved* filesystem-family name (the `type_name` the inspect
+/// grid shows after content-probing — e.g. `"SGI EFS"`, `"XFS"`, `"UFS"`,
+/// `"JFS2"`, `"HFS+"`) names a filesystem whose driver implements `fsck()`.
+///
+/// These all reach the "Check" button through the browsable path but are not
+/// identifiable by partition-type byte alone (0x83 "Linux" and the SGI dvh
+/// bytes are shared across ext / btrfs / xfs / ufs / jfs), so the button gate
+/// consults this in addition to [`is_checkable_type`]. Every driver named here
+/// returns `Some` from `Filesystem::fsck()`: EFS (`efs_fsck`), UFS (`ufs_fsck`),
+/// XFS (R1–R8), JFS (check-only), and HFS/HFS+.
+pub fn is_checkable_fs_name(type_name: &str) -> bool {
+    let n = type_name.to_ascii_uppercase();
+    ["HFS", "EFS", "UFS", "XFS", "JFS"]
+        .iter()
+        .any(|tok| n.contains(tok))
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -2669,6 +2691,24 @@ mod tests {
         assert!(is_checkable_type(0, Some("DOS\\3")));
         assert!(!is_checkable_type(0x0B, None)); // FAT not checkable
         assert!(!is_checkable_type(0, Some("Apple_Driver_IOKit")));
+    }
+
+    #[test]
+    fn checkable_fs_name_covers_probed_unix_families() {
+        // The resolved family names the inspect grid shows for content-probed
+        // Linux (0x83) and SGI (dvh) partitions, plus HFS+.
+        for name in [
+            "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+",
+        ] {
+            assert!(is_checkable_fs_name(name), "{name} should be checkable");
+        }
+        // Filesystems without an fsck() driver stay off the button.
+        for name in ["ext", "btrfs", "ReiserFS", "FAT", "NTFS", "exFAT", "ProDOS"] {
+            assert!(
+                !is_checkable_fs_name(name),
+                "{name} has no fsck; must not enable the button"
+            );
+        }
     }
 
     /// Build a 4 KiB buffer whose first 4 bytes are the XFS superblock magic.
