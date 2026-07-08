@@ -352,9 +352,12 @@ The app has five tabs:
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
     drag-and-drop / delete edits, then Apply atomically with snapshot
     rollback on error.
-- **Optical** — browse and extract files from CD/DVD images and physical
-  optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
-  discs. Re-opens automatically when the underlying disc changes.
+- **Optical** — browse and extract files from CD/DVD/BD images and physical
+  optical drives. Reads ISO 9660 (with Joliet and Rock Ridge extensions),
+  High Sierra (pre-ISO 9660), UDF, HFS and HFS+ (Mac hybrid / data discs),
+  SGI EFS (IRIX), UFS/FFS (Tru64 / Solaris / NeXT), and VMS ODS-2 (OpenVMS)
+  discs — see the *Optical disc filesystems* table below. Re-opens
+  automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
   StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
   (`.mar`, read + write), MacBinary I/II/III (`.bin`), MacZip (Info-ZIP's
@@ -528,6 +531,25 @@ inspect-tab Edit Mode.
 | Alto BFS / TFS | Yes | Yes | Yes (resize) | — | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). |
 | Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so real names come from the Cedar **client name directory** — the FS name->FileID B-tree in `rootFile[client]`, decoded when present — then from each file's leader page (XDE volumes name ~90% of files this way, ViewPoint names its boot/system files), and otherwise are synthesized from the file ID); blank-volume creation + add/delete files + **installing a client name directory** (`pilot_probe set-dir`) via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |
 | Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
+
+### Optical disc filesystems
+
+Optical discs are read through the
+[`opticaldiscs`](https://github.com/danifunker/opticaldiscs-rs) engine and
+surfaced in the **Optical** tab (and `rb-cli optical browse` / `extract`).
+These are **browse + extract only** — no edit, resize, or fsck — and are read
+from `.iso` / `.toast`, `.bin` + `.cue`, and CD/DVD `.chd` containers (a raw
+2352-byte-sector image inside a bare `.iso` is auto-detected).
+
+| Filesystem | Typical discs |
+|------------|---------------|
+| ISO 9660 (+ Joliet, Rock Ridge) | PC / Unix / mixed data CDs and DVDs. Joliet = Unicode long names; Rock Ridge = POSIX names, permissions, and symlinks. |
+| High Sierra | Pre-ISO 9660 CD-ROMs (early Microsoft / IBM titles). |
+| UDF | DVDs and data discs (UDF 1.02–2.01). UDF 2.50+ metadata-partition discs (Blu-ray) are detected only. |
+| HFS / HFS+ | Classic Mac and Mac OS X CDs / DVDs, including "Mac/PC" hybrids — resource forks and type/creator preserved. |
+| SGI EFS | IRIX install / distribution CDs (read via the SGI Volume Header). |
+| UFS / FFS | Digital UNIX / Tru64 and SunOS / Solaris CDs, plus NeXT / OpenStep / Rhapsody discs. |
+| VMS ODS-2 / Files-11 | OpenVMS (VAX / Alpha) discs. |
 
 ### Partition tables
 
