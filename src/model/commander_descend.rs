@@ -39,7 +39,11 @@ pub enum DescendKind {
 /// Extensions that name an optical disc image we can browse via `opticaldiscs`.
 /// `.mds` / `.cue` are the descriptors of two-file formats whose data file sits
 /// alongside; the rest are self-contained.
-const OPTICAL_EXTS: &[&str] = &["iso", "cue", "mdf", "mds", "nrg", "ccd", "cdr", "toast"];
+const OPTICAL_EXTS: &[&str] = &[
+    "iso", "cue", "mdf", "mds", "nrg", "ccd", "cdr", "toast", // Video-game console
+    // discs opticaldiscs 0.8 browses: Dreamcast GD-ROM + GameCube/Wii containers.
+    "gdi", "gcm", "rvz", "wbfs", "ciso", "gcz", "wia", "tgc", "nfs",
+];
 
 /// Classify a filename as descendable, by extension only (no I/O). The actual
 /// open confirms by content; this just decides whether to offer the affordance.

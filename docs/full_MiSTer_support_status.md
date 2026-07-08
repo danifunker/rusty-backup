@@ -31,8 +31,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   directory namespaces; bidirectionally cross-validated byte-exact against
   an independent clean-room DFS reader/writer),
   ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
-  + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS, and
-  VMS ODS-2 — browse/extract, see **Optical / CD-ROM** below).
+  + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
+  VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
+  Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
+  below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
@@ -45,9 +47,12 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Optical / CD-ROM:** rip a physical CD/DVD drive to ISO or BIN/CUE
   (`optical rip`), list drives (`optical drives`), convert ISO <-> BIN/CUE <->
   CD-CHD (`optical convert`), and browse/extract ISO 9660 (+ Joliet /
-  Rock Ridge), High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS, and VMS ODS-2
-  disc images. Built into both the desktop release and the MiSTer
-  `rb-cli-mini` armv7 build (via opticaldiscs 0.7.0), for devices with an
+  Rock Ridge), High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS, VMS ODS-2, and
+  the video-game console discs — Nintendo GameCube / Wii (Wii decrypted
+  internally, no key needed), Sega Dreamcast GD-ROM (`.gdi` + CHD), Philips
+  CD-i, and 3DO — disc images, with console / serial / title / region
+  identification. Built into both the desktop release and the MiSTer
+  `rb-cli-mini` armv7 build (via opticaldiscs 0.8.0), for devices with an
   attached drive (e.g. the SuperStation One).
 - **Remote optical ripping:** the desktop app / CLI can drive a *remote*
   daemon's optical drive over the rb-daemon — the device (e.g. a MiSTer) only
@@ -203,8 +208,9 @@ CD32** (data CDFS = ISO9660; audio not implemented in the core) use CD media.
 No other computer core uses CD-ROM, so no new optical work is required.
 
 (The optical browser reads far more than the cores need — UDF, High Sierra,
-HFS / HFS+, SGI EFS, UFS/FFS, and VMS ODS-2 in addition to ISO 9660 — so no
-CD-using core is filesystem-blocked.)
+HFS / HFS+, SGI EFS, UFS/FFS, VMS ODS-2, and the video-game console
+filesystems GameCube / Wii, CD-i, and 3DO Opera in addition to ISO 9660 — so
+no CD-using core is filesystem-blocked.)
 
 ---
 

@@ -40,6 +40,25 @@ pub fn mac_dates_from(
     crate::fs::resource_fork::MacFileDates { created, modified }
 }
 
+/// Format a game disc's identity into a single ASCII line for logs and UI
+/// labels, e.g. `Nintendo GameCube - Zelda [GALE01] (North America (NTSC-U))`.
+/// Every part is best-effort; only the console name is always present.
+/// No Unicode glyphs (see CLAUDE.md) — plain ASCII separators only.
+pub fn format_game_identity(g: &opticaldiscs::GameDiscInfo) -> String {
+    let mut s = g.console.display_name().to_string();
+    if let Some(title) = &g.title {
+        s.push_str(" - ");
+        s.push_str(title);
+    }
+    if let Some(serial) = &g.serial {
+        s.push_str(&format!(" [{serial}]"));
+    }
+    if let Some(region) = g.region {
+        s.push_str(&format!(" ({})", region.display_name()));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::mac_dates_from;
@@ -81,5 +100,38 @@ mod tests {
         assert_eq!((unix.created, unix.modified), (0, 0));
         let none = mac_dates_from(&None);
         assert_eq!((none.created, none.modified), (0, 0));
+    }
+
+    #[test]
+    fn game_identity_formats_all_parts() {
+        use opticaldiscs::gameid::GameDiscInfo;
+        use opticaldiscs::{Console, Region};
+        let g = GameDiscInfo {
+            console: Console::GameCube,
+            serial: Some("GALE01".into()),
+            title: Some("Super Smash Bros. Melee".into()),
+            region: Some(Region::NtscU),
+            maker: None,
+            version: None,
+        };
+        assert_eq!(
+            super::format_game_identity(&g),
+            "Nintendo GameCube - Super Smash Bros. Melee [GALE01] (North America (NTSC-U))"
+        );
+    }
+
+    #[test]
+    fn game_identity_console_only() {
+        use opticaldiscs::gameid::GameDiscInfo;
+        use opticaldiscs::Console;
+        let g = GameDiscInfo {
+            console: Console::SegaDreamcast,
+            serial: None,
+            title: None,
+            region: None,
+            maker: None,
+            version: None,
+        };
+        assert_eq!(super::format_game_identity(&g), "Sega Dreamcast");
     }
 }

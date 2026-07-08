@@ -355,6 +355,12 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
     let label = fs.volume_name().unwrap_or("/").to_owned();
 
     let mut out = String::new();
+    if let Some(g) = &info.game {
+        out.push_str(&format!(
+            "Game disc: {}\n",
+            crate::optical::format_game_identity(g)
+        ));
+    }
     out.push_str(&label);
     out.push('\n');
     let mut dirs = 0u64;

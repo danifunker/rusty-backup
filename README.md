@@ -355,9 +355,13 @@ The app has five tabs:
 - **Optical** — browse and extract files from CD/DVD/BD images and physical
   optical drives. Reads ISO 9660 (with Joliet and Rock Ridge extensions),
   High Sierra (pre-ISO 9660), UDF, HFS and HFS+ (Mac hybrid / data discs),
-  SGI EFS (IRIX), UFS/FFS (Tru64 / Solaris / NeXT), and VMS ODS-2 (OpenVMS)
-  discs — see the *Optical disc filesystems* table below. Re-opens
-  automatically when the underlying disc changes.
+  SGI EFS (IRIX), UFS/FFS (Tru64 / Solaris / NeXT), VMS ODS-2 (OpenVMS), and
+  the video-game console filesystems — Nintendo GameCube & Wii (Wii decrypted
+  internally, no key file needed), Sega Dreamcast GD-ROM (`.gdi` + CHD),
+  Philips CD-i, and 3DO Opera — discs. Also identifies the console, game
+  serial, title, and region for PlayStation, Saturn, Mega-CD, Neo Geo CD,
+  PC-FX, CD32, and the browsable consoles. See the *Optical disc filesystems*
+  table below. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
   StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
   (`.mar`, read + write), MacBinary I/II/III (`.bin`), MacZip (Info-ZIP's
@@ -554,7 +558,10 @@ Optical discs are read through the
 surfaced in the **Optical** tab (and `rb-cli optical browse` / `extract`).
 These are **browse + extract only** — no edit, resize, or fsck — and are read
 from `.iso` / `.toast`, `.bin` + `.cue`, and CD/DVD `.chd` containers (a raw
-2352-byte-sector image inside a bare `.iso` is auto-detected).
+2352-byte-sector image inside a bare `.iso` is auto-detected), plus the
+Dreamcast `.gdi` track descriptor and the Nintendo GameCube / Wii container
+family (`.gcm .rvz .wbfs .ciso .gcz .wia .tgc .nfs`; a raw GameCube/Wii dump in
+a bare `.iso` is auto-detected by magic).
 
 | Filesystem | Typical discs |
 |------------|---------------|
@@ -565,6 +572,14 @@ from `.iso` / `.toast`, `.bin` + `.cue`, and CD/DVD `.chd` containers (a raw
 | SGI EFS | IRIX install / distribution CDs (read via the SGI Volume Header). |
 | UFS / FFS | Digital UNIX / Tru64 and SunOS / Solaris CDs, plus NeXT / OpenStep / Rhapsody discs. |
 | VMS ODS-2 / Files-11 | OpenVMS (VAX / Alpha) discs. |
+| GameCube / Wii | Nintendo GameCube (GCM/FST) and Wii discs. Wii encrypted partitions are decrypted internally — no key file required. Read via the `nod` crate, including the compressed `.rvz` / `.wbfs` / `.ciso` / `.gcz` / `.wia` containers. |
+| CD-i | Philips CD-i (Green Book) discs — big-endian ISO 9660 variant. |
+| 3DO Opera | Panasonic / 3DO game discs (big-endian block tree). |
+
+Game discs also carry a **console / serial / title / region** identity line
+(shown in the Optical tab, the browse header, and `rb-cli optical browse`),
+recognized for PlayStation 1/2, Saturn, Mega-CD, Dreamcast, Neo Geo CD, PC-FX,
+PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 
 ### Partition tables
 

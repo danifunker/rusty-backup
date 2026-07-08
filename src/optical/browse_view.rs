@@ -185,6 +185,9 @@ impl OpticalDiscBrowseView {
                 if let Some(ref label) = info.volume_label {
                     ui.label(format!("Label: {label}"));
                 }
+                if let Some(g) = &info.game {
+                    ui.label(format!("Game: {}", crate::optical::format_game_identity(g)));
+                }
             }
             if ui.button("Tree").clicked() {
                 self.generate_tree_text();
