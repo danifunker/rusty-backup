@@ -210,8 +210,19 @@ layout-preserving compactor.
 
 ## 3. Filesystem engine — small to medium
 
-(Section currently empty — §3.1 HFS raw-image expand closed 2026-06-03,
-see §10. Reopen when new small-to-medium filesystem work surfaces.)
+### 3.1 Compressed superfloppy output (restore-path fix)
+
+Superfloppy (partition-less) volumes now go through compaction — a lightly-used
+raw ext4 `.img` backs up to a smaller **packed** `.img` and restores/grows back
+e2fsck-clean (backup `sizes.rs`, restore already handles it). But the output is
+still forced to raw (`CompressionType::None` in `backup/mod.rs`): honoring an
+explicit `--format zstd|gzip|lz4` for a superfloppy produced a tiny backup
+(64 MiB → ~1.7 KB) that **failed to restore** ("Bad magic number in super-block",
+wrong size) — the per-partition restore path mishandles a compressed superfloppy
+member. Fix the compressed-superfloppy restore, then re-enable honoring the
+compression format for superfloppy (the codec-gating match was reverted; see the
+comment on `effective_compression`). Big win: KB-scale backups of mostly-empty
+raw fs images.
 
 ---
 
