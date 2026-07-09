@@ -24,6 +24,7 @@ pub mod exfat;
 pub mod exfat_clone;
 pub mod exfat_fsck;
 pub mod ext;
+pub mod ext_csum;
 pub mod ext_format;
 pub mod ext_fsck;
 pub mod fat;

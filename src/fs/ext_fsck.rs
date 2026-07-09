@@ -23,11 +23,13 @@
 //! ## What it repairs
 //!
 //! Rewrites the block + inode bitmaps and the free counts from the computed
-//! state — Pass 5's job. **Repair is withheld on `metadata_csum` / `uninit_bg`
-//! volumes**: their bitmaps and descriptors carry crc checksums we don't yet
-//! recompute, so a naive rewrite would corrupt them; those issues are surfaced
-//! for diagnosis instead (run `e2fsck` to repair). Multiply-claimed blocks are
-//! surfaced only (they need the editor to relocate data).
+//! state — Pass 5's job. On **`metadata_csum`** volumes it additionally verifies
+//! and recomputes the crc32c on every structure it touches (superblock,
+//! descriptors, bitmap checksums) via a reseal pass driven by `ext_csum` — so
+//! ext4 is now check + repair, byte-verified against `e2fsck`. The legacy
+//! **`gdt_csum`/`uninit_bg`** regime (crc16, no bitmap/inode/dir checksums) is
+//! still withheld. Multiply-claimed blocks are surfaced only (they need the
+//! editor to relocate data).
 
 use std::io::{Read, Seek, Write};
 
@@ -88,6 +90,13 @@ enum Fix {
         free_blocks: u32,
         free_inodes: u32,
     },
+    /// (metadata_csum) Recompute group `g`'s descriptor crc32c: its
+    /// block/inode-bitmap checksums (over the on-disk bitmaps) and `bg_checksum`.
+    /// Emitted for any group we rewrite, plus any group whose stored checksums are
+    /// stale.
+    GroupChecksum { group: usize },
+    /// (metadata_csum) Recompute the superblock `s_checksum`.
+    SuperChecksum,
 }
 
 impl Analysis {
@@ -189,7 +198,10 @@ pub(crate) fn build_inode_bitmap(g: &ExtGeom, group: usize, inode_used: &[bool])
 /// The shared analysis pass. Read-only.
 fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis, FilesystemError> {
     let (geom, groups) = fs.fsck_geometry()?;
-    let repairable = !geom.checksummed;
+    // metadata_csum volumes are now repairable — we recompute crc32c on every
+    // structure we rewrite (see the reseal pass in `repair_ext`). The legacy
+    // gdt_csum-only regime (crc16, no bitmap/inode/dir csums) is still withheld.
+    let repairable = !geom.checksummed || geom.metadata_csum;
     let mut a = Analysis {
         geom,
         errors: Vec::new(),
@@ -203,11 +215,11 @@ fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis,
     };
     let g = geom;
 
-    if geom.checksummed {
+    if geom.checksummed && !geom.metadata_csum {
         a.warnings.push(FsckIssue {
             code: "MetadataChecksum".into(),
-            message: "volume uses metadata_csum/uninit_bg; issues are reported but repair is \
-                      withheld (rewriting checksummed structures needs crc recompute — use e2fsck)"
+            message: "volume uses the legacy gdt_csum/uninit_bg checksums (crc16); issues are \
+                      reported but repair is withheld — use e2fsck"
                 .into(),
             repairable: false,
             debug: false,
@@ -413,7 +425,101 @@ fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis,
         });
     }
 
+    // ---- metadata_csum: verify checksums and queue reseals. ----
+    if g.metadata_csum {
+        csum_audit(fs, &g, &groups, &mut a)?;
+    }
+
     Ok(a)
+}
+
+/// For a `metadata_csum` volume: queue a checksum reseal for every group/super we
+/// already produced a content fix for, and additionally verify the stored
+/// superblock / descriptor / bitmap checksums, queuing a reseal (with a reported
+/// issue) for any that are stale. Read-only — the reseal `Fix`es are applied by
+/// `repair_ext` after the content fixes.
+fn csum_audit<R: Read + Seek + Send>(
+    fs: &mut ExtFilesystem<R>,
+    g: &ExtGeom,
+    groups: &[ExtGroup],
+    a: &mut Analysis,
+) -> Result<(), FilesystemError> {
+    use std::collections::BTreeSet;
+    let seed = g.csum_seed;
+
+    let mut reseal_groups: BTreeSet<usize> = BTreeSet::new();
+    let mut reseal_super = false;
+    for f in &a.fixes {
+        match f {
+            Fix::BlockBitmap { group, .. }
+            | Fix::InodeBitmap { group, .. }
+            | Fix::GroupCounts { group, .. } => {
+                reseal_groups.insert(*group);
+            }
+            Fix::SuperCounts { .. } => reseal_super = true,
+            _ => {}
+        }
+    }
+
+    // Superblock checksum.
+    let sb_off = g.partition_offset + 1024;
+    let sb = fs.read_raw(sb_off, 1024)?;
+    let stored = u32::from_le_bytes(
+        sb[super::ext_csum::SB_CSUM_OFF..super::ext_csum::SB_CSUM_OFF + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if super::ext_csum::superblock_csum(&sb) != stored && !reseal_super {
+        a.err(
+            "SuperblockChecksumWrong",
+            "superblock crc32c is stale".into(),
+            true,
+        );
+        reseal_super = true;
+    }
+
+    // Per-group descriptor + bitmap checksums. A cloned descriptor re-stamped over
+    // its current content differs from the original ONLY in the checksum fields,
+    // so an inequality is exactly a stale checksum.
+    let gdt_start = (g.first_data_block as u64 + 1) * g.block_size + g.partition_offset;
+    let ibm_len = (g.inodes_per_group / 8) as usize;
+    for (gi, grp) in groups.iter().enumerate() {
+        if reseal_groups.contains(&gi) {
+            continue;
+        }
+        let desc = fs.read_raw(
+            gdt_start + gi as u64 * g.desc_size as u64,
+            g.desc_size as usize,
+        )?;
+        let bbm = fs.read_raw(
+            g.partition_offset + grp.block_bitmap * g.block_size,
+            g.block_size as usize,
+        )?;
+        let ibm = fs.read_raw(
+            g.partition_offset + grp.inode_bitmap * g.block_size,
+            ibm_len,
+        )?;
+        let mut expected = desc.clone();
+        super::ext_csum::stamp_block_bitmap_csum(seed, &mut expected, &bbm);
+        super::ext_csum::stamp_inode_bitmap_csum(seed, &mut expected, &ibm);
+        super::ext_csum::stamp_group_desc(seed, gi as u32, &mut expected);
+        if expected != desc {
+            a.err(
+                "GroupChecksumWrong",
+                format!("group {gi} descriptor/bitmap crc32c is stale"),
+                true,
+            );
+            reseal_groups.insert(gi);
+        }
+    }
+
+    for gi in reseal_groups {
+        a.fixes.push(Fix::GroupChecksum { group: gi });
+    }
+    if reseal_super {
+        a.fixes.push(Fix::SuperChecksum);
+    }
+    Ok(())
 }
 
 fn stats(a: &Analysis) -> FsckStats {
@@ -452,7 +558,10 @@ pub fn repair_ext<R: Read + Write + Seek + Send>(
     let a = analyze(fs)?;
     let g = a.geom;
 
-    if g.checksummed {
+    // Legacy gdt_csum/uninit_bg (crc16) is still withheld; metadata_csum is
+    // repaired with a crc32c reseal pass (the GroupChecksum/SuperChecksum fixes
+    // `analyze` queued after the content fixes).
+    if g.checksummed && !g.metadata_csum {
         return Ok(super::fsck::RepairReport {
             fixes_applied: Vec::new(),
             fixes_failed: Vec::new(),
@@ -513,6 +622,12 @@ pub fn repair_ext<R: Read + Write + Seek + Send>(
                     ))
                 })()
             }
+            // Reseal fixes run after the content fixes above, so they re-stamp over
+            // already-corrected bitmaps / counts.
+            Fix::GroupChecksum { group } => reseal_group_csum(fs, &g, gdt_start, *group)
+                .map(|_| format!("resealed group {group} checksums")),
+            Fix::SuperChecksum => reseal_super_csum(fs, g.partition_offset)
+                .map(|_| "resealed superblock checksum".into()),
         };
         match r {
             Ok(desc) => applied.push(desc),
@@ -529,6 +644,54 @@ pub fn repair_ext<R: Read + Write + Seek + Send>(
         fixes_failed: failed,
         unrepairable_count: a.unrepairable,
     })
+}
+
+/// Re-stamp group `group`'s descriptor crc32c: its block/inode-bitmap checksums
+/// (computed over the on-disk bitmaps) and `bg_checksum`. The bitmap block numbers
+/// come from the descriptor itself.
+fn reseal_group_csum<R: Read + Write + Seek + Send>(
+    fs: &mut ExtFilesystem<R>,
+    g: &ExtGeom,
+    gdt_start: u64,
+    group: usize,
+) -> Result<(), FilesystemError> {
+    let seed = g.csum_seed;
+    let is64 = g.desc_size >= 64;
+    let desc_off = gdt_start + group as u64 * g.desc_size as u64;
+    let mut desc = fs.read_raw(desc_off, g.desc_size as usize)?;
+    let read_block_no = |d: &[u8], lo: usize, hi: usize| -> u64 {
+        let mut v = u32::from_le_bytes(d[lo..lo + 4].try_into().unwrap()) as u64;
+        if is64 {
+            v |= (u32::from_le_bytes(d[hi..hi + 4].try_into().unwrap()) as u64) << 32;
+        }
+        v
+    };
+    let bb = read_block_no(&desc, 0x00, 0x20); // bg_block_bitmap
+    let ib = read_block_no(&desc, 0x04, 0x24); // bg_inode_bitmap
+    let bbm = fs.read_raw(
+        g.partition_offset + bb * g.block_size,
+        g.block_size as usize,
+    )?;
+    let ibm = fs.read_raw(
+        g.partition_offset + ib * g.block_size,
+        (g.inodes_per_group / 8) as usize,
+    )?;
+    // Stamp bitmap csums before bg_checksum — bg_checksum covers them.
+    super::ext_csum::stamp_block_bitmap_csum(seed, &mut desc, &bbm);
+    super::ext_csum::stamp_inode_bitmap_csum(seed, &mut desc, &ibm);
+    super::ext_csum::stamp_group_desc(seed, group as u32, &mut desc);
+    fs.write_raw(desc_off, &desc)
+}
+
+/// Re-stamp the superblock crc32c.
+fn reseal_super_csum<R: Read + Write + Seek + Send>(
+    fs: &mut ExtFilesystem<R>,
+    partition_offset: u64,
+) -> Result<(), FilesystemError> {
+    let sb_off = partition_offset + 1024;
+    let mut sb = fs.read_raw(sb_off, 1024)?;
+    super::ext_csum::stamp_superblock(&mut sb);
+    fs.write_raw(sb_off, &sb)
 }
 
 /// Locate an e2fsprogs tool (`e2fsck`, `mke2fs`, …) across the usual keg-only /
@@ -636,25 +799,63 @@ mod tests {
     }
 
     #[test]
-    fn ext4_metadata_csum_detects_but_withholds_repair() {
+    fn ext4_metadata_csum_detects_and_repairs() {
         let mut img = load("test_ext4.img.zst");
+        // Patching the free count via write_raw invalidates the value AND leaves
+        // the superblock crc32c stale.
         corrupt_super_free_blocks(&mut img, 12345);
 
         let r = run_fsck(&mut img);
-        // The mismatch is detected...
         assert!(
             codes(&r).contains(&"FreeBlocksCountWrong".to_string()),
             "{:?}",
             r.errors
         );
-        // ...but not auto-repaired (checksummed volume).
-        assert!(
-            !r.repairable,
-            "metadata_csum volume must not offer auto-repair"
-        );
+        // metadata_csum is now repairable — we recompute crc32c (the content fix
+        // implies the superblock reseal, so it isn't reported as a separate csum
+        // issue).
+        assert!(r.repairable, "metadata_csum should now be repairable");
+
         let rep = run_repair(&mut img);
-        assert!(rep.fixes_applied.is_empty());
-        assert!(rep.unrepairable_count >= 1);
+        assert!(rep.fixes_failed.is_empty(), "{:?}", rep.fixes_failed);
+        let after = run_fsck(&mut img);
+        assert!(
+            after.is_clean(),
+            "not clean after repair: {:?}",
+            after.errors
+        );
+    }
+
+    #[test]
+    fn ext4_detects_and_repairs_stale_superblock_checksum() {
+        // A pure checksum corruption: valid content, wrong s_checksum.
+        let mut img = load("test_ext4.img.zst");
+        {
+            let mut fs = open(&mut img);
+            fs.write_raw(1024 + 0x3FC, &0xDEAD_BEEFu32.to_le_bytes())
+                .unwrap();
+            fs.flush_writer().unwrap();
+        }
+        let r = run_fsck(&mut img);
+        assert!(
+            codes(&r).contains(&"SuperblockChecksumWrong".to_string()),
+            "{:?}",
+            r.errors
+        );
+        assert!(
+            !codes(&r).contains(&"FreeBlocksCountWrong".to_string()),
+            "content must be untouched: {:?}",
+            r.errors
+        );
+        assert!(r.repairable);
+        let rep = run_repair(&mut img);
+        assert!(rep.fixes_failed.is_empty(), "{:?}", rep.fixes_failed);
+        let after = run_fsck(&mut img);
+        assert!(
+            after.is_clean(),
+            "not clean after repair: {:?}",
+            after.errors
+        );
     }
 
     // ---- Oracle cross-check against e2fsck (from e2fsprogs). ----
@@ -697,5 +898,52 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let ok = status.map(|o| o.status.success()).unwrap_or(false);
         assert!(ok, "e2fsck should find our repaired ext2 volume clean");
+    }
+
+    #[test]
+    fn oracle_e2fsck_agrees_after_ext4_repair() {
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NONCE: AtomicU32 = AtomicU32::new(0);
+
+        let Some(e2fsck) = e2fsck_bin() else {
+            eprintln!("skipping: e2fsck not available");
+            return;
+        };
+
+        // Corrupt a metadata_csum ext4: wrong SB free count + a leaked block-bitmap
+        // bit. Both the content and the (now-stale) crc32c must be repaired.
+        let mut img = load("test_ext4.img.zst");
+        corrupt_super_free_blocks(&mut img, 999);
+        {
+            let mut fs = open(&mut img);
+            let mut bm = fs.read_block_bitmap(0).unwrap();
+            let total = fs.fsck_geometry().unwrap().0.total_blocks;
+            if let Some(idx) = (100u64..total).find(|&b| bm[(b / 8) as usize] & (1 << (b % 8)) == 0)
+            {
+                bm[(idx / 8) as usize] |= 1 << (idx % 8);
+                fs.write_block_bitmap(0, &bm).unwrap();
+                fs.flush_writer().unwrap();
+            }
+        }
+        run_repair(&mut img);
+
+        let n = NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rb_ext4_{}_{}.img", std::process::id(), n));
+        std::fs::write(&path, img.get_ref()).unwrap();
+        let out = Command::new(e2fsck).args(["-fn"]).arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let clean = match out {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                eprintln!(
+                    "e2fsck (ext4) not clean:\n{}",
+                    String::from_utf8_lossy(&o.stdout)
+                );
+                false
+            }
+            Err(_) => false,
+        };
+        assert!(clean, "e2fsck should find our repaired ext4 volume clean");
     }
 }

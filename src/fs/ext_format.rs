@@ -117,6 +117,8 @@ impl Ext2Layout {
             desc_size: DESC_SIZE,
             sparse_super: true,
             checksummed: false,
+            metadata_csum: false,
+            csum_seed: 0,
             free_blocks: 0,
             free_inodes: 0,
         }

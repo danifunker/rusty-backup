@@ -106,9 +106,15 @@ pub(crate) struct ExtGeom {
     pub(crate) desc_size: u16,
     pub(crate) sparse_super: bool,
     /// True when the volume carries per-metadata checksums (metadata_csum or the
-    /// older uninit_bg/GDT_CSUM). Repair is withheld for these — rewriting a
-    /// bitmap / descriptor without recomputing its crc would corrupt the volume.
+    /// older uninit_bg/GDT_CSUM). `metadata_csum` below distinguishes the modern
+    /// crc32c regime (which we now recompute + repair) from the legacy
+    /// gdt_csum-only case (crc16, still withheld).
     pub(crate) checksummed: bool,
+    /// True for `metadata_csum` (ro_compat 0x400) specifically — crc32c on the
+    /// superblock, descriptors, bitmaps, inodes, and directory blocks.
+    pub(crate) metadata_csum: bool,
+    /// crc32c seed derived from the volume UUID (`ext_csum::csum_seed`).
+    pub(crate) csum_seed: u32,
     pub(crate) free_blocks: u64,
     pub(crate) free_inodes: u32,
 }
@@ -170,6 +176,13 @@ pub struct ExtFilesystem<R> {
     desc_size: u16,
     first_data_block: u32,
     free_blocks: u64,
+    /// `metadata_csum` (ro_compat 0x400): the editor must recompute crc32c on
+    /// every metadata write to keep the volume e2fsck-clean.
+    #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
+    metadata_csum: bool,
+    /// crc32c seed derived from the volume UUID (`ext_csum::csum_seed`).
+    #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
+    csum_seed: u32,
 }
 
 impl<R: Read + Seek + Send> ExtFilesystem<R> {
@@ -198,6 +211,10 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
         let feature_compat = le32(&sb, 0x5C);
         let feature_incompat = le32(&sb, 0x60);
+        let feature_ro_compat = le32(&sb, 0x64);
+        let metadata_csum = feature_ro_compat & 0x0400 != 0;
+        let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+        let csum_seed = super::ext_csum::csum_seed(&uuid);
 
         let block_size = 1024u64 << log_block_size;
         if !(1024..=65536).contains(&block_size) {
@@ -347,6 +364,8 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             desc_size,
             first_data_block,
             free_blocks: total_free_blocks,
+            metadata_csum,
+            csum_seed,
         })
     }
 
@@ -723,6 +742,15 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
     }
 
     /// Snapshot the geometry + group descriptors the fsck module needs.
+    /// Read `len` bytes from an absolute offset (checksum audit / resealing reads
+    /// back the superblock / descriptor / bitmap it is about to verify or stamp).
+    pub(crate) fn read_raw(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, FilesystemError> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     pub(crate) fn fsck_geometry(&mut self) -> Result<(ExtGeom, Vec<ExtGroup>), FilesystemError> {
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + SUPERBLOCK_OFFSET))?;
@@ -742,6 +770,9 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
         let sparse_super = ro_compat & 0x0001 != 0;
         // metadata_csum (0x400) or the older uninit_bg/GDT_CSUM (0x10).
         let checksummed = ro_compat & 0x0410 != 0;
+        let metadata_csum = ro_compat & 0x0400 != 0;
+        let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+        let csum_seed = super::ext_csum::csum_seed(&uuid);
         let is_64bit = incompat & 0x0080 != 0;
         let free_blocks = if is_64bit {
             ((le32(&sb, 0x158) as u64) << 32) | free_blocks_lo
@@ -763,6 +794,8 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             desc_size: self.desc_size,
             sparse_super,
             checksummed,
+            metadata_csum,
+            csum_seed,
             free_blocks,
             free_inodes,
         };
