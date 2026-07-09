@@ -1039,8 +1039,17 @@ pub fn run_restore(config: RestoreConfig, progress: Arc<Mutex<RestoreProgress>>)
             continue;
         }
 
-        // Resize filesystem if the partition size changed.
-        let needs_resize = export_size != pm.original_size_bytes;
+        // Resize filesystem if the target differs from the filesystem currently on
+        // disk. For a compacted (packed) partition the written stream is the *imaged*
+        // (smaller) size, so restoring at the original size must grow it back to
+        // fill the partition — comparing against original_size_bytes alone would miss
+        // that and leave a small filesystem inside a larger partition.
+        let current_fs_bytes = if pm.compacted && pm.imaged_size_bytes > 0 {
+            pm.imaged_size_bytes
+        } else {
+            pm.original_size_bytes
+        };
+        let needs_resize = export_size != current_fs_bytes;
         // For compacted HFS/HFS+ restored to original size: the backup stream was
         // trimmed to the last used block, so the partition tail was zero-filled above.
         // We must still call resize (with the same export_size) to write the correct
