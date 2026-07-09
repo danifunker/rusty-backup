@@ -88,6 +88,11 @@ struct GroupDescriptor {
     free_blocks: u32,
     free_inodes: u32,
     flags: u16,
+    /// `bg_itable_unused`: count of never-scanned inodes at the end of the group's
+    /// inode table (the uninit_bg optimization). The editor must lower this when it
+    /// allocates an inode in the unused region, or e2fsck treats the new inode as
+    /// unused.
+    itable_unused: u32,
 }
 
 /// Geometry snapshot for the fsck module (`ext_fsck`).
@@ -312,6 +317,12 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
             let free_blocks_lo = u16::from_le_bytes([d[0x0C], d[0x0D]]) as u32;
             let free_inodes_lo = u16::from_le_bytes([d[0x0E], d[0x0F]]) as u32;
             let flags = u16::from_le_bytes([d[0x12], d[0x13]]);
+            let itable_unused_lo = u16::from_le_bytes([d[0x1C], d[0x1D]]) as u32;
+            let itable_unused = if is_64bit && desc_size >= 64 {
+                ((u16::from_le_bytes([d[0x32], d[0x33]]) as u32) << 16) | itable_unused_lo
+            } else {
+                itable_unused_lo
+            };
 
             let (block_bitmap, inode_bitmap, inode_table, free_blocks, free_inodes) =
                 if is_64bit && desc_size >= 64 {
@@ -345,6 +356,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                 free_blocks,
                 free_inodes,
                 flags,
+                itable_unused,
             });
         }
 
@@ -1169,7 +1181,9 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         Ok(())
     }
 
-    /// Write raw inode bytes to the inode table.
+    /// Write raw inode bytes to the inode table. On `metadata_csum` volumes the
+    /// inode crc32c is stamped for in-use inodes (a freed/zeroed inode keeps a
+    /// zero checksum, which e2fsck doesn't verify).
     fn write_inode_raw(
         &mut self,
         inode_num: u32,
@@ -1177,13 +1191,90 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     ) -> Result<(), FilesystemError> {
         let group = (inode_num - 1) / self.inodes_per_group;
         let index = (inode_num - 1) % self.inodes_per_group;
-        let gd = &self.group_descriptors[group as usize];
+        let inode_table = self.group_descriptors[group as usize].inode_table;
         let offset = self.partition_offset
-            + gd.inode_table * self.block_size
+            + inode_table * self.block_size
             + index as u64 * self.inode_size as u64;
         self.reader.seek(SeekFrom::Start(offset))?;
-        self.reader.write_all(inode_bytes)?;
+        if self.metadata_csum
+            && inode_bytes.len() >= 2
+            && (inode_bytes[0] != 0 || inode_bytes[1] != 0)
+        {
+            let mut buf = inode_bytes.to_vec();
+            // ext4 256-byte inodes carry i_extra_isize; set it so the checksum's
+            // high half has room (build_inode_bytes leaves it 0).
+            if buf.len() > 0x82 && u16::from_le_bytes([buf[0x80], buf[0x81]]) == 0 {
+                buf[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+            }
+            super::ext_csum::stamp_inode(self.csum_seed, &mut buf, inode_num);
+            self.reader.write_all(&buf)?;
+        } else {
+            self.reader.write_all(inode_bytes)?;
+        }
         Ok(())
+    }
+
+    /// Re-stamp inode `inum`'s crc32c after an in-place field patch (`metadata_csum`
+    /// only; no-op otherwise).
+    fn reseal_inode_csum(&mut self, inum: u32) -> Result<(), FilesystemError> {
+        if !self.metadata_csum {
+            return Ok(());
+        }
+        let group = (inum - 1) / self.inodes_per_group;
+        let index = (inum - 1) % self.inodes_per_group;
+        let inode_table = self.group_descriptors[group as usize].inode_table;
+        let offset = self.partition_offset
+            + inode_table * self.block_size
+            + index as u64 * self.inode_size as u64;
+        let mut buf = vec![0u8; self.inode_size as usize];
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.read_exact(&mut buf)?;
+        if buf[0] != 0 || buf[1] != 0 {
+            super::ext_csum::stamp_inode(self.csum_seed, &mut buf, inum);
+            self.reader.seek(SeekFrom::Start(offset))?;
+            self.reader.write_all(&buf)?;
+        }
+        Ok(())
+    }
+
+    /// The `i_generation` of inode `inum` (needed to checksum its directory blocks).
+    fn inode_generation(&mut self, inum: u32) -> Result<u32, FilesystemError> {
+        let group = (inum - 1) / self.inodes_per_group;
+        let index = (inum - 1) % self.inodes_per_group;
+        let inode_table = self.group_descriptors[group as usize].inode_table;
+        let offset = self.partition_offset
+            + inode_table * self.block_size
+            + index as u64 * self.inode_size as u64
+            + 0x64;
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut b = [0u8; 4];
+        self.reader.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    /// Usable directory-block length: on `metadata_csum` the last 12 bytes hold the
+    /// `ext4_dir_entry_tail` checksum, so entries stop short of it.
+    fn dir_usable_len(&self, block_len: usize) -> usize {
+        if self.metadata_csum {
+            block_len - 12
+        } else {
+            block_len
+        }
+    }
+
+    /// Write a directory block owned by inode `dir_inum`, stamping its checksum
+    /// tail first on `metadata_csum` volumes.
+    fn write_dir_block(
+        &mut self,
+        block_num: u64,
+        dir_inum: u32,
+        data: &mut [u8],
+    ) -> Result<(), FilesystemError> {
+        if self.metadata_csum {
+            let gen = self.inode_generation(dir_inum)?;
+            super::ext_csum::stamp_dir_block(self.csum_seed, data, dir_inum, gen);
+        }
+        self.write_block(block_num, data)
     }
 
     /// Write the superblock with current free counts.
@@ -1209,6 +1300,10 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
         // Patch s_free_inodes_count (offset 0x10)
         sb[0x10..0x14].copy_from_slice(&(total_free_inodes as u32).to_le_bytes());
+
+        if self.metadata_csum {
+            super::ext_csum::stamp_superblock(&mut sb);
+        }
 
         // Write back
         self.reader
@@ -1240,6 +1335,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         buf[0x0C..0x0E].copy_from_slice(&(gd.free_blocks as u16).to_le_bytes());
         buf[0x0E..0x10].copy_from_slice(&(gd.free_inodes as u16).to_le_bytes());
         buf[0x12..0x14].copy_from_slice(&gd.flags.to_le_bytes());
+        buf[0x1C..0x1E].copy_from_slice(&(gd.itable_unused as u16).to_le_bytes());
 
         // High fields for 64-bit
         if self.is_64bit && self.desc_size >= 64 {
@@ -1248,9 +1344,49 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             buf[0x28..0x2C].copy_from_slice(&((gd.inode_table >> 32) as u32).to_le_bytes());
             buf[0x2C..0x2E].copy_from_slice(&((gd.free_blocks >> 16) as u16).to_le_bytes());
             buf[0x2E..0x30].copy_from_slice(&((gd.free_inodes >> 16) as u16).to_le_bytes());
+            buf[0x32..0x34].copy_from_slice(&((gd.itable_unused >> 16) as u16).to_le_bytes());
+        }
+
+        // metadata_csum: re-stamp the bitmap checksums (over the current on-disk
+        // bitmaps, which the alloc/free paths write before calling this) and then
+        // bg_checksum, which covers them. Self-heals every descriptor write.
+        if self.metadata_csum {
+            let (bb, ib) = (gd.block_bitmap, gd.inode_bitmap);
+            let ibm_len = (self.inodes_per_group / 8) as usize;
+            let block_bitmap = self.read_block(bb)?;
+            let inode_bitmap = self.read_block(ib)?;
+            super::ext_csum::stamp_block_bitmap_csum(self.csum_seed, &mut buf, &block_bitmap);
+            super::ext_csum::stamp_inode_bitmap_csum(
+                self.csum_seed,
+                &mut buf,
+                &inode_bitmap[..ibm_len],
+            );
+            super::ext_csum::stamp_group_desc(self.csum_seed, group as u32, &mut buf);
         }
 
         self.reader.seek(SeekFrom::Start(gdt_offset))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Adjust group `group`'s `bg_used_dirs_count` by `delta` (and re-stamp
+    /// `bg_checksum` for metadata_csum). Directory create/delete must keep this
+    /// accurate or e2fsck's Pass 5 flags a mismatch.
+    fn adjust_used_dirs(&mut self, group: usize, delta: i32) -> Result<(), FilesystemError> {
+        let sb_block: u64 = if self.block_size == 1024 { 1 } else { 0 };
+        let desc_off = self.partition_offset
+            + (sb_block + 1) * self.block_size
+            + group as u64 * self.desc_size as u64;
+        let mut buf = vec![0u8; self.desc_size as usize];
+        self.reader.seek(SeekFrom::Start(desc_off))?;
+        self.reader.read_exact(&mut buf)?;
+        let cur = u16::from_le_bytes([buf[0x10], buf[0x11]]) as i32;
+        let new = (cur + delta).max(0) as u16;
+        buf[0x10..0x12].copy_from_slice(&new.to_le_bytes());
+        if self.metadata_csum {
+            super::ext_csum::stamp_group_desc(self.csum_seed, group as u32, &mut buf);
+        }
+        self.reader.seek(SeekFrom::Start(desc_off))?;
         self.reader.write_all(&buf)?;
         Ok(())
     }
@@ -1315,8 +1451,10 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 }
             }
 
-            // Write modified bitmap back
+            // Write modified bitmap back. uninit_bg: the block bitmap is now
+            // materialized, so clear BLOCK_UNINIT.
             self.write_block(self.group_descriptors[group as usize].block_bitmap, &bitmap)?;
+            self.group_descriptors[group as usize].flags &= !0x0002; // ~BLOCK_UNINIT
             self.write_group_descriptor(
                 group as usize,
                 &self.group_descriptors[group as usize].clone(),
@@ -1403,6 +1541,13 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 self.write_block(bitmap_block, &bitmap)?;
 
                 self.group_descriptors[group as usize].free_inodes -= 1;
+                // uninit_bg: the inode bitmap is now materialized, and the new
+                // inode must fall within the scanned (not itable_unused) region.
+                self.group_descriptors[group as usize].flags &= !0x0001; // ~INODE_UNINIT
+                let want = self.inodes_per_group - bit as u32 - 1;
+                if self.group_descriptors[group as usize].itable_unused > want {
+                    self.group_descriptors[group as usize].itable_unused = want;
+                }
                 self.write_group_descriptor(
                     group as usize,
                     &self.group_descriptors[group as usize].clone(),
@@ -1505,7 +1650,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                 file_type,
                 new_entry_len,
             ) {
-                self.write_block(block_num, &block_data)?;
+                self.write_dir_block(block_num, parent_inode, &mut block_data)?;
                 return Ok(());
             }
         }
@@ -1515,15 +1660,16 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         let new_blocks = self.allocate_blocks(1, parent_group)?;
         let new_block = new_blocks[0];
 
-        // Initialize new directory block with single entry spanning entire block
+        // Initialize new directory block with a single entry spanning the usable
+        // area (all but the metadata_csum tail).
         let mut new_block_data = vec![0u8; self.block_size as usize];
-        // Write the new entry
+        let usable = self.dir_usable_len(self.block_size as usize);
         new_block_data[0..4].copy_from_slice(&child_inode.to_le_bytes());
-        new_block_data[4..6].copy_from_slice(&(self.block_size as u16).to_le_bytes()); // rec_len = entire block
+        new_block_data[4..6].copy_from_slice(&(usable as u16).to_le_bytes()); // rec_len
         new_block_data[6] = name.len() as u8;
         new_block_data[7] = file_type;
         new_block_data[8..8 + name.len()].copy_from_slice(name.as_bytes());
-        self.write_block(new_block, &new_block_data)?;
+        self.write_dir_block(new_block, parent_inode, &mut new_block_data)?;
 
         // Update parent inode to include the new block
         self.add_block_to_inode(parent_inode, new_block, &parent)?;
@@ -1546,11 +1692,14 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         new_entry_len: usize,
     ) -> bool {
         let block_len = block_data.len();
+        // metadata_csum reserves the last 12 bytes for the checksum tail, so the
+        // walk never treats it as reusable slack.
+        let usable = self.dir_usable_len(block_len);
         let mut offset = 0;
         let mut prev_offset = 0;
 
         // Walk to find an entry with enough slack space
-        while offset + 8 <= block_len {
+        while offset + 8 <= usable {
             let inode = le32(block_data, offset);
             let rec_len =
                 u16::from_le_bytes([block_data[offset + 4], block_data[offset + 5]]) as usize;
@@ -1622,7 +1771,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             let mut block_data = self.read_block(block_num)?;
 
             if self.try_remove_dir_entry(&mut block_data, name) {
-                self.write_block(block_num, &block_data)?;
+                self.write_dir_block(block_num, parent_inode, &mut block_data)?;
                 return Ok(());
             }
         }
@@ -1635,10 +1784,11 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
     /// Try to remove a directory entry from a block. Returns true if found and removed.
     fn try_remove_dir_entry(&self, block_data: &mut [u8], name: &str) -> bool {
         let block_len = block_data.len();
+        let usable = self.dir_usable_len(block_len); // exclude the csum tail
         let mut offset = 0;
         let mut prev_offset: Option<usize> = None;
 
-        while offset + 8 <= block_len {
+        while offset + 8 <= usable {
             let inode = le32(block_data, offset);
             let rec_len =
                 u16::from_le_bytes([block_data[offset + 4], block_data[offset + 5]]) as usize;
@@ -1835,6 +1985,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
             + 0x28;
         self.reader.seek(SeekFrom::Start(offset))?;
         self.reader.write_all(new_iblock)?;
+        self.reseal_inode_csum(inode_num)?;
         Ok(())
     }
 
@@ -1854,6 +2005,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         self.reader.seek(SeekFrom::Start(base + 0x6C))?;
         self.reader
             .write_all(&((new_size >> 32) as u32).to_le_bytes())?;
+        self.reseal_inode_csum(inode_num)?;
         Ok(())
     }
 
@@ -1871,6 +2023,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
         self.reader.seek(SeekFrom::Start(base + 0x1A))?;
         self.reader.write_all(&new_links.to_le_bytes())?;
+        self.reseal_inode_csum(inode_num)?;
         Ok(())
     }
 
@@ -1883,14 +2036,12 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         let mut iblock = [0u8; 60];
 
         if self.has_extents {
-            // Build extent header + leaf entries
-            // Header: magic(2) + entries(2) + max(2) + depth(2) + generation(4) = 12 bytes
+            // Extent header: magic(2) + entries(2) + max(2) + depth(2) + generation(4).
             iblock[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-            let entries = blocks.len().min(4) as u16; // max 4 extents in inline i_block
-            iblock[2..4].copy_from_slice(&entries.to_le_bytes());
-            iblock[4..6].copy_from_slice(&4u16.to_le_bytes()); // max_entries = 4
+            iblock[4..6].copy_from_slice(&4u16.to_le_bytes()); // eh_max = 4 inline leaves
+                                                               // eh_depth [6..8] = 0, eh_generation [8..12] = 0
 
-            // Build extents — merge contiguous blocks into single extents
+            // Build extents — merge contiguous blocks into single extents.
             let mut ext_idx = 0;
             let mut i = 0;
             while i < blocks.len() && ext_idx < 4 {
@@ -1919,6 +2070,9 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
                     "ext4: file requires more than 4 extents (too fragmented for inline)".into(),
                 ));
             }
+            // eh_entries = the number of extents actually produced (contiguous runs
+            // merge into one), NOT the raw block count.
+            iblock[2..4].copy_from_slice(&(ext_idx as u16).to_le_bytes());
         } else {
             // ext2/3: direct block pointers
             for (idx, &blk) in blocks.iter().enumerate() {
@@ -2054,8 +2208,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let dir_blocks = self.allocate_blocks(1, parent_group)?;
         let dir_block = dir_blocks[0];
 
-        // Initialize directory block with . and .. entries
+        // Initialize directory block with . and .. entries. On metadata_csum the
+        // `..` entry stops short of the 12-byte checksum tail.
         let block_size = self.block_size as usize;
+        let usable = self.dir_usable_len(block_size);
         let mut dir_data = vec![0u8; block_size];
 
         // . entry: inode = new_inode, rec_len = 12, name_len = 1, file_type = FT_DIR
@@ -2065,16 +2221,14 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         dir_data[7] = FT_DIR;
         dir_data[8] = b'.';
 
-        // .. entry: inode = parent_inode, rec_len = rest of block, name_len = 2
-        let dotdot_rec_len = (block_size - 12) as u16;
+        // .. entry: inode = parent_inode, rec_len = rest of the usable area
+        let dotdot_rec_len = (usable - 12) as u16;
         dir_data[12..16].copy_from_slice(&parent_inode.to_le_bytes());
         dir_data[16..18].copy_from_slice(&dotdot_rec_len.to_le_bytes());
         dir_data[18] = 2;
         dir_data[19] = FT_DIR;
         dir_data[20] = b'.';
         dir_data[21] = b'.';
-
-        self.write_block(dir_block, &dir_data)?;
 
         // Build inode
         let mode = options.mode.unwrap_or(0o40755);
@@ -2086,11 +2240,19 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
             self.build_inode_bytes(mode, uid, gid, self.block_size, 2, flags, &iblock);
         self.write_inode_raw(new_inode, &inode_bytes)?;
 
+        // Write the directory block now that inode 8's generation is on disk (its
+        // checksum tail is stamped by write_dir_block).
+        self.write_dir_block(dir_block, new_inode, &mut dir_data)?;
+
         // Add entry in parent directory
         self.add_dir_entry(parent_inode, name, new_inode, FT_DIR)?;
 
         // Increment parent's link count (for the .. reference)
         self.update_inode_links(parent_inode, 1)?;
+
+        // Account for the new directory in the group's bg_used_dirs_count.
+        let new_group = ((new_inode - 1) / self.inodes_per_group) as usize;
+        self.adjust_used_dirs(new_group, 1)?;
 
         let path = if parent.path == "/" {
             format!("/{name}")
@@ -2131,9 +2293,11 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let non_zero: Vec<u64> = data_blocks.into_iter().filter(|&b| b != 0).collect();
         self.free_blocks_list(&non_zero)?;
 
-        // If directory, decrement parent's link count
+        // If directory, decrement parent's link count and the group's dir count.
         if entry.is_directory() {
             self.update_inode_links(parent_inode, -1)?;
+            let group = ((entry_inode - 1) / self.inodes_per_group) as usize;
+            self.adjust_used_dirs(group, -1)?;
         }
 
         // Free the inode
@@ -2195,6 +2359,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
 
         self.reader.seek(SeekFrom::Start(base))?;
         self.reader.write_all(&(new_mode as u16).to_le_bytes())?;
+        self.reseal_inode_csum(inode_num)?;
 
         Ok(())
     }

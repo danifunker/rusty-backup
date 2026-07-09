@@ -1216,4 +1216,126 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ext4_edits_stay_e2fsck_clean() {
+        use crate::fs::filesystem::CreateDirectoryOptions;
+        let Some(e2fsck) = e2fsprogs_bin("e2fsck") else {
+            eprintln!("skipping: e2fsck not available");
+            return;
+        };
+        let mut img = create_blank_ext4(32 << 20, "editvol").unwrap();
+        let payload = vec![0x5Au8; 9000]; // non-block-aligned
+        {
+            let mut fs = ExtFilesystem::open(Cursor::new(&mut img[..]), 0).unwrap();
+            let root = fs.root().unwrap();
+
+            // create_file
+            let mut src = Cursor::new(payload.clone());
+            fs.create_file(
+                &root,
+                "hello.txt",
+                &mut src,
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+            // mkdir + a nested file
+            let sub = fs
+                .create_directory(&root, "subdir", &CreateDirectoryOptions::default())
+                .unwrap();
+            let mut src2 = Cursor::new(vec![7u8; 200]);
+            fs.create_file(
+                &sub,
+                "inner.bin",
+                &mut src2,
+                200,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+            // rename hello.txt
+            let root = fs.root().unwrap();
+            let hello = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "hello.txt")
+                .unwrap();
+            fs.rename(&root, &hello, "renamed.txt").unwrap();
+
+            // delete the nested file
+            let inner = fs
+                .list_directory(&sub)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "inner.bin")
+                .unwrap();
+            fs.delete_entry(&sub, &inner).unwrap();
+
+            fs.sync_metadata().unwrap();
+
+            // round-trip: the renamed file keeps its contents
+            let root = fs.root().unwrap();
+            let renamed = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "renamed.txt")
+                .expect("renamed.txt present");
+            let back = fs.read_file(&renamed, usize::MAX).unwrap();
+            assert_eq!(&back[..payload.len()], &payload[..]);
+        }
+        assert!(
+            e2fsck_clean(&e2fsck, &img),
+            "e2fsck faulted after ext4 create_file/mkdir/rename/delete"
+        );
+    }
+
+    /// Edit a *real* mke2fs ext4 (64-bit, 64-byte descriptors — the checksum path
+    /// our own 32-byte-descriptor formatter doesn't exercise) and confirm the
+    /// editor keeps it e2fsck-clean.
+    #[test]
+    fn edit_mke2fs_ext4_stays_e2fsck_clean() {
+        use crate::fs::filesystem::CreateDirectoryOptions;
+        use std::process::Command;
+        let (Some(mke2fs), Some(e2fsck)) = (e2fsprogs_bin("mke2fs"), e2fsprogs_bin("e2fsck"))
+        else {
+            eprintln!("skipping: e2fsprogs not available");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("rb_ext4edit_{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 32 << 20]).unwrap();
+        let out = Command::new(mke2fs)
+            .args(["-F", "-q", "-t", "ext4", "-b", "4096", "-I", "256"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mke2fs -t ext4 failed");
+        let mut img = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut fs = ExtFilesystem::open(Cursor::new(&mut img[..]), 0).unwrap();
+            assert_eq!(fs.fs_type(), "ext4");
+            let root = fs.root().unwrap();
+            let mut src = Cursor::new(vec![0xA5u8; 6000]);
+            fs.create_file(
+                &root,
+                "f.bin",
+                &mut src,
+                6000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_directory(&root, "d", &CreateDirectoryOptions::default())
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        assert!(
+            e2fsck_clean(&e2fsck, &img),
+            "e2fsck faulted after editing a real mke2fs ext4"
+        );
+    }
 }
