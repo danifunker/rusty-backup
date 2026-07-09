@@ -1293,6 +1293,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ext4_grow_keeps_superblock_checksum_valid() {
+        // resize_ext_in_place is a minimal count-level resize; verify it at least
+        // doesn't leave the metadata_csum superblock checksum stale.
+        let mut img = create_blank_ext4(16 << 20, "grow").unwrap();
+        let new_size = (img.len() + (4 << 20)) as u64;
+        img.resize(new_size as usize, 0);
+        {
+            let mut cur = Cursor::new(&mut img[..]);
+            crate::fs::ext::resize_ext_in_place(&mut cur, 0, new_size, &mut |_| {}).unwrap();
+        }
+        let sb = &img[1024..2048];
+        let stored = u32::from_le_bytes(sb[0x3FC..0x400].try_into().unwrap());
+        assert_eq!(
+            crate::fs::ext_csum::superblock_csum(sb),
+            stored,
+            "superblock checksum stale after grow"
+        );
+    }
+
     /// Edit a *real* mke2fs ext4 (64-bit, 64-byte descriptors — the checksum path
     /// our own 32-byte-descriptor formatter doesn't exercise) and confirm the
     /// editor keeps it e2fsck-clean.

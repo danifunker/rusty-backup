@@ -3742,6 +3742,12 @@ pub fn resize_ext_in_place(
         sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
     }
 
+    // metadata_csum: recompute the superblock crc32c after patching the counts,
+    // or e2fsck flags a stale checksum.
+    if le32(&sb, 0x64) & 0x0400 != 0 {
+        super::ext_csum::stamp_superblock(&mut sb);
+    }
+
     // Write updated superblock
     file.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
     file.write_all(&sb)?;
