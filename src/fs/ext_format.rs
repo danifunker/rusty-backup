@@ -1359,6 +1359,63 @@ mod tests {
         );
     }
 
+    /// Real mke2fs ext4 uses flex_bg — every group's block/inode bitmap + inode
+    /// table clusters into the flex-group leader (group 0). Shrinking must free the
+    /// dropped groups' metadata that physically lives in a surviving group, and the
+    /// block-bitmap checksum must cover blocks_per_group/8 bytes (not the whole
+    /// bitmap block). `-g 1024` makes both bugs bite; a journal-less, resize-inode-
+    /// less image keeps everything to single-block files so no relocation is needed.
+    #[test]
+    fn packed_flex_bg_shrink_no_reloc_e2fsck_clean() {
+        use crate::fs::ext::{build_relocation_map, CompactExtReader};
+        use std::io::Read;
+        let (Some(mke2fs), Some(e2fsck)) = (e2fsprogs_bin("mke2fs"), e2fsprogs_bin("e2fsck"))
+        else {
+            eprintln!("skipping: e2fsprogs not available");
+            return;
+        };
+        for &mb in &[32u64, 64] {
+            let path =
+                std::env::temp_dir().join(format!("rb_flexbg_{}_{mb}.img", std::process::id()));
+            std::fs::write(&path, vec![0u8; (mb << 20) as usize]).unwrap();
+            let out = Command::new(&mke2fs)
+                .args([
+                    "-F",
+                    "-q",
+                    "-t",
+                    "ext4",
+                    "-b",
+                    "4096",
+                    "-g",
+                    "1024",
+                    "-I",
+                    "256",
+                    "-O",
+                    "^resize_inode,^has_journal",
+                ])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "mke2fs failed");
+            let img = std::fs::read(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+
+            let plan = build_relocation_map(&mut Cursor::new(&img), 0).unwrap();
+            assert!(!plan.needs_relocation, "{mb}MiB: expected no relocation");
+            let (mut reader, info) = CompactExtReader::new(Cursor::new(img), 0).unwrap();
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).unwrap();
+            assert!(
+                info.compacted_size < info.original_size,
+                "{mb}MiB: expected shrink"
+            );
+            assert!(
+                e2fsck_clean(&e2fsck, &out),
+                "{mb}MiB: flex_bg no-reloc shrink not e2fsck-clean"
+            );
+        }
+    }
+
     /// Packing a multi-group volume that can drop its trailing empty groups
     /// *without relocating any block* must stay e2fsck-clean — the packed image is
     /// the stored backup, so its superblock/GDT/bitmap checksums and inode counts

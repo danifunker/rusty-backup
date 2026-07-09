@@ -3582,19 +3582,46 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     reader.seek(SeekFrom::Start(gdt_offset))?;
     reader.read_exact(&mut gdt_buf)?;
 
-    // Parse block bitmap locations
-    let mut bitmap_blocks: Vec<u64> = Vec::with_capacity(group_count as usize);
-    for i in 0..group_count as usize {
-        let off = i * desc_size as usize;
-        let d = &gdt_buf[off..];
-        let bb_lo = le32(d, 0x00) as u64;
-        let bb = if is_64bit && desc_size >= 64 {
-            let bb_hi = le32(d, 0x20) as u64;
-            (bb_hi << 32) | bb_lo
+    // Parse per-group metadata locations (block bitmap, inode bitmap, inode
+    // table). With flex_bg these cluster into the flex-group leader rather than
+    // sitting at each group's own start.
+    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
+    let inode_table_blocks = (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size);
+    let gd_u64 = |d: &[u8], lo_off: usize, hi_off: usize| -> u64 {
+        let lo = le32(d, lo_off) as u64;
+        if is_64bit && desc_size >= 64 {
+            (le32(d, hi_off) as u64) << 32 | lo
         } else {
-            bb_lo
-        };
+            lo
+        }
+    };
+    let mut bitmap_blocks: Vec<u64> = Vec::with_capacity(group_count as usize);
+    let mut meta_locs: Vec<(u64, u64, u64)> = Vec::with_capacity(group_count as usize);
+    for i in 0..group_count as usize {
+        let d = &gdt_buf[i * desc_size as usize..];
+        let bb = gd_u64(d, 0x00, 0x20);
+        let ib = gd_u64(d, 0x04, 0x24);
+        let it = gd_u64(d, 0x08, 0x28);
         bitmap_blocks.push(bb);
+        meta_locs.push((bb, ib, it));
+    }
+
+    // Blocks belonging to DROPPED groups that physically live inside a surviving
+    // group (flex_bg clusters bitmaps + inode tables into the flex leader). These
+    // must be freed in the rebuilt bitmap, else e2fsck sees them wrongly in use.
+    let mut dropped_meta: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for d in min_groups as usize..group_count as usize {
+        let (bb, ib, it) = meta_locs[d];
+        for blk in [bb, ib] {
+            if blk < plan.new_total_blocks {
+                dropped_meta.insert(blk);
+            }
+        }
+        for k in 0..inode_table_blocks {
+            if it + k < plan.new_total_blocks {
+                dropped_meta.insert(it + k);
+            }
+        }
     }
 
     // ---- Rebuild block bitmaps for groups 0..min_groups ----
@@ -3632,20 +3659,17 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         // Apply relocations: clear bits for blocks moved OUT, set bits for blocks moved IN
         for bit in 0..group_block_count {
             let abs_block = group_start + bit;
+            let byte_idx = (bit / 8) as usize;
+            let bit_idx = (bit % 8) as u32;
 
-            // If this block was relocated OUT (it's in the relocation map as a key
-            // and its target is in a different group), clear it
-            if plan.relocations.contains_key(&abs_block) {
-                // Block was moved away — clear the bit
-                let byte_idx = (bit / 8) as usize;
-                let bit_idx = (bit % 8) as u32;
+            // Free metadata blocks that belonged to now-dropped groups (flex_bg).
+            // Blocks moved OUT by relocation are also cleared here.
+            if dropped_meta.contains(&abs_block) || plan.relocations.contains_key(&abs_block) {
                 bitmap[byte_idx] &= !(1u8 << bit_idx);
             }
 
             // If this block is a relocation TARGET (something was moved here), set it
             if reverse.contains_key(&abs_block) {
-                let byte_idx = (bit / 8) as usize;
-                let bit_idx = (bit % 8) as u32;
                 bitmap[byte_idx] |= 1u8 << bit_idx;
             }
         }
@@ -3737,10 +3761,16 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     if metadata_csum {
         let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
         let seed = super::ext_csum::csum_seed(&uuid);
+        // The block-bitmap checksum covers exactly blocks_per_group/8 bytes (one
+        // bit per block in the group), NOT the whole bitmap block — they only
+        // coincide when blocks_per_group == block_size*8 (the default geometry).
+        let bbm_len = (blocks_per_group as usize).div_ceil(8);
         for group in 0..min_groups as usize {
             let gdt_off = group * desc_size as usize;
+            let bm = &block_bitmaps[group][..bbm_len.min(block_bitmaps[group].len())];
+            let bm = bm.to_vec();
             let desc = &mut gdt_buf[gdt_off..gdt_off + desc_size as usize];
-            super::ext_csum::stamp_block_bitmap_csum(seed, desc, &block_bitmaps[group]);
+            super::ext_csum::stamp_block_bitmap_csum(seed, desc, &bm);
             super::ext_csum::stamp_group_desc(seed, group as u32, desc);
         }
         super::ext_csum::stamp_superblock(&mut sb);
