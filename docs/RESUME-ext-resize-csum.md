@@ -44,7 +44,24 @@ default geometry, 1 KiB + 4 KiB blocks), `packed_shrink_preserves_file_data`
 `cargo test --lib` green (2211). e2fsck-clean incl. a 64 MiB→12 MiB pack with
 journal relocation + resize-inode drop + metadata_csum.
 
+## Grow (restore-side) — also done
+
+The shrink's mirror: restoring a packed fs into its original-size partition grows
+it back by **adding block groups** (`grow_ext_add_groups`, commit `855bd84`;
+restore wiring `9cd649a`). `resize_ext_in_place` delegates across-group grows to
+it. Scoped to GDT-block-count-unchanged (4 KiB-block ext ≤ 8 TB); a grow needing
+a bigger GDT is skipped (valid smaller fs left → resize2fs). `needs_resize` now
+compares export vs the *imaged* size when compacted, so `restore --size original`
+of a packed partition fills it. CLI-verified: backup MBR+ext4 → 64→12 MiB → grow
+back to 16 groups, e2fsck-clean. Test: `packed_grow_back_e2fsck_clean_and_data_intact`.
+
 ## Known follow-ups (not blocking)
+
+- **GDT-growth grow** (1 KiB-block sub-512 MiB fs gaining groups) is guarded, not
+  handled — the extra GDT blocks would need marking used in old groups' bitmaps
+  (+ relocation if occupied). Left for resize2fs; 4 KiB ext4 is unaffected.
+- **Superfloppy (partition-less raw ext4) skips compaction** — pre-existing gate
+  in `src/backup/sizes.rs` (`is_superfloppy`). Only partitioned disks compact.
 
 - `build_relocation_map`'s min-group **retry loop** is O(group_count) worst case
   (each attempt scans blocks) — fine for typical backups, could be smarter for
