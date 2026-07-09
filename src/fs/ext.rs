@@ -2605,6 +2605,95 @@ pub struct RelocationPlan {
     pub relocations: std::collections::HashMap<u64, u64>,
     /// Whether any relocation is actually needed (false = data already fits).
     pub needs_relocation: bool,
+    /// When true, the packed image drops the `resize_inode` feature: inode 7 is
+    /// zeroed, `s_reserved_gdt_blocks` set to 0, and every block below owned by
+    /// the resize inode is freed. This is the `tune2fs -O ^resize_inode`
+    /// transformation — rebuilding the reserved-GDT double-indirect structure for
+    /// the smaller geometry would be far more error-prone.
+    pub drop_resize_inode: bool,
+    /// Blocks that are allocated in the source but freed in the packed image
+    /// (the resize inode's reserved-GDT blocks + its own indirect blocks). These
+    /// are never relocated; in surviving groups they become free space.
+    pub freed_blocks: std::collections::HashSet<u64>,
+}
+
+/// Recursively collect every block reachable from an indirect block pointer:
+/// `block` is a data block at `depth == 0`, otherwise an indirect block whose
+/// entries are followed at `depth - 1`. The pointer blocks themselves are
+/// collected too.
+fn collect_indirect_owned<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    block: u64,
+    depth: u32,
+    out: &mut std::collections::HashSet<u64>,
+) -> Result<(), FilesystemError> {
+    if block == 0 {
+        return Ok(());
+    }
+    out.insert(block);
+    if depth == 0 {
+        return Ok(());
+    }
+    reader.seek(SeekFrom::Start(partition_offset + block * block_size))?;
+    let mut buf = vec![0u8; block_size as usize];
+    reader.read_exact(&mut buf)?;
+    for i in 0..(block_size as usize / 4) {
+        let child = le32(&buf, i * 4) as u64;
+        if child != 0 {
+            collect_indirect_owned(reader, partition_offset, block_size, child, depth - 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Collect every block owned by the resize inode (inode 7). It is always
+/// indirect-mapped (even on ext4) and reserves GDT-growth blocks through its
+/// double-indirect pointer. `inode7` is the raw inode (>= 0x28+60 bytes).
+fn collect_resize_inode_blocks<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    block_size: u64,
+    inode7: &[u8],
+) -> Result<std::collections::HashSet<u64>, FilesystemError> {
+    let mut out = std::collections::HashSet::new();
+    if inode7.len() < 0x28 + 60 {
+        return Ok(out);
+    }
+    let ib = &inode7[0x28..0x28 + 60];
+    for i in 0..12 {
+        let b = le32(ib, i * 4) as u64;
+        if b != 0 {
+            out.insert(b);
+        }
+    }
+    // i_block[12]=single, [13]=double, [14]=triple indirect.
+    collect_indirect_owned(
+        reader,
+        partition_offset,
+        block_size,
+        le32(ib, 48) as u64,
+        1,
+        &mut out,
+    )?;
+    collect_indirect_owned(
+        reader,
+        partition_offset,
+        block_size,
+        le32(ib, 52) as u64,
+        2,
+        &mut out,
+    )?;
+    collect_indirect_owned(
+        reader,
+        partition_offset,
+        block_size,
+        le32(ib, 56) as u64,
+        3,
+        &mut out,
+    )?;
+    Ok(out)
 }
 
 /// Analyse an ext2/3/4 filesystem and build a plan to pack it into fewer
@@ -2702,6 +2791,29 @@ pub fn build_relocation_map<R: Read + Seek>(
         gd_infos.push((block_bitmap, flags));
     }
 
+    // ---- Resize inode (inode 7): drop it in the packed image ----
+    // Its reserved-GDT double-indirect blocks are scattered across every
+    // superblock-backup group (up to the far end of the disk), which would block
+    // any shrink. Rather than rebuild that structure for the smaller geometry we
+    // drop the feature (as `tune2fs -O ^resize_inode` does): collect its blocks so
+    // they are never relocated and get freed, and mark the plan to zero inode 7.
+    let feature_compat = le32(&sb, 0x5C);
+    let drop_resize_inode = feature_compat & 0x0010 != 0; // COMPAT_RESIZE_INODE
+    let mut freed_blocks: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    if drop_resize_inode {
+        let it0_lo = le32(&gdt_buf, 0x08) as u64;
+        let it0 = if is_64bit && desc_size >= 64 {
+            (le32(&gdt_buf, 0x28) as u64) << 32 | it0_lo
+        } else {
+            it0_lo
+        };
+        let ino7_off = partition_offset + it0 * block_size + 6 * inode_size as u64;
+        reader.seek(SeekFrom::Start(ino7_off))?;
+        let mut ino7 = vec![0u8; inode_size as usize];
+        reader.read_exact(&mut ino7)?;
+        freed_blocks = collect_resize_inode_blocks(reader, partition_offset, block_size, &ino7)?;
+    }
+
     // ---- Scan bitmaps: collect all allocated blocks per group ----
     // We need to know: (a) total allocated blocks, (b) which are in which group,
     // (c) which blocks in each group are metadata vs data.
@@ -2735,35 +2847,59 @@ pub fn build_relocation_map<R: Read + Seek>(
     }
 
     // ---- Determine which allocated blocks are data (not metadata) ----
-    // Metadata blocks are: superblock/GDT backups, block bitmap, inode bitmap,
-    // inode table — all at fixed positions at the start of each group.
-    // Note: in practice, metadata blocks are always allocated in the bitmap,
-    // so we need to distinguish them from user data blocks.
-
-    // Build set of metadata block numbers for each group
-    let mut metadata_blocks_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    for group in 0..group_count as usize {
-        let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
-        let meta_count = metadata_blocks_in_group(
-            group as u32,
-            block_size,
-            blocks_per_group,
-            desc_size,
-            group_count,
-            inodes_per_group,
-            inode_size,
-            sparse_super,
-        );
-        for b in 0..meta_count {
-            metadata_blocks_set.insert(group_start + b);
+    // Take metadata positions from the ACTUAL group descriptors: flex_bg clusters
+    // every group's block/inode bitmap + inode table into the flex-group leader, so
+    // they are NOT at a fixed per-group offset. (Reserved-GDT blocks are handled via
+    // `freed_blocks`, not here.) Also record each group's (bbm, ibm, itable) for the
+    // dropped-metadata free-target calc below.
+    let gd_u64 = |d: &[u8], lo: usize, hi: usize| -> u64 {
+        let v = le32(d, lo) as u64;
+        if is_64bit && desc_size >= 64 {
+            (le32(d, hi) as u64) << 32 | v
+        } else {
+            v
         }
+    };
+    let gdt_blocks_cnt = (group_count as u64 * desc_size as u64).div_ceil(block_size);
+    let itable_blocks = (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size);
+    let sb_blk = if block_size == 1024 { 1u64 } else { 0 };
+    let mut metadata_blocks_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut meta_locs: Vec<(u64, u64, u64)> = Vec::with_capacity(group_count as usize);
+    metadata_blocks_set.insert(0);
+    if block_size == 1024 {
+        metadata_blocks_set.insert(1);
+    }
+    for k in 0..gdt_blocks_cnt {
+        metadata_blocks_set.insert(sb_blk + 1 + k);
+    }
+    for g in 0..group_count as usize {
+        let gs = first_data_block as u64 + g as u64 * blocks_per_group as u64;
+        if g > 0 && has_superblock_backup(g as u32, sparse_super) {
+            metadata_blocks_set.insert(gs);
+            for k in 0..gdt_blocks_cnt {
+                metadata_blocks_set.insert(gs + 1 + k);
+            }
+        }
+        let d = &gdt_buf[g * desc_size as usize..];
+        let (bb, ib, it) = (
+            gd_u64(d, 0x00, 0x20),
+            gd_u64(d, 0x04, 0x24),
+            gd_u64(d, 0x08, 0x28),
+        );
+        metadata_blocks_set.insert(bb);
+        metadata_blocks_set.insert(ib);
+        for k in 0..itable_blocks {
+            metadata_blocks_set.insert(it + k);
+        }
+        meta_locs.push((bb, ib, it));
     }
 
-    // Count total allocated data blocks (excluding metadata)
+    // Count total allocated data blocks (excluding metadata and blocks we're
+    // going to free, i.e. the dropped resize inode's reserved-GDT structure).
     let total_data_blocks: u64 = allocated_by_group
         .iter()
         .flatten()
-        .filter(|b| !metadata_blocks_set.contains(b))
+        .filter(|b| !metadata_blocks_set.contains(b) && !freed_blocks.contains(b))
         .count() as u64;
 
     // ---- Calculate minimum groups ----
@@ -2830,85 +2966,138 @@ pub fn build_relocation_map<R: Read + Seek>(
     }
     min_groups = min_groups.max(min_inode_groups);
 
-    let new_total_blocks = first_data_block as u64 + min_groups as u64 * blocks_per_group as u64;
-    let new_total_blocks = new_total_blocks.min(total_blocks);
+    let no_shrink = |mg: u32| RelocationPlan {
+        min_groups: mg,
+        new_total_blocks: total_blocks,
+        relocations: HashMap::new(),
+        needs_relocation: false,
+        drop_resize_inode: false,
+        freed_blocks: std::collections::HashSet::new(),
+    };
 
     // If min_groups == group_count, no shrinking is possible
     if min_groups >= group_count {
-        return Ok(RelocationPlan {
-            min_groups: group_count,
-            new_total_blocks: total_blocks,
-            relocations: HashMap::new(),
-            needs_relocation: false,
-        });
+        return Ok(no_shrink(group_count));
     }
 
-    // ---- Find out-of-bounds allocated data blocks ----
-    let boundary_block = new_total_blocks;
-    let mut out_of_bounds: Vec<u64> = Vec::new();
-    for group in 0..group_count as usize {
-        for &block in &allocated_by_group[group] {
-            if block >= boundary_block && !metadata_blocks_set.contains(&block) {
-                out_of_bounds.push(block);
+    // Blocks that are live in the packed image (allocated, not freed). Freed
+    // (resize-inode) blocks become free space and are valid relocation targets.
+    let allocated_set: std::collections::HashSet<u64> = allocated_by_group
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|b| !freed_blocks.contains(b))
+        .collect();
+
+    // Try to pack into exactly `mg` groups: relocate every out-of-bounds
+    // contiguous run into an equal-or-longer contiguous free region below the
+    // boundary (start shifts, length preserved, so extents stay valid). Returns the
+    // new block count + relocations, or None if a run can't be placed without
+    // splitting it (it straddles the boundary, or no region is large enough) — the
+    // caller then tries a larger `mg`.
+    let try_pack = |mg: u32| -> Option<(u64, HashMap<u64, u64>)> {
+        let boundary =
+            (first_data_block as u64 + mg as u64 * blocks_per_group as u64).min(total_blocks);
+
+        let mut oob: Vec<u64> = allocated_set
+            .iter()
+            .copied()
+            .filter(|&b| b >= boundary && !metadata_blocks_set.contains(&b))
+            .collect();
+        oob.sort_unstable();
+        if oob.is_empty() {
+            return Some((boundary, HashMap::new()));
+        }
+        let mut runs: Vec<(u64, u64)> = Vec::new(); // (start, len)
+        for &b in &oob {
+            match runs.last_mut() {
+                Some((s, l)) if *s + *l == b => *l += 1,
+                _ => runs.push((b, 1)),
             }
+        }
+        // A run beginning exactly at the boundary whose predecessor is allocated is
+        // the tail of an extent crossing the boundary — moving only the tail would
+        // split it, so this `mg` doesn't work.
+        for &(s, _) in &runs {
+            if s == boundary && s > 0 && allocated_set.contains(&(s - 1)) {
+                return None;
+            }
+        }
+
+        // Freed blocks below the boundary are valid targets: the resize inode's
+        // blocks, plus a dropped group's block/inode bitmap + inode table that
+        // flex_bg clustered into a surviving group.
+        let mut freed_set = freed_blocks.clone();
+        for g in mg as usize..group_count as usize {
+            let (bb, ib, it) = meta_locs[g];
+            for blk in [bb, ib] {
+                if blk < boundary {
+                    freed_set.insert(blk);
+                }
+            }
+            for k in 0..itable_blocks {
+                if it + k < boundary {
+                    freed_set.insert(it + k);
+                }
+            }
+        }
+        // Contiguous free regions below the boundary (iterating ascending keeps them
+        // sorted).
+        let mut regions: Vec<(u64, u64)> = Vec::new();
+        for b in first_data_block as u64..boundary {
+            let source_free = !metadata_blocks_set.contains(&b) && !allocated_set.contains(&b);
+            if freed_set.contains(&b) || source_free {
+                match regions.last_mut() {
+                    Some((s, l)) if *s + *l == b => *l += 1,
+                    _ => regions.push((b, 1)),
+                }
+            }
+        }
+
+        // Largest runs first so they claim big regions before small runs fragment them.
+        runs.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let mut relocations = HashMap::new();
+        for &(rstart, rlen) in &runs {
+            let mut placed = false;
+            for reg in &mut regions {
+                if reg.1 >= rlen {
+                    for k in 0..rlen {
+                        relocations.insert(rstart + k, reg.0 + k);
+                    }
+                    reg.0 += rlen;
+                    reg.1 -= rlen;
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                return None;
+            }
+        }
+        Some((boundary, relocations))
+    };
+
+    // Smallest group count (at or above the data/inode lower bound) that packs
+    // cleanly wins — that is the most we can shrink without splitting a run.
+    let mut packed: Option<(u32, u64, HashMap<u64, u64>)> = None;
+    for mg in min_groups..group_count {
+        if let Some((boundary, relocations)) = try_pack(mg) {
+            packed = Some((mg, boundary, relocations));
+            break;
         }
     }
 
-    if out_of_bounds.is_empty() {
-        return Ok(RelocationPlan {
-            min_groups,
-            new_total_blocks,
-            relocations: HashMap::new(),
-            needs_relocation: false,
-        });
+    match packed {
+        Some((mg, boundary, relocations)) => Ok(RelocationPlan {
+            min_groups: mg,
+            new_total_blocks: boundary,
+            needs_relocation: !relocations.is_empty(),
+            relocations,
+            drop_resize_inode,
+            freed_blocks,
+        }),
+        None => Ok(no_shrink(group_count)),
     }
-
-    // ---- Find free data blocks within boundary ----
-    // A block is "free for data" if it's within the boundary, not metadata,
-    // and not currently allocated.
-    let allocated_set: std::collections::HashSet<u64> =
-        allocated_by_group.iter().flatten().copied().collect();
-
-    let mut free_pool: Vec<u64> = Vec::new();
-    for group in 0..min_groups as usize {
-        let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
-        let group_block_count = if group as u32 == min_groups - 1 {
-            new_total_blocks - group_start
-        } else {
-            blocks_per_group as u64
-        };
-
-        for b in 0..group_block_count {
-            let block = group_start + b;
-            if !metadata_blocks_set.contains(&block) && !allocated_set.contains(&block) {
-                free_pool.push(block);
-            }
-        }
-    }
-
-    // Pair out-of-bounds blocks with free blocks
-    if free_pool.len() < out_of_bounds.len() {
-        // Not enough room — shouldn't happen since we calculated min_groups,
-        // but fall back to no relocation
-        return Ok(RelocationPlan {
-            min_groups: group_count,
-            new_total_blocks: total_blocks,
-            relocations: HashMap::new(),
-            needs_relocation: false,
-        });
-    }
-
-    let mut relocations = HashMap::with_capacity(out_of_bounds.len());
-    for (i, &old_block) in out_of_bounds.iter().enumerate() {
-        relocations.insert(old_block, free_pool[i]);
-    }
-
-    Ok(RelocationPlan {
-        min_groups,
-        new_total_blocks,
-        relocations,
-        needs_relocation: true,
-    })
 }
 
 // ---- Inode block-pointer patching ----
@@ -3085,6 +3274,21 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
             // 0x64. Both feed the crc32c re-stamp after we patch block pointers.
             let inum = group as u32 * inodes_per_group + local_idx as u32 + 1;
             let generation = le32(&table, ioff + 0x64);
+
+            // Dropping resize_inode: zero inode 7 entirely (its reserved-GDT blocks
+            // are freed elsewhere). A zeroed reserved inode is what e2fsck leaves
+            // behind after clearing a stale resize inode.
+            if inum == 7 && plan.drop_resize_inode {
+                table[ioff..ioff + inode_size as usize].fill(0);
+                if metadata_csum {
+                    super::ext_csum::stamp_inode(
+                        csum_seed,
+                        &mut table[ioff..ioff + inode_size as usize],
+                        inum,
+                    );
+                }
+                continue;
+            }
 
             let i_block_off = ioff + 0x28;
             let i_block = &table[i_block_off..i_block_off + 60];
@@ -3624,6 +3828,26 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         }
     }
 
+    // The GDT itself shrinks with the group count, so the now-excess GDT blocks
+    // after the primary superblock and each surviving backup superblock are freed.
+    let sparse_super = le32(&sb, 0x64) & 0x0001 != 0;
+    let old_gdt = (group_count as u64 * desc_size as u64).div_ceil(block_size);
+    let new_gdt = (min_groups as u64 * desc_size as u64).div_ceil(block_size);
+    for g in 0..min_groups as u64 {
+        let base = if g == 0 {
+            sb_block + 1
+        } else if has_superblock_backup(g as u32, sparse_super) {
+            first_data_block as u64 + g * blocks_per_group as u64 + 1
+        } else {
+            continue;
+        };
+        for blk in base + new_gdt..base + old_gdt {
+            if blk < plan.new_total_blocks {
+                dropped_meta.insert(blk);
+            }
+        }
+    }
+
     // ---- Rebuild block bitmaps for groups 0..min_groups ----
     // Build a reverse map: new_block → old_block (to know what was moved IN)
     let reverse: std::collections::HashMap<u64, u64> = plan
@@ -3662,9 +3886,12 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
             let byte_idx = (bit / 8) as usize;
             let bit_idx = (bit % 8) as u32;
 
-            // Free metadata blocks that belonged to now-dropped groups (flex_bg).
-            // Blocks moved OUT by relocation are also cleared here.
-            if dropped_meta.contains(&abs_block) || plan.relocations.contains_key(&abs_block) {
+            // Free: metadata blocks of now-dropped groups (flex_bg), the dropped
+            // resize inode's reserved-GDT blocks, and blocks moved OUT by relocation.
+            if dropped_meta.contains(&abs_block)
+                || plan.freed_blocks.contains(&abs_block)
+                || plan.relocations.contains_key(&abs_block)
+            {
                 bitmap[byte_idx] &= !(1u8 << bit_idx);
             }
 
@@ -3674,6 +3901,31 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
             }
         }
 
+        // Every bit past this group's last real block — the runt-group tail and the
+        // whole-block padding beyond blocks_per_group — must read as used, or e2fsck
+        // flags "padding at end of block bitmap is not set" (formerly-uninit groups
+        // that just received relocations have an all-zero bitmap block). Set the
+        // partial byte bit-wise, then fill the rest of the block with 0xFF.
+        let first_pad = group_block_count as usize;
+        let byte_boundary = ((first_pad + 7) & !7).min(block_size as usize * 8);
+        for bit in first_pad..byte_boundary {
+            bitmap[bit / 8] |= 1u8 << (bit % 8);
+        }
+        for byte in bitmap
+            .iter_mut()
+            .take(block_size as usize)
+            .skip(first_pad.div_ceil(8))
+        {
+            *byte = 0xFF;
+        }
+        // Clear BG_BLOCK_UNINIT — every surviving group now ships an explicit bitmap.
+        let gdt_off = group * desc_size as usize;
+        if gdt_off + 0x14 <= gdt_buf.len() {
+            let flags =
+                u16::from_le_bytes([gdt_buf[gdt_off + 0x12], gdt_buf[gdt_off + 0x13]]) & !0x0002;
+            gdt_buf[gdt_off + 0x12..gdt_off + 0x14].copy_from_slice(&flags.to_le_bytes());
+        }
+
         // Count free blocks in this group
         let bm_reader = BitmapReader::new(&bitmap, group_block_count);
         let used = bm_reader.count_set_bits();
@@ -3681,7 +3933,6 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         total_free += free;
 
         // Update bg_free_blocks_count in GDT for this group
-        let gdt_off = group * desc_size as usize;
         if gdt_off + desc_size as usize <= gdt_buf.len() {
             gdt_buf[gdt_off + 0x0C..gdt_off + 0x0E].copy_from_slice(&(free as u16).to_le_bytes());
             if is_64bit && desc_size >= 64 {
@@ -3746,6 +3997,13 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
     if is_64bit {
         sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
+    }
+
+    // ---- Drop the resize inode feature (see build_relocation_map) ----
+    if plan.drop_resize_inode {
+        let compat = le32(&sb, 0x5C) & !0x0010; // clear COMPAT_RESIZE_INODE
+        sb[0x5C..0x60].copy_from_slice(&compat.to_le_bytes());
+        sb[0xCE..0xD0].copy_from_slice(&0u16.to_le_bytes()); // s_reserved_gdt_blocks
     }
 
     // ---- metadata_csum: re-stamp crc32c on everything we rewrote ----
@@ -4145,185 +4403,176 @@ impl<R: Read + Seek + Send> CompactExtReader<R> {
         let original_total = Self::parse_total_blocks(&mut reader, partition_offset)?;
         let original_size = original_total * block_size;
 
-        // ---- Build sections ----
-        // Walk blocks 0..new_total_blocks and emit the right content for each.
+        // ---- Build sections: classify every output block (flex_bg-aware) ----
+        // flex_bg lets a group's block/inode bitmap + inode table live anywhere
+        // (clustered in the flex leader), so we classify each block by its number
+        // rather than assuming per-group locality. `tags` maps every metadata block
+        // to what it holds; unTagged blocks are data (mapped or zero-filled).
         let mut sections: Vec<CompactSection> = Vec::new();
         let mut total_data_reads: u64 = 0;
 
-        // Block 0 for 1K blocks contains the boot sector (bytes 0-1023) + superblock (1024-2047)
-        // For 4K blocks, block 0 contains boot(0-1023) + superblock(1024-2047) + padding
-        // We always emit block 0 as PreBuilt with patched superblock
-        if first_data_block == 1 {
-            // 1K block size: block 0 is boot sector, block 1 is superblock
-            // Read boot block from source
-            reader.seek(SeekFrom::Start(partition_offset))?;
-            let mut boot = vec![0u8; block_size as usize];
-            reader.read_exact(&mut boot)?;
-            sections.push(CompactSection::PreBuilt(boot));
+        let gdt_total_blocks = (shrink_meta.gdt.len() as u64).div_ceil(block_size);
+        let group_start = |g: u64| first_data_block as u64 + g * blocks_per_group as u64;
+        let metadata_csum = feature_ro_compat & 0x0400 != 0;
 
-            // Block 1: patched superblock
-            sections.push(CompactSection::PreBuilt(shrink_meta.superblock.clone()));
+        // Reusable prebuilt block buffers.
+        reader.seek(SeekFrom::Start(partition_offset))?;
+        let mut boot0 = vec![0u8; block_size as usize];
+        reader.read_exact(&mut boot0)?;
+        let primary_sb_block: Vec<u8> = {
+            // 1K: block 1 is the bare SB. 4K: block 0 is boot(0..1024) + SB(1024..2048).
+            let mut blk = if first_data_block == 1 {
+                vec![0u8; block_size as usize]
+            } else {
+                boot0.clone()
+            };
+            let at = if first_data_block == 1 { 0 } else { 1024 };
+            blk[at..at + 1024].copy_from_slice(&shrink_meta.superblock);
+            blk
+        };
+        let mut gdt_block_bytes: Vec<Vec<u8>> = Vec::with_capacity(gdt_total_blocks as usize);
+        for k in 0..gdt_total_blocks as usize {
+            let start = k * block_size as usize;
+            let end = (start + block_size as usize).min(shrink_meta.gdt.len());
+            let mut blk = vec![0u8; block_size as usize];
+            blk[..end - start].copy_from_slice(&shrink_meta.gdt[start..end]);
+            gdt_block_bytes.push(blk);
+        }
+        // Backup superblock for group g: the SB with s_block_group_nr set (and, on
+        // metadata_csum, its checksum re-stamped) at offset 0 of a full block.
+        let seed = if metadata_csum {
+            let uuid: [u8; 16] = shrink_meta.superblock[0x68..0x78].try_into().unwrap();
+            Some(super::ext_csum::csum_seed(&uuid))
         } else {
-            // 2K/4K blocks: block 0 has boot(0-1023) + superblock(1024-2047) + padding
-            reader.seek(SeekFrom::Start(partition_offset))?;
-            let mut block0 = vec![0u8; block_size as usize];
-            reader.read_exact(&mut block0)?;
-            // Overlay patched superblock at offset 1024
-            let sb_len = shrink_meta.superblock.len().min(block0.len() - 1024);
-            block0[1024..1024 + sb_len].copy_from_slice(&shrink_meta.superblock[..sb_len]);
-            sections.push(CompactSection::PreBuilt(block0));
+            None
+        };
+        let backup_sb_block = |g: u32| -> Vec<u8> {
+            let mut sb = shrink_meta.superblock.clone();
+            sb[0x5A..0x5C].copy_from_slice(&(g as u16).to_le_bytes());
+            if seed.is_some() {
+                super::ext_csum::stamp_superblock(&mut sb);
+            }
+            let mut blk = vec![0u8; block_size as usize];
+            blk[..1024].copy_from_slice(&sb);
+            blk
+        };
+
+        #[derive(Clone, Copy)]
+        enum Tag {
+            Boot,
+            PrimarySb,
+            Gdt(usize),
+            BackupSb(u32),
+            Bbm(usize),
+            Ibm(usize),
+            Itable(usize, usize),
+        }
+        let mut tags: std::collections::HashMap<u64, Tag> = std::collections::HashMap::new();
+        if first_data_block == 1 {
+            tags.insert(0, Tag::Boot);
+            tags.insert(1, Tag::PrimarySb);
+            for k in 0..gdt_total_blocks {
+                tags.insert(2 + k, Tag::Gdt(k as usize));
+            }
+        } else {
+            tags.insert(0, Tag::PrimarySb);
+            for k in 0..gdt_total_blocks {
+                tags.insert(1 + k, Tag::Gdt(k as usize));
+            }
+        }
+        #[allow(clippy::needless_range_loop)] // g is also the block-group number
+        for g in 0..min_groups as usize {
+            if g > 0 && has_superblock_backup(g as u32, sparse_super) {
+                let gs = group_start(g as u64);
+                tags.insert(gs, Tag::BackupSb(g as u32));
+                for k in 0..gdt_total_blocks {
+                    tags.insert(gs + 1 + k, Tag::Gdt(k as usize));
+                }
+            }
+            tags.insert(group_meta[g].block_bitmap, Tag::Bbm(g));
+            tags.insert(group_meta[g].inode_bitmap, Tag::Ibm(g));
+            for k in 0..inode_table_blocks {
+                tags.insert(group_meta[g].inode_table + k, Tag::Itable(g, k as usize));
+            }
         }
 
-        // GDT blocks (immediately after superblock block)
-        let gdt_bytes = &shrink_meta.gdt;
-        let gdt_total_blocks = (gdt_bytes.len() as u64).div_ceil(block_size);
-        // Pad GDT to full blocks
-        let mut gdt_padded = gdt_bytes.clone();
-        let gdt_padded_len = gdt_total_blocks as usize * block_size as usize;
-        gdt_padded.resize(gdt_padded_len, 0);
-        sections.push(CompactSection::PreBuilt(gdt_padded));
+        let reverse: std::collections::HashMap<u64, u64> =
+            plan.relocations.iter().map(|(&o, &n)| (n, o)).collect();
 
-        // Now emit per-group metadata + data blocks
-        // We've already emitted blocks for SB + GDT (which are in group 0's range).
-        // The remaining blocks in each group are: block_bitmap, inode_bitmap,
-        // inode_table, then data blocks.
-        //
-        // Rather than trying to track exactly which block number we're at,
-        // iterate through each group's blocks using the rebuilt bitmap.
-
-        let sb_gdt_blocks = if first_data_block == 1 { 2 } else { 1 } + gdt_total_blocks;
-
-        for group in 0..min_groups as usize {
-            let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
-            let group_block_count = if group as u32 == min_groups - 1 {
-                new_total_blocks - group_start
-            } else {
-                blocks_per_group as u64
-            };
-
-            let gm = &group_meta[group];
-            let rebuilt_bitmap = &shrink_meta.block_bitmaps[group];
-            let bm = BitmapReader::new(rebuilt_bitmap, group_block_count);
-
-            // Skip blocks we've already emitted (SB + GDT in group 0)
-            let start_block_in_group = if group == 0 { sb_gdt_blocks } else { 0 };
-
-            // For groups with SB backup (not group 0), emit backup SB + GDT
-            if group > 0 && has_superblock_backup(group as u32, sparse_super) {
-                // SB backup block
-                sections.push(CompactSection::PreBuilt(shrink_meta.superblock.clone()));
-                // GDT backup
-                let mut gdt_backup = shrink_meta.gdt.clone();
-                gdt_backup.resize(gdt_total_blocks as usize * block_size as usize, 0);
-                sections.push(CompactSection::PreBuilt(gdt_backup));
-            }
-
-            // Emit remaining blocks using the rebuilt bitmap
-            let emit_start = if group == 0 {
-                start_block_in_group
-            } else if has_superblock_backup(group as u32, sparse_super) {
-                1 + gdt_total_blocks // Already emitted SB+GDT backup above
-            } else {
-                0
-            };
-
-            let mut block_idx = emit_start;
-            while block_idx < group_block_count {
-                let abs_block = group_start + block_idx;
-
-                // Check if this is a metadata block we need to serve patched
-                if abs_block == gm.block_bitmap {
-                    sections.push(CompactSection::PreBuilt(rebuilt_bitmap.clone()));
-                    block_idx += 1;
-                    continue;
-                }
-                if abs_block == gm.inode_bitmap {
-                    sections.push(CompactSection::PreBuilt(inode_bitmaps[group].clone()));
-                    block_idx += 1;
-                    continue;
-                }
-                if abs_block >= gm.inode_table && abs_block < gm.inode_table + inode_table_blocks {
-                    // Emit from patched inode table
-                    let table_block_idx = (abs_block - gm.inode_table) as usize;
-                    let byte_start = table_block_idx * block_size as usize;
-                    let byte_end =
-                        (byte_start + block_size as usize).min(patched_inodes.tables[group].len());
-                    if byte_start < patched_inodes.tables[group].len() {
-                        let mut chunk = patched_inodes.tables[group][byte_start..byte_end].to_vec();
-                        chunk.resize(block_size as usize, 0);
-                        sections.push(CompactSection::PreBuilt(chunk));
-                    } else {
-                        sections.push(CompactSection::Zeros(block_size));
+        // Linear scan, coalescing consecutive data blocks into mapped/zero runs.
+        let mut pending_mapped: Vec<u64> = Vec::new();
+        let mut pending_zeros: u64 = 0;
+        for b in 0..new_total_blocks {
+            // Decide this block's content, flushing pending data runs on any
+            // metadata/patch block or when the run kind switches.
+            let prebuilt: Option<Vec<u8>> = if let Some(tag) = tags.get(&b) {
+                Some(match *tag {
+                    Tag::Boot => boot0.clone(),
+                    Tag::PrimarySb => primary_sb_block.clone(),
+                    Tag::Gdt(k) => gdt_block_bytes[k].clone(),
+                    Tag::BackupSb(g) => backup_sb_block(g),
+                    Tag::Bbm(g) => shrink_meta.block_bitmaps[g].clone(),
+                    Tag::Ibm(g) => inode_bitmaps[g].clone(),
+                    Tag::Itable(g, k) => {
+                        let tbl = &patched_inodes.tables[g];
+                        let start = k * block_size as usize;
+                        let mut blk = vec![0u8; block_size as usize];
+                        if start < tbl.len() {
+                            let end = (start + block_size as usize).min(tbl.len());
+                            blk[..end - start].copy_from_slice(&tbl[start..end]);
+                        }
+                        blk
                     }
-                    block_idx += 1;
-                    continue;
-                }
+                })
+            } else {
+                indirect_patches.get(&b).cloned()
+            };
 
-                // Check if this block has an indirect/extent-index patch
-                if let Some(patched_data) = indirect_patches.get(&abs_block) {
-                    sections.push(CompactSection::PreBuilt(patched_data.clone()));
+            if let Some(bytes) = prebuilt {
+                if !pending_mapped.is_empty() {
+                    sections.push(CompactSection::MappedBlocks {
+                        old_blocks: std::mem::take(&mut pending_mapped),
+                    });
+                }
+                if pending_zeros > 0 {
+                    sections.push(CompactSection::Zeros(pending_zeros * block_size));
+                    pending_zeros = 0;
+                }
+                if indirect_patches.contains_key(&b) && !tags.contains_key(&b) {
                     total_data_reads += 1;
-                    block_idx += 1;
-                    continue;
                 }
-
-                // Regular data block — use bitmap to determine allocated vs free
-                let is_alloc = bm.is_bit_set(block_idx);
-                if is_alloc {
-                    // Find run of allocated non-special blocks
-                    let mut run_end = block_idx + 1;
-                    while run_end < group_block_count {
-                        let next_abs = group_start + run_end;
-                        if next_abs == gm.block_bitmap
-                            || next_abs == gm.inode_bitmap
-                            || (next_abs >= gm.inode_table
-                                && next_abs < gm.inode_table + inode_table_blocks)
-                            || indirect_patches.contains_key(&next_abs)
-                            || !bm.is_bit_set(run_end)
-                        {
-                            break;
-                        }
-                        run_end += 1;
-                    }
-
-                    // For relocated blocks, read from ORIGINAL source location
-                    let reverse: std::collections::HashMap<u64, u64> = plan
-                        .relocations
-                        .iter()
-                        .map(|(&old, &new)| (new, old))
-                        .collect();
-
-                    let old_blocks: Vec<u64> = (block_idx..run_end)
-                        .map(|bi| {
-                            let abs = group_start + bi;
-                            // If this block is a relocation target, read from original position
-                            reverse.get(&abs).copied().unwrap_or(abs)
-                        })
-                        .collect();
-                    total_data_reads += old_blocks.len() as u64;
-                    sections.push(CompactSection::MappedBlocks { old_blocks });
-                    block_idx = run_end;
-                } else {
-                    // Find run of free blocks
-                    let mut run_end = block_idx + 1;
-                    while run_end < group_block_count {
-                        let next_abs = group_start + run_end;
-                        if next_abs == gm.block_bitmap
-                            || next_abs == gm.inode_bitmap
-                            || (next_abs >= gm.inode_table
-                                && next_abs < gm.inode_table + inode_table_blocks)
-                            || indirect_patches.contains_key(&next_abs)
-                            || bm.is_bit_set(run_end)
-                        {
-                            break;
-                        }
-                        run_end += 1;
-                    }
-                    let run_len = run_end - block_idx;
-                    sections.push(CompactSection::Zeros(run_len * block_size));
-                    block_idx = run_end;
-                }
+                sections.push(CompactSection::PreBuilt(bytes));
+                continue;
             }
+
+            // Data block: allocated -> mapped (from its source location), else zero.
+            let g = ((b - first_data_block as u64) / blocks_per_group as u64) as usize;
+            let bit = b - group_start(g as u64);
+            let byte = (bit / 8) as usize;
+            let alloc = shrink_meta.block_bitmaps[g][byte] & (1u8 << (bit % 8)) != 0;
+            if alloc {
+                if pending_zeros > 0 {
+                    sections.push(CompactSection::Zeros(pending_zeros * block_size));
+                    pending_zeros = 0;
+                }
+                pending_mapped.push(reverse.get(&b).copied().unwrap_or(b));
+                total_data_reads += 1;
+            } else {
+                if !pending_mapped.is_empty() {
+                    sections.push(CompactSection::MappedBlocks {
+                        old_blocks: std::mem::take(&mut pending_mapped),
+                    });
+                }
+                pending_zeros += 1;
+            }
+        }
+        if !pending_mapped.is_empty() {
+            sections.push(CompactSection::MappedBlocks {
+                old_blocks: pending_mapped,
+            });
+        }
+        if pending_zeros > 0 {
+            sections.push(CompactSection::Zeros(pending_zeros * block_size));
         }
 
         let compacted_size = new_total_blocks * block_size;

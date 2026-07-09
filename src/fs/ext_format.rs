@@ -1359,6 +1359,161 @@ mod tests {
         );
     }
 
+    /// Helper: mke2fs an ext4 image with the given extra args, pack it through
+    /// CompactExtReader, and return (original_size, compacted_size, packed_bytes).
+    #[cfg(test)]
+    fn mke2fs_and_pack(mke2fs: &str, size: u64, extra: &[&str]) -> (u64, u64, Vec<u8>) {
+        use crate::fs::ext::CompactExtReader;
+        use std::io::Read;
+        let path = std::env::temp_dir().join(format!(
+            "rb_pack_{}_{}.img",
+            std::process::id(),
+            E2FSCK_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, vec![0u8; size as usize]).unwrap();
+        let mut args = vec!["-F", "-q", "-t", "ext4"];
+        args.extend(extra);
+        let out = Command::new(mke2fs)
+            .args(&args)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mke2fs failed: {args:?}");
+        let img = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let (mut r, info) = CompactExtReader::new(Cursor::new(img), 0).unwrap();
+        let mut packed = Vec::new();
+        r.read_to_end(&mut packed).unwrap();
+        (info.original_size, info.compacted_size, packed)
+    }
+
+    /// The packed group-shrink must produce an e2fsck-clean image for real mke2fs
+    /// ext4 — with every default modern feature (flex_bg, resize_inode, an
+    /// extent-mapped journal, metadata_csum). This is the full resize2fs-grade
+    /// path: flex_bg metadata migration, dropping the resize inode, and relocating
+    /// the journal as a contiguous run. Small block groups (-g 1024) make a 64 MiB
+    /// volume 16 groups so shrinking is forced; default geometry covers the
+    /// real-world 32768-blocks/group layout.
+    #[test]
+    fn packed_shrink_real_ext4_is_e2fsck_clean() {
+        let Some(mke2fs) = e2fsprogs_bin("mke2fs") else {
+            eprintln!("skipping: mke2fs not available");
+            return;
+        };
+        let Some(e2fsck) = e2fsprogs_bin("e2fsck") else {
+            return;
+        };
+
+        // Small groups: exercise flex_bg emit, resize-inode drop, and journal
+        // relocation densely across feature combinations.
+        for extra in [
+            vec!["-b", "4096", "-g", "1024", "-I", "256"],
+            vec![
+                "-b",
+                "4096",
+                "-g",
+                "1024",
+                "-I",
+                "256",
+                "-O",
+                "^resize_inode",
+            ],
+            vec![
+                "-b",
+                "4096",
+                "-g",
+                "1024",
+                "-I",
+                "256",
+                "-O",
+                "^has_journal",
+            ],
+        ] {
+            for &size in &[32u64 << 20, 64 << 20] {
+                let (orig, compacted, packed) = mke2fs_and_pack(&mke2fs, size, &extra);
+                assert!(
+                    compacted < orig,
+                    "{extra:?} {size}: expected a smaller image"
+                );
+                assert!(
+                    e2fsck_clean(&e2fsck, &packed),
+                    "{extra:?} {size}: packed shrink not e2fsck-clean"
+                );
+            }
+        }
+
+        // Default geometry (32768 blocks/group) — the real-world layout.
+        for &size in &[256u64 << 20, 512 << 20] {
+            let (orig, compacted, packed) = mke2fs_and_pack(&mke2fs, size, &[]);
+            assert!(compacted < orig, "default {size}: expected a smaller image");
+            assert!(
+                e2fsck_clean(&e2fsck, &packed),
+                "default {size}: packed shrink not e2fsck-clean"
+            );
+        }
+    }
+
+    /// Packing must preserve file *data*, not just structure: a known file written
+    /// into a full-feature ext4 must read back byte-for-byte from the shrunk image
+    /// through our own reader (which also confirms the relocated journal + dropped
+    /// resize inode leave a mountable volume).
+    #[test]
+    fn packed_shrink_preserves_file_data() {
+        use crate::fs::filesystem::Filesystem;
+        let (Some(mke2fs), Some(e2fsck), Some(debugfs)) = (
+            e2fsprogs_bin("mke2fs"),
+            e2fsprogs_bin("e2fsck"),
+            e2fsprogs_bin("debugfs"),
+        ) else {
+            eprintln!("skipping: e2fsprogs not available");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("rb_dint_{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 64 << 20]).unwrap();
+        Command::new(&mke2fs)
+            .args([
+                "-F", "-q", "-t", "ext4", "-b", "4096", "-g", "1024", "-I", "256",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let content: Vec<u8> = (0..50_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
+        let srcf = std::env::temp_dir().join(format!("rb_dint_src_{}", std::process::id()));
+        std::fs::write(&srcf, &content).unwrap();
+        let out = Command::new(&debugfs)
+            .args(["-w", "-R"])
+            .arg(format!("write {} known.dat", srcf.display()))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "debugfs write failed");
+        let img = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&srcf);
+
+        let (mut r, info) = crate::fs::ext::CompactExtReader::new(Cursor::new(img), 0).unwrap();
+        let mut packed = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut packed).unwrap();
+        assert!(info.compacted_size < info.original_size, "expected shrink");
+        assert!(
+            e2fsck_clean(&e2fsck, &packed),
+            "packed image not e2fsck-clean"
+        );
+
+        let mut fs = ExtFilesystem::open(Cursor::new(packed), 0).unwrap();
+        let root = fs.root().unwrap();
+        let ent = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "known.dat")
+            .expect("known.dat present after pack");
+        let back = fs.read_file(&ent, usize::MAX).unwrap();
+        assert_eq!(back, content, "file data corrupted by packing");
+    }
+
     /// Real mke2fs ext4 uses flex_bg — every group's block/inode bitmap + inode
     /// table clusters into the flex-group leader (group 0). Shrinking must free the
     /// dropped groups' metadata that physically lives in a surviving group, and the
