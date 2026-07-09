@@ -1,17 +1,20 @@
-//! ext2 blank-volume formatter — the write side of `rb-cli new --fs ext`.
+//! ext2/ext3/ext4 blank-volume formatter — the write side of `rb-cli new --fs
+//! ext|ext3|ext4`.
 //!
-//! Produces a **plain rev-1 ext2** image (128-byte inodes; feature set limited to
-//! `filetype` + `sparse_super`; no journal / extents / metadata checksums) that
+//! An [`ExtVariant`] selects the shape:
+//!   * **ext2** — plain rev-1 (128-byte inodes; `filetype` + `sparse_super`).
+//!   * **ext3** — ext2 + an empty jbd2 journal (inode 8, block-mapped).
+//!   * **ext4** — extents + `metadata_csum` (crc32c on every structure) + a
+//!     journal (inode 8, extent-mapped); 256-byte inodes with `i_extra_isize`.
 //!
-//!   * `ExtFilesystem::open` round-trips,
-//!   * our own [`super::ext_fsck`] reports clean, and
-//!   * the external `e2fsck -fn` accepts as clean.
-//!
-//! The formatter deliberately reuses the metadata-marking and bitmap-building
+//! Every variant is verified to (a) round-trip through `ExtFilesystem::open`,
+//! (b) reconcile clean through [`super::ext_fsck`], and (c) pass external
+//! `e2fsck -fn`. The formatter reuses the metadata-marking and bitmap-building
 //! helpers from `ext_fsck` (`mark_metadata`, `build_block_bitmap`,
-//! `build_inode_bitmap`, `has_super_backup`, `BlockMap`) and the inode serializer
-//! from `ext` (`build_inode_bytes`), so the bytes we lay down are, by
-//! construction, exactly what the checker recomputes and verifies.
+//! `build_inode_bitmap`, `has_super_backup`, `BlockMap`), the inode serializer
+//! from `ext` (`build_inode_bytes`), and the checksum stampers from
+//! [`super::ext_csum`], so the bytes we lay down are, by construction, exactly
+//! what the checker recomputes and verifies.
 //!
 //! ## Layout produced
 //!
@@ -69,13 +72,80 @@ const DEFAULT_BYTES_PER_INODE: u64 = 16384;
 /// Smallest ext2 volume we'll format. Below this the fixed metadata dominates and
 /// the result isn't useful; `new`'s default 800K floppy is comfortably above it.
 const MIN_SIZE: u64 = 256 * 1024;
-/// Smallest ext3 volume — must hold the 4 MiB journal (1024 × 4 KiB) plus
+/// Smallest ext3/ext4 volume — must hold the 4 MiB journal (1024 × 4 KiB) plus
 /// metadata with room to spare.
 const MIN_SIZE_EXT3: u64 = 8 * 1024 * 1024;
 
-/// Resolved geometry for a blank ext2 volume.
+// ---- ext4 (extents + metadata_csum) constants ----
+
+const COMPAT_EXT_ATTR: u32 = 0x0008;
+const INCOMPAT_EXTENTS: u32 = 0x0040;
+const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+const RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+/// Inode flag marking an extent-mapped inode.
+const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+const EXT4_EXT_MAGIC: u16 = 0xF30A;
+/// ext4 uses 256-byte inodes so the inode checksum + `i_extra_isize` fit.
+const INODE_SIZE_EXT4: u16 = 256;
+const EXTRA_ISIZE: u16 = 32;
+
+/// Which ext filesystem to format. Selects block size, inode size, features, and
+/// the checksum/journal/extent discipline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtVariant {
+    Ext2,
+    Ext3,
+    Ext4,
+}
+
+impl ExtVariant {
+    fn journal(self) -> bool {
+        matches!(self, ExtVariant::Ext3 | ExtVariant::Ext4)
+    }
+    fn metadata_csum(self) -> bool {
+        matches!(self, ExtVariant::Ext4)
+    }
+    fn extents(self) -> bool {
+        matches!(self, ExtVariant::Ext4)
+    }
+    fn inode_size(self) -> u16 {
+        if matches!(self, ExtVariant::Ext4) {
+            INODE_SIZE_EXT4
+        } else {
+            INODE_SIZE
+        }
+    }
+    /// ext3/ext4 force 4 KiB blocks (journal + extents assume it).
+    fn block_size(self, size_bytes: u64) -> u64 {
+        if self.journal() {
+            4096
+        } else {
+            choose_block_size(size_bytes)
+        }
+    }
+    fn min_size(self) -> u64 {
+        if self.journal() {
+            MIN_SIZE_EXT3
+        } else {
+            MIN_SIZE
+        }
+    }
+    fn kind(self) -> &'static str {
+        match self {
+            ExtVariant::Ext2 => "ext2",
+            ExtVariant::Ext3 => "ext3",
+            ExtVariant::Ext4 => "ext4",
+        }
+    }
+}
+
+/// Resolved geometry for a blank ext volume.
 struct Ext2Layout {
+    variant: ExtVariant,
     block_size: u64,
+    inode_size: u16,
     total_blocks: u64,
     blocks_per_group: u32,
     first_data_block: u32,
@@ -111,7 +181,7 @@ impl Ext2Layout {
             first_data_block: self.first_data_block,
             inodes_count: self.inodes_count,
             inodes_per_group: self.inodes_per_group,
-            inode_size: INODE_SIZE,
+            inode_size: self.inode_size,
             first_ino: FIRST_INO,
             group_count: self.group_count,
             desc_size: DESC_SIZE,
@@ -138,21 +208,16 @@ fn choose_block_size(size_bytes: u64) -> u64 {
 /// Resolve geometry from a requested byte size. May format slightly fewer bytes
 /// than requested if the trailing block group would be too small to hold its own
 /// metadata (that runt group is dropped, mke2fs-style).
-fn compute_layout(size_bytes: u64, journal: bool) -> Result<Ext2Layout, FilesystemError> {
-    let min = if journal { MIN_SIZE_EXT3 } else { MIN_SIZE };
+fn compute_layout(size_bytes: u64, variant: ExtVariant) -> Result<Ext2Layout, FilesystemError> {
+    let min = variant.min_size();
     if size_bytes < min {
-        let kind = if journal { "ext3" } else { "ext2" };
         return Err(FilesystemError::InvalidData(format!(
-            "{kind} volume must be at least {min} bytes, got {size_bytes}"
+            "{} volume must be at least {min} bytes, got {size_bytes}",
+            variant.kind()
         )));
     }
-    // ext3 is forced to 4 KiB blocks so the 1024-block journal fits in a single
-    // level of indirection (direct + single-indirect).
-    let block_size = if journal {
-        4096
-    } else {
-        choose_block_size(size_bytes)
-    };
+    let block_size = variant.block_size(size_bytes);
+    let inode_size = variant.inode_size();
     let first_data_block: u32 = if block_size == 1024 { 1 } else { 0 };
     let blocks_per_group: u32 = (block_size * 8) as u32; // bits in one block bitmap
 
@@ -166,7 +231,7 @@ fn compute_layout(size_bytes: u64, journal: bool) -> Result<Ext2Layout, Filesyst
     let inodes_per_group = ((inodes_target.div_ceil(initial_groups)) as u32)
         .next_multiple_of(8)
         .clamp(16, blocks_per_group); // <= bits in one inode bitmap block
-    let inode_table_blocks = (inodes_per_group as u64 * INODE_SIZE as u64).div_ceil(block_size);
+    let inode_table_blocks = (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size);
 
     // Drop a trailing runt group that can't hold its own metadata + a data block.
     let mut group_count =
@@ -220,16 +285,22 @@ fn compute_layout(size_bytes: u64, journal: bool) -> Result<Ext2Layout, Filesyst
     let root_dir_block = group0_data_start;
     let lost_found_block = group0_data_start + 1;
 
-    // ext3 journal: single-indirect block then a contiguous run of journal data
-    // blocks, all in group 0 straight after lost+found.
-    let (journal_blocks, journal_indirect_block, journal_data_start) = if journal {
-        let indirect = lost_found_block + 1;
-        let data_start = indirect + 1;
+    // Journal (ext3/ext4): a contiguous run of journal data blocks in group 0,
+    // straight after lost+found. ext3 also needs a single-indirect block (its
+    // block map can't reach 1024 blocks with 12 direct pointers); ext4 maps the
+    // whole run with one inline extent, so no indirect block.
+    let (journal_blocks, journal_indirect_block, journal_data_start) = if variant.journal() {
+        let (indirect, data_start) = if variant.extents() {
+            (0, lost_found_block + 1)
+        } else {
+            (lost_found_block + 1, lost_found_block + 2)
+        };
         let journal_end = data_start + JOURNAL_BLOCKS;
         let group0_end = first_data_block as u64 + blocks_per_group as u64;
         if journal_end > total_blocks || journal_end > group0_end {
             return Err(FilesystemError::InvalidData(format!(
-                "volume too small for an ext3 journal ({JOURNAL_BLOCKS} blocks); use a larger --size"
+                "volume too small for a {}-block journal; use a larger --size",
+                JOURNAL_BLOCKS
             )));
         }
         (JOURNAL_BLOCKS, indirect, data_start)
@@ -238,7 +309,9 @@ fn compute_layout(size_bytes: u64, journal: bool) -> Result<Ext2Layout, Filesyst
     };
 
     Ok(Ext2Layout {
+        variant,
         block_size,
+        inode_size,
         total_blocks,
         blocks_per_group,
         first_data_block,
@@ -254,29 +327,36 @@ fn compute_layout(size_bytes: u64, journal: bool) -> Result<Ext2Layout, Filesyst
     })
 }
 
-/// Format a blank ext (ext2, or ext3 when `journal`) volume of (approximately)
-/// `size_bytes` into `sink` at byte offset `part_off`, writing only the populated
-/// metadata regions so the bulk of the volume stays sparse. Returns the exact
-/// formatted byte length.
+/// Format a blank ext (ext2 / ext3 / ext4) volume of (approximately) `size_bytes`
+/// into `sink` at byte offset `part_off`, writing only the populated metadata
+/// regions so the bulk of the volume stays sparse. Returns the exact formatted
+/// byte length.
 fn write_blank_ext<W: Write + Seek>(
     sink: &mut W,
     part_off: u64,
     size_bytes: u64,
     label: &str,
-    journal: bool,
+    variant: ExtVariant,
 ) -> Result<u64, FilesystemError> {
-    let mut layout = compute_layout(size_bytes, journal)?;
+    let mut layout = compute_layout(size_bytes, variant)?;
     let block_size = layout.block_size;
+    let inode_size = layout.inode_size;
     let geom = layout.geom(part_off);
+
+    let uuid = make_uuid();
+    let seed = super::ext_csum::csum_seed(&uuid);
+    let csum = variant.metadata_csum();
 
     // ---- Compute the block allocation and per-group free counts. ----
     let mut map = BlockMap::new(layout.total_blocks);
     mark_metadata(&geom, &layout.groups, &mut map);
     map.set(layout.root_dir_block);
     map.set(layout.lost_found_block);
-    // ext3: the journal's single-indirect block + all its data blocks are used.
+    // The journal's data blocks (+ ext3's single-indirect block) are used.
     if layout.journal_blocks > 0 {
-        map.set(layout.journal_indirect_block);
+        if layout.journal_indirect_block != 0 {
+            map.set(layout.journal_indirect_block);
+        }
         for i in 0..layout.journal_blocks {
             map.set(layout.journal_data_start + i);
         }
@@ -307,8 +387,7 @@ fn write_blank_ext<W: Write + Seek>(
     }
     let total_free_inodes = layout.inodes_count - FIRST_INO;
 
-    // ext3: build the journal inode's block map (12 direct + single-indirect) and
-    // the superblock's backup copy of it (`s_jnl_blocks`).
+    // Journal inode's block/extent map + the superblock's backup copy of it.
     let journal = if layout.journal_blocks > 0 {
         Some(build_journal_map(&layout))
     } else {
@@ -316,24 +395,46 @@ fn write_blank_ext<W: Write + Seek>(
     };
 
     // ---- Serialize the fixed structures. ----
-    let sb_primary = build_superblock(
+    let mut sb_primary = build_superblock(
         &layout,
         label,
+        &uuid,
         0,
         total_free_blocks,
         total_free_inodes,
         journal.as_ref().map(|j| &j.jnl_backup),
     );
-    let gdt = build_gdt(&layout);
+    if csum {
+        super::ext_csum::stamp_superblock(&mut sb_primary);
+    }
 
-    // Primary superblock is always at byte offset 1024; its GDT follows in the
-    // next block (block 2 for 1 KiB blocks, block 1 for 4 KiB).
+    // Build the per-group bitmaps first, then the GDT — for metadata_csum each
+    // descriptor's bitmap checksums and `bg_checksum` are stamped over them
+    // (bg_checksum covers the bitmap-csum fields, so it goes last).
+    let block_bitmaps: Vec<Vec<u8>> = (0..layout.group_count as usize)
+        .map(|gi| build_block_bitmap(&geom, gi, &map))
+        .collect();
+    let inode_bitmaps: Vec<Vec<u8>> = (0..layout.group_count as usize)
+        .map(|gi| build_inode_bitmap(&geom, gi, &inode_used))
+        .collect();
+    let mut gdt = build_gdt(&layout);
+    if csum {
+        let ibm_len = (layout.inodes_per_group / 8) as usize;
+        for gi in 0..layout.group_count as usize {
+            let d = &mut gdt[gi * DESC_SIZE as usize..(gi + 1) * DESC_SIZE as usize];
+            super::ext_csum::stamp_block_bitmap_csum(seed, d, &block_bitmaps[gi]);
+            super::ext_csum::stamp_inode_bitmap_csum(seed, d, &inode_bitmaps[gi][..ibm_len]);
+            super::ext_csum::stamp_group_desc(seed, gi as u32, d);
+        }
+    }
+
+    // Primary superblock @ byte 1024; its GDT follows in the next block.
     write_at(sink, part_off + 1024, &sb_primary)?;
     let sb_block: u64 = if block_size == 1024 { 1 } else { 0 };
     write_at(sink, part_off + (sb_block + 1) * block_size, &gdt)?;
 
-    // Sparse-super backups: a superblock copy at the group's first block (offset
-    // 0), GDT copy in the next block. Only s_block_group_nr differs.
+    // Sparse-super backups: a superblock copy at the group's first block, GDT copy
+    // in the next block. Only s_block_group_nr differs (then re-stamp its csum).
     for gi in 1..layout.group_count {
         if !has_super_backup(gi, true) {
             continue;
@@ -342,99 +443,106 @@ fn write_blank_ext<W: Write + Seek>(
             layout.first_data_block as u64 + gi as u64 * layout.blocks_per_group as u64;
         let mut sb_copy = sb_primary.clone();
         le16w(&mut sb_copy, 0x5A, gi as u16); // s_block_group_nr
+        if csum {
+            super::ext_csum::stamp_superblock(&mut sb_copy);
+        }
         write_at(sink, part_off + group_start * block_size, &sb_copy)?;
         write_at(sink, part_off + (group_start + 1) * block_size, &gdt)?;
     }
 
     // Per-group block + inode bitmaps.
     for gi in 0..layout.group_count as usize {
-        let bb = build_block_bitmap(&geom, gi, &map);
         write_at(
             sink,
             part_off + layout.groups[gi].block_bitmap * block_size,
-            &bb,
+            &block_bitmaps[gi],
         )?;
-        let ib = build_inode_bitmap(&geom, gi, &inode_used);
         write_at(
             sink,
             part_off + layout.groups[gi].inode_bitmap * block_size,
-            &ib,
+            &inode_bitmaps[gi],
         )?;
     }
 
-    // Root (#2) and lost+found (#11) inodes in group 0's inode table.
+    // Root (#2), lost+found (#11), and (ext3/ext4) journal (#8) inodes in group 0's
+    // inode table — each checksummed for metadata_csum.
     let it0 = layout.groups[0].inode_table * block_size;
-    let root_inode = build_inode_bytes(
-        INODE_SIZE,
-        0o040755,
-        0,
-        0,
-        block_size,
-        3, // ".", ".." and lost+found's ".."
-        0,
-        &direct_iblock(layout.root_dir_block),
-    );
-    write_at(
+    let write_inode =
+        |sink: &mut W, inum: u32, mut inode: Vec<u8>| -> Result<(), FilesystemError> {
+            if csum {
+                super::ext_csum::stamp_inode(seed, &mut inode, inum);
+            }
+            write_at(
+                sink,
+                part_off + it0 + (inum as u64 - 1) * inode_size as u64,
+                &inode,
+            )
+        };
+    write_inode(
         sink,
-        part_off + it0 + (ROOT_INO as u64 - 1) * INODE_SIZE as u64,
-        &root_inode,
+        ROOT_INO,
+        build_dir_inode(&layout, 0o040755, 3, layout.root_dir_block),
     )?;
-    let lf_inode = build_inode_bytes(
-        INODE_SIZE,
-        0o040700,
-        0,
-        0,
-        block_size,
-        2, // "." and root's entry
-        0,
-        &direct_iblock(layout.lost_found_block),
-    );
-    write_at(
+    write_inode(
         sink,
-        part_off + it0 + (LOST_FOUND_INO as u64 - 1) * INODE_SIZE as u64,
-        &lf_inode,
+        LOST_FOUND_INO,
+        build_dir_inode(&layout, 0o040700, 2, layout.lost_found_block),
     )?;
 
-    // Directory data blocks.
+    // Directory data blocks (with a csum tail on metadata_csum).
+    let mut root_dir = build_root_dir(block_size, csum);
+    let mut lf_dir = build_lost_found_dir(block_size, csum);
+    if csum {
+        super::ext_csum::stamp_dir_block(seed, &mut root_dir, ROOT_INO, 0);
+        super::ext_csum::stamp_dir_block(seed, &mut lf_dir, LOST_FOUND_INO, 0);
+    }
     write_at(
         sink,
         part_off + layout.root_dir_block * block_size,
-        &build_root_dir(block_size),
+        &root_dir,
     )?;
     write_at(
         sink,
         part_off + layout.lost_found_block * block_size,
-        &build_lost_found_dir(block_size),
+        &lf_dir,
     )?;
 
-    // ext3 journal: inode 8, its single-indirect block, and the jbd2 superblock.
+    // Journal (ext3/ext4): inode 8 + the jbd2 superblock. ext3 also writes a
+    // single-indirect block; ext4 maps the whole run with one inline extent.
     if let Some(j) = &journal {
         let jsize = layout.journal_blocks * block_size;
-        // Reserved inode 8 is a regular file (mode 0600). i_blocks must count the
-        // single-indirect block too, which `build_inode_bytes` (size-derived)
-        // doesn't — so patch i_blocks_lo directly.
-        let mut jinode = build_inode_bytes(INODE_SIZE, 0o100600, 0, 0, jsize, 1, 0, &j.iblock);
-        let sectors = ((layout.journal_blocks + 1) * (block_size / 512)) as u32;
-        jinode[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes()); // i_blocks_lo
-        write_at(
-            sink,
-            part_off + it0 + (EXT_JOURNAL_INO as u64 - 1) * INODE_SIZE as u64,
-            &jinode,
-        )?;
-
-        // Single-indirect block: pointers to journal data blocks [12..].
-        let mut indblk = vec![0u8; block_size as usize];
-        for k in 0..(layout.journal_blocks as usize - 12) {
-            let b = (layout.journal_data_start + 12 + k as u64) as u32;
-            indblk[k * 4..k * 4 + 4].copy_from_slice(&b.to_le_bytes());
+        let flags = if variant.extents() {
+            EXT4_EXTENTS_FL
+        } else {
+            0
+        };
+        let mut jinode = build_inode_bytes(inode_size, 0o100600, 0, 0, jsize, 1, flags, &j.iblock);
+        if inode_size >= INODE_SIZE_EXT4 {
+            le16w(&mut jinode, 0x80, EXTRA_ISIZE); // i_extra_isize
         }
-        write_at(
-            sink,
-            part_off + layout.journal_indirect_block * block_size,
-            &indblk,
-        )?;
+        if !variant.extents() {
+            // ext3 block map: i_blocks must also count the single-indirect block
+            // (build_inode_bytes derives i_blocks from size, missing it).
+            let sectors = ((layout.journal_blocks + 1) * (block_size / 512)) as u32;
+            jinode[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
+        }
+        write_inode(sink, EXT_JOURNAL_INO, jinode)?;
 
-        // jbd2 journal superblock at journal block 0 (empty: s_start = 0).
+        if !variant.extents() {
+            let mut indblk = vec![0u8; block_size as usize];
+            for k in 0..(layout.journal_blocks as usize - 12) {
+                let b = (layout.journal_data_start + 12 + k as u64) as u32;
+                indblk[k * 4..k * 4 + 4].copy_from_slice(&b.to_le_bytes());
+            }
+            write_at(
+                sink,
+                part_off + layout.journal_indirect_block * block_size,
+                &indblk,
+            )?;
+        }
+
+        // jbd2 journal superblock at journal block 0 (empty: s_start = 0). Its own
+        // checksum feature stays off even on metadata_csum ext4 (matches mke2fs).
         let jsb = build_jbd2_superblock(block_size, layout.journal_blocks);
         write_at(
             sink,
@@ -446,6 +554,35 @@ fn write_blank_ext<W: Write + Seek>(
     Ok(layout.disk_bytes())
 }
 
+/// Build a directory inode (root / lost+found): extent-mapped with `i_extra_isize`
+/// on ext4, direct-block-mapped on ext2/ext3.
+fn build_dir_inode(l: &Ext2Layout, mode: u32, links: u16, dir_block: u64) -> Vec<u8> {
+    let flags = if l.variant.extents() {
+        EXT4_EXTENTS_FL
+    } else {
+        0
+    };
+    let iblock = if l.variant.extents() {
+        extent_iblock(dir_block, 1)
+    } else {
+        direct_iblock(dir_block)
+    };
+    let mut inode = build_inode_bytes(
+        l.inode_size,
+        mode,
+        0,
+        0,
+        l.block_size,
+        links,
+        flags,
+        &iblock,
+    );
+    if l.inode_size >= INODE_SIZE_EXT4 {
+        le16w(&mut inode, 0x80, EXTRA_ISIZE); // i_extra_isize
+    }
+    inode
+}
+
 /// Stream a blank **ext2** volume into `sink` at `part_off`. Returns the exact
 /// formatted byte length.
 pub fn write_blank_ext2<W: Write + Seek>(
@@ -454,7 +591,7 @@ pub fn write_blank_ext2<W: Write + Seek>(
     size_bytes: u64,
     label: &str,
 ) -> Result<u64, FilesystemError> {
-    write_blank_ext(sink, part_off, size_bytes, label, false)
+    write_blank_ext(sink, part_off, size_bytes, label, ExtVariant::Ext2)
 }
 
 /// Stream a blank **ext3** volume (ext2 + an empty jbd2 journal) into `sink`.
@@ -464,45 +601,64 @@ pub fn write_blank_ext3<W: Write + Seek>(
     size_bytes: u64,
     label: &str,
 ) -> Result<u64, FilesystemError> {
-    write_blank_ext(sink, part_off, size_bytes, label, true)
+    write_blank_ext(sink, part_off, size_bytes, label, ExtVariant::Ext3)
 }
 
-/// Format a blank ext2/ext3 volume and return the whole image in memory. Used by
-/// the `batch` multi-partition builder and tests; the CLI `new` verb streams
-/// straight to a file instead.
+/// Stream a blank **ext4** volume (extents + metadata_csum + jbd2 journal) into
+/// `sink`.
+pub fn write_blank_ext4<W: Write + Seek>(
+    sink: &mut W,
+    part_off: u64,
+    size_bytes: u64,
+    label: &str,
+) -> Result<u64, FilesystemError> {
+    write_blank_ext(sink, part_off, size_bytes, label, ExtVariant::Ext4)
+}
+
+/// Format a blank ext volume and return the whole image in memory. Used by the
+/// `batch` multi-partition builder and tests; the CLI `new` verb streams straight
+/// to a file instead.
 fn create_blank_ext(
     size_bytes: u64,
     label: &str,
-    journal: bool,
+    variant: ExtVariant,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let layout = compute_layout(size_bytes, journal)?;
+    let layout = compute_layout(size_bytes, variant)?;
     let mut img = vec![0u8; layout.disk_bytes() as usize];
     write_blank_ext(
         &mut Cursor::new(&mut img[..]),
         0,
         size_bytes,
         label,
-        journal,
+        variant,
     )?;
     Ok(img)
 }
 
 /// Format a blank **ext2** volume as an in-memory image.
 pub fn create_blank_ext2(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
-    create_blank_ext(size_bytes, label, false)
+    create_blank_ext(size_bytes, label, ExtVariant::Ext2)
 }
 
 /// Format a blank **ext3** volume (ext2 + an empty jbd2 journal) as an in-memory
 /// image.
 pub fn create_blank_ext3(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
-    create_blank_ext(size_bytes, label, true)
+    create_blank_ext(size_bytes, label, ExtVariant::Ext3)
+}
+
+/// Format a blank **ext4** volume (extents + metadata_csum + jbd2 journal) as an
+/// in-memory image.
+pub fn create_blank_ext4(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
+    create_blank_ext(size_bytes, label, ExtVariant::Ext4)
 }
 
 // ---- Serializers ----
 
+#[allow(clippy::too_many_arguments)]
 fn build_superblock(
     l: &Ext2Layout,
     label: &str,
+    uuid: &[u8; 16],
     block_group_nr: u16,
     free_blocks: u64,
     free_inodes: u32,
@@ -511,11 +667,23 @@ fn build_superblock(
     let mut sb = vec![0u8; 1024];
     let log_bs = l.block_size.trailing_zeros() - 10; // 1024 -> 0, 4096 -> 2
     let now = now_secs();
-    let feature_compat = if journal_backup.is_some() {
-        COMPAT_HAS_JOURNAL
-    } else {
-        0
-    };
+
+    let mut feature_compat = 0;
+    let mut feature_incompat = INCOMPAT_FILETYPE;
+    let mut feature_ro_compat = RO_COMPAT_SPARSE_SUPER;
+    if l.variant.journal() {
+        feature_compat |= COMPAT_HAS_JOURNAL;
+    }
+    if l.variant.extents() {
+        feature_incompat |= INCOMPAT_EXTENTS;
+    }
+    if l.variant.metadata_csum() {
+        feature_compat |= COMPAT_EXT_ATTR;
+        feature_ro_compat |= RO_COMPAT_LARGE_FILE
+            | RO_COMPAT_DIR_NLINK
+            | RO_COMPAT_EXTRA_ISIZE
+            | RO_COMPAT_METADATA_CSUM;
+    }
 
     le32w(&mut sb, 0x00, l.inodes_count); // s_inodes_count
     le32w(&mut sb, 0x04, l.total_blocks as u32); // s_blocks_count_lo
@@ -536,12 +704,15 @@ fn build_superblock(
     le32w(&mut sb, 0x40, now); // s_lastcheck
     le32w(&mut sb, 0x4C, 1); // s_rev_level = DYNAMIC_REV (honours inode_size/first_ino)
     le32w(&mut sb, 0x54, FIRST_INO); // s_first_ino
-    le16w(&mut sb, 0x58, INODE_SIZE); // s_inode_size
+    le16w(&mut sb, 0x58, l.inode_size); // s_inode_size
     le16w(&mut sb, 0x5A, block_group_nr); // s_block_group_nr
     le32w(&mut sb, 0x5C, feature_compat); // s_feature_compat
-    le32w(&mut sb, 0x60, INCOMPAT_FILETYPE); // s_feature_incompat
-    le32w(&mut sb, 0x64, RO_COMPAT_SPARSE_SUPER); // s_feature_ro_compat
-    sb[0x68..0x78].copy_from_slice(&make_uuid()); // s_uuid
+    le32w(&mut sb, 0x60, feature_incompat); // s_feature_incompat
+    le32w(&mut sb, 0x64, feature_ro_compat); // s_feature_ro_compat
+    sb[0x68..0x78].copy_from_slice(uuid); // s_uuid
+    if l.variant.metadata_csum() {
+        sb[0x175] = 1; // s_checksum_type = crc32c
+    }
 
     let name = label.as_bytes();
     let n = name.len().min(16);
@@ -575,33 +746,38 @@ fn build_gdt(l: &Ext2Layout) -> Vec<u8> {
     gdt
 }
 
-/// The ext3 journal inode's block map, in two forms: the 60-byte `i_block`
-/// (12 direct + single-indirect) for inode 8, and the 17-entry `s_jnl_blocks`
-/// backup for the superblock.
+/// The journal inode's mapping, in two forms: the 60-byte `i_block` (a single
+/// inline extent on ext4, or 12 direct + single-indirect on ext3) for inode 8,
+/// and the 17-entry `s_jnl_blocks` backup for the superblock.
 struct JournalMap {
     iblock: [u8; 60],
     jnl_backup: [u32; 17],
 }
 
-/// Build the journal inode's block map. The journal occupies a contiguous run of
-/// `journal_blocks` blocks from `journal_data_start`, with block 12.. reached via
-/// the single-indirect block. (ext3 is forced to 4 KiB blocks, so one indirect
-/// level covers the 1024-block journal.)
+/// Build the journal inode's mapping over the contiguous run of `journal_blocks`
+/// blocks from `journal_data_start`. ext4 maps it with one inline extent; ext3
+/// uses 12 direct pointers + a single-indirect block (one level covers the
+/// 1024-block journal at 4 KiB).
 fn build_journal_map(l: &Ext2Layout) -> JournalMap {
-    let mut iblock = [0u8; 60];
-    let mut jnl_backup = [0u32; 17];
-    let ndirect = 12.min(l.journal_blocks) as usize;
-    for j in 0..ndirect {
-        let b = (l.journal_data_start + j as u64) as u32;
-        iblock[j * 4..j * 4 + 4].copy_from_slice(&b.to_le_bytes());
-        jnl_backup[j] = b;
-    }
-    // i_block[12] = single-indirect pointer (i_block[13]/[14] double/triple = 0).
-    let ind = l.journal_indirect_block as u32;
-    iblock[48..52].copy_from_slice(&ind.to_le_bytes());
-    jnl_backup[12] = ind;
-    // s_jnl_blocks[15] = i_size_high, [16] = i_size_low.
     let jsize = l.journal_blocks * l.block_size;
+    let iblock = if l.variant.extents() {
+        extent_iblock(l.journal_data_start, l.journal_blocks as u16)
+    } else {
+        let mut ib = [0u8; 60];
+        let ndirect = 12.min(l.journal_blocks) as usize;
+        for j in 0..ndirect {
+            let b = (l.journal_data_start + j as u64) as u32;
+            ib[j * 4..j * 4 + 4].copy_from_slice(&b.to_le_bytes());
+        }
+        // i_block[12] = single-indirect pointer (double/triple stay 0).
+        ib[48..52].copy_from_slice(&(l.journal_indirect_block as u32).to_le_bytes());
+        ib
+    };
+    // s_jnl_blocks backup = the 15 i_block words ++ [i_size_high, i_size_low].
+    let mut jnl_backup = [0u32; 17];
+    for (k, slot) in jnl_backup.iter_mut().enumerate().take(15) {
+        *slot = u32::from_le_bytes(iblock[k * 4..k * 4 + 4].try_into().unwrap());
+    }
     jnl_backup[15] = (jsize >> 32) as u32;
     jnl_backup[16] = jsize as u32;
     JournalMap { iblock, jnl_backup }
@@ -626,9 +802,11 @@ fn build_jbd2_superblock(block_size: u64, journal_blocks: u64) -> Vec<u8> {
 }
 
 /// Root directory block: `.` and `..` both point at root (2), then `lost+found`
-/// (11) fills the rest of the block.
-fn build_root_dir(block_size: u64) -> Vec<u8> {
+/// (11) fills the rest of the block. On metadata_csum the last entry stops 12
+/// bytes short so `reserve_tail` can hold the `ext4_dir_entry_tail` checksum.
+fn build_root_dir(block_size: u64, reserve_tail: bool) -> Vec<u8> {
     let bs = block_size as usize;
+    let tail = if reserve_tail { 12 } else { 0 };
     let mut d = vec![0u8; bs];
     put_dirent(&mut d, 0, ROOT_INO, 12, ".", FT_DIR);
     put_dirent(&mut d, 12, ROOT_INO, 12, "..", FT_DIR);
@@ -636,19 +814,21 @@ fn build_root_dir(block_size: u64) -> Vec<u8> {
         &mut d,
         24,
         LOST_FOUND_INO,
-        (bs - 24) as u16,
+        (bs - 24 - tail) as u16,
         "lost+found",
         FT_DIR,
     );
     d
 }
 
-/// lost+found block: `.` -> itself (11), `..` -> root (2) filling the block.
-fn build_lost_found_dir(block_size: u64) -> Vec<u8> {
+/// lost+found block: `.` -> itself (11), `..` -> root (2) filling the block
+/// (minus the 12-byte checksum tail on metadata_csum).
+fn build_lost_found_dir(block_size: u64, reserve_tail: bool) -> Vec<u8> {
     let bs = block_size as usize;
+    let tail = if reserve_tail { 12 } else { 0 };
     let mut d = vec![0u8; bs];
     put_dirent(&mut d, 0, LOST_FOUND_INO, 12, ".", FT_DIR);
-    put_dirent(&mut d, 12, ROOT_INO, (bs - 12) as u16, "..", FT_DIR);
+    put_dirent(&mut d, 12, ROOT_INO, (bs - 12 - tail) as u16, "..", FT_DIR);
     d
 }
 
@@ -661,10 +841,25 @@ fn put_dirent(buf: &mut [u8], off: usize, inode: u32, rec_len: u16, name: &str, 
     buf[off + 8..off + 8 + nb.len()].copy_from_slice(nb);
 }
 
-/// A 60-byte `i_block` with a single direct pointer (plain ext2, no extents).
+/// A 60-byte `i_block` with a single direct pointer (plain ext2/ext3).
 fn direct_iblock(block: u64) -> [u8; 60] {
     let mut ib = [0u8; 60];
     ib[0..4].copy_from_slice(&(block as u32).to_le_bytes());
+    ib
+}
+
+/// A 60-byte `i_block` holding one inline ext4 extent (depth-0 leaf) mapping
+/// logical block 0..`len` to the contiguous physical run at `start_block`.
+fn extent_iblock(start_block: u64, len: u16) -> [u8; 60] {
+    let mut ib = [0u8; 60];
+    ib[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes()); // eh_magic
+    ib[2..4].copy_from_slice(&1u16.to_le_bytes()); // eh_entries
+    ib[4..6].copy_from_slice(&4u16.to_le_bytes()); // eh_max
+                                                   // eh_depth (0x06) = 0, eh_generation (0x08) = 0
+    ib[12..16].copy_from_slice(&0u32.to_le_bytes()); // ee_block (logical 0)
+    ib[16..18].copy_from_slice(&len.to_le_bytes()); // ee_len
+    ib[18..20].copy_from_slice(&((start_block >> 32) as u16).to_le_bytes()); // ee_start_hi
+    ib[20..24].copy_from_slice(&(start_block as u32).to_le_bytes()); // ee_start_lo
     ib
 }
 
@@ -981,5 +1176,44 @@ mod tests {
             e2fsck_clean(&e2fsck, &img),
             "e2fsck faulted an ext3 volume after create_file"
         );
+    }
+
+    // ---- ext4 (extents + metadata_csum + journal) ----
+
+    const EXT4_SIZES: &[u64] = &[8 << 20, 16 << 20, 64 << 20, 160 << 20];
+
+    #[test]
+    fn blank_ext4_opens_as_ext4_and_is_clean() {
+        for &size in EXT4_SIZES {
+            let img = create_blank_ext4(size, "csumvol").unwrap();
+            let mut fs = ExtFilesystem::open(Cursor::new(img), 0).unwrap();
+            assert_eq!(fs.fs_type(), "ext4", "extent+csum -> ext4 (size {size})");
+            assert!(
+                lost_found(&mut fs).is_some(),
+                "lost+found present (size {size})"
+            );
+            // Our own (now csum-aware) fsck must accept what we formatted.
+            let r = fsck_ext(&mut fs).unwrap();
+            assert!(
+                r.is_clean(),
+                "size {size}: our fsck reported {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn blank_ext4_passes_e2fsck() {
+        let Some(e2fsck) = e2fsprogs_bin("e2fsck") else {
+            eprintln!("skipping: e2fsck not available");
+            return;
+        };
+        for &size in EXT4_SIZES {
+            let img = create_blank_ext4(size, "csumvol").unwrap();
+            assert!(
+                e2fsck_clean(&e2fsck, &img),
+                "e2fsck faulted a blank {size}-byte ext4 volume"
+            );
+        }
     }
 }

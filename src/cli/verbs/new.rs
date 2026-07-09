@@ -41,6 +41,9 @@ pub enum FsKind {
     /// ext3 (Linux). ext2 plus an empty jbd2 journal; 4 KiB blocks, minimum
     /// ~8 MiB (must hold the 4 MiB journal).
     Ext3,
+    /// ext4 (Linux). Extents + metadata_csum (crc32c) + a jbd2 journal; 256-byte
+    /// inodes, 4 KiB blocks, minimum ~8 MiB.
+    Ext4,
 }
 
 #[derive(Debug, Args)]
@@ -49,7 +52,7 @@ pub struct NewArgs {
     pub image: PathBuf,
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
-    /// ext (alias ext2), ext3.
+    /// ext (alias ext2), ext3, ext4.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -242,8 +245,9 @@ pub fn run(args: NewArgs) -> Result<()> {
                 &args.name,
             )
         }
-        FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, false),
-        FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, true),
+        FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
+        FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
+        FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
     }
 }
 
@@ -310,16 +314,15 @@ fn write_blank_ext_image(
     image: &std::path::Path,
     size_str: &str,
     name: &str,
-    journal: bool,
+    kind: &str,
 ) -> Result<()> {
     let size = parse_size(size_str).context("parsing --size")?;
-    let kind = if journal { "ext3" } else { "ext2" };
     let mut file =
         std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
-    let disk_bytes = if journal {
-        crate::fs::ext_format::write_blank_ext3(&mut file, 0, size, name)
-    } else {
-        crate::fs::ext_format::write_blank_ext2(&mut file, 0, size, name)
+    let disk_bytes = match kind {
+        "ext3" => crate::fs::ext_format::write_blank_ext3(&mut file, 0, size, name),
+        "ext4" => crate::fs::ext_format::write_blank_ext4(&mut file, 0, size, name),
+        _ => crate::fs::ext_format::write_blank_ext2(&mut file, 0, size, name),
     }
     .with_context(|| format!("formatting {kind} into {}", image.display()))?;
     // Extend to the exact formatted length; the trailing region stays sparse.
