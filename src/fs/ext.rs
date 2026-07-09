@@ -4100,6 +4100,14 @@ pub fn resize_ext_in_place(
         return Ok(());
     }
 
+    // Growing a packed backup back to a larger partition means adding block groups
+    // (new GDT descriptors, bitmaps, inode tables) — a bare count bump would leave a
+    // fs whose superblock claims more blocks than its group structure describes.
+    // Delegate to the group-adding grow.
+    if new_blocks > old_blocks {
+        return grow_ext_add_groups(file, partition_offset, new_total_bytes, log_cb);
+    }
+
     let old_free_lo = le32(&sb, 0x0C) as u64;
     let old_free = if is_64bit {
         let hi = le32(&sb, 0x158) as u64;
@@ -4170,6 +4178,281 @@ pub fn resize_ext_in_place(
         "ext resize: updated superblock — {new_blocks} total blocks, {new_free} free blocks"
     ));
 
+    Ok(())
+}
+
+/// Grow an ext2/3/4 filesystem by **adding block groups** — the offline
+/// `resize2fs` grow, the mirror of the backup compactor's shrink. Lays down each
+/// new group's block/inode bitmap + (fresh, already-zero) inode table + group
+/// descriptor in the newly-available space, extends the old last group if it was
+/// a runt, rewrites the GDT + superblock (primary and every backup), and stamps
+/// every touched checksum. Restricted to grows where the GDT block count is
+/// unchanged (true for 4 KiB-block ext up to 8 TB); a grow that would enlarge the
+/// GDT into occupied space is skipped, leaving the smaller — still valid — fs.
+#[allow(clippy::needless_range_loop)] // g is also the block-group number
+fn grow_ext_add_groups(
+    file: &mut (impl Read + std::io::Write + Seek),
+    partition_offset: u64,
+    new_total_bytes: u64,
+    log_cb: &mut impl FnMut(&str),
+) -> anyhow::Result<()> {
+    file.seek(SeekFrom::Start(partition_offset + SUPERBLOCK_OFFSET))?;
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    file.read_exact(&mut sb)?;
+    if u16::from_le_bytes([sb[0x38], sb[0x39]]) != EXT_MAGIC {
+        return Ok(());
+    }
+
+    let fdb = le32(&sb, 0x14) as u64;
+    let block_size = 1024u64 << le32(&sb, 0x18);
+    let bpg = le32(&sb, 0x20) as u64;
+    let ipg = le32(&sb, 0x28);
+    let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]) as u64;
+    let feat_incompat = le32(&sb, 0x60);
+    let feat_ro = le32(&sb, 0x64);
+    let is_64bit = feat_incompat & INCOMPAT_64BIT != 0;
+    let metadata_csum = feat_ro & 0x0400 != 0;
+    let sparse = feat_ro & 0x0001 != 0;
+    let desc_size: u64 = if is_64bit {
+        let d = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
+        if d >= 64 {
+            d as u64
+        } else {
+            64
+        }
+    } else {
+        32
+    };
+
+    let old_total = if is_64bit {
+        ((le32(&sb, 0x150) as u64) << 32) | le32(&sb, 0x04) as u64
+    } else {
+        le32(&sb, 0x04) as u64
+    };
+    let new_total = new_total_bytes / block_size;
+    let old_gc = (old_total - fdb).div_ceil(bpg);
+    let new_gc = (new_total - fdb).div_ceil(bpg);
+
+    let gdt_blocks = (new_gc * desc_size).div_ceil(block_size);
+    if gdt_blocks != (old_gc * desc_size).div_ceil(block_size) {
+        log_cb(&format!(
+            "ext grow: GDT would need {gdt_blocks} blocks (was fewer); leaving fs at {old_total} \
+             blocks — run resize2fs to fill the partition"
+        ));
+        return Ok(());
+    }
+    let itable_blocks = (ipg as u64 * inode_size).div_ceil(block_size);
+    let sb_blk = if block_size == 1024 { 1u64 } else { 0 };
+    let group_start = |g: u64| fdb + g * bpg;
+    let gd_hi = is_64bit && desc_size >= 64;
+    let seed = if metadata_csum {
+        let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+        super::ext_csum::csum_seed(&uuid)
+    } else {
+        0
+    };
+
+    // Read the current GDT and grow the buffer to hold the new descriptors.
+    let gdt_start = partition_offset + (sb_blk + 1) * block_size;
+    let mut gdt = vec![0u8; gdt_blocks as usize * block_size as usize];
+    file.seek(SeekFrom::Start(gdt_start))?;
+    file.read_exact(&mut gdt[..old_gc as usize * desc_size as usize])?;
+
+    // A full-block bitmap with `used` leading bits set, the group's real free tail
+    // clear, and everything past the group (runt + block padding) set.
+    let make_bitmap = |used: u64, count: u64| -> Vec<u8> {
+        let mut bm = vec![0u8; block_size as usize];
+        for bit in 0..used {
+            bm[(bit / 8) as usize] |= 1u8 << (bit % 8);
+        }
+        for bit in count..block_size * 8 {
+            bm[(bit / 8) as usize] |= 1u8 << (bit % 8);
+        }
+        bm
+    };
+    let put_desc =
+        |gdt: &mut [u8], g: u64, bbm: u64, ibm: u64, it: u64, free_b: u64, free_i: u32| {
+            let o = g as usize * desc_size as usize;
+            gdt[o..o + 4].copy_from_slice(&(bbm as u32).to_le_bytes());
+            gdt[o + 4..o + 8].copy_from_slice(&(ibm as u32).to_le_bytes());
+            gdt[o + 8..o + 12].copy_from_slice(&(it as u32).to_le_bytes());
+            gdt[o + 0x0C..o + 0x0E].copy_from_slice(&(free_b as u16).to_le_bytes());
+            gdt[o + 0x0E..o + 0x10].copy_from_slice(&(free_i as u16).to_le_bytes());
+            gdt[o + 0x10..o + 0x12].copy_from_slice(&0u16.to_le_bytes()); // used_dirs
+            gdt[o + 0x12..o + 0x14].copy_from_slice(&0u16.to_le_bytes()); // flags (explicit bitmaps)
+            gdt[o + 0x1C..o + 0x1E].copy_from_slice(&(ipg as u16).to_le_bytes()); // itable_unused
+            if gd_hi {
+                gdt[o + 0x20..o + 0x24].copy_from_slice(&((bbm >> 32) as u32).to_le_bytes());
+                gdt[o + 0x24..o + 0x28].copy_from_slice(&((ibm >> 32) as u32).to_le_bytes());
+                gdt[o + 0x28..o + 0x2C].copy_from_slice(&((it >> 32) as u32).to_le_bytes());
+                gdt[o + 0x2C..o + 0x2E].copy_from_slice(&((free_b >> 16) as u16).to_le_bytes());
+                gdt[o + 0x2E..o + 0x30].copy_from_slice(&((free_i >> 16) as u16).to_le_bytes());
+                gdt[o + 0x32..o + 0x34].copy_from_slice(&((ipg >> 16) as u16).to_le_bytes());
+            }
+        };
+
+    let mut added_free: u64 = 0;
+    let mut added_inodes: u64 = 0;
+
+    // ---- New groups old_gc..new_gc ----
+    for g in old_gc..new_gc {
+        let gs = group_start(g);
+        let count = (new_total - gs).min(bpg);
+        let has_backup = has_superblock_backup(g as u32, sparse);
+        let meta_off = if has_backup { 1 + gdt_blocks } else { 0 };
+        let bbm = gs + meta_off;
+        let ibm = bbm + 1;
+        let it = ibm + 1;
+        let used = meta_off + 2 + itable_blocks;
+
+        // Block bitmap for this group.
+        let bm = make_bitmap(used, count);
+        file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+        file.write_all(&bm)?;
+        // Inode bitmap: no inodes used, only padding past ipg set.
+        let ibm_data = make_bitmap(0, ipg as u64);
+        file.seek(SeekFrom::Start(partition_offset + ibm * block_size))?;
+        file.write_all(&ibm_data)?;
+
+        let free_b = count - used;
+        put_desc(&mut gdt, g, bbm, ibm, it, free_b, ipg);
+        added_free += free_b;
+        added_inodes += ipg as u64;
+    }
+
+    // ---- Extend the old last group if it grew (was a runt) ----
+    let old_last = old_gc - 1;
+    let old_last_start = group_start(old_last);
+    let old_last_old_count = old_total - old_last_start;
+    let old_last_new_count = (new_total - old_last_start).min(bpg);
+    if old_last_new_count > old_last_old_count {
+        let o = old_last as usize * desc_size as usize;
+        let bbm = le32(&gdt, o) as u64
+            | if gd_hi {
+                (le32(&gdt, o + 0x20) as u64) << 32
+            } else {
+                0
+            };
+        file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+        let mut bm = vec![0u8; block_size as usize];
+        file.read_exact(&mut bm)?;
+        for bit in old_last_old_count..old_last_new_count {
+            bm[(bit / 8) as usize] &= !(1u8 << (bit % 8));
+        }
+        let gained = old_last_new_count - old_last_old_count;
+        let old_free = u16::from_le_bytes([gdt[o + 0x0C], gdt[o + 0x0D]]) as u64
+            | if gd_hi {
+                (u16::from_le_bytes([gdt[o + 0x2C], gdt[o + 0x2D]]) as u64) << 16
+            } else {
+                0
+            };
+        let nf = old_free + gained;
+        gdt[o + 0x0C..o + 0x0E].copy_from_slice(&(nf as u16).to_le_bytes());
+        if gd_hi {
+            gdt[o + 0x2C..o + 0x2E].copy_from_slice(&((nf >> 16) as u16).to_le_bytes());
+        }
+        added_free += gained;
+        if metadata_csum {
+            let bbm_len = (bpg as usize).div_ceil(8);
+            super::ext_csum::stamp_block_bitmap_csum(
+                seed,
+                &mut gdt[o..o + desc_size as usize],
+                &bm[..bbm_len],
+            );
+        }
+        file.seek(SeekFrom::Start(partition_offset + bbm * block_size))?;
+        file.write_all(&bm)?;
+    }
+
+    // ---- Stamp new groups' checksums (bitmap csums first, then bg_checksum) ----
+    if metadata_csum {
+        let bbm_len = (bpg as usize).div_ceil(8);
+        let ibm_len = (ipg as usize).div_ceil(8);
+        for g in old_gc..new_gc {
+            let gs = group_start(g);
+            let count = (new_total - gs).min(bpg);
+            let has_backup = has_superblock_backup(g as u32, sparse);
+            let used = if has_backup { 1 + gdt_blocks } else { 0 } + 2 + itable_blocks;
+            let bm = make_bitmap(used, count);
+            let ibm_data = make_bitmap(0, ipg as u64);
+            let o = g as usize * desc_size as usize;
+            super::ext_csum::stamp_block_bitmap_csum(
+                seed,
+                &mut gdt[o..o + desc_size as usize],
+                &bm[..bbm_len],
+            );
+            super::ext_csum::stamp_inode_bitmap_csum(
+                seed,
+                &mut gdt[o..o + desc_size as usize],
+                &ibm_data[..ibm_len],
+            );
+        }
+        for g in 0..new_gc {
+            let o = g as usize * desc_size as usize;
+            super::ext_csum::stamp_group_desc(seed, g as u32, &mut gdt[o..o + desc_size as usize]);
+        }
+    }
+
+    // ---- Superblock counts ----
+    let new_free_b = {
+        let lo = le32(&sb, 0x0C) as u64;
+        let hi = if is_64bit { le32(&sb, 0x158) as u64 } else { 0 };
+        ((hi << 32) | lo) + added_free
+    };
+    let new_free_i = le32(&sb, 0x10) as u64 + added_inodes;
+    let new_inodes = {
+        let old = le32(&sb, 0x00) as u64;
+        old + added_inodes
+    };
+    let old_reserved = {
+        let lo = le32(&sb, 0x08) as u64;
+        let hi = if is_64bit { le32(&sb, 0x154) as u64 } else { 0 };
+        (hi << 32) | lo
+    };
+    let new_reserved = (old_reserved as u128 * new_total as u128 / old_total.max(1) as u128) as u64;
+
+    sb[0x00..0x04].copy_from_slice(&(new_inodes as u32).to_le_bytes());
+    sb[0x04..0x08].copy_from_slice(&(new_total as u32).to_le_bytes());
+    sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
+    sb[0x0C..0x10].copy_from_slice(&(new_free_b as u32).to_le_bytes());
+    sb[0x10..0x14].copy_from_slice(&(new_free_i as u32).to_le_bytes());
+    if is_64bit {
+        sb[0x150..0x154].copy_from_slice(&((new_total >> 32) as u32).to_le_bytes());
+        sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
+        sb[0x158..0x15C].copy_from_slice(&((new_free_b >> 32) as u32).to_le_bytes());
+    }
+
+    // ---- Write GDT + superblock, to the primary and every backup group ----
+    let gdt_padded = gdt.clone();
+    for g in 0..new_gc {
+        let is_primary = g == 0;
+        if !is_primary && !has_superblock_backup(g as u32, sparse) {
+            continue;
+        }
+        let mut sbg = sb;
+        if metadata_csum {
+            sbg[0x5A..0x5C].copy_from_slice(&(g as u16).to_le_bytes());
+            super::ext_csum::stamp_superblock(&mut sbg);
+        }
+        let (sb_pos, gdt_pos) = if is_primary {
+            (partition_offset + SUPERBLOCK_OFFSET, gdt_start)
+        } else {
+            let gs = group_start(g);
+            (
+                partition_offset + gs * block_size,
+                partition_offset + (gs + 1) * block_size,
+            )
+        };
+        file.seek(SeekFrom::Start(sb_pos))?;
+        file.write_all(&sbg)?;
+        file.seek(SeekFrom::Start(gdt_pos))?;
+        file.write_all(&gdt_padded)?;
+    }
+
+    log_cb(&format!(
+        "ext grow: added {} groups ({old_total} -> {new_total} blocks)",
+        new_gc - old_gc
+    ));
     Ok(())
 }
 
@@ -5699,16 +5982,17 @@ mod tests {
         })
         .unwrap();
 
-        // Verify superblock was updated
+        // Verify superblock reflects the larger size. Crossing a group boundary
+        // (32768 -> 40000 = 2 groups) now adds a block group rather than a bare
+        // count bump; the real e2fsck-clean behaviour is covered by
+        // `packed_grow_back_e2fsck_clean_and_data_intact`.
         let data = cursor.into_inner();
         let new_blocks = le32(&data, 1024 + 0x04) as u64;
         assert_eq!(new_blocks, 40000);
-
+        // The new group's free-block count = its 7232 blocks minus its own metadata.
         let new_free = le32(&data, 1024 + 0x0C) as u64;
-        // SB s_free_blocks_count was 0 (not set in test image), added 7232
-        assert_eq!(new_free, 7232);
-
-        assert!(logs.iter().any(|l| l.contains("growing")));
+        assert!(new_free > 0 && new_free < 7232, "free={new_free}");
+        assert!(logs.iter().any(|l| l.contains("added")));
     }
 
     #[test]
@@ -5837,8 +6121,8 @@ mod tests {
         })
         .unwrap();
         assert!(
-            logs.iter().any(|l| l.contains("growing")),
-            "should grow to fill larger partition"
+            logs.iter().any(|l| l.contains("added")),
+            "should grow by adding a block group: {logs:?}"
         );
 
         // Verify superblock reflects the larger size

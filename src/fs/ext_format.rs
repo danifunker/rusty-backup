@@ -1514,6 +1514,74 @@ mod tests {
         assert_eq!(back, content, "file data corrupted by packing");
     }
 
+    /// The mirror of the packed shrink: a compacted ext4 restored into its
+    /// original-size partition must grow back by *adding block groups*
+    /// (resize2fs-grade), staying e2fsck-clean, with file data intact and readable
+    /// through our own reader. Exercises `grow_ext_add_groups` end-to-end
+    /// (pack 64 MiB -> 12 MiB, then grow back to 16 groups).
+    #[test]
+    fn packed_grow_back_e2fsck_clean_and_data_intact() {
+        use crate::fs::ext::{resize_ext_in_place, CompactExtReader};
+        use crate::fs::filesystem::Filesystem;
+        use std::io::Read;
+        let (Some(mke2fs), Some(e2fsck), Some(debugfs)) = (
+            e2fsprogs_bin("mke2fs"),
+            e2fsprogs_bin("e2fsck"),
+            e2fsprogs_bin("debugfs"),
+        ) else {
+            eprintln!("skipping: e2fsprogs not available");
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("rb_grow_{}.img", std::process::id()));
+        std::fs::write(&path, vec![0u8; 64 << 20]).unwrap();
+        Command::new(&mke2fs)
+            .args([
+                "-F", "-q", "-t", "ext4", "-b", "4096", "-g", "1024", "-I", "256",
+            ])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let content: Vec<u8> = (0..40_000u32)
+            .map(|i| i.wrapping_mul(2246822519) as u8)
+            .collect();
+        let srcf = std::env::temp_dir().join(format!("rb_grow_src_{}", std::process::id()));
+        std::fs::write(&srcf, &content).unwrap();
+        let out = Command::new(&debugfs)
+            .args(["-w", "-R"])
+            .arg(format!("write {} f.dat", srcf.display()))
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "debugfs write failed");
+        let img = std::fs::read(&path).unwrap();
+        let orig_len = img.len() as u64;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&srcf);
+
+        let (mut r, info) = CompactExtReader::new(Cursor::new(img), 0).unwrap();
+        let mut packed = Vec::new();
+        r.read_to_end(&mut packed).unwrap();
+        assert!(info.compacted_size < orig_len, "expected shrink");
+        // Simulate restore into the original-size partition, then grow to fill it.
+        packed.resize(orig_len as usize, 0);
+        resize_ext_in_place(&mut Cursor::new(&mut packed[..]), 0, orig_len, &mut |_| {}).unwrap();
+        assert!(
+            e2fsck_clean(&e2fsck, &packed),
+            "grown-back image not e2fsck-clean"
+        );
+
+        let mut fs = ExtFilesystem::open(Cursor::new(packed), 0).unwrap();
+        let root = fs.root().unwrap();
+        let ent = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "f.dat")
+            .expect("f.dat present after grow");
+        let back = fs.read_file(&ent, usize::MAX).unwrap();
+        assert_eq!(back, content, "file data corrupted by pack+grow");
+    }
+
     /// Real mke2fs ext4 uses flex_bg — every group's block/inode bitmap + inode
     /// table clusters into the flex-group leader (group 0). Shrinking must free the
     /// dropped groups' metadata that physically lives in a surviving group, and the
