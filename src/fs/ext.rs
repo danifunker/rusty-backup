@@ -46,6 +46,7 @@ const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const EXT4_EXT_MAGIC: u16 = 0xF30A;
 
 // Block group flags
+const BG_INODE_UNINIT: u16 = 0x0001;
 const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 // Special inodes
@@ -2796,6 +2797,39 @@ pub fn build_relocation_map<R: Read + Seek>(
         }
     }
 
+    // Inode safety: the packed image relocates data *blocks* but never inodes, so
+    // a group that still holds an allocated inode must not be dropped — the file it
+    // describes would vanish. Raise min_groups to cover the highest group with any
+    // allocated inode. (Group 0 always holds the reserved inodes; higher groups on
+    // a mostly-empty fs are BG_INODE_UNINIT and hold none.)
+    let mut min_inode_groups: u32 = 1;
+    for group in 0..group_count as usize {
+        let (_bb, flags) = gd_infos[group];
+        if flags & BG_INODE_UNINIT != 0 {
+            continue;
+        }
+        let off = group * desc_size as usize;
+        let ib_lo = le32(&gdt_buf[off..], 0x04) as u64;
+        let inode_bitmap = if is_64bit && desc_size >= 64 {
+            ((le32(&gdt_buf[off..], 0x24) as u64) << 32) | ib_lo
+        } else {
+            ib_lo
+        };
+        reader.seek(SeekFrom::Start(
+            partition_offset + inode_bitmap * block_size,
+        ))?;
+        let mut ibm = vec![0u8; block_size as usize];
+        reader.read_exact(&mut ibm)?;
+        if BitmapReader::new(&ibm, inodes_per_group as u64)
+            .iter_set_bits()
+            .next()
+            .is_some()
+        {
+            min_inode_groups = group as u32 + 1;
+        }
+    }
+    min_groups = min_groups.max(min_inode_groups);
+
     let new_total_blocks = first_data_block as u64 + min_groups as u64 * blocks_per_group as u64;
     let new_total_blocks = new_total_blocks.min(total_blocks);
 
@@ -2925,10 +2959,21 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
     let inodes_per_group = le32(&sb, 0x28);
     let inode_size = u16::from_le_bytes([sb[0x58], sb[0x59]]);
     let feature_incompat = le32(&sb, 0x60);
+    let feature_ro_compat = le32(&sb, 0x64);
 
     let block_size = 1024u64 << log_block_size;
     let is_64bit = feature_incompat & INCOMPAT_64BIT != 0;
     let has_extents = feature_incompat & INCOMPAT_EXTENTS != 0;
+
+    // metadata_csum: relocating an inode's block pointers changes its bytes, so
+    // its crc32c (and any separate extent-tree block's et_checksum) must be
+    // recomputed — otherwise the packed backup is unmountable. Seeded from the
+    // volume UUID, as everywhere else in ext_csum.
+    let metadata_csum = feature_ro_compat & 0x0400 != 0;
+    let csum_seed = {
+        let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+        super::ext_csum::csum_seed(&uuid)
+    };
 
     let desc_size: u16 = if is_64bit {
         let ds = u16::from_le_bytes([sb[0xFE], sb[0xFF]]);
@@ -3036,6 +3081,11 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
                 }
             }
 
+            // Inode number is 1-based across the whole volume; generation lives at
+            // 0x64. Both feed the crc32c re-stamp after we patch block pointers.
+            let inum = group as u32 * inodes_per_group + local_idx as u32 + 1;
+            let generation = le32(&table, ioff + 0x64);
+
             let i_block_off = ioff + 0x28;
             let i_block = &table[i_block_off..i_block_off + 60];
 
@@ -3043,6 +3093,7 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
                 || (has_extents && i_block.len() >= 2 && is_extent_header(i_block))
             {
                 // ---- Extent-based inode ----
+                let iseed = super::ext_csum::inode_seed(csum_seed, inum, generation);
                 patch_extent_tree_in_inode(
                     reader,
                     partition_offset,
@@ -3050,9 +3101,12 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
                     &mut table[i_block_off..i_block_off + 60],
                     &plan.relocations,
                     &mut indirect_patches,
+                    metadata_csum.then_some(iseed),
                 )?;
             } else {
                 // ---- Indirect-block inode ----
+                // (ext2/3 indirect blocks carry no checksum under metadata_csum,
+                // so only the owning inode below needs re-stamping.)
                 patch_indirect_in_inode(
                     reader,
                     partition_offset,
@@ -3062,6 +3116,16 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
                     &plan.relocations,
                     &mut indirect_patches,
                 )?;
+            }
+
+            // Re-stamp the inode's own crc32c: its block pointers (inline extent
+            // root or direct/indirect pointers) may have just changed.
+            if metadata_csum {
+                super::ext_csum::stamp_inode(
+                    csum_seed,
+                    &mut table[ioff..ioff + inode_size as usize],
+                    inum,
+                );
             }
         }
 
@@ -3076,6 +3140,10 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
 
 /// Patch extent tree root stored in i_block (60 bytes inline in the inode).
 /// Also recursively patches extent index blocks (which are separate data blocks).
+///
+/// `iseed` is `Some(inode_seed)` on a metadata_csum volume — separate (child)
+/// extent blocks then get their `et_checksum` tail re-stamped after patching.
+/// The inline root here needs no tail (it is covered by the inode's own csum).
 fn patch_extent_tree_in_inode<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -3083,6 +3151,7 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
     i_block: &mut [u8],
     relocations: &std::collections::HashMap<u64, u64>,
     indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+    iseed: Option<u32>,
 ) -> Result<(), FilesystemError> {
     if i_block.len() < 12 {
         return Ok(());
@@ -3132,7 +3201,13 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
                 &mut child_data,
                 relocations,
                 indirect_patches,
+                iseed,
             )?;
+
+            // This is a separate on-disk extent block — re-stamp its tail csum.
+            if let Some(s) = iseed {
+                super::ext_csum::stamp_extent_block_csum(s, &mut child_data);
+            }
 
             // Store patched child block for later streaming
             let store_at = relocations
@@ -3146,6 +3221,8 @@ fn patch_extent_tree_in_inode<R: Read + Seek>(
 }
 
 /// Recursively patch an extent tree block (non-inline, separate data block).
+/// `iseed` carries the owning inode's seed so recursively-read child blocks get
+/// their `et_checksum` tail re-stamped on a metadata_csum volume.
 fn patch_extent_block<R: Read + Seek>(
     reader: &mut R,
     partition_offset: u64,
@@ -3153,6 +3230,7 @@ fn patch_extent_block<R: Read + Seek>(
     block_data: &mut [u8],
     relocations: &std::collections::HashMap<u64, u64>,
     indirect_patches: &mut std::collections::HashMap<u64, Vec<u8>>,
+    iseed: Option<u32>,
 ) -> Result<(), FilesystemError> {
     let header = match parse_extent_header(block_data) {
         Ok(h) => h,
@@ -3194,7 +3272,12 @@ fn patch_extent_block<R: Read + Seek>(
                 &mut child_data,
                 relocations,
                 indirect_patches,
+                iseed,
             )?;
+
+            if let Some(s) = iseed {
+                super::ext_csum::stamp_extent_block_csum(s, &mut child_data);
+            }
 
             let store_at = relocations
                 .get(&child_block)
@@ -3460,6 +3543,7 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     let first_data_block = le32(&sb, 0x14);
     let log_block_size = le32(&sb, 0x18);
     let blocks_per_group = le32(&sb, 0x20);
+    let inodes_per_group = le32(&sb, 0x28);
     let feature_incompat = le32(&sb, 0x60);
 
     let block_size = 1024u64 << log_block_size;
@@ -3523,6 +3607,7 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
 
     let mut block_bitmaps: Vec<Vec<u8>> = Vec::with_capacity(min_groups as usize);
     let mut total_free: u64 = 0;
+    let mut total_free_inodes: u64 = 0;
 
     for group in 0..min_groups as usize {
         let group_start = first_data_block as u64 + group as u64 * blocks_per_group as u64;
@@ -3579,6 +3664,17 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
                 gdt_buf[gdt_off + 0x2C..gdt_off + 0x2E]
                     .copy_from_slice(&((free >> 16) as u16).to_le_bytes());
             }
+
+            // Inodes are untouched by shrink, so this group keeps its original
+            // free-inode count — accumulate it for the new s_free_inodes_count.
+            let fi_lo =
+                u16::from_le_bytes([gdt_buf[gdt_off + 0x0E], gdt_buf[gdt_off + 0x0F]]) as u64;
+            let fi_hi = if is_64bit && desc_size >= 64 {
+                u16::from_le_bytes([gdt_buf[gdt_off + 0x2E], gdt_buf[gdt_off + 0x2F]]) as u64
+            } else {
+                0
+            };
+            total_free_inodes += (fi_hi << 16) | fi_lo;
         }
 
         block_bitmaps.push(bitmap);
@@ -3596,6 +3692,14 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     if is_64bit {
         sb[0x150..0x154].copy_from_slice(&((new_total >> 32) as u32).to_le_bytes());
     }
+
+    // s_inodes_count / s_free_inodes_count — the inode tables live at fixed
+    // per-group positions, so dropping trailing groups drops their inodes too.
+    // e2fsck treats a stale s_inodes_count (still counting the removed groups) as
+    // fatal superblock corruption, so both must track the new group count.
+    let new_inodes_count = min_groups as u64 * inodes_per_group as u64;
+    sb[0x00..0x04].copy_from_slice(&(new_inodes_count as u32).to_le_bytes());
+    sb[0x10..0x14].copy_from_slice(&(total_free_inodes as u32).to_le_bytes());
 
     // s_free_blocks_count
     sb[0x0C..0x10].copy_from_slice(&(total_free as u32).to_le_bytes());
@@ -3618,6 +3722,28 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
     sb[0x08..0x0C].copy_from_slice(&(new_reserved as u32).to_le_bytes());
     if is_64bit {
         sb[0x154..0x158].copy_from_slice(&((new_reserved >> 32) as u32).to_le_bytes());
+    }
+
+    // ---- metadata_csum: re-stamp crc32c on everything we rewrote ----
+    // The packed image becomes the stored backup, so it must be self-consistently
+    // checksummed — rusty-backup never shells out to e2fsck/resize2fs to fix it up
+    // afterwards. We rewrote each surviving group's block bitmap + GDT free count
+    // and the superblock counts, so re-stamp the block-bitmap checksum and
+    // bg_checksum on every surviving descriptor (bitmap csum first — it lives
+    // inside bg_checksum's coverage), then the superblock last. Inode-bitmap
+    // checksums are untouched by shrink, so the source values carried in gdt_buf
+    // stay valid.
+    let metadata_csum = le32(&sb, 0x64) & 0x0400 != 0;
+    if metadata_csum {
+        let uuid: [u8; 16] = sb[0x68..0x78].try_into().unwrap();
+        let seed = super::ext_csum::csum_seed(&uuid);
+        for group in 0..min_groups as usize {
+            let gdt_off = group * desc_size as usize;
+            let desc = &mut gdt_buf[gdt_off..gdt_off + desc_size as usize];
+            super::ext_csum::stamp_block_bitmap_csum(seed, desc, &block_bitmaps[group]);
+            super::ext_csum::stamp_group_desc(seed, group as u32, desc);
+        }
+        super::ext_csum::stamp_superblock(&mut sb);
     }
 
     Ok(ShrinkMetadata {

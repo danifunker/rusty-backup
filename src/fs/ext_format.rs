@@ -1358,4 +1358,49 @@ mod tests {
             "e2fsck faulted after editing a real mke2fs ext4"
         );
     }
+
+    /// Packing a multi-group volume that can drop its trailing empty groups
+    /// *without relocating any block* must stay e2fsck-clean — the packed image is
+    /// the stored backup, so its superblock/GDT/bitmap checksums and inode counts
+    /// must all reconcile with the smaller geometry. Covers ext2 (no csum) and ext4
+    /// (metadata_csum). Regression for the stale-checksum + stale-inode-count bugs.
+    #[test]
+    fn packed_no_reloc_shrink_is_e2fsck_clean() {
+        use crate::fs::ext::{build_relocation_map, CompactExtReader};
+        use std::io::Read;
+        let Some(e2fsck) = e2fsprogs_bin("e2fsck") else {
+            eprintln!("skipping: e2fsck not available");
+            return;
+        };
+        // 160/512 MiB with 4 KiB blocks => 2 / 4 groups; a blank volume keeps all
+        // data in group 0, so packing drops the trailing group(s) with no moves.
+        for &size in &[160u64 << 20, 512 << 20] {
+            for variant in ["ext2", "ext4"] {
+                let img = if variant == "ext2" {
+                    create_blank_ext2(size, "pk").unwrap()
+                } else {
+                    create_blank_ext4(size, "pk").unwrap()
+                };
+
+                let plan = build_relocation_map(&mut Cursor::new(&img), 0).unwrap();
+                assert!(
+                    !plan.needs_relocation,
+                    "{variant} {size}: blank volume should shrink without relocation"
+                );
+
+                let orig_len = img.len();
+                let (mut reader, info) = CompactExtReader::new(Cursor::new(img), 0).unwrap();
+                assert!(
+                    info.compacted_size < orig_len as u64,
+                    "{variant} {size}: expected a smaller packed image"
+                );
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).unwrap();
+                assert!(
+                    e2fsck_clean(&e2fsck, &out),
+                    "{variant} {size}: packed no-reloc shrink not e2fsck-clean"
+                );
+            }
+        }
+    }
 }

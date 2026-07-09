@@ -173,6 +173,48 @@ pub fn stamp_dir_block(seed: u32, dirblock: &mut [u8], inum: u32, generation: u3
     dirblock[t + 8..t + 12].copy_from_slice(&c.to_le_bytes()); // det_checksum
 }
 
+// ---- extent tree block (separate, non-inline) ----
+
+/// The per-inode checksum seed: `ext_crc(ext_crc(fs_seed, inum), generation)`.
+///
+/// ext4 seeds an inode's extent-tree-block checksums (and, in the kernel, its
+/// inode/dir-block checksums) from this per-inode value rather than the raw
+/// volume seed. `dir_block_csum` / `inode_csum` inline the same construction.
+pub fn inode_seed(seed: u32, inum: u32, generation: u32) -> u32 {
+    ext_crc(
+        ext_crc(seed, &inum.to_le_bytes()),
+        &generation.to_le_bytes(),
+    )
+}
+
+/// Byte length an extent-tree block's checksum covers: `sizeof(header) +
+/// sizeof(extent) * eh_max` (`EXT4_EXTENT_TAIL_OFFSET`). `eh_max` is the 16-bit
+/// field at offset 4 of the extent header. The 4-byte `et_checksum` tail sits at
+/// exactly this offset (the last 4 bytes of a standard-geometry block).
+fn extent_tail_offset(block: &[u8]) -> usize {
+    let eh_max = u16::from_le_bytes([block[4], block[5]]) as usize;
+    12 + 12 * eh_max
+}
+
+/// `ext4_extent_tail.et_checksum` for a separate (non-inline) extent index/leaf
+/// block. Covers the header + all `eh_max` slots, seeded by the owning inode's
+/// seed (`iseed = inode_seed(fs_seed, inum, generation)`). The inline root in an
+/// inode's 60-byte `i_block` has **no** tail — it is covered by the inode csum.
+pub fn extent_block_csum(iseed: u32, block: &[u8]) -> u32 {
+    let tail = extent_tail_offset(block).min(block.len());
+    ext_crc(iseed, &block[..tail])
+}
+
+/// Write `et_checksum` into a separate extent block's 4-byte tail. No-op if the
+/// computed tail offset doesn't leave room (malformed `eh_max`).
+pub fn stamp_extent_block_csum(iseed: u32, block: &mut [u8]) {
+    let tail = extent_tail_offset(block);
+    if tail + 4 <= block.len() {
+        let c = extent_block_csum(iseed, block);
+        block[tail..tail + 4].copy_from_slice(&c.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
