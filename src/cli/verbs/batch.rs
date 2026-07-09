@@ -594,7 +594,11 @@ fn build_blank_fs(
             crate::fs::hfs::create_blank_hfs_sized(size, bs, name, 0, 0)
                 .map_err(|e| anyhow!("create_blank_hfs_sized: {e}"))
         }
-        other => bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs"),
+        "ext" | "ext2" => crate::fs::ext_format::create_blank_ext2(size, name)
+            .map_err(|e| anyhow!("create_blank_ext2: {e}")),
+        "ext3" => crate::fs::ext_format::create_blank_ext3(size, name)
+            .map_err(|e| anyhow!("create_blank_ext3: {e}")),
+        other => bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3"),
     }
 }
 

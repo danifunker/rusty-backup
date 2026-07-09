@@ -36,21 +36,25 @@ use super::filesystem::FilesystemError;
 use super::fsck::{FsckIssue, FsckResult, FsckStats};
 
 /// A block bitmap indexed by absolute block number.
-struct BlockMap {
+///
+/// Shared with the `ext_format` blank-volume formatter, which reuses the same
+/// metadata-marking + bitmap-building helpers so a freshly formatted volume is
+/// byte-for-byte what this fsck expects to find.
+pub(crate) struct BlockMap {
     bits: Vec<u8>,
 }
 
 impl BlockMap {
-    fn new(total_blocks: u64) -> Self {
+    pub(crate) fn new(total_blocks: u64) -> Self {
         BlockMap {
             bits: vec![0u8; (total_blocks as usize).div_ceil(8)],
         }
     }
-    fn get(&self, block: u64) -> bool {
+    pub(crate) fn get(&self, block: u64) -> bool {
         let (byte, off) = ((block / 8) as usize, (block % 8) as u8);
         byte < self.bits.len() && self.bits[byte] & (1 << off) != 0
     }
-    fn set(&mut self, block: u64) {
+    pub(crate) fn set(&mut self, block: u64) {
         let (byte, off) = ((block / 8) as usize, (block % 8) as u8);
         if byte < self.bits.len() {
             self.bits[byte] |= 1 << off;
@@ -100,7 +104,7 @@ impl Analysis {
     }
 }
 
-fn is_power_of(mut n: u32, base: u32) -> bool {
+pub(crate) fn is_power_of(mut n: u32, base: u32) -> bool {
     if n == 0 {
         return false;
     }
@@ -111,7 +115,7 @@ fn is_power_of(mut n: u32, base: u32) -> bool {
 }
 
 /// True when group `g` carries a superblock + GDT backup.
-fn has_super_backup(g: u32, sparse: bool) -> bool {
+pub(crate) fn has_super_backup(g: u32, sparse: bool) -> bool {
     if !sparse {
         return true;
     }
@@ -120,7 +124,7 @@ fn has_super_backup(g: u32, sparse: bool) -> bool {
 
 /// Mark the fixed filesystem metadata (super + GDT + per-group bitmaps + inode
 /// tables) into the computed block map.
-fn mark_metadata(g: &ExtGeom, groups: &[ExtGroup], map: &mut BlockMap) {
+pub(crate) fn mark_metadata(g: &ExtGeom, groups: &[ExtGroup], map: &mut BlockMap) {
     let gdt_blocks = (g.group_count as u64 * g.desc_size as u64).div_ceil(g.block_size);
     let inode_blocks_per_group =
         (g.inodes_per_group as u64 * g.inode_size as u64).div_ceil(g.block_size);
@@ -146,7 +150,7 @@ fn mark_metadata(g: &ExtGeom, groups: &[ExtGroup], map: &mut BlockMap) {
 
 /// Build the computed group block-bitmap block: one bit per block in the group,
 /// bits past the group's real blocks padded to 1 (the ext convention).
-fn build_block_bitmap(g: &ExtGeom, group: usize, computed: &BlockMap) -> Vec<u8> {
+pub(crate) fn build_block_bitmap(g: &ExtGeom, group: usize, computed: &BlockMap) -> Vec<u8> {
     let block_size = g.block_size as usize;
     let mut out = vec![0u8; block_size];
     let group_start = g.first_data_block as u64 + group as u64 * g.blocks_per_group as u64;
@@ -165,7 +169,7 @@ fn build_block_bitmap(g: &ExtGeom, group: usize, computed: &BlockMap) -> Vec<u8>
 }
 
 /// Build the computed group inode-bitmap block.
-fn build_inode_bitmap(g: &ExtGeom, group: usize, inode_used: &[bool]) -> Vec<u8> {
+pub(crate) fn build_inode_bitmap(g: &ExtGeom, group: usize, inode_used: &[bool]) -> Vec<u8> {
     let block_size = g.block_size as usize;
     let mut out = vec![0u8; block_size];
     for idx in 0..(block_size * 8) {
@@ -527,6 +531,22 @@ pub fn repair_ext<R: Read + Write + Seek + Send>(
     })
 }
 
+/// Locate an e2fsprogs tool (`e2fsck`, `mke2fs`, …) across the usual keg-only /
+/// system `sbin` dirs. Shared by the ext_fsck oracle tests and the ext_format
+/// blank-volume oracle tests. Test-only.
+#[cfg(test)]
+pub(crate) fn e2fsprogs_bin(tool: &str) -> Option<String> {
+    [
+        "/opt/homebrew/opt/e2fsprogs/sbin",
+        "/usr/local/opt/e2fsprogs/sbin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    .into_iter()
+    .map(|d| format!("{d}/{tool}"))
+    .find(|p| std::path::Path::new(p).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,15 +659,8 @@ mod tests {
 
     // ---- Oracle cross-check against e2fsck (from e2fsprogs). ----
 
-    fn e2fsck_bin() -> Option<&'static str> {
-        [
-            "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/local/opt/e2fsprogs/sbin/e2fsck",
-            "/usr/sbin/e2fsck",
-            "/sbin/e2fsck",
-        ]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
+    fn e2fsck_bin() -> Option<String> {
+        super::e2fsprogs_bin("e2fsck")
     }
 
     #[test]

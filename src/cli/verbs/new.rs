@@ -34,6 +34,13 @@ pub enum FsKind {
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
     /// --cluster-size / --sector-size; both auto-selected when unset.
     Ntfs,
+    /// ext2 (Linux). A plain rev-1 ext2 volume (128-byte inodes, no journal or
+    /// checksums); block size auto-selected (1 KiB below 8 MiB, else 4 KiB).
+    #[value(alias = "ext2")]
+    Ext,
+    /// ext3 (Linux). ext2 plus an empty jbd2 journal; 4 KiB blocks, minimum
+    /// ~8 MiB (must hold the 4 MiB journal).
+    Ext3,
 }
 
 #[derive(Debug, Args)]
@@ -41,7 +48,8 @@ pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs.
+    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
+    /// ext (alias ext2), ext3.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -234,6 +242,8 @@ pub fn run(args: NewArgs) -> Result<()> {
                 &args.name,
             )
         }
+        FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, false),
+        FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, true),
     }
 }
 
@@ -287,6 +297,37 @@ fn write_blank_ntfs_image(
         image.display(),
         geometry.cluster_size(),
         geometry.bytes_per_sector,
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare ext2/ext3 superfloppy by streaming only its populated metadata
+/// regions to the output file (the rest stays sparse). Returns the exact
+/// formatted length, which may be slightly under `--size` when a trailing runt
+/// block group is dropped.
+fn write_blank_ext_image(
+    image: &std::path::Path,
+    size_str: &str,
+    name: &str,
+    journal: bool,
+) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let kind = if journal { "ext3" } else { "ext2" };
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    let disk_bytes = if journal {
+        crate::fs::ext_format::write_blank_ext3(&mut file, 0, size, name)
+    } else {
+        crate::fs::ext_format::write_blank_ext2(&mut file, 0, size, name)
+    }
+    .with_context(|| format!("formatting {kind} into {}", image.display()))?;
+    // Extend to the exact formatted length; the trailing region stays sparse.
+    file.set_len(disk_bytes)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({disk_bytes} bytes, {kind}, volume {:?})",
+        image.display(),
         name
     ));
     Ok(())

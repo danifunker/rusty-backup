@@ -60,7 +60,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
-| ext2 / ext3 / ext4 | Auto | Yes | Yes | No | Yes (in-place) | Yes (check + repair; ext4 metadata_csum check-only) | Linux |
+| ext2 / ext3 / ext4 | Auto | Yes | Yes | Yes | Yes (in-place) | Yes (check + repair; ext4 metadata_csum check-only) | Linux |
 | btrfs | Auto | Yes | **No** (read-only) | No | Yes (volume resize) | validate | Modern Linux |
 | XFS (v4 / v5) | Auto | Yes (v4 edit) | Yes (v4) | No | Grow only (disk-layout + `xfs_growfs`) | check+repair | SGI IRIX 6.x, Linux |
 | JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
@@ -118,7 +118,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 **Totals:** ~30 filesystem drivers — **26 editable+wired**, **7 with an
 interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, UFS, XFS — all repair except
-JFS, which is check-only), **16 create-blank**, **2 detect-only scaffolds**,
+JFS, which is check-only), **17 create-blank**, **2 detect-only scaffolds**,
 **1 recovery fallback**.
 
 ---

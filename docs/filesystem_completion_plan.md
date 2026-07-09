@@ -45,7 +45,7 @@ missing capability on a driver that already round-trips.
 | FAT12/16/32 | Yes | Yes | **Yes** | — **fsck done** (FAT chains: loops, bad/lost/cross-linked clusters, size-vs-chain; FAT-mirror consistency; repair is FAT-only, byte-verified vs `fsck_msdos`) |
 | exFAT | Yes | Yes | **Yes** | — **fsck done** (allocation-bitmap reconciliation vs the directory tree; boot checksum + backup + VolumeDirty; repair rebuilds the bitmap + resyncs boot, byte-verified vs `fsck_exfat`) |
 | NTFS | Yes | Yes | **Yes** | — **fsck done** (`$Bitmap` reconciliation vs the MFT walk, `$MFTMirr` + backup-boot sync, VolumeDirty; repair rewrites `$Bitmap`, `$MFTMirr`, backup boot, and clears the dirty flag; oracle-verified against Windows `chkdsk`) |
-| ext2/3/4 | No | Yes | **Yes** | **create** (fsck done: block+inode bitmap + free-count reconciliation vs computed allocation, byte-verified vs `e2fsck`; repair withheld on metadata_csum) |
+| ext2/3/4 | **Yes** | Yes | **Yes** | — **create done** (`rb-cli new --fs ext` formats a plain rev-1 ext2 — 128-byte inodes, no extents/csum — and `--fs ext3` adds an empty jbd2 journal (inode 8, 4 KiB blocks); reuses the `ext_fsck` bitmap builders; byte-verified `e2fsck`-clean across 1 MiB–160 MiB, single- and multi-group. ext4 (extents + metadata_csum) intentionally out of scope). fsck done: block+inode bitmap + free-count reconciliation vs computed allocation, byte-verified vs `e2fsck`; repair withheld on metadata_csum. |
 | UFS / FFS | No | Yes | **repair** | **create** |
 | XFS (v4/v5) | No | Yes (v4) | **repair** | **create + v5 edit** (shrink = known limitation) |
 | MFS | No | Yes | No | **create + fsck** |
@@ -86,7 +86,7 @@ independently testable (mount/inspect the output). Order by value:
 
 | Tier | Filesystems | Effort |
 |---|---|---|
-| Unix/Linux | **ext** (ext2 first), **UFS** (newfs-lite) | M each |
+| Unix/Linux | ~~**ext** (ext2)~~ **done** (`ext_format.rs`), **UFS** (newfs-lite) | M each |
 | Apple / retro workhorses | **ProDOS**, **Apple DOS 3.3**, **CP/M** (per-DPB), **Atari DOS** (promote test-only), **OS-9** | S–M each |
 | Others | **QDOS**, **ADFS** (E-format), **MFS** | S–M each |
 
@@ -146,7 +146,12 @@ The order that buys the most capability per unit effort:
    **All four done** (`src/fs/fat_fsck.rs`, `exfat_fsck.rs`, `ext_fsck.rs`,
    `ntfs_fsck.rs`) — **Step 1 complete**.
 2. **create-blank for ext + UFS** — completes the two Unix workhorses (both are
-   already read + edit; UFS already fscks/repairs).
+   already read + edit; UFS already fscks/repairs). **ext2 + ext3 done**
+   (`src/fs/ext_format.rs`, oracle-verified `e2fsck`-clean). **UFS deferred** to a
+   follow-up gated on the independent NetBSD `makefs` + FreeBSD `fsck_ffs` oracle
+   (neither runs on macOS) — target UFS1/LE/SB@8192, single cylinder group,
+   lost+found = inode 3, reusing the existing `ufs.rs` write stack; author
+   `scripts/ufs-oracle.sh` (modeled on `xfs-oracle.sh`) on the WSL/BSD box.
 3. **Amiga PFS3 + SFS fsck** — brings the Amiga trio to parity with AFFS.
 4. **Retro long-tail fsck + create** — small formats, small checkers/formatters
    (CBM, Atari, ProDOS, CP/M, RS-DOS, DragonDOS, DFS, OS-9, Human68k, Alto).

@@ -1419,47 +1419,16 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
         flags: u32,
         block_data: &[u8; 60],
     ) -> Vec<u8> {
-        let mut buf = vec![0u8; self.inode_size as usize];
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as u32;
-
-        // i_mode (0x00)
-        buf[0x00..0x02].copy_from_slice(&(mode as u16).to_le_bytes());
-        // i_uid_lo (0x02)
-        buf[0x02..0x04].copy_from_slice(&(uid as u16).to_le_bytes());
-        // i_size_lo (0x04)
-        buf[0x04..0x08].copy_from_slice(&(size as u32).to_le_bytes());
-        // i_atime (0x08)
-        buf[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
-        // i_ctime (0x0C)
-        buf[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
-        // i_mtime (0x10)
-        buf[0x10..0x14].copy_from_slice(&now.to_le_bytes());
-        // i_links_count (0x1A)
-        buf[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
-        // i_blocks_lo (0x1C) — number of 512-byte sectors (we compute from size)
-        let sectors = size.div_ceil(512) as u32;
-        buf[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
-        // i_flags (0x20)
-        buf[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
-        // i_gid_lo (0x18)
-        buf[0x18..0x1A].copy_from_slice(&(gid as u16).to_le_bytes());
-        // i_block (0x28..0x64) — 60 bytes
-        buf[0x28..0x64].copy_from_slice(block_data);
-        // i_size_hi (0x6C) for large files
-        buf[0x6C..0x70].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
-        // i_uid_hi (0x78)
-        if buf.len() >= 0x7A {
-            buf[0x78..0x7A].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
-        }
-        // i_gid_hi (0x7A)
-        if buf.len() >= 0x7C {
-            buf[0x7A..0x7C].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
-        }
-
-        buf
+        build_inode_bytes(
+            self.inode_size,
+            mode,
+            uid,
+            gid,
+            size,
+            links,
+            flags,
+            block_data,
+        )
     }
 
     // ---- Directory entry manipulation ----
@@ -2006,7 +1975,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let gid = options.gid.unwrap_or(0);
         let flags = if self.has_extents { EXT4_EXTENTS_FL } else { 0 };
         let iblock = self.set_inode_blocks_for_new_file(new_inode, &data_blocks)?;
-        let inode_bytes = self.build_inode_bytes(mode, uid, gid, data_len, 1, flags, &iblock);
+        let mut inode_bytes = self.build_inode_bytes(mode, uid, gid, data_len, 1, flags, &iblock);
+        // i_blocks counts ALLOCATED 512-byte sectors (block_size/512 per fs
+        // block), not ceil(size/512): the two differ for a partial final block on
+        // block sizes above 512, and e2fsck enforces the block-based count. (No
+        // indirect blocks to add — new files here are capped at 12 direct blocks.)
+        let sectors = data_blocks.len() as u32 * (self.block_size as u32 / 512);
+        inode_bytes[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
         self.write_inode_raw(new_inode, &inode_bytes)?;
 
         // Add directory entry
@@ -2226,6 +2201,64 @@ struct ExtentIndex {
 
 fn is_extent_header(data: &[u8]) -> bool {
     data.len() >= 2 && u16::from_le_bytes([data[0], data[1]]) == EXT4_EXT_MAGIC
+}
+
+/// Serialize a single ext inode into an `inode_size`-byte buffer. Free-standing
+/// so the blank-volume formatter (`ext_format`) can lay down the reserved root
+/// and lost+found inodes before any `ExtFilesystem` exists; the `ExtFilesystem`
+/// method of the same name delegates here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_inode_bytes(
+    inode_size: u16,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    links: u16,
+    flags: u32,
+    block_data: &[u8; 60],
+) -> Vec<u8> {
+    let mut buf = vec![0u8; inode_size as usize];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+
+    // i_mode (0x00)
+    buf[0x00..0x02].copy_from_slice(&(mode as u16).to_le_bytes());
+    // i_uid_lo (0x02)
+    buf[0x02..0x04].copy_from_slice(&(uid as u16).to_le_bytes());
+    // i_size_lo (0x04)
+    buf[0x04..0x08].copy_from_slice(&(size as u32).to_le_bytes());
+    // i_atime (0x08)
+    buf[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
+    // i_ctime (0x0C)
+    buf[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+    // i_mtime (0x10)
+    buf[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+    // i_links_count (0x1A)
+    buf[0x1A..0x1C].copy_from_slice(&links.to_le_bytes());
+    // i_blocks_lo (0x1C) — number of 512-byte sectors (we compute from size)
+    let sectors = size.div_ceil(512) as u32;
+    buf[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
+    // i_flags (0x20)
+    buf[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+    // i_gid_lo (0x18)
+    buf[0x18..0x1A].copy_from_slice(&(gid as u16).to_le_bytes());
+    // i_block (0x28..0x64) — 60 bytes
+    buf[0x28..0x64].copy_from_slice(block_data);
+    // i_size_hi (0x6C) for large files
+    buf[0x6C..0x70].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+    // i_uid_hi (0x78)
+    if buf.len() >= 0x7A {
+        buf[0x78..0x7A].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+    }
+    // i_gid_hi (0x7A)
+    if buf.len() >= 0x7C {
+        buf[0x7A..0x7C].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+    }
+
+    buf
 }
 
 fn parse_extent_header(data: &[u8]) -> Result<ExtentHeader, FilesystemError> {
