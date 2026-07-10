@@ -83,7 +83,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
 | AFFS (OFS / FFS, Intl, DirCache) | Auto `DOS\0`..`DOS\7` | Yes | Yes | Yes | Yes (in-place) | check+repair (Disk Validator) | Commodore Amiga |
-| PFS3 / PDS3 / muFS | String | Yes | Yes | Yes | Yes (in-place + defrag clone) | No | Amiga Professional File System 3 |
+| PFS3 / PDS3 / muFS | String | Yes | Yes | Yes | Yes (in-place + defrag clone) | Yes | Amiga Professional File System 3 |
 | SFS (Smart File System) | String | Yes | Yes (single-leaf btree) | Yes | Yes (in-place) | No | Amiga `SFS\0` / `SFS\2` |
 
 ### 8-bit & home micros

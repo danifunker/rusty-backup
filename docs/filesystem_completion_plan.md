@@ -49,7 +49,7 @@ missing capability on a driver that already round-trips.
 | UFS / FFS | No | Yes | **repair** | **create** |
 | XFS (v4/v5) | No | Yes (v4) | **repair** | **create + v5 edit** (shrink = known limitation) |
 | MFS | No | Yes | No | **create + fsck** |
-| PFS3 | Yes | Yes | No | **fsck** |
+| PFS3 | Yes | Yes | **Yes** | — **fsck done** (`pfs3_fsck.rs`: directory-tree + anode-chain walk reconciles both the data and reserved allocation bitmaps + free counters; rebuild is withheld when structural damage would make the walk incomplete) |
 | SFS | Yes | Yes (single-leaf) | No | **fsck + multi-leaf edit** |
 | ProDOS | No | Yes | validate | **create + check/repair** |
 | Apple DOS 3.3 | No | Yes | No | **create + fsck** |
@@ -76,7 +76,7 @@ established (see `hfs_fsck/`, `efs_fsck.rs`, `affs_fsck.rs`, `ufs_fsck` in
 |---|---|---|---|
 | **Most-used first** | ~~FAT~~ (done), ~~exFAT~~ (done), ~~NTFS~~ (done), ~~ext~~ (done) | M each | Promote the existing `validate` gate to a real check + repair. All four shipped. **FAT** (`fat_fsck.rs`): FAT-table walk over the directory tree flags chain loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain, lost cluster chains, an undersized FAT, and FAT-mirror divergence; repair is FAT-only, byte-verified against `fsck_msdos`. **exFAT** (`exfat_fsck.rs`): allocation-bitmap reconciliation against the traced directory tree (contiguous + FAT-chained), boot checksum + backup-region consistency + VolumeDirty; repair rebuilds the bitmap and resyncs the boot regions, byte-verified against `fsck_exfat`. **ext** (`ext_fsck.rs`): block + inode bitmap + free-count reconciliation against the computed allocation (metadata from group descriptors + inode-owned blocks incl. reserved inodes / journal / reserved-GDT), byte-verified against `e2fsck`; **ext4 `metadata_csum` volumes are now fully repaired** — the crc32c on the superblock, descriptors, and bitmaps is verified and recomputed via `ext_csum` (only the legacy gdt_csum-only crc16 case stays withheld). **NTFS** (`ntfs_fsck.rs`): `$Bitmap` reconciliation against the MFT walk (in-use MFT records' non-resident data runs), `$MFTMirr` sync vs the first 4 MFT records, backup-boot-sector vs VBR consistency, and VolumeDirty flag; repair rewrites `$Bitmap`, resyncs `$MFTMirr`, rewrites the backup boot sector, and clears VolumeDirty — oracle-verified against Windows `chkdsk`. Volumes carrying `$ATTRIBUTE_LIST`-spilled data are surfaced with a warning rather than mis-traced. **Tier complete.** |
 | **JFS repair** | JFS | M | `fsck()` exists (check-only); add the `repair()` branch the code comments already scope. |
-| **Amiga** | PFS3, SFS | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). |
+| **Amiga** | ~~PFS3~~ (done), SFS | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). **PFS3 shipped** (`pfs3_fsck.rs`): both bitmaps + free counters reconciled against the tree/anode walk; no block checksums, so structural damage is surfaced read-only. |
 | **Retro long-tail** | ~~CBM~~ (done), Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. **CBM shipped** as the template: recompute the BAM from the directory + file chains (the VALIDATE model), diff against the on-disk BAM, rewrite; byte-verified against `c1541 validate` fixtures for all five variants. |
 
 ### 1c. Add create-blank (`rb-cli new --fs …`)
@@ -155,6 +155,8 @@ The order that buys the most capability per unit effort:
    lost+found = inode 3, reusing the existing `ufs.rs` write stack; author
    `scripts/ufs-oracle.sh` (modeled on `xfs-oracle.sh`) on the WSL/BSD box.
 3. **Amiga PFS3 + SFS fsck** — brings the Amiga trio to parity with AFFS.
+   **PFS3 done** (`src/fs/pfs3_fsck.rs`, self-consistency-verified: format → corrupt
+   bitmap → detect → repair → clean). SFS next.
 4. **Retro long-tail fsck + create** — small formats, small checkers/formatters
    (CBM, Atari, ProDOS, CP/M, RS-DOS, DragonDOS, DFS, OS-9, Human68k, Alto).
 5. **JFS repair** — the one read-only FS whose repair is already scoped.

@@ -67,6 +67,7 @@ pub mod os9;
 pub mod patch;
 pub mod pfs3;
 pub mod pfs3_clone;
+pub mod pfs3_fsck;
 pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
@@ -2304,7 +2305,11 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     ) {
         return true;
     }
-    type_str.map(is_amiga_dos_type).unwrap_or(false)
+    // Amiga RDB filesystems identified by their 4-byte DosType string: AFFS
+    // (`affs_fsck`) and PFS3 (`pfs3_fsck`) implement `fsck()`.
+    type_str
+        .map(|s| is_amiga_dos_type(s) || is_amiga_pfs3_type(s))
+        .unwrap_or(false)
 }
 
 /// True when a *resolved* filesystem-family name (the `type_name` the inspect
@@ -2714,6 +2719,8 @@ mod tests {
         assert!(is_checkable_type(0xAF, None));
         assert!(is_checkable_type(0, Some("Apple_HFS")));
         assert!(is_checkable_type(0, Some("DOS\\3")));
+        assert!(is_checkable_type(0, Some("PFS\\3"))); // PFS3 fsck driver
+        assert!(is_checkable_type(0, Some("PDS\\3")));
         assert!(is_checkable_type(0x0B, None)); // FAT32 now checkable
         assert!(is_checkable_type(0x06, None)); // FAT16 now checkable
         assert!(!is_checkable_type(0x07, None)); // exFAT/NTFS: no fsck driver
