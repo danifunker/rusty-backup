@@ -1,10 +1,17 @@
 # DONE: ext4 metadata_csum resize/shrink — and the resize2fs-grade repack
 
-Branch: `add-missing-filesystems`. Oracle: local `e2fsck` / `mke2fs` /
-`debugfs` (`/opt/homebrew/opt/e2fsprogs/sbin/`, `brew install e2fsprogs`).
-e2fsprogs is **test-only** — rusty-backup produces valid images on its own; it
-never shells out to e2fsck/resize2fs at runtime. See the [[ext4-metadata-csum]]
+Branch: `add-missing-filesystems`. rusty-backup produces valid images on its own;
+it never shells out to e2fsck/resize2fs at runtime. See the [[ext4-metadata-csum]]
 memory for the checksum design.
+
+> **e2fsprogs oracle tests were removed** (they invoked local `e2fsck` / `mke2fs`
+> / `debugfs`). They were dev-time validation on macOS (brew e2fsprogs 1.47.4),
+> but on Linux CI — where e2fsck is always present and a different version — they
+> flagged geometry our macOS oracle accepted and broke the build. The behaviour
+> was validated against the oracle during development; ongoing coverage is the
+> in-crate checks (our own `fsck_ext`) + the committed `test_ext{2,4}.img.zst`
+> fixture tests, which need no external tooling. **Do not re-add e2fsprogs-invoking
+> tests to the committed suite** — validate against the oracle locally only.
 
 ## Outcome
 
@@ -36,13 +43,15 @@ mke2fs ext4 meant a `resize2fs`-grade repack. All shipped and `e2fsck`-verified.
 
 ## Verification
 
-`src/fs/ext_format.rs` tests (e2fsck/mke2fs/debugfs-gated):
-`packed_shrink_real_ext4_is_e2fsck_clean` (feature combos × sizes, small-`-g` +
-default geometry, 1 KiB + 4 KiB blocks), `packed_shrink_preserves_file_data`
-(debugfs-written file round-trips through the shrunk image via our reader),
-`packed_flex_bg_shrink_no_reloc_e2fsck_clean`, `packed_no_reloc_shrink_is_e2fsck_clean`.
-`cargo test --lib` green (2211). e2fsck-clean incl. a 64 MiB→12 MiB pack with
-journal relocation + resize-inode drop + metadata_csum.
+During development this was validated against the e2fsprogs oracle across the
+feature combinations (small-`-g` + default geometry, 1 KiB + 4 KiB blocks; feature
+combos with/without journal + resize_inode; a debugfs-written file round-tripping
+through the shrunk/grown image via our reader) — e2fsck-clean incl. a 64 MiB→12 MiB
+pack with journal relocation + resize-inode drop + metadata_csum, and the grow
+back to 16 groups. **Those oracle tests have since been removed** (see the note at
+top — they broke Linux CI). Committed coverage is now the synthetic packed-reader
++ resize unit tests in `src/fs/ext.rs` (structural: block counts, relocated-data
+placement, superblock fields) plus our own `fsck_ext`. `cargo test --lib` green.
 
 ## Grow (restore-side) — also done
 

@@ -5984,8 +5984,7 @@ mod tests {
 
         // Verify superblock reflects the larger size. Crossing a group boundary
         // (32768 -> 40000 = 2 groups) now adds a block group rather than a bare
-        // count bump; the real e2fsck-clean behaviour is covered by
-        // `packed_grow_back_e2fsck_clean_and_data_intact`.
+        // count bump.
         let data = cursor.into_inner();
         let new_blocks = le32(&data, 1024 + 0x04) as u64;
         assert_eq!(new_blocks, 40000);

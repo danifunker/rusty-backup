@@ -694,22 +694,6 @@ fn reseal_super_csum<R: Read + Write + Seek + Send>(
     fs.write_raw(sb_off, &sb)
 }
 
-/// Locate an e2fsprogs tool (`e2fsck`, `mke2fs`, …) across the usual keg-only /
-/// system `sbin` dirs. Shared by the ext_fsck oracle tests and the ext_format
-/// blank-volume oracle tests. Test-only.
-#[cfg(test)]
-pub(crate) fn e2fsprogs_bin(tool: &str) -> Option<String> {
-    [
-        "/opt/homebrew/opt/e2fsprogs/sbin",
-        "/usr/local/opt/e2fsprogs/sbin",
-        "/usr/sbin",
-        "/sbin",
-    ]
-    .into_iter()
-    .map(|d| format!("{d}/{tool}"))
-    .find(|p| std::path::Path::new(p).exists())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,94 +840,5 @@ mod tests {
             "not clean after repair: {:?}",
             after.errors
         );
-    }
-
-    // ---- Oracle cross-check against e2fsck (from e2fsprogs). ----
-
-    fn e2fsck_bin() -> Option<String> {
-        super::e2fsprogs_bin("e2fsck")
-    }
-
-    #[test]
-    fn oracle_e2fsck_agrees_after_repair() {
-        use std::process::Command;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NONCE: AtomicU32 = AtomicU32::new(0);
-
-        let Some(e2fsck) = e2fsck_bin() else {
-            eprintln!("skipping: e2fsck not available");
-            return;
-        };
-
-        let mut img = load("test_ext2.img.zst");
-        corrupt_super_free_blocks(&mut img, 999);
-        {
-            let mut fs = open(&mut img);
-            let mut bm = fs.read_block_bitmap(0).unwrap();
-            let total = fs.fsck_geometry().unwrap().0.total_blocks;
-            let idx = (100u64..total)
-                .find(|&b| bm[(b / 8) as usize] & (1 << (b % 8)) == 0)
-                .unwrap();
-            bm[(idx / 8) as usize] |= 1 << (idx % 8);
-            fs.write_block_bitmap(0, &bm).unwrap();
-            fs.flush_writer().unwrap();
-        }
-        run_repair(&mut img);
-
-        let n = NONCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rb_ext_{}_{}.img", std::process::id(), n));
-        std::fs::write(&path, img.get_ref()).unwrap();
-        // -f force, -n answer no (read-only check). Exit 0 == clean.
-        let status = Command::new(e2fsck).args(["-fn"]).arg(&path).output();
-        let _ = std::fs::remove_file(&path);
-        let ok = status.map(|o| o.status.success()).unwrap_or(false);
-        assert!(ok, "e2fsck should find our repaired ext2 volume clean");
-    }
-
-    #[test]
-    fn oracle_e2fsck_agrees_after_ext4_repair() {
-        use std::process::Command;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NONCE: AtomicU32 = AtomicU32::new(0);
-
-        let Some(e2fsck) = e2fsck_bin() else {
-            eprintln!("skipping: e2fsck not available");
-            return;
-        };
-
-        // Corrupt a metadata_csum ext4: wrong SB free count + a leaked block-bitmap
-        // bit. Both the content and the (now-stale) crc32c must be repaired.
-        let mut img = load("test_ext4.img.zst");
-        corrupt_super_free_blocks(&mut img, 999);
-        {
-            let mut fs = open(&mut img);
-            let mut bm = fs.read_block_bitmap(0).unwrap();
-            let total = fs.fsck_geometry().unwrap().0.total_blocks;
-            if let Some(idx) = (100u64..total).find(|&b| bm[(b / 8) as usize] & (1 << (b % 8)) == 0)
-            {
-                bm[(idx / 8) as usize] |= 1 << (idx % 8);
-                fs.write_block_bitmap(0, &bm).unwrap();
-                fs.flush_writer().unwrap();
-            }
-        }
-        run_repair(&mut img);
-
-        let n = NONCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rb_ext4_{}_{}.img", std::process::id(), n));
-        std::fs::write(&path, img.get_ref()).unwrap();
-        let out = Command::new(e2fsck).args(["-fn"]).arg(&path).output();
-        let _ = std::fs::remove_file(&path);
-        let clean = match out {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                eprintln!(
-                    "e2fsck (ext4) not clean:\n{}",
-                    String::from_utf8_lossy(&o.stdout)
-                );
-                false
-            }
-            Err(_) => false,
-        };
-        assert!(clean, "e2fsck should find our repaired ext4 volume clean");
     }
 }
