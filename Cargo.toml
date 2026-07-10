@@ -130,7 +130,7 @@ libchdman-rs = { version = "0.288.9", features = ["prebuilt"], optional = true }
 # (it's behind `gui`).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 webbrowser = { version = "1.0", optional = true }
-opticaldiscs = { version = "0.8", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.9", features = ["drives"], optional = true }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-based-backend", optional = true }
 # In-app CD-DA playback (Optical tab). Pinned <0.20 for the
 # OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.

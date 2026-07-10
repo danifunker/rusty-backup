@@ -869,7 +869,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
@@ -959,12 +959,17 @@ Usage: optical <COMMAND>
 List the file tree on an optical disc image
 
 ```
-Usage: browse <SOURCE>
+Usage: browse [OPTIONS] <SOURCE>
 ```
 
 **Arguments**
 
 - `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+**Options**
+
+- `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
+- `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
 
 ### `optical convert`
 
@@ -1012,6 +1017,22 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 - `--to` — Destination folder (created if absent)
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
+
+### `optical info`
+
+Print volume-level metadata for an optical disc image (leniently)
+
+```
+Usage: info [OPTIONS] <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+**Options**
+
+- `--format` — Output format: `text` (default), `json`, or `yaml`
 
 ### `optical rip`
 

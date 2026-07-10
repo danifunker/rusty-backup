@@ -19,8 +19,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
 use crate::backup::LogMessage;
 use crate::cli::logging::log_stderr;
+use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
 use crate::optical::{
     convert::{bincue_to_iso, chd_to_bincue, chd_to_iso, iso_to_bincue, to_chd, ConvertProgress},
     rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress},
@@ -38,6 +42,8 @@ pub enum OpticalCommand {
     Convert(ConvertArgs),
     /// List the file tree on an optical disc image.
     Browse(BrowseArgs),
+    /// Print volume-level metadata for an optical disc image (leniently).
+    Info(InfoArgs),
     /// Extract files from an optical disc image into a host folder.
     Extract(ExtractArgs),
 }
@@ -48,6 +54,7 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
         OpticalCommand::Rip(a) => run_rip_verb(a),
         OpticalCommand::Convert(a) => run_convert_verb(a),
         OpticalCommand::Browse(a) => run_browse_verb(a),
+        OpticalCommand::Info(a) => run_info_verb(a),
         OpticalCommand::Extract(a) => run_extract_verb(a),
     }
 }
@@ -335,15 +342,37 @@ fn drain_convert(progress: Arc<Mutex<ConvertProgress>>) -> Result<()> {
 
 // ---------------- browse ----------------
 
+/// Per-file content-hash algorithm for `optical browse --hash`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HashAlgo {
+    Sha256,
+}
+
 #[derive(Debug, Args)]
 pub struct BrowseArgs {
     /// Optical disc image (.iso, .cue, .chd).
     pub source: PathBuf,
+    /// Output format. `text` (default) prints the human file tree unchanged;
+    /// `json` / `yaml` emit a machine-readable, deterministically path-sorted
+    /// listing.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Per-file content hash to attach to each file entry. Structured output
+    /// only (`--format json`). Currently only `sha256`.
+    #[arg(long, value_enum)]
+    pub hash: Option<HashAlgo>,
 }
 
 fn run_browse_verb(args: BrowseArgs) -> Result<()> {
     use opticaldiscs::browse::open_disc_filesystem;
     use opticaldiscs::detect::DiscImageInfo;
+
+    require_non_flat(args.format, "optical browse")?;
+    if args.hash.is_some() && !args.format.is_structured() {
+        bail!(
+            "--hash requires --format json (per-file hashes are only emitted in structured output)"
+        );
+    }
 
     let info = DiscImageInfo::open(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
@@ -352,8 +381,24 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
-    let label = fs.volume_name().unwrap_or("/").to_owned();
 
+    if args.format.is_structured() {
+        let mut entries = Vec::new();
+        collect_entries(&mut *fs, &root, args.hash.is_some(), &mut entries)?;
+        // Deterministic, byte-wise sort so consumers can fingerprint the listing.
+        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let payload = BrowsePayload {
+            image: args.source.display().to_string(),
+            volume_name: fs.volume_name().map(str::to_owned),
+            filesystem: fs_token(info.filesystem),
+            game: info.game.as_ref().map(crate::optical::format_game_identity),
+            entries,
+        };
+        return emit_envelope(args.format, &Envelope::ok(payload));
+    }
+
+    // Text (default): the human ASCII tree, byte-for-byte unchanged.
+    let label = fs.volume_name().unwrap_or("/").to_owned();
     let mut out = String::new();
     if let Some(g) = &info.game {
         out.push_str(&format!(
@@ -368,6 +413,181 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
     walk_tree(&mut *fs, &root, "", &mut out, &mut dirs, &mut files)?;
     out.push_str(&format!("\n{dirs} directories, {files} files\n"));
     print!("{out}");
+    Ok(())
+}
+
+/// A single entry in the flat, machine-readable browse listing.
+#[derive(Debug, Serialize)]
+struct BrowseEntry {
+    path: String,
+    /// `file` | `dir` | `symlink`.
+    kind: &'static str,
+    /// Data-fork size, files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    /// HFS/HFS+ resource-fork size, present only when non-empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_fork_bytes: Option<u64>,
+    /// HFS/HFS+ Finder type / creator codes, files only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hfs_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hfs_creator: Option<String>,
+    /// Data-fork content hash, present only with `--hash`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    /// Resource-fork content hash, present with `--hash` when a fork exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_fork_sha256: Option<String>,
+    /// Rock Ridge / UDF / Mac-alias symlink target, symlinks only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symlink_target: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowsePayload {
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_name: Option<String>,
+    filesystem: String,
+    /// Game-disc identity string, when the image is a recognized game disc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game: Option<String>,
+    entries: Vec<BrowseEntry>,
+}
+
+/// Stable lowercase machine token for a detected filesystem, for JSON output.
+fn fs_token(ft: opticaldiscs::FilesystemType) -> String {
+    use opticaldiscs::FilesystemType as F;
+    match ft {
+        F::Iso9660 => "iso9660",
+        F::HighSierra => "high_sierra",
+        F::Joliet => "joliet",
+        F::Udf => "udf",
+        F::Hfs => "hfs",
+        F::HfsPlus => "hfsplus",
+        F::Efs => "efs",
+        F::Ufs => "ufs",
+        F::Ods2 => "ods2",
+        F::GameCube => "gamecube",
+        F::Wii => "wii",
+        F::Cdi => "cdi",
+        F::Opera => "opera",
+        F::Xdvdfs => "xdvdfs",
+        F::Unknown => "unknown",
+    }
+    .to_string()
+}
+
+/// 1 MiB streaming-hash chunk — keeps a full-disc walk bounded regardless of
+/// individual file size.
+const HASH_CHUNK: usize = 1 << 20;
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hash_data_fork(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    entry: &opticaldiscs::browse::entry::FileEntry,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let size = entry.size;
+    let mut off = 0u64;
+    while off < size {
+        let want = (size - off).min(HASH_CHUNK as u64) as usize;
+        let buf = fs
+            .read_file_range(entry, off, want)
+            .map_err(|e| anyhow::anyhow!("read_file_range: {e}"))?;
+        if buf.is_empty() {
+            break;
+        }
+        hasher.update(&buf);
+        off += buf.len() as u64;
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+fn hash_resource_fork(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    entry: &opticaldiscs::browse::entry::FileEntry,
+    size: u64,
+) -> Result<Option<String>> {
+    let mut hasher = Sha256::new();
+    let mut off = 0u64;
+    let mut any = false;
+    while off < size {
+        let want = (size - off).min(HASH_CHUNK as u64) as usize;
+        match fs
+            .read_resource_fork_range(entry, off, want)
+            .map_err(|e| anyhow::anyhow!("read_resource_fork_range: {e}"))?
+        {
+            Some(buf) if !buf.is_empty() => {
+                any = true;
+                hasher.update(&buf);
+                off += buf.len() as u64;
+            }
+            _ => break,
+        }
+    }
+    Ok(any.then(|| hex_lower(&hasher.finalize())))
+}
+
+/// Recursively collect a flat listing of `dir`'s subtree into `out`.
+fn collect_entries(
+    fs: &mut dyn opticaldiscs::browse::filesystem::Filesystem,
+    dir: &opticaldiscs::browse::entry::FileEntry,
+    hash: bool,
+    out: &mut Vec<BrowseEntry>,
+) -> Result<()> {
+    let children = fs
+        .list_directory(dir)
+        .map_err(|e| anyhow::anyhow!("list_directory: {e}"))?;
+    for child in children {
+        // A symlink is an `entry_type == File` whose target resolved, so test
+        // the target before the file/dir split.
+        let kind = if child.symlink_target.is_some() {
+            "symlink"
+        } else if child.is_directory() {
+            "dir"
+        } else {
+            "file"
+        };
+        let mut entry = BrowseEntry {
+            path: child.path.clone(),
+            kind,
+            size_bytes: None,
+            resource_fork_bytes: None,
+            hfs_type: None,
+            hfs_creator: None,
+            sha256: None,
+            resource_fork_sha256: None,
+            symlink_target: child.symlink_target.clone(),
+        };
+        if kind == "file" {
+            entry.size_bytes = Some(child.size);
+            let rsrc = child.resource_fork_size.filter(|&r| r > 0);
+            entry.resource_fork_bytes = rsrc;
+            entry.hfs_type = child.type_code_string();
+            entry.hfs_creator = child.creator_code_string();
+            if hash {
+                entry.sha256 = Some(hash_data_fork(fs, &child)?);
+                if let Some(rs) = rsrc {
+                    entry.resource_fork_sha256 = hash_resource_fork(fs, &child, rs)?;
+                }
+            }
+        }
+        out.push(entry);
+        // Recurse only into real directories (never through a symlink).
+        if kind == "dir" {
+            collect_entries(fs, &child, hash, out)?;
+        }
+    }
     Ok(())
 }
 
@@ -418,6 +638,455 @@ fn walk_tree(
         } else {
             *files += 1;
         }
+    }
+    Ok(())
+}
+
+// ---------------- info ----------------
+
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// Optical disc image (.iso, .cue, .chd).
+    pub source: PathBuf,
+    /// Output format: `text` (default), `json`, or `yaml`.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct Iso9660Info {
+    volume_id: String,
+    system_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publisher_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparer_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    application_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_creation_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_modification_date: Option<String>,
+    volume_space_size: u32,
+    logical_block_size: u16,
+    has_rock_ridge: bool,
+    has_joliet: bool,
+    has_udf: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HfsInfo {
+    volume_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    partition_table: String,
+    ddr_present: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ElToritoInfo {
+    present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<String>,
+    bootable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_image_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_image_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InfoPayload {
+    image: String,
+    size_bytes: u64,
+    container: String,
+    filesystems: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iso9660: Option<Iso9660Info>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hfs: Option<HfsInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    el_torito: Option<ElToritoInfo>,
+}
+
+fn run_info_verb(args: InfoArgs) -> Result<()> {
+    use opticaldiscs::detect::DiscImageInfo;
+
+    require_non_flat(args.format, "optical info")?;
+    let image = args.source.display().to_string();
+    let size_bytes = std::fs::metadata(&args.source)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Opening detects container + filesystem. A hard I/O failure is an error;
+    // an unrecognized/unsupported disc is DATA (exit 0 + a warning), because
+    // this verb exists precisely to survive discs strict parsers reject.
+    let info = match DiscImageInfo::open(&args.source) {
+        Ok(i) => i,
+        Err(opticaldiscs::OpticaldiscsError::Io(e)) => {
+            bail!("reading {}: {e}", args.source.display());
+        }
+        Err(e) => {
+            return emit_info(
+                args.format,
+                InfoPayload {
+                    image,
+                    size_bytes,
+                    container: "unknown".to_string(),
+                    filesystems: Vec::new(),
+                    warnings: vec![format!("unrecognized disc image: {e}")],
+                    iso9660: None,
+                    hfs: None,
+                    el_torito: None,
+                },
+            );
+        }
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+    let mut reader = open_sector_reader(&info);
+    if reader.is_none() && !matches!(info.format, opticaldiscs::DiscFormat::Iso) {
+        warnings.push(format!(
+            "raw-sector metadata (preparer id, El Torito) unavailable for the {} container",
+            disc_format_token(info.format)
+        ));
+    }
+
+    // A single borrow of the raw sector reader gathers everything needing
+    // direct sector access: the preparer id, RR/Joliet/UDF presence, the LE/BE
+    // consistency checks, and the El Torito boot catalog.
+    let mut preparer_id = None;
+    let mut has_rock_ridge = false;
+    let mut has_joliet = false;
+    let mut has_udf = false;
+    let mut el_torito = None;
+    if let Some(r) = reader.as_deref_mut() {
+        if let Some(pvd) = info.pvd.as_ref() {
+            if let Ok(sec) = r.read_sector(16) {
+                if sec.len() >= 574 {
+                    preparer_id = iso_trim(&String::from_utf8_lossy(&sec[446..574]));
+                }
+                if sec.len() >= 132 {
+                    let sp_le = u32::from_le_bytes([sec[80], sec[81], sec[82], sec[83]]);
+                    let sp_be = u32::from_be_bytes([sec[84], sec[85], sec[86], sec[87]]);
+                    if sp_le != sp_be {
+                        warnings.push(format!(
+                            "PVD volume_space_size little/big-endian disagree ({sp_le} vs {sp_be}); using little-endian"
+                        ));
+                    }
+                    let bs_le = u16::from_le_bytes([sec[128], sec[129]]);
+                    let bs_be = u16::from_be_bytes([sec[130], sec[131]]);
+                    if bs_le != bs_be {
+                        warnings.push(format!(
+                            "PVD logical_block_size little/big-endian disagree ({bs_le} vs {bs_be}); using little-endian"
+                        ));
+                    }
+                }
+            }
+            has_rock_ridge = probe_rock_ridge(r, pvd);
+            has_joliet = opticaldiscs::JolietVolumeDescriptor::find(r)
+                .ok()
+                .flatten()
+                .is_some();
+            has_udf = opticaldiscs::browse::udf::detect_udf(r);
+        }
+        el_torito = parse_el_torito(r);
+    }
+
+    let iso9660 = info.pvd.as_ref().map(|pvd| Iso9660Info {
+        volume_id: pvd.volume_id.trim().to_string(),
+        system_id: iso_trim(&pvd.system_id).unwrap_or_default(),
+        publisher_id: iso_trim(&pvd.publisher_id),
+        preparer_id,
+        application_id: iso_trim(&pvd.application_id),
+        volume_creation_date: pvd.creation_date.as_ref().map(|d| d.to_iso8601()),
+        volume_modification_date: pvd.modification_date.as_ref().map(|d| d.to_iso8601()),
+        volume_space_size: pvd.volume_space_size,
+        logical_block_size: pvd.logical_block_size,
+        has_rock_ridge,
+        has_joliet,
+        has_udf,
+    });
+
+    // Partition table / HFS. Our own detector handles the zeroed-DDR case.
+    let apm = probe_apm(&args.source);
+    let (partition_table, ddr_present) = match &apm {
+        Some(a) => ("APM".to_string(), a.ddr_present),
+        None => ("none".to_string(), false),
+    };
+    let apm_has_hfs = apm.as_ref().is_some_and(|a| {
+        a.entries
+            .iter()
+            .any(|e| e.partition_type.to_ascii_uppercase().contains("HFS"))
+    });
+    let hfs = build_hfs_info(&info, partition_table, ddr_present);
+
+    // Assemble the filesystems list from everything detected.
+    let mut filesystems: Vec<String> = Vec::new();
+    if let Some(pvd) = &info.pvd {
+        add_fs(
+            &mut filesystems,
+            if pvd.high_sierra {
+                "high_sierra"
+            } else {
+                "iso9660"
+            },
+        );
+    }
+    if let Some(iso) = &iso9660 {
+        if iso.has_joliet {
+            add_fs(&mut filesystems, "joliet");
+        }
+        if iso.has_udf {
+            add_fs(&mut filesystems, "udf");
+        }
+    }
+    if info.hfs_mdb.is_some() || apm_has_hfs {
+        add_fs(&mut filesystems, "hfs");
+    }
+    if info.hfsplus_header.is_some() {
+        add_fs(&mut filesystems, "hfsplus");
+    }
+    // A non-ISO, non-HFS primary (EFS / UFS / ODS-2 / game formats).
+    if info.pvd.is_none() && info.hfs_mdb.is_none() && info.hfsplus_header.is_none() {
+        let token = fs_token(info.filesystem);
+        if token != "unknown" {
+            add_fs(&mut filesystems, &token);
+        }
+    }
+    if filesystems.is_empty() {
+        warnings.push("no supported filesystem identified on this image".to_string());
+    }
+
+    emit_info(
+        args.format,
+        InfoPayload {
+            image,
+            size_bytes,
+            container: disc_format_token(info.format),
+            filesystems,
+            warnings,
+            iso9660,
+            hfs,
+            el_torito,
+        },
+    )
+}
+
+fn add_fs(list: &mut Vec<String>, token: &str) {
+    if !list.iter().any(|x| x == token) {
+        list.push(token.to_string());
+    }
+}
+
+/// Lowercase machine token for the container format (`iso`, `bincue`, `chd`, …).
+fn disc_format_token(f: opticaldiscs::DiscFormat) -> String {
+    format!("{f:?}").to_ascii_lowercase()
+}
+
+/// A raw sector reader for the raw-PVD / El Torito reads, for the containers we
+/// can address directly. `None` (with a warning) for the rest — the
+/// `DiscImageInfo`-derived fields still populate.
+fn open_sector_reader(
+    info: &opticaldiscs::detect::DiscImageInfo,
+) -> Option<Box<dyn opticaldiscs::SectorReader>> {
+    match info.format {
+        opticaldiscs::DiscFormat::Iso => {
+            opticaldiscs::sector_reader::IsoSectorReader::new(&info.path)
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn opticaldiscs::SectorReader>)
+        }
+        _ => None,
+    }
+}
+
+/// Detect the partition table with our own engine (which handles zeroed DDRs).
+fn probe_apm(path: &Path) -> Option<crate::partition::apm::Apm> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::new(f);
+    match crate::partition::PartitionTable::detect(&mut r) {
+        Ok(crate::partition::PartitionTable::Apm(apm)) => Some(apm),
+        _ => None,
+    }
+}
+
+fn iso_trim(s: &str) -> Option<String> {
+    let t = s.trim_end_matches([' ', '\0']).trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Probe the root directory's `.` record System-Use area for SUSP/Rock Ridge.
+fn probe_rock_ridge(
+    reader: &mut dyn opticaldiscs::SectorReader,
+    pvd: &opticaldiscs::PrimaryVolumeDescriptor,
+) -> bool {
+    let dir = match reader.read_sector(pvd.root_directory_lba as u64) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if dir.len() < 34 {
+        return false;
+    }
+    let rec_len = dir[0] as usize;
+    let name_len = dir[32] as usize;
+    let mut su_start = 33 + name_len;
+    if su_start % 2 == 1 {
+        su_start += 1; // pad to even
+    }
+    if rec_len < 34 || rec_len > dir.len() || su_start >= rec_len {
+        return false;
+    }
+    opticaldiscs::browse::rockridge::detect(&dir[su_start..rec_len])
+}
+
+/// Parse the El Torito boot catalog (Boot Record VD at sector 17 → catalog →
+/// initial/default entry). Returns `None` when the disc isn't El Torito.
+fn parse_el_torito(reader: &mut dyn opticaldiscs::SectorReader) -> Option<ElToritoInfo> {
+    let br = reader.read_sector(17).ok()?;
+    if br.len() < 2048 || br[0] != 0x00 || &br[1..6] != b"CD001" {
+        return None;
+    }
+    if &br[7..30] != b"EL TORITO SPECIFICATION" {
+        return None;
+    }
+    let catalog_lba = u32::from_le_bytes([br[71], br[72], br[73], br[74]]) as u64;
+    let cat = reader.read_sector(catalog_lba).ok()?;
+    if cat.len() < 64 || cat[0] != 0x01 {
+        return None; // validation entry header id
+    }
+    let platform = match cat[1] {
+        0x00 => Some("x86"),
+        0x01 => Some("ppc"),
+        0x02 => Some("mac"),
+        0xEF => Some("efi"),
+        _ => None,
+    }
+    .map(str::to_string);
+
+    // Initial / default entry at offset 32.
+    let bootable = cat[32] == 0x88;
+    let media = cat[33];
+    let sector_count = u16::from_le_bytes([cat[38], cat[39]]) as u64;
+    let load_rba = u32::from_le_bytes([cat[40], cat[41], cat[42], cat[43]]) as u64;
+
+    // Floppy emulation encodes the size in the media type; no-emulation uses the
+    // virtual-512-byte sector count.
+    let size = match media {
+        1 => 1_228_800,          // 1.2 MB
+        2 => 1_474_560,          // 1.44 MB
+        3 => 2_949_120,          // 2.88 MB
+        _ => sector_count * 512, // no-emulation / hard-disk: best effort
+    };
+
+    // Hash the boot image extent when it's a sane size.
+    let boot_image_sha256 = if size > 0 && size <= 128 * 1024 * 1024 {
+        reader
+            .read_bytes(load_rba * 2048, size as usize)
+            .ok()
+            .map(|b| hex_lower(&Sha256::digest(&b)))
+    } else {
+        None
+    };
+
+    Some(ElToritoInfo {
+        present: true,
+        platform,
+        bootable,
+        boot_image_size_bytes: (size > 0).then_some(size),
+        boot_image_sha256,
+    })
+}
+
+fn mac_date_string(mac_secs: u32) -> Option<String> {
+    if mac_secs == 0 {
+        return None;
+    }
+    let unix = mac_secs as i64 - 2_082_844_800;
+    chrono::DateTime::from_timestamp(unix, 0)
+        .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+fn build_hfs_info(
+    info: &opticaldiscs::detect::DiscImageInfo,
+    partition_table: String,
+    ddr_present: bool,
+) -> Option<HfsInfo> {
+    if let Some(mdb) = &info.hfs_mdb {
+        return Some(HfsInfo {
+            volume_name: mdb.volume_name.clone(),
+            created: mac_date_string(mdb.creation_date),
+            partition_table,
+            ddr_present,
+        });
+    }
+    if let Some(h) = &info.hfsplus_header {
+        return Some(HfsInfo {
+            volume_name: info.volume_label.clone().unwrap_or_default(),
+            created: mac_date_string(h.create_date),
+            partition_table,
+            ddr_present,
+        });
+    }
+    None
+}
+
+fn emit_info(format: OutputFormat, payload: InfoPayload) -> Result<()> {
+    if format.is_structured() {
+        return emit_envelope(format, &Envelope::ok(payload));
+    }
+    // Human text.
+    println!("Image:       {}", payload.image);
+    println!("Size:        {}", format_size(payload.size_bytes));
+    println!("Container:   {}", payload.container);
+    println!(
+        "Filesystems: {}",
+        if payload.filesystems.is_empty() {
+            "(none recognized)".to_string()
+        } else {
+            payload.filesystems.join(", ")
+        }
+    );
+    if let Some(iso) = &payload.iso9660 {
+        println!("ISO 9660:");
+        println!("  Volume id:   {}", iso.volume_id);
+        if let Some(p) = &iso.preparer_id {
+            println!("  Preparer:    {p}");
+        }
+        if let Some(d) = &iso.volume_creation_date {
+            println!("  Created:     {d}");
+        }
+        println!(
+            "  Space size:  {} blocks x {} B",
+            iso.volume_space_size, iso.logical_block_size
+        );
+        println!(
+            "  Extensions:  rock_ridge={} joliet={} udf={}",
+            iso.has_rock_ridge, iso.has_joliet, iso.has_udf
+        );
+    }
+    if let Some(hfs) = &payload.hfs {
+        println!("HFS:");
+        println!("  Volume:      {}", hfs.volume_name);
+        println!(
+            "  Partitions:  {} (ddr_present={})",
+            hfs.partition_table, hfs.ddr_present
+        );
+    }
+    if let Some(et) = &payload.el_torito {
+        println!("El Torito:");
+        println!(
+            "  bootable={} platform={} image={}",
+            et.bootable,
+            et.platform.as_deref().unwrap_or("?"),
+            et.boot_image_size_bytes
+                .map(format_size)
+                .unwrap_or_else(|| "?".to_string())
+        );
+    }
+    for w in &payload.warnings {
+        log_stderr(format!("warning: {w}"));
     }
     Ok(())
 }
@@ -797,5 +1466,102 @@ fn parse_resource_fork_mode(s: &str) -> Option<CliResourceForkMode> {
         "separatersrc" | "separate" => Some(CliResourceForkMode::SeparateRsrc),
         "macbinary" => Some(CliResourceForkMode::Macbinary),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal in-memory [`opticaldiscs::SectorReader`] over a fixed set of
+    /// 2048-byte sectors, for exercising the El Torito parser.
+    struct VecReader {
+        sectors: Vec<Vec<u8>>,
+    }
+    impl opticaldiscs::SectorReader for VecReader {
+        fn read_sector(&mut self, lba: u64) -> opticaldiscs::error::Result<Vec<u8>> {
+            Ok(self
+                .sectors
+                .get(lba as usize)
+                .cloned()
+                .unwrap_or_else(|| vec![0u8; 2048]))
+        }
+    }
+
+    #[test]
+    fn parse_el_torito_no_emulation() {
+        let mut sectors = vec![vec![0u8; 2048]; 20];
+        // Boot Record Volume Descriptor at sector 17.
+        {
+            let br = &mut sectors[17];
+            br[0] = 0x00;
+            br[1..6].copy_from_slice(b"CD001");
+            br[6] = 1;
+            br[7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
+            br[71..75].copy_from_slice(&18u32.to_le_bytes()); // boot catalog at LBA 18
+        }
+        // Boot catalog at sector 18: validation entry + initial/default entry.
+        {
+            let cat = &mut sectors[18];
+            cat[0] = 0x01; // validation entry header id
+            cat[1] = 0x00; // platform 0x00 = x86
+            cat[30] = 0x55;
+            cat[31] = 0xAA;
+            cat[32] = 0x88; // bootable
+            cat[33] = 0x00; // media type 0 = no emulation
+            cat[38..40].copy_from_slice(&4u16.to_le_bytes()); // 4 virtual 512-B sectors = 2048 B
+            cat[40..44].copy_from_slice(&19u32.to_le_bytes()); // boot image at LBA 19
+        }
+        // The boot image itself.
+        sectors[19] = vec![0xABu8; 2048];
+
+        let mut r = VecReader { sectors };
+        let et = parse_el_torito(&mut r).expect("El Torito must parse");
+        assert!(et.present);
+        assert!(et.bootable);
+        assert_eq!(et.platform.as_deref(), Some("x86"));
+        assert_eq!(et.boot_image_size_bytes, Some(2048));
+
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(vec![0xABu8; 2048]);
+            hex_lower(&h.finalize())
+        };
+        assert_eq!(et.boot_image_sha256.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn parse_el_torito_floppy_media_size() {
+        let mut sectors = vec![vec![0u8; 2048]; 20];
+        sectors[17][0] = 0x00;
+        sectors[17][1..6].copy_from_slice(b"CD001");
+        sectors[17][7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
+        sectors[17][71..75].copy_from_slice(&18u32.to_le_bytes());
+        sectors[18][0] = 0x01;
+        sectors[18][1] = 0x01; // platform ppc
+        sectors[18][32] = 0x88; // bootable
+        sectors[18][33] = 0x02; // media type 2 = 1.44 MB floppy
+        sectors[18][40..44].copy_from_slice(&19u32.to_le_bytes());
+
+        let mut r = VecReader {
+            sectors: {
+                // A 1.44 MB image spans 720 cooked sectors starting at LBA 19.
+                let mut s = sectors;
+                s.resize(19 + 720, vec![0u8; 2048]);
+                s
+            },
+        };
+        let et = parse_el_torito(&mut r).expect("El Torito must parse");
+        assert_eq!(et.platform.as_deref(), Some("ppc"));
+        assert_eq!(et.boot_image_size_bytes, Some(1_474_560));
+        assert!(et.boot_image_sha256.is_some());
+    }
+
+    #[test]
+    fn parse_el_torito_absent_when_no_boot_record() {
+        let mut r = VecReader {
+            sectors: vec![vec![0u8; 2048]; 20],
+        };
+        assert!(parse_el_torito(&mut r).is_none());
     }
 }

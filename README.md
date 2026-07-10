@@ -145,6 +145,12 @@ What's in the MiSTer build:
   `optical rip --device /dev/sr0 --format iso|bincue`), plus `optical
   convert` (ISO ↔ BIN/CUE ↔ CD-CHD) and `optical browse` / `extract`. For
   devices with a CD/DVD drive such as the SuperStation One.
+- **Machine-readable optical inspection:** `optical browse --format json`
+  emits a deterministic, path-sorted file listing (add `--hash sha256` for
+  per-file content hashes), and `optical info --format json` reports
+  volume-level metadata (ISO 9660 PVD identity + Rock Ridge / Joliet / UDF
+  flags, El Torito boot catalog, HFS/APM) leniently — surfacing warnings
+  rather than failing on the sloppy 90s mastering that trips strict parsers.
 - **Remote ripping off-device:** run `rb-daemon` here and drive this drive
   from the desktop app / CLI — the device only issues SCSI reads while the
   desktop does the heavy CHD encoding, so the armv7 CPU isn't taxed.
