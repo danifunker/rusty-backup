@@ -160,6 +160,18 @@ pub struct Apm {
     pub ddr: DriverDescriptorRecord,
     pub entries: Vec<ApmPartitionEntry>,
     pub map_entry_count: u32,
+    /// `false` when block 0 (the Driver Descriptor Record) was absent or all
+    /// zeros and the partition map was located by probing for the `PM`
+    /// signature — a very common mastering pattern on classic-Mac CD-ROMs,
+    /// which need no SCSI driver block. `true` for a normal APM with an intact
+    /// `ER` DDR. Defaults to `true` so persisted-JSON round-trips predate the
+    /// field.
+    #[serde(default = "default_true")]
+    pub ddr_present: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Apm {
@@ -241,6 +253,80 @@ impl Apm {
             ddr,
             entries,
             map_entry_count,
+            ddr_present: true,
+        })
+    }
+
+    /// Parse an APM whose block 0 (Driver Descriptor Record) is absent or all
+    /// zeros — the common classic-Mac CD-ROM pattern. The caller has already
+    /// confirmed a `PM` partition-map entry at byte offset `block_size` (i.e.
+    /// block 1); this reads the map at that block stride and synthesizes a DDR
+    /// carrying the detected block size so downstream byte math
+    /// (`start_block * block_size / 512`, `size_bytes`) still works. The
+    /// resulting [`Apm`] has `ddr_present == false`.
+    pub fn parse_no_ddr(
+        reader: &mut (impl std::io::Read + std::io::Seek),
+        block_size: u32,
+    ) -> Result<Self, RustyBackupError> {
+        use std::io::SeekFrom;
+
+        if !matches!(block_size, 512 | 1024 | 2048) {
+            return Err(RustyBackupError::InvalidApm(format!(
+                "unsupported APM block size {block_size}"
+            )));
+        }
+
+        let mut entry_buf = [0u8; 512];
+        // The first map entry lives at block 1 = byte offset `block_size`.
+        reader
+            .seek(SeekFrom::Start(block_size as u64))
+            .map_err(RustyBackupError::Io)?;
+        reader.read_exact(&mut entry_buf).map_err(|e| {
+            RustyBackupError::InvalidApm(format!("cannot read first APM entry: {e}"))
+        })?;
+        let first_entry = ApmPartitionEntry::parse(&entry_buf)?;
+        let map_entry_count = first_entry.map_entries;
+        if map_entry_count == 0 || map_entry_count > 128 {
+            return Err(RustyBackupError::InvalidApm(format!(
+                "invalid map entry count: {map_entry_count}"
+            )));
+        }
+
+        let mut entries = vec![first_entry];
+        for i in 1..map_entry_count {
+            reader
+                .seek(SeekFrom::Start((1 + i as u64) * block_size as u64))
+                .map_err(RustyBackupError::Io)?;
+            reader.read_exact(&mut entry_buf).map_err(|e| {
+                RustyBackupError::InvalidApm(format!("cannot read APM entry {}: {e}", i + 1))
+            })?;
+            entries.push(ApmPartitionEntry::parse(&entry_buf)?);
+        }
+
+        // No real DDR exists; synthesize one carrying the detected block size
+        // and a block count derived from the map's extent.
+        let block_count = entries
+            .iter()
+            .map(|e| e.start_block as u64 + e.block_count as u64)
+            .max()
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32;
+        let ddr = DriverDescriptorRecord {
+            signature: 0,
+            block_size: block_size as u16,
+            block_count,
+            dev_type: 0,
+            dev_id: 0,
+            sb_data: 0,
+            driver_count: 0,
+            driver_info: Vec::new(),
+        };
+
+        Ok(Apm {
+            ddr,
+            entries,
+            map_entry_count,
+            ddr_present: false,
         })
     }
 
@@ -394,6 +480,7 @@ pub fn build_minimal_apm(
         },
         entries: apm_entries,
         map_entry_count: map_count,
+        ddr_present: true,
     }
 }
 
@@ -449,6 +536,74 @@ mod tests {
         assert_eq!(apm.entries[1].start_block, 64);
         assert_eq!(apm.entries[1].block_count, 50000);
         assert_eq!(apm.entries[2].partition_type, "Apple_Free");
+    }
+
+    /// Build an APM whose block 0 (DDR) is all zeros and whose `PM` entries
+    /// live at `block_size` stride — the classic-Mac CD-ROM mastering pattern.
+    fn build_zeroed_ddr_apm(entries: &[(&str, &str, u32, u32)], block_size: usize) -> Vec<u8> {
+        let total_blocks = 1 + entries.len();
+        let mut data = vec![0u8; total_blocks * block_size];
+        // Block 0 stays all zeros — no Driver Descriptor Record.
+        for (i, (name, ptype, start, count)) in entries.iter().enumerate() {
+            let offset = (1 + i) * block_size;
+            BigEndian::write_u16(&mut data[offset..offset + 2], APM_ENTRY_SIGNATURE);
+            BigEndian::write_u32(&mut data[offset + 4..offset + 8], entries.len() as u32);
+            BigEndian::write_u32(&mut data[offset + 8..offset + 12], *start);
+            BigEndian::write_u32(&mut data[offset + 12..offset + 16], *count);
+            write_c_string(&mut data[offset + 16..offset + 48], name);
+            write_c_string(&mut data[offset + 48..offset + 80], ptype);
+            BigEndian::write_u32(&mut data[offset + 84..offset + 88], *count); // data_count
+            BigEndian::write_u32(&mut data[offset + 88..offset + 92], 0x33); // status
+        }
+        data
+    }
+
+    #[test]
+    fn test_parse_no_ddr_at_1024() {
+        // The ~70-disc bucket: zeroed block 0, PM map at byte 1024.
+        let data = build_zeroed_ddr_apm(
+            &[
+                ("Apple", "Apple_partition_map", 1, 3),
+                ("MacOS", "Apple_HFS", 64, 50000),
+                ("Extra", "Apple_Free", 50064, 49936),
+            ],
+            1024,
+        );
+        let mut cursor = Cursor::new(data);
+        let apm = Apm::parse_no_ddr(&mut cursor, 1024).unwrap();
+        assert!(
+            !apm.ddr_present,
+            "zeroed-DDR parse must report ddr_present=false"
+        );
+        assert_eq!(apm.ddr.block_size, 1024);
+        assert_eq!(apm.map_entry_count, 3);
+        assert_eq!(apm.entries.len(), 3);
+        assert_eq!(apm.entries[1].partition_type, "Apple_HFS");
+        assert_eq!(apm.entries[1].start_block, 64);
+        assert_eq!(apm.entries[1].block_count, 50000);
+    }
+
+    #[test]
+    fn test_ddr_present_true_on_normal_parse() {
+        let data = build_synthetic_apm(&[
+            ("Apple", "Apple_partition_map", 1, 2),
+            ("MacOS", "Apple_HFS", 64, 50000),
+        ]);
+        let apm = Apm::parse(&mut Cursor::new(data)).unwrap();
+        assert!(
+            apm.ddr_present,
+            "an intact ER DDR must report ddr_present=true"
+        );
+    }
+
+    #[test]
+    fn test_ddr_present_defaults_true_on_legacy_json() {
+        // Persisted APM JSON from before the field existed must deserialize
+        // with ddr_present=true.
+        let json = r#"{"ddr":{"signature":17746,"block_size":512,"block_count":100000,
+            "driver_count":0},"entries":[],"map_entry_count":0}"#;
+        let apm: Apm = serde_json::from_str(json).unwrap();
+        assert!(apm.ddr_present);
     }
 
     #[test]

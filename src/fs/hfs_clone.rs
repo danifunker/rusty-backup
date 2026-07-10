@@ -721,6 +721,7 @@ where
         },
         entries: Vec::new(),
         map_entry_count: 0,
+        ddr_present: true,
     });
     new_apm.entries = entries;
     new_apm.map_entry_count = map_entries;
