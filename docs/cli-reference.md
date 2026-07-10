@@ -954,6 +954,49 @@ Optical-media verbs (drives / rip / convert / browse / extract)
 Usage: optical <COMMAND>
 ```
 
+### `optical boot`
+
+Work with El Torito boot images (extract / replace)
+
+```
+Usage: boot <COMMAND>
+```
+
+### `optical boot extract`
+
+Extract a boot image to a file — then inspect or edit it with the disk-image verbs, and put it back with `optical boot replace`
+
+```
+Usage: extract [OPTIONS] --to <TO> <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Bootable optical disc image (.iso, …)
+
+**Options**
+
+- `--to` — Destination file for the extracted boot image
+- `--index` — Which boot entry to extract (default 0; see `optical info`)
+
+### `optical boot replace`
+
+Replace a boot image with the bytes of a (edited) disk-image file. Raw `.iso` only; same-size replaces in place, a grown image relocates
+
+```
+Usage: replace [OPTIONS] --from <FROM> <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Bootable optical image to edit — raw `.iso` only
+
+**Options**
+
+- `--from` — Disk-image file whose bytes become the new boot image
+- `--index` — Which boot entry to replace (default 0)
+- `--media` — Override the emulation/media type (default: keep the entry's current one). One of `floppy1.2` / `floppy1.44` / `floppy2.88` / `no-emulation` / `harddisk`
+
 ### `optical browse`
 
 List the file tree on an optical disc image

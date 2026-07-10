@@ -46,6 +46,11 @@ pub enum OpticalCommand {
     Info(InfoArgs),
     /// Extract files from an optical disc image into a host folder.
     Extract(ExtractArgs),
+    /// Work with El Torito boot images (extract / replace).
+    Boot {
+        #[command(subcommand)]
+        cmd: BootCommand,
+    },
 }
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
@@ -56,6 +61,157 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
         OpticalCommand::Browse(a) => run_browse_verb(a),
         OpticalCommand::Info(a) => run_info_verb(a),
         OpticalCommand::Extract(a) => run_extract_verb(a),
+        OpticalCommand::Boot { cmd } => run_boot(cmd),
+    }
+}
+
+/// `optical boot <SUBCOMMAND>` — El Torito boot-image operations. The disc layer
+/// (this crate + opticaldiscs) extracts / places the boot image as an opaque
+/// blob; the boot image *is* a nested disk image, so its filesystem is browsed
+/// and edited with rusty-backup's ordinary disk-image verbs (`ls`, `inspect`,
+/// `get`, `put`, `rm`, `mkdir`, `fsck`, …).
+#[derive(Debug, Subcommand)]
+pub enum BootCommand {
+    /// Extract a boot image to a file — then inspect or edit it with the
+    /// disk-image verbs, and put it back with `optical boot replace`.
+    Extract(BootExtractArgs),
+    /// Replace a boot image with the bytes of a (edited) disk-image file.
+    /// Raw `.iso` only; same-size replaces in place, a grown image relocates.
+    Replace(BootReplaceArgs),
+}
+
+fn run_boot(cmd: BootCommand) -> Result<()> {
+    match cmd {
+        BootCommand::Extract(a) => run_boot_extract(a),
+        BootCommand::Replace(a) => run_boot_replace(a),
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct BootExtractArgs {
+    /// Bootable optical disc image (.iso, …).
+    pub source: PathBuf,
+    /// Destination file for the extracted boot image.
+    #[arg(long)]
+    pub to: PathBuf,
+    /// Which boot entry to extract (default 0; see `optical info`).
+    #[arg(long, default_value_t = 0)]
+    pub index: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct BootReplaceArgs {
+    /// Bootable optical image to edit — raw `.iso` only.
+    pub source: PathBuf,
+    /// Disk-image file whose bytes become the new boot image.
+    #[arg(long)]
+    pub from: PathBuf,
+    /// Which boot entry to replace (default 0).
+    #[arg(long, default_value_t = 0)]
+    pub index: usize,
+    /// Override the emulation/media type (default: keep the entry's current
+    /// one). One of `floppy1.2` / `floppy1.44` / `floppy2.88` / `no-emulation`
+    /// / `harddisk`.
+    #[arg(long)]
+    pub media: Option<String>,
+}
+
+fn run_boot_extract(args: BootExtractArgs) -> Result<()> {
+    use opticaldiscs::detect::DiscImageInfo;
+
+    let info = DiscImageInfo::open(&args.source)
+        .with_context(|| format!("opening {}", args.source.display()))?;
+    let catalog = info.el_torito.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("{}: not an El Torito bootable disc", args.source.display())
+    })?;
+    let entry = catalog.entries.get(args.index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "boot entry {} out of range ({} present)",
+            args.index,
+            catalog.entries.len()
+        )
+    })?;
+    let mut reader = open_sector_reader(&info).ok_or_else(|| {
+        anyhow::anyhow!(
+            "raw-sector reads are unavailable for the {} container",
+            disc_format_token(info.format)
+        )
+    })?;
+    let bytes = opticaldiscs::read_boot_image(&mut *reader, entry)
+        .map_err(|e| anyhow::anyhow!("reading boot image: {e}"))?;
+    std::fs::write(&args.to, &bytes).with_context(|| format!("writing {}", args.to.display()))?;
+    log_stderr(format!(
+        "Extracted boot image {} ({}) to {}",
+        args.index,
+        format_size(bytes.len() as u64),
+        args.to.display()
+    ));
+    if let Some(fs) = detect_boot_image_fs(&bytes) {
+        log_stderr(format!(
+            "Filesystem: {fs} -- inspect with `rb-cli ls {}` / `inspect`, edit with \
+             `rb-cli put`/`rm`/`mkdir`, then put it back with `optical boot replace`.",
+            args.to.display()
+        ));
+    }
+    Ok(())
+}
+
+fn run_boot_replace(args: BootReplaceArgs) -> Result<()> {
+    use opticaldiscs::el_torito_edit::ElToritoEditor;
+
+    let bytes =
+        std::fs::read(&args.from).with_context(|| format!("reading {}", args.from.display()))?;
+    let mut editor = ElToritoEditor::open_path(&args.source)
+        .map_err(|e| anyhow::anyhow!("opening {} for editing: {e}", args.source.display()))?;
+
+    let entries = editor.entries();
+    let media = match &args.media {
+        Some(s) => {
+            media_type_from_str(s).ok_or_else(|| anyhow::anyhow!("unknown --media '{s}'"))?
+        }
+        None => {
+            entries
+                .get(args.index)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "boot entry {} out of range ({} present)",
+                        args.index,
+                        entries.len()
+                    )
+                })?
+                .media_type
+        }
+    };
+    drop(entries);
+
+    editor
+        .replace_image(args.index, &bytes, media)
+        .map_err(|e| anyhow::anyhow!("replacing boot image: {e}"))?;
+    editor
+        .commit()
+        .map_err(|e| anyhow::anyhow!("writing changes to {}: {e}", args.source.display()))?;
+    log_stderr(format!(
+        "Replaced boot image {} in {} ({})",
+        args.index,
+        args.source.display(),
+        format_size(bytes.len() as u64)
+    ));
+    Ok(())
+}
+
+fn media_type_from_str(s: &str) -> Option<opticaldiscs::BootMediaType> {
+    use opticaldiscs::BootMediaType as M;
+    match s
+        .to_ascii_lowercase()
+        .replace(['_', '-', '.', ' '], "")
+        .as_str()
+    {
+        "floppy12m" | "floppy12" | "12m" => Some(M::Floppy1_2M),
+        "floppy144m" | "floppy144" | "144m" => Some(M::Floppy1_44M),
+        "floppy288m" | "floppy288" | "288m" => Some(M::Floppy2_88M),
+        "noemulation" | "noemul" | "none" => Some(M::NoEmulation),
+        "harddisk" | "hdd" | "hd" => Some(M::HardDisk),
+        _ => None,
     }
 }
 
@@ -686,13 +842,25 @@ struct HfsInfo {
 #[derive(Debug, Serialize)]
 struct ElToritoInfo {
     present: bool,
+    entries: Vec<BootEntryInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct BootEntryInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     platform: Option<String>,
     bootable: bool,
+    media_type: String,
+    load_rba: u32,
+    boot_image_size_bytes: u64,
+    /// The filesystem *inside* the boot image, detected by rusty-backup's own
+    /// engine — the crate hands over an opaque blob and we interpret it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    boot_image_size_bytes: Option<u64>,
+    boot_image_filesystem: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     boot_image_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -761,7 +929,6 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
     let mut has_rock_ridge = false;
     let mut has_joliet = false;
     let mut has_udf = false;
-    let mut el_torito = None;
     if let Some(r) = reader.as_deref_mut() {
         if let Some(pvd) = info.pvd.as_ref() {
             if let Ok(sec) = r.read_sector(16) {
@@ -792,8 +959,12 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
                 .is_some();
             has_udf = opticaldiscs::browse::udf::detect_udf(r);
         }
-        el_torito = parse_el_torito(r);
     }
+
+    // El Torito: the crate parses the boot catalog into `info.el_torito`; per the
+    // disc-layer / disk-image-layer boundary we (rusty-backup) hash each boot
+    // image and detect its *nested* filesystem with our own engine.
+    let el_torito = build_el_torito_info(info.el_torito.as_ref(), &mut reader);
 
     let iso9660 = info.pvd.as_ref().map(|pvd| Iso9660Info {
         volume_id: pvd.volume_id.trim().to_string(),
@@ -941,61 +1112,89 @@ fn probe_rock_ridge(
     opticaldiscs::browse::rockridge::detect(&dir[su_start..rec_len])
 }
 
-/// Parse the El Torito boot catalog (Boot Record VD at sector 17 → catalog →
-/// initial/default entry). Returns `None` when the disc isn't El Torito.
-fn parse_el_torito(reader: &mut dyn opticaldiscs::SectorReader) -> Option<ElToritoInfo> {
-    let br = reader.read_sector(17).ok()?;
-    if br.len() < 2048 || br[0] != 0x00 || &br[1..6] != b"CD001" {
-        return None;
+fn platform_token(p: &opticaldiscs::Platform) -> String {
+    use opticaldiscs::Platform as P;
+    match p {
+        P::X86 => "x86".to_string(),
+        P::PowerPc => "ppc".to_string(),
+        P::Mac => "mac".to_string(),
+        P::Efi => "efi".to_string(),
+        P::Other(v) => format!("0x{v:02x}"),
     }
-    if &br[7..30] != b"EL TORITO SPECIFICATION" {
-        return None;
+}
+
+fn media_type_token(m: &opticaldiscs::BootMediaType) -> String {
+    use opticaldiscs::BootMediaType as M;
+    match m {
+        M::NoEmulation => "no_emulation".to_string(),
+        M::Floppy1_2M => "floppy_1.2m".to_string(),
+        M::Floppy1_44M => "floppy_1.44m".to_string(),
+        M::Floppy2_88M => "floppy_2.88m".to_string(),
+        M::HardDisk => "hard_disk".to_string(),
+        M::Other(v) => format!("0x{v:02x}"),
     }
-    let catalog_lba = u32::from_le_bytes([br[71], br[72], br[73], br[74]]) as u64;
-    let cat = reader.read_sector(catalog_lba).ok()?;
-    if cat.len() < 64 || cat[0] != 0x01 {
-        return None; // validation entry header id
+}
+
+/// Detect the filesystem *inside* a boot image, using rusty-backup's own disk
+/// engine — a floppy-emulation image is a FAT superfloppy; an HDD-emulation
+/// image carries a partition table. Returns a short token / summary.
+fn detect_boot_image_fs(bytes: &[u8]) -> Option<String> {
+    use crate::partition::PartitionTable;
+    let mut cur = std::io::Cursor::new(bytes);
+    let pt = PartitionTable::detect(&mut cur).ok()?;
+    match &pt {
+        PartitionTable::None { fs_hint, .. } => Some(fs_hint.to_ascii_lowercase()),
+        _ => {
+            let types: Vec<String> = pt
+                .partitions()
+                .iter()
+                .map(|p| p.type_name.clone())
+                .filter(|t| !t.is_empty())
+                .collect();
+            Some(if types.is_empty() {
+                pt.type_name().to_string()
+            } else {
+                types.join(", ")
+            })
+        }
     }
-    let platform = match cat[1] {
-        0x00 => Some("x86"),
-        0x01 => Some("ppc"),
-        0x02 => Some("mac"),
-        0xEF => Some("efi"),
-        _ => None,
+}
+
+/// Build the `info` El Torito section from the crate's parsed boot catalog.
+/// The crate owns the catalog; we (the disk-image layer) hash each boot image
+/// and interpret its nested filesystem.
+fn build_el_torito_info(
+    catalog: Option<&opticaldiscs::ElTorito>,
+    reader: &mut Option<Box<dyn opticaldiscs::SectorReader>>,
+) -> Option<ElToritoInfo> {
+    let catalog = catalog?;
+    let mut entries = Vec::with_capacity(catalog.entries.len());
+    for e in &catalog.entries {
+        // Read the boot image blob once; hash it and detect its nested FS.
+        let (sha256, fs) = match reader.as_deref_mut() {
+            Some(r) => match opticaldiscs::read_boot_image(r, e) {
+                Ok(bytes) if !bytes.is_empty() => (
+                    Some(hex_lower(&Sha256::digest(&bytes))),
+                    detect_boot_image_fs(&bytes),
+                ),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        entries.push(BootEntryInfo {
+            platform: Some(platform_token(&e.platform)),
+            bootable: e.bootable,
+            media_type: media_type_token(&e.media_type),
+            load_rba: e.load_rba,
+            boot_image_size_bytes: e.image_size,
+            boot_image_filesystem: fs,
+            boot_image_sha256: sha256,
+            id: e.id.clone(),
+        });
     }
-    .map(str::to_string);
-
-    // Initial / default entry at offset 32.
-    let bootable = cat[32] == 0x88;
-    let media = cat[33];
-    let sector_count = u16::from_le_bytes([cat[38], cat[39]]) as u64;
-    let load_rba = u32::from_le_bytes([cat[40], cat[41], cat[42], cat[43]]) as u64;
-
-    // Floppy emulation encodes the size in the media type; no-emulation uses the
-    // virtual-512-byte sector count.
-    let size = match media {
-        1 => 1_228_800,          // 1.2 MB
-        2 => 1_474_560,          // 1.44 MB
-        3 => 2_949_120,          // 2.88 MB
-        _ => sector_count * 512, // no-emulation / hard-disk: best effort
-    };
-
-    // Hash the boot image extent when it's a sane size.
-    let boot_image_sha256 = if size > 0 && size <= 128 * 1024 * 1024 {
-        reader
-            .read_bytes(load_rba * 2048, size as usize)
-            .ok()
-            .map(|b| hex_lower(&Sha256::digest(&b)))
-    } else {
-        None
-    };
-
     Some(ElToritoInfo {
         present: true,
-        platform,
-        bootable,
-        boot_image_size_bytes: (size > 0).then_some(size),
-        boot_image_sha256,
+        entries,
     })
 }
 
@@ -1075,15 +1274,17 @@ fn emit_info(format: OutputFormat, payload: InfoPayload) -> Result<()> {
         );
     }
     if let Some(et) = &payload.el_torito {
-        println!("El Torito:");
-        println!(
-            "  bootable={} platform={} image={}",
-            et.bootable,
-            et.platform.as_deref().unwrap_or("?"),
-            et.boot_image_size_bytes
-                .map(format_size)
-                .unwrap_or_else(|| "?".to_string())
-        );
+        println!("El Torito: {} boot image(s)", et.entries.len());
+        for (i, e) in et.entries.iter().enumerate() {
+            println!(
+                "  [{i}] platform={} bootable={} media={} image={} fs={}",
+                e.platform.as_deref().unwrap_or("?"),
+                e.bootable,
+                e.media_type,
+                format_size(e.boot_image_size_bytes),
+                e.boot_image_filesystem.as_deref().unwrap_or("?"),
+            );
+        }
     }
     for w in &payload.warnings {
         log_stderr(format!("warning: {w}"));
@@ -1473,95 +1674,173 @@ fn parse_resource_fork_mode(s: &str) -> Option<CliResourceForkMode> {
 mod tests {
     use super::*;
 
-    /// A minimal in-memory [`opticaldiscs::SectorReader`] over a fixed set of
-    /// 2048-byte sectors, for exercising the El Torito parser.
-    struct VecReader {
-        sectors: Vec<Vec<u8>>,
-    }
-    impl opticaldiscs::SectorReader for VecReader {
-        fn read_sector(&mut self, lba: u64) -> opticaldiscs::error::Result<Vec<u8>> {
-            Ok(self
-                .sectors
-                .get(lba as usize)
-                .cloned()
-                .unwrap_or_else(|| vec![0u8; 2048]))
-        }
+    /// A minimal FAT12 boot-floppy image — a valid-enough FAT BPB at sector 0
+    /// in a 1.44 MB buffer, which is what an El Torito floppy-emulation boot
+    /// image looks like once extracted.
+    fn fat12_floppy() -> Vec<u8> {
+        let mut data = vec![0u8; 1_474_560];
+        data[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        data[3..11].copy_from_slice(b"MSDOS5.0");
+        data[11] = 0x00; // bytes/sector = 512
+        data[12] = 0x02;
+        data[13] = 1; // sectors/cluster
+        data[14] = 1; // reserved sectors
+        data[16] = 2; // number of FATs
+        data[21] = 0xF0; // media descriptor (floppy)
+        data[510] = 0x55;
+        data[511] = 0xAA;
+        data
     }
 
     #[test]
-    fn parse_el_torito_no_emulation() {
-        let mut sectors = vec![vec![0u8; 2048]; 20];
-        // Boot Record Volume Descriptor at sector 17.
-        {
-            let br = &mut sectors[17];
-            br[0] = 0x00;
-            br[1..6].copy_from_slice(b"CD001");
-            br[6] = 1;
-            br[7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
-            br[71..75].copy_from_slice(&18u32.to_le_bytes()); // boot catalog at LBA 18
-        }
-        // Boot catalog at sector 18: validation entry + initial/default entry.
-        {
-            let cat = &mut sectors[18];
-            cat[0] = 0x01; // validation entry header id
-            cat[1] = 0x00; // platform 0x00 = x86
-            cat[30] = 0x55;
-            cat[31] = 0xAA;
-            cat[32] = 0x88; // bootable
-            cat[33] = 0x00; // media type 0 = no emulation
-            cat[38..40].copy_from_slice(&4u16.to_le_bytes()); // 4 virtual 512-B sectors = 2048 B
-            cat[40..44].copy_from_slice(&19u32.to_le_bytes()); // boot image at LBA 19
-        }
-        // The boot image itself.
-        sectors[19] = vec![0xABu8; 2048];
+    fn detect_boot_image_fs_names_fat_floppy() {
+        // rusty-backup interprets the boot image the crate hands back.
+        let fs = detect_boot_image_fs(&fat12_floppy()).expect("should detect a filesystem");
+        assert!(fs.contains("fat"), "expected a FAT token, got {fs:?}");
+    }
 
-        let mut r = VecReader { sectors };
-        let et = parse_el_torito(&mut r).expect("El Torito must parse");
+    #[test]
+    fn detect_boot_image_fs_none_on_garbage() {
+        // An unrecognizable blob must not panic and must not claim a bogus FS.
+        assert!(detect_boot_image_fs(&vec![0u8; 64 * 1024]).is_none());
+    }
+
+    #[test]
+    fn el_torito_platform_and_media_tokens() {
+        use opticaldiscs::{BootMediaType, Platform};
+        assert_eq!(platform_token(&Platform::X86), "x86");
+        assert_eq!(platform_token(&Platform::Efi), "efi");
+        assert_eq!(platform_token(&Platform::Other(0x42)), "0x42");
+        assert_eq!(
+            media_type_token(&BootMediaType::Floppy1_44M),
+            "floppy_1.44m"
+        );
+        assert_eq!(
+            media_type_token(&BootMediaType::NoEmulation),
+            "no_emulation"
+        );
+        assert_eq!(media_type_token(&BootMediaType::HardDisk), "hard_disk");
+    }
+
+    /// A synthetic bootable ISO whose single boot image is a 1.44 MB FAT12
+    /// floppy (media type 2), pointed at boot image LBA 20.
+    fn build_bootable_fat_iso() -> Vec<u8> {
+        const SECTOR: usize = 2048;
+        let image_lba: u32 = 20;
+        let floppy = fat12_floppy(); // 1_474_560 bytes
+        let total = image_lba as usize + floppy.len().div_ceil(SECTOR) + 1;
+        let mut img = vec![0u8; total * SECTOR];
+
+        // PVD @16 (root dir at LBA 18) — the crate helper builds an acceptable one.
+        let pvd = opticaldiscs::iso9660::build_test_pvd_sector("BOOTFAT", 18, SECTOR as u32);
+        img[16 * SECTOR..16 * SECTOR + pvd.len()].copy_from_slice(&pvd);
+
+        // Boot Record VD @17 -> boot catalog at LBA 19.
+        {
+            let vd = &mut img[17 * SECTOR..18 * SECTOR];
+            vd[0] = 0x00;
+            vd[1..6].copy_from_slice(b"CD001");
+            vd[6] = 1;
+            vd[7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
+            vd[71..75].copy_from_slice(&19u32.to_le_bytes());
+        }
+
+        // Boot catalog @19: validation entry (x86, valid checksum) + a bootable
+        // 1.44 MB floppy-emulation entry pointing at the boot image LBA.
+        {
+            let cat = 19 * SECTOR;
+            let mut v = [0u8; 32];
+            v[0] = 0x01;
+            v[1] = 0x00; // x86
+            v[30] = 0x55;
+            v[31] = 0xAA;
+            let mut sum: u16 = 0;
+            for w in v.chunks_exact(2) {
+                sum = sum.wrapping_add(u16::from_le_bytes([w[0], w[1]]));
+            }
+            v[28..30].copy_from_slice(&0u16.wrapping_sub(sum).to_le_bytes());
+            img[cat..cat + 32].copy_from_slice(&v);
+
+            let mut e = [0u8; 32];
+            e[0] = 0x88; // bootable
+            e[1] = 0x02; // media type 2 = 1.44 MB floppy
+            e[8..12].copy_from_slice(&image_lba.to_le_bytes());
+            img[cat + 32..cat + 64].copy_from_slice(&e);
+        }
+
+        // The boot image: the FAT12 floppy.
+        img[image_lba as usize * SECTOR..image_lba as usize * SECTOR + floppy.len()]
+            .copy_from_slice(&floppy);
+        img
+    }
+
+    fn write_temp_iso(bytes: &[u8]) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::Builder::new().suffix(".iso").tempfile().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// End-to-end: `optical info`'s builder surfaces the crate-parsed entry and —
+    /// per the disc-layer / disk-image-layer boundary — detects the *nested* FAT
+    /// filesystem with rusty-backup's own engine.
+    #[test]
+    fn info_reports_el_torito_with_nested_fat_fs() {
+        let f = write_temp_iso(&build_bootable_fat_iso());
+        let info = opticaldiscs::detect::DiscImageInfo::open(f.path()).expect("open bootable ISO");
+        let mut reader = open_sector_reader(&info);
+        let et = build_el_torito_info(info.el_torito.as_ref(), &mut reader).expect("el_torito");
         assert!(et.present);
-        assert!(et.bootable);
-        assert_eq!(et.platform.as_deref(), Some("x86"));
-        assert_eq!(et.boot_image_size_bytes, Some(2048));
-
-        let expected = {
-            let mut h = Sha256::new();
-            h.update(vec![0xABu8; 2048]);
-            hex_lower(&h.finalize())
-        };
-        assert_eq!(et.boot_image_sha256.as_deref(), Some(expected.as_str()));
+        assert_eq!(et.entries.len(), 1);
+        let e0 = &et.entries[0];
+        assert_eq!(e0.platform.as_deref(), Some("x86"));
+        assert!(e0.bootable);
+        assert_eq!(e0.media_type, "floppy_1.44m");
+        assert_eq!(e0.boot_image_size_bytes, 1_474_560);
+        assert!(
+            e0.boot_image_filesystem
+                .as_deref()
+                .is_some_and(|fs| fs.contains("fat")),
+            "nested FS should be FAT, got {:?}",
+            e0.boot_image_filesystem
+        );
+        assert!(e0.boot_image_sha256.is_some());
     }
 
+    /// End-to-end: extract a boot image (as `optical boot extract` does), edit a
+    /// byte, and put it back same-size in place (as `optical boot replace` does),
+    /// then confirm the new bytes re-read through the catalog.
     #[test]
-    fn parse_el_torito_floppy_media_size() {
-        let mut sectors = vec![vec![0u8; 2048]; 20];
-        sectors[17][0] = 0x00;
-        sectors[17][1..6].copy_from_slice(b"CD001");
-        sectors[17][7..30].copy_from_slice(b"EL TORITO SPECIFICATION");
-        sectors[17][71..75].copy_from_slice(&18u32.to_le_bytes());
-        sectors[18][0] = 0x01;
-        sectors[18][1] = 0x01; // platform ppc
-        sectors[18][32] = 0x88; // bootable
-        sectors[18][33] = 0x02; // media type 2 = 1.44 MB floppy
-        sectors[18][40..44].copy_from_slice(&19u32.to_le_bytes());
+    fn boot_extract_replace_round_trips() {
+        use opticaldiscs::el_torito_edit::ElToritoEditor;
+        use opticaldiscs::BootMediaType;
 
-        let mut r = VecReader {
-            sectors: {
-                // A 1.44 MB image spans 720 cooked sectors starting at LBA 19.
-                let mut s = sectors;
-                s.resize(19 + 720, vec![0u8; 2048]);
-                s
-            },
-        };
-        let et = parse_el_torito(&mut r).expect("El Torito must parse");
-        assert_eq!(et.platform.as_deref(), Some("ppc"));
-        assert_eq!(et.boot_image_size_bytes, Some(1_474_560));
-        assert!(et.boot_image_sha256.is_some());
-    }
+        let f = write_temp_iso(&build_bootable_fat_iso());
 
-    #[test]
-    fn parse_el_torito_absent_when_no_boot_record() {
-        let mut r = VecReader {
-            sectors: vec![vec![0u8; 2048]; 20],
-        };
-        assert!(parse_el_torito(&mut r).is_none());
+        // Extract.
+        let info = opticaldiscs::detect::DiscImageInfo::open(f.path()).expect("open");
+        let entry = info.el_torito.as_ref().unwrap().entries[0].clone();
+        let mut reader = open_sector_reader(&info).unwrap();
+        let extracted = opticaldiscs::read_boot_image(&mut *reader, &entry).expect("read image");
+        assert_eq!(extracted.len(), 1_474_560);
+        drop(reader);
+
+        // Edit a byte (same size) and replace in place.
+        let mut edited = extracted.clone();
+        edited[600_000] ^= 0xFF;
+        let mut editor = ElToritoEditor::open_path(f.path()).expect("open editor");
+        editor
+            .replace_image(0, &edited, BootMediaType::Floppy1_44M)
+            .expect("replace");
+        editor.commit().expect("commit");
+
+        // Re-read through the catalog — the new bytes must be there.
+        let info2 = opticaldiscs::detect::DiscImageInfo::open(f.path()).expect("reopen");
+        let entry2 = info2.el_torito.as_ref().unwrap().entries[0].clone();
+        let mut reader2 = open_sector_reader(&info2).unwrap();
+        let after = opticaldiscs::read_boot_image(&mut *reader2, &entry2).expect("re-read");
+        assert_eq!(after, edited);
+        assert_ne!(after, extracted);
     }
 }

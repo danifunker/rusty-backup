@@ -151,6 +151,13 @@ What's in the MiSTer build:
   volume-level metadata (ISO 9660 PVD identity + Rock Ridge / Joliet / UDF
   flags, El Torito boot catalog, HFS/APM) leniently — surfacing warnings
   rather than failing on the sloppy 90s mastering that trips strict parsers.
+- **El Torito boot images:** `optical info` lists every boot entry (platform,
+  bootable, media type, size + sha256) and names the *nested* filesystem inside
+  each. `optical boot extract` pulls a boot image out to a file, which is just a
+  disk image — so `ls` / `inspect` / `get` / `put` / `fsck` all work on it — and
+  `optical boot replace` writes an edited image back into the catalog. (The disc
+  layer is handled by the `opticaldiscs` crate; rusty-backup interprets and
+  edits the boot image's filesystem.)
 - **Remote ripping off-device:** run `rb-daemon` here and drive this drive
   from the desktop app / CLI — the device only issues SCSI reads while the
   desktop does the heavy CHD encoding, so the armv7 CPU isn't taxed.
