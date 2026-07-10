@@ -1,11 +1,14 @@
 # Rusty Backup — Filesystem & Format Coverage Audit
 
-A single-source, **code-grounded** map of every filesystem, container, and
-partition table Rusty Backup can handle today, and — just as important — the
-notable ones it **cannot** yet handle. Generated 2026-07-07 by reading the
-`src/fs/mod.rs` dispatch hub, `src/partition/`, `src/rbformats/`,
+The **single source of truth** for what Rusty Backup can do with every
+filesystem, container, and partition table today — a living support checklist
+(Browse / Create / Edit / Shrink-Grow / fsck per filesystem in §1) plus the
+notable formats it **cannot** yet handle (§6). First generated 2026-07-07 by
+reading the `src/fs/mod.rs` dispatch hub, `src/partition/`, `src/rbformats/`,
 `src/model/file_types.rs`, and every driver's trait impls directly (not the
-prose docs, which had drifted — see [§7](#7-known-code-gaps--drift-fixed-in-this-sweep)).
+prose docs, which had drifted — see [§7](#7-known-code-gaps--drift-fixed-in-this-sweep));
+kept current as capabilities land (last: 2026-07-10 — PFS3 + SFS fsck, El Torito
+boot-image extract/replace).
 
 Companion docs: [`full_MiSTer_support_status.md`](full_MiSTer_support_status.md)
 grades each MiSTer computer core; [`../README.md`](../README.md) is the
@@ -47,6 +50,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | MFS (Macintosh File System) | Auto | Yes | Yes | No | No | No | Mac 128K / 512K / Plus, 400 KB SS floppies (1984–86) |
 | HFS (Mac OS Standard) | Auto | Yes | Yes | Yes | Yes (block-size clone) | check+repair | Classic Mac OS (System 7–9), 68k / early PPC |
 | HFS+ / HFSX | Auto | Yes | Yes | Yes | Yes (defrag clone) | check+repair | Mac OS 8.1 → macOS; embedded + wrapped variants |
+| HFV (flat HFS) | via HFS | Yes | Yes | Yes (`--fs hfv`) | Yes | check+repair | BasiliskII / SheepShaver — flat classic HFS ≤ 2047 MB, no APM wrapper |
 | ProDOS | Auto / MBR 0xA8 / APM | Yes | Yes | No | Yes (in-place) | validate | Apple II / IIgs |
 | Apple DOS 3.3 | Auto (140 KB only) | Yes | Yes | No | No | No | Apple II 5.25" (`.dsk` / `.do` / `.po`, sector-order auto) |
 | Apple Lisa FS | Auto (tag-bearing DC42/DART) | Yes | No | No | No | No | Apple Lisa — reconstructed from 12-byte sector tags |
@@ -149,10 +153,16 @@ a new driver.
 ## 3. Optical-disc filesystems
 
 Read through the [`opticaldiscs`](https://github.com/danifunker/opticaldiscs-rs)
-crate (v0.7, `optical` feature). **Browse + extract only** — no edit / resize /
-fsck. Container formats opened: ISO 9660 (`.iso` / `.toast`), BIN/CUE, CHD-CD,
-MDF/MDS, NRG, CCD (raw 2352-byte-sector images auto-detected inside a bare
-`.iso`).
+crate (v0.10, `optical` feature). **Browse + extract only** — no edit / resize /
+fsck on the disc filesystem itself. Container formats opened: ISO 9660 (`.iso` /
+`.toast`), BIN/CUE, CHD-CD, MDF/MDS, NRG, CCD, MDX, DiscJuggler `.cdi` (raw
+2352-byte-sector images auto-detected inside a bare `.iso`). `rb-cli optical
+info --format json` reports the volume metadata leniently (PVD identity, RR /
+Joliet / UDF flags, El Torito boot catalog, HFS/APM). **El Torito boot images**
+are a first-class exception to "read-only": `optical boot extract` pulls a boot
+image out as a nested disk image — then the filesystem drivers above browse /
+edit / fsck it — and `optical boot replace` writes an edited image back into the
+catalog (raw `.iso`).
 
 | Filesystem | Typical discs |
 |---|---|
