@@ -91,7 +91,7 @@ struct GroupDescriptor {
     flags: u16,
     /// `bg_itable_unused`: count of never-scanned inodes at the end of the group's
     /// inode table (the uninit_bg optimization). The editor must lower this when it
-    /// allocates an inode in the unused region, or e2fsck treats the new inode as
+    /// allocates an inode in the unused region, or the new inode is treated as
     /// unused.
     itable_unused: u32,
 }
@@ -183,7 +183,7 @@ pub struct ExtFilesystem<R> {
     first_data_block: u32,
     free_blocks: u64,
     /// `metadata_csum` (ro_compat 0x400): the editor must recompute crc32c on
-    /// every metadata write to keep the volume e2fsck-clean.
+    /// every metadata write to keep the volume checksum-consistent.
     #[allow(dead_code)] // consumed by the checksum-aware editor in Phase D
     metadata_csum: bool,
     /// crc32c seed derived from the volume UUID (`ext_csum::csum_seed`).
@@ -1184,7 +1184,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
     /// Write raw inode bytes to the inode table. On `metadata_csum` volumes the
     /// inode crc32c is stamped for in-use inodes (a freed/zeroed inode keeps a
-    /// zero checksum, which e2fsck doesn't verify).
+    /// zero checksum, which is not verified).
     fn write_inode_raw(
         &mut self,
         inode_num: u32,
@@ -1372,7 +1372,7 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 
     /// Adjust group `group`'s `bg_used_dirs_count` by `delta` (and re-stamp
     /// `bg_checksum` for metadata_csum). Directory create/delete must keep this
-    /// accurate or e2fsck's Pass 5 flags a mismatch.
+    /// accurate or the group summary accounting is inconsistent.
     fn adjust_used_dirs(&mut self, group: usize, delta: i32) -> Result<(), FilesystemError> {
         let sb_block: u64 = if self.block_size == 1024 { 1 } else { 0 };
         let desc_off = self.partition_offset
@@ -2166,7 +2166,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
         let mut inode_bytes = self.build_inode_bytes(mode, uid, gid, data_len, 1, flags, &iblock);
         // i_blocks counts ALLOCATED 512-byte sectors (block_size/512 per fs
         // block), not ceil(size/512): the two differ for a partial final block on
-        // block sizes above 512, and e2fsck enforces the block-based count. (No
+        // block sizes above 512, and the block-based count is the correct one. (No
         // indirect blocks to add — new files here are capped at 12 direct blocks.)
         let sectors = data_blocks.len() as u32 * (self.block_size as u32 / 512);
         inode_bytes[0x1C..0x20].copy_from_slice(&sectors.to_le_bytes());
@@ -2607,9 +2607,9 @@ pub struct RelocationPlan {
     pub needs_relocation: bool,
     /// When true, the packed image drops the `resize_inode` feature: inode 7 is
     /// zeroed, `s_reserved_gdt_blocks` set to 0, and every block below owned by
-    /// the resize inode is freed. This is the `tune2fs -O ^resize_inode`
-    /// transformation — rebuilding the reserved-GDT double-indirect structure for
-    /// the smaller geometry would be far more error-prone.
+    /// the resize inode is freed. Dropping the feature is far simpler than
+    /// rebuilding the reserved-GDT double-indirect structure for the smaller
+    /// geometry, which would be error-prone.
     pub drop_resize_inode: bool,
     /// Blocks that are allocated in the source but freed in the packed image
     /// (the resize inode's reserved-GDT blocks + its own indirect blocks). These
@@ -2795,8 +2795,8 @@ pub fn build_relocation_map<R: Read + Seek>(
     // Its reserved-GDT double-indirect blocks are scattered across every
     // superblock-backup group (up to the far end of the disk), which would block
     // any shrink. Rather than rebuild that structure for the smaller geometry we
-    // drop the feature (as `tune2fs -O ^resize_inode` does): collect its blocks so
-    // they are never relocated and get freed, and mark the plan to zero inode 7.
+    // drop the resize_inode feature: collect its blocks so they are never
+    // relocated and get freed, and mark the plan to zero inode 7.
     let feature_compat = le32(&sb, 0x5C);
     let drop_resize_inode = feature_compat & 0x0010 != 0; // COMPAT_RESIZE_INODE
     let mut freed_blocks: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -3276,8 +3276,8 @@ pub fn scan_and_patch_inodes<R: Read + Seek>(
             let generation = le32(&table, ioff + 0x64);
 
             // Dropping resize_inode: zero inode 7 entirely (its reserved-GDT blocks
-            // are freed elsewhere). A zeroed reserved inode is what e2fsck leaves
-            // behind after clearing a stale resize inode.
+            // are freed elsewhere). A zeroed reserved inode is the expected state
+            // once a stale resize inode has been cleared.
             if inum == 7 && plan.drop_resize_inode {
                 table[ioff..ioff + inode_size as usize].fill(0);
                 if metadata_csum {
@@ -3812,7 +3812,7 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
 
     // Blocks belonging to DROPPED groups that physically live inside a surviving
     // group (flex_bg clusters bitmaps + inode tables into the flex leader). These
-    // must be freed in the rebuilt bitmap, else e2fsck sees them wrongly in use.
+    // must be freed in the rebuilt bitmap, else they would be wrongly marked in use.
     let mut dropped_meta: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for d in min_groups as usize..group_count as usize {
         let (bb, ib, it) = meta_locs[d];
@@ -3902,10 +3902,10 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
         }
 
         // Every bit past this group's last real block — the runt-group tail and the
-        // whole-block padding beyond blocks_per_group — must read as used, or e2fsck
-        // flags "padding at end of block bitmap is not set" (formerly-uninit groups
-        // that just received relocations have an all-zero bitmap block). Set the
-        // partial byte bit-wise, then fill the rest of the block with 0xFF.
+        // whole-block padding beyond blocks_per_group — must read as used, per the
+        // padding-at-end-of-block-bitmap convention (formerly-uninit groups that just
+        // received relocations have an all-zero bitmap block). Set the partial byte
+        // bit-wise, then fill the rest of the block with 0xFF.
         let first_pad = group_block_count as usize;
         let byte_boundary = ((first_pad + 7) & !7).min(block_size as usize * 8);
         for bit in first_pad..byte_boundary {
@@ -3970,8 +3970,8 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
 
     // s_inodes_count / s_free_inodes_count — the inode tables live at fixed
     // per-group positions, so dropping trailing groups drops their inodes too.
-    // e2fsck treats a stale s_inodes_count (still counting the removed groups) as
-    // fatal superblock corruption, so both must track the new group count.
+    // a stale s_inodes_count (still counting the removed groups) is fatal superblock
+    // corruption, so both must track the new group count.
     let new_inodes_count = min_groups as u64 * inodes_per_group as u64;
     sb[0x00..0x04].copy_from_slice(&(new_inodes_count as u32).to_le_bytes());
     sb[0x10..0x14].copy_from_slice(&(total_free_inodes as u32).to_le_bytes());
@@ -4008,7 +4008,7 @@ pub fn rebuild_metadata_for_shrink<R: Read + Seek>(
 
     // ---- metadata_csum: re-stamp crc32c on everything we rewrote ----
     // The packed image becomes the stored backup, so it must be self-consistently
-    // checksummed — rusty-backup never shells out to e2fsck/resize2fs to fix it up
+    // checksummed — rusty-backup never shells out to an external tool to fix it up
     // afterwards. We rewrote each surviving group's block bitmap + GDT free count
     // and the superblock counts, so re-stamp the block-bitmap checksum and
     // bg_checksum on every surviving descriptor (bitmap csum first — it lives
@@ -4063,7 +4063,7 @@ fn le32(data: &[u8], offset: usize) -> u32 {
 /// a packed backup with block relocation), the block count and free count
 /// are adjusted downward.
 ///
-/// This performs a minimal metadata-only resize. A full `e2fsck`/`resize2fs`
+/// This performs a minimal metadata-only resize. A full filesystem check/resize
 /// is still recommended after restore for production use.
 pub fn resize_ext_in_place(
     file: &mut (impl Read + std::io::Write + Seek),
@@ -4165,7 +4165,7 @@ pub fn resize_ext_in_place(
     }
 
     // metadata_csum: recompute the superblock crc32c after patching the counts,
-    // or e2fsck flags a stale checksum.
+    // or the checksum goes stale.
     if le32(&sb, 0x64) & 0x0400 != 0 {
         super::ext_csum::stamp_superblock(&mut sb);
     }
@@ -4182,7 +4182,7 @@ pub fn resize_ext_in_place(
 }
 
 /// Grow an ext2/3/4 filesystem by **adding block groups** — the offline
-/// `resize2fs` grow, the mirror of the backup compactor's shrink. Lays down each
+/// grow, the mirror of the backup compactor's shrink. Lays down each
 /// new group's block/inode bitmap + (fresh, already-zero) inode table + group
 /// descriptor in the newly-available space, extends the old last group if it was
 /// a runt, rewrites the GDT + superblock (primary and every backup), and stamps
@@ -4237,7 +4237,7 @@ fn grow_ext_add_groups(
     if gdt_blocks != (old_gc * desc_size).div_ceil(block_size) {
         log_cb(&format!(
             "ext grow: GDT would need {gdt_blocks} blocks (was fewer); leaving fs at {old_total} \
-             blocks — run resize2fs to fill the partition"
+             blocks — expand the filesystem in the OS to fill the partition"
         ));
         return Ok(());
     }
@@ -4558,8 +4558,8 @@ pub fn validate_ext_integrity(
 /// Allocated blocks are preserved; unallocated blocks are replaced with zeros.
 /// The output image is normally layout-preserving (block pointers remain valid,
 /// free space is zeroed for compression). When the filesystem can be shrunk,
-/// it instead produces a **packed** image with block relocation — like
-/// `resize2fs` but applied during backup.
+/// it instead produces a **packed** image with block relocation — an offline
+/// shrink applied during backup.
 pub struct CompactExtReader<R: Read + Seek> {
     inner: CompactStreamReader<R>,
 }

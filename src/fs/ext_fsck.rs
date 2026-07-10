@@ -26,7 +26,7 @@
 //! state — Pass 5's job. On **`metadata_csum`** volumes it additionally verifies
 //! and recomputes the crc32c on every structure it touches (superblock,
 //! descriptors, bitmap checksums) via a reseal pass driven by `ext_csum` — so
-//! ext4 is now check + repair, byte-verified against `e2fsck`. The legacy
+//! ext4 is now check + repair. The legacy
 //! **`gdt_csum`/`uninit_bg`** regime (crc16, no bitmap/inode/dir checksums) is
 //! still withheld. Multiply-claimed blocks are surfaced only (they need the
 //! editor to relocate data).
@@ -219,7 +219,7 @@ fn analyze<R: Read + Seek + Send>(fs: &mut ExtFilesystem<R>) -> Result<Analysis,
         a.warnings.push(FsckIssue {
             code: "MetadataChecksum".into(),
             message: "volume uses the legacy gdt_csum/uninit_bg checksums (crc16); issues are \
-                      reported but repair is withheld — use e2fsck"
+                      reported but repair is withheld for this legacy format"
                 .into(),
             repairable: false,
             debug: false,
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     fn clean_ext2_and_ext4_report_no_errors() {
         // ext2 (no checksums) and ext4 (metadata_csum) must both reconcile with
-        // no errors — the accounting exactly matches a real e2fsck-clean image.
+        // no errors — the accounting exactly matches a known-clean image.
         for name in ["test_ext2.img.zst", "test_ext4.img.zst"] {
             let mut img = load(name);
             let r = run_fsck(&mut img);

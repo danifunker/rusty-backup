@@ -7,14 +7,13 @@
 //!   * **ext4** — extents + `metadata_csum` (crc32c on every structure) + a
 //!     journal (inode 8, extent-mapped); 256-byte inodes with `i_extra_isize`.
 //!
-//! Every variant is verified to (a) round-trip through `ExtFilesystem::open`,
-//! (b) reconcile clean through [`super::ext_fsck`], and (c) pass external
-//! `e2fsck -fn`. The formatter reuses the metadata-marking and bitmap-building
-//! helpers from `ext_fsck` (`mark_metadata`, `build_block_bitmap`,
-//! `build_inode_bitmap`, `has_super_backup`, `BlockMap`), the inode serializer
-//! from `ext` (`build_inode_bytes`), and the checksum stampers from
-//! [`super::ext_csum`], so the bytes we lay down are, by construction, exactly
-//! what the checker recomputes and verifies.
+//! Every variant is verified to (a) round-trip through `ExtFilesystem::open` and
+//! (b) reconcile clean through [`super::ext_fsck`]. The formatter reuses the
+//! metadata-marking and bitmap-building helpers from `ext_fsck` (`mark_metadata`,
+//! `build_block_bitmap`, `build_inode_bitmap`, `has_super_backup`, `BlockMap`),
+//! the inode serializer from `ext` (`build_inode_bytes`), and the checksum
+//! stampers from [`super::ext_csum`], so the bytes we lay down are, by
+//! construction, exactly what the checker recomputes and verifies.
 //!
 //! ## Layout produced
 //!
@@ -37,7 +36,7 @@ use super::filesystem::FilesystemError;
 const EXT_MAGIC: u16 = 0xEF53;
 const INODE_SIZE: u16 = 128;
 const DESC_SIZE: u16 = 32;
-/// First non-reserved inode. mke2fs stamps 11 and uses inode 11 for lost+found.
+/// First non-reserved inode. The standard value is 11; inode 11 holds lost+found.
 const FIRST_INO: u32 = 11;
 const ROOT_INO: u32 = 2;
 const LOST_FOUND_INO: u32 = 11;
@@ -60,13 +59,13 @@ const EXT_JOURNAL_INO: u32 = 8;
 const JOURNAL_BLOCKS: u64 = 1024;
 /// jbd2 journal-superblock magic (stored **big-endian**, like all jbd2 fields).
 const JBD2_MAGIC: u32 = 0xc03b_3998;
-/// `JBD2_SUPERBLOCK_V2` block type — what mke2fs stamps for a fresh journal.
+/// `JBD2_SUPERBLOCK_V2` block type — the standard type for a fresh journal.
 const JBD2_SUPERBLOCK_V2: u32 = 4;
 /// `EXT3_JNL_BACKUP_BLOCKS` — the superblock carries a copy of the journal
-/// inode's block map so e2fsck can find the journal if inode 8 is damaged.
+/// inode's block map so the journal can be found if inode 8 is damaged.
 const JNL_BACKUP_BLOCKS: u8 = 1;
 
-/// Default inode density — one inode per 16 KiB (the mke2fs default).
+/// Default inode density — one inode per 16 KiB (the standard default).
 const DEFAULT_BYTES_PER_INODE: u64 = 16384;
 
 /// Smallest ext2 volume we'll format. Below this the fixed metadata dominates and
@@ -195,8 +194,8 @@ impl Ext2Layout {
     }
 }
 
-/// 1 KiB blocks below 8 MiB, 4 KiB above — a small subset of mke2fs's size table
-/// that keeps small volumes roomy and large ones cheap on metadata.
+/// 1 KiB blocks below 8 MiB, 4 KiB above — a small size table that keeps small
+/// volumes roomy and large ones cheap on metadata.
 fn choose_block_size(size_bytes: u64) -> u64 {
     if size_bytes <= 8 * 1024 * 1024 {
         1024
@@ -207,7 +206,7 @@ fn choose_block_size(size_bytes: u64) -> u64 {
 
 /// Resolve geometry from a requested byte size. May format slightly fewer bytes
 /// than requested if the trailing block group would be too small to hold its own
-/// metadata (that runt group is dropped, mke2fs-style).
+/// metadata (that runt group is dropped).
 fn compute_layout(size_bytes: u64, variant: ExtVariant) -> Result<Ext2Layout, FilesystemError> {
     let min = variant.min_size();
     if size_bytes < min {
@@ -542,7 +541,7 @@ fn write_blank_ext<W: Write + Seek>(
         }
 
         // jbd2 journal superblock at journal block 0 (empty: s_start = 0). Its own
-        // checksum feature stays off even on metadata_csum ext4 (matches mke2fs).
+        // checksum feature stays off even on metadata_csum ext4 (the standard shape).
         let jsb = build_jbd2_superblock(block_size, layout.journal_blocks);
         write_at(
             sink,
@@ -718,7 +717,7 @@ fn build_superblock(
     let n = name.len().min(16);
     sb[0x78..0x78 + n].copy_from_slice(&name[..n]); // s_volume_name
 
-    // ext3: journal inode number + a backup of its block map (so e2fsck -fn is
+    // ext3: journal inode number + a backup of its block map (so a checker is
     // clean rather than wanting to add the backup).
     if let Some(jnl) = journal_backup {
         le32w(&mut sb, 0xE0, EXT_JOURNAL_INO); // s_journal_inum
@@ -784,7 +783,7 @@ fn build_journal_map(l: &Ext2Layout) -> JournalMap {
 }
 
 /// Build an empty jbd2 journal superblock (all fields **big-endian**). `s_start`
-/// = 0 marks the log empty, so e2fsck sees nothing to recover.
+/// = 0 marks the log empty, so there is nothing to recover.
 fn build_jbd2_superblock(block_size: u64, journal_blocks: u64) -> Vec<u8> {
     let mut jsb = vec![0u8; block_size as usize];
     be32w(&mut jsb, 0x00, JBD2_MAGIC); // h_magic
@@ -895,8 +894,8 @@ fn now_secs() -> u32 {
         .as_secs() as u32
 }
 
-/// A best-effort unique 16-byte UUID (version-4 shape). e2fsck is content with
-/// any non-zero UUID; uniqueness is nice-to-have, not load-bearing.
+/// A best-effort unique 16-byte UUID (version-4 shape). Any non-zero UUID is
+/// accepted; uniqueness is nice-to-have, not load-bearing.
 fn make_uuid() -> [u8; 16] {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

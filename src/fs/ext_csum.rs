@@ -1,11 +1,11 @@
 //! ext4 `metadata_csum` (crc32c) — the checksum discipline shared by the ext4
 //! formatter, fsck repair, and the checksum-aware editor.
 //!
-//! Every algorithm here was verified byte-for-byte against `mke2fs` output (see
-//! the fixture test below): the superblock, group descriptor, block/inode bitmap,
-//! inode (split lo/hi), and directory-block tail checksums.
+//! Every algorithm here matches the on-disk `metadata_csum` format byte-for-byte
+//! (see the fixture test below): the superblock, group descriptor, block/inode
+//! bitmap, inode (split lo/hi), and directory-block tail checksums.
 //!
-//! **The e2fsprogs CRC-32C convention** is the reflected Castagnoli LFSR started
+//! **The ext4 CRC-32C convention** is the reflected Castagnoli LFSR started
 //! from a seed with **no final inversion** — subtly different from the standard
 //! CRC-32C the `crc32c` crate exposes (which inverts at both ends). The mapping is
 //! `ext_crc(seed, data) = crc32c_append(seed ^ !0, data) ^ !0`, which also
@@ -34,8 +34,8 @@ const INO_CSUM_LO: usize = 0x7C;
 const INO_EXTRA_ISIZE: usize = 0x80;
 const INO_CSUM_HI: usize = 0x82;
 
-/// e2fsprogs' raw seeded CRC-32C (reflected Castagnoli, init = `seed`, no final
-/// inversion). Verified against mke2fs; composes for chaining.
+/// The ext4 raw seeded CRC-32C (reflected Castagnoli, init = `seed`, no final
+/// inversion). Composes for chaining.
 pub fn ext_crc(seed: u32, data: &[u8]) -> u32 {
     crc32c::crc32c_append(seed ^ 0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
 }
@@ -233,7 +233,7 @@ mod tests {
         // Standard CRC-32C canonical vector, via the crate directly.
         assert_eq!(crc32c::crc32c(b"123456789"), 0xE306_9283);
         // Seed derived from UUID 11111111-2222-3333-4444-555555555555 — the value
-        // mke2fs stored in s_checksum_seed for that UUID (verified externally).
+        // stored in s_checksum_seed for that UUID (verified externally).
         let uuid: [u8; 16] = [
             0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
             0x55, 0x55,
@@ -251,7 +251,7 @@ mod tests {
     }
 
     /// Verify every stamper reproduces the stored checksums in the committed
-    /// metadata_csum ext4 fixture (a real mke2fs image).
+    /// metadata_csum ext4 fixture image.
     #[test]
     fn stampers_reproduce_fixture_checksums() {
         let d = load_ext4();
