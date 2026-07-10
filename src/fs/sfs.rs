@@ -41,6 +41,7 @@ const OBJECTCONTAINER_ID: u32 = u32::from_be_bytes(*b"OBJC");
 const NODECONTAINER_ID: u32 = u32::from_be_bytes(*b"NDC ");
 const BNODECONTAINER_ID: u32 = u32::from_be_bytes(*b"BNDC");
 const BITMAP_ID: u32 = u32::from_be_bytes(*b"BTMP");
+const ADMINSPACECONTAINER_ID: u32 = u32::from_be_bytes(*b"ADMC");
 #[allow(dead_code)]
 const HASHTABLE_ID: u32 = u32::from_be_bytes(*b"HTAB");
 const SOFTLINK_ID: u32 = u32::from_be_bytes(*b"SLNK");
@@ -609,6 +610,222 @@ impl<R: Read + Seek> SfsFilesystem<R> {
     }
 }
 
+/// A directory child parsed from an ObjectContainer, classified by its
+/// `OTYPE_*` bits. Returned by [`SfsFilesystem::scan_object_container`] so the
+/// fsck module can walk the tree without the private object parser.
+#[derive(Debug, Clone)]
+pub(crate) struct SfsChild {
+    pub(crate) kind: SfsChildKind,
+    /// `fsObject.data` — first data BLCK for a file, or the `SLNK` block for a
+    /// softlink.
+    pub(crate) first_data: u32,
+    /// `fsObject.firstdirblock` — the first `OBJC` of a directory's chain.
+    pub(crate) firstdirblock: u32,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SfsChildKind {
+    Dir,
+    File,
+    Softlink,
+}
+
+// === fsck accessors ========================================================
+//
+// A read-only surface the sibling `sfs_fsck` module uses to walk the volume
+// and reconcile the block-allocation bitmap. Purpose-built methods return
+// plain data (validated block scans, the stored free bitmap, extent lookups)
+// so the private object/extent parsers and block-id constants stay private.
+// The bitmap-rewrite repair primitive lives in the mutation block further
+// down (it stages into `dirty`).
+impl<R: Read + Seek> SfsFilesystem<R> {
+    pub(crate) fn total_blocks(&self) -> u32 {
+        self.root.totalblocks
+    }
+    pub(crate) fn bitmapbase(&self) -> u32 {
+        self.root.bitmapbase
+    }
+    pub(crate) fn adminspacecontainer(&self) -> u32 {
+        self.root.adminspacecontainer
+    }
+    pub(crate) fn reserved_start(&self) -> u32 {
+        SFS_BLOCKS_RESERVED_START
+    }
+    pub(crate) fn reserved_end(&self) -> u32 {
+        SFS_BLOCKS_RESERVED_END
+    }
+    /// Number of contiguous `BTMP` blocks the bitmap occupies.
+    pub(crate) fn bitmap_blocks_needed(&self) -> u32 {
+        let words_per_block = (self.root.blocksize as usize - 12) / 4;
+        let bits_per_block = words_per_block * 32;
+        (self.root.totalblocks as usize).div_ceil(bits_per_block) as u32
+    }
+
+    /// The stored allocation bitmap, one bit per block (`set = free`), as
+    /// [`read_bitmap`] returns it.
+    pub(crate) fn stored_free_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        read_bitmap(self)
+    }
+
+    /// Validate the root block at `blk` (id + ownblock + checksum). Returns an
+    /// error message on failure, `None` when valid.
+    pub(crate) fn verify_root_block(&mut self, blk: u32) -> Option<String> {
+        match self.read_block(blk) {
+            Ok(buf) => validate_block(buf, ROOTBLOCK_ID, blk)
+                .err()
+                .map(|e| e.to_string()),
+            Err(e) => Some(e.to_string()),
+        }
+    }
+
+    /// The `firstdirblock` of the root directory (the first `OBJC` of the
+    /// root's object chain), validating the root ObjectContainer on the way.
+    pub(crate) fn root_firstdirblock(&mut self) -> Result<u32, FilesystemError> {
+        let blk = self.root.rootobjectcontainer;
+        let buf = self.read_block(blk)?.to_vec();
+        validate_block(&buf, OBJECTCONTAINER_ID, blk)?;
+        if buf.len() < 24 + 21 {
+            return Err(parse_err("SFS root container too small"));
+        }
+        Ok(rd_u32(&buf, 24 + 16))
+    }
+
+    /// Scan one `OBJC` block: validate it, then return its `next` pointer and
+    /// the classified children it holds.
+    pub(crate) fn scan_object_container(
+        &mut self,
+        blk: u32,
+    ) -> Result<(u32, Vec<SfsChild>), FilesystemError> {
+        let buf = self.read_block(blk)?.to_vec();
+        validate_block(&buf, OBJECTCONTAINER_ID, blk)?;
+        if buf.len() < 24 {
+            return Err(parse_err("SFS ObjectContainer too small"));
+        }
+        let next = rd_u32(&buf, 16);
+        let mut children = Vec::new();
+        let mut off = 24usize;
+        while off < buf.len() {
+            match parse_object(&buf, off) {
+                Some((obj, consumed)) => {
+                    let kind = if obj.is_dir() {
+                        SfsChildKind::Dir
+                    } else if obj.is_link() {
+                        SfsChildKind::Softlink
+                    } else {
+                        SfsChildKind::File
+                    };
+                    children.push(SfsChild {
+                        kind,
+                        first_data: obj.data_or_hashtable,
+                        firstdirblock: obj.size_or_firstdirblock,
+                        name: obj.name,
+                    });
+                    off += consumed;
+                }
+                None => break,
+            }
+        }
+        Ok((next, children))
+    }
+
+    /// Scan one `ADMC` block: validate it, then return its `next` pointer and
+    /// the `(space, region_size)` of each populated adminspace entry. The whole
+    /// `region_size`-block region behind each `space` is reserved in the main
+    /// bitmap.
+    pub(crate) fn scan_admin_container(
+        &mut self,
+        blk: u32,
+    ) -> Result<(u32, Vec<(u32, u32)>), FilesystemError> {
+        let buf = self.read_block(blk)?.to_vec();
+        validate_block(&buf, ADMINSPACECONTAINER_ID, blk)?;
+        if buf.len() < 36 {
+            return Err(parse_err("SFS AdminSpaceContainer too small"));
+        }
+        let next = rd_u32(&buf, 12);
+        let region_size = buf[24] as u32; // blocks per adminspace region
+        let mut regions = Vec::new();
+        // adminspace[] entries start at offset 28: space(u32) + bits(u32).
+        let mut o = 28usize;
+        while o + 8 <= buf.len() {
+            let space = rd_u32(&buf, o);
+            if space == 0 {
+                break;
+            }
+            regions.push((space, region_size));
+            o += 8;
+        }
+        Ok((next, regions))
+    }
+
+    /// Extent-tree lookup for data block `key`: `(next, prev, blocks)`.
+    pub(crate) fn peek_extent(
+        &mut self,
+        key: u32,
+    ) -> Result<Option<(u32, u32, u32)>, FilesystemError> {
+        self.lookup_extent(key)
+    }
+
+    /// The volume name (the root object's name), for fsck stats.
+    pub(crate) fn volume_name(&mut self) -> Option<String> {
+        let blk = self.root.rootobjectcontainer;
+        let buf = self.read_block(blk).ok()?.to_vec();
+        let (obj, _) = parse_object(&buf, 24)?;
+        if obj.name.is_empty() {
+            None
+        } else {
+            Some(obj.name)
+        }
+    }
+
+    /// Rewrite every `BTMP` block from an observed allocation set (`alloc` bit
+    /// set = block allocated, LSB-first per byte, indexed by absolute block)
+    /// and recompute the cached free count. Stages the bitmap blocks into the
+    /// dirty map; the caller flushes via `sync_metadata` (which re-stamps the
+    /// block checksums). Used by fsck repair.
+    pub(crate) fn rewrite_bitmap_from(&mut self, alloc: &[u8]) -> Result<(), FilesystemError> {
+        let total = self.root.totalblocks as usize;
+        let words_per_block = (self.root.blocksize as usize - 12) / 4;
+        let bits_per_block = words_per_block * 32;
+        let needed = total.div_ceil(bits_per_block);
+        let base = self.root.bitmapbase;
+        for bm_idx in 0..needed {
+            let bm_blk = base + bm_idx as u32;
+            self.ensure_dirty(bm_blk)?;
+            let buf = self.dirty.get_mut(&bm_blk).unwrap();
+            for w in 0..words_per_block {
+                let base_block = bm_idx * bits_per_block + w * 32;
+                let mut word: u32 = 0;
+                for i in 0..32usize {
+                    let global = base_block + i;
+                    if global >= total {
+                        break;
+                    }
+                    let allocated =
+                        (alloc.get(global / 8).copied().unwrap_or(0) >> (global % 8)) & 1 == 1;
+                    if !allocated {
+                        word |= 1u32 << (31 - i as u32);
+                    }
+                }
+                let o = 12 + w * 4;
+                if o + 4 > buf.len() {
+                    break;
+                }
+                buf[o..o + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        // Recompute the cached free count from the observed allocation.
+        let mut free: u64 = 0;
+        for b in 0..total {
+            if (alloc.get(b / 8).copied().unwrap_or(0) >> (b % 8)) & 1 == 0 {
+                free += 1;
+            }
+        }
+        self.free_blocks_cached = free;
+        Ok(())
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         let mut fe = FileEntry::root();
@@ -757,6 +974,10 @@ impl<R: Read + Seek + Send> Filesystem for SfsFilesystem<R> {
         let bs = self.root.blocksize as u64;
         self.total_size()
             .saturating_sub(self.free_blocks_cached * bs)
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::sfs_fsck::check_sfs(self))
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
@@ -2226,6 +2447,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Sf
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_blocks_cached * self.root.blocksize as u64)
     }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::sfs_fsck::repair_sfs(self)
+    }
 }
 
 // === Phase 8: formatter for a blank SFS volume =============================
@@ -3054,6 +3279,130 @@ mod tests {
         let d = kids.iter().find(|c| c.name == "MyDir").unwrap();
         let sub_kids = fs2.list_directory(d).expect("list dir");
         assert!(sub_kids.is_empty());
+    }
+
+    #[test]
+    fn fsck_clean_blank_reports_no_errors() {
+        let img = create_blank_sfs(8192, "CleanSFS").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let res = fs.fsck().expect("fsck available").expect("fsck ok");
+        assert!(
+            res.errors.is_empty(),
+            "blank volume should be clean; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(res.is_clean());
+        assert!(res.stats.directories_checked >= 1);
+    }
+
+    #[test]
+    fn fsck_clean_after_writes() {
+        use super::super::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let img = create_blank_sfs(8192, "Written").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let sub = fs
+            .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+            .expect("mkdir");
+        let payload = vec![0x33u8; 4000];
+        let mut src = std::io::Cursor::new(payload);
+        fs.create_file(
+            &sub,
+            "big.dat",
+            &mut src,
+            4000,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let img = fs.reader.into_inner();
+
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let res = fs.fsck().expect("fsck available").expect("fsck ok");
+        assert!(
+            res.is_clean(),
+            "volume with writes should be clean; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(res.stats.files_checked >= 1);
+        assert!(res.stats.directories_checked >= 2);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_bitmap_mismatch() {
+        use super::super::filesystem::EditableFilesystem;
+        let img = create_blank_sfs(8192, "BM").expect("format");
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        // Mark block 0 (the root block — always allocated) free in the bitmap,
+        // the classic stale-bit condition after an unclean unmount.
+        fs.toggle_bitmap(0, 1, /*set_free=*/ true).expect("corrupt");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let img = fs.reader.into_inner();
+
+        // Detect.
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img.clone()), 0).expect("reopen");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(!res.is_clean(), "fsck should detect the mismatch");
+        assert!(
+            res.errors.iter().any(|e| e.code == "SfsBitmapMismatch"),
+            "expected SfsBitmapMismatch among {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(res.repairable);
+
+        // Repair.
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let report = fs.repair().expect("repair");
+        assert!(
+            !report.fixes_applied.is_empty(),
+            "expected a fix; applied={:?} failed={:?}",
+            report.fixes_applied,
+            report.fixes_failed
+        );
+        let img = fs.reader.into_inner();
+
+        // Verify clean.
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(
+            res.is_clean(),
+            "should be clean after repair; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fsck_surfaces_bad_checksum_unrepairable() {
+        use super::super::filesystem::EditableFilesystem;
+        // Corrupt a byte inside the root ObjectContainer (block 2) so its id +
+        // ownblock still match but the checksum fails. fsck must surface it as
+        // a non-repairable structural error and refuse to touch the bitmap.
+        let mut img = create_blank_sfs(8192, "CK").expect("format");
+        img[2 * 512 + 100] ^= 0xFF;
+
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img.clone()), 0).expect("open");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(!res.is_clean());
+        assert!(
+            res.errors.iter().any(|e| e.code == "SfsBadChecksum"),
+            "expected SfsBadChecksum among {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(
+            !res.repairable,
+            "a checksum failure alone must not be reported as repairable"
+        );
+
+        let mut fs = SfsFilesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let report = fs.repair().expect("repair");
+        assert!(
+            report.fixes_applied.is_empty(),
+            "repair must withhold bitmap rewrite on structural damage; applied={:?}",
+            report.fixes_applied
+        );
+        assert!(report.unrepairable_count >= 1);
     }
 
     /// `rename` round-trips: the new name is listed, the old is gone, and

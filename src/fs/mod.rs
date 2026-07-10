@@ -76,6 +76,7 @@ pub mod reiserfs;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
+pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
 pub mod tree;
@@ -2306,9 +2307,9 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
         return true;
     }
     // Amiga RDB filesystems identified by their 4-byte DosType string: AFFS
-    // (`affs_fsck`) and PFS3 (`pfs3_fsck`) implement `fsck()`.
+    // (`affs_fsck`), PFS3 (`pfs3_fsck`), and SFS (`sfs_fsck`) implement `fsck()`.
     type_str
-        .map(|s| is_amiga_dos_type(s) || is_amiga_pfs3_type(s))
+        .map(|s| is_amiga_dos_type(s) || is_amiga_pfs3_type(s) || is_amiga_sfs_type(s))
         .unwrap_or(false)
 }
 
@@ -2721,6 +2722,8 @@ mod tests {
         assert!(is_checkable_type(0, Some("DOS\\3")));
         assert!(is_checkable_type(0, Some("PFS\\3"))); // PFS3 fsck driver
         assert!(is_checkable_type(0, Some("PDS\\3")));
+        assert!(is_checkable_type(0, Some("SFS\\0"))); // SFS fsck driver
+        assert!(is_checkable_type(0, Some("SFS\\2")));
         assert!(is_checkable_type(0x0B, None)); // FAT32 now checkable
         assert!(is_checkable_type(0x06, None)); // FAT16 now checkable
         assert!(!is_checkable_type(0x07, None)); // exFAT/NTFS: no fsck driver

@@ -2498,6 +2498,49 @@ fn test_sfs_staged_edits_round_trip() {
     );
 }
 
+/// End-to-end fsck on a file-backed SFS volume — the path the CLI
+/// (`rb-cli fsck`) and the Inspect-tab Check button drive through the
+/// `Filesystem::fsck` trait method. Format a blank volume on disk, write a
+/// directory + file into it, then confirm the integrity check is clean.
+#[test]
+fn test_sfs_fsck_clean_on_file_backed_volume() {
+    use rusty_backup::fs::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+    };
+    use rusty_backup::fs::sfs::{create_blank_sfs, SfsFilesystem};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("check.hdf");
+    std::fs::write(&img_path, create_blank_sfs(8192, "FsckSFS").unwrap())
+        .expect("write blank image");
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut fs = SfsFilesystem::open(file, 0).expect("open");
+    let root = fs.root().expect("root");
+    let sub = fs
+        .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+        .expect("mkdir");
+    let payload = vec![0x42u8; 3000];
+    let mut src = std::io::Cursor::new(payload);
+    fs.create_file(&sub, "f.bin", &mut src, 3000, &CreateFileOptions::default())
+        .expect("create_file");
+    fs.sync_metadata().expect("sync");
+    drop(fs);
+
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = SfsFilesystem::open(f2, 0).expect("reopen");
+    let res = fs.fsck().expect("fsck available").expect("fsck ok");
+    assert!(
+        res.is_clean(),
+        "file-backed SFS should be clean; errors: {:?}",
+        res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
 /// End-to-end synthetic test: build a tiny RDB+FFS disk in memory (well
 /// under 64 KiB), run it through the full `PartitionTable::detect` →
 /// `open_filesystem` dispatch pipeline, and verify the AFFS volume
