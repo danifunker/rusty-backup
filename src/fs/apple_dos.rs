@@ -68,12 +68,14 @@
 //! stripping, BASIC detokenization) — that's the consumer's job. The
 //! MiSTer-plan Add/Delete bar will land in a follow-up.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 use crate::rbformats::containers::sector_order::{
     APPLE_II_DISK_BYTES, APPLE_II_SECTORS_PER_TRACK, APPLE_II_SECTOR_BYTES, APPLE_II_TRACKS,
     APPLE_II_TRACK_BYTES,
@@ -511,6 +513,201 @@ impl<R: Read + Seek + Send> Filesystem for AppleDosFilesystem<R> {
         let free = self.vtoc.free_sector_count() as u64 * APPLE_II_SECTOR_BYTES as u64;
         self.total_size().saturating_sub(free)
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
+}
+
+// ─────────────────────────────── fsck (check) ────────────────────────────────
+
+/// Mark T`track`S`sector` as referenced, recording structural damage in
+/// `broken` when the address is out of range or already claimed (a cross-link).
+fn mark_sector(used: &mut [bool], broken: &mut Vec<String>, track: u8, sector: u8, who: &str) {
+    if (track as usize) >= APPLE_II_TRACKS || (sector as usize) >= APPLE_II_SECTORS_PER_TRACK {
+        broken.push(format!(
+            "{who}: T{track}S{sector} is past the end of the disk"
+        ));
+        return;
+    }
+    let i = (track as usize) * APPLE_II_SECTORS_PER_TRACK + (sector as usize);
+    if used[i] {
+        broken.push(format!(
+            "{who}: T{track}S{sector} is cross-linked (referenced more than once)"
+        ));
+    } else {
+        used[i] = true;
+    }
+}
+
+impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
+    /// Recompute the allocated-sector set by walking the catalog chain and every
+    /// live file's T/S-list chain (the CBM VALIDATE model). Returns
+    /// `(used, files, broken)`, indexed `track * 16 + sector`; a non-empty
+    /// `broken` (out-of-range address, cross-link, or a chain cycle) means the
+    /// walk is incomplete and a free-map rewrite would be unsafe.
+    fn collect_used(&mut self) -> Result<(Vec<bool>, u32, Vec<String>), FilesystemError> {
+        let mut used = vec![false; APPLE_II_TRACKS * APPLE_II_SECTORS_PER_TRACK];
+        let mut broken = Vec::new();
+
+        // The VTOC sector is always allocated.
+        mark_sector(&mut used, &mut broken, VTOC_TRACK, VTOC_SECTOR, "VTOC");
+
+        // Walk the catalog chain, marking each catalog sector.
+        let mut ct = self.vtoc.first_catalog_track;
+        let mut cs = self.vtoc.first_catalog_sector;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_CATALOG_SECTORS {
+            if ct == 0 {
+                break;
+            }
+            if (ct as usize) >= APPLE_II_TRACKS || (cs as usize) >= APPLE_II_SECTORS_PER_TRACK {
+                broken.push(format!("catalog sector T{ct}S{cs} is out of range"));
+                break;
+            }
+            if !seen.insert((ct, cs)) {
+                broken.push(format!("catalog chain cycle at T{ct}S{cs}"));
+                break;
+            }
+            mark_sector(&mut used, &mut broken, ct, cs, "catalog");
+            let cat = read_sector(&mut self.reader, self.partition_offset, ct, cs)?;
+            ct = cat[0x01];
+            cs = cat[0x02];
+        }
+
+        // Each live file: walk its T/S-list chain (list sectors + data sectors).
+        let entries = self.entries.clone();
+        let max_pairs = self.vtoc.max_ts_pairs_per_list as usize;
+        let mut files = 0u32;
+        for e in &entries {
+            if e.is_unused() || e.is_deleted() {
+                continue;
+            }
+            files += 1;
+            let mut lt = e.first_ts_track;
+            let mut ls = e.first_ts_sector;
+            let mut lseen = HashSet::new();
+            for _ in 0..MAX_TS_LISTS {
+                if lt == 0 {
+                    break;
+                }
+                if (lt as usize) >= APPLE_II_TRACKS || (ls as usize) >= APPLE_II_SECTORS_PER_TRACK {
+                    broken.push(format!(
+                        "file '{}': T/S list T{lt}S{ls} is out of range",
+                        e.name
+                    ));
+                    break;
+                }
+                if !lseen.insert((lt, ls)) {
+                    broken.push(format!("file '{}': T/S list cycle at T{lt}S{ls}", e.name));
+                    break;
+                }
+                mark_sector(&mut used, &mut broken, lt, ls, &e.name);
+                let list = read_sector(&mut self.reader, self.partition_offset, lt, ls)?;
+                for pair in 0..max_pairs {
+                    let off = 0x0C + pair * 2;
+                    let dt = list[off];
+                    let ds = list[off + 1];
+                    // dt == 0 is either an end/unused pair or a sparse hole —
+                    // neither occupies a data sector.
+                    if dt != 0 {
+                        mark_sector(&mut used, &mut broken, dt, ds, &e.name);
+                    }
+                }
+                lt = list[0x01];
+                ls = list[0x02];
+            }
+        }
+
+        Ok((used, files, broken))
+    }
+
+    /// DOS 3.3 integrity check: reconcile the VTOC free map against the
+    /// allocation recomputed from the catalog + file T/S lists. Leaked sectors
+    /// on tracks 0-2 are treated as the DOS boot image (a benign warning), not
+    /// as reclaimable leaks.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (used, files, broken) = self.collect_used()?;
+        let walk_clean = broken.is_empty();
+
+        let mut used_but_free = 0u32;
+        let mut leaked_data = 0u32;
+        let mut leaked_boot = 0u32;
+        for t in 0..APPLE_II_TRACKS as u8 {
+            for s in 0..APPLE_II_SECTORS_PER_TRACK as u8 {
+                let i = t as usize * APPLE_II_SECTORS_PER_TRACK + s as usize;
+                match (self.vtoc.is_sector_free(t, s), used[i]) {
+                    (true, true) => used_but_free += 1, // referenced but marked free
+                    (false, false) => {
+                        if t < 3 {
+                            leaked_boot += 1; // DOS 3.3 boot image on tracks 0-2
+                        } else {
+                            leaked_data += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        if used_but_free > 0 || leaked_data > 0 {
+            errors.push(FsckIssue {
+                code: "AppleDosFreeMapMismatch".into(),
+                message: format!(
+                    "VTOC free-map mismatch: {used_but_free} sector(s) in use but marked free, \
+                     {leaked_data} sector(s) marked used but unreferenced"
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        if leaked_boot > 0 {
+            warnings.push(FsckIssue {
+                code: "AppleDosBootReserved".into(),
+                message: format!(
+                    "{leaked_boot} sector(s) on tracks 0-2 are allocated but unreferenced — \
+                     the DOS 3.3 boot image; left as-is"
+                ),
+                repairable: false,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "AppleDosStructuralDamage".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = self.vtoc.free_sector_count();
+        let total = (APPLE_II_TRACKS * APPLE_II_SECTORS_PER_TRACK) as u32;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings,
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    ("free sectors".into(), format!("{free} / {total}")),
+                    (
+                        "free map".into(),
+                        if used_but_free == 0 && leaked_data == 0 {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 /// Encode an Apple-ASCII filename to its 30-byte on-disk form (high-bit
@@ -657,6 +854,51 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
         let mut sec = read_sector(&mut self.reader, self.partition_offset, 17, 0)?;
         sec[0x38..0x38 + 200].copy_from_slice(&self.vtoc.bitmap);
         self.write_sector(17, 0, &sec)
+    }
+
+    /// Rebuild the VTOC free map from the catalog + file walk, unless the walk
+    /// found structural damage. `used_but_free` sectors are marked used
+    /// everywhere; leaked sectors are reclaimed (marked free) only on the data
+    /// tracks (3-34) — tracks 0-2 hold the DOS boot image and are left as-is.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (used, _files, broken) = self.collect_used()?;
+        if !broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len(),
+            });
+        }
+        let mut fixed = 0u32;
+        for t in 0..APPLE_II_TRACKS as u8 {
+            for s in 0..APPLE_II_SECTORS_PER_TRACK as u8 {
+                let i = t as usize * APPLE_II_SECTORS_PER_TRACK + s as usize;
+                let free = self.vtoc.is_sector_free(t, s);
+                if used[i] && free {
+                    self.bitmap_mark_used(t, s); // referenced but marked free
+                    fixed += 1;
+                } else if !used[i] && !free && t >= 3 {
+                    self.bitmap_mark_free(t, s); // leaked on a data track — reclaim
+                    fixed += 1;
+                }
+            }
+        }
+        if fixed == 0 {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        self.vtoc_write_back()?;
+        self.reader.flush()?;
+        Ok(RepairReport {
+            fixes_applied: vec![format!(
+                "rebuilt the DOS 3.3 free map from the catalog ({fixed} sector(s) corrected)"
+            )],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -1029,6 +1271,61 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R>
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.vtoc.free_sector_count() as u64 * APPLE_II_SECTOR_BYTES as u64)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
+}
+
+/// Build a blank, freshly formatted Apple DOS 3.3 volume (140 KB, DOS-order):
+/// a VTOC at T17S0, the empty 15-sector catalog chain (T17 S15->S1), and a
+/// free map in which only track 17 is reserved. This is a non-bootable data
+/// disk (tracks 0-2 are left free rather than holding a DOS image), so it
+/// round-trips through [`AppleDosFilesystem::open`] and fscks clean.
+///
+/// The bytes are DOS-order; to write a `.po` (ProDOS-order) file, post-convert
+/// with `containers::sector_order::convert_do_to_po_bytes`.
+pub fn create_blank_apple_dos() -> Vec<u8> {
+    let mut img = vec![0u8; APPLE_II_DISK_BYTES];
+    let sector_at =
+        |track: usize, sector: usize| track * APPLE_II_TRACK_BYTES + sector * APPLE_II_SECTOR_BYTES;
+
+    // --- VTOC at T17S0 ---
+    let v = sector_at(17, 0);
+    img[v + 0x01] = 17; // first catalog track
+    img[v + 0x02] = 15; // first catalog sector
+    img[v + 0x03] = 3; // DOS version
+    img[v + 0x06] = 254; // volume number (DOS 3.3 default)
+    img[v + 0x27] = 122; // max T/S pairs per list
+    img[v + 0x30] = 18; // last track allocated (informational)
+    img[v + 0x31] = 1; // allocation direction (+1, informational)
+    img[v + 0x34] = APPLE_II_TRACKS as u8; // 35 tracks
+    img[v + 0x35] = APPLE_II_SECTORS_PER_TRACK as u8; // 16 sectors/track
+    img[v + 0x36] = (APPLE_II_SECTOR_BYTES & 0xFF) as u8; // 256, LE
+    img[v + 0x37] = (APPLE_II_SECTOR_BYTES >> 8) as u8;
+
+    // Free map (bit SET = free): every track free except track 17. Each track
+    // is 4 bytes: byte0 = sectors 15..8, byte1 = sectors 7..0, bytes 2-3 unused.
+    for t in 0..APPLE_II_TRACKS {
+        let row = v + 0x38 + t * 4;
+        if t == 17 {
+            continue; // track 17 fully reserved (VTOC + catalog)
+        }
+        img[row] = 0xFF;
+        img[row + 1] = 0xFF;
+    }
+
+    // --- Empty catalog chain on track 17: S15 -> S14 -> ... -> S1 -> end ---
+    for s in (1..=15u8).rev() {
+        let c = sector_at(17, s as usize);
+        if s > 1 {
+            img[c + 0x01] = 17; // next catalog track
+            img[c + 0x02] = s - 1; // next catalog sector
+        }
+        // s == 1: next pointer stays (0, 0) = end of chain. Entries all zero.
+    }
+
+    img
 }
 
 impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
@@ -1461,5 +1758,157 @@ mod tests {
             .create_directory(&root, "SUB", &CreateDirectoryOptions::default())
             .unwrap_err();
         assert!(matches!(err, FilesystemError::Unsupported(_)));
+    }
+
+    // ── Create-blank + fsck tests ────────────────────────────────────────
+
+    fn blank_fs() -> AppleDosFilesystem<Cursor<Vec<u8>>> {
+        AppleDosFilesystem::open(Cursor::new(create_blank_apple_dos()), 0).unwrap()
+    }
+
+    #[test]
+    fn create_blank_apple_dos_round_trips_through_open() {
+        let img = create_blank_apple_dos();
+        assert_eq!(img.len(), APPLE_II_DISK_BYTES);
+        let mut fs = AppleDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.fs_type(), "DOS 3.3");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        // 560 total - 16 (track 17) = 544 free (a non-bootable data disk).
+        assert_eq!(fs.vtoc.free_sector_count(), 544);
+    }
+
+    #[test]
+    fn apple_dos_fsck_clean_blank() {
+        let mut fs = blank_fs();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "blank should fsck clean: {:?}", res.errors);
+        // No DOS image on tracks 0-2 -> no boot-reserved warning.
+        assert!(
+            res.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            res.warnings
+        );
+        assert_eq!(res.stats.files_checked, 0);
+    }
+
+    #[test]
+    fn apple_dos_fsck_clean_after_writes() {
+        let mut fs = blank_fs();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "HELLO",
+            &mut Cursor::new(b"hi there".to_vec()),
+            8,
+            &opts,
+        )
+        .unwrap();
+        let big = vec![0x42u8; 900];
+        fs.create_file(
+            &root,
+            "DATA",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "post-write errors: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn apple_dos_fsck_detects_and_repairs_freemap() {
+        let mut fs = blank_fs();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "FILE", &mut Cursor::new(vec![7u8; 300]), 300, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // The first allocation spirals to T18S0 (the T/S list). Mark it free in
+        // the VTOC to create a "used but marked free" mismatch.
+        fs.bitmap_mark_free(18, 0);
+
+        let before = fs.fsck().unwrap().unwrap();
+        assert!(!before.is_clean());
+        assert!(before
+            .errors
+            .iter()
+            .any(|e| e.code == "AppleDosFreeMapMismatch" && e.repairable));
+
+        let report = fs.repair().unwrap();
+        assert!(!report.fixes_applied.is_empty());
+        assert_eq!(report.unrepairable_count, 0);
+
+        let after = fs.fsck().unwrap().unwrap();
+        assert!(after.is_clean(), "post-repair errors: {:?}", after.errors);
+    }
+
+    #[test]
+    fn apple_dos_fsck_boot_tracks_are_benign() {
+        // A real DOS 3.3 disk reserves tracks 0-2 for the DOS image — allocated
+        // but referenced by no file. fsck must treat that as a warning, never an
+        // error, and repair must not reclaim it.
+        let mut fs = blank_fs();
+        for t in 0..3u8 {
+            for s in 0..16u8 {
+                fs.bitmap_mark_used(t, s);
+            }
+        }
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "tracks 0-2 must not be errors: {:?}",
+            res.errors
+        );
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.code == "AppleDosBootReserved"));
+
+        let report = fs.repair().unwrap();
+        assert!(
+            report.fixes_applied.is_empty(),
+            "repair must not touch tracks 0-2: {:?}",
+            report.fixes_applied
+        );
+        assert!(!fs.vtoc.is_sector_free(0, 0)); // still reserved
+    }
+
+    #[test]
+    fn apple_dos_fsck_detects_crosslink_and_withholds_repair() {
+        let mut fs = blank_fs();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A", &mut Cursor::new(vec![1u8; 200]), 200, &opts)
+            .unwrap();
+        fs.create_file(&root, "B", &mut Cursor::new(vec![2u8; 200]), 200, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Both entries live in the first catalog sector (T17S15): A at entry 0,
+        // B at entry 1. Point B's first-T/S at A's to force a cross-link.
+        let mut cat = read_sector(&mut fs.reader, 0, 17, 15).unwrap();
+        let a_t = cat[0x0B];
+        let a_s = cat[0x0B + 1];
+        cat[0x0B + 35] = a_t; // B (entry 1) first-T/S track
+        cat[0x0B + 36] = a_s; // B first-T/S sector
+        fs.write_sector(17, 15, &cat).unwrap();
+        fs.refresh_entries().unwrap();
+
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean());
+        assert!(res
+            .errors
+            .iter()
+            .any(|e| e.code == "AppleDosStructuralDamage"));
+
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(report.unrepairable_count > 0);
     }
 }

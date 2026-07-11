@@ -54,6 +54,12 @@ pub enum FsKind {
     /// sectors) with boot / VTOC / directory reserved. Fixed geometry, so
     /// `--size` and `--name` are ignored (enhanced density is read-only).
     Atari,
+    /// Apple DOS 3.3 (Apple II). A 140 KB 5.25" floppy (35 × 16 × 256, DOS
+    /// order) with a VTOC + empty catalog and only track 17 reserved (a
+    /// non-bootable data disk). Fixed geometry, so `--size` / `--name` are
+    /// ignored.
+    #[value(alias = "appledos", alias = "dos33")]
+    AppleDos,
 }
 
 #[derive(Debug, Args)]
@@ -62,7 +68,8 @@ pub struct NewArgs {
     pub image: PathBuf,
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
-    /// ext (alias ext2), ext3, ext4, prodos, atari.
+    /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
+    /// dos33).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -264,6 +271,11 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
             Ok(crate::fs::atari_dos::create_blank_atari_sd())
         }),
+        FsKind::AppleDos => {
+            format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
+                Ok(crate::fs::apple_dos::create_blank_apple_dos())
+            })
+        }
     }
 }
 
