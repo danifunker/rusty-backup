@@ -1592,6 +1592,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                         reader,
                         partition_offset,
                     )?)),
+                    "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
                     _ => Err(FilesystemError::Unsupported(format!(
                         "editing not yet supported for APM Unix filesystem type '{fs_type}'"
                     ))),
@@ -1806,6 +1810,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),

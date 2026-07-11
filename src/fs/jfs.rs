@@ -39,7 +39,7 @@
 //! * `partimage-0.6.9/src/client/fs/fs_jfs.cpp` — Tier-A reference port.
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -176,6 +176,27 @@ pub(crate) const EXTSPERIAG: usize = 128;
 const IAG_INOEXT_OFF: usize = 72 + 1976 + 512 + 512; // 3072
 /// Byte offset of `pmap[]` (u32[EXTSPERIAG]) within an iag.
 const IAG_PMAP_OFF: usize = 72 + 1976 + 512; // 2560
+/// Byte offset of `wmap[]` (u32[EXTSPERIAG]) within an iag (before pmap).
+const IAG_WMAP_OFF: usize = 72 + 1976; // 2048
+/// Byte offset of `inosmap[SMAPSZ]` (int32[4]) — "extents with free inodes"
+/// summary. Header: agstart(8) iagnum(4) inofreefwd(4) inofreeback(4)
+/// extfreefwd(4) extfreeback(4) iagfree(4) → inosmap starts at 32.
+const IAG_INOSMAP_OFF: usize = 32;
+/// Byte offset of `nfreeinos` (int32) within an iag.
+const IAG_NFREEINOS_OFF: usize = 64;
+/// Words per IAG summary map (`SMAPSZ`); each covers 32 extents.
+const IAG_SMAPSZ: usize = 4;
+/// `dinomap` control page (logical page 0 of FILESYSTEM_I): `in_numfree`
+/// (int32) and the `in_agctl[MAXAG]` (`struct iagctl[128]`) array offsets.
+const DINOMAP_IN_NUMFREE_OFF: usize = 12;
+const DINOMAP_IN_AGCTL_OFF: usize = 2048;
+/// One `struct iagctl` is 16 bytes; its `numfree` field is at +12.
+const IAGCTL_SIZE: usize = 16;
+const IAGCTL_NUMFREE_OFF: usize = 12;
+/// `MAXAG` — maximum allocation groups per aggregate.
+const JFS_MAXAG: usize = 128;
+/// First allocatable fileset inode: 0/1 reserved, 2 = root, 3 = root ACL.
+pub(crate) const FIRST_USER_FILESET_INO: u32 = 4;
 
 /// `dtroot` lives at dinode offset 224 and is 288 bytes (9 × 32-byte
 /// slots, with slot[0] overlapping the header in the kernel's union
@@ -203,6 +224,12 @@ const DTROOT_OFF_STBL: usize = 24; // s8[8] — sorted entry index table
 /// total entry count fits in the 8 free slots (~7 short-name entries),
 /// so the cap below is generous.
 pub(crate) const DT_INLINE_CAP: u64 = 4096;
+
+/// `IDATASIZE` — the inode inline-data size mkfs / fsck stamp as the
+/// `di_size` of an empty inline directory (`jfs_filsys.h`). fsck does not
+/// validate directory size, but a freshly created `/lost+found` uses this
+/// so the value is kernel-faithful and stays under [`DT_INLINE_CAP`].
+const IDATASIZE: u64 = 256;
 
 // ---- External dtpage layout (4 KiB) ----
 //
@@ -361,6 +388,17 @@ impl Pxd {
     /// `(address + length) * bsize`.
     pub fn end_byte(&self, bsize: u64) -> u64 {
         (self.address + self.length as u64) * bsize
+    }
+
+    /// Serialize into 8 on-disk bytes (little-endian). Inverse of
+    /// [`Self::parse`]: word0 = length (low 24 bits) | addr-high (8 bits),
+    /// word1 = low 32 bits of the address.
+    fn write(&self, buf: &mut [u8]) {
+        let addr_hi = ((self.address >> 32) & 0xFF) as u32;
+        let word0 = (self.length & 0x00FF_FFFF) | (addr_hi << 24);
+        let word1 = (self.address & 0xFFFF_FFFF) as u32;
+        buf[0..4].copy_from_slice(&word0.to_le_bytes());
+        buf[4..8].copy_from_slice(&word1.to_le_bytes());
     }
 }
 
@@ -1275,6 +1313,24 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
         root: &XtreeRoot,
         logical_page: u64,
     ) -> Result<Vec<u8>, FilesystemError> {
+        let byte = self.partition_offset + self.xtree_leaf_phys_byte(root, logical_page)?;
+        self.reader.seek(SeekFrom::Start(byte))?;
+        let mut buf = vec![0u8; PSIZE as usize];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Partition-relative byte offset of the leaf page that backs
+    /// `logical_page` in the xtree rooted at `root`. Descends internal
+    /// xtpages the same way [`Self::read_xtree_logical_page`] does; the
+    /// read path reads `PSIZE` bytes here, the write path (J.4b) writes a
+    /// mutated page back to the same byte, so both resolve a logical page
+    /// through one code path.
+    pub(crate) fn xtree_leaf_phys_byte(
+        &mut self,
+        root: &XtreeRoot,
+        logical_page: u64,
+    ) -> Result<u64, FilesystemError> {
         let mut cur = root.clone();
         // Guard against pathological cycles in corrupted xtrees. Real
         // JFS xtrees never exceed a handful of levels (each level
@@ -1296,11 +1352,7 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
             if cur.flag & BT_LEAF_FLAG != 0 {
                 let within = logical_page - xad.logical_offset;
                 let phys_block = xad.physical_address + within;
-                let byte = self.partition_offset + phys_block * self.bsize;
-                self.reader.seek(SeekFrom::Start(byte))?;
-                let mut buf = vec![0u8; PSIZE as usize];
-                self.reader.read_exact(&mut buf)?;
-                return Ok(buf);
+                return Ok(phys_block * self.bsize);
             }
             // INTERNAL — descend into the next xtpage. Internal XAD's
             // `physical_address` points to a child xtpage; its
@@ -1529,6 +1581,423 @@ impl<R: Read + Seek + Send> JfsFilesystem<R> {
     }
 }
 
+// ---- J.4b: write primitives (edit + repair) ----
+//
+// Bounded on `R: Read + Write + Seek` so the read-only reader stays usable
+// by read-only callers (a `Cursor<&[u8]>`, an mmap, etc.). All byte offsets
+// passed to `write_at` are partition-relative; it adds `partition_offset`,
+// mirroring every read path in the block above. Writes are synchronous
+// (seek + `write_all`), so there is no dirty-buffer state to track — the
+// only cache we must invalidate is `iag_cache`, done in
+// `write_fileset_logical_page`.
+impl<R: Read + Write + Seek + Send> JfsFilesystem<R> {
+    /// Write `data` at partition-relative byte `rel`.
+    pub(crate) fn write_at(&mut self, rel: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + rel))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Partition-relative byte offset of fileset inode `fino`'s 512-byte
+    /// dinode. Mirrors the address math in [`Self::read_fileset_inode`]
+    /// (`inoext[extent].address * bsize + (fino % 32) * DISIZE`).
+    pub(crate) fn fileset_inode_byte(&mut self, fino: u32) -> Result<u64, FilesystemError> {
+        let iag = self.iag_for_fino(fino)?;
+        let local_extent = ((fino / INOSPEREXT) as usize) % EXTSPERIAG;
+        let in_extent = (fino % INOSPEREXT) as u64;
+        let pxd = iag.inoext[local_extent];
+        if pxd.length == 0 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: fileset inode {fino}: inoext[{local_extent}] not allocated"
+            )));
+        }
+        Ok(pxd.address * self.bsize + in_extent * DISIZE)
+    }
+
+    /// Re-write fileset inode `fino`'s 512-byte dinode from `raw`. Callers
+    /// mutate the `JfsDinode::raw` buffer in place (preserving every field
+    /// they don't touch — the on-disk-fidelity convention) and pass it here.
+    pub(crate) fn write_dinode(&mut self, fino: u32, raw: &[u8]) -> Result<(), FilesystemError> {
+        if raw.len() != DISIZE as usize {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: write_dinode expects {DISIZE} bytes, got {}",
+                raw.len()
+            )));
+        }
+        let byte = self.fileset_inode_byte(fino)?;
+        self.write_at(byte, raw)
+    }
+
+    /// Read logical page `lp` of the FILESYSTEM_I data fork. Page 0 is the
+    /// `dinomap` control page; page `1 + n` is IAG `n`.
+    pub(crate) fn read_fileset_logical_page(
+        &mut self,
+        lp: u64,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
+        let xtroot = self.parse_inline_xtree_root(&fs_ino.raw)?;
+        self.read_xtree_logical_page(&xtroot, lp)
+    }
+
+    /// Write a full 4096-byte logical page `lp` of the FILESYSTEM_I data
+    /// fork back to disk. IAG pages live at `lp = 1 + iag_no`, so writing
+    /// one invalidates that IAG's cache entry (a subsequent
+    /// [`Self::iag_for_fino`] re-reads the mutated page).
+    pub(crate) fn write_fileset_logical_page(
+        &mut self,
+        lp: u64,
+        page: &[u8],
+    ) -> Result<(), FilesystemError> {
+        if page.len() != PSIZE as usize {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: write_fileset_logical_page expects {PSIZE} bytes, got {}",
+                page.len()
+            )));
+        }
+        let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
+        let xtroot = self.parse_inline_xtree_root(&fs_ino.raw)?;
+        let byte = self.xtree_leaf_phys_byte(&xtroot, lp)?;
+        self.write_at(byte, page)?;
+        if lp >= 1 {
+            self.iag_cache.remove(&((lp - 1) as u32));
+        }
+        Ok(())
+    }
+
+    /// Flush pending writes to the backing store. Writes are synchronous,
+    /// so this just flushes the underlying handle.
+    pub(crate) fn flush_writes(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    /// Free bytes available = BMAP free-block count × aggregate block size.
+    pub(crate) fn free_bytes(&mut self) -> Result<u64, FilesystemError> {
+        let walk = self.require_bmap_walk()?;
+        Ok(walk.nfree * self.bsize)
+    }
+
+    /// Allocate a single free fileset inode from an already-backed inode
+    /// extent and return its global fileset inode number. The dinode slot
+    /// is left as-is — the caller writes a fully-initialised 512-byte
+    /// dinode via [`Self::write_dinode`].
+    ///
+    /// Updates every counter/map fsck.jfs Phase 7 (`iag_alloc_ver` +
+    /// `imapctl` verify) recomputes from the live dinodes:
+    ///   * the IAG's `pmap[e]` **and** `wmap[e]` allocation bit (per-inode,
+    ///     MSB-first: bit `31 - fino%32`);
+    ///   * `inosmap` (set the extent's "no free inodes" summary bit when the
+    ///     allocation consumes the extent's last free slot);
+    ///   * the IAG's `nfreeinos`;
+    ///   * the dinomap control page's `in_numfree` and the owning AG's
+    ///     `in_agctl[ag].numfree`.
+    ///
+    /// Only the reuse-a-free-slot-in-a-backed-extent case is implemented —
+    /// that is all `repair()` needs (it allocates at most one inode,
+    /// `/lost+found`). If no backed extent in any IAG has a free slot,
+    /// returns `Unsupported` rather than growing a new inode extent / IAG.
+    pub(crate) fn alloc_fileset_inode(&mut self) -> Result<u32, FilesystemError> {
+        let fs_ino = self.read_ait_inode(FILESYSTEM_I)?;
+        let logical_pages = fs_ino.size.div_ceil(PSIZE);
+        let n_iags = logical_pages.saturating_sub(1) as u32;
+
+        for iag_no in 0..n_iags {
+            let mut page = self.read_fileset_logical_page(1 + iag_no as u64)?;
+            let nfreeinos = read_i32(&page, IAG_NFREEINOS_OFF);
+            if nfreeinos <= 0 {
+                continue;
+            }
+            for e in 0..EXTSPERIAG {
+                // Only backed extents (inoext[e].length > 0) hold real
+                // dinode slots we can claim.
+                let inoext = Pxd::parse(&page[IAG_INOEXT_OFF + e * 8..IAG_INOEXT_OFF + e * 8 + 8]);
+                if inoext.length == 0 {
+                    continue;
+                }
+                let pmap_off = IAG_PMAP_OFF + e * 4;
+                let pmap_word = read_u32(&page, pmap_off);
+                for in_extent in 0..INOSPEREXT {
+                    let fino = iag_no * (INOSPEREXT * EXTSPERIAG as u32)
+                        + e as u32 * INOSPEREXT
+                        + in_extent;
+                    if fino < FIRST_USER_FILESET_INO {
+                        continue; // reserved (0/1) + root (2) + root ACL (3)
+                    }
+                    let mask = 1u32 << (31 - in_extent);
+                    if pmap_word & mask != 0 {
+                        continue; // already allocated
+                    }
+                    // --- Claim fino: set the pmap + wmap bits. ---
+                    let new_pmap = pmap_word | mask;
+                    page[pmap_off..pmap_off + 4].copy_from_slice(&new_pmap.to_le_bytes());
+                    let wmap_off = IAG_WMAP_OFF + e * 4;
+                    let wmap_word = read_u32(&page, wmap_off);
+                    page[wmap_off..wmap_off + 4].copy_from_slice(&(wmap_word | mask).to_le_bytes());
+                    // --- inosmap: set the extent's summary bit iff it now
+                    //     has no free inodes at all. ---
+                    if new_pmap == 0xFFFF_FFFF {
+                        let sm_word = e / 32;
+                        debug_assert!(sm_word < IAG_SMAPSZ);
+                        let sm_off = IAG_INOSMAP_OFF + sm_word * 4;
+                        let sm = read_u32(&page, sm_off);
+                        let sm_mask = 1u32 << (31 - (e % 32));
+                        page[sm_off..sm_off + 4].copy_from_slice(&(sm | sm_mask).to_le_bytes());
+                    }
+                    // --- nfreeinos -= 1. ---
+                    page[IAG_NFREEINOS_OFF..IAG_NFREEINOS_OFF + 4]
+                        .copy_from_slice(&(nfreeinos - 1).to_le_bytes());
+                    // AG owning this IAG: agstart / agsize (both in agg blocks).
+                    let agstart = i64::from_le_bytes(page[0..8].try_into().unwrap()) as u64;
+                    let ag = if self.agsize > 0 {
+                        (agstart / self.agsize as u64) as usize
+                    } else {
+                        0
+                    };
+                    self.write_fileset_logical_page(1 + iag_no as u64, &page)?;
+
+                    // --- dinomap control page: in_numfree -= 1, per-AG -= 1. ---
+                    let mut ctl = self.read_fileset_logical_page(0)?;
+                    let in_numfree = read_i32(&ctl, DINOMAP_IN_NUMFREE_OFF);
+                    ctl[DINOMAP_IN_NUMFREE_OFF..DINOMAP_IN_NUMFREE_OFF + 4]
+                        .copy_from_slice(&(in_numfree - 1).to_le_bytes());
+                    if ag < JFS_MAXAG {
+                        let off = DINOMAP_IN_AGCTL_OFF + ag * IAGCTL_SIZE + IAGCTL_NUMFREE_OFF;
+                        let agnf = read_i32(&ctl, off);
+                        ctl[off..off + 4].copy_from_slice(&(agnf - 1).to_le_bytes());
+                    }
+                    self.write_fileset_logical_page(0, &ctl)?;
+                    return Ok(fino);
+                }
+            }
+        }
+        Err(FilesystemError::Unsupported(
+            "jfs: no free inode in a backed extent (new-extent/new-IAG \
+             allocation is out of scope for repair)"
+                .into(),
+        ))
+    }
+
+    /// Insert one leaf entry (`name` -> `child_fino`) into the **inline
+    /// dtroot** of directory `dir_fino`, keeping the sorted `stbl` sorted.
+    ///
+    /// Returns `Unsupported` ("would spill") when the directory's dtree is
+    /// external (`BT_INTERNAL`) or the inline free-slot pool / 8-entry stbl
+    /// can't hold the entry — repair reconnects a modest orphan count, so
+    /// spilling to an external dtpage is out of scope and surfaces as
+    /// unrepairable.
+    ///
+    /// The new ldtentry's `index` (dir-table cookie) is set to 0.
+    /// `fsck.jfs`'s `verify_dir_index` treats cookie 0 as "the filesystem
+    /// will assign it at runtime" and skips it (exactly what fsck's own
+    /// `rebuild_dir_index` writes), so no inline dir-table upkeep is needed
+    /// and `di_next_index` stays valid for every existing entry. fsck does
+    /// not validate directory `di_size`, so the parent's size is left as-is.
+    pub(crate) fn dtree_insert(
+        &mut self,
+        dir_fino: u32,
+        name: &str,
+        child_fino: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut dir = self.read_fileset_inode_global(dir_fino)?;
+        let base = DI_OFF_TYPE_AREA;
+        if dir.raw.len() < base + DTROOT_SIZE {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: directory inode {dir_fino} buffer too small for dtroot"
+            )));
+        }
+        let flag = dir.raw[base + DTROOT_OFF_FLAG];
+        if flag & BT_INTERNAL_FLAG != 0 {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: directory inode {dir_fino} has an external dtree; inserting into a \
+                 spilled directory is out of scope for repair"
+            )));
+        }
+
+        // UCS-2LE name. Head slot inlines 11 UniChars, each continuation 15;
+        // NDTLEAF(klen) = ceil((4 + klen) / 15) slots total.
+        let uname: Vec<u16> = name.encode_utf16().collect();
+        let namlen = uname.len();
+        if namlen == 0 || namlen > 255 {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: dtree_insert name length {namlen} out of range (1..=255)"
+            )));
+        }
+        let slots_needed = (4 + namlen).div_ceil(15);
+
+        let nextindex = dir.raw[base + DTROOT_OFF_NEXTINDEX] as usize;
+        if nextindex >= 8 {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: directory inode {dir_fino} inline dtroot is full ({nextindex} entries); \
+                 would spill to an external dtree"
+            )));
+        }
+        let mut freecnt = dir.raw[base + DTROOT_OFF_FREECNT] as i8 as i32;
+        if (freecnt as usize) < slots_needed {
+            return Err(FilesystemError::Unsupported(format!(
+                "jfs: directory inode {dir_fino} inline dtroot has {freecnt} free slot(s), \
+                 need {slots_needed} for a {namlen}-char name; would spill"
+            )));
+        }
+
+        // Pop `slots_needed` slots off the freelist (free slots chain via
+        // their first byte, `dtslot.next`).
+        let mut freelist = dir.raw[base + DTROOT_OFF_FREELIST] as i8 as i32;
+        let mut popped: Vec<usize> = Vec::with_capacity(slots_needed);
+        for _ in 0..slots_needed {
+            if !(1..=8).contains(&freelist) {
+                return Err(FilesystemError::Parse(format!(
+                    "jfs: directory inode {dir_fino} freelist slot {freelist} out of range \
+                     (corrupt free chain)"
+                )));
+            }
+            let slot = freelist as usize;
+            popped.push(slot);
+            freelist = dir.raw[base + slot * DT_SLOT_SIZE] as i8 as i32;
+        }
+        freecnt -= slots_needed as i32;
+
+        // Head ldtentry into popped[0].
+        let head = base + popped[0] * DT_SLOT_SIZE;
+        dir.raw[head..head + DT_SLOT_SIZE].fill(0);
+        dir.raw[head..head + 4].copy_from_slice(&child_fino.to_le_bytes());
+        dir.raw[head + 4] = if slots_needed > 1 {
+            popped[1] as u8 // next continuation slot
+        } else {
+            0xFF // -1: no continuation
+        };
+        dir.raw[head + 5] = namlen as u8;
+        let head_name = namlen.min(11);
+        for (i, cp) in uname.iter().take(head_name).enumerate() {
+            let off = head + 6 + i * 2;
+            dir.raw[off..off + 2].copy_from_slice(&cp.to_le_bytes());
+        }
+        // index (dir-table cookie) = 0 -> verify_dir_index escape.
+        dir.raw[head + 28..head + 32].copy_from_slice(&0u32.to_le_bytes());
+
+        // Continuation dtslots.
+        let mut written = head_name;
+        for k in 1..slots_needed {
+            let slot = base + popped[k] * DT_SLOT_SIZE;
+            dir.raw[slot..slot + DT_SLOT_SIZE].fill(0);
+            let take = (namlen - written).min(15);
+            dir.raw[slot] = if k + 1 < slots_needed {
+                popped[k + 1] as u8
+            } else {
+                0xFF
+            };
+            dir.raw[slot + 1] = take as u8;
+            for i in 0..take {
+                let off = slot + 2 + i * 2;
+                dir.raw[off..off + 2].copy_from_slice(&uname[written + i].to_le_bytes());
+            }
+            written += take;
+        }
+
+        // Insert popped[0] into the sorted stbl. Find the first existing
+        // entry whose name is greater than the new one (case-sensitive
+        // UCS-2 order, JFS_LINUX); `Vec<u16>` Ord is that comparison.
+        let stbl_off = base + DTROOT_OFF_STBL;
+        let mut pos = nextindex;
+        for i in 0..nextindex {
+            let existing_slot = dir.raw[stbl_off + i] as i8 as i32;
+            let existing_name = read_inline_dtree_name(&dir.raw, base, existing_slot)?;
+            if uname < existing_name {
+                pos = i;
+                break;
+            }
+        }
+        for i in (pos..nextindex).rev() {
+            dir.raw[stbl_off + i + 1] = dir.raw[stbl_off + i];
+        }
+        dir.raw[stbl_off + pos] = popped[0] as u8;
+
+        // Commit header: nextindex += 1, new freecnt / freelist head.
+        dir.raw[base + DTROOT_OFF_NEXTINDEX] = (nextindex + 1) as u8;
+        dir.raw[base + DTROOT_OFF_FREECNT] = freecnt as i8 as u8;
+        dir.raw[base + DTROOT_OFF_FREELIST] = freelist as i8 as u8;
+
+        self.write_dinode(dir_fino, &dir.raw)
+    }
+
+    /// Allocate a fileset inode and initialise it as an **empty inline
+    /// directory** whose `..` (idotdot) is `idotdot`, returning its inode
+    /// number. The dinode mirrors a fresh mkfs directory byte-for-byte:
+    /// `di_size = IDATASIZE`, `nlink = 2`, `di_next_index = 2`, and an empty
+    /// inline dtroot (flag `0x83`, freecnt 8, freelist 1, slots 1..8
+    /// chained, `-1`-terminated). `inostamp` / `fileset` / the four
+    /// timestamps are copied from the fileset root so fsck's fileset-wide
+    /// invariants (shared inode stamp) hold; `di_ixpxd` is the inode extent
+    /// that backs the new inode.
+    pub(crate) fn create_empty_dir_inode(
+        &mut self,
+        idotdot: u32,
+        mode: u32,
+    ) -> Result<u32, FilesystemError> {
+        // Fileset-wide template fields (read before allocating so the alloc
+        // side effects don't matter).
+        let root = self.read_fileset_inode_global(FILESET_ROOT_INO)?;
+        let fino = self.alloc_fileset_inode()?;
+        // ixpxd = the inode extent backing `fino`.
+        let iag = self.iag_for_fino(fino)?;
+        let local_extent = ((fino / INOSPEREXT) as usize) % EXTSPERIAG;
+        let ixpxd = iag.inoext[local_extent];
+
+        let mut d = vec![0u8; DISIZE as usize];
+        d[DI_OFF_INOSTAMP..DI_OFF_INOSTAMP + 4].copy_from_slice(&root.inostamp.to_le_bytes());
+        d[DI_OFF_FILESET..DI_OFF_FILESET + 4].copy_from_slice(&root.fileset.to_le_bytes());
+        d[DI_OFF_NUMBER..DI_OFF_NUMBER + 4].copy_from_slice(&fino.to_le_bytes());
+        d[DI_OFF_GEN..DI_OFF_GEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        ixpxd.write(&mut d[DI_OFF_IXPXD..DI_OFF_IXPXD + 8]);
+        d[DI_OFF_SIZE..DI_OFF_SIZE + 8].copy_from_slice(&IDATASIZE.to_le_bytes());
+        // di_nblocks (0), uid (0), gid (0) already zero.
+        d[DI_OFF_NLINK..DI_OFF_NLINK + 4].copy_from_slice(&2u32.to_le_bytes());
+        d[DI_OFF_MODE..DI_OFF_MODE + 4].copy_from_slice(&mode.to_le_bytes());
+        // Timestamps atime/ctime/mtime/otime span dinode bytes 56..88.
+        d[56..88].copy_from_slice(&root.raw[56..88]);
+        // di_next_index @ 120 = 2 (0/1 reserved for '.'/'..').
+        d[120..124].copy_from_slice(&2u32.to_le_bytes());
+        // Empty inline dtroot @ 224.
+        let b = DI_OFF_TYPE_AREA;
+        d[b + DTROOT_OFF_FLAG] = BT_ROOT_FLAG | BT_LEAF_FLAG | 0x80; // 0x83
+        d[b + DTROOT_OFF_NEXTINDEX] = 0;
+        d[b + DTROOT_OFF_FREECNT] = 8;
+        d[b + DTROOT_OFF_FREELIST] = 1;
+        d[b + DTROOT_OFF_IDOTDOT..b + DTROOT_OFF_IDOTDOT + 4]
+            .copy_from_slice(&idotdot.to_le_bytes());
+        // Free-slot chain: slot k.next = k+1 for k in 1..=7, slot 8.next = -1.
+        for k in 1..8 {
+            d[b + k * DT_SLOT_SIZE] = (k + 1) as u8;
+        }
+        d[b + 8 * DT_SLOT_SIZE] = 0xFF;
+
+        self.write_dinode(fino, &d)?;
+        Ok(fino)
+    }
+
+    /// Adjust inode `fino`'s on-disk link count by `delta` (clamped at 0).
+    pub(crate) fn bump_nlink(&mut self, fino: u32, delta: i32) -> Result<(), FilesystemError> {
+        let mut d = self.read_fileset_inode_global(fino)?;
+        let nlink = (d.nlink as i64 + delta as i64).max(0) as u32;
+        d.raw[DI_OFF_NLINK..DI_OFF_NLINK + 4].copy_from_slice(&nlink.to_le_bytes());
+        self.write_dinode(fino, &d.raw)
+    }
+
+    /// Repoint directory `dir_fino`'s `..` (the dtroot header's `idotdot`)
+    /// at `idotdot`. Used when reparenting an adopted orphan directory into
+    /// `/lost+found`.
+    pub(crate) fn set_idotdot(
+        &mut self,
+        dir_fino: u32,
+        idotdot: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut d = self.read_fileset_inode_global(dir_fino)?;
+        let off = DI_OFF_TYPE_AREA + DTROOT_OFF_IDOTDOT;
+        d.raw[off..off + 4].copy_from_slice(&idotdot.to_le_bytes());
+        self.write_dinode(dir_fino, &d.raw)
+    }
+}
+
 // ---- J.3: fileset / dtree types ----
 
 /// Decoded fileset Inode Allocation Group (IAG). Page 1 of the
@@ -1747,6 +2216,52 @@ fn read_i64(buf: &[u8], off: usize) -> i64 {
     ])
 }
 
+/// Reconstruct the UCS-2 name of the inline-dtroot `ldtentry` whose head
+/// slot is `slot` (1..=8), following its continuation chain. Pure byte
+/// parsing over an in-memory dinode buffer; used by `dtree_insert` to find
+/// the sorted stbl insertion point. Mirrors the read side in
+/// `parse_dtree_ldtentry` but returns raw UCS-2 code units so the ordering
+/// comparison matches JFS's UniChar (`u16`) comparison exactly.
+fn read_inline_dtree_name(raw: &[u8], base: usize, slot: i32) -> Result<Vec<u16>, FilesystemError> {
+    if !(1..=8).contains(&slot) {
+        return Err(FilesystemError::Parse(format!(
+            "jfs: dtroot stbl slot {slot} out of range"
+        )));
+    }
+    let head = base + slot as usize * DT_SLOT_SIZE;
+    let namlen = raw[head + 5] as usize;
+    let mut name = Vec::with_capacity(namlen);
+    for i in 0..namlen.min(11) {
+        let off = head + 6 + i * 2;
+        name.push(u16::from_le_bytes([raw[off], raw[off + 1]]));
+    }
+    let mut remaining = namlen.saturating_sub(11);
+    let mut next = raw[head + 4] as i8 as i32;
+    let mut hops = 0;
+    while remaining > 0 {
+        hops += 1;
+        if hops > 8 {
+            return Err(FilesystemError::Parse(
+                "jfs: dtroot name continuation chain too long".into(),
+            ));
+        }
+        if !(1..=8).contains(&next) {
+            return Err(FilesystemError::Parse(format!(
+                "jfs: dtroot continuation slot {next} out of range"
+            )));
+        }
+        let cont = base + next as usize * DT_SLOT_SIZE;
+        let take = (raw[cont + 1] as usize).min(15).min(remaining);
+        for i in 0..take {
+            let off = cont + 2 + i * 2;
+            name.push(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        }
+        remaining -= take;
+        next = raw[cont] as i8 as i32;
+    }
+    Ok(name)
+}
+
 fn parse_label(bytes: &[u8]) -> Option<String> {
     // Stop at the first NUL; trim trailing ASCII whitespace; reject the
     // empty case. Matches the same pattern used by `src/fs/ufs.rs` +
@@ -1884,6 +2399,61 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
                 .max(self.fsckpxd.end_byte(self.bsize)));
         }
         Ok(self.total_byte_extent)
+    }
+}
+
+// ---- J.4b: EditableFilesystem (repair-only) ----
+//
+// JFS edit mode exposes only `repair()` — orphan-inode adoption into
+// `/lost+found`. File / directory creation, deletion, and rename need the
+// full dtree-split + block allocator, out of scope for the repair
+// milestone, so they return `Unsupported` and the GUI/CLI gate them.
+// `free_space` and `sync_metadata` are real.
+impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for JfsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _data: &mut dyn Read,
+        _data_len: u64,
+        _options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "jfs: creating files is not supported (edit mode is repair-only)".into(),
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &super::filesystem::CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "jfs: creating directories is not supported (edit mode is repair-only)".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        _parent: &FileEntry,
+        _entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "jfs: deleting entries is not supported (edit mode is repair-only)".into(),
+        ))
+    }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        crate::fs::jfs_fsck::repair_jfs(self)
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.flush_writes()
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        self.free_bytes()
     }
 }
 
@@ -2809,6 +3379,179 @@ mod tests {
         }
     }
 
+    // ---- J.4b write primitives (round-trip) ----
+
+    /// write_dinode must round-trip: mutate a field in the raw dinode
+    /// buffer, write it back, and read it out again through the normal
+    /// read path.
+    #[test]
+    fn write_dinode_round_trips_nlink() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let mut root = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("read root");
+        let orig_nlink = root.nlink;
+        let new_nlink = orig_nlink + 1;
+        root.raw[DI_OFF_NLINK..DI_OFF_NLINK + 4].copy_from_slice(&new_nlink.to_le_bytes());
+        fs.write_dinode(FILESET_ROOT_INO, &root.raw)
+            .expect("write dinode");
+        let reread = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("reread root");
+        assert_eq!(reread.nlink, new_nlink);
+        assert_ne!(reread.nlink, orig_nlink);
+    }
+
+    /// read/write_fileset_logical_page must round-trip a full 4 KiB IAG
+    /// page and invalidate the IAG cache so a subsequent read observes the
+    /// write rather than the stale cached copy.
+    #[test]
+    fn write_fileset_logical_page_round_trips_iag() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let _ = fs.iag_for_fino(FILESET_ROOT_INO).expect("warm cache");
+        assert_eq!(fs.iag_cache.len(), 1);
+        // IAG 0 lives at logical page 1 of FILESYSTEM_I.
+        let mut page = fs.read_fileset_logical_page(1).expect("read IAG page");
+        assert_eq!(page.len(), PSIZE as usize);
+        // Flip a byte in the pad region (offset 100, between the 72-byte
+        // header and wmap@2048) so no real structure is disturbed.
+        page[100] ^= 0xFF;
+        fs.write_fileset_logical_page(1, &page)
+            .expect("write IAG page");
+        assert_eq!(fs.iag_cache.len(), 0, "IAG write must invalidate cache");
+        let reread = fs.read_fileset_logical_page(1).expect("reread IAG page");
+        assert_eq!(reread[100], page[100]);
+    }
+
+    /// alloc_fileset_inode claims the first free fileset inode (>= 4) from a
+    /// backed extent and decrements every free counter fsck Phase 7
+    /// cross-checks: the IAG's `nfreeinos`, the dinomap `in_numfree`, and
+    /// the owning AG's `numfree`. It also sets the per-inode pmap bit.
+    #[test]
+    fn alloc_fileset_inode_claims_free_slot_and_decrements_counters() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let iag_before = fs.read_fileset_logical_page(1).expect("iag page");
+        let nfree_before = read_i32(&iag_before, IAG_NFREEINOS_OFF);
+        let ctl_before = fs.read_fileset_logical_page(0).expect("ctl page");
+        let numfree_before = read_i32(&ctl_before, DINOMAP_IN_NUMFREE_OFF);
+        let ag0_numfree_before = read_i32(
+            &ctl_before,
+            DINOMAP_IN_AGCTL_OFF + IAGCTL_NUMFREE_OFF, // AG 0
+        );
+
+        let fino = fs.alloc_fileset_inode().expect("alloc");
+        assert!(
+            fino >= FIRST_USER_FILESET_INO,
+            "must not hand out a reserved inode (got {fino})"
+        );
+
+        // The pmap bit for `fino` was clear before and is set after.
+        let e = ((fino / INOSPEREXT) as usize) % EXTSPERIAG;
+        let mask = 1u32 << (31 - (fino % INOSPEREXT));
+        // fino may live past IAG 0; re-read the right IAG page.
+        let iag_no = (fino / (INOSPEREXT * EXTSPERIAG as u32)) as u64;
+        let iag_after = fs
+            .read_fileset_logical_page(1 + iag_no)
+            .expect("iag page after");
+        assert!(
+            read_u32(&iag_after, IAG_PMAP_OFF + e * 4) & mask != 0,
+            "pmap bit for fino {fino} should be set"
+        );
+
+        // Counters decremented by exactly 1 (IAG 0 holds fino 34 on the
+        // fixture, and there is a single AG).
+        assert_eq!(
+            read_i32(&iag_after, IAG_NFREEINOS_OFF),
+            nfree_before - 1,
+            "IAG nfreeinos"
+        );
+        let ctl_after = fs.read_fileset_logical_page(0).expect("ctl page after");
+        assert_eq!(
+            read_i32(&ctl_after, DINOMAP_IN_NUMFREE_OFF),
+            numfree_before - 1,
+            "dinomap in_numfree"
+        );
+        assert_eq!(
+            read_i32(&ctl_after, DINOMAP_IN_AGCTL_OFF + IAGCTL_NUMFREE_OFF),
+            ag0_numfree_before - 1,
+            "AG 0 numfree"
+        );
+    }
+
+    /// dtree_insert adds a leaf entry to an inline dtroot and keeps the
+    /// stbl sorted; the reader (which walks stbl in order) sees the new
+    /// entry in its sorted position with every original entry intact.
+    #[test]
+    fn dtree_insert_adds_sorted_entry_inline() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("root");
+        let before = fs.parse_inline_dtree(&root).expect("parse before");
+        // Point the new entry at an existing inode so it resolves; the
+        // fixture root has freecnt=2, so one 1-slot name fits.
+        let child = before
+            .iter()
+            .find(|e| e.name == "tiny.txt")
+            .expect("tiny.txt")
+            .inumber;
+
+        // "mmm" sorts between "link.txt" and "subdir".
+        fs.dtree_insert(FILESET_ROOT_INO, "mmm", child)
+            .expect("insert");
+
+        let root2 = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("root2");
+        let after = fs.parse_inline_dtree(&root2).expect("parse after");
+        assert_eq!(after.len(), before.len() + 1);
+        let mmm = after.iter().find(|e| e.name == "mmm").expect("mmm present");
+        assert_eq!(mmm.inumber, child);
+        // stbl order (== parse order) must stay sorted by name.
+        let names: Vec<&str> = after.iter().map(|e| e.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "entries must stay sorted in stbl");
+        for e in &before {
+            assert!(
+                after
+                    .iter()
+                    .any(|a| a.name == e.name && a.inumber == e.inumber),
+                "original entry {} lost after insert",
+                e.name
+            );
+        }
+    }
+
+    /// dtree_insert refuses a directory whose dtree already spilled to an
+    /// external multi-page form (`bigdir`, 200 entries) — repair surfaces
+    /// this as unrepairable rather than corrupting the tree.
+    #[test]
+    fn dtree_insert_refuses_external_dtree() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("root");
+        let bigdir = fs
+            .parse_inline_dtree(&root)
+            .expect("parse")
+            .into_iter()
+            .find(|e| e.name == "bigdir")
+            .expect("bigdir");
+        let err = fs
+            .dtree_insert(bigdir.inumber, "x", FILESET_ROOT_INO)
+            .expect_err("external dtree should be refused");
+        assert!(
+            matches!(err, FilesystemError::Unsupported(_)),
+            "got {err:?}"
+        );
+    }
+
     // ---- J.4a fsck (read-only verifier) ----
 
     /// The clean fixture must fsck clean — no errors. We tolerate
@@ -3406,5 +4149,176 @@ mod tests {
             .read_xtree_logical_page(&root, 7)
             .expect_err("must error");
         assert!(matches!(err, FilesystemError::Parse(_)));
+    }
+
+    // ---- J.4b repair: orphan adoption into /lost+found ----
+
+    /// IFJOURNAL | IFDIR | perms — the mode a JFS on-disk directory carries.
+    fn dir_mode(perms: u32) -> u32 {
+        0x0001_0000 | 0x0000_4000 | perms
+    }
+
+    /// Forge a directory orphan (allocate + stamp a valid empty dir, leave it
+    /// unlinked), repair, and confirm our own verifier is clean afterwards
+    /// and the browse view shows `/lost+found/ino_<n>`.
+    #[test]
+    fn repair_adopts_dir_orphan_our_fsck_clean() {
+        let img = load_fixture("test_jfs.img.zst");
+        let mut fs = JfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let orphan = fs
+            .create_empty_dir_inode(FILESET_ROOT_INO, dir_mode(0o755))
+            .expect("forge orphan dir");
+
+        // The unlinked-but-allocated inode is flagged as an orphan.
+        let pre = fs.fsck().unwrap().unwrap();
+        assert!(
+            pre.errors.iter().any(|e| e.code == "OrphanInode"),
+            "orphan not flagged pre-repair: {:?}",
+            pre.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+
+        let report = crate::fs::jfs_fsck::repair_jfs(&mut fs).expect("repair");
+        assert_eq!(report.unrepairable_count, 0, "unrepairable: {report:?}");
+
+        // Post-repair our verifier is clean (warnings such as bigdir's
+        // external-dtree note are tolerated).
+        let post = fs.fsck().unwrap().unwrap();
+        assert!(
+            post.is_clean(),
+            "post-repair errors: {:?}",
+            post.errors
+                .iter()
+                .map(|e| (&e.code, &e.message))
+                .collect::<Vec<_>>()
+        );
+
+        // Browse: /lost+found/ino_<orphan> is reachable.
+        let root = fs.root().unwrap();
+        let lf = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "lost+found")
+            .expect("lost+found created in root");
+        let names: Vec<String> = fs
+            .list_directory(&lf)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.contains(&format!("ino_{orphan}")),
+            "expected ino_{orphan} in lost+found, got {names:?}"
+        );
+    }
+
+    // ---- fsck.jfs oracle (auto-skips when jfsutils is absent) ----
+
+    /// Resolve a jfsutils tool: PATH first, then the no-sudo extract dir the
+    /// repair oracle uses (`$HOME/jfsoracle/root/sbin`). None if absent.
+    fn jfs_tool(name: &str) -> Option<std::path::PathBuf> {
+        use std::process::Command;
+        if Command::new(name).arg("-V").output().is_ok() {
+            return Some(std::path::PathBuf::from(name));
+        }
+        let home = std::env::var("HOME").ok()?;
+        let p = std::path::PathBuf::from(home)
+            .join("jfsoracle/root/sbin")
+            .join(name);
+        p.exists().then_some(p)
+    }
+
+    /// mkfs a fresh JFS image, forge an orphan of the requested kind, repair
+    /// it in-process, and assert the real `fsck.jfs -f -n` finds the result
+    /// clean. Auto-skips when jfsutils is not installed (e.g. CI).
+    #[test]
+    fn oracle_repair_orphans_is_fsck_jfs_clean() {
+        use std::process::Command;
+        let (Some(mkfs), Some(fsck)) = (jfs_tool("mkfs.jfs"), jfs_tool("fsck.jfs")) else {
+            eprintln!("skipping oracle_repair_orphans_is_fsck_jfs_clean: jfsutils not available");
+            return;
+        };
+
+        let img = std::env::temp_dir().join(format!(
+            "rb_jfs_oracle_{}_{}.img",
+            std::process::id(),
+            FILESET_ROOT_INO
+        ));
+        std::fs::write(&img, vec![0u8; 16 * 1024 * 1024]).expect("create image file");
+        let mk = Command::new(&mkfs)
+            .args(["-q", "-L", "rbtest"])
+            .arg(&img)
+            .output()
+            .expect("run mkfs.jfs");
+        assert!(
+            mk.status.success(),
+            "mkfs.jfs failed: {}",
+            String::from_utf8_lossy(&mk.stderr)
+        );
+
+        // Forge one directory orphan and one file orphan, then repair both.
+        let (dir_orphan, file_orphan);
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .expect("open rw");
+            let mut fs = JfsFilesystem::open(file, 0).expect("open jfs");
+            dir_orphan = fs
+                .create_empty_dir_inode(FILESET_ROOT_INO, dir_mode(0o755))
+                .expect("forge dir orphan");
+            file_orphan = forge_file_orphan(&mut fs);
+            let report = crate::fs::jfs_fsck::repair_jfs(&mut fs).expect("repair");
+            assert_eq!(report.unrepairable_count, 0, "unrepairable: {report:?}");
+            fs.flush_writes().expect("flush");
+        }
+
+        let out = Command::new(&fsck)
+            .args(["-f", "-n"])
+            .arg(&img)
+            .output()
+            .expect("run fsck.jfs");
+        let log = String::from_utf8_lossy(&out.stdout);
+        let ok = out.status.success();
+        let _ = std::fs::remove_file(&img);
+        assert!(
+            ok,
+            "fsck.jfs flagged the repaired image (dir orphan {dir_orphan}, file orphan \
+             {file_orphan}):\n{log}"
+        );
+    }
+
+    /// Allocate + stamp a valid empty regular file (`IFJOURNAL | IFREG`,
+    /// nlink 1, empty inline xtree) and leave it unlinked -> a file orphan.
+    fn forge_file_orphan<R: Read + Write + Seek + Send>(fs: &mut JfsFilesystem<R>) -> u32 {
+        let root = fs
+            .read_fileset_inode_global(FILESET_ROOT_INO)
+            .expect("root");
+        let fino = fs.alloc_fileset_inode().expect("alloc");
+        let iag = fs.iag_for_fino(fino).expect("iag");
+        let le = ((fino / INOSPEREXT) as usize) % EXTSPERIAG;
+        let ixpxd = iag.inoext[le];
+
+        let mut d = vec![0u8; DISIZE as usize];
+        d[DI_OFF_INOSTAMP..DI_OFF_INOSTAMP + 4].copy_from_slice(&root.inostamp.to_le_bytes());
+        d[DI_OFF_FILESET..DI_OFF_FILESET + 4].copy_from_slice(&root.fileset.to_le_bytes());
+        d[DI_OFF_NUMBER..DI_OFF_NUMBER + 4].copy_from_slice(&fino.to_le_bytes());
+        d[DI_OFF_GEN..DI_OFF_GEN + 4].copy_from_slice(&1u32.to_le_bytes());
+        ixpxd.write(&mut d[DI_OFF_IXPXD..DI_OFF_IXPXD + 8]);
+        // di_size = 0, di_nblocks = 0, uid/gid = 0 (already zero).
+        d[DI_OFF_NLINK..DI_OFF_NLINK + 4].copy_from_slice(&1u32.to_le_bytes());
+        let mode = 0x0001_0000u32 | S_IFREG | 0o644; // IFJOURNAL | IFREG | 0644
+        d[DI_OFF_MODE..DI_OFF_MODE + 4].copy_from_slice(&mode.to_le_bytes());
+        d[56..88].copy_from_slice(&root.raw[56..88]); // timestamps
+                                                      // Empty inline xtree root @ 224, matching fsck's init_xtree_root:
+                                                      // flag = DXD_INDEX(0x80) | BT_ROOT | BT_LEAF, maxentry = XTROOTMAXSLOT
+                                                      // (18 slots), nextindex = XTENTRYSTART (2 = header only, no XADs).
+        let x = DI_OFF_TYPE_AREA;
+        d[x + XTH_OFF_FLAG] = 0x80 | BT_ROOT_FLAG | BT_LEAF_FLAG;
+        d[x + XTH_OFF_NEXTINDEX..x + XTH_OFF_NEXTINDEX + 2].copy_from_slice(&2u16.to_le_bytes());
+        d[x + XTH_OFF_MAXENTRY..x + XTH_OFF_MAXENTRY + 2].copy_from_slice(&18u16.to_le_bytes());
+        fs.write_dinode(fino, &d).expect("write orphan file dinode");
+        fino
     }
 }

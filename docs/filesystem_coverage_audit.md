@@ -69,7 +69,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | ext2 / ext3 / ext4 | Auto | Yes | Yes | Yes | Yes (in-place) | Yes (check + repair, incl. ext4 metadata_csum crc32c) | Linux |
 | btrfs | Auto | Yes | **No** (read-only) | No | Yes (volume resize) | validate | Modern Linux |
 | XFS (v4 / v5) | Auto | Yes (v4 edit) | Yes (v4) | No | Grow only (disk-layout + `xfs_growfs`) | check+repair | SGI IRIX 6.x, Linux |
-| JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
+| JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check+repair | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
 | ReiserFS (v3.5 / v3.6) | Auto | Yes | **No** (read-only) | No | compaction | No | Linux, late-1990s → mid-2000s |
 | UFS / FFS (UFS1 / UFS2) | Auto | Yes | Yes | No | compaction | check+repair | 4.2/4.4BSD, FreeBSD, SunOS / Solaris, NeXTSTEP |
 
@@ -123,9 +123,9 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Carve (raw recovery) | Fallback | Yes (synthetic) | Last-resort for unmountable / NDOS images: whole-disk blob + carved text/JSON runs + Amiga bootblock |
 
 **Totals:** ~30 filesystem drivers — **26 editable+wired**, **7 with an
-interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, UFS, XFS — all repair except
-JFS, which is check-only), **17 create-blank**, **2 detect-only scaffolds**,
-**1 recovery fallback**.
+interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, UFS, XFS — all repair; JFS
+repairs by adopting orphaned inodes into `/lost+found`), **17 create-blank**,
+**2 detect-only scaffolds**, **1 recovery fallback**.
 
 ---
 
@@ -321,9 +321,14 @@ items are logged for follow-up.
    It edits (v4) and fscks/repairs, but has no `CompactXfsReader` or in-place
    resize, so XFS backups are written full-size. Grow is disk-layout-level only
    (`xfs_growfs`); clone-into-fresh shrink is the planned path (OPEN-WORK §2.2).
-6. **JFS fsck is check-only** — it implements `fsck()` but not `repair()` (the
-   code comments flag repair as future work). Every other interactive fsck
-   repairs: AFFS, EFS, HFS, HFS+, UFS (replica SB / bitmap / orphan), XFS (R1–R8).
+6. **JFS fsck repair — FIXED.** `repair()` now adopts orphaned
+   (allocated-but-unreachable) fileset inodes into `/lost+found/ino_<inum>`,
+   creating `/lost+found` when absent. This pulled forward the JFS edit
+   primitives (inode allocator + inline dtree insert + dinode write-back)
+   behind `EditableFilesystem`; general create/delete/rename remain
+   `Unsupported`. Every structural write is oracle-verified against real
+   `fsck.jfs` (`scripts/jfs-oracle.sh`). Now on par with the other repairing
+   fscks: AFFS, EFS, HFS, HFS+, UFS (replica SB / bitmap / orphan), XFS (R1–R8).
 7. **AIX JFS1 and Reiser4 are detected then rejected** — magic recognized,
    read not implemented.
 8. **fsck reach exceeded the Inspect-tab "Check" button — FIXED.** The button
