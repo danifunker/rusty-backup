@@ -55,6 +55,21 @@ pub fn open_pack(bytes: &[u8]) -> Result<Disk, FilesystemError> {
     }
 }
 
+/// Cheap pre-check for [`open_pack`]: could a file whose first bytes are `magic`
+/// and whose total length is `len` be an Alto / Pilot disk pack? Lets a caller
+/// (e.g. the CLI `fsck` verb) gate an expensive full read + `open_pack` without
+/// duplicating the format-detection table. A `true` result still needs
+/// `open_pack` to confirm; a `false` is a definite "not a pack". Mirrors the
+/// magic/size probes `BrowseSession` uses (minus its gzip-wrapper handling).
+pub fn looks_like_pack(magic: &[u8], len: usize) -> bool {
+    (magic.len() >= pdi::MAGIC.len() && &magic[..pdi::MAGIC.len()] == pdi::MAGIC) // PDI "PARCDISK"
+        || (magic.len() >= 6 && magic[..6] == [0x00, 0x07, 0x00, 0x03, 0x00, 0x0a]) // CopyDisk params
+        || len == salto::IMAGE_BYTES // Salto / ContrAlto2 Diablo `.dsk`
+        || len == trident::T80_BYTES
+        || len == trident::T300_BYTES
+        || (magic.first() == Some(&0x78) && len <= 64 * 1024 * 1024) // zlib (zdisk)
+}
+
 /// Read a big-endian 16-bit word at byte offset `i` in `b`.
 #[inline]
 pub(crate) fn be16(b: &[u8], i: usize) -> u16 {

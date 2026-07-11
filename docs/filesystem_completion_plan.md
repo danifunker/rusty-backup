@@ -63,7 +63,7 @@ missing capability on a driver that already round-trips.
 | Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
 | CP/M | No | Yes | No | **create + fsck** |
 | QDOS (QXL.WIN) | No | Yes | No | **create + fsck** |
-| Alto BFS / TFS | Yes | Yes | **Engine** | **fsck done at trait level** (label/bitmap VALIDATE); CLI/GUI wiring pending (container open path) |
+| Alto BFS / TFS | Yes | Yes | **Yes (CLI)** | — **fsck done** (label/bitmap VALIDATE); `rb-cli fsck` has its own Alto branch (container open path); `--repair` in place for `.pdi` |
 
 ### 1b. Add fsck (check + repair) — the biggest single lever
 
@@ -166,9 +166,11 @@ The order that buys the most capability per unit effort:
    (contiguous-file), Human68k (big-endian FAT + mirror), Alto BFS/TFS
    (label/bitmap) — all on the CBM VALIDATE template, self-consistency-verified.
    The first four wire through the block-reader factory (`rb-cli fsck` + the
-   Inspect Check button light up automatically); Alto's checker is on the trait
-   but its container open path needs separate CLI/GUI wiring. Remaining here:
-   create-blank for Atari / OS-9 / CP/M / ProDOS-CLI, and their fsck.
+   Inspect Check button light up automatically); Alto reaches `rb-cli fsck` via
+   a dedicated Alto branch in the fsck verb (its packs open through the
+   `open_pack` container path, not the factory), with `--repair` in place for
+   `.pdi` inputs. Remaining here: create-blank for Atari / OS-9 / CP/M /
+   ProDOS-CLI, and their fsck.
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,

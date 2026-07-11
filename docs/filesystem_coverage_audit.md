@@ -109,7 +109,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
-| Alto BFS / TFS | Auto | Yes | Yes | Yes | Yes (resize) | Engine | Xerox Alto (Diablo 31/44), Trident T-80/T-300. fsck = label/bitmap reconciliation vs the file page-chains (VALIDATE model): flags overlaps / broken chains read-only, rebuilds the DiskDescriptor free-page bitmap + count as the repair. Implemented on the `Filesystem`/`EditableFilesystem` trait (`BfsFilesystem::fsck`/`repair`); not yet surfaced through `rb-cli fsck` / the GUI Check button, which open through the block-reader factory rather than Alto's `open_pack` container path — that wiring is a follow-up. |
+| Alto BFS / TFS | Auto | Yes | Yes | Yes | Yes (resize) | Yes (CLI) | Xerox Alto (Diablo 31/44), Trident T-80/T-300. fsck = label/bitmap reconciliation vs the file page-chains (VALIDATE model): flags overlaps / broken chains read-only, rebuilds the DiskDescriptor free-page bitmap + count as the repair. Reached via `rb-cli fsck` — which has its own Alto branch because packs open through the `open_pack` container path, not the block-reader factory. `--repair` is allowed in place only for a `.pdi` input (it rebuilds + writes back as a PARC Disk Image; other containers would have their format changed). Not on the GUI Check button (retro fsck is CLI-only, like CBM — `is_checkable_fs_name` has no retro tokens). |
 | Pilot / Cedar | Auto | Yes | No (read-only in GUI) | (test infra) | No | No | Xerox D-machines (Dolphin / Dorado / Dandelion) |
 
 ### Detect-only scaffolds & fallback
