@@ -60,6 +60,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// 18.3 filename: 8 name + 10 name-extension + 3 ext = 21 + dot.
 pub const MAX_NAME_LEN: usize = 21;
@@ -507,6 +508,208 @@ impl<R: Read + Seek + Send> Human68kFilesystem<R> {
         }
         Ok(parse_directory_buffer(&buf))
     }
+
+    /// Exclusive upper bound of valid data-cluster numbers (valid clusters are
+    /// `2..cluster_limit`), derived from the *data* region size so it never
+    /// runs past the FAT table (where `fat_lookup` would report a spurious
+    /// non-zero entry for an out-of-table cluster).
+    fn cluster_limit(&self) -> u16 {
+        let data_sectors = self
+            .bpb
+            .total_sectors
+            .saturating_sub(self.bpb.data_start_sector());
+        let count = data_sectors / self.bpb.sectors_per_cluster as u32;
+        (count + 2).min(0xFFF8) as u16
+    }
+
+    /// Read one on-disk FAT copy (`idx` = 0 is the primary) into a fresh buffer
+    /// the same length as the cached FAT.
+    fn read_fat_copy(&mut self, idx: u16) -> Result<Vec<u8>, FilesystemError> {
+        let bps = self.bpb.bytes_per_sector as u64;
+        let off = self.partition_offset
+            + (self.bpb.fat_start_sector() as u64 + idx as u64 * self.bpb.fat_sectors as u64) * bps;
+        self.reader.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; self.fat_bytes.len()];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Walk the directory tree from the root, marking every cluster reachable
+    /// through a file or subdirectory chain. Returns the referenced-cluster
+    /// set (indexed by cluster), the file + directory counts, any cross-linked
+    /// clusters (claimed by more than one chain), and any structural problems
+    /// (looping / out-of-range chains) that make the walk untrustworthy.
+    fn walk_referenced(&mut self) -> (Vec<bool>, u32, u32, Vec<u16>, Vec<String>) {
+        let limit = self.cluster_limit() as usize;
+        let mut referenced = vec![false; limit];
+        let mut crosslinked = Vec::new();
+        let mut broken = Vec::new();
+        let mut files = 0u32;
+        let mut dirs = 0u32;
+        // BFS over directories; 0 = the fixed root region. Guard against a
+        // directory chain that points back into an already-visited directory.
+        let mut visited_dirs = std::collections::HashSet::new();
+        let mut queue: Vec<u16> = vec![0];
+        while let Some(dir_first) = queue.pop() {
+            let entries = if dir_first == 0 {
+                self.read_root_directory()
+            } else {
+                self.read_subdirectory(dir_first)
+            };
+            let entries = match entries {
+                Ok(e) => e,
+                Err(_) => {
+                    broken.push(if dir_first == 0 {
+                        "root directory is unreadable".to_string()
+                    } else {
+                        format!("subdirectory at cluster {dir_first} is unreadable")
+                    });
+                    continue;
+                }
+            };
+            for e in &entries {
+                if e.is_directory() {
+                    dirs += 1;
+                } else {
+                    files += 1;
+                }
+                let first = e.first_cluster;
+                if first < 2 {
+                    continue; // empty file / directory (no data clusters)
+                }
+                match self.cluster_chain(first) {
+                    Ok(chain) => {
+                        let mut out_of_range = false;
+                        for c in chain {
+                            let ci = c as usize;
+                            if ci >= limit {
+                                out_of_range = true;
+                                break;
+                            }
+                            if referenced[ci] && !crosslinked.contains(&c) {
+                                crosslinked.push(c);
+                            }
+                            referenced[ci] = true;
+                        }
+                        if out_of_range {
+                            broken.push(format!(
+                                "'{}': cluster chain runs past the end of the data area",
+                                e.display_name
+                            ));
+                        }
+                    }
+                    Err(_) => broken.push(format!("'{}': broken cluster chain", e.display_name)),
+                }
+                // Recurse into subdirectories (once per unique start cluster).
+                if e.is_directory() && visited_dirs.insert(first) {
+                    queue.push(first);
+                }
+            }
+        }
+        (referenced, files, dirs, crosslinked, broken)
+    }
+
+    /// Human68k integrity check: reconcile the FAT allocation against the
+    /// clusters actually referenced by the directory tree (the CBM VALIDATE
+    /// model applied to a FAT), plus a FAT-mirror consistency check.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (referenced, files, dirs, crosslinked, broken) = self.walk_referenced();
+        let limit = self.cluster_limit();
+        let walk_clean = broken.is_empty() && crosslinked.is_empty();
+
+        let mut lost = 0u32;
+        let mut allocated = 0u32;
+        for c in 2..limit {
+            if self.fat_lookup(c) != 0 {
+                allocated += 1;
+                if !referenced[c as usize] {
+                    lost += 1;
+                }
+            }
+        }
+
+        // FAT-mirror consistency: every extra FAT copy must equal the primary.
+        let mut mirror_bad = false;
+        if self.bpb.num_fats >= 2 {
+            let primary = self.fat_bytes.clone();
+            for idx in 1..self.bpb.num_fats {
+                if self
+                    .read_fat_copy(idx as u16)
+                    .map(|c| c != primary)
+                    .unwrap_or(false)
+                {
+                    mirror_bad = true;
+                    break;
+                }
+            }
+        }
+
+        let mut errors = Vec::new();
+        if lost > 0 {
+            errors.push(FsckIssue {
+                code: "Human68kLostClusters".into(),
+                message: format!(
+                    "{lost} cluster(s) marked allocated but unreferenced by any file or directory"
+                ),
+                // A broken/cross-linked chain could hide a live reference, so
+                // only reclaim when the walk is trustworthy.
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        if mirror_bad {
+            errors.push(FsckIssue {
+                code: "Human68kFatMirror".into(),
+                message: "the backup FAT copy does not match the primary".into(),
+                repairable: true,
+                debug: false,
+            });
+        }
+        for c in &crosslinked {
+            errors.push(FsckIssue {
+                code: "Human68kCrossLink".into(),
+                message: format!("cluster {c} is claimed by more than one chain"),
+                repairable: false,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "Human68kBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = (limit as u32).saturating_sub(2).saturating_sub(allocated);
+        let consistent = lost == 0 && !mirror_bad && crosslinked.is_empty();
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: dirs + 1, // + the root directory
+                extra: vec![
+                    (
+                        "free clusters".into(),
+                        format!("{free} / {}", limit.saturating_sub(2)),
+                    ),
+                    (
+                        "FAT".into(),
+                        if consistent {
+                            "consistent".into()
+                        } else {
+                            "needs attention".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 /// Write a `.` or `..` self/parent link into a 32-byte directory slot.
@@ -636,6 +839,10 @@ impl<R: Read + Seek + Send> Filesystem for Human68kFilesystem<R> {
         }
         used
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 // ============================================================================
@@ -721,6 +928,62 @@ impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
             self.reader.write_all(&self.fat_bytes[..fat_byte_len])?;
         }
         Ok(())
+    }
+
+    /// Reclaim lost clusters (FAT-allocated but unreferenced) into the free
+    /// list and resync the backup FAT copies from the primary. Refuses to
+    /// touch anything while a chain is broken or cross-linked, since freeing
+    /// then could strand a live file. Rewrites every FAT copy at the end, so a
+    /// FAT-mirror mismatch is repaired even when there are no lost clusters.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (referenced, _files, _dirs, crosslinked, broken) = self.walk_referenced();
+        if !broken.is_empty() || !crosslinked.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len() + crosslinked.len(),
+            });
+        }
+        let limit = self.cluster_limit();
+        let lost: Vec<u16> = (2..limit)
+            .filter(|&c| self.fat_lookup(c) != 0 && !referenced[c as usize])
+            .collect();
+        let mirror_bad = self.bpb.num_fats >= 2 && {
+            let primary = self.fat_bytes.clone();
+            (1..self.bpb.num_fats).any(|idx| {
+                self.read_fat_copy(idx as u16)
+                    .map(|c| c != primary)
+                    .unwrap_or(false)
+            })
+        };
+        if lost.is_empty() && !mirror_bad {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        let mut fixes = Vec::new();
+        for &c in &lost {
+            self.fat_set(c, 0);
+        }
+        if !lost.is_empty() {
+            fixes.push(format!(
+                "reclaimed {} lost cluster(s) into the free list",
+                lost.len()
+            ));
+        }
+        if mirror_bad {
+            fixes.push("resynced the backup FAT copy from the primary".to_string());
+        }
+        // Rewrites all FAT copies from the (now-corrected) primary.
+        self.fat_write_back()?;
+        self.reader.flush()?;
+        Ok(RepairReport {
+            fixes_applied: fixes,
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 
     /// Set a 12- or 16-bit FAT entry.
@@ -1184,6 +1447,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R>
             }
         }
         Ok(free)
+    }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
     }
 }
 
@@ -2553,5 +2820,151 @@ mod tests {
         let mut cur = Cursor::new(&mut disk);
         let did = resize_human68k_in_place(&mut cur, 0, same, &mut |_| {}).unwrap();
         assert!(!did, "same-size resize is a no-op");
+    }
+
+    // ---- fsck (FAT allocation reconciliation) ------------------------------
+
+    /// Build a two-FAT big-endian FAT16 volume with one 2-cluster file
+    /// (`BIG.BIN`, clusters 2-3). 4090 data clusters keeps it FAT16; the FAT
+    /// content is mirrored into both copies so the mirror check starts clean.
+    fn build_fat16_two_fats_with_file() -> Vec<u8> {
+        const BPS: usize = 512;
+        const NFATS: usize = 2;
+        const FATSZ: usize = 16;
+        const RESERVED: usize = 1;
+        const ROOT_ENTRIES: usize = 16;
+        const TOTAL: usize = 4124; // 4124 - 1 - 32 - 1 = 4090 clusters -> FAT16
+
+        let mut disk = vec![0u8; TOTAL * BPS];
+        disk[0] = 0x60;
+        disk[1] = 0x24;
+        disk[2..18].copy_from_slice(b"SHARP/KG TEST   ");
+        BigEndian::write_u16(&mut disk[0x12..0x14], BPS as u16);
+        disk[0x14] = 1; // sectors per cluster
+        disk[0x15] = NFATS as u8;
+        BigEndian::write_u16(&mut disk[0x16..0x18], RESERVED as u16);
+        BigEndian::write_u16(&mut disk[0x18..0x1A], ROOT_ENTRIES as u16);
+        BigEndian::write_u16(&mut disk[0x1A..0x1C], TOTAL as u16);
+        disk[0x1C] = 0xF8;
+        disk[0x1D] = FATSZ as u8;
+
+        // Big-endian FAT16 content, written into BOTH copies.
+        for k in 0..NFATS {
+            let fat = (RESERVED + k * FATSZ) * BPS;
+            BigEndian::write_u16(&mut disk[fat..fat + 2], 0xFFF8); // entry 0
+            BigEndian::write_u16(&mut disk[fat + 2..fat + 4], 0xFFFF); // entry 1
+            BigEndian::write_u16(&mut disk[fat + 4..fat + 6], 3); // cluster 2 -> 3
+            BigEndian::write_u16(&mut disk[fat + 6..fat + 8], 0xFFFF); // cluster 3 EOC
+        }
+
+        // Root entry for BIG.BIN (first_cluster + size little-endian).
+        let root = (RESERVED + NFATS * FATSZ) * BPS;
+        let e = &mut disk[root..root + 32];
+        e[0..8].copy_from_slice(b"BIG     ");
+        e[8..11].copy_from_slice(b"BIN");
+        e[11] = attr::ARCHIVE;
+        LittleEndian::write_u16(&mut e[26..28], 2);
+        LittleEndian::write_u32(&mut e[28..32], 768);
+
+        let data_start = (RESERVED + NFATS * FATSZ + 1) * BPS;
+        for b in &mut disk[data_start..data_start + 512] {
+            *b = 0xAA;
+        }
+        for b in &mut disk[data_start + 512..data_start + 512 + 256] {
+            *b = 0xBB;
+        }
+        disk
+    }
+
+    /// Byte offset of cluster `c`'s big-endian FAT16 entry in copy `k`.
+    fn fat_entry_off(k: usize, c: usize) -> usize {
+        const BPS: usize = 512;
+        const FATSZ: usize = 16;
+        const RESERVED: usize = 1;
+        (RESERVED + k * FATSZ) * BPS + c * 2
+    }
+
+    #[test]
+    fn human68k_fsck_clean() {
+        let mut fs =
+            Human68kFilesystem::open(Cursor::new(build_fat16_two_fats_with_file()), 0).unwrap();
+        let r = fs.fsck().expect("fsck supported").expect("ran");
+        assert!(r.is_clean(), "clean volume errors: {:?}", r.errors);
+        assert!(!r.repairable);
+        assert_eq!(r.stats.files_checked, 1);
+    }
+
+    #[test]
+    fn human68k_fsck_detects_and_repairs_lost_cluster() {
+        let mut img = build_fat16_two_fats_with_file();
+        // Mark cluster 4 allocated (EOC) in BOTH FAT copies, with no directory
+        // entry referencing it -> a lost cluster, mirror still consistent.
+        for k in 0..2 {
+            let off = fat_entry_off(k, 4);
+            img[off..off + 2].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        }
+
+        let mut fs = Human68kFilesystem::open(Cursor::new(img), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].code, "Human68kLostClusters");
+
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert_eq!(rep.fixes_applied.len(), 1);
+
+        // Persisted + clean on a fresh open; BIG.BIN still reads back whole.
+        let bytes = fs.into_reader().into_inner();
+        let mut fs = Human68kFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+        let root = fs.root().unwrap();
+        let e = fs.list_directory(&root).unwrap();
+        assert_eq!(e[0].name, "BIG.BIN");
+        assert_eq!(fs.read_file(&e[0], 4096).unwrap().len(), 768);
+    }
+
+    #[test]
+    fn human68k_fsck_detects_and_repairs_fat_mirror() {
+        let mut img = build_fat16_two_fats_with_file();
+        // Corrupt only the SECOND FAT copy (cluster 2 link) -> mirror mismatch.
+        let off = fat_entry_off(1, 2);
+        img[off..off + 2].copy_from_slice(&0x1234u16.to_be_bytes());
+
+        let mut fs = Human68kFilesystem::open(Cursor::new(img), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert!(r.errors.iter().any(|e| e.code == "Human68kFatMirror"));
+
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert!(!rep.fixes_applied.is_empty());
+
+        let bytes = fs.into_reader().into_inner();
+        let mut fs = Human68kFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+    }
+
+    #[test]
+    fn human68k_fsck_flags_broken_chain_unrepairable() {
+        let mut img = build_fat16_two_fats_with_file();
+        // Self-cycle BIG.BIN's first cluster in both copies -> broken chain.
+        for k in 0..2 {
+            let off = fat_entry_off(k, 2);
+            img[off..off + 2].copy_from_slice(&2u16.to_be_bytes());
+        }
+
+        let mut fs = Human68kFilesystem::open(Cursor::new(img), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.errors.iter().any(|e| e.code == "Human68kBrokenChain"));
+        assert!(!r.repairable);
+        assert!(r.errors.iter().all(|e| !e.repairable));
+
+        let rep = fs.repair().unwrap();
+        assert!(rep.fixes_applied.is_empty());
+        assert!(rep.unrepairable_count >= 1);
     }
 }

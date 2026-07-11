@@ -102,7 +102,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | BBC Micro / Master, Acorn Electron. fsck = contiguous-file consistency (overlap + out-of-bounds detection; canonical descending-catalogue reorder as the repair) |
 | Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | No | No | No | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |
-| Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | No | Sharp X68000 (big-endian FAT dialect) |
+| Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | Yes | Sharp X68000 (big-endian FAT dialect). fsck = FAT allocation reconciliation vs the directory tree (VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy, surfaces cross-links / broken chains |
 | QDOS (QXL.WIN) | Auto / String | Yes | Yes | No | Yes (in-place resize) | No | Sinclair QL hard-disk container |
 
 ### Xerox research systems
