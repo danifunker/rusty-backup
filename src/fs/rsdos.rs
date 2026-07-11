@@ -56,6 +56,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub const SECTOR_SIZE: usize = 256;
 pub const SECTORS_PER_TRACK: u64 = 18;
@@ -408,6 +409,131 @@ impl<R: Read + Seek + Send> RsdosFilesystem<R> {
         }
         Ok(out)
     }
+
+    /// Walk every live file's granule chain. Returns the reachable-granule
+    /// set (indexed by granule), the live-file count, any cross-linked
+    /// granules (claimed by more than one file), and any structural problems
+    /// (broken / looping / out-of-range chains) that make the walk untrustworthy.
+    fn reachable_granules(&self) -> (Vec<bool>, u32, Vec<u8>, Vec<String>) {
+        let n = self.geom.granules as usize;
+        let mut reachable = vec![false; n];
+        let mut crosslinked = Vec::new();
+        let mut broken = Vec::new();
+        let mut files = 0u32;
+        let live: Vec<RsdosDirEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_live())
+            .cloned()
+            .collect();
+        for e in &live {
+            files += 1;
+            match self.chain_of(e) {
+                Ok((chain, _)) => {
+                    for g in chain {
+                        let gi = g as usize;
+                        if gi >= n {
+                            continue; // chain_of already range-guards; belt and braces
+                        }
+                        // Already claimed by another file -> cross-link (a single
+                        // file can't revisit a granule; chain_of rejects loops).
+                        if reachable[gi] && !crosslinked.contains(&g) {
+                            crosslinked.push(g);
+                        }
+                        reachable[gi] = true;
+                    }
+                }
+                Err(_) => broken.push(format!("file '{}': corrupt granule chain", e.name)),
+            }
+        }
+        (reachable, files, crosslinked, broken)
+    }
+
+    /// RS-DOS integrity check: reconcile the granule allocation table against
+    /// the allocation recomputed by walking the directory's file chains (the
+    /// CBM VALIDATE model, adapted to RS-DOS's combined chain+allocation FAT).
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (reachable, files, crosslinked, broken) = self.reachable_granules();
+        let n = self.geom.granules as usize;
+        let walk_clean = broken.is_empty() && crosslinked.is_empty();
+
+        let mut leaked = 0u32;
+        let mut used_but_free = 0u32;
+        for (&fat_byte, &reached) in self.fat[..n].iter().zip(reachable.iter()) {
+            match (fat_byte != GRAN_FREE, reached) {
+                (true, true) => {}                   // in use, correct
+                (true, false) => leaked += 1,        // allocated but no file -> lost
+                (false, true) => used_but_free += 1, // a chain touches a free granule
+                (false, false) => {}                 // free, correct
+            }
+        }
+
+        let mut errors = Vec::new();
+        if leaked > 0 {
+            errors.push(FsckIssue {
+                code: "RsdosLeakedGranules".into(),
+                message: format!(
+                    "{leaked} granule(s) marked allocated but unreferenced by any file"
+                ),
+                // Only reclaim when the walk is trustworthy; a broken or
+                // cross-linked chain could hide a live reference.
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        if used_but_free > 0 {
+            errors.push(FsckIssue {
+                code: "RsdosFatMismatch".into(),
+                message: format!(
+                    "{used_but_free} granule(s) referenced by a file but marked free in the FAT"
+                ),
+                // The chain-link byte can't be recomputed from the walk alone.
+                repairable: false,
+                debug: false,
+            });
+        }
+        for g in &crosslinked {
+            errors.push(FsckIssue {
+                code: "RsdosCrossLink".into(),
+                message: format!("granule {g} is claimed by more than one file"),
+                repairable: false,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "RsdosBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let fat_free = (0..n).filter(|&g| self.fat[g] == GRAN_FREE).count();
+        let consistent = leaked == 0 && used_but_free == 0 && crosslinked.is_empty();
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    ("free granules".into(), format!("{fat_free} / {n}")),
+                    (
+                        "granule table".into(),
+                        if consistent {
+                            "consistent".into()
+                        } else {
+                            "needs attention".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for RsdosFilesystem<R> {
@@ -478,6 +604,10 @@ impl<R: Read + Seek + Send> Filesystem for RsdosFilesystem<R> {
             .count() as u64
             * GRANULE_SIZE as u64
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +626,47 @@ impl<R: Read + Write + Seek + Send> RsdosFilesystem<R> {
         (0..self.geom.granules)
             .filter(|&g| self.fat[g as usize] == GRAN_FREE)
             .collect()
+    }
+
+    /// Reclaim leaked granules — those the FAT marks allocated but no live
+    /// file references. Refuses to touch anything while a chain is broken or
+    /// cross-linked, since freeing then could strand a live file's data. Only
+    /// the FAT sector is rewritten (RS-DOS keeps no backup FAT).
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (reachable, _files, crosslinked, broken) = self.reachable_granules();
+        if !broken.is_empty() || !crosslinked.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len() + crosslinked.len(),
+            });
+        }
+        let n = self.geom.granules as usize;
+        let leaked: Vec<usize> = (0..n)
+            .filter(|&g| self.fat[g] != GRAN_FREE && !reachable[g])
+            .collect();
+        if leaked.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        for &g in &leaked {
+            self.fat[g] = GRAN_FREE;
+        }
+        let fat = self.fat;
+        self.write_at(self.geom.fat_offset(), &fat)?;
+        self.reader.flush()?;
+        self.refresh()?;
+        Ok(RepairReport {
+            fixes_applied: vec![format!(
+                "reclaimed {} leaked granule(s) into the free list",
+                leaked.len()
+            )],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -718,6 +889,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for RsdosFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_granules().len() as u64 * GRANULE_SIZE as u64)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
 }
 
 /// Build a blank, DSKINI-style RS-DOS disk: the whole image is 0xFF (free
@@ -912,5 +1087,128 @@ mod tests {
             .unwrap();
         let err = fs.rename(&root, &two, "ONE").unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    // ---- fsck (granule-table reconciliation) -------------------------------
+
+    #[test]
+    fn rsdos_fsck_clean_blank() {
+        let mut fs = open_mem(create_blank(35));
+        let r = fs.fsck().expect("fsck supported").expect("ran");
+        assert!(r.is_clean(), "blank disk should be clean: {:?}", r.errors);
+        assert!(!r.repairable);
+        assert_eq!(r.stats.files_checked, 0);
+    }
+
+    #[test]
+    fn rsdos_fsck_clean_after_writes() {
+        let mut fs = open_mem(create_blank(40));
+        let root = fs.root().unwrap();
+        let big: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect(); // 3 granules
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(big),
+            5000,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "HI.TXT",
+            &mut Cursor::new(b"hi\r".to_vec()),
+            3,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(r.is_clean(), "errors: {:?}", r.errors);
+        assert_eq!(r.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn rsdos_fsck_detects_and_repairs_leaked_granule() {
+        let mut fs = open_mem(create_blank(35));
+        let root = fs.root().unwrap();
+        let data: Vec<u8> = (0..2560).map(|i| (i % 256) as u8).collect(); // 2 granules
+        fs.create_file(
+            &root,
+            "PROG.BIN",
+            &mut Cursor::new(data.clone()),
+            2560,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Mark a free granule allocated with no directory entry -> a lost
+        // granule (interrupted-write leftover).
+        let leak_g = *fs.free_granules().last().unwrap();
+        fs.fat[leak_g as usize] = GRAN_LAST | 1; // 0xC1: a lone one-granule orphan
+        let fat = fs.fat;
+        let off = fs.geom.fat_offset();
+        fs.write_at(off, &fat).unwrap();
+        fs.reader.flush().unwrap();
+
+        // Reopen and detect.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = RsdosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].code, "RsdosLeakedGranules");
+        assert!(r.errors[0].repairable);
+
+        // Repair, persist, and prove clean on a fresh open.
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert_eq!(rep.fixes_applied.len(), 1);
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = RsdosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+
+        // The real file is untouched.
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "PROG.BIN")
+            .unwrap();
+        assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), data);
+    }
+
+    #[test]
+    fn rsdos_fsck_flags_broken_chain_unrepairable() {
+        let mut fs = open_mem(create_blank(35));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "PROG.BIN",
+            &mut Cursor::new(vec![7u8; 2560]),
+            2560,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Point the file's first granule past the end of the disk.
+        let dir_off = fs.geom.dir_offset(0);
+        let mut e = fs.read_at(dir_off, ENTRY_LEN).unwrap();
+        e[13] = 0xFE; // 254 >= 68 granules -> out of range
+        fs.write_at(dir_off, &e).unwrap();
+        fs.reader.flush().unwrap();
+
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = RsdosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.errors.iter().any(|e| e.code == "RsdosBrokenChain"));
+        assert!(!r.repairable);
+        assert!(r.errors.iter().all(|e| !e.repairable));
+
+        // Repair refuses to touch the FAT while a chain is broken.
+        let rep = fs.repair().unwrap();
+        assert!(rep.fixes_applied.is_empty());
+        assert!(rep.unrepairable_count >= 1);
     }
 }

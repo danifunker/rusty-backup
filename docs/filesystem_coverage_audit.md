@@ -96,7 +96,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 |---|---|---|---|---|---|---|---|
 | CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Commodore C64 / 128 / VIC-20 / C16 / PET. fsck = VALIDATE (BAM reconciliation), rewrite byte-verified vs `c1541 validate` |
 | Atari DOS 2 (2.0S / 2.5) | Auto | Yes | Yes | No | — (fixed geometry) | No | Atari 8-bit (400/800/XL/XE) |
-| RS-DOS / Disk BASIC | Auto | Yes | Yes | Yes | — (fixed geometry) | No | Tandy CoCo 1 / 2 / 3 |
+| RS-DOS / Disk BASIC | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Tandy CoCo 1 / 2 / 3. fsck = granule-table reconciliation vs the directory file chains (VALIDATE model): reclaims leaked granules, surfaces cross-links / broken chains |
 | OS-9 / NitrOS-9 RBF | Auto | Yes | Yes | No | — (fixed geometry) | No | Tandy CoCo, Dragon, 6809 systems |
 | DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Dragon 32 / 64. fsck = bitmap reconciliation vs the directory extent chains (VALIDATE model), rewrites both dir-track copies |
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | No | BBC Micro / Master, Acorn Electron |

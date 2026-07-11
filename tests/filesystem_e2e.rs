@@ -2348,6 +2348,107 @@ fn test_dragondos_fsck_detect_open_repair_on_file() {
     }
 }
 
+/// End-to-end fsck on a file-backed RS-DOS floppy — the superfloppy path the
+/// CLI (`rb-cli fsck`) drives: detect as a `None` volume with fs_hint
+/// "RS-DOS", open through the auto-detect factory, check, then reclaim a
+/// lost granule and re-check clean.
+#[test]
+fn test_rsdos_fsck_detect_open_repair_on_file() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::rsdos::create_blank;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("coco.dsk");
+    std::fs::write(&img_path, create_blank(35)).expect("write blank image");
+
+    // 1. Superfloppy detection reports the RS-DOS hint.
+    {
+        let mut f = std::fs::File::open(&img_path).unwrap();
+        match PartitionTable::detect(&mut f).unwrap() {
+            PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "RS-DOS"),
+            other => panic!("expected RS-DOS superfloppy, got {other:?}"),
+        }
+    }
+
+    // 2. Write a file through the auto-detect editable factory (the CLI path).
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs =
+            open_editable_filesystem(file, 0, 0x00, None).expect("open_editable auto-detect");
+        let root = efs.root().unwrap();
+        let payload: Vec<u8> = (0..900).map(|i| (i % 256) as u8).collect();
+        let mut src = Cursor::new(payload);
+        efs.create_file(
+            &root,
+            "GAME.BIN",
+            &mut src,
+            900,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // 3. fsck clean through open_filesystem (the read-only inspect/CLI path).
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).expect("open_filesystem auto-detect");
+        assert_eq!(fs.fs_type(), "RS-DOS");
+        let res = fs.fsck().expect("fsck supported").expect("fsck ran");
+        assert!(res.is_clean(), "clean disk errors: {:?}", res.errors);
+    }
+
+    // 4. Leak a high granule directly in the FAT (track 17 sector 2), then
+    // detect + repair through the trait.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        // FAT sector: (17*18 + (2-1)) * 256 = 78592; byte g holds granule g.
+        let fat_byte_off = (17u64 * 18 + 1) * 256 + 67; // granule 67 is free
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(fat_byte_off)).unwrap();
+        file.write_all(&[0xC1]).unwrap(); // one-granule orphan (last marker, 1 sector)
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean(), "leaked granule should be detected");
+        assert!(res.repairable, "a lost granule should be repairable");
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let rep = efs.repair().unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        assert_eq!(rep.unrepairable_count, 0);
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "repair should leave it clean"
+        );
+    }
+}
+
 /// Stage `CreateDirectory` + `AddFile` + `DeleteEntry` against a fresh
 /// blank AFFS floppy via the GUI-style dispatcher; round-trip through
 /// reopen to verify writes landed. Mirrors the PFS3 / SFS staged-edits
