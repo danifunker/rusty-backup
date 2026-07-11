@@ -433,6 +433,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             {
                 return Some("ProDOS".to_string());
             }
+            // Minix superblock magic at +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478)
+            // or +24 (V3: 0x4D5A) of this 1024-offset block. Raw Minix floppies
+            // and hard-disk images are flat superfloppies.
+            if crate::fs::minix::detect_magic(&buf).is_some() {
+                return Some("minix".to_string());
+            }
         }
     }
 

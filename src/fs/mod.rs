@@ -56,6 +56,7 @@ pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod mem_archive;
 pub mod mfs;
+pub mod minix;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
@@ -274,6 +275,11 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
                 && sb_buf[36] == 13
             {
                 return "prodos";
+            }
+            // Minix superblock: block 1 (this offset-1024 sector). Magic at
+            // +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478) or +24 (V3: 0x4D5A).
+            if let Some(name) = minix::detect_magic(&sb_buf) {
+                return name;
             }
         }
     }
@@ -1037,6 +1043,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
         0xA1 => "SGI EFS",
+        // Minix (0x81) and old Minix (0x80).
+        0x80 | 0x81 => "Minix",
         _ => "unknown",
     }
 }
@@ -1425,6 +1433,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "minix" => Ok(Box::new(minix::MinixFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1535,6 +1547,12 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
         )?)),
         // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Minix (MBR type 0x81) and old Minix (0x80). The superblock magic is
+        // validated in open(), so a mislabeled partition fails cleanly.
+        0x80 | 0x81 => Ok(Box::new(minix::MinixFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -2234,6 +2252,9 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "btrfs"
             | "EFS"
             | "MFS"
+            // Minix (raw floppy / hard-disk superfloppy); auto-detected at
+            // byte 1024 by both detect_superfloppy and detect_filesystem_type.
+            | "minix"
             | "ADFS"
             | "ANDOS"
             | "QDOS"
