@@ -55,15 +55,15 @@ missing capability on a driver that already round-trips.
 | Apple DOS 3.3 | No | Yes | No | **create + fsck** |
 | CBM DOS | Yes | Yes | **Yes** | — **fsck done** (VALIDATE; byte-verified vs `c1541 validate`) |
 | Atari DOS 2 | test-only | Yes | No | **create + fsck** |
-| RS-DOS | Yes | Yes | No | **fsck** |
+| RS-DOS | Yes | Yes | **Yes** | — **fsck done** (granule-table VALIDATE) |
 | OS-9 / RBF | No | Yes | No | **create + fsck** |
-| DragonDOS | Yes | Yes | No | **fsck** |
-| Acorn DFS | Yes | Yes | No | **fsck** |
+| DragonDOS | Yes | Yes | **Yes** | — **fsck done** (sector-bitmap VALIDATE) |
+| Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency) |
 | Acorn ADFS | No | Partial | No | **finish edit + create + fsck** |
-| Human68k | Yes | Yes | No | **fsck** |
+| Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
 | CP/M | No | Yes | No | **create + fsck** |
 | QDOS (QXL.WIN) | No | Yes | No | **create + fsck** |
-| Alto BFS / TFS | Yes | Yes | No | **fsck** |
+| Alto BFS / TFS | Yes | Yes | **Engine** | **fsck done at trait level** (label/bitmap VALIDATE); CLI/GUI wiring pending (container open path) |
 
 ### 1b. Add fsck (check + repair) — the biggest single lever
 
@@ -161,6 +161,14 @@ The order that buys the most capability per unit effort:
    for the PFS3 (`PFS\3`/`PDS\3`/`muFS`) and SFS (`SFS\0`/`SFS\2`) DosTypes.
 4. **Retro long-tail fsck + create** — small formats, small checkers/formatters
    (CBM, Atari, ProDOS, CP/M, RS-DOS, DragonDOS, DFS, OS-9, Human68k, Alto).
+   **fsck sweep DONE for the five already-create+edit-complete formats:**
+   DragonDOS (sector bitmap), RS-DOS (granule table), Acorn DFS
+   (contiguous-file), Human68k (big-endian FAT + mirror), Alto BFS/TFS
+   (label/bitmap) — all on the CBM VALIDATE template, self-consistency-verified.
+   The first four wire through the block-reader factory (`rb-cli fsck` + the
+   Inspect Check button light up automatically); Alto's checker is on the trait
+   but its container open path needs separate CLI/GUI wiring. Remaining here:
+   create-blank for Atari / OS-9 / CP/M / ProDOS-CLI, and their fsck.
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,
