@@ -98,7 +98,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Atari DOS 2 (2.0S / 2.5) | Auto | Yes | Yes | No | — (fixed geometry) | No | Atari 8-bit (400/800/XL/XE) |
 | RS-DOS / Disk BASIC | Auto | Yes | Yes | Yes | — (fixed geometry) | No | Tandy CoCo 1 / 2 / 3 |
 | OS-9 / NitrOS-9 RBF | Auto | Yes | Yes | No | — (fixed geometry) | No | Tandy CoCo, Dragon, 6809 systems |
-| DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | No | Dragon 32 / 64 |
+| DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Dragon 32 / 64. fsck = bitmap reconciliation vs the directory extent chains (VALIDATE model), rewrites both dir-track copies |
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | No | BBC Micro / Master, Acorn Electron |
 | Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | No | No | No | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |

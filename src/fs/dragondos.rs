@@ -62,6 +62,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub const SECTOR_SIZE: usize = 256;
 pub const SECTORS_PER_TRACK: u64 = 18;
@@ -400,6 +401,122 @@ impl<R: Read + Seek + Send> DragonDosFilesystem<R> {
             .filter(|&l| self.is_free(l))
             .count() as u64
     }
+
+    /// Recompute which LSNs are actually in use — the two directory tracks plus
+    /// every sector reachable from a real file's extent chain. Returns the
+    /// used-set (indexed by LSN), the file count, and any structural problems
+    /// (corrupt chains / out-of-range extents) that make the walk untrustworthy.
+    fn compute_used(&self) -> (Vec<bool>, u32, Vec<String>) {
+        let total = self.geom.total_sectors as usize;
+        let sides = self.geom.sides;
+        let mut used = vec![false; total];
+        // Reserved: the directory track and its backup copy.
+        for t in [DIR_TRACK, BACKUP_DIR_TRACK] {
+            let base = t * SECTORS_PER_TRACK * sides;
+            for i in 0..SECTORS_PER_TRACK {
+                let lsn = (base + i) as usize;
+                if lsn < total {
+                    used[lsn] = true;
+                }
+            }
+        }
+        let mut files = 0u32;
+        let mut broken = Vec::new();
+        for index in 0..MAX_DIRENTS {
+            if !self.is_real_file(index) {
+                continue;
+            }
+            files += 1;
+            match self.collect_extents(index) {
+                Ok((extents, _)) => {
+                    'ext: for ext in extents {
+                        for s in 0..ext.count as u64 {
+                            let lsn = (ext.lsn as u64 + s) as usize;
+                            if lsn >= total {
+                                broken.push(format!(
+                                    "file entry {index}: extent sector {lsn} is past the end of the disk"
+                                ));
+                                break 'ext;
+                            }
+                            used[lsn] = true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    broken.push(format!(
+                        "file entry {index}: corrupt directory/extent chain"
+                    ));
+                }
+            }
+        }
+        (used, files, broken)
+    }
+
+    /// DragonDOS integrity check: reconcile the on-disk bitmap against the
+    /// allocation recomputed from the directory (the CBM/AFFS VALIDATE model).
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (used, files, broken) = self.compute_used();
+        let total = self.geom.total_sectors;
+        let walk_clean = broken.is_empty();
+
+        let mut used_but_free = 0u32;
+        let mut leaked = 0u32;
+        for lsn in 0..total {
+            match (self.is_free(lsn), used[lsn as usize]) {
+                (true, true) => used_but_free += 1, // referenced but marked free
+                (false, true) => {}                 // allocated, correct
+                (false, false) => leaked += 1,      // marked used but unreferenced
+                (true, false) => {}                 // free, correct
+            }
+        }
+
+        let mut errors = Vec::new();
+        if used_but_free > 0 || leaked > 0 {
+            errors.push(FsckIssue {
+                code: "DragonBitmapMismatch".into(),
+                message: format!(
+                    "bitmap mismatch: {used_but_free} sector(s) in use but marked free, \
+                     {leaked} sector(s) marked allocated but unreferenced"
+                ),
+                // Only trust a rewrite when the directory walk was complete;
+                // a broken chain could hide live sectors and cause a bad free.
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "DragonBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = used.iter().filter(|&&u| !u).count() as u64;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    ("free sectors".into(), format!("{free} / {total}")),
+                    (
+                        "bitmap".into(),
+                        if used_but_free == 0 && leaked == 0 {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for DragonDosFilesystem<R> {
@@ -462,6 +579,10 @@ impl<R: Read + Seek + Send> Filesystem for DragonDosFilesystem<R> {
 
     fn used_size(&self) -> u64 {
         (self.bitmap_count() - self.free_lsn_count()) * SECTOR_SIZE as u64
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
     }
 }
 
@@ -531,6 +652,45 @@ impl<R: Read + Write + Seek + Send> DragonDosFilesystem<R> {
         self.write_at(backup_off, &dir)?;
         self.reader.flush()?;
         Ok(())
+    }
+
+    /// Rewrite the bitmap (main + backup dir track) from the directory walk,
+    /// unless the walk found structural damage that could hide live sectors.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (used, _files, broken) = self.compute_used();
+        let total = self.geom.total_sectors;
+        if !broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len(),
+            });
+        }
+        let diff = (0..total)
+            .filter(|&lsn| self.is_free(lsn) == used[lsn as usize])
+            .count();
+        if diff == 0 {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        for lsn in 0..total {
+            if used[lsn as usize] {
+                self.set_used(lsn);
+            } else {
+                self.set_free(lsn);
+            }
+        }
+        self.flush_dir_track()?;
+        Ok(RepairReport {
+            fixes_applied: vec![format!(
+                "rebuilt the DragonDOS bitmap from the directory ({diff} bit(s) corrected)"
+            )],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -829,6 +989,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DragonDosFilesystem<R
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_lsn_count() * SECTOR_SIZE as u64)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
 }
 
 /// Build a blank, freshly formatted DragonDOS disk. Mirrors
@@ -1100,5 +1264,143 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    // ---- fsck (bitmap reconciliation) --------------------------------------
+
+    #[test]
+    fn dragondos_fsck_clean_blank() {
+        let mut fs = open_mem(create_blank(40, 1));
+        let r = fs.fsck().expect("fsck supported").expect("ran");
+        assert!(r.is_clean(), "blank disk should be clean: {:?}", r.errors);
+        assert!(!r.repairable);
+        assert_eq!(r.stats.files_checked, 0);
+    }
+
+    #[test]
+    fn dragondos_fsck_clean_after_writes() {
+        let mut fs = open_mem(create_blank(40, 2));
+        let root = fs.root().unwrap();
+        let big: Vec<u8> = (0..1500).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "BIG.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "SMALL",
+            &mut Cursor::new(vec![7u8; 200]),
+            200,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(r.is_clean(), "errors: {:?}", r.errors);
+        assert_eq!(r.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn dragondos_fsck_detects_and_repairs_bitmap() {
+        let mut fs = open_mem(create_blank(40, 1));
+        let root = fs.root().unwrap();
+        let data: Vec<u8> = (0..700).map(|i| (i % 256) as u8).collect(); // 3 sectors
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(data.clone()),
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // A live sector and a currently-free sector.
+        let idx = fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "DATA.BIN")
+            .unwrap()
+            .location as usize;
+        let used_lsn = fs.collect_extents(idx).unwrap().0[0].lsn as u64;
+        let free_lsn = (0..fs.bitmap_count()).find(|&l| fs.is_free(l)).unwrap();
+        assert_ne!(used_lsn, free_lsn);
+
+        // Corrupt both directions: live sector marked free, free sector marked used.
+        fs.set_free(used_lsn); // used-but-free
+        fs.set_used(free_lsn); // leaked
+        fs.flush_dir_track().unwrap();
+
+        // Reopen from disk and detect.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = DragonDosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].code, "DragonBitmapMismatch");
+        assert!(r.errors[0].repairable);
+
+        // Repair, persist, and prove clean on a fresh open.
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert_eq!(rep.fixes_applied.len(), 1);
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = DragonDosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+
+        // Data survived the bitmap rebuild.
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "DATA.BIN")
+            .unwrap();
+        assert_eq!(fs.read_file(&e, usize::MAX).unwrap(), data);
+    }
+
+    #[test]
+    fn dragondos_fsck_flags_broken_chain_unrepairable() {
+        let mut fs = open_mem(create_blank(40, 1));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(vec![9u8; 700]),
+            700,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let idx = fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "DATA.BIN")
+            .unwrap()
+            .location as usize;
+
+        // Point the file's first extent past the end of the disk.
+        let (s, _e) = DragonDosFilesystem::<Cursor<Vec<u8>>>::dirent_range(idx);
+        fs.dir_track[s + 12] = 0xFF; // lsn hi
+        fs.dir_track[s + 13] = 0xFF; // lsn lo -> 0xFFFF, far past 720
+        fs.flush_dir_track().unwrap();
+
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = DragonDosFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.errors.iter().any(|e| e.code == "DragonBrokenChain"));
+        // Nothing is auto-repairable while a chain is broken.
+        assert!(!r.repairable);
+        assert!(r.errors.iter().all(|e| !e.repairable));
+
+        // Repair refuses to touch the bitmap and reports the damage.
+        let rep = fs.repair().unwrap();
+        assert!(rep.fixes_applied.is_empty());
+        assert!(rep.unrepairable_count >= 1);
     }
 }
