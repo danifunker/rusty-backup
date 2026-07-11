@@ -2348,6 +2348,74 @@ fn test_dragondos_fsck_detect_open_repair_on_file() {
     }
 }
 
+/// The GUI inspect-grid Check + Repair path for a retro superfloppy: the grid
+/// gates on `is_checkable_retro_fs` then hands `fsck_runner` exactly the
+/// `(offset=0, ptype=0, type_string=None)` a DragonDOS superfloppy row carries.
+/// This pins that the runner opens + checks + repairs it end to end.
+#[test]
+fn test_dragondos_fsck_via_runner_the_gui_inspect_path() {
+    use rusty_backup::fs::dragondos::create_blank;
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{is_checkable_retro_fs, open_editable_filesystem};
+    use rusty_backup::model::fsck_runner::{run_fsck, run_repair};
+
+    // The gate the inspect grid applies to a DragonDOS superfloppy row.
+    assert!(is_checkable_retro_fs(0, None, "DragonDOS"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let img_path = tmp.path().join("dragon.dsk");
+    std::fs::write(&img_path, create_blank(40, 1)).unwrap();
+
+    // Seed a file, then corrupt bitmap byte 0 (LSNs 0..7) on the dir track.
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let root = efs.root().unwrap();
+        let mut src = Cursor::new(vec![7u8; 900]);
+        efs.create_file(
+            &root,
+            "GAME.BIN",
+            &mut src,
+            900,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir_track_off = (20u64 * 18) * 256;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b).unwrap();
+        b[0] = 0xFF;
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        file.write_all(&b).unwrap();
+    }
+
+    // run_fsck (the check-mode runner) detects it.
+    let report = run_fsck(&img_path, 0, 0, None)
+        .expect("run_fsck ok")
+        .expect("fsck supported");
+    assert!(!report.is_clean());
+    assert!(report.repairable);
+
+    // run_repair (the repair-mode runner) fixes it; a fresh check is clean.
+    let rep = run_repair(&img_path, 0, 0, None).expect("run_repair ok");
+    assert!(!rep.fixes_applied.is_empty());
+    let report = run_fsck(&img_path, 0, 0, None).unwrap().unwrap();
+    assert!(report.is_clean(), "runner repair should leave it clean");
+}
+
 /// End-to-end fsck on a file-backed RS-DOS floppy — the superfloppy path the
 /// CLI (`rb-cli fsck`) drives: detect as a `None` volume with fs_hint
 /// "RS-DOS", open through the auto-detect factory, check, then reclaim a

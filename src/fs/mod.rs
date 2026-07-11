@@ -2234,6 +2234,15 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "Alto BFS"
             | "Pilot/Cedar"
             | "lisafs"
+            // 8-bit / retro floppy filesystems the engine auto-detects at
+            // byte 0. These were previously omitted, so the inspect grid and
+            // Commander silently refused to browse them.
+            | "Acorn DFS"
+            | "Atari DOS"
+            | "CBM DOS"
+            | "DragonDOS"
+            | "OS-9"
+            | "RS-DOS"
             | "Unknown"
     )
 }
@@ -2335,6 +2344,24 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
     ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS"]
         .iter()
         .any(|tok| n.contains(tok))
+}
+
+/// True for the retro superfloppy / X68k filesystems whose driver implements
+/// `fsck()` but which are identified only by their resolved `type_name` /
+/// dispatch string (not a partition-type byte or APM string): CBM DOS,
+/// DragonDOS, RS-DOS, Acorn DFS, and Human68k.
+///
+/// Kept separate from [`is_checkable_fs_name`] because those tokens
+/// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
+/// so these use exact names. Human68k (floppy `"Human68k (FAT)"` and X68k HDD
+/// `"X68k Human68k (…)"`) is matched by its `"human68k"` dispatch string, which
+/// both shapes carry. Every filesystem named here is factory-reachable, so the
+/// generic `fsck_runner` opens and checks/repairs it.
+pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
+    if type_string == Some("human68k") {
+        return true;
+    }
+    ptype == 0 && matches!(type_name, "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS")
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -2695,6 +2722,12 @@ mod tests {
             "Alto BFS",
             "Pilot/Cedar",
             "lisafs",
+            "Acorn DFS",
+            "Atari DOS",
+            "CBM DOS",
+            "DragonDOS",
+            "OS-9",
+            "RS-DOS",
         ] {
             assert!(
                 is_browsable_superfloppy(0, hint),
@@ -2702,6 +2735,27 @@ mod tests {
             );
             assert!(partition_is_browsable(0, None, hint), "hint {hint:?}");
         }
+    }
+
+    #[test]
+    fn checkable_retro_fs_gate() {
+        // Factory-reachable retro filesystems that implement fsck().
+        assert!(is_checkable_retro_fs(0, None, "CBM DOS"));
+        assert!(is_checkable_retro_fs(0, None, "DragonDOS"));
+        assert!(is_checkable_retro_fs(0, None, "RS-DOS"));
+        assert!(is_checkable_retro_fs(0, None, "Acorn DFS"));
+        // Human68k (floppy + X68k HDD) via its dispatch string.
+        assert!(is_checkable_retro_fs(0, Some("human68k"), "Human68k (FAT)"));
+        assert!(is_checkable_retro_fs(
+            0x01,
+            Some("human68k"),
+            "X68k Human68k (MYVOL)"
+        ));
+        // Non-fsck retro filesystems must NOT be gated.
+        assert!(!is_checkable_retro_fs(0, None, "Atari DOS"));
+        assert!(!is_checkable_retro_fs(0, None, "OS-9"));
+        // "DFS" must not substring-match "ADFS" (ADFS has no fsck).
+        assert!(!is_checkable_retro_fs(0, None, "ADFS"));
     }
 
     #[test]
