@@ -99,7 +99,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | RS-DOS / Disk BASIC | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Tandy CoCo 1 / 2 / 3. fsck = granule-table reconciliation vs the directory file chains (VALIDATE model): reclaims leaked granules, surfaces cross-links / broken chains |
 | OS-9 / NitrOS-9 RBF | Auto | Yes | Yes | No | — (fixed geometry) | No | Tandy CoCo, Dragon, 6809 systems |
 | DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Dragon 32 / 64. fsck = bitmap reconciliation vs the directory extent chains (VALIDATE model), rewrites both dir-track copies |
-| Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | No | BBC Micro / Master, Acorn Electron |
+| Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | BBC Micro / Master, Acorn Electron. fsck = contiguous-file consistency (overlap + out-of-bounds detection; canonical descending-catalogue reorder as the repair) |
 | Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | No | No | No | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |
 | Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | No | Sharp X68000 (big-endian FAT dialect) |

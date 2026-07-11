@@ -56,6 +56,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub const SECTOR_SIZE: usize = 256;
 pub const MAX_FILES: usize = 31;
@@ -365,6 +366,121 @@ impl<R: Read + Seek + Send> DfsFilesystem<R> {
             .iter()
             .position(|e| e.same_file(dir, &name))
     }
+
+    /// Scan the catalogue for the consistency problems a contiguous-file,
+    /// bitmap-free filesystem can develop: files whose runs overlap each other,
+    /// files that fall outside the data area, and a catalogue that is not in
+    /// the canonical descending start-sector order.
+    ///
+    /// Returns the issue list plus `(overlaps, out_of_range, order_ok)`. The
+    /// only auto-repairable finding is the ordering (a pure catalogue rewrite
+    /// that never moves file data); overlaps and out-of-range files are
+    /// surfaced read-only.
+    fn dfs_scan(&self) -> (Vec<FsckIssue>, u32, u32, bool) {
+        let total = self.geom.total_sectors as u32;
+        let mut issues = Vec::new();
+
+        // Bounds: each file must live entirely inside sectors 2..total.
+        let mut out_of_range = 0u32;
+        for e in &self.cat.entries {
+            let start = e.start_sector as u32;
+            let end = start + e.sectors() as u32;
+            if e.start_sector < 2 || start >= total || end > total {
+                out_of_range += 1;
+                issues.push(FsckIssue {
+                    code: "DfsOutOfRange".into(),
+                    message: format!(
+                        "file '{}' occupies sectors {start}..{end}, outside the data area 2..{total}",
+                        e.display_name()
+                    ),
+                    repairable: false,
+                    debug: false,
+                });
+            }
+        }
+
+        // Overlap: sort a copy of the runs by start sector and look for any
+        // pair whose extents intersect (cross-linked files).
+        let mut runs: Vec<(u16, u16, String)> = self
+            .cat
+            .entries
+            .iter()
+            .map(|e| (e.start_sector, e.sectors(), e.display_name()))
+            .collect();
+        runs.sort_by_key(|r| r.0);
+        let mut overlaps = 0u32;
+        for w in runs.windows(2) {
+            let (s0, n0, ref name0) = w[0];
+            let (s1, _n1, ref name1) = w[1];
+            if s0 as u32 + n0 as u32 > s1 as u32 {
+                overlaps += 1;
+                issues.push(FsckIssue {
+                    code: "DfsOverlap".into(),
+                    message: format!("files '{name0}' and '{name1}' overlap on disk"),
+                    repairable: false,
+                    debug: false,
+                });
+            }
+        }
+
+        // Ordering: the on-disk catalogue must list files in descending
+        // start-sector order (the Acorn DFS convention).
+        let stored: Vec<u16> = self.cat.entries.iter().map(|e| e.start_sector).collect();
+        let mut canonical = stored.clone();
+        canonical.sort_by(|a, b| b.cmp(a));
+        let order_ok = stored == canonical;
+        if !order_ok {
+            issues.push(FsckIssue {
+                code: "DfsCatalogOrder".into(),
+                message: "catalogue entries are not in descending start-sector order".into(),
+                repairable: true,
+                debug: false,
+            });
+        }
+
+        (issues, overlaps, out_of_range, order_ok)
+    }
+
+    /// Acorn DFS integrity check: verify the contiguous-file catalogue is
+    /// self-consistent (no overlaps, all files in-bounds, canonical ordering).
+    fn run_fsck(&self) -> Result<FsckResult, FilesystemError> {
+        let (errors, overlaps, out_of_range, order_ok) = self.dfs_scan();
+        let files = self.cat.entries.len() as u32;
+
+        let claimed: u32 = 2 + self
+            .cat
+            .entries
+            .iter()
+            .map(|e| e.sectors() as u32)
+            .sum::<u32>();
+        let free = (self.geom.total_sectors as u32).saturating_sub(claimed);
+        let consistent = overlaps == 0 && out_of_range == 0 && order_ok;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    (
+                        "free sectors".into(),
+                        format!("{free} / {}", self.geom.total_sectors),
+                    ),
+                    (
+                        "catalogue".into(),
+                        if consistent {
+                            "consistent".into()
+                        } else {
+                            "needs attention".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 /// Read sectors 0 and 1 (the catalogue) from `partition_offset`.
@@ -447,6 +563,10 @@ impl<R: Read + Seek + Send> Filesystem for DfsFilesystem<R> {
         let file_sectors: u64 = self.cat.entries.iter().map(|e| e.sectors() as u64).sum();
         (file_sectors + 2) * SECTOR_SIZE as u64
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +622,34 @@ impl<R: Read + Write + Seek + Send> DfsFilesystem<R> {
         let (s0, s1) = read_two_sectors(&mut self.reader, self.partition_offset)?;
         self.cat = Catalogue::parse(&s0, &s1);
         Ok(())
+    }
+
+    /// Normalize the catalogue into canonical (descending start-sector) order,
+    /// the one safely-recomputable repair for a DFS volume. Overlapping or
+    /// out-of-range files are structural and left untouched (data can't be
+    /// disambiguated) — they are reported back as `unrepairable_count`.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (_issues, overlaps, out_of_range, order_ok) = self.dfs_scan();
+        let unrepairable_count = (overlaps + out_of_range) as usize;
+        if order_ok {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count,
+            });
+        }
+        // A catalogue rewrite; bump the cycle number as DFS does on any write.
+        self.cat.cycle = bcd_increment(self.cat.cycle);
+        self.flush_catalogue()?;
+        self.reader.flush()?;
+        self.refresh()?;
+        Ok(RepairReport {
+            fixes_applied: vec![
+                "reordered the DFS catalogue into descending start-sector order".into(),
+            ],
+            fixes_failed: Vec::new(),
+            unrepairable_count,
+        })
     }
 }
 
@@ -690,6 +838,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for DfsFilesystem<R> {
             .saturating_sub(2)
             .saturating_sub(used);
         Ok(free_sectors as u64 * SECTOR_SIZE as u64)
+    }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
     }
 }
 
@@ -958,5 +1110,102 @@ mod tests {
         assert_eq!(bcd_increment(0x09), 0x10);
         assert_eq!(bcd_increment(0x19), 0x20);
         assert_eq!(bcd_increment(0x99), 0x00);
+    }
+
+    // ---- fsck (contiguous-file catalogue consistency) ----------------------
+
+    /// Swap two 8-byte catalogue half-entries in place.
+    fn swap8(img: &mut [u8], a: usize, b: usize) {
+        for k in 0..8 {
+            img.swap(a + k, b + k);
+        }
+    }
+
+    fn make_two_files() -> Vec<u8> {
+        let mut fs = open_mem(create_blank_dfs(400, "FSCK"));
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "AAA",
+            &mut Cursor::new(vec![1u8; 300]), // 2 sectors -> [2,3]
+            300,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "BB",
+            &mut Cursor::new(vec![2u8; 100]), // 1 sector -> [4]
+            100,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.into_inner().into_inner()
+    }
+
+    #[test]
+    fn dfs_fsck_clean_blank() {
+        let mut fs = open_mem(create_blank_dfs(400, "BLANK"));
+        let r = fs.fsck().expect("fsck supported").expect("ran");
+        assert!(r.is_clean(), "blank disk should be clean: {:?}", r.errors);
+        assert!(!r.repairable);
+        assert_eq!(r.stats.files_checked, 0);
+    }
+
+    #[test]
+    fn dfs_fsck_clean_after_writes() {
+        let mut fs = open_mem(make_two_files());
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(r.is_clean(), "errors: {:?}", r.errors);
+        assert_eq!(r.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn dfs_fsck_detects_and_repairs_catalog_order() {
+        // On-disk order after create is descending (BB@4, AAA@2). Swap the two
+        // catalogue half-entries (in both sectors) to make it ascending.
+        let mut img = make_two_files();
+        swap8(&mut img, 8, 16); // sector 0 name half-entries
+        swap8(&mut img, SECTOR_SIZE + 8, SECTOR_SIZE + 16); // sector 1 info half-entries
+
+        let mut fs = open_mem(img);
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert_eq!(r.errors.len(), 1);
+        assert_eq!(r.errors[0].code, "DfsCatalogOrder");
+
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert_eq!(rep.fixes_applied.len(), 1);
+
+        // Persisted and clean on a fresh open; both files still readable.
+        let bytes = fs.into_inner().into_inner();
+        let mut fs = DfsFilesystem::open(Cursor::new(bytes), 0).unwrap();
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+        let root = fs.root().unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn dfs_fsck_detects_overlap_unrepairable() {
+        // Force the two files to claim the same start sector -> overlap.
+        let mut img = make_two_files();
+        // Copy entry 0's start (sector 1, io=8) into entry 1 (io=16).
+        let s1 = SECTOR_SIZE;
+        img[s1 + 16 + 7] = img[s1 + 8 + 7]; // start-lo
+        img[s1 + 16 + 6] = (img[s1 + 16 + 6] & 0xFC) | (img[s1 + 8 + 6] & 0x03); // start-hi bits
+
+        let mut fs = open_mem(img);
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.errors.iter().any(|e| e.code == "DfsOverlap"));
+        assert!(!r.repairable);
+        assert!(r.errors.iter().all(|e| !e.repairable));
+
+        // Repair leaves the structural overlap for the user (no data guess).
+        let rep = fs.repair().unwrap();
+        assert!(rep.fixes_applied.is_empty());
+        assert!(rep.unrepairable_count >= 1);
     }
 }

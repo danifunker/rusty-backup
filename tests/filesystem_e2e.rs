@@ -2449,6 +2449,118 @@ fn test_rsdos_fsck_detect_open_repair_on_file() {
     }
 }
 
+/// End-to-end fsck on a file-backed Acorn DFS floppy — the superfloppy path
+/// the CLI (`rb-cli fsck`) drives: detect as a `None` volume with fs_hint
+/// "Acorn DFS", open through the auto-detect factory, check, then normalize a
+/// scrambled catalogue order and re-check clean.
+#[test]
+fn test_dfs_fsck_detect_open_repair_on_file() {
+    use rusty_backup::fs::dfs::create_blank_dfs;
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("bbc.ssd");
+    std::fs::write(&img_path, create_blank_dfs(400, "E2E")).expect("write blank image");
+
+    // 1. Superfloppy detection reports the Acorn DFS hint.
+    {
+        let mut f = std::fs::File::open(&img_path).unwrap();
+        match PartitionTable::detect(&mut f).unwrap() {
+            PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "Acorn DFS"),
+            other => panic!("expected Acorn DFS superfloppy, got {other:?}"),
+        }
+    }
+
+    // 2. Write two files through the auto-detect editable factory.
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs =
+            open_editable_filesystem(file, 0, 0x00, None).expect("open_editable auto-detect");
+        let root = efs.root().unwrap();
+        efs.create_file(
+            &root,
+            "AAA",
+            &mut Cursor::new(vec![1u8; 300]),
+            300,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.create_file(
+            &root,
+            "BB",
+            &mut Cursor::new(vec![2u8; 100]),
+            100,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // 3. fsck clean through open_filesystem.
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).expect("open_filesystem auto-detect");
+        assert_eq!(fs.fs_type(), "Acorn DFS");
+        let res = fs.fsck().expect("fsck supported").expect("fsck ran");
+        assert!(res.is_clean(), "clean disk errors: {:?}", res.errors);
+    }
+
+    // 4. Scramble the catalogue order on disk (swap the two half-entries in
+    // both catalogue sectors), then detect + repair through the trait.
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut cat = [0u8; 512];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut cat).unwrap();
+        for k in 0..8 {
+            cat.swap(8 + k, 16 + k); // sector 0 name half-entries
+            cat.swap(256 + 8 + k, 256 + 16 + k); // sector 1 info half-entries
+        }
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&cat).unwrap();
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean(), "scrambled order should be detected");
+        assert!(res.repairable, "catalogue order should be repairable");
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let rep = efs.repair().unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        assert_eq!(rep.unrepairable_count, 0);
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "repair should leave it clean"
+        );
+    }
+}
+
 /// Stage `CreateDirectory` + `AddFile` + `DeleteEntry` against a fresh
 /// blank AFFS floppy via the GUI-style dispatcher; round-trip through
 /// reopen to verify writes landed. Mirrors the PFS3 / SFS staged-edits
