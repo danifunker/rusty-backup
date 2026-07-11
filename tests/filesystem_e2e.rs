@@ -1800,6 +1800,30 @@ fn test_prodos_list_and_recurse() {
 }
 
 #[test]
+fn test_prodos_fsck_clean_on_real_volume() {
+    // Independent oracle: a real Apple IIgs ProDOS volume must fsck clean. This
+    // volume includes an extended (GS/OS forked) file (TSTFLDR/TEST.TXT, storage
+    // type 5) whose data + resource forks the bitmap walk must follow — a
+    // regression guard so fsck never mistakes live fork blocks for leaked ones
+    // (which --repair would otherwise free, corrupting the volume).
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+    let res = fs
+        .fsck()
+        .expect("ProDOS implements fsck")
+        .expect("fsck ran");
+    assert!(
+        res.is_clean(),
+        "real ProDOS volume should fsck clean, got: {:?}",
+        res.errors
+    );
+    assert_eq!(res.stats.files_checked, 6);
+    assert_eq!(res.stats.directories_checked, 3);
+}
+
+#[test]
 fn test_prodos_type_codes_populated() {
     // Verify list_directory populates FileEntry::type_code from the new
     // prodos_types table rather than returning raw hex codes.
@@ -2198,6 +2222,437 @@ fn test_pfs3_staged_edits_round_trip() {
     );
 }
 
+/// End-to-end fsck on a file-backed PFS3 volume — the exact path the CLI
+/// (`rb-cli fsck`) and the Inspect-tab Check button drive through the
+/// `Filesystem::fsck` trait method. Format a blank volume on disk, write a
+/// directory + file into it, then confirm the integrity check is clean.
+#[test]
+fn test_pfs3_fsck_clean_on_file_backed_volume() {
+    use rusty_backup::fs::filesystem::{CreateFileOptions, EditableFilesystem};
+    use rusty_backup::fs::pfs3::{create_blank_pfs3, Pfs3Filesystem};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("check.hdf");
+    std::fs::write(&img_path, create_blank_pfs3(8192, "FsckVol").unwrap())
+        .expect("write blank image");
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut fs = Pfs3Filesystem::open(file, 0).expect("open");
+    let root = fs.root().expect("root");
+    let payload = vec![0x7Eu8; 5000];
+    let mut src = std::io::Cursor::new(payload);
+    fs.create_file(
+        &root,
+        "payload.bin",
+        &mut src,
+        5000,
+        &CreateFileOptions::default(),
+    )
+    .expect("create_file");
+    fs.sync_metadata().expect("sync");
+    drop(fs);
+
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = Pfs3Filesystem::open(f2, 0).expect("reopen");
+    let res = fs.fsck().expect("fsck available").expect("fsck ok");
+    assert!(
+        res.is_clean(),
+        "file-backed PFS3 should be clean; errors: {:?}",
+        res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+}
+
+/// End-to-end fsck on a file-backed DragonDOS floppy — the exact superfloppy
+/// path the CLI (`rb-cli fsck`) drives: detect as a `None` volume with
+/// fs_hint "DragonDOS", open through the auto-detect factory, then check.
+/// Corrupting a bitmap word and repairing through the trait proves the whole
+/// detect -> open -> check -> repair chain, not just the in-module unit tests.
+#[test]
+fn test_dragondos_fsck_detect_open_repair_on_file() {
+    use rusty_backup::fs::dragondos::create_blank;
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("dragon.dsk");
+    std::fs::write(&img_path, create_blank(40, 1)).expect("write blank image");
+
+    // 1. Superfloppy detection reports the DragonDOS hint.
+    {
+        let mut f = std::fs::File::open(&img_path).unwrap();
+        match PartitionTable::detect(&mut f).unwrap() {
+            PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "DragonDOS"),
+            other => panic!("expected DragonDOS superfloppy, got {other:?}"),
+        }
+    }
+
+    // 2. Write a file through the auto-detect editable factory (the CLI path).
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs =
+            open_editable_filesystem(file, 0, 0x00, None).expect("open_editable auto-detect");
+        let root = efs.root().unwrap();
+        let payload: Vec<u8> = (0..900).map(|i| (i % 256) as u8).collect();
+        let mut src = Cursor::new(payload);
+        efs.create_file(
+            &root,
+            "GAME.BIN",
+            &mut src,
+            900,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // 3. fsck clean through open_filesystem (the read-only inspect/CLI path).
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).expect("open_filesystem auto-detect");
+        assert_eq!(fs.fs_type(), "DragonDOS");
+        let res = fs.fsck().expect("fsck supported").expect("fsck ran");
+        assert!(res.is_clean(), "clean disk errors: {:?}", res.errors);
+    }
+
+    // 4. Corrupt one bitmap byte on disk, then detect + repair via the trait.
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        // Byte 0 of the directory track (track 20) holds the bitmap bits for
+        // LSNs 0..7 — GAME.BIN's first sectors. Flip them all to "free".
+        let dir_track_off = (20u64 * 18) * 256;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b).unwrap();
+        b[0] = 0xFF; // mark LSN 0..7 free even though GAME.BIN uses them
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        file.write_all(&b).unwrap();
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean(), "corruption should be detected");
+        assert!(res.repairable, "bitmap mismatch should be repairable");
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let rep = efs.repair().unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        assert_eq!(rep.unrepairable_count, 0);
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "repair should leave it clean"
+        );
+    }
+}
+
+/// The GUI inspect-grid Check + Repair path for a retro superfloppy: the grid
+/// gates on `is_checkable_retro_fs` then hands `fsck_runner` exactly the
+/// `(offset=0, ptype=0, type_string=None)` a DragonDOS superfloppy row carries.
+/// This pins that the runner opens + checks + repairs it end to end.
+#[test]
+fn test_dragondos_fsck_via_runner_the_gui_inspect_path() {
+    use rusty_backup::fs::dragondos::create_blank;
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{is_checkable_retro_fs, open_editable_filesystem};
+    use rusty_backup::model::fsck_runner::{run_fsck, run_repair};
+
+    // The gate the inspect grid applies to a DragonDOS superfloppy row.
+    assert!(is_checkable_retro_fs(0, None, "DragonDOS"));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let img_path = tmp.path().join("dragon.dsk");
+    std::fs::write(&img_path, create_blank(40, 1)).unwrap();
+
+    // Seed a file, then corrupt bitmap byte 0 (LSNs 0..7) on the dir track.
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let root = efs.root().unwrap();
+        let mut src = Cursor::new(vec![7u8; 900]);
+        efs.create_file(
+            &root,
+            "GAME.BIN",
+            &mut src,
+            900,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir_track_off = (20u64 * 18) * 256;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b).unwrap();
+        b[0] = 0xFF;
+        file.seek(SeekFrom::Start(dir_track_off)).unwrap();
+        file.write_all(&b).unwrap();
+    }
+
+    // run_fsck (the check-mode runner) detects it.
+    let report = run_fsck(&img_path, 0, 0, None)
+        .expect("run_fsck ok")
+        .expect("fsck supported");
+    assert!(!report.is_clean());
+    assert!(report.repairable);
+
+    // run_repair (the repair-mode runner) fixes it; a fresh check is clean.
+    let rep = run_repair(&img_path, 0, 0, None).expect("run_repair ok");
+    assert!(!rep.fixes_applied.is_empty());
+    let report = run_fsck(&img_path, 0, 0, None).unwrap().unwrap();
+    assert!(report.is_clean(), "runner repair should leave it clean");
+}
+
+/// End-to-end fsck on a file-backed RS-DOS floppy — the superfloppy path the
+/// CLI (`rb-cli fsck`) drives: detect as a `None` volume with fs_hint
+/// "RS-DOS", open through the auto-detect factory, check, then reclaim a
+/// lost granule and re-check clean.
+#[test]
+fn test_rsdos_fsck_detect_open_repair_on_file() {
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::rsdos::create_blank;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("coco.dsk");
+    std::fs::write(&img_path, create_blank(35)).expect("write blank image");
+
+    // 1. Superfloppy detection reports the RS-DOS hint.
+    {
+        let mut f = std::fs::File::open(&img_path).unwrap();
+        match PartitionTable::detect(&mut f).unwrap() {
+            PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "RS-DOS"),
+            other => panic!("expected RS-DOS superfloppy, got {other:?}"),
+        }
+    }
+
+    // 2. Write a file through the auto-detect editable factory (the CLI path).
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs =
+            open_editable_filesystem(file, 0, 0x00, None).expect("open_editable auto-detect");
+        let root = efs.root().unwrap();
+        let payload: Vec<u8> = (0..900).map(|i| (i % 256) as u8).collect();
+        let mut src = Cursor::new(payload);
+        efs.create_file(
+            &root,
+            "GAME.BIN",
+            &mut src,
+            900,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // 3. fsck clean through open_filesystem (the read-only inspect/CLI path).
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).expect("open_filesystem auto-detect");
+        assert_eq!(fs.fs_type(), "RS-DOS");
+        let res = fs.fsck().expect("fsck supported").expect("fsck ran");
+        assert!(res.is_clean(), "clean disk errors: {:?}", res.errors);
+    }
+
+    // 4. Leak a high granule directly in the FAT (track 17 sector 2), then
+    // detect + repair through the trait.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        // FAT sector: (17*18 + (2-1)) * 256 = 78592; byte g holds granule g.
+        let fat_byte_off = (17u64 * 18 + 1) * 256 + 67; // granule 67 is free
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(fat_byte_off)).unwrap();
+        file.write_all(&[0xC1]).unwrap(); // one-granule orphan (last marker, 1 sector)
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean(), "leaked granule should be detected");
+        assert!(res.repairable, "a lost granule should be repairable");
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let rep = efs.repair().unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        assert_eq!(rep.unrepairable_count, 0);
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "repair should leave it clean"
+        );
+    }
+}
+
+/// End-to-end fsck on a file-backed Acorn DFS floppy — the superfloppy path
+/// the CLI (`rb-cli fsck`) drives: detect as a `None` volume with fs_hint
+/// "Acorn DFS", open through the auto-detect factory, check, then normalize a
+/// scrambled catalogue order and re-check clean.
+#[test]
+fn test_dfs_fsck_detect_open_repair_on_file() {
+    use rusty_backup::fs::dfs::create_blank_dfs;
+    use rusty_backup::fs::filesystem::CreateFileOptions;
+    use rusty_backup::fs::{open_editable_filesystem, open_filesystem};
+    use rusty_backup::partition::PartitionTable;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("bbc.ssd");
+    std::fs::write(&img_path, create_blank_dfs(400, "E2E")).expect("write blank image");
+
+    // 1. Superfloppy detection reports the Acorn DFS hint.
+    {
+        let mut f = std::fs::File::open(&img_path).unwrap();
+        match PartitionTable::detect(&mut f).unwrap() {
+            PartitionTable::None { fs_hint, .. } => assert_eq!(fs_hint, "Acorn DFS"),
+            other => panic!("expected Acorn DFS superfloppy, got {other:?}"),
+        }
+    }
+
+    // 2. Write two files through the auto-detect editable factory.
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs =
+            open_editable_filesystem(file, 0, 0x00, None).expect("open_editable auto-detect");
+        let root = efs.root().unwrap();
+        efs.create_file(
+            &root,
+            "AAA",
+            &mut Cursor::new(vec![1u8; 300]),
+            300,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.create_file(
+            &root,
+            "BB",
+            &mut Cursor::new(vec![2u8; 100]),
+            100,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    // 3. fsck clean through open_filesystem.
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).expect("open_filesystem auto-detect");
+        assert_eq!(fs.fs_type(), "Acorn DFS");
+        let res = fs.fsck().expect("fsck supported").expect("fsck ran");
+        assert!(res.is_clean(), "clean disk errors: {:?}", res.errors);
+    }
+
+    // 4. Scramble the catalogue order on disk (swap the two half-entries in
+    // both catalogue sectors), then detect + repair through the trait.
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut cat = [0u8; 512];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut cat).unwrap();
+        for k in 0..8 {
+            cat.swap(8 + k, 16 + k); // sector 0 name half-entries
+            cat.swap(256 + 8 + k, 256 + 16 + k); // sector 1 info half-entries
+        }
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&cat).unwrap();
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean(), "scrambled order should be detected");
+        assert!(res.repairable, "catalogue order should be repairable");
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&img_path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(file, 0, 0x00, None).unwrap();
+        let rep = efs.repair().unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        assert_eq!(rep.unrepairable_count, 0);
+    }
+
+    {
+        let f = std::fs::File::open(&img_path).unwrap();
+        let mut fs = open_filesystem(f, 0, 0x00, None).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "repair should leave it clean"
+        );
+    }
+}
+
 /// Stage `CreateDirectory` + `AddFile` + `DeleteEntry` against a fresh
 /// blank AFFS floppy via the GUI-style dispatcher; round-trip through
 /// reopen to verify writes landed. Mirrors the PFS3 / SFS staged-edits
@@ -2451,6 +2906,49 @@ fn test_sfs_staged_edits_round_trip() {
         names,
         vec!["Sub"],
         "hello.txt should be gone after staged delete"
+    );
+}
+
+/// End-to-end fsck on a file-backed SFS volume — the path the CLI
+/// (`rb-cli fsck`) and the Inspect-tab Check button drive through the
+/// `Filesystem::fsck` trait method. Format a blank volume on disk, write a
+/// directory + file into it, then confirm the integrity check is clean.
+#[test]
+fn test_sfs_fsck_clean_on_file_backed_volume() {
+    use rusty_backup::fs::filesystem::{
+        CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+    };
+    use rusty_backup::fs::sfs::{create_blank_sfs, SfsFilesystem};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let img_path = tmp.path().join("check.hdf");
+    std::fs::write(&img_path, create_blank_sfs(8192, "FsckSFS").unwrap())
+        .expect("write blank image");
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&img_path)
+        .expect("open editable");
+    let mut fs = SfsFilesystem::open(file, 0).expect("open");
+    let root = fs.root().expect("root");
+    let sub = fs
+        .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+        .expect("mkdir");
+    let payload = vec![0x42u8; 3000];
+    let mut src = std::io::Cursor::new(payload);
+    fs.create_file(&sub, "f.bin", &mut src, 3000, &CreateFileOptions::default())
+        .expect("create_file");
+    fs.sync_metadata().expect("sync");
+    drop(fs);
+
+    let f2 = std::fs::File::open(&img_path).expect("reopen");
+    let mut fs = SfsFilesystem::open(f2, 0).expect("reopen");
+    let res = fs.fsck().expect("fsck available").expect("fsck ok");
+    assert!(
+        res.is_clean(),
+        "file-backed SFS should be clean; errors: {:?}",
+        res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
     );
 }
 

@@ -147,3 +147,23 @@ fn put_get_rm_round_trip() {
         "rm clobbered HELLO.TXT:\n{after}"
     );
 }
+
+#[test]
+fn fsck_reports_clean_on_real_fixture() {
+    // The cpmtools-authored fixture carries a CP/M 3 disk label (status 0x20);
+    // fsck must treat that as valid, not as a garbage entry, and report clean.
+    // `run` panics on a non-zero exit, so a clean run implies no fsck errors.
+    let tmp = tempfile::tempdir().unwrap();
+    let img = tmp.path().join("amstrad.dsk");
+    fixture_to(&img);
+    let out = run(&["fsck", "--fs-type", FS, img.to_str().unwrap()]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("2 files / 1 dirs checked"),
+        "fsck summary missing:\n{combined}"
+    );
+}

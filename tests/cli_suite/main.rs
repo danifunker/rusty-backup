@@ -12,6 +12,7 @@
 //! binaries (the former is large; the latter has distinct snapshot deps).
 
 mod cli_altair;
+mod cli_alto;
 mod cli_archie;
 mod cli_atari800;
 mod cli_atarist;

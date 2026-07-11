@@ -476,6 +476,12 @@ impl OpticalTab {
                 if let Some(ref label) = info.volume_label {
                     ui.label(format!("Volume: {label}"));
                 }
+                if let Some(g) = &info.game {
+                    ui.label(format!(
+                        "Game: {}",
+                        rusty_backup::optical::format_game_identity(g)
+                    ));
+                }
             } else if let Some(err) = &self.disc_info_error {
                 ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
             } else {
@@ -758,6 +764,12 @@ impl OpticalTab {
                     info.filesystem.display_name(),
                     info.volume_label.as_deref().unwrap_or(""),
                 ));
+                if let Some(g) = &info.game {
+                    log.info(format!(
+                        "Game disc: {}",
+                        rusty_backup::optical::format_game_identity(g)
+                    ));
+                }
                 self.disc_info = Some(info);
             }
             Err(e) => {

@@ -195,6 +195,34 @@ fn amiga_root_block_present(first_sector: &[u8; 512], reader: &mut (impl Read + 
     result
 }
 
+/// Probe for an APM whose block 0 (Driver Descriptor Record) is zeroed or
+/// garbage by looking for a `PM` partition-map entry (big-endian signature
+/// `0x504D`) at the three APM block sizes 512 / 1024 / 2048. Returns the parsed
+/// map on the first hit, `None` otherwise. The offset a `PM` is found at is the
+/// APM block size (the map's block 1). See [`Apm::parse_no_ddr`].
+fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
+    for &block_size in &[512u32, 1024, 2048] {
+        if reader.seek(SeekFrom::Start(block_size as u64)).is_err() {
+            continue;
+        }
+        let mut sig = [0u8; 2];
+        if reader.read_exact(&mut sig).is_err() {
+            continue;
+        }
+        if u16::from_be_bytes(sig) != 0x504D {
+            // `PM` — Apple Partition Map entry signature.
+            continue;
+        }
+        if reader.seek(SeekFrom::Start(0)).is_err() {
+            continue;
+        }
+        if let Ok(apm) = Apm::parse_no_ddr(reader, block_size) {
+            return Some(apm);
+        }
+    }
+    None
+}
+
 /// Detect whether a disk image is a superfloppy (no partition table, filesystem at sector 0).
 ///
 /// Checks the first sector for a valid FAT BPB, and offset 1024 for HFS/HFS+.
@@ -686,6 +714,21 @@ impl PartitionTable {
             });
         }
 
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(RustyBackupError::Io)?;
+
+        // Classic-Mac CD-ROMs are frequently mastered with an APM whose block 0
+        // (Driver Descriptor Record) is all zeros — a CD needs no SCSI driver
+        // block. Block 0 isn't `ER`, so the APM branch above was skipped. Probe
+        // for a `PM` partition-map entry at the APM block sizes (512 / 1024 /
+        // 2048); a hit means a valid APM with a missing DDR. This runs before
+        // MBR parsing so those discs stop erroring with "invalid boot
+        // signature". A bare superfloppy has no `PM` at those offsets, so it was
+        // already claimed by `detect_superfloppy` above.
+        if let Some(apm) = probe_apm_without_ddr(reader) {
+            return Ok(PartitionTable::Apm(apm));
+        }
         reader
             .seek(SeekFrom::Start(0))
             .map_err(RustyBackupError::Io)?;
@@ -1247,6 +1290,46 @@ mod tests {
         assert_eq!(table.type_name(), "MBR");
         assert_eq!(table.partitions().len(), 1);
         assert_eq!(table.partitions()[0].type_name, "FAT32 (LBA)");
+    }
+
+    #[test]
+    fn detect_zeroed_ddr_apm_cd() {
+        // A classic-Mac CD with a valid APM but an all-zero block 0 (a CD needs
+        // no SCSI driver block) and its PM map at byte 1024 must detect as APM,
+        // not error out with "invalid boot signature".
+        let block_size = 1024usize;
+        let entries: &[(&str, u32, u32)] = &[
+            ("Apple_partition_map", 1, 3),
+            ("Apple_HFS", 64, 200),
+            ("Apple_Free", 264, 100),
+        ];
+        let total_blocks = 1 + entries.len();
+        let mut data = vec![0u8; total_blocks * block_size]; // block 0 stays zero
+        for (i, (ptype, start, count)) in entries.iter().enumerate() {
+            let off = (1 + i) * block_size;
+            data[off..off + 2].copy_from_slice(&0x504Du16.to_be_bytes()); // "PM"
+            data[off + 4..off + 8].copy_from_slice(&(entries.len() as u32).to_be_bytes());
+            data[off + 8..off + 12].copy_from_slice(&start.to_be_bytes());
+            data[off + 12..off + 16].copy_from_slice(&count.to_be_bytes());
+            let pt = ptype.as_bytes();
+            data[off + 48..off + 48 + pt.len()].copy_from_slice(pt); // partition_type
+            data[off + 88..off + 92].copy_from_slice(&0x33u32.to_be_bytes()); // status
+        }
+
+        let mut cursor = Cursor::new(data);
+        let table = PartitionTable::detect(&mut cursor).expect("zeroed-DDR APM must detect");
+        match &table {
+            PartitionTable::Apm(apm) => {
+                assert!(
+                    !apm.ddr_present,
+                    "ddr_present should be false for a zeroed DDR"
+                );
+                assert_eq!(apm.entries.len(), 3);
+                assert_eq!(apm.entries[1].partition_type, "Apple_HFS");
+                assert_eq!(apm.entries[1].start_block, 64);
+            }
+            other => panic!("expected APM, got {}", other.type_name()),
+        }
     }
 
     #[test]

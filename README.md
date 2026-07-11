@@ -145,6 +145,19 @@ What's in the MiSTer build:
   `optical rip --device /dev/sr0 --format iso|bincue`), plus `optical
   convert` (ISO ↔ BIN/CUE ↔ CD-CHD) and `optical browse` / `extract`. For
   devices with a CD/DVD drive such as the SuperStation One.
+- **Machine-readable optical inspection:** `optical browse --format json`
+  emits a deterministic, path-sorted file listing (add `--hash sha256` for
+  per-file content hashes), and `optical info --format json` reports
+  volume-level metadata (ISO 9660 PVD identity + Rock Ridge / Joliet / UDF
+  flags, El Torito boot catalog, HFS/APM) leniently — surfacing warnings
+  rather than failing on the sloppy 90s mastering that trips strict parsers.
+- **El Torito boot images:** `optical info` lists every boot entry (platform,
+  bootable, media type, size + sha256) and names the *nested* filesystem inside
+  each. `optical boot extract` pulls a boot image out to a file, which is just a
+  disk image — so `ls` / `inspect` / `get` / `put` / `fsck` all work on it — and
+  `optical boot replace` writes an edited image back into the catalog. (The disc
+  layer is handled by the `opticaldiscs` crate; rusty-backup interprets and
+  edits the boot image's filesystem.)
 - **Remote ripping off-device:** run `rb-daemon` here and drive this drive
   from the desktop app / CLI — the device only issues SCSI reads while the
   desktop does the heavy CHD encoding, so the armv7 CPU isn't taxed.
@@ -298,9 +311,15 @@ The app has five tabs:
     file at a time. Bulk folder conversion lives in the existing
     **Bulk Convert** dialog, which now lists the same four formats
     as output targets.
-  - **Check** (`fsck`) on classic HFS, HFS+, AmigaDOS (Disk Validator),
-    and SGI EFS, with **Repair** that uses replica blocks + lost+found
-    where supported.
+  - **Check** (`fsck`) + **Repair** on every filesystem whose driver
+    implements it. From the Inspect grid: HFS / HFS+, FAT / exFAT / NTFS,
+    ext2/3/4, SGI EFS, UFS, XFS, JFS, AmigaDOS OFS/FFS (Disk Validator) /
+    PFS3 / SFS, and the retro floppies CBM DOS / DragonDOS / RS-DOS /
+    Acorn DFS / Human68k. From the browse view: Alto BFS/TFS (their packs
+    open through the container path, not the block factory). Repair uses
+    replica superblocks, lost+found, FAT-mirror resync, or allocation-bitmap
+    rebuild depending on the filesystem. Everything here is also scriptable
+    via `rb-cli fsck` (+ `--repair`).
   - **Defragment…** on Human68k (X68000) partitions: repack the volume so
     files are stored contiguously, reclaiming holes left by deleted files
     (also `rb-cli repack`).
@@ -352,9 +371,16 @@ The app has five tabs:
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
     drag-and-drop / delete edits, then Apply atomically with snapshot
     rollback on error.
-- **Optical** — browse and extract files from CD/DVD images and physical
-  optical drives. Supports ISO9660, Joliet, Rock Ridge, and HFS hybrid
-  discs. Re-opens automatically when the underlying disc changes.
+- **Optical** — browse and extract files from CD/DVD/BD images and physical
+  optical drives. Reads ISO 9660 (with Joliet and Rock Ridge extensions),
+  High Sierra (pre-ISO 9660), UDF, HFS and HFS+ (Mac hybrid / data discs),
+  SGI EFS (IRIX), UFS/FFS (Tru64 / Solaris / NeXT), VMS ODS-2 (OpenVMS), and
+  the video-game console filesystems — Nintendo GameCube & Wii (Wii decrypted
+  internally, no key file needed), Sega Dreamcast GD-ROM (`.gdi` + CHD),
+  Philips CD-i, and 3DO Opera — discs. Also identifies the console, game
+  serial, title, and region for PlayStation, Saturn, Mega-CD, Neo Geo CD,
+  PC-FX, CD32, and the browsable consoles. See the *Optical disc filesystems*
+  table below. Re-opens automatically when the underlying disc changes.
 - **Archives** — browse and extract classic Macintosh archives. Auto-detects
   StuffIt 1-5 (`.sit`, `.sea` self-extracting), Compact Pro (`.cpt`), MAR
   (`.mar`, read + write), MacBinary I/II/III (`.bin`), MacZip (Info-ZIP's
@@ -502,32 +528,77 @@ inspect-tab Edit Mode.
 
 | Filesystem     | Browse | Edit | Shrink / expand | fsck | Notes |
 |----------------|:------:|:----:|:---------------:|:----:|-------|
-| FAT12          | Yes    | Yes  | Yes             | —    | Apple II SuperDrive, DOS floppies. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
-| FAT16          | Yes    | Yes  | Yes             | —    | DOS / Windows 3.x / 9x. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
-| FAT32          | Yes    | Yes  | Yes             | —    | Windows 95 OSR2+ through XP, vintage Linux. `rb-cli backup --defrag` repacks files contiguously (boot-aware). |
-| exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. |
-| NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | —    | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch clean-room formatter, validated to mount under ntfs-3g). Create blank volumes with `rb-cli new --fs ntfs` (selectable `--cluster-size` / `--sector-size`, 512 B–2 MiB clusters); the defragmenting clone inherits the source volume's cluster and sector size. |
-| ext2 / ext3 / ext4 | Yes | Yes | Yes             | —    | Early Linux installs onward |
+| FAT12          | Yes    | Yes  | Yes             | Yes (check + repair) | Apple II SuperDrive, DOS floppies. `rb-cli backup --defrag` repacks files contiguously (boot-aware). fsck reconciles FAT chains (loops, bad/lost/cross-linked clusters, size vs. chain) and FAT-mirror consistency; repair is FAT-only (frees lost chains, truncates, resyncs mirrors), validated against `fsck_msdos`. |
+| FAT16          | Yes    | Yes  | Yes             | Yes (check + repair) | DOS / Windows 3.x / 9x. `rb-cli backup --defrag` repacks files contiguously (boot-aware). fsck reconciles FAT chains + mirror copies; see FAT12. |
+| FAT32          | Yes    | Yes  | Yes             | Yes (check + repair) | Windows 95 OSR2+ through XP, vintage Linux. `rb-cli backup --defrag` repacks files contiguously (boot-aware). fsck reconciles FAT chains + mirror copies; see FAT12. |
+| exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | Yes (check + repair) | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. fsck reconciles the allocation bitmap against the directory tree (lost / cross-linked clusters), checks the boot-region checksum + backup, and clears the VolumeDirty flag; repair rebuilds the bitmap and resyncs the boot regions, validated against `fsck_exfat`. |
+| NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | Yes (check + repair) | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch clean-room formatter, validated to mount under ntfs-3g). Create blank volumes with `rb-cli new --fs ntfs` (selectable `--cluster-size` / `--sector-size`, 512 B–2 MiB clusters); the defragmenting clone inherits the source volume's cluster and sector size. fsck reconciles `$Bitmap` against the MFT walk, resyncs `$MFTMirr` and the backup boot sector, and clears the VolumeDirty flag; repair rewrites these metadata structures, validated against Windows `chkdsk`. |
+| ext2 / ext3 / ext4 | Yes | Yes | Yes (backup-compaction group shrink) | Yes (check + repair, incl. ext4 `metadata_csum`) | Early Linux installs onward. Create blank volumes with `rb-cli new --fs ext` (plain ext2), `--fs ext3` (adds a jbd2 journal), or `--fs ext4` (extents + `metadata_csum` + journal); all `e2fsck`-clean. fsck reconciles the block + inode bitmaps and free counts (Pass-5 style) and repairs them, validated against `e2fsck`. On `metadata_csum` (ext4) volumes the crc32c on the superblock, descriptors, bitmaps, inodes, and directory blocks is verified and recomputed — so fsck-repair and in-place edits (create/delete/rename) keep the volume `e2fsck`-clean. The backup compactor packs a volume into fewer block groups (`resize2fs`-grade: flex_bg metadata migration, dropping the resize inode, and relocating the journal + multi-block files as contiguous runs), so a lightly-used real-world ext4 backs up to ~its real data size. Restoring at original size grows it back by adding block groups (the mirror `resize2fs`-grade grow) to fill the partition; both directions verify `e2fsck`-clean. (A grow whose GDT would need more blocks — e.g. a 1 KiB-block sub-512 MiB volume gaining groups — is left for `resize2fs`; 4 KiB-block ext4 up to 8 TB grows in place.) |
 | HFS (Mac OS Standard) | Yes | Yes | Yes         | Yes (check + repair: replica copy, bitmap fixup, lost+found for orphans) | Classic Mac OS 68k / early PowerPC. Includes block-size expansion via clone (`Expand HFS Volume…`). Volumes written by rusty-backup are `fsck_hfs`-clean and mountable on real Mac OS (verified on Mac OS X 10.4). |
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. Create blank volumes with `rb-cli new --fs hfsplus` (`--case-sensitive` for HFSX). The catalog / extents-overflow / attributes B-trees grow their backing fork on demand, so an under-sized or foreign catalog fills in place without a spurious "disk full"; all written volumes are `fsck_hfs`-clean and mountable on macOS. |
-| btrfs          | Yes    | No   | No              | —    | Modern Linux; read-only browse |
-| ProDOS         | Yes    | Yes  | Yes             | —    | Apple II / IIgs |
+| MacPlus MFS    | Yes    | Yes  | —               | —    | Macintosh File System — the original flat Mac filesystem for 128K / 512K / Plus 400 KB single-sided floppies (pre-HFS, 1984-86). Read + edit; no blank-format or resize. |
+| btrfs          | Yes    | No   | Yes (volume resize) | —    | Modern Linux; read-only browse (no file-level edit). |
+| JFS (JFS2)     | Yes    | No   | Yes (compaction) | Yes (check only) | IBM OS/2 Warp Server, AIX 5+, Linux JFS2. Read-only browse + backup compaction + integrity check. Legacy AIX JFS1 is detected but not read. |
+| ReiserFS (v3)  | Yes    | No   | Yes (compaction) | —    | Linux, late-1990s to mid-2000s. v3.5 / v3.6 read-only browse + backup compaction. Reiser4 is detected but not supported. |
+| UFS / FFS (UFS1 / UFS2) | Yes | Yes | Yes (compaction) | Yes (check + repair) | BSD Fast File System — 4.2/4.4BSD, FreeBSD, SunOS / Solaris, NeXTSTEP. Read + edit (create / delete / rename, fixture-validated), backup compaction, and fsck with replica-superblock / bitmap / orphan repair. |
+| ProDOS         | Yes    | Yes  | Yes             | Yes  | Apple II / IIgs (`.po` / `.hdv` / `.2mg`, 8 KiB–32 MiB). Create blank volumes with `rb-cli new --fs prodos` (boot + 4-block volume directory + bitmap). fsck reconciles the volume bitmap against the directory-tree + file-index walk (seedling / sapling / tree files + subdirectories, the CBM VALIDATE model): reclaims leaked blocks and flags blocks in use but marked free; repair rebuilds the bitmap, withheld on cross-links / past-end blocks / directory-chain cycles. |
+| Apple DOS 3.3  | Yes    | Yes  | —               | Yes  | Apple II. 140 KB 5.25" disks (`.dsk` / `.do` / `.po`, sector-order auto-detected). Gated to the exact 140 KB geometry. Create blank (non-bootable) data disks with `rb-cli new --fs apple-dos`. fsck reconciles the VTOC free map (bit-set-is-free) against the catalog + file T/S-list chains (the CBM VALIDATE model): reclaims leaked sectors, flags sectors in use but marked free, surfaces cross-links / broken chains read-only; the DOS-image region on tracks 0-2 is reported as a benign warning, never reclaimed. |
 | Apple Lisa File System | Yes | No | — | — | Apple Lisa (Office System 1.0 / 2.0 / 3.0), read-only browse + extract. Opened from tag-bearing DiskCopy 4.2 (`.dc42` / `.image`) and DART images. Files are reconstructed from the 12-byte sector tags (file ID + file-relative block) — independent of the three catalog formats — so extraction works on every disk; friendly names come from the flat-table (`0x0e`) / flat-hash (`0x0f`) catalog, while the hierarchical B-tree version (`0x11`, Office System 3.0) falls back to `file-XXXX`. The metadata label (first 0xF0 bytes) is stripped from each file's data fork. Requires an image that still carries tags (DiskCopy versions after 4.2 strip them). Mirrors Ray Arachelian's `lisafsh-tool`. |
-| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Yes | Yes | — (floppy, fixed geometry) | — | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81` / `.d80` / `.d82`; `.g64` GCR decoded to sectors. |
-| Atari DOS 2 (2.0S / 2.5) | Yes | Yes | — (floppy, fixed geometry) | — | Atari 8-bit (Atari800 core). VTOC@360 (bit-set-is-free), 64-file directory, linked-sector files. Single + enhanced density `.atr` / `.xfd`. |
-| RS-DOS (CoCo Disk BASIC) | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores). Granule allocation table on track 17, 72-file directory, granule-chain files. Raw 35- / 40-track `.dsk` / `.jvc`. Read/extract + add/delete bidirectionally cross-validated against an independent clean-room reader/writer derived from the toolshed `libdecb` semantics. |
-| OS-9 / NitrOS-9 RBF | Yes | Yes | — (floppy, fixed geometry) | — | Tandy Color Computer (CoCo2 / CoCo3 cores) and Dragon. Hierarchical Unix-like FS: LSN-0 identification sector, per-file/dir 256-byte file descriptors, segment-list extents, allocation bitmap (set-bit = allocated). Raw `.dsk` / `.vdk`. Read/extract + add/delete (incl. subdirectories) cross-validated byte-exact against an independent clean-room RBF reader on real NitrOS-9 toolshed disks. |
-| DragonDOS | Yes | Yes | — (floppy, fixed geometry) | — | Dragon Data Dragon 32/64 (and CoCo running DragonDOS), MiSTer Dragon core. Directory track 20 (backup on 16), one's-complement geometry signature, sector bitmap (set-bit = free), 25-byte directory entries with header + continuation extent blocks. Raw single- / double-sided 40-track `.dsk`. Read/extract + add/delete cross-validated byte-exact against an independent clean-room reader/writer and against real third-party DragonDOS disks (empty + a populated 9-file disk). |
-| Acorn DFS | Yes | Yes | — (floppy, fixed geometry) | — | BBC Micro / BBC Master / Acorn Electron (MiSTer BBCMicro / AcornElectron cores). Flat-catalogue FS in sectors 0–1: 12-char disc title, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length. Single-sided `.ssd` (40-/80-track). Read/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` directories, real load/exec addresses all round-trip). |
-| Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | — | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. |
+| CBM DOS (1541 / 1571 / 1581 / 8050 / 8250) | Yes | Yes | — (floppy, fixed geometry) | Yes | Commodore C64 / C128 / C16 / VIC-20 / PET. PETSCII names, bit-set-is-free BAM, linked-sector files. `.d64` / `.d71` / `.d81` / `.d80` / `.d82`; `.g64` GCR decoded to sectors. fsck = CBM DOS VALIDATE (BAM reconciliation: leaked / used-but-free blocks, free-count fixes), rewrite cross-validated byte-for-byte against `c1541 validate`. |
+| Atari DOS 2 (2.0S / 2.5) | Yes | Yes | — (floppy, fixed geometry) | Yes | Atari 8-bit (Atari800 core). VTOC@360 (bit-set-is-free), 64-file directory, linked-sector files. Single + enhanced density `.atr` / `.xfd`. Create blank single-density disks with `rb-cli new --fs atari`. fsck reconciles the VTOC bitmap + free-sector count against the directory's linked-sector chains (the CBM VALIDATE model): reclaims leaked sectors, flags sectors in use but marked free, surfaces cross-links / broken chains read-only; repair rewrites the bitmap + count (single density — the DOS 2.5 VTOC2 upper region is left unchecked). |
+| RS-DOS (CoCo Disk BASIC) | Yes | Yes | — (floppy, fixed geometry) | Yes | Tandy Color Computer (CoCo2 / CoCo3 cores). Granule allocation table on track 17, 72-file directory, granule-chain files. Raw 35- / 40-track `.dsk` / `.jvc`. Read/extract + add/delete bidirectionally cross-validated against an independent clean-room reader/writer derived from the toolshed `libdecb` semantics. fsck reconciles the granule table against the directory file chains (the CBM VALIDATE model): reclaims leaked granules into the free list, surfaces cross-linked granules and broken chains read-only. |
+| OS-9 / NitrOS-9 RBF | Yes | Yes | — (floppy, fixed geometry) | Yes | Tandy Color Computer (CoCo2 / CoCo3 cores) and Dragon. Hierarchical Unix-like FS: LSN-0 identification sector, per-file/dir 256-byte file descriptors, segment-list extents, allocation bitmap (set-bit = allocated). Raw `.dsk` / `.vdk`. Read/extract + add/delete (incl. subdirectories) cross-validated byte-exact against an independent clean-room RBF reader on real NitrOS-9 toolshed disks. Create blank 35-track floppies with `rb-cli new --fs os9`. fsck walks the directory tree from the root FD (FDs + segment-list runs, recursing into subdirectories) and reconciles it against the cluster bitmap: a referenced cluster marked free is a repairable error; allocated-but-unreferenced clusters (the boot area or a reserved track — a real NitrOS-9 disk reserves its last track) are surfaced as a benign warning, never freed; cross-links / past-end segments are read-only. |
+| DragonDOS | Yes | Yes | — (floppy, fixed geometry) | Yes | Dragon Data Dragon 32/64 (and CoCo running DragonDOS), MiSTer Dragon core. Directory track 20 (backup on 16), one's-complement geometry signature, sector bitmap (set-bit = free), 25-byte directory entries with header + continuation extent blocks. Raw single- / double-sided 40-track `.dsk`. Read/extract + add/delete cross-validated byte-exact against an independent clean-room reader/writer and against real third-party DragonDOS disks (empty + a populated 9-file disk). fsck reconciles the sector bitmap against the directory extent chains (the CBM VALIDATE model — leaked / used-but-free sectors), rewriting both the main and backup directory-track copies. |
+| Acorn DFS | Yes | Yes | — (floppy, fixed geometry) | Yes | BBC Micro / BBC Master / Acorn Electron (MiSTer BBCMicro / AcornElectron cores). Flat-catalogue FS in sectors 0–1: 12-char disc title, up to 31 contiguous files in descending start-sector order, single-character directory namespaces, 18-bit load/exec/length. Single-sided `.ssd` (40-/80-track). Read/extract + add/delete bidirectionally cross-validated byte-exact against an independent clean-room DFS reader/writer (locked files, non-`$` directories, real load/exec addresses all round-trip). fsck verifies the contiguous-file catalogue is self-consistent — flags overlapping and out-of-bounds files read-only, and reorders a scrambled catalogue back into canonical descending start-sector order as the one safe repair. |
+| Acorn ADFS / FileCore | Yes | Partial | — | — | Acorn Archimedes, BBC Master, RISC OS. Read + browse `.adf` floppy and bare / Arculator-wrapped `.hdf` HDD (E-format validated). Create/delete implemented for E-format; the full write path is still maturing. |
+| Human68k (FAT12 / FAT16) | Yes | Yes | Yes (HDD in-place grow + shrink, plus defragmenting repack) | Yes | Sharp X68000. SASI/SCSI hard disks use a Sharp/KG big-endian BPB + big-endian FAT; floppies use standard little-endian FAT. Shift-JIS 18.3 filenames. Shrink stays above the FAT16 floor. `rb-cli repack` / the Inspect-tab "Defragment…" button repack the volume contiguously, reclaiming holes left by deleted files. fsck reconciles the FAT against the directory tree (the CBM VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy from the primary, and surfaces cross-linked clusters and broken chains read-only. |
+| CP/M (2.2 / 3 / Plus) | Yes | Yes | — | Yes | Amstrad CPC / PCW, Tatung Einstein, Spectravideo SV-328, MITS Altair, Grant Searle MultiComp, ZX Spectrum +3. Nine built-in disk-parameter blocks (DPBs); CP/M has no on-disk signature, so the format is chosen explicitly (`--fs-type cpm:<preset>`, or `rb-cli new --fs cpm --cpm-preset <name>` to format a blank disk). fsck is a directory self-consistency check (CP/M keeps no on-disk free map): it flags cross-linked blocks, out-of-range block pointers, and invalid directory entries (CP/M 3 disk-label / timestamp entries are recognized as valid); repair reclaims invalid entries — cross-links have no redundant metadata to recover from, so they are surfaced read-only. |
+| QDOS (QXL.WIN) | Yes | Yes | Yes (in-place resize) | — | Sinclair QL hard-disk container. Read + write + resize; the per-file 64-byte QDOS header is preserved. Microdrive `.mdv` is detect-only. |
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
-| PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | —    | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. |
-| SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | —    | Amiga `SFS\0` / `SFS\2`. |
+| PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | Yes (validate + repair) | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. fsck walks the directory tree + anode chains and reconciles both the data and reserved allocation bitmaps (plus the free-block counters) against the walk, rebuilding them when the structure is intact — the classic "validation needed" after an unclean unmount. PFS3 has no block checksums, so structural damage is surfaced read-only rather than silently rewritten. |
+| SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | Yes (validate + repair) | Amiga `SFS\0` / `SFS\2`. fsck validates every metadata-block checksum, walks the AdminSpaceContainer chain + object tree, and reconciles the single block bitmap against the walk, rebuilding it when the structure is intact. Repair touches only bitmap blocks, so it is safe regardless of btree depth. |
 | SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Aggressive shrink renumbers inodes into low CGs. |
-| SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow via "Add free space" + in-OS `xfs_growfs`; shrink via clone-into-fresh is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
-| Alto BFS / TFS | Yes | Yes | Yes (resize) | — | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). |
+| SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow only — disk-layout "Add free space" + in-OS `xfs_growfs`. **Known limitation: no backup compaction or in-place shrink** (XFS backups are written full-size); clone-into-fresh shrink is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
+| Alto BFS / TFS | Yes | Yes | Yes (resize) | Yes | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). fsck reconciles the DiskDescriptor free-page bitmap + count against the file page-chains (VALIDATE model), flagging overlaps / broken chains read-only and rebuilding the bitmap as the repair; `rb-cli fsck --repair` writes the fix back as a PDI (in place for a `.pdi` input). |
 | Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so real names come from the Cedar **client name directory** — the FS name->FileID B-tree in `rootFile[client]`, decoded when present — then from each file's leader page (XDE volumes name ~90% of files this way, ViewPoint names its boot/system files), and otherwise are synthesized from the file ID); blank-volume creation + add/delete files + **installing a client name directory** (`pilot_probe set-dir`) via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |
 | Carve (raw recovery) | Yes (read-only) | No | — | — | Fallback for disks with **no mountable filesystem**: custom bootblock Amiga disks (demos / intros / diagnostics that boot from the boot block and write raw sectors — AmigaDOS labels these "NDOS"), and any superfloppy whose filesystem isn't recognized. Surfaces `whole-disk.img`, `bootblock.bin` (Amiga), and `carved-blkNNNNNN.{jsonl,json,txt}` for each recoverable run of contiguous text. Browse + extract only (`rb-cli ls` / `get`). Scans the first 10 MB by default; the browse-view **Full scan** toggle (CLI `--carve-full`) scans the whole image. |
+
+Two more filesystems are **detect-only scaffolds** — Rusty Backup recognizes
+them but cannot yet browse their contents: **ANDOS** (Soviet BK0011M /
+Elektronika BK) and the Sinclair QL **Microdrive** (`.mdv`). The complete
+engine-level matrix — every filesystem's detect / browse / edit / create /
+shrink / fsck level, plus the filesystems *not* yet supported and why — lives
+in [`docs/filesystem_coverage_audit.md`](docs/filesystem_coverage_audit.md).
+
+### Optical disc filesystems
+
+Optical discs are read through the
+[`opticaldiscs`](https://github.com/danifunker/opticaldiscs-rs) engine and
+surfaced in the **Optical** tab (and `rb-cli optical browse` / `extract`).
+These are **browse + extract only** — no edit, resize, or fsck — and are read
+from `.iso` / `.toast`, `.bin` + `.cue`, and CD/DVD `.chd` containers (a raw
+2352-byte-sector image inside a bare `.iso` is auto-detected), plus the
+Dreamcast `.gdi` track descriptor and the Nintendo GameCube / Wii container
+family (`.gcm .rvz .wbfs .ciso .gcz .wia .tgc .nfs`; a raw GameCube/Wii dump in
+a bare `.iso` is auto-detected by magic).
+
+| Filesystem | Typical discs |
+|------------|---------------|
+| ISO 9660 (+ Joliet, Rock Ridge) | PC / Unix / mixed data CDs and DVDs. Joliet = Unicode long names; Rock Ridge = POSIX names, permissions, and symlinks. |
+| High Sierra | Pre-ISO 9660 CD-ROMs (early Microsoft / IBM titles). |
+| UDF | DVDs and data discs (UDF 1.02–2.01). UDF 2.50+ metadata-partition discs (Blu-ray) are detected only. |
+| HFS / HFS+ | Classic Mac and Mac OS X CDs / DVDs, including "Mac/PC" hybrids — resource forks and type/creator preserved. |
+| SGI EFS | IRIX install / distribution CDs (read via the SGI Volume Header). |
+| UFS / FFS | Digital UNIX / Tru64 and SunOS / Solaris CDs, plus NeXT / OpenStep / Rhapsody discs. |
+| VMS ODS-2 / Files-11 | OpenVMS (VAX / Alpha) discs. |
+| GameCube / Wii | Nintendo GameCube (GCM/FST) and Wii discs. Wii encrypted partitions are decrypted internally — no key file required. Read via the `nod` crate, including the compressed `.rvz` / `.wbfs` / `.ciso` / `.gcz` / `.wia` containers. |
+| CD-i | Philips CD-i (Green Book) discs — big-endian ISO 9660 variant. |
+| 3DO Opera | Panasonic / 3DO game discs (big-endian block tree). |
+
+Game discs also carry a **console / serial / title / region** identity line
+(shown in the Optical tab, the browse header, and `rb-cli optical browse`),
+recognized for PlayStation 1/2, Saturn, Mega-CD, Dreamcast, Neo Geo CD, PC-FX,
+PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 
 ### Partition tables
 

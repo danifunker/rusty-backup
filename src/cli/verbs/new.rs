@@ -24,7 +24,8 @@ pub enum FsKind {
     /// allocation block size auto-floored so the result is mountable by
     /// BasiliskII / SheepShaver and classic Mac OS.
     Hfv,
-    /// FAT12 (≤ 32 MiB) or FAT16 (≤ 2 GiB), auto-selected by size.
+    /// FAT12 / FAT16 / FAT32, auto-selected: FAT32 above 2 GiB, otherwise
+    /// FAT12 or FAT16 by cluster count (small volumes are FAT12).
     Fat,
     /// IRIX EFS (single cylinder group).
     Efs,
@@ -33,6 +34,43 @@ pub enum FsKind {
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
     /// --cluster-size / --sector-size; both auto-selected when unset.
     Ntfs,
+    /// ext2 (Linux). A plain rev-1 ext2 volume (128-byte inodes, no journal or
+    /// checksums); block size auto-selected (1 KiB below 8 MiB, else 4 KiB).
+    #[value(alias = "ext2")]
+    Ext,
+    /// ext3 (Linux). ext2 plus an empty jbd2 journal; 4 KiB blocks, minimum
+    /// ~8 MiB (must hold the 4 MiB journal).
+    Ext3,
+    /// ext4 (Linux). Extents + metadata_csum (crc32c) + a jbd2 journal; 256-byte
+    /// inodes, 4 KiB blocks, minimum ~8 MiB.
+    Ext4,
+    /// ProDOS (Apple II / IIgs). A bare volume with boot blocks, a 4-block
+    /// volume directory, and a bitmap; size rounds to 512-byte blocks, from a
+    /// 8 KiB minimum up to a ~32 MiB (65535-block) maximum. The name is
+    /// uppercased and must follow ProDOS rules: up to 15 of A-Z / 0-9 / '.',
+    /// with a leading letter.
+    Prodos,
+    /// Atari DOS 2.0S (Atari 8-bit). A single-density 90 KB floppy (720 × 128 B
+    /// sectors) with boot / VTOC / directory reserved. Fixed geometry, so
+    /// `--size` and `--name` are ignored (enhanced density is read-only).
+    Atari,
+    /// Apple DOS 3.3 (Apple II). A 140 KB 5.25" floppy (35 × 16 × 256, DOS
+    /// order) with a VTOC + empty catalog and only track 17 reserved (a
+    /// non-bootable data disk). Fixed geometry, so `--size` / `--name` are
+    /// ignored.
+    #[value(alias = "appledos", alias = "dos33")]
+    AppleDos,
+    /// CP/M (Amstrad / PCW, Einstein, SV-328, Altair, MultiComp, ZX +3). The
+    /// geometry comes from the disk-parameter block chosen with `--cpm-preset`
+    /// (required); `--size` / `--name` are ignored. A blank CP/M disk is just
+    /// its reserved tracks + data area filled with 0xE5.
+    Cpm,
+    /// OS-9 / NitrOS-9 RBF (Tandy CoCo, Dragon). A standard 35-track floppy
+    /// (630 × 256-byte sectors): identification sector, allocation bitmap, and
+    /// an empty root directory. Fixed geometry, so `--size` is ignored; `--name`
+    /// is sanitized to the OS-9 name set (A-Z a-z 0-9 . _ $).
+    #[value(alias = "nitros9", alias = "rbf")]
+    Os9,
 }
 
 #[derive(Debug, Args)]
@@ -40,7 +78,9 @@ pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
     pub image: PathBuf,
 
-    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs.
+    /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
+    /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
+    /// dos33), cpm, os9 (alias nitros9 / rbf).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -91,6 +131,12 @@ pub struct NewArgs {
     #[arg(long = "affs-variant", default_value = "1")]
     pub affs_variant: u8,
 
+    /// CP/M disk-parameter-block preset (required with `--fs cpm`). One of:
+    /// amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm,
+    /// altair_8in, altair_cf, multicomp, zxplus3.
+    #[arg(long = "cpm-preset")]
+    pub cpm_preset: Option<String>,
+
     /// EFS only: approximate total inode count. The formatter scales its
     /// cylinder groups to hit roughly this many inodes. Mutually exclusive with
     /// `--bytes-per-inode`; default density is ~1 inode/4 KiB.
@@ -131,6 +177,9 @@ pub fn run(args: NewArgs) -> Result<()> {
     }
     if (args.case_sensitive || args.min_catalog.is_some()) && args.fs != FsKind::Hfsplus {
         anyhow::bail!("--case-sensitive / --min-catalog are only valid with --fs hfsplus");
+    }
+    if args.cpm_preset.is_some() && args.fs != FsKind::Cpm {
+        anyhow::bail!("--cpm-preset is only valid with --fs cpm");
     }
     match args.fs {
         FsKind::Hfs => {
@@ -233,6 +282,44 @@ pub fn run(args: NewArgs) -> Result<()> {
                 &args.name,
             )
         }
+        FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
+        FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
+        FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
+        FsKind::Prodos => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            crate::fs::prodos::create_blank_prodos(size, name)
+        }),
+        FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
+            Ok(crate::fs::atari_dos::create_blank_atari_sd())
+        }),
+        FsKind::AppleDos => {
+            format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
+                Ok(crate::fs::apple_dos::create_blank_apple_dos())
+            })
+        }
+        FsKind::Os9 => {
+            let vname = sanitize_os9_volume_name(&args.name);
+            format_and_write(&args.image, &args.size, &vname, |_size, name| {
+                Ok(crate::fs::os9::create_blank_os9(name)?)
+            })
+        }
+        FsKind::Cpm => {
+            let preset_name = args.cpm_preset.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--fs cpm requires --cpm-preset <name> (e.g. amstrad_data)")
+            })?;
+            let dpb = *crate::fs::cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                let valid: Vec<&str> = crate::fs::cpm_diskdefs::ALL_PRESETS
+                    .iter()
+                    .map(|d| d.name)
+                    .collect();
+                anyhow::anyhow!(
+                    "unknown CP/M preset '{preset_name}'; valid presets: {}",
+                    valid.join(", ")
+                )
+            })?;
+            format_and_write(&args.image, &args.size, &args.name, move |_size, _name| {
+                Ok(crate::fs::cpm::create_blank(dpb))
+            })
+        }
     }
 }
 
@@ -252,6 +339,22 @@ fn format_and_write(
         name
     ));
     Ok(())
+}
+
+/// Coerce a free-form `--name` into a valid OS-9 volume name: keep only
+/// `A-Z a-z 0-9 . _ $`, cap at 29 chars, and guarantee a leading letter (the
+/// generic default `rusty-backup` becomes `rustybackup`; a digit-leading or
+/// empty result is prefixed with `OS9`).
+fn sanitize_os9_volume_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
+        .take(29)
+        .collect();
+    match cleaned.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '.' => cleaned,
+        _ => format!("OS9{cleaned}").chars().take(29).collect(),
+    }
 }
 
 /// Format a bare NTFS superfloppy straight into the target file. `create_ntfs`
@@ -286,6 +389,36 @@ fn write_blank_ntfs_image(
         image.display(),
         geometry.cluster_size(),
         geometry.bytes_per_sector,
+        name
+    ));
+    Ok(())
+}
+
+/// Format a bare ext2/ext3 superfloppy by streaming only its populated metadata
+/// regions to the output file (the rest stays sparse). Returns the exact
+/// formatted length, which may be slightly under `--size` when a trailing runt
+/// block group is dropped.
+fn write_blank_ext_image(
+    image: &std::path::Path,
+    size_str: &str,
+    name: &str,
+    kind: &str,
+) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let mut file =
+        std::fs::File::create(image).with_context(|| format!("creating {}", image.display()))?;
+    let disk_bytes = match kind {
+        "ext3" => crate::fs::ext_format::write_blank_ext3(&mut file, 0, size, name),
+        "ext4" => crate::fs::ext_format::write_blank_ext4(&mut file, 0, size, name),
+        _ => crate::fs::ext_format::write_blank_ext2(&mut file, 0, size, name),
+    }
+    .with_context(|| format!("formatting {kind} into {}", image.display()))?;
+    // Extend to the exact formatted length; the trailing region stays sparse.
+    file.set_len(disk_bytes)
+        .with_context(|| format!("sizing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({disk_bytes} bytes, {kind}, volume {:?})",
+        image.display(),
         name
     ));
     Ok(())

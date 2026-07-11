@@ -984,8 +984,12 @@ impl BrowseView {
                 }
             }
 
-            // Check filesystem button (HFS only for now)
-            if self.fs_type == "HFS" && ui.button("Check").clicked() {
+            // Check filesystem button. HFS has always been here; Alto BFS/TFS
+            // packs open through the container path (BrowseSession -> open_pack)
+            // rather than the block factory the inspect-grid Check button uses,
+            // so the browse view is where their check/repair lives. Both are
+            // small volumes, so the synchronous fsck below is fine.
+            if matches!(self.fs_type.as_str(), "HFS" | "Alto BFS") && ui.button("Check").clicked() {
                 match self.take_or_open_fs() {
                     Some(mut fs) => {
                         match fs.fsck() {

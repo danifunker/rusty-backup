@@ -165,8 +165,8 @@ pub struct RestoreTab {
     /// How much free space to leave at the end of the target image, in MiB.
     /// In Mode A the trailing region is unallocated and the user partitions
     /// it in their guest OS; in Mode B the last partition is extended over
-    /// it so only a filesystem-side grow tool (xfs_growfs, resize2fs, ...)
-    /// is needed.
+    /// it so only the filesystem's own grow tool (run in the guest OS) is
+    /// needed.
     expand_free_space_mib: u32,
     /// True when the user chose "Extend last partition automatically"
     /// (Mode B). Forces the last partition's restore size to FillRemaining
@@ -604,8 +604,8 @@ impl RestoreTab {
                     "Useful for restoring a backup onto a larger virtual disk and \
                      letting the guest OS extend or add a partition there. After \
                      restore, run your OS's partitioner (parted, fdisk, IRIX fx, \
-                     Disk Management) followed by your filesystem's grow tool \
-                     (xfs_growfs, resize2fs, ...). Works for any filesystem.",
+                     Disk Management) followed by your filesystem's own grow \
+                     tool. Works for any filesystem.",
                 );
 
                 if self.expand_disk_enabled {
@@ -648,8 +648,8 @@ impl RestoreTab {
                     .on_hover_text(
                         "Mode B: the last partition is sized to absorb the new free space \
                          during restore (equivalent to picking 'Fill' for the last partition \
-                         in the size table below). After restore, only the filesystem-side \
-                         grow tool (xfs_growfs, resize2fs, ...) is needed in the guest OS.",
+                         in the size table below). After restore, only the filesystem's \
+                         own grow tool is needed in the guest OS.",
                     );
 
                     // Visualization: current vs after PartitionBar pair.

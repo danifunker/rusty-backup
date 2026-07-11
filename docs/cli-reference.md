@@ -653,6 +653,8 @@ Usage: fsck [OPTIONS] <IMAGE>
 - `--repair` — Auto-repair detected issues without prompting
 - `--prompt-timeout` — Seconds to wait for an interactive repair confirmation before resolving to "No" (default 30; or `[fsck] prompt-timeout` from the config file when set). `0` waits indefinitely (TTY only)
 - `--format` — Output format. `text` (default) emits the human-readable report; `json` / `yaml` emit a status-wrapped envelope mirroring the other read-only verbs. `csv` / `tsv` are rejected — the report is nested
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `get`
 
@@ -679,7 +681,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
 - `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `get-binhex`
@@ -789,7 +791,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
 - `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `mac-scsi-bless`
@@ -869,7 +871,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf)
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
@@ -878,6 +880,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 - `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume instead of the default case-insensitive HFS+. Ignored for other filesystems
 - `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up to whole 4096-byte nodes). Set this *small* to make the catalog easy to outgrow and exercise the fork grow-on-full path. Ignored for other filesystems
 - `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
+- `--cpm-preset` — CP/M disk-parameter-block preset (required with `--fs cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3
 - `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 - `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain byte count. A power of two from 512 to 2 MiB and at least the sector size. When unset, chosen automatically from the volume size (the classic mkntfs default-by-size table). Ignored for other filesystems
@@ -954,17 +957,65 @@ Optical-media verbs (drives / rip / convert / browse / extract)
 Usage: optical <COMMAND>
 ```
 
+### `optical boot`
+
+Work with El Torito boot images (extract / replace)
+
+```
+Usage: boot <COMMAND>
+```
+
+### `optical boot extract`
+
+Extract a boot image to a file — then inspect or edit it with the disk-image verbs, and put it back with `optical boot replace`
+
+```
+Usage: extract [OPTIONS] --to <TO> <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Bootable optical disc image (.iso, …)
+
+**Options**
+
+- `--to` — Destination file for the extracted boot image
+- `--index` — Which boot entry to extract (default 0; see `optical info`)
+
+### `optical boot replace`
+
+Replace a boot image with the bytes of a (edited) disk-image file. Raw `.iso` only; same-size replaces in place, a grown image relocates
+
+```
+Usage: replace [OPTIONS] --from <FROM> <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Bootable optical image to edit — raw `.iso` only
+
+**Options**
+
+- `--from` — Disk-image file whose bytes become the new boot image
+- `--index` — Which boot entry to replace (default 0)
+- `--media` — Override the emulation/media type (default: keep the entry's current one). One of `floppy1.2` / `floppy1.44` / `floppy2.88` / `no-emulation` / `harddisk`
+
 ### `optical browse`
 
 List the file tree on an optical disc image
 
 ```
-Usage: browse <SOURCE>
+Usage: browse [OPTIONS] <SOURCE>
 ```
 
 **Arguments**
 
 - `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+**Options**
+
+- `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
+- `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
 
 ### `optical convert`
 
@@ -1012,6 +1063,22 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 - `--to` — Destination folder (created if absent)
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
+
+### `optical info`
+
+Print volume-level metadata for an optical disc image (leniently)
+
+```
+Usage: info [OPTIONS] <SOURCE>
+```
+
+**Arguments**
+
+- `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+
+**Options**
+
+- `--format` — Output format: `text` (default), `json`, or `yaml`
 
 ### `optical rip`
 
@@ -1180,7 +1247,7 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
 - `--force` — Overwrite an existing entry at the destination path
 - `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `put-binhex`
@@ -1317,7 +1384,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `-L` / `--literal` — Treat the path as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
 - `--ignore-case` — Match case-insensitively regardless of the target's native rule
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `serve`
@@ -1491,7 +1558,7 @@ Usage: tar [OPTIONS] <IMAGE> <SRC> <OUT>
 - `--case-sensitive` — Match `--exclude` globs case-sensitively (default follows the filesystem's native rule)
 - `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Ignored for non-zip sources
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `terminal`
@@ -1522,7 +1589,7 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 - `--skip-existing` — Skip entries that already exist at the destination. Mutually exclusive with `--force`
 - `--no-permissions` — Do not apply archived Unix permission bits (mode) to imported files
 - `--include-appledouble` — Import macOS AppleDouble sidecars (`._*`) too. By default they are skipped as Mac metadata cruft
-- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
 ### `write`

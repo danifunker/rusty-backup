@@ -25,7 +25,7 @@ use rusty_backup::fs::entry::FileEntry;
 use rusty_backup::fs::fork_export::{export_file_with_fork, safe_name};
 use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
-use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus};
+use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus, StageCopyStatus};
 use rusty_backup::partition::format_size;
 
 use super::file_detail::{self, FileContent};
@@ -34,18 +34,25 @@ use super::metadata_editor::{
 };
 
 mod pane;
+mod progress;
 
 use pane::CommanderPane;
+use progress::{ProgressAction, ProgressSnapshot, ProgressWindow};
 
 /// Upper bound on bytes read off a volume to preview the selected file in the
 /// File Info window (matches the classic browse view's cap).
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024;
 
-/// An open "Calculate Checksums" window: its title and the worker status it
-/// polls each frame.
+/// An open "Calculate Checksums" window: its title, the worker status it
+/// polls each frame, and a rate tracker so the progress line can show the
+/// same rate + ETA suffix the rest of the app uses.
 struct ChecksumWindow {
     title: String,
     status: Arc<Mutex<ChecksumStatus>>,
+    /// Sum of every selected file's size, precomputed when the window opens
+    /// so the progress bar spans the whole batch (not just the current file).
+    total_bytes: u64,
+    tracker: super::progress::RateTracker,
 }
 
 /// An open "File Info" window: the entry it describes, its decoded preview, and
@@ -120,6 +127,14 @@ pub struct CommanderMode {
     /// "Export to hard drive" write, whose destination is an external folder
     /// not shown in either pane (nothing to re-list).
     pending_host_copy: Option<(Option<Side>, Arc<Mutex<HostCopyStatus>>)>,
+    /// In-flight off-thread image->image staging copy (see
+    /// [`commander_ops::spawn_stage_copy`]), plus the destination side its
+    /// finished edits push onto.
+    pending_stage_copy: Option<(Side, Arc<Mutex<StageCopyStatus>>)>,
+    /// One-shared progress modal for whichever long-running op is in flight
+    /// (host copy / stage copy / apply). Only one op runs at a time, so this
+    /// is a single [`ProgressWindow`] that reads the appropriate status.
+    progress_window: ProgressWindow,
     /// The open "Calculate Checksums" window, if any (one at a time).
     checksums: Option<ChecksumWindow>,
     /// The open "File Info" window, if any (one at a time).
@@ -161,6 +176,8 @@ impl CommanderMode {
             temp: None,
             unsaved_close: false,
             pending_host_copy: None,
+            pending_stage_copy: None,
+            progress_window: ProgressWindow::default(),
             checksums: None,
             detail: None,
             keep_dates: true,
@@ -211,6 +228,8 @@ impl CommanderMode {
         let mut close = false;
 
         self.poll_host_copy(ui.ctx());
+        self.poll_stage_copy(ui.ctx());
+        self.render_progress_modal(ui.ctx());
 
         egui::Panel::top("commander_top").show_inside(ui, |ui| {
             ui.add_space(2.0);
@@ -507,6 +526,9 @@ impl CommanderMode {
                 format!("Staged copy of {n} host item(s) into the {other} pane. Apply to write.")
             }
             // image -> image: extract to temp, stage onto the destination queue.
+            // Runs on a worker thread so a large multi-file copy shows the same
+            // progress modal (percent + rate + ETA) the host-copy path does, and
+            // doesn't freeze the UI while extracting.
             (false, false) => {
                 if self.temp.is_none() {
                     self.temp = tempfile::tempdir().ok();
@@ -514,22 +536,22 @@ impl CommanderMode {
                 let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
                     return "Could not create a temp directory for the copy.".to_string();
                 };
-                let Some(src_fs) = src.fs_mut() else {
-                    return "Source volume is not open.".to_string();
+                let Some(session) = src.session() else {
+                    return "Source volume has no cached session — reopen it and try again."
+                        .to_string();
                 };
-                match commander_ops::stage_copy(
-                    src_fs,
-                    &entries,
-                    &dest_parent,
-                    &temp_dir,
-                    keep_dates,
-                ) {
-                    Ok(edits) => {
-                        let n = dest.stage_edits(edits);
-                        format!("Staged copy of {n} item(s) into the {other} pane. Apply to write.")
-                    }
-                    Err(e) => format!("Copy failed: {e:#}"),
-                }
+                self.pending_stage_copy = Some((
+                    from.other(),
+                    commander_ops::spawn_stage_copy(
+                        session,
+                        entries,
+                        dest_parent,
+                        temp_dir,
+                        keep_dates,
+                    ),
+                ));
+                self.progress_window.reset();
+                format!("Copying to the {other} pane...")
             }
             // image -> host: immediate extraction.
             (false, true) => {
@@ -649,6 +671,7 @@ impl CommanderMode {
         let err = guard.error.take();
         let copied = guard.copied;
         drop(guard);
+        self.progress_window.reset();
 
         // Re-list the destination pane only for a cross-pane copy; an export
         // writes to an external folder that isn't shown in either pane.
@@ -670,6 +693,121 @@ impl CommanderMode {
         self.record_log(self.status.clone());
     }
 
+    /// Poll an in-flight image->image stage copy; on completion, push its
+    /// edits onto the destination pane's queue and surface the result. Errors
+    /// discard the staged edits (the queue is left untouched).
+    fn poll_stage_copy(&mut self, ctx: &egui::Context) {
+        let Some((dest_side, arc)) = self.pending_stage_copy.clone() else {
+            return;
+        };
+        ctx.request_repaint();
+        let Ok(mut guard) = arc.lock() else {
+            return;
+        };
+        if !guard.finished {
+            return;
+        }
+        self.pending_stage_copy = None;
+        let err = guard.error.take();
+        let edits = std::mem::take(&mut guard.edits);
+        drop(guard);
+        self.progress_window.reset();
+
+        let dest = match dest_side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        };
+        self.status = match err {
+            Some(e) => format!("Copy to the {} pane failed: {e}", dest_side.label()),
+            None => {
+                let n = dest.stage_edits(edits);
+                format!(
+                    "Staged copy of {n} item(s) into the {} pane. Apply to write.",
+                    dest_side.label()
+                )
+            }
+        };
+        self.record_log(self.status.clone());
+    }
+
+    /// Render the progress modal for whichever long-running operation is in
+    /// flight, if any. Only one runs at a time — image->host copy, image->image
+    /// stage copy, or a pane's apply — and each maps to the same
+    /// [`ProgressSnapshot`] the widget consumes. Returning early keeps the
+    /// modal out of the way when everything is idle.
+    fn render_progress_modal(&mut self, ctx: &egui::Context) {
+        // 1) Host copy (image->host / host->host / Export to hard drive).
+        if let Some((_, arc)) = self.pending_host_copy.clone() {
+            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
+                title: "Copying".into(),
+                current: g.current_file.clone(),
+                items_done: g.copied,
+                items_total: g.files_total,
+                bytes_done: g.bytes_done,
+                bytes_total: g.bytes_total,
+                finished: g.finished,
+                error: g.error.clone(),
+                can_cancel: true,
+                cancel_requested: g.cancel_requested,
+            });
+            if let Some(snap) = snap {
+                if self.progress_window.show(ctx, &snap) == ProgressAction::Cancel {
+                    if let Ok(mut g) = arc.lock() {
+                        g.cancel_requested = true;
+                    }
+                }
+            }
+            return;
+        }
+        // 2) Image->image staging copy.
+        if let Some((_, arc)) = self.pending_stage_copy.clone() {
+            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
+                title: "Copying to other pane".into(),
+                current: g.current_file.clone(),
+                items_done: g.files_done,
+                items_total: g.files_total,
+                bytes_done: g.bytes_done,
+                bytes_total: g.bytes_total,
+                finished: g.finished,
+                error: g.error.clone(),
+                can_cancel: true,
+                cancel_requested: g.cancel_requested,
+            });
+            if let Some(snap) = snap {
+                if self.progress_window.show(ctx, &snap) == ProgressAction::Cancel {
+                    if let Ok(mut g) = arc.lock() {
+                        g.cancel_requested = true;
+                    }
+                }
+            }
+            return;
+        }
+        // 3) Apply queue on either pane (only one is in flight at a time — the
+        // pane refuses staging until the previous apply finishes).
+        for (side, arc_opt) in [
+            (Side::Left, self.left.pending_apply_status()),
+            (Side::Right, self.right.pending_apply_status()),
+        ] {
+            let Some(arc) = arc_opt else { continue };
+            let snap = arc.lock().ok().map(|g| ProgressSnapshot {
+                title: format!("Applying {} pane edits", side.label()),
+                current: g.current_edit.clone(),
+                items_done: g.edits_done,
+                items_total: g.edits_total,
+                bytes_done: g.bytes_done,
+                bytes_total: g.bytes_total,
+                finished: g.finished,
+                error: g.error.clone(),
+                can_cancel: false,
+                cancel_requested: false,
+            });
+            if let Some(snap) = snap {
+                let _ = self.progress_window.show(ctx, &snap);
+            }
+            return;
+        }
+    }
+
     /// Open a "Calculate Checksums" window over the `from` pane's selected files
     /// (§15.2). Directories are skipped; an image source is re-opened on the
     /// worker thread (same as export). Replaces any window already open.
@@ -687,6 +825,9 @@ impl CommanderMode {
             );
         }
 
+        // Precompute the batch total before entries is consumed by the job.
+        let total_bytes: u64 = entries.iter().filter(|e| e.is_file()).map(|e| e.size).sum();
+
         let job = if src.is_host_pane() {
             ChecksumJob::Host { entries }
         } else {
@@ -703,6 +844,8 @@ impl CommanderMode {
         self.checksums = Some(ChecksumWindow {
             title,
             status: checksum::spawn(job),
+            total_bytes,
+            tracker: super::progress::RateTracker::default(),
         });
         format!("Calculating checksums for {file_count} file(s)...")
     }
@@ -711,13 +854,15 @@ impl CommanderMode {
     /// worker runs, then a CRC32 / MD5 / SHA1 / SHA256 grid per file, each value
     /// with a Copy button.
     fn render_checksum_window(&mut self, ctx: &egui::Context) {
-        let Some(win) = &self.checksums else {
+        let Some(win) = self.checksums.as_mut() else {
             return;
         };
         let mut open = true;
         let mut to_copy: Option<String> = None;
         let mut running = false;
-        egui::Window::new(&win.title)
+        let title = win.title.clone();
+        let total_bytes = win.total_bytes;
+        egui::Window::new(&title)
             .open(&mut open)
             .resizable(true)
             .default_width(560.0)
@@ -740,7 +885,25 @@ impl CommanderMode {
                             st.total_files
                         ));
                     });
-                    if st.current_total > 0 {
+                    // Batch-wide byte progress: everything hashed on prior
+                    // files (their sizes are recorded in `results`) plus the
+                    // in-flight byte counter for the current file. Fed to the
+                    // shared RateTracker so the label carries rate + ETA.
+                    let done_bytes: u64 =
+                        st.results.iter().map(|r| r.size).sum::<u64>() + st.current_bytes;
+                    if total_bytes > 0 {
+                        win.tracker.record(done_bytes, "Hashing");
+                        let frac = (done_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0);
+                        let suffix = win.tracker.suffix(done_bytes, total_bytes);
+                        let text = format!(
+                            "{} / {} ({:.0}%){}",
+                            format_size(done_bytes),
+                            format_size(total_bytes),
+                            frac * 100.0,
+                            suffix,
+                        );
+                        ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
+                    } else if st.current_total > 0 {
                         let frac = st.current_bytes as f32 / st.current_total as f32;
                         ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
                     }

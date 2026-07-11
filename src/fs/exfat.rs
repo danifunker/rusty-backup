@@ -9,11 +9,12 @@ use super::filesystem::{
 use super::CompactResult;
 
 // exFAT directory entry types
-const ENTRY_TYPE_ALLOCATION_BITMAP: u8 = 0x81;
+pub(crate) const ENTRY_TYPE_ALLOCATION_BITMAP: u8 = 0x81;
+pub(crate) const ENTRY_TYPE_UPCASE_TABLE: u8 = 0x82;
 const ENTRY_TYPE_VOLUME_LABEL: u8 = 0x83;
-const ENTRY_TYPE_FILE: u8 = 0x85;
-const ENTRY_TYPE_STREAM_EXT: u8 = 0xC0;
-const ENTRY_TYPE_FILE_NAME: u8 = 0xC1;
+pub(crate) const ENTRY_TYPE_FILE: u8 = 0x85;
+pub(crate) const ENTRY_TYPE_STREAM_EXT: u8 = 0xC0;
+pub(crate) const ENTRY_TYPE_FILE_NAME: u8 = 0xC1;
 
 // File attributes
 const ATTR_DIRECTORY: u16 = 0x10;
@@ -110,6 +111,18 @@ pub struct ExfatFilesystem<R> {
     bitmap_start_cluster: u32,
     bitmap_size: u64,
     used_bytes: u64,
+}
+
+/// Immutable geometry snapshot handed to the fsck module (`exfat_fsck`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExfatGeom {
+    pub(crate) cluster_count: u32,
+    pub(crate) cluster_size: u64,
+    pub(crate) bytes_per_sector: u64,
+    pub(crate) root_cluster: u32,
+    pub(crate) bitmap_start_cluster: u32,
+    pub(crate) bitmap_size: u64,
+    pub(crate) partition_offset: u64,
 }
 
 /// Validate an exFAT filename.
@@ -222,8 +235,30 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
         self.partition_offset + self.fat_offset_sectors as u64 * self.bytes_per_sector
     }
 
+    /// Geometry snapshot for the fsck module. Read-only.
+    pub(crate) fn fsck_geometry(&self) -> ExfatGeom {
+        ExfatGeom {
+            cluster_count: self.cluster_count,
+            cluster_size: self.cluster_size,
+            bytes_per_sector: self.bytes_per_sector,
+            root_cluster: self.root_cluster,
+            bitmap_start_cluster: self.bitmap_start_cluster,
+            bitmap_size: self.bitmap_size,
+            partition_offset: self.partition_offset,
+        }
+    }
+
+    /// Read `len` bytes at an absolute byte offset. Used by `exfat_fsck` to
+    /// read the main / backup boot regions.
+    pub(crate) fn read_raw(&mut self, offset: u64, len: usize) -> Result<Vec<u8>, FilesystemError> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Read the next cluster from the FAT.
-    fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
+    pub(crate) fn next_cluster(&mut self, cluster: u32) -> Result<Option<u32>, FilesystemError> {
         if cluster < 2 || cluster >= self.cluster_count + 2 {
             return Ok(None);
         }
@@ -276,7 +311,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
     }
 
     /// Read cluster chain data.
-    fn read_cluster_chain(
+    pub(crate) fn read_cluster_chain(
         &mut self,
         start_cluster: u32,
         max_bytes: Option<u64>,
@@ -315,7 +350,7 @@ impl<R: Read + Seek> ExfatFilesystem<R> {
     }
 
     /// Read contiguous cluster data (NoFatChain flag set).
-    fn read_contiguous_clusters(
+    pub(crate) fn read_contiguous_clusters(
         &mut self,
         start_cluster: u32,
         data_length: u64,
@@ -673,6 +708,10 @@ impl<R: Read + Seek + Send> Filesystem for ExfatFilesystem<R> {
         "exFAT"
     }
 
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::exfat_fsck::fsck_exfat(self))
+    }
+
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         validate_exfat_name(name)
     }
@@ -750,7 +789,7 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
     }
 
     /// Write the allocation bitmap back to disk (sector-aligned).
-    fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
+    pub(crate) fn write_bitmap(&mut self, bitmap: &[u8]) -> Result<(), FilesystemError> {
         let offset = self.cluster_offset(self.bitmap_start_cluster);
         self.reader.seek(SeekFrom::Start(offset))?;
         // Pad to sector alignment for raw device compatibility
@@ -758,6 +797,21 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
         let mut aligned = vec![0u8; aligned_size];
         aligned[..bitmap.len()].copy_from_slice(bitmap);
         self.reader.write_all(&aligned)?;
+        Ok(())
+    }
+
+    /// Write `bytes` at an absolute byte offset. Used by `exfat_fsck`'s repair to
+    /// patch the VBR (percent-in-use / volume flags) and rewrite the main /
+    /// backup boot regions and their checksums.
+    pub(crate) fn write_raw(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(offset))?;
+        self.reader.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Flush the underlying writer. Called once at the end of a repair pass.
+    pub(crate) fn flush_writer(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
         Ok(())
     }
 
@@ -1268,6 +1322,10 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 // =============================================================================
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::exfat_fsck::repair_exfat(self)
+    }
+
     fn create_file(
         &mut self,
         parent: &FileEntry,
@@ -2040,7 +2098,7 @@ pub fn resize_exfat_in_place(
 }
 
 /// Compute the exFAT boot region checksum over sectors 0-10.
-fn compute_exfat_boot_checksum(boot_region: &[u8], bytes_per_sector: u64) -> u32 {
+pub(crate) fn compute_exfat_boot_checksum(boot_region: &[u8], bytes_per_sector: u64) -> u32 {
     let mut checksum: u32 = 0;
     let check_size = 11 * bytes_per_sector as usize;
 
@@ -2061,7 +2119,7 @@ fn compute_exfat_boot_checksum(boot_region: &[u8], bytes_per_sector: u64) -> u32
 }
 
 /// Build a full sector filled with the checksum value repeated.
-fn build_checksum_sector(checksum: u32, bytes_per_sector: u64) -> Vec<u8> {
+pub(crate) fn build_checksum_sector(checksum: u32, bytes_per_sector: u64) -> Vec<u8> {
     let mut sector = vec![0u8; bytes_per_sector as usize];
     let checksum_bytes = checksum.to_le_bytes();
     for i in (0..sector.len()).step_by(4) {
@@ -2109,7 +2167,7 @@ fn build_exfat_upcase_table() -> Vec<u8> {
 
 /// exFAT rolling u32 checksum over every byte (no skips) — used for the up-case
 /// table's `TableChecksum` field. Same primitive as the boot-region checksum.
-fn exfat_table_checksum(bytes: &[u8]) -> u32 {
+pub(crate) fn exfat_table_checksum(bytes: &[u8]) -> u32 {
     let mut cs: u32 = 0;
     for &b in bytes {
         cs = if cs & 1 != 0 {

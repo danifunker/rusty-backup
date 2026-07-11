@@ -92,6 +92,13 @@ fn emit_text(
 ) -> Result<()> {
     out_stdout(format!("Image:           {}", image.display()));
     out_stdout(format!("Partition table: {}", pt.type_name()));
+    if let PartitionTable::Apm(apm) = pt {
+        if !apm.ddr_present {
+            out_stdout(
+                "Driver descriptor: absent (zeroed block 0 — common on mastered Mac CD-ROMs)",
+            );
+        }
+    }
     if let Some(report) = chd_report {
         out_stdout("");
         for line in report.lines() {
@@ -173,9 +180,14 @@ fn emit_structured(
     partitions: &[crate::partition::PartitionInfo],
     chd_report: Option<&str>,
 ) -> Result<()> {
+    let ddr_present = match pt {
+        PartitionTable::Apm(apm) => Some(apm.ddr_present),
+        _ => None,
+    };
     let payload = InspectPayload {
         image: image.display().to_string(),
         partition_table: pt.type_name().to_string(),
+        ddr_present,
         chd_info: chd_report.map(|s| s.to_string()),
         partitions: partitions
             .iter()
@@ -199,6 +211,11 @@ fn emit_structured(
 struct InspectPayload {
     image: String,
     partition_table: String,
+    /// For APM tables: whether block 0 carried a Driver Descriptor Record.
+    /// `false` on Mac CD-ROMs mastered with a zeroed block 0. `None` for
+    /// non-APM tables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ddr_present: Option<bool>,
     /// CHD `chdman info`-style report, when the image is a `.chd`.
     /// Structured per-field accessors are planned for a later phase.
     #[serde(skip_serializing_if = "Option::is_none")]

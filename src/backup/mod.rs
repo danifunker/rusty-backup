@@ -1414,7 +1414,10 @@ fn run_backup_inner(
         let progress_clone = Arc::clone(&progress);
         let base_bytes = overall_bytes_done;
 
-        // Superfloppy: force raw compression to produce a universally compatible .img file
+        // Superfloppy: force raw compression to produce a universally compatible
+        // .img file. (Compaction still applies — the compacted stream is what gets
+        // written raw — so a lightly-used volume shrinks to ~its real data size. A
+        // compressed superfloppy output needs restore-path work; see OPEN-WORK.)
         let effective_compression = if is_superfloppy {
             CompressionType::None
         } else {

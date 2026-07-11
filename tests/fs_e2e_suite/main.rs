@@ -10,6 +10,7 @@
 
 mod apple_dos_e2e;
 mod atarist_e2e;
+mod cbm_fsck;
 mod cbm_g64;
 mod cbm_g71;
 mod cpc_e2e;

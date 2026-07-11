@@ -66,24 +66,24 @@ const MODE_SUPERINDEX: u32 = 128;
 const MODE_LARGEFILE: u32 = 2048;
 
 // block IDs (UWORD at offset 0)
-const ID_DIRBLOCK: u16 = 0x4442; // 'DB'
-const ID_ANODEBLOCK: u16 = 0x4142; // 'AB'
-const ID_INDEXBLOCK: u16 = 0x4942; // 'IB'
-const ID_BITMAPBLOCK: u16 = 0x424D; // 'BM'
-const ID_BITMAPINDEXBLOCK: u16 = 0x4D49; // 'MI'
-const ID_EXTENSIONBLOCK: u16 = 0x4558; // 'EX'
-const ID_SUPERBLOCK: u16 = 0x5342; // 'SB'
+pub(crate) const ID_DIRBLOCK: u16 = 0x4442; // 'DB'
+pub(crate) const ID_ANODEBLOCK: u16 = 0x4142; // 'AB'
+pub(crate) const ID_INDEXBLOCK: u16 = 0x4942; // 'IB'
+pub(crate) const ID_BITMAPBLOCK: u16 = 0x424D; // 'BM'
+pub(crate) const ID_BITMAPINDEXBLOCK: u16 = 0x4D49; // 'MI'
+pub(crate) const ID_EXTENSIONBLOCK: u16 = 0x4558; // 'EX'
+pub(crate) const ID_SUPERBLOCK: u16 = 0x5342; // 'SB'
 
-const ANODE_ROOTDIR: u32 = 5;
+pub(crate) const ANODE_ROOTDIR: u32 = 5;
 
 fn parse_err<S: Into<String>>(msg: S) -> FilesystemError {
     FilesystemError::Parse(msg.into())
 }
 
-fn rd_u16(buf: &[u8], o: usize) -> u16 {
+pub(crate) fn rd_u16(buf: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([buf[o], buf[o + 1]])
 }
-fn rd_u32(buf: &[u8], o: usize) -> u32 {
+pub(crate) fn rd_u32(buf: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
 }
 
@@ -198,10 +198,10 @@ impl Pfs3RootBlockExt {
 
 /// In-memory anode resolved from disk.
 #[derive(Debug, Clone, Copy, Default)]
-struct Canode {
-    clustersize: u32,
-    blocknr: u32,
-    next: u32,
+pub(crate) struct Canode {
+    pub(crate) clustersize: u32,
+    pub(crate) blocknr: u32,
+    pub(crate) next: u32,
 }
 
 /// Cache key for one reserved block (size = `reserved_blksize`).
@@ -746,6 +746,183 @@ fn parse_direntry(entries: &[u8], off: usize, largefile: bool) -> Option<DirEntr
     })
 }
 
+/// A directory child parsed from a dirblock, classified by its `ST_*`
+/// type byte. Returned by [`Pfs3Filesystem::parse_dir_children`] so the
+/// fsck module can walk the tree without needing the private direntry
+/// parser or the raw `ST_*` constants.
+#[derive(Debug, Clone)]
+pub(crate) struct Pfs3Child {
+    pub(crate) kind: Pfs3ChildKind,
+    /// The child object's own anode (dirblock chain for dirs, data chain
+    /// for files/softlinks, link node for hardlinks).
+    pub(crate) anode: u32,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pfs3ChildKind {
+    Dir,
+    LinkDir,
+    File,
+    Softlink,
+    LinkFile,
+    /// Any `ST_*` value we don't recognize — surfaced by fsck as a bad type.
+    Unknown(i8),
+}
+
+// === fsck accessors ========================================================
+//
+// A read-only surface the sibling `pfs3_fsck` module uses to walk the
+// volume and reconcile both bitmaps. Modelled on the AFFS accessor block
+// (`affs.rs`): geometry getters, block/anode peeks, the two "stored"
+// bitmaps (set bit = free, matching the on-disk convention), and the
+// directory-child scan. The bitmap-rewrite repair primitives live in the
+// mutation block further down.
+impl<R: Read + Seek> Pfs3Filesystem<R> {
+    /// Total HW sectors in the volume (data + reserved + boot).
+    pub(crate) fn total_sectors(&self) -> u32 {
+        (self.partition_size / HW_SECTOR) as u32
+    }
+    pub(crate) fn rscluster(&self) -> u32 {
+        self.rscluster
+    }
+    pub(crate) fn indexperblock(&self) -> u32 {
+        self.indexperblock
+    }
+    pub(crate) fn blocks_free(&self) -> u32 {
+        self.root.blocks_free
+    }
+    pub(crate) fn reserved_free(&self) -> u32 {
+        self.root.reserved_free
+    }
+    pub(crate) fn extension_block(&self) -> u32 {
+        self.root.extension
+    }
+    pub(crate) fn is_supermode(&self) -> bool {
+        self.supermode
+    }
+    pub(crate) fn disk_name_owned(&self) -> String {
+        self.root.disk_name.clone()
+    }
+    pub(crate) fn bitmapindex(&self) -> Vec<u32> {
+        self.root.bitmapindex.clone()
+    }
+    pub(crate) fn small_indexblocks(&self) -> Vec<u32> {
+        self.root.small_indexblocks.clone()
+    }
+    pub(crate) fn super_index(&self) -> Vec<u32> {
+        self.ext
+            .as_ref()
+            .map(|e| e.super_index.clone())
+            .unwrap_or_default()
+    }
+    /// First HW sector of the user-data area (the sector the data bitmap's
+    /// local index 0 refers to).
+    pub(crate) fn data_bitmap_start(&self) -> u32 {
+        self.root.last_reserved.saturating_add(1)
+    }
+    /// HW sector of the rootblock cluster (which also holds the reserved
+    /// bitmap at offset 512).
+    pub(crate) fn rootblock_sector(&self) -> u32 {
+        ROOTBLOCK_SECTOR
+    }
+    /// Number of reserved-block clusters the reserved bitmap covers.
+    pub(crate) fn numreserved(&self) -> u32 {
+        if self.rscluster == 0 {
+            return 0;
+        }
+        (self
+            .root
+            .last_reserved
+            .saturating_sub(self.root.first_reserved)
+            + 1)
+            / self.rscluster
+    }
+    /// Reserved-cluster index for a reserved-area HW sector, or `None` if the
+    /// sector is outside the reserved region or not cluster-aligned.
+    pub(crate) fn reserved_cluster_of_sector(&self, sec: u32) -> Option<u32> {
+        if self.rscluster == 0
+            || sec < self.root.first_reserved
+            || sec > self.root.last_reserved
+            || !(sec - self.root.first_reserved).is_multiple_of(self.rscluster)
+        {
+            return None;
+        }
+        Some((sec - self.root.first_reserved) / self.rscluster)
+    }
+
+    /// Read a whole reserved block (cluster) into an owned buffer.
+    pub(crate) fn peek_reserved_block(&mut self, sec: u32) -> Result<Vec<u8>, FilesystemError> {
+        Ok(self.read_reserved_block(sec)?.to_vec())
+    }
+    /// Resolve `anodenr` to its `(clustersize, blocknr, next)` triple.
+    pub(crate) fn peek_anode(&mut self, anodenr: u32) -> Result<Canode, FilesystemError> {
+        self.get_anode(anodenr)
+    }
+
+    /// The stored **data** bitmap, one bit per user-data sector, **set bit =
+    /// free** (LSB-first within each output byte). Empty when unreadable.
+    pub(crate) fn read_data_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        read_user_bitmap(self)
+    }
+    /// The stored **reserved** bitmap, one bit per reserved cluster, **set
+    /// bit = free** (LSB-first within each output byte). Lives at offset
+    /// 512+12 of the rootblock cluster.
+    pub(crate) fn read_reserved_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let numreserved = self.numreserved();
+        let bm_off = 512 + 12;
+        let cluster = self.read_reserved_block(ROOTBLOCK_SECTOR)?;
+        let mut out = vec![0u8; (numreserved as usize).div_ceil(8)];
+        for idx in 0..numreserved {
+            let o = bm_off + (idx / 32) as usize * 4;
+            if o + 4 > cluster.len() {
+                break;
+            }
+            let word = rd_u32(cluster, o);
+            if (word >> (31 - (idx % 32))) & 1 == 1 {
+                out[(idx / 8) as usize] |= 1u8 << (idx % 8);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Parse the direntries of one dirblock (full reserved-block bytes,
+    /// including the 20-byte header) into classified children. Returns an
+    /// empty vector when the block is not a dirblock.
+    pub(crate) fn parse_dir_children(&self, blk: &[u8]) -> Vec<Pfs3Child> {
+        let mut out = Vec::new();
+        if blk.len() <= 20 || rd_u16(blk, 0) != ID_DIRBLOCK {
+            return out;
+        }
+        let entries = &blk[20..];
+        let mut off = 0usize;
+        while let Some(de) = parse_direntry(entries, off, self.largefile) {
+            let next = entries[off] as usize;
+            if next == 0 {
+                break;
+            }
+            off += next;
+            let kind = match de.ttype {
+                ST_DIR => Pfs3ChildKind::Dir,
+                ST_LINKDIR => Pfs3ChildKind::LinkDir,
+                ST_FILE => Pfs3ChildKind::File,
+                ST_SOFTLINK => Pfs3ChildKind::Softlink,
+                ST_LINKFILE => Pfs3ChildKind::LinkFile,
+                // ST_ROLLOVERFILE (-16) and anything else: treat as file-ish
+                // data for reachability but flag genuinely unknown types.
+                -16 => Pfs3ChildKind::File,
+                other => Pfs3ChildKind::Unknown(other),
+            };
+            out.push(Pfs3Child {
+                kind,
+                anode: de.anode,
+                name: de.name,
+            });
+        }
+        out
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         let mut fe = FileEntry::root();
@@ -890,6 +1067,10 @@ impl<R: Read + Seek + Send> Filesystem for Pfs3Filesystem<R> {
         // reserved region). Approximate used = total - free.
         let free = self.root.blocks_free as u64 * HW_SECTOR;
         self.total_size().saturating_sub(free)
+    }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::pfs3_fsck::check_pfs3(self))
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
@@ -1790,6 +1971,127 @@ impl<R: Read + Seek> Pfs3Filesystem<R> {
             }
             bm[o..o + 4].copy_from_slice(&word.to_be_bytes());
         }
+        Ok(())
+    }
+
+    /// Rewrite the entire **data** bitmap from an observed allocation set
+    /// (`alloc` bit set = sector allocated, LSB-first per byte, indexed by
+    /// local data sector) and recompute `blocks_free`. Stages every `BM`
+    /// block into the dirty map; the caller flushes via `sync_metadata`.
+    /// Used by fsck repair.
+    pub(crate) fn rewrite_data_bitmap_from(&mut self, alloc: &[u8]) -> Result<(), FilesystemError> {
+        let data_sectors = self
+            .total_sectors()
+            .saturating_sub(self.data_bitmap_start());
+        let longsperbmb = (self.reserved_blksize / 4).saturating_sub(3);
+        let sectors_per_bmb = longsperbmb * 32;
+        let indexperblock = self.indexperblock;
+        let mut free_count: u32 = 0;
+        let mi_pointers = self.root.bitmapindex.clone();
+        for (mi_seq, &mi_blk) in mi_pointers.iter().enumerate() {
+            if mi_blk == 0 {
+                continue;
+            }
+            let mi = self.read_reserved_block(mi_blk)?.to_vec();
+            if rd_u16(&mi, 0) != ID_BITMAPINDEXBLOCK {
+                continue;
+            }
+            for i in 0..indexperblock {
+                let o = 12 + i as usize * 4;
+                if o + 4 > mi.len() {
+                    break;
+                }
+                let bm_blk = rd_u32(&mi, o);
+                if bm_blk == 0 {
+                    continue;
+                }
+                let bm_seq = mi_seq as u32 * indexperblock + i;
+                self.ensure_reserved_dirty(bm_blk)?;
+                let bm = self.dirty_reserved.get_mut(&bm_blk).unwrap();
+                if rd_u16(bm, 0) != ID_BITMAPBLOCK {
+                    continue;
+                }
+                for w in 0..longsperbmb {
+                    let base = bm_seq * sectors_per_bmb + w * 32;
+                    let mut word: u32 = 0;
+                    for b in 0..32u32 {
+                        let sec = base + b;
+                        // Padding bits past the data area stay free (1) to
+                        // match the formatter, but are not counted.
+                        let in_range = sec < data_sectors;
+                        let allocated = in_range
+                            && (alloc.get((sec / 8) as usize).copied().unwrap_or(0) >> (sec % 8))
+                                & 1
+                                == 1;
+                        if !allocated {
+                            word |= 1u32 << (31 - b);
+                            if in_range {
+                                free_count += 1;
+                            }
+                        }
+                    }
+                    let off = 12 + w as usize * 4;
+                    if off + 4 > bm.len() {
+                        break;
+                    }
+                    bm[off..off + 4].copy_from_slice(&word.to_be_bytes());
+                }
+            }
+        }
+        self.root.blocks_free = free_count;
+        self.persist_rootblock_fields()?;
+        Ok(())
+    }
+
+    /// Rewrite the **reserved** bitmap from an observed allocation set
+    /// (`alloc` bit set = cluster allocated, LSB-first per byte, indexed by
+    /// reserved cluster) and recompute `reserved_free`. Used by fsck repair.
+    pub(crate) fn rewrite_reserved_bitmap_from(
+        &mut self,
+        alloc: &[u8],
+    ) -> Result<(), FilesystemError> {
+        let numreserved = self.numreserved();
+        let bm_off = 512 + 12;
+        let cluster_sec = self.rootblock_cluster_sec();
+        self.ensure_reserved_dirty(cluster_sec)?;
+        let mut free_count: u32 = 0;
+        {
+            let cluster = self.dirty_reserved.get_mut(&cluster_sec).unwrap();
+            for w in 0..(numreserved as usize).div_ceil(32) {
+                let mut word: u32 = 0;
+                for b in 0..32u32 {
+                    let idx = w as u32 * 32 + b;
+                    if idx >= numreserved {
+                        break;
+                    }
+                    let allocated =
+                        (alloc.get((idx / 8) as usize).copied().unwrap_or(0) >> (idx % 8)) & 1 == 1;
+                    if !allocated {
+                        word |= 1u32 << (31 - b);
+                        free_count += 1;
+                    }
+                }
+                let o = bm_off + w * 4;
+                if o + 4 > cluster.len() {
+                    break;
+                }
+                cluster[o..o + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+        self.root.reserved_free = free_count;
+        self.persist_rootblock_fields()?;
+        Ok(())
+    }
+
+    /// Re-serialize the mutable rootblock scalar fields (blocks_free /
+    /// reserved_free) into the rootblock cluster's dirty buffer, leaving the
+    /// reserved bitmap and index arrays intact.
+    fn persist_rootblock_fields(&mut self) -> Result<(), FilesystemError> {
+        let cluster_sec = self.rootblock_cluster_sec();
+        self.ensure_reserved_dirty(cluster_sec)?;
+        let root_clone = self.root.clone();
+        let cluster_buf = self.dirty_reserved.get_mut(&cluster_sec).unwrap();
+        root_clone.write_into(&mut cluster_buf[..512]);
         Ok(())
     }
 }
@@ -2932,6 +3234,10 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pf
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.root.blocks_free as u64 * HW_SECTOR)
     }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::pfs3_fsck::repair_pfs3(self)
+    }
 }
 
 // === Phase 6: formatter for a blank PFS3 volume =============================
@@ -3944,6 +4250,170 @@ mod tests {
         let dir_entry = kids.iter().find(|c| c.name == "MyDir").unwrap();
         let dir_kids = fs2.list_directory(dir_entry).expect("list new dir");
         assert!(dir_kids.is_empty(), "new dir should start empty");
+    }
+
+    #[test]
+    fn fsck_clean_blank_reports_no_errors() {
+        let img = create_blank_pfs3(8192, "CleanPFS").expect("format");
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let res = fs.fsck().expect("fsck available").expect("fsck ok");
+        assert!(
+            res.errors.is_empty(),
+            "blank volume should be clean; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(res.is_clean());
+        assert!(res.stats.directories_checked >= 1);
+    }
+
+    #[test]
+    fn fsck_clean_after_writes() {
+        use super::super::filesystem::{
+            CreateDirectoryOptions, CreateFileOptions, EditableFilesystem,
+        };
+        let img = create_blank_pfs3(8192, "Written").expect("format");
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let sub = fs
+            .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+            .expect("mkdir");
+        let payload = vec![0x5Au8; 6000];
+        let mut src = std::io::Cursor::new(payload.clone());
+        fs.create_file(
+            &sub,
+            "big.dat",
+            &mut src,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+        fs.create_symlink(&root, "link", "sub/big.dat", &CreateFileOptions::default())
+            .expect("symlink");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+        let img = fs.reader.into_inner();
+
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let res = fs.fsck().expect("fsck available").expect("fsck ok");
+        assert!(
+            res.is_clean(),
+            "volume with writes should be clean; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(res.stats.files_checked >= 1);
+        assert!(res.stats.directories_checked >= 2);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_data_bitmap_mismatch() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+        let img = create_blank_pfs3(8192, "BM").expect("format");
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        // A 16-sector file lands at data-local sectors 0..15 (first free run).
+        let payload = vec![0xABu8; 8192];
+        let mut src = std::io::Cursor::new(payload.clone());
+        fs.create_file(
+            &root,
+            "data.bin",
+            &mut src,
+            payload.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Corrupt: mark data-local sector 0 free in the bitmap without
+        // touching blocks_free — the classic stale-bit-after-crash condition.
+        fs.toggle_data_bitmap_bits(0, 1, /*set_free=*/ true)
+            .expect("corrupt");
+        EditableFilesystem::sync_metadata(&mut fs).expect("resync");
+        let img = fs.reader.into_inner();
+
+        // Detect.
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img.clone()), 0).expect("reopen");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(!res.is_clean(), "fsck should detect the mismatch");
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.code == "Pfs3DataBitmapMismatch"),
+            "expected Pfs3DataBitmapMismatch among {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(res.repairable);
+
+        // Repair.
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let report = fs.repair().expect("repair");
+        assert!(
+            !report.fixes_applied.is_empty(),
+            "expected a fix; applied={:?} failed={:?}",
+            report.fixes_applied,
+            report.fixes_failed
+        );
+        let img = fs.reader.into_inner();
+
+        // Verify clean.
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(
+            res.is_clean(),
+            "should be clean after repair; errors: {:?}",
+            res.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_blocks_free_mismatch() {
+        use super::super::filesystem::EditableFilesystem;
+        // Rootblock sits at HW sector 2 (byte 1024); blocks_free is at +68.
+        let mut img = create_blank_pfs3(8192, "CNT").expect("format");
+        let off = 1024 + 68;
+        img[off..off + 4].copy_from_slice(&12u32.to_be_bytes()); // bogus count
+
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img.clone()), 0).expect("open");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.code == "Pfs3BlocksFreeMismatch"),
+            "expected Pfs3BlocksFreeMismatch among {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(res.repairable);
+
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        assert!(!fs.repair().expect("repair").fixes_applied.is_empty());
+        let img = fs.reader.into_inner();
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        assert!(fs.fsck().expect("avail").expect("ok").is_clean());
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_reserved_bitmap_mismatch() {
+        use super::super::filesystem::EditableFilesystem;
+        // Reserved bitmap: rootblock cluster (byte 1024) + 512 + 12 = byte
+        // 1548; word 0's MSB (bit 31) is reserved cluster 0 (the rootblock).
+        // OR 0x80 marks it free, contradicting the walk that reaches it.
+        let mut img = create_blank_pfs3(8192, "RES").expect("format");
+        img[1548] |= 0x80;
+
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img.clone()), 0).expect("open");
+        let res = fs.fsck().expect("avail").expect("ok");
+        assert!(
+            res.errors
+                .iter()
+                .any(|e| e.code == "Pfs3ReservedBitmapMismatch"),
+            "expected Pfs3ReservedBitmapMismatch among {:?}",
+            res.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+        assert!(res.repairable);
+
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        assert!(!fs.repair().expect("repair").fixes_applied.is_empty());
+        let img = fs.reader.into_inner();
+        let mut fs = Pfs3Filesystem::open(std::io::Cursor::new(img), 0).expect("reopen");
+        assert!(fs.fsck().expect("avail").expect("ok").is_clean());
     }
 
     #[test]

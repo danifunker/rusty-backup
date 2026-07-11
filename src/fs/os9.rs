@@ -50,12 +50,14 @@
 //!   set; a leading `0x00` marks a deleted slot) + 3-byte FD LSN. The first
 //!   two live entries are conventionally `..` (parent) and `.` (self).
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// CoCo/Dragon OS-9 floppies use 256-byte sectors. We still derive the
 /// effective sector size from the identification sector and accept 512 for
@@ -74,6 +76,12 @@ const ATT_DIR: u8 = 0x80;
 /// Runaway guards.
 const MAX_SEGMENTS_WALK: usize = MAX_SEGMENTS;
 const MAX_DIR_ENTRIES: usize = 4096;
+
+/// Result of the fsck directory-tree walk: `(owner, files, dirs, broken)`,
+/// where `owner[cluster]` is the id of the structure that claims a cluster
+/// (`usize::MAX` = system), `files`/`dirs` are the counts checked, and
+/// `broken` collects structural-damage messages.
+type Os9Walk = (Vec<Option<usize>>, u32, u32, Vec<String>);
 
 fn u24_be(b: &[u8]) -> u64 {
     ((b[0] as u64) << 16) | ((b[1] as u64) << 8) | (b[2] as u64)
@@ -467,6 +475,10 @@ impl<R: Read + Seek + Send> Filesystem for Os9Filesystem<R> {
         }
         used * self.ident.sectors_per_cluster * self.sector
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
 }
 
 impl<R: Read + Seek + Send> Os9Filesystem<R> {
@@ -477,6 +489,209 @@ impl<R: Read + Seek + Send> Os9Filesystem<R> {
             .get(byte)
             .map(|&b| b & mask != 0)
             .unwrap_or(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fsck (check + repair) — cluster-bitmap-vs-tree reconciliation
+// ---------------------------------------------------------------------------
+
+impl<R: Read + Seek + Send> Os9Filesystem<R> {
+    /// Mark every allocation cluster a sector range `(lsn, count)` occupies as
+    /// owned by `id` (`usize::MAX` = system). Records structural damage in
+    /// `broken` for a past-end range or a cluster already owned by a different
+    /// structure (a cross-link).
+    fn mark_range(
+        &self,
+        owner: &mut [Option<usize>],
+        broken: &mut Vec<String>,
+        lsn: u64,
+        count: u64,
+        id: usize,
+        who: &str,
+    ) {
+        if count == 0 {
+            return;
+        }
+        if lsn + count > self.ident.total_sectors {
+            broken.push(format!(
+                "{who}: LSN {lsn}+{count} is past the end of the volume ({} sectors)",
+                self.ident.total_sectors
+            ));
+            return;
+        }
+        let spc = self.ident.sectors_per_cluster;
+        let first = lsn / spc;
+        let last = (lsn + count - 1) / spc;
+        for c in first..=last {
+            let ci = c as usize;
+            if ci >= owner.len() {
+                continue;
+            }
+            match owner[ci] {
+                None => owner[ci] = Some(id),
+                Some(e) if e == id => {}
+                Some(_) => broken.push(format!(
+                    "{who}: cluster {c} (near LSN {}) is cross-linked (owned by more than one file)",
+                    c * spc
+                )),
+            }
+        }
+    }
+
+    /// Recompute cluster ownership by walking the directory tree from the root
+    /// FD (the CBM VALIDATE model, hierarchical): the identification sector and
+    /// bitmap are system clusters; every FD marks its own sector plus its
+    /// segment-list runs; directories recurse into their children. Returns
+    /// `(owner, files, dirs, broken)`; a non-empty `broken` means the walk is
+    /// incomplete and a bitmap rewrite is unsafe.
+    fn collect_used(&mut self) -> Result<Os9Walk, FilesystemError> {
+        let total_clusters = self
+            .ident
+            .total_sectors
+            .div_ceil(self.ident.sectors_per_cluster) as usize;
+        let mut owner: Vec<Option<usize>> = vec![None; total_clusters];
+        let mut broken = Vec::new();
+
+        // System clusters: LSN 0 (identification) and the bitmap at LSN 1..
+        let span = self.ident.bitmap_bytes.div_ceil(self.sector);
+        self.mark_range(
+            &mut owner,
+            &mut broken,
+            0,
+            1,
+            usize::MAX,
+            "identification sector",
+        );
+        self.mark_range(
+            &mut owner,
+            &mut broken,
+            1,
+            span,
+            usize::MAX,
+            "allocation bitmap",
+        );
+
+        let mut files = 0u32;
+        let mut dirs = 0u32;
+        let mut stack = vec![self.ident.root_dir_lsn];
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut next_id = 0usize;
+        while let Some(fd_lsn) = stack.pop() {
+            if fd_lsn == 0 || fd_lsn >= self.ident.total_sectors {
+                broken.push(format!(
+                    "directory entry points at FD LSN {fd_lsn}, out of range"
+                ));
+                continue;
+            }
+            if !visited.insert(fd_lsn) {
+                continue; // already walked (a `..` back-reference or a cycle)
+            }
+            next_id += 1;
+            let id = next_id;
+            // The FD occupies its own single sector.
+            self.mark_range(&mut owner, &mut broken, fd_lsn, 1, id, "file descriptor");
+            let fd = self.read_fd(fd_lsn)?;
+            for &(lsn, count) in &fd.segments {
+                self.mark_range(&mut owner, &mut broken, lsn, count, id, "file data");
+            }
+            if fd.is_dir() {
+                dirs += 1;
+                match self.read_dir_entries(&fd) {
+                    Ok(entries) => {
+                        for (_name, child) in entries {
+                            stack.push(child);
+                        }
+                    }
+                    Err(e) => broken.push(format!("directory FD {fd_lsn}: {e}")),
+                }
+            } else {
+                files += 1;
+            }
+        }
+
+        Ok((owner, files, dirs, broken))
+    }
+
+    /// OS-9 RBF integrity check: reconcile the on-disk allocation bitmap against
+    /// the cluster ownership recomputed from the directory tree.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (owner, files, dirs, broken) = self.collect_used()?;
+        let total_clusters = owner.len() as u64;
+        let walk_clean = broken.is_empty();
+
+        let mut used_but_free = 0u32;
+        let mut leaked = 0u32;
+        for c in 0..total_clusters {
+            match (self.bit_is_set(c), owner[c as usize].is_some()) {
+                (false, true) => used_but_free += 1, // referenced but marked free
+                (true, false) => leaked += 1,        // marked allocated but unreferenced
+                _ => {}
+            }
+        }
+
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        // A referenced cluster marked free is the dangerous direction — the
+        // allocator could hand it out and clobber live data.
+        if used_but_free > 0 {
+            errors.push(FsckIssue {
+                code: "Os9BitmapMismatch".into(),
+                message: format!(
+                    "{used_but_free} cluster(s) are in use but marked free in the allocation bitmap"
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        // Allocated-but-unreferenced clusters are usually a formatter
+        // reservation the on-disk structures don't name — the boot area, or a
+        // reserved track (a real NitrOS-9 disk reserves its last track). We
+        // can't tell those from a genuine leak, so we surface them read-only
+        // rather than freeing space the volume deliberately withheld.
+        if leaked > 0 {
+            warnings.push(FsckIssue {
+                code: "Os9ReservedClusters".into(),
+                message: format!(
+                    "{leaked} cluster(s) are marked allocated but referenced by no file — \
+                     reserved space (boot area / reserved track); left as-is"
+                ),
+                repairable: false,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "Os9StructuralDamage".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = owner.iter().filter(|o| o.is_none()).count() as u64;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings,
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: dirs,
+                extra: vec![
+                    ("free clusters".into(), format!("{free} / {total_clusters}")),
+                    (
+                        "bitmap".into(),
+                        if used_but_free == 0 {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
     }
 }
 
@@ -596,6 +811,47 @@ impl<R: Read + Write + Seek + Send> Os9Filesystem<R> {
             off += SEG_ENTRY_LEN;
         }
         fd
+    }
+
+    /// Fix the dangerous direction of an allocation-bitmap mismatch: mark every
+    /// cluster the directory tree references as allocated (a live cluster the
+    /// bitmap thought was free could be handed out and clobbered). Leaked
+    /// clusters are *not* freed — they are usually a formatter reservation
+    /// (boot area / reserved track) we can't distinguish from a genuine leak.
+    /// Withheld entirely when the walk found structural damage.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (owner, _files, _dirs, broken) = self.collect_used()?;
+        if !broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len(),
+            });
+        }
+        let total_clusters = self.cluster_count();
+        let mut diff = 0u32;
+        for c in 0..total_clusters {
+            if owner[c as usize].is_some() && !self.bit_is_set(c) {
+                self.set_bit(c, true);
+                diff += 1;
+            }
+        }
+        if diff == 0 {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        self.flush_bitmap()?;
+        self.reader.flush()?;
+        Ok(RepairReport {
+            fixes_applied: vec![format!(
+                "marked {diff} referenced cluster(s) allocated in the OS-9 bitmap"
+            )],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 
     /// Append a directory entry `(name -> fd_lsn)` to `dir_lsn`, reusing a
@@ -958,6 +1214,72 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
         }
         Ok(free * self.ident.sectors_per_cluster * self.sector)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
+}
+
+/// Build a blank, freshly formatted OS-9 / RBF volume — a standard 35-track
+/// CoCo floppy (630 × 256-byte sectors, one sector per cluster): the LSN-0
+/// identification sector, an allocation bitmap at LSN 1 with the system +
+/// root clusters marked, the root directory FD, and its `.`/`..` data. The
+/// result round-trips through [`Os9Filesystem::open`] and fscks clean.
+pub fn create_blank_os9(volume_name: &str) -> Result<Vec<u8>, FilesystemError> {
+    const SECTOR: usize = 256;
+    const TOTAL: u64 = 630; // 35 tracks x 18 sectors
+    const SPT: u64 = 18;
+    const SPC: u64 = 1; // one sector per cluster on a floppy
+    let name = encode_os9_name(volume_name)?;
+
+    let clusters = TOTAL.div_ceil(SPC); // 630
+    let bitmap_bytes = clusters.div_ceil(8); // 79
+    let root_fd_lsn = 2u64;
+    let root_data_lsn = 3u64;
+
+    let mut img = vec![0u8; TOTAL as usize * SECTOR];
+
+    // --- LSN 0: identification sector (all big-endian) ---
+    img[0..3].copy_from_slice(&put_u24_be(TOTAL)); // DD.TOT
+    img[3] = SPT as u8; // DD.TKS (track size in sectors)
+    img[4..6].copy_from_slice(&(bitmap_bytes as u16).to_be_bytes()); // DD.MAP
+    img[6..8].copy_from_slice(&(SPC as u16).to_be_bytes()); // DD.BIT (sectors/cluster)
+    img[8..11].copy_from_slice(&put_u24_be(root_fd_lsn)); // DD.DIR
+    img[13] = ATT_DIR | 0x3F; // DD.ATT (disk attributes)
+    img[16] = 0x02; // DD.FMT (double density, single sided)
+    img[17..19].copy_from_slice(&(SPT as u16).to_be_bytes()); // DD.SPT
+    img[31..31 + name.len()].copy_from_slice(&name); // DD.NAM
+
+    // --- LSN 1: allocation bitmap (set bit = allocated, MSB-first). ---
+    let bm = SECTOR; // byte offset of LSN 1
+    let mut alloc = |c: u64| img[bm + (c / 8) as usize] |= 0x80u8 >> (c % 8);
+    alloc(0); // LSN 0 (identification)
+    alloc(1); // LSN 1 (bitmap)
+    alloc(root_fd_lsn); // root FD (spc = 1 so cluster == lsn)
+    alloc(root_data_lsn); // root directory data
+    for c in clusters..(bitmap_bytes * 8) {
+        alloc(c); // phantom clusters in the last byte — never allocatable
+    }
+
+    // --- LSN 2: root directory FD (directory attribute + full perms). ---
+    let fd = root_fd_lsn as usize * SECTOR;
+    img[fd] = ATT_DIR | 0x3F; // attributes
+    img[fd + 8] = 1; // link count
+    img[fd + 9..fd + 13].copy_from_slice(&((2 * DIR_ENTRY_LEN) as u32).to_be_bytes()); // size
+    img[fd + SEG_LIST_OFFSET..fd + SEG_LIST_OFFSET + 3].copy_from_slice(&put_u24_be(root_data_lsn));
+    img[fd + SEG_LIST_OFFSET + 3..fd + SEG_LIST_OFFSET + 5].copy_from_slice(&1u16.to_be_bytes());
+
+    // --- LSN 3: root directory data — ".." and "." both point to the root. ---
+    let d = root_data_lsn as usize * SECTOR;
+    let dotdot = encode_os9_name("..")?;
+    let dot = encode_os9_name(".")?;
+    img[d..d + NAME_LEN].copy_from_slice(&dotdot);
+    img[d + NAME_LEN..d + NAME_LEN + 3].copy_from_slice(&put_u24_be(root_fd_lsn));
+    img[d + DIR_ENTRY_LEN..d + DIR_ENTRY_LEN + NAME_LEN].copy_from_slice(&dot);
+    img[d + DIR_ENTRY_LEN + NAME_LEN..d + DIR_ENTRY_LEN + NAME_LEN + 3]
+        .copy_from_slice(&put_u24_be(root_fd_lsn));
+
+    Ok(img)
 }
 
 #[cfg(test)]
@@ -1055,5 +1377,155 @@ mod tests {
         .unwrap();
         let err = fs.rename(&root, &one, "BETA.X").unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    // ── Create-blank + fsck tests ────────────────────────────────────────
+
+    fn blank_os9() -> Os9Filesystem<std::io::Cursor<Vec<u8>>> {
+        Os9Filesystem::open(
+            std::io::Cursor::new(create_blank_os9("TESTDISK").unwrap()),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_blank_os9_round_trips_through_open() {
+        let img = create_blank_os9("MYVOL").unwrap();
+        assert_eq!(img.len(), 630 * 256);
+        let mut fs = Os9Filesystem::open(std::io::Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.fs_type(), "OS-9");
+        assert_eq!(fs.volume_name(), "MYVOL");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        // 630 clusters - 4 allocated (ident, bitmap, root FD, root data) = 626.
+        assert_eq!(fs.cluster_count(), 630);
+    }
+
+    #[test]
+    fn os9_fsck_clean_blank() {
+        let mut fs = blank_os9();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "blank should fsck clean: {:?}", res.errors);
+        // The minimal blank reserves no extra track, so no reserved-cluster warning.
+        assert!(
+            res.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            res.warnings
+        );
+        assert_eq!(res.stats.directories_checked, 1);
+    }
+
+    #[test]
+    fn os9_fsck_clean_after_writes() {
+        use std::io::Cursor;
+        let mut fs = blank_os9();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "HELLO",
+            &mut Cursor::new(b"hi there".to_vec()),
+            8,
+            &opts,
+        )
+        .unwrap();
+        let big: Vec<u8> = (0..2000u32).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "DATA",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        fs.create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "post-write errors: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 2);
+        assert_eq!(res.stats.directories_checked, 2); // root + SUB
+    }
+
+    #[test]
+    fn os9_fsck_detects_and_repairs_bitmap() {
+        use std::io::Cursor;
+        let mut fs = blank_os9();
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "FILE",
+            &mut Cursor::new(vec![7u8; 600]),
+            600,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+
+        // Corrupt: mark a referenced cluster free in the bitmap.
+        let c = (4..fs.cluster_count()).find(|&c| fs.bit_is_set(c)).unwrap();
+        fs.set_bit(c, false);
+
+        let before = fs.fsck().unwrap().unwrap();
+        assert!(!before.is_clean());
+        assert!(before
+            .errors
+            .iter()
+            .any(|e| e.code == "Os9BitmapMismatch" && e.repairable));
+
+        let report = fs.repair().unwrap();
+        assert!(!report.fixes_applied.is_empty());
+        assert_eq!(report.unrepairable_count, 0);
+
+        let after = fs.fsck().unwrap().unwrap();
+        assert!(after.is_clean(), "post-repair errors: {:?}", after.errors);
+    }
+
+    #[test]
+    fn os9_fsck_reserved_clusters_are_a_benign_warning() {
+        // A formatter reservation (an allocated cluster referenced by no file,
+        // like a reserved last track) must be a warning, never an error, and
+        // repair must not free it.
+        let mut fs = blank_os9();
+        fs.set_bit(500, true);
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "reserved clusters must not be errors: {:?}",
+            res.errors
+        );
+        assert!(res.warnings.iter().any(|w| w.code == "Os9ReservedClusters"));
+
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(fs.bit_is_set(500)); // still reserved
+    }
+
+    #[test]
+    fn os9_fsck_detects_crosslink_and_withholds_repair() {
+        use std::io::Cursor;
+        let mut fs = blank_os9();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A", &mut Cursor::new(vec![1u8; 600]), 600, &opts)
+            .unwrap();
+        fs.create_file(&root, "B", &mut Cursor::new(vec![2u8; 600]), 600, &opts)
+            .unwrap();
+
+        let entries = fs.list_directory(&root).unwrap();
+        let a_lsn = entries.iter().find(|e| e.name == "A").unwrap().location;
+        let b_lsn = entries.iter().find(|e| e.name == "B").unwrap().location;
+        // Point B's FD first segment at A's first data segment.
+        let a_data = fs.read_fd(a_lsn).unwrap().segments[0].0;
+        let mut b_fd = fs.read_sectors(b_lsn, 1).unwrap();
+        b_fd[SEG_LIST_OFFSET..SEG_LIST_OFFSET + 3].copy_from_slice(&put_u24_be(a_data));
+        fs.write_sectors(b_lsn, &b_fd).unwrap();
+
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean());
+        assert!(res.errors.iter().any(|e| e.code == "Os9StructuralDamage"));
+
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(report.unrepairable_count > 0);
     }
 }

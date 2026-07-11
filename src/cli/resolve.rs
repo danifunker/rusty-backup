@@ -569,7 +569,7 @@ pub struct FsDispatchOverride {
     /// Force a specific filesystem dispatch. The main use is `cpm:<preset>`
     /// for CP/M images (which have no on-disk signature). Valid CP/M
     /// presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`,
-    /// `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zx_plus3`.
+    /// `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`.
     /// Other strings (e.g. `human68k`, `qdos`) are also accepted and
     /// forwarded to the partition_type_string dispatch.
     #[arg(long = "fs-type", value_name = "TYPE")]

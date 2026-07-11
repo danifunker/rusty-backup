@@ -21,6 +21,7 @@ use super::super::entry::FileEntry;
 use super::super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 use super::{be16, Disk, LabelCodec};
 
 /// `eofDA` (Disks.d): a `next`/`previous` link of this value terminates the
@@ -213,6 +214,191 @@ impl<'a> Bfs<'a> {
             free_pages: be16(&data, 18) as u32,
         })
     }
+
+    /// Collect every page a file occupies: its leader plus the whole data-page
+    /// chain, by VDA. Errors on a broken / looping / out-of-range chain.
+    fn file_page_vdas(&self, leader_vda: usize) -> Result<Vec<usize>, FilesystemError> {
+        let g = &self.disk.geometry;
+        let codec = LabelCodec::for_family(g.family);
+        let total = g.total_sectors();
+        let leader = self.disk.sector(leader_vda).ok_or_else(|| {
+            FilesystemError::InvalidData(format!("leader VDA {leader_vda} out of range"))
+        })?;
+        let mut out = vec![leader_vda];
+        let mut link = codec.next(g, &leader.label);
+        while let Some(vda) = link {
+            let s = self.disk.sector(vda).ok_or_else(|| {
+                FilesystemError::InvalidData(format!("page VDA {vda} out of range"))
+            })?;
+            out.push(vda);
+            if out.len() > total + 1 {
+                return Err(FilesystemError::InvalidData(
+                    "BFS page chain longer than the disk (loop?)".into(),
+                ));
+            }
+            link = codec.next(g, &s.label);
+        }
+        Ok(out)
+    }
+
+    /// Integrity check: reconcile the `DiskDescriptor` free-page bitmap and
+    /// count against the pages actually referenced by the directory + every
+    /// file's page chain (the label/bitmap reconciliation VALIDATE model).
+    ///
+    /// Alto's write side rebuilds the bitmap wholesale on every edit, so the
+    /// bitmap / free-count mismatches are repairable by that same rebuild; a
+    /// broken or cross-linked page chain is surfaced read-only.
+    pub fn check(&self) -> Result<FsckResult, FilesystemError> {
+        let g = &self.disk.geometry;
+        let total = g.total_sectors();
+
+        // 1. Recompute the used-page set from the directory + every chain.
+        let mut used = vec![false; total];
+        if total > 0 {
+            used[0] = true; // boot page (always VDA 0)
+        }
+        let mut crosslinked: Vec<usize> = Vec::new();
+        let mut broken: Vec<String> = Vec::new();
+        let mut user_files = 0u32;
+
+        let dir_bytes = self.read_file_bytes(SYSDIR_LEADER_VDA, 8 * 1024 * 1024)?;
+        let entries = parse_dir_entries(&dir_bytes)?;
+        for e in &entries {
+            if e.entry_type != DV_TYPE_FILE {
+                continue;
+            }
+            let bare = e.name.trim_end_matches('.');
+            let is_meta =
+                bare.eq_ignore_ascii_case("SysDir") || bare.eq_ignore_ascii_case("DiskDescriptor");
+            if !is_meta {
+                user_files += 1;
+            }
+            match self.file_page_vdas(e.leader_vda) {
+                Ok(vdas) => {
+                    let mut oor = false;
+                    for v in vdas {
+                        if v >= total {
+                            oor = true;
+                            break;
+                        }
+                        if used[v] && !crosslinked.contains(&v) {
+                            crosslinked.push(v);
+                        }
+                        used[v] = true;
+                    }
+                    if oor {
+                        broken.push(format!(
+                            "'{}': page chain runs past the end of the disk",
+                            e.name
+                        ));
+                    }
+                }
+                Err(_) => broken.push(format!("'{}': broken page chain", e.name)),
+            }
+        }
+
+        // 2. Read the on-disk DiskDescriptor bit table + free-page count.
+        let dd = self.read_file_by_name("DiskDescriptor", 64 * 1024);
+        let dd_ok = matches!(&dd, Ok(d) if d.len() >= 20);
+        if !dd_ok {
+            broken.push("DiskDescriptor is missing or unreadable".to_string());
+        }
+        let walk_clean = broken.is_empty() && crosslinked.is_empty();
+
+        let recomputed_used = used.iter().filter(|&&u| u).count();
+        let recomputed_free = total - recomputed_used;
+
+        let mut errors = Vec::new();
+        let mut bitmap_ok = true;
+        if let Ok(dd) = &dd {
+            if dd.len() >= 20 {
+                // Bit table begins after the 16-word KDH header (`LKDHEADER`).
+                const BT0: usize = 32;
+                let bit_used = |v: usize| -> bool {
+                    let off = BT0 + (v >> 4) * 2;
+                    if off + 1 >= dd.len() {
+                        return true; // past the table -> treated as in use
+                    }
+                    (be16(dd, off) & (0x8000u16 >> (v & 15))) != 0
+                };
+                let mut used_but_free = 0u32;
+                let mut leaked = 0u32;
+                for (v, &is_used) in used.iter().enumerate() {
+                    match (is_used, bit_used(v)) {
+                        (true, false) => used_but_free += 1,
+                        (false, true) => leaked += 1,
+                        _ => {}
+                    }
+                }
+                if used_but_free > 0 || leaked > 0 {
+                    bitmap_ok = false;
+                    errors.push(FsckIssue {
+                        code: "AltoBitmapMismatch".into(),
+                        message: format!(
+                            "free-page bitmap disagrees with the file allocation: \
+                             {used_but_free} page(s) in use but marked free, \
+                             {leaked} page(s) marked used but unreferenced"
+                        ),
+                        repairable: walk_clean,
+                        debug: false,
+                    });
+                }
+                let free_pages = be16(dd, 18) as usize;
+                if free_pages != recomputed_free {
+                    bitmap_ok = false;
+                    errors.push(FsckIssue {
+                        code: "AltoFreePagesMismatch".into(),
+                        message: format!(
+                            "DiskDescriptor free-page count is {free_pages}, \
+                             but {recomputed_free} pages are actually free"
+                        ),
+                        repairable: walk_clean,
+                        debug: false,
+                    });
+                }
+            }
+        }
+
+        for v in &crosslinked {
+            errors.push(FsckIssue {
+                code: "AltoCrossLink".into(),
+                message: format!("page {v} is claimed by more than one file"),
+                repairable: false,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "AltoBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: user_files,
+                directories_checked: 1,
+                extra: vec![
+                    ("free pages".into(), format!("{recomputed_free} / {total}")),
+                    (
+                        "bitmap".into(),
+                        if bitmap_ok && walk_clean {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 /// The `DiskDescriptor` file's header (`KDH` in `AltoFileSys.d`). Field byte
@@ -347,6 +533,10 @@ impl Filesystem for BfsFilesystem {
             None => 0,
         }
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(Bfs::new(&self.disk).check())
+    }
 }
 
 impl EditableFilesystem for BfsFilesystem {
@@ -415,6 +605,44 @@ impl EditableFilesystem for BfsFilesystem {
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_pages.unwrap_or(0) as u64 * self.disk.geometry.data_bytes as u64)
+    }
+
+    /// Repair a stale DiskDescriptor by rebuilding the volume from its file
+    /// set — the same defragmenting rebuild every edit performs, which
+    /// recomputes the free-page bitmap and count from scratch. Refuses while
+    /// any chain is broken or cross-linked (the rebuild reads every file, so a
+    /// broken chain would abort it anyway). Persists to the save path when the
+    /// volume was opened editable.
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let report = Bfs::new(&self.disk).check()?;
+        let structural = report.errors.iter().filter(|e| !e.repairable).count();
+        if structural > 0 {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: structural,
+            });
+        }
+        if !report.errors.iter().any(|e| e.repairable) {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        self.disk = super::write::clone_to(&self.disk, self.disk.geometry.clone())?;
+        self.refresh_free();
+        if let Some(path) = self.save_path.clone() {
+            std::fs::write(&path, super::pdi::write(&self.disk)).map_err(FilesystemError::Io)?;
+        }
+        Ok(RepairReport {
+            fixes_applied: vec![
+                "rebuilt the DiskDescriptor free-page bitmap and count from the file allocation"
+                    .into(),
+            ],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -771,5 +999,129 @@ mod tests {
             serial_after, serial_before,
             "serial number (identity) must survive a rename"
         );
+    }
+
+    // ---- fsck (label / bitmap reconciliation) ------------------------------
+
+    /// A small Diablo-31-shaped BFS pack (192 pages) holding two user files.
+    fn small_bfs_with_files() -> super::super::Disk {
+        use super::super::write::{add_file, create_blank};
+        use super::super::{FsFamily, Geometry};
+        let geom = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 8,
+            n_heads: 2,
+            n_sectors: 12,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let mut disk = create_blank(geom).unwrap();
+        disk = add_file(&disk, "HELLO.TXT", b"hello alto world").unwrap();
+        disk = add_file(&disk, "DATA.BIN", &vec![0xABu8; 900]).unwrap();
+        disk
+    }
+
+    /// VDA of the DiskDescriptor's first data page — the one holding the
+    /// free-page count (byte 18) and the bit table (byte 32+).
+    fn dd_first_data_vda(disk: &super::super::Disk) -> usize {
+        use super::super::LabelCodec;
+        let e = Bfs::new(disk).find_entry("DiskDescriptor").unwrap();
+        let codec = LabelCodec::for_family(disk.geometry.family);
+        let leader = disk.sector(e.leader_vda).unwrap();
+        codec.next(&disk.geometry, &leader.label).unwrap()
+    }
+
+    #[test]
+    fn alto_bfs_fsck_clean() {
+        let mut fs = BfsFilesystem::open(small_bfs_with_files());
+        let r = fs.fsck().expect("fsck supported").expect("ran");
+        assert!(r.is_clean(), "clean volume errors: {:?}", r.errors);
+        assert!(!r.repairable);
+        assert_eq!(r.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn alto_bfs_fsck_detects_and_repairs_free_pages() {
+        let mut disk = small_bfs_with_files();
+        let dd = dd_first_data_vda(&disk);
+        // Claim zero free pages (byte 18-19 of the KDH) — a stale count.
+        disk.sectors[dd].data[18] = 0x00;
+        disk.sectors[dd].data[19] = 0x00;
+
+        let mut fs = BfsFilesystem::open(disk);
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert!(r.errors.iter().any(|e| e.code == "AltoFreePagesMismatch"));
+
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert!(!rep.fixes_applied.is_empty());
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+
+        // The two user files survived the rebuild.
+        let root = fs.root().unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n.starts_with("HELLO")));
+        assert!(names.iter().any(|n| n.starts_with("DATA")));
+    }
+
+    #[test]
+    fn alto_bfs_fsck_detects_and_repairs_bitmap() {
+        let mut disk = small_bfs_with_files();
+        let dd = dd_first_data_vda(&disk);
+        // Mark a definitely-free page (100) used in the bit table (byte 32+).
+        let v = 100usize;
+        let off = 32 + (v >> 4) * 2;
+        let mask = 0x8000u16 >> (v & 15);
+        let data = &mut disk.sectors[dd].data;
+        let cur = ((data[off] as u16) << 8) | data[off + 1] as u16;
+        let nv = cur | mask;
+        data[off] = (nv >> 8) as u8;
+        data[off + 1] = (nv & 0xff) as u8;
+
+        let mut fs = BfsFilesystem::open(disk);
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.repairable);
+        assert!(r.errors.iter().any(|e| e.code == "AltoBitmapMismatch"));
+
+        let rep = fs.repair().unwrap();
+        assert_eq!(rep.unrepairable_count, 0);
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+    }
+
+    #[test]
+    fn alto_bfs_fsck_flags_broken_chain_unrepairable() {
+        let mut disk = small_bfs_with_files();
+        let leader_vda = Bfs::new(&disk)
+            .list_files()
+            .unwrap()
+            .iter()
+            .find(|f| f.name.starts_with("HELLO"))
+            .unwrap()
+            .leader_vda;
+        // Point the leader's `next` link (Diablo label word 0) at itself.
+        let self_da = disk.geometry.da_from_vda(leader_vda);
+        disk.sectors[leader_vda].label[0] = (self_da >> 8) as u8;
+        disk.sectors[leader_vda].label[1] = (self_da & 0xff) as u8;
+
+        let mut fs = BfsFilesystem::open(disk);
+        let r = fs.fsck().unwrap().unwrap();
+        assert!(!r.is_clean());
+        assert!(r.errors.iter().any(|e| e.code == "AltoBrokenChain"));
+        assert!(!r.repairable);
+
+        // Repair refuses while a chain is broken.
+        let rep = fs.repair().unwrap();
+        assert!(rep.fixes_applied.is_empty());
+        assert!(rep.unrepairable_count >= 1);
     }
 }

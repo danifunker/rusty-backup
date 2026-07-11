@@ -34,7 +34,18 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz"];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
-pub const OPTICAL_EXTS: &[&str] = &["iso", "bin", "cue", "chd", "toast", "img"];
+///
+/// Includes the video-game console containers the `opticaldiscs` crate opens
+/// (Dreamcast `.gdi` and the Nintendo GameCube/Wii family), so the Optical tab
+/// picker shows them. Keep this in sync with
+/// `opticaldiscs::formats::supported_extensions()` — the crate is optional
+/// (behind the `optical` feature) so we can't reference it from this always-on
+/// module; the regression test `optical_game_disc_exts_present` guards drift.
+pub const OPTICAL_EXTS: &[&str] = &[
+    "iso", "bin", "cue", "chd", "toast", "img", // Dreamcast GD-ROM track descriptor.
+    "gdi", // Nintendo GameCube / Wii containers (nod crate).
+    "gcm", "rvz", "wbfs", "ciso", "gcz", "wia", "tgc", "nfs",
+];
 
 /// Macintosh archive / encoding extensions (StuffIt + Compact Pro + BinHex), a
 /// picker group for the Archives tab. Includes uppercase variants for
@@ -228,6 +239,21 @@ mod tests {
             "dart disk-image extension dropped"
         );
         assert!(!DISK_IMAGE_EXTS.contains(&"image"), "image is too generic");
+    }
+
+    #[test]
+    fn optical_game_disc_exts_present() {
+        // The video-game console containers opticaldiscs 0.8 added must stay in
+        // the Optical-tab picker group. A future cleanup that drops one has to
+        // do it deliberately. Mirrors opticaldiscs::formats::supported_extensions().
+        for must in [
+            "gdi", "gcm", "rvz", "wbfs", "ciso", "gcz", "wia", "tgc", "nfs",
+        ] {
+            assert!(
+                OPTICAL_EXTS.contains(&must),
+                "OPTICAL_EXTS missing game-disc extension {must}"
+            );
+        }
     }
 
     #[test]

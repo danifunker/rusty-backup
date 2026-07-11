@@ -24,7 +24,11 @@ use crate::cli::exit;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
-use crate::cli::resolve::{resolve_partition_ro, resolve_partition_rw};
+use crate::cli::resolve::{
+    resolve_partition_rw_forced, resolve_partition_streaming_forced, FsDispatchOverride,
+};
+use crate::fs::alto::{self, bfs::BfsFilesystem, FsFamily};
+use crate::fs::filesystem::{EditableFilesystem, Filesystem};
 use crate::fs::fsck::{FsckResult, RepairReport};
 
 #[derive(Debug, Args)]
@@ -52,6 +56,12 @@ pub struct FsckArgs {
     /// is nested.
     #[arg(long, default_value_t = OutputFormat::Text, value_enum)]
     pub format: OutputFormat,
+
+    /// Force a filesystem dispatch (`--fs-type`). Required for signatureless
+    /// images: CP/M has no on-disk magic, so `--fs-type cpm:<preset>` selects
+    /// the disk-parameter block (e.g. `cpm:amstrad_data`).
+    #[command(flatten)]
+    pub fs_override: FsDispatchOverride,
 }
 
 /// Structured payload for the `--format json|yaml` envelope. Wraps the
@@ -88,13 +98,33 @@ pub fn run(args: FsckArgs) -> Result<()> {
     require_non_flat(args.format, "fsck")?;
 
     if args.repair {
-        return repair_mode(&args.image, args.format);
+        return repair_mode(&args.image, args.format, &args.fs_override);
     }
-    check_mode(&args.image, args.format)
+    check_mode(&args.image, args.format, &args.fs_override)
 }
 
-fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
-    let (file, ctx) = resolve_partition_ro(&image.path, image.partition)?;
+fn check_mode(
+    image: &ImageRef,
+    format: OutputFormat,
+    fs_override: &FsDispatchOverride,
+) -> Result<()> {
+    // Alto disk packs open through the container parser, not the block factory.
+    if let Some((disk, _is_pdi)) = read_alto_disk(&image.path)? {
+        return alto_check(disk, image, format);
+    }
+
+    // `resolve_partition_streaming_forced` peels container / image wrappers
+    // (.atr, .d88, CHD, GHO, …) to a flat stream — the same read path ls / get
+    // / inspect use — so `fsck` (check) works on a wrapped image, matching the
+    // read-write repair path. The `--fs-type` override makes a signatureless
+    // image (CP/M) dispatchable when detection alone can't identify it.
+    let (file, mut ctx) = resolve_partition_streaming_forced(
+        &image.path,
+        image.partition,
+        None,
+        fs_override.fs_type.as_deref(),
+    )?;
+    fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs =
         crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
@@ -111,10 +141,17 @@ fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
         }
     };
 
+    emit_check_report(&report, format)
+}
+
+/// Emit an `fsck` (check-mode) report through the text or structured path and
+/// return the correct exit status. Shared by the block-factory path and the
+/// Alto-pack path.
+fn emit_check_report(report: &FsckResult, format: OutputFormat) -> Result<()> {
     if format.is_structured() {
         let payload = FsckPayload {
             clean: report.is_clean(),
-            report: &report,
+            report,
         };
         let env = Envelope::ok(payload);
         emit_envelope(format, &env)?;
@@ -127,7 +164,7 @@ fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
         };
     }
 
-    print_report(&report);
+    print_report(report);
     if report.is_clean() {
         Ok(())
     } else {
@@ -144,8 +181,20 @@ fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
     }
 }
 
-fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
-    let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition)?;
+fn repair_mode(
+    image: &ImageRef,
+    format: OutputFormat,
+    fs_override: &FsDispatchOverride,
+) -> Result<()> {
+    // Alto disk packs open through the container parser + persist as PDI, not
+    // through the block-factory / commit path.
+    if let Some((disk, is_pdi)) = read_alto_disk(&image.path)? {
+        return alto_repair(disk, is_pdi, image, format);
+    }
+
+    let (file, mut ctx, commit) =
+        resolve_partition_rw_forced(&image.path, image.partition, fs_override.fs_type.as_deref())?;
+    fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,
@@ -161,35 +210,10 @@ fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
     };
 
     if report.is_clean() {
-        if format.is_structured() {
-            let env = Envelope::ok(RepairPayload {
-                clean_before: true,
-                report: &report,
-                repair: None,
-            });
-            emit_envelope(format, &env)?;
-        } else {
-            print_report(&report);
-            out_stdout("fsck: clean, nothing to repair");
-        }
-        return Ok(());
+        return emit_repair_clean(&report, format);
     }
     if !report.repairable {
-        if format.is_structured() {
-            let env = Envelope::error(
-                exit::GENERIC_FAILURE,
-                "fsck: no repairable errors found",
-                Some(RepairPayload {
-                    clean_before: false,
-                    report: &report,
-                    repair: None,
-                }),
-            );
-            emit_envelope(format, &env)?;
-            bail!("fsck: no repairable errors found");
-        }
-        print_report(&report);
-        bail!("fsck: no repairable errors found");
+        return emit_repair_unrepairable(&report, format);
     }
 
     let repair = fs.repair().map_err(|e| anyhow!("repair: {e}"))?;
@@ -199,17 +223,61 @@ fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
     drop(fs);
     commit.commit()?;
 
+    emit_repair_done(&report, &repair, format)
+}
+
+/// Clean-before-repair: nothing to do. Shared emit path.
+fn emit_repair_clean(report: &FsckResult, format: OutputFormat) -> Result<()> {
+    if format.is_structured() {
+        let env = Envelope::ok(RepairPayload {
+            clean_before: true,
+            report,
+            repair: None,
+        });
+        emit_envelope(format, &env)?;
+    } else {
+        print_report(report);
+        out_stdout("fsck: clean, nothing to repair");
+    }
+    Ok(())
+}
+
+/// Errors found but none are auto-repairable. Shared emit path (non-zero exit).
+fn emit_repair_unrepairable(report: &FsckResult, format: OutputFormat) -> Result<()> {
+    if format.is_structured() {
+        let env = Envelope::error(
+            exit::GENERIC_FAILURE,
+            "fsck: no repairable errors found",
+            Some(RepairPayload {
+                clean_before: false,
+                report,
+                repair: None,
+            }),
+        );
+        emit_envelope(format, &env)?;
+        bail!("fsck: no repairable errors found");
+    }
+    print_report(report);
+    bail!("fsck: no repairable errors found");
+}
+
+/// A repair ran; report what it did. Shared emit path.
+fn emit_repair_done(
+    report: &FsckResult,
+    repair: &RepairReport,
+    format: OutputFormat,
+) -> Result<()> {
     if format.is_structured() {
         let env = Envelope::ok(RepairPayload {
             clean_before: false,
-            report: &report,
-            repair: Some(&repair),
+            report,
+            repair: Some(repair),
         });
         emit_envelope(format, &env)?;
         return Ok(());
     }
 
-    print_report(&report);
+    print_report(report);
     out_stdout(format!(
         "Repaired: {} fix(es) applied, {} failed, {} unrepairable",
         repair.fixes_applied.len(),
@@ -263,6 +331,111 @@ fn print_report(r: &FsckResult) {
             o.id, o.missing_parent_id, o.name, o.is_directory
         ));
     }
+}
+
+/// If `path` is an Alto / Pilot disk pack, decode it into an in-memory `Disk`;
+/// otherwise `Ok(None)` so the caller falls through to the block factory. These
+/// packs (`.pdi` / `.bfs` / CopyDisk / Salto / ContrAlto / Trident / `.zdisk`)
+/// carry out-of-band sector labels and can't be represented as a flat sector
+/// stream, so they open through `alto::open_pack` rather than `open_filesystem`.
+///
+/// Returns `(disk, is_pdi)`; `is_pdi` gates in-place `--repair` (repair rebuilds
+/// the pack as a PDI, which would silently change a non-PDI container's format).
+/// A cheap magic/size pre-check gates the full read so an unrelated large image
+/// is never slurped just to be rejected.
+fn read_alto_disk(path: &std::path::Path) -> Result<Option<(alto::Disk, bool)>> {
+    use std::io::Read as _;
+    let len = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => m.len() as usize,
+        _ => return Ok(None),
+    };
+    // The largest legitimate Alto pack is a Trident T-300; skip anything bigger.
+    if len == 0 || len > alto::trident::T300_BYTES {
+        return Ok(None);
+    }
+    let mut magic = [0u8; 8];
+    let n = std::fs::File::open(path)?.read(&mut magic).unwrap_or(0);
+    if !alto::looks_like_pack(&magic[..n], len) {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    match alto::open_pack(&bytes) {
+        Ok(disk) => {
+            let is_pdi = bytes.len() >= alto::pdi::MAGIC.len()
+                && &bytes[..alto::pdi::MAGIC.len()] == alto::pdi::MAGIC;
+            Ok(Some((disk, is_pdi)))
+        }
+        // Gate passed but it isn't actually a pack (e.g. an unrelated image of
+        // exactly the Salto/Trident size) — fall through to the normal path.
+        Err(_) => Ok(None),
+    }
+}
+
+fn alto_family_label(disk: &alto::Disk) -> &'static str {
+    match disk.geometry.family {
+        FsFamily::Diablo => "Alto BFS (Diablo)",
+        FsFamily::Trident => "Alto TFS (Trident)",
+        FsFamily::Pilot => "Pilot/Cedar",
+    }
+}
+
+/// `fsck` (check-mode) on an Alto BFS/TFS pack. Pilot/Cedar volumes have no
+/// checker, so they surface the same "unsupported" response as any other FS.
+fn alto_check(disk: alto::Disk, image: &ImageRef, format: OutputFormat) -> Result<()> {
+    if image.partition.is_some() {
+        bail!("Alto disk packs have no partition table; drop the `@N` suffix");
+    }
+    log_stderr(format!("Alto pack: {}", alto_family_label(&disk)));
+    if disk.geometry.family == FsFamily::Pilot {
+        return fsck_unsupported(format);
+    }
+    let mut fs = BfsFilesystem::open(disk);
+    let report = fs
+        .fsck()
+        .expect("BFS implements fsck")
+        .map_err(|e| anyhow!("fsck: {e}"))?;
+    emit_check_report(&report, format)
+}
+
+/// `fsck --repair` on an Alto BFS/TFS pack. Repair rebuilds the volume and
+/// writes it back as a PARC Disk Image, so it is only allowed in place for a
+/// `.pdi` input — any other container would have its format silently changed.
+fn alto_repair(
+    disk: alto::Disk,
+    is_pdi: bool,
+    image: &ImageRef,
+    format: OutputFormat,
+) -> Result<()> {
+    if image.partition.is_some() {
+        bail!("Alto disk packs have no partition table; drop the `@N` suffix");
+    }
+    if disk.geometry.family == FsFamily::Pilot {
+        return fsck_unsupported(format);
+    }
+    if !is_pdi {
+        bail!(
+            "Alto --repair rebuilds the volume and writes it back as a PARC Disk Image (PDI); \
+             the input is not a .pdi, and repairing it in place would change the container \
+             format. Copy/convert it to a .pdi first, or repair it in the GUI (which saves \
+             the fix to a chosen PDI path)."
+        );
+    }
+    log_stderr(format!("Alto pack: {}", alto_family_label(&disk)));
+    let mut fs = BfsFilesystem::open_editable(disk, image.path.clone());
+    let report = fs
+        .fsck()
+        .expect("BFS implements fsck")
+        .map_err(|e| anyhow!("fsck: {e}"))?;
+    if report.is_clean() {
+        return emit_repair_clean(&report, format);
+    }
+    if !report.repairable {
+        return emit_repair_unrepairable(&report, format);
+    }
+    // BfsFilesystem::repair() rebuilds the DiskDescriptor and writes the PDI to
+    // the save path (the original file) itself — no container commit step.
+    let repair = fs.repair().map_err(|e| anyhow!("repair: {e}"))?;
+    emit_repair_done(&report, &repair, format)
 }
 
 #[cfg(test)]

@@ -8,29 +8,40 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 ## What Rusty Backup supports today
 
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
-  JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS, Apple DOS 3.3, MacPlus MFS,
-  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (multi-DPB:
-  amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
-  altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
-  QDOS (QXL.WIN read), QDOS Microdrive (detect-only scaffold),
-  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write;
-  bidirectionally cross-validated against the `c1541` / Python `d64`
-  reference), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
-  RS-DOS / CoCo Disk BASIC (read + write, raw 35- / 40-track `.dsk` / `.jvc`;
-  cross-validated against an independent clean-room reader/writer derived
-  from the toolshed `libdecb` semantics),
+  JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS (read + edit + create + fsck),
+  Apple DOS 3.3 (read + edit + create + fsck), MacPlus MFS,
+  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
+  fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
+  svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
+  QDOS (QXL.WIN read + write + resize), QDOS Microdrive (detect-only scaffold),
+  CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write + fsck;
+  add/delete bidirectionally cross-validated against the `c1541` / Python `d64`
+  reference, fsck = VALIDATE with the BAM rewrite byte-verified against
+  `c1541 validate`), Atari DOS 2 (2.0S / 2.5 read + write + create + fsck,
+  `.atr` / `.xfd`),
+  RS-DOS / CoCo Disk BASIC (read + write + fsck, raw 35- / 40-track `.dsk` /
+  `.jvc`; cross-validated against an independent clean-room reader/writer
+  derived from the toolshed `libdecb` semantics; fsck = granule-table
+  reconciliation vs the directory chains, VALIDATE model),
   OS-9 / NitrOS-9 RBF (hierarchical Unix-like FS — read + write incl.
-  subdirectories, raw `.dsk` / `.vdk`; cross-validated byte-exact against an
-  independent clean-room RBF reader on real NitrOS-9 toolshed disks),
-  DragonDOS (Dragon 32/64 read + write, single- / double-sided 40-track
+  subdirectories + create + fsck, raw `.dsk` / `.vdk`; cross-validated
+  byte-exact against an independent clean-room RBF reader on real NitrOS-9
+  toolshed disks, fsck validated clean on the real fixture),
+  DragonDOS (Dragon 32/64 read + write + fsck, single- / double-sided 40-track
   `.dsk`; cross-validated byte-exact against an independent clean-room
-  reader/writer and against real third-party DragonDOS disks),
-  Acorn DFS (BBC Micro / BBC Master / Acorn Electron read + write,
+  reader/writer and against real third-party DragonDOS disks; fsck =
+  sector-bitmap reconciliation, VALIDATE model),
+  Acorn DFS (BBC Micro / BBC Master / Acorn Electron read + write + fsck,
   single-sided `.ssd` 40-/80-track; flat catalogue in sectors 0–1,
   contiguous files in descending start-sector order, single-character
   directory namespaces; bidirectionally cross-validated byte-exact against
-  an independent clean-room DFS reader/writer),
-  ANDOS (detect-only scaffold), ISO9660 (optical browse).
+  an independent clean-room DFS reader/writer; fsck = contiguous-file
+  consistency + canonical-order repair),
+  ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
+  + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
+  VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
+  Philips CD-i, and 3DO Opera — browse/extract, see **Optical / CD-ROM**
+  below).
 - **Partition tables:** MBR, GPT, APM, Amiga RDB, Atari AHDI, Sharp X68000.
 - **Containers:** CHD, VHD (fixed + dynamic), QCOW2, VMDK, 2MG, WOZ,
   DC42, HFV, IMZ (encrypted ZIP), `.zip` (a RAW disk image inside a plain
@@ -42,10 +53,14 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Raw / superfloppy** (partitionless) images are handled.
 - **Optical / CD-ROM:** rip a physical CD/DVD drive to ISO or BIN/CUE
   (`optical rip`), list drives (`optical drives`), convert ISO <-> BIN/CUE <->
-  CD-CHD (`optical convert`), and browse/extract ISO9660 / Joliet / HFS disc
-  images. Built into the desktop release and — as of opticaldiscs 0.4.5 — the
-  MiSTer `rb-cli-mini` armv7 build, for devices with an attached drive (e.g.
-  the SuperStation One).
+  CD-CHD (`optical convert`), and browse/extract ISO 9660 (+ Joliet /
+  Rock Ridge), High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS, VMS ODS-2, and
+  the video-game console discs — Nintendo GameCube / Wii (Wii decrypted
+  internally, no key needed), Sega Dreamcast GD-ROM (`.gdi` + CHD), Philips
+  CD-i, and 3DO — disc images, with console / serial / title / region
+  identification. Built into both the desktop release and the MiSTer
+  `rb-cli-mini` armv7 build (via opticaldiscs 0.8.0), for devices with an
+  attached drive (e.g. the SuperStation One).
 - **Remote optical ripping:** the desktop app / CLI can drive a *remote*
   daemon's optical drive over the rb-daemon — the device (e.g. a MiSTer) only
   issues SCSI reads while the desktop does all the encoding (CHD compression
@@ -75,9 +90,9 @@ Legend for the **Support** column:
 | Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Partial** — HFS yes; MFS 400K floppy no |
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
-| Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + fsck) + Apple DOS 3.3 (read + edit on 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
+| Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new --fs prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new --fs apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
-| X68000 | Sharp X68000 | Floppy, SASI/SCSI HDD | Human68k (FAT-derived dialect) | **Yes** — floppy (Human68k read/browse/extract + add/delete/mkdir on `.d88` / `.xdf` / `.hdm` / `.dim`; edits decode->mutate->re-encode back into the container, GUI and CLI) and SASI/SCSI HDD (`.hda` / `.hdf` / `.hds`) read/browse/extract/add/delete/mkdir + in-place FS grow/shrink (`rb-cli resize`) + defragmenting repack (`rb-cli repack` / Inspect-tab "Defragment…" — packs files contiguously, reclaiming holes left by deletions), incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images (sector size derived from the boot signature; Sharp/KG big-endian BPB + big-endian FAT). Verified byte-exact on the BlueSCSI HD10 SCSI fixture and the Populous/Lemmings/SSF2/Votoms 256-byte SASI game disks across grow→shrink round-trips (multi-cluster `COMMAND.X` + Japanese filenames survive). Backup/restore/reconstruct honor the true (non-512-aligned) partition byte offset via the persisted `start_byte`, so SASI backup→restore lands the partition region byte-identical. **New 2026-06-10:** `rb-cli new-x68k-hdd` scaffolds self-bootable SASI/SCSI HDDs from scratch — emits the Sharp IPL signature, X68K partition table, IPL stub (halt or printed-banner via IOCS B_PRINT), and optionally clones an entire Human68k donor floppy (flat or `.dim` / `.D88` / `.xdf` / `.hdm`) into the partition. MAME-verified on `x68000 -sasi` (SASI variant, 256-B sectors) and `x68030 -hard` (SCSI variant, 1024-B sectors). The donor's `SWITCH.X /HD` installs the partition boot sector on first FDD0 boot, after which the HDD self-boots to C:. **Zero-manual-step mode** also available: `--boot-sector-donor hd0.hds --size 100M --variant scsi` extracts the Sharp partition boot sector (Sharp IPL Copyright 1990 SHARP) from the well-known `hd0.hds` 100 MB Sharp/Keisoku Giken donor at build time and overlays it onto the output partition — no `SWITCH.X` step needed, self-boots straight to C:> on first power-on. Sharp's boot-sector bytes never live in the rusty-backup repo; same legal pattern as `--system-disk` (you provide the donor file, the bytes flow user→user). |
+| X68000 | Sharp X68000 | Floppy, SASI/SCSI HDD | Human68k (FAT-derived dialect) | **Yes** — floppy (Human68k read/browse/extract + add/delete/mkdir on `.d88` / `.xdf` / `.hdm` / `.dim`; edits decode->mutate->re-encode back into the container, GUI and CLI) and SASI/SCSI HDD (`.hda` / `.hdf` / `.hds`) read/browse/extract/add/delete/mkdir + in-place FS grow/shrink (`rb-cli resize`) + defragmenting repack (`rb-cli repack` / Inspect-tab "Defragment…" — packs files contiguously, reclaiming holes left by deletions) + fsck (`rb-cli fsck` / Inspect-tab Check — FAT-chain reconciliation + FAT-mirror resync, lost-cluster reclaim), incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images (sector size derived from the boot signature; Sharp/KG big-endian BPB + big-endian FAT). Verified byte-exact on the BlueSCSI HD10 SCSI fixture and the Populous/Lemmings/SSF2/Votoms 256-byte SASI game disks across grow→shrink round-trips (multi-cluster `COMMAND.X` + Japanese filenames survive). Backup/restore/reconstruct honor the true (non-512-aligned) partition byte offset via the persisted `start_byte`, so SASI backup→restore lands the partition region byte-identical. **New 2026-06-10:** `rb-cli new-x68k-hdd` scaffolds self-bootable SASI/SCSI HDDs from scratch — emits the Sharp IPL signature, X68K partition table, IPL stub (halt or printed-banner via IOCS B_PRINT), and optionally clones an entire Human68k donor floppy (flat or `.dim` / `.D88` / `.xdf` / `.hdm`) into the partition. MAME-verified on `x68000 -sasi` (SASI variant, 256-B sectors) and `x68030 -hard` (SCSI variant, 1024-B sectors). The donor's `SWITCH.X /HD` installs the partition boot sector on first FDD0 boot, after which the HDD self-boots to C:. **Zero-manual-step mode** also available: `--boot-sector-donor hd0.hds --size 100M --variant scsi` extracts the Sharp partition boot sector (Sharp IPL Copyright 1990 SHARP) from the well-known `hd0.hds` 100 MB Sharp/Keisoku Giken donor at build time and overlays it onto the output partition — no `SWITCH.X` step needed, self-boots straight to C:> on first power-on. Sharp's boot-sector bytes never live in the rusty-backup repo; same legal pattern as `--system-disk` (you provide the donor file, the bytes flow user→user). |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — Disc Record scan now spans the HD, E-format-floppy, and legacy-floppy candidate offsets (0xFC0/0x404/0xDC0); byte-correct against marutan.net blank pre-formatted HD samples (`blank256E.hdf`, `blank1024Eplus.hdf`) and the 8bs.com Acorn archive `arc-04.800.adf` (E-format populated); `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD container handling shipped; CLI parity tests cover inspect/ls/get on the synthetic E-format fixture; root-directory lookup via FSM indirect-disc-address still pending (dr.root encoding mystery + non-blank HD reference both required); ADFS write path parked behind the FSM walker |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read + write end-to-end (byte-correct against kilgus + smsqe MiSTer samples; write path validated against headless sQLux oracle — rb-cli put → SuperBASIC COPY → host file round-trips byte-exact, per-file 64-byte QDOS header convention honoured); `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
 | Amstrad | Amstrad CPC 6128 | Floppy | AMSDOS, CP/M 2.2/Plus | **Yes** — `fs::cpm` ships the `amstrad_data` + `amstrad_sys` DPBs covering both CPC data + system formats. |
@@ -98,7 +113,7 @@ Legend for the **Support** column:
 | Dragon | Dragon 32/64 | Floppy | DragonDOS, OS-9 (RBF) | **Yes** — `fs::dragondos` reads + writes DragonDOS (directory track 20 + backup track 16, one's-complement geometry signature, set-bit-free sector bitmap, 25-byte header/continuation directory entries; single- / double-sided 40-track `.dsk`). Byte-exact cross-validated against an independent clean-room reader/writer AND against real third-party DragonDOS disks (rolfmichelsen/dragontools' empty volume plus a populated 9-file AGD-suite disk, all files byte-identical across both readers). `fs::os9` covers OS-9 / NitrOS-9 RBF. |
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
-| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |
+| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes + creates + fscks Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`; `rb-cli new --fs atari` formats a blank SD disk, and fsck reconciles the VTOC bitmap + free-count against the directory chains. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way; fsck validated clean on the real fixture. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |
@@ -198,6 +213,11 @@ convert only.
 CD-ROM support is effectively **done**. Only **ao486** (ISO9660) and **Amiga
 CD32** (data CDFS = ISO9660; audio not implemented in the core) use CD media.
 No other computer core uses CD-ROM, so no new optical work is required.
+
+(The optical browser reads far more than the cores need — UDF, High Sierra,
+HFS / HFS+, SGI EFS, UFS/FFS, VMS ODS-2, and the video-game console
+filesystems GameCube / Wii, CD-i, and 3DO Opera in addition to ISO 9660 — so
+no CD-using core is filesystem-blocked.)
 
 ---
 

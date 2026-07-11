@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 use super::hfs_common::{bitmap_clear_bit_be, bitmap_find_set_bit_be, bitmap_set_bit_be};
 use super::CompactResult;
 
@@ -180,6 +182,300 @@ impl<R: Read + Seek + Send> Filesystem for ProDosFilesystem<R> {
             }
         }
         Ok((last_used as u64 + 1) * BLOCK_SIZE)
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
+}
+
+// ─────────────────────────────── fsck (check) ────────────────────────────────
+
+/// Mark `block` as referenced in `used`, recording structural damage in
+/// `broken` when the block is past the end of the volume or already claimed by
+/// another structure (a cross-link). Reserved metadata is marked first, so any
+/// file/index pointer that lands on it surfaces here.
+fn mark_block(used: &mut [bool], broken: &mut Vec<String>, total: usize, block: u16, who: &str) {
+    let b = block as usize;
+    if b >= total {
+        broken.push(format!(
+            "{who}: block {block} is past the end of the volume ({total} blocks)"
+        ));
+    } else if used[b] {
+        broken.push(format!(
+            "{who}: block {block} is cross-linked (referenced more than once)"
+        ));
+    } else {
+        used[b] = true;
+    }
+}
+
+impl<R: Read + Seek + Send> ProDosFilesystem<R> {
+    /// Read a 512-byte block through the read-only path (fsck needs no write).
+    fn read_block_ro(&mut self, block: u16) -> Result<[u8; 512], FilesystemError> {
+        let offset = self.partition_offset + block as u64 * BLOCK_SIZE;
+        self.reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(FilesystemError::Io)?;
+        let mut buf = [0u8; 512];
+        self.reader
+            .read_exact(&mut buf)
+            .map_err(FilesystemError::Io)?;
+        Ok(buf)
+    }
+
+    /// Mark every block a file occupies per its storage type. Seedling (1) /
+    /// sapling (2) / tree (3) are marked directly; an extended (5) GS/OS forked
+    /// file recurses into its two forks. Mirrors `free_file_blocks` plus the
+    /// extended case. Sparse pointers (0) are holes and occupy nothing.
+    fn mark_file_blocks(
+        &mut self,
+        used: &mut [bool],
+        broken: &mut Vec<String>,
+        total: usize,
+        key_pointer: u16,
+        storage_type: u8,
+        who: &str,
+    ) -> Result<(), FilesystemError> {
+        if key_pointer == 0 {
+            return Ok(());
+        }
+        if storage_type == 5 {
+            // Extended (Apple IIgs GS/OS forked) file: the key block is a
+            // mini-directory with a data-fork entry at offset 0 and a
+            // resource-fork entry at offset 256. Each is an 8-byte record
+            // {storage_type (byte), key_block (LE u16), blocks_used, EOF}; a
+            // fork is itself a seedling/sapling/tree, never another extended.
+            mark_block(used, broken, total, key_pointer, who);
+            if (key_pointer as usize) < total {
+                let ek = self.read_block_ro(key_pointer)?;
+                for base in [0usize, 256] {
+                    let fork_st = ek[base];
+                    let fork_kp = u16::from_le_bytes([ek[base + 1], ek[base + 2]]);
+                    if matches!(fork_st, 1..=3) {
+                        self.mark_data_fork(used, broken, total, fork_kp, fork_st, who)?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.mark_data_fork(used, broken, total, key_pointer, storage_type, who)
+    }
+
+    /// Mark the blocks of a single seedling/sapling/tree data run (the fork
+    /// primitive shared by plain files and each fork of an extended file).
+    fn mark_data_fork(
+        &mut self,
+        used: &mut [bool],
+        broken: &mut Vec<String>,
+        total: usize,
+        key_pointer: u16,
+        storage_type: u8,
+        who: &str,
+    ) -> Result<(), FilesystemError> {
+        if key_pointer == 0 {
+            return Ok(());
+        }
+        match storage_type {
+            // Seedling: the key block is the single data block.
+            1 => mark_block(used, broken, total, key_pointer, who),
+            // Sapling: key block is the index, holding up to 256 data blocks.
+            2 => {
+                mark_block(used, broken, total, key_pointer, who);
+                if (key_pointer as usize) < total {
+                    let index =
+                        read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
+                    for &db in index.iter() {
+                        if db != 0 {
+                            mark_block(used, broken, total, db, who);
+                        }
+                    }
+                }
+            }
+            // Tree: master index -> up to 128 index blocks -> data blocks.
+            3 => {
+                mark_block(used, broken, total, key_pointer, who);
+                if (key_pointer as usize) < total {
+                    let master =
+                        read_index_block(&mut self.reader, self.partition_offset, key_pointer)?;
+                    for &ib in master[..128].iter() {
+                        if ib == 0 {
+                            continue;
+                        }
+                        mark_block(used, broken, total, ib, who);
+                        if (ib as usize) < total {
+                            let index =
+                                read_index_block(&mut self.reader, self.partition_offset, ib)?;
+                            for &db in index.iter() {
+                                if db != 0 {
+                                    mark_block(used, broken, total, db, who);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Unknown storage type: at least account for the key block.
+            _ => mark_block(used, broken, total, key_pointer, who),
+        }
+        Ok(())
+    }
+
+    /// Recompute the allocated-block set by walking the directory tree and every
+    /// file's index structure (the CBM/AFFS VALIDATE model). Returns
+    /// `(used, files, dirs, broken)`; a non-empty `broken` (out-of-range block,
+    /// cross-link, or directory-chain cycle) means the walk is incomplete and a
+    /// bitmap rewrite would be unsafe.
+    fn collect_used(&mut self) -> Result<(Vec<bool>, u32, u32, Vec<String>), FilesystemError> {
+        let total = self.header.total_blocks as usize;
+        let mut used = vec![false; total];
+        let mut broken = Vec::new();
+
+        // Reserved metadata: the two boot blocks and the volume bitmap.
+        mark_block(&mut used, &mut broken, total, 0, "boot");
+        mark_block(&mut used, &mut broken, total, 1, "boot");
+        let bitmap_blocks = (self.header.total_blocks as u32).div_ceil(4096) as u16;
+        for i in 0..bitmap_blocks {
+            mark_block(
+                &mut used,
+                &mut broken,
+                total,
+                self.header.bitmap_pointer + i,
+                "bitmap",
+            );
+        }
+
+        // Walk directories depth-first from the volume directory (block 2). Each
+        // directory's block chain is marked used; files mark their own blocks.
+        let mut files = 0u32;
+        let mut dirs = 0u32;
+        let mut dir_stack = vec![2u16];
+        let mut visited_dirs: HashSet<u16> = HashSet::new();
+        while let Some(key) = dir_stack.pop() {
+            if key == 0 || !visited_dirs.insert(key) {
+                continue;
+            }
+            dirs += 1;
+            let mut block_num = key;
+            let mut chain_guard: HashSet<u16> = HashSet::new();
+            while block_num != 0 {
+                if block_num as usize >= total {
+                    broken.push(format!(
+                        "directory at block {key}: chain block {block_num} is past the end of the volume"
+                    ));
+                    break;
+                }
+                if !chain_guard.insert(block_num) {
+                    broken.push(format!(
+                        "directory at block {key}: block-chain cycle at block {block_num}"
+                    ));
+                    break;
+                }
+                mark_block(&mut used, &mut broken, total, block_num, "directory");
+                let block = self.read_block_ro(block_num)?;
+                let next = u16::from_le_bytes([block[2], block[3]]);
+                for i in 0..13usize {
+                    let eo = 4 + i * 39;
+                    let type_nibble = block[eo] >> 4;
+                    let name_len = (block[eo] & 0xF) as usize;
+                    // Skip deleted (0), volume-dir header (0xF), subdir header (0xE).
+                    if type_nibble == 0 || type_nibble == 0xF || type_nibble == 0xE {
+                        continue;
+                    }
+                    if name_len == 0 || name_len > 15 {
+                        continue;
+                    }
+                    let name: String = block[eo + 1..eo + 1 + name_len]
+                        .iter()
+                        .map(|&b| b as char)
+                        .collect();
+                    let key_pointer = u16::from_le_bytes([block[eo + 17], block[eo + 18]]);
+                    if type_nibble == 0xD {
+                        // Subdirectory: queue its key block for the walk.
+                        dir_stack.push(key_pointer);
+                    } else {
+                        files += 1;
+                        self.mark_file_blocks(
+                            &mut used,
+                            &mut broken,
+                            total,
+                            key_pointer,
+                            type_nibble,
+                            &name,
+                        )?;
+                    }
+                }
+                block_num = next;
+            }
+        }
+
+        Ok((used, files, dirs, broken))
+    }
+
+    /// ProDOS integrity check: reconcile the on-disk volume bitmap against the
+    /// allocation recomputed from the directory tree.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (used, files, dirs, broken) = self.collect_used()?;
+        let total = self.header.total_blocks as u32;
+        let bitmap = read_bitmap(&mut self.reader, self.partition_offset, &self.header)?;
+        let walk_clean = broken.is_empty();
+
+        let mut used_but_free = 0u32;
+        let mut leaked = 0u32;
+        for block in 0..total {
+            match (is_block_used(&bitmap, block), used[block as usize]) {
+                (false, true) => used_but_free += 1, // referenced but marked free
+                (true, false) => leaked += 1,        // marked used but unreferenced
+                _ => {}
+            }
+        }
+
+        let mut errors = Vec::new();
+        if used_but_free > 0 || leaked > 0 {
+            errors.push(FsckIssue {
+                code: "ProdosBitmapMismatch".into(),
+                message: format!(
+                    "volume bitmap mismatch: {used_but_free} block(s) in use but marked free, \
+                     {leaked} block(s) marked used but unreferenced"
+                ),
+                // Only trust a rewrite when the tree walk was complete; a broken
+                // chain could hide live blocks and cause a bad free.
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "ProdosStructuralDamage".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = used.iter().filter(|&&u| !u).count() as u64;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: dirs,
+                extra: vec![
+                    ("free blocks".into(), format!("{free} / {total}")),
+                    (
+                        "bitmap".into(),
+                        if used_but_free == 0 && leaked == 0 {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
     }
 }
 
@@ -615,6 +911,63 @@ impl<R: Read + Write + Seek + Send> ProDosFilesystem<R> {
             block_num = next;
         }
         Ok(true)
+    }
+
+    /// Rebuild the volume bitmap from the directory-tree walk, unless the walk
+    /// found structural damage that could hide live blocks.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (used, _files, _dirs, broken) = self.collect_used()?;
+        if !broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len(),
+            });
+        }
+        let total = self.header.total_blocks as u32;
+        let bitmap = read_bitmap(&mut self.reader, self.partition_offset, &self.header)?;
+        let diff = (0..total)
+            .filter(|&b| is_block_used(&bitmap, b) != used[b as usize])
+            .count();
+        if diff == 0 {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+
+        // Recompute the bitmap: set bit = free (ProDOS convention, MSB-first);
+        // blocks beyond `total` stay 0 (unavailable) so they're never allocated.
+        let bitmap_blocks = (self.header.total_blocks as u32).div_ceil(4096) as usize;
+        let mut new_bitmap = vec![0u8; bitmap_blocks * 512];
+        for (block, &is_used) in used.iter().enumerate() {
+            if !is_used {
+                new_bitmap[block / 8] |= 1 << (7 - (block % 8));
+            }
+        }
+        for i in 0..bitmap_blocks {
+            let offset =
+                self.partition_offset + (self.header.bitmap_pointer as u64 + i as u64) * BLOCK_SIZE;
+            self.reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(FilesystemError::Io)?;
+            self.reader
+                .write_all(&new_bitmap[i * 512..i * 512 + 512])
+                .map_err(FilesystemError::Io)?;
+        }
+        self.reader.flush().map_err(FilesystemError::Io)?;
+        // Keep the in-memory copy + free count consistent for later edits.
+        let free = used.iter().filter(|&&u| !u).count();
+        self.header.free_blocks = free.min(u16::MAX as usize) as u16;
+        self.bitmap = Some(new_bitmap);
+        Ok(RepairReport {
+            fixes_applied: vec![format!(
+                "rebuilt the ProDOS volume bitmap from the directory tree ({diff} bit(s) corrected)"
+            )],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -1122,6 +1475,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
         // If bitmap is loaded, use in-memory count; otherwise use header.
         Ok(self.header.free_blocks as u64 * BLOCK_SIZE)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
 }
 
 // ─────────────────────────────── compact reader ──────────────────────────────
@@ -1347,6 +1704,74 @@ pub fn validate_prodos_integrity(
     }
 
     Ok(warnings)
+}
+
+/// Build a blank, freshly formatted ProDOS volume of `size_bytes`, named `name`.
+///
+/// Layout follows the canonical ProDOS geometry:
+///   - blocks 0-1: boot blocks (zeroed — this is a data volume, not bootable)
+///   - blocks 2-5: the 4-block volume directory (key block at 2, chained 2→3→4→5)
+///   - block 6..:  the volume bitmap (`ceil(total_blocks / 4096)` blocks)
+///   - remainder:  free data area
+///
+/// The bitmap uses the ProDOS convention (set bit = free, MSB-first); every
+/// block below is reserved by clearing its bit. The result round-trips through
+/// [`ProDosFilesystem::open`] and passes `fsck` clean.
+pub fn create_blank_prodos(size_bytes: u64, name: &str) -> anyhow::Result<Vec<u8>> {
+    let vname = validate_prodos_name(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // total_blocks is a u16 field: ProDOS tops out at 65535 blocks (~32 MiB).
+    // Floor at 16 blocks (8 KiB) so boot + directory + bitmap always fit with
+    // free space to spare.
+    let raw_blocks = size_bytes / BLOCK_SIZE;
+    if raw_blocks < 16 {
+        anyhow::bail!("ProDOS volume too small: {size_bytes} bytes is under the 8 KiB minimum");
+    }
+    let total_blocks = raw_blocks.min(65535) as u16;
+    let bitmap_blocks = (total_blocks as u32).div_ceil(4096) as u16;
+    // Reserved: boot(0,1) + volume directory(2..=5) + bitmap(6..6+bitmap_blocks).
+    let bitmap_pointer = 6u16;
+    let reserved_end = bitmap_pointer + bitmap_blocks; // first free data block
+
+    let mut img = vec![0u8; total_blocks as usize * BLOCK_SIZE as usize];
+
+    // --- Volume directory: 4 blocks, chained 2→3→4→5. ---
+    let put_u16 = |img: &mut [u8], off: usize, v: u16| {
+        img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    for (blk, prev, next) in [(2u16, 0u16, 3u16), (3, 2, 4), (4, 3, 5), (5, 4, 0)] {
+        let base = blk as usize * BLOCK_SIZE as usize;
+        put_u16(&mut img, base, prev);
+        put_u16(&mut img, base + 2, next);
+    }
+
+    // Volume directory header entry (39 bytes) at block 2, offset 4.
+    let (date, time) = make_prodos_datetime_now();
+    let entry_base = 2 * BLOCK_SIZE as usize + 4;
+    let name_bytes = vname.as_bytes();
+    let name_len = name_bytes.len() as u8; // validated to 1..=15
+    img[entry_base] = (0xF << 4) | name_len; // storage_type=0xF + name_length
+    img[entry_base + 1..entry_base + 1 + name_len as usize].copy_from_slice(name_bytes);
+    put_u16(&mut img, entry_base + 24, date); // creation date  (entry offset 24)
+    put_u16(&mut img, entry_base + 26, time); // creation time  (entry offset 26)
+    img[entry_base + 30] = 0xC3; // access (destroy/rename/backup/write/read)
+    img[entry_base + 31] = 39; // entry_length
+    img[entry_base + 32] = 13; // entries_per_block
+                               // file_count (entry offset 33-34) stays 0
+    put_u16(&mut img, entry_base + 35, bitmap_pointer); // bit_map_pointer
+    put_u16(&mut img, entry_base + 37, total_blocks); // total_blocks
+
+    // --- Volume bitmap at block 6: every block free (bit=1), then reserve the
+    // boot/directory/bitmap blocks by clearing their bits. ---
+    let bitmap_base = bitmap_pointer as usize * BLOCK_SIZE as usize;
+    for block in 0..total_blocks as usize {
+        img[bitmap_base + block / 8] |= 1 << (7 - (block % 8)); // free
+    }
+    for block in 0..reserved_end as usize {
+        img[bitmap_base + block / 8] &= !(1 << (7 - (block % 8))); // used
+    }
+
+    Ok(img)
 }
 
 // ─────────────────────────────── internal helpers ────────────────────────────
@@ -2445,5 +2870,137 @@ mod tests {
         assert_eq!(block[eo + 16], 0x06); // file_type unchanged
         assert_eq!(u16::from_le_bytes([block[eo + 31], block[eo + 32]]), 0x2000);
         // aux_type unchanged
+    }
+
+    // ── Create-blank + fsck tests ────────────────────────────────────────
+
+    #[test]
+    fn create_blank_prodos_round_trips_through_open() {
+        let img = create_blank_prodos(800 * 1024, "MYVOL").unwrap();
+        assert_eq!(img.len(), 1600 * 512);
+        let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.fs_type(), "ProDOS");
+        assert_eq!(fs.volume_label(), Some("MYVOL"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        // 1600 total - 7 reserved (boot 2 + voldir 4 + bitmap 1) = 1593 free.
+        assert_eq!(fs.free_space().unwrap(), 1593 * 512);
+    }
+
+    #[test]
+    fn create_blank_prodos_lowercases_are_rejected_but_size_floor_enforced() {
+        // Names normalize to uppercase; a valid short name works.
+        assert!(create_blank_prodos(140 * 1024, "disk").is_ok());
+        // Under the 8 KiB floor is refused.
+        assert!(create_blank_prodos(4 * 1024, "TINY").is_err());
+        // A leading digit is not a legal ProDOS name.
+        assert!(create_blank_prodos(140 * 1024, "9BAD").is_err());
+    }
+
+    #[test]
+    fn prodos_fsck_clean_blank() {
+        let img = create_blank_prodos(800 * 1024, "BLANK").unwrap();
+        let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.is_clean(),
+            "blank volume should fsck clean: {:?}",
+            result.errors
+        );
+        assert_eq!(result.stats.files_checked, 0);
+        assert_eq!(result.stats.directories_checked, 1);
+    }
+
+    #[test]
+    fn prodos_fsck_clean_after_writes() {
+        let img = create_blank_prodos(800 * 1024, "DATA").unwrap();
+        let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        // A seedling (<=512B), a sapling (multi-block), and a subdirectory.
+        fs.create_file(&root, "SMALL", &mut &b"hi"[..], 2, &opts)
+            .unwrap();
+        let big = vec![0xABu8; 3000];
+        fs.create_file(&root, "BIG", &mut &big[..], big.len() as u64, &opts)
+            .unwrap();
+        fs.create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.is_clean(),
+            "post-write fsck errors: {:?}",
+            result.errors
+        );
+        assert_eq!(result.stats.files_checked, 2);
+        assert_eq!(result.stats.directories_checked, 2); // root + SUB
+    }
+
+    #[test]
+    fn prodos_fsck_detects_and_repairs_bitmap() {
+        let img = create_blank_prodos(800 * 1024, "FIXME").unwrap();
+        let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        // The first allocation lands on block 7 (blocks 0-6 are reserved).
+        fs.create_file(&root, "FILE", &mut &b"content"[..], 7, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Corrupt: mark the file's data block (7) free in the on-disk bitmap.
+        // The bitmap is at block 6 (byte offset 3072); block 7 is byte 0, bit 0
+        // (MSB-first, so 0x01). Set bit = free.
+        {
+            let disk = fs.reader.get_mut();
+            disk[3072] |= 0x01;
+        }
+
+        let before = fs.fsck().unwrap().unwrap();
+        assert!(!before.is_clean());
+        assert!(before
+            .errors
+            .iter()
+            .any(|e| e.code == "ProdosBitmapMismatch" && e.repairable));
+
+        let report = fs.repair().unwrap();
+        assert_eq!(report.fixes_applied.len(), 1);
+        assert_eq!(report.unrepairable_count, 0);
+
+        let after = fs.fsck().unwrap().unwrap();
+        assert!(after.is_clean(), "post-repair errors: {:?}", after.errors);
+    }
+
+    #[test]
+    fn prodos_fsck_detects_crosslink_and_withholds_repair() {
+        let img = create_blank_prodos(800 * 1024, "XLINK").unwrap();
+        let mut fs = ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A", &mut &b"aaaa"[..], 4, &opts)
+            .unwrap();
+        fs.create_file(&root, "B", &mut &b"bbbb"[..], 4, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Point B's key block at A's data block (7) to force a cross-link.
+        let (block_num, slot) = fs.locate_dir_entry_by_path("/B").unwrap();
+        let mut block = fs.read_block(block_num).unwrap();
+        let eo = 4 + slot * 39;
+        block[eo + 17] = 7;
+        block[eo + 18] = 0;
+        fs.write_block(block_num, &block).unwrap();
+
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(!result.is_clean());
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.code == "ProdosStructuralDamage"));
+
+        // Structural damage withholds the bitmap rewrite.
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(report.unrepairable_count > 0);
     }
 }

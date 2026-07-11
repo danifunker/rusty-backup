@@ -1008,4 +1008,92 @@ mod tests {
         // A .zdisk Pilot volume is read-only.
         assert!(session.open_editable().is_err());
     }
+
+    /// The exact chain the browse-view Check + Repair buttons drive for an Alto
+    /// pack: `session.open() -> fsck()` (read-only check) and
+    /// `session.open_editable() -> repair() -> commit` (repair persists as PDI).
+    #[test]
+    fn browse_session_alto_check_and_repair_round_trip() {
+        use crate::fs::alto::bfs::Bfs;
+        use crate::fs::alto::write::{add_file, create_blank};
+        use crate::fs::alto::{pdi, Disk, FsFamily, Geometry, LabelCodec};
+        use std::io::Write as _;
+
+        let geom = Geometry {
+            family: FsFamily::Diablo,
+            disk_model: 31,
+            n_disks: 1,
+            n_cylinders: 8,
+            n_heads: 2,
+            n_sectors: 12,
+            label_bytes: 16,
+            data_bytes: 512,
+        };
+        let clean = || -> Disk {
+            let d = create_blank(geom.clone()).unwrap();
+            add_file(&d, "HELLO.TXT", b"hi from the alto").unwrap()
+        };
+
+        // Clean pack: the Check chain reports clean.
+        {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(&pdi::write(&clean())).unwrap();
+            let session = BrowseSession {
+                source_path: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            };
+            let mut fs = session.open().unwrap();
+            assert_eq!(fs.fs_type(), "Alto BFS");
+            let r = fs.fsck().expect("BFS supports fsck").expect("ran");
+            assert!(r.is_clean(), "clean pack: {:?}", r.errors);
+        }
+
+        // Corrupt the DiskDescriptor free-page count: Check detects, Repair fixes.
+        {
+            let mut disk = clean();
+            let dd_leader = Bfs::new(&disk)
+                .list_files()
+                .unwrap()
+                .into_iter()
+                .find(|f| {
+                    f.name
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case("DiskDescriptor")
+                })
+                .unwrap()
+                .leader_vda;
+            let codec = LabelCodec::for_family(disk.geometry.family);
+            let dd_data = codec
+                .next(&disk.geometry, &disk.sector(dd_leader).unwrap().label)
+                .unwrap();
+            disk.sectors[dd_data].data[18] = 0;
+            disk.sectors[dd_data].data[19] = 0;
+
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(&pdi::write(&disk)).unwrap();
+            let session = BrowseSession {
+                source_path: Some(tmp.path().to_path_buf()),
+                ..Default::default()
+            };
+
+            // Check detects the corruption.
+            let mut fs = session.open().unwrap();
+            let r = fs.fsck().unwrap().unwrap();
+            assert!(!r.is_clean());
+            assert!(r.repairable);
+            drop(fs);
+
+            // Repair through the editable handle, then commit (no-op for Alto —
+            // BfsFilesystem::repair rewrites the PDI itself).
+            let (mut efs, commit) = session.open_editable().unwrap();
+            let rep = efs.repair().unwrap();
+            assert!(!rep.fixes_applied.is_empty());
+            drop(efs);
+            commit.commit().unwrap();
+
+            // A fresh open is clean.
+            let mut fs = session.open().unwrap();
+            assert!(fs.fsck().unwrap().unwrap().is_clean());
+        }
+    }
 }

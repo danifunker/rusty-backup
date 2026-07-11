@@ -161,3 +161,22 @@ fn put_get_rm_round_trip_preserves_originals() {
         "OS9Boot corrupted by put/rm"
     );
 }
+
+#[test]
+fn fsck_reports_clean_on_real_fixture() {
+    // The real NitrOS-9 L2 system disk reserves its last track (allocated but
+    // referenced by no file); fsck must treat that as a benign warning, not an
+    // error. `run` panics on a non-zero exit, so a clean run implies no errors.
+    let tmp = tempfile::tempdir().unwrap();
+    let img = fixture_to(tmp.path());
+    let out = run(&["fsck", img.to_str().unwrap()]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("57 files / 3 dirs checked"),
+        "fsck summary missing:\n{combined}"
+    );
+}

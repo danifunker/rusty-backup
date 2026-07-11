@@ -34,16 +34,71 @@ use crate::model::edit_queue::{apply_edit, StagedEdit};
 /// containers). Errors abort the batch — the queue is left intact by the caller
 /// so the user can retry.
 pub fn apply_edits(session: &BrowseSession, edits: &[StagedEdit]) -> Result<()> {
+    apply_edits_reporting(session, edits, |_| {})
+}
+
+/// The `apply_edits` engine, with a per-edit callback for progress. The
+/// callback fires *after* each edit completes, carrying an [`EditProgress`]
+/// snapshot — this is what `spawn_apply` uses to update its [`ApplyStatus`].
+pub fn apply_edits_reporting(
+    session: &BrowseSession,
+    edits: &[StagedEdit],
+    mut on_progress: impl FnMut(EditProgress<'_>),
+) -> Result<()> {
     let (mut efs, commit) = session
         .open_editable()
         .context("opening source for editing")?;
-    for edit in edits {
+    for (index, edit) in edits.iter().enumerate() {
         apply_edit(efs.as_mut(), edit).context("applying a staged edit")?;
+        on_progress(EditProgress { index, edit });
     }
     efs.sync_metadata().context("writing filesystem metadata")?;
     drop(efs);
     commit.commit().context("committing container edits")?;
     Ok(())
+}
+
+/// One edit's completion snapshot, handed to the `apply_edits_reporting`
+/// callback so the progress modal can label + count what's happening.
+pub struct EditProgress<'a> {
+    pub index: usize,
+    pub edit: &'a StagedEdit,
+}
+
+/// Total bytes that will actually be written for an edit queue: the sum of
+/// every `AddFile.size` (deletes / renames / mkdir contribute nothing). This
+/// is what the ApplyStatus progress bar tracks against.
+fn edits_total_bytes(edits: &[StagedEdit]) -> u64 {
+    edits
+        .iter()
+        .map(|e| match e {
+            StagedEdit::AddFile { size, .. } => *size,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Human-readable label for one edit, shown as the "Writing X" line while
+/// that edit is in flight. Kept short and stable across edit shapes.
+fn edit_label(edit: &StagedEdit) -> String {
+    match edit {
+        StagedEdit::AddFile { parent, name, .. } => join_path(&parent.path, name),
+        StagedEdit::CreateDirectory { parent, name } => join_path(&parent.path, name),
+        StagedEdit::DeleteEntry { entry, .. } => format!("Delete {}", entry.path),
+        StagedEdit::DeleteRecursive { entry, .. } => format!("Delete {}", entry.path),
+        StagedEdit::Rename {
+            entry, new_name, ..
+        } => format!("Rename {} -> {}", entry.path, new_name),
+        StagedEdit::SetProdosType { entry, .. } => format!("Set ProDOS type: {}", entry.path),
+        StagedEdit::SetProdosAccess { entry, .. } => format!("Set ProDOS access: {}", entry.path),
+        StagedEdit::BlessFolder { entry } => format!("Bless {}", entry.path),
+        StagedEdit::WriteBootBlocks { .. } => "Write boot blocks".to_string(),
+        StagedEdit::SetTypeCreator { entry, .. } => {
+            format!("Set type/creator: {}", entry.path)
+        }
+        StagedEdit::SetPermissions { entry, .. } => format!("Set permissions: {}", entry.path),
+        StagedEdit::SetDates { entry, .. } => format!("Set dates: {}", entry.path),
+    }
 }
 
 /// Stage a cross-volume (image -> image) copy of `entries` from `src_fs` into
@@ -77,8 +132,110 @@ pub fn stage_copy(
         temp_dir,
         keep_dates,
         &mut edits,
+        None,
     )?;
     Ok(edits)
+}
+
+/// Shared state between the GUI and a [`spawn_stage_copy`] worker. Mirrors
+/// [`HostCopyStatus`]'s fields so the progress modal can render both with the
+/// same code; on success, `edits` carries the staged edit list back for the
+/// destination pane to push into its queue.
+#[derive(Default)]
+pub struct StageCopyStatus {
+    pub finished: bool,
+    pub error: Option<String>,
+    /// Staged edits ready to be pushed onto the destination queue.
+    pub edits: Vec<StagedEdit>,
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub current_file: String,
+    pub cancel_requested: bool,
+}
+
+/// Off-thread [`stage_copy`]: opens the source session on a worker, extracts
+/// each file to `temp_dir`, and hands the resulting [`StagedEdit`]s back via
+/// [`StageCopyStatus`]. Keeps large image->image copies from freezing the UI.
+pub fn spawn_stage_copy(
+    session: BrowseSession,
+    entries: Vec<FileEntry>,
+    dest_parent: FileEntry,
+    temp_dir: PathBuf,
+    keep_dates: bool,
+) -> Arc<Mutex<StageCopyStatus>> {
+    let status = Arc::new(Mutex::new(StageCopyStatus::default()));
+    let status_thread = Arc::clone(&status);
+    thread::spawn(move || {
+        let result = run_stage_copy(
+            session,
+            &entries,
+            &dest_parent,
+            &temp_dir,
+            keep_dates,
+            &status_thread,
+        );
+        if let Ok(mut g) = status_thread.lock() {
+            match result {
+                Ok(edits) => g.edits = edits,
+                Err(e) => g.error = Some(format!("{e:#}")),
+            }
+            g.finished = true;
+        }
+    });
+    status
+}
+
+fn run_stage_copy(
+    session: BrowseSession,
+    entries: &[FileEntry],
+    dest_parent: &FileEntry,
+    temp_dir: &Path,
+    keep_dates: bool,
+    status: &Arc<Mutex<StageCopyStatus>>,
+) -> Result<Vec<StagedEdit>> {
+    let mut fs = session.open().context("opening source image")?;
+    let (files_total, bytes_total) = scan_image_entries_stage(fs.as_mut(), entries)?;
+    if let Ok(mut g) = status.lock() {
+        g.files_total = files_total;
+        g.bytes_total = bytes_total;
+    }
+    let mut edits = Vec::new();
+    stage_copy_into(
+        fs.as_mut(),
+        entries,
+        dest_parent,
+        temp_dir,
+        keep_dates,
+        &mut edits,
+        Some(status),
+    )?;
+    Ok(edits)
+}
+
+/// Same tally as `scan_image_entries` but keyed to [`StageCopyStatus`]'s
+/// cancel gate — kept separate so its `?`s bubble the same way.
+fn scan_image_entries_stage(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+) -> Result<(usize, u64)> {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries {
+        if entry.is_directory() {
+            let children = fs
+                .list_directory(entry)
+                .with_context(|| format!("listing '{}' for scan", entry.name))?;
+            let (f, b) = scan_image_entries_stage(fs, &children)?;
+            files += f;
+            bytes += b;
+        } else if entry.is_file() {
+            files += 1;
+            bytes = bytes.saturating_add(entry.size);
+        }
+    }
+    Ok((files, bytes))
 }
 
 fn stage_copy_into(
@@ -88,8 +245,14 @@ fn stage_copy_into(
     temp_dir: &Path,
     keep_dates: bool,
     edits: &mut Vec<StagedEdit>,
+    status: Option<&Arc<Mutex<StageCopyStatus>>>,
 ) -> Result<()> {
     for entry in entries {
+        if let Some(s) = status {
+            if s.lock().map(|g| g.cancel_requested).unwrap_or(false) {
+                return Err(anyhow::anyhow!("copy cancelled"));
+            }
+        }
         match entry.entry_type {
             EntryType::Directory => {
                 edits.push(StagedEdit::CreateDirectory {
@@ -111,9 +274,15 @@ fn stage_copy_into(
                     temp_dir,
                     keep_dates,
                     edits,
+                    status,
                 )?;
             }
             EntryType::File => {
+                if let Some(s) = status {
+                    if let Ok(mut g) = s.lock() {
+                        g.current_file = entry.path.clone();
+                    }
+                }
                 let (mut blob, blob_path) = tempfile::Builder::new()
                     .prefix("blob")
                     .tempfile_in(temp_dir)
@@ -154,6 +323,13 @@ fn stage_copy_into(
                         None
                     },
                 });
+
+                if let Some(s) = status {
+                    if let Ok(mut g) = s.lock() {
+                        g.files_done = g.files_done.saturating_add(1);
+                        g.bytes_done = g.bytes_done.saturating_add(size);
+                    }
+                }
             }
             EntryType::Symlink | EntryType::Special => {
                 // Not representable as a plain cross-volume copy; skip.
@@ -255,21 +431,40 @@ pub enum HostCopyJob {
 }
 
 /// Shared state between the GUI and the [`spawn_host_copy`] worker.
+///
+/// Byte- and file-level counters are updated live so the Commander progress
+/// modal can render a percentage + rate + ETA. `files_total` / `bytes_total`
+/// are seeded from a pre-scan of the source tree before the copy starts; a
+/// value of 0 means "unknown, show a spinner instead".
 #[derive(Default)]
 pub struct HostCopyStatus {
     pub finished: bool,
     pub error: Option<String>,
-    /// Number of files written (directories aren't counted).
+    /// Number of files written so far (directories aren't counted). Bumps
+    /// after each file completes.
     pub copied: usize,
+    /// Total files the worker plans to copy, from the pre-scan. 0 until set.
+    pub files_total: usize,
+    /// Bytes written so far. Bumped after each file completes.
+    pub bytes_done: u64,
+    /// Total bytes the worker plans to copy, from the pre-scan. 0 until set.
+    pub bytes_total: u64,
+    /// The file currently being written, for the modal's "Copying X" line.
+    pub current_file: String,
+    /// Set by the GUI to ask the worker to stop at the next file boundary.
+    /// When honoured, the worker sets `error` to a cancellation message and
+    /// finishes early.
+    pub cancel_requested: bool,
 }
 
 /// Run a [`HostCopyJob`] on a worker thread (host writes are immediate, not
-/// staged). The returned status flips `finished` when done.
+/// staged). The returned status flips `finished` when done, with live
+/// byte/file counters the Commander progress modal reads each frame.
 pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     let status = Arc::new(Mutex::new(HostCopyStatus::default()));
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
-        let result = run_host_copy(job);
+        let result = run_host_copy(job, &status_thread);
         if let Ok(mut g) = status_thread.lock() {
             match result {
                 Ok(n) => g.copied = n,
@@ -281,7 +476,7 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
     status
 }
 
-fn run_host_copy(job: HostCopyJob) -> Result<usize> {
+fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
     match job {
         HostCopyJob::ImageToHost {
             session,
@@ -290,12 +485,93 @@ fn run_host_copy(job: HostCopyJob) -> Result<usize> {
             fork_mode,
         } => {
             let mut fs = session.open().context("opening source image")?;
-            copy_image_entries_to_host(fs.as_mut(), &entries, &dest_dir, fork_mode)
+            let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
+            if let Ok(mut g) = status.lock() {
+                g.files_total = files_total;
+                g.bytes_total = bytes_total;
+            }
+            copy_image_entries_to_host(fs.as_mut(), &entries, &dest_dir, fork_mode, status)
         }
         HostCopyJob::HostToHost { entries, dest_dir } => {
-            copy_host_entries_to_host(&entries, &dest_dir)
+            let (files_total, bytes_total) = scan_host_entries(&entries);
+            if let Ok(mut g) = status.lock() {
+                g.files_total = files_total;
+                g.bytes_total = bytes_total;
+            }
+            copy_host_entries_to_host(&entries, &dest_dir, status)
         }
     }
+}
+
+/// True if the GUI has flipped `cancel_requested`. Checked at every file
+/// boundary; when set, the worker returns early with a cancellation error.
+fn is_cancelled(status: &Arc<Mutex<HostCopyStatus>>) -> bool {
+    status.lock().map(|g| g.cancel_requested).unwrap_or(false)
+}
+
+fn cancelled_err() -> anyhow::Error {
+    anyhow::anyhow!("copy cancelled")
+}
+
+/// Recursively tally `entries`' file count + byte count on the source
+/// filesystem, so the modal can render a meaningful percentage.
+fn scan_image_entries(fs: &mut dyn Filesystem, entries: &[FileEntry]) -> Result<(usize, u64)> {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries {
+        if entry.is_directory() {
+            let children = fs
+                .list_directory(entry)
+                .with_context(|| format!("listing '{}'", entry.name))?;
+            let (f, b) = scan_image_entries(fs, &children)?;
+            files += f;
+            bytes += b;
+        } else if entry.is_file() {
+            files += 1;
+            bytes = bytes.saturating_add(entry.size);
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn scan_host_entries(entries: &[FileEntry]) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in entries {
+        let path = PathBuf::from(&entry.path);
+        if entry.is_directory() {
+            let (f, b) = scan_host_dir(&path);
+            files += f;
+            bytes += b;
+        } else if entry.is_file() {
+            files += 1;
+            bytes = bytes.saturating_add(entry.size);
+        }
+    }
+    (files, bytes)
+}
+
+fn scan_host_dir(dir: &Path) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (files, bytes);
+    };
+    for dent in rd.flatten() {
+        let Ok(meta) = dent.path().symlink_metadata() else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_dir() {
+            let (f, b) = scan_host_dir(&dent.path());
+            files += f;
+            bytes += b;
+        } else if ft.is_file() {
+            files += 1;
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    (files, bytes)
 }
 
 /// Extract image `entries` into `dest_dir`, recursing directories and
@@ -306,49 +582,86 @@ fn copy_image_entries_to_host(
     entries: &[FileEntry],
     dest_dir: &Path,
     fork_mode: ResourceForkMode,
+    status: &Arc<Mutex<HostCopyStatus>>,
 ) -> Result<usize> {
     let mut count = 0;
     for entry in entries {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
         if entry.is_directory() {
             let sub = dest_dir.join(&entry.name);
             std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
             let children = fs
                 .list_directory(entry)
                 .with_context(|| format!("listing '{}'", entry.name))?;
-            count += copy_image_entries_to_host(fs, &children, &sub, fork_mode)?;
+            count += copy_image_entries_to_host(fs, &children, &sub, fork_mode, status)?;
         } else if entry.is_file() {
+            if let Ok(mut g) = status.lock() {
+                g.current_file = entry.path.clone();
+            }
             export_file_with_fork(fs, entry, dest_dir, &safe_name(entry), fork_mode)
                 .with_context(|| format!("extracting '{}'", entry.name))?;
             count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = count;
+                g.bytes_done = g.bytes_done.saturating_add(entry.size);
+            }
         }
     }
     Ok(count)
 }
 
 /// Copy host `entries` into `dest_dir`, recursing directories.
-fn copy_host_entries_to_host(entries: &[FileEntry], dest_dir: &Path) -> Result<usize> {
+fn copy_host_entries_to_host(
+    entries: &[FileEntry],
+    dest_dir: &Path,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<usize> {
     let mut count = 0;
     for entry in entries {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
         let src = PathBuf::from(&entry.path);
         let dst = dest_dir.join(&entry.name);
         if entry.is_directory() {
-            count += copy_host_dir(&src, &dst)?;
+            copy_host_dir(&src, &dst, &mut count, status)?;
         } else if entry.is_file() {
-            std::fs::copy(&src, &dst)
+            if let Ok(mut g) = status.lock() {
+                g.current_file = entry.path.clone();
+            }
+            let bytes = std::fs::copy(&src, &dst)
                 .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
             count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = count;
+                g.bytes_done = g.bytes_done.saturating_add(bytes);
+            }
         }
     }
     Ok(count)
 }
 
-fn copy_host_dir(src: &Path, dst: &Path) -> Result<usize> {
+/// Recurse into `src`, mirroring its file tree under `dst`. `count` is the
+/// single running total across the whole batch — each file bump feeds both
+/// the caller's return value and the progress modal's `copied` counter. Kept
+/// as one counter (not one per level) so the modal shows a monotonically
+/// increasing "N of M" instead of double-counting subdirectories.
+fn copy_host_dir(
+    src: &Path,
+    dst: &Path,
+    count: &mut usize,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
-    let mut count = 0;
     for dent in std::fs::read_dir(src)
         .with_context(|| format!("reading {}", src.display()))?
         .flatten()
     {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
         let meta = match dent.path().symlink_metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -356,31 +669,67 @@ fn copy_host_dir(src: &Path, dst: &Path) -> Result<usize> {
         let ft = meta.file_type();
         let child_dst = dst.join(dent.file_name());
         if ft.is_dir() {
-            count += copy_host_dir(&dent.path(), &child_dst)?;
+            copy_host_dir(&dent.path(), &child_dst, count, status)?;
         } else if ft.is_file() {
-            std::fs::copy(dent.path(), &child_dst)
+            if let Ok(mut g) = status.lock() {
+                g.current_file = dent.path().display().to_string();
+            }
+            let bytes = std::fs::copy(dent.path(), &child_dst)
                 .with_context(|| format!("copying {}", dent.path().display()))?;
-            count += 1;
+            *count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = *count;
+                g.bytes_done = g.bytes_done.saturating_add(bytes);
+            }
         }
     }
-    Ok(count)
+    Ok(())
 }
 
 /// Shared state between the GUI and the [`spawn_apply`] worker.
+///
+/// Byte/file counters drive the same Commander progress modal
+/// [`HostCopyStatus`] does; `bytes_total` is the sum of every `AddFile` edit
+/// in the queue (deletes / renames / mkdir contribute nothing) so the bar
+/// reflects the actual write cost, not the raw edit count.
 #[derive(Default)]
 pub struct ApplyStatus {
     pub finished: bool,
     /// Set when the apply failed; the pane surfaces it and keeps the queue.
     pub error: Option<String>,
+    /// Edits completed so far (any kind).
+    pub edits_done: usize,
+    /// Total edits in the queue, from a pre-scan.
+    pub edits_total: usize,
+    /// Bytes written so far (only `AddFile` edits contribute).
+    pub bytes_done: u64,
+    /// Total bytes to write, summed over every `AddFile` edit's `size`.
+    pub bytes_total: u64,
+    /// The edit currently being applied, for the modal's "Writing X" line.
+    pub current_edit: String,
 }
 
 /// Run [`apply_edits`] on a worker thread. The returned status flips `finished`
-/// when done, with `error` set on failure.
+/// when done, with `error` set on failure, and updates per-edit counters live
+/// so the Commander progress modal can render percent + rate + ETA.
 pub fn spawn_apply(session: BrowseSession, edits: Vec<StagedEdit>) -> Arc<Mutex<ApplyStatus>> {
     let status = Arc::new(Mutex::new(ApplyStatus::default()));
+    if let Ok(mut g) = status.lock() {
+        g.edits_total = edits.len();
+        g.bytes_total = edits_total_bytes(&edits);
+    }
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
-        let result = apply_edits(&session, &edits);
+        let status_cb = Arc::clone(&status_thread);
+        let result = apply_edits_reporting(&session, &edits, move |p| {
+            if let Ok(mut g) = status_cb.lock() {
+                g.edits_done = p.index + 1;
+                g.current_edit = edit_label(p.edit);
+                if let StagedEdit::AddFile { size, .. } = p.edit {
+                    g.bytes_done = g.bytes_done.saturating_add(*size);
+                }
+            }
+        });
         if let Ok(mut g) = status_thread.lock() {
             if let Err(e) = result {
                 g.error = Some(format!("{e:#}"));
@@ -416,6 +765,7 @@ fn remote_apply(
     image_path: &str,
     partition: Option<u32>,
     edits: &[StagedEdit],
+    mut on_progress: impl FnMut(EditProgress<'_>),
 ) -> Result<()> {
     use crate::remote::RemoteSession;
     let mut session = RemoteSession::connect(addr).context("connecting to the daemon")?;
@@ -423,7 +773,7 @@ fn remote_apply(
         .open_session(image_path, partition)
         .context("opening a remote write session")?;
     let staged = (|| -> Result<()> {
-        for edit in edits {
+        for (index, edit) in edits.iter().enumerate() {
             match edit {
                 StagedEdit::AddFile {
                     parent,
@@ -466,6 +816,7 @@ fn remote_apply(
                     ));
                 }
             }
+            on_progress(EditProgress { index, edit });
         }
         session.apply(sid).context("applying the remote edits")?;
         Ok(())
@@ -485,9 +836,22 @@ pub fn spawn_remote_apply(
     edits: Vec<StagedEdit>,
 ) -> Arc<Mutex<ApplyStatus>> {
     let status = Arc::new(Mutex::new(ApplyStatus::default()));
+    if let Ok(mut g) = status.lock() {
+        g.edits_total = edits.len();
+        g.bytes_total = edits_total_bytes(&edits);
+    }
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
-        let result = remote_apply(&addr, &image_path, partition, &edits);
+        let status_cb = Arc::clone(&status_thread);
+        let result = remote_apply(&addr, &image_path, partition, &edits, move |p| {
+            if let Ok(mut g) = status_cb.lock() {
+                g.edits_done = p.index + 1;
+                g.current_edit = edit_label(p.edit);
+                if let StagedEdit::AddFile { size, .. } = p.edit {
+                    g.bytes_done = g.bytes_done.saturating_add(*size);
+                }
+            }
+        });
         if let Ok(mut g) = status_thread.lock() {
             if let Err(e) = result {
                 g.error = Some(format!("{e:#}"));
@@ -839,11 +1203,13 @@ mod tests {
         let entries = fs.list_directory(&root).unwrap();
 
         let out = tempfile::tempdir().unwrap();
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
         let n = copy_image_entries_to_host(
             fs.as_mut(),
             &entries,
             out.path(),
             ResourceForkMode::DataForkOnly,
+            &status,
         )
         .expect("extract");
         assert_eq!(n, 2);
@@ -864,7 +1230,8 @@ mod tests {
 
         let entries = host_children(&src.path().to_string_lossy());
         let dest = tempfile::tempdir().unwrap();
-        let n = copy_host_entries_to_host(&entries, dest.path()).expect("copy");
+        let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+        let n = copy_host_entries_to_host(&entries, dest.path(), &status).expect("copy");
         assert_eq!(n, 2);
         assert_eq!(std::fs::read(dest.path().join("f.txt")).unwrap(), b"data");
         assert_eq!(

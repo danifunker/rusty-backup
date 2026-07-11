@@ -73,10 +73,15 @@ pub(super) fn analyze_partitions(
             push_skip(&mut sizing, 0);
             continue;
         }
-        if sector_by_sector || part.is_extended_container || is_superfloppy {
+        if sector_by_sector || part.is_extended_container {
             push_skip(&mut sizing, part.size_bytes);
             continue;
         }
+        // Superfloppy (partition-less) volumes go through compaction too: the
+        // filesystem fills the whole image, so the per-fs compact reader packs /
+        // zero-fills it exactly as it would a real partition. Filesystems with no
+        // compact reader fall back to the raw read below (try_compact returns None).
+        let _ = is_superfloppy;
 
         log(
             progress,

@@ -22,8 +22,13 @@ pub mod efs_resize;
 pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
+pub mod exfat_fsck;
 pub mod ext;
+pub mod ext_csum;
+pub mod ext_format;
+pub mod ext_fsck;
 pub mod fat;
+pub mod fat_fsck;
 pub mod filesystem;
 pub mod fork_export;
 pub mod fsck;
@@ -54,6 +59,7 @@ pub mod mfs;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
+pub mod ntfs_fsck;
 mod ntfs_tables;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
@@ -61,6 +67,7 @@ pub mod os9;
 pub mod patch;
 pub mod pfs3;
 pub mod pfs3_clone;
+pub mod pfs3_fsck;
 pub mod prodos;
 pub mod prodos_types;
 pub mod qdos;
@@ -69,6 +76,7 @@ pub mod reiserfs;
 pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
+pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
 pub mod tree;
@@ -1735,6 +1743,14 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // UFS/FFS edit mirrors the read dispatch above (0x00 arm of
+                // open_filesystem). The EditableFilesystem impl is fixture-
+                // tested (create/rename/delete + fsck-clean); this arm is what
+                // makes it reachable.
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for filesystem type '{fs_type}'"
                 ))),
@@ -1786,6 +1802,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ufs" => Ok(Box::new(ufs::UfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2214,6 +2234,15 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "Alto BFS"
             | "Pilot/Cedar"
             | "lisafs"
+            // 8-bit / retro floppy filesystems the engine auto-detects at
+            // byte 0. These were previously omitted, so the inspect grid and
+            // Commander silently refused to browse them.
+            | "Acorn DFS"
+            | "Atari DOS"
+            | "CBM DOS"
+            | "DragonDOS"
+            | "OS-9"
+            | "RS-DOS"
             | "Unknown"
     )
 }
@@ -2264,12 +2293,98 @@ pub fn is_classic_hfs(ptype: u8, type_string: Option<&str>, type_name: &str) -> 
 }
 
 /// True for a partition type that supports filesystem checking (fsck): classic
-/// HFS (`0xAF` or APM `Apple_HFS`) and the AmigaDOS OFS/FFS variants.
+/// HFS (`0xAF` or APM `Apple_HFS`), the FAT12/16/32 type bytes, and the
+/// AmigaDOS OFS/FFS variants.
+///
+/// This only covers the cases identifiable from the partition-type byte / APM
+/// string alone. The Unix filesystems whose family is only known after a
+/// content probe (SGI EFS, UFS/FFS, XFS, JFS, and HFS+) are matched by
+/// [`is_checkable_fs_name`] against the resolved `type_name` instead.
+///
+/// Note `0x07` (exFAT / NTFS / HPFS) is deliberately excluded — neither exFAT
+/// nor NTFS has an fsck driver yet, and their shared type byte can't tell them
+/// apart anyway.
 pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
         return true;
     }
-    type_str.map(is_amiga_dos_type).unwrap_or(false)
+    // ProDOS (`prodos::fsck`): MBR type byte 0xA8, or the APM DosType strings.
+    if ptype == 0xA8 || matches!(type_str, Some("Apple_PRODOS") | Some("Apple_ProDOS")) {
+        return true;
+    }
+    // FAT12/16/32 partition types (same set as `fs_name_for`'s FAT arm).
+    if matches!(
+        ptype,
+        0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E | 0x14 | 0x16 | 0x1B | 0x1C | 0x1E
+    ) {
+        return true;
+    }
+    // Amiga RDB filesystems identified by their 4-byte DosType string: AFFS
+    // (`affs_fsck`), PFS3 (`pfs3_fsck`), and SFS (`sfs_fsck`) implement `fsck()`.
+    type_str
+        .map(|s| is_amiga_dos_type(s) || is_amiga_pfs3_type(s) || is_amiga_sfs_type(s))
+        .unwrap_or(false)
+}
+
+/// True when a *resolved* filesystem-family name (the `type_name` the inspect
+/// grid shows after content-probing — e.g. `"SGI EFS"`, `"XFS"`, `"UFS"`,
+/// `"JFS2"`, `"HFS+"`) names a filesystem whose driver implements `fsck()`.
+///
+/// These all reach the "Check" button through the browsable path but are not
+/// identifiable by partition-type byte alone (0x83 "Linux" and the SGI dvh
+/// bytes are shared across ext / btrfs / xfs / ufs / jfs), so the button gate
+/// consults this in addition to [`is_checkable_type`]. Every driver named here
+/// returns `Some` from `Filesystem::fsck()`: EFS (`efs_fsck`), UFS (`ufs_fsck`),
+/// XFS (R1–R8), JFS (check-only), HFS/HFS+, FAT12/16/32, and exFAT.
+///
+/// The FAT family and exFAT reach the button through the *name* path: FAT has
+/// several partition-type bytes but exFAT shares `0x07` with NTFS/HPFS, so the
+/// byte alone can't distinguish them — the resolved `type_name` (`"FAT16"`,
+/// `"exFAT"`, …) does. Both `"FAT"` and `"EXFAT"` contain "FAT", so a single
+/// token covers them. NTFS also shares `0x07` and needs its own token here
+/// (its resolved name is `"NTFS"` / `"NTFS 3.1"`).
+pub fn is_checkable_fs_name(type_name: &str) -> bool {
+    let n = type_name.to_ascii_uppercase();
+    ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS"]
+        .iter()
+        .any(|tok| n.contains(tok))
+}
+
+/// True for the retro superfloppy / X68k filesystems whose driver implements
+/// `fsck()` but which are identified only by their resolved `type_name` /
+/// dispatch string (not a partition-type byte or APM string): CBM DOS,
+/// DragonDOS, RS-DOS, Acorn DFS, Human68k, ProDOS, Atari DOS, Apple
+/// DOS 3.3, OS-9, and CP/M (matched by its `cpm:<preset>` dispatch string).
+///
+/// Kept separate from [`is_checkable_fs_name`] because those tokens
+/// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
+/// so these use exact names. Human68k (floppy `"Human68k (FAT)"` and X68k HDD
+/// `"X68k Human68k (…)"`) is matched by its `"human68k"` dispatch string, which
+/// both shapes carry. ProDOS reaches this path as a bare `.po`/`.hdv`/`.2mg`
+/// superfloppy (`ptype == 0`, `type_name == "ProDOS"`); partition-hosted ProDOS
+/// is covered by [`is_checkable_type`]. Every filesystem named here is
+/// factory-reachable, so the generic `fsck_runner` opens and checks/repairs it.
+pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
+    if type_string == Some("human68k") {
+        return true;
+    }
+    // CP/M has no on-disk signature, so it is dispatched by a `cpm:<preset>`
+    // type string (via `--fs-type`); its `fsck()` is directory-based.
+    if type_string.is_some_and(|s| s.starts_with("cpm:")) {
+        return true;
+    }
+    ptype == 0
+        && matches!(
+            type_name,
+            "CBM DOS"
+                | "DragonDOS"
+                | "RS-DOS"
+                | "Acorn DFS"
+                | "ProDOS"
+                | "Atari DOS"
+                | "DOS 3.3"
+                | "OS-9"
+        )
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -2630,6 +2745,12 @@ mod tests {
             "Alto BFS",
             "Pilot/Cedar",
             "lisafs",
+            "Acorn DFS",
+            "Atari DOS",
+            "CBM DOS",
+            "DragonDOS",
+            "OS-9",
+            "RS-DOS",
         ] {
             assert!(
                 is_browsable_superfloppy(0, hint),
@@ -2637,6 +2758,33 @@ mod tests {
             );
             assert!(partition_is_browsable(0, None, hint), "hint {hint:?}");
         }
+    }
+
+    #[test]
+    fn checkable_retro_fs_gate() {
+        // Factory-reachable retro filesystems that implement fsck().
+        assert!(is_checkable_retro_fs(0, None, "CBM DOS"));
+        assert!(is_checkable_retro_fs(0, None, "DragonDOS"));
+        assert!(is_checkable_retro_fs(0, None, "RS-DOS"));
+        assert!(is_checkable_retro_fs(0, None, "Acorn DFS"));
+        // Human68k (floppy + X68k HDD) via its dispatch string.
+        assert!(is_checkable_retro_fs(0, Some("human68k"), "Human68k (FAT)"));
+        assert!(is_checkable_retro_fs(
+            0x01,
+            Some("human68k"),
+            "X68k Human68k (MYVOL)"
+        ));
+        // ProDOS as a bare superfloppy (partition-hosted ProDOS goes through
+        // is_checkable_type via 0xA8 / Apple_PRODOS).
+        assert!(is_checkable_retro_fs(0, None, "ProDOS"));
+        // Atari DOS 2 (single-density floppy) now fscks.
+        assert!(is_checkable_retro_fs(0, None, "Atari DOS"));
+        // Apple DOS 3.3 (140 KB floppy) now fscks.
+        assert!(is_checkable_retro_fs(0, None, "DOS 3.3"));
+        // OS-9 / NitrOS-9 RBF now fscks.
+        assert!(is_checkable_retro_fs(0, None, "OS-9"));
+        // "DFS" must not substring-match "ADFS" (ADFS has no fsck).
+        assert!(!is_checkable_retro_fs(0, None, "ADFS"));
     }
 
     #[test]
@@ -2655,8 +2803,36 @@ mod tests {
         assert!(is_checkable_type(0xAF, None));
         assert!(is_checkable_type(0, Some("Apple_HFS")));
         assert!(is_checkable_type(0, Some("DOS\\3")));
-        assert!(!is_checkable_type(0x0B, None)); // FAT not checkable
+        assert!(is_checkable_type(0, Some("PFS\\3"))); // PFS3 fsck driver
+        assert!(is_checkable_type(0, Some("PDS\\3")));
+        assert!(is_checkable_type(0, Some("SFS\\0"))); // SFS fsck driver
+        assert!(is_checkable_type(0, Some("SFS\\2")));
+        assert!(is_checkable_type(0x0B, None)); // FAT32 now checkable
+        assert!(is_checkable_type(0x06, None)); // FAT16 now checkable
+        assert!(is_checkable_type(0xA8, None)); // ProDOS (MBR) now checkable
+        assert!(is_checkable_type(0, Some("Apple_PRODOS"))); // ProDOS (APM)
+        assert!(is_checkable_type(0, Some("Apple_ProDOS")));
+        assert!(!is_checkable_type(0x07, None)); // exFAT/NTFS: no fsck driver
         assert!(!is_checkable_type(0, Some("Apple_Driver_IOKit")));
+    }
+
+    #[test]
+    fn checkable_fs_name_covers_probed_unix_families() {
+        // The resolved family names the inspect grid shows for content-probed
+        // Linux (0x83) and SGI (dvh) partitions, plus HFS+ and NTFS.
+        for name in [
+            "SGI EFS", "EFS", "SGI XFS", "XFS", "UFS", "JFS2", "HFS+", "HFS/HFS+", "FAT12",
+            "FAT16", "FAT32", "exFAT", "ext2", "ext3", "ext4", "NTFS", "NTFS 3.1",
+        ] {
+            assert!(is_checkable_fs_name(name), "{name} should be checkable");
+        }
+        // Filesystems without an fsck() driver stay off the button.
+        for name in ["btrfs", "ReiserFS", "ProDOS"] {
+            assert!(
+                !is_checkable_fs_name(name),
+                "{name} has no fsck; must not enable the button"
+            );
+        }
     }
 
     /// Build a 4 KiB buffer whose first 4 bytes are the XFS superblock magic.
