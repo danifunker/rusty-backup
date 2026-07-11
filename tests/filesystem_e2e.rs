@@ -1800,6 +1800,30 @@ fn test_prodos_list_and_recurse() {
 }
 
 #[test]
+fn test_prodos_fsck_clean_on_real_volume() {
+    // Independent oracle: a real Apple IIgs ProDOS volume must fsck clean. This
+    // volume includes an extended (GS/OS forked) file (TSTFLDR/TEST.TXT, storage
+    // type 5) whose data + resource forks the bitmap walk must follow — a
+    // regression guard so fsck never mistakes live fork blocks for leaked ones
+    // (which --repair would otherwise free, corrupting the volume).
+    use rusty_backup::fs::filesystem::Filesystem;
+
+    let img = load_fixture("test_prodos.hdv.zst");
+    let mut fs = rusty_backup::fs::prodos::ProDosFilesystem::open(Cursor::new(img), 0).unwrap();
+    let res = fs
+        .fsck()
+        .expect("ProDOS implements fsck")
+        .expect("fsck ran");
+    assert!(
+        res.is_clean(),
+        "real ProDOS volume should fsck clean, got: {:?}",
+        res.errors
+    );
+    assert_eq!(res.stats.files_checked, 6);
+    assert_eq!(res.stats.directories_checked, 3);
+}
+
+#[test]
 fn test_prodos_type_codes_populated() {
     // Verify list_directory populates FileEntry::type_code from the new
     // prodos_types table rather than returning raw hex codes.

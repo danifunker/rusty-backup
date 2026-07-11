@@ -51,7 +51,7 @@ missing capability on a driver that already round-trips.
 | MFS | No | Yes | No | **create + fsck** |
 | PFS3 | Yes | Yes | **Yes** | — **fsck done** (`pfs3_fsck.rs`: directory-tree + anode-chain walk reconciles both the data and reserved allocation bitmaps + free counters; rebuild is withheld when structural damage would make the walk incomplete) |
 | SFS | Yes | Yes (single-leaf) | **Yes** | **multi-leaf edit** (fsck done — `sfs_fsck.rs`: metadata-block checksums + AdminSpaceContainer chain + object-tree walk reconcile the single block bitmap; repair is bitmap-only, safe at any btree depth) |
-| ProDOS | No | Yes | validate | **create + check/repair** |
+| ProDOS | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs prodos` (boot + 4-block volume directory + bitmap; 8 KiB–32 MiB). fsck: volume-bitmap reconciliation against the directory-tree + file-index walk (seedling/sapling/tree + subdirs), byte-verified self-consistent; repair rebuilds the bitmap, withheld on cross-links / past-end blocks / directory-chain cycles. |
 | Apple DOS 3.3 | No | Yes | No | **create + fsck** |
 | CBM DOS | Yes | Yes | **Yes** | — **fsck done** (VALIDATE; byte-verified vs `c1541 validate`) |
 | Atari DOS 2 | test-only | Yes | No | **create + fsck** |
@@ -169,8 +169,12 @@ The order that buys the most capability per unit effort:
    Inspect Check button light up automatically); Alto reaches `rb-cli fsck` via
    a dedicated Alto branch in the fsck verb (its packs open through the
    `open_pack` container path, not the factory), with `--repair` in place for
-   `.pdi` inputs. Remaining here: create-blank for Atari / OS-9 / CP/M /
-   ProDOS-CLI, and their fsck.
+   `.pdi` inputs. **ProDOS create-blank + fsck now done too:**
+   `rb-cli new --fs prodos` formats a bare volume (boot + 4-block volume
+   directory + bitmap), and `prodos.rs` reconciles the volume bitmap against
+   the directory-tree/file-index walk (block-factory-reachable, so `rb-cli
+   fsck` + the Inspect Check/Repair button light up automatically). Remaining
+   here: create-blank + fsck for Atari DOS, Apple DOS 3.3, CP/M, and OS-9.
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,

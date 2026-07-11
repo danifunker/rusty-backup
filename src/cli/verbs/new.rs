@@ -44,6 +44,12 @@ pub enum FsKind {
     /// ext4 (Linux). Extents + metadata_csum (crc32c) + a jbd2 journal; 256-byte
     /// inodes, 4 KiB blocks, minimum ~8 MiB.
     Ext4,
+    /// ProDOS (Apple II / IIgs). A bare volume with boot blocks, a 4-block
+    /// volume directory, and a bitmap; size rounds to 512-byte blocks, from a
+    /// 8 KiB minimum up to a ~32 MiB (65535-block) maximum. The name is
+    /// uppercased and must follow ProDOS rules: up to 15 of A-Z / 0-9 / '.',
+    /// with a leading letter.
+    Prodos,
 }
 
 #[derive(Debug, Args)]
@@ -52,7 +58,7 @@ pub struct NewArgs {
     pub image: PathBuf,
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
-    /// ext (alias ext2), ext3, ext4.
+    /// ext (alias ext2), ext3, ext4, prodos.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -248,6 +254,9 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
         FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
         FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
+        FsKind::Prodos => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            crate::fs::prodos::create_blank_prodos(size, name)
+        }),
     }
 }
 

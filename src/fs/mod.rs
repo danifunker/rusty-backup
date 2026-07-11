@@ -2308,6 +2308,10 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
     if ptype == 0xAF || matches!(type_str, Some("Apple_HFS")) {
         return true;
     }
+    // ProDOS (`prodos::fsck`): MBR type byte 0xA8, or the APM DosType strings.
+    if ptype == 0xA8 || matches!(type_str, Some("Apple_PRODOS") | Some("Apple_ProDOS")) {
+        return true;
+    }
     // FAT12/16/32 partition types (same set as `fs_name_for`'s FAT arm).
     if matches!(
         ptype,
@@ -2349,19 +2353,25 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
 /// True for the retro superfloppy / X68k filesystems whose driver implements
 /// `fsck()` but which are identified only by their resolved `type_name` /
 /// dispatch string (not a partition-type byte or APM string): CBM DOS,
-/// DragonDOS, RS-DOS, Acorn DFS, and Human68k.
+/// DragonDOS, RS-DOS, Acorn DFS, Human68k, and ProDOS.
 ///
 /// Kept separate from [`is_checkable_fs_name`] because those tokens
 /// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
 /// so these use exact names. Human68k (floppy `"Human68k (FAT)"` and X68k HDD
 /// `"X68k Human68k (…)"`) is matched by its `"human68k"` dispatch string, which
-/// both shapes carry. Every filesystem named here is factory-reachable, so the
-/// generic `fsck_runner` opens and checks/repairs it.
+/// both shapes carry. ProDOS reaches this path as a bare `.po`/`.hdv`/`.2mg`
+/// superfloppy (`ptype == 0`, `type_name == "ProDOS"`); partition-hosted ProDOS
+/// is covered by [`is_checkable_type`]. Every filesystem named here is
+/// factory-reachable, so the generic `fsck_runner` opens and checks/repairs it.
 pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
     if type_string == Some("human68k") {
         return true;
     }
-    ptype == 0 && matches!(type_name, "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS")
+    ptype == 0
+        && matches!(
+            type_name,
+            "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS" | "ProDOS"
+        )
 }
 
 /// Resolve the actual HFS filesystem variant for an "Apple_HFS" APM partition.
@@ -2751,6 +2761,9 @@ mod tests {
             Some("human68k"),
             "X68k Human68k (MYVOL)"
         ));
+        // ProDOS as a bare superfloppy (partition-hosted ProDOS goes through
+        // is_checkable_type via 0xA8 / Apple_PRODOS).
+        assert!(is_checkable_retro_fs(0, None, "ProDOS"));
         // Non-fsck retro filesystems must NOT be gated.
         assert!(!is_checkable_retro_fs(0, None, "Atari DOS"));
         assert!(!is_checkable_retro_fs(0, None, "OS-9"));
@@ -2780,6 +2793,9 @@ mod tests {
         assert!(is_checkable_type(0, Some("SFS\\2")));
         assert!(is_checkable_type(0x0B, None)); // FAT32 now checkable
         assert!(is_checkable_type(0x06, None)); // FAT16 now checkable
+        assert!(is_checkable_type(0xA8, None)); // ProDOS (MBR) now checkable
+        assert!(is_checkable_type(0, Some("Apple_PRODOS"))); // ProDOS (APM)
+        assert!(is_checkable_type(0, Some("Apple_ProDOS")));
         assert!(!is_checkable_type(0x07, None)); // exFAT/NTFS: no fsck driver
         assert!(!is_checkable_type(0, Some("Apple_Driver_IOKit")));
     }
