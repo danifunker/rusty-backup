@@ -2353,8 +2353,8 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
 /// True for the retro superfloppy / X68k filesystems whose driver implements
 /// `fsck()` but which are identified only by their resolved `type_name` /
 /// dispatch string (not a partition-type byte or APM string): CBM DOS,
-/// DragonDOS, RS-DOS, Acorn DFS, Human68k, ProDOS, Atari DOS, and Apple
-/// DOS 3.3.
+/// DragonDOS, RS-DOS, Acorn DFS, Human68k, ProDOS, Atari DOS, Apple
+/// DOS 3.3, and CP/M (matched by its `cpm:<preset>` dispatch string).
 ///
 /// Kept separate from [`is_checkable_fs_name`] because those tokens
 /// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
@@ -2366,6 +2366,11 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
 /// factory-reachable, so the generic `fsck_runner` opens and checks/repairs it.
 pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &str) -> bool {
     if type_string == Some("human68k") {
+        return true;
+    }
+    // CP/M has no on-disk signature, so it is dispatched by a `cpm:<preset>`
+    // type string (via `--fs-type`); its `fsck()` is directory-based.
+    if type_string.is_some_and(|s| s.starts_with("cpm:")) {
         return true;
     }
     ptype == 0

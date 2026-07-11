@@ -61,7 +61,7 @@ missing capability on a driver that already round-trips.
 | Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency) |
 | Acorn ADFS | No | Partial | No | **finish edit + create + fsck** |
 | Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
-| CP/M | No | Yes | No | **create + fsck** |
+| CP/M | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs cpm --cpm-preset <name>` (per-DPB 0xE5-fill). fsck: directory self-consistency (no on-disk free map) — cross-links, out-of-range pointers, invalid entries (CP/M 3 label/timestamp SFCBs recognized); repair reclaims invalid entries, cross-links surfaced read-only. |
 | QDOS (QXL.WIN) | No | Yes | No | **create + fsck** |
 | Alto BFS / TFS | Yes | Yes | **Yes (CLI)** | — **fsck done** (label/bitmap VALIDATE); `rb-cli fsck` has its own Alto branch (container open path); `--repair` in place for `.pdi` |
 
@@ -182,7 +182,12 @@ The order that buys the most capability per unit effort:
    done too:** `rb-cli new --fs apple-dos` formats a 140 KB data disk, and
    `apple_dos.rs` reconciles the VTOC free map against the catalog + file
    T/S-list chains (the tracks-0-2 DOS image is a benign warning, never
-   reclaimed). Remaining here: create-blank + fsck for CP/M and OS-9.
+   reclaimed). **CP/M create-blank + fsck now done too:** `rb-cli new --fs cpm
+   --cpm-preset <name>` formats a per-DPB blank, and `cpm.rs` runs a directory
+   self-consistency check (CP/M has no free map) — cross-links, out-of-range
+   pointers, and invalid entries (CP/M 3 label / timestamp SFCBs recognized as
+   valid). The fsck verb gained a `--fs-type` flag so a signatureless CP/M
+   image is dispatchable. Remaining here: create-blank + fsck for OS-9.
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,

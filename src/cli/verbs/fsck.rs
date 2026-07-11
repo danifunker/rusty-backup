@@ -24,7 +24,9 @@ use crate::cli::exit;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
-use crate::cli::resolve::{resolve_partition_rw, resolve_partition_streaming};
+use crate::cli::resolve::{
+    resolve_partition_rw_forced, resolve_partition_streaming_forced, FsDispatchOverride,
+};
 use crate::fs::alto::{self, bfs::BfsFilesystem, FsFamily};
 use crate::fs::filesystem::{EditableFilesystem, Filesystem};
 use crate::fs::fsck::{FsckResult, RepairReport};
@@ -54,6 +56,12 @@ pub struct FsckArgs {
     /// is nested.
     #[arg(long, default_value_t = OutputFormat::Text, value_enum)]
     pub format: OutputFormat,
+
+    /// Force a filesystem dispatch (`--fs-type`). Required for signatureless
+    /// images: CP/M has no on-disk magic, so `--fs-type cpm:<preset>` selects
+    /// the disk-parameter block (e.g. `cpm:amstrad_data`).
+    #[command(flatten)]
+    pub fs_override: FsDispatchOverride,
 }
 
 /// Structured payload for the `--format json|yaml` envelope. Wraps the
@@ -90,22 +98,33 @@ pub fn run(args: FsckArgs) -> Result<()> {
     require_non_flat(args.format, "fsck")?;
 
     if args.repair {
-        return repair_mode(&args.image, args.format);
+        return repair_mode(&args.image, args.format, &args.fs_override);
     }
-    check_mode(&args.image, args.format)
+    check_mode(&args.image, args.format, &args.fs_override)
 }
 
-fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
+fn check_mode(
+    image: &ImageRef,
+    format: OutputFormat,
+    fs_override: &FsDispatchOverride,
+) -> Result<()> {
     // Alto disk packs open through the container parser, not the block factory.
     if let Some((disk, _is_pdi)) = read_alto_disk(&image.path)? {
         return alto_check(disk, image, format);
     }
 
-    // `resolve_partition_streaming` peels container / image wrappers (.atr,
-    // .d88, CHD, GHO, …) to a flat stream — the same read path ls / get /
-    // inspect use — so `fsck` (check) works on a wrapped image, matching the
-    // read-write repair path (which already decodes containers).
-    let (file, ctx) = resolve_partition_streaming(&image.path, image.partition)?;
+    // `resolve_partition_streaming_forced` peels container / image wrappers
+    // (.atr, .d88, CHD, GHO, …) to a flat stream — the same read path ls / get
+    // / inspect use — so `fsck` (check) works on a wrapped image, matching the
+    // read-write repair path. The `--fs-type` override makes a signatureless
+    // image (CP/M) dispatchable when detection alone can't identify it.
+    let (file, mut ctx) = resolve_partition_streaming_forced(
+        &image.path,
+        image.partition,
+        None,
+        fs_override.fs_type.as_deref(),
+    )?;
+    fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs =
         crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
@@ -162,14 +181,20 @@ fn emit_check_report(report: &FsckResult, format: OutputFormat) -> Result<()> {
     }
 }
 
-fn repair_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
+fn repair_mode(
+    image: &ImageRef,
+    format: OutputFormat,
+    fs_override: &FsDispatchOverride,
+) -> Result<()> {
     // Alto disk packs open through the container parser + persist as PDI, not
     // through the block-factory / commit path.
     if let Some((disk, is_pdi)) = read_alto_disk(&image.path)? {
         return alto_repair(disk, is_pdi, image, format);
     }
 
-    let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition)?;
+    let (file, mut ctx, commit) =
+        resolve_partition_rw_forced(&image.path, image.partition, fs_override.fs_type.as_deref())?;
+    fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_editable_filesystem(
         file,

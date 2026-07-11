@@ -60,6 +60,11 @@ pub enum FsKind {
     /// ignored.
     #[value(alias = "appledos", alias = "dos33")]
     AppleDos,
+    /// CP/M (Amstrad / PCW, Einstein, SV-328, Altair, MultiComp, ZX +3). The
+    /// geometry comes from the disk-parameter block chosen with `--cpm-preset`
+    /// (required); `--size` / `--name` are ignored. A blank CP/M disk is just
+    /// its reserved tracks + data area filled with 0xE5.
+    Cpm,
 }
 
 #[derive(Debug, Args)]
@@ -69,7 +74,7 @@ pub struct NewArgs {
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
-    /// dos33).
+    /// dos33), cpm.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -120,6 +125,12 @@ pub struct NewArgs {
     #[arg(long = "affs-variant", default_value = "1")]
     pub affs_variant: u8,
 
+    /// CP/M disk-parameter-block preset (required with `--fs cpm`). One of:
+    /// amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm,
+    /// altair_8in, altair_cf, multicomp, zxplus3.
+    #[arg(long = "cpm-preset")]
+    pub cpm_preset: Option<String>,
+
     /// EFS only: approximate total inode count. The formatter scales its
     /// cylinder groups to hit roughly this many inodes. Mutually exclusive with
     /// `--bytes-per-inode`; default density is ~1 inode/4 KiB.
@@ -160,6 +171,9 @@ pub fn run(args: NewArgs) -> Result<()> {
     }
     if (args.case_sensitive || args.min_catalog.is_some()) && args.fs != FsKind::Hfsplus {
         anyhow::bail!("--case-sensitive / --min-catalog are only valid with --fs hfsplus");
+    }
+    if args.cpm_preset.is_some() && args.fs != FsKind::Cpm {
+        anyhow::bail!("--cpm-preset is only valid with --fs cpm");
     }
     match args.fs {
         FsKind::Hfs => {
@@ -274,6 +288,24 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::AppleDos => {
             format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
                 Ok(crate::fs::apple_dos::create_blank_apple_dos())
+            })
+        }
+        FsKind::Cpm => {
+            let preset_name = args.cpm_preset.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--fs cpm requires --cpm-preset <name> (e.g. amstrad_data)")
+            })?;
+            let dpb = *crate::fs::cpm_diskdefs::preset_by_name(preset_name).ok_or_else(|| {
+                let valid: Vec<&str> = crate::fs::cpm_diskdefs::ALL_PRESETS
+                    .iter()
+                    .map(|d| d.name)
+                    .collect();
+                anyhow::anyhow!(
+                    "unknown CP/M preset '{preset_name}'; valid presets: {}",
+                    valid.join(", ")
+                )
+            })?;
+            format_and_write(&args.image, &args.size, &args.name, move |_size, _name| {
+                Ok(crate::fs::cpm::create_blank(dpb))
             })
         }
     }

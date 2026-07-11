@@ -10,9 +10,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
   JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck), MacPlus MFS,
-  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (multi-DPB:
-  amstrad_data / amstrad_sys / amstrad_pcw / einstein / svi328_cpm /
-  altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
+  Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
+  fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
+  svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
   QDOS (QXL.WIN read + write + resize), QDOS Microdrive (detect-only scaffold),
   CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write + fsck;
   add/delete bidirectionally cross-validated against the `c1541` / Python `d64`

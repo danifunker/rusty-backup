@@ -39,6 +39,7 @@
 //! All multi-byte fields are **little-endian**. Filenames are ASCII
 //! upper-case by convention (CP/M's CCP uppercases input).
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::cpm_diskdefs::Dpb;
@@ -46,6 +47,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// One CP/M directory entry, decoded.
 #[derive(Debug, Clone)]
@@ -380,6 +382,155 @@ fn read_directory<R: Read + Seek>(
     Ok(out)
 }
 
+// ─────────────────────────── fsck (check + repair) ───────────────────────────
+
+/// Result of walking the directory for consistency. CP/M keeps no on-disk free
+/// bitmap — allocation is derived from the directory — so the check is a
+/// directory self-consistency pass rather than a bitmap reconciliation.
+struct CpmAnalysis {
+    /// Directory-entry indices whose status byte is neither a user area (0-15)
+    /// nor the empty marker (0xE5) — garbage that can be safely reclaimed.
+    invalid: Vec<usize>,
+    /// Allocation blocks claimed by more than one entry (or a directory block).
+    cross_links: u32,
+    /// Block pointers past the last addressable block.
+    out_of_range: u32,
+    /// Distinct active files (grouped by user + name + extension).
+    files: usize,
+    used_blocks: usize,
+    total_blocks: usize,
+}
+
+impl<R: Read + Seek + Send> CpmFilesystem<R> {
+    /// Recompute allocation from the directory (mirrors `free_blocks`, but
+    /// flags conflicts instead of silently absorbing them).
+    fn analyze(&self) -> CpmAnalysis {
+        let total = self.dpb.total_blocks() as usize;
+        let bitmap = ((self.dpb.al0 as u16) << 8) | self.dpb.al1 as u16;
+        // owner[b] = Some(index) once claimed; usize::MAX marks a directory block.
+        let mut owner: Vec<Option<usize>> = vec![None; total];
+        for b in 0..16u16 {
+            if bitmap & (0x8000 >> b) != 0 && (b as usize) < total {
+                owner[b as usize] = Some(usize::MAX);
+            }
+        }
+        let mut invalid = Vec::new();
+        let mut cross_links = 0u32;
+        let mut out_of_range = 0u32;
+        let mut files: HashSet<(u8, String, String)> = HashSet::new();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.user == 0xE5 {
+                continue; // empty slot
+            }
+            // CP/M 3 special directory entries carry no allocation blocks:
+            // 0x20 = disk label, 0x21 = SFCB (date/time stamp). They are valid,
+            // so they are neither files nor invalid.
+            if e.user == 0x20 || e.user == 0x21 {
+                continue;
+            }
+            if e.user >= 16 {
+                invalid.push(i); // not a user area, label, SFCB, or 0xE5
+                continue;
+            }
+            files.insert((e.user, e.name.clone(), e.ext.clone()));
+            for &ptr in &e.block_ptrs {
+                if ptr == 0 {
+                    continue;
+                }
+                if (ptr as usize) >= total {
+                    out_of_range += 1;
+                    continue;
+                }
+                match owner[ptr as usize] {
+                    None => owner[ptr as usize] = Some(i),
+                    Some(_) => cross_links += 1,
+                }
+            }
+        }
+        let used_blocks = owner.iter().filter(|o| o.is_some()).count();
+        CpmAnalysis {
+            invalid,
+            cross_links,
+            out_of_range,
+            files: files.len(),
+            used_blocks,
+            total_blocks: total,
+        }
+    }
+
+    /// CP/M integrity check: reconcile the directory against itself — invalid
+    /// entries, cross-linked blocks, and out-of-range pointers.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let a = self.analyze();
+        let mut errors = Vec::new();
+        if !a.invalid.is_empty() {
+            errors.push(FsckIssue {
+                code: "CpmInvalidEntry".into(),
+                message: format!(
+                    "{} directory entr{} an invalid user/status byte (not 0-15 or 0xE5)",
+                    a.invalid.len(),
+                    if a.invalid.len() == 1 {
+                        "y has"
+                    } else {
+                        "ies have"
+                    }
+                ),
+                repairable: true,
+                debug: false,
+            });
+        }
+        if a.cross_links > 0 {
+            errors.push(FsckIssue {
+                code: "CpmCrossLink".into(),
+                message: format!(
+                    "{} allocation block(s) are cross-linked (claimed by more than one file, \
+                     or by a directory block)",
+                    a.cross_links
+                ),
+                // No redundant metadata tells us which file truly owns the
+                // block, so a cross-link can't be auto-repaired.
+                repairable: false,
+                debug: false,
+            });
+        }
+        if a.out_of_range > 0 {
+            errors.push(FsckIssue {
+                code: "CpmBlockOutOfRange".into(),
+                message: format!(
+                    "{} block pointer(s) point past the last block ({})",
+                    a.out_of_range, a.total_blocks
+                ),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = a.total_blocks.saturating_sub(a.used_blocks);
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: a.files as u32,
+                directories_checked: 1,
+                extra: vec![
+                    ("free blocks".into(), format!("{free} / {}", a.total_blocks)),
+                    (
+                        "directory".into(),
+                        if a.invalid.is_empty() && a.cross_links == 0 && a.out_of_range == 0 {
+                            "consistent".into()
+                        } else {
+                            "inconsistent".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for CpmFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
@@ -437,6 +588,10 @@ impl<R: Read + Seek + Send> Filesystem for CpmFilesystem<R> {
             bytes += g.total_size;
         }
         bytes
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
     }
 }
 
@@ -572,6 +727,34 @@ impl<R: Read + Write + Seek + Send> CpmFilesystem<R> {
             }
         }
         Ok(())
+    }
+
+    /// Repair what CP/M safely can: reclaim directory entries whose status byte
+    /// is neither a user area nor `0xE5` (garbage) by marking them deleted.
+    /// Cross-links and out-of-range pointers have no redundant metadata to
+    /// recover from, so they are surfaced as unrepairable rather than guessed.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let a = self.analyze();
+        let unrepairable = (a.cross_links + a.out_of_range) as usize;
+        let mut reclaimed = 0u32;
+        for &idx in &a.invalid {
+            self.entries[idx].user = 0xE5;
+            reclaimed += 1;
+        }
+        let mut fixes = Vec::new();
+        if reclaimed > 0 {
+            self.dir_write_back()?;
+            self.reader.flush()?;
+            fixes.push(format!(
+                "reclaimed {reclaimed} invalid directory entr{} (marked deleted)",
+                if reclaimed == 1 { "y" } else { "ies" }
+            ));
+        }
+        Ok(RepairReport {
+            fixes_applied: fixes,
+            fixes_failed: Vec::new(),
+            unrepairable_count: unrepairable,
+        })
     }
 }
 
@@ -849,6 +1032,21 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for CpmFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_blocks().len() as u64 * self.dpb.block_size() as u64)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
+}
+
+/// Build a blank, freshly formatted CP/M volume for the given DPB preset. A
+/// blank CP/M disk is simply the reserved (system) tracks plus the data area
+/// filled with `0xE5` — the directory lives in the first data block(s), and
+/// `0xE5` in the status byte marks every directory slot empty. The result
+/// round-trips through [`CpmFilesystem::open_with_dpb`] with an empty catalog.
+pub fn create_blank(dpb: Dpb) -> Vec<u8> {
+    let reserved = dpb.off as usize * dpb.spt as usize * 128;
+    let size = reserved + dpb.data_bytes() as usize;
+    vec![0xE5u8; size]
 }
 
 #[cfg(test)]
@@ -1063,5 +1261,162 @@ mod tests {
         assert_eq!(renamed.size, target.size);
         let got = fs2.read_file(renamed, 4096).unwrap();
         assert_eq!(got, original);
+    }
+
+    // ── Create-blank + fsck tests ────────────────────────────────────────
+
+    fn blank_cpm() -> CpmFilesystem<Cursor<Vec<u8>>> {
+        CpmFilesystem::open_with_dpb(Cursor::new(create_blank(AMSTRAD_DATA)), 0, AMSTRAD_DATA)
+            .unwrap()
+    }
+
+    fn active_index(fs: &CpmFilesystem<Cursor<Vec<u8>>>, name: &str) -> usize {
+        fs.entries
+            .iter()
+            .position(|e| e.is_active() && e.name.trim_end() == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn create_blank_cpm_round_trips_through_open() {
+        let img = create_blank(AMSTRAD_DATA);
+        // amstrad_data: off=0, spt=36, data_bytes = 180 * 1024.
+        assert_eq!(img.len(), 184320);
+        let mut fs = CpmFilesystem::open_with_dpb(Cursor::new(img), 0, AMSTRAD_DATA).unwrap();
+        assert_eq!(fs.fs_type(), "CP/M");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        // 180 blocks - 2 directory blocks (al0 = 0xC0) = 178 free.
+        assert_eq!(fs.free_blocks().len(), 178);
+    }
+
+    #[test]
+    fn cpm_fsck_clean_blank() {
+        let mut fs = blank_cpm();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "blank should fsck clean: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 0);
+    }
+
+    #[test]
+    fn cpm_fsck_clean_after_writes() {
+        let mut fs = blank_cpm();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "HELLO.TXT",
+            &mut Cursor::new(b"hi there".to_vec()),
+            8,
+            &opts,
+        )
+        .unwrap();
+        let big = vec![0x42u8; 3000];
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "post-write errors: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn cpm_fsck_detects_and_reclaims_invalid_entry() {
+        let mut fs = blank_cpm();
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "GOOD.TXT",
+            &mut Cursor::new(b"data".to_vec()),
+            4,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        // Corrupt the entry's status byte to garbage (not 0-15 and not 0xE5).
+        let idx = active_index(&fs, "GOOD");
+        fs.entries[idx].user = 0x40;
+
+        let before = fs.fsck().unwrap().unwrap();
+        assert!(!before.is_clean());
+        assert!(before
+            .errors
+            .iter()
+            .any(|e| e.code == "CpmInvalidEntry" && e.repairable));
+
+        let report = fs.repair().unwrap();
+        assert!(!report.fixes_applied.is_empty());
+        assert_eq!(report.unrepairable_count, 0);
+
+        // Re-open from disk to confirm the reclaim persisted clean.
+        let bytes = fs.reader.clone().into_inner();
+        let mut fs2 = CpmFilesystem::open_with_dpb(Cursor::new(bytes), 0, AMSTRAD_DATA).unwrap();
+        let after = fs2.fsck().unwrap().unwrap();
+        assert!(after.is_clean(), "post-repair errors: {:?}", after.errors);
+    }
+
+    #[test]
+    fn cpm_fsck_detects_crosslink_and_withholds_repair() {
+        let mut fs = blank_cpm();
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A.TXT", &mut Cursor::new(vec![1u8; 500]), 500, &opts)
+            .unwrap();
+        fs.create_file(&root, "B.TXT", &mut Cursor::new(vec![2u8; 500]), 500, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Point one of B's block pointers at a block A already owns.
+        let a_idx = active_index(&fs, "A");
+        let b_idx = active_index(&fs, "B");
+        let a_block = *fs.entries[a_idx]
+            .block_ptrs
+            .iter()
+            .find(|&&p| p != 0)
+            .unwrap();
+        let b_pos = fs.entries[b_idx]
+            .block_ptrs
+            .iter()
+            .position(|&p| p != 0)
+            .unwrap();
+        fs.entries[b_idx].block_ptrs[b_pos] = a_block;
+
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean());
+        assert!(res.errors.iter().any(|e| e.code == "CpmCrossLink"));
+
+        let report = fs.repair().unwrap();
+        assert!(report.unrepairable_count > 0);
+    }
+
+    #[test]
+    fn cpm_fsck_detects_out_of_range_block() {
+        let mut fs = blank_cpm();
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "F.TXT",
+            &mut Cursor::new(vec![9u8; 200]),
+            200,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let idx = active_index(&fs, "F");
+        let pos = fs.entries[idx]
+            .block_ptrs
+            .iter()
+            .position(|&p| p != 0)
+            .unwrap();
+        fs.entries[idx].block_ptrs[pos] = 9999; // far past the 180-block ceiling
+
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean());
+        assert!(res.errors.iter().any(|e| e.code == "CpmBlockOutOfRange"));
     }
 }
