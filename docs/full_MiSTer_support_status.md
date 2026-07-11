@@ -17,7 +17,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   CBM DOS (1541 / 1571 / 1581 + PET 8050 / 8250 IEEE-488 read + write + fsck;
   add/delete bidirectionally cross-validated against the `c1541` / Python `d64`
   reference, fsck = VALIDATE with the BAM rewrite byte-verified against
-  `c1541 validate`), Atari DOS 2 (2.0S / 2.5 read + write, `.atr` / `.xfd`),
+  `c1541 validate`), Atari DOS 2 (2.0S / 2.5 read + write + create + fsck,
+  `.atr` / `.xfd`),
   RS-DOS / CoCo Disk BASIC (read + write + fsck, raw 35- / 40-track `.dsk` /
   `.jvc`; cross-validated against an independent clean-room reader/writer
   derived from the toolshed `libdecb` semantics; fsck = granule-table
@@ -111,7 +112,7 @@ Legend for the **Support** column:
 | Dragon | Dragon 32/64 | Floppy | DragonDOS, OS-9 (RBF) | **Yes** — `fs::dragondos` reads + writes DragonDOS (directory track 20 + backup track 16, one's-complement geometry signature, set-bit-free sector bitmap, 25-byte header/continuation directory entries; single- / double-sided 40-track `.dsk`). Byte-exact cross-validated against an independent clean-room reader/writer AND against real third-party DragonDOS disks (rolfmichelsen/dragontools' empty volume plus a populated 9-file AGD-suite disk, all files byte-identical across both readers). `fs::os9` covers OS-9 / NitrOS-9 RBF. |
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
-| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way. |
+| Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes + creates + fscks Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`; `rb-cli new --fs atari` formats a blank SD disk, and fsck reconciles the VTOC bitmap + free-count against the directory chains. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way; fsck validated clean on the real fixture. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |

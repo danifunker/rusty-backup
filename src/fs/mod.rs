@@ -2353,7 +2353,7 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
 /// True for the retro superfloppy / X68k filesystems whose driver implements
 /// `fsck()` but which are identified only by their resolved `type_name` /
 /// dispatch string (not a partition-type byte or APM string): CBM DOS,
-/// DragonDOS, RS-DOS, Acorn DFS, Human68k, and ProDOS.
+/// DragonDOS, RS-DOS, Acorn DFS, Human68k, ProDOS, and Atari DOS.
 ///
 /// Kept separate from [`is_checkable_fs_name`] because those tokens
 /// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
@@ -2370,7 +2370,7 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
     ptype == 0
         && matches!(
             type_name,
-            "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS" | "ProDOS"
+            "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS" | "ProDOS" | "Atari DOS"
         )
 }
 
@@ -2764,8 +2764,9 @@ mod tests {
         // ProDOS as a bare superfloppy (partition-hosted ProDOS goes through
         // is_checkable_type via 0xA8 / Apple_PRODOS).
         assert!(is_checkable_retro_fs(0, None, "ProDOS"));
+        // Atari DOS 2 (single-density floppy) now fscks.
+        assert!(is_checkable_retro_fs(0, None, "Atari DOS"));
         // Non-fsck retro filesystems must NOT be gated.
-        assert!(!is_checkable_retro_fs(0, None, "Atari DOS"));
         assert!(!is_checkable_retro_fs(0, None, "OS-9"));
         // "DFS" must not substring-match "ADFS" (ADFS has no fsck).
         assert!(!is_checkable_retro_fs(0, None, "ADFS"));

@@ -57,6 +57,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub const VTOC_SECTOR: u16 = 360;
 pub const DIR_FIRST_SECTOR: u16 = 361;
@@ -380,6 +381,230 @@ impl<R: Read + Seek + Send> Filesystem for AtariDosFilesystem<R> {
             .map(|e| e.sector_count as u64 * self.geom.sector_size as u64)
             .sum()
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VTOC bitmap helpers (shared by the read-side fsck and the write side)
+// ---------------------------------------------------------------------------
+
+/// The Atari DOS 2 VTOC free bitmap: bit SET = free (opposite of most FS),
+/// MSB-first, based at [`BITMAP_OFFSET`] within the VTOC sector.
+fn bitmap_is_free(vtoc: &[u8], sector: u16) -> bool {
+    let byte = BITMAP_OFFSET + (sector as usize) / 8;
+    let bit = 7 - (sector as usize) % 8;
+    byte < vtoc.len() && (vtoc[byte] >> bit) & 1 == 1
+}
+
+fn bitmap_set(vtoc: &mut [u8], sector: u16, free: bool) {
+    let byte = BITMAP_OFFSET + (sector as usize) / 8;
+    let bit = 7 - (sector as usize) % 8;
+    if byte >= vtoc.len() {
+        return;
+    }
+    if free {
+        vtoc[byte] |= 1 << bit;
+    } else {
+        vtoc[byte] &= !(1 << bit);
+    }
+}
+
+fn vtoc_free_count(vtoc: &[u8]) -> u16 {
+    u16::from_le_bytes([vtoc[3], vtoc[4]])
+}
+
+fn vtoc_set_free_count(vtoc: &mut [u8], count: u16) {
+    let b = count.to_le_bytes();
+    vtoc[3] = b[0];
+    vtoc[4] = b[1];
+}
+
+// ---------------------------------------------------------------------------
+// fsck (check + repair) — VTOC-bitmap-vs-directory reconciliation
+// ---------------------------------------------------------------------------
+
+impl<R: Read + Seek + Send> AtariDosFilesystem<R> {
+    /// Sectors the VTOC free bitmap physically addresses. On single density
+    /// (128-byte sectors) this is 944, covering the whole 720-sector disk; on
+    /// enhanced density the sectors above it live in the DOS 2.5 VTOC2 (sector
+    /// 1024), which this driver does not model.
+    fn vtoc_covered_sectors(&self) -> u16 {
+        ((self.geom.sector_size - BITMAP_OFFSET) * 8) as u16
+    }
+
+    /// Walk a file's sector chain, returning its ordered sector list. Detects
+    /// chain loops and links past the end of the disk (as `Err(message)`).
+    fn chain_sectors(&mut self, entry: &AtariDirEntry) -> Result<Vec<u16>, String> {
+        let data_bytes = self.geom.data_bytes();
+        let mut out = Vec::new();
+        let mut sec = entry.start_sector;
+        let mut seen = HashSet::new();
+        for _ in 0..MAX_FILE_SECTORS {
+            if sec == 0 {
+                break;
+            }
+            if sec > self.geom.total_sectors {
+                return Err(format!(
+                    "file '{}' links to sector {sec}, past the end of the disk",
+                    entry.name
+                ));
+            }
+            if !seen.insert(sec) {
+                return Err(format!(
+                    "file '{}' has a sector-chain loop at {sec}",
+                    entry.name
+                ));
+            }
+            out.push(sec);
+            let buf = self
+                .read_sector(sec)
+                .map_err(|e| format!("file '{}': {e}", entry.name))?;
+            let next = (((buf[data_bytes] & 0x03) as u16) << 8) | buf[data_bytes + 1] as u16;
+            sec = next;
+        }
+        Ok(out)
+    }
+
+    /// Recompute the allocated-sector set from the directory (the CBM VALIDATE
+    /// model): reserved metadata plus every live file's sector chain. Returns
+    /// `(used, files, broken)`; a non-empty `broken` (loop, out-of-range link,
+    /// or cross-link) means the walk is incomplete and a bitmap rewrite is
+    /// unsafe. `used` is indexed by 1-based sector number.
+    fn compute_used(&mut self) -> Result<(Vec<bool>, u32, Vec<String>), FilesystemError> {
+        let total = self.geom.total_sectors as usize;
+        let mut used = vec![false; total + 1];
+        let mut broken = Vec::new();
+        // Reserved sectors (never allocatable): boot (1-3), VTOC, directory,
+        // and the reserved last sector.
+        for s in 1..=3u16 {
+            used[s as usize] = true;
+        }
+        used[VTOC_SECTOR as usize] = true;
+        for s in DIR_FIRST_SECTOR..DIR_FIRST_SECTOR + DIR_SECTORS {
+            used[s as usize] = true;
+        }
+        used[self.geom.total_sectors as usize] = true;
+
+        let entries = self.entries.clone();
+        let mut files = 0u32;
+        for entry in entries.iter().filter(|e| e.is_live()) {
+            files += 1;
+            match self.chain_sectors(entry) {
+                Ok(sectors) => {
+                    for s in sectors {
+                        if used[s as usize] {
+                            broken.push(format!(
+                                "sector {s} is cross-linked (claimed by '{}' and another structure)",
+                                entry.name
+                            ));
+                        } else {
+                            used[s as usize] = true;
+                        }
+                    }
+                }
+                Err(msg) => broken.push(msg),
+            }
+        }
+        Ok((used, files, broken))
+    }
+
+    /// Atari DOS integrity check: reconcile the VTOC free bitmap and its
+    /// free-sector count against the allocation recomputed from the directory.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let (used, files, broken) = self.compute_used()?;
+        let total = self.geom.total_sectors;
+        let covered = self.vtoc_covered_sectors();
+        let check_hi = total.min(covered.saturating_sub(1));
+        let vtoc = self.read_sector(VTOC_SECTOR)?;
+        let walk_clean = broken.is_empty();
+
+        let mut used_but_free = 0u32;
+        let mut leaked = 0u32;
+        for s in 1..=check_hi {
+            match (bitmap_is_free(&vtoc, s), used[s as usize]) {
+                (true, true) => used_but_free += 1, // referenced but marked free
+                (false, false) => leaked += 1,      // marked used but unreferenced
+                _ => {}
+            }
+        }
+
+        let mut warnings = Vec::new();
+        if total >= covered {
+            warnings.push(FsckIssue {
+                code: "AtariExtendedVtocUnchecked".into(),
+                message: format!(
+                    "sectors {covered}..={total} are tracked by the DOS 2.5 VTOC2, \
+                     which this driver does not reconcile"
+                ),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let mut errors = Vec::new();
+        if used_but_free > 0 || leaked > 0 {
+            errors.push(FsckIssue {
+                code: "AtariVtocMismatch".into(),
+                message: format!(
+                    "VTOC bitmap mismatch: {used_but_free} sector(s) in use but marked free, \
+                     {leaked} sector(s) marked used but unreferenced"
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+        // The VTOC free-sector counter should equal the free bits (single
+        // density, where the primary VTOC covers the whole disk).
+        if total < covered {
+            let recorded = vtoc_free_count(&vtoc);
+            let actual = (1..=check_hi).filter(|&s| bitmap_is_free(&vtoc, s)).count() as u16;
+            if recorded != actual {
+                errors.push(FsckIssue {
+                    code: "AtariFreeCountMismatch".into(),
+                    message: format!(
+                        "VTOC free-sector count is {recorded} but the bitmap has {actual} free"
+                    ),
+                    repairable: walk_clean,
+                    debug: false,
+                });
+            }
+        }
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "AtariBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let free = (1..=check_hi).filter(|&s| !used[s as usize]).count() as u64;
+        let repairable = errors.iter().any(|e| e.repairable);
+        Ok(FsckResult {
+            errors,
+            warnings,
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: 1,
+                extra: vec![
+                    ("free sectors".into(), format!("{free} / {total}")),
+                    (
+                        "bitmap".into(),
+                        if used_but_free == 0 && leaked == 0 {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,36 +633,6 @@ impl<R: Read + Write + Seek + Send> AtariDosFilesystem<R> {
         self.read_sector(VTOC_SECTOR)
     }
 
-    /// Bit SET = free.
-    fn bitmap_is_free(vtoc: &[u8], sector: u16) -> bool {
-        let byte = BITMAP_OFFSET + (sector as usize) / 8;
-        let bit = 7 - (sector as usize) % 8;
-        byte < vtoc.len() && (vtoc[byte] >> bit) & 1 == 1
-    }
-
-    fn bitmap_set(vtoc: &mut [u8], sector: u16, free: bool) {
-        let byte = BITMAP_OFFSET + (sector as usize) / 8;
-        let bit = 7 - (sector as usize) % 8;
-        if byte >= vtoc.len() {
-            return;
-        }
-        if free {
-            vtoc[byte] |= 1 << bit;
-        } else {
-            vtoc[byte] &= !(1 << bit);
-        }
-    }
-
-    fn vtoc_free_count(vtoc: &[u8]) -> u16 {
-        u16::from_le_bytes([vtoc[3], vtoc[4]])
-    }
-
-    fn vtoc_set_free_count(vtoc: &mut [u8], count: u16) {
-        let b = count.to_le_bytes();
-        vtoc[3] = b[0];
-        vtoc[4] = b[1];
-    }
-
     /// Sectors usable for file data: everything except the boot sectors
     /// (1-3), the VTOC (360), the directory (361-368), and the reserved
     /// last sector (720 on SD). Allocation walks them low-to-high.
@@ -450,6 +645,70 @@ impl<R: Read + Write + Seek + Send> AtariDosFilesystem<R> {
                     && s != last
             })
             .collect()
+    }
+
+    /// Rebuild the VTOC free bitmap + free-sector count from the directory
+    /// walk, unless the walk found structural damage (a loop, an out-of-range
+    /// link, or a cross-link) that could hide a live sector. Enhanced density's
+    /// VTOC2 region is outside the primary VTOC, so a rewrite is withheld there.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let (used, _files, broken) = self.compute_used()?;
+        if !broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: broken.len(),
+            });
+        }
+        let total = self.geom.total_sectors;
+        let covered = self.vtoc_covered_sectors();
+        if total >= covered {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: vec![
+                    "enhanced-density VTOC2 is not modeled; the bitmap was left unchanged".into(),
+                ],
+                unrepairable_count: 0,
+            });
+        }
+
+        let mut vtoc = self.read_vtoc()?;
+        let mut bit_fixes = 0u32;
+        for s in 1..=total {
+            let want_free = !used[s as usize];
+            if bitmap_is_free(&vtoc, s) != want_free {
+                bitmap_set(&mut vtoc, s, want_free);
+                bit_fixes += 1;
+            }
+        }
+        let actual_free = (1..=total).filter(|&s| !used[s as usize]).count() as u16;
+        let free_fixed = vtoc_free_count(&vtoc) != actual_free;
+        vtoc_set_free_count(&mut vtoc, actual_free);
+        if bit_fixes == 0 && !free_fixed {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        self.write_sector(VTOC_SECTOR, &vtoc)?;
+        self.reader.flush()?;
+        let mut fixes = Vec::new();
+        if bit_fixes > 0 {
+            fixes.push(format!(
+                "rebuilt the Atari VTOC bitmap from the directory ({bit_fixes} bit(s) corrected)"
+            ));
+        }
+        if free_fixed {
+            fixes.push(format!(
+                "corrected the VTOC free-sector count to {actual_free}"
+            ));
+        }
+        Ok(RepairReport {
+            fixes_applied: fixes,
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
     }
 }
 
@@ -501,10 +760,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
             .ok_or_else(|| FilesystemError::DiskFull("directory is full (64 files)".into()))?;
 
         let mut vtoc = self.read_vtoc()?;
-        if (Self::vtoc_free_count(&vtoc) as usize) < sectors_needed {
+        if (vtoc_free_count(&vtoc) as usize) < sectors_needed {
             return Err(FilesystemError::DiskFull(format!(
                 "need {sectors_needed} sectors, {} free",
-                Self::vtoc_free_count(&vtoc)
+                vtoc_free_count(&vtoc)
             )));
         }
 
@@ -514,8 +773,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
             if chain.len() == sectors_needed {
                 break;
             }
-            if Self::bitmap_is_free(&vtoc, s) {
-                Self::bitmap_set(&mut vtoc, s, false);
+            if bitmap_is_free(&vtoc, s) {
+                bitmap_set(&mut vtoc, s, false);
                 chain.push(s);
             }
         }
@@ -559,8 +818,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         self.write_sector(dir_sector, &dbuf)?;
 
         // Update VTOC free count + write it back.
-        let new_free = Self::vtoc_free_count(&vtoc) - sectors_needed as u16;
-        Self::vtoc_set_free_count(&mut vtoc, new_free);
+        let new_free = vtoc_free_count(&vtoc) - sectors_needed as u16;
+        vtoc_set_free_count(&mut vtoc, new_free);
         self.write_sector(VTOC_SECTOR, &vtoc)?;
         self.reader.flush()?;
         self.refresh_entries()?;
@@ -633,7 +892,7 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
             }
             let buf = self.read_sector(sec)?;
             let next = (((buf[data_bytes] & 0x03) as u16) << 8) | buf[data_bytes + 1] as u16;
-            Self::bitmap_set(&mut vtoc, sec, true);
+            bitmap_set(&mut vtoc, sec, true);
             freed += 1;
             sec = next;
         }
@@ -645,8 +904,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
         dbuf[eoff] = FLAG_DELETED;
         self.write_sector(dir_sector, &dbuf)?;
 
-        let new_free = Self::vtoc_free_count(&vtoc) + freed;
-        Self::vtoc_set_free_count(&mut vtoc, new_free);
+        let new_free = vtoc_free_count(&vtoc) + freed;
+        vtoc_set_free_count(&mut vtoc, new_free);
         self.write_sector(VTOC_SECTOR, &vtoc)?;
         self.reader.flush()?;
         self.refresh_entries()?;
@@ -717,8 +976,52 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AtariDosFilesystem<R>
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         let vtoc = self.read_vtoc()?;
-        Ok(Self::vtoc_free_count(&vtoc) as u64 * self.geom.data_bytes() as u64)
+        Ok(vtoc_free_count(&vtoc) as u64 * self.geom.data_bytes() as u64)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
+}
+
+/// Build a blank, freshly formatted single-density (90 KB, DOS 2.0S) Atari
+/// disk: boot / VTOC / directory sectors reserved, every data sector free,
+/// and 707 in the VTOC free-sector count. Enhanced density (DOS 2.5) is read
+/// but not yet formattable (its dual-VTOC allocation isn't modeled).
+pub fn create_blank_atari_sd() -> Vec<u8> {
+    let geom = AtariGeometry {
+        sector_size: 128,
+        total_sectors: 720,
+    };
+    let mut img = vec![0u8; geom.total_sectors as usize * geom.sector_size];
+    let voff = geom.sector_offset(VTOC_SECTOR) as usize;
+    // VTOC header: DOS 2 code, total available (707) and free-count (707).
+    img[voff] = 2;
+    let total = 707u16.to_le_bytes();
+    img[voff + 1] = total[0];
+    img[voff + 2] = total[1];
+    img[voff + 3] = total[0];
+    img[voff + 4] = total[1];
+    // Bitmap: mark every sector free (bit set), then reserve the structural
+    // ones (bit clear). 90 bytes = 720 bits.
+    for b in &mut img[voff + BITMAP_OFFSET..voff + BITMAP_OFFSET + 90] {
+        *b = 0xFF;
+    }
+    let reserve = |img: &mut [u8], sector: u16| {
+        let byte = voff + BITMAP_OFFSET + (sector as usize) / 8;
+        let bit = 7 - (sector as usize) % 8;
+        img[byte] &= !(1 << bit);
+    };
+    reserve(&mut img, 0); // sector 0 doesn't exist
+    for s in 1..=3 {
+        reserve(&mut img, s); // boot
+    }
+    reserve(&mut img, VTOC_SECTOR);
+    for s in DIR_FIRST_SECTOR..DIR_FIRST_SECTOR + DIR_SECTORS {
+        reserve(&mut img, s);
+    }
+    reserve(&mut img, 720); // reserved last sector
+    img
 }
 
 #[cfg(test)]
@@ -726,41 +1029,9 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Build a blank single-density DOS 2.0S image: boot/VTOC/directory
-    /// reserved, all data sectors free, 707 free in the VTOC.
+    /// Test alias for the production single-density formatter.
     pub fn create_blank_sd() -> Vec<u8> {
-        let geom = AtariGeometry {
-            sector_size: 128,
-            total_sectors: 720,
-        };
-        let mut img = vec![0u8; geom.total_sectors as usize * geom.sector_size];
-        let voff = geom.sector_offset(VTOC_SECTOR) as usize;
-        // VTOC header.
-        img[voff] = 2; // DOS 2
-        let total = 707u16.to_le_bytes();
-        img[voff + 1] = total[0];
-        img[voff + 2] = total[1];
-        img[voff + 3] = total[0];
-        img[voff + 4] = total[1];
-        // Bitmap: mark every sector free, then reserve the structural ones.
-        for b in &mut img[voff + BITMAP_OFFSET..voff + BITMAP_OFFSET + 90] {
-            *b = 0xFF;
-        }
-        let reserve = |img: &mut [u8], sector: u16| {
-            let byte = voff + BITMAP_OFFSET + (sector as usize) / 8;
-            let bit = 7 - (sector as usize) % 8;
-            img[byte] &= !(1 << bit);
-        };
-        reserve(&mut img, 0); // sector 0 doesn't exist
-        for s in 1..=3 {
-            reserve(&mut img, s); // boot
-        }
-        reserve(&mut img, VTOC_SECTOR);
-        for s in DIR_FIRST_SECTOR..DIR_FIRST_SECTOR + DIR_SECTORS {
-            reserve(&mut img, s);
-        }
-        reserve(&mut img, 720); // reserved last sector
-        img
+        create_blank_atari_sd()
     }
 
     fn open_mem(img: Vec<u8>) -> AtariDosFilesystem<Cursor<Vec<u8>>> {
@@ -924,5 +1195,124 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, FilesystemError::AlreadyExists(_)));
+    }
+
+    // ── Create-blank + fsck tests ────────────────────────────────────────
+
+    #[test]
+    fn create_blank_atari_round_trips_through_open() {
+        let img = create_blank_atari_sd();
+        assert_eq!(img.len(), 720 * 128);
+        let mut fs = open_mem(img);
+        assert_eq!(fs.fs_type(), "Atari DOS 2");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert_eq!(fs.free_space().unwrap(), 707 * 125);
+    }
+
+    #[test]
+    fn atari_fsck_clean_blank() {
+        let mut fs = open_mem(create_blank_atari_sd());
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "blank should fsck clean: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 0);
+        assert!(res.warnings.is_empty()); // single density is fully covered
+    }
+
+    #[test]
+    fn atari_fsck_clean_after_writes() {
+        let mut fs = open_mem(create_blank_atari_sd());
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(
+            &root,
+            "HELLO.TXT",
+            &mut Cursor::new(b"hi".to_vec()),
+            2,
+            &opts,
+        )
+        .unwrap();
+        let big: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "DATA.BIN",
+            &mut Cursor::new(big.clone()),
+            big.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "post-write errors: {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn atari_fsck_detects_and_repairs_bitmap() {
+        let mut fs = open_mem(create_blank_atari_sd());
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        fs.create_file(
+            &root,
+            "FILE.BIN",
+            &mut Cursor::new(data.clone()),
+            data.len() as u64,
+            &opts,
+        )
+        .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Corrupt: mark the file's first data sector (4) free in the VTOC
+        // bitmap. VTOC = sector 360 -> byte offset 359*128 = 45952; bitmap at
+        // +0x0A = 45962. Sector 4 = byte 45962, bit 7-(4%8)=3. Set bit = free.
+        {
+            let disk = fs.reader.get_mut();
+            disk[45962] |= 0x08; // sector 4 = byte 45962 bit 3 (MSB-first)
+        }
+        let before = fs.fsck().unwrap().unwrap();
+        assert!(!before.is_clean());
+        assert!(before
+            .errors
+            .iter()
+            .any(|e| e.code == "AtariVtocMismatch" && e.repairable));
+
+        let report = fs.repair().unwrap();
+        assert!(!report.fixes_applied.is_empty());
+        assert_eq!(report.unrepairable_count, 0);
+
+        let after = fs.fsck().unwrap().unwrap();
+        assert!(after.is_clean(), "post-repair errors: {:?}", after.errors);
+    }
+
+    #[test]
+    fn atari_fsck_detects_crosslink_and_withholds_repair() {
+        let mut fs = open_mem(create_blank_atari_sd());
+        let root = fs.root().unwrap();
+        let opts = CreateFileOptions::default();
+        fs.create_file(&root, "A.BIN", &mut Cursor::new(vec![1u8; 50]), 50, &opts)
+            .unwrap();
+        fs.create_file(&root, "B.BIN", &mut Cursor::new(vec![2u8; 50]), 50, &opts)
+            .unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Point B's directory entry at A's data sector (4) to force a
+        // cross-link. Locate B's slot, then patch start_sector (entry+3..5).
+        let slot = fs.entries.iter().find(|e| e.name == "B.BIN").unwrap().slot;
+        let off = (360 + slot / 8) * 128 + (slot % 8) * 16;
+        {
+            let disk = fs.reader.get_mut();
+            disk[off + 3] = 4;
+            disk[off + 4] = 0;
+        }
+        fs.refresh_entries().unwrap();
+
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(!res.is_clean());
+        assert!(res.errors.iter().any(|e| e.code == "AtariBrokenChain"));
+
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(report.unrepairable_count > 0);
     }
 }

@@ -24,7 +24,7 @@ use crate::cli::exit;
 use crate::cli::img_at::ImageRef;
 use crate::cli::logging::{log_stderr, out_stdout};
 use crate::cli::output::{emit_envelope, require_non_flat, Envelope, OutputFormat};
-use crate::cli::resolve::{resolve_partition_ro, resolve_partition_rw};
+use crate::cli::resolve::{resolve_partition_rw, resolve_partition_streaming};
 use crate::fs::alto::{self, bfs::BfsFilesystem, FsFamily};
 use crate::fs::filesystem::{EditableFilesystem, Filesystem};
 use crate::fs::fsck::{FsckResult, RepairReport};
@@ -101,7 +101,11 @@ fn check_mode(image: &ImageRef, format: OutputFormat) -> Result<()> {
         return alto_check(disk, image, format);
     }
 
-    let (file, ctx) = resolve_partition_ro(&image.path, image.partition)?;
+    // `resolve_partition_streaming` peels container / image wrappers (.atr,
+    // .d88, CHD, GHO, …) to a flat stream — the same read path ls / get /
+    // inspect use — so `fsck` (check) works on a wrapped image, matching the
+    // read-write repair path (which already decodes containers).
+    let (file, ctx) = resolve_partition_streaming(&image.path, image.partition)?;
     log_stderr(&ctx.label);
     let mut fs =
         crate::fs::open_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())

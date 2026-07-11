@@ -54,7 +54,7 @@ missing capability on a driver that already round-trips.
 | ProDOS | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs prodos` (boot + 4-block volume directory + bitmap; 8 KiB–32 MiB). fsck: volume-bitmap reconciliation against the directory-tree + file-index walk (seedling/sapling/tree + subdirs), byte-verified self-consistent; repair rebuilds the bitmap, withheld on cross-links / past-end blocks / directory-chain cycles. |
 | Apple DOS 3.3 | No | Yes | No | **create + fsck** |
 | CBM DOS | Yes | Yes | **Yes** | — **fsck done** (VALIDATE; byte-verified vs `c1541 validate`) |
-| Atari DOS 2 | test-only | Yes | No | **create + fsck** |
+| Atari DOS 2 | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs atari` (single density, promoted from the test-only formatter). fsck: VTOC-bitmap + free-count reconciliation against the directory's linked-sector chains; repair rewrites the bitmap + count (SD only — the DOS 2.5 VTOC2 region is surfaced as an unchecked warning). |
 | RS-DOS | Yes | Yes | **Yes** | — **fsck done** (granule-table VALIDATE) |
 | OS-9 / RBF | No | Yes | No | **create + fsck** |
 | DragonDOS | Yes | Yes | **Yes** | — **fsck done** (sector-bitmap VALIDATE) |
@@ -173,8 +173,13 @@ The order that buys the most capability per unit effort:
    `rb-cli new --fs prodos` formats a bare volume (boot + 4-block volume
    directory + bitmap), and `prodos.rs` reconciles the volume bitmap against
    the directory-tree/file-index walk (block-factory-reachable, so `rb-cli
-   fsck` + the Inspect Check/Repair button light up automatically). Remaining
-   here: create-blank + fsck for Atari DOS, Apple DOS 3.3, CP/M, and OS-9.
+   fsck` + the Inspect Check/Repair button light up automatically). **Atari
+   DOS create-blank + fsck now done too:** `rb-cli new --fs atari` formats a
+   single-density disk, and `atari_dos.rs` reconciles the VTOC bitmap +
+   free-count against the directory's linked-sector chains (block-factory
+   reachable; the fsck check verb now peels floppy containers like `.atr` so
+   it works on wrapped images too). Remaining here: create-blank + fsck for
+   Apple DOS 3.3, CP/M, and OS-9.
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,

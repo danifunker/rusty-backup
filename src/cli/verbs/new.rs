@@ -50,6 +50,10 @@ pub enum FsKind {
     /// uppercased and must follow ProDOS rules: up to 15 of A-Z / 0-9 / '.',
     /// with a leading letter.
     Prodos,
+    /// Atari DOS 2.0S (Atari 8-bit). A single-density 90 KB floppy (720 × 128 B
+    /// sectors) with boot / VTOC / directory reserved. Fixed geometry, so
+    /// `--size` and `--name` are ignored (enhanced density is read-only).
+    Atari,
 }
 
 #[derive(Debug, Args)]
@@ -58,7 +62,7 @@ pub struct NewArgs {
     pub image: PathBuf,
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
-    /// ext (alias ext2), ext3, ext4, prodos.
+    /// ext (alias ext2), ext3, ext4, prodos, atari.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -256,6 +260,9 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),
         FsKind::Prodos => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::prodos::create_blank_prodos(size, name)
+        }),
+        FsKind::Atari => format_and_write(&args.image, &args.size, &args.name, |_size, _name| {
+            Ok(crate::fs::atari_dos::create_blank_atari_sd())
         }),
     }
 }
