@@ -64,10 +64,19 @@ overriding these methods.
 6. Implement `repair_<name>(...)` returning `RepairReport` (if any repairs are possible).
 7. Override `fsck()` and `repair()` on your filesystem's `Filesystem` / `EditableFilesystem` impl.
 8. Add `pub mod <name>_fsck;` to `src/fs/mod.rs`.
+9. Wire the filesystem into the GUI Check-button **gate** so the button appears
+   (`rb-cli fsck` needs no gate — it calls `fsck()` directly):
+   - identifiable by partition-type byte / APM string -> extend `is_checkable_type`;
+   - identifiable only by a content-probed `type_name` -> extend `is_checkable_fs_name`;
+   - a retro superfloppy / dispatch-string filesystem (CBM, DragonDOS, RS-DOS,
+     Acorn DFS, Human68k) -> extend `is_checkable_retro_fs`
+   (all three in `src/fs/mod.rs`; the Inspect grid ORs them together). A
+   container-only filesystem that opens outside the block factory (Alto packs,
+   via `open_pack`) instead gates the **browse-view** button on `fs_type`.
 
-The GUI (both browse_view and inspect_tab) automatically handles display of
-errors, warnings, orphaned entries, stats, and repair reports using the shared
-types -- no GUI changes needed.
+Once the gate passes, the GUI (both browse_view and inspect_tab) automatically
+handles display of errors, warnings, orphaned entries, stats, and repair
+reports using the shared types -- no GUI changes needed for the results view.
 
 ## Check phases (HFS example)
 
