@@ -65,6 +65,12 @@ pub enum FsKind {
     /// (required); `--size` / `--name` are ignored. A blank CP/M disk is just
     /// its reserved tracks + data area filled with 0xE5.
     Cpm,
+    /// OS-9 / NitrOS-9 RBF (Tandy CoCo, Dragon). A standard 35-track floppy
+    /// (630 × 256-byte sectors): identification sector, allocation bitmap, and
+    /// an empty root directory. Fixed geometry, so `--size` is ignored; `--name`
+    /// is sanitized to the OS-9 name set (A-Z a-z 0-9 . _ $).
+    #[value(alias = "nitros9", alias = "rbf")]
+    Os9,
 }
 
 #[derive(Debug, Args)]
@@ -74,7 +80,7 @@ pub struct NewArgs {
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
-    /// dos33), cpm.
+    /// dos33), cpm, os9 (alias nitros9 / rbf).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -290,6 +296,12 @@ pub fn run(args: NewArgs) -> Result<()> {
                 Ok(crate::fs::apple_dos::create_blank_apple_dos())
             })
         }
+        FsKind::Os9 => {
+            let vname = sanitize_os9_volume_name(&args.name);
+            format_and_write(&args.image, &args.size, &vname, |_size, name| {
+                Ok(crate::fs::os9::create_blank_os9(name)?)
+            })
+        }
         FsKind::Cpm => {
             let preset_name = args.cpm_preset.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--fs cpm requires --cpm-preset <name> (e.g. amstrad_data)")
@@ -327,6 +339,22 @@ fn format_and_write(
         name
     ));
     Ok(())
+}
+
+/// Coerce a free-form `--name` into a valid OS-9 volume name: keep only
+/// `A-Z a-z 0-9 . _ $`, cap at 29 chars, and guarantee a leading letter (the
+/// generic default `rusty-backup` becomes `rustybackup`; a digit-leading or
+/// empty result is prefixed with `OS9`).
+fn sanitize_os9_volume_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '$'))
+        .take(29)
+        .collect();
+    match cleaned.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '.' => cleaned,
+        _ => format!("OS9{cleaned}").chars().take(29).collect(),
+    }
 }
 
 /// Format a bare NTFS superfloppy straight into the target file. `create_ntfs`

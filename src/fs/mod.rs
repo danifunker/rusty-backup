@@ -2354,7 +2354,7 @@ pub fn is_checkable_fs_name(type_name: &str) -> bool {
 /// `fsck()` but which are identified only by their resolved `type_name` /
 /// dispatch string (not a partition-type byte or APM string): CBM DOS,
 /// DragonDOS, RS-DOS, Acorn DFS, Human68k, ProDOS, Atari DOS, Apple
-/// DOS 3.3, and CP/M (matched by its `cpm:<preset>` dispatch string).
+/// DOS 3.3, OS-9, and CP/M (matched by its `cpm:<preset>` dispatch string).
 ///
 /// Kept separate from [`is_checkable_fs_name`] because those tokens
 /// substring-match (e.g. `"DFS"` would also match `"ADFS"`, which has no fsck),
@@ -2376,7 +2376,14 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
     ptype == 0
         && matches!(
             type_name,
-            "CBM DOS" | "DragonDOS" | "RS-DOS" | "Acorn DFS" | "ProDOS" | "Atari DOS" | "DOS 3.3"
+            "CBM DOS"
+                | "DragonDOS"
+                | "RS-DOS"
+                | "Acorn DFS"
+                | "ProDOS"
+                | "Atari DOS"
+                | "DOS 3.3"
+                | "OS-9"
         )
 }
 
@@ -2774,8 +2781,8 @@ mod tests {
         assert!(is_checkable_retro_fs(0, None, "Atari DOS"));
         // Apple DOS 3.3 (140 KB floppy) now fscks.
         assert!(is_checkable_retro_fs(0, None, "DOS 3.3"));
-        // Non-fsck retro filesystems must NOT be gated.
-        assert!(!is_checkable_retro_fs(0, None, "OS-9"));
+        // OS-9 / NitrOS-9 RBF now fscks.
+        assert!(is_checkable_retro_fs(0, None, "OS-9"));
         // "DFS" must not substring-match "ADFS" (ADFS has no fsck).
         assert!(!is_checkable_retro_fs(0, None, "ADFS"));
     }

@@ -24,8 +24,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   derived from the toolshed `libdecb` semantics; fsck = granule-table
   reconciliation vs the directory chains, VALIDATE model),
   OS-9 / NitrOS-9 RBF (hierarchical Unix-like FS — read + write incl.
-  subdirectories, raw `.dsk` / `.vdk`; cross-validated byte-exact against an
-  independent clean-room RBF reader on real NitrOS-9 toolshed disks),
+  subdirectories + create + fsck, raw `.dsk` / `.vdk`; cross-validated
+  byte-exact against an independent clean-room RBF reader on real NitrOS-9
+  toolshed disks, fsck validated clean on the real fixture),
   DragonDOS (Dragon 32/64 read + write + fsck, single- / double-sided 40-track
   `.dsk`; cross-validated byte-exact against an independent clean-room
   reader/writer and against real third-party DragonDOS disks; fsck =

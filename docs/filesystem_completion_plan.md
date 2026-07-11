@@ -56,7 +56,7 @@ missing capability on a driver that already round-trips.
 | CBM DOS | Yes | Yes | **Yes** | — **fsck done** (VALIDATE; byte-verified vs `c1541 validate`) |
 | Atari DOS 2 | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs atari` (single density, promoted from the test-only formatter). fsck: VTOC-bitmap + free-count reconciliation against the directory's linked-sector chains; repair rewrites the bitmap + count (SD only — the DOS 2.5 VTOC2 region is surfaced as an unchecked warning). |
 | RS-DOS | Yes | Yes | **Yes** | — **fsck done** (granule-table VALIDATE) |
-| OS-9 / RBF | No | Yes | No | **create + fsck** |
+| OS-9 / RBF | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs os9` (35-track CoCo floppy: ident sector + bitmap + empty root). fsck: cluster-bitmap reconciliation against a directory-tree walk from the root FD; repair marks referenced-but-free clusters allocated, leaves reserved clusters (boot / reserved track) as a benign warning, and withholds on structural damage. |
 | DragonDOS | Yes | Yes | **Yes** | — **fsck done** (sector-bitmap VALIDATE) |
 | Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency) |
 | Acorn ADFS | No | Partial | No | **finish edit + create + fsck** |
@@ -187,7 +187,11 @@ The order that buys the most capability per unit effort:
    self-consistency check (CP/M has no free map) — cross-links, out-of-range
    pointers, and invalid entries (CP/M 3 label / timestamp SFCBs recognized as
    valid). The fsck verb gained a `--fs-type` flag so a signatureless CP/M
-   image is dispatchable. Remaining here: create-blank + fsck for OS-9.
+   image is dispatchable. **OS-9 create-blank + fsck now done too:** `rb-cli
+   new --fs os9` formats a 35-track CoCo floppy, and `os9.rs` walks the
+   directory tree from the root FD to reconcile the cluster bitmap (reserved
+   clusters — boot / last track — are a benign warning, never freed). **Step 4
+   retro long-tail complete: all create + fsck gaps closed.**
 5. **JFS repair** — the one read-only FS whose repair is already scoped.
 6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
    quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,
