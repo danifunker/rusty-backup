@@ -792,6 +792,27 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
     fn used_size(&self) -> u64 {
         (self.mdb.num_alloc_blocks - self.mdb.free_blocks) as u64 * self.mdb.alloc_block_size as u64
     }
+
+    /// Stream a file's resource fork. MFS files carry a data + resource fork
+    /// like HFS; consumers (`get-binhex`, MacBinary / AppleDouble export, `cp`,
+    /// the remote daemon) reach it only through this trait method, so it must
+    /// bridge to the inherent [`read_resource_fork`](Self::read_resource_fork)
+    /// (which follows the resource fork's own allocation-block chain).
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn std::io::Write,
+    ) -> Result<u64, FilesystemError> {
+        let data = self.read_resource_fork(entry)?;
+        writer.write_all(&data)?;
+        Ok(data.len() as u64)
+    }
+
+    fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        self.entry_by_file_number(entry.location as u32)
+            .map(|de| de.rsrc_logical_length as u64)
+            .unwrap_or(0)
+    }
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
@@ -1252,6 +1273,67 @@ mod tests {
         let hello = entries.iter().find(|e| e.name == "Hello").unwrap();
         let empty = fs.read_resource_fork(hello).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn resource_fork_via_trait_object() {
+        // Regression: every real consumer (get-binhex, MacBinary/AppleDouble
+        // export, cp, the remote daemon) holds a `dyn Filesystem` and reaches
+        // the resource fork ONLY through the trait's `write_resource_fork_to` /
+        // `resource_fork_size` — never the inherent `read_resource_fork`. Before
+        // these were wired they defaulted to `Ok(0)` / `0`, silently dropping
+        // every MFS resource fork.
+        let disk = build_test_mfs();
+        let mut fs = MfsFilesystem::open(Cursor::new(disk), 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        let doc = entries.iter().find(|e| e.name == "Doc").unwrap().clone();
+        let hello = entries.iter().find(|e| e.name == "Hello").unwrap().clone();
+
+        let fsys: &mut dyn Filesystem = &mut fs;
+        assert_eq!(fsys.resource_fork_size(&doc), 4);
+        let mut buf = Vec::new();
+        assert_eq!(fsys.write_resource_fork_to(&doc, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"RSRC");
+
+        // A fork-less file still yields zero through the trait.
+        assert_eq!(fsys.resource_fork_size(&hello), 0);
+        let mut empty = Vec::new();
+        assert_eq!(fsys.write_resource_fork_to(&hello, &mut empty).unwrap(), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn resource_fork_survives_real_export_consumer() {
+        // End-to-end through the *actual* shared export path used by the browse
+        // view's "Extract" and Commander's copy-to-host
+        // (fork_export::export_file_with_fork). SeparateRsrc mode writes the raw
+        // resource fork to a `<name>.rsrc` sidecar — before the trait wiring this
+        // sidecar was empty / never written for MFS files.
+        use crate::fs::fork_export::export_file_with_fork;
+        use crate::fs::resource_fork::ResourceForkMode;
+
+        let dir = std::env::temp_dir().join(format!("rb_mfs_fork_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut fs = MfsFilesystem::open(Cursor::new(build_test_mfs()), 0).unwrap();
+        let root = fs.root().unwrap();
+        let doc = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Doc")
+            .unwrap();
+
+        export_file_with_fork(&mut fs, &doc, &dir, "Doc", ResourceForkMode::SeparateRsrc).unwrap();
+
+        // Data fork under the plain name, plus a NON-EMPTY resource-fork sidecar
+        // carrying the real bytes.
+        assert_eq!(std::fs::read(dir.join("Doc")).unwrap(), b"first line\n");
+        assert_eq!(std::fs::read(dir.join("Doc.rsrc")).unwrap(), b"RSRC");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
