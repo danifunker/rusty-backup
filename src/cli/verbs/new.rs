@@ -71,6 +71,16 @@ pub enum FsKind {
     /// is sanitized to the OS-9 name set (A-Z a-z 0-9 . _ $).
     #[value(alias = "nitros9", alias = "rbf")]
     Os9,
+    /// Minix V1 (Minix, early Linux). Classic 30-char-name filesystem (magic
+    /// 0x138F), 1 KiB blocks, geometry matching `mkfs.minix -1`; up to 64 MiB.
+    /// `--name` is ignored (Minix has no volume label).
+    #[value(alias = "minix1")]
+    Minix,
+    /// Minix V2 (magic 0x2478): like V1 with 32-bit zone pointers and triple
+    /// indirection, matching `mkfs.minix -2`.
+    Minix2,
+    /// Minix V3 (magic 0x4D5A): 60-char names, matching `mkfs.minix -3`.
+    Minix3,
 }
 
 #[derive(Debug, Args)]
@@ -80,7 +90,8 @@ pub struct NewArgs {
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
-    /// dos33), cpm, os9 (alias nitros9 / rbf).
+    /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
+    /// minix3.
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -320,7 +331,34 @@ pub fn run(args: NewArgs) -> Result<()> {
                 Ok(crate::fs::cpm::create_blank(dpb))
             })
         }
+        FsKind::Minix => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V1)
+        }
+        FsKind::Minix2 => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V2)
+        }
+        FsKind::Minix3 => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V3)
+        }
     }
+}
+
+fn write_blank_minix_image(
+    image: &std::path::Path,
+    size_str: &str,
+    version: crate::fs::minix::MinixVersion,
+) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::minix::create_blank_minix(size, version)
+        .map_err(|e| anyhow::anyhow!("formatting Minix: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, Minix {:?})",
+        image.display(),
+        img.len(),
+        version
+    ));
+    Ok(())
 }
 
 fn format_and_write(

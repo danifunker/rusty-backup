@@ -1177,6 +1177,190 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
     }
 }
 
+// ---- create-blank (rb-cli new --fs minix{,2,3}) ----
+
+/// mkfs-parity magic for a freshly formatted volume: V1 uses 30-char names
+/// (0x138F), V2 uses 30-char (0x2478), V3 uses 0x4D5A — matching `mkfs.minix
+/// -1/-2/-3`.
+fn blank_magic(version: MinixVersion) -> (u16, usize) {
+    match version {
+        MinixVersion::V1 => (MAGIC_V1_30, 30),
+        MinixVersion::V2 => (MAGIC_V2_30, 30),
+        MinixVersion::V3 => (MAGIC_V3, 60),
+    }
+}
+
+/// Set bits `[first, last]` (inclusive) LSB-first in a byte slice.
+fn set_bit_range(bitmap: &mut [u8], first: usize, last: usize) {
+    for bit in first..=last {
+        bitmap[bit / 8] |= 1 << (bit % 8);
+    }
+}
+
+/// Format a blank Minix volume of `size_bytes`, reproducing the on-disk layout
+/// (and geometry algorithm) of `mkfs.minix`. Returns the raw image. 1024-byte
+/// blocks; `log_zone_size = 0`. Root is inode 1 with `.`/`..`.
+pub fn create_blank_minix(
+    size_bytes: u64,
+    version: MinixVersion,
+) -> Result<Vec<u8>, FilesystemError> {
+    let block_size: u64 = 1024;
+    let blocks = size_bytes / block_size;
+    let inode_size: u64 = if version == MinixVersion::V1 { 32 } else { 64 };
+    let ipb = block_size / inode_size; // inodes per block
+    let bpb = block_size * 8; // bits per block
+    let zones = blocks; // log_zone_size = 0
+
+    if version == MinixVersion::V1 && blocks > 65_535 {
+        return Err(FilesystemError::Unsupported(
+            "Minix V1 volumes are limited to 64 MiB (use --fs minix2/minix3)".into(),
+        ));
+    }
+
+    // ninodes = round_up(blocks/3, ipb), matching mkfs.minix; clamp to the
+    // u16 inode-count ceiling on V1/V2.
+    let mut ninodes = (blocks / 3).div_ceil(ipb) * ipb;
+    if ninodes < ipb {
+        ninodes = ipb;
+    }
+    let max_inodes = if version == MinixVersion::V3 {
+        (u32::MAX as u64 / ipb) * ipb
+    } else {
+        (65535 / ipb) * ipb
+    };
+    ninodes = ninodes.min(max_inodes);
+
+    let imap_blocks = (ninodes + 1).div_ceil(bpb);
+    let inode_blocks = ninodes / ipb;
+
+    // firstdatazone and zmap_blocks are mutually dependent; iterate to a fixed
+    // point (mkfs does the same).
+    let mut zmap_blocks = 1u64;
+    for _ in 0..64 {
+        let fdz = 2 + imap_blocks + zmap_blocks + inode_blocks;
+        if fdz >= zones {
+            return Err(FilesystemError::Unsupported(
+                "image too small for a Minix filesystem".into(),
+            ));
+        }
+        let nz = (zones - fdz + 1).div_ceil(bpb);
+        if nz == zmap_blocks {
+            break;
+        }
+        zmap_blocks = nz;
+    }
+    let firstdatazone = 2 + imap_blocks + zmap_blocks + inode_blocks;
+    if firstdatazone >= zones {
+        return Err(FilesystemError::Unsupported(
+            "image too small for a Minix filesystem".into(),
+        ));
+    }
+
+    let (magic, name_len) = blank_magic(version);
+    let dir_entry_size = if version == MinixVersion::V3 {
+        4 + name_len
+    } else {
+        2 + name_len
+    };
+
+    let mut img = vec![0u8; (blocks * block_size) as usize];
+
+    // ---- superblock (block 1) ----
+    {
+        let sb = &mut img[block_size as usize..block_size as usize + 64];
+        if version == MinixVersion::V3 {
+            sb[0..4].copy_from_slice(&(ninodes as u32).to_le_bytes());
+            sb[6..8].copy_from_slice(&(imap_blocks as u16).to_le_bytes());
+            sb[8..10].copy_from_slice(&(zmap_blocks as u16).to_le_bytes());
+            sb[10..12].copy_from_slice(&(firstdatazone as u16).to_le_bytes());
+            sb[12..14].copy_from_slice(&0u16.to_le_bytes()); // log_zone_size
+            sb[16..20].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // max_size
+            sb[20..24].copy_from_slice(&(zones as u32).to_le_bytes());
+            sb[24..26].copy_from_slice(&magic.to_le_bytes());
+            sb[28..30].copy_from_slice(&(block_size as u16).to_le_bytes());
+        } else {
+            sb[0..2].copy_from_slice(&(ninodes as u16).to_le_bytes());
+            // nzones@2 (u16) is used on V1; V2 carries the count at @20 instead.
+            let nzones16 = if version == MinixVersion::V1 {
+                zones as u16
+            } else {
+                0
+            };
+            sb[2..4].copy_from_slice(&nzones16.to_le_bytes());
+            sb[4..6].copy_from_slice(&(imap_blocks as u16).to_le_bytes());
+            sb[6..8].copy_from_slice(&(zmap_blocks as u16).to_le_bytes());
+            sb[8..10].copy_from_slice(&(firstdatazone as u16).to_le_bytes());
+            sb[10..12].copy_from_slice(&0u16.to_le_bytes()); // log_zone_size
+            sb[12..16].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // max_size
+            sb[16..18].copy_from_slice(&magic.to_le_bytes());
+            sb[18..20].copy_from_slice(&1u16.to_le_bytes()); // state = clean
+            if version == MinixVersion::V2 {
+                sb[20..24].copy_from_slice(&(zones as u32).to_le_bytes());
+            }
+        }
+    }
+
+    // ---- inode bitmap (block 2) ----
+    {
+        let start = 2 * block_size as usize;
+        let imap = &mut img[start..start + (imap_blocks * block_size) as usize];
+        imap[0] |= 1; // bit 0 sentinel
+        imap[0] |= 1 << 1; // inode 1 (root)
+                           // Padding: inodes beyond ninodes don't exist -> mark used.
+        set_bit_range(
+            imap,
+            (ninodes + 1) as usize,
+            (imap_blocks * bpb - 1) as usize,
+        );
+    }
+
+    // ---- zone bitmap (block 2 + imap_blocks) ----
+    {
+        let start = ((2 + imap_blocks) * block_size) as usize;
+        let zmap = &mut img[start..start + (zmap_blocks * block_size) as usize];
+        zmap[0] |= 1; // bit 0 sentinel
+        zmap[0] |= 1 << 1; // bit 1 = firstdatazone (root directory)
+                           // Padding beyond the last real data zone.
+        set_bit_range(
+            zmap,
+            (zones - firstdatazone + 1) as usize,
+            (zmap_blocks * bpb - 1) as usize,
+        );
+    }
+
+    // ---- root inode (inode 1) ----
+    {
+        let mut root = MinixInode::empty(ROOT_INO);
+        root.mode = 0o040755;
+        root.nlinks = 2; // "." and ".."
+        root.size = (dir_entry_size * 2) as u32;
+        root.zones[0] = firstdatazone as u32;
+        let raw = root.serialize(version);
+        let off = ((2 + imap_blocks + zmap_blocks) * block_size) as usize;
+        img[off..off + raw.len()].copy_from_slice(&raw);
+    }
+
+    // ---- root directory zone (firstdatazone): "." and ".." ----
+    {
+        let ino_field = if version == MinixVersion::V3 { 4 } else { 2 };
+        let off = (firstdatazone * block_size) as usize;
+        encode_dirent(
+            &mut img[off..off + dir_entry_size],
+            ino_field,
+            ROOT_INO,
+            b".",
+        );
+        encode_dirent(
+            &mut img[off + dir_entry_size..off + dir_entry_size * 2],
+            ino_field,
+            ROOT_INO,
+            b"..",
+        );
+    }
+
+    Ok(img)
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
     fn create_file(
         &mut self,
@@ -1930,5 +2114,121 @@ mod tests {
     #[test]
     fn oracle_large_file_roundtrip_v3() {
         oracle_large_file_roundtrip(3);
+    }
+
+    // ---- Create-blank ----
+
+    #[test]
+    fn create_blank_opens_as_empty_volume() {
+        for mver in [MinixVersion::V1, MinixVersion::V2, MinixVersion::V3] {
+            let img = create_blank_minix(2 * 1024 * 1024, mver).expect("blank");
+            let mut fs = MinixFilesystem::open(Cursor::new(img), 0).expect("open blank");
+            let root = fs.root().expect("root");
+            assert!(root.is_directory());
+            assert!(
+                fs.list_directory(&root).unwrap().is_empty(),
+                "fresh {mver:?} root should be empty"
+            );
+        }
+    }
+
+    fn fsck_clean(fsck: &PathBuf, img: &std::path::Path) -> Result<(), String> {
+        let out = Command::new(fsck)
+            .arg("-f")
+            .arg(img)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run fsck.minix");
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr))
+        }
+    }
+
+    /// Our blank must match mkfs.minix's geometry byte-for-byte in the
+    /// superblock, pass fsck.minix, and remain fsck-clean after an edit.
+    fn oracle_create_blank(version: u8, mver: MinixVersion) {
+        let (Some(mkfs), Some(fsck)) = (minix_tool("mkfs.minix"), minix_tool("fsck.minix")) else {
+            eprintln!("skipping oracle_create_blank v{version}: util-linux not available");
+            return;
+        };
+        let size = 2 * 1024 * 1024u64;
+        let ours = create_blank_minix(size, mver).expect("create_blank_minix");
+
+        // Geometry parity against mkfs.minix for the same size.
+        let ref_img = std::env::temp_dir().join(format!(
+            "rb_minix_ref_v{version}_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&ref_img, vec![0u8; size as usize]).unwrap();
+        assert!(Command::new(&mkfs)
+            .arg(format!("-{version}"))
+            .arg(&ref_img)
+            .output()
+            .expect("mkfs")
+            .status
+            .success());
+        let theirs = std::fs::read(&ref_img).unwrap();
+        let _ = std::fs::remove_file(&ref_img);
+        let so = MinixSuperblock::parse(&ours[1024..2048]).unwrap();
+        let st = MinixSuperblock::parse(&theirs[1024..2048]).unwrap();
+        assert_eq!(so.magic, st.magic, "v{version} magic");
+        assert_eq!(so.ninodes, st.ninodes, "v{version} ninodes");
+        assert_eq!(so.imap_blocks, st.imap_blocks, "v{version} imap_blocks");
+        assert_eq!(so.zmap_blocks, st.zmap_blocks, "v{version} zmap_blocks");
+        assert_eq!(
+            so.firstdatazone, st.firstdatazone,
+            "v{version} firstdatazone"
+        );
+        assert_eq!(so.zones, st.zones, "v{version} zones");
+
+        // Our blank must be fsck-clean, and stay clean after writing a file.
+        let path = std::env::temp_dir().join(format!(
+            "rb_minix_blank_v{version}_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&path, &ours).unwrap();
+        if let Err(log) = fsck_clean(&fsck, &path) {
+            let _ = std::fs::remove_file(&path);
+            panic!("fsck.minix flagged our blank v{version}:\n{log}");
+        }
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut fs = MinixFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "readme",
+                &mut &b"hi"[..],
+                2,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        if let Err(log) = fsck_clean(&fsck, &path) {
+            let _ = std::fs::remove_file(&path);
+            panic!("fsck.minix flagged our blank v{version} after edit:\n{log}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oracle_create_blank_v1() {
+        oracle_create_blank(1, MinixVersion::V1);
+    }
+    #[test]
+    fn oracle_create_blank_v2() {
+        oracle_create_blank(2, MinixVersion::V2);
+    }
+    #[test]
+    fn oracle_create_blank_v3() {
+        oracle_create_blank(3, MinixVersion::V3);
     }
 }
