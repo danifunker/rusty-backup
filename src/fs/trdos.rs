@@ -31,10 +31,12 @@
 //! This is the read half of the TR-DOS quartet (Browse); edit / create / fsck
 //! build on it (`docs/filesystem_completion_plan.md` Part 2).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 /// Bytes per sector.
 pub(crate) const SECTOR: u64 = 256;
@@ -172,12 +174,16 @@ pub struct TrdosFilesystem<R: Read + Seek> {
     free_sectors: u16,
     /// Number of catalogue slots in use (live + tombstoned), from disk-info.
     num_files: u16,
+    /// Number of deleted (tombstoned) slots, from disk-info (0xF4).
+    deleted_count: u8,
     /// Live (non-deleted) entries, in catalogue order.
     entries: Vec<TrdosEntry>,
-    /// Highest linear sector consumed by any allocation (defensive high-water
-    /// mark for backup trimming: the max of the disk-info pointer and every
-    /// entry's end, so a understated free-count never trims a real file).
-    high_water: u64,
+    /// First-free linear sector — the high-water mark where the next file is
+    /// appended. Taken as the max of the disk-info pointer and every entry's
+    /// packed end, so an understated free-count can neither hide a file from
+    /// backup trimming nor let a create overwrite live data. Advances on
+    /// `create_file`; never retreats on delete (TR-DOS reclaims only via MOVE).
+    first_free_linear: u64,
 }
 
 /// Parse a 16-byte catalogue entry at `off` into a live entry, or `None` when
@@ -271,6 +277,7 @@ impl<R: Read + Seek> TrdosFilesystem<R> {
 
         let free_sectors = u16::from_le_bytes([info[0xE5], info[0xE6]]);
         let num_files = info[0xE4] as u16;
+        let deleted_count = info[0xF4];
         let volume_label = trim_name(&info[0xF5..0xFD]);
 
         let mut entries = Vec::new();
@@ -290,7 +297,7 @@ impl<R: Read + Seek> TrdosFilesystem<R> {
             }
         }
         let info_high_water = geometry.total_sectors().saturating_sub(free_sectors as u64);
-        let high_water = packed_end
+        let first_free_linear = packed_end
             .max(info_high_water)
             .min(geometry.total_sectors());
 
@@ -301,8 +308,9 @@ impl<R: Read + Seek> TrdosFilesystem<R> {
             volume_label,
             free_sectors,
             num_files,
+            deleted_count,
             entries,
-            high_water,
+            first_free_linear,
         })
     }
 
@@ -396,7 +404,224 @@ impl<R: Read + Seek + Send> Filesystem for TrdosFilesystem<R> {
     }
 
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
-        Ok(self.high_water * SECTOR)
+        Ok(self.first_free_linear * SECTOR)
+    }
+
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        parse_trdos_name(name).map(|_| ())
+    }
+}
+
+/// Split a display name (`NAME.T`) into the 8-byte, space-padded on-disk name
+/// and the single type character. A basename with no `.T` suffix (or a suffix
+/// that isn't exactly one character) keeps its whole basename and defaults to a
+/// `C` (CODE) type. Errors when the name part is empty, longer than 8 bytes, or
+/// carries a non-printable byte.
+fn parse_trdos_name(name: &str) -> Result<([u8; 8], u8), FilesystemError> {
+    let (stem, type_char) = match name.rsplit_once('.') {
+        Some((s, t)) if t.len() == 1 => (s, t.as_bytes()[0]),
+        _ => (name, b'C'),
+    };
+    let bytes = stem.as_bytes();
+    if bytes.is_empty() || bytes.len() > 8 {
+        return Err(FilesystemError::InvalidData(format!(
+            "invalid TR-DOS file name {name:?} (name part must be 1-8 characters)"
+        )));
+    }
+    if bytes.iter().any(|&b| !(0x20..0x7F).contains(&b)) || !(0x20..0x7F).contains(&type_char) {
+        return Err(FilesystemError::InvalidData(format!(
+            "invalid TR-DOS file name {name:?} (printable ASCII only)"
+        )));
+    }
+    let mut name8 = [b' '; 8];
+    name8[..bytes.len()].copy_from_slice(bytes);
+    Ok((name8, type_char))
+}
+
+impl<R: Read + Write + Seek> TrdosFilesystem<R> {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + off))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Serialize and write a 16-byte catalogue entry at its slot.
+    fn write_entry(&mut self, e: &TrdosEntry) -> Result<(), FilesystemError> {
+        let mut raw = [0u8; ENTRY];
+        raw[0..8].copy_from_slice(&e.name);
+        raw[8] = e.type_char;
+        raw[9..11].copy_from_slice(&e.start_param.to_le_bytes());
+        raw[11..13].copy_from_slice(&e.length_bytes.to_le_bytes());
+        raw[13] = e.length_sectors;
+        raw[14] = e.start_sector;
+        raw[15] = e.start_track;
+        self.write_at((e.slot * ENTRY) as u64, &raw)
+    }
+
+    /// Write the mutable disk-info counters (first-free pointer, file count,
+    /// free-sector count, deleted count) back to the disk-info sector.
+    fn write_disk_info(&mut self) -> Result<(), FilesystemError> {
+        let ff = self.first_free_linear;
+        self.write_at(INFO_OFF + 0xE1, &[(ff % SPT) as u8, (ff / SPT) as u8])?;
+        self.write_at(INFO_OFF + 0xE4, &[self.num_files as u8])?;
+        self.write_at(INFO_OFF + 0xE5, &self.free_sectors.to_le_bytes())?;
+        self.write_at(INFO_OFF + 0xF4, &[self.deleted_count])?;
+        Ok(())
+    }
+
+    /// Find a live entry by its display name, returning its index in `entries`.
+    fn find_live(&self, display: &str) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.display_name() == display)
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() || parent.path != "/" {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let (name8, type_char) = parse_trdos_name(name)?;
+        if self
+            .entries
+            .iter()
+            .any(|e| e.name == name8 && e.type_char == type_char)
+        {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+        if self.num_files as usize >= MAX_FILES {
+            return Err(FilesystemError::DiskFull(
+                "TR-DOS catalogue full (128 entries)".into(),
+            ));
+        }
+        let need = data_len.div_ceil(SECTOR).max(1);
+        // The length-in-sectors field is a single byte, so a TR-DOS file tops
+        // out at 255 sectors (65280 bytes).
+        if need > 255 {
+            return Err(FilesystemError::InvalidData(
+                "file too large for TR-DOS (max 255 sectors / 65280 bytes)".into(),
+            ));
+        }
+        let start = self.first_free_linear;
+        if start + need > self.geometry.total_sectors() {
+            return Err(FilesystemError::DiskFull(format!(
+                "not enough contiguous free space (need {need} sectors)"
+            )));
+        }
+        // Write the payload, zero-padding the final sector.
+        let mut buf = vec![0u8; (need * SECTOR) as usize];
+        if data_len > 0 {
+            data.read_exact(&mut buf[..data_len as usize])?;
+        }
+        self.write_at(start * SECTOR, &buf)?;
+
+        let entry = TrdosEntry {
+            slot: self.num_files as usize,
+            name: name8,
+            type_char,
+            start_param: 0,
+            length_bytes: data_len as u16, // fits: need <= 255 => data_len <= 65280
+            length_sectors: need as u8,
+            start_sector: (start % SPT) as u8,
+            start_track: (start / SPT) as u8,
+        };
+        self.write_entry(&entry)?;
+
+        // Advance the high-water mark and free count (append semantics).
+        self.num_files += 1;
+        self.first_free_linear = start + need;
+        self.free_sectors =
+            (self.geometry.total_sectors() - self.first_free_linear).min(u16::MAX as u64) as u16;
+        self.write_disk_info()?;
+
+        let fe = self.entry_to_file(&entry);
+        self.entries.push(entry);
+        Ok(fe)
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "TR-DOS is a flat filesystem — no subdirectories".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let idx = self
+            .find_live(&entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+        let slot = self.entries[idx].slot;
+        // Tombstone: TR-DOS marks a deleted file by setting the first name byte
+        // to 0x01, bumps the deleted count, and does NOT reclaim the sectors or
+        // the catalogue slot (space is recovered only by the MOVE command).
+        self.write_at((slot * ENTRY) as u64, &[0x01])?;
+        self.deleted_count = self.deleted_count.saturating_add(1);
+        self.write_at(INFO_OFF + 0xF4, &[self.deleted_count])?;
+        self.entries.remove(idx);
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let (name8, type_char) = parse_trdos_name(new_name)?;
+        if self
+            .entries
+            .iter()
+            .any(|e| e.name == name8 && e.type_char == type_char)
+        {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+        let idx = self
+            .find_live(&entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+        let slot = self.entries[idx].slot;
+        // Rewrite the 8-byte name + type char in place (identity/contents keep).
+        let mut hdr = [0u8; 9];
+        hdr[0..8].copy_from_slice(&name8);
+        hdr[8] = type_char;
+        self.write_at((slot * ENTRY) as u64, &hdr)?;
+        self.entries[idx].name = name8;
+        self.entries[idx].type_char = type_char;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.free_sectors as u64 * SECTOR)
     }
 }
 
@@ -577,5 +802,213 @@ mod tests {
         let data = fs.read_file(big, usize::MAX).unwrap();
         assert_eq!(data.len(), 5000);
         assert!(data.iter().all(|&b| b == 0x42));
+    }
+
+    // ---- Edit ----
+
+    /// A blank writable TR-DOS volume (empty catalogue) built in memory.
+    fn blank_image(disk_type: u8, label: &str) -> Vec<u8> {
+        let geom = TrdosGeometry::from_type(disk_type).unwrap();
+        let mut img = vec![0u8; geom.total_bytes() as usize];
+        let base = INFO_OFF as usize;
+        img[base + 0xE1] = (DATA_START % SPT) as u8; // first free sector
+        img[base + 0xE2] = (DATA_START / SPT) as u8; // first free track
+        img[base + 0xE3] = disk_type;
+        img[base + 0xE4] = 0; // file count
+        let free = (geom.total_sectors() - DATA_START) as u16;
+        img[base + 0xE5..base + 0xE7].copy_from_slice(&free.to_le_bytes());
+        img[base + 0xE7] = TRDOS_ID;
+        let mut lab = [b' '; 8];
+        let lb = label.as_bytes();
+        let n = lb.len().min(8);
+        lab[..n].copy_from_slice(&lb[..n]);
+        img[base + 0xF5..base + 0xFD].copy_from_slice(&lab);
+        img
+    }
+
+    #[test]
+    fn parse_name_forms() {
+        assert_eq!(parse_trdos_name("GAME.C").unwrap(), (*b"GAME    ", b'C'));
+        assert_eq!(parse_trdos_name("boot").unwrap(), (*b"boot    ", b'C')); // default type
+        assert_eq!(parse_trdos_name("A.B.D").unwrap(), (*b"A.B     ", b'D')); // dots in name
+        assert_eq!(
+            parse_trdos_name("EIGHTLET.#").unwrap(),
+            (*b"EIGHTLET", b'#')
+        );
+        assert!(parse_trdos_name("TOOLONGNAME.C").is_err()); // stem > 8
+        assert!(parse_trdos_name("").is_err());
+    }
+
+    #[test]
+    fn edit_create_rename_delete_roundtrip() {
+        let mut fs = TrdosFilesystem::open(Cursor::new(blank_image(0x16, "EDITVOL")), 0)
+            .expect("open blank");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+
+        let a = vec![0x2Au8; 300]; // 2 sectors
+        fs.create_file(
+            &root,
+            "ALPHA.C",
+            &mut &a[..],
+            300,
+            &CreateFileOptions::default(),
+        )
+        .expect("create ALPHA");
+        let b = vec![0x5Bu8; 5000]; // 20 sectors
+        fs.create_file(
+            &root,
+            "BETA.B",
+            &mut &b[..],
+            5000,
+            &CreateFileOptions::default(),
+        )
+        .expect("create BETA");
+
+        let alpha = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ALPHA.C")
+            .unwrap();
+        fs.rename(&root, &alpha, "GAMMA.C").expect("rename");
+
+        fs.create_file(
+            &root,
+            "TMP.D",
+            &mut &b"xy"[..],
+            2,
+            &CreateFileOptions::default(),
+        )
+        .expect("create TMP");
+        let tmp = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TMP.D")
+            .unwrap();
+        fs.delete_entry(&root, &tmp).expect("delete TMP");
+
+        let files = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = files.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"GAMMA.C"), "{names:?}");
+        assert!(names.contains(&"BETA.B"), "{names:?}");
+        assert!(!names.contains(&"ALPHA.C"));
+        assert!(!names.contains(&"TMP.D"));
+
+        // BETA's data survived the rename + delete-of-another-file untouched.
+        let beta = files.iter().find(|e| e.name == "BETA.B").unwrap();
+        assert_eq!(beta.size, 5000);
+        let data = fs.read_file(beta, usize::MAX).unwrap();
+        assert_eq!(data.len(), 5000);
+        assert!(data.iter().all(|&x| x == 0x5B));
+
+        // Subdirectories are not a thing in TR-DOS.
+        assert!(matches!(
+            fs.create_directory(&root, "sub", &CreateDirectoryOptions::default()),
+            Err(FilesystemError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn edit_persists_across_reopen() {
+        let mut cur = Cursor::new(blank_image(0x16, "REOPEN"));
+        {
+            let mut fs = TrdosFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let data = vec![0x7Eu8; 1500];
+            fs.create_file(
+                &root,
+                "KEEP.C",
+                &mut &data[..],
+                1500,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = TrdosFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let files = fs.list_directory(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "KEEP.C");
+        assert_eq!(files[0].size, 1500);
+        assert_eq!(fs.read_file(&files[0], usize::MAX).unwrap().len(), 1500);
+    }
+
+    #[test]
+    fn oracle_validates_our_edits() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_validates_our_edits: oracle unavailable");
+            return;
+        };
+        if !have_python() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_trdos_edit_{}.trd", std::process::id()));
+        let volp = vol.to_str().unwrap();
+        let run = |args: &[&str]| {
+            Command::new("python3")
+                .arg(&script)
+                .args(args)
+                .output()
+                .expect("python3")
+        };
+        assert!(run(&["mkfs", volp, "80DS", "OVOL"]).status.success());
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = TrdosFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "ALPHA.C",
+                &mut &[0x41u8; 400][..],
+                400,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_file(
+                &root,
+                "BETA.C",
+                &mut &[0x42u8; 5000][..],
+                5000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_file(
+                &root,
+                "TMP.C",
+                &mut &[0x43u8; 300][..],
+                300,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let tmp = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "TMP.C")
+                .unwrap();
+            fs.delete_entry(&root, &tmp).unwrap();
+            let alpha = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "ALPHA.C")
+                .unwrap();
+            fs.rename(&root, &alpha, "GAMMA.C").unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // The oracle's fsck must find our create + delete + rename consistent.
+        let out = run(&["fsck", volp]);
+        let clean = out.status.success();
+        let log = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged our edits:\n{log}");
     }
 }
