@@ -23,10 +23,12 @@
 //! This is the read half of the UCSD quartet (Browse); edit / create / fsck
 //! build on it (`docs/filesystem_completion_plan.md` Part 2).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 const BLOCK: u64 = 512;
 /// Directory starts at block 2 and spans 4 blocks.
@@ -74,9 +76,14 @@ impl UcsdEntry {
 pub struct UcsdFilesystem<R: Read + Seek> {
     reader: R,
     partition_offset: u64,
+    little_endian: bool,
     volume_name: String,
     /// Blocks on the volume, from the label (`DEOVBLK`).
     eov_blocks: u16,
+    /// First block past the directory (`DLASTBLK` of the label): 6 or 10.
+    dir_end: u16,
+    /// Volume label date word (preserved across writes).
+    vol_date: u16,
     entries: Vec<UcsdEntry>,
 }
 
@@ -156,7 +163,9 @@ impl<R: Read + Seek> UcsdFilesystem<R> {
         }
         let little = detect_byte_sex(&dir).unwrap();
         let volume_name = read_name(&dir, 6, 7).unwrap_or_default();
+        let dir_end = read_u16(&dir, 2, little);
         let eov_blocks = read_u16(&dir, 14, little);
+        let vol_date = read_u16(&dir, 20, little);
         let num_files = read_u16(&dir, 16, little) as usize;
 
         let mut entries = Vec::new();
@@ -181,12 +190,19 @@ impl<R: Read + Seek> UcsdFilesystem<R> {
                 date,
             });
         }
+        // Keep entries ordered by first block so gap-finding and write-back
+        // (which the format assumes is sorted) are correct even on a foreign
+        // volume whose directory order drifted.
+        entries.sort_by_key(|e| e.first_block);
 
         Ok(UcsdFilesystem {
             reader,
             partition_offset,
+            little_endian: little,
             volume_name,
             eov_blocks,
+            dir_end,
+            vol_date,
             entries,
         })
     }
@@ -314,6 +330,244 @@ pub fn kind_name(kind: u8) -> &'static str {
     KIND_NAMES.get(kind as usize).copied().unwrap_or("unknown")
 }
 
+fn write_u16(buf: &mut [u8], off: usize, val: u16, little: bool) {
+    let b = if little {
+        val.to_le_bytes()
+    } else {
+        val.to_be_bytes()
+    };
+    buf[off..off + 2].copy_from_slice(&b);
+}
+
+fn write_name(buf: &mut [u8], off: usize, name: &str, max: usize) {
+    let nb = name.to_ascii_uppercase().into_bytes();
+    let n = nb.len().min(max);
+    buf[off] = n as u8;
+    buf[off + 1..off + 1 + max].fill(0);
+    buf[off + 1..off + 1 + n].copy_from_slice(&nb[..n]);
+}
+
+/// Guess a UCSD file kind from the name suffix; defaults to datafile.
+fn kind_from_name(name: &str) -> u8 {
+    let upper = name.to_ascii_uppercase();
+    if upper.ends_with(".TEXT") {
+        3
+    } else if upper.ends_with(".CODE") {
+        2
+    } else if upper.ends_with(".INFO") {
+        4
+    } else if upper.ends_with(".GRAF") {
+        6
+    } else if upper.ends_with(".FOTO") {
+        7
+    } else {
+        5 // datafile
+    }
+}
+
+fn valid_ucsd_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    !up.is_empty()
+        && up.len() <= 15
+        && up
+            .bytes()
+            .all(|b| (0x20..=0x7E).contains(&b) && b != b'/' && b != b':')
+}
+
+impl<R: Read + Write + Seek> UcsdFilesystem<R> {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + off))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    /// Re-serialize the volume label + file entries and write the directory
+    /// (blocks 2..5). Entries are assumed sorted by first block.
+    fn write_directory(&mut self) -> Result<(), FilesystemError> {
+        let little = self.little_endian;
+        let mut dir = vec![0u8; (DIR_BLOCKS * BLOCK) as usize];
+        write_u16(&mut dir, 0, 0, little); // FIRSTBLK
+        write_u16(&mut dir, 2, self.dir_end, little); // DLASTBLK
+        write_u16(&mut dir, 4, 0, little); // kind
+        write_name(&mut dir, 6, &self.volume_name, 7);
+        write_u16(&mut dir, 14, self.eov_blocks, little); // DEOVBLK
+        write_u16(&mut dir, 16, self.entries.len() as u16, little); // DNUMFILES
+        write_u16(&mut dir, 20, self.vol_date, little); // DLASTBOOT
+        for (i, e) in self.entries.iter().enumerate() {
+            let off = (i + 1) * ENTRY;
+            write_u16(&mut dir, off, e.first_block, little);
+            write_u16(&mut dir, off + 2, e.last_block, little);
+            write_u16(&mut dir, off + 4, e.kind as u16, little);
+            write_name(&mut dir, off + 6, &e.name, 15);
+            write_u16(&mut dir, off + 22, e.last_byte, little);
+            write_u16(&mut dir, off + 24, e.date, little);
+        }
+        self.write_at(DIR_BLOCK * BLOCK, &dir)
+    }
+
+    /// First-fit contiguous free run of `need` blocks (entries kept sorted).
+    fn find_gap(&self, need: u16) -> Option<u16> {
+        let mut cursor = self.dir_end;
+        for e in &self.entries {
+            if e.first_block >= cursor && e.first_block - cursor >= need {
+                return Some(cursor);
+            }
+            cursor = cursor.max(e.last_block);
+        }
+        if self.eov_blocks >= cursor && self.eov_blocks - cursor >= need {
+            Some(cursor)
+        } else {
+            None
+        }
+    }
+
+    fn total_free_blocks(&self) -> u64 {
+        let mut free = 0u64;
+        let mut cursor = self.dir_end;
+        for e in &self.entries {
+            if e.first_block > cursor {
+                free += (e.first_block - cursor) as u64;
+            }
+            cursor = cursor.max(e.last_block);
+        }
+        if self.eov_blocks > cursor {
+            free += (self.eov_blocks - cursor) as u64;
+        }
+        free
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() || parent.path != "/" {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if !valid_ucsd_name(name) {
+            return Err(FilesystemError::InvalidData(format!(
+                "invalid UCSD file name {name:?} (1-15 printable chars, no / :)"
+            )));
+        }
+        let uname = name.to_ascii_uppercase();
+        if self.entries.iter().any(|e| e.name == uname) {
+            return Err(FilesystemError::AlreadyExists(uname));
+        }
+        if self.entries.len() >= 77 {
+            return Err(FilesystemError::DiskFull(
+                "UCSD directory full (77 files)".into(),
+            ));
+        }
+        let need = if data_len == 0 {
+            1
+        } else {
+            data_len.div_ceil(BLOCK) as u16
+        };
+        let start = self.find_gap(need).ok_or_else(|| {
+            FilesystemError::DiskFull(format!(
+                "no contiguous free run of {need} blocks (UCSD files are contiguous)"
+            ))
+        })?;
+        // Write the data, zero-padding the final block.
+        let mut buf = vec![0u8; need as usize * BLOCK as usize];
+        if data_len > 0 {
+            data.read_exact(&mut buf[..data_len as usize])?;
+        }
+        self.write_at(start as u64 * BLOCK, &buf)?;
+        let last_byte = if data_len == 0 {
+            BLOCK as u16
+        } else {
+            (data_len - (need as u64 - 1) * BLOCK) as u16
+        };
+        let entry = UcsdEntry {
+            first_block: start,
+            last_block: start + need,
+            kind: kind_from_name(&uname),
+            name: uname,
+            last_byte,
+            date: 0,
+        };
+        let fe = self.entry_to_file(&entry);
+        self.entries.push(entry);
+        self.entries.sort_by_key(|e| e.first_block);
+        self.write_directory()?;
+        Ok(fe)
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "UCSD p-System is a flat filesystem — no subdirectories".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let before = self.entries.len();
+        self.entries.retain(|e| e.name != entry.name);
+        if self.entries.len() == before {
+            return Err(FilesystemError::NotFound(entry.name.clone()));
+        }
+        // Contiguous allocation has no bitmap; removing the entry frees the run.
+        self.write_directory()
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        if !valid_ucsd_name(new_name) {
+            return Err(FilesystemError::InvalidData(format!(
+                "invalid UCSD file name {new_name:?}"
+            )));
+        }
+        let uname = new_name.to_ascii_uppercase();
+        if self.entries.iter().any(|e| e.name == uname) {
+            return Err(FilesystemError::AlreadyExists(uname));
+        }
+        let target = self
+            .entries
+            .iter_mut()
+            .find(|e| e.name == entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+        target.name = uname;
+        self.write_directory()
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.total_free_blocks() * BLOCK)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +669,177 @@ mod tests {
         let word = (84u16 << 9) | (6 << 5) | 15;
         assert_eq!(decode_date(word).as_deref(), Some("1984-06-15"));
         assert_eq!(decode_date(0), None);
+    }
+
+    // ---- Edit ----
+
+    /// A blank little-endian UCSD volume (empty directory) built in memory.
+    fn blank_volume(blocks: u16, name: &str) -> Vec<u8> {
+        let mut img = vec![0u8; blocks as usize * BLOCK as usize];
+        let base = (DIR_BLOCK * BLOCK) as usize;
+        img[base..base + 2].copy_from_slice(&0u16.to_le_bytes()); // FIRSTBLK
+        img[base + 2..base + 4].copy_from_slice(&DIR_END.to_le_bytes()); // DLASTBLK
+        img[base + 6] = name.len() as u8;
+        img[base + 7..base + 7 + name.len()].copy_from_slice(name.as_bytes());
+        img[base + 14..base + 16].copy_from_slice(&blocks.to_le_bytes()); // DEOVBLK
+        img
+    }
+
+    #[test]
+    fn edit_create_rename_delete_roundtrip() {
+        let mut fs =
+            UcsdFilesystem::open(Cursor::new(blank_volume(280, "EDITVOL")), 0).expect("open blank");
+        let root = fs.root().unwrap();
+        let a = [0x2Au8; 100];
+        fs.create_file(
+            &root,
+            "ALPHA.TEXT",
+            &mut &a[..],
+            100,
+            &CreateFileOptions::default(),
+        )
+        .expect("create ALPHA");
+        let b = [0x5Bu8; 2000]; // 4 blocks
+        fs.create_file(
+            &root,
+            "BETA.DATA",
+            &mut &b[..],
+            2000,
+            &CreateFileOptions::default(),
+        )
+        .expect("create BETA");
+
+        let alpha = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ALPHA.TEXT")
+            .unwrap();
+        fs.rename(&root, &alpha, "GAMMA.TEXT").expect("rename");
+
+        fs.create_file(
+            &root,
+            "TMP.DATA",
+            &mut &b"x"[..],
+            1,
+            &CreateFileOptions::default(),
+        )
+        .expect("create TMP");
+        let tmp = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TMP.DATA")
+            .unwrap();
+        fs.delete_entry(&root, &tmp).expect("delete TMP");
+
+        let files = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = files.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"GAMMA.TEXT"), "{names:?}");
+        assert!(names.contains(&"BETA.DATA"), "{names:?}");
+        assert!(!names.contains(&"ALPHA.TEXT"));
+        assert!(!names.contains(&"TMP.DATA"));
+
+        let beta = files.iter().find(|e| e.name == "BETA.DATA").unwrap();
+        assert_eq!(beta.size, 2000);
+        let data = fs.read_file(beta, usize::MAX).unwrap();
+        assert_eq!(data.len(), 2000);
+        assert!(data.iter().all(|&x| x == 0x5B));
+
+        // Subdirectories are not a thing in UCSD.
+        assert!(matches!(
+            fs.create_directory(&root, "sub", &CreateDirectoryOptions::default()),
+            Err(FilesystemError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn edit_reads_back_through_reopen() {
+        // Edit an in-memory volume, then reopen it to prove the directory was
+        // persisted to disk (not just held in memory).
+        let mut cur = Cursor::new(blank_volume(280, "REOPEN"));
+        {
+            let mut fs = UcsdFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let data = [0x7Eu8; 1500];
+            fs.create_file(
+                &root,
+                "KEEP.DATA",
+                &mut &data[..],
+                1500,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = UcsdFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let files = fs.list_directory(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "KEEP.DATA");
+        assert_eq!(files[0].size, 1500);
+        assert_eq!(fs.read_file(&files[0], usize::MAX).unwrap().len(), 1500);
+    }
+
+    #[test]
+    fn oracle_edit_is_fsck_clean() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_edit_is_fsck_clean: oracle unavailable");
+            return;
+        };
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ucsd_edit_{}.vol", std::process::id()));
+        let volp = vol.to_str().unwrap();
+        let run = |args: &[&str]| {
+            Command::new("python3")
+                .arg(&script)
+                .args(args)
+                .output()
+                .expect("python3")
+        };
+        assert!(run(&["mkfs", volp, "280", "OVOL"]).status.success());
+
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = UcsdFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "ALPHA.TEXT",
+                &mut &[0x41u8; 100][..],
+                100,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_file(
+                &root,
+                "BETA.DATA",
+                &mut &[0x42u8; 2000][..],
+                2000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let alpha = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "ALPHA.TEXT")
+                .unwrap();
+            fs.rename(&root, &alpha, "GAMMA.TEXT").unwrap();
+            fs.sync_metadata().unwrap();
+        }
+
+        let out = run(&["fsck", volp]);
+        let clean = out.status.success();
+        let log = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged our edits:\n{log}");
     }
 }
