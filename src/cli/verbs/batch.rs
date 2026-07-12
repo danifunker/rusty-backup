@@ -608,8 +608,10 @@ fn build_blank_fs(
             .map_err(|e| anyhow!("create_blank_minix: {e}")),
         "minix3" => crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V3)
             .map_err(|e| anyhow!("create_blank_minix: {e}")),
+        "ucsd" | "pascal" => crate::fs::ucsd::create_blank_ucsd(size, name)
+            .map_err(|e| anyhow!("create_blank_ucsd: {e}")),
         other => {
-            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3")
+            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd")
         }
     }
 }

@@ -81,6 +81,11 @@ pub enum FsKind {
     Minix2,
     /// Minix V3 (magic 0x4D5A): 60-char names, matching `mkfs.minix -3`.
     Minix3,
+    /// UCSD p-System (UCSD Pascal — Apple II/III, PC). A flat volume with a
+    /// zeroed bootstrap and an empty directory. `--name` sets the volume label
+    /// (uppercased, ≤ 7 chars). Defaults to a 140 KB Apple II floppy.
+    #[value(alias = "pascal", alias = "psystem")]
+    Ucsd,
 }
 
 #[derive(Debug, Args)]
@@ -91,7 +96,7 @@ pub struct NewArgs {
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
     /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
-    /// minix3.
+    /// minix3, ucsd (alias pascal / psystem).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -340,7 +345,21 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Minix3 => {
             write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V3)
         }
+        FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
     }
+}
+
+fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::ucsd::create_blank_ucsd(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting UCSD p-System: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, UCSD p-System volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
 }
 
 fn write_blank_minix_image(

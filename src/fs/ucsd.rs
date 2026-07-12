@@ -330,6 +330,51 @@ pub fn kind_name(kind: u8) -> &'static str {
     KIND_NAMES.get(kind as usize).copied().unwrap_or("unknown")
 }
 
+/// Sanitize a volume name to the UCSD rules: uppercase, ≤ 7 printable ASCII
+/// chars (no `/` `:`), non-empty. Falls back to `RBVOL`.
+fn sanitize_volume_name(name: &str) -> String {
+    let up: String = name
+        .to_ascii_uppercase()
+        .chars()
+        .filter(|&c| c.is_ascii_graphic() && c != '/' && c != ':')
+        .take(7)
+        .collect();
+    if up.is_empty() {
+        "RBVOL".to_string()
+    } else {
+        up
+    }
+}
+
+/// Format a blank UCSD p-System volume of `size_bytes` (little-endian, the
+/// Apple II / PC convention): zeroed boot + a volume label at block 2 with an
+/// empty directory. Returns the raw image.
+pub fn create_blank_ucsd(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let blocks = size_bytes / BLOCK;
+    if blocks <= DIR_END as u64 {
+        return Err(FilesystemError::Unsupported(
+            "UCSD volume too small (needs more than 6 blocks)".into(),
+        ));
+    }
+    if blocks > u16::MAX as u64 {
+        return Err(FilesystemError::Unsupported(
+            "UCSD volume too large (max 65535 blocks / 32 MiB)".into(),
+        ));
+    }
+    let vname = sanitize_volume_name(name);
+    let mut img = vec![0u8; (blocks * BLOCK) as usize];
+    let base = (DIR_BLOCK * BLOCK) as usize;
+    let d = &mut img[base..base + (DIR_BLOCKS * BLOCK) as usize];
+    write_u16(d, 0, 0, true); // FIRSTBLK
+    write_u16(d, 2, DIR_END, true); // DLASTBLK = 6
+    write_u16(d, 4, 0, true); // kind = untyped
+    write_name(d, 6, &vname, 7);
+    write_u16(d, 14, blocks as u16, true); // DEOVBLK
+    write_u16(d, 16, 0, true); // DNUMFILES
+    write_u16(d, 20, 0, true); // DLASTBOOT date
+    Ok(img)
+}
+
 fn write_u16(buf: &mut [u8], off: usize, val: u16, little: bool) {
     let b = if little {
         val.to_le_bytes()
@@ -841,5 +886,81 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout).into_owned();
         let _ = std::fs::remove_file(&vol);
         assert!(clean, "oracle fsck flagged our edits:\n{log}");
+    }
+
+    // ---- Create-blank ----
+
+    #[test]
+    fn create_blank_opens_and_edits() {
+        let img = create_blank_ucsd(140 * 1024, "APPLE1").expect("format");
+        let mut fs = UcsdFilesystem::open(Cursor::new(img), 0).expect("open blank");
+        assert_eq!(fs.volume_label(), Some("APPLE1"));
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        assert_eq!(fs.total_size(), 280 * BLOCK);
+        // The blank is a valid substrate for edits.
+        fs.create_file(
+            &root,
+            "X.DATA",
+            &mut &[1u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_blank_name_sanitized() {
+        // Lowercase, too long, and illegal chars are cleaned to ≤7 upper ASCII.
+        let img = create_blank_ucsd(140 * 1024, "my/vol:name").unwrap();
+        let fs = UcsdFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.volume_label(), Some("MYVOLNA"));
+    }
+
+    #[test]
+    fn oracle_create_blank_is_fsck_clean() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_create_blank_is_fsck_clean: oracle unavailable");
+            return;
+        };
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ucsd_blank_{}.vol", std::process::id()));
+        std::fs::write(&vol, create_blank_ucsd(140 * 1024, "BLANKV").unwrap()).unwrap();
+        let volp = vol.to_str().unwrap();
+        let fsck = |v: &str| {
+            Command::new("python3")
+                .arg(&script)
+                .args(["fsck", v])
+                .output()
+                .expect("python3")
+                .status
+                .success()
+        };
+        assert!(fsck(volp), "oracle fsck flagged our blank");
+        // Still clean after writing a file through our editor.
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = UcsdFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "R.TEXT",
+                &mut &[0x20u8; 900][..],
+                900,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let ok = fsck(volp);
+        let _ = std::fs::remove_file(&vol);
+        assert!(ok, "oracle fsck flagged our blank after an edit");
     }
 }
