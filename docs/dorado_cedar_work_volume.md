@@ -55,5 +55,14 @@ The first GUI/login image is not enough.  The test passes when the Guest login
 can create or open a local file without `FS.Error: No more free pages/names on
 a local volume`.
 
+### Current observed result
+
+On 2026-07-11, a fresh `CedarDorado-work.pdi` built by the script passed
+`pilot_probe verify` and Dorado `pdidump`, then cold-booted to Cedar 6.1's
+SimpleTerminal `Please login ... / Name:` screen at 720,000,000 emulator
+cycles (28,538 display-list pixels).  This proves the generated volume is a
+valid graphical-login boot volume.  Guest login plus successful local-file
+creation is still the required next acceptance result.
+
 Do not reclaim space from an installed image by deleting an arbitrary FileID
 range.  Pilot FileID ordering does not encode Cedar package dependencies.
