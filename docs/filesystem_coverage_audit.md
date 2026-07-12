@@ -71,7 +71,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | XFS (v4 / v5) | Auto | Yes (v4 edit) | Yes (v4) | No | Grow only (disk-layout + `xfs_growfs`) | check+repair | SGI IRIX 6.x, Linux |
 | JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check+repair | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
 | ReiserFS (v3.5 / v3.6) | Auto | Yes | **No** (read-only) | No | compaction | No | Linux, late-1990s → mid-2000s |
-| Minix (V1 / V2 / V3) | Auto | Yes | **No** (read-only) | No | — | No | Minix, early Linux (pre-ext) |
+| Minix (V1 / V2 / V3) | Auto | Yes | Yes | No | — | No | Minix, early Linux (pre-ext); edit fsck.minix-validated |
 | UFS / FFS (UFS1 / UFS2) | Auto | Yes | Yes | No | compaction | check+repair | 4.2/4.4BSD, FreeBSD, SunOS / Solaris, NeXTSTEP |
 
 > UFS is browse + edit (create / delete / rename) + fsck with repair (replica

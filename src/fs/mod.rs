@@ -1749,6 +1749,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "minix" => Ok(Box::new(minix::MinixFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1852,6 +1856,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         )?)),
         // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Minix (MBR type 0x81) and old Minix (0x80).
+        0x80 | 0x81 => Ok(Box::new(minix::MinixFilesystem::open(
             reader,
             partition_offset,
         )?)),

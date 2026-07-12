@@ -37,10 +37,12 @@
 //! This module is the read half of the Minix quartet (Browse). Edit, create,
 //! and fsck build on it (`docs/filesystem_completion_plan.md` Part 2).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::{EntryType, FileEntry};
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 // Superblock magic numbers (little-endian u16).
 const MAGIC_V1_14: u16 = 0x137F;
@@ -334,6 +336,53 @@ impl MinixInode {
     fn is_regular(&self) -> bool {
         self.type_bits() == 0x8000
     }
+
+    /// A zeroed inode (all fields 0) — what a free inode slot must look like so
+    /// the allocator reuses it.
+    fn empty(ino: u32) -> Self {
+        MinixInode {
+            ino,
+            mode: 0,
+            nlinks: 0,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            mtime: 0,
+            zones: [0; 10],
+        }
+    }
+
+    /// Serialize into the on-disk inode (32 bytes for V1, 64 for V2/V3).
+    fn serialize(&self, version: MinixVersion) -> Vec<u8> {
+        if version == MinixVersion::V1 {
+            let mut buf = vec![0u8; 32];
+            buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
+            buf[2..4].copy_from_slice(&self.uid.to_le_bytes());
+            buf[4..8].copy_from_slice(&self.size.to_le_bytes());
+            buf[8..12].copy_from_slice(&self.mtime.to_le_bytes());
+            buf[12] = self.gid as u8;
+            buf[13] = self.nlinks as u8;
+            for (i, z) in self.zones.iter().take(9).enumerate() {
+                buf[14 + i * 2..16 + i * 2].copy_from_slice(&(*z as u16).to_le_bytes());
+            }
+            buf
+        } else {
+            let mut buf = vec![0u8; 64];
+            buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
+            buf[2..4].copy_from_slice(&self.nlinks.to_le_bytes());
+            buf[4..6].copy_from_slice(&self.uid.to_le_bytes());
+            buf[6..8].copy_from_slice(&self.gid.to_le_bytes());
+            buf[8..12].copy_from_slice(&self.size.to_le_bytes());
+            // atime / mtime / ctime — write the same stamp to all three.
+            buf[12..16].copy_from_slice(&self.mtime.to_le_bytes());
+            buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());
+            buf[20..24].copy_from_slice(&self.mtime.to_le_bytes());
+            for (i, z) in self.zones.iter().enumerate() {
+                buf[24 + i * 4..28 + i * 4].copy_from_slice(&z.to_le_bytes());
+            }
+            buf
+        }
+    }
 }
 
 pub struct MinixFilesystem<R: Read + Seek> {
@@ -611,6 +660,29 @@ fn bit_set(bitmap: &[u8], bit: usize) -> bool {
     byte < bitmap.len() && (bitmap[byte] >> (bit % 8)) & 1 == 1
 }
 
+/// Read a directory entry's inode field (u16 on V1/V2, u32 on V3).
+fn dirent_ino(chunk: &[u8], ino_field: usize) -> u32 {
+    if ino_field == 4 {
+        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+    } else {
+        u16::from_le_bytes([chunk[0], chunk[1]]) as u32
+    }
+}
+
+/// Serialize one directory entry (inode field + NUL-padded name) into `buf`.
+fn encode_dirent(buf: &mut [u8], ino_field: usize, ino: u32, name: &[u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    if ino_field == 4 {
+        buf[0..4].copy_from_slice(&ino.to_le_bytes());
+    } else {
+        buf[0..2].copy_from_slice(&(ino as u16).to_le_bytes());
+    }
+    let n = name.len().min(buf.len() - ino_field);
+    buf[ino_field..ino_field + n].copy_from_slice(&name[..n]);
+}
+
 fn special_kind(mode: u16) -> &'static str {
     match mode & 0xF000 {
         0x6000 => "block device",
@@ -738,6 +810,551 @@ impl<R: Read + Seek + Send> Filesystem for MinixFilesystem<R> {
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let zone = self.highest_used_zone()?;
         Ok((zone as u64 + 1) * self.sb.zone_size())
+    }
+}
+
+// ---- Write primitives (edit stage) ----
+//
+// Minix has no free-count fields in the superblock — free inodes/zones are
+// computed from the two bitmaps — so edits never touch the superblock. Bit
+// convention: set = used, bit 0 reserved; inode N -> imap bit N; zone Z ->
+// zmap bit `Z - firstdatazone + 1`. Bitmap edits are single-byte read/modify/
+// write; the edit path operates on image files, so sub-block writes are fine.
+
+impl<R: Read + Write + Seek> MinixFilesystem<R> {
+    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader
+            .seek(SeekFrom::Start(self.partition_offset + off))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    fn write_zone(&mut self, zno: u32, data: &[u8]) -> Result<(), FilesystemError> {
+        self.write_at(zno as u64 * self.sb.zone_size(), data)
+    }
+
+    fn write_inode(&mut self, inode: &MinixInode) -> Result<(), FilesystemError> {
+        let raw = inode.serialize(self.sb.version);
+        let off = self.sb.inode_table_block() * self.sb.block_size as u64
+            + (inode.ino as u64 - 1) * self.sb.inode_size;
+        self.write_at(off, &raw)
+    }
+
+    /// Flip one bit in a bitmap. `region_start` is the byte offset of the
+    /// bitmap's first block; `bit` is the bit index within it.
+    fn set_bitmap_bit(
+        &mut self,
+        region_start: u64,
+        bit: usize,
+        used: bool,
+    ) -> Result<(), FilesystemError> {
+        let byte_off = region_start + (bit / 8) as u64;
+        let mut b = [0u8; 1];
+        self.read_at(byte_off, &mut b)?;
+        if used {
+            b[0] |= 1 << (bit % 8);
+        } else {
+            b[0] &= !(1 << (bit % 8));
+        }
+        self.write_at(byte_off, &b)
+    }
+
+    fn imap_start(&self) -> u64 {
+        2 * self.sb.block_size as u64
+    }
+    fn zmap_start(&self) -> u64 {
+        (2 + self.sb.imap_blocks as u64) * self.sb.block_size as u64
+    }
+
+    /// Allocate a free inode (imap bit clear, 1..=ninodes) and mark it used.
+    fn alloc_inode(&mut self) -> Result<u32, FilesystemError> {
+        let bmap = self.read_inode_bitmap()?;
+        for ino in 1..=self.sb.ninodes as usize {
+            if !bit_set(&bmap, ino) {
+                self.set_bitmap_bit(self.imap_start(), ino, true)?;
+                return Ok(ino as u32);
+            }
+        }
+        Err(FilesystemError::DiskFull("no free Minix inodes".into()))
+    }
+
+    fn free_inode(&mut self, ino: u32) -> Result<(), FilesystemError> {
+        self.set_bitmap_bit(self.imap_start(), ino as usize, false)
+    }
+
+    /// Allocate a free data zone (zmap bit clear) and mark it used.
+    fn alloc_zone(&mut self) -> Result<u32, FilesystemError> {
+        let bmap = self.read_zone_bitmap()?;
+        let max_bit = (self.sb.zones - self.sb.firstdatazone) as usize;
+        for bit in 1..=max_bit {
+            if !bit_set(&bmap, bit) {
+                self.set_bitmap_bit(self.zmap_start(), bit, true)?;
+                self.used_zones += 1;
+                return Ok(self.sb.firstdatazone + bit as u32 - 1);
+            }
+        }
+        Err(FilesystemError::DiskFull("no free Minix zones".into()))
+    }
+
+    fn free_zone(&mut self, zno: u32) -> Result<(), FilesystemError> {
+        if zno < self.sb.firstdatazone || zno >= self.sb.zones {
+            return Ok(());
+        }
+        let bit = (zno - self.sb.firstdatazone + 1) as usize;
+        self.set_bitmap_bit(self.zmap_start(), bit, false)?;
+        self.used_zones = self.used_zones.saturating_sub(1);
+        Ok(())
+    }
+
+    fn read_inode_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let len = (self.sb.imap_blocks as u64 * self.sb.block_size as u64) as usize;
+        let mut buf = vec![0u8; len];
+        self.read_at(self.imap_start(), &mut buf)?;
+        Ok(buf)
+    }
+
+    fn write_ptr(&self, block: &mut [u8], idx: usize, zone: u32) {
+        if self.sb.version == MinixVersion::V1 {
+            block[idx * 2..idx * 2 + 2].copy_from_slice(&(zone as u16).to_le_bytes());
+        } else {
+            block[idx * 4..idx * 4 + 4].copy_from_slice(&zone.to_le_bytes());
+        }
+    }
+
+    /// Stream `len` bytes of `data` into freshly allocated zones and wire them
+    /// into `inode` (direct + single/double/triple indirect), setting its size.
+    fn write_file_data(
+        &mut self,
+        inode: &mut MinixInode,
+        data: &mut dyn Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        let zs = self.sb.zone_size() as usize;
+        let nzones = (len as usize).div_ceil(zs);
+        let mut data_zones = Vec::with_capacity(nzones);
+        let mut remaining = len as usize;
+        for _ in 0..nzones {
+            let take = zs.min(remaining);
+            let mut buf = vec![0u8; zs];
+            data.read_exact(&mut buf[..take])?;
+            let z = self.alloc_zone()?;
+            self.write_zone(z, &buf)?;
+            data_zones.push(z);
+            remaining -= take;
+        }
+        inode.zones = self.build_zone_tree(&data_zones)?;
+        inode.size = len as u32;
+        Ok(())
+    }
+
+    /// Build an inode's zone array from a flat list of data zones, writing
+    /// indirect blocks as needed.
+    fn build_zone_tree(&mut self, data_zones: &[u32]) -> Result<[u32; 10], FilesystemError> {
+        let mut slots = [0u32; 10];
+        let mut idx = 0usize;
+        while idx < DIRECT_ZONES && idx < data_zones.len() {
+            slots[idx] = data_zones[idx];
+            idx += 1;
+        }
+        let per_inode = self.sb.zones_per_inode();
+        for (slot, level) in [(7usize, 1u32), (8, 2), (9, 3)] {
+            if idx >= data_zones.len() {
+                break;
+            }
+            if slot >= per_inode {
+                return Err(FilesystemError::DiskFull(
+                    "file too large for Minix indirection".into(),
+                ));
+            }
+            slots[slot] = self.build_indirect(level, data_zones, &mut idx)?;
+        }
+        if idx < data_zones.len() {
+            return Err(FilesystemError::DiskFull(
+                "file too large for Minix indirection".into(),
+            ));
+        }
+        Ok(slots)
+    }
+
+    /// Allocate one indirect zone of `level` (1/2/3) and fill it with pointers
+    /// consuming `data_zones[*idx..]`; returns the indirect zone number.
+    fn build_indirect(
+        &mut self,
+        level: u32,
+        data_zones: &[u32],
+        idx: &mut usize,
+    ) -> Result<u32, FilesystemError> {
+        let zone = self.alloc_zone()?;
+        let per = self.sb.ptrs_per_zone() as usize;
+        let mut block = vec![0u8; self.sb.zone_size() as usize];
+        for i in 0..per {
+            if *idx >= data_zones.len() {
+                break;
+            }
+            let child = if level == 1 {
+                let z = data_zones[*idx];
+                *idx += 1;
+                z
+            } else {
+                self.build_indirect(level - 1, data_zones, idx)?
+            };
+            self.write_ptr(&mut block, i, child);
+        }
+        self.write_zone(zone, &block)?;
+        Ok(zone)
+    }
+
+    /// Free every data zone and indirect block an inode references.
+    fn free_inode_zones(&mut self, inode: &MinixInode) -> Result<(), FilesystemError> {
+        for i in 0..DIRECT_ZONES {
+            if inode.zones[i] != 0 {
+                self.free_zone(inode.zones[i])?;
+            }
+        }
+        let per_inode = self.sb.zones_per_inode();
+        for (slot, level) in [(7usize, 1u32), (8, 2), (9, 3)] {
+            if slot < per_inode && inode.zones[slot] != 0 {
+                self.free_indirect(inode.zones[slot], level)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn free_indirect(&mut self, zone: u32, level: u32) -> Result<(), FilesystemError> {
+        if zone == 0 {
+            return Ok(());
+        }
+        let block = self.read_zone(zone)?;
+        let per = self.sb.ptrs_per_zone() as usize;
+        for i in 0..per {
+            let ptr = self.read_ptr(&block, i);
+            if ptr != 0 {
+                if level == 1 {
+                    self.free_zone(ptr)?;
+                } else {
+                    self.free_indirect(ptr, level - 1)?;
+                }
+            }
+        }
+        self.free_zone(zone)
+    }
+
+    fn ino_field(&self) -> usize {
+        if self.sb.version == MinixVersion::V3 {
+            4
+        } else {
+            2
+        }
+    }
+
+    /// Return the child inode of `name` in `dir`, if present.
+    fn dir_find(&mut self, dir: &MinixInode, name: &[u8]) -> Result<Option<u32>, FilesystemError> {
+        let data = self.read_inode_data(dir, dir.size as usize)?;
+        let stride = self.sb.dir_entry_size;
+        let ino_field = self.ino_field();
+        for chunk in data.chunks(stride) {
+            if chunk.len() < stride {
+                break;
+            }
+            let ino = dirent_ino(chunk, ino_field);
+            if ino == 0 {
+                continue;
+            }
+            let nb = &chunk[ino_field..stride];
+            let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+            if &nb[..end] == name {
+                return Ok(Some(ino));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Physical zone backing logical zone `lz` of a directory (direct slots
+    /// only). Allocates and zeroes a new zone when `alloc` and the slot is
+    /// empty; refuses beyond the 7 direct slots (indirect dir growth is out of
+    /// scope — realistic directories stay well under 7 zones).
+    fn dir_zone(
+        &mut self,
+        dir: &mut MinixInode,
+        lz: usize,
+        alloc: bool,
+    ) -> Result<u32, FilesystemError> {
+        if lz >= DIRECT_ZONES {
+            return Err(FilesystemError::Unsupported(
+                "Minix directory too large (indirect directory growth unsupported)".into(),
+            ));
+        }
+        if dir.zones[lz] != 0 {
+            return Ok(dir.zones[lz]);
+        }
+        if !alloc {
+            return Err(FilesystemError::InvalidData(
+                "missing directory zone".into(),
+            ));
+        }
+        let z = self.alloc_zone()?;
+        self.write_zone(z, &vec![0u8; self.sb.zone_size() as usize])?;
+        dir.zones[lz] = z;
+        Ok(z)
+    }
+
+    /// Insert `name -> child` into `dir`, reusing a free slot or appending
+    /// (growing the directory by a zone at a zone boundary). Mutates `dir`
+    /// (size / zone slots); the caller writes it back.
+    fn dir_add(
+        &mut self,
+        dir: &mut MinixInode,
+        name: &[u8],
+        child: u32,
+    ) -> Result<(), FilesystemError> {
+        if name.len() > self.sb.name_len {
+            return Err(FilesystemError::InvalidData(format!(
+                "name too long for Minix (max {} chars)",
+                self.sb.name_len
+            )));
+        }
+        let stride = self.sb.dir_entry_size;
+        let ino_field = self.ino_field();
+        let zs = self.sb.zone_size() as usize;
+
+        // Find a free slot (inode == 0) within the current size, else append.
+        let data = self.read_inode_data(dir, dir.size as usize)?;
+        let mut target = None;
+        let mut off = 0;
+        while off + stride <= data.len() {
+            if dirent_ino(&data[off..], ino_field) == 0 {
+                target = Some(off);
+                break;
+            }
+            off += stride;
+        }
+        let appended = target.is_none();
+        let target_off = target.unwrap_or(dir.size as usize);
+
+        let phys = self.dir_zone(dir, target_off / zs, true)?;
+        let mut ent = vec![0u8; stride];
+        encode_dirent(&mut ent, ino_field, child, name);
+        self.write_at(phys as u64 * zs as u64 + (target_off % zs) as u64, &ent)?;
+        if appended {
+            dir.size += stride as u32;
+        }
+        Ok(())
+    }
+
+    /// Remove `name` from `dir` by zeroing its dirent's inode field (Minix
+    /// leaves the slot as a hole). Returns the removed child inode.
+    fn dir_remove(&mut self, dir: &MinixInode, name: &[u8]) -> Result<u32, FilesystemError> {
+        let stride = self.sb.dir_entry_size;
+        let ino_field = self.ino_field();
+        let zs = self.sb.zone_size() as usize;
+        let data = self.read_inode_data(dir, dir.size as usize)?;
+        let mut off = 0;
+        while off + stride <= data.len() {
+            let ino = dirent_ino(&data[off..], ino_field);
+            if ino != 0 {
+                let nb = &data[off + ino_field..off + stride];
+                let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+                if &nb[..end] == name {
+                    // Directory data lives in direct zones, so the backing zone
+                    // is simply dir.zones[logical]. Zero the inode field.
+                    let phys = dir.zones[off / zs];
+                    let zero = vec![0u8; ino_field];
+                    self.write_at(phys as u64 * zs as u64 + (off % zs) as u64, &zero)?;
+                    return Ok(ino);
+                }
+            }
+            off += stride;
+        }
+        Err(FilesystemError::NotFound(
+            String::from_utf8_lossy(name).into_owned(),
+        ))
+    }
+
+    /// Count free data zones (for `free_space`).
+    fn free_data_zones(&mut self) -> Result<u32, FilesystemError> {
+        let total = self.sb.zones - self.sb.firstdatazone;
+        Ok(total.saturating_sub(self.used_zones))
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if !options.skip_name_checks && self.dir_find(&parent_inode, name.as_bytes())?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let inum = self.alloc_inode()?;
+        let mut ino = MinixInode::empty(inum);
+        ino.mode = options.mode.map(|m| m as u16).unwrap_or(0o100644);
+        ino.nlinks = 1;
+        ino.uid = options.uid.unwrap_or(0) as u16;
+        ino.gid = options.gid.unwrap_or(0) as u16;
+        if options.skip_data_write {
+            ino.size = data_len as u32;
+        } else {
+            self.write_file_data(&mut ino, data, data_len)?;
+        }
+        self.write_inode(&ino)?;
+
+        // Re-read the parent — dir_add may have grown it — link, write back.
+        let mut parent_inode = self.read_inode(parent_inum)?;
+        self.dir_add(&mut parent_inode, name.as_bytes(), inum)?;
+        self.write_inode(&parent_inode)?;
+
+        Ok(self.entry_from_inode(name, &parent.path, &ino))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name.as_bytes())?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let inum = self.alloc_inode()?;
+        let zone = self.alloc_zone()?;
+        let stride = self.sb.dir_entry_size;
+        let ino_field = self.ino_field();
+        // Initial dir zone: "." -> self, ".." -> parent.
+        let mut zbuf = vec![0u8; self.sb.zone_size() as usize];
+        encode_dirent(&mut zbuf[0..stride], ino_field, inum, b".");
+        encode_dirent(&mut zbuf[stride..stride * 2], ino_field, parent_inum, b"..");
+        self.write_zone(zone, &zbuf)?;
+
+        let mut dir = MinixInode::empty(inum);
+        dir.mode = options.mode.map(|m| m as u16).unwrap_or(0o040755);
+        dir.nlinks = 2; // "." plus the parent's link
+        dir.uid = options.uid.unwrap_or(0) as u16;
+        dir.gid = options.gid.unwrap_or(0) as u16;
+        dir.size = (stride * 2) as u32;
+        dir.zones[0] = zone;
+        self.write_inode(&dir)?;
+
+        let mut parent_inode = self.read_inode(parent_inum)?;
+        self.dir_add(&mut parent_inode, name.as_bytes(), inum)?;
+        // Parent gains a link (the new dir's "..").
+        parent_inode.nlinks = parent_inode.nlinks.saturating_add(1);
+        self.write_inode(&parent_inode)?;
+
+        Ok(self.entry_from_inode(name, &parent.path, &dir))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let entry_inum = entry.location as u32;
+        if entry_inum <= ROOT_INO {
+            return Err(FilesystemError::InvalidData(format!(
+                "refusing to delete reserved Minix inode {entry_inum}"
+            )));
+        }
+        let target = self.read_inode(entry_inum)?;
+        if target.is_dir() {
+            // Must be empty (only "." and "..").
+            let data = self.read_inode_data(&target, target.size as usize)?;
+            let stride = self.sb.dir_entry_size;
+            let ino_field = self.ino_field();
+            for chunk in data.chunks(stride) {
+                if chunk.len() < stride || dirent_ino(chunk, ino_field) == 0 {
+                    continue;
+                }
+                let nb = &chunk[ino_field..stride];
+                let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+                if &nb[..end] != b"." && &nb[..end] != b".." {
+                    return Err(FilesystemError::InvalidData(format!(
+                        "Minix directory '{}' not empty",
+                        entry.path
+                    )));
+                }
+            }
+        }
+
+        // Unlink from parent first (a crash then leaves a recoverable orphan
+        // inode rather than a dangling dirent).
+        let mut parent_inode = self.read_inode(parent.location as u32)?;
+        let removed = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        if removed != entry_inum {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix delete: dirent inode {removed} != entry inode {entry_inum}"
+            )));
+        }
+        self.free_inode_zones(&target)?;
+        self.free_inode(entry_inum)?;
+        self.write_inode(&MinixInode::empty(entry_inum))?;
+        if target.is_dir() {
+            parent_inode.nlinks = parent_inode.nlinks.saturating_sub(1);
+            self.write_inode(&parent_inode)?;
+        }
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        self.validate_name(new_name)?;
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, new_name.as_bytes())?.is_some() {
+            return Err(FilesystemError::AlreadyExists(new_name.into()));
+        }
+        // Fixed-size dirents: remove the old entry (leaves a free slot) and add
+        // the new name pointing at the same inode. Identity/data untouched.
+        let removed = self.dir_remove(&parent_inode, entry.name.as_bytes())?;
+        if removed != entry.location as u32 {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix rename: dirent inode {removed} != entry inode {}",
+                entry.location
+            )));
+        }
+        let mut parent_inode = self.read_inode(parent_inum)?;
+        self.dir_add(&mut parent_inode, new_name.as_bytes(), removed)?;
+        self.write_inode(&parent_inode)?;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.free_data_zones()? as u64 * self.sb.zone_size())
     }
 }
 
@@ -911,6 +1528,12 @@ mod tests {
         sb[24..26].copy_from_slice(&MAGIC_V3.to_le_bytes()); // magic
         sb[28..30].copy_from_slice(&(BS as u16).to_le_bytes()); // block_size
 
+        // inode bitmap (block 2): inodes 1..=5 used + bit 0 sentinel, so the
+        // edit allocator hands out inode 6 next.
+        let imap = 2 * BS;
+        for ino in 0..=5usize {
+            img[imap + ino / 8] |= 1 << (ino % 8);
+        }
         // zone bitmap (block 3): mark data zones 8..=20 used so used_size is
         // sane. zone z -> bit (z - firstdatazone + 1); plus bit 0 sentinel.
         let zmap = 3 * BS;
@@ -1059,5 +1682,253 @@ mod tests {
         assert_eq!(fs.total_size(), SYN_ZONES as u64 * BS as u64);
         // Metadata (8 zones) + 13 marked data zones (8..=20).
         assert_eq!(fs.used_size(), (FDZ as u64 + 13) * BS as u64);
+    }
+
+    // ---- Edit ----
+
+    #[test]
+    fn synthetic_edit_create_file_reads_back() {
+        // Deterministic (no oracle): create a file on the hand-laid image and
+        // read it back through the reader.
+        let mut fs = MinixFilesystem::open(Cursor::new(build_synthetic_v3()), 0).expect("open");
+        let root = fs.root().unwrap();
+        let content = vec![0x5Au8; 1500]; // spans 2 zones
+        fs.create_file(
+            &root,
+            "new.txt",
+            &mut &content[..],
+            content.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .expect("create_file");
+
+        let entries = fs.list_directory(&root).unwrap();
+        let e = entries
+            .iter()
+            .find(|e| e.name == "new.txt")
+            .expect("new.txt");
+        assert_eq!(e.size, 1500);
+        let data = fs.read_file(e, usize::MAX).unwrap();
+        assert_eq!(data.len(), 1500);
+        assert!(data.iter().all(|&b| b == 0x5A));
+        // Pre-existing entries survive the append.
+        assert!(entries.iter().any(|e| e.name == "big.bin"));
+    }
+
+    /// mkfs.minix a real image, run a full edit sequence through our writer,
+    /// then require `fsck.minix -f -n` to call it clean and read the tree back.
+    fn oracle_edit_roundtrip(version: u8) {
+        let (Some(mkfs), Some(fsck)) = (minix_tool("mkfs.minix"), minix_tool("fsck.minix")) else {
+            eprintln!("skipping oracle_edit_roundtrip v{version}: util-linux not available");
+            return;
+        };
+        let img = std::env::temp_dir().join(format!(
+            "rb_minix_edit_v{version}_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&img, vec![0u8; 2 * 1024 * 1024]).expect("write image");
+        assert!(
+            Command::new(&mkfs)
+                .arg(format!("-{version}"))
+                .arg(&img)
+                .output()
+                .expect("mkfs")
+                .status
+                .success(),
+            "mkfs.minix -{version} failed"
+        );
+
+        let big = vec![0xABu8; 3000]; // ~3 zones (crosses zone boundaries)
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .expect("open rw");
+            let mut fs = MinixFilesystem::open(file, 0).expect("open editable");
+            let root = fs.root().unwrap();
+            let hello = fs
+                .create_file(
+                    &root,
+                    "hello.txt",
+                    &mut &big[..],
+                    big.len() as u64,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create hello.txt");
+            let sub = fs
+                .create_directory(&root, "sub", &CreateDirectoryOptions::default())
+                .expect("mkdir sub");
+            let inner = b"inner data";
+            fs.create_file(
+                &sub,
+                "inner.txt",
+                &mut &inner[..],
+                inner.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create inner.txt");
+            // Create then delete a file (exercises the free path + orphan-free).
+            let tmp = fs
+                .create_file(
+                    &root,
+                    "tmp.bin",
+                    &mut &b"x"[..],
+                    1,
+                    &CreateFileOptions::default(),
+                )
+                .expect("create tmp.bin");
+            fs.delete_entry(&root, &tmp).expect("delete tmp.bin");
+            fs.rename(&root, &hello, "renamed.txt").expect("rename");
+            fs.sync_metadata().expect("sync");
+        }
+
+        // fsck.minix has no dry-run flag; `-f` forces a check and, with stdin
+        // closed, any repair prompt reads EOF ("no") so an inconsistency exits
+        // nonzero rather than being silently fixed. Exit 0 = clean.
+        let out = Command::new(&fsck)
+            .arg("-f")
+            .arg(&img)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run fsck.minix");
+        if !out.status.success() {
+            let log = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = std::fs::remove_file(&img);
+            panic!("fsck.minix flagged the edited v{version} image:\n{log}");
+        }
+
+        // Read the tree back through a fresh open.
+        {
+            let file = std::fs::File::open(&img).expect("reopen ro");
+            let mut fs = MinixFilesystem::open(file, 0).expect("reopen");
+            let root = fs.root().unwrap();
+            let entries = fs.list_directory(&root).unwrap();
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert!(names.contains(&"renamed.txt"), "v{version}: {names:?}");
+            assert!(names.contains(&"sub"), "v{version}: {names:?}");
+            assert!(!names.contains(&"hello.txt"), "old name lingers: {names:?}");
+            assert!(!names.contains(&"tmp.bin"), "deleted lingers: {names:?}");
+
+            let renamed = entries.iter().find(|e| e.name == "renamed.txt").unwrap();
+            let data = fs.read_file(renamed, usize::MAX).unwrap();
+            assert_eq!(data.len(), 3000, "v{version} content length");
+            assert!(data.iter().all(|&b| b == 0xAB), "v{version} content bytes");
+
+            let sub = entries.iter().find(|e| e.name == "sub").unwrap();
+            let kids = fs.list_directory(sub).unwrap();
+            assert_eq!(kids.len(), 1);
+            assert_eq!(kids[0].name, "inner.txt");
+            assert_eq!(fs.read_file(&kids[0], usize::MAX).unwrap(), b"inner data");
+        }
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn oracle_edit_roundtrip_v1() {
+        oracle_edit_roundtrip(1);
+    }
+    #[test]
+    fn oracle_edit_roundtrip_v2() {
+        oracle_edit_roundtrip(2);
+    }
+    #[test]
+    fn oracle_edit_roundtrip_v3() {
+        oracle_edit_roundtrip(3);
+    }
+
+    /// Write a file large enough to need single- AND double-indirect zones,
+    /// exercising the indirect-block write path (u16 pointers on V1, u32 on
+    /// V2/V3). Verified fsck.minix-clean and byte-exact on read-back, with a
+    /// per-zone content signature so out-of-order assembly would fail.
+    fn oracle_large_file_roundtrip(version: u8) {
+        let (Some(mkfs), Some(fsck)) = (minix_tool("mkfs.minix"), minix_tool("fsck.minix")) else {
+            eprintln!("skipping oracle_large_file_roundtrip v{version}: util-linux not available");
+            return;
+        };
+        let img = std::env::temp_dir().join(format!(
+            "rb_minix_big_v{version}_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&img, vec![0u8; 4 * 1024 * 1024]).expect("write image");
+        assert!(Command::new(&mkfs)
+            .arg(format!("-{version}"))
+            .arg(&img)
+            .output()
+            .expect("mkfs")
+            .status
+            .success());
+
+        // 600 KiB: 7 direct + single-indirect + into double-indirect on every
+        // generation (V1 512 ptrs/zone, V2/V3 256). Each 1 KiB zone is filled
+        // with its own index so a misordered read is caught.
+        let nzones = 600usize;
+        let mut content = vec![0u8; nzones * 1024];
+        for (z, chunk) in content.chunks_mut(1024).enumerate() {
+            chunk.fill((z & 0xFF) as u8);
+        }
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .expect("open rw");
+            let mut fs = MinixFilesystem::open(file, 0).expect("open editable");
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "big.dat",
+                &mut &content[..],
+                content.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .expect("create big.dat");
+            fs.sync_metadata().unwrap();
+        }
+
+        let out = Command::new(&fsck)
+            .arg("-f")
+            .arg(&img)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("fsck");
+        if !out.status.success() {
+            let log = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            let _ = std::fs::remove_file(&img);
+            panic!("fsck.minix flagged the large-file v{version} image:\n{log}");
+        }
+
+        {
+            let file = std::fs::File::open(&img).expect("reopen");
+            let mut fs = MinixFilesystem::open(file, 0).expect("reopen");
+            let root = fs.root().unwrap();
+            let big = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "big.dat")
+                .expect("big.dat");
+            let data = fs.read_file(&big, usize::MAX).unwrap();
+            assert_eq!(data, content, "v{version} large-file content mismatch");
+        }
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn oracle_large_file_roundtrip_v1() {
+        oracle_large_file_roundtrip(1);
+    }
+    #[test]
+    fn oracle_large_file_roundtrip_v2() {
+        oracle_large_file_roundtrip(2);
+    }
+    #[test]
+    fn oracle_large_file_roundtrip_v3() {
+        oracle_large_file_roundtrip(3);
     }
 }
