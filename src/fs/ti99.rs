@@ -35,6 +35,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 pub(crate) const SECTOR: u64 = 256;
 /// The VIB is sector 0 (image start); the FDIR is sector 1.
@@ -388,6 +389,10 @@ impl<R: Read + Seek + Send> Filesystem for Ti99Filesystem<R> {
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         validate_ti99_name(name).map(|_| ())
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(fsck_ti99(self))
+    }
 }
 
 /// Validate and normalize a TI-99 file name: uppercased, 1-10 printable ASCII
@@ -716,6 +721,247 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for Ti99Filesystem<R> {
             .count() as u64;
         Ok(free * SECTOR)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        repair_ti99(self)
+    }
+}
+
+// ---- fsck (check + repair) ----
+//
+// The check reconciles the VIB allocation bitmap against a walk of the
+// directory (FDIR -> FDR -> cluster chain): a structural pass (DSK marker,
+// in-range FDR/data sectors, chain-length agreement, FDIR sort order, no
+// cross-linked sectors) and then the bitmap comparison. The bitmap mismatch is
+// a repairable error — marked repairable only when the structure is intact, so
+// `repair()` rebuilds the bitmap from the walk and is withheld the moment a
+// structural problem makes that walk untrustworthy (the Atari/CBM VALIDATE
+// model). Every FDR field the walk relies on was validated against MAME's
+// imgtool + the clean-room oracle.
+
+fn issue(code: &str, message: String, repairable: bool) -> FsckIssue {
+    FsckIssue {
+        code: code.into(),
+        message,
+        repairable,
+        debug: false,
+    }
+}
+
+fn bit_used(vib: &[u8], sector: u16) -> bool {
+    let byte = BITMAP_OFF + (sector / 8) as usize;
+    byte < vib.len() && (vib[byte] >> (sector % 8)) & 1 != 0
+}
+
+fn mark_used(used: &mut [bool], errors: &mut Vec<FsckIssue>, sector: u16, what: &str) {
+    let i = sector as usize;
+    if i >= used.len() {
+        return;
+    }
+    if used[i] {
+        errors.push(issue(
+            "CrossLink",
+            format!("sector {sector} is claimed more than once ({what})"),
+            false,
+        ));
+    } else {
+        used[i] = true;
+    }
+}
+
+/// Re-walk the directory (FDIR -> FDR -> clusters) and return the used-sector
+/// vector (VIB + FDIR + FDRs + data). Used by repair once the structure is known
+/// intact.
+fn computed_allocation<R: Read + Seek>(
+    fs: &mut Ti99Filesystem<R>,
+) -> Result<Vec<bool>, FilesystemError> {
+    let total = fs.geometry.total_sectors;
+    let mut fdir = vec![0u8; SECTOR as usize];
+    fs.read_sector(FDIR_SECTOR as u16, &mut fdir)?;
+    let mut used = vec![false; total as usize];
+    used[0] = true;
+    used[1] = true;
+    for i in 0..MAX_FILES {
+        let ptr = be16(&fdir, i * 2);
+        if ptr == 0 {
+            break;
+        }
+        if !(FIRST_DATA..total).contains(&ptr) {
+            continue;
+        }
+        used[ptr as usize] = true;
+        let mut fdr = vec![0u8; SECTOR as usize];
+        fs.read_sector(ptr, &mut fdr)?;
+        let secs = be16(&fdr, 0x0E);
+        for s in walk_clusters(&fdr, secs) {
+            if (FIRST_DATA..total).contains(&s) {
+                used[s as usize] = true;
+            }
+        }
+    }
+    Ok(used)
+}
+
+pub fn fsck_ti99<R: Read + Seek>(
+    fs: &mut Ti99Filesystem<R>,
+) -> Result<FsckResult, FilesystemError> {
+    let total = fs.geometry.total_sectors;
+    let end = fs.reader.seek(SeekFrom::End(0))?;
+    let disk_sectors = end.saturating_sub(fs.partition_offset) / SECTOR;
+
+    let mut vib = vec![0u8; SECTOR as usize];
+    fs.read_sector(0, &mut vib)?;
+    let mut fdir = vec![0u8; SECTOR as usize];
+    fs.read_sector(FDIR_SECTOR as u16, &mut fdir)?;
+
+    let mut errors = Vec::new();
+    let warnings: Vec<FsckIssue> = Vec::new();
+
+    if &vib[0x0D..0x10] != b"DSK" {
+        errors.push(issue(
+            "DskMarker",
+            "missing DSK volume marker".into(),
+            false,
+        ));
+    }
+    if total as u64 > disk_sectors {
+        errors.push(issue(
+            "Truncated",
+            format!("VIB total {total} sectors exceeds the {disk_sectors}-sector image"),
+            false,
+        ));
+    }
+
+    let mut used = vec![false; total as usize];
+    mark_used(&mut used, &mut errors, 0, "VIB");
+    mark_used(&mut used, &mut errors, 1, "FDIR");
+
+    let mut files = 0u32;
+    let mut prev_name = [0u8; 10];
+    let mut first = true;
+    for i in 0..MAX_FILES {
+        let ptr = be16(&fdir, i * 2);
+        if ptr == 0 {
+            break;
+        }
+        if !(FIRST_DATA..total).contains(&ptr) {
+            errors.push(issue(
+                "FdrRange",
+                format!("FDIR entry {i}: FDR sector {ptr} is out of range"),
+                false,
+            ));
+            continue;
+        }
+        mark_used(&mut used, &mut errors, ptr, "FDR");
+        let mut fdr = vec![0u8; SECTOR as usize];
+        fs.read_sector(ptr, &mut fdr)?;
+        let mut nm = [0u8; 10];
+        nm.copy_from_slice(&fdr[0..10]);
+        let name = trim_name(&nm);
+        files += 1;
+        if !first && nm < prev_name {
+            errors.push(issue(
+                "FdirOrder",
+                format!("FDIR is not name-sorted at {name:?}"),
+                false,
+            ));
+        }
+        prev_name = nm;
+        first = false;
+
+        let secs = be16(&fdr, 0x0E);
+        let chain = walk_clusters(&fdr, secs);
+        if chain.len() != secs as usize {
+            errors.push(issue(
+                "ChainCount",
+                format!(
+                    "file {name:?}: cluster chain yields {} sectors but the FDR says {secs}",
+                    chain.len()
+                ),
+                false,
+            ));
+        }
+        for s in chain {
+            if !(FIRST_DATA..total).contains(&s) {
+                errors.push(issue(
+                    "DataRange",
+                    format!("file {name:?}: data sector {s} is out of range"),
+                    false,
+                ));
+            } else {
+                mark_used(&mut used, &mut errors, s, &format!("file {name:?}"));
+            }
+        }
+    }
+
+    // Bitmap reconciliation — only trustworthy when the structural walk is clean.
+    let structure_clean = errors.is_empty();
+    let mut leaked = 0u32; // used on disk, unreferenced
+    let mut missing = 0u32; // referenced, marked free on disk
+    for s in 0..total {
+        let on_disk = bit_used(&vib, s);
+        if on_disk != used[s as usize] {
+            if on_disk {
+                leaked += 1;
+            } else {
+                missing += 1;
+            }
+        }
+    }
+    if leaked > 0 || missing > 0 {
+        errors.push(issue(
+            "BitmapMismatch",
+            format!(
+                "allocation bitmap disagrees with the directory walk: {leaked} leaked \
+                 (marked used but unreferenced), {missing} referenced but marked free"
+            ),
+            structure_clean,
+        ));
+    }
+
+    let free = total as usize - used.iter().filter(|&&u| u).count();
+    let repairable = errors.iter().any(|e| e.repairable);
+    Ok(FsckResult {
+        stats: FsckStats {
+            files_checked: files,
+            directories_checked: 1,
+            extra: vec![
+                ("volume".into(), fs.volume_label.clone()),
+                ("geometry".into(), fs.geometry.describe()),
+                ("free_sectors".into(), free.to_string()),
+            ],
+        },
+        repairable,
+        errors,
+        warnings,
+        orphaned_entries: Vec::new(),
+    })
+}
+
+pub fn repair_ti99<R: Read + Write + Seek>(
+    fs: &mut Ti99Filesystem<R>,
+) -> Result<RepairReport, FilesystemError> {
+    let check = fsck_ti99(fs)?;
+    let mut report = RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: check.errors.iter().filter(|e| !e.repairable).count(),
+    };
+    // The bitmap mismatch is the only repairable error, and it is marked
+    // repairable only when the structure is intact — so a repairable error being
+    // present already implies the directory walk is trustworthy.
+    if check.errors.iter().any(|e| e.repairable) {
+        let used = computed_allocation(fs)?;
+        for s in 0..fs.geometry.total_sectors {
+            fs.bitmap_set(s, used[s as usize]);
+        }
+        fs.write_vib()?;
+        fs.reader.flush()?;
+        report
+            .fixes_applied
+            .push("rebuilt the allocation bitmap from the directory + cluster-chain walk".into());
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1152,5 +1398,185 @@ mod tests {
         }
         let _ = std::fs::remove_file(&vol);
         assert!(ok, "oracle/imgtool rejected our blank");
+    }
+
+    // ---- fsck ----
+
+    #[test]
+    fn fsck_on_blank_and_populated_is_clean() {
+        let mut fs = Ti99Filesystem::open(
+            Cursor::new(create_blank_ti99(90 * 1024, "CLEAN").unwrap()),
+            0,
+        )
+        .unwrap();
+        assert!(fsck_ti99(&mut fs).unwrap().is_clean());
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "A",
+            &mut &[1u8; 1000][..],
+            1000,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "B",
+            &mut &[2u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let r = fsck_ti99(&mut fs).unwrap();
+        assert!(r.is_clean(), "errors={:?}", r.errors);
+        assert_eq!(r.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_leaked_bitmap() {
+        let mut cur = Cursor::new(create_blank_ti99(90 * 1024, "FIX").unwrap());
+        {
+            let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "F",
+                &mut &[9u8; 700][..],
+                700,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Leak: mark a genuinely free sector (100) used in the bitmap.
+        cur.get_mut()[BITMAP_OFF + 100 / 8] |= 1 << (100 % 8);
+        {
+            let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+            let r = fsck_ti99(&mut fs).unwrap();
+            assert!(
+                r.errors.iter().any(|e| e.code == "BitmapMismatch"),
+                "{:?}",
+                r.errors
+            );
+            assert!(r.repairable);
+            let rep = repair_ti99(&mut fs).unwrap();
+            assert!(!rep.fixes_applied.is_empty(), "{rep:?}");
+            assert_eq!(rep.unrepairable_count, 0);
+        }
+        cur.set_position(0);
+        let mut fs2 = Ti99Filesystem::open(&mut cur, 0).unwrap();
+        assert!(fsck_ti99(&mut fs2).unwrap().is_clean());
+    }
+
+    #[test]
+    fn fsck_flags_cross_link_unrepairable() {
+        let mut cur = Cursor::new(blank_image(1, 40, 9, 1, "XLINK"));
+        {
+            let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "A",
+                &mut &[1u8; 200][..],
+                200,
+                &CreateFileOptions::default(),
+            )
+            .unwrap(); // FDR@2, data@3
+            fs.sync_metadata().unwrap();
+        }
+        // Forge a second file B (FDR at sector 4) whose cluster claims A's data
+        // sector 3 — a cross-link.
+        {
+            let img = cur.get_mut();
+            let fdr = 4 * SECTOR as usize;
+            let mut name = [b' '; 10];
+            name[0] = b'B';
+            img[fdr..fdr + 10].copy_from_slice(&name);
+            img[fdr + 0x0C] = 0x01;
+            img[fdr + 0x0E..fdr + 0x10].copy_from_slice(&1u16.to_be_bytes());
+            img[fdr + 0x1C..fdr + 0x1F].copy_from_slice(&[3, 0, 0]); // start=3, last_off=0
+            let fdir = SECTOR as usize;
+            img[fdir + 2..fdir + 4].copy_from_slice(&4u16.to_be_bytes()); // B after A
+            img[BITMAP_OFF] |= 1 << 4; // mark B's FDR sector used
+        }
+        cur.set_position(0);
+        let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+        let r = fsck_ti99(&mut fs).unwrap();
+        assert!(
+            r.errors.iter().any(|e| e.code == "CrossLink"),
+            "{:?}",
+            r.errors
+        );
+        let rep = repair_ti99(&mut fs).unwrap();
+        assert!(
+            rep.fixes_applied.is_empty(),
+            "repair should be withheld: {rep:?}"
+        );
+        assert!(rep.unrepairable_count >= 1);
+    }
+
+    #[test]
+    fn oracle_accepts_our_repair() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_accepts_our_repair: oracle unavailable");
+            return;
+        };
+        if !have_python() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ti99_rep_{}.dsk", std::process::id()));
+        std::fs::write(&vol, create_blank_ti99(180 * 1024, "REPV").unwrap()).unwrap();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = Ti99Filesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "K",
+                &mut &[7u8; 900][..],
+                900,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Corrupt the bitmap on disk (leak a sector), then repair through our code.
+        {
+            use std::io::{Read as _, Seek as _, Write as _};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            f.seek(SeekFrom::Start(BITMAP_OFF as u64 + 50 / 8)).unwrap();
+            let mut byte = [0u8];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] |= 1 << (50 % 8);
+            f.seek(SeekFrom::Start(BITMAP_OFF as u64 + 50 / 8)).unwrap();
+            f.write_all(&byte).unwrap();
+        }
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = Ti99Filesystem::open(file, 0).unwrap();
+            let rep = repair_ti99(&mut fs).unwrap();
+            assert_eq!(rep.unrepairable_count, 0, "{rep:?}");
+        }
+        let clean = Command::new("python3")
+            .arg(&script)
+            .args(["fsck", vol.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged the repaired volume");
     }
 }

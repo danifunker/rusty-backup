@@ -116,7 +116,7 @@ risky — noted as such; "where possible" applies.
 | ~~**Minix FS**~~ (done) | Minix, early Linux | **Full quartet shipped** — V1/V2/V3 browse + edit + create-blank (`rb-cli new --fs minix{,2,3}`, mkfs.minix-parity geometry) + fsck (bitmap/link-count reconciliation + orphan adoption into `/lost+found`), every write verified against Linux `fsck.minix` | S–M |
 | ~~**TR-DOS**~~ (done) | ZX Spectrum | **Full quartet shipped** — browse + edit (create / delete / rename; append at the first-free high-water mark, tombstone deletes) + create-blank (`rb-cli new --fs trdos`) + fsck (contiguous-packing check + disk-info-counter reconciliation, repair withheld on structural damage). Raw `.trd`, geometry from the disk-info type byte. Validated against an independent clean-room oracle (`scripts/trdos-oracle.py`) | M |
 | **TRSDOS / LDOS** | TRS-80 | Browse + edit; variants complicate | M |
-| **TI-99 FS** | TI-99/4A | Full quartet (VIB/FDIR) | M |
+| ~~**TI-99 FS**~~ (done) | TI-99/4A | **Full quartet shipped** — browse + edit (create / delete / rename; bitmap allocation + FDR/cluster-chain writes) + create-blank (`rb-cli new --fs ti99`) + fsck (VIB bitmap vs directory walk, cross-link detection, repair withheld on structural damage). Flat V9T9 `.dsk`, big-endian. Cross-validated against BOTH MAME's `imgtool` and a clean-room oracle (`scripts/ti99-oracle.py`) | M |
 | **Sedoric / Oric DOS** | Oric | Full quartet | M |
 | **N88-BASIC** | NEC PC-8801 | Full quartet (shares `.d88`) | M |
 | **SpartaDOS / MyDOS** | Atari 8-bit | Extend the Atari DOS driver | S–M |
@@ -198,9 +198,11 @@ The order that buys the most capability per unit effort:
    `EditableFilesystem` (general create/delete/rename still `Unsupported`).
 6. **New high-value filesystems** — ~~Minix~~ **done** (full quartet, V1/V2/V3,
    `fsck.minix`-verified), ~~UCSD p-System~~ **done** (full quartet,
-   clean-room-oracle-verified), and ~~TR-DOS~~ **done** (full quartet, ZX
-   Spectrum Beta Disk `.trd`, clean-room-oracle-verified); next the remaining
-   MiSTer-core long-tail (TI-99, Oric, N88-BASIC, TRSDOS), then HPFS.
+   clean-room-oracle-verified), ~~TR-DOS~~ **done** (full quartet, ZX
+   Spectrum Beta Disk `.trd`, clean-room-oracle-verified), and ~~TI-99~~ **done**
+   (full quartet, TI-99/4A V9T9 `.dsk`, verified against BOTH MAME's imgtool and
+   a clean-room oracle); next the remaining MiSTer-core long-tail (Oric,
+   N88-BASIC, TRSDOS), then HPFS.
 7. **Read-only-to-edit for btrfs / JFS / APFS / ZFS** — last; large effort, and
    read is the realistic ceiling for the CoW/checksummed ones.
 

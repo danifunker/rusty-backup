@@ -2478,6 +2478,7 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "DOS 3.3"
                 | "OS-9"
                 | "TR-DOS"
+                | "TI-99"
         )
 }
 

@@ -105,6 +105,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Dragon 32 / 64. fsck = bitmap reconciliation vs the directory extent chains (VALIDATE model), rewrites both dir-track copies |
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | BBC Micro / Master, Acorn Electron. fsck = contiguous-file consistency (overlap + out-of-bounds detection; canonical descending-catalogue reorder as the repair) |
 | TR-DOS | Auto | Yes | Yes | Yes (`--fs trdos`) | — (fixed geometry) | check+repair | ZX Spectrum Beta Disk (`.trd`, 80-/40-track SS/DS). Flat 128-entry catalogue of contiguous files, append at a first-free high-water mark. fsck = catalogue-packing check + disk-info-counter reconciliation (repair withheld on structural damage); full quartet, clean-room-oracle-validated |
+| TI-99/4A | Auto | Yes | Yes | Yes (`--fs ti99`) | — (fixed geometry) | check+repair | TI-99/4A (flat V9T9 `.dsk`, SSSD/DSSD/DSDD). VIB allocation bitmap + sorted FDIR of extent-based FDRs, big-endian. fsck = VIB-bitmap-vs-directory-walk reconciliation + cross-link detection (repair withheld on structural damage); full quartet, validated against BOTH MAME's `imgtool` and a clean-room oracle |
 | Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | Yes (`--fs cpm --cpm-preset`) | No | check+repair | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |
 | Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | Yes | Sharp X68000 (big-endian FAT dialect). fsck = FAT allocation reconciliation vs the directory tree (VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy, surfaces cross-links / broken chains |
@@ -255,7 +256,7 @@ images, with a MiSTer-FPGA lean** — the gaps sort into four bands.
 | **Minix FS** | Minix, early Linux | Small, well-documented; the FS Linux booted on in 1991 | Linux kernel `fs/minix` |
 | ~~**TR-DOS**~~ (done) | ZX Spectrum (Beta Disk) | MiSTer **ZX-Spectrum** core; native Spectrum disk FS | full quartet shipped — see §1 |
 | **TRSDOS / LDOS / NEWDOS** | TRS-80 | MiSTer **TRS-80** core | — |
-| **TI-99 FS (VIB / FDIR)** | TI-99/4A | MiSTer **TI-99_4A** core | — |
+| ~~**TI-99 FS (VIB / FDIR)**~~ (done) | TI-99/4A | MiSTer **TI-99_4A** core | full quartet shipped — see §1 |
 | **Sedoric / Oric DOS** | Oric | MiSTer **Oric** core | — |
 | **N88-BASIC** | NEC PC-8801 | MiSTer **PC88** core | — |
 | **SpartaDOS / MyDOS / DOS 3** | Atari 8-bit | Alternative Atari DOSes beyond the supported DOS 2 | — |

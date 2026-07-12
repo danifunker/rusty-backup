@@ -44,6 +44,11 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   files packed from a first-free high-water mark; every write cross-validated
   against an independent clean-room oracle, fsck = catalogue-packing +
   disk-info-counter reconciliation),
+  TI-99/4A (read + write + create + fsck, flat V9T9 `.dsk` SSSD/DSSD/DSDD; a
+  VIB allocation bitmap + a sorted FDIR of extent-based File Descriptor Records,
+  big-endian; every write cross-validated against BOTH MAME's `imgtool` reader
+  and an independent clean-room oracle, fsck = bitmap-vs-directory-walk
+  reconciliation),
   ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
   + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
   VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
@@ -121,7 +126,7 @@ Legend for the **Support** column:
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
 | Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes + creates + fscks Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`; `rb-cli new --fs atari` formats a blank SD disk, and fsck reconciles the VTOC bitmap + free-count against the directory chains. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way; fsck validated clean on the real fixture. |
-| TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
+| TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **Yes** — full quartet on the V9T9 `.dsk` (read + edit + create + fsck) |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |
 | PC88 | NEC PC-8801 mkII SR | Floppy | N88-BASIC Disk BASIC | **No** |
