@@ -596,6 +596,23 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
         ))
     }
 
+    /// Allocate an allocation-block chain for `bytes` and write it, returning
+    /// `(first_block, logical_len)`. An empty fork allocates nothing and returns
+    /// `(0, 0)`. Shared by `create_file` (both forks) and `write_resource_fork`.
+    fn alloc_and_write_fork(&mut self, bytes: &[u8]) -> Result<(u16, u32), FilesystemError> {
+        let bs = self.mdb.alloc_block_size as usize;
+        let count = if bytes.is_empty() {
+            0
+        } else {
+            bytes.len().div_ceil(bs) as u32
+        };
+        let first = self.alloc_chain(count)?;
+        if first != 0 {
+            self.write_data_chain(first, bytes)?;
+        }
+        Ok((first, bytes.len() as u32))
+    }
+
     /// Write `data` across the allocation-block chain starting at `first`.
     /// The chain must have been pre-allocated by `alloc_chain`. Each block
     /// holds `mdb.alloc_block_size` bytes; the last block is zero-padded
@@ -851,17 +868,26 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
                 bytes.len()
             )));
         }
-        let bs = self.mdb.alloc_block_size;
-        let block_count = if bytes.is_empty() {
-            0u32
-        } else {
-            bytes.len().div_ceil(bs as usize) as u32
+        let (first_block, _) = self.alloc_and_write_fork(&bytes)?;
+
+        // Resource fork from CreateFileOptions, if the caller supplied one
+        // (put-binhex / put-macbinary / fork-carrying cp). Roll the data
+        // allocation back if the resource fork can't fit, so a failed create
+        // leaks nothing.
+        let rsrc_bytes: Vec<u8> = match &options.resource_fork {
+            Some(super::filesystem::ResourceForkSource::Data(d)) => d.clone(),
+            Some(super::filesystem::ResourceForkSource::File(p)) => {
+                std::fs::read(p).map_err(FilesystemError::Io)?
+            }
+            None => Vec::new(),
         };
-        let first_block = self.alloc_chain(block_count)?;
-        // Commit data + map.
-        if first_block != 0 {
-            self.write_data_chain(first_block, &bytes)?;
-        }
+        let (rsrc_first_block, rsrc_logical_length) = match self.alloc_and_write_fork(&rsrc_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.free_chain(first_block);
+                return Err(e);
+            }
+        };
 
         let file_number = self.mdb.next_file_number;
         self.mdb.next_file_number += 1;
@@ -898,8 +924,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
             file_number,
             data_first_block: first_block,
             data_logical_length: bytes.len() as u32,
-            rsrc_first_block: 0,
-            rsrc_logical_length: 0,
+            rsrc_first_block,
+            rsrc_logical_length,
             create_date: 0,
             modify_date: 0,
             name: name.to_string(),
@@ -915,6 +941,9 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         );
         fe.type_code = Some(type_code);
         fe.creator_code = Some(creator_code);
+        if rsrc_logical_length > 0 {
+            fe.resource_fork_size = Some(rsrc_logical_length as u64);
+        }
         Ok(fe)
     }
 
@@ -975,6 +1004,45 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.mdb.free_blocks as u64 * self.mdb.alloc_block_size as u64)
+    }
+
+    /// Replace a file's resource fork (used by `setrsrc`, the batch archive
+    /// importer, and fork-carrying `cp`). Frees the old resource chain, then
+    /// allocates + writes the new one and updates the directory entry. Call
+    /// `sync_metadata` to persist. Freeing before allocating means a replacement
+    /// only needs the *delta* in free space, not room for both copies.
+    fn write_resource_fork(
+        &mut self,
+        entry: &FileEntry,
+        data: &mut dyn std::io::Read,
+        len: u64,
+    ) -> Result<(), FilesystemError> {
+        if len > u32::MAX as u64 {
+            return Err(FilesystemError::InvalidData(
+                "MFS resource fork capped at u32::MAX bytes".into(),
+            ));
+        }
+        let fnum = entry.location as u32;
+        let old_head = self
+            .entries
+            .iter()
+            .find(|e| e.is_in_use() && e.file_number == fnum)
+            .map(|e| e.rsrc_first_block)
+            .ok_or_else(|| {
+                FilesystemError::NotFound(format!("file number {fnum} not in directory"))
+            })?;
+        let mut bytes = Vec::with_capacity(len as usize);
+        data.read_to_end(&mut bytes)?;
+        self.free_chain(old_head)?;
+        let (first, rlen) = self.alloc_and_write_fork(&bytes)?;
+        let de = self
+            .entries
+            .iter_mut()
+            .find(|e| e.is_in_use() && e.file_number == fnum)
+            .expect("entry present after lookup above");
+        de.rsrc_first_block = first;
+        de.rsrc_logical_length = rlen;
+        Ok(())
     }
 
     fn set_type_creator(
@@ -1334,6 +1402,95 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("Doc.rsrc")).unwrap(), b"RSRC");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_file_with_resource_fork_persists() {
+        // The put-binhex / put-macbinary path: create_file with a resource fork
+        // in CreateFileOptions. Must allocate + write a second chain and survive
+        // sync + reopen — before this, MFS create_file dropped the fork.
+        use crate::fs::filesystem::ResourceForkSource;
+        let mut cur = Cursor::new(build_test_mfs());
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let opts = CreateFileOptions {
+                resource_fork: Some(ResourceForkSource::Data(b"NEW-RSRC-BYTES".to_vec())),
+                ..Default::default()
+            };
+            let data = b"data fork content";
+            let fe = fs
+                .create_file(&root, "Forked", &mut &data[..], data.len() as u64, &opts)
+                .unwrap();
+            assert_eq!(fe.resource_fork_size, Some(14));
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let forked = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "Forked")
+            .unwrap();
+        assert_eq!(forked.resource_fork_size, Some(14));
+        assert_eq!(
+            fs.read_file(&forked, usize::MAX).unwrap(),
+            b"data fork content"
+        );
+        // Through the trait, as the export consumers read it back.
+        let fsys: &mut dyn Filesystem = &mut fs;
+        let mut buf = Vec::new();
+        fsys.write_resource_fork_to(&forked, &mut buf).unwrap();
+        assert_eq!(&buf, b"NEW-RSRC-BYTES");
+    }
+
+    #[test]
+    fn write_resource_fork_sets_and_replaces() {
+        // The setrsrc / batch path: set a fork on a fork-less file, then replace
+        // it with a different-sized one (frees the old chain first).
+        let mut cur = Cursor::new(build_test_mfs());
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let fe = fs
+                .create_file(
+                    &root,
+                    "SetR",
+                    &mut &b"body"[..],
+                    4,
+                    &CreateFileOptions::default(),
+                )
+                .unwrap();
+            fs.write_resource_fork(&fe, &mut &b"FIRST"[..], 5).unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let e = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "SetR")
+                .unwrap();
+            assert_eq!(fs.read_resource_fork(&e).unwrap(), b"FIRST");
+            fs.write_resource_fork(&e, &mut &b"SECOND-and-longer"[..], 17)
+                .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let e = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "SetR")
+            .unwrap();
+        assert_eq!(fs.read_resource_fork(&e).unwrap(), b"SECOND-and-longer");
     }
 
     #[test]
