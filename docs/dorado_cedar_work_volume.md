@@ -66,3 +66,31 @@ creation is still the required next acceptance result.
 
 Do not reclaim space from an installed image by deleting an arbitrary FileID
 range.  Pilot FileID ordering does not encode Cedar package dependencies.
+
+## Fast debugging snapshot
+
+Once the Guest/Loader state is stable, save a fresh snapshot (do not reuse an
+old snapshot after changing the emulator ABI):
+
+```sh
+cd ../../dorado
+./build/dorado --boot-reason disk --no-alto-boot \
+  --eb ../chm/dorado/CedarDorado.eb!6 \
+  --germ ../chm/cedar/germ-alt/Dorado.germ-6.1.6 \
+  --pilot-disk ../CedarDisk/CedarDorado-work.pdi \
+  --ftp-root ../chm/cedar/stp-root \
+  --type-at 760000000 --type 'Guest\n\n' --cycles 1350000000 \
+  --snapshot-out /tmp/cedar-work-loader.snap
+```
+
+Restore with the PDI and FTP root explicitly supplied again; this keeps the
+host-side media and server configuration current after snapshot restore:
+
+```sh
+./build/dorado --snapshot-in /tmp/cedar-work-loader.snap \
+  --pilot-disk ../CedarDisk/CedarDorado-work.pdi \
+  --ftp-root ../chm/cedar/stp-root --cycles 10000000
+```
+
+This was verified on 2026-07-11: the restore returned to the LoaderDriver
+state with 30,592 rendered pixels after 10M additional cycles.
