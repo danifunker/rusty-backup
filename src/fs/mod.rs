@@ -1797,6 +1797,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ti99" => Ok(Box::new(ti99::Ti99Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,

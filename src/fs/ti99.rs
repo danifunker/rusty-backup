@@ -29,10 +29,12 @@
 //! This is the read half of the TI-99 quartet (Browse); edit / create / fsck
 //! build on it (`docs/filesystem_completion_plan.md` Part 2).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
-use super::filesystem::{Filesystem, FilesystemError};
+use super::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
+};
 
 pub(crate) const SECTOR: u64 = 256;
 /// The VIB is sector 0 (image start); the FDIR is sector 1.
@@ -382,6 +384,288 @@ impl<R: Read + Seek + Send> Filesystem for Ti99Filesystem<R> {
             .map_or(FIRST_DATA, |s| s + 1);
         Ok(last as u64 * SECTOR)
     }
+
+    fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
+        validate_ti99_name(name).map(|_| ())
+    }
+}
+
+/// Validate and normalize a TI-99 file name: uppercased, 1-10 printable ASCII
+/// bytes, no `.` / `/` / space (space is the on-disk pad/terminator). Returns
+/// the 10-byte, space-padded on-disk name.
+fn validate_ti99_name(name: &str) -> Result<[u8; 10], FilesystemError> {
+    let up = name.to_ascii_uppercase();
+    let bytes = up.as_bytes();
+    if bytes.is_empty() || bytes.len() > 10 {
+        return Err(FilesystemError::InvalidData(format!(
+            "invalid TI-99 file name {name:?} (1-10 characters)"
+        )));
+    }
+    if bytes
+        .iter()
+        .any(|&b| !(0x21..0x7F).contains(&b) || b == b'.' || b == b'/')
+    {
+        return Err(FilesystemError::InvalidData(format!(
+            "invalid TI-99 file name {name:?} (printable ASCII, no '.' '/' or space)"
+        )));
+    }
+    let mut n = [b' '; 10];
+    n[..bytes.len()].copy_from_slice(bytes);
+    Ok(n)
+}
+
+/// The 10-byte, space-padded form of a display name (for FDIR sort order).
+fn padded_name(name: &str) -> [u8; 10] {
+    let mut n = [b' '; 10];
+    let b = name.as_bytes();
+    let k = b.len().min(10);
+    n[..k].copy_from_slice(&b[..k]);
+    n
+}
+
+/// Pack a list of physical data sectors into 3-byte cluster entries, grouping
+/// contiguous runs. Inverse of [`walk_clusters`].
+pub(crate) fn pack_clusters(sectors: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut file_au: u16 = 0;
+    while i < sectors.len() {
+        let start = sectors[i];
+        let mut j = i;
+        while j + 1 < sectors.len() && sectors[j + 1] == sectors[j] + 1 {
+            j += 1;
+        }
+        let run_len = (j - i + 1) as u16;
+        let last_off = file_au + run_len - 1;
+        out.push((start & 0xFF) as u8);
+        out.push((((start >> 8) & 0x0F) | ((last_off & 0x0F) << 4)) as u8);
+        out.push(((last_off >> 4) & 0xFF) as u8);
+        file_au += run_len;
+        i = j + 1;
+    }
+    out
+}
+
+impl<R: Read + Write + Seek> Ti99Filesystem<R> {
+    fn write_sector(&mut self, sector: u16, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + sector as u64 * SECTOR,
+        ))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    fn bitmap_set(&mut self, sector: u16, used: bool) {
+        let byte = BITMAP_OFF + (sector / 8) as usize;
+        if byte >= self.vib.len() {
+            return;
+        }
+        let mask = 1u8 << (sector % 8);
+        if used {
+            self.vib[byte] |= mask;
+        } else {
+            self.vib[byte] &= !mask;
+        }
+    }
+
+    /// Allocate `count` free data sectors (a single contiguous run when one
+    /// exists, else the lowest scattered sectors), marking them used. Returns
+    /// `None` when the disk lacks `count` free sectors.
+    fn alloc_sectors(&mut self, count: u16) -> Option<Vec<u16>> {
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let total = self.geometry.total_sectors;
+        let free: Vec<u16> = (FIRST_DATA..total)
+            .filter(|&s| !self.bitmap_used(s))
+            .collect();
+        if free.len() < count as usize {
+            return None;
+        }
+        let need = count as usize;
+        // Prefer a contiguous run so the cluster chain stays a single entry.
+        let chosen = (0..=free.len() - need)
+            .map(|i| &free[i..i + need])
+            .find(|run| run[need - 1] - run[0] == count - 1)
+            .map(<[u16]>::to_vec)
+            .unwrap_or_else(|| free[..need].to_vec());
+        for &s in &chosen {
+            self.bitmap_set(s, true);
+        }
+        Some(chosen)
+    }
+
+    fn write_vib(&mut self) -> Result<(), FilesystemError> {
+        let vib = self.vib.clone();
+        self.write_sector(0, &vib)
+    }
+
+    /// Serialize the (sorted) entry list into the FDIR sector (sector 1).
+    fn write_fdir(&mut self) -> Result<(), FilesystemError> {
+        let mut fdir = vec![0u8; SECTOR as usize];
+        for (i, e) in self.entries.iter().enumerate() {
+            fdir[i * 2..i * 2 + 2].copy_from_slice(&e.fdr_sector.to_be_bytes());
+        }
+        self.write_sector(FDIR_SECTOR as u16, &fdir)
+    }
+}
+
+impl<R: Read + Write + Seek + Send> EditableFilesystem for Ti99Filesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        _options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() || parent.path != "/" {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let padded = validate_ti99_name(name)?;
+        let display = trim_name(&padded);
+        if self.entries.iter().any(|e| padded_name(&e.name) == padded) {
+            return Err(FilesystemError::AlreadyExists(display));
+        }
+        if self.entries.len() >= MAX_FILES {
+            return Err(FilesystemError::DiskFull(
+                "TI-99 directory full (127 files)".into(),
+            ));
+        }
+        let n_data = data_len.div_ceil(SECTOR) as u16;
+        if n_data as u64 > BITMAP_BITS as u64 {
+            return Err(FilesystemError::InvalidData(
+                "file too large for TI-99".into(),
+            ));
+        }
+        // Allocate the FDR sector, then the data sectors.
+        let fdr_sector = self.alloc_sectors(1).ok_or_else(|| {
+            FilesystemError::DiskFull("no free sector for the file descriptor".into())
+        })?[0];
+        let data_sectors = match self.alloc_sectors(n_data) {
+            Some(v) => v,
+            None => {
+                self.bitmap_set(fdr_sector, false);
+                return Err(FilesystemError::DiskFull(format!(
+                    "not enough free space (need {n_data} data sectors)"
+                )));
+            }
+        };
+        // Write the payload across the data sectors, zero-padding the last one.
+        let mut remaining = data_len;
+        for &s in &data_sectors {
+            let mut buf = [0u8; SECTOR as usize];
+            let take = remaining.min(SECTOR) as usize;
+            if take > 0 {
+                data.read_exact(&mut buf[..take])?;
+            }
+            self.write_sector(s, &buf)?;
+            remaining -= take as u64;
+        }
+        // Build the FDR (a PROGRAM file: raw bytes).
+        let mut fdr = vec![0u8; SECTOR as usize];
+        fdr[0..10].copy_from_slice(&padded);
+        fdr[0x0C] = 0x01; // program
+        fdr[0x0E..0x10].copy_from_slice(&n_data.to_be_bytes());
+        fdr[0x10] = (data_len % SECTOR) as u8; // EOF offset (0 = full last sector)
+        let clusters = pack_clusters(&data_sectors);
+        fdr[FDR_CLUSTERS_OFF..FDR_CLUSTERS_OFF + clusters.len()].copy_from_slice(&clusters);
+        self.write_sector(fdr_sector, &fdr)?;
+
+        let entry = Ti99Entry {
+            fdr_sector,
+            name: display,
+            flags: 0x01,
+            sectors_alloc: n_data,
+            eof_offset: (data_len % SECTOR) as u8,
+            data_sectors,
+        };
+        let fe = self.entry_to_file(&entry);
+        self.entries.push(entry);
+        self.entries.sort_by_key(|e| padded_name(&e.name));
+        self.write_vib()?;
+        self.write_fdir()?;
+        Ok(fe)
+    }
+
+    fn create_directory(
+        &mut self,
+        _parent: &FileEntry,
+        _name: &str,
+        _options: &CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "TI-99 subdirectories are not supported (flat root filesystem)".into(),
+        ))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| e.name == entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+        let e = self.entries.remove(idx);
+        // Free the data sectors + the FDR sector in the bitmap.
+        for s in &e.data_sectors {
+            self.bitmap_set(*s, false);
+        }
+        self.bitmap_set(e.fdr_sector, false);
+        self.write_vib()?;
+        self.write_fdir()
+    }
+
+    fn rename(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+        new_name: &str,
+    ) -> Result<(), FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        if new_name == entry.name {
+            return Ok(());
+        }
+        let padded = validate_ti99_name(new_name)?;
+        let display = trim_name(&padded);
+        if self.entries.iter().any(|e| padded_name(&e.name) == padded) {
+            return Err(FilesystemError::AlreadyExists(display));
+        }
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| e.name == entry.name)
+            .ok_or_else(|| FilesystemError::NotFound(entry.name.clone()))?;
+        let fdr_sector = self.entries[idx].fdr_sector;
+        // Rewrite the name in the FDR (identity/contents keep).
+        let mut fdr = vec![0u8; SECTOR as usize];
+        self.read_sector(fdr_sector, &mut fdr)?;
+        fdr[0..10].copy_from_slice(&padded);
+        self.write_sector(fdr_sector, &fdr)?;
+        self.entries[idx].name = display;
+        self.entries.sort_by_key(|e| padded_name(&e.name));
+        self.write_fdir()
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.reader.flush()?;
+        Ok(())
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        let free = (FIRST_DATA..self.geometry.total_sectors)
+            .filter(|&s| !self.bitmap_used(s))
+            .count() as u64;
+        Ok(free * SECTOR)
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +807,246 @@ mod tests {
         assert!(
             out.status.success() && listing.contains("PROG"),
             "imgtool did not list our oracle disk:\n{listing}"
+        );
+    }
+
+    // ---- Edit ----
+
+    /// A blank writable TI-99 volume built in memory (mkfs equivalent).
+    fn blank_image(sides: u8, tracks: u8, spt: u8, density: u8, name: &str) -> Vec<u8> {
+        let total = sides as u16 * tracks as u16 * spt as u16;
+        let mut img = vec![0u8; total as usize * SECTOR as usize];
+        img[0..10].copy_from_slice(&padded_name(&name.to_ascii_uppercase()));
+        img[0x0A..0x0C].copy_from_slice(&total.to_be_bytes());
+        img[0x0C] = spt;
+        img[0x0D..0x10].copy_from_slice(b"DSK");
+        img[0x10] = 0x20;
+        img[0x11] = tracks;
+        img[0x12] = sides;
+        img[0x13] = density;
+        img[0xEC..0x100].fill(0xFF); // reserved bitmap tail
+        for s in total..BITMAP_BITS {
+            img[BITMAP_OFF + (s / 8) as usize] |= 1 << (s % 8); // beyond-disk = used
+        }
+        img[BITMAP_OFF] |= 0b11; // sectors 0 (VIB) + 1 (FDIR) used
+        img
+    }
+
+    #[test]
+    fn edit_create_rename_delete_roundtrip() {
+        let mut fs = Ti99Filesystem::open(Cursor::new(blank_image(1, 40, 9, 1, "EDITVOL")), 0)
+            .expect("open blank");
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+
+        let a = vec![0x41u8; 300]; // 2 sectors
+        fs.create_file(
+            &root,
+            "ALPHA",
+            &mut &a[..],
+            300,
+            &CreateFileOptions::default(),
+        )
+        .expect("create ALPHA");
+        let b = vec![0x42u8; 5000]; // 20 sectors
+        fs.create_file(
+            &root,
+            "BETA",
+            &mut &b[..],
+            5000,
+            &CreateFileOptions::default(),
+        )
+        .expect("create BETA");
+
+        let alpha = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "ALPHA")
+            .unwrap();
+        fs.rename(&root, &alpha, "GAMMA").expect("rename");
+
+        fs.create_file(
+            &root,
+            "TEMP",
+            &mut &b"xy"[..],
+            2,
+            &CreateFileOptions::default(),
+        )
+        .expect("create TEMP");
+        let temp = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "TEMP")
+            .unwrap();
+        fs.delete_entry(&root, &temp).expect("delete TEMP");
+
+        let files = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = files.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["BETA", "GAMMA"], "{names:?}"); // sorted, ALPHA renamed, TEMP gone
+
+        let beta = files.iter().find(|e| e.name == "BETA").unwrap();
+        assert_eq!(beta.size, 5000);
+        let d = fs.read_file(beta, usize::MAX).unwrap();
+        assert_eq!(d.len(), 5000);
+        assert!(d.iter().all(|&x| x == 0x42));
+
+        assert!(matches!(
+            fs.create_directory(&root, "sub", &CreateDirectoryOptions::default()),
+            Err(FilesystemError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn edit_persists_across_reopen() {
+        let mut cur = Cursor::new(blank_image(1, 40, 9, 1, "REOPEN"));
+        {
+            let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let data = vec![0x7Eu8; 1500];
+            fs.create_file(
+                &root,
+                "KEEP",
+                &mut &data[..],
+                1500,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = Ti99Filesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let files = fs.list_directory(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "KEEP");
+        assert_eq!(files[0].size, 1500);
+        assert_eq!(fs.read_file(&files[0], usize::MAX).unwrap().len(), 1500);
+    }
+
+    #[test]
+    fn oracle_validates_our_edits() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_validates_our_edits: oracle unavailable");
+            return;
+        };
+        if !have_python() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ti99_edit_{}.dsk", std::process::id()));
+        let volp = vol.to_str().unwrap();
+        let py = |args: &[&str]| {
+            Command::new("python3")
+                .arg(&script)
+                .args(args)
+                .output()
+                .expect("python3")
+        };
+        assert!(py(&["mkfs", volp, "dssd", "OVOL"]).status.success());
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = Ti99Filesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "ALPHA",
+                &mut &[0x41u8; 400][..],
+                400,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_file(
+                &root,
+                "BETA",
+                &mut &[0x42u8; 5000][..],
+                5000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            let alpha = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "ALPHA")
+                .unwrap();
+            fs.rename(&root, &alpha, "GAMMA").unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // The oracle's fsck must find our create + rename bitmap-consistent.
+        let out = py(&["fsck", volp]);
+        let clean = out.status.success();
+        let log = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged our edits:\n{log}");
+    }
+
+    #[test]
+    fn imgtool_reads_our_writes() {
+        if Command::new("imgtool").arg("--version").output().is_err() {
+            eprintln!("skipping imgtool_reads_our_writes: imgtool unavailable");
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ti99_wr_{}.dsk", std::process::id()));
+        std::fs::write(&vol, blank_image(1, 40, 9, 1, "WRITTEN")).unwrap();
+        let payload: Vec<u8> = (0..1000).map(|i| (i * 3) as u8).collect();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = Ti99Filesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "MYPROG",
+                &mut &payload[..],
+                1000,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Real tool lists + extracts our written file (TIFILES: 128-byte header).
+        let got = std::env::temp_dir().join(format!("rb_ti99_got_{}.tfi", std::process::id()));
+        let dir = Command::new("imgtool")
+            .args(["dir", "v9t9", vol.to_str().unwrap()])
+            .output()
+            .expect("imgtool");
+        let listing = String::from_utf8_lossy(&dir.stdout).into_owned();
+        let get = Command::new("imgtool")
+            .args([
+                "get",
+                "v9t9",
+                vol.to_str().unwrap(),
+                "MYPROG",
+                got.to_str().unwrap(),
+            ])
+            .output()
+            .expect("imgtool");
+        let extracted = std::fs::read(&got).unwrap_or_default();
+        let _ = std::fs::remove_file(&vol);
+        let _ = std::fs::remove_file(&got);
+        assert!(
+            listing.contains("MYPROG"),
+            "imgtool dir missing our file:\n{listing}"
+        );
+        assert!(get.status.success(), "imgtool get failed");
+        // Skip the 128-byte TIFILES header; the next 1000 bytes are our payload.
+        assert!(
+            extracted.len() >= 128 + 1000,
+            "short extraction ({} bytes)",
+            extracted.len()
+        );
+        assert_eq!(
+            &extracted[128..128 + 1000],
+            &payload[..],
+            "imgtool read different bytes"
         );
     }
 }
