@@ -581,6 +581,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("Acorn DFS".to_string());
     }
 
+    // TR-DOS (ZX Spectrum Beta Disk, flat .trd). No magic; gated on the
+    // disk-info sector's id byte (0x10) + a valid disk-type byte at fixed
+    // offsets, plus a size/geometry sanity check.
+    if crate::fs::trdos::looks_like_trdos(reader, 0).is_some() {
+        return Some("TR-DOS".to_string());
+    }
+
     None
 }
 

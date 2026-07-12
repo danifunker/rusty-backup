@@ -81,6 +81,7 @@ pub mod sfs;
 pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
+pub mod trdos;
 pub mod tree;
 pub mod ucsd;
 pub mod ufs;
@@ -445,6 +446,14 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // random blobs are rejected.
     if rsdos::looks_like_rsdos(reader, partition_offset).is_some() {
         return "rsdos";
+    }
+
+    // TR-DOS (ZX Spectrum Beta Disk, flat .trd). No partition table; gated on
+    // the disk-info sector's id byte (0x10) + a valid disk-type byte at fixed
+    // offsets, plus a size/geometry sanity check — a confident signature that
+    // random same-sized blobs won't satisfy.
+    if trdos::looks_like_trdos(reader, partition_offset).is_some() {
+        return "trdos";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1448,6 +1457,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "trdos" => Ok(Box::new(trdos::TrdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2298,6 +2311,9 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "DragonDOS"
             | "OS-9"
             | "RS-DOS"
+            // TR-DOS (ZX Spectrum Beta Disk, flat .trd); auto-detected at the
+            // disk-info sector (offset 0x800) as `trdos`.
+            | "TR-DOS"
             | "Unknown"
     )
 }
