@@ -92,6 +92,11 @@ pub enum FsKind {
     /// (80-track DS, the default and maximum) that covers it.
     #[value(alias = "beta", alias = "betadisk", alias = "zx")]
     Trdos,
+    /// TI-99/4A disk. An empty VIB + FDIR (flat V9T9 `.dsk`). `--name` sets the
+    /// 10-char disk name. Geometry follows `--size`: the smallest of 90 KB
+    /// (SSSD), 180 KB (DSSD), or 360 KB (DSDD, the default and maximum).
+    #[value(alias = "ti99_4a", alias = "ti994a")]
+    Ti99,
 }
 
 #[derive(Debug, Args)]
@@ -102,7 +107,8 @@ pub struct NewArgs {
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
     /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
-    /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx).
+    /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx),
+    /// ti99 (alias ti99_4a / ti994a).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -353,6 +359,7 @@ pub fn run(args: NewArgs) -> Result<()> {
         }
         FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
         FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
+        FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
     }
 }
 
@@ -376,6 +383,19 @@ fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) 
     std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, TR-DOS volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
+}
+
+fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::ti99::create_blank_ti99(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting TI-99: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, TI-99 volume)",
         image.display(),
         img.len()
     ));

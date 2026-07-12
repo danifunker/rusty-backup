@@ -612,8 +612,10 @@ fn build_blank_fs(
             .map_err(|e| anyhow!("create_blank_ucsd: {e}")),
         "trdos" | "beta" => crate::fs::trdos::create_blank_trdos(size, name)
             .map_err(|e| anyhow!("create_blank_trdos: {e}")),
+        "ti99" => crate::fs::ti99::create_blank_ti99(size, name)
+            .map_err(|e| anyhow!("create_blank_ti99: {e}")),
         other => {
-            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos")
+            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
         }
     }
 }

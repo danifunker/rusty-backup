@@ -423,6 +423,56 @@ fn padded_name(name: &str) -> [u8; 10] {
     n
 }
 
+/// Sanitize a volume name to 10 space-padded printable-ASCII bytes (uppercased,
+/// no `.`). Volume names may contain spaces, unlike file names.
+fn sanitize_ti99_volname(name: &str) -> [u8; 10] {
+    let up = name.to_ascii_uppercase();
+    let filtered: Vec<u8> = up
+        .bytes()
+        .filter(|&b| (0x20..0x7F).contains(&b) && b != b'.')
+        .take(10)
+        .collect();
+    let mut n = [b' '; 10];
+    n[..filtered.len()].copy_from_slice(&filtered);
+    n
+}
+
+/// Build a blank TI-99 volume of the given geometry: a VIB (name, geometry,
+/// "DSK" marker) with an allocation bitmap marking sectors 0-1 (VIB + FDIR) and
+/// every past-the-end sector used, plus an empty FDIR.
+pub(crate) fn build_blank_ti99(sides: u8, tracks: u8, spt: u8, density: u8, name: &str) -> Vec<u8> {
+    let total = sides as u16 * tracks as u16 * spt as u16;
+    let mut img = vec![0u8; total as usize * SECTOR as usize];
+    img[0..10].copy_from_slice(&sanitize_ti99_volname(name));
+    img[0x0A..0x0C].copy_from_slice(&total.to_be_bytes());
+    img[0x0C] = spt;
+    img[0x0D..0x10].copy_from_slice(b"DSK");
+    img[0x10] = 0x20; // unprotected
+    img[0x11] = tracks;
+    img[0x12] = sides;
+    img[0x13] = density;
+    img[0xEC..0x100].fill(0xFF); // reserved bitmap tail
+    for s in total..BITMAP_BITS {
+        img[BITMAP_OFF + (s / 8) as usize] |= 1 << (s % 8); // beyond-disk = used
+    }
+    img[BITMAP_OFF] |= 0b11; // sectors 0 (VIB) + 1 (FDIR) used
+    img
+}
+
+/// Format a blank TI-99 volume. Geometry is the smallest standard floppy that
+/// covers `size_bytes`, capped at DSDD (360 KiB): ≤ 90 KiB → SSSD, ≤ 180 KiB →
+/// DSSD, else DSDD. `name` becomes the 10-char disk name.
+pub fn create_blank_ti99(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let (sides, tracks, spt, density) = if size_bytes <= 90 * 1024 {
+        (1, 40, 9, 1) // SSSD, 360 sectors
+    } else if size_bytes <= 180 * 1024 {
+        (2, 40, 9, 1) // DSSD, 720 sectors
+    } else {
+        (2, 40, 18, 2) // DSDD, 1440 sectors (the floppy maximum)
+    };
+    Ok(build_blank_ti99(sides, tracks, spt, density, name))
+}
+
 /// Pack a list of physical data sectors into 3-byte cluster entries, grouping
 /// contiguous runs. Inverse of [`walk_clusters`].
 pub(crate) fn pack_clusters(sectors: &[u16]) -> Vec<u8> {
@@ -812,24 +862,10 @@ mod tests {
 
     // ---- Edit ----
 
-    /// A blank writable TI-99 volume built in memory (mkfs equivalent).
+    /// A blank writable TI-99 volume built in memory (delegates to the shared
+    /// formatter used by `create_blank_ti99`).
     fn blank_image(sides: u8, tracks: u8, spt: u8, density: u8, name: &str) -> Vec<u8> {
-        let total = sides as u16 * tracks as u16 * spt as u16;
-        let mut img = vec![0u8; total as usize * SECTOR as usize];
-        img[0..10].copy_from_slice(&padded_name(&name.to_ascii_uppercase()));
-        img[0x0A..0x0C].copy_from_slice(&total.to_be_bytes());
-        img[0x0C] = spt;
-        img[0x0D..0x10].copy_from_slice(b"DSK");
-        img[0x10] = 0x20;
-        img[0x11] = tracks;
-        img[0x12] = sides;
-        img[0x13] = density;
-        img[0xEC..0x100].fill(0xFF); // reserved bitmap tail
-        for s in total..BITMAP_BITS {
-            img[BITMAP_OFF + (s / 8) as usize] |= 1 << (s % 8); // beyond-disk = used
-        }
-        img[BITMAP_OFF] |= 0b11; // sectors 0 (VIB) + 1 (FDIR) used
-        img
+        build_blank_ti99(sides, tracks, spt, density, name)
     }
 
     #[test]
@@ -1048,5 +1084,73 @@ mod tests {
             &payload[..],
             "imgtool read different bytes"
         );
+    }
+
+    // ---- Create-blank ----
+
+    #[test]
+    fn create_blank_geometry_by_size() {
+        // Size selects the smallest covering geometry, capped at DSDD (360 KiB).
+        let checks = [
+            (90 * 1024, 360u16),     // SSSD
+            (120 * 1024, 720),       // -> DSSD
+            (180 * 1024, 720),       // DSSD
+            (360 * 1024, 1440),      // DSDD
+            (2 * 1024 * 1024, 1440), // capped
+        ];
+        for (req, want_sectors) in checks {
+            let img = create_blank_ti99(req, "SZ").unwrap();
+            assert_eq!(img.len() as u64, want_sectors as u64 * SECTOR, "size {req}");
+            let fs = Ti99Filesystem::open(Cursor::new(img), 0).unwrap();
+            assert_eq!(fs.geometry.total_sectors, want_sectors, "size {req}");
+        }
+    }
+
+    #[test]
+    fn create_blank_opens_and_edits() {
+        let img = create_blank_ti99(90 * 1024, "TIDISK").unwrap();
+        let mut fs = Ti99Filesystem::open(Cursor::new(img), 0).expect("open blank");
+        assert_eq!(fs.volume_label(), Some("TIDISK"));
+        assert_eq!(fs.total_size(), 360 * SECTOR);
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        fs.create_file(
+            &root,
+            "X",
+            &mut &[1u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oracle_and_imgtool_accept_our_blank() {
+        // Our blank must fsck-clean in the oracle AND list in imgtool.
+        let vol = std::env::temp_dir().join(format!("rb_ti99_blank_{}.dsk", std::process::id()));
+        std::fs::write(&vol, create_blank_ti99(180 * 1024, "BLANKV").unwrap()).unwrap();
+        let volp = vol.to_str().unwrap();
+        let mut ok = true;
+        if let Some(script) = oracle() {
+            if have_python() {
+                ok &= Command::new("python3")
+                    .arg(&script)
+                    .args(["fsck", volp])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success();
+            }
+        }
+        if Command::new("imgtool").arg("--version").output().is_ok() {
+            let out = Command::new("imgtool")
+                .args(["dir", "v9t9", volp])
+                .output()
+                .unwrap();
+            ok &= out.status.success();
+        }
+        let _ = std::fs::remove_file(&vol);
+        assert!(ok, "oracle/imgtool rejected our blank");
     }
 }

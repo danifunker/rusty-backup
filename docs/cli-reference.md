@@ -871,7 +871,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2, minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx)
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2, minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx), ti99 (alias ti99_4a / ti994a)
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
