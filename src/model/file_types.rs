@@ -21,8 +21,8 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
     "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "pdi", "bfs", "copydisk", "altodisk",
-    "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk", "dart",
+    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "trd", "pdi", "bfs", "copydisk",
+    "altodisk", "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk", "dart",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -217,6 +217,8 @@ mod tests {
             ("acorn dfs", &["ssd"]),
             // CoCo Disk BASIC / RS-DOS (CoCo2/CoCo3 cores).
             ("coco disk", &["dsk", "jvc", "vdk"]),
+            // TR-DOS (ZX Spectrum Beta Disk) flat .trd (ZX-Spectrum core).
+            ("trdos disk", &["trd"]),
         ];
         let exts = association_exts();
         for (family, must) in families {

@@ -56,6 +56,8 @@ pub mod mac_scsi_bless;
 pub mod make_bootable;
 pub mod mem_archive;
 pub mod mfs;
+pub mod minix;
+pub mod minix_fsck;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
@@ -79,7 +81,10 @@ pub mod sfs;
 pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
+pub mod ti99;
+pub mod trdos;
 pub mod tree;
+pub mod ucsd;
 pub mod ufs;
 pub mod ufs_fsck;
 pub mod unix_common;
@@ -275,6 +280,16 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
             {
                 return "prodos";
             }
+            // Minix superblock: block 1 (this offset-1024 sector). Magic at
+            // +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478) or +24 (V3: 0x4D5A).
+            if let Some(name) = minix::detect_magic(&sb_buf) {
+                return name;
+            }
+            // UCSD p-System volume label at block 2 (this offset-1024 read).
+            // No magic — a structural signature — so it is checked last here.
+            if ucsd::looks_like_ucsd(&sb_buf) {
+                return "ucsd";
+            }
         }
     }
 
@@ -432,6 +447,21 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // random blobs are rejected.
     if rsdos::looks_like_rsdos(reader, partition_offset).is_some() {
         return "rsdos";
+    }
+
+    // TR-DOS (ZX Spectrum Beta Disk, flat .trd). No partition table; gated on
+    // the disk-info sector's id byte (0x10) + a valid disk-type byte at fixed
+    // offsets, plus a size/geometry sanity check — a confident signature that
+    // random same-sized blobs won't satisfy.
+    if trdos::looks_like_trdos(reader, partition_offset).is_some() {
+        return "trdos";
+    }
+
+    // TI-99/4A disk (flat V9T9 `.dsk`). The ASCII "DSK" marker at VIB offset
+    // 0x0D plus a self-consistent geometry is a confident signature; distinct
+    // from the CoCo/Dragon `.dsk` families even at a shared byte size.
+    if ti99::looks_like_ti99(reader, partition_offset).is_some() {
+        return "ti99";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1037,6 +1067,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
         0xA1 => "SGI EFS",
+        // Minix (0x81) and old Minix (0x80).
+        0x80 | 0x81 => "Minix",
         _ => "unknown",
     }
 }
@@ -1425,6 +1457,22 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "minix" => Ok(Box::new(minix::MinixFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ucsd" => Ok(Box::new(ucsd::UcsdFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "trdos" => Ok(Box::new(trdos::TrdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ti99" => Ok(Box::new(ti99::Ti99Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1538,6 +1586,12 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // Minix (MBR type 0x81) and old Minix (0x80). The superblock magic is
+        // validated in open(), so a mislabeled partition fails cleanly.
+        0x80 | 0x81 => Ok(Box::new(minix::MinixFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
         _ => Err(FilesystemError::Unsupported(format!(
             "filesystem type 0x{:02X} not supported for browsing",
             partition_type
@@ -1589,6 +1643,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                         partition_offset,
                     )?)),
                     "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
+                        reader,
+                        partition_offset,
+                    )?)),
+                    "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
                         reader,
                         partition_offset,
                     )?)),
@@ -1727,6 +1785,22 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "minix" => Ok(Box::new(minix::MinixFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ucsd" => Ok(Box::new(ucsd::UcsdFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "trdos" => Ok(Box::new(trdos::TrdosFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "ti99" => Ok(Box::new(ti99::Ti99Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1809,6 +1883,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "jfs" => Ok(Box::new(jfs::JfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for type 0x83 filesystem '{fs_type}'"
                 ))),
@@ -1826,6 +1904,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
         )?)),
         // SGI XFS — synthetic type byte emitted by PartitionTable::Sgi.
         0xA0 => Ok(Box::new(xfs::XfsFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Minix (MBR type 0x81) and old Minix (0x80).
+        0x80 | 0x81 => Ok(Box::new(minix::MinixFilesystem::open(
             reader,
             partition_offset,
         )?)),
@@ -2226,6 +2309,11 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "btrfs"
             | "EFS"
             | "MFS"
+            // Minix (raw floppy / hard-disk superfloppy); auto-detected at
+            // byte 1024 by both detect_superfloppy and detect_filesystem_type.
+            | "minix"
+            // UCSD p-System (Apple II/III Pascal floppies); block-2 volume label.
+            | "ucsd"
             | "ADFS"
             | "ANDOS"
             | "QDOS"
@@ -2243,6 +2331,11 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "DragonDOS"
             | "OS-9"
             | "RS-DOS"
+            // TR-DOS (ZX Spectrum Beta Disk, flat .trd); auto-detected at the
+            // disk-info sector (offset 0x800) as `trdos`.
+            | "TR-DOS"
+            // TI-99/4A (flat V9T9 .dsk); auto-detected via the VIB "DSK" marker.
+            | "TI-99"
             | "Unknown"
     )
 }
@@ -2384,6 +2477,8 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "Atari DOS"
                 | "DOS 3.3"
                 | "OS-9"
+                | "TR-DOS"
+                | "TI-99"
         )
 }
 

@@ -39,10 +39,10 @@
 //! brings in.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 
 use super::filesystem::FilesystemError;
-use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry};
+use super::fsck::{FsckIssue, FsckResult, FsckStats, OrphanedEntry, RepairReport};
 use super::jfs::{
     JfsFilesystem, AGGREGATE_I, AIT_INODES, BADBLOCK_I, BMAP_I, DT_INLINE_CAP, EXTSPERIAG,
     FILESET_ROOT_INO, FILESYSTEM_I, INOSPEREXT, LOG_I, PSIZE,
@@ -459,4 +459,123 @@ fn check_connectivity<R: Read + Seek + Send>(
         }
     }
     reached
+}
+
+// ---- J.4b repair: orphan-inode adoption into /lost+found ----
+
+/// Reconnect every orphaned (allocated-but-unreachable) fileset inode into
+/// `/lost+found`, creating that directory if it does not already exist.
+/// This is the write half of the JFS `repair()` milestone: it drives the
+/// J.4b edit primitives on [`JfsFilesystem`] (inode allocator + inline
+/// dtree insert + dinode write-back) and is verified end-to-end against the
+/// real `fsck.jfs` by `scripts/jfs-oracle.sh`.
+///
+/// Each orphan becomes `/lost+found/ino_<inum>`. A directory orphan also has
+/// its `..` (idotdot) repointed at `/lost+found` and bumps `/lost+found`'s
+/// link count — the standard Unix directory nlink of `2 + subdirectories`.
+/// An orphan whose adoption would require spilling an inline dtree to an
+/// external page (a very large orphan count, or a pathologically long name)
+/// is surfaced as unrepairable in the report rather than corrupting the
+/// tree.
+pub fn repair_jfs<R: Read + Write + Seek + Send>(
+    fs: &mut JfsFilesystem<R>,
+) -> Result<RepairReport, FilesystemError> {
+    let mut report = RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: 0,
+    };
+
+    // Orphans come straight from the read-only verifier's connectivity pass.
+    let result = fsck_jfs(fs)?;
+    let orphans: Vec<(u32, bool)> = result
+        .orphaned_entries
+        .iter()
+        .map(|o| (o.id as u32, o.is_directory))
+        .collect();
+    if orphans.is_empty() {
+        return Ok(report);
+    }
+
+    // Ensure /lost+found exists (create it on first need).
+    let lf_fino = match find_lost_found(fs)? {
+        Some(f) => f,
+        None => match create_lost_found(fs) {
+            Ok(f) => {
+                report.fixes_applied.push("created /lost+found".into());
+                f
+            }
+            Err(e) => {
+                // No adoption target — report every orphan as unrepairable.
+                for (inum, _) in &orphans {
+                    report
+                        .fixes_failed
+                        .push(format!("inode {inum}: cannot create /lost+found: {e}"));
+                    report.unrepairable_count += 1;
+                }
+                fs.flush_writes()?;
+                return Ok(report);
+            }
+        },
+    };
+
+    for (inum, is_dir) in orphans {
+        match adopt_orphan(fs, lf_fino, inum, is_dir) {
+            Ok(()) => report.fixes_applied.push(format!(
+                "reconnected inode {inum} as /lost+found/ino_{inum}"
+            )),
+            Err(e) => {
+                report.fixes_failed.push(format!("inode {inum}: {e}"));
+                report.unrepairable_count += 1;
+            }
+        }
+    }
+
+    fs.flush_writes()?;
+    Ok(report)
+}
+
+/// Return the fileset inode number of `/lost+found` if the root lists it.
+fn find_lost_found<R: Read + Seek + Send>(
+    fs: &mut JfsFilesystem<R>,
+) -> Result<Option<u32>, FilesystemError> {
+    let root = fs.read_fileset_inode_global(FILESET_ROOT_INO)?;
+    let entries = fs.parse_inline_dtree(&root)?;
+    Ok(entries
+        .into_iter()
+        .find(|e| e.name == "lost+found")
+        .map(|e| e.inumber))
+}
+
+/// Create an empty `/lost+found` directory in the fileset root and return
+/// its inode number. Mode is `IFJOURNAL | IFDIR | 0700` — the mode fsck.jfs
+/// expects for the reserved directory. Adding it makes the root gain a
+/// subdirectory, so the root's link count is bumped by one.
+fn create_lost_found<R: Read + Write + Seek + Send>(
+    fs: &mut JfsFilesystem<R>,
+) -> Result<u32, FilesystemError> {
+    const IFJOURNAL: u32 = 0x0001_0000;
+    const IFDIR: u32 = 0x0000_4000;
+    let mode = IFJOURNAL | IFDIR | 0o700;
+    let lf = fs.create_empty_dir_inode(FILESET_ROOT_INO, mode)?;
+    fs.dtree_insert(FILESET_ROOT_INO, "lost+found", lf)?;
+    fs.bump_nlink(FILESET_ROOT_INO, 1)?;
+    Ok(lf)
+}
+
+/// Link orphan `inum` into `/lost+found` as `ino_<inum>`. A directory orphan
+/// is reparented: its `..` is repointed at `/lost+found` and the parent's
+/// link count is bumped (it gained a subdirectory).
+fn adopt_orphan<R: Read + Write + Seek + Send>(
+    fs: &mut JfsFilesystem<R>,
+    lf_fino: u32,
+    inum: u32,
+    is_dir: bool,
+) -> Result<(), FilesystemError> {
+    fs.dtree_insert(lf_fino, &format!("ino_{inum}"), inum)?;
+    if is_dir {
+        fs.set_idotdot(inum, lf_fino)?;
+        fs.bump_nlink(lf_fino, 1)?;
+    }
+    Ok(())
 }

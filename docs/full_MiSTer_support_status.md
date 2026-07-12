@@ -8,8 +8,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 ## What Rusty Backup supports today
 
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
-  JFS, ReiserFS, UFS1/UFS2, btrfs, ProDOS (read + edit + create + fsck),
-  Apple DOS 3.3 (read + edit + create + fsck), MacPlus MFS,
+  JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
+  ProDOS (read + edit + create + fsck),
+  Apple DOS 3.3 (read + edit + create + fsck),
+  UCSD p-System (read + edit + create + fsck), MacPlus MFS,
   Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
   svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
@@ -37,6 +39,16 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   directory namespaces; bidirectionally cross-validated byte-exact against
   an independent clean-room DFS reader/writer; fsck = contiguous-file
   consistency + canonical-order repair),
+  TR-DOS (ZX Spectrum Beta Disk read + write + create + fsck, raw `.trd`
+  80-/40-track single-/double-sided; a flat 128-entry catalogue of contiguous
+  files packed from a first-free high-water mark; every write cross-validated
+  against an independent clean-room oracle, fsck = catalogue-packing +
+  disk-info-counter reconciliation),
+  TI-99/4A (read + write + create + fsck, flat V9T9 `.dsk` SSSD/DSSD/DSDD; a
+  VIB allocation bitmap + a sorted FDIR of extent-based File Descriptor Records,
+  big-endian; every write cross-validated against BOTH MAME's `imgtool` reader
+  and an independent clean-room oracle, fsck = bitmap-vs-directory-walk
+  reconciliation),
   ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
   + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
   VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
@@ -91,7 +103,7 @@ Legend for the **Support** column:
 | MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Partial** — HFS yes; MFS 400K floppy no |
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new --fs prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new --fs apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
-| ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — FAT (DivMMC/esxDOS) yes; native FS no |
+| ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — TR-DOS (`.trd`, full quartet) + esxDOS FAT yes; +3DOS via CP/M (`zxplus3` preset); G+DOS (MGT) no |
 | X68000 | Sharp X68000 | Floppy, SASI/SCSI HDD | Human68k (FAT-derived dialect) | **Yes** — floppy (Human68k read/browse/extract + add/delete/mkdir on `.d88` / `.xdf` / `.hdm` / `.dim`; edits decode->mutate->re-encode back into the container, GUI and CLI) and SASI/SCSI HDD (`.hda` / `.hdf` / `.hds`) read/browse/extract/add/delete/mkdir + in-place FS grow/shrink (`rb-cli resize`) + defragmenting repack (`rb-cli repack` / Inspect-tab "Defragment…" — packs files contiguously, reclaiming holes left by deletions) + fsck (`rb-cli fsck` / Inspect-tab Check — FAT-chain reconciliation + FAT-mirror resync, lost-cluster reclaim), incl. real BlueSCSI `X68SCSI1` 1024-byte-sector images (sector size derived from the boot signature; Sharp/KG big-endian BPB + big-endian FAT). Verified byte-exact on the BlueSCSI HD10 SCSI fixture and the Populous/Lemmings/SSF2/Votoms 256-byte SASI game disks across grow→shrink round-trips (multi-cluster `COMMAND.X` + Japanese filenames survive). Backup/restore/reconstruct honor the true (non-512-aligned) partition byte offset via the persisted `start_byte`, so SASI backup→restore lands the partition region byte-identical. **New 2026-06-10:** `rb-cli new-x68k-hdd` scaffolds self-bootable SASI/SCSI HDDs from scratch — emits the Sharp IPL signature, X68K partition table, IPL stub (halt or printed-banner via IOCS B_PRINT), and optionally clones an entire Human68k donor floppy (flat or `.dim` / `.D88` / `.xdf` / `.hdm`) into the partition. MAME-verified on `x68000 -sasi` (SASI variant, 256-B sectors) and `x68030 -hard` (SCSI variant, 1024-B sectors). The donor's `SWITCH.X /HD` installs the partition boot sector on first FDD0 boot, after which the HDD self-boots to C:. **Zero-manual-step mode** also available: `--boot-sector-donor hd0.hds --size 100M --variant scsi` extracts the Sharp partition boot sector (Sharp IPL Copyright 1990 SHARP) from the well-known `hd0.hds` 100 MB Sharp/Keisoku Giken donor at build time and overlays it onto the output partition — no `SWITCH.X` step needed, self-boots straight to C:> on first power-on. Sharp's boot-sector bytes never live in the rusty-backup repo; same legal pattern as `--system-disk` (you provide the donor file, the bytes flow user→user). |
 | Archie | Acorn Archimedes | Floppy, HDD | ADFS / FileCore | **Partial** — Disc Record scan now spans the HD, E-format-floppy, and legacy-floppy candidate offsets (0xFC0/0x404/0xDC0); byte-correct against marutan.net blank pre-formatted HD samples (`blank256E.hdf`, `blank1024Eplus.hdf`) and the 8bs.com Acorn archive `arc-04.800.adf` (E-format populated); `.adf` 800K floppy + bare `.hdf` and Arculator-wrapped `.hdf` HDD container handling shipped; CLI parity tests cover inspect/ls/get on the synthetic E-format fixture; root-directory lookup via FSM indirect-disc-address still pending (dr.root encoding mystery + non-blank HD reference both required); ADFS write path parked behind the FSM walker |
 | QL | Sinclair QL | Microdrive, HDD | QDOS (QXL.WIN) | **Partial** — QXL.WIN HDD read + write end-to-end (byte-correct against kilgus + smsqe MiSTer samples; write path validated against headless sQLux oracle — rb-cli put → SuperBASIC COPY → host file round-trips byte-exact, per-file 64-byte QDOS header convention honoured); `.mdv` microdrive detect + cart-name surfaced (full directory walk parked at OPEN-WORK §7 behind real-hardware oracle) |
@@ -114,7 +126,7 @@ Legend for the **Support** column:
 | CoCo3 | Tandy CoCo 3 | Floppy/virtual | RS-DOS, OS-9 / NitrOS-9 (RBF) | **Yes** — `fs::rsdos` RS-DOS / Disk BASIC read + write (see CoCo2) and `fs::os9` OS-9 / NitrOS-9 RBF read + write (add/delete incl. subdirectories), the two filesystems the CoCo3 core uses. |
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
 | Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes + creates + fscks Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`; `rb-cli new --fs atari` formats a blank SD disk, and fsck reconciles the VTOC bitmap + free-count against the directory chains. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way; fsck validated clean on the real fixture. |
-| TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **No** |
+| TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **Yes** — full quartet on the V9T9 `.dsk` (read + edit + create + fsck) |
 | Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |
 | PC88 | NEC PC-8801 mkII SR | Floppy | N88-BASIC Disk BASIC | **No** |

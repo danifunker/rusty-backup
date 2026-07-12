@@ -55,6 +55,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | HFV (flat HFS) | via HFS | Yes | Yes | Yes (`--fs hfv`) | Yes | check+repair | BasiliskII / SheepShaver — flat classic HFS ≤ 2047 MB, no APM wrapper |
 | ProDOS | Auto / MBR 0xA8 / APM | Yes | Yes | Yes (`--fs prodos`) | Yes (in-place) | check+repair | Apple II / IIgs |
 | Apple DOS 3.3 | Auto (140 KB only) | Yes | Yes | Yes (`--fs apple-dos`) | No | check+repair | Apple II 5.25" (`.dsk` / `.do` / `.po`, sector-order auto) |
+| UCSD p-System | Auto | Yes | Yes | Yes (`--fs ucsd`) | — | check+repair | UCSD Pascal — Apple II/III, PC (contiguous flat FS); full quartet, clean-room-oracle-validated |
 | Apple Lisa FS | Auto (tag-bearing DC42/DART) | Yes | No | No | No | No | Apple Lisa — reconstructed from 12-byte sector tags |
 
 > **HFV** is the *write* side of classic HFS for BasiliskII / SheepShaver: a
@@ -69,8 +70,9 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | ext2 / ext3 / ext4 | Auto | Yes | Yes | Yes | Yes (in-place) | Yes (check + repair, incl. ext4 metadata_csum crc32c) | Linux |
 | btrfs | Auto | Yes | **No** (read-only) | No | Yes (volume resize) | validate | Modern Linux |
 | XFS (v4 / v5) | Auto | Yes (v4 edit) | Yes (v4) | No | Grow only (disk-layout + `xfs_growfs`) | check+repair | SGI IRIX 6.x, Linux |
-| JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
+| JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check+repair | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
 | ReiserFS (v3.5 / v3.6) | Auto | Yes | **No** (read-only) | No | compaction | No | Linux, late-1990s → mid-2000s |
+| Minix (V1 / V2 / V3) | Auto | Yes | Yes | Yes | — | check+repair | Minix, early Linux (pre-ext); full quartet, fsck.minix-validated |
 | UFS / FFS (UFS1 / UFS2) | Auto | Yes | Yes | No | compaction | check+repair | 4.2/4.4BSD, FreeBSD, SunOS / Solaris, NeXTSTEP |
 
 > UFS is browse + edit (create / delete / rename) + fsck with repair (replica
@@ -102,6 +104,8 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | OS-9 / NitrOS-9 RBF | Auto | Yes | Yes | Yes (`--fs os9`) | — (fixed geometry) | check+repair | Tandy CoCo, Dragon, 6809 systems |
 | DragonDOS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | Dragon 32 / 64. fsck = bitmap reconciliation vs the directory extent chains (VALIDATE model), rewrites both dir-track copies |
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | BBC Micro / Master, Acorn Electron. fsck = contiguous-file consistency (overlap + out-of-bounds detection; canonical descending-catalogue reorder as the repair) |
+| TR-DOS | Auto | Yes | Yes | Yes (`--fs trdos`) | — (fixed geometry) | check+repair | ZX Spectrum Beta Disk (`.trd`, 80-/40-track SS/DS). Flat 128-entry catalogue of contiguous files, append at a first-free high-water mark. fsck = catalogue-packing check + disk-info-counter reconciliation (repair withheld on structural damage); full quartet, clean-room-oracle-validated |
+| TI-99/4A | Auto | Yes | Yes | Yes (`--fs ti99`) | — (fixed geometry) | check+repair | TI-99/4A (flat V9T9 `.dsk`, SSSD/DSSD/DSDD). VIB allocation bitmap + sorted FDIR of extent-based FDRs, big-endian. fsck = VIB-bitmap-vs-directory-walk reconciliation + cross-link detection (repair withheld on structural damage); full quartet, validated against BOTH MAME's `imgtool` and a clean-room oracle |
 | Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | Yes (`--fs cpm --cpm-preset`) | No | check+repair | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |
 | Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | Yes | Sharp X68000 (big-endian FAT dialect). fsck = FAT allocation reconciliation vs the directory tree (VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy, surfaces cross-links / broken chains |
@@ -122,10 +126,10 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | ANDOS | Auto / String | **Detect only** | Signature probe surfaces "ANDOS"; browse returns `Unsupported`. Soviet BK0011M / Elektronika BK |
 | Carve (raw recovery) | Fallback | Yes (synthetic) | Last-resort for unmountable / NDOS images: whole-disk blob + carved text/JSON runs + Amiga bootblock |
 
-**Totals:** ~30 filesystem drivers — **26 editable+wired**, **7 with an
-interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, UFS, XFS — all repair except
-JFS, which is check-only), **17 create-blank**, **2 detect-only scaffolds**,
-**1 recovery fallback**.
+**Totals:** ~30 filesystem drivers — **27 editable+wired**, **8 with an
+interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, Minix, UFS, XFS — all repair;
+JFS and Minix repair by adopting orphaned inodes into `/lost+found`),
+**18 create-blank**, **2 detect-only scaffolds**, **1 recovery fallback**.
 
 ---
 
@@ -250,9 +254,9 @@ images, with a MiSTer-FPGA lean** — the gaps sort into four bands.
 | **UCSD p-System** | Apple II/III, IBM PC, many | Cross-platform Pascal environment; common on Apple II archival disks | a2kit has partial p-System |
 | **HPFS** | OS/2 | The defining OS/2 filesystem; PC-preservation gap | TotalImage (C#, portable) |
 | **Minix FS** | Minix, early Linux | Small, well-documented; the FS Linux booted on in 1991 | Linux kernel `fs/minix` |
-| **TR-DOS** | ZX Spectrum (Beta Disk) | MiSTer **ZX-Spectrum** core; native Spectrum disk FS | — |
+| ~~**TR-DOS**~~ (done) | ZX Spectrum (Beta Disk) | MiSTer **ZX-Spectrum** core; native Spectrum disk FS | full quartet shipped — see §1 |
 | **TRSDOS / LDOS / NEWDOS** | TRS-80 | MiSTer **TRS-80** core | — |
-| **TI-99 FS (VIB / FDIR)** | TI-99/4A | MiSTer **TI-99_4A** core | — |
+| ~~**TI-99 FS (VIB / FDIR)**~~ (done) | TI-99/4A | MiSTer **TI-99_4A** core | full quartet shipped — see §1 |
 | **Sedoric / Oric DOS** | Oric | MiSTer **Oric** core | — |
 | **N88-BASIC** | NEC PC-8801 | MiSTer **PC88** core | — |
 | **SpartaDOS / MyDOS / DOS 3** | Atari 8-bit | Alternative Atari DOSes beyond the supported DOS 2 | — |
@@ -321,9 +325,14 @@ items are logged for follow-up.
    It edits (v4) and fscks/repairs, but has no `CompactXfsReader` or in-place
    resize, so XFS backups are written full-size. Grow is disk-layout-level only
    (`xfs_growfs`); clone-into-fresh shrink is the planned path (OPEN-WORK §2.2).
-6. **JFS fsck is check-only** — it implements `fsck()` but not `repair()` (the
-   code comments flag repair as future work). Every other interactive fsck
-   repairs: AFFS, EFS, HFS, HFS+, UFS (replica SB / bitmap / orphan), XFS (R1–R8).
+6. **JFS fsck repair — FIXED.** `repair()` now adopts orphaned
+   (allocated-but-unreachable) fileset inodes into `/lost+found/ino_<inum>`,
+   creating `/lost+found` when absent. This pulled forward the JFS edit
+   primitives (inode allocator + inline dtree insert + dinode write-back)
+   behind `EditableFilesystem`; general create/delete/rename remain
+   `Unsupported`. Every structural write is oracle-verified against real
+   `fsck.jfs` (`scripts/jfs-oracle.sh`). Now on par with the other repairing
+   fscks: AFFS, EFS, HFS, HFS+, UFS (replica SB / bitmap / orphan), XFS (R1–R8).
 7. **AIX JFS1 and Reiser4 are detected then rejected** — magic recognized,
    read not implemented.
 8. **fsck reach exceeded the Inspect-tab "Check" button — FIXED.** The button

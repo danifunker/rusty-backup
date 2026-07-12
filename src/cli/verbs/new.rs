@@ -71,6 +71,32 @@ pub enum FsKind {
     /// is sanitized to the OS-9 name set (A-Z a-z 0-9 . _ $).
     #[value(alias = "nitros9", alias = "rbf")]
     Os9,
+    /// Minix V1 (Minix, early Linux). Classic 30-char-name filesystem (magic
+    /// 0x138F), 1 KiB blocks, geometry matching `mkfs.minix -1`; up to 64 MiB.
+    /// `--name` is ignored (Minix has no volume label).
+    #[value(alias = "minix1")]
+    Minix,
+    /// Minix V2 (magic 0x2478): like V1 with 32-bit zone pointers and triple
+    /// indirection, matching `mkfs.minix -2`.
+    Minix2,
+    /// Minix V3 (magic 0x4D5A): 60-char names, matching `mkfs.minix -3`.
+    Minix3,
+    /// UCSD p-System (UCSD Pascal — Apple II/III, PC). A flat volume with a
+    /// zeroed bootstrap and an empty directory. `--name` sets the volume label
+    /// (uppercased, ≤ 7 chars). Defaults to a 140 KB Apple II floppy.
+    #[value(alias = "pascal", alias = "psystem")]
+    Ucsd,
+    /// TR-DOS (ZX Spectrum Beta Disk). A flat volume with an empty catalogue.
+    /// `--name` sets the 8-char disk label. Geometry follows `--size`: the
+    /// smallest of 160 KB (40-track SS), 320 KB (80-track SS), or 640 KB
+    /// (80-track DS, the default and maximum) that covers it.
+    #[value(alias = "beta", alias = "betadisk", alias = "zx")]
+    Trdos,
+    /// TI-99/4A disk. An empty VIB + FDIR (flat V9T9 `.dsk`). `--name` sets the
+    /// 10-char disk name. Geometry follows `--size`: the smallest of 90 KB
+    /// (SSSD), 180 KB (DSSD), or 360 KB (DSDD, the default and maximum).
+    #[value(alias = "ti99_4a", alias = "ti994a")]
+    Ti99,
 }
 
 #[derive(Debug, Args)]
@@ -80,7 +106,9 @@ pub struct NewArgs {
 
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
-    /// dos33), cpm, os9 (alias nitros9 / rbf).
+    /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
+    /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx),
+    /// ti99 (alias ti99_4a / ti994a).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -320,7 +348,76 @@ pub fn run(args: NewArgs) -> Result<()> {
                 Ok(crate::fs::cpm::create_blank(dpb))
             })
         }
+        FsKind::Minix => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V1)
+        }
+        FsKind::Minix2 => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V2)
+        }
+        FsKind::Minix3 => {
+            write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V3)
+        }
+        FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
+        FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
+        FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
     }
+}
+
+fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::ucsd::create_blank_ucsd(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting UCSD p-System: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, UCSD p-System volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
+}
+
+fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::trdos::create_blank_trdos(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting TR-DOS: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, TR-DOS volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
+}
+
+fn write_blank_ti99_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::ti99::create_blank_ti99(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting TI-99: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, TI-99 volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
+}
+
+fn write_blank_minix_image(
+    image: &std::path::Path,
+    size_str: &str,
+    version: crate::fs::minix::MinixVersion,
+) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::minix::create_blank_minix(size, version)
+        .map_err(|e| anyhow::anyhow!("formatting Minix: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, Minix {:?})",
+        image.display(),
+        img.len(),
+        version
+    ));
+    Ok(())
 }
 
 fn format_and_write(

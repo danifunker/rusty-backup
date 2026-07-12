@@ -600,8 +600,22 @@ fn build_blank_fs(
             .map_err(|e| anyhow!("create_blank_ext3: {e}")),
         "ext4" => crate::fs::ext_format::create_blank_ext4(size, name)
             .map_err(|e| anyhow!("create_blank_ext4: {e}")),
+        "minix" | "minix1" => {
+            crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V1)
+                .map_err(|e| anyhow!("create_blank_minix: {e}"))
+        }
+        "minix2" => crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V2)
+            .map_err(|e| anyhow!("create_blank_minix: {e}")),
+        "minix3" => crate::fs::minix::create_blank_minix(size, crate::fs::minix::MinixVersion::V3)
+            .map_err(|e| anyhow!("create_blank_minix: {e}")),
+        "ucsd" | "pascal" => crate::fs::ucsd::create_blank_ucsd(size, name)
+            .map_err(|e| anyhow!("create_blank_ucsd: {e}")),
+        "trdos" | "beta" => crate::fs::trdos::create_blank_trdos(size, name)
+            .map_err(|e| anyhow!("create_blank_trdos: {e}")),
+        "ti99" => crate::fs::ti99::create_blank_ti99(size, name)
+            .map_err(|e| anyhow!("create_blank_ti99: {e}")),
         other => {
-            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4")
+            bail!("unsupported fs {other:?}; expected one of fat, efs, affs, hfs, ext, ext3, ext4, minix, minix2, minix3, ucsd, trdos, ti99")
         }
     }
 }
@@ -694,7 +708,8 @@ fn apply_disk_block(path: &std::path::Path, disk: &DiskBlock) -> Result<()> {
             "fat" => fat_type_byte_for(size),
             "efs" => 0x83, // Linux native; close enough — IRIX uses its own SGI table normally
             "affs" => 0x83,
-            "hfs" => 0xAF, // Apple HFS
+            "hfs" => 0xAF,                                    // Apple HFS
+            "minix" | "minix1" | "minix2" | "minix3" => 0x81, // Minix
             other => bail!("unsupported fs in disk.partitions: {other:?}"),
         };
         entries.push((type_byte, cursor_lba, fs_sectors, p.bootable));

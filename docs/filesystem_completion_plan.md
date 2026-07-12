@@ -75,7 +75,7 @@ established (see `hfs_fsck/`, `efs_fsck.rs`, `affs_fsck.rs`, `ufs_fsck` in
 | Target | Filesystems | Effort | Notes |
 |---|---|---|---|
 | **Most-used first** | ~~FAT~~ (done), ~~exFAT~~ (done), ~~NTFS~~ (done), ~~ext~~ (done) | M each | Promote the existing `validate` gate to a real check + repair. All four shipped. **FAT** (`fat_fsck.rs`): FAT-table walk over the directory tree flags chain loops, links into free/bad/reserved/out-of-range clusters, cross-links, size-vs-chain, lost cluster chains, an undersized FAT, and FAT-mirror divergence; repair is FAT-only, byte-verified against `fsck_msdos`. **exFAT** (`exfat_fsck.rs`): allocation-bitmap reconciliation against the traced directory tree (contiguous + FAT-chained), boot checksum + backup-region consistency + VolumeDirty; repair rebuilds the bitmap and resyncs the boot regions, byte-verified against `fsck_exfat`. **ext** (`ext_fsck.rs`): block + inode bitmap + free-count reconciliation against the computed allocation (metadata from group descriptors + inode-owned blocks incl. reserved inodes / journal / reserved-GDT), byte-verified against `e2fsck`; **ext4 `metadata_csum` volumes are now fully repaired** — the crc32c on the superblock, descriptors, and bitmaps is verified and recomputed via `ext_csum` (only the legacy gdt_csum-only crc16 case stays withheld). **NTFS** (`ntfs_fsck.rs`): `$Bitmap` reconciliation against the MFT walk (in-use MFT records' non-resident data runs), `$MFTMirr` sync vs the first 4 MFT records, backup-boot-sector vs VBR consistency, and VolumeDirty flag; repair rewrites `$Bitmap`, resyncs `$MFTMirr`, rewrites the backup boot sector, and clears VolumeDirty — oracle-verified against Windows `chkdsk`. Volumes carrying `$ATTRIBUTE_LIST`-spilled data are surfaced with a warning rather than mis-traced. **Tier complete.** |
-| **JFS repair** | JFS | M | `fsck()` exists (check-only); add the `repair()` branch the code comments already scope. |
+| ~~**JFS repair**~~ (done) | JFS | M | `repair()` shipped: orphaned (allocated-but-unreachable) fileset inodes are adopted into `/lost+found/ino_<inum>`, creating `/lost+found` when absent. Pulled forward the JFS edit primitives (inode allocator + inline dtree insert + dinode write-back) behind `EditableFilesystem`; general create/delete/rename stay `Unsupported`. Every structural write is oracle-verified against real `fsck.jfs` (`scripts/jfs-oracle.sh`). |
 | **Amiga** | ~~PFS3~~ (done), ~~SFS~~ (done) | M each | Mirror the AFFS Disk-Validator model (bitmap + directory-tree walk, set-bit-free convention). **Both shipped.** PFS3 (`pfs3_fsck.rs`): both bitmaps + free counters reconciled against the tree/anode walk; no block checksums, so structural damage is surfaced read-only. SFS (`sfs_fsck.rs`): metadata-block checksums + AdminSpaceContainer chain + object-tree walk reconcile the single block bitmap; repair is bitmap-only (safe at any btree depth). Both withhold bitmap rewrite when the structural walk is incomplete. |
 | **Retro long-tail** | ~~CBM~~ (done), Atari DOS, RS-DOS, OS-9, DragonDOS, DFS, ProDOS, CP/M, MFS, Human68k, Alto BFS, ADFS, QDOS | S each | Lightweight consistency checks: BAM/VTOC/granule/allocation-bitmap vs directory chains, orphan detection, free-count reconciliation. Small formats → small checkers. Repair where a replica or recomputable structure exists. **CBM shipped** as the template: recompute the BAM from the directory + file chains (the VALIDATE model), diff against the on-disk BAM, rewrite; byte-verified against `c1541 validate` fixtures for all five variants. |
 
@@ -111,12 +111,12 @@ risky — noted as such; "where possible" applies.
 
 | Filesystem | Systems | Quartet feasibility | Effort to browse |
 |---|---|---|---|
-| **UCSD p-System** | Apple II/III, PC | Full quartet realistic (simple block FS) | M |
+| ~~**UCSD p-System**~~ (done) | Apple II/III, PC | **Full quartet shipped** — browse + edit (contiguous first-fit) + create-blank (`rb-cli new --fs ucsd`) + fsck (directory self-consistency: bounds / overlaps / file-count, re-sort + count repair). No standard oracle builds here (needs Boost+libexplain+libfuse), so validated against an independent clean-room `scripts/ucsd-oracle.py`, per the RS-DOS clean-room precedent | M |
 | **HPFS** | OS/2 | Browse + edit realistic; fsck M | M–L |
-| **Minix FS** | Minix, early Linux | Full quartet easy (small, documented) | S–M |
-| **TR-DOS** | ZX Spectrum | Full quartet (fixed-geometry floppy) | M |
+| ~~**Minix FS**~~ (done) | Minix, early Linux | **Full quartet shipped** — V1/V2/V3 browse + edit + create-blank (`rb-cli new --fs minix{,2,3}`, mkfs.minix-parity geometry) + fsck (bitmap/link-count reconciliation + orphan adoption into `/lost+found`), every write verified against Linux `fsck.minix` | S–M |
+| ~~**TR-DOS**~~ (done) | ZX Spectrum | **Full quartet shipped** — browse + edit (create / delete / rename; append at the first-free high-water mark, tombstone deletes) + create-blank (`rb-cli new --fs trdos`) + fsck (contiguous-packing check + disk-info-counter reconciliation, repair withheld on structural damage). Raw `.trd`, geometry from the disk-info type byte. Validated against an independent clean-room oracle (`scripts/trdos-oracle.py`) | M |
 | **TRSDOS / LDOS** | TRS-80 | Browse + edit; variants complicate | M |
-| **TI-99 FS** | TI-99/4A | Full quartet (VIB/FDIR) | M |
+| ~~**TI-99 FS**~~ (done) | TI-99/4A | **Full quartet shipped** — browse + edit (create / delete / rename; bitmap allocation + FDR/cluster-chain writes) + create-blank (`rb-cli new --fs ti99`) + fsck (VIB bitmap vs directory walk, cross-link detection, repair withheld on structural damage). Flat V9T9 `.dsk`, big-endian. Cross-validated against BOTH MAME's `imgtool` and a clean-room oracle (`scripts/ti99-oracle.py`) | M |
 | **Sedoric / Oric DOS** | Oric | Full quartet | M |
 | **N88-BASIC** | NEC PC-8801 | Full quartet (shares `.d88`) | M |
 | **SpartaDOS / MyDOS** | Atari 8-bit | Extend the Atari DOS driver | S–M |
@@ -192,10 +192,17 @@ The order that buys the most capability per unit effort:
    directory tree from the root FD to reconcile the cluster bitmap (reserved
    clusters — boot / last track — are a benign warning, never freed). **Step 4
    retro long-tail complete: all create + fsck gaps closed.**
-5. **JFS repair** — the one read-only FS whose repair is already scoped.
-6. **New high-value filesystems** — Minix and UCSD p-System first (cheapest full
-   quartet), then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC,
-   TRSDOS), then HPFS.
+5. ~~**JFS repair**~~ — **done**: orphan-inode adoption into `/lost+found`,
+   oracle-verified against real `fsck.jfs`. Pulled forward the JFS inode
+   allocator + inline dtree insert + dinode write-back behind
+   `EditableFilesystem` (general create/delete/rename still `Unsupported`).
+6. **New high-value filesystems** — ~~Minix~~ **done** (full quartet, V1/V2/V3,
+   `fsck.minix`-verified), ~~UCSD p-System~~ **done** (full quartet,
+   clean-room-oracle-verified), ~~TR-DOS~~ **done** (full quartet, ZX
+   Spectrum Beta Disk `.trd`, clean-room-oracle-verified), and ~~TI-99~~ **done**
+   (full quartet, TI-99/4A V9T9 `.dsk`, verified against BOTH MAME's imgtool and
+   a clean-room oracle); next the remaining MiSTer-core long-tail (Oric,
+   N88-BASIC, TRSDOS), then HPFS.
 7. **Read-only-to-edit for btrfs / JFS / APFS / ZFS** — last; large effort, and
    read is the realistic ceiling for the CoW/checksummed ones.
 

@@ -433,6 +433,17 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             {
                 return Some("ProDOS".to_string());
             }
+            // Minix superblock magic at +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478)
+            // or +24 (V3: 0x4D5A) of this 1024-offset block. Raw Minix floppies
+            // and hard-disk images are flat superfloppies.
+            if crate::fs::minix::detect_magic(&buf).is_some() {
+                return Some("minix".to_string());
+            }
+            // UCSD p-System volume label at block 2 (this offset-1024 read).
+            // No magic — a structural signature — so checked after Minix.
+            if crate::fs::ucsd::looks_like_ucsd(&buf) {
+                return Some("ucsd".to_string());
+            }
         }
     }
 
@@ -568,6 +579,19 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
     // matches the disk size (separates a real .ssd from a flat .dsd).
     if crate::fs::dfs::looks_like_dfs(reader, 0).is_some() {
         return Some("Acorn DFS".to_string());
+    }
+
+    // TR-DOS (ZX Spectrum Beta Disk, flat .trd). No magic; gated on the
+    // disk-info sector's id byte (0x10) + a valid disk-type byte at fixed
+    // offsets, plus a size/geometry sanity check.
+    if crate::fs::trdos::looks_like_trdos(reader, 0).is_some() {
+        return Some("TR-DOS".to_string());
+    }
+
+    // TI-99/4A (flat V9T9 .dsk). Gated on the VIB "DSK" marker at offset 0x0D
+    // plus a self-consistent geometry.
+    if crate::fs::ti99::looks_like_ti99(reader, 0).is_some() {
+        return Some("TI-99".to_string());
     }
 
     None

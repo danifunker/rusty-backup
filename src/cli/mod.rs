@@ -153,7 +153,7 @@ pub enum Command {
     /// ProDOS file.
     Chmeta(verbs::chmeta::ChmetaArgs),
 
-    /// Write the resource fork of an existing HFS / HFS+ file from a
+    /// Write the resource fork of an existing HFS / HFS+ / MFS file from a
     /// host file.
     Setrsrc(verbs::setrsrc::SetRsrcArgs),
 
@@ -165,7 +165,8 @@ pub enum Command {
     Reformat(verbs::reformat::ReformatArgs),
 
     /// Put a MacBinary I / II archive: both forks + full Finder info in
-    /// one shot (HFS today).
+    /// one shot (HFS; on MFS both forks + type/creator, extended Finder
+    /// flags/dates skipped).
     #[command(name = "put-macbinary")]
     PutMacBinary(verbs::put_macbinary::PutMacBinaryArgs),
 
