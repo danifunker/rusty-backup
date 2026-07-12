@@ -86,6 +86,12 @@ pub enum FsKind {
     /// (uppercased, ≤ 7 chars). Defaults to a 140 KB Apple II floppy.
     #[value(alias = "pascal", alias = "psystem")]
     Ucsd,
+    /// TR-DOS (ZX Spectrum Beta Disk). A flat volume with an empty catalogue.
+    /// `--name` sets the 8-char disk label. Geometry follows `--size`: the
+    /// smallest of 160 KB (40-track SS), 320 KB (80-track SS), or 640 KB
+    /// (80-track DS, the default and maximum) that covers it.
+    #[value(alias = "beta", alias = "betadisk", alias = "zx")]
+    Trdos,
 }
 
 #[derive(Debug, Args)]
@@ -96,7 +102,7 @@ pub struct NewArgs {
     /// Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs,
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
     /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
-    /// minix3, ucsd (alias pascal / psystem).
+    /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -346,6 +352,7 @@ pub fn run(args: NewArgs) -> Result<()> {
             write_blank_minix_image(&args.image, &args.size, crate::fs::minix::MinixVersion::V3)
         }
         FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
+        FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
     }
 }
 
@@ -356,6 +363,19 @@ fn write_blank_ucsd_image(image: &std::path::Path, size_str: &str, name: &str) -
     std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
     log_stderr(format!(
         "wrote {} ({} bytes, UCSD p-System volume)",
+        image.display(),
+        img.len()
+    ));
+    Ok(())
+}
+
+fn write_blank_trdos_image(image: &std::path::Path, size_str: &str, name: &str) -> Result<()> {
+    let size = parse_size(size_str).context("parsing --size")?;
+    let img = crate::fs::trdos::create_blank_trdos(size, name)
+        .map_err(|e| anyhow::anyhow!("formatting TR-DOS: {e}"))?;
+    std::fs::write(image, &img).with_context(|| format!("writing {}", image.display()))?;
+    log_stderr(format!(
+        "wrote {} ({} bytes, TR-DOS volume)",
         image.display(),
         img.len()
     ));

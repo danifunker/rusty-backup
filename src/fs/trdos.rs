@@ -438,6 +438,45 @@ fn parse_trdos_name(name: &str) -> Result<([u8; 8], u8), FilesystemError> {
     Ok((name8, type_char))
 }
 
+/// Sanitize a disk label to 8 space-padded printable-ASCII bytes.
+fn sanitize_trdos_label(name: &str) -> [u8; 8] {
+    let mut lab = [b' '; 8];
+    let bytes: Vec<u8> = name
+        .bytes()
+        .filter(|&b| (0x20..0x7F).contains(&b))
+        .take(8)
+        .collect();
+    lab[..bytes.len()].copy_from_slice(&bytes);
+    lab
+}
+
+/// Format a blank TR-DOS volume. The geometry is the smallest TR-DOS disk type
+/// whose capacity covers `size_bytes`, capped at 80-track double-sided (640 KiB,
+/// the format's maximum): ≤ 160 KiB → 40-track SS, ≤ 320 KiB → 80-track SS, else
+/// 640 KiB. `label` becomes the 8-char disk label. Returns the raw image.
+pub fn create_blank_trdos(size_bytes: u64, label: &str) -> Result<Vec<u8>, FilesystemError> {
+    let disk_type = if size_bytes <= 160 * 1024 {
+        0x19 // 40 track, single sided (160 KiB)
+    } else if size_bytes <= 320 * 1024 {
+        0x18 // 80 track, single sided (320 KiB)
+    } else {
+        0x16 // 80 track, double sided (640 KiB) — the maximum
+    };
+    let geom = TrdosGeometry::from_type(disk_type).expect("valid disk type");
+    let mut img = vec![0u8; geom.total_bytes() as usize];
+    let base = INFO_OFF as usize;
+    img[base + 0xE1] = (DATA_START % SPT) as u8; // first free sector = 0
+    img[base + 0xE2] = (DATA_START / SPT) as u8; // first free track = 1
+    img[base + 0xE3] = disk_type;
+    img[base + 0xE4] = 0; // file count
+    let free = (geom.total_sectors() - DATA_START) as u16;
+    img[base + 0xE5..base + 0xE7].copy_from_slice(&free.to_le_bytes());
+    img[base + 0xE7] = TRDOS_ID;
+    // 0xF4 deleted count is already 0.
+    img[base + 0xF5..base + 0xFD].copy_from_slice(&sanitize_trdos_label(label));
+    Ok(img)
+}
+
 impl<R: Read + Write + Seek> TrdosFilesystem<R> {
     fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
         self.reader
@@ -1010,5 +1049,100 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout).into_owned();
         let _ = std::fs::remove_file(&vol);
         assert!(clean, "oracle fsck flagged our edits:\n{log}");
+    }
+
+    // ---- Create-blank ----
+
+    #[test]
+    fn create_blank_geometry_by_size() {
+        // Size selects the smallest covering geometry, capped at 640 KiB.
+        let checks = [
+            (140 * 1024, 0x19u8, 160 * 1024u64), // rounds up to 160 KiB
+            (160 * 1024, 0x19, 160 * 1024),
+            (300 * 1024, 0x18, 320 * 1024),
+            (640 * 1024, 0x16, 640 * 1024),
+            (2 * 1024 * 1024, 0x16, 640 * 1024), // capped at the maximum
+        ];
+        for (req, want_type, want_bytes) in checks {
+            let img = create_blank_trdos(req, "SZ").unwrap();
+            assert_eq!(img.len() as u64, want_bytes, "size {req}");
+            let fs = TrdosFilesystem::open(Cursor::new(img), 0).unwrap();
+            assert_eq!(fs.geometry.disk_type, want_type, "size {req}");
+        }
+    }
+
+    #[test]
+    fn create_blank_opens_and_edits() {
+        let img = create_blank_trdos(640 * 1024, "SPECCY").unwrap();
+        let mut fs = TrdosFilesystem::open(Cursor::new(img), 0).expect("open blank");
+        assert_eq!(fs.volume_label(), Some("SPECCY"));
+        assert_eq!(fs.total_size(), 655_360);
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        // The blank is a valid substrate for edits.
+        fs.create_file(
+            &root,
+            "X.C",
+            &mut &[1u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fs.list_directory(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_blank_label_sanitized() {
+        // Overlong labels are truncated to 8 bytes; the reader trims the
+        // trailing space, so "my long label!" -> "my long " -> "my long".
+        let img = create_blank_trdos(640 * 1024, "my long label!").unwrap();
+        let fs = TrdosFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.volume_label(), Some("my long"));
+    }
+
+    #[test]
+    fn oracle_create_blank_is_fsck_clean() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_create_blank_is_fsck_clean: oracle unavailable");
+            return;
+        };
+        if !have_python() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_trdos_blank_{}.trd", std::process::id()));
+        std::fs::write(&vol, create_blank_trdos(640 * 1024, "BLANKV").unwrap()).unwrap();
+        let volp = vol.to_str().unwrap();
+        let fsck = |v: &str| {
+            Command::new("python3")
+                .arg(&script)
+                .args(["fsck", v])
+                .output()
+                .expect("python3")
+                .status
+                .success()
+        };
+        assert!(fsck(volp), "oracle fsck flagged our blank");
+        // Still clean after writing a file through our editor.
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = TrdosFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "R.C",
+                &mut &[0x20u8; 900][..],
+                900,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        let ok = fsck(volp);
+        let _ = std::fs::remove_file(&vol);
+        assert!(ok, "oracle fsck flagged our blank after an edit");
     }
 }
