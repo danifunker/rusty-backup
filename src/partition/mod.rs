@@ -439,6 +439,11 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
             if crate::fs::minix::detect_magic(&buf).is_some() {
                 return Some("minix".to_string());
             }
+            // UCSD p-System volume label at block 2 (this offset-1024 read).
+            // No magic — a structural signature — so checked after Minix.
+            if crate::fs::ucsd::looks_like_ucsd(&buf) {
+                return Some("ucsd".to_string());
+            }
         }
     }
 

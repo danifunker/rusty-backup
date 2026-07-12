@@ -82,6 +82,7 @@ pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
 pub mod tree;
+pub mod ucsd;
 pub mod ufs;
 pub mod ufs_fsck;
 pub mod unix_common;
@@ -281,6 +282,11 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
             // +16 (V1/V2: 0x137F/0x138F/0x2468/0x2478) or +24 (V3: 0x4D5A).
             if let Some(name) = minix::detect_magic(&sb_buf) {
                 return name;
+            }
+            // UCSD p-System volume label at block 2 (this offset-1024 read).
+            // No magic — a structural signature — so it is checked last here.
+            if ucsd::looks_like_ucsd(&sb_buf) {
+                return "ucsd";
             }
         }
     }
@@ -1438,6 +1444,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ucsd" => Ok(Box::new(ucsd::UcsdFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2265,6 +2275,8 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             // Minix (raw floppy / hard-disk superfloppy); auto-detected at
             // byte 1024 by both detect_superfloppy and detect_filesystem_type.
             | "minix"
+            // UCSD p-System (Apple II/III Pascal floppies); block-2 volume label.
+            | "ucsd"
             | "ADFS"
             | "ANDOS"
             | "QDOS"
