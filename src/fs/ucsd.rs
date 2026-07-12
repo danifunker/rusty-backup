@@ -29,6 +29,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 const BLOCK: u64 = 512;
 /// Directory starts at block 2 and spans 4 blocks.
@@ -323,6 +324,10 @@ impl<R: Read + Seek + Send> Filesystem for UcsdFilesystem<R> {
             .unwrap_or(DIR_END);
         Ok(last as u64 * BLOCK)
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(fsck_ucsd(self))
+    }
 }
 
 /// Human-readable file-kind name (for callers that want the type).
@@ -611,6 +616,207 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for UcsdFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.total_free_blocks() * BLOCK)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        repair_ucsd(self)
+    }
+}
+
+// ---- fsck (check + repair) ----
+//
+// UCSD has no allocation bitmap — the sorted directory *is* the allocation
+// map — so the check is directory self-consistency: a valid volume label,
+// each file within bounds, and non-overlapping contiguous runs. The safely
+// recomputable fixes (re-sort entries, correct DNUMFILES, drop invalid-name
+// entries) are repaired by re-serializing the directory; structural damage
+// (overlaps, past-end / into-directory runs) is surfaced read-only.
+
+fn issue(code: &str, message: String, repairable: bool) -> FsckIssue {
+    FsckIssue {
+        code: code.into(),
+        message,
+        repairable,
+        debug: false,
+    }
+}
+
+pub fn fsck_ucsd<R: Read + Seek>(
+    fs: &mut UcsdFilesystem<R>,
+) -> Result<FsckResult, FilesystemError> {
+    let little = fs.little_endian;
+    let dir_end = fs.dir_end;
+    let eov = fs.eov_blocks;
+    let end = fs.reader.seek(SeekFrom::End(0))?;
+    let disk_blocks = end.saturating_sub(fs.partition_offset) / BLOCK;
+
+    let mut dir = vec![0u8; (DIR_BLOCKS * BLOCK) as usize];
+    fs.read_at(DIR_BLOCK * BLOCK, &mut dir)?;
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    if read_u16(&dir, 0, little) != 0 {
+        errors.push(issue(
+            "VolFirstBlk",
+            "volume label FIRSTBLK is not 0".into(),
+            false,
+        ));
+    }
+    let dlast = read_u16(&dir, 2, little);
+    if dlast != DIR_END && dlast != DIR_END_DUP {
+        errors.push(issue(
+            "VolDirEnd",
+            format!("volume label DLASTBLK is {dlast}, expected 6 or 10"),
+            false,
+        ));
+    }
+    if read_name(&dir, 6, 7).is_none() {
+        errors.push(issue(
+            "VolName",
+            "volume label name length is invalid".into(),
+            false,
+        ));
+    }
+    if eov as u64 > disk_blocks {
+        errors.push(issue(
+            "VolSize",
+            format!("DEOVBLK {eov} exceeds the {disk_blocks}-block image"),
+            false,
+        ));
+    }
+
+    let dnumfiles = read_u16(&dir, 16, little) as usize;
+    let max_entries = (DIR_BLOCKS * BLOCK) as usize / ENTRY - 1;
+    let mut spans: Vec<(u16, u16, String)> = Vec::new();
+    let mut files = 0u32;
+    for i in 1..=dnumfiles.min(max_entries) {
+        let off = i * ENTRY;
+        let first = read_u16(&dir, off, little);
+        let last = read_u16(&dir, off + 2, little);
+        let kind = read_u16(&dir, off + 4, little) & 0xF;
+        let last_byte = read_u16(&dir, off + 22, little);
+        let Some(name) = read_name(&dir, off + 6, 15) else {
+            errors.push(issue(
+                "BadName",
+                format!("directory entry {i} has an invalid name length"),
+                true,
+            ));
+            continue;
+        };
+        files += 1;
+        if first >= last {
+            errors.push(issue(
+                "BadRange",
+                format!("file '{name}' FIRSTBLK {first} >= DLASTBLK {last}"),
+                false,
+            ));
+        }
+        if first < dir_end {
+            errors.push(issue(
+                "IntoDir",
+                format!("file '{name}' overlaps the directory (first block {first})"),
+                false,
+            ));
+        }
+        if last as u64 > eov as u64 {
+            errors.push(issue(
+                "PastEnd",
+                format!("file '{name}' DLASTBLK {last} is past DEOVBLK {eov}"),
+                false,
+            ));
+        }
+        if !(1..=512).contains(&last_byte) {
+            errors.push(issue(
+                "BadLastByte",
+                format!("file '{name}' DLASTBYTE {last_byte} out of range"),
+                false,
+            ));
+        }
+        if kind > 8 {
+            warnings.push(issue(
+                "BadKind",
+                format!("file '{name}' has invalid kind {kind}"),
+                false,
+            ));
+        }
+        spans.push((first, last, name));
+    }
+
+    // Overlap check over the block-sorted runs.
+    let mut sorted = spans.clone();
+    sorted.sort_by_key(|s| s.0);
+    for w in sorted.windows(2) {
+        if w[1].0 < w[0].1 {
+            errors.push(issue(
+                "Overlap",
+                format!(
+                    "files '{}' ({}..{}) and '{}' ({}..{}) overlap",
+                    w[0].2, w[0].0, w[0].1, w[1].2, w[1].0, w[1].1
+                ),
+                false,
+            ));
+        }
+    }
+
+    // Recomputable inconsistencies.
+    if spans.iter().map(|s| s.0).ne(sorted.iter().map(|s| s.0)) {
+        warnings.push(issue(
+            "Unsorted",
+            "directory entries are not sorted by first block".into(),
+            true,
+        ));
+    }
+    if dnumfiles != fs.entries.len() {
+        warnings.push(issue(
+            "FileCount",
+            format!(
+                "DNUMFILES {dnumfiles} disagrees with {} valid entries",
+                fs.entries.len()
+            ),
+            true,
+        ));
+    }
+
+    let repairable = errors.iter().any(|e| e.repairable) || warnings.iter().any(|w| w.repairable);
+    Ok(FsckResult {
+        stats: FsckStats {
+            files_checked: files,
+            directories_checked: 1,
+            extra: vec![
+                ("volume".into(), fs.volume_name.clone()),
+                ("blocks".into(), eov.to_string()),
+            ],
+        },
+        repairable,
+        errors,
+        warnings,
+        orphaned_entries: Vec::new(),
+    })
+}
+
+pub fn repair_ucsd<R: Read + Write + Seek>(
+    fs: &mut UcsdFilesystem<R>,
+) -> Result<RepairReport, FilesystemError> {
+    let check = fsck_ucsd(fs)?;
+    let mut report = RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: check.errors.iter().filter(|e| !e.repairable).count(),
+    };
+    let has_fixable =
+        check.errors.iter().any(|e| e.repairable) || check.warnings.iter().any(|w| w.repairable);
+    if has_fixable {
+        // `fs.entries` is the parsed, valid, block-sorted set; re-serializing
+        // corrects DNUMFILES and sort order and drops invalid-name entries.
+        fs.write_directory()?;
+        fs.reader.flush()?;
+        report.fixes_applied.push(
+            "rewrote the directory: sorted entries, corrected the file count, dropped \
+             invalid entries"
+                .into(),
+        );
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -962,5 +1168,168 @@ mod tests {
         let ok = fsck(volp);
         let _ = std::fs::remove_file(&vol);
         assert!(ok, "oracle fsck flagged our blank after an edit");
+    }
+
+    // ---- fsck ----
+
+    fn forge_entry(img: &mut [u8], off: usize, first: u16, last: u16, kind: u16, name: &str) {
+        write_u16(img, off, first, true);
+        write_u16(img, off + 2, last, true);
+        write_u16(img, off + 4, kind, true);
+        write_name(img, off + 6, name, 15);
+        write_u16(img, off + 22, 512, true); // DLASTBYTE
+    }
+
+    #[test]
+    fn fsck_on_blank_and_populated_is_clean() {
+        let mut fs = UcsdFilesystem::open(
+            Cursor::new(create_blank_ucsd(140 * 1024, "CLEAN").unwrap()),
+            0,
+        )
+        .unwrap();
+        let r = fsck_ucsd(&mut fs).unwrap();
+        assert!(r.is_clean() && r.warnings.is_empty(), "{r:?}");
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "A.DATA",
+            &mut &[1u8; 1000][..],
+            1000,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "B.TEXT",
+            &mut &[2u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let r2 = fsck_ucsd(&mut fs).unwrap();
+        assert!(
+            r2.is_clean() && r2.warnings.is_empty(),
+            "errors={:?} warnings={:?}",
+            r2.errors,
+            r2.warnings
+        );
+        assert_eq!(r2.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_bad_file_count() {
+        let mut cur = Cursor::new(create_blank_ucsd(140 * 1024, "COUNT").unwrap());
+        {
+            let mut fs = UcsdFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "X.DATA",
+                &mut &[9u8; 300][..],
+                300,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Corrupt DNUMFILES (block 2 + 16) to 7; only one real file exists.
+        cur.get_mut()[1024 + 16] = 7;
+
+        cur.set_position(0);
+        let mut fs = UcsdFilesystem::open(&mut cur, 0).unwrap();
+        let r = fsck_ucsd(&mut fs).unwrap();
+        assert!(
+            r.warnings.iter().any(|w| w.code == "FileCount"),
+            "{:?}",
+            r.warnings
+        );
+        let rep = repair_ucsd(&mut fs).unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+
+        cur.set_position(0);
+        let mut fs2 = UcsdFilesystem::open(&mut cur, 0).unwrap();
+        let r2 = fsck_ucsd(&mut fs2).unwrap();
+        assert!(r2.is_clean() && r2.warnings.is_empty(), "{r2:?}");
+        let root = fs2.root().unwrap();
+        assert_eq!(fs2.list_directory(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fsck_flags_overlap_unrepairable() {
+        let mut img = create_blank_ucsd(140 * 1024, "OVL").unwrap();
+        write_u16(&mut img, 1024 + 16, 2, true); // DNUMFILES = 2
+        forge_entry(&mut img, 1024 + ENTRY, 6, 10, 5, "A.DATA");
+        forge_entry(&mut img, 1024 + 2 * ENTRY, 8, 12, 5, "B.DATA"); // overlaps 6..10
+        let mut fs = UcsdFilesystem::open(Cursor::new(img), 0).unwrap();
+        let r = fsck_ucsd(&mut fs).unwrap();
+        assert!(
+            r.errors.iter().any(|e| e.code == "Overlap"),
+            "{:?}",
+            r.errors
+        );
+        let rep = repair_ucsd(&mut fs).unwrap();
+        assert!(rep.unrepairable_count >= 1, "{rep:?}");
+    }
+
+    #[test]
+    fn oracle_repair_of_corrupt_count_is_fsck_clean() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_repair_of_corrupt_count: oracle unavailable");
+            return;
+        };
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_ucsd_rep_{}.vol", std::process::id()));
+        std::fs::write(&vol, create_blank_ucsd(140 * 1024, "REPV").unwrap()).unwrap();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = UcsdFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "K.DATA",
+                &mut &[7u8; 700][..],
+                700,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Corrupt DNUMFILES on disk, then repair through our code.
+        {
+            use std::io::{Read as _, Seek as _, Write as _};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            f.seek(SeekFrom::Start(1024 + 16)).unwrap();
+            f.write_all(&9u16.to_le_bytes()).unwrap();
+            let _ = f.read(&mut [0u8; 0]);
+        }
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = UcsdFilesystem::open(file, 0).unwrap();
+            let rep = repair_ucsd(&mut fs).unwrap();
+            assert_eq!(rep.unrepairable_count, 0, "{rep:?}");
+        }
+        let clean = Command::new("python3")
+            .arg(&script)
+            .args(["fsck", vol.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged the repaired volume");
     }
 }

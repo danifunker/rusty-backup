@@ -55,7 +55,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | HFV (flat HFS) | via HFS | Yes | Yes | Yes (`--fs hfv`) | Yes | check+repair | BasiliskII / SheepShaver — flat classic HFS ≤ 2047 MB, no APM wrapper |
 | ProDOS | Auto / MBR 0xA8 / APM | Yes | Yes | Yes (`--fs prodos`) | Yes (in-place) | check+repair | Apple II / IIgs |
 | Apple DOS 3.3 | Auto (140 KB only) | Yes | Yes | Yes (`--fs apple-dos`) | No | check+repair | Apple II 5.25" (`.dsk` / `.do` / `.po`, sector-order auto) |
-| UCSD p-System | Auto | Yes | Yes | Yes (`--fs ucsd`) | — | No | UCSD Pascal — Apple II/III, PC (contiguous flat FS); edit + create clean-room-validated |
+| UCSD p-System | Auto | Yes | Yes | Yes (`--fs ucsd`) | — | check+repair | UCSD Pascal — Apple II/III, PC (contiguous flat FS); full quartet, clean-room-oracle-validated |
 | Apple Lisa FS | Auto (tag-bearing DC42/DART) | Yes | No | No | No | No | Apple Lisa — reconstructed from 12-byte sector tags |
 
 > **HFV** is the *write* side of classic HFS for BasiliskII / SheepShaver: a

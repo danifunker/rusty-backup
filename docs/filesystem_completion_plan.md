@@ -111,7 +111,7 @@ risky — noted as such; "where possible" applies.
 
 | Filesystem | Systems | Quartet feasibility | Effort to browse |
 |---|---|---|---|
-| **UCSD p-System** | Apple II/III, PC | Full quartet realistic (simple block FS) | M |
+| ~~**UCSD p-System**~~ (done) | Apple II/III, PC | **Full quartet shipped** — browse + edit (contiguous first-fit) + create-blank (`rb-cli new --fs ucsd`) + fsck (directory self-consistency: bounds / overlaps / file-count, re-sort + count repair). No standard oracle builds here (needs Boost+libexplain+libfuse), so validated against an independent clean-room `scripts/ucsd-oracle.py`, per the RS-DOS clean-room precedent | M |
 | **HPFS** | OS/2 | Browse + edit realistic; fsck M | M–L |
 | ~~**Minix FS**~~ (done) | Minix, early Linux | **Full quartet shipped** — V1/V2/V3 browse + edit + create-blank (`rb-cli new --fs minix{,2,3}`, mkfs.minix-parity geometry) + fsck (bitmap/link-count reconciliation + orphan adoption into `/lost+found`), every write verified against Linux `fsck.minix` | S–M |
 | **TR-DOS** | ZX Spectrum | Full quartet (fixed-geometry floppy) | M |
@@ -197,9 +197,9 @@ The order that buys the most capability per unit effort:
    allocator + inline dtree insert + dinode write-back behind
    `EditableFilesystem` (general create/delete/rename still `Unsupported`).
 6. **New high-value filesystems** — ~~Minix~~ **done** (full quartet, V1/V2/V3,
-   `fsck.minix`-verified); UCSD p-System next (the other cheapest full quartet),
-   then the MiSTer-core long-tail (TR-DOS, TI-99, Oric, N88-BASIC, TRSDOS), then
-   HPFS.
+   `fsck.minix`-verified) and ~~UCSD p-System~~ **done** (full quartet,
+   clean-room-oracle-verified); next the MiSTer-core long-tail (TR-DOS, TI-99,
+   Oric, N88-BASIC, TRSDOS), then HPFS.
 7. **Read-only-to-edit for btrfs / JFS / APFS / ZFS** — last; large effort, and
    read is the realistic ceiling for the CoW/checksummed ones.
 

@@ -10,7 +10,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 - **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
   JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
-  Apple DOS 3.3 (read + edit + create + fsck), MacPlus MFS,
+  Apple DOS 3.3 (read + edit + create + fsck),
+  UCSD p-System (read + edit + create + fsck), MacPlus MFS,
   Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
   svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
