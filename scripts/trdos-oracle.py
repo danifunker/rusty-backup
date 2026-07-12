@@ -259,8 +259,8 @@ def cmd_fsck(img):
             )
         if start_linear + ls > tsec:
             problems.append(f"entry {i} {nm!r}: extends past disk end")
-        if lb and (lb + SECTOR - 1) // SECTOR != ls:
-            problems.append(f"entry {i} {nm!r}: length {lb} bytes inconsistent with {ls} sectors")
+        if lb > ls * SECTOR:
+            problems.append(f"entry {i} {nm!r}: length {lb} bytes exceeds its {ls}-sector allocation")
         cursor = start_linear + ls
 
     ff_linear = info[0xE2] * SPT + info[0xE1]

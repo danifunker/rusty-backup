@@ -37,6 +37,7 @@ use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// Bytes per sector.
 pub(crate) const SECTOR: u64 = 256;
@@ -410,6 +411,10 @@ impl<R: Read + Seek + Send> Filesystem for TrdosFilesystem<R> {
     fn validate_name(&self, name: &str) -> Result<(), FilesystemError> {
         parse_trdos_name(name).map(|_| ())
     }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(fsck_trdos(self))
+    }
 }
 
 /// Split a display name (`NAME.T`) into the 8-byte, space-padded on-disk name
@@ -662,6 +667,248 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for TrdosFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_sectors as u64 * SECTOR)
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        repair_trdos(self)
+    }
+}
+
+// ---- fsck (check + repair) ----
+//
+// TR-DOS has no allocation bitmap — the packed catalogue *is* the allocation
+// map — so the check is self-consistency: a valid disk-info signature, every
+// catalogue entry packed contiguously from the first data sector and within the
+// disk, and the disk-info counters (file / deleted counts, first-free pointer,
+// free-sector count) agreeing with a walk of the catalogue. The counters are
+// safely recomputable and repaired by rewriting the disk-info sector; structural
+// damage (non-contiguous / past-end / zero-length entries, a bad signature) is
+// surfaced read-only, and repair is then withheld.
+
+fn issue(code: &str, message: String, repairable: bool) -> FsckIssue {
+    FsckIssue {
+        code: code.into(),
+        message,
+        repairable,
+        debug: false,
+    }
+}
+
+/// Label an entry for a diagnostic message.
+fn entry_label(cat: &[u8], slot: usize) -> String {
+    let off = slot * ENTRY;
+    if cat[off] == 0x01 {
+        return format!("deleted slot {slot}");
+    }
+    format!(
+        "{}.{}",
+        trim_name(&cat[off..off + 8]),
+        printable(cat[off + 8])
+    )
+}
+
+pub fn fsck_trdos<R: Read + Seek>(
+    fs: &mut TrdosFilesystem<R>,
+) -> Result<FsckResult, FilesystemError> {
+    let geom = fs.geometry;
+    let total = geom.total_sectors();
+    let end = fs.reader.seek(SeekFrom::End(0))?;
+    let disk_sectors = end.saturating_sub(fs.partition_offset) / SECTOR;
+
+    let mut cat = vec![0u8; (CATALOG_SECTORS * SECTOR) as usize];
+    fs.read_at(0, &mut cat)?;
+    let mut info = [0u8; SECTOR as usize];
+    fs.read_at(INFO_OFF, &mut info)?;
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    // Disk-info signature / geometry.
+    if info[0xE7] != TRDOS_ID {
+        errors.push(issue(
+            "TrdosId",
+            format!("disk-info id byte 0x{:02X} is not 0x10", info[0xE7]),
+            false,
+        ));
+    }
+    if TrdosGeometry::from_type(info[0xE3]).is_none() {
+        errors.push(issue(
+            "DiskType",
+            format!("invalid disk-type byte 0x{:02X}", info[0xE3]),
+            false,
+        ));
+    }
+    if total > disk_sectors {
+        errors.push(issue(
+            "Truncated",
+            format!("disk type implies {total} sectors but the image has {disk_sectors}"),
+            false,
+        ));
+    }
+
+    // Walk every used catalogue slot (live + tombstoned), verifying the
+    // contiguous packing that TR-DOS maintains.
+    let mut used = 0usize;
+    let mut tombstones = 0usize;
+    let mut files_checked = 0u32;
+    let mut cursor = DATA_START;
+    for slot in 0..MAX_FILES {
+        if is_end_of_catalog(&cat, slot) {
+            break;
+        }
+        used += 1;
+        let off = slot * ENTRY;
+        let deleted = cat[off] == 0x01;
+        if deleted {
+            tombstones += 1;
+        } else {
+            files_checked += 1;
+        }
+        let length_sectors = cat[off + 13] as u64;
+        let length_bytes = u16::from_le_bytes([cat[off + 11], cat[off + 12]]) as u64;
+        let start_linear = cat[off + 15] as u64 * SPT + cat[off + 14] as u64;
+        let label = entry_label(&cat, slot);
+        if length_sectors == 0 {
+            errors.push(issue(
+                "ZeroLength",
+                format!("entry {slot} ({label}) has a zero length in sectors"),
+                false,
+            ));
+        }
+        if start_linear != cursor {
+            errors.push(issue(
+                "NonContiguous",
+                format!(
+                    "entry {slot} ({label}) starts at sector {start_linear}, expected {cursor}"
+                ),
+                false,
+            ));
+        }
+        if start_linear + length_sectors > total {
+            errors.push(issue(
+                "PastEnd",
+                format!("entry {slot} ({label}) extends past the disk end"),
+                false,
+            ));
+        }
+        if length_bytes > length_sectors * SECTOR {
+            warnings.push(issue(
+                "LengthOverflow",
+                format!(
+                    "entry {slot} ({label}) byte length {length_bytes} exceeds its \
+                     {length_sectors}-sector allocation"
+                ),
+                false,
+            ));
+        }
+        cursor = start_linear + length_sectors;
+    }
+
+    // The disk-info counters are recomputable from the catalogue, but only
+    // *safely* when the structure the walk relies on is intact. If a structural
+    // error was found above, the derived high-water mark is unreliable, so we
+    // mark the counter mismatches unrepairable and surface them read-only.
+    let structure_clean = errors.is_empty();
+
+    let num_files = info[0xE4] as usize;
+    if num_files != used {
+        errors.push(issue(
+            "FileCount",
+            format!("disk-info file count {num_files} disagrees with {used} used catalogue slots"),
+            structure_clean,
+        ));
+    }
+    if info[0xF4] as usize != tombstones {
+        errors.push(issue(
+            "DeletedCount",
+            format!(
+                "disk-info deleted count {} disagrees with {tombstones} tombstones",
+                info[0xF4]
+            ),
+            structure_clean,
+        ));
+    }
+    let ff_linear = info[0xE2] as u64 * SPT + info[0xE1] as u64;
+    if ff_linear != cursor {
+        errors.push(issue(
+            "FirstFree",
+            format!("first-free pointer {ff_linear} disagrees with the high-water mark {cursor}"),
+            structure_clean,
+        ));
+    }
+    let free = u16::from_le_bytes([info[0xE5], info[0xE6]]) as u64;
+    let expect_free = total.saturating_sub(cursor);
+    if free != expect_free {
+        errors.push(issue(
+            "FreeCount",
+            format!("free-sector count {free} disagrees with the computed {expect_free}"),
+            structure_clean,
+        ));
+    }
+
+    let repairable = errors.iter().any(|e| e.repairable);
+    Ok(FsckResult {
+        stats: FsckStats {
+            files_checked,
+            directories_checked: 1,
+            extra: vec![
+                ("volume".into(), fs.volume_label.clone()),
+                ("geometry".into(), geom.describe().to_string()),
+                ("deleted".into(), tombstones.to_string()),
+                ("free_sectors".into(), expect_free.to_string()),
+            ],
+        },
+        repairable,
+        errors,
+        warnings,
+        orphaned_entries: Vec::new(),
+    })
+}
+
+pub fn repair_trdos<R: Read + Write + Seek>(
+    fs: &mut TrdosFilesystem<R>,
+) -> Result<RepairReport, FilesystemError> {
+    let check = fsck_trdos(fs)?;
+    let mut report = RepairReport {
+        fixes_applied: Vec::new(),
+        fixes_failed: Vec::new(),
+        unrepairable_count: check.errors.iter().filter(|e| !e.repairable).count(),
+    };
+    // The counter mismatches are the only repairable errors, and they are marked
+    // repairable only when the structure is intact — so a repairable error being
+    // present already implies the packing walk is trustworthy.
+    if check.errors.iter().any(|e| e.repairable) {
+        let mut cat = vec![0u8; (CATALOG_SECTORS * SECTOR) as usize];
+        fs.read_at(0, &mut cat)?;
+        let mut used = 0usize;
+        let mut tombstones = 0usize;
+        let mut cursor = DATA_START;
+        for slot in 0..MAX_FILES {
+            if is_end_of_catalog(&cat, slot) {
+                break;
+            }
+            used += 1;
+            if cat[slot * ENTRY] == 0x01 {
+                tombstones += 1;
+            }
+            cursor += cat[slot * ENTRY + 13] as u64; // contiguous: start == cursor
+        }
+        fs.num_files = used as u16;
+        fs.deleted_count = tombstones as u8;
+        fs.first_free_linear = cursor;
+        fs.free_sectors = fs
+            .geometry
+            .total_sectors()
+            .saturating_sub(cursor)
+            .min(u16::MAX as u64) as u16;
+        fs.write_disk_info()?;
+        fs.reader.flush()?;
+        report.fixes_applied.push(
+            "recomputed the disk-info counters (file count, deleted count, first-free pointer, \
+             free-sector count) from the catalogue"
+                .into(),
+        );
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1144,5 +1391,236 @@ mod tests {
         let ok = fsck(volp);
         let _ = std::fs::remove_file(&vol);
         assert!(ok, "oracle fsck flagged our blank after an edit");
+    }
+
+    // ---- fsck ----
+
+    /// Poke a raw catalogue entry into an image (for structural-damage tests).
+    /// `start` is the (logical track, sector) of the entry's first sector.
+    fn poke_entry(
+        img: &mut [u8],
+        slot: usize,
+        name: &str,
+        tc: u8,
+        len_bytes: u16,
+        secs: u8,
+        start: (u8, u8),
+    ) {
+        let off = slot * ENTRY;
+        let nm = format!("{name:<8}");
+        img[off..off + 8].copy_from_slice(&nm.as_bytes()[..8]);
+        img[off + 8] = tc;
+        img[off + 11..off + 13].copy_from_slice(&len_bytes.to_le_bytes());
+        img[off + 13] = secs;
+        img[off + 14] = start.1; // sector
+        img[off + 15] = start.0; // track
+    }
+
+    #[test]
+    fn fsck_on_blank_and_populated_is_clean() {
+        let mut fs = TrdosFilesystem::open(
+            Cursor::new(create_blank_trdos(640 * 1024, "CLEAN").unwrap()),
+            0,
+        )
+        .unwrap();
+        let r = fsck_trdos(&mut fs).unwrap();
+        assert!(r.is_clean() && r.warnings.is_empty(), "{r:?}");
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "A.C",
+            &mut &[1u8; 1000][..],
+            1000,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "B.B",
+            &mut &[2u8; 500][..],
+            500,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let r2 = fsck_trdos(&mut fs).unwrap();
+        assert!(
+            r2.is_clean() && r2.warnings.is_empty(),
+            "errors={:?} warnings={:?}",
+            r2.errors,
+            r2.warnings
+        );
+        assert_eq!(r2.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn fsck_clean_after_delete_tombstone() {
+        // A tombstoned entry keeps its slot + sectors; the counters must still
+        // reconcile (the delete path the oracle also validates).
+        let mut fs = TrdosFilesystem::open(
+            Cursor::new(create_blank_trdos(640 * 1024, "TOMB").unwrap()),
+            0,
+        )
+        .unwrap();
+        let root = fs.root().unwrap();
+        fs.create_file(
+            &root,
+            "KEEP.C",
+            &mut &[1u8; 300][..],
+            300,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        fs.create_file(
+            &root,
+            "GONE.C",
+            &mut &[2u8; 300][..],
+            300,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        let gone = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "GONE.C")
+            .unwrap();
+        fs.delete_entry(&root, &gone).unwrap();
+        let r = fsck_trdos(&mut fs).unwrap();
+        assert!(
+            r.is_clean() && r.warnings.is_empty(),
+            "errors={:?} warnings={:?}",
+            r.errors,
+            r.warnings
+        );
+        assert_eq!(r.stats.files_checked, 1);
+        let deleted = &r
+            .stats
+            .extra
+            .iter()
+            .find(|(k, _)| k == "deleted")
+            .unwrap()
+            .1;
+        assert_eq!(deleted, "1");
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_bad_free_count() {
+        let mut cur = Cursor::new(create_blank_trdos(640 * 1024, "FIX").unwrap());
+        {
+            let mut fs = TrdosFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "X.C",
+                &mut &[9u8; 700][..],
+                700,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Corrupt the free-sector count (disk-info 0xE5..0xE6).
+        cur.get_mut()[INFO_OFF as usize + 0xE5] = 0;
+        cur.get_mut()[INFO_OFF as usize + 0xE6] = 0;
+
+        {
+            let mut fs = TrdosFilesystem::open(&mut cur, 0).unwrap();
+            let r = fsck_trdos(&mut fs).unwrap();
+            assert!(
+                r.errors.iter().any(|e| e.code == "FreeCount"),
+                "{:?}",
+                r.errors
+            );
+            assert!(r.repairable);
+            let rep = repair_trdos(&mut fs).unwrap();
+            assert!(!rep.fixes_applied.is_empty(), "{rep:?}");
+            assert_eq!(rep.unrepairable_count, 0);
+        }
+        cur.set_position(0);
+        let mut fs2 = TrdosFilesystem::open(&mut cur, 0).unwrap();
+        let r2 = fsck_trdos(&mut fs2).unwrap();
+        assert!(r2.is_clean() && r2.warnings.is_empty(), "{r2:?}");
+    }
+
+    #[test]
+    fn fsck_flags_non_contiguous_unrepairable() {
+        let mut img = create_blank_trdos(640 * 1024, "GAP").unwrap();
+        // Second entry starts past where the first ends (a gap) — non-contiguous.
+        poke_entry(&mut img, 0, "A", b'C', 512, 2, (1, 0)); // linear 16..18
+        poke_entry(&mut img, 1, "B", b'C', 256, 1, (1, 5)); // linear 21 (expected 18)
+        img[INFO_OFF as usize + 0xE4] = 2; // file count
+        let mut fs = TrdosFilesystem::open(Cursor::new(img), 0).unwrap();
+        let r = fsck_trdos(&mut fs).unwrap();
+        assert!(
+            r.errors.iter().any(|e| e.code == "NonContiguous"),
+            "{:?}",
+            r.errors
+        );
+        // Repair is withheld while the structure is damaged.
+        let rep = repair_trdos(&mut fs).unwrap();
+        assert!(rep.unrepairable_count >= 1, "{rep:?}");
+        assert!(rep.fixes_applied.is_empty(), "{rep:?}");
+    }
+
+    #[test]
+    fn oracle_repair_of_corrupt_counters_is_fsck_clean() {
+        let Some(script) = oracle() else {
+            eprintln!("skipping oracle_repair_of_corrupt_counters: oracle unavailable");
+            return;
+        };
+        if !have_python() {
+            return;
+        }
+        let vol = std::env::temp_dir().join(format!("rb_trdos_rep_{}.trd", std::process::id()));
+        std::fs::write(&vol, create_blank_trdos(640 * 1024, "REPV").unwrap()).unwrap();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = TrdosFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "K.C",
+                &mut &[7u8; 700][..],
+                700,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        // Corrupt the disk-info file count on disk, then repair through our code.
+        {
+            use std::io::{Read as _, Seek as _, Write as _};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            f.seek(SeekFrom::Start(INFO_OFF + 0xE4)).unwrap();
+            f.write_all(&[9u8]).unwrap();
+            let _ = f.read(&mut [0u8; 0]);
+        }
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&vol)
+                .unwrap();
+            let mut fs = TrdosFilesystem::open(file, 0).unwrap();
+            let rep = repair_trdos(&mut fs).unwrap();
+            assert_eq!(rep.unrepairable_count, 0, "{rep:?}");
+        }
+        let clean = Command::new("python3")
+            .arg(&script)
+            .args(["fsck", vol.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        let _ = std::fs::remove_file(&vol);
+        assert!(clean, "oracle fsck flagged the repaired volume");
     }
 }
