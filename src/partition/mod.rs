@@ -588,6 +588,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("TR-DOS".to_string());
     }
 
+    // TI-99/4A (flat V9T9 .dsk). Gated on the VIB "DSK" marker at offset 0x0D
+    // plus a self-consistent geometry.
+    if crate::fs::ti99::looks_like_ti99(reader, 0).is_some() {
+        return Some("TI-99".to_string());
+    }
+
     None
 }
 

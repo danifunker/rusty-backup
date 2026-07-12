@@ -1,0 +1,528 @@
+//! TI-99/4A disk filesystem — read driver.
+//!
+//! The filesystem of the TI-99/4A's disk controller (and the MiSTer
+//! **TI-99_4A** core), stored in the ubiquitous flat V9T9 `.dsk` sector image.
+//! Unlike the contiguous CoCo/ZX floppies it is a proper little filesystem: a
+//! Volume Information Block with an allocation bitmap, a sorted index of File
+//! Descriptor Records, and **extent-based** files (a packed cluster chain).
+//!
+//! Layout:
+//!
+//! ```text
+//!   sector 0   Volume Information Block (VIB): name, geometry, alloc bitmap
+//!   sector 1   File Descriptor Index Record (FDIR): sorted FDR pointers
+//!   sector 2+  File Descriptor Records + file data
+//! ```
+//!
+//! Every multi-byte field is **big-endian** (the TMS9900 convention). Geometry
+//! is read from the VIB, not guessed from the file size. The allocation bitmap
+//! at VIB offset 0x38 uses **bit set = used** (LSB of byte 0x38 = sector 0);
+//! sectors 0 and 1, and every sector past the disk end, are marked used.
+//!
+//! A file's data is an extent list packed three bytes per cluster at FDR offset
+//! 0x1C: the 12-bit start AU is `b0 | ((b1 & 0x0F) << 8)` and the 12-bit
+//! file-relative index of the cluster's last AU is `(b1 >> 4) | (b2 << 4)`
+//! (AU = 1 sector on floppies). All offsets were validated byte-for-byte
+//! against MAME's `imgtool` reader and an independent clean-room oracle
+//! (`scripts/ti99-oracle.py`).
+//!
+//! This is the read half of the TI-99 quartet (Browse); edit / create / fsck
+//! build on it (`docs/filesystem_completion_plan.md` Part 2).
+
+use std::io::{Read, Seek, SeekFrom};
+
+use super::entry::FileEntry;
+use super::filesystem::{Filesystem, FilesystemError};
+
+pub(crate) const SECTOR: u64 = 256;
+/// The VIB is sector 0 (image start); the FDIR is sector 1.
+pub(crate) const FDIR_SECTOR: u64 = 1;
+/// First sector available for FDRs / file data.
+pub(crate) const FIRST_DATA: u16 = 2;
+/// Allocation bitmap offset within the VIB.
+pub(crate) const BITMAP_OFF: usize = 0x38;
+/// The bitmap spans 0x38..0xEC (180 bytes = 1440 bits).
+pub(crate) const BITMAP_BITS: u16 = 1440;
+/// Cluster chain offset within an FDR.
+pub(crate) const FDR_CLUSTERS_OFF: usize = 0x1C;
+/// FDIR capacity (127 two-byte pointers + a 0x0000 terminator).
+pub(crate) const MAX_FILES: usize = 127;
+
+fn be16(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([buf[off], buf[off + 1]])
+}
+
+/// Disk geometry, read from the VIB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ti99Geometry {
+    pub total_sectors: u16,
+    pub sectors_per_track: u8,
+    pub tracks_per_side: u8,
+    pub sides: u8,
+    pub density: u8,
+}
+
+impl Ti99Geometry {
+    pub fn total_bytes(&self) -> u64 {
+        self.total_sectors as u64 * SECTOR
+    }
+
+    pub fn describe(&self) -> String {
+        let dens = match self.density {
+            1 => "SD",
+            2 => "DD",
+            3 => "HD",
+            _ => "?D",
+        };
+        format!(
+            "{} side(s), {} tracks, {} sec/track, {}",
+            self.sides, self.tracks_per_side, self.sectors_per_track, dens
+        )
+    }
+}
+
+/// A parsed File Descriptor Record.
+#[derive(Clone, Debug)]
+pub struct Ti99Entry {
+    /// Sector holding this file's FDR.
+    pub fdr_sector: u16,
+    pub name: String,
+    /// FDR status flags (0x0C): bit0 program, bit1 internal, bit3 protected,
+    /// bit7 variable-length records.
+    pub flags: u8,
+    /// Sectors of file data (excludes the FDR sector).
+    pub sectors_alloc: u16,
+    /// Bytes used in the final data sector (0 = a full 256-byte sector).
+    pub eof_offset: u8,
+    /// Physical data sectors, resolved from the cluster chain at open.
+    pub data_sectors: Vec<u16>,
+}
+
+impl Ti99Entry {
+    pub fn byte_size(&self) -> u64 {
+        if self.sectors_alloc == 0 {
+            return 0;
+        }
+        let last = if self.eof_offset == 0 {
+            SECTOR
+        } else {
+            self.eof_offset as u64
+        };
+        (self.sectors_alloc as u64 - 1) * SECTOR + last
+    }
+
+    pub fn is_program(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+}
+
+/// Decode the FDR cluster chain into the file's physical data sectors.
+/// `fdr` is the 256-byte FDR sector. Stops at the declared sector count, a zero
+/// cluster, or the end of the chain area — whichever comes first.
+pub(crate) fn walk_clusters(fdr: &[u8], sectors_alloc: u16) -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut prev_off: i32 = -1;
+    let mut c = FDR_CLUSTERS_OFF;
+    while c + 3 <= SECTOR as usize && out.len() < sectors_alloc as usize {
+        let (b0, b1, b2) = (fdr[c] as u16, fdr[c + 1] as u16, fdr[c + 2] as u16);
+        let start = b0 | ((b1 & 0x0F) << 8);
+        let last_off = ((b1 >> 4) | (b2 << 4)) as i32;
+        if start == 0 && last_off == 0 {
+            break;
+        }
+        let count = last_off - prev_off;
+        if count <= 0 {
+            break; // malformed / non-increasing offset
+        }
+        for k in 0..count {
+            out.push(start.wrapping_add(k as u16));
+        }
+        prev_off = last_off;
+        c += 3;
+    }
+    out.truncate(sectors_alloc as usize);
+    out
+}
+
+fn trim_name(name: &[u8]) -> String {
+    let end = name.iter().rposition(|&b| b != b' ').map_or(0, |i| i + 1);
+    name[..end]
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7F).contains(&b) {
+                b as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+pub struct Ti99Filesystem<R: Read + Seek> {
+    reader: R,
+    partition_offset: u64,
+    geometry: Ti99Geometry,
+    volume_label: String,
+    /// The VIB (sector 0), kept for the bitmap.
+    vib: Vec<u8>,
+    entries: Vec<Ti99Entry>,
+}
+
+/// Structural detector: a TI-99 disk has the ASCII "DSK" marker at VIB offset
+/// 0x0D plus a self-consistent geometry. Returns the parsed geometry on a match.
+pub fn looks_like_ti99<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<Ti99Geometry> {
+    let len = reader
+        .seek(SeekFrom::End(0))
+        .ok()?
+        .checked_sub(partition_offset)?;
+    if len < FIRST_DATA as u64 * SECTOR || len % SECTOR != 0 {
+        return None;
+    }
+    reader.seek(SeekFrom::Start(partition_offset)).ok()?;
+    let mut vib = [0u8; SECTOR as usize];
+    reader.read_exact(&mut vib).ok()?;
+
+    if &vib[0x0D..0x10] != b"DSK" {
+        return None;
+    }
+    let total_sectors = be16(&vib, 0x0A);
+    let sectors_per_track = vib[0x0C];
+    let sides = vib[0x12];
+    let density = vib[0x13];
+    // Geometry sanity — a confident discriminator alongside the DSK marker.
+    if !(FIRST_DATA..=BITMAP_BITS).contains(&total_sectors)
+        || total_sectors as u64 * SECTOR > len
+        || !matches!(sectors_per_track, 9 | 16 | 18 | 36)
+        || !matches!(sides, 1 | 2)
+        || !(1..=3).contains(&density)
+    {
+        return None;
+    }
+    Some(Ti99Geometry {
+        total_sectors,
+        sectors_per_track,
+        tracks_per_side: vib[0x11],
+        sides,
+        density,
+    })
+}
+
+impl<R: Read + Seek> Ti99Filesystem<R> {
+    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        let geometry = looks_like_ti99(&mut reader, partition_offset)
+            .ok_or_else(|| FilesystemError::InvalidData("not a TI-99 disk".into()))?;
+
+        let mut vib = vec![0u8; SECTOR as usize];
+        reader.seek(SeekFrom::Start(partition_offset))?;
+        reader.read_exact(&mut vib)?;
+        let volume_label = trim_name(&vib[0..10]);
+
+        // FDIR (sector 1): up to 127 big-endian FDR-sector pointers, 0-terminated.
+        let mut fdir = vec![0u8; SECTOR as usize];
+        reader.seek(SeekFrom::Start(partition_offset + FDIR_SECTOR * SECTOR))?;
+        reader.read_exact(&mut fdir)?;
+
+        let mut entries = Vec::new();
+        for i in 0..MAX_FILES {
+            let ptr = be16(&fdir, i * 2);
+            if ptr == 0 {
+                break;
+            }
+            if ptr < FIRST_DATA || ptr >= geometry.total_sectors {
+                // Out-of-range pointer: skip (fsck surfaces it).
+                continue;
+            }
+            let mut fdr = vec![0u8; SECTOR as usize];
+            reader.seek(SeekFrom::Start(partition_offset + ptr as u64 * SECTOR))?;
+            if reader.read_exact(&mut fdr).is_err() {
+                continue;
+            }
+            let name = trim_name(&fdr[0..10]);
+            if name.is_empty() {
+                continue;
+            }
+            let sectors_alloc = be16(&fdr, 0x0E);
+            let data_sectors = walk_clusters(&fdr, sectors_alloc);
+            entries.push(Ti99Entry {
+                fdr_sector: ptr,
+                name,
+                flags: fdr[0x0C],
+                sectors_alloc,
+                eof_offset: fdr[0x10],
+                data_sectors,
+            });
+        }
+
+        Ok(Ti99Filesystem {
+            reader,
+            partition_offset,
+            geometry,
+            volume_label,
+            vib,
+            entries,
+        })
+    }
+
+    fn read_sector(&mut self, sector: u16, buf: &mut [u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + sector as u64 * SECTOR,
+        ))?;
+        self.reader.read_exact(buf)?;
+        Ok(())
+    }
+
+    fn bitmap_used(&self, sector: u16) -> bool {
+        let byte = BITMAP_OFF + (sector / 8) as usize;
+        byte < self.vib.len() && (self.vib[byte] >> (sector % 8)) & 1 != 0
+    }
+
+    fn used_sectors(&self) -> u64 {
+        (0..self.geometry.total_sectors)
+            .filter(|&s| self.bitmap_used(s))
+            .count() as u64
+    }
+
+    fn entry_to_file(&self, e: &Ti99Entry) -> FileEntry {
+        FileEntry::new_file(
+            e.name.clone(),
+            format!("/{}", e.name),
+            e.byte_size(),
+            e.fdr_sector as u64,
+        )
+    }
+}
+
+impl<R: Read + Seek + Send> Filesystem for Ti99Filesystem<R> {
+    fn root(&mut self) -> Result<FileEntry, FilesystemError> {
+        Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
+    }
+
+    fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        if !entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        if entry.path != "/" {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .entries
+            .clone()
+            .iter()
+            .map(|e| self.entry_to_file(e))
+            .collect())
+    }
+
+    fn read_file(
+        &mut self,
+        entry: &FileEntry,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        if entry.is_directory() {
+            return Err(FilesystemError::InvalidData(format!(
+                "TI-99 read_file on directory: {}",
+                entry.path
+            )));
+        }
+        let want = (entry.size as usize).min(max_bytes);
+        if want == 0 {
+            return Ok(Vec::new());
+        }
+        // Find the entry by its FDR sector (entry.location) to get the chain.
+        let sectors = self
+            .entries
+            .iter()
+            .find(|e| e.fdr_sector as u64 == entry.location)
+            .map(|e| e.data_sectors.clone())
+            .ok_or_else(|| FilesystemError::NotFound(entry.path.clone()))?;
+
+        let mut out = Vec::with_capacity(want);
+        let mut sec = [0u8; SECTOR as usize];
+        for s in sectors {
+            if out.len() >= want {
+                break;
+            }
+            self.read_sector(s, &mut sec)?;
+            let take = (want - out.len()).min(SECTOR as usize);
+            out.extend_from_slice(&sec[..take]);
+        }
+        Ok(out)
+    }
+
+    fn volume_label(&self) -> Option<&str> {
+        if self.volume_label.is_empty() {
+            None
+        } else {
+            Some(&self.volume_label)
+        }
+    }
+
+    fn fs_type(&self) -> &str {
+        "TI-99"
+    }
+
+    fn total_size(&self) -> u64 {
+        self.geometry.total_bytes()
+    }
+
+    fn used_size(&self) -> u64 {
+        self.used_sectors() * SECTOR
+    }
+
+    fn allocation_unit(&self) -> Option<u64> {
+        Some(SECTOR)
+    }
+
+    fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
+        let last = (0..self.geometry.total_sectors)
+            .rev()
+            .find(|&s| self.bitmap_used(s))
+            .map_or(FIRST_DATA, |s| s + 1);
+        Ok(last as u64 * SECTOR)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn oracle() -> Option<PathBuf> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ti99-oracle.py");
+        p.exists().then_some(p)
+    }
+
+    fn have_python() -> bool {
+        Command::new("python3").arg("--version").output().is_ok()
+    }
+
+    /// Build a TI-99 SSSD volume with the clean-room oracle + a couple of files.
+    fn oracle_volume() -> Option<Vec<u8>> {
+        let script = oracle()?;
+        if !have_python() {
+            return None;
+        }
+        let dir = std::env::temp_dir();
+        let vol = dir.join(format!("rb_ti99_{}.dsk", std::process::id()));
+        let volp = vol.to_str()?;
+        let run = |args: &[&str]| {
+            Command::new("python3")
+                .arg(&script)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !run(&["mkfs", volp, "sssd", "MYDISK"]) {
+            return None;
+        }
+        let small = dir.join(format!("rb_ti99_s_{}.bin", std::process::id()));
+        std::fs::write(&small, b"HELLO TI-99\n").ok()?;
+        let big = dir.join(format!("rb_ti99_b_{}.bin", std::process::id()));
+        std::fs::write(&big, vec![0x5Au8; 3000]).ok()?;
+        run(&["addfile", volp, "GREETING", small.to_str()?]);
+        run(&["addfile", volp, "BIGFILE", big.to_str()?]);
+        let bytes = std::fs::read(&vol).ok();
+        let _ = std::fs::remove_file(&vol);
+        let _ = std::fs::remove_file(&small);
+        let _ = std::fs::remove_file(&big);
+        bytes
+    }
+
+    #[test]
+    fn reads_oracle_volume() {
+        let Some(img) = oracle_volume() else {
+            eprintln!("skipping reads_oracle_volume: python3/oracle unavailable");
+            return;
+        };
+        let mut fs = Ti99Filesystem::open(Cursor::new(img), 0).expect("open oracle volume");
+        assert_eq!(fs.volume_label(), Some("MYDISK"));
+        assert_eq!(fs.total_size(), 360 * SECTOR); // SSSD = 90 KiB
+        let root = fs.root().unwrap();
+        let files = fs.list_directory(&root).unwrap();
+        let names: Vec<&str> = files.iter().map(|e| e.name.as_str()).collect();
+        // FDIR is alphabetically sorted.
+        assert_eq!(names, vec!["BIGFILE", "GREETING"], "{names:?}");
+
+        let big = files.iter().find(|e| e.name == "BIGFILE").unwrap();
+        assert_eq!(big.size, 3000);
+        let data = fs.read_file(big, usize::MAX).unwrap();
+        assert_eq!(data.len(), 3000);
+        assert!(data.iter().all(|&b| b == 0x5A));
+
+        let greet = files.iter().find(|e| e.name == "GREETING").unwrap();
+        assert_eq!(fs.read_file(greet, usize::MAX).unwrap(), b"HELLO TI-99\n");
+    }
+
+    #[test]
+    fn cluster_decode() {
+        // A 3-sector file starting at sector 34, single contiguous cluster:
+        // b0=0x22, b1=(0)|(2<<4)=0x20, b2=0.
+        let mut fdr = vec![0u8; SECTOR as usize];
+        fdr[FDR_CLUSTERS_OFF] = 0x22;
+        fdr[FDR_CLUSTERS_OFF + 1] = 0x20;
+        fdr[FDR_CLUSTERS_OFF + 2] = 0x00;
+        assert_eq!(walk_clusters(&fdr, 3), vec![34, 35, 36]);
+
+        // Two clusters: sectors 10,11 then 20,21,22 (file AUs 0..4).
+        // cluster A: start=10, last_off=1 -> b0=10,b1=(0)|(1<<4)=0x10,b2=0.
+        // cluster B: start=20, last_off=4 -> b0=20,b1=(0)|(4<<4)=0x40,b2=0.
+        let mut fdr2 = vec![0u8; SECTOR as usize];
+        fdr2[FDR_CLUSTERS_OFF..FDR_CLUSTERS_OFF + 6].copy_from_slice(&[10, 0x10, 0, 20, 0x40, 0]);
+        assert_eq!(walk_clusters(&fdr2, 5), vec![10, 11, 20, 21, 22]);
+    }
+
+    #[test]
+    fn rejects_non_ti99() {
+        assert!(looks_like_ti99(&mut Cursor::new(vec![0u8; 92160]), 0).is_none());
+        // DSK marker but an implausible geometry.
+        let mut img = vec![0u8; 92160];
+        img[0x0D..0x10].copy_from_slice(b"DSK");
+        img[0x0A..0x0C].copy_from_slice(&360u16.to_be_bytes());
+        img[0x0C] = 7; // invalid sectors/track
+        assert!(looks_like_ti99(&mut Cursor::new(img), 0).is_none());
+    }
+
+    /// Cross-check: the disk our oracle writes lists through MAME's imgtool.
+    #[test]
+    fn oracle_disk_reads_through_imgtool() {
+        let Some(script) = oracle() else {
+            return;
+        };
+        if !have_python() || Command::new("imgtool").arg("--version").output().is_err() {
+            eprintln!("skipping imgtool cross-check: imgtool/python unavailable");
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let vol = dir.join(format!("rb_ti99_im_{}.dsk", std::process::id()));
+        let volp = vol.to_str().unwrap();
+        let py = |args: &[&str]| {
+            Command::new("python3")
+                .arg(&script)
+                .args(args)
+                .output()
+                .expect("python3")
+                .status
+                .success()
+        };
+        assert!(py(&["mkfs", volp, "sssd", "IMGCHK"]));
+        let src = dir.join(format!("rb_ti99_src_{}.bin", std::process::id()));
+        std::fs::write(&src, vec![0x33u8; 500]).unwrap();
+        assert!(py(&["addfile", volp, "PROG", src.to_str().unwrap()]));
+        let out = Command::new("imgtool")
+            .args(["dir", "v9t9", volp])
+            .output()
+            .expect("imgtool");
+        let listing = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_file(&vol);
+        let _ = std::fs::remove_file(&src);
+        assert!(
+            out.status.success() && listing.contains("PROG"),
+            "imgtool did not list our oracle disk:\n{listing}"
+        );
+    }
+}

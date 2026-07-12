@@ -81,6 +81,7 @@ pub mod sfs;
 pub mod sfs_fsck;
 pub mod tar_export;
 pub mod tar_import;
+pub mod ti99;
 pub mod trdos;
 pub mod tree;
 pub mod ucsd;
@@ -454,6 +455,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // random same-sized blobs won't satisfy.
     if trdos::looks_like_trdos(reader, partition_offset).is_some() {
         return "trdos";
+    }
+
+    // TI-99/4A disk (flat V9T9 `.dsk`). The ASCII "DSK" marker at VIB offset
+    // 0x0D plus a self-consistent geometry is a confident signature; distinct
+    // from the CoCo/Dragon `.dsk` families even at a shared byte size.
+    if ti99::looks_like_ti99(reader, partition_offset).is_some() {
+        return "ti99";
     }
 
     // Sinclair QL QXL.WIN container: signature "QLWA" at byte 0.
@@ -1461,6 +1469,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "ti99" => Ok(Box::new(ti99::Ti99Filesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
@@ -2318,6 +2330,8 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             // TR-DOS (ZX Spectrum Beta Disk, flat .trd); auto-detected at the
             // disk-info sector (offset 0x800) as `trdos`.
             | "TR-DOS"
+            // TI-99/4A (flat V9T9 .dsk); auto-detected via the VIB "DSK" marker.
+            | "TI-99"
             | "Unknown"
     )
 }
