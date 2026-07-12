@@ -224,7 +224,7 @@ impl MinixSuperblock {
     }
 
     /// Size of one zone in bytes (`block_size << log_zone_size`).
-    fn zone_size(&self) -> u64 {
+    pub(crate) fn zone_size(&self) -> u64 {
         (self.block_size as u64) << self.log_zone_size
     }
 
@@ -339,7 +339,7 @@ impl MinixInode {
 
     /// A zeroed inode (all fields 0) — what a free inode slot must look like so
     /// the allocator reuses it.
-    fn empty(ino: u32) -> Self {
+    pub(crate) fn empty(ino: u32) -> Self {
         MinixInode {
             ino,
             mode: 0,
@@ -437,7 +437,7 @@ impl<R: Read + Seek> MinixFilesystem<R> {
         Ok(buf)
     }
 
-    fn read_inode(&mut self, ino: u32) -> Result<MinixInode, FilesystemError> {
+    pub(crate) fn read_inode(&mut self, ino: u32) -> Result<MinixInode, FilesystemError> {
         if ino == 0 || ino > self.sb.ninodes {
             return Err(FilesystemError::InvalidData(format!(
                 "Minix inode {ino} out of range (1..={})",
@@ -542,7 +542,7 @@ impl<R: Read + Seek> MinixFilesystem<R> {
     }
 
     /// Read up to `max_bytes` of an inode's data.
-    fn read_inode_data(
+    pub(crate) fn read_inode_data(
         &mut self,
         inode: &MinixInode,
         max_bytes: usize,
@@ -598,13 +598,87 @@ impl<R: Read + Seek> MinixFilesystem<R> {
         Ok(count)
     }
 
-    fn read_zone_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+    pub(crate) fn read_zone_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
         let bs = self.sb.block_size as u64;
         let start = (2 + self.sb.imap_blocks as u64) * bs;
         let len = (self.sb.zmap_blocks as u64 * bs) as usize;
         let mut buf = vec![0u8; len];
         self.read_at(start, &mut buf)?;
         Ok(buf)
+    }
+
+    pub(crate) fn read_inode_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
+        let len = (self.sb.imap_blocks as u64 * self.sb.block_size as u64) as usize;
+        let mut buf = vec![0u8; len];
+        self.read_at(self.imap_start(), &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Byte offset of the inode / zone bitmap regions.
+    pub(crate) fn imap_start(&self) -> u64 {
+        2 * self.sb.block_size as u64
+    }
+    pub(crate) fn zmap_start(&self) -> u64 {
+        (2 + self.sb.imap_blocks as u64) * self.sb.block_size as u64
+    }
+
+    /// Directory-entry inode-field width (4 on V3, else 2).
+    pub(crate) fn ino_field(&self) -> usize {
+        if self.sb.version == MinixVersion::V3 {
+            4
+        } else {
+            2
+        }
+    }
+
+    pub(crate) fn superblock(&self) -> &MinixSuperblock {
+        &self.sb
+    }
+
+    /// Every zone an inode occupies — data zones AND the indirect blocks
+    /// themselves — for fsck bitmap reconciliation.
+    pub(crate) fn inode_all_zones(
+        &mut self,
+        inode: &MinixInode,
+    ) -> Result<Vec<u32>, FilesystemError> {
+        let mut out = Vec::new();
+        for i in 0..DIRECT_ZONES {
+            if inode.zones[i] != 0 {
+                out.push(inode.zones[i]);
+            }
+        }
+        let per_inode = self.sb.zones_per_inode();
+        for (slot, level) in [(7usize, 1u32), (8, 2), (9, 3)] {
+            if slot < per_inode && inode.zones[slot] != 0 {
+                self.collect_indirect_zones(inode.zones[slot], level, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn collect_indirect_zones(
+        &mut self,
+        zone: u32,
+        level: u32,
+        out: &mut Vec<u32>,
+    ) -> Result<(), FilesystemError> {
+        if zone == 0 {
+            return Ok(());
+        }
+        out.push(zone); // the indirect block is itself an allocated zone
+        let block = self.read_zone(zone)?;
+        let per = self.sb.ptrs_per_zone() as usize;
+        for i in 0..per {
+            let ptr = self.read_ptr(&block, i);
+            if ptr != 0 {
+                if level == 1 {
+                    out.push(ptr);
+                } else {
+                    self.collect_indirect_zones(ptr, level - 1, out)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn entry_from_inode(&mut self, name: &str, parent_path: &str, inode: &MinixInode) -> FileEntry {
@@ -811,6 +885,10 @@ impl<R: Read + Seek + Send> Filesystem for MinixFilesystem<R> {
         let zone = self.highest_used_zone()?;
         Ok((zone as u64 + 1) * self.sb.zone_size())
     }
+
+    fn fsck(&mut self) -> Option<Result<super::fsck::FsckResult, FilesystemError>> {
+        Some(super::minix_fsck::fsck_minix(self))
+    }
 }
 
 // ---- Write primitives (edit stage) ----
@@ -822,7 +900,7 @@ impl<R: Read + Seek + Send> Filesystem for MinixFilesystem<R> {
 // write; the edit path operates on image files, so sub-block writes are fine.
 
 impl<R: Read + Write + Seek> MinixFilesystem<R> {
-    fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
+    pub(crate) fn write_at(&mut self, off: u64, data: &[u8]) -> Result<(), FilesystemError> {
         self.reader
             .seek(SeekFrom::Start(self.partition_offset + off))?;
         self.reader.write_all(data)?;
@@ -833,7 +911,7 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         self.write_at(zno as u64 * self.sb.zone_size(), data)
     }
 
-    fn write_inode(&mut self, inode: &MinixInode) -> Result<(), FilesystemError> {
+    pub(crate) fn write_inode(&mut self, inode: &MinixInode) -> Result<(), FilesystemError> {
         let raw = inode.serialize(self.sb.version);
         let off = self.sb.inode_table_block() * self.sb.block_size as u64
             + (inode.ino as u64 - 1) * self.sb.inode_size;
@@ -857,13 +935,6 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
             b[0] &= !(1 << (bit % 8));
         }
         self.write_at(byte_off, &b)
-    }
-
-    fn imap_start(&self) -> u64 {
-        2 * self.sb.block_size as u64
-    }
-    fn zmap_start(&self) -> u64 {
-        (2 + self.sb.imap_blocks as u64) * self.sb.block_size as u64
     }
 
     /// Allocate a free inode (imap bit clear, 1..=ninodes) and mark it used.
@@ -904,13 +975,6 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         self.set_bitmap_bit(self.zmap_start(), bit, false)?;
         self.used_zones = self.used_zones.saturating_sub(1);
         Ok(())
-    }
-
-    fn read_inode_bitmap(&mut self) -> Result<Vec<u8>, FilesystemError> {
-        let len = (self.sb.imap_blocks as u64 * self.sb.block_size as u64) as usize;
-        let mut buf = vec![0u8; len];
-        self.read_at(self.imap_start(), &mut buf)?;
-        Ok(buf)
     }
 
     fn write_ptr(&self, block: &mut [u8], idx: usize, zone: u32) {
@@ -1039,16 +1103,12 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
         self.free_zone(zone)
     }
 
-    fn ino_field(&self) -> usize {
-        if self.sb.version == MinixVersion::V3 {
-            4
-        } else {
-            2
-        }
-    }
-
     /// Return the child inode of `name` in `dir`, if present.
-    fn dir_find(&mut self, dir: &MinixInode, name: &[u8]) -> Result<Option<u32>, FilesystemError> {
+    pub(crate) fn dir_find(
+        &mut self,
+        dir: &MinixInode,
+        name: &[u8],
+    ) -> Result<Option<u32>, FilesystemError> {
         let data = self.read_inode_data(dir, dir.size as usize)?;
         let stride = self.sb.dir_entry_size;
         let ino_field = self.ino_field();
@@ -1101,7 +1161,7 @@ impl<R: Read + Write + Seek> MinixFilesystem<R> {
     /// Insert `name -> child` into `dir`, reusing a free slot or appending
     /// (growing the directory by a zone at a zone boundary). Mutates `dir`
     /// (size / zone slots); the caller writes it back.
-    fn dir_add(
+    pub(crate) fn dir_add(
         &mut self,
         dir: &mut MinixInode,
         name: &[u8],
@@ -1539,6 +1599,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.free_data_zones()? as u64 * self.sb.zone_size())
+    }
+
+    fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
+        super::minix_fsck::repair_minix(self)
     }
 }
 
@@ -2230,5 +2294,172 @@ mod tests {
     #[test]
     fn oracle_create_blank_v3() {
         oracle_create_blank(3, MinixVersion::V3);
+    }
+
+    // ---- fsck ----
+
+    #[test]
+    fn fsck_on_blank_is_clean() {
+        for mver in [MinixVersion::V1, MinixVersion::V2, MinixVersion::V3] {
+            let img = create_blank_minix(2 * 1024 * 1024, mver).unwrap();
+            let mut fs = MinixFilesystem::open(Cursor::new(img), 0).unwrap();
+            let r = crate::fs::minix_fsck::fsck_minix(&mut fs).unwrap();
+            assert!(r.is_clean(), "{mver:?} errors: {:?}", r.errors);
+            assert!(r.warnings.is_empty(), "{mver:?} warnings: {:?}", r.warnings);
+        }
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_link_count() {
+        let img = create_blank_minix(2 * 1024 * 1024, MinixVersion::V3).unwrap();
+        let mut fs = MinixFilesystem::open(Cursor::new(img), 0).unwrap();
+        let root = fs.root().unwrap();
+        fs.create_directory(&root, "d", &CreateDirectoryOptions::default())
+            .unwrap(); // root nlink should now be 3
+                       // Corrupt the root link count.
+        let mut ri = fs.read_inode(1).unwrap();
+        ri.nlinks = 9;
+        fs.write_inode(&ri).unwrap();
+
+        let res = crate::fs::minix_fsck::fsck_minix(&mut fs).unwrap();
+        assert!(
+            res.errors.iter().any(|e| e.code == "LinkCount"),
+            "expected a LinkCount error, got {:?}",
+            res.errors
+        );
+        let rep = crate::fs::minix_fsck::repair_minix(&mut fs).unwrap();
+        assert!(!rep.fixes_applied.is_empty());
+        let res2 = crate::fs::minix_fsck::fsck_minix(&mut fs).unwrap();
+        assert!(res2.is_clean(), "post-repair errors: {:?}", res2.errors);
+        assert_eq!(fs.read_inode(1).unwrap().nlinks, 3);
+    }
+
+    /// Forge a file orphan and a directory orphan, corrupt a bitmap + a link
+    /// count, then require repair to make the image `fsck.minix`-clean and the
+    /// orphans reachable under /lost+found.
+    fn oracle_repair_is_fsck_clean(version: u8, mver: MinixVersion) {
+        let (Some(mkfs), Some(fsck)) = (minix_tool("mkfs.minix"), minix_tool("fsck.minix")) else {
+            eprintln!("skipping oracle_repair_is_fsck_clean v{version}: util-linux not available");
+            return;
+        };
+        let img = std::env::temp_dir().join(format!(
+            "rb_minix_fsck_v{version}_{}.img",
+            std::process::id()
+        ));
+        std::fs::write(&img, vec![0u8; 2 * 1024 * 1024]).unwrap();
+        assert!(Command::new(&mkfs)
+            .arg(format!("-{version}"))
+            .arg(&img)
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        let stride = if mver == MinixVersion::V3 { 64 } else { 32 };
+        let ino_field = if mver == MinixVersion::V3 { 4 } else { 2 };
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut fs = MinixFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "keep.txt",
+                &mut &b"data"[..],
+                4,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+
+            // Forge a file orphan: allocate an inode + zone, write content, but
+            // never link it into a directory.
+            let f_ino = fs.alloc_inode().unwrap();
+            let f_zone = fs.alloc_zone().unwrap();
+            fs.write_zone(f_zone, &vec![0x11u8; 600]).unwrap();
+            let mut fi = MinixInode::empty(f_ino);
+            fi.mode = 0o100644;
+            fi.nlinks = 1;
+            fi.size = 600;
+            fi.zones[0] = f_zone;
+            fs.write_inode(&fi).unwrap();
+
+            // Forge a directory orphan (with "." / "..").
+            let d_ino = fs.alloc_inode().unwrap();
+            let d_zone = fs.alloc_zone().unwrap();
+            let mut zbuf = vec![0u8; 1024];
+            encode_dirent(&mut zbuf[0..stride], ino_field, d_ino, b".");
+            encode_dirent(&mut zbuf[stride..stride * 2], ino_field, ROOT_INO, b"..");
+            fs.write_zone(d_zone, &zbuf).unwrap();
+            let mut di = MinixInode::empty(d_ino);
+            di.mode = 0o040755;
+            di.nlinks = 2;
+            di.size = (stride * 2) as u32;
+            di.zones[0] = d_zone;
+            fs.write_inode(&di).unwrap();
+
+            // Corrupt a link count so the rebuild path runs.
+            let mut ri = fs.read_inode(ROOT_INO).unwrap();
+            ri.nlinks = 7;
+            fs.write_inode(&ri).unwrap();
+            fs.sync_metadata().unwrap();
+        }
+
+        // Repair.
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut fs = MinixFilesystem::open(file, 0).unwrap();
+            let rep = crate::fs::minix_fsck::repair_minix(&mut fs).unwrap();
+            assert_eq!(rep.unrepairable_count, 0, "unrepairable: {rep:?}");
+        }
+
+        // fsck.minix must call it clean.
+        let out = Command::new(&fsck)
+            .arg("-f")
+            .arg(&img)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            let log = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            let _ = std::fs::remove_file(&img);
+            panic!("fsck.minix flagged the repaired v{version} image:\n{log}");
+        }
+
+        // The orphans are now under /lost+found.
+        {
+            let file = std::fs::File::open(&img).unwrap();
+            let mut fs = MinixFilesystem::open(file, 0).unwrap();
+            let root = fs.root().unwrap();
+            let lf = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "lost+found")
+                .expect("lost+found created");
+            let adopted = fs.list_directory(&lf).unwrap();
+            assert_eq!(adopted.len(), 2, "v{version} adopted: {adopted:?}");
+        }
+        let _ = std::fs::remove_file(&img);
+    }
+
+    #[test]
+    fn oracle_repair_is_fsck_clean_v1() {
+        oracle_repair_is_fsck_clean(1, MinixVersion::V1);
+    }
+    #[test]
+    fn oracle_repair_is_fsck_clean_v2() {
+        oracle_repair_is_fsck_clean(2, MinixVersion::V2);
+    }
+    #[test]
+    fn oracle_repair_is_fsck_clean_v3() {
+        oracle_repair_is_fsck_clean(3, MinixVersion::V3);
     }
 }

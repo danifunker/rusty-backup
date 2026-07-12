@@ -71,7 +71,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | XFS (v4 / v5) | Auto | Yes (v4 edit) | Yes (v4) | No | Grow only (disk-layout + `xfs_growfs`) | check+repair | SGI IRIX 6.x, Linux |
 | JFS (JFS2) | Auto | Yes | **No** (read-only) | No | compaction | check+repair | IBM OS/2 Warp Server, AIX 5+, Linux JFS2 |
 | ReiserFS (v3.5 / v3.6) | Auto | Yes | **No** (read-only) | No | compaction | No | Linux, late-1990s → mid-2000s |
-| Minix (V1 / V2 / V3) | Auto | Yes | Yes | Yes | — | No | Minix, early Linux (pre-ext); edit + create fsck.minix-validated |
+| Minix (V1 / V2 / V3) | Auto | Yes | Yes | Yes | — | check+repair | Minix, early Linux (pre-ext); full quartet, fsck.minix-validated |
 | UFS / FFS (UFS1 / UFS2) | Auto | Yes | Yes | No | compaction | check+repair | 4.2/4.4BSD, FreeBSD, SunOS / Solaris, NeXTSTEP |
 
 > UFS is browse + edit (create / delete / rename) + fsck with repair (replica
@@ -123,10 +123,10 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | ANDOS | Auto / String | **Detect only** | Signature probe surfaces "ANDOS"; browse returns `Unsupported`. Soviet BK0011M / Elektronika BK |
 | Carve (raw recovery) | Fallback | Yes (synthetic) | Last-resort for unmountable / NDOS images: whole-disk blob + carved text/JSON runs + Amiga bootblock |
 
-**Totals:** ~30 filesystem drivers — **26 editable+wired**, **7 with an
-interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, UFS, XFS — all repair; JFS
-repairs by adopting orphaned inodes into `/lost+found`), **17 create-blank**,
-**2 detect-only scaffolds**, **1 recovery fallback**.
+**Totals:** ~30 filesystem drivers — **27 editable+wired**, **8 with an
+interactive fsck** (AFFS, EFS, HFS, HFS+, JFS, Minix, UFS, XFS — all repair;
+JFS and Minix repair by adopting orphaned inodes into `/lost+found`),
+**18 create-blank**, **2 detect-only scaffolds**, **1 recovery fallback**.
 
 ---
 

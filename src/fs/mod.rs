@@ -57,6 +57,7 @@ pub mod make_bootable;
 pub mod mem_archive;
 pub mod mfs;
 pub mod minix;
+pub mod minix_fsck;
 pub mod ntfs;
 pub mod ntfs_clone;
 pub mod ntfs_format;
