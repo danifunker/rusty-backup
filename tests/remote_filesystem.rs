@@ -9,9 +9,55 @@ use std::net::TcpListener;
 use std::sync::Arc;
 
 use rusty_backup::cli::resolve::resolve_partition_rw;
-use rusty_backup::fs::filesystem::{CreateFileOptions, Filesystem, ResourceForkSource};
+use rusty_backup::fs::filesystem::{
+    CreateDirectoryOptions, CreateFileOptions, Filesystem, ResourceForkSource,
+};
 use rusty_backup::fs::{fat, hfs, open_editable_filesystem};
 use rusty_backup::remote::{serve_on, RemoteConnection, RemoteFilesystem, RemoteHostFilesystem};
+
+/// Build an 8 MiB FAT image at `path` with `/TOP.BIN` and `/SUB/INNER.BIN`
+/// holding the given payloads — a small tree for the copy-out regression tests.
+fn make_fat_image_with_subtree(path: &std::path::Path, top: &[u8], inner: &[u8]) {
+    std::fs::write(
+        path,
+        fat::create_blank_fat(8 * 1024 * 1024, Some("SRCVOL")).unwrap(),
+    )
+    .unwrap();
+    let (file, ctx, commit) = resolve_partition_rw(path, None).unwrap();
+    let mut efs =
+        open_editable_filesystem(file, ctx.offset, ctx.type_byte, ctx.type_string.as_deref())
+            .unwrap();
+    let parent = efs.root().unwrap();
+    let mut d = top;
+    efs.create_file(
+        &parent,
+        "TOP.BIN",
+        &mut d,
+        top.len() as u64,
+        &CreateFileOptions::default(),
+    )
+    .unwrap();
+    efs.create_directory(&parent, "SUB", &CreateDirectoryOptions::default())
+        .unwrap();
+    let sub = efs
+        .list_directory(&parent)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name.eq_ignore_ascii_case("SUB"))
+        .unwrap();
+    let mut d2 = inner;
+    efs.create_file(
+        &sub,
+        "INNER.BIN",
+        &mut d2,
+        inner.len() as u64,
+        &CreateFileOptions::default(),
+    )
+    .unwrap();
+    efs.sync_metadata().unwrap();
+    drop(efs);
+    commit.commit().unwrap();
+}
 
 /// Build an 8 MiB FAT image at `path` with a single file `file_name` full of
 /// `byte` repeated `len` times, under volume label `vol`.
@@ -291,6 +337,195 @@ fn family_f_write_stages_file_and_dir_into_remote_image() {
     let mut got = Vec::new();
     rfs.write_file_to(copied, &mut got).unwrap();
     assert_eq!(got, payload, "uploaded bytes are byte-exact");
+}
+
+/// Regression test for the Commander async copy *out of* a remote image
+/// (`image -> image` with a remote source). A remote pane has no local
+/// `BrowseSession`, so `spawn_stage_copy` reopens the source on a fresh daemon
+/// connection off the UI thread (`StageSource::Remote`), extracts each file over
+/// the wire into temp blobs, and hands back the `StagedEdit`s for the
+/// destination queue — the same path that used to dead-end with "Source volume
+/// has no cached session". Proves the worker recreates the subtree byte-exact.
+#[test]
+fn remote_source_stage_copy_extracts_subtree_over_wire() {
+    use rusty_backup::fs::entry::FileEntry;
+    use rusty_backup::model::commander_ops::{spawn_stage_copy, StageSource};
+    use rusty_backup::model::edit_queue::StagedEdit;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    // Source remote image: /TOP.BIN and /SUB/INNER.BIN with known payloads.
+    let src_img = root.join("src.img");
+    let top_payload = vec![0x11u8; 4096];
+    let inner_payload = vec![0x22u8; 2048];
+    make_fat_image_with_subtree(&src_img, &top_payload, &inner_payload);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // What the GUI copies is the pane's selected entries — here the root's
+    // children, listed over the wire exactly as the pane's listing does.
+    let (mut rfs, root_entry, _children) = RemoteFilesystem::open(&addr, "/src.img", None).unwrap();
+    let entries = rfs.list_directory(&root_entry).unwrap();
+    assert_eq!(entries.len(), 2, "source root has TOP.BIN + SUB");
+
+    // Drive the async worker: it opens its OWN connection (StageSource::Remote),
+    // not the browse handle above.
+    let temp = tempfile::tempdir().unwrap();
+    let status = spawn_stage_copy(
+        StageSource::Remote {
+            addr: addr.clone(),
+            path: "/src.img".to_string(),
+            partition: None,
+        },
+        entries,
+        FileEntry::root(),
+        temp.path().to_path_buf(),
+        false,
+    );
+
+    // Poll to completion (the GUI does this each frame via poll_stage_copy).
+    let mut waited = 0;
+    loop {
+        if status.lock().unwrap().finished {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited += 1;
+        assert!(waited < 200, "remote stage copy did not finish in time");
+    }
+
+    let guard = status.lock().unwrap();
+    assert!(
+        guard.error.is_none(),
+        "remote stage copy errored: {:?}",
+        guard.error
+    );
+
+    // The staged edits recreate the subtree; blobs hold byte-exact content.
+    let mut found_top = false;
+    let mut found_sub = false;
+    let mut found_inner = false;
+    for edit in &guard.edits {
+        match edit {
+            StagedEdit::AddFile {
+                name,
+                host_path,
+                size,
+                ..
+            } if name.eq_ignore_ascii_case("TOP.BIN") => {
+                assert_eq!(
+                    std::fs::read(host_path).unwrap(),
+                    top_payload,
+                    "TOP.BIN blob"
+                );
+                assert_eq!(*size, top_payload.len() as u64);
+                found_top = true;
+            }
+            StagedEdit::AddFile {
+                name, host_path, ..
+            } if name.eq_ignore_ascii_case("INNER.BIN") => {
+                assert_eq!(
+                    std::fs::read(host_path).unwrap(),
+                    inner_payload,
+                    "INNER.BIN blob"
+                );
+                found_inner = true;
+            }
+            StagedEdit::CreateDirectory { name, .. } if name.eq_ignore_ascii_case("SUB") => {
+                found_sub = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        found_top && found_sub && found_inner,
+        "expected TOP.BIN + SUB + INNER.BIN staged from the remote source"
+    );
+}
+
+/// Regression test for the Commander async copy/export of a remote image *to a
+/// host folder* (`image -> host` with a remote source). Like the stage-copy
+/// case, a remote pane has no `BrowseSession`, so `HostCopyJob::ImageToHost`
+/// now carries a `StageSource` the worker reopens on a fresh daemon connection
+/// off the UI thread — the path that used to extract synchronously and block
+/// the UI. Proves the tree is written to disk byte-exact.
+#[test]
+fn remote_source_host_copy_extracts_tree_over_wire() {
+    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use rusty_backup::model::commander_ops::{spawn_host_copy, HostCopyJob, StageSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    let src_img = root.join("src.img");
+    let top_payload = vec![0x33u8; 4096];
+    let inner_payload = vec![0x44u8; 2048];
+    make_fat_image_with_subtree(&src_img, &top_payload, &inner_payload);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None);
+    });
+
+    // The pane's selected entries, listed over the wire.
+    let (mut rfs, root_entry, _children) = RemoteFilesystem::open(&addr, "/src.img", None).unwrap();
+    let entries = rfs.list_directory(&root_entry).unwrap();
+
+    // A host destination folder to extract into.
+    let dest = tempfile::tempdir().unwrap();
+    let dest_dir = dest.path().to_path_buf();
+
+    let status = spawn_host_copy(HostCopyJob::ImageToHost {
+        source: StageSource::Remote {
+            addr: addr.clone(),
+            path: "/src.img".to_string(),
+            partition: None,
+        },
+        entries,
+        dest_dir: dest_dir.clone(),
+        fork_mode: ResourceForkMode::DataForkOnly,
+    });
+
+    let mut waited = 0;
+    loop {
+        if status.lock().unwrap().finished {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        waited += 1;
+        assert!(waited < 200, "remote host copy did not finish in time");
+    }
+    let guard = status.lock().unwrap();
+    assert!(
+        guard.error.is_none(),
+        "remote host copy errored: {:?}",
+        guard.error
+    );
+    assert_eq!(guard.copied, 2, "two files extracted (TOP.BIN + INNER.BIN)");
+
+    // The tree landed on the host disk byte-exact.
+    let top = dest_dir.join("TOP.BIN");
+    let inner = dest_dir.join("SUB").join("INNER.BIN");
+    assert!(top.exists(), "TOP.BIN extracted to the host folder");
+    assert_eq!(
+        std::fs::read(&top).unwrap(),
+        top_payload,
+        "TOP.BIN byte-exact"
+    );
+    assert!(inner.exists(), "SUB/INNER.BIN extracted to the host folder");
+    assert_eq!(
+        std::fs::read(&inner).unwrap(),
+        inner_payload,
+        "INNER.BIN byte-exact"
+    );
 }
 
 /// Proves the core of "switch images without reconnecting": two images opened

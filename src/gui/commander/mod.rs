@@ -536,76 +536,73 @@ impl CommanderMode {
                 let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
                     return "Could not create a temp directory for the copy.".to_string();
                 };
-                // A wrapper-tree mount (a '+'-expanded container, e.g. a floppy
-                // image opened inline within the filesystem) has no BrowseSession,
-                // so the async worker can't reopen it. Extract synchronously
-                // through the live wrapper filesystem instead — mirroring the
-                // session-less image->host branch below. These are small (floppy)
-                // sources, so blocking the UI briefly is fine.
-                let Some(session) = src.session() else {
-                    let Some(src_fs) = src.fs_mut() else {
-                        return "Source volume is not open.".to_string();
-                    };
-                    return match commander_ops::stage_copy(
-                        src_fs,
-                        &entries,
-                        &dest_parent,
-                        &temp_dir,
-                        keep_dates,
-                    ) {
-                        Ok(edits) => {
-                            let n = dest.stage_edits(edits);
-                            format!(
-                                "Staged copy of {n} item(s) into the {other} pane. Apply to write."
-                            )
-                        }
-                        Err(e) => format!("Copy to the {other} pane failed: {e:#}"),
-                    };
-                };
-                self.pending_stage_copy = Some((
-                    from.other(),
-                    commander_ops::spawn_stage_copy(
-                        session,
-                        entries,
-                        dest_parent,
-                        temp_dir,
-                        keep_dates,
-                    ),
-                ));
-                self.progress_window.reset();
-                format!("Copying to the {other} pane...")
-            }
-            // image -> host: immediate extraction.
-            (false, true) => {
-                let dest_dir = PathBuf::from(&dest_parent.path);
-                // A remote image pane has no local BrowseSession (the threaded
-                // host-copy job needs one), so extract over the wire via its
-                // filesystem instead. Synchronous for now — fine for the small
-                // files this targets; large-file async is a follow-up.
-                if src.session().is_none() {
-                    let Some(src_fs) = src.fs_mut() else {
-                        return "Source volume is not open.".to_string();
-                    };
-                    return match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
-                        Ok(n) => {
-                            dest.reload_listing();
-                            format!("Copied {n} item(s) to the {other} folder.")
-                        }
-                        Err(e) => format!("Copy failed: {e}"),
-                    };
+                // A reopenable source (local session or remote image) runs on a
+                // worker with the same progress modal (percent + rate + ETA) —
+                // the worker reopens it off the UI thread.
+                if let Some(stage_source) = src.copy_stage_source() {
+                    self.pending_stage_copy = Some((
+                        from.other(),
+                        commander_ops::spawn_stage_copy(
+                            stage_source,
+                            entries,
+                            dest_parent,
+                            temp_dir,
+                            keep_dates,
+                        ),
+                    ));
+                    self.progress_window.reset();
+                    return format!("Copying to the {other} pane...");
                 }
-                let Some(session) = src.session() else {
+                // No reopenable handle: a wrapper-tree mount (a '+'-expanded
+                // container, e.g. a floppy opened inline). It's a small, local
+                // source, so extract synchronously through its live fs and stage
+                // the result — mirroring the session-less image->host branch below.
+                let Some(src_fs) = src.fs_mut() else {
                     return "Source volume is not open.".to_string();
                 };
-                let job = HostCopyJob::ImageToHost {
-                    session,
-                    entries,
-                    dest_dir,
-                    fork_mode,
+                match commander_ops::stage_copy(
+                    src_fs,
+                    &entries,
+                    &dest_parent,
+                    &temp_dir,
+                    keep_dates,
+                ) {
+                    Ok(edits) => {
+                        let n = dest.stage_edits(edits);
+                        format!("Staged copy of {n} item(s) into the {other} pane. Apply to write.")
+                    }
+                    Err(e) => format!("Copy to the {other} pane failed: {e:#}"),
+                }
+            }
+            // image -> host: immediate extraction on a worker thread.
+            (false, true) => {
+                let dest_dir = PathBuf::from(&dest_parent.path);
+                // A reopenable source (local session or remote image) extracts on
+                // a worker with the same progress modal as any host copy. The
+                // completion poll re-lists the destination pane.
+                if let Some(source) = src.copy_stage_source() {
+                    let job = HostCopyJob::ImageToHost {
+                        source,
+                        entries,
+                        dest_dir,
+                        fork_mode,
+                    };
+                    self.pending_host_copy =
+                        Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
+                    return format!("Copying to the {other} folder...");
+                }
+                // No reopenable handle: a wrapper-tree mount (small, local) —
+                // extract synchronously over its live fs.
+                let Some(src_fs) = src.fs_mut() else {
+                    return "Source volume is not open.".to_string();
                 };
-                self.pending_host_copy =
-                    Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
-                format!("Copying to the {other} folder...")
+                match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
+                    Ok(n) => {
+                        dest.reload_listing();
+                        format!("Copied {n} item(s) to the {other} folder.")
+                    }
+                    Err(e) => format!("Copy failed: {e}"),
+                }
             }
             // host -> host: immediate filesystem copy on a worker thread.
             (true, true) => {
@@ -648,31 +645,29 @@ impl CommanderMode {
                 from.label()
             );
         }
-        // A remote image pane has no local BrowseSession, so extract over the
-        // wire synchronously (same path the cross-pane remote copy uses).
-        if src.session().is_none() {
-            let Some(src_fs) = src.fs_mut() else {
-                return "Source volume is not open.".to_string();
+        // A reopenable source (local session or remote image) extracts on a
+        // worker with progress; a wrapper-tree mount (small, local) has no
+        // reopenable handle, so extract synchronously over its live fs.
+        if let Some(source) = src.copy_stage_source() {
+            let job = HostCopyJob::ImageToHost {
+                source,
+                entries,
+                dest_dir,
+                fork_mode,
             };
-            return match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
-                Ok(n) => format!("Exported {n} item(s) to {}.", dest_dir.display()),
-                Err(e) => format!("Export failed: {e}"),
-            };
+            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
+            return format!(
+                "Exporting the {} pane selection to the host folder...",
+                from.label()
+            );
         }
-        let Some(session) = src.session() else {
+        let Some(src_fs) = src.fs_mut() else {
             return "Source volume is not open.".to_string();
         };
-        let job = HostCopyJob::ImageToHost {
-            session,
-            entries,
-            dest_dir,
-            fork_mode,
-        };
-        self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
-        format!(
-            "Exporting the {} pane selection to the host folder...",
-            from.label()
-        )
+        match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
+            Ok(n) => format!("Exported {n} item(s) to {}.", dest_dir.display()),
+            Err(e) => format!("Export failed: {e}"),
+        }
     }
 
     /// Poll an in-flight immediate host copy; on completion, re-list the
@@ -852,11 +847,10 @@ impl CommanderMode {
 
         let job = if src.is_host_pane() {
             ChecksumJob::Host { entries }
+        } else if let Some(source) = src.copy_stage_source() {
+            ChecksumJob::Image { source, entries }
         } else {
-            let Some(session) = src.session() else {
-                return "Source volume is not open.".to_string();
-            };
-            ChecksumJob::Image { session, entries }
+            return "Source volume is not open.".to_string();
         };
         let title = if file_count == 1 {
             "Checksums".to_string()
