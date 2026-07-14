@@ -59,11 +59,65 @@ impl OpticalFilesystem {
     }
 
     /// Look up the cached opticaldiscs entry for one of our entries' paths.
-    fn opt_entry(&self, path: &str) -> Result<OptEntry, FilesystemError> {
-        self.by_path
-            .get(path)
-            .cloned()
-            .ok_or_else(|| FilesystemError::NotFound(path.to_string()))
+    ///
+    /// The cache fills lazily as directories are listed, so a path is present
+    /// only after its parent has been listed *on this instance*. That holds for
+    /// interactive browsing, but not when an entry produced by a *different*
+    /// instance is handed back to a fresh one — which is exactly what the
+    /// Commander async copy/checksum workers do: they reopen the disc on a
+    /// worker thread and call `write_file_to` / `list_directory` with entries
+    /// captured from the live pane's filesystem. On a cache miss we resolve the
+    /// path by walking from the root, listing each directory along the way so
+    /// `by_path` back-fills and the lookup succeeds.
+    fn opt_entry(&mut self, path: &str) -> Result<OptEntry, FilesystemError> {
+        if let Some(e) = self.by_path.get(path) {
+            return Ok(e.clone());
+        }
+        self.resolve_from_root(path)
+    }
+
+    /// Walk from the disc root toward `target`, listing each directory on the
+    /// way so its children land in `by_path`, and return the entry once its
+    /// path matches. Errors with [`FilesystemError::NotFound`] if the path
+    /// doesn't exist. Path strings are compared whole (never split on `/`) so a
+    /// filename containing a slash — legal on HFS — still resolves.
+    fn resolve_from_root(&mut self, target: &str) -> Result<OptEntry, FilesystemError> {
+        let root = self
+            .inner
+            .root()
+            .map_err(|e| FilesystemError::Parse(format!("disc root: {e}")))?;
+        self.by_path.insert(root.path.clone(), root.clone());
+        if root.path == target {
+            return Ok(root);
+        }
+        let mut current = root;
+        loop {
+            let kids = self
+                .inner
+                .list_directory(&current)
+                .map_err(|e| FilesystemError::Parse(format!("list '{}': {e}", current.path)))?;
+            // The child that is `target` itself, or a directory whose path is a
+            // `/`-delimited prefix of `target` (the next hop toward it).
+            let mut next: Option<OptEntry> = None;
+            for k in kids {
+                let is_target = k.path == target;
+                let is_ancestor = matches!(k.entry_type, OptType::Directory)
+                    && target.len() > k.path.len()
+                    && target.as_bytes().get(k.path.len()) == Some(&b'/')
+                    && target.starts_with(&k.path);
+                self.by_path.insert(k.path.clone(), k.clone());
+                if is_target {
+                    return Ok(k);
+                }
+                if is_ancestor {
+                    next = Some(k);
+                }
+            }
+            match next {
+                Some(dir) => current = dir,
+                None => return Err(FilesystemError::NotFound(target.to_string())),
+            }
+        }
     }
 }
 
@@ -188,5 +242,178 @@ impl Filesystem for OpticalFilesystem {
 
     fn used_size(&self) -> u64 {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opticaldiscs::browse::filesystem::FilesystemError as OptError;
+
+    /// A fixed in-memory disc tree resolved purely by `location` (a node index),
+    /// exactly as the real opticaldiscs backends resolve HFS/ISO entries. The
+    /// point is that the *inner* fs needs no priming — only our `by_path` cache
+    /// did, which is the bug under test.
+    struct MockDisc {
+        nodes: Vec<MockNode>,
+    }
+    struct MockNode {
+        entry: OptEntry,
+        children: Vec<usize>,
+        data: Vec<u8>,
+        rsrc: Option<Vec<u8>>,
+    }
+
+    fn mock_disc() -> MockDisc {
+        // /                      (0)
+        //   sub/                 (1)
+        //     deep.txt           (2)  data="hello"
+        //     rsrconly           (3)  data="", rsrc="RSRC"
+        let root = OptEntry::new_directory("".into(), "/".into(), 0);
+        let sub = OptEntry::new_directory("sub".into(), "/sub".into(), 1);
+        let deep = OptEntry::new_file("deep.txt".into(), "/sub/deep.txt".into(), 5, 2);
+        let mut rsrconly = OptEntry::new_file("rsrconly".into(), "/sub/rsrconly".into(), 0, 3);
+        rsrconly.resource_fork_size = Some(4);
+        MockDisc {
+            nodes: vec![
+                MockNode {
+                    entry: root,
+                    children: vec![1],
+                    data: vec![],
+                    rsrc: None,
+                },
+                MockNode {
+                    entry: sub,
+                    children: vec![2, 3],
+                    data: vec![],
+                    rsrc: None,
+                },
+                MockNode {
+                    entry: deep,
+                    children: vec![],
+                    data: b"hello".to_vec(),
+                    rsrc: None,
+                },
+                MockNode {
+                    entry: rsrconly,
+                    children: vec![],
+                    data: vec![],
+                    rsrc: Some(b"RSRC".to_vec()),
+                },
+            ],
+        }
+    }
+
+    impl OptFilesystem for MockDisc {
+        fn root(&mut self) -> Result<OptEntry, OptError> {
+            Ok(self.nodes[0].entry.clone())
+        }
+        fn list_directory(&mut self, entry: &OptEntry) -> Result<Vec<OptEntry>, OptError> {
+            let n = &self.nodes[entry.location as usize];
+            Ok(n.children
+                .iter()
+                .map(|&i| self.nodes[i].entry.clone())
+                .collect())
+        }
+        fn read_file(&mut self, entry: &OptEntry) -> Result<Vec<u8>, OptError> {
+            Ok(self.nodes[entry.location as usize].data.clone())
+        }
+        fn read_file_range(
+            &mut self,
+            entry: &OptEntry,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, OptError> {
+            let d = &self.nodes[entry.location as usize].data;
+            let start = (offset as usize).min(d.len());
+            let end = (start + length).min(d.len());
+            Ok(d[start..end].to_vec())
+        }
+        fn read_resource_fork(&mut self, entry: &OptEntry) -> Result<Option<Vec<u8>>, OptError> {
+            Ok(self.nodes[entry.location as usize].rsrc.clone())
+        }
+        fn read_resource_fork_range(
+            &mut self,
+            entry: &OptEntry,
+            offset: u64,
+            length: usize,
+        ) -> Result<Option<Vec<u8>>, OptError> {
+            Ok(self.nodes[entry.location as usize].rsrc.as_ref().map(|r| {
+                let start = (offset as usize).min(r.len());
+                let end = (start + length).min(r.len());
+                r[start..end].to_vec()
+            }))
+        }
+        fn volume_name(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    /// Build an `OpticalFilesystem` the way `open()` leaves it: inner mounted,
+    /// only the root cached in `by_path` — no directory listed yet.
+    fn fresh(disc: MockDisc) -> OpticalFilesystem {
+        let root = disc.nodes[0].entry.clone();
+        let mut by_path = HashMap::new();
+        by_path.insert(root.path.clone(), root);
+        OpticalFilesystem {
+            inner: Box::new(disc),
+            by_path,
+            label: None,
+            fs_type: "MockHfs".into(),
+        }
+    }
+
+    /// Regression: the Commander async copy reopens the disc fresh (only root
+    /// cached) and hands it a deep entry captured from the live pane. Reads must
+    /// still resolve — before the fix `opt_entry` returned NotFound on the miss.
+    #[test]
+    fn fresh_fs_resolves_deep_entry_without_prior_listing() {
+        // A deep file entry as the live pane would have produced it.
+        let deep = FileEntry::new_file("deep.txt".into(), "/sub/deep.txt".into(), 5, 2);
+
+        let mut fs = fresh(mock_disc());
+        let mut out = Vec::new();
+        let n = fs
+            .write_file_to(&deep, &mut out)
+            .expect("write_file_to must resolve a deep entry on a fresh instance");
+        assert_eq!(n, 5);
+        assert_eq!(out, b"hello");
+
+        // read_file too.
+        let mut fs = fresh(mock_disc());
+        assert_eq!(fs.read_file(&deep, usize::MAX).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn fresh_fs_resolves_deep_resource_fork() {
+        let rf = FileEntry::new_file("rsrconly".into(), "/sub/rsrconly".into(), 0, 3);
+        let mut fs = fresh(mock_disc());
+        let mut out = Vec::new();
+        let n = fs.write_resource_fork_to(&rf, &mut out).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(out, b"RSRC");
+    }
+
+    #[test]
+    fn fresh_fs_lists_deep_directory_without_prior_listing() {
+        let sub = FileEntry::new_directory("sub".into(), "/sub".into(), 1);
+        let mut fs = fresh(mock_disc());
+        let kids = fs
+            .list_directory(&sub)
+            .expect("list_directory must resolve a deep dir on a fresh instance");
+        let names: Vec<_> = kids.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["deep.txt", "rsrconly"]);
+    }
+
+    #[test]
+    fn genuinely_missing_path_still_errors() {
+        let ghost = FileEntry::new_file("ghost".into(), "/sub/ghost".into(), 1, 99);
+        let mut fs = fresh(mock_disc());
+        let mut out = Vec::new();
+        let err = fs.write_file_to(&ghost, &mut out).unwrap_err();
+        assert!(
+            matches!(err, FilesystemError::NotFound(ref p) if p == "/sub/ghost"),
+            "a path that does not exist should still be NotFound, got {err:?}"
+        );
     }
 }
