@@ -400,7 +400,13 @@ impl WireDevice {
 // optical-built daemon link that crate).
 // ---------------------------------------------------------------------------
 
-/// Sector read mode — serde mirror of `cd_da_reader::SectorReadMode`.
+/// Sector read format — serde mirror of `cd_da_reader::SectorReadFormat`.
+///
+/// Only the three formats the rip pipeline uses have a wire encoding: audio,
+/// cooked Mode 1 (`DataCooked` == `Mode1Cooked`), and raw Mode 1 (`DataRaw` ==
+/// `Mode1Raw`). The variant names are kept stable so the on-wire JSON does not
+/// change across the 1.0 upgrade. `SectorReadFormat::Mode2Raw` has no wire
+/// encoding — rusty-backup's rip never emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireSectorMode {
     Audio,
@@ -438,6 +444,12 @@ pub struct WireToc {
 
 /// Read-retry policy sent at `OpenOptical` and applied daemon-side — serde
 /// mirror of `cd_da_reader::RetryConfig`.
+///
+/// The crate's own `RetryConfig` fields became private (builder-only) in the
+/// 1.0 API, so this DTO is now the owner of the wire representation: the daemon
+/// rebuilds a `RetryConfig` from it via the `From` impl below, and the client
+/// sends [`WireRetryConfig::default`] (which mirrors `RetryConfig::default`)
+/// since that is the only policy the rip pipeline uses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireRetryConfig {
     pub max_attempts: u8,
@@ -445,6 +457,20 @@ pub struct WireRetryConfig {
     pub max_backoff_ms: u64,
     pub reduce_chunk_on_retry: bool,
     pub min_sectors_per_read: u32,
+}
+
+impl Default for WireRetryConfig {
+    /// Mirrors `cd_da_reader::RetryConfig::default()` (4 attempts, 20 ms initial
+    /// backoff, 300 ms max backoff, adaptive chunk reduction, 1-sector floor).
+    fn default() -> Self {
+        Self {
+            max_attempts: 4,
+            initial_backoff_ms: 20,
+            max_backoff_ms: 300,
+            reduce_chunk_on_retry: true,
+            min_sectors_per_read: 1,
+        }
+    }
 }
 
 /// A physical optical drive on the daemon machine — the remote arm of the
@@ -504,47 +530,41 @@ mod optical_conv {
         }
     }
 
-    impl From<cd_da_reader::SectorReadMode> for WireSectorMode {
-        fn from(m: cd_da_reader::SectorReadMode) -> Self {
+    impl From<cd_da_reader::SectorReadFormat> for WireSectorMode {
+        fn from(m: cd_da_reader::SectorReadFormat) -> Self {
             match m {
-                cd_da_reader::SectorReadMode::Audio => WireSectorMode::Audio,
-                cd_da_reader::SectorReadMode::DataCooked => WireSectorMode::DataCooked,
-                cd_da_reader::SectorReadMode::DataRaw => WireSectorMode::DataRaw,
+                cd_da_reader::SectorReadFormat::Audio => WireSectorMode::Audio,
+                cd_da_reader::SectorReadFormat::Mode1Cooked => WireSectorMode::DataCooked,
+                // The rip pipeline only ever reads raw Mode 1 for data tracks;
+                // Mode 2 raw has no wire encoding, so fold it into DataRaw (both
+                // are 2352-byte raw reads) to keep the conversion total.
+                cd_da_reader::SectorReadFormat::Mode1Raw
+                | cd_da_reader::SectorReadFormat::Mode2Raw => WireSectorMode::DataRaw,
             }
         }
     }
 
-    impl From<WireSectorMode> for cd_da_reader::SectorReadMode {
+    impl From<WireSectorMode> for cd_da_reader::SectorReadFormat {
         fn from(m: WireSectorMode) -> Self {
             match m {
-                WireSectorMode::Audio => cd_da_reader::SectorReadMode::Audio,
-                WireSectorMode::DataCooked => cd_da_reader::SectorReadMode::DataCooked,
-                WireSectorMode::DataRaw => cd_da_reader::SectorReadMode::DataRaw,
-            }
-        }
-    }
-
-    impl From<&cd_da_reader::RetryConfig> for WireRetryConfig {
-        fn from(c: &cd_da_reader::RetryConfig) -> Self {
-            Self {
-                max_attempts: c.max_attempts,
-                initial_backoff_ms: c.initial_backoff_ms,
-                max_backoff_ms: c.max_backoff_ms,
-                reduce_chunk_on_retry: c.reduce_chunk_on_retry,
-                min_sectors_per_read: c.min_sectors_per_read,
+                WireSectorMode::Audio => cd_da_reader::SectorReadFormat::Audio,
+                WireSectorMode::DataCooked => cd_da_reader::SectorReadFormat::Mode1Cooked,
+                WireSectorMode::DataRaw => cd_da_reader::SectorReadFormat::Mode1Raw,
             }
         }
     }
 
     impl From<&WireRetryConfig> for cd_da_reader::RetryConfig {
         fn from(c: &WireRetryConfig) -> Self {
-            cd_da_reader::RetryConfig {
-                max_attempts: c.max_attempts,
-                initial_backoff_ms: c.initial_backoff_ms,
-                max_backoff_ms: c.max_backoff_ms,
-                reduce_chunk_on_retry: c.reduce_chunk_on_retry,
-                min_sectors_per_read: c.min_sectors_per_read,
-            }
+            // RetryConfig's fields are private in 1.0; rebuild it through the
+            // builder API instead of a struct literal.
+            use std::time::Duration;
+            cd_da_reader::RetryConfig::default()
+                .with_max_attempts(c.max_attempts)
+                .with_initial_backoff(Duration::from_millis(c.initial_backoff_ms))
+                .with_max_backoff(Duration::from_millis(c.max_backoff_ms))
+                .with_chunk_reduction(c.reduce_chunk_on_retry)
+                .with_min_sectors_per_read(c.min_sectors_per_read)
         }
     }
 
@@ -552,7 +572,8 @@ mod optical_conv {
         fn from(d: &cd_da_reader::DriveInfo) -> Self {
             Self {
                 device_path: d.path.clone(),
-                display_name: d.display_name.clone().unwrap_or_else(|| d.path.clone()),
+                // DriveInfo no longer carries a display name in 1.0; use the path.
+                display_name: d.path.clone(),
                 has_audio_cd: d.has_audio_cd,
             }
         }
@@ -1329,11 +1350,14 @@ mod tests {
             WireSectorMode::DataCooked,
             WireSectorMode::DataRaw,
         ] {
-            let native: cd_da_reader::SectorReadMode = m.into();
+            let native: cd_da_reader::SectorReadFormat = m.into();
             let back: WireSectorMode = native.into();
             assert_eq!(m, back);
         }
 
+        // RetryConfig is one-way now (its fields are private in 1.0, so there is
+        // no read-back conversion). Verify the wire values land in the rebuilt
+        // native config via its Debug output.
         let retry = WireRetryConfig {
             max_attempts: 3,
             initial_backoff_ms: 10,
@@ -1342,8 +1366,12 @@ mod tests {
             min_sectors_per_read: 2,
         };
         let native: cd_da_reader::RetryConfig = (&retry).into();
-        let back: WireRetryConfig = (&native).into();
-        assert_eq!(format!("{retry:?}"), format!("{back:?}"));
+        let dbg = format!("{native:?}");
+        assert!(dbg.contains("max_attempts: 3"), "{dbg}");
+        assert!(dbg.contains("10ms"), "{dbg}");
+        assert!(dbg.contains("200ms"), "{dbg}");
+        assert!(dbg.contains("reduce_chunk_on_retry: false"), "{dbg}");
+        assert!(dbg.contains("min_sectors_per_read: 2"), "{dbg}");
     }
 
     /// The resume-map reply's skip flag + entries round-trip (7h).

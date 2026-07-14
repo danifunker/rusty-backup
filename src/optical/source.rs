@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use cd_da_reader::{CdReader, RetryConfig, SectorReadMode, Toc};
+use cd_da_reader::{CdReader, ReadOptions, RetryConfig, SectorReadFormat, Toc};
 
 /// A source of optical-disc sectors. The three methods are the entire physical
 /// surface the rip pipeline needs, so an implementor can be a locally-attached
@@ -21,10 +21,10 @@ pub trait OpticalSource {
     /// Read the disc's table of contents.
     fn read_toc(&self) -> Result<Toc>;
 
-    /// Read `count` sectors starting at `lba` in the given mode. Retry / backoff
+    /// Read `count` sectors starting at `lba` in the given format. Retry / backoff
     /// is configured when the source is opened (kept next to the drive for the
     /// remote case), so it is intentionally not a parameter here.
-    fn read_data_sectors(&self, lba: u32, count: u32, mode: SectorReadMode) -> Result<Vec<u8>>;
+    fn read_data_sectors(&self, lba: u32, count: u32, format: SectorReadFormat) -> Result<Vec<u8>>;
 
     /// Eject the disc.
     fn eject(&self) -> Result<()>;
@@ -46,7 +46,7 @@ impl LocalCdReader {
 
     /// Open `device_path` with an explicit retry policy.
     pub fn with_retry(device_path: &str, retry: RetryConfig) -> Result<Self> {
-        let inner = CdReader::open(device_path)
+        let inner = CdReader::open_path(device_path)
             .with_context(|| format!("Failed to open drive: {device_path}"))?;
         Ok(Self {
             inner,
@@ -61,9 +61,12 @@ impl OpticalSource for LocalCdReader {
         self.inner.read_toc().map_err(anyhow::Error::from)
     }
 
-    fn read_data_sectors(&self, lba: u32, count: u32, mode: SectorReadMode) -> Result<Vec<u8>> {
+    fn read_data_sectors(&self, lba: u32, count: u32, format: SectorReadFormat) -> Result<Vec<u8>> {
+        let options = ReadOptions::default()
+            .with_format(format)
+            .with_retry(self.retry.clone());
         self.inner
-            .read_data_sectors(lba, count, mode, &self.retry)
+            .read_sector_range(lba, count, &options)
             .map_err(anyhow::Error::from)
     }
 
@@ -81,7 +84,7 @@ mod remote_source {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use anyhow::{anyhow, Context, Result};
-    use cd_da_reader::{RetryConfig, SectorReadMode, Toc};
+    use cd_da_reader::{SectorReadFormat, Toc};
 
     use super::OpticalSource;
     use crate::remote::connection::RemoteConnection;
@@ -98,12 +101,12 @@ mod remote_source {
         pub fn open(
             conn: Arc<Mutex<RemoteConnection>>,
             device_path: &str,
-            retry: RetryConfig,
+            retry: WireRetryConfig,
         ) -> Result<Self> {
             let handle = conn
                 .lock()
                 .map_err(|_| anyhow!("remote connection lock poisoned"))?
-                .open_optical(device_path, WireRetryConfig::from(&retry))
+                .open_optical(device_path, retry)
                 .with_context(|| format!("opening remote optical drive {device_path}"))?;
             Ok(Self { conn, handle })
         }
@@ -121,9 +124,14 @@ mod remote_source {
             Ok(Toc::from(&wire))
         }
 
-        fn read_data_sectors(&self, lba: u32, count: u32, mode: SectorReadMode) -> Result<Vec<u8>> {
+        fn read_data_sectors(
+            &self,
+            lba: u32,
+            count: u32,
+            format: SectorReadFormat,
+        ) -> Result<Vec<u8>> {
             self.lock()?
-                .read_optical_sectors(self.handle, lba, count, WireSectorMode::from(mode))
+                .read_optical_sectors(self.handle, lba, count, WireSectorMode::from(format))
         }
 
         fn eject(&self) -> Result<()> {
