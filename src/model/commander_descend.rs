@@ -229,6 +229,49 @@ pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn File
     anyhow::bail!("this build was compiled without optical-disc support")
 }
 
+/// A recipe to reopen a browsable source *fresh* on a worker thread — for
+/// sources that have no reusable [`BrowseSession`](crate::model::browse_session::BrowseSession)
+/// (a Mac archive opened in-pane, or an inline-expanded disk-image / optical
+/// wrapper mount). Cloning is cheap (paths + a label); each `open()` builds an
+/// independent filesystem, so a copy / checksum worker never touches the pane's
+/// live handle.
+///
+/// The referenced path must outlive the recipe: for a wrapper mount that is the
+/// materialized temp file the mount keeps alive; for a top-level archive it is
+/// the real source file on disk.
+#[derive(Clone)]
+pub enum ReopenRecipe {
+    /// Reopen a Mac / host archive by file path.
+    Archive {
+        path: PathBuf,
+        label: Option<String>,
+    },
+    /// Reopen a disk-image container's first browsable volume by path.
+    DiskImage { path: PathBuf },
+    /// Reopen an optical disc image by path.
+    Optical {
+        path: PathBuf,
+        label: Option<String>,
+    },
+}
+
+impl ReopenRecipe {
+    /// Open a fresh owned filesystem from this recipe (called on the worker).
+    pub fn open(&self) -> Result<Box<dyn Filesystem>> {
+        match self {
+            ReopenRecipe::Archive { path, label } => open_archive(path, label.clone()),
+            ReopenRecipe::DiskImage { path } => {
+                let parts = browsable_partitions(path)?;
+                let (_, first) = parts.first().ok_or_else(|| {
+                    anyhow::anyhow!("'{}' has no browsable volumes", path.display())
+                })?;
+                open_image_partition(path, first)
+            }
+            ReopenRecipe::Optical { path, label } => open_optical(path, label.clone()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +334,81 @@ mod tests {
         let kids = fs.list_directory(&root).unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0].name, "hi.txt");
+    }
+
+    /// A `ReopenRecipe::Archive` reopens the same archive fresh each call — the
+    /// property a copy / checksum worker relies on (independent handle, no touch
+    /// of the pane's live fs).
+    #[test]
+    fn reopen_recipe_reopens_archive_by_path_repeatedly() {
+        use crate::macarchive::stuffit::{
+            build_archive_tree, StuffItInput, StuffItInputNode, WriteMethod,
+        };
+        let tree = vec![StuffItInputNode::File(StuffItInput {
+            name: "hi.txt".into(),
+            type_code: *b"TEXT",
+            creator_code: *b"ttxt",
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: b"payload".to_vec(),
+            resource_fork: Vec::new(),
+        })];
+        let bytes = build_archive_tree(&tree, WriteMethod::Store).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.sit");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let recipe = ReopenRecipe::Archive {
+            path: path.clone(),
+            label: Some("a.sit".into()),
+        };
+        for _ in 0..2 {
+            let mut fs = recipe.open().unwrap();
+            let root = fs.root().unwrap();
+            let kids = fs.list_directory(&root).unwrap();
+            assert_eq!(kids.len(), 1);
+            assert_eq!(kids[0].name, "hi.txt");
+        }
+    }
+
+    /// A `ReopenRecipe::DiskImage` reopens a nested disk image's first volume by
+    /// path — the inline-`+`-expanded CD-ROM / hard-disk-image copy path.
+    #[test]
+    fn reopen_recipe_reopens_disk_image_by_path() {
+        use crate::fs::filesystem::CreateFileOptions;
+        use crate::fs::{fat, open_editable_filesystem};
+
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        std::fs::write(
+            &img,
+            fat::create_blank_fat(2 * 1024 * 1024, Some("VOL")).unwrap(),
+        )
+        .unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut efs = open_editable_filesystem(f, 0, 0x01, None).unwrap();
+            let root = efs.root().unwrap();
+            let mut d = &b"hello"[..];
+            efs.create_file(&root, "HELLO.TXT", &mut d, 5, &CreateFileOptions::default())
+                .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        let recipe = ReopenRecipe::DiskImage { path: img.clone() };
+        let mut fs = recipe.open().expect("reopen nested disk image");
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        assert!(
+            kids.iter()
+                .any(|e| e.name.eq_ignore_ascii_case("HELLO.TXT")),
+            "reopened volume lists its file: {:?}",
+            kids.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
     }
 }

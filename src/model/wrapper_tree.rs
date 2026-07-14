@@ -67,6 +67,11 @@ const SEP: char = '\u{1}';
 struct Mount {
     fs: Box<dyn Filesystem>,
     _temp: Option<tempfile::TempDir>,
+    /// How to reopen this mount's filesystem fresh on a worker thread (copy /
+    /// checksum off the UI thread). `None` for archive mounts — they're read
+    /// from an in-memory buffer with no path to reopen, so they stay
+    /// synchronous.
+    reopen: Option<commander_descend::ReopenRecipe>,
 }
 
 /// One visible row produced by the tree walk (a descendant of an expanded
@@ -166,6 +171,14 @@ impl WrapperTree {
     /// The filesystem of a mount, for reads / copy.
     pub fn mount_fs(&mut self, mount_key: &str) -> Option<&mut (dyn Filesystem + 'static)> {
         self.mounts.get_mut(mount_key).map(|m| m.fs.as_mut())
+    }
+
+    /// A recipe to reopen a mount's filesystem fresh on a worker thread, so a
+    /// long copy / checksum runs off the UI thread without touching the live
+    /// mount. `None` for archive mounts (read from an in-memory buffer — no path
+    /// to reopen), which stay on the synchronous path.
+    pub fn mount_reopen(&self, mount_key: &str) -> Option<commander_descend::ReopenRecipe> {
+        self.mounts.get(mount_key).and_then(|m| m.reopen.clone())
     }
 
     /// Read the openable bytes of a nested wrapper row so the pane can hand them
@@ -275,14 +288,22 @@ fn open_mount(
 ) -> Result<(Mount, Option<String>)> {
     match kind {
         DescendKind::Archive => {
-            // Archives are read into a buffer — no temp file needed.
+            // Archives are read into a buffer — no temp file needed, and no path
+            // to reopen from, so they stay on the synchronous copy path.
             let bytes = source.into_bytes()?;
             let fs = commander_descend::open_archive_bytes(
                 bytes,
                 file_name,
                 Some(file_name.to_string()),
             )?;
-            Ok((Mount { fs, _temp: None }, None))
+            Ok((
+                Mount {
+                    fs,
+                    _temp: None,
+                    reopen: None,
+                },
+                None,
+            ))
         }
         DescendKind::DiskImage => {
             // Images open by path (the partition probe + readers seek a file).
@@ -299,14 +320,33 @@ fn open_mount(
                     parts.len()
                 )
             });
-            Ok((Mount { fs, _temp: temp }, note))
+            let reopen = Some(commander_descend::ReopenRecipe::DiskImage { path });
+            Ok((
+                Mount {
+                    fs,
+                    _temp: temp,
+                    reopen,
+                },
+                note,
+            ))
         }
         DescendKind::Optical => {
             // Optical formats open by path; bin/cue and mdf/mds need the sibling
             // data file, which the `Path` source preserves.
             let (temp, path) = source.into_path(file_name)?;
             let fs = commander_descend::open_optical(&path, Some(file_name.to_string()))?;
-            Ok((Mount { fs, _temp: temp }, None))
+            let reopen = Some(commander_descend::ReopenRecipe::Optical {
+                path,
+                label: Some(file_name.to_string()),
+            });
+            Ok((
+                Mount {
+                    fs,
+                    _temp: temp,
+                    reopen,
+                },
+                None,
+            ))
         }
     }
 }
@@ -398,5 +438,20 @@ mod tests {
         let mut buf = Vec::new();
         fs.write_file_to(&top.entry, &mut buf).unwrap();
         assert_eq!(buf, b"top");
+    }
+
+    #[test]
+    fn archive_mount_has_no_reopen_recipe() {
+        let mut tree = WrapperTree::new();
+        tree.expand_wrapper(
+            "/a.sit",
+            "a.sit",
+            DescendKind::Archive,
+            WrapperSource::Bytes(archive_bytes()),
+        )
+        .unwrap();
+        // Archive mounts read from an in-memory buffer with no path, so there is
+        // no reopen recipe — those copies stay on the synchronous path.
+        assert!(tree.mount_reopen("/a.sit").is_none());
     }
 }

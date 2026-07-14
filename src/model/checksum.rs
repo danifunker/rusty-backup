@@ -25,7 +25,7 @@ use sha1::Sha1;
 use sha2::Sha256;
 
 use crate::fs::entry::FileEntry;
-use crate::model::browse_session::BrowseSession;
+use crate::model::commander_ops::StageSource;
 
 /// The four computed digests for one file. Raw bytes; use the `*_hex`
 /// accessors for display.
@@ -171,9 +171,11 @@ pub struct ChecksumStatus {
 
 /// What to checksum, and where the bytes come from.
 pub enum ChecksumJob {
-    /// Files on a disk-image volume; re-opened read-only on the worker thread.
+    /// Files on a disk-image volume; the source is re-opened read-only on the
+    /// worker thread (a local session, a remote image, or an inline / archive
+    /// source via its reopen recipe).
     Image {
-        session: BrowseSession,
+        source: StageSource,
         entries: Vec<FileEntry>,
     },
     /// Host-OS files referenced by their absolute path.
@@ -197,10 +199,10 @@ pub fn spawn(job: ChecksumJob) -> Arc<Mutex<ChecksumStatus>> {
 
 fn run(job: ChecksumJob, status: &Arc<Mutex<ChecksumStatus>>) {
     match job {
-        ChecksumJob::Image { session, entries } => {
+        ChecksumJob::Image { source, entries } => {
             let files: Vec<FileEntry> = entries.into_iter().filter(|e| e.is_file()).collect();
             set_total(status, files.len());
-            let mut fs = match session.open() {
+            let mut fs = match source.open() {
                 Ok(fs) => fs,
                 Err(e) => {
                     if let Ok(mut g) = status.lock() {

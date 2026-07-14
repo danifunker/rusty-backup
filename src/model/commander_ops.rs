@@ -155,11 +155,60 @@ pub struct StageCopyStatus {
     pub cancel_requested: bool,
 }
 
-/// Off-thread [`stage_copy`]: opens the source session on a worker, extracts
-/// each file to `temp_dir`, and hands the resulting [`StagedEdit`]s back via
-/// [`StageCopyStatus`]. Keeps large image->image copies from freezing the UI.
+/// How a [`spawn_stage_copy`] worker obtains its own owned source filesystem to
+/// read off the UI thread. Both variants are reopened *fresh* on the worker so
+/// the pane's own handle is never touched:
+/// - `Session` reopens a local image via its [`BrowseSession`];
+/// - `Remote` opens a fresh daemon connection to the same `(image, partition)`.
+///
+/// A live wrapper-mount fs can't be reopened this way, so those copies stay on
+/// the synchronous [`stage_copy`] path (they're small, local sources).
+pub enum StageSource {
+    /// Reopen a local image through its browse session.
+    Session(BrowseSession),
+    /// Reopen a remote image on a fresh daemon connection to `addr`.
+    #[cfg(feature = "remote")]
+    Remote {
+        addr: String,
+        path: String,
+        partition: Option<u32>,
+    },
+    /// Reopen a session-less local source — a Mac archive or an inline-expanded
+    /// disk-image / optical wrapper mount — fresh from a
+    /// [`ReopenRecipe`](crate::model::commander_descend::ReopenRecipe).
+    Reopen(crate::model::commander_descend::ReopenRecipe),
+}
+
+impl StageSource {
+    /// Open the owned source filesystem this describes, on the calling (worker)
+    /// thread. Every variant reopens *fresh*, so the pane's own handle is never
+    /// touched. Shared by the copy ([`spawn_stage_copy`], [`spawn_host_copy`])
+    /// and checksum ([`crate::model::checksum::spawn`]) workers.
+    pub fn open(self) -> Result<Box<dyn Filesystem>> {
+        match self {
+            StageSource::Session(session) => Ok(session.open().context("opening source image")?),
+            #[cfg(feature = "remote")]
+            StageSource::Remote {
+                addr,
+                path,
+                partition,
+            } => {
+                let (fs, _root, _entries) =
+                    crate::remote::fs::RemoteFilesystem::open(&addr, &path, partition)
+                        .context("opening remote source image")?;
+                Ok(Box::new(fs))
+            }
+            StageSource::Reopen(recipe) => recipe.open(),
+        }
+    }
+}
+
+/// Off-thread [`stage_copy`]: reopens the source on a worker, extracts each file
+/// to `temp_dir`, and hands the resulting [`StagedEdit`]s back via
+/// [`StageCopyStatus`]. Keeps large or remote image->image copies from freezing
+/// the UI — the same progress modal a local image->image copy uses.
 pub fn spawn_stage_copy(
-    session: BrowseSession,
+    source: StageSource,
     entries: Vec<FileEntry>,
     dest_parent: FileEntry,
     temp_dir: PathBuf,
@@ -169,7 +218,7 @@ pub fn spawn_stage_copy(
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
         let result = run_stage_copy(
-            session,
+            source,
             &entries,
             &dest_parent,
             &temp_dir,
@@ -188,14 +237,14 @@ pub fn spawn_stage_copy(
 }
 
 fn run_stage_copy(
-    session: BrowseSession,
+    source: StageSource,
     entries: &[FileEntry],
     dest_parent: &FileEntry,
     temp_dir: &Path,
     keep_dates: bool,
     status: &Arc<Mutex<StageCopyStatus>>,
 ) -> Result<Vec<StagedEdit>> {
-    let mut fs = session.open().context("opening source image")?;
+    let mut fs = source.open()?;
     let (files_total, bytes_total) = scan_image_entries_stage(fs.as_mut(), entries)?;
     if let Ok(mut g) = status.lock() {
         g.files_total = files_total;
@@ -416,9 +465,11 @@ fn host_children(path: &str) -> Vec<FileEntry> {
 /// An immediate (unstaged) host-write copy, run on a worker thread.
 pub enum HostCopyJob {
     /// Extract image-volume `entries` into the host directory `dest_dir`,
-    /// preserving resource forks per `fork_mode`.
+    /// preserving resource forks per `fork_mode`. `source` is reopened on the
+    /// worker (a local session or a fresh remote connection) so both local and
+    /// remote image sources extract off the UI thread with progress.
     ImageToHost {
-        session: BrowseSession,
+        source: StageSource,
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
         fork_mode: ResourceForkMode,
@@ -479,12 +530,12 @@ pub fn spawn_host_copy(job: HostCopyJob) -> Arc<Mutex<HostCopyStatus>> {
 fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
     match job {
         HostCopyJob::ImageToHost {
-            session,
+            source,
             entries,
             dest_dir,
             fork_mode,
         } => {
-            let mut fs = session.open().context("opening source image")?;
+            let mut fs = source.open()?;
             let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
             if let Ok(mut g) = status.lock() {
                 g.files_total = files_total;

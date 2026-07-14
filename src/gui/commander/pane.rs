@@ -31,7 +31,9 @@ use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
-use rusty_backup::model::commander_descend::{classify_entry, open_archive, DescendKind};
+use rusty_backup::model::commander_descend::{
+    classify_entry, open_archive, DescendKind, ReopenRecipe,
+};
 use rusty_backup::model::commander_ops::{self, ApplyStatus};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
@@ -1249,6 +1251,66 @@ impl CommanderPane {
             return None;
         }
         self.session.clone()
+    }
+
+    /// If this pane's *source* is a remote image (no local session — its fs lives
+    /// over the wire), the `(addr, path, partition)` needed to reopen it fresh on
+    /// a copy worker, so an image->image copy out of it runs async with progress
+    /// instead of blocking the UI. `None` for local sources, remote *host* panes,
+    /// and while a wrapper mount is the active source (that stays on the sync
+    /// [`commander_ops::stage_copy`] path — a small, local temp fs).
+    #[cfg(feature = "remote")]
+    pub(crate) fn remote_image_source(&self) -> Option<(String, String, Option<u32>)> {
+        if self.tree_active() {
+            return None;
+        }
+        match &self.remote {
+            Some(RemoteConn {
+                addr,
+                mode: BrowseMode::Image { path, partition },
+            }) => Some((addr.clone(), path.clone(), *partition)),
+            _ => None,
+        }
+    }
+
+    /// How an async copy / checksum worker should reopen this pane's image source
+    /// off the UI thread. Covers every image source with a way to reopen fresh:
+    /// a local [`BrowseSession`], a remote connection, an inline-expanded
+    /// disk-image / optical wrapper mount, or a Mac archive (by file path).
+    /// `None` only for a source with no reopenable handle — an archive-in-a-
+    /// container wrapper (read from an in-memory buffer) — where the caller falls
+    /// back to a synchronous extraction over its live `fs_mut()`.
+    pub(crate) fn copy_stage_source(&self) -> Option<commander_ops::StageSource> {
+        // A wrapper-tree mount is the effective source when a tree selection is
+        // active; reopen it from its recipe (None for archive mounts -> sync).
+        if let Some((mount_key, _)) = self.tree_selection() {
+            return self
+                .wrapper_tree
+                .mount_reopen(&mount_key)
+                .map(commander_ops::StageSource::Reopen);
+        }
+        if let Some(session) = self.session() {
+            return Some(commander_ops::StageSource::Session(session));
+        }
+        #[cfg(feature = "remote")]
+        if let Some((addr, path, partition)) = self.remote_image_source() {
+            return Some(commander_ops::StageSource::Remote {
+                addr,
+                path,
+                partition,
+            });
+        }
+        // A Mac archive opened in-pane has no session — reopen it by file path.
+        if self.archive_source {
+            if let Some(path) = &self.source {
+                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
+                    path: path.clone(),
+                    label,
+                }));
+            }
+        }
+        None
     }
 
     /// A clone of the pending-apply status handle for the progress modal.

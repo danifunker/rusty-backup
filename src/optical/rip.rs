@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use cd_da_reader::SectorReadMode;
+use cd_da_reader::SectorReadFormat;
 
 use crate::backup::{LogLevel, LogMessage};
 use crate::optical::source::{LocalCdReader, OpticalSource};
@@ -207,7 +207,7 @@ fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
             Ok(Box::new(crate::optical::source::RemoteCdReader::open(
                 conn.clone(),
                 device_path,
-                cd_da_reader::RetryConfig::default(),
+                crate::remote::protocol::WireRetryConfig::default(),
             )?))
         }
     }
@@ -245,7 +245,7 @@ fn rip_iso(
 
     let start_lba = first_data.start_lba;
     let total_sectors = toc.leadout_lba - start_lba;
-    let sector_size = SectorReadMode::DataCooked.sector_size() as u64;
+    let sector_size = SectorReadFormat::Mode1Cooked.sector_size() as u64;
     let total_bytes = total_sectors as u64 * sector_size;
 
     log(
@@ -279,7 +279,7 @@ fn rip_iso(
 
         let count = remaining.min(SECTORS_PER_CHUNK);
         let data = source
-            .read_data_sectors(lba, count, SectorReadMode::DataCooked)
+            .read_data_sectors(lba, count, SectorReadFormat::Mode1Cooked)
             .with_context(|| format!("Read error at LBA {lba}"))?;
 
         out.write_all(&data)
@@ -362,9 +362,9 @@ fn rip_bin_cue(
 
         let track_sectors = next_lba - track.start_lba;
         let mode = if track.is_audio {
-            SectorReadMode::Audio
+            SectorReadFormat::Audio
         } else {
-            SectorReadMode::DataRaw
+            SectorReadFormat::Mode1Raw
         };
 
         log(
@@ -547,17 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sector_read_mode_properties() {
-        assert_eq!(SectorReadMode::Audio.sector_size(), 2352);
-        assert_eq!(SectorReadMode::DataCooked.sector_size(), 2048);
-        assert_eq!(SectorReadMode::DataRaw.sector_size(), 2352);
-
-        // Expected Sector Type is the type value shifted left by 2, so Mode 1
-        // (data) is `010b << 2 = 0x08`. (`0x04` = `001b << 2` would wrongly mean
-        // CD-DA — cd-da-reader corrected this in the file-based-backend branch.)
-        assert_eq!(SectorReadMode::DataCooked.cdb_byte1(), 0x08);
-        assert_eq!(SectorReadMode::DataRaw.cdb_byte1(), 0x08);
-        assert_eq!(SectorReadMode::DataCooked.cdb_byte9(), 0x10);
-        assert_eq!(SectorReadMode::DataRaw.cdb_byte9(), 0xF8);
+    fn test_sector_read_format_properties() {
+        // The cd-da-reader 1.0 API exposes only sector_size() publicly; the CDB
+        // byte layout is now a crate-internal detail.
+        assert_eq!(SectorReadFormat::Audio.sector_size(), 2352);
+        assert_eq!(SectorReadFormat::Mode1Cooked.sector_size(), 2048);
+        assert_eq!(SectorReadFormat::Mode1Raw.sector_size(), 2352);
     }
 }
