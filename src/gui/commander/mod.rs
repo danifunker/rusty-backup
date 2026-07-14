@@ -536,9 +536,31 @@ impl CommanderMode {
                 let Some(temp_dir) = self.temp.as_ref().map(|t| t.path().to_path_buf()) else {
                     return "Could not create a temp directory for the copy.".to_string();
                 };
+                // A wrapper-tree mount (a '+'-expanded container, e.g. a floppy
+                // image opened inline within the filesystem) has no BrowseSession,
+                // so the async worker can't reopen it. Extract synchronously
+                // through the live wrapper filesystem instead — mirroring the
+                // session-less image->host branch below. These are small (floppy)
+                // sources, so blocking the UI briefly is fine.
                 let Some(session) = src.session() else {
-                    return "Source volume has no cached session — reopen it and try again."
-                        .to_string();
+                    let Some(src_fs) = src.fs_mut() else {
+                        return "Source volume is not open.".to_string();
+                    };
+                    return match commander_ops::stage_copy(
+                        src_fs,
+                        &entries,
+                        &dest_parent,
+                        &temp_dir,
+                        keep_dates,
+                    ) {
+                        Ok(edits) => {
+                            let n = dest.stage_edits(edits);
+                            format!(
+                                "Staged copy of {n} item(s) into the {other} pane. Apply to write."
+                            )
+                        }
+                        Err(e) => format!("Copy to the {other} pane failed: {e:#}"),
+                    };
                 };
                 self.pending_stage_copy = Some((
                     from.other(),
