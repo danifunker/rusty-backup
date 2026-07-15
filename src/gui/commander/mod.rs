@@ -22,10 +22,13 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::fork_export::{export_file_with_fork, safe_name};
 use rusty_backup::fs::resource_fork::ResourceForkMode;
 use rusty_backup::model::checksum::{self, ChecksumJob, ChecksumStatus};
-use rusty_backup::model::commander_ops::{self, HostCopyJob, HostCopyStatus, StageCopyStatus};
+use rusty_backup::model::commander_ops::{
+    self, ExportJob, HostCopyJob, HostCopyStatus, StageCopyStatus,
+};
 use rusty_backup::partition::format_size;
 
 use super::file_detail::{self, FileContent};
@@ -147,6 +150,10 @@ pub struct CommanderMode {
     /// a host folder (MacBinary / BinHex / AppleDouble / … via
     /// [`export_file_with_fork`]). Ignored for host->host copies.
     export_fork_mode: ResourceForkMode,
+    /// The default output shape for "Export to hard drive..." — loose files, a
+    /// per-file-compressed tree, or a single tar/zip/sit archive. The row menu's
+    /// "Export as" submenu can override it per action.
+    export_format: ExportFormat,
     /// The pane the user last interacted with — the middle-column Delete acts
     /// on it. Updated from each pane's `focused` response.
     active: Side,
@@ -182,6 +189,7 @@ impl CommanderMode {
             detail: None,
             keep_dates: true,
             export_fork_mode: ResourceForkMode::MacBinary,
+            export_format: ExportFormat::LooseFiles,
             active: Side::Left,
             session_log: Vec::new(),
             show_log: false,
@@ -290,7 +298,10 @@ impl CommanderMode {
                             self.status = self.copy(Side::Left);
                         }
                         if resp.export_to_host {
-                            self.status = self.export(Side::Left);
+                            self.status = self.export(Side::Left, None);
+                        }
+                        if let Some(fmt) = resp.export_as {
+                            self.status = self.export(Side::Left, Some(fmt));
                         }
                         if resp.checksums {
                             self.status = self.start_checksums(Side::Left);
@@ -329,7 +340,10 @@ impl CommanderMode {
                             self.status = self.copy(Side::Right);
                         }
                         if resp.export_to_host {
-                            self.status = self.export(Side::Right);
+                            self.status = self.export(Side::Right, None);
+                        }
+                        if let Some(fmt) = resp.export_as {
+                            self.status = self.export(Side::Right, Some(fmt));
                         }
                         if resp.checksums {
                             self.status = self.start_checksums(Side::Right);
@@ -463,24 +477,43 @@ impl CommanderMode {
                  stamping the current time. Image-to-image copies only.",
             );
         ui.add_space(8.0);
-        // Resource-fork format for image->host copies / exports. When copying a
-        // Mac file out to a host folder, its resource fork is preserved in the
-        // chosen container (MacBinary / BinHex / AppleDouble / …).
-        ui.label("Export forks as:");
-        egui::ComboBox::from_id_salt("commander_fork_mode")
-            .selected_text(self.export_fork_mode.label())
+        // Output shape for "Export to hard drive..." — loose files, a per-file
+        // compressed tree, or a single tar/zip/sit archive.
+        ui.label("Export as:");
+        egui::ComboBox::from_id_salt("commander_export_format")
+            .selected_text(self.export_format.label())
             .width(150.0)
             .show_ui(ui, |ui| {
-                for mode in ResourceForkMode::ALL {
-                    ui.selectable_value(&mut self.export_fork_mode, mode, mode.label());
+                for fmt in ExportFormat::ALL {
+                    ui.selectable_value(&mut self.export_format, fmt, fmt.label());
                 }
             })
             .response
             .on_hover_text(
-                "How to preserve a Mac file's resource fork when copying it out to \
-                 a host folder (image->host copies and Export). Host->host copies \
-                 keep bytes as-is.",
+                "How the row menu's \"Export to hard drive...\" writes the selection \
+                 out. The row menu's \"Export as\" submenu can pick a format inline.",
             );
+        ui.add_space(4.0);
+        // Resource-fork container, used only by the "Loose files" format. When
+        // exporting a Mac file out, its resource fork is preserved in the chosen
+        // container (MacBinary / BinHex / AppleDouble / …).
+        ui.add_enabled_ui(self.export_format == ExportFormat::LooseFiles, |ui| {
+            ui.label("Forks as:");
+            egui::ComboBox::from_id_salt("commander_fork_mode")
+                .selected_text(self.export_fork_mode.label())
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    for mode in ResourceForkMode::ALL {
+                        ui.selectable_value(&mut self.export_fork_mode, mode, mode.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How to preserve a Mac file's resource fork when exporting loose \
+                     files. Tar keeps data forks only; Zip and StuffIt carry forks \
+                     natively.",
+                );
+        });
         status
     }
 
@@ -616,11 +649,12 @@ impl CommanderMode {
     /// independent of what the other pane shows; this is the immediate host
     /// write engine ([`commander_ops::spawn_host_copy`]) with no re-list on
     /// completion (the picked folder isn't a pane).
-    fn export(&mut self, from: Side) -> String {
+    fn export(&mut self, from: Side, format_override: Option<ExportFormat>) -> String {
         if self.pending_host_copy.is_some() {
             return "A copy is already in progress; wait for it to finish.".to_string();
         }
         let fork_mode = self.export_fork_mode;
+        let format = format_override.unwrap_or(self.export_format);
         let src = match from {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
@@ -629,40 +663,69 @@ impl CommanderMode {
         if entries.is_empty() {
             return format!("Nothing selected in the {} pane to export.", from.label());
         }
-        let Some(dest_dir) = super::file_dialog().pick_folder() else {
-            return "Export cancelled.".to_string();
+        // A host source has no `Filesystem` to read archive members from, so only
+        // loose files are supported there — reject before prompting for a dest.
+        if src.is_host_pane() && format != ExportFormat::LooseFiles {
+            return format!(
+                "'{}' export runs from an image/volume source; a host folder can only \
+                 export as loose files.",
+                format.label()
+            );
+        }
+
+        // Single-file formats prompt for an archive filename; folder formats
+        // (loose / per-file) prompt for a destination directory.
+        let dest = if format.is_single_file() {
+            let ext = format.file_extension().unwrap_or("out");
+            let name = export_archive_name(&entries, ext);
+            let Some(p) = super::file_dialog()
+                .set_file_name(&name)
+                .add_filter(format.label(), &[ext])
+                .save_file()
+            else {
+                return "Export cancelled.".to_string();
+            };
+            p
+        } else {
+            let Some(d) = super::file_dialog().pick_folder() else {
+                return "Export cancelled.".to_string();
+            };
+            d
         };
 
+        // Host source + loose files: an immediate host-to-host copy.
         if src.is_host_pane() {
-            let job = HostCopyJob::HostToHost { entries, dest_dir };
-            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
-            return format!(
-                "Exporting the {} pane selection to the host folder...",
-                from.label()
-            );
-        }
-        // A reopenable source (local session or remote image) extracts on a
-        // worker with progress; a wrapper-tree mount (small, local) has no
-        // reopenable handle, so extract synchronously over its live fs.
-        if let Some(source) = src.copy_stage_source() {
-            let job = HostCopyJob::ImageToHost {
-                source,
+            let job = HostCopyJob::HostToHost {
                 entries,
-                dest_dir,
-                fork_mode,
+                dest_dir: dest,
             };
             self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
+            return format!("Exporting the {} pane selection...", from.label());
+        }
+        // A reopenable image source (local session, remote image, archive, or an
+        // inline disk-image/optical wrapper) exports on a worker with progress.
+        if let Some(source) = src.copy_stage_source() {
+            let job = HostCopyJob::ExportSelection(Box::new(ExportJob {
+                source,
+                entries,
+                dest,
+                format,
+                fork_mode,
+            }));
+            self.pending_host_copy = Some((None, commander_ops::spawn_host_copy(job)));
             return format!(
-                "Exporting the {} pane selection to the host folder...",
-                from.label()
+                "Exporting the {} pane selection as {}...",
+                from.label(),
+                format.label()
             );
         }
+        // A non-reopenable wrapper mount (small, local): export synchronously.
         let Some(src_fs) = src.fs_mut() else {
             return "Source volume is not open.".to_string();
         };
-        match extract_entries_to_host(src_fs, &entries, &dest_dir, fork_mode) {
-            Ok(n) => format!("Exported {n} item(s) to {}.", dest_dir.display()),
-            Err(e) => format!("Export failed: {e}"),
+        match commander_ops::export_now(src_fs, &entries, &dest, format, fork_mode) {
+            Ok(s) => format!("Exported {} file(s) to {}.", s.files, dest.display()),
+            Err(e) => format!("Export failed: {e:#}"),
         }
     }
 
@@ -1224,6 +1287,21 @@ fn extract_entries_to_host(
 
 fn log_timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Default filename for a single-file export: `<stem>.<ext>` when exactly one
+/// entry is selected (its own name, minus any extension), else `export.<ext>`.
+fn export_archive_name(entries: &[FileEntry], ext: &str) -> String {
+    let stem = match entries {
+        [only] => only
+            .name
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&only.name),
+        _ => "export",
+    };
+    format!("{stem}.{ext}")
 }
 
 // --- procedural button icons -----------------------------------------------

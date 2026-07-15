@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
@@ -74,9 +75,13 @@ pub(crate) struct PaneResponse {
     /// The user asked (via the row menu) to copy this pane's selection to the
     /// other pane; `CommanderMode` performs the cross-pane copy.
     pub copy_to_other: bool,
-    /// The user asked (via the row menu) to export this pane's selection to a
-    /// host folder they pick; `CommanderMode` runs the threaded host write.
+    /// The user asked (via the row menu) to export this pane's selection to the
+    /// host using the middle-column "Export as" format; `CommanderMode` runs the
+    /// threaded write.
     pub export_to_host: bool,
+    /// The user picked a specific format from the row menu's "Export" submenu,
+    /// overriding the dropdown for this one export.
+    pub export_as: Option<ExportFormat>,
     /// The user asked (via the row menu) to calculate checksums for this pane's
     /// selection; `CommanderMode` opens the threaded checksum window.
     pub checksums: bool,
@@ -99,8 +104,10 @@ struct RowActions {
     status: Option<String>,
     /// Copy the selection to the other pane.
     copy: bool,
-    /// Export the selection to a picked host folder.
+    /// Export the selection to the host using the dropdown's "Export as" format.
     export: bool,
+    /// Export the selection in a format picked from the "Export" submenu.
+    export_as: Option<ExportFormat>,
     /// Calculate checksums for the selection.
     checksums: bool,
     /// Open the File Info window for this entry (by name).
@@ -534,6 +541,7 @@ impl CommanderPane {
         }
         let mut copy_to_other = false;
         let mut export_to_host = false;
+        let mut export_as: Option<ExportFormat> = None;
         let mut checksums = false;
         let mut detail = None;
         let mut focused = false;
@@ -651,6 +659,7 @@ impl CommanderPane {
             }
             copy_to_other = actions.copy;
             export_to_host = actions.export;
+            export_as = actions.export_as;
             checksums = actions.checksums;
             detail = actions.detail;
             focused = actions.focused;
@@ -696,6 +705,7 @@ impl CommanderPane {
             status,
             copy_to_other,
             export_to_host,
+            export_as,
             checksums,
             detail,
             focused,
@@ -2625,6 +2635,7 @@ impl CommanderPane {
         let mut m_host_delete = false;
         let mut m_copy = false;
         let mut m_export = false;
+        let mut m_export_as: Option<ExportFormat> = None;
         let mut m_checksums = false;
         let mut m_rename: Option<String> = None;
         let mut m_cancel_rename: Option<String> = None;
@@ -2743,15 +2754,23 @@ impl CommanderPane {
                                 m_copy = true;
                                 ui.close();
                             }
-                            // Export the selection to a host folder the user
-                            // picks (loose files, not an archive). Like Copy,
-                            // it needs real data, so a not-yet-applied staged
-                            // add is excluded.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Export to hard drive...").clicked()
-                            {
-                                m_export = true;
-                                ui.close();
+                            // Export the selection to the host. "Export to hard
+                            // drive..." uses the middle-column "Export as" format;
+                            // the "Export" submenu picks a format inline. Needs
+                            // real data, so a not-yet-applied staged add is out.
+                            if !matches!(row.kind, RowKind::PendingAdd) {
+                                if ui.button("Export to hard drive...").clicked() {
+                                    m_export = true;
+                                    ui.close();
+                                }
+                                ui.menu_button("Export as", |ui| {
+                                    for fmt in ExportFormat::ALL {
+                                        if ui.button(fmt.label()).clicked() {
+                                            m_export_as = Some(fmt);
+                                            ui.close();
+                                        }
+                                    }
+                                });
                             }
                             // Checksums need real data, so a not-yet-applied
                             // staged add is excluded (same as Copy / Export).
@@ -2947,6 +2966,7 @@ impl CommanderPane {
             status,
             copy: m_copy,
             export: m_export,
+            export_as: m_export_as,
             checksums: m_checksums,
             detail: m_info,
             open_image: m_open_image,

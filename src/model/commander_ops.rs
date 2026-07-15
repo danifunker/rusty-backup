@@ -560,6 +560,20 @@ pub enum HostCopyJob {
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
     },
+    /// Export image-volume `entries` to the host in `format` — loose files / a
+    /// per-file-compressed tree into a folder, or one tar/zip/sit archive file.
+    /// `dest` is the folder or the archive file per `format.is_single_file()`.
+    /// Boxed to keep the enum's variants close in size.
+    ExportSelection(Box<ExportJob>),
+}
+
+/// Payload for [`HostCopyJob::ExportSelection`].
+pub struct ExportJob {
+    pub source: StageSource,
+    pub entries: Vec<FileEntry>,
+    pub dest: PathBuf,
+    pub format: crate::fs::export_selection::ExportFormat,
+    pub fork_mode: ResourceForkMode,
 }
 
 /// Shared state between the GUI and the [`spawn_host_copy`] worker.
@@ -632,6 +646,68 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             }
             copy_host_entries_to_host(&entries, &dest_dir, status)
         }
+        HostCopyJob::ExportSelection(job) => run_export(*job, status),
+    }
+}
+
+fn run_export(job: ExportJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+    use crate::fs::export_selection::{export_to_file, export_to_folder};
+    let ExportJob {
+        source,
+        entries,
+        dest,
+        format,
+        fork_mode,
+    } = job;
+    let mut fs = source.open()?;
+    let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
+    if let Ok(mut g) = status.lock() {
+        g.files_total = files_total;
+        g.bytes_total = bytes_total;
+    }
+    let ps = Arc::clone(status);
+    let progress = move |cur: &str, done: usize, bytes: u64| {
+        if let Ok(mut g) = ps.lock() {
+            g.current_file = cur.to_string();
+            g.copied = done;
+            g.bytes_done = bytes;
+        }
+    };
+    let cs = Arc::clone(status);
+    let cancelled = move || cs.lock().map(|g| g.cancel_requested).unwrap_or(false);
+    let summary = if format.is_single_file() {
+        export_to_file(fs.as_mut(), &entries, &dest, format, &progress, &cancelled)?
+    } else {
+        export_to_folder(
+            fs.as_mut(),
+            &entries,
+            &dest,
+            format,
+            fork_mode,
+            &progress,
+            &cancelled,
+        )?
+    };
+    Ok(summary.files)
+}
+
+/// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
+/// filesystem synchronously — the small/local fallback that mirrors the
+/// synchronous copy path. `dest` is a folder or an archive file per `format`.
+pub fn export_now(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+    dest: &Path,
+    format: crate::fs::export_selection::ExportFormat,
+    fork_mode: ResourceForkMode,
+) -> Result<crate::fs::export_selection::ExportSummary> {
+    use crate::fs::export_selection::{export_to_file, export_to_folder};
+    let noprog = |_: &str, _: usize, _: u64| {};
+    let never = || false;
+    if format.is_single_file() {
+        export_to_file(fs, entries, dest, format, &noprog, &never)
+    } else {
+        export_to_folder(fs, entries, dest, format, fork_mode, &noprog, &never)
     }
 }
 
