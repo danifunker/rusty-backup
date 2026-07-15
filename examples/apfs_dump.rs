@@ -2,9 +2,9 @@
 //!
 //! Usage: `cargo run --example apfs_dump -- <raw-apfs-container.img>`
 //!
-//! Not shipped or wired into the app — it exists to validate the
-//! `src/fs/apfs.rs` parser against real macOS-formatted images while the
-//! read-only browse driver is being built (see docs/apfs_support_plan.md).
+//! Not shipped or wired into the app — a developer tool for validating the
+//! `src/fs/apfs.rs` parser against real macOS-formatted images (see
+//! docs/apfs_support_plan.md).
 
 use std::io::Cursor;
 
@@ -23,7 +23,7 @@ fn main() {
     println!("total_size   = {}", fs.total_size());
     println!("used_size    = {}", fs.used_size());
 
-    // Walk the tree if browsing is implemented (later phases).
+    // Recursively print the volume's directory tree.
     fn walk(fs: &mut dyn Filesystem, dir: &rusty_backup::fs::entry::FileEntry, depth: usize) {
         let children = match fs.list_directory(dir) {
             Ok(c) => c,

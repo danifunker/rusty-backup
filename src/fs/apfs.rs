@@ -1,9 +1,11 @@
 //! APFS (Apple File System) — read-only browse driver.
 //!
-//! Scope (see `docs/apfs_support_plan.md`): **read-only browse** of
-//! **unencrypted** APFS volumes. Snapshots, FileVault encryption, and any
-//! write / shrink / fsck support are explicitly deferred — the trait's
-//! `Unsupported` / layout-preserving defaults cover those for now.
+//! Scope (see `docs/apfs_support_plan.md`): **read-only browse** of APFS
+//! volumes, including **FileVault-encrypted** volumes (unlocked with the volume
+//! password or personal recovery key — see [`apfs_crypto`] and
+//! [`ApfsFilesystem::open_with_passphrase`]). Snapshots and any write / shrink /
+//! fsck support are explicitly deferred — the trait's `Unsupported` /
+//! layout-preserving defaults cover those for now.
 //!
 //! ## On-disk model (the layers a single `read_file` walks through)
 //!
@@ -868,9 +870,9 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         }
     }
 
-    /// One-line summary of the container's headline fields. Used by the
-    /// `apfs_dump` example during driver bring-up; also the seam the later
-    /// phases hang volume enumeration off of.
+    /// One-line summary of the container's headline fields (block geometry,
+    /// container omap, and the enumerated volumes). Used by the `apfs_dump`
+    /// developer example; not part of the browse API.
     pub fn debug_summary(&self) -> String {
         let vols: Vec<String> = self
             .volumes
