@@ -13,8 +13,12 @@ explicitly deferred to a later phase (see Phase 6).
 > recovery key (`rb-cli ls/get --password`) and the encrypted fixture
 > (`test_apfs_encrypted.img.zst`) browses + extracts with every file matching
 > its oracle. Wired into GUI Inspect + Commander and the CLI via the shared
-> dispatch. **Still deferred:** snapshots (Phase 6, below), a GUI passphrase
-> prompt (interactive, GUI-only), and edit / shrink / fsck.
+> dispatch, including the **GUI Inspect/Browse passphrase prompt** (reuses the
+> IMZ/Ghost unlock modal in `browse_view.rs` — an encrypted volume opens
+> "locked" with its label shown, then prompts and re-opens with the entered
+> secret). **Still deferred:** snapshots (Phase 6, below), the Commander pane
+> unlock prompt (it has no password modal for any source yet), and edit /
+> shrink / fsck.
 
 APFS did not exist before macOS 10.13 (2017), so this sits outside the usual
 "vintage" remit — it is included for users capturing modern Mac CF/SD/SSD

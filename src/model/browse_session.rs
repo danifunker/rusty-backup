@@ -54,9 +54,10 @@ pub struct BrowseSession {
     /// `source_path` — the GUI's CHD edit-mode flow installs it for the
     /// duration of editing and clears it on apply/discard.
     pub chd_edit_session: Option<Arc<Mutex<ChdEditSession>>>,
-    /// Password for encrypted containers (currently IMZ only). When set,
-    /// `open()` passes it to the decryption API. The GUI sets this after
-    /// prompting the user.
+    /// Password / passphrase for an encrypted source. When set, `open()` passes
+    /// it to the container decryptor (WinImage IMZ, Ghost, ZIP) *and* to the
+    /// filesystem-level opener (APFS FileVault — the volume password or personal
+    /// recovery key). The GUI sets this after prompting the user.
     pub password: Option<String>,
     /// Remote image over the block tier: `(shared connection, remote path)`.
     /// When set, `open()` builds a fresh read-only `RemoteBlockReader` on the
@@ -79,6 +80,24 @@ fn is_hfs_plus_partition(partition_type: u8, partition_type_string: Option<&str>
     partition_type == 0xAF
 }
 
+/// True when a filesystem-open or root-listing error indicates a missing or
+/// wrong password / passphrase, so the GUI should (re-)show the unlock prompt.
+///
+/// Matches specific phrases rather than the bare word "password" to avoid false
+/// positives from image paths that happen to contain it (e.g. a folder named
+/// "GH11-password"). Covers the container drivers (WinImage IMZ, Ghost, ZIP)
+/// and APFS FileVault ("passphrase … required", "wrong APFS passphrase").
+pub fn looks_like_password_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("password-protected")
+        || lower.contains("password is required")
+        || lower.contains("password must be specified")
+        || lower.contains("incorrect password")
+        || lower.contains("wrong password")
+        || lower.contains("passphrase")
+        || lower.contains("filevault")
+}
+
 impl BrowseSession {
     pub fn new() -> Self {
         Self::default()
@@ -92,11 +111,12 @@ impl BrowseSession {
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open(Arc::clone(conn), rpath)
                 .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
-            return fs::open_filesystem(
+            return fs::open_filesystem_with_passphrase(
                 reader,
                 self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
+                self.password.as_deref(),
             );
         }
 
@@ -104,28 +124,36 @@ impl BrowseSession {
         // writes the editor has staged in memory.
         if let Some(arc) = &self.chd_edit_session {
             let handle = ChdEditHandle::from_arc(Arc::clone(arc));
-            return fs::open_filesystem(
+            return fs::open_filesystem_with_passphrase(
                 handle,
                 self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
+                self.password.as_deref(),
             );
         }
 
         // Partclone cache short-circuits all other paths.
         if let Some(cache) = &self.partclone_cache {
             let reader = PartcloneBlockReader::new(Arc::clone(cache));
-            return fs::open_filesystem(reader, 0, self.partition_type, None);
+            return fs::open_filesystem_with_passphrase(
+                reader,
+                0,
+                self.partition_type,
+                None,
+                self.password.as_deref(),
+            );
         }
 
         // Streaming zstd cache.
         if let Some(cache) = &self.zstd_cache {
             let reader = ZstdStreamReader::new(Arc::clone(cache));
-            return fs::open_filesystem(
+            return fs::open_filesystem_with_passphrase(
                 reader,
                 self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
+                self.password.as_deref(),
             );
         }
 
@@ -149,11 +177,12 @@ impl BrowseSession {
                 }
             }
             let reader = crate::os::SectorAlignedReader::new(file);
-            return fs::open_filesystem(
+            return fs::open_filesystem_with_passphrase(
                 reader,
                 self.partition_offset,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
+                self.password.as_deref(),
             );
         }
 
@@ -444,21 +473,23 @@ impl BrowseSession {
                 } else {
                     self.partition_offset
                 };
-                fs::open_filesystem(
+                fs::open_filesystem_with_passphrase(
                     reader,
                     effective_offset,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
+                    self.password.as_deref(),
                 )
             }
             _ => {
                 let file = File::open(path).map_err(FilesystemError::Io)?;
                 let reader = BufReader::new(file);
-                fs::open_filesystem(
+                fs::open_filesystem_with_passphrase(
                     reader,
                     self.partition_offset,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
+                    self.password.as_deref(),
                 )
             }
         }
@@ -502,18 +533,10 @@ impl BrowseSession {
             let mut fs = match opened {
                 Ok(fs) => fs,
                 Err(e) => {
-                    let msg = format!("{e}");
-                    // Detect password-related open failures (missing or wrong
-                    // password) so the GUI re-shows the password prompt. Match
-                    // on specific phrases rather than the bare word "password"
-                    // to avoid false positives from image paths that happen to
-                    // contain it (e.g. a folder named "GH11-password").
-                    let lower = msg.to_lowercase();
-                    let is_pw = lower.contains("password-protected")
-                        || lower.contains("password is required")
-                        || lower.contains("password must be specified")
-                        || lower.contains("incorrect password")
-                        || lower.contains("wrong password");
+                    // Detect password/passphrase-related open failures (missing
+                    // or wrong secret) so the GUI re-shows the prompt — e.g. a
+                    // wrong APFS FileVault passphrase fails here.
+                    let is_pw = looks_like_password_error(&format!("{e}"));
                     if let Ok(mut g) = status_thread.lock() {
                         g.error = Some(format!("Cannot open filesystem: {e}"));
                         g.needs_password = is_pw;
@@ -549,6 +572,11 @@ impl BrowseSession {
                 Err(e) => (None, None, Some(format!("Failed to get root: {e}"))),
             };
 
+            // An encrypted-but-locked volume (APFS FileVault opened without a
+            // passphrase) opens fine — its metadata is plaintext, so the label
+            // shows — but fails at the root listing with a "passphrase required"
+            // error. Surface that as a password prompt rather than a dead error.
+            let needs_pw = list_err.as_deref().map(looks_like_password_error) == Some(true);
             if let Ok(mut g) = status_thread.lock() {
                 g.phase = "Done".to_string();
                 g.fs_type = fs_type;
@@ -559,6 +587,7 @@ impl BrowseSession {
                 g.root = root;
                 g.root_entries = root_entries;
                 g.error = list_err;
+                g.needs_password = needs_pw;
                 g.fs = Some(fs);
                 g.finished = true;
             }
@@ -785,6 +814,31 @@ impl BrowseOpenStatus {
 mod tests {
     use super::*;
     use crate::fs::filesystem::CreateFileOptions;
+
+    #[test]
+    fn password_error_detection() {
+        // Container drivers (IMZ / Ghost / ZIP).
+        assert!(looks_like_password_error(
+            "This image is password-protected"
+        ));
+        assert!(looks_like_password_error("Incorrect password"));
+        // APFS FileVault: locked (root-listing) and wrong-passphrase (open).
+        assert!(looks_like_password_error(
+            "Failed to read root directory: APFS volume is encrypted (FileVault) \
+             — a passphrase or personal recovery key is required to browse it"
+        ));
+        assert!(looks_like_password_error(
+            "wrong APFS passphrase (KEK unwrap failed)"
+        ));
+        // Must NOT fire on an unrelated error or a path that merely contains
+        // the word "password".
+        assert!(!looks_like_password_error(
+            "no such file: /Users/x/GH11-password/a.img"
+        ));
+        assert!(!looks_like_password_error(
+            "unsupported partition type 0x42"
+        ));
+    }
 
     /// GUI edit-mode write path: opening a floppy container for editing, adding
     /// a file, and committing must persist the file back INTO the container

@@ -789,18 +789,27 @@ impl BrowseView {
         // Poll extraction progress
         self.poll_extraction(ui);
 
-        // Password prompt for encrypted containers (e.g. IMZ with ZipCrypto).
+        // Unlock prompt for an encrypted container (e.g. IMZ with ZipCrypto)
+        // or an encrypted filesystem (APFS FileVault). The retry loop is shared:
+        // stash the secret on the session and re-spawn the open.
         if self.needs_password {
+            let is_apfs = self.fs_type == "APFS";
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
-                ui.label("This image is password-protected.");
+                if is_apfs {
+                    ui.label("This APFS volume is encrypted with FileVault.");
+                    ui.add_space(4.0);
+                    ui.label("Enter the volume password or personal recovery key.");
+                } else {
+                    ui.label("This image is password-protected.");
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("Password:");
+                    ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.password_input)
                             .password(true)
-                            .desired_width(200.0),
+                            .desired_width(240.0),
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if ui.button("Unlock").clicked() || enter {
