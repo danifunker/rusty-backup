@@ -290,8 +290,7 @@ impl BtreeNode {
     }
 
     /// The i-th entry for a **variable**-KV node (self-describing key/value
-    /// lengths in the toc). Used by the Phase 3 catalog (FS-tree) walk.
-    #[allow(dead_code)]
+    /// lengths in the toc). Used by the catalog (FS-tree) walk.
     fn entry_var(&self, i: usize) -> Result<(&[u8], &[u8]), FilesystemError> {
         let toc = self.toc_start + i * 8;
         if toc + 8 > self.block.len() {
@@ -472,8 +471,8 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
 ///
 /// Built by a single walk of the FS (catalog) tree. `children` powers
 /// `list_directory` (a parent-inode oid maps to its directory entries) and
-/// `inodes` supplies per-file metadata (size, and — in Phase 4 — the
-/// data-stream id used to gather file extents).
+/// `inodes` supplies per-file metadata (size, plus the data-stream id used to
+/// gather file extents).
 #[derive(Default)]
 struct Catalog {
     /// parent inode oid -> its directory entries.
@@ -826,9 +825,8 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         Ok(cat)
     }
 
-    /// Decode one FS-tree leaf record into the catalog. Unknown / not-yet-used
-    /// record kinds (xattrs, extents, sibling links, …) are skipped here; the
-    /// ones Phase 4 needs are added there.
+    /// Decode one FS-tree leaf record into the catalog. Record kinds we don't
+    /// consume (sibling links, dir-stats, crypto-state, …) are skipped.
     fn decode_record(cat: &mut Catalog, key: &[u8], val: &[u8], hashed: bool) {
         if key.len() < 8 {
             return;

@@ -11,8 +11,8 @@
 //!   key from the passphrase using the salt + iteration count in the keybag.
 //!
 //! The exact parameters (512-byte XTS units, `UUID‖UUID` keys, the DER KEK/VEK
-//! blob layout) were confirmed against a real macOS-encrypted fixture during the
-//! Phase 6 bring-up spike — see `tests/fixtures/apfs/ENCRYPTED_FIXTURE.md`.
+//! blob layout) were confirmed against a real macOS-encrypted fixture — see
+//! `tests/fixtures/apfs/ENCRYPTED_FIXTURE.md`.
 
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
