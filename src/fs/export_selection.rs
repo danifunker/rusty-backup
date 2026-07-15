@@ -46,24 +46,32 @@ pub enum ExportFormat {
     TarGz,
     /// A single zstd-compressed `.tar.zst`.
     TarZstd,
+    /// One BinHex 4.0 `.hqx` text file per file (both forks + Finder info),
+    /// into a mirrored folder tree.
+    BinHex,
     /// A single `.zip`; Mac resource forks ride along as `__MACOSX/._name`
     /// AppleDouble members (the convention macOS itself uses).
     Zip,
     /// A single classic StuffIt `.sit`; forks + Finder type/creator native.
     StuffIt,
+    /// A single MacArchive `.mar`; forks + Finder type/creator native, same
+    /// input tree as StuffIt.
+    MacArchive,
 }
 
 impl ExportFormat {
     /// Every format, in menu order (folder outputs first, then archives).
-    pub const ALL: [ExportFormat; 8] = [
+    pub const ALL: [ExportFormat; 10] = [
         ExportFormat::LooseFiles,
         ExportFormat::GzipPerFile,
         ExportFormat::ZstdPerFile,
+        ExportFormat::BinHex,
         ExportFormat::Tar,
         ExportFormat::TarGz,
         ExportFormat::TarZstd,
         ExportFormat::Zip,
         ExportFormat::StuffIt,
+        ExportFormat::MacArchive,
     ];
 
     /// Short menu / dropdown label.
@@ -72,11 +80,13 @@ impl ExportFormat {
             ExportFormat::LooseFiles => "Loose files",
             ExportFormat::GzipPerFile => "Gzip each file (.gz)",
             ExportFormat::ZstdPerFile => "Zstd each file (.zst)",
+            ExportFormat::BinHex => "BinHex each file (.hqx)",
             ExportFormat::Tar => "Tar (.tar)",
             ExportFormat::TarGz => "Tar + gzip (.tar.gz)",
             ExportFormat::TarZstd => "Tar + zstd (.tar.zst)",
             ExportFormat::Zip => "Zip (.zip)",
             ExportFormat::StuffIt => "StuffIt (.sit)",
+            ExportFormat::MacArchive => "Mac Archive (.mar)",
         }
     }
 
@@ -90,6 +100,7 @@ impl ExportFormat {
                 | ExportFormat::TarZstd
                 | ExportFormat::Zip
                 | ExportFormat::StuffIt
+                | ExportFormat::MacArchive
         )
     }
 
@@ -101,6 +112,7 @@ impl ExportFormat {
             ExportFormat::TarZstd => Some("tar.zst"),
             ExportFormat::Zip => Some("zip"),
             ExportFormat::StuffIt => Some("sit"),
+            ExportFormat::MacArchive => Some("mar"),
             _ => None,
         }
     }
@@ -179,8 +191,15 @@ fn folder_recurse(
             }
             EntryType::File => {
                 match format {
-                    ExportFormat::LooseFiles => {
-                        export_file_with_fork(fs, e, dest_dir, &safe_name(e), fork_mode)
+                    // BinHex is a fixed fork container, independent of the loose
+                    // "Forks as:" choice.
+                    ExportFormat::LooseFiles | ExportFormat::BinHex => {
+                        let mode = if format == ExportFormat::BinHex {
+                            ResourceForkMode::BinHex
+                        } else {
+                            fork_mode
+                        };
+                        export_file_with_fork(fs, e, dest_dir, &safe_name(e), mode)
                             .with_context(|| format!("exporting '{}'", e.name))?;
                     }
                     ExportFormat::GzipPerFile | ExportFormat::ZstdPerFile => {
@@ -264,7 +283,9 @@ pub fn export_to_file(
             export_tar_file(fs, entries, out_path, format, progress)
         }
         ExportFormat::Zip => export_zip_file(fs, entries, out_path, progress, cancelled),
-        ExportFormat::StuffIt => export_sit_file(fs, entries, out_path, progress, cancelled),
+        ExportFormat::StuffIt | ExportFormat::MacArchive => {
+            export_mac_archive_file(fs, entries, out_path, format, progress, cancelled)
+        }
         _ => anyhow::bail!("{:?} is not a single-file format", format),
     }
 }
@@ -383,16 +404,27 @@ fn zip_recurse<W: Write + std::io::Seek>(
     Ok(())
 }
 
-fn export_sit_file(
+/// Build a `.sit` (StuffIt) or `.mar` (MacArchive) from the selection — both use
+/// the same [`StuffItInputNode`] tree, differing only in the container writer.
+fn export_mac_archive_file(
     fs: &mut dyn Filesystem,
     entries: &[FileEntry],
     out_path: &Path,
+    format: ExportFormat,
     progress: &Progress,
     cancelled: &Cancelled,
 ) -> Result<ExportSummary> {
     let mut summary = ExportSummary::default();
     let nodes = sit_nodes(fs, entries, progress, cancelled, &mut summary)?;
-    let bytes = build_archive_tree(&nodes, WriteMethod::Rle).context("building StuffIt archive")?;
+    let bytes = if format == ExportFormat::MacArchive {
+        let root = out_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("archive");
+        crate::macarchive::mar::build_archive(root, &nodes).context("building MacArchive (.mar)")?
+    } else {
+        build_archive_tree(&nodes, WriteMethod::Rle).context("building StuffIt archive")?
+    };
     std::fs::write(out_path, &bytes).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(summary)
 }
@@ -628,6 +660,53 @@ mod tests {
             .iter()
             .find(|e| e.name == "HELLO.TXT")
             .expect("HELLO.TXT in sit");
+        let data =
+            crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn binhex_per_file_round_trips() {
+        let (mut fs, entries, _g) = fixture();
+        let out = tempfile::tempdir().unwrap();
+        export_to_folder(
+            &mut *fs,
+            &entries,
+            out.path(),
+            ExportFormat::BinHex,
+            ResourceForkMode::Native,
+            &noprog,
+            &never,
+        )
+        .unwrap();
+        let hqx = std::fs::read(out.path().join("HELLO.TXT.hqx")).unwrap();
+        let bh = crate::fs::binhex::parse_binhex(&hqx).unwrap();
+        assert_eq!(bh.data_fork, b"hello world");
+    }
+
+    #[test]
+    fn mac_archive_round_trips_through_parser() {
+        let (mut fs, entries, _g) = fixture();
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("out.mar");
+        let s = export_to_file(
+            &mut *fs,
+            &entries,
+            &path,
+            ExportFormat::MacArchive,
+            &noprog,
+            &never,
+        )
+        .unwrap();
+        assert_eq!(s.files, 3);
+        let raw = std::fs::read(&path).unwrap();
+        let (bytes, archive) = crate::macarchive::mar::parse(&raw).unwrap();
+        let hello = archive
+            .entries
+            .iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .expect("HELLO.TXT in mar");
         let data =
             crate::macarchive::stuffit::decompress_fork(&bytes, hello.data.as_ref().unwrap())
                 .unwrap();
