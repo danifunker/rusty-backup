@@ -150,7 +150,13 @@ pub fn parse(data: &[u8]) -> Result<(Vec<u8>, StuffItArchive)> {
     let mut pos = 0usize;
     parse_record(data, &mut pos, &[], &mut entries).context("parsing MAR archive")?;
 
-    Ok((data.to_vec(), StuffItArchive { entries }))
+    Ok((
+        data.to_vec(),
+        StuffItArchive {
+            entries,
+            truncated: None,
+        },
+    ))
 }
 
 /// Parse one record at `*pos` (advancing it past the record and any fork

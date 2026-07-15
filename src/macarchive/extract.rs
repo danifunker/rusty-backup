@@ -239,6 +239,7 @@ fn synth_single_entry(
         buf,
         StuffItArchive {
             entries: vec![entry],
+            truncated: None,
         },
     )
 }
@@ -277,6 +278,13 @@ pub fn extract_filtered(
     mut progress: impl FnMut(usize, usize, &str),
     mut log: impl FnMut(String),
 ) -> Result<ExtractStats> {
+    // Say this once, before the per-entry skips: a truncated archive makes every
+    // entry past the cut fail, and the per-fork error alone reads like a decoder
+    // bug rather than a missing-disk problem.
+    if let Some(t) = archive.truncated {
+        log(t.describe());
+    }
+
     std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
 
     let total = archive

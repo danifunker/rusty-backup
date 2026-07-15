@@ -130,6 +130,48 @@ impl StuffItEntry {
 #[derive(Debug, Clone)]
 pub struct StuffItArchive {
     pub entries: Vec<StuffItEntry>,
+    /// `Some` when the archive header declares more bytes than the container
+    /// actually holds — see [`SitTruncation`].
+    pub truncated: Option<SitTruncation>,
+}
+
+/// An archive whose header declares a longer stream than is present.
+///
+/// The entry headers sit early in the stream, so such an archive still *parses*
+/// and *lists* — but any entry whose compressed fork lies past the cut cannot be
+/// extracted, because those bytes are simply not in the file.
+///
+/// The usual cause is a StuffIt InstallerMaker installer, which fills disk 1 to
+/// capacity and continues the same byte stream on disk 2..N. Handed only disk 1,
+/// we see a complete, CRC-valid file carrying a partial archive. Recording this
+/// at parse time lets the extract path say so up front rather than emitting a
+/// per-entry "extends past end of archive" that reads like a decoder bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SitTruncation {
+    /// Total archive length declared in the header at `[6..10]`.
+    pub declared: u64,
+    /// Bytes actually present from the archive base to end-of-buffer.
+    pub available: u64,
+}
+
+impl SitTruncation {
+    /// Bytes the header accounts for that the container does not hold.
+    pub fn missing(&self) -> u64 {
+        self.declared.saturating_sub(self.available)
+    }
+
+    /// One-line ASCII summary for logs and the CLI (no Unicode glyphs — the
+    /// egui font has no symbol coverage).
+    pub fn describe(&self) -> String {
+        format!(
+            "Warning: truncated StuffIt archive - header declares {} bytes, {} present ({} missing). \
+             Any entry whose data lies past the cut will be skipped. StuffIt InstallerMaker splits \
+             large installers across several disks, so this is likely the first disk of a set.",
+            self.declared,
+            self.available,
+            self.missing()
+        )
+    }
 }
 
 fn method_name(method: u8) -> &'static str {
@@ -190,9 +232,15 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         bail!("StuffIt: truncated archive header");
     }
 
-    let total_size = BigEndian::read_u32(&archive[6..10]) as usize;
-    // Clamp to what we actually have (some SEAs over-report).
-    let total_size = total_size.min(archive.len());
+    let declared_total = BigEndian::read_u32(&archive[6..10]) as usize;
+    // Clamp to what we actually have (some SEAs over-report) so the entry walk
+    // stays in bounds, but remember the shortfall: it's the difference between
+    // "this archive is complete" and "this is disk 1 of an InstallerMaker set".
+    let total_size = declared_total.min(archive.len());
+    let truncated = (declared_total > archive.len()).then_some(SitTruncation {
+        declared: declared_total as u64,
+        available: archive.len() as u64,
+    });
 
     let mut entries = Vec::new();
     let mut currdir: Vec<String> = Vec::new();
@@ -300,7 +348,7 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         pos += ENTRY_HEADER_LEN + rsrc_clen as usize + data_clen as usize;
     }
 
-    Ok(StuffItArchive { entries })
+    Ok(StuffItArchive { entries, truncated })
 }
 
 /// Decompress one fork from the archive bytes, verifying its CRC.
@@ -315,7 +363,17 @@ pub fn decompress_fork(archive: &[u8], fork: &ForkInfo) -> Result<Vec<u8>> {
     let start = fork.offset as usize;
     let end = start + fork.compressed_len as usize;
     if end > archive.len() {
-        bail!("StuffIt: fork data extends past end of archive");
+        // Not a bounds-check bug: `compressed_len` is the on-disk length, so
+        // this fires only when those bytes genuinely aren't in the container
+        // (a truncated / multi-disk archive). Quote the arithmetic so the next
+        // reader doesn't have to re-derive it.
+        bail!(
+            "StuffIt: fork data extends past end of archive (needs {} compressed bytes at offset \
+             {start}, archive holds {}; {} missing - the archive is truncated)",
+            fork.compressed_len,
+            archive.len(),
+            end - archive.len()
+        );
     }
     let comp = &archive[start..end];
     let want = fork.uncompressed_len as usize;
@@ -610,6 +668,65 @@ mod tests {
         buf[10..14].copy_from_slice(b"rLau");
         assert!(is_stuffit(&buf));
         assert!(!is_stuffit(b"not a sit file"));
+    }
+
+    #[test]
+    fn truncated_archive_is_reported_not_silently_clamped() {
+        // Mirrors a StuffIt InstallerMaker disk 1: a well-formed prefix of an
+        // archive whose header still declares the full multi-disk length. Such a
+        // file parses and lists fine, so the truncation has to be reported
+        // explicitly or it surfaces only as a confusing per-entry skip.
+        let files = vec![
+            StuffItInput {
+                name: "Small".to_string(),
+                type_code: *b"TEXT",
+                creator_code: *b"ttxt",
+                finder_flags: 0,
+                create_date: 0,
+                mod_date: 0,
+                data_fork: b"fits before the cut".to_vec(),
+                resource_fork: Vec::new(),
+            },
+            StuffItInput {
+                name: "Big".to_string(),
+                type_code: *b"APPL",
+                creator_code: *b"Spe2",
+                finder_flags: 0,
+                create_date: 0,
+                mod_date: 0,
+                // Incompressible-ish so Store really stores 40k.
+                data_fork: (0..40_000u32).map(|i| (i % 251) as u8).collect(),
+                resource_fork: Vec::new(),
+            },
+        ];
+        let full = build_archive(&files, WriteMethod::Store).unwrap();
+
+        // A complete archive must stay quiet.
+        assert!(parse(&full).unwrap().truncated.is_none());
+
+        // Chop mid-fork, the way filling a floppy does.
+        let cut = full.len() - 10_000;
+        let disk1 = full[..cut].to_vec();
+
+        let archive = parse(&disk1).expect("disk 1 must still parse and list");
+        assert_eq!(archive.entries.len(), 2, "both headers precede the cut");
+        let t = archive.truncated.expect("truncation must be recorded");
+        assert_eq!(t.declared, full.len() as u64);
+        assert_eq!(t.available, cut as u64);
+        assert_eq!(t.missing(), 10_000);
+
+        // The entry before the cut still extracts...
+        let e0 = &archive.entries[0];
+        assert_eq!(
+            decompress_fork(&disk1, e0.data.as_ref().unwrap()).unwrap(),
+            files[0].data_fork
+        );
+        // ...and the one past it fails naming the real cause, not a bounds bug.
+        let err = decompress_fork(&disk1, archive.entries[1].data.as_ref().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated"), "unhelpful message: {err}");
+        assert!(err.contains("10000 missing"), "no shortfall in: {err}");
     }
 
     #[test]

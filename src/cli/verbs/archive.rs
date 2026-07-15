@@ -106,6 +106,9 @@ pub fn run(cmd: ArchiveCommand) -> Result<()> {
 fn run_list(args: ListArgs) -> Result<()> {
     let (_, archive) =
         extract::open(&args.archive).with_context(|| args.archive.display().to_string())?;
+    if let Some(t) = archive.truncated {
+        log_stderr(t.describe());
+    }
     for e in &archive.entries {
         if e.is_dir {
             println!("DIR   {}/", e.display_path());

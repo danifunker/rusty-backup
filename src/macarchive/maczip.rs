@@ -485,6 +485,7 @@ pub fn parse(bytes: &[u8]) -> Result<(Vec<u8>, StuffItArchive)> {
         buf,
         StuffItArchive {
             entries: out_entries,
+            truncated: None,
         },
     ))
 }

@@ -267,7 +267,10 @@ pub fn parse(data: &[u8]) -> Result<StuffItArchive> {
         done += 1;
     }
 
-    Ok(StuffItArchive { entries })
+    Ok(StuffItArchive {
+        entries,
+        truncated: None,
+    })
 }
 
 #[cfg(test)]

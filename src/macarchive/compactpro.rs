@@ -108,7 +108,10 @@ pub fn parse(bytes: &[u8]) -> Result<StuffItArchive> {
 
     let mut entries = Vec::new();
     parse_directory(bytes, &mut pos, &[], numentries, &mut entries)?;
-    Ok(StuffItArchive { entries })
+    Ok(StuffItArchive {
+        entries,
+        truncated: None,
+    })
 }
 
 fn parse_directory(

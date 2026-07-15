@@ -320,6 +320,37 @@ indistinguishable by extension.
   Treat `.smi` as "extract the app forks" only. NDIF support is a separate,
   larger effort (its own `rbformats`/`Disk` module).
 - **StuffIt X `.sitx`**: already recognized-and-declined; unchanged.
+- **Multi-disk StuffIt InstallerMaker installers**: recognized-and-declined.
+  An InstallerMaker installer (`APPL`, creator `STi1`) fills disk 1 to capacity
+  and continues the *same* `SIT!` byte stream on disks 2..N. Handed only disk 1
+  we get a complete, CRC-valid BinHex/file carrying a partial archive: the entry
+  headers sit early in the stream so it parses and lists, but every fork past the
+  cut is simply absent. `stuffit::parse` records this as
+  [`SitTruncation`] (header-declared length vs. bytes present) and the extract
+  path reports it up front; there is no decoder change that can recover the
+  missing bytes. What the three known disk-1 samples show:
+  - The cut is **byte-arbitrary, mid-fork** — not entry-aligned. Two unrelated
+    installers came to 1,431,984 and 1,431,864 bytes (data+rsrc), 120 bytes
+    apart, with the data fork shrinking exactly to offset a larger resource
+    fork: InstallerMaker fills to a fixed disk capacity. So segments should be
+    **pure byte-continuations**, and `concat(payloads)` ought to reconstitute the
+    original stream — the existing parser walks a contiguous buffer with
+    absolute offsets and would need no codec changes.
+  - Disk 1 carries a **~100-byte fixed-layout header before `SIT!`**: `u16` at
+    `[0..2]` (checksum?), `0x0001` at `[2..4]`, a Pascal name at `[4..]` in a
+    fixed-width field, type+creator `'STin'`/`'STin'` at `[68]`/`[72]`, and
+    create/mod dates at `[78]`/`[82]`. Disks 2..N presumably repeat this frame;
+    a joiner would skip it and concatenate the remainder.
+  - **Blocked on a sample.** The prefix length on subsequent disks, whether the
+    header carries a segment index/count, and how a set is named on disk are all
+    unverifiable from disk 1 alone. Don't write the reader speculatively — get a
+    complete multi-disk set first. Note this is a *different* container from
+    StuffIt Deluxe's own segmented archives (numbered `.sit` parts); don't
+    conflate them.
+  - If/when built: the byte-joining belongs in `src/macarchive/` as a pure
+    `&[&[u8]] -> Vec<u8>`; "user picked disk 1, find and order the siblings"
+    is a `model/` source-resolver both the CLI and GUI call (CONTRIBUTING's
+    one-model-many-UIs rule).
 - **MAR LZW/LZ4 compressed members**: already recognized-and-declined; unchanged.
 - **MacBinary *writing*** beyond the existing `build_macbinary` (MacBinary III
   writer) and `ForkFormat::MacBinary` extract target: no new write features.
