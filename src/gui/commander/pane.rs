@@ -60,6 +60,9 @@ const META_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 190, 255);
 const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
 /// The "Close Image" affordance — amber, to read as "step back out".
 const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
+/// The "Read-only" media badge in the volume readout — amber, "look but touch
+/// carefully".
+const READ_ONLY_BADGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
 
 /// What a pane reports back to [`super::CommanderMode`] after a frame.
 #[derive(Default)]
@@ -1218,6 +1221,34 @@ impl CommanderPane {
             && (self.remote.is_none() || self.is_remote_image())
     }
 
+    /// True when this pane's source is read-only media that can never receive a
+    /// copy — a Mac archive, a backup folder, or a remote host folder (no
+    /// host-write verb yet). Distinct from `can_receive`, which is also false
+    /// for transient states (mid-open/apply); this reflects the *medium*, so the
+    /// pane header can show a "Read-only" badge. Host folders and writable image
+    /// volumes are not read-only.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.listing.is_loaded()
+            && !self.listing.is_host()
+            && (self.archive_source
+                || self.resolved_backup.is_some()
+                || (self.remote.is_some() && !self.is_remote_image()))
+    }
+
+    /// A short reason a copy into this pane is refused, for the copy button's
+    /// disabled hover. `None` when the pane can receive.
+    pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
+        if self.archive_source {
+            Some("the archive is read-only")
+        } else if self.resolved_backup.is_some() {
+            Some("the backup is read-only")
+        } else if self.remote.is_some() && !self.is_remote_image() {
+            Some("a remote host folder can't receive copies yet")
+        } else {
+            None
+        }
+    }
+
     /// True when this pane lists a host-OS folder rather than a disk image.
     /// When a wrapper selection is active the effective source is the mounted
     /// wrapper filesystem (not the host), so report `false`.
@@ -1469,13 +1500,6 @@ impl CommanderPane {
     /// write path doesn't carry yet (delete / rename over the wire).
     pub(crate) fn is_remote(&self) -> bool {
         self.remote.is_some()
-    }
-
-    /// True when this pane is a remote *host* folder — a copy destination the
-    /// write path can't reach yet (the daemon has no host-write verb; only
-    /// remote disk images can be written). Drives the Copy button's hint.
-    pub(crate) fn is_remote_host_dest(&self) -> bool {
-        self.remote.is_some() && !self.is_remote_image()
     }
 
     /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
@@ -1779,6 +1803,17 @@ impl CommanderPane {
                     ui.separator();
                     let free = self.total_size.saturating_sub(self.used_size);
                     ui.label(format!("free: {}", format_size(free)));
+                    // Read-only media (archive / backup / remote host): flag it so
+                    // the greyed copy-into button reads as "by design", and edits
+                    // aren't attempted.
+                    if self.is_read_only() {
+                        ui.separator();
+                        ui.colored_label(READ_ONLY_BADGE_COLOR, "Read-only")
+                            .on_hover_text(
+                                "This source can be browsed and copied out of, but not \
+                                 written to — copies into this pane are disabled.",
+                            );
+                    }
                 }
             });
         }

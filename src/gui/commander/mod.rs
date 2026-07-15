@@ -392,26 +392,22 @@ impl CommanderMode {
         let l_can = idle && self.left.has_selection() && self.right.can_receive();
         let r_can = idle && self.right.has_selection() && self.left.can_receive();
 
-        // Copy into a remote *host* folder isn't supported yet (only remote disk
-        // images) — surface that in the hover so the greyed button reads as
-        // "not yet" rather than "broken".
-        const REMOTE_HOST_HINT: &str =
-            "Copying into a remote host folder isn't supported yet — only remote disk images";
-        let l_copy_hover = if self.right.is_remote_host_dest() {
-            REMOTE_HOST_HINT
-        } else {
-            "Copy the left pane's selection into the right pane"
+        // When a destination can't receive a copy, say why in the hover so the
+        // greyed button reads as "by design" rather than "broken": read-only
+        // media (archive / backup / remote host folder) each give a reason.
+        let l_copy_hover = match self.right.readonly_reason() {
+            Some(reason) => format!("Can't copy into the right pane — {reason}"),
+            None => "Copy the left pane's selection into the right pane".to_string(),
         };
-        let r_copy_hover = if self.left.is_remote_host_dest() {
-            REMOTE_HOST_HINT
-        } else {
-            "Copy the right pane's selection into the left pane"
+        let r_copy_hover = match self.left.readonly_reason() {
+            Some(reason) => format!("Can't copy into the left pane — {reason}"),
+            None => "Copy the right pane's selection into the left pane".to_string(),
         };
 
         // Pictured buttons (procedurally painted — no font glyphs, no assets):
         // stacked floppies + arrow for copy, a floppy with a red X for delete,
         // and "101=011?" for the (disabled) compare.
-        if icon_button(ui, sz, l_can, l_copy_hover, |p, r, c| {
+        if icon_button(ui, sz, l_can, &l_copy_hover, |p, r, c| {
             draw_copy_icon(p, r, c, true)
         })
         .clicked()
@@ -419,7 +415,7 @@ impl CommanderMode {
             status = Some(self.copy(Side::Left));
         }
         ui.add_space(6.0);
-        if icon_button(ui, sz, r_can, r_copy_hover, |p, r, c| {
+        if icon_button(ui, sz, r_can, &r_copy_hover, |p, r, c| {
             draw_copy_icon(p, r, c, false)
         })
         .clicked()
