@@ -30,6 +30,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use super::apfs_crypto;
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
 
@@ -112,6 +113,19 @@ const SYMLINK_XATTR_NAME: &[u8] = b"com.apple.fs.symlink";
 /// allocate or stream absurd amounts. 64 GiB is far above any real vintage-Mac
 /// APFS file yet bounds the damage.
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+// --- FileVault encryption ---
+/// `apfs_fs_flags` bit 0: the volume is **not** encrypted. When clear, the
+/// volume's catalog and file data are AES-XTS-encrypted with the VEK.
+const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
+/// Keybag entry tags. `KB_TAG_VOLUME_KEY` holds a volume's wrapped VEK (in the
+/// container keybag); `KB_TAG_VOLUME_UNLOCK_RECORDS` holds a `prange` to the
+/// volume keybag (in the container keybag) or a crypto user's KEK blob (in the
+/// volume keybag).
+const KB_TAG_VOLUME_KEY: u16 = 2;
+const KB_TAG_VOLUME_UNLOCK_RECORDS: u16 = 3;
+/// APFS keybags use 512-byte AES-XTS data units, like the rest of the volume.
+const XTS_UNIT: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Fletcher-64 (APFS variant)
@@ -350,6 +364,10 @@ struct VolumeInfo {
     /// (`j_drec_hashed_key`) — the case here for case-insensitive or
     /// normalization-insensitive volumes, which is the macOS default.
     drec_hashed: bool,
+    /// Volume UUID (`apfs_vol_uuid`) — the AES-XTS key for the volume keybag.
+    uuid: [u8; 16],
+    /// True when the volume is FileVault-encrypted (catalog + data ciphered).
+    encrypted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +388,14 @@ struct NxSuperblock {
     omap_oid: u64,
     /// Virtual oids of the container's volumes; resolved via the container omap.
     fs_oids: Vec<u64>,
+    /// Container UUID (`nx_uuid`) — the AES-XTS key for the container keybag.
+    uuid: [u8; 16],
+    /// `nx_keylocker` prange: the container keybag's block + length. Zero when
+    /// the container has no encrypted volumes. The keybag is a single block in
+    /// practice; the length is kept for on-disk fidelity.
+    keylocker_paddr: u64,
+    #[allow(dead_code)]
+    keylocker_blocks: u64,
 }
 
 impl NxSuperblock {
@@ -397,6 +423,14 @@ impl NxSuperblock {
                 fs_oids.push(oid);
             }
         }
+        // nx_uuid @72; nx_keylocker prange @1296 (paddr + block count).
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&block[72..88]);
+        let (keylocker_paddr, keylocker_blocks) = if block.len() >= 1312 {
+            (rd_u64(block, 1296), rd_u64(block, 1304))
+        } else {
+            (0, 0)
+        };
         Ok(Self {
             block_size,
             block_count,
@@ -404,6 +438,9 @@ impl NxSuperblock {
             xp_desc_blocks,
             omap_oid,
             fs_oids,
+            uuid,
+            keylocker_paddr,
+            keylocker_blocks,
         })
     }
 }
@@ -425,6 +462,10 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
     active_vol: usize,
     /// Lazily-built catalog for the active volume (parsed on first browse).
     catalog: Option<Catalog>,
+    /// Volume encryption key for the active volume, once unlocked. `None` for
+    /// unencrypted volumes and for encrypted volumes opened without a
+    /// passphrase (which then browse as "locked").
+    vek: Option<[u8; 32]>,
 }
 
 /// The active volume's decoded catalog, cached after the first browse.
@@ -479,11 +520,26 @@ struct InodeRec {
 }
 
 impl<R: Read + Seek + Send> ApfsFilesystem<R> {
-    /// Open an APFS container at `partition_offset` within `reader`.
+    /// Open an APFS container at `partition_offset`, without a passphrase.
+    /// Encrypted volumes open in a "locked" state (container/volume metadata is
+    /// plaintext, so the label shows, but browsing errors until unlocked).
+    pub fn open(reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_with_passphrase(reader, partition_offset, None)
+    }
+
+    /// Open an APFS container, unlocking the first (browsed) volume with
+    /// `passphrase` when it is FileVault-encrypted.
     ///
     /// Reads block 0 to learn the block size, then scans the checkpoint
     /// descriptor ring for the newest valid NXSB (block 0 alone can be stale).
-    pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
+    /// A wrong passphrase on an encrypted volume is an error; `None` on an
+    /// encrypted volume leaves it locked (browse then reports "passphrase
+    /// required"); a passphrase on an unencrypted volume is ignored.
+    pub fn open_with_passphrase(
+        mut reader: R,
+        partition_offset: u64,
+        passphrase: Option<&str>,
+    ) -> Result<Self, FilesystemError> {
         // Block 0 is read at 4 KiB — the standard APFS block size — which is
         // enough to hold the whole superblock regardless of the real value.
         let mut b0 = vec![0u8; 4096];
@@ -506,6 +562,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             volumes: Vec::new(),
             active_vol: 0,
             catalog: None,
+            vek: None,
         };
 
         // Prefer the newest valid superblock from the checkpoint descriptor
@@ -527,7 +584,92 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
                 Err(_) => continue,
             }
         }
+
+        // Unlock the active (browsed) volume if it is encrypted and a
+        // passphrase was supplied.
+        if fs.active_volume().map(|v| v.encrypted).unwrap_or(false) {
+            if let Some(pass) = passphrase {
+                fs.vek = Some(fs.unlock_active_volume(pass)?);
+            }
+        }
         Ok(fs)
+    }
+
+    /// Derive the active volume's VEK from `passphrase` by walking the keybag
+    /// chain: container keybag (keyed by the container UUID) → the wrapped VEK
+    /// and the volume keybag location → volume keybag (keyed by the volume
+    /// UUID) → the crypto user's KEK blob → PBKDF2 → unwrap KEK → unwrap VEK.
+    fn unlock_active_volume(&mut self, passphrase: &str) -> Result<[u8; 32], FilesystemError> {
+        let vol = self
+            .active_volume()
+            .ok_or_else(|| FilesystemError::Unsupported("no volume to unlock".into()))?;
+        let vol_uuid = vol.uuid;
+        let cont_uuid = self.nxsb.uuid;
+        let kl_paddr = self.nxsb.keylocker_paddr;
+        if kl_paddr == 0 {
+            return Err(FilesystemError::Parse(
+                "encrypted volume but the container has no keybag".into(),
+            ));
+        }
+
+        // Container keybag → wrapped VEK (tag 2) + volume keybag prange (tag 3).
+        let cont_kb = self.read_keybag(kl_paddr, &cont_uuid)?;
+        let vek_blob = cont_kb
+            .iter()
+            .find(|e| e.tag == KB_TAG_VOLUME_KEY && e.uuid == vol_uuid)
+            .map(|e| e.data.clone())
+            .ok_or_else(|| FilesystemError::Parse("no wrapped VEK for volume".into()))?;
+        let vol_kb_prange = cont_kb
+            .iter()
+            .find(|e| e.tag == KB_TAG_VOLUME_UNLOCK_RECORDS && e.uuid == vol_uuid)
+            .map(|e| e.data.clone())
+            .ok_or_else(|| FilesystemError::Parse("no volume-keybag record".into()))?;
+        if vol_kb_prange.len() < 8 {
+            return Err(FilesystemError::Parse("bad volume-keybag prange".into()));
+        }
+        let vol_kb_paddr = rd_u64(&vol_kb_prange, 0);
+
+        // Volume keybag → the crypto user's KEK blob (tag 3).
+        let vol_kb = self.read_keybag(vol_kb_paddr, &vol_uuid)?;
+        let kek_blob = vol_kb
+            .iter()
+            .find(|e| e.tag == KB_TAG_VOLUME_UNLOCK_RECORDS)
+            .map(|e| e.data.clone())
+            .ok_or_else(|| FilesystemError::Parse("no KEK blob in volume keybag".into()))?;
+
+        // Unwrap KEK from the passphrase, then unwrap the VEK from the KEK.
+        let (wrapped_kek, salt, iters) = parse_kek_blob(&kek_blob)
+            .ok_or_else(|| FilesystemError::Parse("malformed KEK blob".into()))?;
+        let derived = apfs_crypto::pbkdf2_hmac_sha256(passphrase.as_bytes(), &salt, iters, 32);
+        let derived: [u8; 32] = derived.try_into().unwrap();
+        let kek = apfs_crypto::aes256_key_unwrap(&derived, &wrapped_kek).ok_or_else(|| {
+            FilesystemError::InvalidData("wrong APFS passphrase (KEK unwrap failed)".into())
+        })?;
+        let kek: [u8; 32] = kek
+            .try_into()
+            .map_err(|_| FilesystemError::Parse("unexpected KEK length".into()))?;
+        let wrapped_vek = parse_vek_blob(&vek_blob)
+            .ok_or_else(|| FilesystemError::Parse("malformed VEK blob".into()))?;
+        let vek = apfs_crypto::aes256_key_unwrap(&kek, &wrapped_vek)
+            .ok_or_else(|| FilesystemError::Parse("VEK unwrap failed".into()))?;
+        vek.try_into()
+            .map_err(|_| FilesystemError::Parse("unexpected VEK length".into()))
+    }
+
+    /// Read and AES-XTS-decrypt a keybag at physical block `paddr`, keyed by
+    /// `uuid` (`UUID‖UUID`), then parse its entries.
+    fn read_keybag(
+        &mut self,
+        paddr: u64,
+        uuid: &[u8; 16],
+    ) -> Result<Vec<KeybagEntry>, FilesystemError> {
+        let mut block = self.read_block(paddr)?;
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(uuid);
+        key[16..].copy_from_slice(uuid);
+        let first_sector = paddr * (self.block_size as u64 / XTS_UNIT as u64);
+        apfs_crypto::xts_decrypt(&key, first_sector as u128, XTS_UNIT, &mut block);
+        Ok(parse_keybag(&block))
     }
 
     /// Load an object map (`omap_phys_t` at `omap_oid`) and flatten its B-tree
@@ -584,11 +726,15 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             ));
         }
         // apfs_incompatible_features @56, apfs_fs_alloc_count @88,
-        // apfs_omap_oid @128, apfs_root_tree_oid @136, apfs_volname[256] @704.
+        // apfs_omap_oid @128, apfs_root_tree_oid @136, apfs_vol_uuid @240,
+        // apfs_fs_flags @264, apfs_volname[256] @704.
         let incompat = rd_u64(&block, 56);
         let alloc_count = rd_u64(&block, 88);
         let omap_oid = rd_u64(&block, 128);
         let root_tree_oid = rd_u64(&block, 136);
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&block[240..256]);
+        let fs_flags = rd_u64(&block, 264);
         let name_bytes = &block[704..704 + 256];
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(256);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
@@ -601,6 +747,8 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             root_tree_oid,
             alloc_count,
             drec_hashed,
+            uuid,
+            encrypted: fs_flags & APFS_FS_UNENCRYPTED == 0,
         })
     }
 
@@ -609,8 +757,20 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         self.volumes.get(self.active_vol)
     }
 
+    /// True when the active volume is encrypted but not yet unlocked.
+    fn active_locked(&self) -> bool {
+        self.active_volume().map(|v| v.encrypted).unwrap_or(false) && self.vek.is_none()
+    }
+
     /// Ensure the active volume's catalog is built and return a reference to it.
     fn catalog(&mut self) -> Result<&Catalog, FilesystemError> {
+        if self.active_locked() {
+            return Err(FilesystemError::Unsupported(
+                "APFS volume is encrypted (FileVault) — a passphrase or personal \
+                 recovery key is required to browse it"
+                    .into(),
+            ));
+        }
         if self.catalog.is_none() {
             let cat = self.build_catalog()?;
             self.catalog = Some(cat);
@@ -645,7 +805,9 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             if visited > MAX_BTREE_NODES {
                 return Err(FilesystemError::Parse("FS B-tree too large".into()));
             }
-            let node = BtreeNode::parse(self.read_block(paddr)?)?;
+            // FS-tree nodes are VEK-encrypted on FileVault volumes (the omap,
+            // read above, is not); read_block_decrypted no-ops when unencrypted.
+            let node = BtreeNode::parse(self.read_block_decrypted(paddr)?)?;
             let leaf = node.is_leaf();
             for i in 0..node.nkeys {
                 let (key, val) = node.entry_var(i)?;
@@ -811,6 +973,21 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             let pos = self.partition_offset + blk * bs;
             self.reader.seek(SeekFrom::Start(pos))?;
             self.reader.read_exact(&mut buf[..read_bytes])?;
+            // On an encrypted volume, decrypt each data block with the VEK,
+            // tweak = the block's physical sector index.
+            if let Some(vek) = self.vek {
+                let units = bs / XTS_UNIT as u64;
+                for j in 0..need_blocks {
+                    let start = (j * bs) as usize;
+                    let first_sector = (blk + j) * units;
+                    apfs_crypto::xts_decrypt(
+                        &vek,
+                        first_sector as u128,
+                        XTS_UNIT,
+                        &mut buf[start..start + bs as usize],
+                    );
+                }
+            }
             let to_write = remaining.min(read_bytes as u64) as usize;
             writer.write_all(&buf[..to_write])?;
             remaining -= to_write as u64;
@@ -819,12 +996,25 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         Ok(())
     }
 
-    /// Read a single object block by physical block address.
+    /// Read a single object block by physical block address (plaintext — used
+    /// for container/omap/APSB metadata, which stays unencrypted).
     fn read_block(&mut self, paddr: u64) -> Result<Vec<u8>, FilesystemError> {
         let mut buf = vec![0u8; self.block_size as usize];
         let pos = self.partition_offset + paddr * self.block_size as u64;
         self.reader.seek(SeekFrom::Start(pos))?;
         self.reader.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Read an object block, decrypting it with the VEK when the active volume
+    /// is unlocked-encrypted. Used for FS-tree (catalog) nodes, which are
+    /// ciphered on FileVault volumes; a no-op otherwise.
+    fn read_block_decrypted(&mut self, paddr: u64) -> Result<Vec<u8>, FilesystemError> {
+        let mut buf = self.read_block(paddr)?;
+        if let Some(vek) = self.vek {
+            let first_sector = paddr * (self.block_size as u64 / XTS_UNIT as u64);
+            apfs_crypto::xts_decrypt(&vek, first_sector as u128, XTS_UNIT, &mut buf);
+        }
         Ok(buf)
     }
 
@@ -951,6 +1141,125 @@ fn decode_drec(key: &[u8], val: &[u8], hashed: bool) -> Option<ChildRec> {
     let oid = rd_u64(val, 0);
     let dtype = rd_u16(val, 16) & DREC_TYPE_MASK;
     Some(ChildRec { name, oid, dtype })
+}
+
+// ---------------------------------------------------------------------------
+// Keybag + DER (BER TLV) parsing for the FileVault unlock chain
+// ---------------------------------------------------------------------------
+
+/// One decrypted keybag entry (`keybag_entry_t`).
+struct KeybagEntry {
+    uuid: [u8; 16],
+    tag: u16,
+    data: Vec<u8>,
+}
+
+/// Parse a decrypted keybag block (`kb_locker` at obj_phys offset 32) into its
+/// entries. Each `keybag_entry_t` is `uuid[16] tag:u16 keylen:u16 pad[4]
+/// keydata[keylen]`, padded to a 16-byte boundary.
+fn parse_keybag(block: &[u8]) -> Vec<KeybagEntry> {
+    let mut out = Vec::new();
+    if block.len() < 48 {
+        return out;
+    }
+    let nkeys = rd_u16(block, 34) as usize;
+    let mut p = 48usize;
+    for _ in 0..nkeys {
+        if p + 24 > block.len() {
+            break;
+        }
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&block[p..p + 16]);
+        let tag = rd_u16(block, p + 16);
+        let keylen = rd_u16(block, p + 18) as usize;
+        let end = (p + 24 + keylen).min(block.len());
+        let data = block[p + 24..end].to_vec();
+        out.push(KeybagEntry { uuid, tag, data });
+        p += (24 + keylen + 15) & !15; // 16-byte aligned entries
+    }
+    out
+}
+
+/// Minimal BER/DER TLV split: return each top-level `(tag, value)` in `b`.
+/// APFS KEK/VEK blobs use only definite-length short/long forms.
+fn der_children(b: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p + 2 <= b.len() {
+        let tag = b[p];
+        let mut len = b[p + 1] as usize;
+        let mut hdr = 2;
+        if len & 0x80 != 0 {
+            let n = len & 0x7f;
+            if n == 0 || n > 4 || p + 2 + n > b.len() {
+                break;
+            }
+            len = 0;
+            for i in 0..n {
+                len = (len << 8) | b[p + 2 + i] as usize;
+            }
+            hdr = 2 + n;
+        }
+        let end = (p + hdr + len).min(b.len());
+        out.push((tag, &b[p + hdr..end]));
+        p = end;
+    }
+    out
+}
+
+/// The DER context tag holding the inner KEK/VEK record inside the blob.
+const DER_TAG_KEY_RECORD: u8 = 0xa3;
+/// Field tags within the KEK/VEK record.
+const DER_TAG_WRAPPED_KEY: u8 = 0x83;
+const DER_TAG_ITERATIONS: u8 = 0x84;
+const DER_TAG_SALT: u8 = 0x85;
+
+/// Descend a KEK/VEK blob to the inner record (`0x30` SEQUENCE → `0xA3`).
+fn key_record(blob: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let outer = der_children(blob)
+        .into_iter()
+        .find(|(t, _)| *t == 0x30)?
+        .1
+        .to_vec();
+    let record = der_children(&outer)
+        .into_iter()
+        .find(|(t, _)| *t == DER_TAG_KEY_RECORD)?
+        .1
+        .to_vec();
+    Some(
+        der_children(&record)
+            .into_iter()
+            .map(|(t, v)| (t, v.to_vec()))
+            .collect(),
+    )
+}
+
+/// Parse a KEK blob → `(wrapped_kek, salt, iterations)`.
+fn parse_kek_blob(blob: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u32)> {
+    let fields = key_record(blob)?;
+    let get = |tag: u8| {
+        fields
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, v)| v.clone())
+    };
+    let wrapped = get(DER_TAG_WRAPPED_KEY)?;
+    let salt = get(DER_TAG_SALT)?;
+    let iters_bytes = get(DER_TAG_ITERATIONS)?;
+    let mut iters = 0u32;
+    for b in &iters_bytes {
+        iters = (iters << 8) | *b as u32;
+    }
+    Some((wrapped, salt, iters))
+}
+
+/// Parse a VEK blob → the wrapped VEK (unwrapped by the KEK, no PBKDF2).
+fn parse_vek_blob(blob: &[u8]) -> Option<Vec<u8>> {
+    let fields = key_record(blob)?;
+    fields
+        .iter()
+        .find(|(t, _)| *t == DER_TAG_WRAPPED_KEY)
+        .map(|(_, v)| v.clone())
 }
 
 /// Write `count` zero bytes to `writer` in bounded chunks. Returns `count`.
