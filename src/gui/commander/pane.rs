@@ -1415,6 +1415,18 @@ impl CommanderPane {
         name: &str,
         max: usize,
     ) -> Option<(FileEntry, Option<Vec<u8>>)> {
+        // A wrapper-tree row (a file inside an expanded .sit / .toast / disk-image
+        // wrapper): resolve against the active tree selection — a right-click
+        // selects the row first — and read through the mounted wrapper fs.
+        if self.tree_active() {
+            let (_, entries) = self.tree_selection()?;
+            let entry = entries.into_iter().find(|e| e.name == name)?;
+            if !entry.is_file() {
+                return Some((entry, None));
+            }
+            let data = self.fs_mut().and_then(|fs| fs.read_file(&entry, max).ok());
+            return Some((entry, data));
+        }
         let entry = self
             .listing
             .entries()
@@ -1432,6 +1444,24 @@ impl CommanderPane {
                 .and_then(|fs| fs.read_file(&entry, max).ok())
         };
         Some((entry, data))
+    }
+
+    /// True when an expanded-wrapper row is the active selection. Its contents
+    /// are read-only (copy out, don't edit), so File Info shows no editors.
+    pub(crate) fn wrapper_selection_active(&self) -> bool {
+        self.tree_active()
+    }
+
+    /// The filesystem type to show in File Info: the mounted wrapper's type
+    /// when a tree selection is active (e.g. "HFS" for a file inside a `.toast`
+    /// opened through a `.sit`), else the base pane's type.
+    pub(crate) fn detail_fs_type(&mut self) -> String {
+        if let Some((mount, _)) = self.tree_selection() {
+            if let Some(fs) = self.wrapper_tree.mount_fs(&mount) {
+                return fs.fs_type().to_string();
+            }
+        }
+        self.fs_type().to_string()
     }
 
     /// True when this pane is browsing a remote daemon (host FS or an image on
@@ -2580,11 +2610,12 @@ impl CommanderPane {
                                 m_checksums = true;
                                 ui.close();
                             }
-                            // File Info / Details: metadata + preview, with the
-                            // editable-metadata subset on image panes. Needs
-                            // real data, so a not-yet-applied add is excluded.
-                            if !row.is_tree
-                                && !matches!(row.kind, RowKind::PendingAdd)
+                            // File Info / Details: metadata + preview. Available
+                            // for base-listing rows AND wrapper-tree rows (files
+                            // inside a .sit / .toast / disk-image wrapper), which
+                            // resolve through the mounted wrapper filesystem.
+                            // Needs real data, so a not-yet-applied add is excluded.
+                            if !matches!(row.kind, RowKind::PendingAdd)
                                 && ui.button("File Info / Details...").clicked()
                             {
                                 m_info = Some(row.name.clone());

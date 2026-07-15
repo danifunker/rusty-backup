@@ -989,10 +989,14 @@ impl CommanderMode {
             Side::Left => &mut self.left,
             Side::Right => &mut self.right,
         };
-        // A writable image volume gets the metadata editors; host folders and
-        // read-only backups / archives show the metadata without them.
-        let editable = !pane.is_host_pane() && !pane.is_backup_pane() && !pane.is_archive_pane();
-        let fs_type = pane.fs_type().to_string();
+        // A writable image volume gets the metadata editors; host folders,
+        // read-only backups / archives, and wrapper contents (copy out, don't
+        // edit) show the metadata without them.
+        let editable = !pane.is_host_pane()
+            && !pane.is_backup_pane()
+            && !pane.is_archive_pane()
+            && !pane.wrapper_selection_active();
+        let fs_type = pane.detail_fs_type();
         let Some((entry, bytes)) = pane.detail_payload(&name, MAX_PREVIEW_SIZE) else {
             return format!("[{}] could not open File Info for '{name}'.", from.label());
         };
