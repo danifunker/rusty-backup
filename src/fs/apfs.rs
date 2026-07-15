@@ -67,6 +67,36 @@ const MAX_BTREE_NODES: usize = 1_000_000;
 /// array at 100 on current APFS.
 const NX_MAX_FILE_SYSTEMS: usize = 100;
 
+// FS-tree record kinds — the top 4 bits of a `j_key.obj_id_and_type`.
+const OBJ_TYPE_SHIFT: u32 = 60;
+const OBJ_ID_MASK: u64 = 0x0fff_ffff_ffff_ffff;
+const APFS_TYPE_INODE: u8 = 3;
+const APFS_TYPE_XATTR: u8 = 4;
+const APFS_TYPE_FILE_EXTENT: u8 = 8;
+const APFS_TYPE_DIR_REC: u8 = 9;
+
+// Directory-entry file kinds (`j_drec_val.flags & DREC_TYPE_MASK`), mirroring
+// the BSD `DT_*` values.
+const DREC_TYPE_MASK: u16 = 0x000f;
+const DT_DIR: u16 = 4;
+const DT_LNK: u16 = 10;
+
+/// Inode number of the volume root directory (`ROOT_DIR_INO_NUM`).
+const ROOT_DIR_INO: u64 = 2;
+
+/// Extended-field type carrying a file's data-stream record (`j_dstream_t`),
+/// whose first field is the logical file size.
+const INO_EXT_TYPE_DSTREAM: u8 = 8;
+
+// Volume incompatible-feature bits that select the *hashed* directory-record
+// key layout (`j_drec_hashed_key`) over the plain one.
+const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
+const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
+
+/// Length mask over `j_drec_hashed_key.name_len_and_hash` (low 10 bits =
+/// name length including the trailing NUL).
+const J_DREC_LEN_MASK: u32 = 0x0000_03ff;
+
 // ---------------------------------------------------------------------------
 // Fletcher-64 (APFS variant)
 // ---------------------------------------------------------------------------
@@ -292,16 +322,18 @@ impl Omap {
 /// The fields of `apfs_superblock_t` (APSB) this driver needs.
 struct VolumeInfo {
     name: String,
-    /// Physical block of the volume's own object map (`omap_phys_t`). Used by
-    /// the Phase 3 catalog walk to resolve the root tree's virtual oid.
-    #[allow(dead_code)]
+    /// Physical block of the volume's own object map (`omap_phys_t`). The
+    /// catalog walk resolves the root tree's virtual oid through it.
     omap_oid: u64,
     /// Virtual oid of the volume's root (catalog) FS tree; resolved via the
-    /// volume omap. Consumed by the Phase 3 catalog walk.
-    #[allow(dead_code)]
+    /// volume omap.
     root_tree_oid: u64,
     /// Blocks currently allocated to the volume (`apfs_fs_alloc_count`).
     alloc_count: u64,
+    /// True when directory records use the hashed key layout
+    /// (`j_drec_hashed_key`) — the case here for case-insensitive or
+    /// normalization-insensitive volumes, which is the macOS default.
+    drec_hashed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +407,45 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
     volumes: Vec<VolumeInfo>,
     /// Index into `volumes` of the volume currently being browsed.
     active_vol: usize,
+    /// Lazily-built catalog for the active volume (parsed on first browse).
+    catalog: Option<Catalog>,
+}
+
+/// The active volume's decoded catalog, cached after the first browse.
+///
+/// Built by a single walk of the FS (catalog) tree. `children` powers
+/// `list_directory` (a parent-inode oid maps to its directory entries) and
+/// `inodes` supplies per-file metadata (size, and — in Phase 4 — the
+/// data-stream id used to gather file extents).
+#[derive(Default)]
+struct Catalog {
+    /// parent inode oid -> its directory entries.
+    children: std::collections::HashMap<u64, Vec<ChildRec>>,
+    /// inode oid -> inode metadata.
+    inodes: std::collections::HashMap<u64, InodeRec>,
+}
+
+/// One directory entry (`j_drec_*` key/value pair).
+struct ChildRec {
+    name: String,
+    /// Child inode oid (`j_drec_val.file_id`).
+    oid: u64,
+    /// Directory-entry file kind (`DT_*`).
+    dtype: u16,
+}
+
+/// Per-inode metadata pulled from a `j_inode_val` record.
+struct InodeRec {
+    /// Logical file size from the data-stream extended field (0 for
+    /// directories / forkless inodes).
+    size: u64,
+    /// `j_inode_val.private_id` — the id file extents are keyed on. Used in
+    /// Phase 4 to read file data.
+    #[allow(dead_code)]
+    private_id: u64,
+    /// `j_inode_val.mode` (the `S_IF*` file-type bits live here).
+    #[allow(dead_code)]
+    mode: u16,
 }
 
 impl<R: Read + Seek + Send> ApfsFilesystem<R> {
@@ -404,6 +475,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             nxsb: sb0,
             volumes: Vec::new(),
             active_vol: 0,
+            catalog: None,
         };
 
         // Prefer the newest valid superblock from the checkpoint descriptor
@@ -481,25 +553,112 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
                 "not an APSB volume superblock".into(),
             ));
         }
-        // apfs_fs_alloc_count @88, apfs_omap_oid @128, apfs_root_tree_oid @136,
-        // apfs_volname[256] @704.
+        // apfs_incompatible_features @56, apfs_fs_alloc_count @88,
+        // apfs_omap_oid @128, apfs_root_tree_oid @136, apfs_volname[256] @704.
+        let incompat = rd_u64(&block, 56);
         let alloc_count = rd_u64(&block, 88);
         let omap_oid = rd_u64(&block, 128);
         let root_tree_oid = rd_u64(&block, 136);
         let name_bytes = &block[704..704 + 256];
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(256);
         let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+        let drec_hashed = incompat
+            & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)
+            != 0;
         Ok(VolumeInfo {
             name,
             omap_oid,
             root_tree_oid,
             alloc_count,
+            drec_hashed,
         })
     }
 
     /// The volume currently selected for browsing, if the container has one.
     fn active_volume(&self) -> Option<&VolumeInfo> {
         self.volumes.get(self.active_vol)
+    }
+
+    /// Ensure the active volume's catalog is built and return a reference to it.
+    fn catalog(&mut self) -> Result<&Catalog, FilesystemError> {
+        if self.catalog.is_none() {
+            let cat = self.build_catalog()?;
+            self.catalog = Some(cat);
+        }
+        Ok(self.catalog.as_ref().unwrap())
+    }
+
+    /// Walk the active volume's FS (catalog) tree once, decoding inode and
+    /// directory-record entries into a [`Catalog`].
+    ///
+    /// The FS tree is a *virtual* B-tree: its root and every index child are
+    /// virtual oids resolved through the volume's own object map. Leaf nodes
+    /// hold the `j_*` records we care about.
+    fn build_catalog(&mut self) -> Result<Catalog, FilesystemError> {
+        let vol = self
+            .active_volume()
+            .ok_or_else(|| FilesystemError::Unsupported("APFS container has no volume".into()))?;
+        let root_tree_oid = vol.root_tree_oid;
+        let vol_omap_oid = vol.omap_oid;
+        let hashed = vol.drec_hashed;
+
+        let vol_omap = self.load_omap(vol_omap_oid)?;
+        let root_paddr = vol_omap
+            .resolve(root_tree_oid)
+            .ok_or_else(|| FilesystemError::Parse("root FS tree oid unresolved in omap".into()))?;
+
+        let mut cat = Catalog::default();
+        let mut stack = vec![root_paddr];
+        let mut visited = 0usize;
+        while let Some(paddr) = stack.pop() {
+            visited += 1;
+            if visited > MAX_BTREE_NODES {
+                return Err(FilesystemError::Parse("FS B-tree too large".into()));
+            }
+            let node = BtreeNode::parse(self.read_block(paddr)?)?;
+            let leaf = node.is_leaf();
+            for i in 0..node.nkeys {
+                let (key, val) = node.entry_var(i)?;
+                if leaf {
+                    Self::decode_record(&mut cat, key, val, hashed);
+                } else {
+                    // Index node: value is an 8-byte virtual child oid.
+                    if val.len() >= 8 {
+                        if let Some(child) = vol_omap.resolve(rd_u64(val, 0)) {
+                            stack.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(cat)
+    }
+
+    /// Decode one FS-tree leaf record into the catalog. Unknown / not-yet-used
+    /// record kinds (xattrs, extents, sibling links, …) are skipped here; the
+    /// ones Phase 4 needs are added there.
+    fn decode_record(cat: &mut Catalog, key: &[u8], val: &[u8], hashed: bool) {
+        if key.len() < 8 {
+            return;
+        }
+        let id_and_type = rd_u64(key, 0);
+        let kind = (id_and_type >> OBJ_TYPE_SHIFT) as u8;
+        let obj_id = id_and_type & OBJ_ID_MASK;
+        match kind {
+            APFS_TYPE_INODE => {
+                if let Some(rec) = decode_inode(val) {
+                    cat.inodes.insert(obj_id, rec);
+                }
+            }
+            APFS_TYPE_DIR_REC => {
+                if let Some(child) = decode_drec(key, val, hashed) {
+                    cat.children.entry(obj_id).or_default().push(child);
+                }
+            }
+            // APFS_TYPE_FILE_EXTENT / APFS_TYPE_XATTR are handled in Phase 4.
+            APFS_TYPE_FILE_EXTENT | APFS_TYPE_XATTR => {}
+            _ => {}
+        }
     }
 
     /// One-line summary of the container's headline fields. Used by the
@@ -572,17 +731,135 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
     }
 }
 
+/// Decode a `j_inode_val` into the metadata we keep.
+fn decode_inode(val: &[u8]) -> Option<InodeRec> {
+    // Fixed part of j_inode_val is 92 bytes; private_id @8, mode @80.
+    if val.len() < 92 {
+        return None;
+    }
+    let private_id = rd_u64(val, 8);
+    let mode = rd_u16(val, 80);
+    let size = inode_dstream_size(val).unwrap_or(0);
+    Some(InodeRec {
+        size,
+        private_id,
+        mode,
+    })
+}
+
+/// Pull the logical file size out of an inode's `INO_EXT_TYPE_DSTREAM` extended
+/// field, if present (directories and forkless inodes have none → `None`).
+///
+/// The xfield blob begins at offset 92 of `j_inode_val`: a 4-byte header
+/// (`xf_num_exts`, `xf_used_data`), then `xf_num_exts` × 4-byte `x_field`
+/// descriptors, then the data area where each field's payload is padded up to
+/// an 8-byte boundary. The dstream payload is a `j_dstream_t` whose first u64
+/// is the logical size.
+fn inode_dstream_size(val: &[u8]) -> Option<u64> {
+    let xf = val.get(92..)?;
+    if xf.len() < 4 {
+        return None;
+    }
+    let num = rd_u16(xf, 0) as usize;
+    let mut desc = 4usize;
+    let mut data = 4 + num.checked_mul(4)?;
+    for _ in 0..num {
+        if desc + 4 > xf.len() {
+            return None;
+        }
+        let x_type = xf[desc];
+        let x_size = rd_u16(xf, desc + 2) as usize;
+        if x_type == INO_EXT_TYPE_DSTREAM {
+            // j_dstream.size is the first u64 of the payload.
+            if data + 8 <= xf.len() {
+                return Some(rd_u64(xf, data));
+            }
+            return None;
+        }
+        data += (x_size + 7) & !7; // 8-byte aligned payloads
+        desc += 4;
+    }
+    None
+}
+
+/// Decode a directory-record (`j_drec_*`) key/value pair into a [`ChildRec`].
+///
+/// The key layout depends on the volume: hashed volumes store
+/// `name_len_and_hash` (a u32 whose low 10 bits are the NUL-terminated name
+/// length) before the name; plain volumes store a bare u16 length.
+fn decode_drec(key: &[u8], val: &[u8], hashed: bool) -> Option<ChildRec> {
+    // j_key header is 8 bytes; the name descriptor follows.
+    let name_bytes = if hashed {
+        if key.len() < 12 {
+            return None;
+        }
+        let name_len = (rd_u32(key, 8) & J_DREC_LEN_MASK) as usize; // includes trailing NUL
+        let end = 12usize.checked_add(name_len)?.min(key.len());
+        key.get(12..end)?
+    } else {
+        if key.len() < 10 {
+            return None;
+        }
+        let name_len = rd_u16(key, 8) as usize; // includes trailing NUL
+        let end = 10usize.checked_add(name_len)?.min(key.len());
+        key.get(10..end)?
+    };
+    // Strip the trailing NUL and decode as UTF-8 (APFS names are UTF-8).
+    let trimmed = name_bytes.split(|&b| b == 0).next().unwrap_or(name_bytes);
+    let name = String::from_utf8_lossy(trimmed).into_owned();
+    if name.is_empty() {
+        return None;
+    }
+    // j_drec_val: file_id @0 (child inode oid), flags @16 (kind in low bits).
+    if val.len() < 18 {
+        return None;
+    }
+    let oid = rd_u64(val, 0);
+    let dtype = rd_u16(val, 16) & DREC_TYPE_MASK;
+    Some(ChildRec { name, oid, dtype })
+}
+
 impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
+        // The APFS volume root directory is inode 2; carry that as `location`
+        // so `list_directory` can find its children.
+        Ok(FileEntry::new_directory(
+            "/".into(),
+            "/".into(),
+            ROOT_DIR_INO,
+        ))
     }
 
-    fn list_directory(&mut self, _entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
-        // Catalog walk lands in Phase 3; until then surface a clear error
-        // instead of silently reporting an empty volume.
-        Err(FilesystemError::Unsupported(
-            "APFS directory browsing not implemented yet — see src/fs/apfs.rs".into(),
-        ))
+    fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
+        if !entry.is_directory() {
+            return Err(FilesystemError::NotADirectory(entry.path.clone()));
+        }
+        let parent_oid = entry.location;
+        let parent_path = entry.path.trim_end_matches('/').to_string();
+        let cat = self.catalog()?;
+        let mut out = Vec::new();
+        if let Some(children) = cat.children.get(&parent_oid) {
+            for child in children {
+                let path = format!("{parent_path}/{}", child.name);
+                let mut fe = if child.dtype == DT_DIR {
+                    FileEntry::new_directory(child.name.clone(), path, child.oid)
+                } else if child.dtype == DT_LNK {
+                    // Symlink target is read from an xattr in Phase 4; leave it
+                    // empty for now so the entry still lists.
+                    FileEntry::new_symlink(child.name.clone(), path, 0, child.oid, String::new())
+                } else {
+                    let size = cat.inodes.get(&child.oid).map(|i| i.size).unwrap_or(0);
+                    FileEntry::new_file(child.name.clone(), path, size, child.oid)
+                };
+                // Carry a directory's own inode size as 0; files already set.
+                if fe.is_directory() {
+                    fe.size = 0;
+                }
+                out.push(fe);
+            }
+        }
+        out.sort_by_key(|e| e.name.to_lowercase());
+        Ok(out)
     }
 
     fn read_file(
