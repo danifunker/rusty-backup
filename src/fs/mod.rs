@@ -23,6 +23,7 @@ pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
 pub mod exfat_fsck;
+pub mod export_selection;
 pub mod ext;
 pub mod ext_csum;
 pub mod ext_format;

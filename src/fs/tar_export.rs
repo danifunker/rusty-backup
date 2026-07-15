@@ -164,6 +164,59 @@ pub fn export_tar<W: Write>(
     Ok(stats)
 }
 
+/// Archive several `roots` (a Commander selection of files/folders) into `out`
+/// as one tar stream, each placed at the archive root under its own name (a file
+/// `foo` becomes `foo`, a directory `bar` becomes `bar/…`). Same engine as
+/// [`export_tar`]; use this when the selection is more than a single subtree.
+pub fn export_tar_multi<W: Write>(
+    fs: &mut dyn Filesystem,
+    roots: &[FileEntry],
+    out: W,
+    compression: TarCompression,
+    opts: &TarExportOptions,
+    progress: &dyn Fn(&TarExportStats),
+) -> Result<TarExportStats> {
+    let mut stats = TarExportStats::default();
+    match compression {
+        TarCompression::Gzip => {
+            let enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            write_roots(fs, roots, &mut builder, opts, &mut stats, progress)?;
+            let enc = builder.into_inner().context("finishing tar stream")?;
+            enc.finish().context("finishing gzip stream")?;
+        }
+        TarCompression::Zstd => {
+            let enc = crate::rbformats::zstd_compat::ZstdEncoder::new(out, 0)
+                .context("init zstd encoder")?;
+            let mut builder = tar::Builder::new(enc);
+            write_roots(fs, roots, &mut builder, opts, &mut stats, progress)?;
+            let enc = builder.into_inner().context("finishing tar stream")?;
+            enc.finish().context("finishing zstd stream")?;
+        }
+        TarCompression::None => {
+            let mut builder = tar::Builder::new(out);
+            write_roots(fs, roots, &mut builder, opts, &mut stats, progress)?;
+            builder.into_inner().context("finishing tar stream")?;
+        }
+    }
+    Ok(stats)
+}
+
+/// Append each selected root to `builder` under its own name.
+fn write_roots<W: Write>(
+    fs: &mut dyn Filesystem,
+    roots: &[FileEntry],
+    builder: &mut tar::Builder<W>,
+    opts: &TarExportOptions,
+    stats: &mut TarExportStats,
+    progress: &dyn Fn(&TarExportStats),
+) -> Result<()> {
+    for root in roots {
+        export_into(fs, root, &root.name, builder, opts, stats, progress)?;
+    }
+    Ok(())
+}
+
 fn export_into<W: Write>(
     fs: &mut dyn Filesystem,
     root: &FileEntry,
