@@ -24,7 +24,9 @@ use crate::fs::filesystem::Filesystem;
 use crate::fs::fork_export::{export_file_with_fork, safe_name};
 use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
+use crate::model::commander_descend::DescendKind;
 use crate::model::edit_queue::{apply_edit, StagedEdit};
+use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 
 /// Apply `edits` to the source described by `session`, in order.
 ///
@@ -201,6 +203,85 @@ impl StageSource {
             StageSource::Reopen(recipe) => recipe.open(),
         }
     }
+}
+
+/// How a wrapper-open worker gets the wrapper file's bytes to mount. Materializing
+/// a large `.toast` / `.chd` / `.iso` and probing it can take seconds, so the
+/// pane runs this off the UI thread behind a spinner ([`spawn_wrapper_open`]).
+pub enum WrapperOpenPlan {
+    /// A host file — opened by its real path (no extraction; also the only form
+    /// multi-file optical formats like bin/cue can use).
+    HostPath(PathBuf),
+    /// Extract the wrapper file from a reopenable enclosing source (a local
+    /// image session, a remote image, or a Mac archive), then mount it. Boxed —
+    /// a `StageSource` + `FileEntry` dwarfs the other variants.
+    Extract(Box<WrapperExtract>),
+    /// The wrapper bytes, already pulled off a non-reopenable enclosing layer on
+    /// the UI thread; the worker still owns the materialize + probe + open.
+    Bytes(Vec<u8>),
+}
+
+/// The reopenable source + wrapper entry for a [`WrapperOpenPlan::Extract`].
+pub struct WrapperExtract {
+    pub base: StageSource,
+    pub entry: FileEntry,
+}
+
+/// Progress + result of an off-thread wrapper open. `result` carries a
+/// [`PreparedMount`] to install, or a short error string.
+#[derive(Default)]
+pub struct WrapperOpenStatus {
+    pub phase: String,
+    pub finished: bool,
+    pub result: Option<std::result::Result<PreparedMount, String>>,
+}
+
+/// Open a wrapper (`file_name`, classified as `kind`) off the UI thread. The
+/// pane polls the returned handle each frame, shows a spinner with `phase`, and
+/// installs the [`PreparedMount`] via `WrapperTree::install_prepared` on finish.
+pub fn spawn_wrapper_open(
+    plan: WrapperOpenPlan,
+    kind: DescendKind,
+    file_name: String,
+) -> Arc<Mutex<WrapperOpenStatus>> {
+    let status = Arc::new(Mutex::new(WrapperOpenStatus {
+        phase: "Reading...".to_string(),
+        finished: false,
+        result: None,
+    }));
+    let st = Arc::clone(&status);
+    thread::spawn(move || {
+        let result = run_wrapper_open(plan, kind, file_name, &st);
+        if let Ok(mut g) = st.lock() {
+            g.result = Some(result);
+            g.finished = true;
+        }
+    });
+    status
+}
+
+fn run_wrapper_open(
+    plan: WrapperOpenPlan,
+    kind: DescendKind,
+    file_name: String,
+    status: &Arc<Mutex<WrapperOpenStatus>>,
+) -> std::result::Result<PreparedMount, String> {
+    let source = match plan {
+        WrapperOpenPlan::HostPath(path) => WrapperSource::Path(path),
+        WrapperOpenPlan::Bytes(bytes) => WrapperSource::Bytes(bytes),
+        WrapperOpenPlan::Extract(ex) => {
+            let WrapperExtract { base, entry } = *ex;
+            let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
+            let mut buf = Vec::new();
+            fs.write_file_to(&entry, &mut buf)
+                .map_err(|e| format!("reading '{}': {e}", entry.name))?;
+            WrapperSource::Bytes(buf)
+        }
+    };
+    if let Ok(mut g) = status.lock() {
+        g.phase = "Opening...".to_string();
+    }
+    WrapperTree::prepare(source, &file_name, kind).map_err(|e| format!("{e:#}"))
 }
 
 /// Off-thread [`stage_copy`]: reopens the source on a worker, extracts each file
@@ -479,6 +560,20 @@ pub enum HostCopyJob {
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
     },
+    /// Export image-volume `entries` to the host in `format` — loose files / a
+    /// per-file-compressed tree into a folder, or one tar/zip/sit archive file.
+    /// `dest` is the folder or the archive file per `format.is_single_file()`.
+    /// Boxed to keep the enum's variants close in size.
+    ExportSelection(Box<ExportJob>),
+}
+
+/// Payload for [`HostCopyJob::ExportSelection`].
+pub struct ExportJob {
+    pub source: StageSource,
+    pub entries: Vec<FileEntry>,
+    pub dest: PathBuf,
+    pub format: crate::fs::export_selection::ExportFormat,
+    pub fork_mode: ResourceForkMode,
 }
 
 /// Shared state between the GUI and the [`spawn_host_copy`] worker.
@@ -551,6 +646,68 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
             }
             copy_host_entries_to_host(&entries, &dest_dir, status)
         }
+        HostCopyJob::ExportSelection(job) => run_export(*job, status),
+    }
+}
+
+fn run_export(job: ExportJob, status: &Arc<Mutex<HostCopyStatus>>) -> Result<usize> {
+    use crate::fs::export_selection::{export_to_file, export_to_folder};
+    let ExportJob {
+        source,
+        entries,
+        dest,
+        format,
+        fork_mode,
+    } = job;
+    let mut fs = source.open()?;
+    let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
+    if let Ok(mut g) = status.lock() {
+        g.files_total = files_total;
+        g.bytes_total = bytes_total;
+    }
+    let ps = Arc::clone(status);
+    let progress = move |cur: &str, done: usize, bytes: u64| {
+        if let Ok(mut g) = ps.lock() {
+            g.current_file = cur.to_string();
+            g.copied = done;
+            g.bytes_done = bytes;
+        }
+    };
+    let cs = Arc::clone(status);
+    let cancelled = move || cs.lock().map(|g| g.cancel_requested).unwrap_or(false);
+    let summary = if format.is_single_file() {
+        export_to_file(fs.as_mut(), &entries, &dest, format, &progress, &cancelled)?
+    } else {
+        export_to_folder(
+            fs.as_mut(),
+            &entries,
+            &dest,
+            format,
+            fork_mode,
+            &progress,
+            &cancelled,
+        )?
+    };
+    Ok(summary.files)
+}
+
+/// Export `entries` from an already-open (non-reopenable, e.g. wrapper-mount)
+/// filesystem synchronously — the small/local fallback that mirrors the
+/// synchronous copy path. `dest` is a folder or an archive file per `format`.
+pub fn export_now(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+    dest: &Path,
+    format: crate::fs::export_selection::ExportFormat,
+    fork_mode: ResourceForkMode,
+) -> Result<crate::fs::export_selection::ExportSummary> {
+    use crate::fs::export_selection::{export_to_file, export_to_folder};
+    let noprog = |_: &str, _: usize, _: u64| {};
+    let never = || false;
+    if format.is_single_file() {
+        export_to_file(fs, entries, dest, format, &noprog, &never)
+    } else {
+        export_to_folder(fs, entries, dest, format, fork_mode, &noprog, &never)
     }
 }
 

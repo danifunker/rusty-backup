@@ -74,6 +74,14 @@ struct Mount {
     reopen: Option<commander_descend::ReopenRecipe>,
 }
 
+/// A wrapper mount built off the UI thread (all fields `Send`), ready to install
+/// into a [`WrapperTree`]. Opaque so a worker can build it via
+/// [`WrapperTree::prepare`] without touching a live tree.
+pub struct PreparedMount {
+    mount: Mount,
+    note: Option<String>,
+}
+
 /// One visible row produced by the tree walk (a descendant of an expanded
 /// wrapper — base rows come from the pane's `DirListing`, not from here).
 #[derive(Clone)]
@@ -156,6 +164,31 @@ impl WrapperTree {
         }
         self.expanded.insert(node_id.to_string());
         Ok(())
+    }
+
+    /// Build a wrapper mount from `source` on the *calling* thread. This is the
+    /// expensive part of an expand — materializing a large image to a temp file,
+    /// probing its partitions, and opening the on-disc filesystem — so a pane
+    /// runs it on a worker (everything here is `Send`) and installs the result
+    /// with [`install_prepared`](Self::install_prepared) when it finishes.
+    pub fn prepare(
+        source: WrapperSource,
+        file_name: &str,
+        kind: DescendKind,
+    ) -> Result<PreparedMount> {
+        let (mount, note) = open_mount(source, file_name, kind)?;
+        Ok(PreparedMount { mount, note })
+    }
+
+    /// Install a [`PreparedMount`] built off-thread under `node_id` and mark the
+    /// node expanded. Returns its note (e.g. a multi-volume image fallback).
+    pub fn install_prepared(&mut self, node_id: &str, prepared: PreparedMount) -> Option<String> {
+        self.mounts.insert(node_id.to_string(), prepared.mount);
+        if let Some(n) = &prepared.note {
+            self.notes.insert(node_id.to_string(), n.clone());
+        }
+        self.expanded.insert(node_id.to_string());
+        prepared.note
     }
 
     /// Expand a folder node (its enclosing wrapper is already mounted).

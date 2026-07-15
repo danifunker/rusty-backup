@@ -364,6 +364,13 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("XFS".to_string());
     }
 
+    // APFS container superblock (NXSB) magic at offset 32 of block 0. A raw
+    // APFS container image (dd of a GPT `Apple_APFS` partition, or a
+    // partition-less container) is a flat superfloppy rooted at byte 0.
+    if crate::fs::apfs::detect_apfs(first_sector) {
+        return Some("APFS".to_string());
+    }
+
     // Sinclair QL QXL.WIN container: 4-byte "QLWA" signature at byte 0.
     // Raw .win images carry no partition table — they're a single QDOS
     // volume rooted at byte 0 — so the superfloppy path is the right

@@ -64,7 +64,8 @@ pub struct GetBinHexArgs {
     /// Destination `.hqx` path on the host.
     pub dst: PathBuf,
 
-    /// Password for encrypted containers (currently: WinImage IMZ).
+    /// Password for encrypted containers (WinImage IMZ) or an encrypted
+    /// filesystem (APFS FileVault — the volume password or recovery key).
     #[arg(long)]
     pub password: Option<String>,
 
@@ -192,11 +193,12 @@ pub fn run_get(args: GetBinHexArgs) -> Result<()> {
         pw_bytes,
     )?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem(
+    let mut fs = crate::fs::open_filesystem_with_passphrase(
         reader,
         ctx.offset,
         ctx.type_byte,
         ctx.type_string.as_deref(),
+        args.password.as_deref(),
     )
     .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 

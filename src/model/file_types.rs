@@ -12,6 +12,11 @@
 //! re-registers the new extensions on next launch without a reinstaller.
 //! On macOS/Linux the equivalent metadata (`Info.plist` `CFBundleDocumentTypes`,
 //! `.desktop` `MimeType=`) is generated from these same lists at build time.
+//!
+//! [`association_exts`] is per-target: [`NON_ASSOCIATED_EXTS`] is subtracted
+//! everywhere (picker-only formats like `.zip`), and [`OS_EXCLUDED_ASSOC_EXTS`]
+//! is subtracted on macOS only (Apple owns `.dmg`), so the Windows/Linux builds
+//! register `.dmg` while the macOS build does not.
 
 /// Disk-image extensions for rfd file pickers — the canonical set plus
 /// uppercase variants of the case-sensitive container formats (rfd matches
@@ -32,6 +37,19 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
 /// handler for *every* `.zip` the user double-clicks. Filtered out of
 /// [`association_exts`].
 pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz"];
+
+/// Extensions excluded from OS file-association registration **on macOS only**,
+/// because macOS itself owns the format. `.dmg` is Apple's disk-image type
+/// (`com.apple.disk-image`, handled by the system DiskImageMounter), so on a
+/// Mac we must not seize its default association — we still open `.dmg` from the
+/// in-app picker, we just leave the OS handler alone. On non-Apple systems
+/// (Windows / Linux) `.dmg` has no native owner, so we DO register for it there
+/// (this list is empty off macOS). Subtracted at the [`association_exts`]
+/// choke-point, so the split is automatic per build target.
+#[cfg(target_os = "macos")]
+pub const OS_EXCLUDED_ASSOC_EXTS: &[&str] = &["dmg"];
+#[cfg(not(target_os = "macos"))]
+pub const OS_EXCLUDED_ASSOC_EXTS: &[&str] = &[];
 
 /// Optical disc-image extensions (CD/DVD images), a distinct picker group.
 ///
@@ -105,7 +123,9 @@ pub fn association_exts() -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(DISK_IMAGE_EXTS.len());
     for ext in DISK_IMAGE_EXTS {
         let lower = ext.to_ascii_lowercase();
-        if NON_ASSOCIATED_EXTS.contains(&lower.as_str()) {
+        if NON_ASSOCIATED_EXTS.contains(&lower.as_str())
+            || OS_EXCLUDED_ASSOC_EXTS.contains(&lower.as_str())
+        {
             continue;
         }
         if !out.contains(&lower) {
@@ -168,6 +188,25 @@ mod tests {
     }
 
     #[test]
+    fn dmg_associated_except_on_macos() {
+        // `.dmg` is a first-class disk image in the picker on every platform.
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"dmg"),
+            "dmg must be in the picker list on all platforms"
+        );
+        // OS association: registered on non-Apple systems (no native owner),
+        // but NOT on macOS, where Apple's DiskImageMounter owns the format.
+        let associated = association_exts().contains(&"dmg".to_string());
+        #[cfg(target_os = "macos")]
+        assert!(
+            !associated,
+            "dmg must NOT be OS-associated on macOS (Apple owns .dmg)"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(associated, "dmg must be OS-associated on non-Apple systems");
+    }
+
+    #[test]
     fn cbk_is_picker_and_associated() {
         // `.cbk` is the cb-dos backup container; the app opens it as a native
         // disk image (inspect/browse/restore), so it belongs in the picker AND,
@@ -189,11 +228,9 @@ mod tests {
         // association_exts() so the OS file picker / double-click routing keeps
         // surfacing that format. Dropping one has to be a deliberate table edit.
         let families: &[(&str, &[&str])] = &[
-            // Common disk / backup formats.
-            (
-                "common",
-                &["img", "raw", "vhd", "chd", "adf", "hdf", "dmg", "hda"],
-            ),
+            // Common disk / backup formats. (`.dmg` is asserted separately in
+            // `dmg_associated_except_on_macos` because it is macOS-excluded.)
+            ("common", &["img", "raw", "vhd", "chd", "adf", "hdf", "hda"]),
             // Sharp X68000 SASI/SCSI HDD images (Human68k engine).
             ("x68000 hdd", &["hda", "hdf", "hds"]),
             // Xerox Alto / Pilot disk packs (BrowseSession Alto branch).

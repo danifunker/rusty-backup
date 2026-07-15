@@ -7,7 +7,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 
 ## What Rusty Backup supports today
 
-- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX, ext2/3/4, XFS,
+- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX,
+  APFS (read-only browse + extract, incl. FileVault via password / recovery
+  key; no snapshots),
+  ext2/3/4, XFS,
   JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),

@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use rusty_backup::fs::entry::FileEntry;
+use rusty_backup::fs::export_selection::ExportFormat;
 use rusty_backup::fs::filesystem::Filesystem;
 use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
@@ -34,7 +35,9 @@ use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_descend::{
     classify_entry, open_archive, DescendKind, ReopenRecipe,
 };
-use rusty_backup::model::commander_ops::{self, ApplyStatus};
+use rusty_backup::model::commander_ops::{
+    self, ApplyStatus, WrapperExtract, WrapperOpenPlan, WrapperOpenStatus,
+};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
@@ -60,6 +63,9 @@ const META_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 190, 255);
 const IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(110, 210, 190);
 /// The "Close Image" affordance — amber, to read as "step back out".
 const CLOSE_IMAGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
+/// The "Read-only" media badge in the volume readout — amber, "look but touch
+/// carefully".
+const READ_ONLY_BADGE_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 170, 90);
 
 /// What a pane reports back to [`super::CommanderMode`] after a frame.
 #[derive(Default)]
@@ -69,9 +75,13 @@ pub(crate) struct PaneResponse {
     /// The user asked (via the row menu) to copy this pane's selection to the
     /// other pane; `CommanderMode` performs the cross-pane copy.
     pub copy_to_other: bool,
-    /// The user asked (via the row menu) to export this pane's selection to a
-    /// host folder they pick; `CommanderMode` runs the threaded host write.
+    /// The user asked (via the row menu) to export this pane's selection to the
+    /// host using the middle-column "Export as" format; `CommanderMode` runs the
+    /// threaded write.
     pub export_to_host: bool,
+    /// The user picked a specific format from the row menu's "Export" submenu,
+    /// overriding the dropdown for this one export.
+    pub export_as: Option<ExportFormat>,
     /// The user asked (via the row menu) to calculate checksums for this pane's
     /// selection; `CommanderMode` opens the threaded checksum window.
     pub checksums: bool,
@@ -94,8 +104,10 @@ struct RowActions {
     status: Option<String>,
     /// Copy the selection to the other pane.
     copy: bool,
-    /// Export the selection to a picked host folder.
+    /// Export the selection to the host using the dropdown's "Export as" format.
     export: bool,
+    /// Export the selection in a format picked from the "Export" submenu.
+    export_as: Option<ExportFormat>,
     /// Calculate checksums for the selection.
     checksums: bool,
     /// Open the File Info window for this entry (by name).
@@ -134,6 +146,10 @@ pub(crate) struct CommanderPane {
     /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
     /// partclone-cache session and hands off to `pending_open`.
     pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
+    /// In-flight async wrapper expansion (a large `.toast`/`.chd`/`.iso` being
+    /// materialized + probed off the UI thread). `poll_wrapper` installs the
+    /// mount when it finishes; a spinner shows meanwhile.
+    pending_wrapper: Option<PendingWrapper>,
     /// Scanned Clonezilla block caches reused across opens this session. The
     /// shared store also holds the in-memory/on-disk/scan decision tree so this
     /// pane and the Inspect tab agree (see `commander_source::PartcloneCacheStore`).
@@ -151,6 +167,13 @@ pub(crate) struct CommanderPane {
     used_size: u64,
     /// Last open / navigation / apply error, shown in the pane body.
     error: Option<String>,
+    /// True when the current source needs a password / passphrase to open
+    /// (encrypted container, or a locked APFS FileVault volume). Renders the
+    /// unlock prompt in the pane body; on submit the secret is stashed on
+    /// `session.password` and the open is re-spawned.
+    needs_password: bool,
+    /// The user's in-progress password / passphrase entry for the unlock prompt.
+    password_input: String,
     /// A source/partition switch the user requested while the queue was
     /// non-empty; held until they confirm discarding the staged edits.
     pending_switch: Option<PendingSwitch>,
@@ -268,6 +291,14 @@ enum PendingSwitch {
     Close,
 }
 
+/// An in-flight async wrapper expansion: the node being opened, its display
+/// name (for the spinner + status), and the worker's shared status handle.
+struct PendingWrapper {
+    node_id: String,
+    name: String,
+    status: Arc<Mutex<WrapperOpenStatus>>,
+}
+
 impl CommanderPane {
     pub(crate) fn new(side: Side) -> Self {
         Self {
@@ -282,6 +313,7 @@ impl CommanderPane {
             pending_open: None,
             pending_apply: None,
             pending_scan: None,
+            pending_wrapper: None,
             cache_store: commander_source::PartcloneCacheStore::new(),
             open_phase: String::new(),
             open_rate: super::super::progress::RateTracker::default(),
@@ -290,6 +322,8 @@ impl CommanderPane {
             total_size: 0,
             used_size: 0,
             error: None,
+            needs_password: false,
+            password_input: String::new(),
             pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
@@ -383,7 +417,15 @@ impl CommanderPane {
                 self.wrapper_tree.expand_folder(node_id);
             }
         } else {
-            // Base wrapper: its bytes come from the host file or the base fs.
+            // Base wrapper: open it off the UI thread with a spinner —
+            // materializing a large `.toast`/`.chd`/`.iso` to a temp file and
+            // probing it can take seconds. Only one wrapper opens at a time.
+            if self.pending_wrapper.is_some() {
+                let side = self.side.label();
+                return Some(format!(
+                    "[{side}] a wrapper is already opening; wait for it."
+                ));
+            }
             let entry = self
                 .listing
                 .entries()
@@ -394,9 +436,15 @@ impl CommanderPane {
             // A host file opens by its real path — cheaper than reading it all,
             // and required for multi-file optical formats (bin/cue, mdf/mds)
             // whose sibling data file sits next to it. A wrapper inside an image
-            // pane must be read out of that filesystem first.
-            let source = if self.listing.is_host() {
-                WrapperSource::Path(PathBuf::from(&entry.path))
+            // pane is extracted on the worker from a fresh reopen of the base
+            // source; a non-reopenable base (rare) extracts synchronously here.
+            let plan = if self.listing.is_host() {
+                WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
+            } else if let Some(base) = self.base_stage_source() {
+                WrapperOpenPlan::Extract(Box::new(WrapperExtract {
+                    base,
+                    entry: entry.clone(),
+                }))
             } else {
                 let Some(fs) = self.listing.fs_mut() else {
                     return self.wrapper_open_failed(name, "source is not open".into());
@@ -405,19 +453,52 @@ impl CommanderPane {
                 if let Err(e) = fs.write_file_to(&entry, &mut buf) {
                     return self.wrapper_open_failed(name, e.to_string());
                 }
-                WrapperSource::Bytes(buf)
+                WrapperOpenPlan::Bytes(buf)
             };
-            if let Err(e) = self
-                .wrapper_tree
-                .expand_wrapper(node_id, name, kind, source)
-            {
-                return self.wrapper_open_failed(name, format!("{e:#}"));
-            }
+            self.pending_wrapper = Some(PendingWrapper {
+                node_id: node_id.to_string(),
+                name: name.to_string(),
+                status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
+            });
+            return Some(format!("[{}] opening {name}...", self.side.label()));
         }
         let side = self.side.label();
         self.wrapper_tree
             .note(node_id)
             .map(|n| format!("[{side}] {name}: {n}"))
+    }
+
+    /// The reopen handle for this pane's *base* source (ignoring any active
+    /// wrapper-tree selection) — a local image session, a remote image, or a Mac
+    /// archive by path. Used to extract a base wrapper's bytes on a worker so a
+    /// large expand doesn't freeze the UI. `None` for a host base (opened by
+    /// path instead) or a source with no reopenable handle.
+    fn base_stage_source(&self) -> Option<commander_ops::StageSource> {
+        if let Some(session) = self.session.clone() {
+            return Some(commander_ops::StageSource::Session(session));
+        }
+        #[cfg(feature = "remote")]
+        if let Some(RemoteConn {
+            addr,
+            mode: BrowseMode::Image { path, partition },
+        }) = &self.remote
+        {
+            return Some(commander_ops::StageSource::Remote {
+                addr: addr.clone(),
+                path: path.clone(),
+                partition: *partition,
+            });
+        }
+        if self.archive_source {
+            if let Some(path) = &self.source {
+                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
+                    path: path.clone(),
+                    label,
+                }));
+            }
+        }
+        None
     }
 
     /// Record a failed wrapper expansion in the session log (where the full
@@ -451,6 +532,8 @@ impl CommanderPane {
             self.last_cwd = cwd_now;
             self.wrapper_tree.clear();
             self.tree_selected.clear();
+            // Abandon any wrapper open still in flight — its target row is gone.
+            self.pending_wrapper = None;
         }
         let mut status = self.poll_open(ui.ctx());
         if let Some(s) = self.poll_apply(ui.ctx()) {
@@ -459,11 +542,15 @@ impl CommanderPane {
         if let Some(s) = self.poll_scan(ui.ctx()) {
             status = Some(s);
         }
+        if let Some(s) = self.poll_wrapper(ui.ctx()) {
+            status = Some(s);
+        }
         if let Some(s) = self.poll_remote(ui.ctx()) {
             status = Some(s);
         }
         let mut copy_to_other = false;
         let mut export_to_host = false;
+        let mut export_as: Option<ExportFormat> = None;
         let mut checksums = false;
         let mut detail = None;
         let mut focused = false;
@@ -473,6 +560,27 @@ impl CommanderPane {
         }
         self.path_line(ui);
         ui.separator();
+
+        // A wrapper being opened off-thread: show a spinner + phase above the
+        // still-visible listing (the expand is inline, so the base rows stay).
+        if let Some(pw) = &self.pending_wrapper {
+            let phase = pw
+                .status
+                .lock()
+                .ok()
+                .map(|g| g.phase.clone())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label(if phase.is_empty() {
+                    format!("Opening {}...", pw.name)
+                } else {
+                    format!("{}: {}", pw.name, phase)
+                });
+            });
+            ui.ctx().request_repaint();
+        }
 
         if self.pending_apply.is_some() {
             ui.add_space(20.0);
@@ -549,6 +657,49 @@ impl CommanderPane {
                     self.open_phase.clone()
                 });
             });
+        } else if self.needs_password && self.session.is_some() {
+            // Unlock prompt for an encrypted source — reuses the same
+            // stash-secret-and-re-spawn retry as the Inspect BrowseView. Adapts
+            // its copy for a locked APFS FileVault volume vs. a container image.
+            // Gated on `session.is_some()` so switching away to a session-less
+            // source (host folder, closed pane) drops a stale prompt.
+            let is_apfs = self.fs_type == "APFS";
+            let mut submit = false;
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                if is_apfs {
+                    ui.label("This APFS volume is encrypted with FileVault.");
+                    ui.add_space(4.0);
+                    ui.label("Enter the volume password or personal recovery key.");
+                } else {
+                    ui.label("This source is password-protected.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.password_input)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Unlock").clicked() || enter {
+                        submit = true;
+                    }
+                });
+            });
+            if submit {
+                let secret = self.password_input.clone();
+                let spawned = self.session.as_mut().map(|session| {
+                    session.password = Some(secret);
+                    session.spawn_open()
+                });
+                if let Some(arc) = spawned {
+                    self.pending_open = Some(arc);
+                    self.needs_password = false;
+                    self.error = None;
+                }
+            }
         } else if let Some(err) = &self.error {
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
@@ -560,6 +711,7 @@ impl CommanderPane {
             }
             copy_to_other = actions.copy;
             export_to_host = actions.export;
+            export_as = actions.export_as;
             checksums = actions.checksums;
             detail = actions.detail;
             focused = actions.focused;
@@ -605,6 +757,7 @@ impl CommanderPane {
             status,
             copy_to_other,
             export_to_host,
+            export_as,
             checksums,
             detail,
             focused,
@@ -1218,6 +1371,34 @@ impl CommanderPane {
             && (self.remote.is_none() || self.is_remote_image())
     }
 
+    /// True when this pane's source is read-only media that can never receive a
+    /// copy — a Mac archive, a backup folder, or a remote host folder (no
+    /// host-write verb yet). Distinct from `can_receive`, which is also false
+    /// for transient states (mid-open/apply); this reflects the *medium*, so the
+    /// pane header can show a "Read-only" badge. Host folders and writable image
+    /// volumes are not read-only.
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.listing.is_loaded()
+            && !self.listing.is_host()
+            && (self.archive_source
+                || self.resolved_backup.is_some()
+                || (self.remote.is_some() && !self.is_remote_image()))
+    }
+
+    /// A short reason a copy into this pane is refused, for the copy button's
+    /// disabled hover. `None` when the pane can receive.
+    pub(crate) fn readonly_reason(&self) -> Option<&'static str> {
+        if self.archive_source {
+            Some("the archive is read-only")
+        } else if self.resolved_backup.is_some() {
+            Some("the backup is read-only")
+        } else if self.remote.is_some() && !self.is_remote_image() {
+            Some("a remote host folder can't receive copies yet")
+        } else {
+            None
+        }
+    }
+
     /// True when this pane lists a host-OS folder rather than a disk image.
     /// When a wrapper selection is active the effective source is the mounted
     /// wrapper filesystem (not the host), so report `false`.
@@ -1415,6 +1596,18 @@ impl CommanderPane {
         name: &str,
         max: usize,
     ) -> Option<(FileEntry, Option<Vec<u8>>)> {
+        // A wrapper-tree row (a file inside an expanded .sit / .toast / disk-image
+        // wrapper): resolve against the active tree selection — a right-click
+        // selects the row first — and read through the mounted wrapper fs.
+        if self.tree_active() {
+            let (_, entries) = self.tree_selection()?;
+            let entry = entries.into_iter().find(|e| e.name == name)?;
+            if !entry.is_file() {
+                return Some((entry, None));
+            }
+            let data = self.fs_mut().and_then(|fs| fs.read_file(&entry, max).ok());
+            return Some((entry, data));
+        }
         let entry = self
             .listing
             .entries()
@@ -1434,18 +1627,29 @@ impl CommanderPane {
         Some((entry, data))
     }
 
+    /// True when an expanded-wrapper row is the active selection. Its contents
+    /// are read-only (copy out, don't edit), so File Info shows no editors.
+    pub(crate) fn wrapper_selection_active(&self) -> bool {
+        self.tree_active()
+    }
+
+    /// The filesystem type to show in File Info: the mounted wrapper's type
+    /// when a tree selection is active (e.g. "HFS" for a file inside a `.toast`
+    /// opened through a `.sit`), else the base pane's type.
+    pub(crate) fn detail_fs_type(&mut self) -> String {
+        if let Some((mount, _)) = self.tree_selection() {
+            if let Some(fs) = self.wrapper_tree.mount_fs(&mount) {
+                return fs.fs_type().to_string();
+            }
+        }
+        self.fs_type().to_string()
+    }
+
     /// True when this pane is browsing a remote daemon (host FS or an image on
     /// it). Cross-pane callers use this to gate in-place edits that the remote
     /// write path doesn't carry yet (delete / rename over the wire).
     pub(crate) fn is_remote(&self) -> bool {
         self.remote.is_some()
-    }
-
-    /// True when this pane is a remote *host* folder — a copy destination the
-    /// write path can't reach yet (the daemon has no host-write verb; only
-    /// remote disk images can be written). Drives the Copy button's hint.
-    pub(crate) fn is_remote_host_dest(&self) -> bool {
-        self.remote.is_some() && !self.is_remote_image()
     }
 
     /// Open a drag-and-dropped path as this pane's source (drag-and-drop router).
@@ -1749,6 +1953,17 @@ impl CommanderPane {
                     ui.separator();
                     let free = self.total_size.saturating_sub(self.used_size);
                     ui.label(format!("free: {}", format_size(free)));
+                    // Read-only media (archive / backup / remote host): flag it so
+                    // the greyed copy-into button reads as "by design", and edits
+                    // aren't attempted.
+                    if self.is_read_only() {
+                        ui.separator();
+                        ui.colored_label(READ_ONLY_BADGE_COLOR, "Read-only")
+                            .on_hover_text(
+                                "This source can be browsed and copied out of, but not \
+                                 written to — copies into this pane are disabled.",
+                            );
+                    }
                 }
             });
         }
@@ -1770,6 +1985,7 @@ impl CommanderPane {
         self.pending_open = None;
         self.pending_apply = None;
         self.pending_scan = None;
+        self.pending_wrapper = None;
         self.open_phase.clear();
         self.volume_label.clear();
         self.fs_type.clear();
@@ -2143,6 +2359,33 @@ impl CommanderPane {
         ))
     }
 
+    /// Poll an in-flight async wrapper expansion; on completion, install the
+    /// prepared mount (or record the failure) and drop the spinner.
+    fn poll_wrapper(&mut self, ctx: &egui::Context) -> Option<String> {
+        let finished = {
+            let pw = self.pending_wrapper.as_ref()?;
+            ctx.request_repaint();
+            pw.status.lock().ok().map(|g| g.finished).unwrap_or(false)
+        };
+        if !finished {
+            return None;
+        }
+        let pw = self.pending_wrapper.take()?;
+        let result = pw.status.lock().ok().and_then(|mut g| g.result.take());
+        match result {
+            Some(Ok(prepared)) => {
+                let note = self.wrapper_tree.install_prepared(&pw.node_id, prepared);
+                let side = self.side.label();
+                Some(match note {
+                    Some(n) => format!("[{side}] {}: {n}", pw.name),
+                    None => format!("[{side}] opened {}.", pw.name),
+                })
+            }
+            Some(Err(e)) => self.wrapper_open_failed(&pw.name, e),
+            None => None,
+        }
+    }
+
     /// Poll an in-flight open; on completion, hand the filesystem + root listing
     /// to the model or record the error. Returns a status line on completion.
     fn poll_open(&mut self, ctx: &egui::Context) -> Option<String> {
@@ -2155,6 +2398,24 @@ impl CommanderPane {
         }
         // Finished — detach the pending handle either way.
         self.pending_open = None;
+
+        // Encrypted source: the worker flags `needs_password` for a locked
+        // container OR a locked APFS FileVault volume (which opens fine but
+        // fails at the root listing). Show the unlock prompt instead of a dead
+        // error; the (locked) fs is dropped. Capture the label/fs_type first so
+        // the prompt can adapt (APFS) and the source bar still reads the volume.
+        if guard.needs_password {
+            self.volume_label = guard.volume_label.clone();
+            self.fs_type = guard.fs_type.clone();
+            self.needs_password = true;
+            self.error = None;
+            return None;
+        }
+        // The open completed without needing a secret — clear any prior prompt
+        // (e.g. a successful unlock, or switching to an unencrypted source) and
+        // drop the entered secret from memory.
+        self.needs_password = false;
+        self.password_input.clear();
 
         if let Some(err) = guard.error.take() {
             self.error = Some(err);
@@ -2444,6 +2705,7 @@ impl CommanderPane {
         let mut m_host_delete = false;
         let mut m_copy = false;
         let mut m_export = false;
+        let mut m_export_as: Option<ExportFormat> = None;
         let mut m_checksums = false;
         let mut m_rename: Option<String> = None;
         let mut m_cancel_rename: Option<String> = None;
@@ -2562,15 +2824,23 @@ impl CommanderPane {
                                 m_copy = true;
                                 ui.close();
                             }
-                            // Export the selection to a host folder the user
-                            // picks (loose files, not an archive). Like Copy,
-                            // it needs real data, so a not-yet-applied staged
-                            // add is excluded.
-                            if !matches!(row.kind, RowKind::PendingAdd)
-                                && ui.button("Export to hard drive...").clicked()
-                            {
-                                m_export = true;
-                                ui.close();
+                            // Export the selection to the host. "Export to hard
+                            // drive..." uses the middle-column "Export as" format;
+                            // the "Export" submenu picks a format inline. Needs
+                            // real data, so a not-yet-applied staged add is out.
+                            if !matches!(row.kind, RowKind::PendingAdd) {
+                                if ui.button("Export to hard drive...").clicked() {
+                                    m_export = true;
+                                    ui.close();
+                                }
+                                ui.menu_button("Export as", |ui| {
+                                    for fmt in ExportFormat::ALL {
+                                        if ui.button(fmt.label()).clicked() {
+                                            m_export_as = Some(fmt);
+                                            ui.close();
+                                        }
+                                    }
+                                });
                             }
                             // Checksums need real data, so a not-yet-applied
                             // staged add is excluded (same as Copy / Export).
@@ -2580,11 +2850,12 @@ impl CommanderPane {
                                 m_checksums = true;
                                 ui.close();
                             }
-                            // File Info / Details: metadata + preview, with the
-                            // editable-metadata subset on image panes. Needs
-                            // real data, so a not-yet-applied add is excluded.
-                            if !row.is_tree
-                                && !matches!(row.kind, RowKind::PendingAdd)
+                            // File Info / Details: metadata + preview. Available
+                            // for base-listing rows AND wrapper-tree rows (files
+                            // inside a .sit / .toast / disk-image wrapper), which
+                            // resolve through the mounted wrapper filesystem.
+                            // Needs real data, so a not-yet-applied add is excluded.
+                            if !matches!(row.kind, RowKind::PendingAdd)
                                 && ui.button("File Info / Details...").clicked()
                             {
                                 m_info = Some(row.name.clone());
@@ -2667,7 +2938,21 @@ impl CommanderPane {
         }
         if let Some(name) = to_enter {
             if let Err(e) = self.listing.enter(&name) {
-                status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
+                // A synchronous read that hits an encrypted, still-locked volume
+                // (belt-and-suspenders for the "directly through open" paths —
+                // for APFS the root listing already fails at open, but any FS
+                // that opens then errors deeper on a locked read lands here):
+                // surface the unlock prompt instead of a dead status line.
+                if self.session.is_some()
+                    && rusty_backup::model::browse_session::looks_like_password_error(
+                        &e.to_string(),
+                    )
+                {
+                    self.needs_password = true;
+                    self.error = None;
+                } else {
+                    status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
+                }
             }
         }
         if bg_deselect {
@@ -2765,6 +3050,7 @@ impl CommanderPane {
             status,
             copy: m_copy,
             export: m_export,
+            export_as: m_export_as,
             checksums: m_checksums,
             detail: m_info,
             open_image: m_open_image,

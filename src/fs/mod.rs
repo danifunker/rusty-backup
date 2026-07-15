@@ -4,6 +4,8 @@ pub mod affs_common;
 pub mod affs_fsck;
 pub mod alto;
 pub mod andos;
+pub mod apfs;
+pub mod apfs_crypto;
 pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
@@ -23,6 +25,7 @@ pub mod entry;
 pub mod exfat;
 pub mod exfat_clone;
 pub mod exfat_fsck;
+pub mod export_selection;
 pub mod ext;
 pub mod ext_csum;
 pub mod ext_format;
@@ -233,6 +236,12 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // fully supported for read + edit + fsck (§2.1 hole (E)).
     if &sector0[0..4] == b"XFSB" {
         return "xfs";
+    }
+    // APFS container superblock (NXSB) magic at offset 32 of block 0. The full
+    // checksum-validated checkpoint scan happens in ApfsFilesystem::open; here
+    // we only sniff the magic + a plausible block size on the single probe read.
+    if apfs::detect_apfs(&sector0) {
+        return "apfs";
     }
 
     // Sectors 2-3 (offset 1024): HFS/HFS+ volume header / MDB and ext superblock.
@@ -1050,6 +1059,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
+            // Apple APFS GPT partition GUID.
+            "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             // Amiga boot block present, no AmigaDOS filesystem (custom
@@ -1343,14 +1354,35 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
 /// `partition_type` is the MBR partition type byte.
 /// `partition_type_string` is the APM partition type string (e.g. "Apple_HFS").
 pub fn open_filesystem<R: Read + Seek + Send + 'static>(
-    mut reader: R,
+    reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_with_passphrase(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        None,
+    )
+}
+
+/// Like [`open_filesystem`], but carries an optional filesystem-level
+/// `passphrase` for volumes that encrypt their own contents (APFS FileVault).
+/// The passphrase is ignored by every filesystem that isn't encrypted; on an
+/// encrypted APFS volume, `None` opens it locked (browse then reports
+/// "passphrase required") and a wrong passphrase is an error.
+pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return open_filesystem_by_string(reader, partition_offset, type_str);
+        return open_filesystem_by_string(reader, partition_offset, type_str, passphrase);
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -1476,6 +1508,11 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
                     reader,
                     partition_offset,
+                )?)),
+                "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open_with_passphrase(
+                    reader,
+                    partition_offset,
+                    passphrase,
                 )?)),
                 // No filesystem recognized. Rather than erroring, fall back to
                 // the synthetic carve view so the user can still pull a raw
@@ -1941,6 +1978,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     type_str: &str,
+    passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
         "Apple_HFS" => {
@@ -2086,6 +2124,12 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // Apple APFS GPT partition GUID. The partition holds an APFS
+        // *container* (which may host several volumes); the driver opens the
+        // container and browses its first non-empty volume. Read-only.
+        "7C3457EF-0000-11AA-AA11-00306543ECAC" => Ok(Box::new(
+            apfs::ApfsFilesystem::open_with_passphrase(reader, partition_offset, passphrase)?,
+        )),
         // Apple Lisa File System: the tag-bearing DiskCopy 4.2 / DART container
         // is opened as a whole (the driver parses the header + 12-byte sector
         // tags itself), so `partition_offset` is ignored. Read-only.
@@ -2270,6 +2314,9 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Apple_ProDOS"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
             | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+            // GPT "Apple APFS" container GUID — read-only browse of the
+            // container's first unencrypted volume.
+            | "7C3457EF-0000-11AA-AA11-00306543ECAC"
             // Custom bootblock Amiga disk with no filesystem — browsable via
             // the synthetic carve view (whole-disk + recoverable text/JSON).
             | "Amiga-NDOS"
@@ -2300,6 +2347,10 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "HFS+"
             | "NTFS"
             | "exFAT"
+            // Raw APFS container image (dd of an Apple_APFS partition, or a
+            // partition-less container); auto-detected at byte 0 by the NXSB
+            // magic and opened read-only.
+            | "APFS"
             | "ProDOS"
             // Apple DOS 3.3 (the `detect_superfloppy` hint for a 140 KB Apple II
             // floppy / WOZ); open_filesystem auto-detects it as `applesdos33`.

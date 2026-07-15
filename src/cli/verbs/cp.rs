@@ -109,7 +109,9 @@ pub struct CpArgs {
     #[arg(long)]
     pub parents: bool,
 
-    /// Password for an encrypted source container (currently: WinImage IMZ).
+    /// Password for an encrypted source container (WinImage IMZ) or an
+    /// encrypted source filesystem (APFS FileVault — the volume password or
+    /// personal recovery key).
     #[arg(long)]
     pub password: Option<String>,
 
@@ -197,11 +199,12 @@ pub fn run(args: CpArgs) -> Result<()> {
     }
     .apply(&mut src_ctx);
     log_stderr(format!("source: {}", src_ctx.label));
-    let mut src = crate::fs::open_filesystem(
+    let mut src = crate::fs::open_filesystem_with_passphrase(
         reader,
         src_ctx.offset,
         src_ctx.type_byte,
         src_ctx.type_string.as_deref(),
+        args.password.as_deref(),
     )
     .map_err(|e| anyhow!("opening source filesystem: {e}"))?;
 
