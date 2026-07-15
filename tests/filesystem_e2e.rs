@@ -3638,3 +3638,119 @@ fn test_hfv_source_open_unwraps_dynamic_vhd() {
         .expect("container-aware open finds the HFS volume");
     assert_eq!(fs.volume_summary().volume_name, "HfvDynRT");
 }
+
+// ============================================================================
+// Test Group APFS: read-only browse of a real macOS-formatted APFS container
+//
+// Fixture: tests/fixtures/test_apfs.img.zst — a 24 MiB unencrypted APFS
+// container (one volume "RBTEST") captured from macOS. Checksum oracle for the
+// file tree lives in tests/fixtures/apfs/oracle_checksums.txt.
+// ============================================================================
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn test_apfs_open_and_labels() {
+    let img = load_fixture("test_apfs.img.zst");
+    let fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    assert_eq!(fs.fs_type(), "APFS");
+    assert_eq!(fs.volume_label(), Some("RBTEST"));
+    // Container is 24 MiB; used size is the volume's allocated blocks (> 0).
+    assert_eq!(fs.total_size(), 25_124_864);
+    assert!(fs.used_size() > 0 && fs.used_size() < fs.total_size());
+}
+
+#[test]
+fn test_apfs_browse_root_and_nested() {
+    let img = load_fixture("test_apfs.img.zst");
+    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    for want in [
+        "big.bin",
+        "docs",
+        "hello.txt",
+        "medium.txt",
+        "link_to_hello",
+    ] {
+        assert!(names.contains(&want), "missing {want} in {names:?}");
+    }
+
+    // Sizes match what macOS wrote.
+    let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+    assert!(by_name("docs").is_directory());
+    assert_eq!(by_name("hello.txt").size, 17);
+    assert_eq!(by_name("medium.txt").size, 5000);
+    assert_eq!(by_name("big.bin").size, 524_288);
+
+    // Symlink target resolves via the com.apple.fs.symlink xattr.
+    let link = by_name("link_to_hello");
+    assert!(link.is_symlink());
+    assert_eq!(link.symlink_target.as_deref(), Some("hello.txt"));
+
+    // Nested directory: docs/nested/deep.txt.
+    let docs = by_name("docs").clone();
+    let docs_kids = fs.list_directory(&docs).unwrap();
+    let nested = docs_kids
+        .iter()
+        .find(|e| e.name == "nested")
+        .unwrap()
+        .clone();
+    let nested_kids = fs.list_directory(&nested).unwrap();
+    assert!(nested_kids.iter().any(|e| e.name == "deep.txt"));
+}
+
+#[test]
+fn test_apfs_read_matches_oracle_checksums() {
+    // Parse the checksum oracle: "<sha256>  <relative path>".
+    let oracle = std::fs::read_to_string("tests/fixtures/apfs/oracle_checksums.txt").unwrap();
+    let mut expected: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in oracle.lines() {
+        let (hash, path) = line.split_once("  ").unwrap();
+        expected.insert(path.to_string(), hash.to_string());
+    }
+
+    let img = load_fixture("test_apfs.img.zst");
+    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+
+    // Walk the whole tree and check every file's content hash against macOS.
+    fn check(
+        fs: &mut rusty_backup::fs::apfs::ApfsFilesystem<Cursor<Vec<u8>>>,
+        dir: &rusty_backup::fs::entry::FileEntry,
+        prefix: &str,
+        expected: &std::collections::HashMap<String, String>,
+        checked: &mut usize,
+    ) {
+        for child in fs.list_directory(dir).unwrap() {
+            let rel = if prefix.is_empty() {
+                child.name.clone()
+            } else {
+                format!("{prefix}/{}", child.name)
+            };
+            if child.is_directory() {
+                check(fs, &child, &rel, expected, checked);
+            } else if child.is_file() {
+                let data = fs.read_file(&child, usize::MAX).unwrap();
+                assert_eq!(data.len() as u64, child.size, "size mismatch for {rel}");
+                let got = sha256_hex(&data);
+                assert_eq!(
+                    Some(&got),
+                    expected.get(&rel),
+                    "checksum mismatch for {rel}"
+                );
+                *checked += 1;
+            }
+        }
+    }
+
+    let root = fs.root().unwrap();
+    let mut checked = 0;
+    check(&mut fs, &root, "", &expected, &mut checked);
+    assert_eq!(checked, expected.len(), "did not verify every oracle file");
+}

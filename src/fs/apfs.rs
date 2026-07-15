@@ -28,7 +28,7 @@
 //! Reference: Apple's *Apple File System Reference* (the `nx_*` / `apfs_*` /
 //! `j_*` / `btree_node_phys` / `omap_*` struct names used below match it).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -96,6 +96,22 @@ const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
 /// Length mask over `j_drec_hashed_key.name_len_and_hash` (low 10 bits =
 /// name length including the trailing NUL).
 const J_DREC_LEN_MASK: u32 = 0x0000_03ff;
+
+/// Length mask over `j_file_extent_val.len_and_flags` (low 56 bits = extent
+/// length in bytes).
+const J_FILE_EXTENT_LEN_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// `j_xattr_val.flags` bit: the attribute data is embedded inline in `xdata`
+/// (as opposed to living in a separate data stream).
+const XATTR_DATA_EMBEDDED: u16 = 0x0002;
+
+/// Extended-attribute name that stores a symlink's target path.
+const SYMLINK_XATTR_NAME: &[u8] = b"com.apple.fs.symlink";
+
+/// Cap a single file read/extract so a corrupt extent list can't make us
+/// allocate or stream absurd amounts. 64 GiB is far above any real vintage-Mac
+/// APFS file yet bounds the damage.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Fletcher-64 (APFS variant)
@@ -423,6 +439,22 @@ struct Catalog {
     children: std::collections::HashMap<u64, Vec<ChildRec>>,
     /// inode oid -> inode metadata.
     inodes: std::collections::HashMap<u64, InodeRec>,
+    /// data-stream id (`j_inode_val.private_id`) -> file extents. Sorted by
+    /// logical address at read time.
+    extents: std::collections::HashMap<u64, Vec<Extent>>,
+    /// inode oid -> symlink target path (from the `com.apple.fs.symlink`
+    /// extended attribute).
+    symlinks: std::collections::HashMap<u64, String>,
+}
+
+/// One `j_file_extent` record: a run of `length` bytes at logical offset
+/// `logical_addr` in the file, stored starting at physical block `phys_block`
+/// (0 = a sparse hole → reads as zeros).
+#[derive(Clone, Copy)]
+struct Extent {
+    logical_addr: u64,
+    length: u64,
+    phys_block: u64,
 }
 
 /// One directory entry (`j_drec_*` key/value pair).
@@ -439,9 +471,7 @@ struct InodeRec {
     /// Logical file size from the data-stream extended field (0 for
     /// directories / forkless inodes).
     size: u64,
-    /// `j_inode_val.private_id` — the id file extents are keyed on. Used in
-    /// Phase 4 to read file data.
-    #[allow(dead_code)]
+    /// `j_inode_val.private_id` — the id file extents are keyed on.
     private_id: u64,
     /// `j_inode_val.mode` (the `S_IF*` file-type bits live here).
     #[allow(dead_code)]
@@ -655,8 +685,25 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
                     cat.children.entry(obj_id).or_default().push(child);
                 }
             }
-            // APFS_TYPE_FILE_EXTENT / APFS_TYPE_XATTR are handled in Phase 4.
-            APFS_TYPE_FILE_EXTENT | APFS_TYPE_XATTR => {}
+            APFS_TYPE_FILE_EXTENT => {
+                // key: j_key(8) + logical_addr u64 @8; obj_id == the file's
+                // data-stream id (private_id).
+                if key.len() >= 16 && val.len() >= 16 {
+                    let logical_addr = rd_u64(key, 8);
+                    let length = rd_u64(val, 0) & J_FILE_EXTENT_LEN_MASK;
+                    let phys_block = rd_u64(val, 8);
+                    cat.extents.entry(obj_id).or_default().push(Extent {
+                        logical_addr,
+                        length,
+                        phys_block,
+                    });
+                }
+            }
+            APFS_TYPE_XATTR => {
+                if let Some(target) = decode_symlink_xattr(key, val) {
+                    cat.symlinks.insert(obj_id, target);
+                }
+            }
             _ => {}
         }
     }
@@ -683,6 +730,93 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             self.nxsb.fs_oids,
             vols.join(", "),
         )
+    }
+
+    /// Resolve a file inode to its logical size and logical-address-sorted
+    /// extent list, ready for streaming.
+    fn gather_file(&mut self, oid: u64) -> Result<(u64, Vec<Extent>), FilesystemError> {
+        let cat = self.catalog()?;
+        let inode = cat
+            .inodes
+            .get(&oid)
+            .ok_or_else(|| FilesystemError::NotFound(format!("APFS inode {oid}")))?;
+        let size = inode.size;
+        let pid = inode.private_id;
+        let mut extents = cat.extents.get(&pid).cloned().unwrap_or_default();
+        extents.sort_by_key(|e| e.logical_addr);
+        Ok((size, extents))
+    }
+
+    /// Stream up to `limit` bytes of a file's data (bounded by `size`) to
+    /// `writer`, honoring sparse holes (unmapped ranges and `phys_block == 0`
+    /// extents emit zeros). Returns the number of bytes written.
+    fn stream_extents(
+        &mut self,
+        extents: &[Extent],
+        size: u64,
+        limit: u64,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        let limit = limit.min(size).min(MAX_FILE_BYTES);
+        let mut written: u64 = 0;
+        let mut logical_pos: u64 = 0;
+        for ext in extents {
+            if written >= limit {
+                break;
+            }
+            // Sparse gap before this extent -> zeros.
+            if ext.logical_addr > logical_pos {
+                let gap = (ext.logical_addr - logical_pos).min(limit - written);
+                written += write_zeros(writer, gap)?;
+                logical_pos = ext.logical_addr;
+                if written >= limit {
+                    break;
+                }
+            }
+            let take = ext.length.min(limit - written);
+            if ext.phys_block == 0 {
+                written += write_zeros(writer, take)?;
+            } else {
+                self.stream_phys(ext.phys_block, take, writer)?;
+                written += take;
+            }
+            logical_pos = logical_pos.saturating_add(ext.length);
+        }
+        // Sparse tail up to the requested limit.
+        if written < limit {
+            written += write_zeros(writer, limit - written)?;
+        }
+        Ok(written)
+    }
+
+    /// Stream `byte_len` bytes starting at physical block `phys_block` to
+    /// `writer`. Reads are issued at block-aligned offsets in block-multiple
+    /// sizes (so raw character devices, which reject unaligned reads, are
+    /// happy) while only `byte_len` bytes are forwarded.
+    fn stream_phys(
+        &mut self,
+        phys_block: u64,
+        byte_len: u64,
+        writer: &mut dyn Write,
+    ) -> Result<(), FilesystemError> {
+        let bs = self.block_size as u64;
+        // ~1 MiB scratch, rounded to a whole number of blocks.
+        let chunk_blocks = (1024 * 1024 / bs).max(1);
+        let mut buf = vec![0u8; (chunk_blocks * bs) as usize];
+        let mut remaining = byte_len;
+        let mut blk = phys_block;
+        while remaining > 0 {
+            let need_blocks = remaining.div_ceil(bs).min(chunk_blocks);
+            let read_bytes = (need_blocks * bs) as usize;
+            let pos = self.partition_offset + blk * bs;
+            self.reader.seek(SeekFrom::Start(pos))?;
+            self.reader.read_exact(&mut buf[..read_bytes])?;
+            let to_write = remaining.min(read_bytes as u64) as usize;
+            writer.write_all(&buf[..to_write])?;
+            remaining -= to_write as u64;
+            blk += need_blocks;
+        }
+        Ok(())
     }
 
     /// Read a single object block by physical block address.
@@ -819,6 +953,46 @@ fn decode_drec(key: &[u8], val: &[u8], hashed: bool) -> Option<ChildRec> {
     Some(ChildRec { name, oid, dtype })
 }
 
+/// Write `count` zero bytes to `writer` in bounded chunks. Returns `count`.
+fn write_zeros(writer: &mut dyn Write, count: u64) -> Result<u64, FilesystemError> {
+    let zeros = [0u8; 8192];
+    let mut remaining = count;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        writer.write_all(&zeros[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(count)
+}
+
+/// Decode a `com.apple.fs.symlink` extended-attribute record into its target
+/// path. Returns `None` for any other xattr or a non-embedded value.
+fn decode_symlink_xattr(key: &[u8], val: &[u8]) -> Option<String> {
+    // key: j_key(8) + name_len u16 @8 + name bytes @10 (NUL-terminated).
+    if key.len() < 10 {
+        return None;
+    }
+    let name_len = rd_u16(key, 8) as usize;
+    let end = 10usize.checked_add(name_len)?.min(key.len());
+    let name = key.get(10..end)?;
+    let name = name.split(|&b| b == 0).next().unwrap_or(name);
+    if name != SYMLINK_XATTR_NAME {
+        return None;
+    }
+    // val: j_xattr_val: flags u16 @0, xdata_len u16 @2, xdata @4.
+    if val.len() < 4 {
+        return None;
+    }
+    let flags = rd_u16(val, 0);
+    let xdata_len = rd_u16(val, 2) as usize;
+    if flags & XATTR_DATA_EMBEDDED == 0 {
+        return None; // stream-backed symlink target is not expected in practice
+    }
+    let xdata = val.get(4..4 + xdata_len.min(val.len().saturating_sub(4)))?;
+    let xdata = xdata.split(|&b| b == 0).next().unwrap_or(xdata);
+    Some(String::from_utf8_lossy(xdata).into_owned())
+}
+
 impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         // The APFS volume root directory is inode 2; carry that as `location`
@@ -841,20 +1015,16 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
         if let Some(children) = cat.children.get(&parent_oid) {
             for child in children {
                 let path = format!("{parent_path}/{}", child.name);
-                let mut fe = if child.dtype == DT_DIR {
+                let fe = if child.dtype == DT_DIR {
                     FileEntry::new_directory(child.name.clone(), path, child.oid)
                 } else if child.dtype == DT_LNK {
-                    // Symlink target is read from an xattr in Phase 4; leave it
-                    // empty for now so the entry still lists.
-                    FileEntry::new_symlink(child.name.clone(), path, 0, child.oid, String::new())
+                    let target = cat.symlinks.get(&child.oid).cloned().unwrap_or_default();
+                    let size = target.len() as u64;
+                    FileEntry::new_symlink(child.name.clone(), path, size, child.oid, target)
                 } else {
                     let size = cat.inodes.get(&child.oid).map(|i| i.size).unwrap_or(0);
                     FileEntry::new_file(child.name.clone(), path, size, child.oid)
                 };
-                // Carry a directory's own inode size as 0; files already set.
-                if fe.is_directory() {
-                    fe.size = 0;
-                }
                 out.push(fe);
             }
         }
@@ -864,12 +1034,45 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
 
     fn read_file(
         &mut self,
-        _entry: &FileEntry,
-        _max_bytes: usize,
+        entry: &FileEntry,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, FilesystemError> {
-        Err(FilesystemError::Unsupported(
-            "APFS file read not implemented yet".into(),
-        ))
+        if entry.is_symlink() {
+            // A symlink's "contents" is its target path.
+            let cat = self.catalog()?;
+            let target = cat
+                .symlinks
+                .get(&entry.location)
+                .cloned()
+                .unwrap_or_default();
+            let mut bytes = target.into_bytes();
+            bytes.truncate(max_bytes);
+            return Ok(bytes);
+        }
+        let (size, extents) = self.gather_file(entry.location)?;
+        let limit = size.min(max_bytes as u64);
+        let mut out = Vec::with_capacity(limit.min(1 << 20) as usize);
+        self.stream_extents(&extents, size, limit, &mut out)?;
+        Ok(out)
+    }
+
+    fn write_file_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        if entry.is_symlink() {
+            let cat = self.catalog()?;
+            let target = cat
+                .symlinks
+                .get(&entry.location)
+                .cloned()
+                .unwrap_or_default();
+            writer.write_all(target.as_bytes())?;
+            return Ok(target.len() as u64);
+        }
+        let (size, extents) = self.gather_file(entry.location)?;
+        self.stream_extents(&extents, size, size, writer)
     }
 
     fn fs_type(&self) -> &str {

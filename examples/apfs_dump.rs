@@ -60,4 +60,35 @@ fn main() {
         }
         Err(e) => println!("root error: {e}"),
     }
+
+    // Optional second arg: a directory to extract every file into (for oracle
+    // checksum comparison).
+    if let Some(outdir) = std::env::args().nth(2) {
+        println!("--- extracting to {outdir} ---");
+        fn extract(
+            fs: &mut dyn Filesystem,
+            dir: &rusty_backup::fs::entry::FileEntry,
+            base: &std::path::Path,
+        ) {
+            let children = match fs.list_directory(dir) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            for child in children {
+                let dest = base.join(&child.name);
+                if child.is_directory() {
+                    std::fs::create_dir_all(&dest).unwrap();
+                    extract(fs, &child, &dest);
+                } else if child.is_file() {
+                    let mut f = std::fs::File::create(&dest).unwrap();
+                    fs.write_file_to(&child, &mut f).unwrap();
+                }
+            }
+        }
+        let base = std::path::PathBuf::from(&outdir);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = fs.root().unwrap();
+        extract(&mut fs, &root, &base);
+        println!("done");
+    }
 }
