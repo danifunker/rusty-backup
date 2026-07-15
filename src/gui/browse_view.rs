@@ -719,8 +719,8 @@ impl BrowseView {
     /// as Mac archive...", "Browse archive...", and the "Export Mac
     /// archive" bundling row — so they only appear when the source volume
     /// is one whose files actually carry forks / type / creator codes.
-    /// (APFS and MFS aren't fully readable yet, but they're listed so the
-    /// gate is correct the day a driver reports them.)
+    /// (APFS is browse-readable; MFS isn't fully readable yet, but both are
+    /// listed so the gate is correct the day a driver reports them.)
     fn is_mac_filesystem(&self) -> bool {
         matches!(
             self.fs_type.as_str(),

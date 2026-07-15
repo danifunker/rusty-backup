@@ -2291,6 +2291,9 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Apple_ProDOS"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
             | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+            // GPT "Apple APFS" container GUID — read-only browse of the
+            // container's first unencrypted volume.
+            | "7C3457EF-0000-11AA-AA11-00306543ECAC"
             // Custom bootblock Amiga disk with no filesystem — browsable via
             // the synthetic carve view (whole-disk + recoverable text/JSON).
             | "Amiga-NDOS"
@@ -2321,6 +2324,10 @@ pub fn is_browsable_superfloppy(ptype: u8, type_name: &str) -> bool {
             | "HFS+"
             | "NTFS"
             | "exFAT"
+            // Raw APFS container image (dd of an Apple_APFS partition, or a
+            // partition-less container); auto-detected at byte 0 by the NXSB
+            // magic and opened read-only.
+            | "APFS"
             | "ProDOS"
             // Apple DOS 3.3 (the `detect_superfloppy` hint for a 140 KB Apple II
             // floppy / WOZ); open_filesystem auto-detects it as `applesdos33`.
