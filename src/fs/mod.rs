@@ -4,6 +4,7 @@ pub mod affs_common;
 pub mod affs_fsck;
 pub mod alto;
 pub mod andos;
+pub mod apfs;
 pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
@@ -234,6 +235,12 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // fully supported for read + edit + fsck (§2.1 hole (E)).
     if &sector0[0..4] == b"XFSB" {
         return "xfs";
+    }
+    // APFS container superblock (NXSB) magic at offset 32 of block 0. The full
+    // checksum-validated checkpoint scan happens in ApfsFilesystem::open; here
+    // we only sniff the magic + a plausible block size on the single probe read.
+    if apfs::detect_apfs(&sector0) {
+        return "apfs";
     }
 
     // Sectors 2-3 (offset 1024): HFS/HFS+ volume header / MDB and ext superblock.
@@ -1051,6 +1058,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
+            // Apple APFS GPT partition GUID.
+            "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             "Linux" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
             // Amiga boot block present, no AmigaDOS filesystem (custom
@@ -1475,6 +1484,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "affs" => Ok(Box::new(affs::AffsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2084,6 +2097,13 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // nothing to mount, so fall back to the synthetic carve view, which
         // surfaces the whole disk plus any recoverable text/JSON payloads.
         "Amiga-NDOS" => Ok(Box::new(carve::CarveFilesystem::open(
+            reader,
+            partition_offset,
+        )?)),
+        // Apple APFS GPT partition GUID. The partition holds an APFS
+        // *container* (which may host several volumes); the driver opens the
+        // container and browses its first non-empty volume. Read-only.
+        "7C3457EF-0000-11AA-AA11-00306543ECAC" => Ok(Box::new(apfs::ApfsFilesystem::open(
             reader,
             partition_offset,
         )?)),
