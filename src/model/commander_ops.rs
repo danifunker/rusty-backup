@@ -24,7 +24,9 @@ use crate::fs::filesystem::Filesystem;
 use crate::fs::fork_export::{export_file_with_fork, safe_name};
 use crate::fs::resource_fork::{ImportedResourceFork, ResourceForkMode};
 use crate::model::browse_session::BrowseSession;
+use crate::model::commander_descend::DescendKind;
 use crate::model::edit_queue::{apply_edit, StagedEdit};
+use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
 
 /// Apply `edits` to the source described by `session`, in order.
 ///
@@ -201,6 +203,85 @@ impl StageSource {
             StageSource::Reopen(recipe) => recipe.open(),
         }
     }
+}
+
+/// How a wrapper-open worker gets the wrapper file's bytes to mount. Materializing
+/// a large `.toast` / `.chd` / `.iso` and probing it can take seconds, so the
+/// pane runs this off the UI thread behind a spinner ([`spawn_wrapper_open`]).
+pub enum WrapperOpenPlan {
+    /// A host file — opened by its real path (no extraction; also the only form
+    /// multi-file optical formats like bin/cue can use).
+    HostPath(PathBuf),
+    /// Extract the wrapper file from a reopenable enclosing source (a local
+    /// image session, a remote image, or a Mac archive), then mount it. Boxed —
+    /// a `StageSource` + `FileEntry` dwarfs the other variants.
+    Extract(Box<WrapperExtract>),
+    /// The wrapper bytes, already pulled off a non-reopenable enclosing layer on
+    /// the UI thread; the worker still owns the materialize + probe + open.
+    Bytes(Vec<u8>),
+}
+
+/// The reopenable source + wrapper entry for a [`WrapperOpenPlan::Extract`].
+pub struct WrapperExtract {
+    pub base: StageSource,
+    pub entry: FileEntry,
+}
+
+/// Progress + result of an off-thread wrapper open. `result` carries a
+/// [`PreparedMount`] to install, or a short error string.
+#[derive(Default)]
+pub struct WrapperOpenStatus {
+    pub phase: String,
+    pub finished: bool,
+    pub result: Option<std::result::Result<PreparedMount, String>>,
+}
+
+/// Open a wrapper (`file_name`, classified as `kind`) off the UI thread. The
+/// pane polls the returned handle each frame, shows a spinner with `phase`, and
+/// installs the [`PreparedMount`] via `WrapperTree::install_prepared` on finish.
+pub fn spawn_wrapper_open(
+    plan: WrapperOpenPlan,
+    kind: DescendKind,
+    file_name: String,
+) -> Arc<Mutex<WrapperOpenStatus>> {
+    let status = Arc::new(Mutex::new(WrapperOpenStatus {
+        phase: "Reading...".to_string(),
+        finished: false,
+        result: None,
+    }));
+    let st = Arc::clone(&status);
+    thread::spawn(move || {
+        let result = run_wrapper_open(plan, kind, file_name, &st);
+        if let Ok(mut g) = st.lock() {
+            g.result = Some(result);
+            g.finished = true;
+        }
+    });
+    status
+}
+
+fn run_wrapper_open(
+    plan: WrapperOpenPlan,
+    kind: DescendKind,
+    file_name: String,
+    status: &Arc<Mutex<WrapperOpenStatus>>,
+) -> std::result::Result<PreparedMount, String> {
+    let source = match plan {
+        WrapperOpenPlan::HostPath(path) => WrapperSource::Path(path),
+        WrapperOpenPlan::Bytes(bytes) => WrapperSource::Bytes(bytes),
+        WrapperOpenPlan::Extract(ex) => {
+            let WrapperExtract { base, entry } = *ex;
+            let mut fs = base.open().map_err(|e| format!("{e:#}"))?;
+            let mut buf = Vec::new();
+            fs.write_file_to(&entry, &mut buf)
+                .map_err(|e| format!("reading '{}': {e}", entry.name))?;
+            WrapperSource::Bytes(buf)
+        }
+    };
+    if let Ok(mut g) = status.lock() {
+        g.phase = "Opening...".to_string();
+    }
+    WrapperTree::prepare(source, &file_name, kind).map_err(|e| format!("{e:#}"))
 }
 
 /// Off-thread [`stage_copy`]: reopens the source on a worker, extracts each file

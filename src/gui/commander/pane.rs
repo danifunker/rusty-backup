@@ -34,7 +34,9 @@ use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_descend::{
     classify_entry, open_archive, DescendKind, ReopenRecipe,
 };
-use rusty_backup::model::commander_ops::{self, ApplyStatus};
+use rusty_backup::model::commander_ops::{
+    self, ApplyStatus, WrapperExtract, WrapperOpenPlan, WrapperOpenStatus,
+};
 use rusty_backup::model::commander_source;
 use rusty_backup::model::dir_listing::{type_tag, DirListing, Row, SortColumn};
 use rusty_backup::model::edit_queue::{EditQueue, StagedEdit};
@@ -137,6 +139,10 @@ pub(crate) struct CommanderPane {
     /// `cache_runner::spawn_partclone_scan`. On completion `poll_scan` builds a
     /// partclone-cache session and hands off to `pending_open`.
     pending_scan: Option<Arc<Mutex<BlockCacheScan>>>,
+    /// In-flight async wrapper expansion (a large `.toast`/`.chd`/`.iso` being
+    /// materialized + probed off the UI thread). `poll_wrapper` installs the
+    /// mount when it finishes; a spinner shows meanwhile.
+    pending_wrapper: Option<PendingWrapper>,
     /// Scanned Clonezilla block caches reused across opens this session. The
     /// shared store also holds the in-memory/on-disk/scan decision tree so this
     /// pane and the Inspect tab agree (see `commander_source::PartcloneCacheStore`).
@@ -271,6 +277,14 @@ enum PendingSwitch {
     Close,
 }
 
+/// An in-flight async wrapper expansion: the node being opened, its display
+/// name (for the spinner + status), and the worker's shared status handle.
+struct PendingWrapper {
+    node_id: String,
+    name: String,
+    status: Arc<Mutex<WrapperOpenStatus>>,
+}
+
 impl CommanderPane {
     pub(crate) fn new(side: Side) -> Self {
         Self {
@@ -285,6 +299,7 @@ impl CommanderPane {
             pending_open: None,
             pending_apply: None,
             pending_scan: None,
+            pending_wrapper: None,
             cache_store: commander_source::PartcloneCacheStore::new(),
             open_phase: String::new(),
             open_rate: super::super::progress::RateTracker::default(),
@@ -386,7 +401,15 @@ impl CommanderPane {
                 self.wrapper_tree.expand_folder(node_id);
             }
         } else {
-            // Base wrapper: its bytes come from the host file or the base fs.
+            // Base wrapper: open it off the UI thread with a spinner —
+            // materializing a large `.toast`/`.chd`/`.iso` to a temp file and
+            // probing it can take seconds. Only one wrapper opens at a time.
+            if self.pending_wrapper.is_some() {
+                let side = self.side.label();
+                return Some(format!(
+                    "[{side}] a wrapper is already opening; wait for it."
+                ));
+            }
             let entry = self
                 .listing
                 .entries()
@@ -397,9 +420,15 @@ impl CommanderPane {
             // A host file opens by its real path — cheaper than reading it all,
             // and required for multi-file optical formats (bin/cue, mdf/mds)
             // whose sibling data file sits next to it. A wrapper inside an image
-            // pane must be read out of that filesystem first.
-            let source = if self.listing.is_host() {
-                WrapperSource::Path(PathBuf::from(&entry.path))
+            // pane is extracted on the worker from a fresh reopen of the base
+            // source; a non-reopenable base (rare) extracts synchronously here.
+            let plan = if self.listing.is_host() {
+                WrapperOpenPlan::HostPath(PathBuf::from(&entry.path))
+            } else if let Some(base) = self.base_stage_source() {
+                WrapperOpenPlan::Extract(Box::new(WrapperExtract {
+                    base,
+                    entry: entry.clone(),
+                }))
             } else {
                 let Some(fs) = self.listing.fs_mut() else {
                     return self.wrapper_open_failed(name, "source is not open".into());
@@ -408,19 +437,52 @@ impl CommanderPane {
                 if let Err(e) = fs.write_file_to(&entry, &mut buf) {
                     return self.wrapper_open_failed(name, e.to_string());
                 }
-                WrapperSource::Bytes(buf)
+                WrapperOpenPlan::Bytes(buf)
             };
-            if let Err(e) = self
-                .wrapper_tree
-                .expand_wrapper(node_id, name, kind, source)
-            {
-                return self.wrapper_open_failed(name, format!("{e:#}"));
-            }
+            self.pending_wrapper = Some(PendingWrapper {
+                node_id: node_id.to_string(),
+                name: name.to_string(),
+                status: commander_ops::spawn_wrapper_open(plan, kind, name.to_string()),
+            });
+            return Some(format!("[{}] opening {name}...", self.side.label()));
         }
         let side = self.side.label();
         self.wrapper_tree
             .note(node_id)
             .map(|n| format!("[{side}] {name}: {n}"))
+    }
+
+    /// The reopen handle for this pane's *base* source (ignoring any active
+    /// wrapper-tree selection) — a local image session, a remote image, or a Mac
+    /// archive by path. Used to extract a base wrapper's bytes on a worker so a
+    /// large expand doesn't freeze the UI. `None` for a host base (opened by
+    /// path instead) or a source with no reopenable handle.
+    fn base_stage_source(&self) -> Option<commander_ops::StageSource> {
+        if let Some(session) = self.session.clone() {
+            return Some(commander_ops::StageSource::Session(session));
+        }
+        #[cfg(feature = "remote")]
+        if let Some(RemoteConn {
+            addr,
+            mode: BrowseMode::Image { path, partition },
+        }) = &self.remote
+        {
+            return Some(commander_ops::StageSource::Remote {
+                addr: addr.clone(),
+                path: path.clone(),
+                partition: *partition,
+            });
+        }
+        if self.archive_source {
+            if let Some(path) = &self.source {
+                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                return Some(commander_ops::StageSource::Reopen(ReopenRecipe::Archive {
+                    path: path.clone(),
+                    label,
+                }));
+            }
+        }
+        None
     }
 
     /// Record a failed wrapper expansion in the session log (where the full
@@ -454,12 +516,17 @@ impl CommanderPane {
             self.last_cwd = cwd_now;
             self.wrapper_tree.clear();
             self.tree_selected.clear();
+            // Abandon any wrapper open still in flight — its target row is gone.
+            self.pending_wrapper = None;
         }
         let mut status = self.poll_open(ui.ctx());
         if let Some(s) = self.poll_apply(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.poll_scan(ui.ctx()) {
+            status = Some(s);
+        }
+        if let Some(s) = self.poll_wrapper(ui.ctx()) {
             status = Some(s);
         }
         if let Some(s) = self.poll_remote(ui.ctx()) {
@@ -476,6 +543,27 @@ impl CommanderPane {
         }
         self.path_line(ui);
         ui.separator();
+
+        // A wrapper being opened off-thread: show a spinner + phase above the
+        // still-visible listing (the expand is inline, so the base rows stay).
+        if let Some(pw) = &self.pending_wrapper {
+            let phase = pw
+                .status
+                .lock()
+                .ok()
+                .map(|g| g.phase.clone())
+                .unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.spinner();
+                ui.label(if phase.is_empty() {
+                    format!("Opening {}...", pw.name)
+                } else {
+                    format!("{}: {}", pw.name, phase)
+                });
+            });
+            ui.ctx().request_repaint();
+        }
 
         if self.pending_apply.is_some() {
             ui.add_space(20.0);
@@ -1835,6 +1923,7 @@ impl CommanderPane {
         self.pending_open = None;
         self.pending_apply = None;
         self.pending_scan = None;
+        self.pending_wrapper = None;
         self.open_phase.clear();
         self.volume_label.clear();
         self.fs_type.clear();
@@ -2206,6 +2295,33 @@ impl CommanderPane {
             "[{}] metadata ready; opening...",
             self.side.label()
         ))
+    }
+
+    /// Poll an in-flight async wrapper expansion; on completion, install the
+    /// prepared mount (or record the failure) and drop the spinner.
+    fn poll_wrapper(&mut self, ctx: &egui::Context) -> Option<String> {
+        let finished = {
+            let pw = self.pending_wrapper.as_ref()?;
+            ctx.request_repaint();
+            pw.status.lock().ok().map(|g| g.finished).unwrap_or(false)
+        };
+        if !finished {
+            return None;
+        }
+        let pw = self.pending_wrapper.take()?;
+        let result = pw.status.lock().ok().and_then(|mut g| g.result.take());
+        match result {
+            Some(Ok(prepared)) => {
+                let note = self.wrapper_tree.install_prepared(&pw.node_id, prepared);
+                let side = self.side.label();
+                Some(match note {
+                    Some(n) => format!("[{side}] {}: {n}", pw.name),
+                    None => format!("[{side}] opened {}.", pw.name),
+                })
+            }
+            Some(Err(e)) => self.wrapper_open_failed(&pw.name, e),
+            None => None,
+        }
     }
 
     /// Poll an in-flight open; on completion, hand the filesystem + root listing
