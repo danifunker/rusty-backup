@@ -148,11 +148,45 @@ Explicitly out of scope for the read-only cut, tracked here per request:
   Later: enumerate snapshots and allow browsing a chosen one. The omap's
   `(oid, xid)` keying already contemplates this — design the omap resolver so
   a target `xid` can be threaded through from the start to avoid a rewrite.
-- **Encryption (FileVault)**: encrypted volumes are unreadable without the
-  volume key. Later work: unlock via password/recovery key → derive the
-  volume encryption key (keybag / wrapped-key crypto), decrypt object blocks
-  before checksum/parse. Large, crypto-heavy, and a hard dependency for
-  reading most real modern Mac volumes — schedule deliberately.
+- **Encryption (FileVault)** — the active next phase. Scope decided:
+  **offline decrypt from a user-supplied secret only** — the **volume
+  password** or the **personal recovery key** (which is cryptographically the
+  same passphrase → KEK path). No Apple ID / iCloud-escrow integration (that
+  key isn't on the disk in a usable form; it must be retrieved interactively
+  from Apple) and no Secure-Enclave path (machine-bound, unavailable to an
+  offline reader). This keeps decryption universal across machines.
+
+  **Bring-up spike done** — the crypto parameters are confirmed against a real
+  macOS-encrypted fixture (`tests/fixtures/test_apfs_encrypted.img.zst`; see
+  `tests/fixtures/apfs/ENCRYPTED_FIXTURE.md` for the passphrase and the full
+  keybag walk). Confirmed facts:
+  - Container metadata (NXSB, checkpoints, keybags-as-blocks) is **not**
+    encrypted; only the volume's data and volume-tree blocks are.
+  - **Keybag decryption**: AES-128-XTS, 512-byte units, tweak = the 512-byte
+    logical-sector index (`block_addr * block_size/512 + unit`), XTS key =
+    `UUID || UUID`. Container keybag (`nx_keylocker`) uses the **container**
+    UUID; the volume keybag (found via a container-keybag tag-3 `prange`
+    entry) uses the **volume** UUID.
+  - Container keybag yields the **wrapped VEK** (tag 2) and the volume-keybag
+    location (tag 3). Volume keybag yields the crypto user's **KEK blob**
+    (tag 3, a DER structure with PBKDF2 salt + iteration count + wrapped KEK).
+
+  Implementation steps:
+  1. Add `aes` + `xts-mode` crates (spike-verified) and an RFC-3394
+     AES-key-unwrap + PBKDF2-HMAC-SHA256 helper (`sha2`/`hmac`/`pbkdf2` or
+     hand-rolled).
+  2. Detect encryption from the volume APSB flags / presence of a keybag; add
+     an optional `passphrase` to `ApfsFilesystem::open` (CLI `--password` /
+     `--recovery-key`, GUI prompt). Absent passphrase on an encrypted volume →
+     a clear "volume is encrypted, passphrase required" error, not a panic.
+  3. Decrypt container keybag → parse the DER KEK blob → PBKDF2(passphrase) →
+     unwrap KEK → unwrap VEK.
+  4. Wrap the block reader so volume data blocks are AES-XTS-decrypted with the
+     VEK (per-block tweak) before checksum/parse. Container-level reads stay
+     plaintext.
+  5. e2e test: decrypt the fixture with its documented passphrase, walk the
+     tree, and match SHA-256s against `oracle_encrypted_checksums.txt` — same
+     harness as the unencrypted read path.
 
 ## Deferred: edit / shrink / fsck (full parity)
 
