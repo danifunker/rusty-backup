@@ -1354,14 +1354,35 @@ pub fn partition_minimum_size<R: Read + Seek + Send + 'static>(
 /// `partition_type` is the MBR partition type byte.
 /// `partition_type_string` is the APM partition type string (e.g. "Apple_HFS").
 pub fn open_filesystem<R: Read + Seek + Send + 'static>(
-    mut reader: R,
+    reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
+    open_filesystem_with_passphrase(
+        reader,
+        partition_offset,
+        partition_type,
+        partition_type_string,
+        None,
+    )
+}
+
+/// Like [`open_filesystem`], but carries an optional filesystem-level
+/// `passphrase` for volumes that encrypt their own contents (APFS FileVault).
+/// The passphrase is ignored by every filesystem that isn't encrypted; on an
+/// encrypted APFS volume, `None` opens it locked (browse then reports
+/// "passphrase required") and a wrong passphrase is an error.
+pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+    passphrase: Option<&str>,
+) -> Result<Box<dyn Filesystem>, FilesystemError> {
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
-        return open_filesystem_by_string(reader, partition_offset, type_str);
+        return open_filesystem_by_string(reader, partition_offset, type_str, passphrase);
     }
     match partition_type {
         // Auto-detect (superfloppy / type byte 0)
@@ -1488,9 +1509,10 @@ pub fn open_filesystem<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open(
+                "apfs" => Ok(Box::new(apfs::ApfsFilesystem::open_with_passphrase(
                     reader,
                     partition_offset,
+                    passphrase,
                 )?)),
                 // No filesystem recognized. Rather than erroring, fall back to
                 // the synthetic carve view so the user can still pull a raw
@@ -1956,6 +1978,7 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
     type_str: &str,
+    passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
         "Apple_HFS" => {
@@ -2104,10 +2127,9 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
         // Apple APFS GPT partition GUID. The partition holds an APFS
         // *container* (which may host several volumes); the driver opens the
         // container and browses its first non-empty volume. Read-only.
-        "7C3457EF-0000-11AA-AA11-00306543ECAC" => Ok(Box::new(apfs::ApfsFilesystem::open(
-            reader,
-            partition_offset,
-        )?)),
+        "7C3457EF-0000-11AA-AA11-00306543ECAC" => Ok(Box::new(
+            apfs::ApfsFilesystem::open_with_passphrase(reader, partition_offset, passphrase)?,
+        )),
         // Apple Lisa File System: the tag-bearing DiskCopy 4.2 / DART container
         // is opened as a whole (the driver parses the header + 12-byte sector
         // tags itself), so `partition_offset` is ignored. Read-only.

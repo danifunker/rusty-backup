@@ -4,13 +4,17 @@ Goal: **read-only browse driver now, full parity (edit / shrink / fsck) later.**
 Targets: **unencrypted modern APFS first**; snapshots and encryption are
 explicitly deferred to a later phase (see Phase 6).
 
-> **Status (Phases 0–5 shipped).** The read-only browse driver is live in
-> `src/fs/apfs.rs`: detect, container/omap/volume parse, catalog browse, and
-> file/symlink extract, all verified against a real macOS-formatted fixture
+> **Status (Phases 0–6 encryption shipped).** The read-only browse driver is
+> live in `src/fs/apfs.rs`: detect, container/omap/volume parse, catalog browse,
+> and file/symlink extract, all verified against a real macOS-formatted fixture
 > (`tests/fixtures/test_apfs.img.zst`) whose file tree round-trips byte-for-byte
-> (SHA-256 oracle). Wired into GUI Inspect + Commander and `rb-cli ls` / `get`
-> via the shared dispatch (no APFS-specific CLI code). **Deferred as planned:**
-> snapshots + FileVault encryption (Phase 6) and edit / shrink / fsck.
+> (SHA-256 oracle). **FileVault decryption is shipped** (`src/fs/apfs_crypto.rs`
+> + the keybag/VEK chain in `apfs.rs`): supply the volume password or personal
+> recovery key (`rb-cli ls/get --password`) and the encrypted fixture
+> (`test_apfs_encrypted.img.zst`) browses + extracts with every file matching
+> its oracle. Wired into GUI Inspect + Commander and the CLI via the shared
+> dispatch. **Still deferred:** snapshots (Phase 6, below), a GUI passphrase
+> prompt (interactive, GUI-only), and edit / shrink / fsck.
 
 APFS did not exist before macOS 10.13 (2017), so this sits outside the usual
 "vintage" remit — it is included for users capturing modern Mac CF/SD/SSD

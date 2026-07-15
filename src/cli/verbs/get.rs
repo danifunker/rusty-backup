@@ -96,8 +96,9 @@ pub struct GetArgs {
     #[arg(long = "skip-existing", conflicts_with = "force")]
     pub skip_existing: bool,
 
-    /// Password for encrypted containers (currently: WinImage IMZ, and
-    /// password-protected `.zip` disks).
+    /// Password for encrypted containers (WinImage IMZ, password-protected
+    /// `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume
+    /// password or personal recovery key).
     #[arg(long)]
     pub password: Option<String>,
 
@@ -153,11 +154,12 @@ pub fn run(args: GetArgs) -> Result<()> {
     )?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_filesystem(
+    let mut fs = crate::fs::open_filesystem_with_passphrase(
         reader,
         ctx.offset,
         ctx.type_byte,
         ctx.type_string.as_deref(),
+        args.password.as_deref(),
     )
     .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
