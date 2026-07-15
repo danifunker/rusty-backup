@@ -167,6 +167,13 @@ pub(crate) struct CommanderPane {
     used_size: u64,
     /// Last open / navigation / apply error, shown in the pane body.
     error: Option<String>,
+    /// True when the current source needs a password / passphrase to open
+    /// (encrypted container, or a locked APFS FileVault volume). Renders the
+    /// unlock prompt in the pane body; on submit the secret is stashed on
+    /// `session.password` and the open is re-spawned.
+    needs_password: bool,
+    /// The user's in-progress password / passphrase entry for the unlock prompt.
+    password_input: String,
     /// A source/partition switch the user requested while the queue was
     /// non-empty; held until they confirm discarding the staged edits.
     pending_switch: Option<PendingSwitch>,
@@ -315,6 +322,8 @@ impl CommanderPane {
             total_size: 0,
             used_size: 0,
             error: None,
+            needs_password: false,
+            password_input: String::new(),
             pending_switch: None,
             pending_host_delete: None,
             rename_dialog: None,
@@ -648,6 +657,49 @@ impl CommanderPane {
                     self.open_phase.clone()
                 });
             });
+        } else if self.needs_password && self.session.is_some() {
+            // Unlock prompt for an encrypted source — reuses the same
+            // stash-secret-and-re-spawn retry as the Inspect BrowseView. Adapts
+            // its copy for a locked APFS FileVault volume vs. a container image.
+            // Gated on `session.is_some()` so switching away to a session-less
+            // source (host folder, closed pane) drops a stale prompt.
+            let is_apfs = self.fs_type == "APFS";
+            let mut submit = false;
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                if is_apfs {
+                    ui.label("This APFS volume is encrypted with FileVault.");
+                    ui.add_space(4.0);
+                    ui.label("Enter the volume password or personal recovery key.");
+                } else {
+                    ui.label("This source is password-protected.");
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(if is_apfs { "Passphrase:" } else { "Password:" });
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.password_input)
+                            .password(true)
+                            .desired_width(220.0),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Unlock").clicked() || enter {
+                        submit = true;
+                    }
+                });
+            });
+            if submit {
+                let secret = self.password_input.clone();
+                let spawned = self.session.as_mut().map(|session| {
+                    session.password = Some(secret);
+                    session.spawn_open()
+                });
+                if let Some(arc) = spawned {
+                    self.pending_open = Some(arc);
+                    self.needs_password = false;
+                    self.error = None;
+                }
+            }
         } else if let Some(err) = &self.error {
             ui.add_space(12.0);
             ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
@@ -2347,6 +2399,24 @@ impl CommanderPane {
         // Finished — detach the pending handle either way.
         self.pending_open = None;
 
+        // Encrypted source: the worker flags `needs_password` for a locked
+        // container OR a locked APFS FileVault volume (which opens fine but
+        // fails at the root listing). Show the unlock prompt instead of a dead
+        // error; the (locked) fs is dropped. Capture the label/fs_type first so
+        // the prompt can adapt (APFS) and the source bar still reads the volume.
+        if guard.needs_password {
+            self.volume_label = guard.volume_label.clone();
+            self.fs_type = guard.fs_type.clone();
+            self.needs_password = true;
+            self.error = None;
+            return None;
+        }
+        // The open completed without needing a secret — clear any prior prompt
+        // (e.g. a successful unlock, or switching to an unencrypted source) and
+        // drop the entered secret from memory.
+        self.needs_password = false;
+        self.password_input.clear();
+
         if let Some(err) = guard.error.take() {
             self.error = Some(err);
             return Some(format!("[{}] open failed.", self.side.label()));
@@ -2868,7 +2938,21 @@ impl CommanderPane {
         }
         if let Some(name) = to_enter {
             if let Err(e) = self.listing.enter(&name) {
-                status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
+                // A synchronous read that hits an encrypted, still-locked volume
+                // (belt-and-suspenders for the "directly through open" paths —
+                // for APFS the root listing already fails at open, but any FS
+                // that opens then errors deeper on a locked read lands here):
+                // surface the unlock prompt instead of a dead status line.
+                if self.session.is_some()
+                    && rusty_backup::model::browse_session::looks_like_password_error(
+                        &e.to_string(),
+                    )
+                {
+                    self.needs_password = true;
+                    self.error = None;
+                } else {
+                    status = Some(format!("[{}] cannot open '{name}': {e}", self.side.label()));
+                }
             }
         }
         if bg_deselect {
