@@ -41,11 +41,27 @@ use super::filesystem::{Filesystem, FilesystemError};
 /// `u32` = `0x4253_584E`). We keep it as the ASCII bytes for a direct compare.
 const NX_MAGIC: &[u8; 4] = b"NXSB";
 
+/// `APSB` — volume superblock magic, at offset 32 of a volume superblock.
+const APFS_MAGIC: &[u8; 4] = b"APSB";
+
 /// Object-type mask over the low 16 bits of `o_type`.
 const OBJECT_TYPE_MASK: u32 = 0x0000_ffff;
 
 // Object types we recognize (low 16 bits of `obj_phys.o_type`).
 const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 0x0001;
+
+// B-tree node flags (`btn_flags`). Leaf-ness is read from `btn_level == 0`
+// rather than a flag, which is the layout-independent test.
+const BTNODE_ROOT: u16 = 0x0001;
+const BTNODE_FIXED_KV_SIZE: u16 = 0x0004;
+
+/// Size of the `btree_info_t` trailer stored at the end of a B-tree root node.
+const BTREE_INFO_SIZE: usize = 40;
+/// Size of an `omap_key` (oid + xid) and the leaf `omap_val`.
+const OMAP_KEY_SIZE: usize = 16;
+const OMAP_VAL_SIZE: usize = 16;
+/// Guard against a corrupt tree sending us into an unbounded walk.
+const MAX_BTREE_NODES: usize = 1_000_000;
 
 /// Largest container we will map: NXSB `nx_max_file_systems` bounds the volume
 /// array at 100 on current APFS.
@@ -120,11 +136,172 @@ impl ObjPhys {
 // Little-endian field readers (keep the parse code terse and bounds-checked)
 // ---------------------------------------------------------------------------
 
+fn rd_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
 fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 fn rd_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// btree_node_phys — the generic B-tree node, shared by the omap and FS trees
+// ---------------------------------------------------------------------------
+
+/// A parsed view over one `btree_node_phys` block: it locates the table of
+/// contents plus the key and value areas so callers can pull out the i-th
+/// (key, value) byte slice regardless of which tree the node belongs to.
+///
+/// Two layouts are handled: **fixed** KV (`BTNODE_FIXED_KV_SIZE`, used by the
+/// omap — the toc is an array of `(key_off, val_off)` u16 pairs) and
+/// **variable** KV (the FS/catalog tree — the toc is an array of
+/// `(key_off, key_len, val_off, val_len)` u16 quads). In both, key offsets are
+/// measured forward from the start of the key area and value offsets backward
+/// from the end of the value area (which excludes the root node's info trailer).
+struct BtreeNode {
+    block: Vec<u8>,
+    level: u16,
+    nkeys: usize,
+    fixed: bool,
+    toc_start: usize,
+    key_area: usize,
+    val_area_end: usize,
+}
+
+impl BtreeNode {
+    fn parse(block: Vec<u8>) -> Result<Self, FilesystemError> {
+        if block.len() < 56 {
+            return Err(FilesystemError::Parse("btree node too small".into()));
+        }
+        let flags = rd_u16(&block, 32);
+        let level = rd_u16(&block, 34);
+        let nkeys = rd_u32(&block, 36) as usize;
+        let toc_off = rd_u16(&block, 40) as usize;
+        let toc_len = rd_u16(&block, 42) as usize;
+        let toc_start = 56 + toc_off;
+        let key_area = toc_start + toc_len;
+        let is_root = flags & BTNODE_ROOT != 0;
+        let val_area_end = block
+            .len()
+            .saturating_sub(if is_root { BTREE_INFO_SIZE } else { 0 });
+        if key_area > block.len() || val_area_end > block.len() || key_area > val_area_end {
+            return Err(FilesystemError::Parse(
+                "btree node areas out of range".into(),
+            ));
+        }
+        Ok(Self {
+            block,
+            level,
+            nkeys,
+            fixed: flags & BTNODE_FIXED_KV_SIZE != 0,
+            toc_start,
+            key_area,
+            val_area_end,
+        })
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.level == 0
+    }
+
+    /// The i-th entry for a **fixed**-KV node. `val_size` differs between leaf
+    /// (record) and index (an 8-byte child oid) nodes, so the caller supplies
+    /// it. Returns `(key, value)` byte slices, bounds-checked.
+    fn entry_fixed(
+        &self,
+        i: usize,
+        key_size: usize,
+        val_size: usize,
+    ) -> Result<(&[u8], &[u8]), FilesystemError> {
+        let toc = self.toc_start + i * 4;
+        if toc + 4 > self.block.len() {
+            return Err(FilesystemError::Parse("btree toc out of range".into()));
+        }
+        let koff = rd_u16(&self.block, toc) as usize;
+        let voff = rd_u16(&self.block, toc + 2) as usize;
+        let kstart = self.key_area + koff;
+        let vstart = self
+            .val_area_end
+            .checked_sub(voff)
+            .ok_or_else(|| FilesystemError::Parse("btree value offset underflow".into()))?;
+        self.slice_pair(kstart, key_size, vstart, val_size)
+    }
+
+    /// The i-th entry for a **variable**-KV node (self-describing key/value
+    /// lengths in the toc). Used by the Phase 3 catalog (FS-tree) walk.
+    #[allow(dead_code)]
+    fn entry_var(&self, i: usize) -> Result<(&[u8], &[u8]), FilesystemError> {
+        let toc = self.toc_start + i * 8;
+        if toc + 8 > self.block.len() {
+            return Err(FilesystemError::Parse("btree toc out of range".into()));
+        }
+        let koff = rd_u16(&self.block, toc) as usize;
+        let klen = rd_u16(&self.block, toc + 2) as usize;
+        let voff = rd_u16(&self.block, toc + 4) as usize;
+        let vlen = rd_u16(&self.block, toc + 6) as usize;
+        let kstart = self.key_area + koff;
+        let vstart = self
+            .val_area_end
+            .checked_sub(voff)
+            .ok_or_else(|| FilesystemError::Parse("btree value offset underflow".into()))?;
+        self.slice_pair(kstart, klen, vstart, vlen)
+    }
+
+    fn slice_pair(
+        &self,
+        kstart: usize,
+        klen: usize,
+        vstart: usize,
+        vlen: usize,
+    ) -> Result<(&[u8], &[u8]), FilesystemError> {
+        let kend = kstart + klen;
+        let vend = vstart + vlen;
+        if kend > self.block.len() || vend > self.block.len() {
+            return Err(FilesystemError::Parse("btree entry out of range".into()));
+        }
+        Ok((&self.block[kstart..kend], &self.block[vstart..vend]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// omap_phys + omap resolution
+// ---------------------------------------------------------------------------
+
+/// A container/volume object map, flattened to `oid -> physical block address`.
+///
+/// The omap B-tree is keyed by `(oid, xid)`; for a single-state (no-snapshot)
+/// read we keep, per oid, the mapping with the highest xid. Volumes here are
+/// tiny, so collecting the whole tree up front is cheaper and simpler than a
+/// per-lookup descent.
+struct Omap {
+    map: std::collections::HashMap<u64, u64>,
+}
+
+impl Omap {
+    fn resolve(&self, oid: u64) -> Option<u64> {
+        self.map.get(&oid).copied()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A volume (APSB) within the container
+// ---------------------------------------------------------------------------
+
+/// The fields of `apfs_superblock_t` (APSB) this driver needs.
+struct VolumeInfo {
+    name: String,
+    /// Physical block of the volume's own object map (`omap_phys_t`). Used by
+    /// the Phase 3 catalog walk to resolve the root tree's virtual oid.
+    #[allow(dead_code)]
+    omap_oid: u64,
+    /// Virtual oid of the volume's root (catalog) FS tree; resolved via the
+    /// volume omap. Consumed by the Phase 3 catalog walk.
+    #[allow(dead_code)]
+    root_tree_oid: u64,
+    /// Blocks currently allocated to the volume (`apfs_fs_alloc_count`).
+    alloc_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +371,10 @@ pub struct ApfsFilesystem<R: Read + Seek + Send> {
     block_count: u64,
     /// Authoritative container superblock (newest valid checkpoint copy).
     nxsb: NxSuperblock,
+    /// Volumes discovered in the container, in `nx_fs_oid[]` order.
+    volumes: Vec<VolumeInfo>,
+    /// Index into `volumes` of the volume currently being browsed.
+    active_vol: usize,
 }
 
 impl<R: Read + Seek + Send> ApfsFilesystem<R> {
@@ -221,6 +402,8 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             block_size,
             block_count: sb0.block_count,
             nxsb: sb0,
+            volumes: Vec::new(),
+            active_vol: 0,
         };
 
         // Prefer the newest valid superblock from the checkpoint descriptor
@@ -228,20 +411,118 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         if let Some(newest) = fs.find_latest_superblock()? {
             fs.nxsb = newest;
         }
+
+        // Resolve the container object map, then walk each volume's superblock.
+        let container_omap = fs.load_omap(fs.nxsb.omap_oid)?;
+        let fs_oids = fs.nxsb.fs_oids.clone();
+        for vol_oid in fs_oids {
+            let Some(apsb_paddr) = container_omap.resolve(vol_oid) else {
+                continue;
+            };
+            match fs.parse_volume(apsb_paddr) {
+                Ok(v) => fs.volumes.push(v),
+                // A single unreadable volume shouldn't sink the whole container.
+                Err(_) => continue,
+            }
+        }
         Ok(fs)
+    }
+
+    /// Load an object map (`omap_phys_t` at `omap_oid`) and flatten its B-tree
+    /// into an `oid -> paddr` table.
+    fn load_omap(&mut self, omap_oid: u64) -> Result<Omap, FilesystemError> {
+        let omap_block = self.read_block(omap_oid)?;
+        if omap_block.len() < 56 {
+            return Err(FilesystemError::Parse("omap_phys too small".into()));
+        }
+        // omap_phys.om_tree_oid @48 — physical block of the omap B-tree root.
+        let tree_root = rd_u64(&omap_block, 48);
+        let mut map = std::collections::HashMap::new();
+        let mut best_xid: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut stack = vec![tree_root];
+        let mut visited = 0usize;
+        while let Some(paddr) = stack.pop() {
+            visited += 1;
+            if visited > MAX_BTREE_NODES {
+                return Err(FilesystemError::Parse("omap B-tree too large".into()));
+            }
+            let node = BtreeNode::parse(self.read_block(paddr)?)?;
+            if !node.fixed {
+                return Err(FilesystemError::Parse("omap node is not fixed-KV".into()));
+            }
+            let leaf = node.is_leaf();
+            let val_size = if leaf { OMAP_VAL_SIZE } else { 8 };
+            for i in 0..node.nkeys {
+                let (k, v) = node.entry_fixed(i, OMAP_KEY_SIZE, val_size)?;
+                if leaf {
+                    let oid = rd_u64(k, 0);
+                    let xid = rd_u64(k, 8);
+                    // omap_val.ov_paddr @8.
+                    let paddr = rd_u64(v, 8);
+                    let slot = best_xid.entry(oid).or_insert(0);
+                    if xid >= *slot {
+                        *slot = xid;
+                        map.insert(oid, paddr);
+                    }
+                } else {
+                    // Index node: value is the child node's physical block.
+                    stack.push(rd_u64(v, 0));
+                }
+            }
+        }
+        Ok(Omap { map })
+    }
+
+    /// Parse a volume superblock (APSB) at `apsb_paddr`.
+    fn parse_volume(&mut self, apsb_paddr: u64) -> Result<VolumeInfo, FilesystemError> {
+        let block = self.read_block(apsb_paddr)?;
+        if block.len() < 960 || &block[32..36] != APFS_MAGIC {
+            return Err(FilesystemError::Parse(
+                "not an APSB volume superblock".into(),
+            ));
+        }
+        // apfs_fs_alloc_count @88, apfs_omap_oid @128, apfs_root_tree_oid @136,
+        // apfs_volname[256] @704.
+        let alloc_count = rd_u64(&block, 88);
+        let omap_oid = rd_u64(&block, 128);
+        let root_tree_oid = rd_u64(&block, 136);
+        let name_bytes = &block[704..704 + 256];
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(256);
+        let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+        Ok(VolumeInfo {
+            name,
+            omap_oid,
+            root_tree_oid,
+            alloc_count,
+        })
+    }
+
+    /// The volume currently selected for browsing, if the container has one.
+    fn active_volume(&self) -> Option<&VolumeInfo> {
+        self.volumes.get(self.active_vol)
     }
 
     /// One-line summary of the container's headline fields. Used by the
     /// `apfs_dump` example during driver bring-up; also the seam the later
     /// phases hang volume enumeration off of.
     pub fn debug_summary(&self) -> String {
+        let vols: Vec<String> = self
+            .volumes
+            .iter()
+            .map(|v| {
+                format!(
+                    "{{name={:?} omap={} root_tree={} alloc={}}}",
+                    v.name, v.omap_oid, v.root_tree_oid, v.alloc_count
+                )
+            })
+            .collect();
         format!(
-            "block_size={} block_count={} xp_desc_base={} container_omap_oid={} volumes={:?}",
+            "block_size={} block_count={} container_omap_oid={} fs_oids={:?} volumes=[{}]",
             self.block_size,
             self.block_count,
-            self.nxsb.xp_desc_base,
             self.nxsb.omap_oid,
             self.nxsb.fs_oids,
+            vols.join(", "),
         )
     }
 
@@ -319,7 +600,7 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     }
 
     fn volume_label(&self) -> Option<&str> {
-        None
+        self.active_volume().map(|v| v.name.as_str())
     }
 
     fn total_size(&self) -> u64 {
@@ -327,9 +608,11 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     }
 
     fn used_size(&self) -> u64 {
-        // Real usage comes from the space manager / volume alloc counts in a
-        // later phase; 0 until then.
-        0
+        // Blocks allocated to the active volume. (A multi-volume container
+        // shares free space; this reports the browsed volume's own usage.)
+        self.active_volume()
+            .map(|v| v.alloc_count * self.block_size as u64)
+            .unwrap_or(0)
     }
 }
 
