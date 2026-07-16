@@ -504,6 +504,76 @@ pub enum HashAlgo {
     Sha256,
 }
 
+/// Which filesystem to open on a disc that carries more than one (a hybrid
+/// Mac/PC disc: an ISO 9660 volume plus an Apple HFS partition on one track).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum FilesystemSelect {
+    /// The primary filesystem opticaldiscs detects — ISO 9660 on a hybrid disc.
+    #[default]
+    Auto,
+    /// The ISO 9660 / High Sierra volume (the PC side).
+    Iso,
+    /// The Apple HFS / HFS+ volume (the Mac side of a hybrid disc).
+    Hfs,
+}
+
+/// Open the filesystem the `--filesystem` selection asks for, returning it along
+/// with the [`FilesystemType`](opticaldiscs::FilesystemType) actually opened (so
+/// callers report the real tree, not the primary). Errors clearly when the
+/// requested side isn't on the disc.
+///
+/// Shared by `optical browse` and `optical extract` so the two never diverge.
+fn open_selected_filesystem(
+    info: &opticaldiscs::detect::DiscImageInfo,
+    select: FilesystemSelect,
+) -> Result<(
+    Box<dyn opticaldiscs::browse::filesystem::Filesystem>,
+    opticaldiscs::FilesystemType,
+)> {
+    use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
+    use opticaldiscs::FilesystemType as F;
+
+    let primary = || {
+        open_disc_filesystem(info)
+            .map(|fs| (fs, info.filesystem))
+            .map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))
+    };
+
+    match select {
+        FilesystemSelect::Auto => primary(),
+        FilesystemSelect::Hfs => {
+            if matches!(info.filesystem, F::Hfs | F::HfsPlus) {
+                // A pure-Mac disc: the primary already is the HFS volume.
+                primary()
+            } else if let Some(idx) = info
+                .hybrid_filesystems
+                .iter()
+                .position(|h| matches!(h.filesystem, F::Hfs | F::HfsPlus))
+            {
+                let ty = info.hybrid_filesystems[idx].filesystem;
+                open_hybrid_filesystem(info, idx)
+                    .map(|fs| (fs, ty))
+                    .map_err(|e| anyhow::anyhow!("opening hybrid HFS filesystem: {e}"))
+            } else {
+                bail!(
+                    "no HFS filesystem on this disc (not a hybrid Mac/PC disc); its filesystem is {}",
+                    fs_token(info.filesystem)
+                )
+            }
+        }
+        FilesystemSelect::Iso => {
+            if matches!(info.filesystem, F::Iso9660 | F::HighSierra) {
+                primary()
+            } else {
+                bail!(
+                    "no ISO 9660 filesystem to select on this disc; its primary filesystem is {}",
+                    fs_token(info.filesystem)
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct BrowseArgs {
     /// Optical disc image (.iso, .cue, .chd).
@@ -517,10 +587,14 @@ pub struct BrowseArgs {
     /// only (`--format json`). Currently only `sha256`.
     #[arg(long, value_enum)]
     pub hash: Option<HashAlgo>,
+    /// Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default)
+    /// opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso`
+    /// forces the ISO 9660 tree. See `optical info` to see what a disc carries.
+    #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
+    pub filesystem: FilesystemSelect,
 }
 
 fn run_browse_verb(args: BrowseArgs) -> Result<()> {
-    use opticaldiscs::browse::open_disc_filesystem;
     use opticaldiscs::detect::DiscImageInfo;
 
     require_non_flat(args.format, "optical browse")?;
@@ -532,8 +606,7 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
 
     let info = DiscImageInfo::open(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let mut fs =
-        open_disc_filesystem(&info).map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
+    let (mut fs, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;
@@ -546,7 +619,7 @@ fn run_browse_verb(args: BrowseArgs) -> Result<()> {
         let payload = BrowsePayload {
             image: args.source.display().to_string(),
             volume_name: fs.volume_name().map(str::to_owned),
-            filesystem: fs_token(info.filesystem),
+            filesystem: fs_token(opened_fs),
             game: info.game.as_ref().map(crate::optical::format_game_identity),
             entries,
         };
@@ -1453,6 +1526,12 @@ pub struct ExtractArgs {
     /// case-sensitive — everything extracts verbatim there.
     #[arg(long = "on-collision", value_enum)]
     pub on_collision: Option<CliCaseCollisionMode>,
+
+    /// Which filesystem to extract from on a hybrid Mac/PC disc. `auto`
+    /// (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS
+    /// side; `iso` forces the ISO 9660 tree. See `optical info`.
+    #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
+    pub filesystem: FilesystemSelect,
 }
 
 /// How to resolve case-insensitive filename collisions during extraction.
@@ -1467,15 +1546,13 @@ pub enum CliCaseCollisionMode {
 }
 
 fn run_extract_verb(args: ExtractArgs) -> Result<()> {
-    use opticaldiscs::browse::open_disc_filesystem;
     use opticaldiscs::detect::DiscImageInfo;
 
     std::fs::create_dir_all(&args.to).with_context(|| format!("creating {}", args.to.display()))?;
 
     let info = DiscImageInfo::open(&args.source)
         .with_context(|| format!("opening {}", args.source.display()))?;
-    let mut fs =
-        open_disc_filesystem(&info).map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
+    let (mut fs, _opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
     let root = fs
         .root()
         .map_err(|e| anyhow::anyhow!("reading root: {e}"))?;

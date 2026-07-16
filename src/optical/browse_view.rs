@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use opticaldiscs::browse::entry::{EntryType, FileEntry};
 use opticaldiscs::browse::filesystem::{Filesystem, FilesystemError};
-use opticaldiscs::browse::open_disc_filesystem;
+use opticaldiscs::browse::{open_disc_filesystem, open_hybrid_filesystem};
 use opticaldiscs::detect::DiscImageInfo;
 use opticaldiscs::formats::FilesystemType;
 
@@ -33,6 +33,10 @@ struct ExtractionProgress {
 pub struct OpticalDiscBrowseView {
     disc_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
+    /// Selected filesystem on a hybrid disc: `0` = the primary, `N` =
+    /// `disc_info.hybrid_filesystems[N - 1]` (the Mac HFS side). Always `0` for
+    /// an ordinary single-filesystem disc.
+    selected_fs: usize,
     root: Option<FileEntry>,
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_paths: HashSet<String>,
@@ -67,6 +71,7 @@ impl Default for OpticalDiscBrowseView {
         Self {
             disc_path: None,
             disc_info: None,
+            selected_fs: 0,
             root: None,
             directory_cache: HashMap::new(),
             expanded_paths: HashSet::new(),
@@ -89,6 +94,7 @@ impl OpticalDiscBrowseView {
     pub fn open(&mut self, path: &Path) {
         self.close();
         self.disc_path = Some(path.to_path_buf());
+        self.selected_fs = 0;
 
         match DiscImageInfo::open(path) {
             Ok(info) => {
@@ -131,6 +137,7 @@ impl OpticalDiscBrowseView {
     pub fn close(&mut self) {
         self.disc_path = None;
         self.disc_info = None;
+        self.selected_fs = 0;
         self.root = None;
         self.directory_cache.clear();
         self.expanded_paths.clear();
@@ -149,25 +156,94 @@ impl OpticalDiscBrowseView {
     }
 
     /// Create a new filesystem instance for each operation (don't cache state).
+    /// Honors the hybrid-disc selection: `selected_fs == 0` is the primary,
+    /// otherwise the co-resident HFS partition at index `selected_fs - 1`.
     fn open_fs(&self) -> Result<Box<dyn Filesystem>, FilesystemError> {
         let info = self
             .disc_info
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no disc info available".into()))?;
-        open_disc_filesystem(info)
+        if self.selected_fs == 0 {
+            open_disc_filesystem(info)
+        } else {
+            open_hybrid_filesystem(info, self.selected_fs - 1)
+        }
     }
 
-    /// Whether the disc filesystem is HFS or HFS+.
+    /// The [`FilesystemType`] currently selected for browsing (primary or, on a
+    /// hybrid disc, the chosen HFS side).
+    fn selected_fs_type(&self) -> Option<FilesystemType> {
+        let info = self.disc_info.as_ref()?;
+        if self.selected_fs == 0 {
+            Some(info.filesystem)
+        } else {
+            info.hybrid_filesystems
+                .get(self.selected_fs - 1)
+                .map(|h| h.filesystem)
+        }
+    }
+
+    /// Whether the *selected* filesystem is HFS or HFS+ (gates the resource-fork
+    /// controls), so browsing the Mac side of a hybrid disc enables them.
     fn is_hfs_type(&self) -> bool {
-        self.disc_info
-            .as_ref()
-            .map(|info| {
-                matches!(
-                    info.filesystem,
-                    FilesystemType::Hfs | FilesystemType::HfsPlus
-                )
-            })
-            .unwrap_or(false)
+        matches!(
+            self.selected_fs_type(),
+            Some(FilesystemType::Hfs | FilesystemType::HfsPlus)
+        )
+    }
+
+    /// Switch which filesystem is browsed on a hybrid disc, re-reading the root
+    /// from the newly selected volume. No-op if `idx` is already selected.
+    fn select_fs(&mut self, idx: usize) {
+        if idx == self.selected_fs {
+            return;
+        }
+        self.selected_fs = idx;
+        // Drop everything tied to the previous volume, then re-read the root.
+        self.directory_cache.clear();
+        self.expanded_paths.clear();
+        self.selected_entry = None;
+        self.content = None;
+        self.error = None;
+        match self.open_fs() {
+            Ok(mut fs) => match fs.root() {
+                Ok(root) => {
+                    match fs.list_directory(&root) {
+                        Ok(entries) => {
+                            self.directory_cache.insert("/".into(), entries);
+                            self.expanded_paths.insert("/".into());
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Failed to read root directory: {e}"));
+                        }
+                    }
+                    self.root = Some(root);
+                }
+                Err(e) => self.error = Some(format!("Failed to get root: {e}")),
+            },
+            Err(e) => self.error = Some(format!("Cannot open filesystem: {e}")),
+        }
+    }
+
+    /// Human label for one selectable filesystem index (for the picker).
+    fn fs_choice_label(&self, idx: usize) -> String {
+        let Some(info) = self.disc_info.as_ref() else {
+            return "?".into();
+        };
+        if idx == 0 {
+            match &info.volume_label {
+                Some(l) => format!("{} ({l})", info.filesystem.display_name()),
+                None => info.filesystem.display_name().to_string(),
+            }
+        } else if let Some(h) = info.hybrid_filesystems.get(idx - 1) {
+            let name = h.filesystem.display_name();
+            match &h.volume_label {
+                Some(l) => format!("{name} ({l})"),
+                None => name.to_string(),
+            }
+        } else {
+            "?".into()
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
@@ -177,17 +253,43 @@ impl OpticalDiscBrowseView {
 
         self.poll_extraction(ui);
 
-        // Header
+        // Header. On a hybrid Mac/PC disc (>1 selectable filesystem) the plain
+        // filesystem label becomes a picker; precompute the labels so the combo
+        // closure doesn't re-borrow `self`.
+        let num_choices = self
+            .disc_info
+            .as_ref()
+            .map(|i| 1 + i.hybrid_filesystems.len())
+            .unwrap_or(0);
+        let choice_labels: Vec<String> =
+            (0..num_choices).map(|i| self.fs_choice_label(i)).collect();
+        let game_label = self
+            .disc_info
+            .as_ref()
+            .and_then(|i| i.game.as_ref())
+            .map(crate::optical::format_game_identity);
+        let mut new_selection: Option<usize> = None;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Disc Browser").strong());
-            if let Some(info) = &self.disc_info {
-                ui.label(format!("[{}]", info.filesystem.display_name()));
-                if let Some(ref label) = info.volume_label {
-                    ui.label(format!("Label: {label}"));
-                }
-                if let Some(g) = &info.game {
-                    ui.label(format!("Game: {}", crate::optical::format_game_identity(g)));
-                }
+            if num_choices > 1 {
+                ui.label("Filesystem:");
+                egui::ComboBox::from_id_salt("optical_fs_picker")
+                    .selected_text(choice_labels[self.selected_fs].clone())
+                    .show_ui(ui, |ui| {
+                        for (idx, label) in choice_labels.iter().enumerate() {
+                            if ui
+                                .selectable_label(idx == self.selected_fs, label)
+                                .clicked()
+                            {
+                                new_selection = Some(idx);
+                            }
+                        }
+                    });
+            } else if num_choices == 1 {
+                ui.label(format!("[{}]", choice_labels[0]));
+            }
+            if let Some(g) = &game_label {
+                ui.label(format!("Game: {g}"));
             }
             if ui.button("Tree").clicked() {
                 self.generate_tree_text();
@@ -196,6 +298,9 @@ impl OpticalDiscBrowseView {
                 self.close();
             }
         });
+        if let Some(idx) = new_selection {
+            self.select_fs(idx);
+        }
 
         self.render_tree_popup(ui);
 

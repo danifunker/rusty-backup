@@ -1016,6 +1016,7 @@ Usage: browse [OPTIONS] <SOURCE>
 
 - `--format` — Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing
 - `--hash` — Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`
+- `--filesystem` — Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries
 
 ### `optical convert`
 
@@ -1063,6 +1064,7 @@ Usage: extract [OPTIONS] --to <TO> <SOURCE>
 - `--to` — Destination folder (created if absent)
 - `--resource-forks` — How to handle HFS resource forks. Ignored on non-HFS discs. Defaults to `appledouble`, or `[optical] resource-forks` from the config file when set
 - `--on-collision` — What to do when two names on a **case-sensitive** disc (UFS, NeXT, Rock Ridge, …) collide only by case on a **case-insensitive** destination (e.g. macOS). Defaults to `rename`, or `[optical] on-collision` from the config. Ignored when the destination is case-sensitive — everything extracts verbatim there
+- `--filesystem` — Which filesystem to extract from on a hybrid Mac/PC disc. `auto` (default) uses the primary (ISO 9660); `hfs` extracts the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info`
 
 ### `optical info`
 

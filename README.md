@@ -155,7 +155,10 @@ What's in the MiSTer build:
   disc, not just the primary. A hybrid CD (an ISO 9660 volume plus an
   Apple_HFS partition sharing one data track, the way most 90s Mac/PC game
   discs were mastered) lists both sides — so the Mac volume is visible even
-  when the PC ISO 9660 tree is what the browser opens by default.
+  when the PC ISO 9660 tree is what the browser opens by default. Reach the Mac
+  side with `optical browse --filesystem hfs` / `optical extract --filesystem
+  hfs` (the default `auto` keeps opening the PC ISO 9660 tree), or pick it from
+  the filesystem dropdown in the GUI's optical disc browser.
 - **El Torito boot images:** `optical info` lists every boot entry (platform,
   bootable, media type, size + sha256) and names the *nested* filesystem inside
   each. `optical boot extract` pulls a boot image out to a file, which is just a
