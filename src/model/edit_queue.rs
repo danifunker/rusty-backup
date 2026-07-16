@@ -569,18 +569,19 @@ impl EditQueue {
                 }
                 let imp_t = resource_fork.as_ref().and_then(|i| i.type_code);
                 let imp_c = resource_fork.as_ref().and_then(|i| i.creator_code);
-                let dict = crate::fs::hfs_common::type_creator_for_extension(
-                    name.rsplit('.').next().unwrap_or(""),
+                // Mirror `apply` exactly: it hands `create_file` an `os_type` of
+                // override-or-import, and the create path then resolves blanks /
+                // the extension dictionary. Going through the same resolver here
+                // is what keeps this preview honest -- an import carrying a blank
+                // FInfo must display the dictionary value that will actually be
+                // written, not a blank.
+                return crate::fs::hfs_common::resolve_create_type_creator(
+                    name,
+                    hfs_type_override.or(imp_t),
+                    hfs_creator_override.or(imp_c),
+                    None,
+                    None,
                 );
-                let t = hfs_type_override
-                    .or(imp_t)
-                    .or(dict.map(|(t, _)| t))
-                    .unwrap_or([0; 4]);
-                let c = hfs_creator_override
-                    .or(imp_c)
-                    .or(dict.map(|(_, c)| c))
-                    .unwrap_or([0; 4]);
-                return (t, c);
             }
         }
         // A staged SetTypeCreator on an existing file wins over the on-disk

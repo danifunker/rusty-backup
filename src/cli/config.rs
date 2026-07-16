@@ -138,6 +138,9 @@ pub const TEMPLATE: &str = "\
 # prompt-timeout = 30     # seconds; 0 = wait indefinitely
 
 [put]
+# Pin a 4-char HFS type/creator for every `put`. Leave both unset to infer
+# from the file extension (TEXT/ttxt for .txt, GIFf/ogle for .gif, ...),
+# falling back to BINA/???? for extensions the built-in list doesn't know.
 # type = BINA             # 4-char HFS type code
 # creator = ????          # 4-char HFS creator code
 

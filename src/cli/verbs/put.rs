@@ -74,13 +74,16 @@ pub struct PutArgs {
     #[arg(long = "boot-from", conflicts_with_all = ["host_file", "dst", "dst_flag", "zero", "type_code", "creator", "force", "boot"])]
     pub boot_from: Option<ImageRef>,
 
-    /// 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`,
-    /// or `[put] type` from the config file when set.
+    /// 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type`
+    /// from the config file, then — on HFS / HFS+ / MFS — to the file
+    /// extension (same list as the GUI's type/creator picker), and finally to
+    /// `BINA` for names the list doesn't recognize.
     #[arg(long = "type")]
     pub type_code: Option<String>,
 
-    /// 4-character creator code (HFS / HFS+ only). Defaults to `????`,
-    /// or `[put] creator` from the config file when set.
+    /// 4-character creator code (HFS / HFS+ only). Falls back to
+    /// `[put] creator` from the config file, then to the file extension, and
+    /// finally to `????`.
     #[arg(long)]
     pub creator: Option<String>,
 
@@ -186,6 +189,15 @@ pub fn run(args: PutArgs) -> Result<()> {
             .map_err(|e| anyhow!("delete existing: {e}"))?;
     }
 
+    // An explicit --type / --creator (or the config default) always wins. Failing
+    // that, on the classic-Mac filesystems we leave both unset so `create_file`
+    // consults the shared extension dictionary -- the same list the GUI's
+    // type/creator picker offers -- and a `.txt` lands as TEXT/ttxt instead of a
+    // generic BINA blob. BINA/???? stays the fallback for names the dictionary
+    // doesn't recognize, and for every other filesystem (ProDOS types are `$XX`,
+    // a different space entirely).
+    let auto_from_extension = crate::fs::hfs_common::uses_hfs_type_dictionary(fs.fs_type())
+        && crate::fs::hfs_common::type_creator_for_filename(&name).is_some();
     let type_code = args
         .type_code
         .clone()
@@ -194,7 +206,7 @@ pub fn run(args: PutArgs) -> Result<()> {
                 .and_then(|c| c.get("put", "type"))
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "BINA".to_string());
+        .or_else(|| (!auto_from_extension).then(|| "BINA".to_string()));
     let creator = args
         .creator
         .clone()
@@ -203,10 +215,10 @@ pub fn run(args: PutArgs) -> Result<()> {
                 .and_then(|c| c.get("put", "creator"))
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "????".to_string());
+        .or_else(|| (!auto_from_extension).then(|| "????".to_string()));
     let options = CreateFileOptions {
-        type_code: Some(type_code),
-        creator_code: Some(creator),
+        type_code,
+        creator_code: creator,
         ..Default::default()
     };
 
@@ -267,33 +279,31 @@ fn remote_put(
     }
     let host = host_file.ok_or_else(|| anyhow!("host file required (positional HOST argument)"))?;
 
-    // Type/creator defaults mirror the local path: flag, else config, else BINA/????.
+    // Type/creator defaults mirror the local path: flag, else config, else the
+    // extension dictionary, else BINA/????. Unlike the local path we can't see
+    // the remote filesystem from here, so the dictionary check is name-only: a
+    // recognized extension sends `None` and lets the server's `create_file`
+    // resolve it (which consults the same dictionary on HFS/HFS+/MFS, and picks
+    // its own sensible default elsewhere).
+    let auto_from_extension = crate::fs::hfs_common::type_creator_for_filename(name).is_some();
     let type_code = type_code
         .or_else(|| {
             crate::cli::logging::loaded_config()
                 .and_then(|c| c.get("put", "type"))
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "BINA".to_string());
+        .or_else(|| (!auto_from_extension).then(|| "BINA".to_string()));
     let creator = creator
         .or_else(|| {
             crate::cli::logging::loaded_config()
                 .and_then(|c| c.get("put", "creator"))
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| "????".to_string());
+        .or_else(|| (!auto_from_extension).then(|| "????".to_string()));
 
     let mut session = crate::remote::RemoteSession::connect(&rref.addr())?;
     let sid = session.open_session(&rref.path, partition)?;
-    session.stage_upload(
-        sid,
-        parent_path,
-        name,
-        &host,
-        force,
-        Some(type_code),
-        Some(creator),
-    )?;
+    session.stage_upload(sid, parent_path, name, &host, force, type_code, creator)?;
     let n = session.apply(sid)?;
     session.close_session(sid)?;
     crate::cli::logging::out_stdout(format!("Wrote {name} ({n} edit applied over rb://)"));

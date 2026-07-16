@@ -321,6 +321,76 @@ pub fn describe_type_creator(type_code: &[u8; 4], creator_code: &[u8; 4]) -> Opt
         .map(|e| e.description.as_str())
 }
 
+/// True for the classic-Mac filesystems whose `create_file` consults the
+/// extension dictionary: HFS, HFS+/HFSX, and MFS. ProDOS carries a file type
+/// too, but in its own `$XX` space, so it is deliberately excluded — handing it
+/// a Finder OSType like `TEXT` would be meaningless.
+pub fn uses_hfs_type_dictionary(fs_type: &str) -> bool {
+    fs_type.starts_with("HFS") || fs_type == "MFS"
+}
+
+/// True when an `OSType` carries no information — all four bytes zero, which is
+/// how a classic-Mac volume records "no Finder type set".
+///
+/// An all-*space* code is deliberately not blank: `cp` promises byte-exact
+/// OSType fidelity, and blanking spaces would rewrite bytes a real volume chose.
+/// Empty caller-typed *text* is handled separately in
+/// [`resolve_create_type_creator`].
+pub fn is_blank_ostype(code: &[u8; 4]) -> bool {
+    code == &[0u8; 4]
+}
+
+/// Extension-dictionary lookup keyed by a file *name* rather than a bare
+/// extension. Returns `None` for a name with no extension at all, so a file
+/// literally named `txt` isn't mistaken for a `.txt` document.
+pub fn type_creator_for_filename(name: &str) -> Option<([u8; 4], [u8; 4])> {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    if ext == name {
+        return None; // no '.' in the name
+    }
+    type_creator_for_extension(ext)
+}
+
+/// Resolve the Finder type/creator to stamp on a newly created HFS / HFS+ / MFS
+/// file. Shared by all three `create_file` implementations.
+///
+/// Each half resolves independently, so a partial FInfo (an imported AppleDouble
+/// that carried only a creator, say) keeps what it has and fills the rest.
+/// Precedence per half:
+///
+/// 1. `os_type` / `os_creator` — raw bytes, byte-exact and high-bit safe.
+/// 2. `type_code` / `creator_code` — the lossy caller-typed text form.
+/// 3. The extension dictionary (`assets/hfs_file_types.json`) — the same list
+///    the GUI's type/creator picker offers.
+/// 4. `[0; 4]` when nothing above knows.
+///
+/// A *blank* value at steps 1-2 does not suppress the dictionary. An all-zero
+/// OSType, or empty/whitespace text, means "no type" rather than a real code, so
+/// a type-less file copied onto HFS still picks up a sensible Finder type when
+/// its name tells us one. That is what makes `cp` of an untyped `README.TXT`
+/// land as `TEXT`/`ttxt` instead of staying unopenable in the Finder.
+pub fn resolve_create_type_creator(
+    name: &str,
+    os_type: Option<[u8; 4]>,
+    os_creator: Option<[u8; 4]>,
+    type_code: Option<&str>,
+    creator_code: Option<&str>,
+) -> ([u8; 4], [u8; 4]) {
+    let (dict_t, dict_c) = type_creator_for_filename(name).unwrap_or(([0; 4], [0; 4]));
+    // Emptiness is judged on the trimmed text, but the original is what gets
+    // encoded — `encode_fourcc` re-pads, so a real `"ZIP "` survives, while a
+    // hypothetical leading-space code isn't silently shifted.
+    let resolve = |raw: Option<[u8; 4]>, text: Option<&str>, dict: [u8; 4]| {
+        raw.filter(|c| !is_blank_ostype(c))
+            .or_else(|| text.filter(|s| !s.trim().is_empty()).map(encode_fourcc))
+            .unwrap_or(dict)
+    };
+    (
+        resolve(os_type, type_code, dict_t),
+        resolve(os_creator, creator_code, dict_c),
+    )
+}
+
 /// Look up the type and creator codes for a file extension.
 /// Returns None for unknown extensions.
 pub fn type_creator_for_extension(ext: &str) -> Option<([u8; 4], [u8; 4])> {
@@ -2420,6 +2490,89 @@ mod tests {
         let (tc, cc) = type_creator_for_extension("TXT").unwrap();
         assert_eq!(&tc, b"TEXT");
         assert_eq!(&cc, b"ttxt");
+    }
+
+    #[test]
+    fn test_uses_hfs_type_dictionary() {
+        for t in ["HFS", "HFS+", "HFSX", "MFS"] {
+            assert!(uses_hfs_type_dictionary(t), "{t} should use the dictionary");
+        }
+        // ProDOS has a file type, but in its own `$XX` space.
+        for t in ["ProDOS", "FAT16", "ext4", ""] {
+            assert!(!uses_hfs_type_dictionary(t), "{t} should not");
+        }
+    }
+
+    #[test]
+    fn test_type_creator_for_filename_needs_a_real_extension() {
+        assert!(type_creator_for_filename("readme.txt").is_some());
+        // A dotless name has no extension: a file *named* `txt` is not a
+        // `.txt` document, even though `rsplit('.')` hands back the whole name.
+        assert!(type_creator_for_filename("txt").is_none());
+        assert!(type_creator_for_filename("README").is_none());
+    }
+
+    #[test]
+    fn test_resolve_blank_ostype_falls_through_to_dictionary() {
+        // The InstallerMaker-of-this-feature: a type-less file (all-zero FInfo,
+        // how a real Mac volume records "no type") copied onto HFS should pick
+        // up TEXT/ttxt from its name rather than land unopenable.
+        let (t, c) =
+            resolve_create_type_creator("readme.txt", Some([0; 4]), Some([0; 4]), None, None);
+        assert_eq!(&t, b"TEXT");
+        assert_eq!(&c, b"ttxt");
+
+        // Same for empty / whitespace-only caller text.
+        let (t, c) = resolve_create_type_creator("pic.gif", None, None, Some(""), Some("   "));
+        assert_eq!(&t, b"GIFf");
+        assert_eq!(&c, b"ogle");
+    }
+
+    #[test]
+    fn test_resolve_real_ostype_wins_over_dictionary() {
+        // Byte-exact fidelity: a high-bit creator (Prince of Persia's `PoƒP`)
+        // on a `.txt` name must survive, not be "corrected" to TEXT/ttxt.
+        let (t, c) = resolve_create_type_creator(
+            "poi.txt",
+            Some(*b"APPL"),
+            Some([0x50, 0x6f, 0xC4, 0x50]),
+            None,
+            None,
+        );
+        assert_eq!(&t, b"APPL");
+        assert_eq!(c, [0x50, 0x6f, 0xC4, 0x50]);
+
+        // An all-space OSType is a real code, not a blank: `cp` promises
+        // byte-exact fidelity, so it must not be rewritten from the dictionary.
+        let (t, _) =
+            resolve_create_type_creator("spc.txt", Some(*b"    "), Some(*b"    "), None, None);
+        assert_eq!(&t, b"    ");
+    }
+
+    #[test]
+    fn test_resolve_fills_only_the_missing_half() {
+        // A partial FInfo (creator known, type absent) keeps the creator and
+        // fills the type from the dictionary.
+        let (t, c) = resolve_create_type_creator("pic.gif", None, Some(*b"MINE"), None, None);
+        assert_eq!(&t, b"GIFf");
+        assert_eq!(&c, b"MINE");
+    }
+
+    #[test]
+    fn test_resolve_unknown_extension_stays_blank() {
+        // Nothing known and nothing inferable: stay [0;4]. Callers that want a
+        // generic fallback (the CLI's BINA/????) apply it themselves.
+        let (t, c) = resolve_create_type_creator("thing.xyz123", None, None, None, None);
+        assert_eq!(t, [0; 4]);
+        assert_eq!(c, [0; 4]);
+    }
+
+    #[test]
+    fn test_resolve_text_type_keeps_trailing_space_codes() {
+        // `ZIP ` / `PDF ` are real four-byte codes whose fourth byte is a space;
+        // the blank check must not eat them.
+        let (t, _) = resolve_create_type_creator("x.unknown", None, None, Some("ZIP "), None);
+        assert_eq!(&t, b"ZIP ");
     }
 
     #[test]

@@ -164,8 +164,8 @@ Usage: put [OPTIONS] <IMAGE> <HOST_FILE> <MAC_PATH>
 
 **Options**
 
-- `--type` — HFS 4-character type code. Defaults to `BINA`
-- `--creator` — HFS 4-character creator code. Defaults to `????`
+- `--type` — HFS 4-character type code. Inferred from the file extension when unset (same list as the GUI's type/creator picker), falling back to `BINA` for names the list doesn't recognize
+- `--creator` — HFS 4-character creator code. Inferred from the file extension when unset, falling back to `????`
 - `--force` — Overwrite an existing entry at the destination path
 - `--partition` — 
 
@@ -573,7 +573,7 @@ Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
 - `--attrs` — Whether to carry FS-specific attributes (type/creator, Unix perms, DOS attribute bits, Amiga bits). Default: preserve
 - `--flatten` — Collapse a source tree into the destination directory when the destination filesystem has no subdirectories (CP/M, DFS, CBM, …)
 - `--parents` — Auto-create missing destination parent directories
-- `--password` — Password for an encrypted source container (currently: WinImage IMZ)
+- `--password` — Password for an encrypted source container (WinImage IMZ) or an encrypted source filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--src-fs-type` — Force a specific filesystem dispatch for the SOURCE (e.g. `cpm:amstrad_data`). See `get --fs-type`
 - `--dst-fs-type` — Force a specific filesystem dispatch for the DESTINATION
 - `--carve-full` — Scan the entire source image for recoverable text in the synthetic carve view (NDOS disks). Source-side only
@@ -679,7 +679,7 @@ Usage: get [OPTIONS] <IMAGE> <SRC> <DST>
 - `--case-sensitive` — Match case-sensitively regardless of the target's native rule
 - `--force` — Overwrite existing host files. Mutually exclusive with `--skip-existing`
 - `--skip-existing` — Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error
-- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
@@ -700,7 +700,7 @@ Usage: get-binhex [OPTIONS] <IMAGE> <SRC> <DST>
 
 **Options**
 
-- `--password` — Password for encrypted containers (currently: WinImage IMZ)
+- `--password` — Password for encrypted containers (WinImage IMZ) or an encrypted filesystem (APFS FileVault — the volume password or recovery key)
 - `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `get-binhex` always treats the source as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+)
 
 ### `grow`
@@ -789,7 +789,7 @@ Usage: ls [OPTIONS] <IMAGE> [PATH]
 - `-L` / `--literal` — Treat the path as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
 - `--ignore-case` — Treat case-insensitively, regardless of the target's native rule
 - `--case-sensitive` — Treat case-sensitively, regardless of the target's native rule
-- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
@@ -1243,8 +1243,8 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
 - `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
 - `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
-- `--type` — 4-character type code (HFS / HFS+ / ProDOS). Defaults to `BINA`, or `[put] type` from the config file when set
-- `--creator` — 4-character creator code (HFS / HFS+ only). Defaults to `????`, or `[put] creator` from the config file when set
+- `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
+- `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
 - `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
@@ -1272,7 +1272,7 @@ Usage: put-binhex [OPTIONS] <IMAGE> <HOST_FILE>
 
 ### `put-macbinary`
 
-Put a MacBinary I / II archive: both forks + full Finder info in one shot (HFS today)
+Put a MacBinary I / II archive: both forks + full Finder info in one shot (HFS; on MFS both forks + type/creator, extended Finder flags/dates skipped)
 
 ```
 Usage: put-macbinary [OPTIONS] <IMAGE> <HOST_FILE>
@@ -1423,7 +1423,7 @@ Usage: setup
 
 ### `setrsrc`
 
-Write the resource fork of an existing HFS / HFS+ file from a host file
+Write the resource fork of an existing HFS / HFS+ / MFS file from a host file
 
 ```
 Usage: setrsrc --from-file <FROM_FILE> <IMAGE> <PATH>
@@ -1556,7 +1556,7 @@ Usage: tar [OPTIONS] <IMAGE> <SRC> <OUT>
 - `--force` — Overwrite OUT if it already exists
 - `--ignore-case` — Match `--exclude` globs case-insensitively (default follows the filesystem's native rule)
 - `--case-sensitive` — Match `--exclude` globs case-sensitively (default follows the filesystem's native rule)
-- `--password` — Password for encrypted containers (currently: WinImage IMZ, and password-protected `.zip` disks)
+- `--password` — Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)
 - `--inside` — For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Ignored for non-zip sources
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem

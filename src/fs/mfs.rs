@@ -893,27 +893,17 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         self.mdb.next_file_number += 1;
         self.mdb.num_files += 1;
 
-        // Honor the caller's Mac type/creator: raw `os_type`/`os_creator` win
-        // (byte-exact, high-bit safe), then the lossy text `type_code`, then the
-        // extension dictionary. Written into the dir entry's Finder info so the
-        // codes actually persist on disk (and the returned entry matches).
-        let ext = name.rsplit('.').next().unwrap_or("");
-        let (dict_t, dict_c) =
-            super::hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]));
-        let type_code = options.os_type.unwrap_or_else(|| {
-            options
-                .type_code
-                .as_deref()
-                .map(super::hfs_common::encode_fourcc)
-                .unwrap_or(dict_t)
-        });
-        let creator_code = options.os_creator.unwrap_or_else(|| {
-            options
-                .creator_code
-                .as_deref()
-                .map(super::hfs_common::encode_fourcc)
-                .unwrap_or(dict_c)
-        });
+        // Honor the caller's Mac type/creator, filling any missing or blank half
+        // from the extension dictionary. Written into the dir entry's Finder
+        // info so the codes actually persist on disk (and the returned entry
+        // matches).
+        let (type_code, creator_code) = super::hfs_common::resolve_create_type_creator(
+            name,
+            options.os_type,
+            options.os_creator,
+            options.type_code.as_deref(),
+            options.creator_code.as_deref(),
+        );
         let mut finder_info = [0u8; 16];
         finder_info[0..4].copy_from_slice(&type_code);
         finder_info[4..8].copy_from_slice(&creator_code);

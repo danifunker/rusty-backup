@@ -4611,28 +4611,16 @@ impl<R: Read + Write + Seek + Send> HfsPlusFilesystem<R> {
         let file_id = self.vh.next_catalog_id;
         self.vh.next_catalog_id += 1;
 
-        // Determine type/creator: prefer caller-supplied, fill any missing
-        // half from the extension dictionary so a partial FInfo from an
+        // Determine type/creator: prefer caller-supplied, fill any missing or
+        // blank half from the extension dictionary so a partial FInfo from an
         // imported AppleDouble isn't thrown away.
-        let ext = name.rsplit('.').next().unwrap_or("");
-        let (dict_t, dict_c) =
-            hfs_common::type_creator_for_extension(ext).unwrap_or(([0; 4], [0; 4]));
-        // Raw `os_type`/`os_creator` win (byte-exact, high-bit safe); else
-        // fall back to the lossy text `type_code`, then the extension dict.
-        let type_code = options.os_type.unwrap_or_else(|| {
-            options
-                .type_code
-                .as_deref()
-                .map(hfs_common::encode_fourcc)
-                .unwrap_or(dict_t)
-        });
-        let creator_code = options.os_creator.unwrap_or_else(|| {
-            options
-                .creator_code
-                .as_deref()
-                .map(hfs_common::encode_fourcc)
-                .unwrap_or(dict_c)
-        });
+        let (type_code, creator_code) = hfs_common::resolve_create_type_creator(
+            name,
+            options.os_type,
+            options.os_creator,
+            options.type_code.as_deref(),
+            options.creator_code.as_deref(),
+        );
 
         // Allocate blocks and write data
         let data_fork = self.write_data_to_blocks(data, data_len, file_id, HFSPLUS_FORK_DATA)?;

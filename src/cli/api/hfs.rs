@@ -62,12 +62,15 @@ pub enum HfsCommand {
         /// Destination Mac path inside the volume. The parent directory must
         /// already exist.
         mac_path: String,
-        /// HFS 4-character type code. Defaults to `BINA`.
-        #[arg(long = "type", default_value = "BINA")]
-        type_code: String,
-        /// HFS 4-character creator code. Defaults to `????`.
-        #[arg(long, default_value = "????")]
-        creator: String,
+        /// HFS 4-character type code. Inferred from the file extension when
+        /// unset (same list as the GUI's type/creator picker), falling back to
+        /// `BINA` for names the list doesn't recognize.
+        #[arg(long = "type")]
+        type_code: Option<String>,
+        /// HFS 4-character creator code. Inferred from the file extension when
+        /// unset, falling back to `????`.
+        #[arg(long)]
+        creator: Option<String>,
         /// Overwrite an existing entry at the destination path.
         #[arg(long)]
         force: bool,
@@ -81,10 +84,10 @@ pub enum HfsCommand {
         mac_path: String,
         /// Number of zero bytes to allocate.
         size: u64,
-        #[arg(long = "type", default_value = "BINA")]
-        type_code: String,
-        #[arg(long, default_value = "????")]
-        creator: String,
+        #[arg(long = "type")]
+        type_code: Option<String>,
+        #[arg(long)]
+        creator: Option<String>,
         #[arg(long)]
         force: bool,
         #[arg(long)]
@@ -144,8 +147,8 @@ pub fn run(verb: HfsCommand) -> Result<()> {
             image,
             Some(host_file),
             &mac_path,
-            &type_code,
-            &creator,
+            type_code.as_deref(),
+            creator.as_deref(),
             None,
             force,
             partition,
@@ -162,8 +165,8 @@ pub fn run(verb: HfsCommand) -> Result<()> {
             image,
             None,
             &mac_path,
-            &type_code,
-            &creator,
+            type_code.as_deref(),
+            creator.as_deref(),
             Some(size),
             force,
             partition,
@@ -445,8 +448,8 @@ pub(crate) fn cmd_put(
     image: PathBuf,
     host_file: Option<PathBuf>,
     mac_path: &str,
-    type_code: &str,
-    creator: &str,
+    type_code: Option<&str>,
+    creator: Option<&str>,
     zero_pad: Option<u64>,
     force: bool,
     partition: Option<u32>,
@@ -482,9 +485,18 @@ pub(crate) fn cmd_put(
             .map_err(|e| anyhow!("delete existing: {e}"))?;
     }
 
+    // An explicit --type / --creator wins; otherwise let the extension
+    // dictionary (the same list the GUI's picker offers) name the file, and only
+    // fall back to BINA/???? when it doesn't recognize the extension. This path
+    // is HFS-only, so no filesystem-family gate is needed.
+    let auto_from_extension = crate::fs::hfs_common::type_creator_for_filename(&name).is_some();
     let options = CreateFileOptions {
-        type_code: Some(type_code.to_string()),
-        creator_code: Some(creator.to_string()),
+        type_code: type_code
+            .map(str::to_string)
+            .or_else(|| (!auto_from_extension).then(|| "BINA".to_string())),
+        creator_code: creator
+            .map(str::to_string)
+            .or_else(|| (!auto_from_extension).then(|| "????".to_string())),
         ..Default::default()
     };
 
