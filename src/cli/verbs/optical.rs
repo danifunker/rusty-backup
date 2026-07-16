@@ -839,6 +839,19 @@ struct HfsInfo {
     ddr_present: bool,
 }
 
+/// A filesystem co-resident with the primary on a hybrid Mac/PC disc — the
+/// Apple_HFS side an ISO 9660 primary otherwise hides. Mirrors
+/// `opticaldiscs::detect::HybridFilesystem`.
+#[derive(Debug, Serialize)]
+struct HybridFsInfo {
+    /// `hfs` or `hfsplus`.
+    filesystem: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume_name: Option<String>,
+    /// Byte offset of the partition within the data track.
+    partition_offset: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct ElToritoInfo {
     present: bool,
@@ -866,9 +879,19 @@ struct BootEntryInfo {
 #[derive(Debug, Serialize)]
 struct InfoPayload {
     image: String,
+    /// Disc data size. For BIN/CUE this is the referenced BIN file(s), not the
+    /// tiny CUE text; for a plain ISO/CHD it is the file itself.
     size_bytes: u64,
+    /// Size of the sidecar `.cue`, when the image is a BIN/CUE pair and the cue
+    /// exists. `None` for single-file containers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cue_size_bytes: Option<u64>,
     container: String,
     filesystems: Vec<String>,
+    /// Co-resident filesystems on a hybrid disc (the Mac HFS side beside an ISO
+    /// 9660 primary). Empty for a single-filesystem disc.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hybrid_filesystems: Vec<HybridFsInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -903,7 +926,9 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
                     image,
                     size_bytes,
                     container: "unknown".to_string(),
+                    cue_size_bytes: None,
                     filesystems: Vec::new(),
+                    hybrid_filesystems: Vec::new(),
                     warnings: vec![format!("unrecognized disc image: {e}")],
                     iso9660: None,
                     hfs: None,
@@ -912,6 +937,10 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
             );
         }
     };
+
+    // For BIN/CUE, report the BIN data size (not the tiny CUE text the initial
+    // `size_bytes` captured) plus the sidecar CUE size.
+    let (size_bytes, cue_size_bytes) = optical_data_and_cue_sizes(&args.source, info.format);
 
     let mut warnings: Vec<String> = Vec::new();
     let mut reader = open_sector_reader(&info);
@@ -1020,6 +1049,23 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
     if info.hfsplus_header.is_some() {
         add_fs(&mut filesystems, "hfsplus");
     }
+    // Hybrid Mac/PC disc: opticaldiscs detects the Apple_HFS side that the ISO
+    // 9660 primary hides. Surface it in the token list and as structured detail
+    // so a user knows the Mac tree is there (and can reach it with the browse /
+    // extract filesystem selector).
+    let hybrid_filesystems: Vec<HybridFsInfo> = info
+        .hybrid_filesystems
+        .iter()
+        .map(|h| {
+            let token = fs_token(h.filesystem);
+            add_fs(&mut filesystems, &token);
+            HybridFsInfo {
+                filesystem: token,
+                volume_name: h.volume_label.clone(),
+                partition_offset: h.partition_offset,
+            }
+        })
+        .collect();
     // A non-ISO, non-HFS primary (EFS / UFS / ODS-2 / game formats).
     if info.pvd.is_none() && info.hfs_mdb.is_none() && info.hfsplus_header.is_none() {
         let token = fs_token(info.filesystem);
@@ -1037,7 +1083,9 @@ fn run_info_verb(args: InfoArgs) -> Result<()> {
             image,
             size_bytes,
             container: disc_format_token(info.format),
+            cue_size_bytes,
             filesystems,
+            hybrid_filesystems,
             warnings,
             iso9660,
             hfs,
@@ -1074,6 +1122,53 @@ fn open_sector_reader(
 }
 
 /// Detect the partition table with our own engine (which handles zeroed DDRs).
+/// Resolve the disc *data* size and the sidecar `.cue` size for `optical info`.
+///
+/// A BIN/CUE image passed by its `.cue` would otherwise report the CUE's tiny
+/// text size as "the disc" — misleading for a multi-hundred-MB rip. Here
+/// `size_bytes` becomes the referenced BIN file(s) (summed, de-duplicated for
+/// multi-FILE cues) and the CUE is reported alongside. Every other container is
+/// a single file with no cue.
+fn optical_data_and_cue_sizes(
+    source: &Path,
+    format: opticaldiscs::DiscFormat,
+) -> (u64, Option<u64>) {
+    let file_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    if format != opticaldiscs::DiscFormat::BinCue {
+        return (file_size, None);
+    }
+    // Locate the .cue: the source itself, or the sibling of a .bin.
+    let cue_path = if source
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+    {
+        Some(source.to_path_buf())
+    } else {
+        let stem = source.file_stem().unwrap_or_default();
+        let sibling = source.with_file_name(format!("{}.cue", stem.to_string_lossy()));
+        sibling.exists().then_some(sibling)
+    };
+    let Some(cue_path) = cue_path else {
+        return (file_size, None); // a bare .bin with no cue beside it
+    };
+    let cue_size = std::fs::metadata(&cue_path).map(|m| m.len()).ok();
+    // Sum the unique BIN file(s) the cue references (opticaldiscs resolves each
+    // path, including the stem fallback for a mismatched FILE line).
+    let data_size = opticaldiscs::bincue::parse_cue_tracks(&cue_path)
+        .ok()
+        .map(|tracks| {
+            let mut seen = std::collections::HashSet::new();
+            tracks
+                .iter()
+                .filter(|t| seen.insert(t.bin_path.clone()))
+                .map(|t| std::fs::metadata(&t.bin_path).map(|m| m.len()).unwrap_or(0))
+                .sum::<u64>()
+        })
+        .filter(|&n| n > 0)
+        .unwrap_or(file_size);
+    (data_size, cue_size)
+}
+
 fn probe_apm(path: &Path) -> Option<crate::partition::apm::Apm> {
     let f = std::fs::File::open(path).ok()?;
     let mut r = std::io::BufReader::new(f);
@@ -1238,6 +1333,9 @@ fn emit_info(format: OutputFormat, payload: InfoPayload) -> Result<()> {
     // Human text.
     println!("Image:       {}", payload.image);
     println!("Size:        {}", format_size(payload.size_bytes));
+    if let Some(cue) = payload.cue_size_bytes {
+        println!("Cue:         {}", format_size(cue));
+    }
     println!("Container:   {}", payload.container);
     println!(
         "Filesystems: {}",
@@ -1272,6 +1370,18 @@ fn emit_info(format: OutputFormat, payload: InfoPayload) -> Result<()> {
             "  Partitions:  {} (ddr_present={})",
             hfs.partition_table, hfs.ddr_present
         );
+    }
+    if !payload.hybrid_filesystems.is_empty() {
+        println!("Hybrid (Mac side):");
+        for h in &payload.hybrid_filesystems {
+            println!(
+                "  {}  volume {:?}  @ offset {}",
+                h.filesystem,
+                h.volume_name.as_deref().unwrap_or("(unnamed)"),
+                h.partition_offset
+            );
+        }
+        println!("  browse with: optical browse --filesystem hfs <image>");
     }
     if let Some(et) = &payload.el_torito {
         println!("El Torito: {} boot image(s)", et.entries.len());

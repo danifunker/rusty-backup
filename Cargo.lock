@@ -344,7 +344,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
  "x11rb",
 ]
 
@@ -3942,9 +3942,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opticaldiscs"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02dacc4a100df0feadbccf9f97ee27f2803e38727e23f065a93a5edf926bcc9d"
+checksum = "585f62119532e7099e2c7e4aa4158c6e2827bf439c7ff26e3abb791d46a93130"
 dependencies = [
  "cue_sheet",
  "encoding_rs",
@@ -4385,7 +4385,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
