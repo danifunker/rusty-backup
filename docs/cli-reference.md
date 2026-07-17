@@ -578,6 +578,29 @@ Usage: cp [OPTIONS] <SRC_IMAGE> <SRC> <DST_IMAGE> <DST>
 - `--dst-fs-type` — Force a specific filesystem dispatch for the DESTINATION
 - `--carve-full` — Scan the entire source image for recoverable text in the synthetic carve view (NDOS disks). Source-side only
 
+### `du`
+
+Recursive both-fork (data + resource) disk usage of paths inside a filesystem. Unlike `ls`, which reports data-fork sizes only, `du` counts the resource fork too — essential for classic-Mac apps whose code lives in a resource fork over a 0-byte data fork
+
+```
+Usage: du [OPTIONS] <IMAGE> [PATH]...
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATHS>` — One or more paths inside the filesystem (use `/` as the separator). Each is measured independently. Defaults to the volume root when none are given. A literal `/` inside a name is written `\/` (and a literal `\` as `\\`); on HFS / HFS+ a `:`-separated path also works
+
+**Options**
+
+- `--depth` — Report subdirectory totals down to this many levels below each PATH (like `du --max-depth`). `0` (default) prints only the totals for the path itself; `1` adds its immediate children, and so on. The full subtree is always summed regardless — depth only controls how much detail is printed
+- `--json` — Emit machine-readable JSON. Shorthand for `--format json`
+- `--format` — Output format
+- `--password` — Password for encrypted containers / filesystems (see `ls`)
+- `--inside` — For a `.zip` holding more than one disk image, the archive entry to open
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+
 ### `expand`
 
 Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images
@@ -871,7 +894,7 @@ Usage: new [OPTIONS] --fs <FS> <IMAGE>
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2, minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx), ti99 (alias ti99_4a / ti994a)
+- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2, minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx), ti99 (alias ti99_4a / ti994a), mfs (alias macintosh), adfs (alias acorn)
 - `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
 - `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
 - `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems

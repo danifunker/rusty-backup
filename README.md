@@ -44,6 +44,7 @@ and automated build farms.
 rb-cli new disk.dsk --fs hfs --size 800K --name "My Disk"
 rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
 rb-cli ls  disk.dsk /System
+rb-cli du  disk.dsk "/System Folder" --json   # recursive both-fork (data+resource) size of a path
 rb-cli cp  floppy.adf / harddisk.hda@1 /Floppies/d01/ -r   # consolidate an image onto a HD
 rb-cli tar irix.img@1 / irix.tar.gz   # archive a case-sensitive volume (keeps case + symlinks)
 rb-cli untar disk.hda src.tar.gz /   # import an archive's contents INTO an image (skips ._* + unstorable names)

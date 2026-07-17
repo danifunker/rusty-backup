@@ -100,6 +100,12 @@ pub enum Command {
     /// List a directory inside a filesystem.
     Ls(verbs::ls::LsArgs),
 
+    /// Recursive both-fork (data + resource) disk usage of paths inside a
+    /// filesystem. Unlike `ls`, which reports data-fork sizes only, `du`
+    /// counts the resource fork too — essential for classic-Mac apps whose
+    /// code lives in a resource fork over a 0-byte data fork.
+    Du(verbs::du::DuArgs),
+
     /// Print the absolute byte offset and length of a file inside an
     /// image (HFS only today). Output is JSON so build scripts that
     /// patch disk offsets into boot blocks can parse it with `jq`.
@@ -319,6 +325,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),
+        Command::Du(args) => verbs::du::run(args),
         Command::Locate(args) => verbs::locate::run(args),
         Command::Put(args) => verbs::put::run(args),
         Command::Get(args) => verbs::get::run(args),
