@@ -158,8 +158,14 @@ What's in the MiSTer build:
   discs were mastered) lists both sides — so the Mac volume is visible even
   when the PC ISO 9660 tree is what the browser opens by default. Reach the Mac
   side with `optical browse --filesystem hfs` / `optical extract --filesystem
-  hfs` (the default `auto` keeps opening the PC ISO 9660 tree), or pick it from
-  the filesystem dropdown in the GUI's optical disc browser.
+  hfs` / `optical du --filesystem hfs` (the default `auto` keeps opening the PC
+  ISO 9660 tree), or pick it from the filesystem dropdown in the GUI's optical
+  disc browser.
+- **Both-fork disc sizing:** `optical du <disc> <path>... [--filesystem hfs]`
+  reports recursive data + resource fork bytes (and allocation-block-rounded
+  size) for a path on a disc — the disc counterpart of the top-level `du`, so a
+  hybrid Mac disc's app folders size correctly instead of undercounting the
+  resource-fork-only apps.
 - **El Torito boot images:** `optical info` lists every boot entry (platform,
   bootable, media type, size + sha256) and names the *nested* filesystem inside
   each. `optical boot extract` pulls a boot image out to a file, which is just a

@@ -202,19 +202,34 @@ pub fn run(args: DuArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem: {e}"))?;
 
+    emit_du(&mut *fs, args.paths, args.depth, format)
+}
+
+/// The `du` engine over any opened [`Filesystem`]: resolve each path, sum both
+/// forks recursively (rounding to the volume's allocation block where known),
+/// and emit text or JSON/YAML. Front-ends (the flat `du` verb over block-image
+/// filesystems, `optical du` over a disc adapter) open the filesystem their own
+/// way and hand it here so the walk / output shape is identical.
+///
+/// `format` must already be non-flat (callers run `require_non_flat`).
+pub(crate) fn emit_du(
+    fs: &mut dyn Filesystem,
+    mut paths: Vec<String>,
+    depth: u32,
+    format: OutputFormat,
+) -> Result<()> {
     let alloc_unit = fs.allocation_unit();
 
     // Default to the volume root when no path is given.
-    let mut paths = args.paths;
     if paths.is_empty() {
         paths.push("/".to_string());
     }
 
     let mut results = Vec::with_capacity(paths.len());
     for path in &paths {
-        match super::ls::resolve_path(&mut *fs, path) {
+        match super::ls::resolve_path(fs, path) {
             Ok(entry) => {
-                let mut node = walk(&mut *fs, &entry, alloc_unit, args.depth)?;
+                let mut node = walk(fs, &entry, alloc_unit, depth)?;
                 // Report under the exact path the user asked for (resolved
                 // entries carry their canonical on-volume path, which may
                 // differ in separator/case from the argument).

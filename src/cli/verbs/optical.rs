@@ -42,6 +42,10 @@ pub enum OpticalCommand {
     Convert(ConvertArgs),
     /// List the file tree on an optical disc image.
     Browse(BrowseArgs),
+    /// Recursive both-fork (data + resource) disk usage of paths on an optical
+    /// disc image — the disc counterpart of the top-level `du` verb, for
+    /// hybrid Mac discs whose apps keep code in the resource fork.
+    Du(OpticalDuArgs),
     /// Print volume-level metadata for an optical disc image (leniently).
     Info(InfoArgs),
     /// Extract files from an optical disc image into a host folder.
@@ -59,6 +63,7 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
         OpticalCommand::Rip(a) => run_rip_verb(a),
         OpticalCommand::Convert(a) => run_convert_verb(a),
         OpticalCommand::Browse(a) => run_browse_verb(a),
+        OpticalCommand::Du(a) => run_du_verb(a),
         OpticalCommand::Info(a) => run_info_verb(a),
         OpticalCommand::Extract(a) => run_extract_verb(a),
         OpticalCommand::Boot { cmd } => run_boot(cmd),
@@ -869,6 +874,63 @@ fn walk_tree(
         }
     }
     Ok(())
+}
+
+// ---------------- du ----------------
+
+#[derive(Debug, Args)]
+pub struct OpticalDuArgs {
+    /// Optical disc image (.iso, .cue, .chd).
+    pub source: PathBuf,
+    /// One or more paths inside the disc filesystem (use `/` as the
+    /// separator). Defaults to the volume root when none are given.
+    #[arg(value_name = "PATH")]
+    pub paths: Vec<String>,
+    /// Report subdirectory totals down to this many levels below each PATH
+    /// (`0`, the default, prints only the totals for the path itself). The
+    /// full subtree is always summed regardless.
+    #[arg(long, default_value_t = 0)]
+    pub depth: u32,
+    /// Emit machine-readable JSON. Shorthand for `--format json`.
+    #[arg(long, conflicts_with = "format")]
+    pub json: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Which filesystem to measure on a hybrid Mac/PC disc. `auto` (default)
+    /// opens the primary (ISO 9660); `hfs` opens the Apple HFS side — the one
+    /// carrying resource forks. See `optical info` for what a disc holds.
+    #[arg(long = "filesystem", value_enum, default_value_t = FilesystemSelect::Auto)]
+    pub filesystem: FilesystemSelect,
+}
+
+fn run_du_verb(args: OpticalDuArgs) -> Result<()> {
+    use opticaldiscs::detect::DiscImageInfo;
+
+    let format = if args.json {
+        OutputFormat::Json
+    } else {
+        args.format
+    };
+    require_non_flat(format, "optical du")?;
+
+    let info = DiscImageInfo::open(&args.source)
+        .with_context(|| format!("opening {}", args.source.display()))?;
+    let (inner, opened_fs) = open_selected_filesystem(&info, args.filesystem)?;
+
+    // Wrap the selected opticaldiscs filesystem in our adapter so the shared
+    // `du` engine (both-fork sums + allocation-block rounding via the adapter's
+    // allocation_unit) runs identically to the top-level `du` verb.
+    // Label defaults to the inner filesystem's own volume name (see
+    // `OpticalFilesystem::volume_label`).
+    let mut fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(
+        inner,
+        fs_token(opened_fs).to_string(),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))?;
+
+    crate::cli::verbs::du::emit_du(&mut fs, args.paths, args.depth, format)
 }
 
 // ---------------- info ----------------

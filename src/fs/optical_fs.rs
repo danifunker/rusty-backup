@@ -58,6 +58,28 @@ impl OpticalFilesystem {
         })
     }
 
+    /// Wrap an already-opened opticaldiscs filesystem — e.g. a specific side of
+    /// a hybrid Mac/PC disc selected via `open_hybrid_filesystem`, which
+    /// [`open`](Self::open) (auto/primary only) can't reach. `fs_type` is the
+    /// display token (e.g. "Hfs", "Iso9660"); `label` the volume name override.
+    pub fn from_inner(
+        mut inner: Box<dyn OptFilesystem>,
+        fs_type: String,
+        label: Option<String>,
+    ) -> Result<Self, FilesystemError> {
+        let root = inner
+            .root()
+            .map_err(|e| FilesystemError::Parse(format!("disc root: {e}")))?;
+        let mut by_path = HashMap::new();
+        by_path.insert(root.path.clone(), root);
+        Ok(Self {
+            inner,
+            by_path,
+            label,
+            fs_type,
+        })
+    }
+
     /// Look up the cached opticaldiscs entry for one of our entries' paths.
     ///
     /// The cache fills lazily as directories are listed, so a path is present
