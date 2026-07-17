@@ -104,6 +104,12 @@ pub enum FsKind {
     /// to 800 KB; pass `--size 400K` for the classic single-sided floppy).
     #[value(alias = "macintosh")]
     Mfs,
+    /// Acorn ADFS E-format (Archimedes / RISC OS). An 800 KB double-sided
+    /// floppy: 1024-byte sectors, single-zone new-map Free Space Map, and an
+    /// empty Hugo root directory. Fixed geometry, so `--size` is ignored;
+    /// `--name` sets the 10-char disc name (space-padded).
+    #[value(alias = "acorn")]
+    Adfs,
 }
 
 #[derive(Debug, Args)]
@@ -115,7 +121,7 @@ pub struct NewArgs {
     /// ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos /
     /// dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2,
     /// minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx),
-    /// ti99 (alias ti99_4a / ti994a), mfs (alias macintosh).
+    /// ti99 (alias ti99_4a / ti994a), mfs (alias macintosh), adfs (alias acorn).
     #[arg(long, value_enum)]
     pub fs: FsKind,
 
@@ -369,6 +375,9 @@ pub fn run(args: NewArgs) -> Result<()> {
         FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
         FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
+        }),
+        FsKind::Adfs => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
+            Ok(crate::fs::adfs::create_blank_adfs(name))
         }),
     }
 }

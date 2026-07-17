@@ -2531,6 +2531,7 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "TR-DOS"
                 | "TI-99"
                 | "MFS"
+                | "ADFS"
         )
 }
 
@@ -2932,8 +2933,8 @@ mod tests {
         assert!(is_checkable_retro_fs(0, None, "OS-9"));
         // MFS (Macintosh File System, 400/800 KB floppy) now fscks.
         assert!(is_checkable_retro_fs(0, None, "MFS"));
-        // "DFS" must not substring-match "ADFS" (ADFS has no fsck).
-        assert!(!is_checkable_retro_fs(0, None, "ADFS"));
+        // ADFS new-map (E/F/HD) now fscks (zone-checksum + FSM reconciliation).
+        assert!(is_checkable_retro_fs(0, None, "ADFS"));
     }
 
     #[test]

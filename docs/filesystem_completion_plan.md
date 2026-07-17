@@ -59,7 +59,7 @@ missing capability on a driver that already round-trips.
 | OS-9 / RBF | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs os9` (35-track CoCo floppy: ident sector + bitmap + empty root). fsck: cluster-bitmap reconciliation against a directory-tree walk from the root FD; repair marks referenced-but-free clusters allocated, leaves reserved clusters (boot / reserved track) as a benign warning, and withholds on structural damage. |
 | DragonDOS | Yes | Yes | **Yes** | — **fsck done** (sector-bitmap VALIDATE) |
 | Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency) |
-| Acorn ADFS | No | Partial | No | **finish edit + create + fsck** |
+| Acorn ADFS | **Yes** (E-format) | **Yes** (new-map) | **Yes** (new-map) | D-format (old-map) write still open. Create: `rb-cli new --fs adfs` (800 KB E-format, single-zone new-map FSM + empty Hugo root). fsck: FSM zone-checksum + cross-check verify, plus allocated-fragment-vs-directory-tree reconciliation (dangling refs, leaked fragments); repair re-stamps zone checksums (leaked-fragment reclaim needs a full FileCore map rebuild, withheld). Edit (create/delete/rename) already covered E/F/HD new-map. |
 | Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
 | CP/M | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs cpm --cpm-preset <name>` (per-DPB 0xE5-fill). fsck: directory self-consistency (no on-disk free map) — cross-links, out-of-range pointers, invalid entries (CP/M 3 label/timestamp SFCBs recognized); repair reclaims invalid entries, cross-links surfaced read-only. |
 | QDOS (QXL.WIN) | No | Yes | No | **create + fsck** |
@@ -88,7 +88,7 @@ independently testable (mount/inspect the output). Order by value:
 |---|---|---|
 | Unix/Linux | ~~**ext** (ext2)~~ **done** (`ext_format.rs`), **UFS** (newfs-lite) | M each |
 | Apple / retro workhorses | **ProDOS**, **Apple DOS 3.3**, **CP/M** (per-DPB), **Atari DOS** (promote test-only), **OS-9** | S–M each |
-| Others | **QDOS**, **ADFS** (E-format), ~~**MFS**~~ **done** (`create_blank_mfs`) | S–M each |
+| Others | **QDOS**, ~~**ADFS** (E-format)~~ **done** (`create_blank_adfs`), ~~**MFS**~~ **done** (`create_blank_mfs`) | S–M each |
 
 ### 1d. Finish the two detect-only scaffolds
 

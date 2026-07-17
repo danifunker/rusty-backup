@@ -76,10 +76,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use std::collections::HashSet;
+
 use super::entry::FileEntry;
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// Boot-block offset candidates for the Disc Record. Real-world ADFS
 /// samples surveyed so far:
@@ -894,6 +897,176 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
         }
         Ok(entries)
     }
+
+    /// Walk the directory tree from the root, collecting every referenced
+    /// fragment id (files + subdirectories + the root itself). `broken`
+    /// collects structural faults — a directory block that won't read/parse, or
+    /// an entry whose fragment isn't present in the FSM (a dangling reference).
+    /// A non-empty `broken` means the walk is incomplete, so leaked-fragment
+    /// detection is unsafe.
+    fn collect_referenced_frags(&mut self) -> (HashSet<u32>, u32, u32, Vec<String>) {
+        let mut referenced = HashSet::new();
+        let mut broken = Vec::new();
+        let mut files = 0u32;
+        let mut dirs = 0u32;
+        let root = self.disc_record.root;
+        referenced.insert(root >> 8);
+        let mut queue = vec![root];
+        let mut visited = HashSet::new();
+        let mut guard = 0u32;
+        while let Some(indaddr) = queue.pop() {
+            if !visited.insert(indaddr) {
+                continue;
+            }
+            guard += 1;
+            if guard > 100_000 {
+                broken.push("directory tree is too large or cyclic".into());
+                break;
+            }
+            dirs += 1;
+            let block = match self.read_dir_block(indaddr) {
+                Ok(b) => b,
+                Err(e) => {
+                    broken.push(format!(
+                        "cannot read directory fragment {}: {e}",
+                        indaddr >> 8
+                    ));
+                    continue;
+                }
+            };
+            let entries = match Self::parse_dir_block(&block) {
+                Ok(e) => e,
+                Err(e) => {
+                    broken.push(format!(
+                        "cannot parse directory fragment {}: {e}",
+                        indaddr >> 8
+                    ));
+                    continue;
+                }
+            };
+            for e in entries {
+                referenced.insert(e.indirect_disc_addr >> 8);
+                let resolves = self
+                    .fsm
+                    .as_ref()
+                    .and_then(|f| f.map_lookup(e.indirect_disc_addr, 0))
+                    .is_some();
+                if !resolves {
+                    broken.push(format!(
+                        "'{}' references fragment {} which is not present in the map",
+                        e.name,
+                        e.indirect_disc_addr >> 8
+                    ));
+                } else if e.is_directory() {
+                    queue.push(e.indirect_disc_addr);
+                } else {
+                    files += 1;
+                }
+            }
+        }
+        (referenced, files, dirs, broken)
+    }
+
+    /// New-map ADFS integrity check: verify the FSM zone checksums, reconcile
+    /// the allocated fragments against the directory-tree walk (dangling
+    /// references + leaked fragments), and sanity-check the free space. Returns
+    /// `None`-equivalent unsupported handling for old-map D-format at the call
+    /// site (which has no FSM).
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        // 1. Zone checksums (recomputable → repairable).
+        let (per_zone_ok, cross_ok) = self
+            .fsm
+            .as_ref()
+            .expect("run_fsck is new-map only")
+            .verify_checksums();
+        let bad_zones = per_zone_ok.iter().filter(|ok| !**ok).count();
+        if bad_zones > 0 {
+            errors.push(FsckIssue {
+                code: "AdfsZoneChecksum".into(),
+                message: format!("{bad_zones} FSM zone(s) have an incorrect checksum"),
+                repairable: true,
+                debug: false,
+            });
+        }
+        if !cross_ok {
+            errors.push(FsckIssue {
+                code: "AdfsMapCrossCheck".into(),
+                message: "FSM cross-check (XOR of zone byte 3 == 0xFF) failed".into(),
+                repairable: true,
+                debug: false,
+            });
+        }
+
+        // 2. Directory-tree walk → referenced fragments + structural faults.
+        let (referenced, files, dirs, broken) = self.collect_referenced_frags();
+        let walk_clean = broken.is_empty();
+        for msg in &broken {
+            errors.push(FsckIssue {
+                code: "AdfsDanglingReference".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        // 3. Leaked fragments: allocated in the FSM but unreferenced. Only
+        //    trustworthy when the directory walk completed.
+        let allocated: HashSet<u32> = self
+            .fsm
+            .as_ref()
+            .unwrap()
+            .scan_allocated_frag_ids()
+            .into_iter()
+            .collect();
+        let leaked: Vec<u32> = allocated.difference(&referenced).copied().collect();
+        if walk_clean && !leaked.is_empty() {
+            warnings.push(FsckIssue {
+                code: "AdfsLeakedFragment".into(),
+                message: format!(
+                    "{} fragment(s) allocated but unreferenced ({}); a full FileCore \
+                     map rebuild (RISC OS *CheckMap) is needed to reclaim them",
+                    leaked.len(),
+                    leaked
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                repairable: false,
+                debug: false,
+            });
+        }
+
+        let repairable = errors.iter().any(|e| e.repairable);
+        let free = self.fsm.as_ref().unwrap().free_bytes();
+        Ok(FsckResult {
+            errors,
+            warnings,
+            stats: FsckStats {
+                files_checked: files,
+                directories_checked: dirs,
+                extra: vec![
+                    (
+                        "free space".into(),
+                        format!("{free} / {} bytes", self.disc_record.total_disc_size()),
+                    ),
+                    (
+                        "map checksums".into(),
+                        if bad_zones == 0 && cross_ok {
+                            "consistent".into()
+                        } else {
+                            "needs re-stamp".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
@@ -991,6 +1164,12 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
             Some(fsm) => self.total_size().saturating_sub(fsm.free_bytes()),
             None => 0,
         }
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        // New-map (E/F/HD) only — D-format old-map has no FSM to reconcile.
+        self.fsm.as_ref()?;
+        Some(self.run_fsck())
     }
 }
 
@@ -1242,6 +1421,65 @@ impl AdfsFsm {
             }
         }
         max_seen + 1
+    }
+
+    /// Enumerate every *allocated* fragment id across all zones (non-zero id,
+    /// excluding the free-list-link entries). Free space and the reserved FSM
+    /// area carry id 0, so this yields exactly the fragments the directory tree
+    /// should account for. Ids may repeat when a fragment spans zones.
+    fn scan_allocated_frag_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let idmask = (1u32 << self.idlen) - 1;
+        for zi in 0..self.nzones {
+            let (startbit, endbit, _) = self.zone_metadata(zi);
+            let Some(zone) = self.zones.get(zi as usize) else {
+                continue;
+            };
+            let mut freelink = {
+                let f = Self::get_frag_id(zone, 8, idmask & 0x7FFF);
+                if f != 0 {
+                    8 + f
+                } else {
+                    0
+                }
+            };
+            let mut start = startbit;
+            let cap = 2 * (self.zone_size_bits / (self.idlen + 1)).max(1) + 16;
+            let mut iter = 0;
+            while start + self.idlen < endbit && iter < cap {
+                iter += 1;
+                let frag = Self::get_frag_id(zone, start, idmask);
+                let fragend = Self::find_next_set_bit(zone, start + self.idlen, endbit);
+                if fragend >= endbit {
+                    break;
+                }
+                if start == freelink {
+                    freelink += frag & 0x7FFF;
+                } else if frag != 0 {
+                    ids.push(frag);
+                }
+                start = fragend + 1;
+            }
+        }
+        ids
+    }
+
+    /// Verify every zone's stored checksum. Returns `(per_zone_ok, cross_ok)`:
+    /// `per_zone_ok[zi]` is true when zone `zi`'s byte-0 matches its computed
+    /// check; `cross_ok` is the kernel `adfs_checkmap` XOR-of-byte-3 == 0xFF
+    /// invariant. `restamp_all_checksums` fixes both.
+    fn verify_checksums(&self) -> (Vec<bool>, bool) {
+        let mut per_zone = Vec::with_capacity(self.nzones as usize);
+        let mut acc: u8 = 0;
+        for zi in 0..self.nzones {
+            if let Some(zone) = self.zones.get(zi as usize) {
+                per_zone.push(zone[0] == adfs_calczonecheck(zone));
+                acc ^= zone[3];
+            } else {
+                per_zone.push(false);
+            }
+        }
+        (per_zone, acc == 0xFF)
     }
 
     /// Recompute zone 0..nzones-2's byte 0 (per-zone checksum) and
@@ -1549,6 +1787,97 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
     }
 }
 
+/// Write a Filecore fragment of `length_bits` map bits into a zone bitstream
+/// at bit `start`: `idlen` bits of frag id, zero fill, then one terminator
+/// bit. Assumes the target bits are currently zero (fresh format).
+fn format_write_frag(buf: &mut [u8], start: u32, idlen: u32, length_bits: u32, frag_id: u32) {
+    write_bits_le_inplace(buf, start, idlen, frag_id as u64);
+    let term = start + length_bits - 1;
+    set_bit_le(buf, term, 1);
+}
+
+/// Format a blank **E-format** ADFS disc (the 800 KB double-sided floppy: 1024-B
+/// sectors, single-zone new-map FSM). Returns the raw 819,200-byte image with an
+/// empty root directory.
+///
+/// Geometry matches the real arc-04 E-format Disc Record the reader is validated
+/// against (`log2secsize=10, idlen=15, log2bpmb=7, nzones=1, zone_spare=1312`),
+/// so the result round-trips through [`AdfsFilesystem::open`] and accepts files
+/// via `EditableFilesystem`. Layout:
+///
+/// ```text
+/// sector 0     zone 0 = zone header + Disc Record + FSM bitstream
+/// sector 1     reserved (covered by the off-free-chain FSM fragment)
+/// sector 2-3   root directory (empty Hugo block)
+/// sector 4+    free
+/// ```
+pub fn create_blank_adfs(name: &str) -> Vec<u8> {
+    const SECTOR_SIZE: usize = 1024;
+    const TOTAL_BYTES: usize = 800 * SECTOR_SIZE; // 819_200
+    const IDLEN: u32 = 15;
+    // dm_startbit = 32 + ADFS_DR_SIZE_BITS (60-byte DR = 480 bits) = 512.
+    const DM_STARTBIT: u32 = 512;
+    // zone_size_bits = sector_size_bits (8192) - zone_spare (1312) = 6880.
+    // dm_endbit = 32 + zone_size_bits = 6912; usable map bits 512..6912 cover
+    // exactly 6400 * 128 B = 819,200 B (log2bpmb=7 -> 128 B per map bit).
+    const DM_ENDBIT: u32 = 6912;
+
+    let mut disk = vec![0u8; TOTAL_BYTES];
+
+    // --- Disc Record at byte 4 (zone 0 header occupies bytes 0..3). ---
+    let dr = 0x04usize;
+    disk[dr] = 10; // log2(1024)
+    disk[dr + 0x01] = 5; // sectors per track
+    disk[dr + 0x02] = 2; // heads
+    disk[dr + 0x03] = 2; // density
+    disk[dr + 0x04] = IDLEN as u8; // idlen
+    disk[dr + 0x05] = 7; // log2bpmb -> 1 map bit = 128 B
+    disk[dr + 0x06] = 0; // skew
+    disk[dr + 0x07] = 0; // boot option
+    disk[dr + 0x08] = 0; // low sector
+    disk[dr + 0x09] = 1; // nzones
+    LittleEndian::write_u16(&mut disk[dr + 0x0A..dr + 0x0C], 1312); // zone_spare
+    LittleEndian::write_u32(&mut disk[dr + 0x0C..dr + 0x10], 0x200); // root = frag 2
+    LittleEndian::write_u32(&mut disk[dr + 0x10..dr + 0x14], TOTAL_BYTES as u32); // disc size
+    LittleEndian::write_u16(&mut disk[dr + 0x14..dr + 0x16], 0x0107); // disc id (cycle)
+                                                                      // Disc name: 10 bytes, Acorn allows A-Z 0-9 etc.; space-pad, truncate.
+    let mut disc_name = [b' '; 10];
+    for (i, c) in name.bytes().take(10).enumerate() {
+        disc_name[i] = c;
+    }
+    disk[dr + 0x16..dr + 0x20].copy_from_slice(&disc_name);
+
+    // --- Zone 0 FSM bitstream (bits from DM_STARTBIT). ---
+    {
+        let zone = &mut disk[..SECTOR_SIZE];
+        // frag 0, len 16: reserves sectors 0-1 (FSM area) — id 0 but kept OFF
+        // the free-list chain, so the allocator never hands it out.
+        format_write_frag(zone, DM_STARTBIT, IDLEN, 16, 0);
+        // frag 2, len 16: root directory at sectors 2-3.
+        format_write_frag(zone, DM_STARTBIT + 16, IDLEN, 16, 2);
+        // Free tail (id 0) spanning the rest of the disc, ON the free chain.
+        let free_start = DM_STARTBIT + 32; // 544
+        format_write_frag(zone, free_start, IDLEN, DM_ENDBIT - free_start, 0);
+        // Free-list chain root at bit 8: 15-bit delta to the first free frag.
+        write_bits_le_inplace(zone, 8, 15, (free_start - 8) as u64);
+    }
+
+    // --- Empty Hugo root directory at sector 2 (2048-byte new-dir block). ---
+    let root = 2 * SECTOR_SIZE;
+    disk[root] = 0;
+    disk[root + 1..root + 5].copy_from_slice(b"Hugo");
+    let root_end = root + ADFS_NEWDIR_SIZE as usize;
+    disk[root_end - 5..root_end - 1].copy_from_slice(b"Hugo");
+    disk[root_end - 1] = 0; // dir cycle
+
+    // --- Zone 0 checksum (single-zone: cross-check byte 3 = 0xFF). ---
+    disk[3] = 0xFF;
+    disk[0] = 0;
+    disk[0] = adfs_calczonecheck(&disk[..SECTOR_SIZE]);
+
+    disk
+}
+
 impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
     fn create_file(
         &mut self,
@@ -1812,6 +2141,40 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
         Ok(self.fsm.as_ref().map(|f| f.free_bytes()).unwrap_or(0))
     }
+
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        if self.fsm.is_none() {
+            return Err(FilesystemError::Unsupported(
+                "D-format ADFS repair not supported (no FSM)".into(),
+            ));
+        }
+        // Only the FSM zone checksums are safely recomputable. Leaked
+        // fragments and dangling references need a full FileCore map rebuild
+        // (RISC OS *CheckMap), which we deliberately do not attempt here — a
+        // partial rewrite of a fragment-chained free map risks data loss.
+        let (per_zone_ok, cross_ok) = self.fsm.as_ref().unwrap().verify_checksums();
+        let needs_restamp = per_zone_ok.iter().any(|ok| !ok) || !cross_ok;
+        if !needs_restamp {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+        self.fsm.as_mut().unwrap().restamp_all_checksums();
+        let nzones = self.disc_record.total_zones();
+        for z in 0..nzones {
+            self.flush_zone(z)?;
+        }
+        self.reader.flush()?;
+        Ok(RepairReport {
+            fixes_applied: vec![
+                "re-stamped the FSM zone checksums (per-zone byte 0 + cross-check)".into(),
+            ],
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1939,6 +2302,149 @@ mod tests {
         disk[file_off..file_off + payload.len()].copy_from_slice(payload);
 
         disk
+    }
+
+    #[test]
+    fn create_blank_eformat_opens_with_empty_root() {
+        let img = create_blank_adfs("BLANKDISC");
+        assert_eq!(img.len(), 800 * 1024);
+        let mut fs = AdfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.format, AdfsFormat::EFormat);
+        assert_eq!(fs.volume_label(), Some("BLANKDISC"));
+        let root = fs.root().unwrap();
+        assert!(
+            fs.list_directory(&root).unwrap().is_empty(),
+            "fresh E-format root must be empty"
+        );
+        // Free space = disc - FSM(2 sectors) - root dir(2 sectors).
+        let free = EditableFilesystem::free_space(&mut fs).unwrap();
+        assert_eq!(free, 800 * 1024 - 4 * 1024, "unexpected free space");
+    }
+
+    #[test]
+    fn create_blank_accepts_files_and_reads_back() {
+        let img = create_blank_adfs("WORKDISC");
+        let mut cur = Cursor::new(img);
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let payload = b"hello from a freshly formatted E-format disc";
+            fs.create_file(
+                &root,
+                "README",
+                &mut &payload[..],
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "README");
+        let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&data, b"hello from a freshly formatted E-format disc");
+    }
+
+    #[test]
+    fn fsck_clean_on_blank_and_populated_disc() {
+        // Blank disc is clean.
+        let mut fs = AdfsFilesystem::open(Cursor::new(create_blank_adfs("D")), 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "blank disc should fsck clean: {:?}",
+            res.errors
+        );
+
+        // Add a file + a subdir; still clean.
+        let mut cur = Cursor::new(create_blank_adfs("D"));
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "FILE",
+                &mut &b"data"[..],
+                4,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_directory(&root, "SUB", &CreateDirectoryOptions::default())
+                .unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "populated disc should fsck clean: {:?}",
+            res.errors
+        );
+        assert_eq!(res.stats.files_checked, 1);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_zone_checksum() {
+        let mut cur = Cursor::new(create_blank_adfs("D"));
+        // Corrupt zone 0's stored checksum byte (byte 0).
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let good = fs.fsck().unwrap().unwrap();
+            assert!(good.is_clean());
+        }
+        // Flip byte 0 on disc directly.
+        cur.get_mut()[0] ^= 0xFF;
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(!res.is_clean());
+            assert!(res
+                .errors
+                .iter()
+                .any(|e| e.code == "AdfsZoneChecksum" && e.repairable));
+            assert!(res.repairable);
+            let report = fs.repair().unwrap();
+            assert_eq!(report.unrepairable_count, 0);
+            assert!(!report.fixes_applied.is_empty());
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        assert!(
+            fs.fsck().unwrap().unwrap().is_clean(),
+            "post-repair disc should be clean"
+        );
+    }
+
+    #[test]
+    fn fsck_flags_leaked_fragment_after_manual_alloc() {
+        // Allocate a fragment via the edit path, then remove its directory
+        // entry out-of-band so the fragment is orphaned in the FSM.
+        let mut cur = Cursor::new(create_blank_adfs("D"));
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "ORPHAN",
+                &mut &b"leak me"[..],
+                7,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            // Drop the directory entry but leave the fragment allocated.
+            fs.remove_dir_entry(fs.disc_record.root, "ORPHAN").unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.warnings.iter().any(|w| w.code == "AdfsLeakedFragment"),
+            "expected a leaked-fragment warning: {:?}",
+            res.warnings
+        );
     }
 
     #[test]
