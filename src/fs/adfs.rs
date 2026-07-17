@@ -464,6 +464,48 @@ impl AdfsOldMap {
     fn free_bytes(&self) -> u64 {
         self.free.iter().map(|&(_, len)| len as u64 * 256).sum()
     }
+
+    /// Allocate `n` contiguous 256-byte sectors (first-fit), returning the start
+    /// sector. Files on old-map discs are contiguous, so an allocation is a
+    /// single run carved from the head of the first large-enough free fragment.
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        if n == 0 {
+            return None;
+        }
+        for i in 0..self.free.len() {
+            let (start, len) = self.free[i];
+            if len >= n {
+                if len == n {
+                    self.free.remove(i);
+                } else {
+                    self.free[i] = (start + n, len - n);
+                }
+                return Some(start);
+            }
+        }
+        None
+    }
+
+    /// Return `n` sectors starting at `start` to the free list, coalescing with
+    /// any adjacent free runs (the old map keeps fragments sorted + merged).
+    fn free_run(&mut self, start: u32, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.free.push((start, n));
+        self.free.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u32, u32)> = Vec::new();
+        for &(s, l) in &self.free {
+            if let Some(last) = merged.last_mut() {
+                if last.0 + last.1 == s {
+                    last.1 += l;
+                    continue;
+                }
+            }
+            merged.push((s, l));
+        }
+        self.free = merged;
+    }
 }
 
 /// True if `partition_offset` begins an old-map (S/M/L/D format) ADFS disc:
@@ -1825,6 +1867,75 @@ impl<R: Read + Write + Seek + Send> AdfsFilesystem<R> {
         Ok((frag_id, start_sector))
     }
 
+    /// Old-map (D-format) allocate + write: reserve `data_bytes` worth of
+    /// contiguous 256-byte sectors, write the payload, persist the updated old
+    /// map, and return the start disc address (the directory-entry indaddr).
+    fn old_map_alloc_and_write(
+        &mut self,
+        data: &mut dyn Read,
+        data_bytes: u64,
+    ) -> Result<u32, FilesystemError> {
+        let n_sectors = (data_bytes.max(1).div_ceil(OLD_MAP_ADDR_UNIT)) as u32;
+        let start = self
+            .old_map
+            .as_mut()
+            .ok_or_else(|| FilesystemError::Unsupported("not an old-map disc".into()))?
+            .alloc(n_sectors)
+            .ok_or_else(|| {
+                FilesystemError::Unsupported("ADFS: no contiguous free space for this file".into())
+            })?;
+        self.write_old_map()?;
+        // Write the payload contiguously from the allocated start.
+        let abs = self.partition_offset + start as u64 * OLD_MAP_ADDR_UNIT;
+        self.reader.seek(SeekFrom::Start(abs))?;
+        let mut remaining = data_bytes;
+        let mut buf = [0u8; OLD_MAP_ADDR_UNIT as usize];
+        while remaining > 0 {
+            let take = remaining.min(OLD_MAP_ADDR_UNIT) as usize;
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+            data.read_exact(&mut buf[..take])?;
+            self.reader.write_all(&buf)?;
+            remaining -= take as u64;
+        }
+        Ok(start)
+    }
+
+    /// Serialize the in-memory old map back to sectors 0-1, preserving every
+    /// non-free-list field (disc name, size, id, boot option, L3 fields) by
+    /// re-reading and patching only the FreeStart / FreeLen tables, FreeEnd, and
+    /// checksums.
+    fn write_old_map(&mut self) -> Result<(), FilesystemError> {
+        let free = self.old_map.as_ref().expect("old_map present").free.clone();
+        if free.len() > 82 {
+            return Err(FilesystemError::InvalidData(
+                "ADFS old map: too fragmented (>82 free runs)".into(),
+            ));
+        }
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        let mut buf = [0u8; 512];
+        self.reader.read_exact(&mut buf)?;
+        // Clear + rewrite FreeStart (sector 0, 0..0xF6) and FreeLen (sector 1,
+        // 0x100..0x1F6).
+        for b in &mut buf[0..0xF6] {
+            *b = 0;
+        }
+        for b in &mut buf[0x100..0x1F6] {
+            *b = 0;
+        }
+        for (i, &(s, l)) in free.iter().enumerate() {
+            buf[i * 3..i * 3 + 3].copy_from_slice(&s.to_le_bytes()[..3]);
+            buf[0x100 + i * 3..0x100 + i * 3 + 3].copy_from_slice(&l.to_le_bytes()[..3]);
+        }
+        buf[0x1FE] = (free.len() * 3) as u8; // FreeEnd
+        buf[0xFF] = old_map_checksum(&buf[0..256]);
+        buf[0x1FF] = old_map_checksum(&buf[256..512]);
+        self.reader.seek(SeekFrom::Start(self.partition_offset))?;
+        self.reader.write_all(&buf)?;
+        Ok(())
+    }
+
     /// Insert a directory entry into the dir block reached via
     /// `dir_indaddr`. Fails if the dir block is full (the kernel-style
     /// fixed-77-entry F-format layout has no overflow path).
@@ -2064,24 +2175,44 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         data_len: u64,
         _options: &CreateFileOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        if self.fsm.is_none() {
-            return Err(FilesystemError::Unsupported(
-                "D-format ADFS write not supported".into(),
-            ));
-        }
         if data_len > u32::MAX as u64 {
             return Err(FilesystemError::Unsupported(
                 "ADFS file size > 4 GiB not supported".into(),
             ));
         }
-        // Allocate + write payload first; if the dir insert later
-        // fails we leak the fragment but the disc stays consistent.
-        let (frag_id, _start_sector) = self.alloc_and_write_data(data, data_len)?;
         let parent_indaddr = if parent.path == "/" {
             self.disc_record.root
         } else {
             parent.location as u32
         };
+        // Old-map D-format: contiguous allocation, the disc address IS the
+        // directory-entry indaddr (no fragment-id indirection).
+        if self.old_map.is_some() {
+            let start = self.old_map_alloc_and_write(data, data_len)?;
+            let entry = AdfsDirEntry {
+                name: name.to_string(),
+                load_addr: 0xFFFFFFFF,
+                exec_addr: 0,
+                file_length: data_len as u32,
+                indirect_disc_addr: start,
+                attrs: 0x03,
+            };
+            self.insert_dir_entry(parent_indaddr, &entry)?;
+            let path = if parent.path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", parent.path.trim_end_matches('/'), name)
+            };
+            return Ok(FileEntry::new_file(
+                name.to_string(),
+                path,
+                data_len,
+                start as u64,
+            ));
+        }
+        // Allocate + write payload first; if the dir insert later
+        // fails we leak the fragment but the disc stays consistent.
+        let (frag_id, _start_sector) = self.alloc_and_write_data(data, data_len)?;
         let indaddr = build_indaddr(frag_id, 0, self.disc_record.log2sharesize);
         let entry = AdfsDirEntry {
             name: name.to_string(),
@@ -2111,21 +2242,40 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         name: &str,
         _options: &CreateDirectoryOptions,
     ) -> Result<FileEntry, FilesystemError> {
-        if self.fsm.is_none() {
-            return Err(FilesystemError::Unsupported(
-                "D-format ADFS write not supported".into(),
-            ));
-        }
-        // Build the empty 2-KiB dir block, then write it the same way
-        // we'd write file data (alloc + write).
-        let block = self.build_empty_dir_block();
-        let mut cursor = std::io::Cursor::new(block);
-        let (frag_id, _start) = self.alloc_and_write_data(&mut cursor, ADFS_NEWDIR_SIZE)?;
         let parent_indaddr = if parent.path == "/" {
             self.disc_record.root
         } else {
             parent.location as u32
         };
+        // Build the empty 2-KiB dir block, then write it the same way
+        // we'd write file data (alloc + write).
+        let block = self.build_empty_dir_block();
+        // Old-map D-format: contiguous allocation; indaddr = start disc address.
+        if self.old_map.is_some() {
+            let mut cursor = std::io::Cursor::new(block);
+            let start = self.old_map_alloc_and_write(&mut cursor, ADFS_NEWDIR_SIZE)?;
+            let entry = AdfsDirEntry {
+                name: name.to_string(),
+                load_addr: 0xFFFFFFFF,
+                exec_addr: 0,
+                file_length: ADFS_NEWDIR_SIZE as u32,
+                indirect_disc_addr: start,
+                attrs: 0x0B,
+            };
+            self.insert_dir_entry(parent_indaddr, &entry)?;
+            let path = if parent.path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", parent.path.trim_end_matches('/'), name)
+            };
+            return Ok(FileEntry::new_directory(
+                name.to_string(),
+                path,
+                start as u64,
+            ));
+        }
+        let mut cursor = std::io::Cursor::new(block);
+        let (frag_id, _start) = self.alloc_and_write_data(&mut cursor, ADFS_NEWDIR_SIZE)?;
         let indaddr = build_indaddr(frag_id, 0, self.disc_record.log2sharesize);
         let entry = AdfsDirEntry {
             name: name.to_string(),
@@ -2153,11 +2303,6 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         parent: &FileEntry,
         entry: &FileEntry,
     ) -> Result<(), FilesystemError> {
-        if self.fsm.is_none() {
-            return Err(FilesystemError::Unsupported(
-                "D-format ADFS write not supported".into(),
-            ));
-        }
         // Empty-directory check for non-leaf entries.
         if entry.is_directory() {
             let kids = self.list_directory(entry)?;
@@ -2172,6 +2317,20 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         } else {
             parent.location as u32
         };
+        // Old-map D-format: free the contiguous run, then persist the old map.
+        if self.old_map.is_some() {
+            let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
+            let start = removed.indirect_disc_addr;
+            let n = (removed.file_length.max(1) as u64).div_ceil(OLD_MAP_ADDR_UNIT) as u32;
+            if start <= OLD_MAP_ROOT_ADDR {
+                return Err(FilesystemError::InvalidData(format!(
+                    "ADFS: refused to free reserved disc address {start}"
+                )));
+            }
+            self.old_map.as_mut().unwrap().free_run(start, n);
+            self.write_old_map()?;
+            return Ok(());
+        }
         // Splice out the dir entry first (cheap rollback if the FSM
         // mutate fails: re-insert).
         let removed = self.remove_dir_entry(parent_indaddr, &entry.name)?;
@@ -2214,11 +2373,8 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
         if new_name == entry.name {
             return Ok(());
         }
-        if self.fsm.is_none() {
-            return Err(FilesystemError::Unsupported(
-                "D-format ADFS write not supported".into(),
-            ));
-        }
+        // rename only rewrites the parent slot's name field, so it works
+        // identically on new-map and old-map (D-format) discs.
         // Name guard mirroring `parse_dir_entry`: <= 10 ASCII chars, no CR /
         // control bytes / spaces (which the parser treats as terminators).
         if new_name.is_empty() {
@@ -2316,7 +2472,13 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for AdfsFilesystem<R> {
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
-        Ok(self.fsm.as_ref().map(|f| f.free_bytes()).unwrap_or(0))
+        if let Some(fsm) = self.fsm.as_ref() {
+            Ok(fsm.free_bytes())
+        } else if let Some(om) = self.old_map.as_ref() {
+            Ok(om.free_bytes())
+        } else {
+            Ok(0)
+        }
     }
 
     fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
@@ -2547,6 +2709,86 @@ mod tests {
         assert_eq!(entries[0].name, "HELLO");
         let data = fs.read_file(&entries[0], usize::MAX).unwrap();
         assert_eq!(&data, b"D-format contiguous file content");
+    }
+
+    #[test]
+    fn dformat_write_create_delete_round_trip() {
+        let mut cur = Cursor::new(build_dformat_with_one_file());
+        let free_before;
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            free_before = EditableFilesystem::free_space(&mut fs).unwrap();
+            let root = fs.root().unwrap();
+            // Create a file + a subdirectory.
+            let payload = b"newly written contiguous file on a D-format disc";
+            fs.create_file(
+                &root,
+                "NEWFILE",
+                &mut &payload[..],
+                payload.len() as u64,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.create_directory(&root, "SUBDIR", &CreateDirectoryOptions::default())
+                .unwrap();
+        }
+        // Reopen: both must be present + readable, old map checksum-valid.
+        cur.set_position(0);
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let names: Vec<String> = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert!(names.contains(&"NEWFILE".to_string()), "{names:?}");
+            assert!(names.contains(&"SUBDIR".to_string()), "{names:?}");
+            let nf = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "NEWFILE")
+                .unwrap();
+            assert_eq!(
+                fs.read_file(&nf, usize::MAX).unwrap(),
+                b"newly written contiguous file on a D-format disc"
+            );
+        }
+        // The image itself must still detect as a valid old-map disc.
+        cur.set_position(0);
+        assert!(detect_old_map_dformat(&mut cur, 0));
+
+        // Delete the file; space returns, entry gone.
+        cur.set_position(0);
+        {
+            let mut fs = AdfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            let nf = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "NEWFILE")
+                .unwrap();
+            fs.delete_entry(&root, &nf).unwrap();
+            let sub = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.name == "SUBDIR")
+                .unwrap();
+            fs.delete_entry(&root, &sub).unwrap();
+            let after = EditableFilesystem::free_space(&mut fs).unwrap();
+            assert_eq!(after, free_before, "space not fully reclaimed after delete");
+            let names: Vec<String> = fs
+                .list_directory(&root)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(names, vec!["HELLO".to_string()]);
+        }
     }
 
     #[test]
