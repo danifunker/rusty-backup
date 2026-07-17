@@ -17,6 +17,7 @@ mod cli_archie;
 mod cli_atari800;
 mod cli_atarist;
 mod cli_bbcmicro;
+mod cli_bbcmicro_dsd;
 mod cli_bk0011m;
 mod cli_cbm;
 mod cli_coco;

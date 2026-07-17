@@ -26,8 +26,9 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
     "woz", "moof", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs",
     "GHO", "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81",
-    "g64", "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "trd", "pdi", "bfs", "copydisk",
-    "altodisk", "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk", "dart",
+    "g64", "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "dsd", "trd", "pdi", "bfs",
+    "copydisk", "altodisk", "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk",
+    "dart",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -157,6 +158,16 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), exts.len());
+    }
+
+    #[test]
+    fn acorn_dfs_extensions_present() {
+        // Single-sided `.ssd` and double-sided `.dsd` Acorn DFS discs are both
+        // picker-visible, openable containers — guard the pair against a future
+        // extension-list trim (the `.dsd` de-interleave path depends on it).
+        assert!(DISK_IMAGE_EXTS.contains(&"ssd"));
+        assert!(DISK_IMAGE_EXTS.contains(&"dsd"));
+        assert!(association_exts().contains(&"dsd".to_string()));
     }
 
     #[test]

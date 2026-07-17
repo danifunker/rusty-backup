@@ -156,6 +156,40 @@ pub fn is_atr_path(path: &Path) -> bool {
     matches!(f.read(&mut head), Ok(n) if n >= 2) && looks_like_atr_header(&head)
 }
 
+/// Sniff for a double-sided Acorn DFS (`.dsd`) image: the `.dsd` extension, a
+/// known DSD size (204800 = 2×40-track, 409600 = 2×80-track), AND — after
+/// de-interleaving the two track-interleaved sides — a valid DFS catalogue at
+/// **both** sides. Requiring a catalogue on each side is the discriminator that
+/// stops a plain 400K flat image from being mistaken for a `.dsd`.
+///
+/// [`open_read`] de-interleaves a match into a flat `side0 ‖ side1` buffer, so
+/// the partition detector and DFS reader see two contiguous single-sided
+/// volumes ([`PartitionTable::Dsd`](crate::partition)).
+pub fn is_dsd_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("dsd"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(204_800) | Ok(409_600) => {}
+        _ => return false,
+    }
+    let Ok(raw) = std::fs::read(path) else {
+        return false;
+    };
+    let Some(flat) = crate::rbformats::interleave::deinterleave_dsd(&raw) else {
+        return false;
+    };
+    let side_len = (flat.len() / 2) as u64;
+    let mut cur = std::io::Cursor::new(flat);
+    crate::fs::dfs::looks_like_dfs_within(&mut cur, 0, side_len).is_some()
+        && crate::fs::dfs::looks_like_dfs_within(&mut cur, side_len, side_len).is_some()
+}
+
 /// Cheap sniff for a Commodore G64 / G71 raw-GCR image: requires the
 /// `.g64` / `.g71` extension AND the `GCR-1541` / `GCR-1571` signature, so
 /// it never false-positives on a same-extension blob.
@@ -973,6 +1007,17 @@ fn open_read_dispatch(
         let flat =
             decode_atr_bytes(&bytes).with_context(|| format!("decode ATR {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_dsd_path(path) {
+        // Double-sided Acorn DFS `.dsd`: the two DFS volumes are stored
+        // track-interleaved. De-interleave into a flat `side0 ‖ side1` buffer
+        // so partition detection presents them as two "Acorn DFS" partitions
+        // (PartitionTable::Dsd) and the DFS reader opens each side at its
+        // byte offset. Small (<= 400K), so decode-in-memory like the other
+        // flat floppy containers.
+        let bytes = std::fs::read(path).with_context(|| format!("read DSD {}", path.display()))?;
+        let flat = crate::rbformats::interleave::deinterleave_dsd(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("{} is not a valid .dsd image", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_dim_path(path) {
         // DiskExplorer .dim floppy (X68000 / PC-98): 256-byte header + flat
         // payload, decodes to ~1.2 MB. In-memory like EDSK / MSA / D88.
@@ -1224,6 +1269,7 @@ pub fn is_editable_container_path(path: &Path) -> bool {
         || is_atr_path(path)
         || is_gzip_image_path(path)
         || is_woz_path(path)
+        || is_dsd_path(path)
 }
 
 /// True when [`open_read`] would transparently unwrap `path` into a decoded
@@ -1241,6 +1287,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_gzip_wrapped_path(path)
         || is_woz_path(path)
         || is_moof_path(path)
+        || is_dsd_path(path)
         || is_flat_floppy_container_path(path)
 }
 

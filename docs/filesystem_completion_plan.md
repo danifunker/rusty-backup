@@ -58,7 +58,7 @@ missing capability on a driver that already round-trips.
 | RS-DOS | Yes | Yes | **Yes** | — **fsck done** (granule-table VALIDATE) |
 | OS-9 / RBF | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs os9` (35-track CoCo floppy: ident sector + bitmap + empty root). fsck: cluster-bitmap reconciliation against a directory-tree walk from the root FD; repair marks referenced-but-free clusters allocated, leaves reserved clusters (boot / reserved track) as a benign warning, and withholds on structural damage. |
 | DragonDOS | Yes | Yes | **Yes** | — **fsck done** (sector-bitmap VALIDATE) |
-| Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency) |
+| Acorn DFS | Yes | Yes | **Yes** | — **fsck done** (contiguous-file consistency). Single-sided `.ssd` + double-sided `.dsd` (two partitions, de-interleaved). |
 | Acorn ADFS | **Yes** (E-format) | **Yes** (new-map + old-map) | **Yes** (new-map) | — **complete** for the common cases. Edit covers both **new-map** (E/F/HD, FSM allocator) and **old-map D-format** (contiguous allocator; detect + read + create/delete/rename validated against real Repton 3 / Lemmings discs, writes keep the old-map checksums valid). Create: `rb-cli new --fs adfs` (800 KB E-format). fsck (new-map): FSM zone-checksum + cross-check verify + allocated-fragment-vs-directory-tree reconciliation; repair re-stamps zone checksums. (D-format fsck is moot — `open` already rejects a disc whose old-map checksums don't verify, so an openable D-format disc is checksum-clean.) |
 | Human68k | Yes | Yes | **Yes** | — **fsck done** (FAT VALIDATE + mirror sync) |
 | CP/M | **Yes** | Yes | **Yes** | — **complete**. Create: `rb-cli new --fs cpm --cpm-preset <name>` (per-DPB 0xE5-fill). fsck: directory self-consistency (no on-disk free map) — cross-links, out-of-range pointers, invalid entries (CP/M 3 label/timestamp SFCBs recognized); repair reclaims invalid entries, cross-links surfaced read-only. |
@@ -125,7 +125,8 @@ risky — noted as such; "where possible" applies.
 
 ### Medium value
 
-Finish **ADFS write + double-sided `.dsd`**; commercial-Unix **VxFS / AdvFS /
+(ADFS write and double-sided DFS `.dsd` are **done** — `.dsd` de-interleaves
+into two Acorn DFS partitions, edits re-interleaving on save.) Commercial-Unix **VxFS / AdvFS /
 QFS** (browse-first); **OpenVMS ODS-2 on a raw disk** (already read on optical);
 **Apple SOS / DOS 3.2 / Pascal**; optical **UDF 2.50+ / El Torito**.
 

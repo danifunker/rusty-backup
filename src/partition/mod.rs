@@ -68,6 +68,17 @@ pub enum PartitionTable {
         /// Detected filesystem hint: "FAT", "HFS", "HFS+", or "Unknown".
         fs_hint: String,
     },
+    /// Double-sided Acorn DFS (`.dsd`): two independent single-sided DFS
+    /// volumes. The source reader has already de-interleaved the two
+    /// track-interleaved sides into a flat `side0 ‖ side1` buffer, so this
+    /// yields **two** "Acorn DFS" partitions — side 0 at byte 0, side 1 at
+    /// `size_bytes / 2`. See `src/fs/dfs.rs` and
+    /// `crate::rbformats::interleave::deinterleave_dsd`.
+    Dsd {
+        /// Total de-interleaved size in bytes (204800 or 409600); each side is
+        /// half.
+        size_bytes: u64,
+    },
 }
 
 /// Unified partition info for display purposes.
@@ -739,6 +750,29 @@ impl PartitionTable {
             }
         }
 
+        // Double-sided Acorn DFS (`.dsd`, already de-interleaved by the source
+        // reader into `side0 ‖ side1`): a valid DFS catalogue at BOTH byte 0 and
+        // the midpoint. Requiring catalogues on both sides is the discriminator
+        // that keeps a plain single-sided `.ssd` (whose midpoint is file data,
+        // not a catalogue) on the superfloppy path below.
+        {
+            let total = reader
+                .seek(SeekFrom::End(0))
+                .map_err(RustyBackupError::Io)?;
+            if total == 204_800 || total == 409_600 {
+                let side_len = total / 2;
+                let side0 = crate::fs::dfs::looks_like_dfs_within(reader, 0, side_len).is_some();
+                let side1 =
+                    crate::fs::dfs::looks_like_dfs_within(reader, side_len, side_len).is_some();
+                reader
+                    .seek(SeekFrom::Start(0))
+                    .map_err(RustyBackupError::Io)?;
+                if side0 && side1 {
+                    return Ok(PartitionTable::Dsd { size_bytes: total });
+                }
+            }
+        }
+
         // Check for superfloppy (no partition table) before MBR parsing
         if let Some(fs_hint) = detect_superfloppy(&mbr_data, reader) {
             // Get disk size via seek to end
@@ -1146,6 +1180,31 @@ impl PartitionTable {
                     drv_name: None,
                 }]
             }
+            PartitionTable::Dsd { size_bytes } => {
+                // Two single-sided DFS volumes in a de-interleaved
+                // `side0 ‖ side1` buffer. Side 0 at byte 0, side 1 at the
+                // midpoint. `partition_type_string = "acorndfs"` routes the
+                // string dispatcher to the side-bounded DFS open (which derives
+                // each side's length from its own catalogue, not the stream).
+                let side_len = size_bytes / 2;
+                (0..2)
+                    .map(|s| PartitionInfo {
+                        index: s + 1,
+                        type_name: "Acorn DFS".to_string(),
+                        partition_type_byte: 0,
+                        start_lba: (s as u64 * side_len) / 512,
+                        start_byte: Some(s as u64 * side_len),
+                        size_bytes: side_len,
+                        bootable: false,
+                        is_logical: false,
+                        is_extended_container: false,
+                        partition_type_string: Some("acorndfs".to_string()),
+                        hfs_block_size: None,
+                        rdb_part_block: None,
+                        drv_name: None,
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -1160,6 +1219,7 @@ impl PartitionTable {
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
+            PartitionTable::Dsd { .. } => "DSD",
         }
     }
 
@@ -1174,7 +1234,8 @@ impl PartitionTable {
             | PartitionTable::Sgi(_)
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
-            | PartitionTable::None { .. } => 0,
+            | PartitionTable::None { .. }
+            | PartitionTable::Dsd { .. } => 0,
         }
     }
 }

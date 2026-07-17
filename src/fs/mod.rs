@@ -1752,6 +1752,21 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?));
             }
+            "acorndfs" => {
+                // A side of a double-sided `.dsd`: length comes from this
+                // side's own catalogue, not the (two-side) stream length.
+                let geom =
+                    dfs::dfs_side_geometry(&mut reader, partition_offset).ok_or_else(|| {
+                        FilesystemError::InvalidData(
+                            "no Acorn DFS catalogue at this offset (expected a .dsd side)".into(),
+                        )
+                    })?;
+                return Ok(Box::new(dfs::DfsFilesystem::open_within(
+                    reader,
+                    partition_offset,
+                    geom.body_len(),
+                )?));
+            }
             _ => {
                 return Err(FilesystemError::Unsupported(format!(
                     "editing not yet supported for APM type '{type_str}'"
@@ -2089,6 +2104,22 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
             reader,
             partition_offset,
         )?)),
+        // Acorn DFS side of a double-sided `.dsd` (PartitionTable::Dsd).
+        // The two sides live in one `side0 ‖ side1` buffer, so side 0's
+        // distance-to-end spans both sides; derive this side's length from
+        // its own catalogue and open it bounded to that.
+        "acorndfs" => {
+            let geom = dfs::dfs_side_geometry(&mut reader, partition_offset).ok_or_else(|| {
+                FilesystemError::InvalidData(
+                    "no Acorn DFS catalogue at this offset (expected a .dsd side)".into(),
+                )
+            })?;
+            Ok(Box::new(dfs::DfsFilesystem::open_within(
+                reader,
+                partition_offset,
+                geom.body_len(),
+            )?))
+        }
         // Sinclair QL QXL.WIN container. Auto-detect / superfloppy hint
         // returns "QDOS" uppercase; explicit CLI flag uses lowercase.
         "qdos" | "qxlwin" | "QDOS" => Ok(Box::new(qdos::QdosFilesystem::open(

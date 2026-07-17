@@ -960,6 +960,13 @@ fn run_backup_inner(
                 format!("No partition table (superfloppy, filesystem: {fs_hint})"),
             );
         }
+        PartitionTable::Dsd { .. } => {
+            log(
+                &progress,
+                LogLevel::Info,
+                "Double-sided Acorn DFS (.dsd): two DFS partitions, no partition-table sidecar",
+            );
+        }
     }
 
     if is_cancelled(&progress) {

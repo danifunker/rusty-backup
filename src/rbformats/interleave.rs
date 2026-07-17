@@ -206,9 +206,94 @@ pub fn is_dos_order(raw: &[u8]) -> bool {
     has_prodos_volume_header(&block2)
 }
 
+/// Bytes per DFS sector (256) times ten sectors per track — one track of an
+/// Acorn DFS disc.
+const DFS_TRACK_BYTES: usize = 10 * 256;
+
+/// De-interleave a double-sided Acorn DFS (`.dsd`) image into a flat
+/// `side0 ‖ side1` buffer.
+///
+/// On a `.dsd` the two sides are stored **track-interleaved**: the logical slot
+/// for (track `t`, side `s`) is `t*2 + s`, each slot being one 2560-byte track.
+/// De-interleaving lays side 0's tracks contiguously, then side 1's — so each
+/// side becomes a standard single-sided DFS volume the [`crate::fs::dfs`] reader
+/// opens as-is (side 0 at byte 0, side 1 at `raw.len()/2`).
+///
+/// Returns `None` unless `raw` is a clean `tracks * 2` tracks with each side a
+/// recognized DFS geometry (40-track → 204800 total, 80-track → 409600).
+pub fn deinterleave_dsd(raw: &[u8]) -> Option<Vec<u8>> {
+    let len = raw.len();
+    // Two sides, each a valid single-sided DFS body (102400 or 204800 bytes).
+    if len != 204_800 && len != 409_600 {
+        return None;
+    }
+    let side_len = len / 2;
+    let tracks = side_len / DFS_TRACK_BYTES; // 40 or 80
+    let mut out = vec![0u8; len];
+    for s in 0..2 {
+        for t in 0..tracks {
+            let src = (t * 2 + s) * DFS_TRACK_BYTES;
+            let dst = s * side_len + t * DFS_TRACK_BYTES;
+            out[dst..dst + DFS_TRACK_BYTES].copy_from_slice(&raw[src..src + DFS_TRACK_BYTES]);
+        }
+    }
+    Some(out)
+}
+
+/// Re-interleave a de-interleaved `side0 ‖ side1` buffer back into `.dsd`
+/// track-interleaved order — the exact inverse of [`deinterleave_dsd`], used to
+/// write edits back to a `.dsd` container. Returns `None` on a length that isn't
+/// a known DSD geometry.
+pub fn interleave_dsd(flat: &[u8]) -> Option<Vec<u8>> {
+    let len = flat.len();
+    if len != 204_800 && len != 409_600 {
+        return None;
+    }
+    let side_len = len / 2;
+    let tracks = side_len / DFS_TRACK_BYTES;
+    let mut out = vec![0u8; len];
+    for s in 0..2 {
+        for t in 0..tracks {
+            let src = s * side_len + t * DFS_TRACK_BYTES;
+            let dst = (t * 2 + s) * DFS_TRACK_BYTES;
+            out[dst..dst + DFS_TRACK_BYTES].copy_from_slice(&flat[src..src + DFS_TRACK_BYTES]);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dsd_deinterleave_round_trip() {
+        // Tag every 2560-byte slot with a unique byte so we can prove the
+        // permutation is exact and self-inverse.
+        for &len in &[204_800usize, 409_600usize] {
+            let slots = len / DFS_TRACK_BYTES;
+            let mut raw = vec![0u8; len];
+            for slot in 0..slots {
+                let off = slot * DFS_TRACK_BYTES;
+                raw[off..off + DFS_TRACK_BYTES].fill((slot & 0xFF) as u8);
+            }
+            let flat = deinterleave_dsd(&raw).unwrap();
+            let back = interleave_dsd(&flat).unwrap();
+            assert_eq!(raw, back, "interleave(deinterleave(x)) == x for len {len}");
+
+            // Spot-check: side 0 track 1 (slot 2 in raw) lands at flat offset
+            // 1*2560; side 1 track 0 (slot 1 in raw) lands at side_len + 0.
+            let side_len = len / 2;
+            assert_eq!(flat[DFS_TRACK_BYTES], 2u8);
+            assert_eq!(flat[side_len], 1u8);
+        }
+    }
+
+    #[test]
+    fn test_dsd_rejects_bad_size() {
+        assert!(deinterleave_dsd(&[0u8; 143_360]).is_none());
+        assert!(interleave_dsd(&[0u8; 1000]).is_none());
+    }
 
     #[test]
     fn test_interleave_table_is_permutation() {
