@@ -243,6 +243,14 @@ impl Filesystem for OpticalFilesystem {
     fn used_size(&self) -> u64 {
         0
     }
+
+    /// Delegate to the opticaldiscs backend's allocation/logical block size
+    /// (HFS/HFS+ allocation block, ISO 9660 logical block). Lets `du` round
+    /// each fork up to a real block on optical HFS discs instead of the
+    /// 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        self.inner.allocation_unit()
+    }
 }
 
 #[cfg(test)]
