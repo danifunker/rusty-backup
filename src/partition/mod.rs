@@ -516,6 +516,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         }
     }
 
+    // Old-map ADFS (D-format / S/M/L): no Disc Record, detected via the
+    // checksum-valid old free-space map + Hugo root directory at byte 1024.
+    if crate::fs::adfs::detect_old_map_dformat(reader, 0) {
+        return Some("ADFS".to_string());
+    }
+
     // Acorn DFS catalog at sectors 0-1 (the small flat catalog FS used
     // by BBC Micro / AcornElectron 5.25" disks). Title bytes 0..8 at
     // sector 0 are ASCII, byte 0x105 holds nsectors-low, byte 0x106 the

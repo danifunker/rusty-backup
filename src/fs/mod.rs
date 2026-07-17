@@ -517,6 +517,13 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
         }
     }
 
+    // Old-map ADFS (D-format, and S/M/L): no Disc Record, so the probe above
+    // can't find it. Detect via the checksum-valid old free-space map + a Hugo
+    // root directory at byte 1024.
+    if adfs::detect_old_map_dformat(reader, partition_offset) {
+        return "adfs";
+    }
+
     // BK0011M ANDOS: signature "ANDOS" at one of several boot-block
     // offsets per src/fs/andos.rs. Restrict to sector 0 to keep this
     // cheap.

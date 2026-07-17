@@ -7,12 +7,16 @@
 //! (`__adfs_block_map` + `adfs_map_lookup` + the underlying
 //! `lookup_zone` / `scan_map` / `adfs_map_layout` primitives). Verified
 //! against `CROS42.hdf`, `ICEBIRD.hdf`, and the 8bs.com `arc-04`
-//! E-format floppy by `examples/adfs_fsm_probe.rs`. D-format (old-map)
-//! still uses the legacy direct-byte-offset fallback — there's no
-//! D-format real sample in tree to validate a walker against.
+//! E-format floppy by `examples/adfs_fsm_probe.rs`.
 //!
-//! Write path, HDD resize, and F+ big-directory entries are still
-//! TODO (tracked in `docs/OPEN-WORK.md` §7 Archie row).
+//! **Old-map D-format** (no Disc Record; the old free-space map in the
+//! first two 256-byte sectors + a Hugo root at byte 1024) is read via
+//! [`AdfsOldMap`]: files are *contiguous*, addressed by 256-byte-sector
+//! disc address (`byte = indaddr * 256`), so there is no fragment chain.
+//! Validated against real Repton 3 / Lemmings D-format floppies.
+//!
+//! New-map HDD resize and F+ big-directory entries are still TODO
+//! (tracked in `docs/OPEN-WORK.md` §7 Archie row).
 //!
 //! ## On-disk layout (FileCore spec; Acorn TechRef vol I)
 //!
@@ -319,6 +323,155 @@ impl DiscRecord {
             _ => AdfsFormat::Hard,
         }
     }
+
+    /// Synthesize a Disc Record for an **old-map D-format** disc, which carries
+    /// no on-disc Disc Record. Addressing is in 256-byte units (`log2_sector_size
+    /// = 8`), the root directory sits at a fixed byte 1024 (disc address 4), and
+    /// the size / name / id / boot option come from the old map.
+    fn synth_dformat(om: &AdfsOldMap) -> Self {
+        Self {
+            log2_sector_size: 8, // 256-byte addressing units
+            sectors_per_track: 5,
+            heads: 2,
+            density: 2,
+            id_len: 0,
+            log2bpmb: 8,
+            skew: 0,
+            boot_option: om.boot_option,
+            low_sector: 0,
+            nzones: 0,
+            zone_spare: 0,
+            root: OLD_MAP_ROOT_ADDR, // disc address 4 -> byte 1024
+            disc_size_bytes: om.disc_sectors.saturating_mul(256),
+            disc_id: om.disc_id,
+            disc_name: om.disc_name.clone(),
+            disc_size_high: 0,
+            log2sharesize: 0,
+            big_flag: 0,
+            nzones_high: 0,
+            format_version: 0,
+            root_size: 0,
+        }
+    }
+}
+
+/// Address-unit and root location for old-map (S/M/L/D) discs. Disc addresses in
+/// directory entries and the free-space map are 256-byte-sector numbers; the
+/// root directory is always at byte 1024 = disc address 4.
+const OLD_MAP_ADDR_UNIT: u64 = 256;
+const OLD_MAP_ROOT_ADDR: u32 = 4;
+
+/// Old-map (FileCore "old map", used by S/M/L and D formats) free-space map,
+/// stored in the first two 256-byte sectors of the disc.
+///
+/// - Sector 0: `FreeStart[82]` (3-byte start sectors) · disc-name odd chars ·
+///   `OldSize` (3-byte disc size in 256-B sectors) · `Check0`.
+/// - Sector 1: `FreeLen[82]` (3-byte fragment lengths) · disc-name even chars ·
+///   `OldId` · boot option · `FreeEnd` (3 × fragment count) · `Check1`.
+///
+/// Free fragments are `(start_sector, length_sectors)` pairs, sorted ascending,
+/// adjacent runs merged. Files are **contiguous** (start + length), so there is
+/// no fragment chain to walk — unlike the new-map FSM.
+#[derive(Debug, Clone)]
+pub struct AdfsOldMap {
+    /// `(start_sector, length_sectors)` free fragments, in 256-byte-sector units.
+    pub free: Vec<(u32, u32)>,
+    pub disc_sectors: u32,
+    pub disc_id: u16,
+    pub boot_option: u8,
+    pub disc_name: String,
+}
+
+/// Old-map sector checksum: start at 255, then add-with-carry bytes 254..=0.
+/// (Byte 255 is the stored checksum and is excluded.)
+fn old_map_checksum(sec: &[u8]) -> u8 {
+    let mut sum: u32 = 255;
+    let mut carry: u32 = 0;
+    for i in (0..=254usize).rev() {
+        sum = sec[i] as u32 + (sum & 0xFF) + carry;
+        carry = u32::from(sum > 0xFF);
+        sum &= 0xFF;
+    }
+    (sum & 0xFF) as u8
+}
+
+impl AdfsOldMap {
+    /// Detect + parse an old-map disc. Returns `Err` when the map checksums
+    /// don't verify or the root directory isn't a Hugo/Nick block — i.e. this
+    /// is not an old-map ADFS disc.
+    fn parse<R: Read + Seek>(
+        reader: &mut R,
+        partition_offset: u64,
+    ) -> Result<Self, FilesystemError> {
+        reader.seek(SeekFrom::Start(partition_offset))?;
+        let mut buf = [0u8; 512];
+        reader.read_exact(&mut buf)?;
+        let s0 = &buf[0..256];
+        let s1 = &buf[256..512];
+
+        if s0[0xFF] != old_map_checksum(s0) || s1[0xFF] != old_map_checksum(s1) {
+            return Err(FilesystemError::InvalidData(
+                "ADFS old-map checksum mismatch (not a D-format disc)".into(),
+            ));
+        }
+
+        // Root directory must be a Hugo (or Nick) block at byte 1024.
+        reader.seek(SeekFrom::Start(partition_offset + 1024))?;
+        let mut root = [0u8; 5];
+        reader.read_exact(&mut root)?;
+        if !matches!(&root[1..5], b"Hugo" | b"Nick") {
+            return Err(FilesystemError::InvalidData(
+                "ADFS old-map: no root directory at byte 1024".into(),
+            ));
+        }
+
+        let free_end = s1[0xFE] as usize; // 3 × fragment count
+        let mut free = Vec::new();
+        for i in 0..(free_end / 3).min(82) {
+            let start = u32::from_le_bytes([s0[i * 3], s0[i * 3 + 1], s0[i * 3 + 2], 0]);
+            let len = u32::from_le_bytes([s1[i * 3], s1[i * 3 + 1], s1[i * 3 + 2], 0]);
+            free.push((start, len));
+        }
+        let disc_sectors = u32::from_le_bytes([s0[0xFC], s0[0xFD], s0[0xFE], 0]);
+        let disc_id = u16::from_le_bytes([s1[0xFB], s1[0xFC]]);
+        let boot_option = s1[0xFD];
+        // Disc name: 10 chars interleaved — odd-index chars in sector 0
+        // (0xF7..0xFC), even-index chars in sector 1 (0xF6..0xFB). Best-effort;
+        // the name is cosmetic.
+        let mut name = String::new();
+        for i in 0..10 {
+            let b = if i % 2 == 0 {
+                s1[0xF6 + i / 2]
+            } else {
+                s0[0xF7 + i / 2]
+            };
+            if (0x20..=0x7E).contains(&b) {
+                name.push(b as char);
+            }
+        }
+        let disc_name = name.trim().to_string();
+
+        Ok(Self {
+            free,
+            disc_sectors,
+            disc_id,
+            boot_option,
+            disc_name,
+        })
+    }
+
+    /// Total free space in bytes (sum of fragment lengths × 256).
+    fn free_bytes(&self) -> u64 {
+        self.free.iter().map(|&(_, len)| len as u64 * 256).sum()
+    }
+}
+
+/// True if `partition_offset` begins an old-map (S/M/L/D format) ADFS disc:
+/// checksum-valid old free-space map in the first two sectors + a Hugo/Nick root
+/// directory at byte 1024. Used by the superfloppy / filesystem detectors, since
+/// old-map discs carry no Disc Record for the primary ADFS probe to find.
+pub fn detect_old_map_dformat<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    AdfsOldMap::parse(reader, partition_offset).is_ok()
 }
 
 /// 32-bit signed-arithmetic-shift-left used throughout the ADFS map
@@ -788,6 +941,10 @@ pub struct AdfsFilesystem<R: Read + Seek + Send> {
     /// D-format (old-map) which addresses fragments by raw sector
     /// number rather than by frag id.
     pub fsm: Option<AdfsFsm>,
+    /// Old-map free-space list. `Some` for old-map D-format (mutually exclusive
+    /// with `fsm`); `None` for new-map. Files are contiguous, addressed by
+    /// 256-byte-sector disc address.
+    pub old_map: Option<AdfsOldMap>,
 }
 
 /// Fixed F-format directory size (`ADFS_NEWDIR_SIZE` in the kernel).
@@ -797,23 +954,39 @@ const ADFS_NEWDIR_SIZE: u64 = 2048;
 
 impl<R: Read + Seek + Send> AdfsFilesystem<R> {
     pub fn open(mut reader: R, partition_offset: u64) -> Result<Self, FilesystemError> {
-        let (_offset, disc_record) = find_disc_record(&mut reader, partition_offset)?;
-        let format = disc_record.classify();
-        // For new-map formats build the FSM eagerly so subsequent
-        // directory / file reads can resolve fragment IDs. D-format
-        // (old-map) skips this — fragments are addressed by raw sector
-        // number on those discs.
-        let fsm = match format {
-            AdfsFormat::DFormat => None,
-            _ => Some(AdfsFsm::read(&mut reader, partition_offset, &disc_record)?),
-        };
-        Ok(Self {
-            reader,
-            partition_offset,
-            disc_record,
-            format,
-            fsm,
-        })
+        // Disc-Record-bearing discs (new-map E/F/HD) take the FSM path. A disc
+        // with no Disc Record is an old-map D-format — detected + parsed via its
+        // old free-space map (checksum-verified).
+        match find_disc_record(&mut reader, partition_offset) {
+            Ok((_offset, disc_record)) => {
+                let format = disc_record.classify();
+                let fsm = match format {
+                    AdfsFormat::DFormat => None,
+                    _ => Some(AdfsFsm::read(&mut reader, partition_offset, &disc_record)?),
+                };
+                Ok(Self {
+                    reader,
+                    partition_offset,
+                    disc_record,
+                    format,
+                    fsm,
+                    old_map: None,
+                })
+            }
+            Err(dr_err) => {
+                let old_map =
+                    AdfsOldMap::parse(&mut reader, partition_offset).map_err(|_| dr_err)?;
+                let disc_record = DiscRecord::synth_dformat(&old_map);
+                Ok(Self {
+                    reader,
+                    partition_offset,
+                    disc_record,
+                    format: AdfsFormat::DFormat,
+                    fsm: None,
+                    old_map: Some(old_map),
+                })
+            }
+        }
     }
 
     /// Translate an ADFS indirect disc address (24- or 32-bit) plus an
@@ -835,8 +1008,9 @@ impl<R: Read + Seek + Send> AdfsFilesystem<R> {
             })?;
             self.partition_offset + sec * sector_size
         } else {
-            // D-format fallback: indaddr is the byte offset.
-            self.partition_offset + indaddr as u64 + block_sec_in_file * sector_size
+            // Old-map D-format: the indaddr is a 256-byte-sector disc address,
+            // and files are contiguous, so block `n` is at (indaddr + n) * 256.
+            self.partition_offset + (indaddr as u64 + block_sec_in_file) * OLD_MAP_ADDR_UNIT
         };
         Ok(abs_byte)
     }
@@ -1158,11 +1332,14 @@ impl<R: Read + Seek + Send> Filesystem for AdfsFilesystem<R> {
     }
 
     fn used_size(&self) -> u64 {
-        // FSM-driven free-space accounting (kernel `adfs_map_statfs`).
-        // D-format old-map discs have no FSM — return 0 (unknown).
-        match self.fsm.as_ref() {
-            Some(fsm) => self.total_size().saturating_sub(fsm.free_bytes()),
-            None => 0,
+        // FSM-driven free-space accounting (kernel `adfs_map_statfs`); old-map
+        // D-format uses its free-fragment list instead.
+        if let Some(fsm) = self.fsm.as_ref() {
+            self.total_size().saturating_sub(fsm.free_bytes())
+        } else if let Some(om) = self.old_map.as_ref() {
+            self.total_size().saturating_sub(om.free_bytes())
+        } else {
+            0
         }
     }
 
@@ -2302,6 +2479,82 @@ mod tests {
         disk[file_off..file_off + payload.len()].copy_from_slice(payload);
 
         disk
+    }
+
+    /// Build a minimal valid **old-map D-format** disc (256-byte addressing
+    /// units) for read tests, mirroring the on-disc structures verified against
+    /// real Repton 3 / Lemmings discs: old map in sectors 0-1 (checksummed),
+    /// Hugo root at byte 1024 (sector 4, 8 sectors), one file, free tail.
+    fn build_dformat_with_one_file() -> Vec<u8> {
+        const TOTAL_SECTORS: u32 = 3200; // 800 KB / 256
+        let mut disk = vec![0u8; TOTAL_SECTORS as usize * 256];
+
+        // File "HELLO" at sector 12.
+        let payload = b"D-format contiguous file content";
+        let file_sec = 12u32;
+        disk[file_sec as usize * 256..file_sec as usize * 256 + payload.len()]
+            .copy_from_slice(payload);
+
+        // Root Hugo directory at byte 1024 (sectors 4..12) with one entry.
+        let root = 1024usize;
+        disk[root + 1..root + 5].copy_from_slice(b"Hugo");
+        let e = root + DIR_SMALL_HEADER;
+        disk[e..e + 5].copy_from_slice(b"HELLO");
+        disk[e + 5] = 0x0D; // CR terminator
+        LittleEndian::write_u32(&mut disk[e + 18..e + 22], payload.len() as u32); // length
+        disk[e + 22] = (file_sec & 0xFF) as u8;
+        disk[e + 23] = ((file_sec >> 8) & 0xFF) as u8;
+        disk[e + 24] = ((file_sec >> 16) & 0xFF) as u8;
+        disk[e + 25] = 0x03; // R/W
+        let rlen = root + ADFS_NEWDIR_SIZE as usize;
+        disk[rlen - 5..rlen - 1].copy_from_slice(b"Hugo");
+
+        // Old map. Free fragment: from sector 13 to end.
+        let free_start = 13u32;
+        let free_len = TOTAL_SECTORS - free_start;
+        disk[0] = (free_start & 0xFF) as u8;
+        disk[1] = ((free_start >> 8) & 0xFF) as u8;
+        disk[2] = ((free_start >> 16) & 0xFF) as u8;
+        disk[256] = (free_len & 0xFF) as u8;
+        disk[257] = ((free_len >> 8) & 0xFF) as u8;
+        disk[258] = ((free_len >> 16) & 0xFF) as u8;
+        // OldSize (sector 0, 0xFC..0xFF) = total sectors.
+        disk[0xFC] = (TOTAL_SECTORS & 0xFF) as u8;
+        disk[0xFD] = ((TOTAL_SECTORS >> 8) & 0xFF) as u8;
+        disk[0xFE] = ((TOTAL_SECTORS >> 16) & 0xFF) as u8;
+        // Sector 1 tail: id, boot, FreeEnd = 3 (one fragment).
+        disk[256 + 0xFB] = 0x34;
+        disk[256 + 0xFC] = 0x12;
+        disk[256 + 0xFD] = 0x00; // boot option
+        disk[256 + 0xFE] = 3; // FreeEnd
+                              // Checksums.
+        disk[0xFF] = old_map_checksum(&disk[0..256]);
+        disk[256 + 0xFF] = old_map_checksum(&disk[256..512]);
+        disk
+    }
+
+    #[test]
+    fn dformat_old_map_detects_and_reads() {
+        let disk = build_dformat_with_one_file();
+        assert!(detect_old_map_dformat(&mut Cursor::new(disk.clone()), 0));
+        let mut fs = AdfsFilesystem::open(Cursor::new(disk), 0).unwrap();
+        assert_eq!(fs.format, AdfsFormat::DFormat);
+        assert!(fs.old_map.is_some());
+        assert_eq!(fs.total_size(), 3200 * 256);
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "HELLO");
+        let data = fs.read_file(&entries[0], usize::MAX).unwrap();
+        assert_eq!(&data, b"D-format contiguous file content");
+    }
+
+    #[test]
+    fn dformat_rejects_bad_checksum() {
+        let mut disk = build_dformat_with_one_file();
+        disk[0xFF] ^= 0xFF; // corrupt Check0
+        assert!(!detect_old_map_dformat(&mut Cursor::new(disk.clone()), 0));
+        assert!(AdfsFilesystem::open(Cursor::new(disk), 0).is_err());
     }
 
     #[test]
