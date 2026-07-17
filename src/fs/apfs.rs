@@ -119,6 +119,10 @@ const SYMLINK_XATTR_NAME: &[u8] = b"com.apple.fs.symlink";
 /// fork on APFS. Its logical size becomes `FileEntry::resource_fork_size`.
 const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
 
+/// Extended-attribute name holding the 32-byte Finder info (FInfo + FXInfo);
+/// the type/creator `OSType`s and Finder flags come from its first 10 bytes.
+const FINDER_INFO_XATTR_NAME: &[u8] = b"com.apple.FinderInfo";
+
 /// Cap a single file read/extract so a corrupt extent list can't make us
 /// allocate or stream absurd amounts. 64 GiB is far above any real vintage-Mac
 /// APFS file yet bounds the damage.
@@ -495,10 +499,40 @@ struct Catalog {
     /// inode oid -> symlink target path (from the `com.apple.fs.symlink`
     /// extended attribute).
     symlinks: std::collections::HashMap<u64, String>,
-    /// inode oid -> resource-fork logical size (from the
-    /// `com.apple.ResourceFork` extended attribute). Only present for files
-    /// that actually carry a non-empty resource fork.
-    resource_forks: std::collections::HashMap<u64, u64>,
+    /// inode oid -> resource fork (from the `com.apple.ResourceFork` extended
+    /// attribute). Only present for files that actually carry a non-empty
+    /// resource fork.
+    resource_forks: std::collections::HashMap<u64, ResourceFork>,
+    /// inode oid -> Mac type/creator/flags (from the `com.apple.FinderInfo`
+    /// extended attribute). Only present for files that carry one.
+    finder_info: std::collections::HashMap<u64, FinderInfo>,
+}
+
+/// Type/creator `OSType`s and Finder flags decoded from a `com.apple.FinderInfo`
+/// xattr's leading FInfo bytes.
+struct FinderInfo {
+    type_code: [u8; 4],
+    creator: [u8; 4],
+    flags: u16,
+}
+
+/// A file's resource fork, as stored in its `com.apple.ResourceFork` xattr.
+enum ResourceFork {
+    /// Small fork stored inline in the xattr value — the bytes verbatim.
+    Embedded(Vec<u8>),
+    /// Larger fork stored as its own data stream (`j_xattr_dstream`). The
+    /// bytes live in `FILE_EXTENT` records keyed by `stream_id` (already in
+    /// `Catalog::extents`); `size` is the logical length.
+    Stream { stream_id: u64, size: u64 },
+}
+
+impl ResourceFork {
+    fn size(&self) -> u64 {
+        match self {
+            ResourceFork::Embedded(b) => b.len() as u64,
+            ResourceFork::Stream { size, .. } => *size,
+        }
+    }
 }
 
 /// One `j_file_extent` record: a run of `length` bytes at logical offset
@@ -876,10 +910,12 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             APFS_TYPE_XATTR => {
                 if let Some(target) = decode_symlink_xattr(key, val) {
                     cat.symlinks.insert(obj_id, target);
-                } else if let Some(size) = decode_resource_fork_xattr(key, val) {
-                    if size > 0 {
-                        cat.resource_forks.insert(obj_id, size);
+                } else if let Some(rf) = decode_resource_fork_xattr(key, val) {
+                    if rf.size() > 0 {
+                        cat.resource_forks.insert(obj_id, rf);
                     }
+                } else if let Some(fi) = decode_finder_info_xattr(key, val) {
+                    cat.finder_info.insert(obj_id, fi);
                 }
             }
             _ => {}
@@ -1318,20 +1354,17 @@ fn decode_symlink_xattr(key: &[u8], val: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(xdata).into_owned())
 }
 
-/// Decode a `com.apple.ResourceFork` extended-attribute record into its
-/// logical size in bytes. Returns `None` for any other xattr.
+/// Decode a `com.apple.ResourceFork` extended-attribute record into a
+/// [`ResourceFork`]. Returns `None` for any other xattr.
 ///
 /// Two storage forms:
 /// - **embedded** (`XATTR_DATA_EMBEDDED`): the fork bytes are inline in
-///   `xdata`, so the size is `xdata_len`. Small forks only.
+///   `xdata` — captured verbatim. Small forks only.
 /// - **stream** (`XATTR_DATA_STREAM`): `xdata` is a `j_xattr_dstream` —
 ///   `xattr_obj_id` (u64) followed by a `j_dstream_t` whose first u64 is the
-///   logical size. This is the common case for real resource forks.
-///
-/// Only the *size* is decoded; reading the fork bytes (following the stream's
-/// own extents) is not implemented yet, so `write_resource_fork_to` still
-/// returns 0 for APFS. The size is enough for `du` / display.
-fn decode_resource_fork_xattr(key: &[u8], val: &[u8]) -> Option<u64> {
+///   logical size. The fork bytes live in `FILE_EXTENT` records keyed by that
+///   `xattr_obj_id`. This is the common case for real resource forks.
+fn decode_resource_fork_xattr(key: &[u8], val: &[u8]) -> Option<ResourceFork> {
     // key: j_key(8) + name_len u16 @8 + name bytes @10 (NUL-terminated).
     if key.len() < 10 {
         return None;
@@ -1349,18 +1382,54 @@ fn decode_resource_fork_xattr(key: &[u8], val: &[u8]) -> Option<u64> {
     }
     let flags = rd_u16(val, 0);
     let xdata_len = rd_u16(val, 2) as usize;
+    let xdata = val.get(4..)?;
     if flags & XATTR_DATA_EMBEDDED != 0 {
-        return Some(xdata_len as u64);
+        let take = xdata_len.min(xdata.len());
+        return Some(ResourceFork::Embedded(xdata[..take].to_vec()));
     }
     if flags & XATTR_DATA_STREAM != 0 {
         // j_xattr_dstream: xattr_obj_id u64 @0, then j_dstream_t; dstream.size
         // is the first u64 of the j_dstream_t, i.e. at offset 8 of xdata.
-        let xdata = val.get(4..)?;
         if xdata.len() >= 16 {
-            return Some(rd_u64(xdata, 8));
+            let stream_id = rd_u64(xdata, 0);
+            let size = rd_u64(xdata, 8);
+            return Some(ResourceFork::Stream { stream_id, size });
         }
     }
     None
+}
+
+/// Decode a `com.apple.FinderInfo` extended-attribute record into type/creator
+/// `OSType`s and Finder flags. The 32-byte value is the classic FInfo+FXInfo:
+/// `fdType` @0, `fdCreator` @4, `fdFlags` (big-endian u16) @8. Always embedded.
+/// Returns `None` for any other xattr or a too-short value.
+fn decode_finder_info_xattr(key: &[u8], val: &[u8]) -> Option<FinderInfo> {
+    if key.len() < 10 {
+        return None;
+    }
+    let name_len = rd_u16(key, 8) as usize;
+    let end = 10usize.checked_add(name_len)?.min(key.len());
+    let name = key.get(10..end)?;
+    let name = name.split(|&b| b == 0).next().unwrap_or(name);
+    if name != FINDER_INFO_XATTR_NAME {
+        return None;
+    }
+    // val: j_xattr_val header (flags u16 @0, xdata_len u16 @2), then xdata.
+    let xdata = val.get(4..)?;
+    if xdata.len() < 10 {
+        return None;
+    }
+    let mut type_code = [0u8; 4];
+    let mut creator = [0u8; 4];
+    type_code.copy_from_slice(&xdata[0..4]);
+    creator.copy_from_slice(&xdata[4..8]);
+    // Finder flags are stored big-endian in the on-disk FInfo.
+    let flags = u16::from_be_bytes([xdata[8], xdata[9]]);
+    Some(FinderInfo {
+        type_code,
+        creator,
+        flags,
+    })
 }
 
 impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
@@ -1395,9 +1464,15 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
                     let size = cat.inodes.get(&child.oid).map(|i| i.size).unwrap_or(0);
                     let mut fe = FileEntry::new_file(child.name.clone(), path, size, child.oid);
                     // Classic-Mac resource fork, stored as the
-                    // `com.apple.ResourceFork` xattr. Only the size is known;
-                    // reading the fork bytes is not implemented yet.
-                    fe.resource_fork_size = cat.resource_forks.get(&child.oid).copied();
+                    // `com.apple.ResourceFork` xattr (read via
+                    // `write_resource_fork_to`).
+                    fe.resource_fork_size = cat.resource_forks.get(&child.oid).map(|rf| rf.size());
+                    // Mac type/creator/flags from the `com.apple.FinderInfo` xattr.
+                    if let Some(fi) = cat.finder_info.get(&child.oid) {
+                        fe.type_code = Some(fi.type_code);
+                        fe.creator_code = Some(fi.creator);
+                        fe.finder_flags = Some(fi.flags);
+                    }
                     fe
                 };
                 out.push(fe);
@@ -1448,6 +1523,50 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
         }
         let (size, extents) = self.gather_file(entry.location)?;
         self.stream_extents(&extents, size, size, writer)
+    }
+
+    fn resource_fork_size(&mut self, entry: &FileEntry) -> u64 {
+        match self.catalog() {
+            Ok(cat) => cat
+                .resource_forks
+                .get(&entry.location)
+                .map(|rf| rf.size())
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Stream the file's `com.apple.ResourceFork` bytes. Embedded forks are
+    /// written from the inline xattr bytes; stream-backed forks are read from
+    /// their own `FILE_EXTENT` records (keyed by the xattr's stream id) exactly
+    /// like a data fork — sparse-hole and on-encrypted-volume decryption reuse
+    /// `stream_extents`. Returns `Ok(0)` when the file has no resource fork.
+    fn write_resource_fork_to(
+        &mut self,
+        entry: &FileEntry,
+        writer: &mut dyn Write,
+    ) -> Result<u64, FilesystemError> {
+        // Pull what we need out of the (borrowed) catalog into owned locals so
+        // the later `&mut self` stream call doesn't overlap the borrow.
+        let plan = {
+            let cat = self.catalog()?;
+            match cat.resource_forks.get(&entry.location) {
+                None => return Ok(0),
+                Some(ResourceFork::Embedded(bytes)) => Ok(bytes.clone()),
+                Some(ResourceFork::Stream { stream_id, size }) => {
+                    let mut extents = cat.extents.get(stream_id).cloned().unwrap_or_default();
+                    extents.sort_by_key(|e| e.logical_addr);
+                    Err((extents, *size))
+                }
+            }
+        };
+        match plan {
+            Ok(bytes) => {
+                writer.write_all(&bytes)?;
+                Ok(bytes.len() as u64)
+            }
+            Err((extents, size)) => self.stream_extents(&extents, size, size, writer),
+        }
     }
 
     fn fs_type(&self) -> &str {
