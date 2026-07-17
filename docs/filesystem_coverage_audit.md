@@ -49,7 +49,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
-| MFS (Macintosh File System) | Auto | Yes | Yes | No | No | No | Mac 128K / 512K / Plus, 400 KB SS floppies (1984–86) |
+| MFS (Macintosh File System) | Auto | Yes | Yes | Yes (`--fs mfs`) | N/A (fixed floppy) | check+repair | Mac 128K / 512K / Plus, 400 / 800 KB floppies (1984–86) |
 | HFS (Mac OS Standard) | Auto | Yes | Yes | Yes | Yes (block-size clone) | check+repair | Classic Mac OS (System 7–9), 68k / early PPC |
 | HFS+ / HFSX | Auto | Yes | Yes | Yes | Yes (defrag clone) | check+repair | Mac OS 8.1 → macOS; embedded + wrapped variants |
 | HFV (flat HFS) | via HFS | Yes | Yes | Yes (`--fs hfv`) | Yes | check+repair | BasiliskII / SheepShaver — flat classic HFS ≤ 2047 MB, no APM wrapper |

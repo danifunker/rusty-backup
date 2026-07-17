@@ -14,7 +14,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),
-  UCSD p-System (read + edit + create + fsck), MacPlus MFS,
+  UCSD p-System (read + edit + create + fsck),
+  MacPlus MFS (read + edit + create + fsck),
   Amiga OFS/FFS (AFFS) / PFS3 / SFS, IRIX EFS, CP/M (read + edit + create +
   fsck; multi-DPB: amstrad_data / amstrad_sys / amstrad_pcw / einstein /
   svi328_cpm / altair_8in / altair_cf / multicomp / zxplus3), Human68k, ADFS (read),
@@ -103,7 +104,7 @@ Legend for the **Support** column:
 | ZXNext | ZX Spectrum Next | SD/HDD (VHD) | FAT32/16/12 | **Yes** |
 | TSConf | ZX-Evolution | SD/HDD (VHD) | FAT32 (non-MBR) | **Yes** |
 | Minimig-AGA | Commodore Amiga | Floppy, HDD, CD | OFS/FFS, PFS3, SFS (RDB) / ISO9660 | **Yes** |
-| MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Partial** — HFS yes; MFS 400K floppy no |
+| MacPlus | Macintosh Plus | Floppy, HDD | HFS / MFS (400K floppy) | **Yes** — HFS + MFS both read/edit/create/fsck (400K / 800K MFS floppy) |
 | AtariST | Atari ST/STe | Floppy, HDD | GEMDOS = FAT12 / FAT16 | **Partial** — FAT yes; needs Atari AHDI partition table for HDD |
 | Apple-II | Apple IIe | Floppy, HDD | DOS 3.3 / ProDOS | **Yes** — ProDOS (read + edit + create + fsck; `rb-cli new --fs prodos`) + Apple DOS 3.3 (read + edit + create + fsck; `rb-cli new --fs apple-dos`, 140 KB `.dsk`/`.do`/`.po`). Sector-order auto-detect via `containers::sector_order`. |
 | ZX-Spectrum | Sinclair ZX Spectrum | Floppy, SD/HDD | TR-DOS, G+DOS, +3DOS (CP/M-like), esxDOS FAT | **Partial** — TR-DOS (`.trd`, full quartet) + esxDOS FAT yes; +3DOS via CP/M (`zxplus3` preset); G+DOS (MGT) no |
@@ -219,7 +220,6 @@ convert only.
 |---|---|---|---|
 | **Atari AHDI partition table** | AtariST | S | Atari's MBR-like scheme; makes ST hard-disk images first-class (FAT already supported). |
 | **Apple DOS 3.3** | Apple-II | S-M | Complements existing ProDOS; covers sector-order .dsk/.do. |
-| **MFS** | MacPlus | S | Macintosh File System for 400 KB floppies; low priority. |
 
 ---
 

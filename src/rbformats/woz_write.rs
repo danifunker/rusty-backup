@@ -793,6 +793,22 @@ pub fn sectors_to_woz_35(sectors: &[u8], sides: u8) -> anyhow::Result<Vec<u8>> {
             sectors.len()
         );
     }
+    let tracks = tracks_from_sectors_35(sectors, sides);
+    Ok(build_woz2_file(DISK_TYPE_35, sides, &tracks))
+}
+
+/// Encode a raw 3.5" floppy image into per-track GCR bitstreams (the shared
+/// front half of both the WOZ2 and MOOF writers — the two formats differ only
+/// in their container wrapper, not the on-disk GCR encoding).
+///
+/// Input layout is the reader's 3.5" order: for each track 0..=79, the
+/// `sectors_for_track_35(t)` side-0 sectors followed by the same count of
+/// side-1 sectors when `sides == 2`. Returns `(bytes, bit_count)` entries in
+/// `track*sides + side` order (matching the TMAP assignment both containers use).
+///
+/// Caller must have validated `sectors.len()` against the expected size for
+/// `sides` (400K for 1, 800K for 2); this indexes straight through the buffer.
+pub(crate) fn tracks_from_sectors_35(sectors: &[u8], sides: u8) -> Vec<(Vec<u8>, u32)> {
     let format = if sides == 2 {
         FORMAT_35_DSDD
     } else {
@@ -814,8 +830,7 @@ pub fn sectors_to_woz_35(sectors: &[u8], sides: u8) -> anyhow::Result<Vec<u8>> {
             tracks.push(generate_track_35(t, side, format, &sector_data));
         }
     }
-
-    Ok(build_woz2_file(DISK_TYPE_35, sides, &tracks))
+    tracks
 }
 
 /// Encode a raw floppy-sized sector buffer as a WOZ 2.0 file, auto-detecting

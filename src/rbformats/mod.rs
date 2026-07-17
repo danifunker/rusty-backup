@@ -179,6 +179,7 @@ pub mod imz;
 pub mod interleave;
 pub mod lz4;
 pub mod lzhuf;
+pub mod moof;
 pub mod ndif;
 pub mod qcow2;
 #[cfg(test)]
@@ -1285,6 +1286,9 @@ pub enum ImageFormat {
     Dart,
     /// WOZ 1.0/2.0 — nibble/bitstream floppy image, decoded to logical sectors.
     Woz(woz::WozReader),
+    /// MOOF — Applesauce Macintosh 3.5" GCR bitstream floppy (400K/800K),
+    /// decoded to logical sectors (shares WOZ's 3.5" GCR decoder).
+    Moof(moof::MoofReader),
     /// QCOW2 (v2 or v3, uncompressed) — opened on-demand by path via
     /// [`qcow2::Qcow2Reader`]; `logical_size` is the virtual disk size.
     Qcow2 {
@@ -1356,6 +1360,9 @@ impl ImageFormat {
                     reader.disk_type_name(),
                     reader.len()
                 )
+            }
+            ImageFormat::Moof(ref reader) => {
+                format!("MOOF Macintosh 3.5\" ({} bytes decoded)", reader.len())
             }
             ImageFormat::Qcow2 {
                 logical_size,
@@ -1447,6 +1454,24 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                 Ok(reader) => return Ok(ImageFormat::Woz(reader)),
                 Err(_) => {
                     // WOZ magic matched but decoding failed — fall through
+                }
+            }
+        }
+    }
+
+    // 1a. MOOF magic at offset 0 (`MOOF FF 0A 0D 0A`) — Applesauce Macintosh
+    //     3.5" bitstream floppy. Same strong-signature treatment as WOZ.
+    if file_size >= 12 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && moof::is_moof(&magic) {
+            file.seek(SeekFrom::Start(0))?;
+            let mut raw = Vec::new();
+            file.read_to_end(&mut raw)?;
+            match moof::MoofReader::from_bytes(raw) {
+                Ok(reader) => return Ok(ImageFormat::Moof(reader)),
+                Err(_) => {
+                    // MOOF magic matched but decoding failed — fall through.
                 }
             }
         }
@@ -1736,6 +1761,12 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
         ImageFormat::Woz(reader) => {
             // WOZ data was already decoded during format detection.
             // The file parameter is unused — the WozReader holds the decoded data.
+            drop(file);
+            let size = reader.len();
+            Ok((Box::new(reader), size))
+        }
+        ImageFormat::Moof(reader) => {
+            // MOOF data was already decoded during format detection.
             drop(file);
             let size = reader.len();
             Ok((Box::new(reader), size))

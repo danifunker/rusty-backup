@@ -180,6 +180,8 @@ impl BulkConvertDialog {
                     ui.radio_value(&mut self.format, ExportFormat::TwoMg, "2MG (.2mg)");
                     ui.radio_value(&mut self.format, ExportFormat::Woz, "WOZ (.woz)")
                         .on_hover_text("Floppy only: 140K / 400K / 800K sources");
+                    ui.radio_value(&mut self.format, ExportFormat::Moof, "MOOF (.moof)")
+                        .on_hover_text("Macintosh 3.5\" bitstream, floppy only: 400K / 800K (Snow / MAME)");
                     ui.radio_value(&mut self.format, ExportFormat::Dc42, "DiskCopy 4.2 (.dsk)")
                         .on_hover_text("Floppy only: 400K / 720K / 800K / 1440K sources");
                     ui.radio_value(&mut self.format, ExportFormat::Chd, "CHD (Hard Disk)")

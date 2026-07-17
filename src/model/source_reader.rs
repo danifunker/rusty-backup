@@ -954,6 +954,17 @@ fn open_read_dispatch(
             .read_to_end(&mut flat)
             .with_context(|| format!("read WOZ {}", path.display()))?;
         Ok(Box::new(std::io::Cursor::new(flat)))
+    } else if is_moof_path(path) {
+        // MOOF (Applesauce Macintosh 3.5" GCR bitstream): decode to a flat
+        // 400K/800K sector buffer via the shared 3.5" GCR decoder, like WOZ.
+        // Read-only here (no in-place re-encode wired into container_edit yet).
+        let mut reader = crate::rbformats::moof::MoofReader::open(path)
+            .with_context(|| format!("decode MOOF {}", path.display()))?;
+        let mut flat = Vec::with_capacity(reader.len() as usize);
+        reader
+            .read_to_end(&mut flat)
+            .with_context(|| format!("read MOOF {}", path.display()))?;
+        Ok(Box::new(std::io::Cursor::new(flat)))
     } else if is_atr_path(path) {
         // Atari .atr: strip the 16-byte header to expose the flat sector
         // body the atari_dos engine reads. `.xfd` is headerless and falls
@@ -1174,6 +1185,30 @@ pub fn is_woz_path(path: &Path) -> bool {
     }
 }
 
+/// True for a `.moof` Applesauce Macintosh 3.5" bitstream floppy (magic
+/// `MOOF FF 0A 0D 0A`). Read-only: [`open_read`] decodes it to a flat
+/// 400K/800K sector buffer via the shared 3.5" GCR decoder. Not yet in
+/// [`is_editable_container_path`] — no re-encode-on-commit path is wired up
+/// (use `rb-cli convert … --format moof` to write one).
+pub fn is_moof_path(path: &Path) -> bool {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("moof"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return false;
+    }
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    match f.read(&mut magic) {
+        Ok(n) if n >= 8 => crate::rbformats::moof::is_moof(&magic[..n]),
+        _ => false,
+    }
+}
+
 /// Containers that support in-place editing via
 /// [`crate::model::container_edit`] (decode -> edit -> re-encode): the four
 /// PC/Sharp floppy formats (XDF, HDM, DIM, D88), the Atari `.atr` (a trivial
@@ -1205,6 +1240,7 @@ pub fn is_container_path(path: &Path) -> bool {
         || is_zip_image_path(path)
         || is_gzip_wrapped_path(path)
         || is_woz_path(path)
+        || is_moof_path(path)
         || is_flat_floppy_container_path(path)
 }
 

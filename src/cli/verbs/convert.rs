@@ -49,6 +49,9 @@ pub enum ConvertFormat {
     Twomg,
     /// WOZ 2.0 (Apple II floppy).
     Woz,
+    /// MOOF (Applesauce Macintosh 3.5" floppy — 400K / 800K). Loadable by Snow,
+    /// MAME, and Applesauce; preserves the GCR bitstream.
+    Moof,
     /// DiskCopy 4.2 (Mac / Apple IIgs floppy).
     Dc42,
 }
@@ -68,6 +71,7 @@ impl From<ConvertFormat> for ExportFormat {
             ConvertFormat::Raw => ExportFormat::Raw,
             ConvertFormat::Twomg => ExportFormat::TwoMg,
             ConvertFormat::Woz => ExportFormat::Woz,
+            ConvertFormat::Moof => ExportFormat::Moof,
             ConvertFormat::Dc42 => ExportFormat::Dc42,
         }
     }

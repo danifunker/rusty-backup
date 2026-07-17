@@ -783,6 +783,29 @@ fn decode_35_woz(woz: &WozFile) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Decode a 3.5" GCR bitstream image into flat logical sectors from its parsed
+/// TMAP + TRKS chunk data + full file bytes.
+///
+/// WOZ2 and MOOF share an identical 3.5" TRKS layout (8-byte descriptors whose
+/// `start_blk` is a file-absolute 512-byte block index), so the MOOF reader
+/// reuses this by handing over its own TMAP, TRKS chunk, and file bytes. The
+/// GCR track decoding itself is byte-for-byte the same on both formats.
+pub(crate) fn decode_35_bitstream(
+    tmap: [u8; 160],
+    trks_data: Vec<u8>,
+    file_data: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let woz = WozFile {
+        version: 2,
+        disk_type: DISK_TYPE_35,
+        tmap,
+        trks_data,
+        trks_chunk_offset: 0,
+        file_data,
+    };
+    decode_35_woz(&woz)
+}
+
 // ──────────────────────────── WozReader ─────────────────────────────────────
 
 /// A `Read + Seek` adapter that presents decoded WOZ floppy data as a flat

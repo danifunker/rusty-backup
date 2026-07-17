@@ -24,9 +24,9 @@
 /// explicit entries to be selectable).
 pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
-    "woz", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs", "GHO",
-    "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81", "g64",
-    "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "trd", "pdi", "bfs", "copydisk",
+    "woz", "moof", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs",
+    "GHO", "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81",
+    "g64", "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "trd", "pdi", "bfs", "copydisk",
     "altodisk", "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk", "dart",
 ];
 
@@ -145,6 +145,10 @@ mod tests {
         // Uppercase duplicates collapse: GHO/gho -> gho, etc.
         assert!(exts.contains(&"gho".to_string()));
         assert!(exts.contains(&"hfv".to_string()));
+        // MOOF (Applesauce Macintosh 3.5" bitstream) is a picker-visible,
+        // openable container — guard it against a future extension-list trim.
+        assert!(DISK_IMAGE_EXTS.contains(&"moof"));
+        assert!(exts.contains(&"moof".to_string()));
         assert!(!exts
             .iter()
             .any(|e| e.chars().any(|c| c.is_ascii_uppercase())));
