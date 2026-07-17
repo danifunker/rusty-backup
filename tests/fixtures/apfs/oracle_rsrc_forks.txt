@@ -1,0 +1,13 @@
+# Resource-fork size oracle for tests/fixtures/test_apfs_rsrc.img.zst
+#
+# A 16 MiB bare (no partition scheme) unencrypted APFS container, volume
+# "RsrcTest", captured from macOS. Each file's resource fork was written via
+# its `..namedfork/rsrc` path; sizes below come from `stat -f%z` (data fork)
+# and `ls -l@` / the rsrc namedfork size (resource fork), i.e. exactly what
+# macOS reports.
+#
+# Format: <name>  data=<data-fork bytes>  rsrc=<resource-fork bytes>  storage
+#
+BigApp     data=15  rsrc=6017  stream      # XATTR_DATA_STREAM (j_xattr_dstream)
+TinyApp    data=1   rsrc=40    embedded    # XATTR_DATA_EMBEDDED (inline xdata)
+Plain.txt  data=9   rsrc=0     none        # no com.apple.ResourceFork xattr

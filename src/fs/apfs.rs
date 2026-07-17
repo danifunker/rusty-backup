@@ -104,12 +104,20 @@ const J_DREC_LEN_MASK: u32 = 0x0000_03ff;
 /// length in bytes).
 const J_FILE_EXTENT_LEN_MASK: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// `j_xattr_val.flags` bit: the attribute data lives in a separate data
+/// stream (`j_xattr_dstream`), not inline in `xdata`.
+const XATTR_DATA_STREAM: u16 = 0x0001;
+
 /// `j_xattr_val.flags` bit: the attribute data is embedded inline in `xdata`
 /// (as opposed to living in a separate data stream).
 const XATTR_DATA_EMBEDDED: u16 = 0x0002;
 
 /// Extended-attribute name that stores a symlink's target path.
 const SYMLINK_XATTR_NAME: &[u8] = b"com.apple.fs.symlink";
+
+/// Extended-attribute name under which classic-Mac files keep their resource
+/// fork on APFS. Its logical size becomes `FileEntry::resource_fork_size`.
+const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
 
 /// Cap a single file read/extract so a corrupt extent list can't make us
 /// allocate or stream absurd amounts. 64 GiB is far above any real vintage-Mac
@@ -487,6 +495,10 @@ struct Catalog {
     /// inode oid -> symlink target path (from the `com.apple.fs.symlink`
     /// extended attribute).
     symlinks: std::collections::HashMap<u64, String>,
+    /// inode oid -> resource-fork logical size (from the
+    /// `com.apple.ResourceFork` extended attribute). Only present for files
+    /// that actually carry a non-empty resource fork.
+    resource_forks: std::collections::HashMap<u64, u64>,
 }
 
 /// One `j_file_extent` record: a run of `length` bytes at logical offset
@@ -864,6 +876,10 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             APFS_TYPE_XATTR => {
                 if let Some(target) = decode_symlink_xattr(key, val) {
                     cat.symlinks.insert(obj_id, target);
+                } else if let Some(size) = decode_resource_fork_xattr(key, val) {
+                    if size > 0 {
+                        cat.resource_forks.insert(obj_id, size);
+                    }
                 }
             }
             _ => {}
@@ -1302,6 +1318,51 @@ fn decode_symlink_xattr(key: &[u8], val: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(xdata).into_owned())
 }
 
+/// Decode a `com.apple.ResourceFork` extended-attribute record into its
+/// logical size in bytes. Returns `None` for any other xattr.
+///
+/// Two storage forms:
+/// - **embedded** (`XATTR_DATA_EMBEDDED`): the fork bytes are inline in
+///   `xdata`, so the size is `xdata_len`. Small forks only.
+/// - **stream** (`XATTR_DATA_STREAM`): `xdata` is a `j_xattr_dstream` —
+///   `xattr_obj_id` (u64) followed by a `j_dstream_t` whose first u64 is the
+///   logical size. This is the common case for real resource forks.
+///
+/// Only the *size* is decoded; reading the fork bytes (following the stream's
+/// own extents) is not implemented yet, so `write_resource_fork_to` still
+/// returns 0 for APFS. The size is enough for `du` / display.
+fn decode_resource_fork_xattr(key: &[u8], val: &[u8]) -> Option<u64> {
+    // key: j_key(8) + name_len u16 @8 + name bytes @10 (NUL-terminated).
+    if key.len() < 10 {
+        return None;
+    }
+    let name_len = rd_u16(key, 8) as usize;
+    let end = 10usize.checked_add(name_len)?.min(key.len());
+    let name = key.get(10..end)?;
+    let name = name.split(|&b| b == 0).next().unwrap_or(name);
+    if name != RESOURCE_FORK_XATTR_NAME {
+        return None;
+    }
+    // val: j_xattr_val: flags u16 @0, xdata_len u16 @2, xdata @4.
+    if val.len() < 4 {
+        return None;
+    }
+    let flags = rd_u16(val, 0);
+    let xdata_len = rd_u16(val, 2) as usize;
+    if flags & XATTR_DATA_EMBEDDED != 0 {
+        return Some(xdata_len as u64);
+    }
+    if flags & XATTR_DATA_STREAM != 0 {
+        // j_xattr_dstream: xattr_obj_id u64 @0, then j_dstream_t; dstream.size
+        // is the first u64 of the j_dstream_t, i.e. at offset 8 of xdata.
+        let xdata = val.get(4..)?;
+        if xdata.len() >= 16 {
+            return Some(rd_u64(xdata, 8));
+        }
+    }
+    None
+}
+
 impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         // The APFS volume root directory is inode 2; carry that as `location`
@@ -1332,7 +1393,12 @@ impl<R: Read + Seek + Send> Filesystem for ApfsFilesystem<R> {
                     FileEntry::new_symlink(child.name.clone(), path, size, child.oid, target)
                 } else {
                     let size = cat.inodes.get(&child.oid).map(|i| i.size).unwrap_or(0);
-                    FileEntry::new_file(child.name.clone(), path, size, child.oid)
+                    let mut fe = FileEntry::new_file(child.name.clone(), path, size, child.oid);
+                    // Classic-Mac resource fork, stored as the
+                    // `com.apple.ResourceFork` xattr. Only the size is known;
+                    // reading the fork bytes is not implemented yet.
+                    fe.resource_fork_size = cat.resource_forks.get(&child.oid).copied();
+                    fe
                 };
                 out.push(fe);
             }

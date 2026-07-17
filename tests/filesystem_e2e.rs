@@ -3706,6 +3706,38 @@ fn test_apfs_browse_root_and_nested() {
     assert!(nested_kids.iter().any(|e| e.name == "deep.txt"));
 }
 
+// Fixture: tests/fixtures/test_apfs_rsrc.img.zst — a 16 MiB unencrypted APFS
+// container (volume "RsrcTest") captured from macOS, holding three files whose
+// resource forks were written via the `..namedfork/rsrc` path. The oracle
+// (data-fork + resource-fork byte sizes, from `stat` / `ls -l@`) lives in
+// tests/fixtures/apfs/oracle_rsrc_forks.txt. Exercises both APFS xattr storage
+// forms: BigApp's fork is stream-backed (XATTR_DATA_STREAM), TinyApp's is
+// embedded inline (XATTR_DATA_EMBEDDED).
+#[test]
+fn test_apfs_resource_fork_sizes_match_macos() {
+    let img = load_fixture("test_apfs_rsrc.img.zst");
+    let mut fs = rusty_backup::fs::apfs::ApfsFilesystem::open(Cursor::new(img), 0).unwrap();
+    let root = fs.root().unwrap();
+    let entries = fs.list_directory(&root).unwrap();
+    let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+
+    // Stream-backed resource fork: 15-byte data fork, 6017-byte resource fork.
+    let big = by_name("BigApp");
+    assert_eq!(big.size, 15);
+    assert_eq!(big.resource_fork_size, Some(6017));
+
+    // Embedded (inline) resource fork: 1-byte data fork, 40-byte resource fork.
+    let tiny = by_name("TinyApp");
+    assert_eq!(tiny.size, 1);
+    assert_eq!(tiny.resource_fork_size, Some(40));
+
+    // Plain file with no resource fork: the field stays None so `du` treats it
+    // as data-fork-only (distinct from Some(0)).
+    let plain = by_name("Plain.txt");
+    assert_eq!(plain.size, 9);
+    assert_eq!(plain.resource_fork_size, None);
+}
+
 #[test]
 fn test_apfs_read_matches_oracle_checksums() {
     // Parse the checksum oracle: "<sha256>  <relative path>".
