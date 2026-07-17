@@ -77,6 +77,26 @@ fn optical_du_hfs_side_counts_resource_fork() {
 }
 
 #[test]
+fn generic_verbs_on_disc_redirect_to_optical() {
+    let (disc, _guard) = fixture_disc();
+    let disc = disc.to_str().unwrap();
+    // The generic ls/du can't drive optical geometry; instead of a cryptic
+    // parse error they must point at the optical verbs.
+    for verb in [vec!["ls", disc, "/"], vec!["du", disc, "/"]] {
+        let out = Command::new(cli_bin()).args(&verb).output().expect("spawn");
+        assert!(
+            !out.status.success(),
+            "{verb:?} should fail on a disc image"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("optical disc image") && stderr.contains("optical browse"),
+            "{verb:?} should redirect to the optical verbs, got:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn optical_du_missing_path_is_clean() {
     let (disc, _guard) = fixture_disc();
     let disc = disc.to_str().unwrap();

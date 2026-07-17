@@ -30,6 +30,7 @@ pub mod glob;
 pub mod img_at;
 pub mod io;
 pub mod logging;
+pub mod optical_hint;
 pub mod output;
 pub mod parse;
 pub mod resolve;
