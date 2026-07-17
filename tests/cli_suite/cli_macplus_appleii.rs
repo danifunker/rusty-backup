@@ -215,6 +215,26 @@ fn rb_cli_ls_on_mfs_volume_lists_seeded_file() {
     );
 }
 
+/// `du` on MFS must report the allocation unit (drAlBlkSiz) and round each
+/// fork up to it, matching the classic-HFS behavior. The seeded "Hello" is a
+/// 15-byte data-fork file, so it occupies one 1024-byte allocation block.
+#[test]
+fn rb_cli_du_on_mfs_reports_alloc_unit_and_rounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = dir.path().join("mfs.dsk");
+    write_mfs_volume(&img);
+
+    let out = run(&["du", img.to_str().unwrap(), "/", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["result"]["allocation_unit"], 1024);
+    let root = &v["result"]["paths"][0];
+    assert_eq!(root["found"], true);
+    assert_eq!(root["data_bytes"], 15, "the 15-byte Hello data fork");
+    assert_eq!(root["rsrc_bytes"], 0);
+    assert_eq!(root["files"], 1);
+    assert_eq!(root["alloc_bytes"], 1024, "15 bytes rounds up to one block");
+}
+
 #[test]
 fn rb_cli_get_extracts_mfs_file_byte_exactly() {
     let dir = tempfile::tempdir().unwrap();

@@ -3182,6 +3182,19 @@ impl<R: Read + Seek + Send> Filesystem for HfsPlusFilesystem<R> {
         (self.vh.total_blocks - self.vh.free_blocks) as u64 * self.vh.block_size as u64
     }
 
+    /// HFS+ allocates fork storage in fixed-size allocation blocks
+    /// (`blockSize`), so a fork's real on-disk footprint is its length
+    /// rounded up to this unit. Exposing it lets the copy preflight and
+    /// `du` model destination consumption exactly instead of falling back
+    /// to a 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        if self.vh.block_size == 0 {
+            None
+        } else {
+            Some(self.vh.block_size as u64)
+        }
+    }
+
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let bitmap = self.read_allocation_bitmap()?;
         // The HFS+ alternate volume header occupies the second-to-last 512-byte sector

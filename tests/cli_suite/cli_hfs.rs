@@ -250,3 +250,57 @@ fn du_counts_both_forks_and_distinguishes_missing_from_empty() {
     let entries = v["result"]["paths"][0]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 3, "Doc, TheApp, Empty");
 }
+
+/// The same both-fork accounting must work on HFS+, including the larger
+/// allocation block (4 KiB by default), which `alloc_bytes` rounds to.
+#[test]
+fn du_on_hfsplus_counts_resource_fork_and_rounds_to_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("plus.img");
+    let img_s = img.to_str().unwrap();
+
+    run(&[
+        "new", img_s, "--fs", "hfsplus", "--size", "32M", "--name", "Plus",
+    ]);
+    run(&["mkdir", img_s, "/App"]);
+
+    // Resource-fork-only app: 0-byte data fork, 30000-byte resource fork.
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    run(&[
+        "put",
+        img_s,
+        empty.to_str().unwrap(),
+        "/App/TheApp",
+        "--type",
+        "APPL",
+        "--creator",
+        "MYAP",
+    ]);
+    let rsrc = dir.path().join("rsrc.bin");
+    std::fs::write(&rsrc, vec![0u8; 30000]).unwrap();
+    run(&[
+        "setrsrc",
+        img_s,
+        "/App/TheApp",
+        "--from-file",
+        rsrc.to_str().unwrap(),
+    ]);
+
+    let out = run(&["du", img_s, "/App", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let unit = v["result"]["allocation_unit"].as_u64().unwrap();
+    assert!(
+        unit >= 4096,
+        "HFS+ block size should be >= 4096, got {unit}"
+    );
+
+    let app = &v["result"]["paths"][0];
+    assert_eq!(app["data_bytes"], 0);
+    assert_eq!(app["rsrc_bytes"], 30000, "resource fork must be counted");
+    assert_eq!(app["apparent_bytes"], 30000);
+    // 30000 bytes rounds up to a whole number of allocation blocks.
+    let alloc = app["alloc_bytes"].as_u64().unwrap();
+    assert_eq!(alloc, 30000u64.div_ceil(unit) * unit);
+    assert_eq!(app["files"], 1);
+}

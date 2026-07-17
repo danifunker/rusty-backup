@@ -1087,6 +1087,19 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
         (self.mdb.num_alloc_blocks - self.mdb.free_blocks) as u64 * self.mdb.alloc_block_size as u64
     }
 
+    /// MFS allocates fork storage in fixed-size allocation blocks
+    /// (`drAlBlkSiz`), so a fork's real on-disk footprint is its length
+    /// rounded up to this unit. Exposing it lets the copy preflight and
+    /// `du` model destination consumption exactly instead of falling back
+    /// to a 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        if self.mdb.alloc_block_size == 0 {
+            None
+        } else {
+            Some(self.mdb.alloc_block_size as u64)
+        }
+    }
+
     /// Stream a file's resource fork. MFS files carry a data + resource fork
     /// like HFS; consumers (`get-binhex`, MacBinary / AppleDouble export, `cp`,
     /// the remote daemon) reach it only through this trait method, so it must
