@@ -1,8 +1,9 @@
 //! DMG (UDIF) disk image format parser and virtual reader.
 //!
-//! Supports Apple UDIF compressed DMG images with zlib, bzip2, ADC, raw, and
-//! zero block types.  Provides a `DmgReader` that implements `Read + Seek` over
-//! the decompressed virtual disk.
+//! Supports Apple UDIF compressed DMG images with zlib (UDZO), bzip2 (UDBZ),
+//! ADC (UDCO), LZFSE (ULFO), LZMA/xz (ULMO), raw, and zero block types.
+//! Provides a `DmgReader` that implements `Read + Seek` over the decompressed
+//! virtual disk.
 
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
 
@@ -27,6 +28,8 @@ const METHOD_ZERO_2: u32 = 0x0000_0002;
 const METHOD_ADC: u32 = 0x8000_0004;
 const METHOD_ZLIB: u32 = 0x8000_0005;
 const METHOD_BZIP2: u32 = 0x8000_0006;
+const METHOD_LZFSE: u32 = 0x8000_0007;
+const METHOD_LZMA: u32 = 0x8000_0008;
 const METHOD_COMMENT: u32 = 0x7FFF_FFFE;
 const METHOD_END: u32 = 0xFFFF_FFFF;
 
@@ -372,6 +375,39 @@ impl DmgReader {
                     .map_err(io::Error::other)?;
                 decompress_adc(&compressed, block.unpack_size as usize).map_err(io::Error::other)?
             }
+            METHOD_LZFSE => {
+                // ULFO: each chunk is a self-contained LZFSE block stream
+                // (`bvxn`/`bvx2`/`bvx1`/`bvx-` magic, `bvx$` end-of-stream).
+                // See README.md for the big-endian (PowerPC) decode caveat.
+                self.source
+                    .seek(SeekFrom::Start(block.pack_pos))
+                    .map_err(io::Error::other)?;
+                let mut compressed = vec![0u8; block.pack_size as usize];
+                self.source
+                    .read_exact(&mut compressed)
+                    .map_err(io::Error::other)?;
+                let mut out = Vec::with_capacity(block.unpack_size as usize);
+                lzfse_rust::decode_bytes(&compressed, &mut out).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("LZFSE decode: {e}"))
+                })?;
+                out
+            }
+            METHOD_LZMA => {
+                // ULMO: each chunk is a complete XZ stream (`.7zXZ` magic).
+                self.source
+                    .seek(SeekFrom::Start(block.pack_pos))
+                    .map_err(io::Error::other)?;
+                let mut compressed = vec![0u8; block.pack_size as usize];
+                self.source
+                    .read_exact(&mut compressed)
+                    .map_err(io::Error::other)?;
+                let mut out = Vec::with_capacity(block.unpack_size as usize);
+                let mut input = io::BufReader::new(Cursor::new(compressed));
+                lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("LZMA/xz decode: {e}"))
+                })?;
+                out
+            }
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -541,6 +577,12 @@ pub fn describe_dmg_methods(reader: &DmgReader) -> String {
             }
             METHOD_ADC => {
                 methods.insert("ADC");
+            }
+            METHOD_LZFSE => {
+                methods.insert("LZFSE");
+            }
+            METHOD_LZMA => {
+                methods.insert("LZMA");
             }
             _ => {
                 methods.insert("other");
@@ -802,5 +844,65 @@ mod tests {
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(n, 512);
         assert!(buf.iter().all(|&b| b == 0xAB));
+    }
+
+    /// Read a whole DmgReader whose single block holds `compressed`, decoding
+    /// via `method`, and assert it round-trips back to `original`.
+    fn assert_block_round_trips(method: u32, compressed: &[u8], original: &[u8]) {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(compressed).unwrap();
+        tmp.flush().unwrap();
+        let file = std::fs::File::open(tmp.path()).unwrap();
+
+        let blocks = vec![DmgBlock {
+            block_type: method,
+            unpack_pos: 0,
+            unpack_size: original.len() as u64,
+            pack_pos: 0,
+            pack_size: compressed.len() as u64,
+        }];
+        let mut reader = DmgReader {
+            source: BufReader::new(file),
+            blocks,
+            total_size: original.len() as u64,
+            position: 0,
+            cache_block_idx: None,
+            cache_data: Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn test_dmg_reader_lzfse_block() {
+        // ULFO: a self-contained LZFSE block stream. Encode a payload with
+        // enough structure that the encoder emits a real (non-raw) stream.
+        let mut original = Vec::new();
+        for i in 0..4096u32 {
+            original.extend_from_slice(&(i % 251).to_le_bytes());
+        }
+        let mut compressed = Vec::new();
+        lzfse_rust::encode_bytes(&original, &mut compressed).unwrap();
+        assert_eq!(&compressed[..3], b"bvx", "expected an LZFSE block magic");
+        assert_block_round_trips(METHOD_LZFSE, &compressed, &original);
+    }
+
+    #[test]
+    fn test_dmg_reader_lzma_block() {
+        // ULMO: each chunk is a complete XZ stream.
+        let mut original = Vec::new();
+        for i in 0..4096u32 {
+            original.extend_from_slice(&(i % 251).to_le_bytes());
+        }
+        let mut compressed = Vec::new();
+        lzma_rs::xz_compress(&mut Cursor::new(&original), &mut compressed).unwrap();
+        assert_eq!(
+            &compressed[..6],
+            &[0xFD, b'7', b'z', b'X', b'Z', 0x00],
+            "expected the XZ stream magic"
+        );
+        assert_block_round_trips(METHOD_LZMA, &compressed, &original);
     }
 }

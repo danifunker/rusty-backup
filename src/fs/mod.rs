@@ -1066,6 +1066,8 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         return match s {
             "Apple_HFS" => "HFS",
             "Apple_HFSX" => "HFSX",
+            // Apple HFS/HFS+ GPT partition GUID (UDIF DMG / hdiutil disks).
+            "48465300-0000-11AA-AA11-00306543ECAC" => "HFS/HFS+",
             // Apple APFS GPT partition GUID.
             "7C3457EF-0000-11AA-AA11-00306543ECAC" => "APFS",
             "Apple_UNIX_SVR2" => "ext/btrfs/xfs/reiserfs/UFS/JFS",
@@ -1657,7 +1659,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
-            "Apple_HFS" => {
+            // "Apple_HFS" (APM) and "48465300-..." (GPT "Apple HFS/HFS+" type
+            // GUID, from `hdiutil create` / UDIF DMGs) both resolve through the
+            // same HFS-vs-HFS+ probe.
+            "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
                 let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
                 return match fs_type {
                     "hfsplus" => {
@@ -2003,7 +2008,11 @@ fn open_filesystem_by_string<R: Read + Seek + Send + 'static>(
     passphrase: Option<&str>,
 ) -> Result<Box<dyn Filesystem>, FilesystemError> {
     match type_str {
-        "Apple_HFS" => {
+        // "Apple_HFS" is the APM type string; "48465300-..." is the GPT
+        // "Apple HFS/HFS+" type GUID (an HFS or HFS+ volume in a GPT-wrapped
+        // disk, as produced by `hdiutil create` / UDIF DMGs). Both resolve
+        // through the same HFS-vs-HFS+ probe.
+        "Apple_HFS" | "48465300-0000-11AA-AA11-00306543ECAC" => {
             let (fs_type, hfsplus_offset) = resolve_apple_hfs(&mut reader, partition_offset);
             match fs_type {
                 "hfsplus" => Ok(Box::new(hfsplus::HfsPlusFilesystem::open(
@@ -2352,6 +2361,9 @@ pub fn is_browsable_type_string(type_str: Option<&str>) -> bool {
             | "Apple_ProDOS"
             // GPT "Linux Filesystem" GUID — ext, btrfs, or xfs at runtime.
             | "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+            // GPT "Apple HFS/HFS+" GUID — HFS or HFS+ volume in a GPT-wrapped
+            // disk (UDIF DMG / hdiutil create).
+            | "48465300-0000-11AA-AA11-00306543ECAC"
             // GPT "Apple APFS" container GUID — read-only browse of the
             // container's first unencrypted volume.
             | "7C3457EF-0000-11AA-AA11-00306543ECAC"

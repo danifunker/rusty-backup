@@ -15,8 +15,14 @@
 //! - `u32` chunk count at offset 124,
 //! - then `count` × 12-byte chunk entries from offset 128:
 //!   `w0 = (firstSector << 8) | type`, `w1 = dataForkOffset`, `w2 = length`.
-//!   `type` `0xFF` ends the table, `0x00` (length 0) is a zero-fill run, and any
-//!   other entry is raw when its length equals the span it covers, else ADC.
+//!
+//! Chunk `type` (the low byte of `w0`) selects the per-chunk codec:
+//! `0x00` NOCOPY (zero-fill), `0x02` COPY (raw), `0x83` ADC, `0x81` RLE,
+//! `0x82` LZH, `0x80` KenCode, `0xF0` StuffIt, `0xFF` end-of-table. Zero / raw /
+//! ADC are decoded; the other compressed codecs are recognized and reported
+//! with a clear "not yet supported" error (rather than silently misdecoded) —
+//! they await real sample images to implement and verify against. Real
+//! Disk Copy 6 output overwhelmingly uses zero + raw + ADC.
 
 use anyhow::{bail, Context, Result};
 
@@ -32,7 +38,13 @@ const OFF_CHUNKS: usize = 128;
 const CHUNK_LEN: usize = 12;
 
 /// Chunk type codes (the low byte of the first word).
-const TYPE_ZERO: u8 = 0x00;
+const TYPE_ZERO: u8 = 0x00; // NOCOPY — zero-fill run
+const TYPE_RAW: u8 = 0x02; // COPY — uncompressed
+const TYPE_KENCODE: u8 = 0x80; // KenCode (undocumented)
+const TYPE_RLE: u8 = 0x81; // Apple RLE
+const TYPE_LZH: u8 = 0x82; // LZH
+const TYPE_ADC: u8 = 0x83; // Apple Data Compression
+const TYPE_STUFFIT: u8 = 0xf0; // StuffIt
 const TYPE_END: u8 = 0xff;
 
 /// Cap on the reconstructed size (4 GiB) — classic NDIF volumes are far
@@ -94,13 +106,46 @@ pub fn reconstruct(data_fork: &[u8], bcem: &[u8]) -> Result<Vec<u8>> {
                 off + len
             )
         })?;
-        if len == span {
-            out[o..o + span].copy_from_slice(src); // raw / uncompressed
-        } else {
-            let dec = decompress_adc(src, span)
-                .with_context(|| format!("NDIF: ADC decompress failed for chunk {i}"))?;
-            let n = dec.len().min(span);
-            out[o..o + n].copy_from_slice(&dec[..n]);
+        match ty {
+            TYPE_RAW => {
+                // Uncompressed: the stored length equals the span it covers.
+                let n = len.min(span);
+                out[o..o + n].copy_from_slice(&src[..n]);
+            }
+            TYPE_ADC => {
+                let dec = decompress_adc(src, span)
+                    .with_context(|| format!("NDIF: ADC decompress failed for chunk {i}"))?;
+                let n = dec.len().min(span);
+                out[o..o + n].copy_from_slice(&dec[..n]);
+            }
+            // Recognized-but-unimplemented codecs: report clearly instead of
+            // silently misrouting the bytes to the ADC decoder. These await a
+            // real sample image that uses them (Disk Copy 6 almost always emits
+            // zero/raw/ADC; KenCode is undocumented).
+            TYPE_RLE => bail!(
+                "NDIF chunk {i} uses Apple RLE compression (type 0x81), which is not yet \
+                 supported"
+            ),
+            TYPE_LZH => {
+                bail!("NDIF chunk {i} uses LZH compression (type 0x82), which is not yet supported")
+            }
+            TYPE_KENCODE => bail!(
+                "NDIF chunk {i} uses KenCode compression (type 0x80), which is undocumented and \
+                 not supported"
+            ),
+            TYPE_STUFFIT => bail!(
+                "NDIF chunk {i} uses StuffIt compression (type 0xF0), which is not yet supported"
+            ),
+            _ => {
+                // Unknown type: if the stored bytes fill the span exactly, treat
+                // it as a verbatim copy (safe); otherwise it's a codec we don't
+                // recognize and can't guess at.
+                if len == span {
+                    out[o..o + span].copy_from_slice(src);
+                } else {
+                    bail!("NDIF chunk {i} has unknown type 0x{ty:02X} (length {len}, span {span})");
+                }
+            }
         }
     }
     Ok(out)
@@ -204,9 +249,9 @@ mod tests {
         let mut bcem = vec![0u8; OFF_CHUNKS];
         bcem[OFF_TOTAL_SECTORS..OFF_TOTAL_SECTORS + 4].copy_from_slice(&total.to_be_bytes());
         let entries: &[(u32, u8, usize, usize)] = &[
-            (0, 1, 0, 1024),      // raw: sectors 0..2 (1024 bytes) from data[0..1024]
-            (2, TYPE_ZERO, 0, 0), // zero: sector 2
-            (3, TYPE_END, 0, 0),  // end (sector 3 left zero by total)
+            (0, TYPE_RAW, 0, 1024), // raw: sectors 0..2 (1024 bytes) from data[0..1024]
+            (2, TYPE_ZERO, 0, 0),   // zero: sector 2
+            (3, TYPE_END, 0, 0),    // end (sector 3 left zero by total)
         ];
         bcem[OFF_CHUNK_COUNT..OFF_CHUNK_COUNT + 4]
             .copy_from_slice(&(entries.len() as u32).to_be_bytes());
@@ -222,5 +267,29 @@ mod tests {
         assert_eq!(img.len(), total as usize * 512);
         assert_eq!(&img[0..1024], &data[..]); // raw chunk landed
         assert!(img[1024..2048].iter().all(|&b| b == 0)); // zero sector
+    }
+
+    /// A chunk using an unimplemented codec (LZH) reports a clear error naming
+    /// the codec, instead of silently misrouting the bytes to the ADC decoder.
+    #[test]
+    fn reconstruct_lzh_chunk_reports_clear_error() {
+        let total = 2u32;
+        let mut bcem = vec![0u8; OFF_CHUNKS];
+        bcem[OFF_TOTAL_SECTORS..OFF_TOTAL_SECTORS + 4].copy_from_slice(&total.to_be_bytes());
+        let entries: &[(u32, u8, usize, usize)] = &[
+            (0, TYPE_LZH, 0, 4), // an LZH-compressed chunk spanning sectors 0..2
+            (2, TYPE_END, 0, 0),
+        ];
+        bcem[OFF_CHUNK_COUNT..OFF_CHUNK_COUNT + 4]
+            .copy_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (sector, ty, off, len) in entries {
+            let w0 = (sector << 8) | (*ty as u32);
+            bcem.extend_from_slice(&w0.to_be_bytes());
+            bcem.extend_from_slice(&(*off as u32).to_be_bytes());
+            bcem.extend_from_slice(&(*len as u32).to_be_bytes());
+        }
+        let data = vec![0u8; 16];
+        let err = reconstruct(&data, &bcem).unwrap_err().to_string();
+        assert!(err.contains("LZH"), "error should name the codec: {err}");
     }
 }

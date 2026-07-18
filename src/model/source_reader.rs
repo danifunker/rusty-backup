@@ -1099,6 +1099,14 @@ fn open_read_dispatch(
         // flat image stream — a Lisa disk becomes DiskCopy 4.2 *with* tags,
         // everything else its block data.
         Ok(Box::new(std::io::Cursor::new(image)))
+    } else if let Some(image) = try_open_ndif_carrier(path) {
+        // Self-mounting image / NDIF disk image delivered through a fork carrier
+        // (MacBinary `.smi.bin`, AppleDouble sidecar, or a native resource fork):
+        // the raw disk lives across both forks — data-fork chunks described by a
+        // `bcem` block map in the resource fork. Reconstruct it to a flat image
+        // so it opens like any other disk. Gated on the presence of `bcem`, so a
+        // plain `.bin` raw image never triggers this.
+        Ok(Box::new(std::io::Cursor::new(image)))
     } else {
         // Apple Twiggy / FileWare .dc42: the two sides are stored sequentially,
         // so the MFS/HFS volume is the data region rotated by one side.
@@ -1121,6 +1129,58 @@ fn open_read_dispatch(
         let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(Box::new(BufReader::new(f)))
     }
+}
+
+/// Try to reconstruct a raw disk image from a **self-mounting image (`.smi`) /
+/// NDIF disk image** delivered through a resource-fork carrier.
+///
+/// A classic-Mac SMI is an application whose resource fork holds a `bcem` NDIF
+/// block map and whose data fork holds the (zero/raw/ADC) disk chunks. Such
+/// files reach us as a MacBinary `.smi.bin`, an AppleDouble `._name` sidecar
+/// pair, or (on macOS) a native resource fork. Returns the flat image only when
+/// a `bcem` resource is present, so a plain `.bin` raw image is never hijacked.
+fn try_open_ndif_carrier(path: &Path) -> Option<Vec<u8>> {
+    use crate::fs::resource_fork::{detect_resource_fork, parse_macbinary};
+    use crate::rbformats::ndif;
+
+    // Cheap gate: peek the 128-byte MacBinary header before reading a whole
+    // (possibly multi-GB) file. If it's not MacBinary, fall back to the
+    // sidecar/native probe, which only touches small companion files.
+    let head = {
+        let mut f = File::open(path).ok()?;
+        let mut buf = [0u8; 128];
+        use std::io::Read as _;
+        match f.read_exact(&mut buf) {
+            Ok(()) => Some(buf),
+            Err(_) => None,
+        }
+    };
+
+    if let Some(head) = head {
+        if crate::macarchive::macbinary::is_macbinary(&head).is_some() {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Some(rf) = parse_macbinary(&bytes) {
+                    if let Some(bcem) = ndif::extract_bcem(&rf.data) {
+                        let data = rf.data_fork.unwrap_or_default();
+                        return ndif::reconstruct(&data, &bcem).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    // AppleDouble sidecar / native resource fork: the resource fork lives beside
+    // (or within) the file, the data fork is the file's own bytes.
+    if let Some(rf) = detect_resource_fork(path) {
+        if let Some(bcem) = ndif::extract_bcem(&rf.data) {
+            let data = rf
+                .data_fork
+                .or_else(|| std::fs::read(path).ok())
+                .unwrap_or_default();
+            return ndif::reconstruct(&data, &bcem).ok();
+        }
+    }
+    None
 }
 
 /// Content-detect a DART image and, if so, decode it into a flat image stream.
@@ -1171,6 +1231,34 @@ pub fn open_peeled_read_with_entry(
 ) -> Result<Box<dyn ReadSeek>> {
     if is_container_path(path) {
         return open_read_dispatch(path, password, inside);
+    }
+    // Encrypted DMG (encrcdsa v2): the `koly`/partition table only appears after
+    // decryption, so peel the encryption here — this is the layer that carries
+    // the password. The decrypted stream is a plaintext disk image that then
+    // flows through the normal partition/FS detection.
+    {
+        let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut head = [0u8; 8];
+        if std::io::Read::read_exact(&mut probe, &mut head).is_ok()
+            && crate::rbformats::dmg_crypto::detect_encrypted_dmg(&head).is_some()
+        {
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+            let pw = password.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} is an encrypted disk image; pass a password to open it",
+                    path.display()
+                )
+            })?;
+            let reader = crate::rbformats::dmg_crypto::open_encrypted_dmg(file, pw)
+                .with_context(|| format!("decrypt {}", path.display()))?;
+            return Ok(Box::new(reader));
+        }
+    }
+    // Self-mounting image / NDIF via a fork carrier (`.smi.bin`, AppleDouble,
+    // native resource fork): reconstruct the raw disk from both forks. Gated on
+    // a `bcem` resource, so a plain `.bin` raw image is never affected.
+    if let Some(image) = try_open_ndif_carrier(path) {
+        return Ok(Box::new(std::io::Cursor::new(image)));
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     match detect_image_format_with_path(file, Some(path)) {
