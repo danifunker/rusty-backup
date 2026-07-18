@@ -23,12 +23,72 @@
 /// extensions case-sensitively on some platforms, so `.GHO` / `.HFV` need
 /// explicit entries to be selectable).
 pub const DISK_IMAGE_EXTS: &[&str] = &[
-    "vhd", "img", "raw", "bin", "iso", "dd", "hda", "hdv", "2mg", "dmg", "po", "do", "dsk", "dc42",
-    "woz", "moof", "chd", "adf", "hdf", "adz", "hdz", "imz", "vmdk", "qcow2", "qcow", "gho", "ghs",
-    "GHO", "GHS", "hfv", "HFV", "d88", "xdf", "hdm", "dim", "hds", "ima", "d64", "d71", "d81",
-    "g64", "g71", "d80", "d82", "atr", "xfd", "jvc", "vdk", "ssd", "dsd", "trd", "pdi", "bfs",
-    "copydisk", "altodisk", "zdisk", "zdelta", "dsk80", "dsk300", "dsk44", "zip", "gz", "cbk",
+    "vhd",
+    "img",
+    "raw",
+    "bin",
+    "iso",
+    "dd",
+    "hda",
+    "hdv",
+    "2mg",
+    "dmg",
+    "po",
+    "do",
+    "dsk",
+    "dc42",
+    "woz",
+    "moof",
+    "chd",
+    "adf",
+    "hdf",
+    "adz",
+    "hdz",
+    "imz",
+    "vmdk",
+    "qcow2",
+    "qcow",
+    "gho",
+    "ghs",
+    "GHO",
+    "GHS",
+    "hfv",
+    "HFV",
+    "d88",
+    "xdf",
+    "hdm",
+    "dim",
+    "hds",
+    "ima",
+    "d64",
+    "d71",
+    "d81",
+    "g64",
+    "g71",
+    "d80",
+    "d82",
+    "atr",
+    "xfd",
+    "jvc",
+    "vdk",
+    "ssd",
+    "dsd",
+    "trd",
+    "pdi",
+    "bfs",
+    "copydisk",
+    "altodisk",
+    "zdisk",
+    "zdelta",
+    "dsk80",
+    "dsk300",
+    "dsk44",
+    "zip",
+    "gz",
+    "cbk",
     "dart",
+    "sparseimage",
+    "smi",
 ];
 
 /// Extensions that appear in the GUI file-picker dropdown (so a user can
@@ -48,7 +108,7 @@ pub const NON_ASSOCIATED_EXTS: &[&str] = &["zip", "gz"];
 /// (this list is empty off macOS). Subtracted at the [`association_exts`]
 /// choke-point, so the split is automatic per build target.
 #[cfg(target_os = "macos")]
-pub const OS_EXCLUDED_ASSOC_EXTS: &[&str] = &["dmg"];
+pub const OS_EXCLUDED_ASSOC_EXTS: &[&str] = &["dmg", "sparseimage"];
 #[cfg(not(target_os = "macos"))]
 pub const OS_EXCLUDED_ASSOC_EXTS: &[&str] = &[];
 
@@ -219,6 +279,28 @@ mod tests {
         );
         #[cfg(not(target_os = "macos"))]
         assert!(associated, "dmg must be OS-associated on non-Apple systems");
+    }
+
+    #[test]
+    fn sparseimage_associated_except_on_macos() {
+        // `.sparseimage` (Apple UDSP sparse image) is a picker-visible disk
+        // image on every platform, but like `.dmg` it's Apple-owned on macOS
+        // (DiskImageMounter), so we don't seize its association there.
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"sparseimage"),
+            "sparseimage must be in the picker list on all platforms"
+        );
+        let associated = association_exts().contains(&"sparseimage".to_string());
+        #[cfg(target_os = "macos")]
+        assert!(
+            !associated,
+            "sparseimage must NOT be OS-associated on macOS (Apple owns it)"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            associated,
+            "sparseimage must be OS-associated on non-Apple systems"
+        );
     }
 
     #[test]

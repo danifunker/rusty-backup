@@ -31,6 +31,76 @@ Compress/decompress handlers for backup output formats, plus disk reconstruction
 | Zstd   | `.zst`    | Zstd level 3 | Yes (post-hoc) | Good compression ratio |
 | CHD    | `.chd`    | MAME CHD    | Yes (post-hoc) | Native via `libchdman-rs` (no external tool) |
 
+## DMG (UDIF) reader — big-endian caveat
+
+`dmg.rs` is a read-only source-container reader (not a backup output). It
+decodes UDIF blocks of type raw/UDRW, zlib (UDZO), bzip2 (UDBZ), ADC (UDCO),
+LZFSE (ULFO), and LZMA/xz (ULMO) into a `Read + Seek` virtual disk.
+
+The two newest codecs differ in big-endian safety, which matters only if
+rusty-backup is ever *run on* a big-endian host (e.g. a PowerPC G5 on Debian's
+`powerpc`/`ppc64` big-endian port — not the little-endian `ppc64el`). The
+decode always runs on the machine executing rusty-backup, never on the vintage
+box being imaged.
+
+- **ULMO / LZMA (`lzma-rs`)** — big-endian safe. The crate declares
+  `#![forbid(unsafe_code)]` and reads every field through explicit
+  `byteorder` little/big tags, so decode is correct on any host endianness.
+- **ULFO / LZFSE (`lzfse_rust`)** — big-endian **unverified**. The crate uses
+  `unsafe` native-endian reads (`read_unaligned::<u32>()`,
+  `usize::from_ne_bytes`) whose big-endian correctness is unproven and almost
+  certainly untested upstream; ULFO decode could silently produce wrong bytes
+  there. Verified only on little-endian (x86 / arm64 / ppc64el).
+
+Both crates are left ungated today (every CI target is little-endian). If we
+target a big-endian host, gate `lzfse_rust` behind a Cargo feature (so a
+big-endian build can drop just that crate while keeping ULMO and the other DMG
+codecs) and round-trip-test ULFO on that host against an `hdiutil`-produced
+fixture before trusting it.
+
+## Other Apple source-container readers
+
+These are read-only source-container readers (like `dmg.rs`), not backup
+outputs. They decode a wrapped image into a `Read + Seek` flat disk that flows
+through the normal partition / filesystem detection.
+
+- **`dmg_crypto.rs` — encrypted disk images (`encrcdsa` v2).** AES-128/256
+  per-image encryption (Apple "FileVault 1", 10.5+ and still produced by
+  `hdiutil create -encryption`). Passphrase → `PBKDF2-HMAC-SHA1` → CBC unwrap of
+  the volume-key blob (AES-192 on modern macOS, 3DES on older images; strip
+  PKCS#7 + `CKIE\0`) → per-512-byte-block `AES-CBC` with an `HMAC-SHA1(be32(n))`
+  IV. Verified end-to-end (payload round-trip) against `hdiutil` AES-128 and
+  AES-256 images. Wired into the password-carrying source path
+  (`source_reader::open_peeled_read_with_entry`); password-less paths get a
+  clear "provide the password" error instead of a cryptic MBR failure.
+
+  > **Note — vintage relevance.** Per-image encryption is uncommon in classic
+  > Mac preservation (it's a modern security feature; its heaviest real use is
+  > iOS firmware and personal vaults). It's supported here so an old encrypted
+  > `.dmg` a user still holds the passphrase for can be opened offline and
+  > cross-machine, with no Apple ID / Secure-Enclave dependency. The 3DES
+  > key-wrap path (the truly old images) is wired but has **not** been verified
+  > against a real vintage sample — modern `hdiutil` wraps with AES-192 even for
+  > AES-128 volumes, so we have no 3DES fixture yet.
+
+- **`sparseimage.rs` — Apple sparse images (`.sparseimage`, UDSP).** A growable
+  single file (Mac OS X 10.3+) storing only written 1 MiB bands via a `sprs`
+  band map; unallocated bands read as zeros. Verified byte-exact against
+  `hdiutil` images. Handles up to ~1 GiB of *written* data (the in-header band
+  map addresses ≤ 1008 physical bands); larger images use a band-index
+  continuation scheme that returns a clear error rather than a misread.
+
+- **`ndif.rs` — NDIF / self-mounting images (`.smi`).** The pre-UDIF Disk Copy 6
+  format (Mac OS 8/9): data-fork chunks described by a `bcem` block map in the
+  resource fork. Delivered through a fork carrier (MacBinary `.smi.bin`,
+  AppleDouble, or a native resource fork); `model/source_reader` decodes the
+  carrier and reconstructs the flat image (gated on `bcem`, so a plain `.bin`
+  raw image is never touched). Zero / raw / ADC chunks are decoded (verified
+  against a real Disk First Aid 8.6.1 SMI); the RLE (0x81), LZH (0x82), KenCode
+  (0x80), and StuffIt (0xF0) chunk codecs are recognized and reported with a
+  clear per-codec error — they await real sample images that use them (KenCode
+  is undocumented and needs reverse-engineering).
+
 ## How to Add a New Output Format
 
 1. Create `src/rbformats/myformat.rs` with a compression function:

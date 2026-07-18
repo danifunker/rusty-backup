@@ -46,7 +46,11 @@ pub struct InspectArgs {
 pub fn run(args: InspectArgs) -> Result<()> {
     require_non_flat(args.format, "inspect")?;
     let pw_bytes = args.password.as_deref().map(|s| s.as_bytes());
-    let mut reader = crate::model::source_reader::open_read_with_password_and_entry(
+    // Peel container *and* image-wrapper layers (CHD / GHO / zip / … plus
+    // VHD / 2MG / DMG / DiskCopy 4.2) so inspect sees the same flat disk the
+    // browse path does; the plain-open path did not unwrap DMG/VHD/2MG and
+    // mis-read the wrapped bytes as the partition table.
+    let mut reader = crate::model::source_reader::open_peeled_read_with_entry(
         &args.image,
         pw_bytes,
         args.inside.as_deref(),

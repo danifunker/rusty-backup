@@ -170,6 +170,7 @@ pub mod containers;
 pub mod dart;
 pub mod dc42;
 pub mod dmg;
+pub mod dmg_crypto;
 pub mod export;
 pub mod gho;
 pub mod gho_crypto;
@@ -186,6 +187,7 @@ pub mod qcow2;
 pub(crate) mod qemu_img_test;
 pub mod raw;
 pub mod sparse;
+pub mod sparseimage;
 pub mod twomg;
 pub mod vhd;
 pub mod vmdk;
@@ -1273,6 +1275,8 @@ pub enum ImageFormat {
     TwoMg(twomg::TwoMgHeader),
     /// UDIF DMG — virtual decompressed reader.
     Dmg(dmg::DmgReader),
+    /// Apple sparse image (`.sparseimage`, UDSP) — virtual band-mapped reader.
+    Sparse(sparseimage::SparseImageReader<File>),
     /// Apple II DOS sector order — 5.25" floppy (140 KB), needs interleave to ProDOS order.
     DosOrder,
     /// DiskCopy 4.2 — classic Mac/Apple IIgs floppy image with 84-byte header.
@@ -1325,6 +1329,9 @@ impl ImageFormat {
             }
             ImageFormat::TwoMg(hdr) => {
                 format!("2MG ({}, {} bytes)", hdr.format_name(), hdr.data_length)
+            }
+            ImageFormat::Sparse(reader) => {
+                format!("Apple sparse image ({} bytes)", reader.total_size())
             }
             ImageFormat::Dmg(reader) => {
                 format!(
@@ -1474,6 +1481,42 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
                     // MOOF magic matched but decoding failed — fall through.
                 }
             }
+        }
+    }
+
+    // 1a2. Apple sparse image magic at offset 0 (`sprs`). Not a UDIF/koly image
+    //      — its own band-mapped container. Detect early like the other
+    //      offset-0 magics; the reader owns the band map and virtual size.
+    if file_size >= 0x1000 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 4];
+        if file.read_exact(&mut magic).is_ok() && &magic == b"sprs" {
+            file.seek(SeekFrom::Start(0))?;
+            match sparseimage::detect_sparseimage(file.try_clone()?) {
+                Ok(Some(reader)) => return Ok(ImageFormat::Sparse(reader)),
+                // A recognized-but-undecodable sparse image (e.g. > ~1 GiB of
+                // written data): surface the clear error instead of falling
+                // through to a cryptic "Invalid MBR" on the raw bytes.
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    // 1a3. Encrypted disk image (`encrcdsa` / `cdsaencr`) magic at offset 0.
+    //      Decryption needs a password and is handled by the password-carrying
+    //      source path (`source_reader::open_peeled_read_with_entry`); this
+    //      format-detection path has no password, so surface a clear error
+    //      instead of falling through to a cryptic "Invalid MBR" on ciphertext.
+    if file_size >= 8 {
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && dmg_crypto::detect_encrypted_dmg(&magic).is_some()
+        {
+            anyhow::bail!(
+                "encrypted disk image: provide the password to open it \
+                 (rb-cli --password, or the password prompt in the GUI)"
+            );
         }
     }
 
@@ -1734,6 +1777,10 @@ pub fn wrap_image_reader(file: File, format: ImageFormat) -> Result<(BoxReadSeek
             ))
         }
         ImageFormat::Dmg(reader) => {
+            let size = reader.total_size();
+            Ok((Box::new(reader), size))
+        }
+        ImageFormat::Sparse(reader) => {
             let size = reader.total_size();
             Ok((Box::new(reader), size))
         }
