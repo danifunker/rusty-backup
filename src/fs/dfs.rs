@@ -80,6 +80,11 @@ impl DfsGeometry {
             _ => None,
         }
     }
+
+    /// Body length in bytes of a single-sided volume of this geometry.
+    pub fn body_len(&self) -> u64 {
+        self.total_sectors as u64 * SECTOR_SIZE as u64
+    }
 }
 
 /// One parsed catalogue entry.
@@ -264,7 +269,27 @@ pub fn looks_like_dfs<R: Read + Seek>(
         .seek(SeekFrom::End(0))
         .ok()?
         .checked_sub(partition_offset)?;
-    let geom = DfsGeometry::from_body_len(len)?;
+    looks_like_dfs_within(reader, partition_offset, len)
+}
+
+/// Like [`looks_like_dfs`] but the volume's body length is supplied explicitly
+/// rather than derived from the distance to end-of-stream. This is what lets a
+/// **double-sided** `.dsd` present as two independent DFS volumes: side 0 lives
+/// at byte 0 of a `side0 ‖ side1` buffer, so its true body length is half the
+/// stream, not the whole thing. `body_len` must name one of the known
+/// single-sided geometries (102400 / 204800) and that many bytes must exist
+/// from `partition_offset`.
+pub fn looks_like_dfs_within<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    body_len: u64,
+) -> Option<DfsGeometry> {
+    let geom = DfsGeometry::from_body_len(body_len)?;
+    // The declared body must actually fit in the stream.
+    let end = reader.seek(SeekFrom::End(0)).ok()?;
+    if partition_offset.checked_add(body_len)? > end {
+        return None;
+    }
     reader.seek(SeekFrom::Start(partition_offset)).ok()?;
     let mut s0 = [0u8; SECTOR_SIZE];
     let mut s1 = [0u8; SECTOR_SIZE];
@@ -305,6 +330,26 @@ pub fn looks_like_dfs<R: Read + Seek>(
     Some(geom)
 }
 
+/// Geometry of a DFS **side** whose body length is taken from the catalogue's
+/// declared sector count rather than the stream length.
+///
+/// Used when opening one side of a de-interleaved `.dsd` (`side0 ‖ side1`):
+/// side 0 sits at byte 0 with `side1` following it, so the distance to
+/// end-of-stream spans both sides. The catalogue's `declared_total` names this
+/// side's own sector count; we trust it (validated to a known geometry and to
+/// fit within the stream) instead. Only call this once the caller already knows
+/// the offset holds a DFS side — [`PartitionTable::Dsd`](crate::partition) set
+/// the `acorndfs` dispatch string during detection.
+pub fn dfs_side_geometry<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Option<DfsGeometry> {
+    let (s0, s1) = read_two_sectors(reader, partition_offset).ok()?;
+    let cat = Catalogue::parse(&s0, &s1);
+    let geom = DfsGeometry::from_body_len(cat.declared_total as u64 * SECTOR_SIZE as u64)?;
+    looks_like_dfs_within(reader, partition_offset, geom.body_len())
+}
+
 /// An Acorn DFS filesystem over a flat single-sided sector body.
 pub struct DfsFilesystem<R: Read + Seek + Send> {
     reader: R,
@@ -319,8 +364,22 @@ impl<R: Read + Seek + Send> DfsFilesystem<R> {
             .seek(SeekFrom::End(0))?
             .checked_sub(partition_offset)
             .ok_or_else(|| FilesystemError::InvalidData("partition offset past EOF".into()))?;
-        let geom = DfsGeometry::from_body_len(len).ok_or_else(|| {
-            FilesystemError::InvalidData(format!("{len} bytes is not a known DFS geometry"))
+        Self::open_within(reader, partition_offset, len)
+    }
+
+    /// Open a DFS volume whose body length is supplied explicitly (rather than
+    /// derived from the stream length). This is how one side of a de-interleaved
+    /// `.dsd` opens: side 0 lives at byte 0 with side 1 following, so the
+    /// distance to end-of-stream is twice the real volume length. See
+    /// [`dfs_side_geometry`], which computes the side's `body_len` from its
+    /// catalogue.
+    pub fn open_within(
+        mut reader: R,
+        partition_offset: u64,
+        body_len: u64,
+    ) -> Result<Self, FilesystemError> {
+        let geom = DfsGeometry::from_body_len(body_len).ok_or_else(|| {
+            FilesystemError::InvalidData(format!("{body_len} bytes is not a known DFS geometry"))
         })?;
         let (s0, s1) = read_two_sectors(&mut reader, partition_offset)?;
         let cat = Catalogue::parse(&s0, &s1);

@@ -73,6 +73,7 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{
     CreateDirectoryOptions, CreateFileOptions, EditableFilesystem, Filesystem, FilesystemError,
 };
+use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};
 
 /// MFS magic — big-endian u16 at byte 1024.
 pub const MFS_SIGNATURE: u16 = 0xD2D7;
@@ -741,6 +742,282 @@ impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
         Ok(())
     }
 }
+// ---------------------------------------------------------------------------
+// fsck (check) — allocation-map-vs-directory reconciliation
+// ---------------------------------------------------------------------------
+
+/// Outcome of recomputing the allocated-block set from the directory. `used`
+/// is indexed by allocation-block number (valid entries live at 2..=num_alloc
+/// blocks + 1); `broken` lists structural faults (loop, out-of-range link,
+/// link into a free block, cross-link) that make the walk incomplete — while
+/// it is non-empty a map rewrite is unsafe.
+struct MfsWalk {
+    used: Vec<bool>,
+    files: u32,
+    broken: Vec<String>,
+}
+
+impl<R: Read + Seek + Send> MfsFilesystem<R> {
+    /// Highest addressable allocation block (blocks are numbered from 2).
+    fn last_block(&self) -> u16 {
+        self.mdb.num_alloc_blocks + 1
+    }
+
+    /// Walk one fork's allocation-block chain, marking every block it visits in
+    /// `used`. `owner` names the file for diagnostics. Structural faults are
+    /// pushed to `broken` (the walk of that fork stops at the fault).
+    fn walk_fork(
+        &self,
+        first: u16,
+        owner: &str,
+        fork: &str,
+        used: &mut [bool],
+        broken: &mut Vec<String>,
+    ) {
+        if first == 0 {
+            return;
+        }
+        let last = self.last_block();
+        let mut block = first;
+        for _ in 0..MAX_ALLOC_CHAIN {
+            if block < 2 || block > last {
+                broken.push(format!(
+                    "file '{owner}' {fork} fork links to block {block}, outside the volume (2..={last})"
+                ));
+                return;
+            }
+            if used[block as usize] {
+                broken.push(format!(
+                    "block {block} is cross-linked (claimed by '{owner}' {fork} fork and another chain)"
+                ));
+                return;
+            }
+            used[block as usize] = true;
+            let next = self.map_get(block);
+            if next == 1 {
+                return; // end-of-chain
+            }
+            if next == 0 {
+                broken.push(format!(
+                    "file '{owner}' {fork} fork chain hits a free block after {block}"
+                ));
+                return;
+            }
+            block = next;
+        }
+        broken.push(format!(
+            "file '{owner}' {fork} fork chain exceeds {MAX_ALLOC_CHAIN} blocks (runaway)"
+        ));
+    }
+
+    /// Recompute the allocated-block set from every in-use directory entry's
+    /// data + resource fork chain (the CBM/Atari VALIDATE model applied to the
+    /// MFS volume-allocation map).
+    fn compute_used(&self) -> MfsWalk {
+        let mut used = vec![false; self.last_block() as usize + 1];
+        let mut broken = Vec::new();
+        let mut files = 0u32;
+        let entries: Vec<MfsDirEntry> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_in_use())
+            .cloned()
+            .collect();
+        for de in &entries {
+            files += 1;
+            self.walk_fork(
+                de.data_first_block,
+                &de.name,
+                "data",
+                &mut used,
+                &mut broken,
+            );
+            self.walk_fork(
+                de.rsrc_first_block,
+                &de.name,
+                "resource",
+                &mut used,
+                &mut broken,
+            );
+        }
+        MfsWalk {
+            used,
+            files,
+            broken,
+        }
+    }
+
+    /// Count allocation blocks currently marked free in the on-disk map.
+    fn map_free_count(&self) -> u32 {
+        (2..=self.last_block())
+            .filter(|&b| self.map_get(b) == 0)
+            .count() as u32
+    }
+
+    /// MFS integrity check: reconcile the volume allocation-block map, the free
+    /// count, and the file count against the directory walk. Repair (freeing
+    /// unreachable blocks + fixing the counters) is offered only when the walk
+    /// completed without structural damage.
+    fn run_fsck(&mut self) -> Result<FsckResult, FilesystemError> {
+        let walk = self.compute_used();
+        let walk_clean = walk.broken.is_empty();
+        let last = self.last_block();
+
+        // Leaked blocks: marked allocated (map entry non-zero) but unreachable
+        // from any file's fork chain.
+        let mut leaked = 0u32;
+        for b in 2..=last {
+            if self.map_get(b) != 0 && !walk.used[b as usize] {
+                leaked += 1;
+            }
+        }
+
+        let mut errors = Vec::new();
+        for msg in &walk.broken {
+            errors.push(FsckIssue {
+                code: "MfsBrokenChain".into(),
+                message: msg.clone(),
+                repairable: false,
+                debug: false,
+            });
+        }
+        if leaked > 0 {
+            errors.push(FsckIssue {
+                code: "MfsLostBlocks".into(),
+                message: format!(
+                    "{leaked} allocation block(s) marked used but unreachable from any file"
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+
+        // Free-count reconciliation. The recomputed free count treats leaked
+        // blocks as free (they will be after a repair); the on-disk drFreeBks
+        // should match the *current* map, which counts them as allocated.
+        let map_free = self.map_free_count();
+        if self.mdb.free_blocks as u32 != map_free {
+            errors.push(FsckIssue {
+                code: "MfsFreeCountMismatch".into(),
+                message: format!(
+                    "MDB free-block count is {} but the allocation map has {map_free} free",
+                    self.mdb.free_blocks
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+
+        // File-count reconciliation.
+        if self.mdb.num_files as u32 != walk.files {
+            errors.push(FsckIssue {
+                code: "MfsFileCountMismatch".into(),
+                message: format!(
+                    "MDB file count is {} but the directory holds {} file(s)",
+                    self.mdb.num_files, walk.files
+                ),
+                repairable: walk_clean,
+                debug: false,
+            });
+        }
+
+        let repairable = errors.iter().any(|e| e.repairable);
+        let free_after = map_free + leaked; // free once leaked blocks are reclaimed
+        Ok(FsckResult {
+            errors,
+            warnings: Vec::new(),
+            stats: FsckStats {
+                files_checked: walk.files,
+                directories_checked: 1,
+                extra: vec![
+                    (
+                        "free blocks".into(),
+                        format!("{free_after} / {}", self.mdb.num_alloc_blocks),
+                    ),
+                    (
+                        "allocation map".into(),
+                        if leaked == 0 && walk_clean {
+                            "consistent".into()
+                        } else {
+                            "needs rebuild".into()
+                        },
+                    ),
+                ],
+            },
+            repairable,
+            orphaned_entries: Vec::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fsck (repair) — reclaim leaked blocks + resync the MDB counters
+// ---------------------------------------------------------------------------
+
+impl<R: Read + Write + Seek + Send> MfsFilesystem<R> {
+    /// Repair the volume allocation map + MDB counters. Leaked (allocated but
+    /// unreachable) blocks are freed; the free-block and file counts are reset
+    /// to match the directory. Withheld entirely when the walk found structural
+    /// damage — the MFS map encodes each file's chain linkage, so a broken
+    /// chain could hide live blocks and rewriting would risk data loss.
+    fn run_repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        let walk = self.compute_used();
+        if !walk.broken.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: vec![
+                    "structural damage (broken/cross-linked chain) — the allocation map was left \
+                     unchanged to avoid losing live blocks"
+                        .into(),
+                ],
+                unrepairable_count: walk.broken.len(),
+            });
+        }
+
+        let last = self.last_block();
+        let mut freed = 0u32;
+        for b in 2..=last {
+            if self.map_get(b) != 0 && !walk.used[b as usize] {
+                self.map_set(b, 0);
+                freed += 1;
+            }
+        }
+
+        let map_free = self.map_free_count();
+        let mut fixes = Vec::new();
+        if freed > 0 {
+            fixes.push(format!(
+                "reclaimed {freed} unreachable allocation block(s) into the free map"
+            ));
+        }
+        if self.mdb.free_blocks as u32 != map_free {
+            fixes.push(format!("corrected the MDB free-block count to {map_free}"));
+            self.mdb.free_blocks = map_free as u16;
+        }
+        if self.mdb.num_files as u32 != walk.files {
+            fixes.push(format!("corrected the MDB file count to {}", walk.files));
+            self.mdb.num_files = walk.files as u16;
+        }
+
+        if fixes.is_empty() {
+            return Ok(RepairReport {
+                fixes_applied: Vec::new(),
+                fixes_failed: Vec::new(),
+                unrepairable_count: 0,
+            });
+        }
+
+        self.map_write_back()?;
+        self.mdb_write_back()?;
+        self.reader.flush()?;
+        Ok(RepairReport {
+            fixes_applied: fixes,
+            fixes_failed: Vec::new(),
+            unrepairable_count: 0,
+        })
+    }
+}
+
 impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
         Ok(FileEntry::new_directory("/".into(), "/".into(), 0))
@@ -810,6 +1087,19 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
         (self.mdb.num_alloc_blocks - self.mdb.free_blocks) as u64 * self.mdb.alloc_block_size as u64
     }
 
+    /// MFS allocates fork storage in fixed-size allocation blocks
+    /// (`drAlBlkSiz`), so a fork's real on-disk footprint is its length
+    /// rounded up to this unit. Exposing it lets the copy preflight and
+    /// `du` model destination consumption exactly instead of falling back
+    /// to a 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        if self.mdb.alloc_block_size == 0 {
+            None
+        } else {
+            Some(self.mdb.alloc_block_size as u64)
+        }
+    }
+
     /// Stream a file's resource fork. MFS files carry a data + resource fork
     /// like HFS; consumers (`get-binhex`, MacBinary / AppleDouble export, `cp`,
     /// the remote daemon) reach it only through this trait method, so it must
@@ -829,6 +1119,10 @@ impl<R: Read + Seek + Send> Filesystem for MfsFilesystem<R> {
         self.entry_by_file_number(entry.location as u32)
             .map(|de| de.rsrc_logical_length as u64)
             .unwrap_or(0)
+    }
+
+    fn fsck(&mut self) -> Option<Result<FsckResult, FilesystemError>> {
+        Some(self.run_fsck())
     }
 }
 
@@ -996,6 +1290,10 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         Ok(self.mdb.free_blocks as u64 * self.mdb.alloc_block_size as u64)
     }
 
+    fn repair(&mut self) -> Result<RepairReport, FilesystemError> {
+        self.run_repair()
+    }
+
     /// Replace a file's resource fork (used by `setrsrc`, the batch archive
     /// importer, and fork-carrying `cp`). Frees the old resource chain, then
     /// allocates + writes the new one and updates the directory entry. Call
@@ -1104,6 +1402,135 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MfsFilesystem<R> {
         de.name = new_name.to_string();
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// create-blank formatter
+// ---------------------------------------------------------------------------
+
+/// Geometry of a freshly formatted MFS volume, in 512-byte logical sectors.
+struct MfsBlankGeom {
+    total_sectors: u64,
+    alloc_block_size: u32,
+    num_alloc_blocks: u16,
+    dir_start_sector: u16,
+    dir_length_sectors: u16,
+    first_alloc_block_sector: u16,
+}
+
+/// Directory length (in 512-byte sectors) for a blank volume. 12 sectors — the
+/// canonical 400 KB MFS directory — is the floor; larger volumes get more so a
+/// full floppy's file count isn't artificially capped. The on-disk `drDirLen`
+/// field is a u16 count of sectors, so 255 is a comfortable ceiling.
+fn blank_dir_sectors(num_alloc_blocks: u32) -> u64 {
+    (num_alloc_blocks as u64 / 40).clamp(12, 255)
+}
+
+/// Solve the reserved-region layout for a blank MFS volume of `size_bytes`.
+///
+/// MFS packs one 12-bit allocation-map entry per block, so at most 4094 blocks
+/// (0/1 reserved) are addressable; the allocation-block size is grown from
+/// 1 KiB in 512-byte steps until the data region fits under that ceiling. The
+/// reserved region is boot(2) + MDB/map + directory, solved to a fixed point
+/// because the map length depends on the block count, which depends on where
+/// the data region starts.
+fn mfs_blank_geometry(size_bytes: u64) -> Result<MfsBlankGeom, FilesystemError> {
+    const SECTOR: u64 = 512;
+    if size_bytes < 32 * SECTOR {
+        return Err(FilesystemError::InvalidData(
+            "MFS volume must be at least 16 KiB".into(),
+        ));
+    }
+    let total_sectors = size_bytes / SECTOR;
+
+    // Grow the block size (in sectors-per-block) until the block count fits the
+    // 12-bit map. spb 128 = 64 KiB blocks → ~256 MB, well past any real MFS.
+    for spb in 2..=128u64 {
+        let abs = spb * SECTOR;
+        let mut first_ab: u64 = 16; // seed with the canonical 400 KB value
+        let mut num_ab = 0u64;
+        let mut dir_start = 4u64;
+        let mut dir_len = 12u64;
+        let mut converged = false;
+        for _ in 0..16 {
+            if total_sectors <= first_ab {
+                break;
+            }
+            num_ab = (total_sectors - first_ab) / spb;
+            let map_bytes = (num_ab * 12).div_ceil(8);
+            // The MDB sits at sector 2; its allocation map begins 64 bytes in
+            // and may straddle into following sectors.
+            let mdb_map_sectors = (64 + map_bytes).div_ceil(SECTOR);
+            dir_start = 2 + mdb_map_sectors;
+            dir_len = blank_dir_sectors(num_ab as u32);
+            let next_first = dir_start + dir_len;
+            if next_first == first_ab {
+                converged = true;
+                break;
+            }
+            first_ab = next_first;
+        }
+        if !converged || num_ab == 0 {
+            continue;
+        }
+        if num_ab > 4094 {
+            continue; // too many blocks for the 12-bit map at this size — grow abs
+        }
+        return Ok(MfsBlankGeom {
+            total_sectors,
+            alloc_block_size: abs as u32,
+            num_alloc_blocks: num_ab as u16,
+            dir_start_sector: dir_start as u16,
+            dir_length_sectors: dir_len as u16,
+            first_alloc_block_sector: first_ab as u16,
+        });
+    }
+    Err(FilesystemError::InvalidData(
+        "MFS volume too large to format (max ~256 MB)".into(),
+    ))
+}
+
+/// Format a blank MFS volume of `size_bytes` with volume name `name`.
+///
+/// Produces a bare MFS image: zeroed boot blocks (non-bootable data volume),
+/// an MDB describing the geometry, an all-free allocation map, and an empty
+/// file directory. The canonical 400 KB / 800 KB floppy sizes format cleanly,
+/// as do larger sizes up to the 12-bit-map ceiling. The result round-trips
+/// through [`MfsFilesystem::open`] and accepts files via `EditableFilesystem`.
+pub fn create_blank_mfs(size_bytes: u64, name: &str) -> Result<Vec<u8>, FilesystemError> {
+    let g = mfs_blank_geometry(size_bytes)?;
+    let total_bytes = g.total_sectors * 512;
+    let mut disk = vec![0u8; total_bytes as usize];
+
+    // Clump size: 8 allocation blocks, capped at the data region so it stays
+    // meaningful on tiny volumes. Cosmetic (the allocator works in blocks), but
+    // real disks carry a sensible value here.
+    let data_bytes = g.num_alloc_blocks as u32 * g.alloc_block_size;
+    let clump = (g.alloc_block_size.saturating_mul(8)).min(data_bytes.max(g.alloc_block_size));
+
+    let mdb = &mut disk[MDB_OFFSET as usize..MDB_OFFSET as usize + 512];
+    BigEndian::write_u16(&mut mdb[0..2], MFS_SIGNATURE);
+    // Create / last-backup dates left 0 (Mac epoch); real Mac OS restamps them.
+    BigEndian::write_u16(&mut mdb[10..12], 0); // attributes
+    BigEndian::write_u16(&mut mdb[12..14], 0); // num files
+    BigEndian::write_u16(&mut mdb[14..16], g.dir_start_sector);
+    BigEndian::write_u16(&mut mdb[16..18], g.dir_length_sectors);
+    BigEndian::write_u16(&mut mdb[18..20], g.num_alloc_blocks);
+    BigEndian::write_u32(&mut mdb[20..24], g.alloc_block_size);
+    BigEndian::write_u32(&mut mdb[24..28], clump);
+    BigEndian::write_u16(&mut mdb[28..30], g.first_alloc_block_sector);
+    BigEndian::write_u32(&mut mdb[30..34], 1); // next file number
+    BigEndian::write_u16(&mut mdb[34..36], g.num_alloc_blocks); // all free
+
+    let name_bytes = super::hfs::utf8_to_mac_roman(name).unwrap_or_default();
+    let name_len = name_bytes.len().min(MFS_MAX_NAME_LEN);
+    mdb[36] = name_len as u8;
+    mdb[37..37 + name_len].copy_from_slice(&name_bytes[..name_len]);
+
+    // The allocation map (byte 64 of the MDB, straddling into later sectors)
+    // and the directory sectors are all-free / all-zero, which the surrounding
+    // zero-fill already provides.
+    Ok(disk)
 }
 
 #[cfg(test)]
@@ -1496,6 +1923,175 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidData, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // create-blank + fsck
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn create_blank_400k_round_trips_and_fscks_clean() {
+        let img = create_blank_mfs(MFS_400K_BYTES, "Blank400").unwrap();
+        assert_eq!(img.len() as u64, MFS_400K_BYTES);
+        let mut fs = MfsFilesystem::open(Cursor::new(img), 0).unwrap();
+        assert_eq!(fs.fs_type(), "MFS");
+        assert_eq!(fs.volume_label(), Some("Blank400"));
+        assert_eq!(fs.mdb.num_files, 0);
+        assert_eq!(fs.mdb.free_blocks, fs.mdb.num_alloc_blocks);
+        let root = fs.root().unwrap();
+        assert!(fs.list_directory(&root).unwrap().is_empty());
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "blank 400K should fsck clean: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn create_blank_geometry_valid_across_sizes() {
+        for size in [
+            MFS_400K_BYTES,
+            MFS_800K_BYTES,
+            1_474_560, // 1.44 MB
+            4 * 1024 * 1024,
+            20 * 1024 * 1024,
+        ] {
+            let img = create_blank_mfs(size, "Vol").unwrap();
+            let mut fs = MfsFilesystem::open(Cursor::new(img), 0).unwrap();
+            // Data region must fit inside the volume.
+            let (first_ab, nab, abs) = (
+                fs.mdb.first_alloc_block_sector as u64,
+                fs.mdb.num_alloc_blocks as u64,
+                fs.mdb.alloc_block_size as u64,
+            );
+            let last_sector = first_ab + nab * (abs / 512);
+            assert!(
+                last_sector <= size / 512,
+                "size {size}: data region ends at sector {last_sector}, past {}",
+                size / 512
+            );
+            assert!(nab <= 4094, "size {size}: too many blocks");
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(
+                res.is_clean(),
+                "size {size} should fsck clean: {:?}",
+                res.errors
+            );
+        }
+    }
+
+    #[test]
+    fn create_blank_too_small_is_rejected() {
+        assert!(create_blank_mfs(8 * 1024, "X").is_err());
+    }
+
+    #[test]
+    fn blank_volume_accepts_files_and_stays_clean() {
+        let img = create_blank_mfs(MFS_400K_BYTES, "Work").unwrap();
+        let mut cur = Cursor::new(img);
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            let root = fs.root().unwrap();
+            fs.create_file(
+                &root,
+                "ReadMe",
+                &mut &b"hello from a blank MFS volume"[..],
+                29,
+                &CreateFileOptions::default(),
+            )
+            .unwrap();
+            fs.sync_metadata().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        let root = fs.root().unwrap();
+        let entries = fs.list_directory(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "ReadMe");
+        assert_eq!(
+            fs.read_file(&entries[0], usize::MAX).unwrap(),
+            b"hello from a blank MFS volume"
+        );
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "populated volume should fsck clean: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn fsck_clean_on_synthetic_volume() {
+        let mut fs = MfsFilesystem::open(Cursor::new(build_test_mfs()), 0).unwrap();
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.is_clean(), "expected clean, got {:?}", res.errors);
+        assert_eq!(res.stats.files_checked, 2);
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_leaked_block() {
+        let mut cur = Cursor::new(build_test_mfs());
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            // Mark a currently-free block allocated (end-of-chain) without any
+            // directory entry referencing it: a leaked block.
+            fs.map_set(6, 1);
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(!res.is_clean());
+            assert!(res
+                .errors
+                .iter()
+                .any(|e| e.code == "MfsLostBlocks" && e.repairable));
+            assert!(res.repairable);
+            let report = fs.repair().unwrap();
+            assert_eq!(report.unrepairable_count, 0);
+            assert!(!report.fixes_applied.is_empty());
+            fs.reader.flush().unwrap();
+        }
+        // Reopen from disk: the reclaimed block is now free and fsck is clean.
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        assert_eq!(fs.map_get(6), 0, "block 6 reclaimed");
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(
+            res.is_clean(),
+            "post-repair should be clean: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn fsck_detects_and_repairs_file_count() {
+        let mut cur = Cursor::new(build_test_mfs());
+        {
+            let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+            fs.mdb.num_files = 9; // wrong (actual: 2)
+            let res = fs.fsck().unwrap().unwrap();
+            assert!(res
+                .errors
+                .iter()
+                .any(|e| e.code == "MfsFileCountMismatch" && e.repairable));
+            fs.repair().unwrap();
+            fs.reader.flush().unwrap();
+        }
+        cur.set_position(0);
+        let mut fs = MfsFilesystem::open(&mut cur, 0).unwrap();
+        assert_eq!(fs.mdb.num_files, 2);
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+    }
+
+    #[test]
+    fn fsck_withholds_repair_on_broken_chain() {
+        let mut fs = MfsFilesystem::open(Cursor::new(build_test_mfs()), 0).unwrap();
+        // Point a file's data fork past the end of the volume.
+        fs.entries[0].data_first_block = 50; // last valid block is 9
+        let res = fs.fsck().unwrap().unwrap();
+        assert!(res.errors.iter().any(|e| e.code == "MfsBrokenChain"));
+        assert!(!res.repairable, "a broken chain must not be repairable");
+        let report = fs.repair().unwrap();
+        assert!(report.fixes_applied.is_empty());
+        assert!(report.unrepairable_count >= 1);
     }
 
     #[test]

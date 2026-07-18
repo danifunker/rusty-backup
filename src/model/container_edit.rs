@@ -38,6 +38,10 @@ enum EditFormat {
     /// sector buffer; re-encoded via `sectors_to_woz` on commit. Fixed
     /// geometry, so the edited flat must keep the same length.
     Woz,
+    /// A double-sided Acorn DFS (`.dsd`). Decoded by de-interleaving the two
+    /// track-interleaved sides into a flat `side0 ‖ side1` buffer; re-interleaved
+    /// via `interleave_dsd` on commit. Fixed geometry.
+    Dsd,
 }
 
 /// A container opened for editing: decoded to a temp flat image that the caller
@@ -98,6 +102,23 @@ impl ContainerEditSession {
             });
         }
 
+        // Double-sided Acorn DFS: de-interleave the two sides into the flat
+        // `side0 ‖ side1` buffer the DFS editor mutates; re-interleave on commit.
+        if crate::model::source_reader::is_dsd_path(path) {
+            let raw =
+                std::fs::read(path).with_context(|| format!("read DSD {}", path.display()))?;
+            let flat = crate::rbformats::interleave::deinterleave_dsd(&raw)
+                .ok_or_else(|| anyhow::anyhow!("{} is not a valid .dsd image", path.display()))?;
+            std::fs::write(temp.path(), &flat)
+                .with_context(|| format!("write decoded flat to {}", temp.path().display()))?;
+            return Ok(Self {
+                original_path: path.to_path_buf(),
+                format: EditFormat::Dsd,
+                original_flat_len: flat.len() as u64,
+                temp,
+            });
+        }
+
         let (kind, flat) = decode_floppy_container_file(path)?;
         std::fs::write(temp.path(), &flat)
             .with_context(|| format!("write decoded flat to {}", temp.path().display()))?;
@@ -122,6 +143,7 @@ impl ContainerEditSession {
             EditFormat::Floppy(kind) => kind.display_name(),
             EditFormat::Gzip => "gzip",
             EditFormat::Woz => "woz",
+            EditFormat::Dsd => "dsd",
         }
     }
 
@@ -172,6 +194,22 @@ impl ContainerEditSession {
                 }
                 crate::rbformats::woz_write::sectors_to_woz(&flat)
                     .context("re-encode WOZ container")?
+            }
+            EditFormat::Dsd => {
+                let flat = std::fs::read(self.temp.path())
+                    .with_context(|| format!("read edited flat {}", self.temp.path().display()))?;
+                // DFS edits stay within the fixed side geometry, so the
+                // de-interleaved flat must keep its length; interleave_dsd only
+                // accepts the known DSD sizes.
+                if flat.len() as u64 != self.original_flat_len {
+                    anyhow::bail!(
+                        "edited image changed size ({} -> {} bytes); .dsd discs are fixed-geometry",
+                        self.original_flat_len,
+                        flat.len()
+                    );
+                }
+                crate::rbformats::interleave::interleave_dsd(&flat)
+                    .ok_or_else(|| anyhow::anyhow!("re-interleave .dsd container"))?
             }
         };
 

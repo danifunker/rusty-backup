@@ -2799,6 +2799,19 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
         (self.mdb.total_blocks - self.mdb.free_blocks) as u64 * self.mdb.block_size as u64
     }
 
+    /// HFS allocates fork storage in fixed-size allocation blocks
+    /// (`drAlBlkSiz`), so a fork's real on-disk footprint is its length
+    /// rounded up to this unit. Exposing it lets the copy preflight and
+    /// `du` model destination consumption exactly instead of falling back
+    /// to a 512-byte floor.
+    fn allocation_unit(&self) -> Option<u64> {
+        if self.mdb.block_size == 0 {
+            None
+        } else {
+            Some(self.mdb.block_size as u64)
+        }
+    }
+
     fn last_data_byte(&mut self) -> Result<u64, FilesystemError> {
         let bitmap = self.read_volume_bitmap()?;
         let last_block = find_last_set_bit(&bitmap, self.mdb.total_blocks as u32);

@@ -1,0 +1,17 @@
+# Resource-fork + Finder-info oracle for tests/fixtures/test_apfs_rsrc.img.zst
+#
+# A 16 MiB bare (no partition scheme) unencrypted APFS container, volume
+# "RsrcTest", captured from macOS. Each file's resource fork was written via
+# its `..namedfork/rsrc` path; sizes below come from `stat -f%z` (data fork)
+# and the rsrc namedfork size (resource fork). Type/creator/flags for the
+# `Typed` file were set with `SetFile -t APPL -c ttxt -a C` and read back with
+# `GetFileInfo` / `xattr -px com.apple.FinderInfo` — i.e. exactly what macOS
+# reports. Fork bytes are a single repeated ASCII char so a reader can verify
+# content, not just length.
+#
+# Format: <name>  data=<bytes>  rsrc=<bytes>[/<fill>]  storage  [type/creator/flags]
+#
+BigApp     data=15  rsrc=6017/R  stream      # XATTR_DATA_STREAM (j_xattr_dstream)
+TinyApp    data=1   rsrc=40/T    embedded    # XATTR_DATA_EMBEDDED (inline xdata)
+Plain.txt  data=9   rsrc=0       none        # no com.apple.ResourceFork xattr
+Typed      data=8   rsrc=20/F    stream?     # type=APPL creator=ttxt flags=0x0400 (hasCustomIcon)

@@ -36,6 +36,7 @@ fn top_level_verbs_present() {
     for verb in &[
         "new",
         "ls",
+        "du",
         "put",
         "get",
         "cp",

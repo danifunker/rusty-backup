@@ -68,7 +68,8 @@ pub fn detect_alignment(table: &PartitionTable) -> PartitionAlignment {
         | PartitionTable::Sgi(_)
         | PartitionTable::Ahdi(_)
         | PartitionTable::X68k { .. }
-        | PartitionTable::None { .. } => (0, 0),
+        | PartitionTable::None { .. }
+        | PartitionTable::Dsd { .. } => (0, 0),
     };
 
     // Check for DOS traditional alignment: first partition at LBA 63

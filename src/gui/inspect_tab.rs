@@ -1964,6 +1964,11 @@ impl InspectTab {
                         .on_hover_text(
                             "Apple II WOZ 2.0 (floppy only: 140K / 400K / 800K sources)",
                         );
+                    ui.radio_value(&mut self.export_format, ExportFormat::Moof, "MOOF (.moof)")
+                        .on_hover_text(
+                            "Applesauce Macintosh 3.5\" GCR bitstream (floppy only: 400K / 800K). \
+                             Loadable by Snow / MAME / Applesauce.",
+                        );
                     ui.radio_value(
                         &mut self.export_format,
                         ExportFormat::Dc42,

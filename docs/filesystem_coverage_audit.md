@@ -49,7 +49,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 
 | Filesystem | Detect | Browse | Edit | Create | Shrink/Grow | fsck | Systems / era |
 |---|---|---|---|---|---|---|---|
-| MFS (Macintosh File System) | Auto | Yes | Yes | No | No | No | Mac 128K / 512K / Plus, 400 KB SS floppies (1984–86) |
+| MFS (Macintosh File System) | Auto | Yes | Yes | Yes (`--fs mfs`) | N/A (fixed floppy) | check+repair | Mac 128K / 512K / Plus, 400 / 800 KB floppies (1984–86) |
 | HFS (Mac OS Standard) | Auto | Yes | Yes | Yes | Yes (block-size clone) | check+repair | Classic Mac OS (System 7–9), 68k / early PPC |
 | HFS+ / HFSX | Auto | Yes | Yes | Yes | Yes (defrag clone) | check+repair | Mac OS 8.1 → macOS; embedded + wrapped variants |
 | HFV (flat HFS) | via HFS | Yes | Yes | Yes (`--fs hfv`) | Yes | check+repair | BasiliskII / SheepShaver — flat classic HFS ≤ 2047 MB, no APM wrapper |
@@ -106,7 +106,7 @@ filesystem-*aware* value-adds (browse, edit, shrink, fsck) on top of that.
 | Acorn DFS | Auto | Yes | Yes | Yes | — (fixed geometry) | Yes | BBC Micro / Master, Acorn Electron. fsck = contiguous-file consistency (overlap + out-of-bounds detection; canonical descending-catalogue reorder as the repair) |
 | TR-DOS | Auto | Yes | Yes | Yes (`--fs trdos`) | — (fixed geometry) | check+repair | ZX Spectrum Beta Disk (`.trd`, 80-/40-track SS/DS). Flat 128-entry catalogue of contiguous files, append at a first-free high-water mark. fsck = catalogue-packing check + disk-info-counter reconciliation (repair withheld on structural damage); full quartet, clean-room-oracle-validated |
 | TI-99/4A | Auto | Yes | Yes | Yes (`--fs ti99`) | — (fixed geometry) | check+repair | TI-99/4A (flat V9T9 `.dsk`, SSSD/DSSD/DSDD). VIB allocation bitmap + sorted FDIR of extent-based FDRs, big-endian. fsck = VIB-bitmap-vs-directory-walk reconciliation + cross-link detection (repair withheld on structural damage); full quartet, validated against BOTH MAME's `imgtool` and a clean-room oracle |
-| Acorn ADFS / FileCore | Auto / String | Yes | Partial (create/delete, E-format) | No | No | No | Acorn Archimedes, BBC Master, RISC OS |
+| Acorn ADFS / FileCore | Auto / String | Yes | Yes (new-map E/F/HD + old-map D) | Yes (`--fs adfs`, E-format) | N/A (fixed floppy) | check+repair (new-map) | Acorn Archimedes, BBC Master, RISC OS. Old-map D-format read+write validated vs real Repton 3 / Lemmings |
 | CP/M (2.2 / 3 / Plus) | **String** | Yes | Yes | Yes (`--fs cpm --cpm-preset`) | No | check+repair | Amstrad CPC/PCW, Einstein, SV-328, Altair, MultiComp, ZX +3 (9 DPBs — see §2) |
 | Human68k (FAT12 / FAT16) | Auto / String | Yes | Yes | Yes | Yes (HDD in-place + defrag repack) | Yes | Sharp X68000 (big-endian FAT dialect). fsck = FAT allocation reconciliation vs the directory tree (VALIDATE model): reclaims lost clusters, resyncs the backup FAT copy, surfaces cross-links / broken chains |
 | QDOS (QXL.WIN) | Auto / String | Yes | Yes | No | Yes (in-place resize) | No | Sinclair QL hard-disk container |

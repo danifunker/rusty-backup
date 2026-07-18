@@ -87,7 +87,8 @@ pub fn run(args: LsArgs) -> Result<()> {
         pw_bytes,
         args.fs_override.fs_type.as_deref(),
         args.inside.as_deref(),
-    )?;
+    )
+    .map_err(|e| crate::cli::optical_hint::with_optical_hint(e, &args.image.path))?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
     let mut fs = crate::fs::open_filesystem_with_passphrase(
@@ -97,7 +98,12 @@ pub fn run(args: LsArgs) -> Result<()> {
         ctx.type_string.as_deref(),
         args.password.as_deref(),
     )
-    .map_err(|e| anyhow!("opening filesystem: {e}"))?;
+    .map_err(|e| {
+        crate::cli::optical_hint::with_optical_hint(
+            anyhow!("opening filesystem: {e}"),
+            &args.image.path,
+        )
+    })?;
 
     // Volume-level advisory: surface the blessed System Folder (HFS / HFS+)
     // so users see what's currently bootable without a separate `bless show`.

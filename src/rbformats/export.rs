@@ -47,6 +47,9 @@ pub enum ExportFormat {
     TwoMg,
     /// WOZ 2.0 (Apple II GCR bitstream) — floppy-only: 140K, 400K, or 800K sources.
     Woz,
+    /// MOOF (Applesauce Macintosh 3.5" GCR bitstream) — floppy-only: 400K or
+    /// 800K sources. Same GCR encoding as WOZ 3.5" in a Mac-flavoured container.
+    Moof,
     /// DiskCopy 4.2 (Mac / Apple IIgs) — floppy-only: 400K / 720K / 800K / 1440K sources.
     Dc42,
     /// MAME CHD, hard-disk profile (512-byte unit). Behind the `chd`
@@ -89,6 +92,7 @@ impl ExportFormat {
             Self::Raw => "img",
             Self::TwoMg => "2mg",
             Self::Woz => "woz",
+            Self::Moof => "moof",
             Self::Dc42 => "dsk",
             Self::Chd | Self::ChdDvd | Self::ChdCd => "chd",
             Self::BinCue => "cue",
@@ -111,6 +115,7 @@ impl ExportFormat {
             Self::Raw => "Raw Image",
             Self::TwoMg => "2MG (Apple II)",
             Self::Woz => "WOZ (Apple II)",
+            Self::Moof => "MOOF (Macintosh)",
             Self::Dc42 => "DiskCopy 4.2",
             Self::Chd => "CHD (Hard Disk)",
             Self::ChdDvd => "DVD CHD",
@@ -138,6 +143,7 @@ impl ExportFormat {
             Self::Raw => ("Raw Images", &["img", "raw", "bin", "dd"]),
             Self::TwoMg => ("2MG Files", &["2mg"]),
             Self::Woz => ("WOZ Files", &["woz"]),
+            Self::Moof => ("MOOF Files", &["moof"]),
             Self::Dc42 => ("DiskCopy 4.2", &["dsk", "image", "dc42", "img"]),
             Self::Chd | Self::ChdDvd | Self::ChdCd => ("MAME CHD", &["chd"]),
             Self::BinCue => ("BIN/CUE Sheet", &["cue"]),
@@ -155,7 +161,7 @@ impl ExportFormat {
     pub fn is_floppy_only(&self) -> bool {
         matches!(
             self,
-            Self::Woz | Self::Dc42 | Self::Xdf | Self::Hdm | Self::Dim | Self::D88
+            Self::Woz | Self::Moof | Self::Dc42 | Self::Xdf | Self::Hdm | Self::Dim | Self::D88
         )
     }
 
@@ -270,6 +276,29 @@ fn write_woz_from_sectors(
         .with_context(|| format!("failed to write {}", dest_path.display()))?;
     log_cb(&format!(
         "WOZ export complete: {} ({} input bytes -> {} WOZ bytes)",
+        dest_path.display(),
+        sectors.len(),
+        bytes.len(),
+    ));
+    Ok(())
+}
+
+/// Encode raw sector bytes as an Applesauce MOOF file and write to `dest_path`.
+///
+/// `sectors.len()` must be 409,600 (400K single-sided) or 819,200 (800K
+/// double-sided) — MOOF is 3.5"-only; [`crate::rbformats::moof::sectors_to_moof`]
+/// rejects anything else.
+fn write_moof_from_sectors(
+    sectors: &[u8],
+    dest_path: &Path,
+    log_cb: &mut impl FnMut(&str),
+) -> Result<()> {
+    let bytes = crate::rbformats::moof::sectors_to_moof(sectors)
+        .context("MOOF export failed: source is not a 400K or 800K 3.5\" floppy")?;
+    std::fs::write(dest_path, &bytes)
+        .with_context(|| format!("failed to write {}", dest_path.display()))?;
+    log_cb(&format!(
+        "MOOF export complete: {} ({} input bytes -> {} MOOF bytes)",
         dest_path.display(),
         sectors.len(),
         bytes.len(),
@@ -637,7 +666,7 @@ pub fn export_whole_disk(
     // WOZ and DiskCopy 4.2: floppy-only.  Reconstruct (or slurp) the source
     // into memory, then encode.  Raw-image path covers superfloppies (2MG,
     // .dsk, DC42, etc.); backup-folder path reconstructs the whole disk first.
-    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
+    if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let buf = if let Some(meta) = backup_metadata {
             let mut buf: Vec<u8> = Vec::new();
             reconstruct_disk_from_backup(
@@ -669,6 +698,8 @@ pub fn export_whole_disk(
         };
         return if format == ExportFormat::Woz {
             write_woz_from_sectors(&buf, dest_path, &mut log_cb)
+        } else if format == ExportFormat::Moof {
+            write_moof_from_sectors(&buf, dest_path, &mut log_cb)
         } else {
             write_dc42_from_sectors(&buf, dest_path, &mut log_cb)
         };
@@ -936,7 +967,7 @@ pub fn export_partition(
 
     // WOZ / DiskCopy 4.2: slurp into memory, encode, write.  Requires the
     // decompressed partition size to be a recognised floppy size.
-    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
+    if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let buf = read_source_to_memory(
             source_path,
             compression_type,
@@ -947,6 +978,8 @@ pub fn export_partition(
         )?;
         return if format == ExportFormat::Woz {
             write_woz_from_sectors(&buf, dest_path, &mut log_cb)
+        } else if format == ExportFormat::Moof {
+            write_moof_from_sectors(&buf, dest_path, &mut log_cb)
         } else {
             write_dc42_from_sectors(&buf, dest_path, &mut log_cb)
         };
@@ -1106,13 +1139,15 @@ fn convert_from_vhd_temp(
     let data_size = vhd_size.saturating_sub(512); // strip VHD footer
 
     // WOZ / DC42 path: read the stripped data into memory, encode, write.
-    if format == ExportFormat::Woz || format == ExportFormat::Dc42 {
+    if format == ExportFormat::Woz || format == ExportFormat::Moof || format == ExportFormat::Dc42 {
         let mut f = File::open(vhd_path)
             .with_context(|| format!("failed to open {}", vhd_path.display()))?;
         let mut buf = vec![0u8; data_size as usize];
         f.read_exact(&mut buf).context("failed to read VHD temp")?;
         return if format == ExportFormat::Woz {
             write_woz_from_sectors(&buf, dest_path, log_cb)
+        } else if format == ExportFormat::Moof {
+            write_moof_from_sectors(&buf, dest_path, log_cb)
         } else {
             write_dc42_from_sectors(&buf, dest_path, log_cb)
         };
