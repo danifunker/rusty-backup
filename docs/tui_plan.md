@@ -131,9 +131,15 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - [x] Rip: drive -> config (output path / format ISO|BIN-CUE / eject) -> run
   `optical::rip::run_rip(config, Arc<Mutex<RipProgress>>)` on a worker thread
   (same threading + progress-bar pattern as Backup/Restore); Esc cancels.
-- [ ] Browse/extract of an optical image and `optical new` (SGI EFS) deferred —
-  optical browse is a distinct code path from the partition Explorer.
-- **Verified here:** drive enumeration + screen render (no drive in CI sandbox).
+- [x] Optical *image* operations launcher (`i` on the Drives step): a menu
+  (Browse / Extract / Info / Convert / New SGI-EFS) prefills the `:` command
+  palette with the matching `optical ...` verb, run through shared CLI dispatch.
+  Optical browse/extract use the `opticaldiscs` crate's own filesystem trait (a
+  distinct browser from the partition Explorer), so — like the Explorer's
+  transforms — they're palette-served rather than a second inline browser.
+- **Verified here:** drive enumeration + screen render (no drive in CI sandbox);
+  the `i` launcher's "New SGI EFS" ran through the palette and produced a valid
+  629 MB SGI-EFS `.iso` (`rb-cli inspect` shows the SYSV slot-7 + VOLHDR layout).
   **Needs a physical drive** to verify an end-to-end rip (wired per the CLI's
   `run_rip` path, so it mirrors a proven flow).
 
@@ -143,10 +149,12 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - [x] Extract to a host folder preserving forks via `macarchive::extract::
   extract_all` in a chosen container format (`f` cycles BinHex / MacBinary /
   AppleDouble / Raw). Synchronous — archives are small.
-- [ ] Create an archive from image contents deferred (host-file create is
-  available via `rb-cli archive create`).
+- [x] Create an archive from host files: `c` on the empty Archives screen
+  prefills the `:` palette with `archive create` (the supported create form),
+  run through shared CLI dispatch. Creating from *image contents* stays a
+  stage-to-host-then-archive job and is deferred.
 - **Verified:** opened a `.mar` (entry list matched `rb-cli archive list`),
-  extracted to `.hqx` host files.
+  extracted to `.hqx` host files; `c` prefills the archive-create command line.
 
 ### Step 6 — Commander tab  [core DONE]
 - [x] Dual-pane, each pane a host folder (`DirListing::load_host_root`) OR an

@@ -1308,6 +1308,29 @@ const RIP_FORMATS: &[(&str, crate::optical::rip::RipFormat)] = &[
 /// Config-form rows: 0 output, 1 format, 2 eject, 3 "Start".
 const OPTICAL_FIELDS: usize = 4;
 
+/// Optical *image* operations (as opposed to ripping a physical drive), offered
+/// by the Optical tab's `i` launcher. Optical browse/extract run on the
+/// `opticaldiscs` crate's own filesystem trait — a distinct code path from the
+/// partition Explorer — so, like the Explorer's transforms, they're launched
+/// through the `:` command palette (shared CLI `dispatch`) with a template the
+/// user completes. `(label, verb-template)`.
+const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
+    ("Browse an optical image", "optical browse \"<IMAGE.iso>\""),
+    (
+        "Extract files to a folder",
+        "optical extract --to \"<OUTPUT_DIR>\" \"<IMAGE.iso>\"",
+    ),
+    ("Show volume info", "optical info \"<IMAGE.iso>\""),
+    (
+        "Convert to another format",
+        "optical convert --format iso \"<IMAGE>\" \"<OUTPUT.iso>\"",
+    ),
+    (
+        "New blank CD-ROM (SGI EFS)",
+        "optical new sgi-efs \"<OUTPUT.iso>\"",
+    ),
+];
+
 struct OpticalState {
     step: OpticalStep,
     drives: Vec<crate::model::optical_devices::RipDevice>,
@@ -1323,6 +1346,8 @@ struct OpticalState {
     op: String,
     result: Option<String>,
     is_error: bool,
+    /// The optical-image-operations launcher menu (selected index), when open.
+    image_menu: Option<usize>,
 }
 
 impl Default for OpticalState {
@@ -1342,6 +1367,7 @@ impl Default for OpticalState {
             op: String::new(),
             result: None,
             is_error: false,
+            image_menu: None,
         }
     }
 }
@@ -4485,7 +4511,43 @@ impl App {
             return true;
         }
 
+        // Optical-image-operations launcher menu (modal).
+        if self
+            .optical
+            .as_ref()
+            .map(|o| o.image_menu.is_some())
+            .unwrap_or(false)
+        {
+            let sel = self
+                .optical
+                .as_ref()
+                .and_then(|o| o.image_menu)
+                .unwrap_or(0);
+            match code {
+                KeyCode::Esc => self.optical.as_mut().unwrap().image_menu = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.optical.as_mut().unwrap().image_menu = Some(sel.saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.optical.as_mut().unwrap().image_menu =
+                        Some((sel + 1).min(OPTICAL_IMAGE_OPS.len() - 1));
+                }
+                KeyCode::Enter => {
+                    self.optical.as_mut().unwrap().image_menu = None;
+                    let tmpl = OPTICAL_IMAGE_OPS.get(sel).map(|t| t.1).unwrap_or("");
+                    self.palette_input = Some(tmpl.to_string());
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         let step = self.optical.as_ref().unwrap().step;
+        // `i` opens the optical-image-operations launcher from any step.
+        if code == KeyCode::Char('i') {
+            self.optical.as_mut().unwrap().image_menu = Some(0);
+            return true;
+        }
         if step == OpticalStep::Config
             && code == KeyCode::Enter
             && self.optical.as_ref().map(|o| o.field).unwrap_or(0) == 3
@@ -4713,6 +4775,15 @@ impl App {
                         FilePicker::new(PickKind::File, "Open a Mac archive").with_recent(recent),
                     );
                     a.picker_dest = false;
+                    true
+                }
+                // `c` prefills the `:` palette with `archive create` (from host
+                // files — the supported create form; the palette runs it through
+                // shared CLI dispatch). Creating from image contents stays a
+                // stage-to-host-then-archive job, deferred.
+                KeyCode::Char('c') => {
+                    self.palette_input =
+                        Some("archive create \"<OUTPUT.sit>\" <HOST_FILE> ...".to_string());
                     true
                 }
                 _ => false,
@@ -6760,6 +6831,10 @@ impl App {
                 Span::styled("  Enter / o  ", self.palette.accent()),
                 Span::raw("choose an archive file"),
             ]));
+            lines.push(Line::from(vec![
+                Span::styled("  c         ", self.palette.accent()),
+                Span::raw("create an archive from host files (via the command line)"),
+            ]));
             if let Some(s) = &a.status {
                 lines.push(Line::raw(""));
                 let style = if a.is_error {
@@ -6858,7 +6933,7 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Up/Down select   Enter next   r rescan",
+                    "Up/Down select   Enter next   r rescan   i image ops (browse/extract/new)",
                     self.palette.dim(),
                 ));
                 if let Some(note) = self.device_note() {
@@ -6960,6 +7035,35 @@ impl App {
         );
         if let Some(picker) = &o.picker {
             picker.draw(frame, area, self.palette, self.border);
+        }
+        // Optical-image-operations launcher menu overlay.
+        if let Some(sel) = o.image_menu {
+            let mut mlines: Vec<Line> = vec![Line::raw("")];
+            for (i, (label, _)) in OPTICAL_IMAGE_OPS.iter().enumerate() {
+                let on = i == sel;
+                let marker = if on { "> " } else { "  " };
+                let style = if on {
+                    self.palette
+                        .accent()
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    self.palette.accent()
+                };
+                mlines.push(Line::styled(format!("{marker}{label}"), style));
+            }
+            mlines.push(Line::raw(""));
+            mlines.push(Line::styled(
+                "  Enter -> prefills the command line; edit and run.  Esc cancel",
+                self.palette.dim(),
+            ));
+            let h = (mlines.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let popup = centered_rect(60, h, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(mlines))
+                    .block(self.pane_block("Optical image operations", true)),
+                popup,
+            );
         }
     }
 
