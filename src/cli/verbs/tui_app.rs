@@ -1294,6 +1294,42 @@ impl Default for OpticalState {
     }
 }
 
+/// Fork container formats for archive extraction.
+const ARCHIVE_FORK_FORMATS: &[(&str, crate::macarchive::extract::ForkFormat)] = &[
+    (
+        "BinHex (.hqx)",
+        crate::macarchive::extract::ForkFormat::BinHex,
+    ),
+    (
+        "MacBinary (.bin)",
+        crate::macarchive::extract::ForkFormat::MacBinary,
+    ),
+    (
+        "AppleDouble",
+        crate::macarchive::extract::ForkFormat::AppleDouble,
+    ),
+    ("Raw (.rsrc)", crate::macarchive::extract::ForkFormat::Raw),
+];
+
+/// The Archives screen: open a classic Mac archive (`.sit` / `.sea` / `.cpt` /
+/// `.mar` / `.hqx`), list its entries, and extract to the host preserving forks.
+/// Extraction is synchronous (archives are small) via `macarchive::extract`.
+#[derive(Default)]
+struct ArchiveState {
+    picker: Option<FilePicker>,
+    /// When true, a picker confirm chooses the extract destination folder.
+    picker_dest: bool,
+    archive_path: String,
+    bytes: Vec<u8>,
+    archive: Option<crate::macarchive::stuffit::StuffItArchive>,
+    /// Pre-rendered entry lines for display.
+    entries: Vec<String>,
+    list_sel: usize,
+    fork_fmt_sel: usize,
+    status: Option<String>,
+    is_error: bool,
+}
+
 /// The Settings tab state: the loaded `UpdateConfig` plus a cursor over the
 /// editable preference toggles. Edits save straight back to `config.json` via
 /// `UpdateConfig::save` (the same file the GUI reads/writes).
@@ -1340,6 +1376,8 @@ struct App {
     bulk: Option<BulkState>,
     /// The Optical (rip) screen state (lazily created on first visit).
     optical: Option<OpticalState>,
+    /// The Archives screen state (lazily created on first visit).
+    archive: Option<ArchiveState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     show_help: bool,
@@ -1367,6 +1405,7 @@ impl App {
             restore: None,
             bulk: None,
             optical: None,
+            archive: None,
             settings: None,
             show_help: false,
             should_quit: false,
@@ -1487,6 +1526,11 @@ impl App {
 
         // The Optical screen owns most keys on its tab.
         if self.current() == TabId::Optical && self.handle_optical_key(key.code) {
+            return Ok(());
+        }
+
+        // The Archives screen owns most keys on its tab.
+        if self.current() == TabId::Archives && self.handle_archive_key(key.code) {
             return Ok(());
         }
 
@@ -2330,6 +2374,9 @@ impl App {
                 drives: crate::model::optical_devices::list_local_rip_devices(),
                 ..OpticalState::default()
             });
+        }
+        if self.current() == TabId::Archives && self.archive.is_none() {
+            self.archive = Some(ArchiveState::default());
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -3583,6 +3630,203 @@ impl App {
         });
     }
 
+    /// Archives screen keys. Returns `true` when consumed.
+    fn handle_archive_key(&mut self, code: KeyCode) -> bool {
+        if self.archive.is_none() {
+            self.archive = Some(ArchiveState::default());
+        }
+        // Archive / destination picker (modal).
+        if self
+            .archive
+            .as_ref()
+            .map(|a| a.picker.is_some())
+            .unwrap_or(false)
+        {
+            let for_dest = self.archive.as_ref().unwrap().picker_dest;
+            let res = self
+                .archive
+                .as_mut()
+                .unwrap()
+                .picker
+                .as_mut()
+                .unwrap()
+                .handle_key(code);
+            match res {
+                Some(PickResult::Cancel) => self.archive.as_mut().unwrap().picker = None,
+                Some(PickResult::Confirm(path)) => {
+                    self.archive.as_mut().unwrap().picker = None;
+                    if for_dest {
+                        self.archive_extract(path);
+                    } else {
+                        self.load_archive(path);
+                    }
+                }
+                None => {}
+            }
+            return true;
+        }
+
+        let loaded = self
+            .archive
+            .as_ref()
+            .map(|a| a.archive.is_some())
+            .unwrap_or(false);
+        let page = self.explorer_page() as isize;
+        let a = self.archive.as_mut().unwrap();
+        if !loaded {
+            return match code {
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    let recent = crate::update::load_recent(crate::update::RecentMode::Archives);
+                    a.picker = Some(
+                        FilePicker::new(PickKind::File, "Open a Mac archive").with_recent(recent),
+                    );
+                    a.picker_dest = false;
+                    true
+                }
+                _ => false,
+            };
+        }
+        // Archive loaded: browse the entry list, choose format, extract.
+        let n = a.entries.len() as isize;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                a.list_sel = a.list_sel.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                a.list_sel = ((a.list_sel as isize + 1).min(n - 1).max(0)) as usize;
+                true
+            }
+            KeyCode::PageUp => {
+                a.list_sel = (a.list_sel as isize - page).max(0) as usize;
+                true
+            }
+            KeyCode::PageDown => {
+                a.list_sel = ((a.list_sel as isize + page).min(n - 1).max(0)) as usize;
+                true
+            }
+            KeyCode::Home => {
+                a.list_sel = 0;
+                true
+            }
+            KeyCode::End => {
+                a.list_sel = (n - 1).max(0) as usize;
+                true
+            }
+            KeyCode::Char('f') => {
+                a.fork_fmt_sel = (a.fork_fmt_sel + 1) % ARCHIVE_FORK_FORMATS.len();
+                true
+            }
+            KeyCode::Char('e') => {
+                a.picker = Some(FilePicker::new(PickKind::Dir, "Extract to folder"));
+                a.picker_dest = true;
+                a.status = None;
+                true
+            }
+            KeyCode::Esc => {
+                // Close the archive, back to the open prompt.
+                *a = ArchiveState::default();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Open a Mac archive and pre-render its entry list.
+    fn load_archive(&mut self, path: std::path::PathBuf) {
+        match crate::macarchive::extract::open(&path) {
+            Ok((bytes, archive)) => {
+                let mut entries = Vec::new();
+                for e in &archive.entries {
+                    if e.is_dir {
+                        entries.push(format!("DIR   {}/", e.display_path()));
+                        continue;
+                    }
+                    let data = e
+                        .data
+                        .as_ref()
+                        .filter(|f| f.uncompressed_len > 0)
+                        .map(|f| format!("data {}", format_size(f.uncompressed_len as u64)))
+                        .unwrap_or_default();
+                    let rsrc = e
+                        .rsrc
+                        .as_ref()
+                        .filter(|f| f.uncompressed_len > 0)
+                        .map(|f| format!("rsrc {}", format_size(f.uncompressed_len as u64)))
+                        .unwrap_or_default();
+                    let ty = crate::fs::hfs::format_ostype(&e.type_code);
+                    let cr = crate::fs::hfs::format_ostype(&e.creator_code);
+                    entries.push(format!(
+                        "FILE  {:<34} {:>4} {:>4}  {}  {}",
+                        e.display_path(),
+                        ty,
+                        cr,
+                        data,
+                        rsrc
+                    ));
+                }
+                crate::update::push_recent(
+                    crate::update::RecentMode::Archives,
+                    &path.to_string_lossy(),
+                );
+                if let Some(a) = self.archive.as_mut() {
+                    a.archive_path = path.display().to_string();
+                    a.bytes = bytes;
+                    a.archive = Some(archive);
+                    a.entries = entries;
+                    a.list_sel = 0;
+                    a.status = Some(format!("Opened ({} entries).", a.entries.len()));
+                    a.is_error = false;
+                }
+            }
+            Err(e) => {
+                if let Some(a) = self.archive.as_mut() {
+                    a.status = Some(format!("Cannot open archive: {e:#}"));
+                    a.is_error = true;
+                }
+            }
+        }
+    }
+
+    /// Extract the open archive to `dest` in the chosen fork format.
+    fn archive_extract(&mut self, dest: std::path::PathBuf) {
+        let Some(a) = self.archive.as_ref() else {
+            return;
+        };
+        let Some(archive) = a.archive.as_ref() else {
+            return;
+        };
+        let format = ARCHIVE_FORK_FORMATS[a.fork_fmt_sel.min(ARCHIVE_FORK_FORMATS.len() - 1)].1;
+        let result = crate::macarchive::extract::extract_all(
+            &a.bytes,
+            archive,
+            &dest,
+            format,
+            |_, _, _| {},
+            |_| {},
+        );
+        let a = self.archive.as_mut().unwrap();
+        match result {
+            Ok(stats) => {
+                a.status = Some(format!(
+                    "Extracted {} file(s){} to {}",
+                    stats.files,
+                    if stats.skipped > 0 {
+                        format!(" ({} skipped)", stats.skipped)
+                    } else {
+                        String::new()
+                    },
+                    dest.display()
+                ));
+                a.is_error = false;
+            }
+            Err(e) => {
+                a.status = Some(format!("Extract failed: {e:#}"));
+                a.is_error = true;
+            }
+        }
+    }
+
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
@@ -4202,6 +4446,12 @@ impl App {
         if self.current() == TabId::Optical {
             if let Some(o) = &self.optical {
                 self.draw_optical(frame, area, o);
+                return;
+            }
+        }
+        if self.current() == TabId::Archives {
+            if let Some(a) = &self.archive {
+                self.draw_archive(frame, area, a);
                 return;
             }
         }
@@ -4926,6 +5176,78 @@ impl App {
         }
     }
 
+    /// The Archives screen: open a Mac archive, list its entries, extract.
+    fn draw_archive(&self, frame: &mut Frame, area: Rect, a: &ArchiveState) {
+        let mut lines: Vec<Line> = Vec::new();
+        if a.archive.is_none() {
+            lines.push(Line::styled(
+                "Open a classic Mac archive (.sit / .sea / .cpt / .mar / .hqx):",
+                self.palette.accent(),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Enter / o  ", self.palette.accent()),
+                Span::raw("choose an archive file"),
+            ]));
+            if let Some(s) = &a.status {
+                lines.push(Line::raw(""));
+                let style = if a.is_error {
+                    self.palette.warn()
+                } else {
+                    self.palette.dim()
+                };
+                lines.push(Line::styled(format!("  {s}"), style));
+            }
+            frame.render_widget(
+                Paragraph::new(Text::from(lines))
+                    .block(self.pane_block("Archives", true))
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            if let Some(picker) = &a.picker {
+                picker.draw(frame, area, self.palette, self.border);
+            }
+            return;
+        }
+
+        // Loaded: header + scrollable entry list.
+        let title = format!(
+            "Archives  {}  [{} entries]  fork: {}",
+            basename(&a.archive_path),
+            a.entries.len(),
+            ARCHIVE_FORK_FORMATS[a.fork_fmt_sel].0
+        );
+        let visible = area.height.saturating_sub(4) as usize;
+        let start = a.list_sel.saturating_sub(visible.saturating_sub(1));
+        for (i, line) in a.entries.iter().enumerate().skip(start).take(visible) {
+            let sel = i == a.list_sel;
+            let style = if sel {
+                self.palette
+                    .accent()
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(format!(" {line}"), style));
+        }
+        if let Some(s) = &a.status {
+            lines.push(Line::raw(""));
+            let style = if a.is_error {
+                self.palette.warn()
+            } else {
+                self.palette.accent()
+            };
+            lines.push(Line::styled(format!(" {s}"), style));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, true)),
+            area,
+        );
+        if let Some(picker) = &a.picker {
+            picker.draw(frame, area, self.palette, self.border);
+        }
+    }
+
     /// The Optical rip screen: drive list -> config -> run.
     fn draw_optical(&self, frame: &mut Frame, area: Rect, o: &OpticalState) {
         let title = match o.step {
@@ -5382,6 +5704,22 @@ impl App {
                     ("Esc", "Back"),
                 ],
                 _ => vec![("Esc", "Back")],
+            }
+        } else if self.current() == TabId::Archives {
+            let loaded = self
+                .archive
+                .as_ref()
+                .map(|a| a.archive.is_some())
+                .unwrap_or(false);
+            if loaded {
+                vec![
+                    ("Up/Dn", "Scroll"),
+                    ("f", "Fork fmt"),
+                    ("e", "Extract"),
+                    ("Esc", "Close"),
+                ]
+            } else {
+                vec![("<-/->", "Tabs"), ("Enter/o", "Open"), ("?", "Help")]
             }
         } else if self.current() == TabId::NewDisk {
             let step = self.newdisk.as_ref().map(|w| w.step);

@@ -62,6 +62,8 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   via `bulk_convert_runner::start_bulk_convert` with per-file progress.
 - [x] **Optical (rip)** — local drive list → config (output/format/eject) → run
   via `optical::rip::run_rip`. Wired; needs a physical drive to verify a full rip.
+- [x] **Archives** — open a Mac archive, list entries, extract to host (fork
+  format cycled with `f`) via `macarchive::extract`.
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -130,11 +132,16 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   **Needs a physical drive** to verify an end-to-end rip (wired per the CLI's
   `run_rip` path, so it mirrors a proven flow).
 
-### Step 5 — Archives tab
-- [ ] Open `.sit/.sea/.cpt/.mar` (+ `.hqx`) via `archive_edit`; list entries.
-- [ ] Extract to host preserving both forks + Finder info; create an archive from
-  image contents.
-- **Accept:** open a `.mar`, extract a file, verify forks.
+### Step 5 — Archives tab  [DONE]
+- [x] Open `.sit/.sea/.cpt/.mar` (+ `.hqx`) via `macarchive::extract::open`; list
+  entries (path / type / creator / fork sizes), scrollable.
+- [x] Extract to a host folder preserving forks via `macarchive::extract::
+  extract_all` in a chosen container format (`f` cycles BinHex / MacBinary /
+  AppleDouble / Raw). Synchronous — archives are small.
+- [ ] Create an archive from image contents deferred (host-file create is
+  available via `rb-cli archive create`).
+- **Verified:** opened a `.mar` (entry list matched `rb-cli archive list`),
+  extracted to `.hqx` host files.
 
 ### Step 6 — Commander tab
 - [ ] Dual-pane, each pane a host folder OR an image/container, over `dir_listing`.
