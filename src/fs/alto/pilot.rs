@@ -88,6 +88,34 @@ const ROOT_PAGE_NUMBER: u32 = 0;
 /// root — starts at this page. (Empty for a non-boot blank volume.)
 const OTHELLO_PV_RESERVE: usize = 3 * 28; // 84
 
+/// `FSPropertiesImpl.validation` — the seal Cedar requires at the start of a
+/// file's property storage (its second header page). Cedar computes it as
+/// `GVBasics.MakeKey["August 19, 1983 1:16 pm"]` (the source marks that stamp
+/// "DON'T CHANGE THIS!!!"), and every property accessor — `GetProps`,
+/// `SetProps`, `GetNameBodyAndVersion` — checks `pPtr.validation = validation`
+/// first, treating a mismatch as "invalid property page". A file whose
+/// property page is blank is therefore skipped by directory enumeration
+/// ("Property page of a local file has a bad property page"), even though its
+/// name and contents are perfectly good.
+///
+/// Rather than reimplement Grapevine's key hash, these are the four words as
+/// written by Cedar 6.1 itself, read back from files it created during a live
+/// install (identical across every such file).
+const PROPERTIES_VALIDATION: [u16; 4] = [53958, 60644, 54392, 64546];
+
+/// Word layout of `FSPropertiesImpl.PropertiesObject`, which occupies the
+/// second header page:
+///   0..3  validation (GVBasics.Password)
+///   4..5  bytes      (INT, low word first)
+///   6     keep       (CARDINAL)
+///   7..8  created    (BasicTime.GMT)
+///   9     version    (FSBackdoor.Version)
+///   10    nameBody   TextRep length in chars, characters follow 2/word
+const PROP_BYTES_WORD: usize = 4;
+const PROP_KEEP_WORD: usize = 6;
+const PROP_VERSION_WORD: usize = 9;
+const PROP_NAME_WORD: usize = 10;
+
 /// Well-known 32-bit FileID of the Volume Allocation Map file (Cedar nucleus
 /// `VolumeFile::VAM` = root-file slot 7). We allocate it first, so user files
 /// start at FileID 2.
@@ -1266,11 +1294,24 @@ pub fn add_file(
         wrlong(d, wi, LAST_LOGICAL_RUN); // terminator
     }
 
-    // Second header page: normal property storage (currently blank).
+    // Second header page: property storage. It must carry Cedar's validation
+    // seal, or every FS property accessor rejects the file and directory
+    // enumeration silently skips it. `bytes` is the payload length Cedar
+    // reports in a listing; `created` is left null (Cedar prints "??") and the
+    // name body empty, since neither is known at this level -- the name is
+    // applied later through the client directory.
     {
         let s = &mut disk.sectors[pv_page + header_lps[1] as usize];
         s.label = Label::new(file_id, 1, attr::FREE_PAGE).bytes();
         s.data.fill(0);
+        let d = &mut s.data;
+        for (i, w) in PROPERTIES_VALIDATION.iter().enumerate() {
+            wrw(d, i, *w);
+        }
+        wrlong(d, PROP_BYTES_WORD, data.len() as u32);
+        wrw(d, PROP_KEEP_WORD, 0);
+        wrw(d, PROP_VERSION_WORD, 1);
+        wrw(d, PROP_NAME_WORD, 0); // empty nameBody TextRep
     }
 
     // Data pages (filePage numbered 0.. within the file).
