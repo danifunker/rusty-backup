@@ -1377,6 +1377,12 @@ struct CommanderState {
     active: Side,
     status: Option<String>,
     is_error: bool,
+    /// A new-folder name being typed for the active pane, if the mkdir prompt
+    /// is showing.
+    mkdir_input: Option<String>,
+    /// The `(name, is_dir)` of the active pane's entry pending a delete
+    /// confirmation.
+    confirm_delete: Option<(String, bool)>,
 }
 
 impl CommanderState {
@@ -1505,15 +1511,9 @@ impl CommanderState {
                 std::slice::from_ref(&entry),
                 &dest_parent,
             );
-            match with_stderr_suppressed(|| {
-                crate::model::commander_ops::apply_edits(&session, &edits)
-            }) {
-                Ok(()) => {
-                    cmd_refresh(dst);
-                    Ok(format!("Copied {name} into the image."))
-                }
-                Err(e) => Err(format!("Copy failed: {e:#}")),
-            }
+            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
+                .map(|()| format!("Copied {name} into the image."))
+                .map_err(|e| format!("Copy failed: {e:#}"))
         } else if !src.is_host && dst.is_host {
             let dest_dir = match dst.listing.cwd() {
                 Some(e) => std::path::PathBuf::from(&e.path),
@@ -1555,10 +1555,55 @@ impl CommanderState {
                 .map(|_| format!("Copied {name}."))
                 .map_err(|e| format!("Copy failed: {e}"))
         } else {
-            Err("Image-to-image copy isn't supported here yet.".to_string())
+            // image -> image: extract the entry to a temp dir, stage it as an
+            // AddFile on the destination's browse session, then apply. The temp
+            // dir must outlive apply_edits (the staged edits point into it).
+            let dest_parent = match dst.listing.cwd() {
+                Some(e) => e.clone(),
+                None => {
+                    self.status = Some("No destination directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let session = match dst.session.clone() {
+                Some(s) => s,
+                None => {
+                    self.status = Some("Destination has no write session.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let src_fs = match src.listing.fs_mut() {
+                Some(f) => f,
+                None => {
+                    self.status = Some("Source has no filesystem.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            (|| -> Result<String, String> {
+                let temp = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
+                let edits = with_stderr_suppressed(|| {
+                    crate::model::commander_ops::stage_copy(
+                        src_fs,
+                        std::slice::from_ref(&entry),
+                        &dest_parent,
+                        temp.path(),
+                        true,
+                    )
+                })
+                .map_err(|e| format!("Copy failed: {e:#}"))?;
+                with_stderr_suppressed(|| {
+                    crate::model::commander_ops::apply_edits(&session, &edits)
+                })
+                .map_err(|e| format!("Copy failed: {e:#}"))?;
+                Ok(format!("Copied {name} into the image."))
+            })()
         };
-        // Host destinations refresh after the source borrow is released.
-        if result.is_ok() && dst.is_host {
+        // The destination refreshes after the source borrow is released
+        // (host or image, both kinds).
+        if result.is_ok() {
             cmd_refresh(dst);
         }
         match result {
@@ -1571,6 +1616,128 @@ impl CommanderState {
                 self.is_error = true;
             }
         }
+    }
+
+    /// Set the status line from a `Result`, error styling on `Err`.
+    fn set_result(&mut self, r: Result<String, String>) {
+        match r {
+            Ok(m) => {
+                self.status = Some(m);
+                self.is_error = false;
+            }
+            Err(e) => {
+                self.status = Some(e);
+                self.is_error = true;
+            }
+        }
+    }
+
+    /// Create a directory named `name` in the active pane's cwd (host: real
+    /// `create_dir`; image: a `CreateDirectory` staged edit applied through the
+    /// pane's browse session), then refresh the pane.
+    fn mkdir(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = Some("Folder name can't be empty.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let side = self.active;
+        let pane = self.pane_mut(side);
+        let result: Result<String, String> = if pane.is_host {
+            match pane.listing.cwd() {
+                Some(cwd) => std::fs::create_dir(std::path::PathBuf::from(&cwd.path).join(name))
+                    .map(|()| format!("Created folder {name}."))
+                    .map_err(|e| format!("New folder failed: {e}")),
+                None => Err("No current directory.".to_string()),
+            }
+        } else {
+            let parent = match pane.listing.cwd() {
+                Some(e) => e.clone(),
+                None => {
+                    self.status = Some("No current directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let session = match pane.session.clone() {
+                Some(s) => s,
+                None => {
+                    self.status = Some("Pane has no write session.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let edits = vec![crate::model::edit_queue::StagedEdit::CreateDirectory {
+                parent,
+                name: name.to_string(),
+            }];
+            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
+                .map(|()| format!("Created folder {name}."))
+                .map_err(|e| format!("New folder failed: {e:#}"))
+        };
+        if result.is_ok() {
+            cmd_refresh(self.pane_mut(side));
+        }
+        self.set_result(result);
+    }
+
+    /// Delete the active pane's selected entry (host: `remove_file` /
+    /// `remove_dir_all`; image: a `DeleteRecursive` staged edit applied through
+    /// the pane's browse session), then refresh the pane.
+    fn delete_selected(&mut self) {
+        let side = self.active;
+        let pane = self.pane_mut(side);
+        let entry = match pane.selected() {
+            Some(e) => e,
+            None => {
+                self.status = Some("Select a file or folder to delete.".to_string());
+                self.is_error = true;
+                return;
+            }
+        };
+        let name = entry.name.clone();
+        let is_dir = matches!(entry.entry_type, EntryType::Directory);
+        let result: Result<String, String> = if pane.is_host {
+            let path = std::path::PathBuf::from(&entry.path);
+            let r = if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            r.map(|()| format!("Deleted {name}."))
+                .map_err(|e| format!("Delete failed: {e}"))
+        } else {
+            let parent = match pane.listing.cwd() {
+                Some(e) => e.clone(),
+                None => {
+                    self.status = Some("No current directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let session = match pane.session.clone() {
+                Some(s) => s,
+                None => {
+                    self.status = Some("Pane has no write session.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let edits = vec![crate::model::edit_queue::StagedEdit::DeleteRecursive {
+                parent,
+                entry: entry.clone(),
+            }];
+            with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
+                .map(|()| format!("Deleted {name}."))
+                .map_err(|e| format!("Delete failed: {e:#}"))
+        };
+        if result.is_ok() {
+            let p = self.pane_mut(side);
+            cmd_refresh(p);
+            p.sel = p.sel.min(p.rows_len().saturating_sub(1));
+        }
+        self.set_result(result);
     }
 }
 
@@ -4468,6 +4635,41 @@ impl App {
             return true;
         }
 
+        // New-folder name prompt (modal).
+        if c.mkdir_input.is_some() {
+            match code {
+                KeyCode::Esc => c.mkdir_input = None,
+                KeyCode::Enter => {
+                    let name = c.mkdir_input.take().unwrap_or_default();
+                    c.mkdir(&name);
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = c.mkdir_input.as_mut() {
+                        s.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(s) = c.mkdir_input.as_mut() {
+                        s.push(ch);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Delete confirmation (modal).
+        if c.confirm_delete.is_some() {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    c.confirm_delete = None;
+                    c.delete_selected();
+                }
+                _ => c.confirm_delete = None,
+            }
+            return true;
+        }
+
         // Partition chooser on the active pane (modal).
         if c.pane(active).part_pick {
             let np = c.pane(active).parts.len();
@@ -4578,6 +4780,22 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::F(5) => {
                 c.copy();
+                true
+            }
+            KeyCode::Char('n') => {
+                c.mkdir_input = Some(String::new());
+                c.status = None;
+                c.is_error = false;
+                true
+            }
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::F(8) => {
+                if let Some(e) = c.pane(active).selected() {
+                    c.confirm_delete =
+                        Some((e.name.clone(), matches!(e.entry_type, EntryType::Directory)));
+                } else {
+                    c.status = Some("Select a file or folder to delete.".to_string());
+                    c.is_error = true;
+                }
                 true
             }
             _ => false,
@@ -6017,7 +6235,7 @@ impl App {
         let status = match &c.status {
             Some(s) => s.clone(),
             None => {
-                "Tab switch pane   o host folder   i image   Enter open   c copy to other   r refresh"
+                "Tab pane  o host  i image  Enter open  c copy  n new folder  x delete  r refresh"
                     .to_string()
             }
         };
@@ -6040,6 +6258,43 @@ impl App {
             if pane.part_pick {
                 self.draw_commander_partpick(frame, area, pane);
             }
+        }
+
+        // New-folder name prompt (active pane).
+        if let Some(name) = &c.mkdir_input {
+            let cp = centered_rect(50, 5, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("  Name: ", self.palette.accent()),
+                        Span::raw(name.clone()),
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
+                    ]),
+                    Line::raw(""),
+                    Line::styled("  Enter create   Esc cancel", self.palette.dim()),
+                ]))
+                .block(self.pane_block("New folder", true)),
+                cp,
+            );
+        }
+
+        // Delete confirmation (active pane).
+        if let Some((name, is_dir)) = &c.confirm_delete {
+            let kind = if *is_dir { "folder" } else { "file" };
+            let cp = centered_rect(60, 5, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(
+                        format!("  Delete {kind} \"{name}\"?  (y / n)"),
+                        self.palette.warn(),
+                    ),
+                ]))
+                .block(self.pane_block("Confirm delete", true)),
+                cp,
+            );
         }
     }
 

@@ -157,9 +157,16 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - [x] Copy the selected entry to the other pane's cwd (`c` / F5): host→image
   stages + `commander_ops::apply_edits`; image→host via `fork_export`; host→host
   via `std::fs`. Destination refreshes after.
-- [ ] image→image copy, multi-select, sort, delete/mkdir, checksum deferred.
-- **Verified:** host→image copy through the TUI put a file into a FAT image;
-  re-extracting it is content-identical (`cmp`).
+- [x] image->image copy (`c`/F5): `commander_ops::stage_copy` extracts the entry
+  to a temp dir, then `apply_edits` on the destination pane's `BrowseSession`.
+- [x] delete (`x`/Del/F8, confirmed) and new folder (`n`, name prompt) on the
+  active pane: host = `std::fs`; image = a `DeleteRecursive` / `CreateDirectory`
+  staged edit applied through the pane's session. Both refresh after.
+- [ ] multi-select, sort, checksum still deferred (next Commander pass).
+- **Verified:** host->image copy put a file into a FAT image (content-identical
+  `cmp`); image->image copy left->right through the TUI produced a `SEED.TXT`
+  byte-identical to the source; `n`/`x` created then removed a folder on an image
+  pane; both images `fsck`-clean afterwards.
 
 ### Step 7 — Edit + transform actions (into Inspect/Explorer)  [mkdir/rm/put DONE]
 - [x] In the Explorer: `i` import (put), `n` new folder
