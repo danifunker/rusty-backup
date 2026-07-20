@@ -1414,6 +1414,23 @@ struct CmdPane {
     part_pick: bool,
     part_sel: usize,
     pending_img: Option<std::path::PathBuf>,
+    /// Set when this pane is showing an optical disc image's filesystem (a
+    /// hybrid CD's ISO 9660 / HFS side). Read-only; carries what a refresh /
+    /// re-switch needs. `None` for host / partition-image / archive panes.
+    optical: Option<OpticalPane>,
+    /// The optical-filesystem chooser modal (ISO 9660 vs HFS side) + its cursor.
+    optical_pick: bool,
+    optical_sel: usize,
+}
+
+/// An optical disc image opened in a Commander pane: the path, its selectable
+/// filesystems (primary ISO 9660 + any hybrid Mac side), and the one currently
+/// shown. Read-only; a refresh / re-switch reopens via `commander_descend`.
+#[derive(Clone)]
+struct OpticalPane {
+    path: std::path::PathBuf,
+    choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
+    sel: usize,
 }
 
 impl Default for CmdPane {
@@ -1431,6 +1448,9 @@ impl Default for CmdPane {
             part_pick: false,
             part_sel: 0,
             pending_img: None,
+            optical: None,
+            optical_pick: false,
+            optical_sel: 0,
         }
     }
 }
@@ -1466,6 +1486,23 @@ impl CmdPane {
         if let Some(e) = self.selected() {
             self.listing.ctrl_click(&e.name);
         }
+    }
+
+    /// Stage the optical-filesystem chooser (used when a disc carries more than
+    /// one filesystem — e.g. a hybrid CD's ISO 9660 + HFS sides). Nothing is
+    /// loaded until the user confirms a choice.
+    fn optical_choices_stage(
+        &mut self,
+        choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
+        path: std::path::PathBuf,
+    ) {
+        self.optical = Some(OpticalPane {
+            path,
+            choices,
+            sel: 0,
+        });
+        self.optical_pick = true;
+        self.optical_sel = 0;
     }
 }
 
@@ -1518,6 +1555,32 @@ impl CommanderState {
     /// there's more than one, else load directly (superfloppy = whole disk).
     fn open_image(&mut self, path: std::path::PathBuf) {
         let side = self.active;
+
+        // Optical disc image first: a hybrid Mac/PC CD carries an ISO 9660 volume
+        // *and* an HFS side that the partition table (APM) hides, so enumerate
+        // its filesystems via opticaldiscs and offer them in the chooser.
+        if is_optical_image_path(&path) {
+            let choices = crate::model::commander_descend::optical_filesystems(&path);
+            if !choices.is_empty() {
+                if choices.len() > 1 {
+                    let p = self.pane_mut(side);
+                    p.optical_choices_stage(choices, path);
+                } else {
+                    match cmd_load_optical(self.pane_mut(side), &path, choices, 0) {
+                        Ok(()) => {
+                            self.status = None;
+                            self.is_error = false;
+                        }
+                        Err(e) => {
+                            self.status = Some(e);
+                            self.is_error = true;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
         let parts = crate::model::commander_source::probe_partitions(&path).unwrap_or_default();
         if parts.len() > 1 {
             let p = self.pane_mut(side);
@@ -1557,6 +1620,45 @@ impl CommanderState {
                     self.status = Some(e);
                     self.is_error = true;
                 }
+            }
+        }
+    }
+
+    /// Confirm the optical-filesystem chooser and open the selected side.
+    fn choose_optical(&mut self) {
+        let side = self.active;
+        let (path, choices, idx) = {
+            let p = self.pane(side);
+            match &p.optical {
+                Some(op) => (op.path.clone(), op.choices.clone(), p.optical_sel),
+                None => return,
+            }
+        };
+        match cmd_load_optical(self.pane_mut(side), &path, choices, idx) {
+            Ok(()) => {
+                self.status = None;
+                self.is_error = false;
+            }
+            Err(e) => {
+                self.status = Some(e);
+                self.is_error = true;
+            }
+        }
+    }
+
+    /// Reopen the filesystem chooser for the active pane so the user can switch
+    /// sides of a hybrid optical disc (ISO 9660 <-> HFS) after opening.
+    fn reopen_chooser(&mut self) {
+        let side = self.active;
+        let p = self.pane_mut(side);
+        match &p.optical {
+            Some(op) if op.choices.len() > 1 => {
+                p.optical_sel = op.sel;
+                p.optical_pick = true;
+            }
+            _ => {
+                self.status = Some("Filesystem switching is for hybrid optical discs.".to_string());
+                self.is_error = false;
             }
         }
     }
@@ -1870,6 +1972,10 @@ fn cmd_load_host(pane: &mut CmdPane, path: std::path::PathBuf) -> Result<(), Str
     pane.loaded = true;
     pane.label = format!("host: {}", path.display());
     pane.sel = 0;
+    pane.optical = None;
+    pane.optical_pick = false;
+    pane.part_pick = false;
+    pane.parts.clear();
     Ok(())
 }
 
@@ -1911,6 +2017,62 @@ fn cmd_load_image(
     pane.part_pick = false;
     pane.parts.clear();
     pane.pending_img = None;
+    pane.optical = None;
+    pane.optical_pick = false;
+    Ok(())
+}
+
+/// True when `path` names an optical disc image (by extension) we can browse via
+/// `opticaldiscs` — the discriminator for routing to [`cmd_load_optical`]
+/// instead of the partition-table path.
+fn is_optical_image_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(crate::model::commander_descend::classify)
+        == Some(crate::model::commander_descend::DescendKind::Optical)
+}
+
+/// Open the filesystem at `choices[idx]` of the optical disc image at `path`
+/// (the primary ISO 9660, or a hybrid Mac HFS/HFS+ side) into a Commander pane
+/// and list its root. Read-only and session-less — like a Mac archive.
+fn cmd_load_optical(
+    pane: &mut CmdPane,
+    path: &std::path::Path,
+    choices: Vec<crate::model::commander_descend::OpticalFsChoice>,
+    idx: usize,
+) -> Result<(), String> {
+    let choice = choices
+        .get(idx)
+        .cloned()
+        .ok_or_else(|| "no such filesystem on this disc".to_string())?;
+    let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut fs = match choice.hybrid_index {
+        None => crate::model::commander_descend::open_optical(path, label),
+        Some(h) => crate::model::commander_descend::open_optical_hybrid(path, h, label),
+    }
+    .map_err(|e| format!("{e:#}"))?;
+    let root = fs.root().map_err(|e| format!("reading root: {e}"))?;
+    let entries = fs.list_directory(&root).unwrap_or_default();
+    pane.listing.load_root(fs, root, entries, false);
+    pane.session = None;
+    pane.is_host = false;
+    pane.loaded = true;
+    pane.label = format!(
+        "cd: {} [{}]",
+        basename(&path.to_string_lossy()),
+        choice.label
+    );
+    pane.sel = 0;
+    pane.part_pick = false;
+    pane.parts.clear();
+    pane.pending_img = None;
+    pane.optical_pick = false;
+    pane.optical_sel = idx;
+    pane.optical = Some(OpticalPane {
+        path: path.to_path_buf(),
+        choices,
+        sel: idx,
+    });
     Ok(())
 }
 
@@ -1920,6 +2082,28 @@ fn cmd_refresh(pane: &mut CmdPane) {
     let cwd_path = pane.listing.cwd().map(|e| e.path.clone());
     if pane.is_host {
         let _ = pane.listing.reload();
+    } else if let Some(op) = pane.optical.clone() {
+        // Optical panes have no `BrowseSession`; reopen the selected filesystem
+        // (primary or hybrid) fresh from the disc image.
+        let label = op
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let reopened = op.choices.get(op.sel).and_then(|c| match c.hybrid_index {
+            None => crate::model::commander_descend::open_optical(&op.path, label).ok(),
+            Some(h) => {
+                crate::model::commander_descend::open_optical_hybrid(&op.path, h, label).ok()
+            }
+        });
+        if let Some(mut fs) = reopened {
+            if let Ok(root) = fs.root() {
+                let entries = fs.list_directory(&root).unwrap_or_default();
+                pane.listing.load_root(fs, root, entries, false);
+                if let Some(p) = cwd_path {
+                    let _ = pane.listing.navigate_to(&p);
+                }
+            }
+        }
     } else if let Some(session) = pane.session.clone() {
         if let Ok(mut fs) = session.open() {
             if let Ok(root) = fs.root() {
@@ -5215,6 +5399,39 @@ impl App {
             return true;
         }
 
+        // Optical-filesystem chooser on the active pane (modal): pick the ISO
+        // 9660 or HFS side of a hybrid disc.
+        if c.pane(active).optical_pick {
+            let nfs = c
+                .pane(active)
+                .optical
+                .as_ref()
+                .map(|o| o.choices.len())
+                .unwrap_or(0);
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let p = c.pane_mut(active);
+                    p.optical_sel = p.optical_sel.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let p = c.pane_mut(active);
+                    p.optical_sel = (p.optical_sel + 1).min(nfs.saturating_sub(1));
+                }
+                KeyCode::Esc => {
+                    let p = c.pane_mut(active);
+                    p.optical_pick = false;
+                    // If nothing was ever loaded (first open), drop the staged
+                    // optical state so the pane returns to empty.
+                    if !p.loaded {
+                        p.optical = None;
+                    }
+                }
+                KeyCode::Enter => c.choose_optical(),
+                _ => {}
+            }
+            return true;
+        }
+
         // Tab / BackTab switch the focused pane.
         if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
             c.active = match active {
@@ -5297,6 +5514,12 @@ impl App {
             }
             KeyCode::Char('r') => {
                 c.refresh_active();
+                true
+            }
+            // Switch the filesystem shown for a hybrid optical disc (ISO 9660
+            // <-> HFS side).
+            KeyCode::Char('p') => {
+                c.reopen_chooser();
                 true
             }
             KeyCode::Char('c') | KeyCode::F(5) => {
@@ -6933,8 +7156,10 @@ impl App {
 
         let status = match &c.status {
             Some(s) => s.clone(),
-            None => "Tab pane  Enter open  Space mark  c copy  n mkdir  x del  s sort  r refresh"
-                .to_string(),
+            None => {
+                "Tab pane  Enter open  Space mark  c copy  n mkdir  x del  s sort  p fs  r refresh"
+                    .to_string()
+            }
         };
         let style = if c.is_error {
             self.palette.warn()
@@ -6954,6 +7179,9 @@ impl App {
             }
             if pane.part_pick {
                 self.draw_commander_partpick(frame, area, pane);
+            }
+            if pane.optical_pick {
+                self.draw_commander_opticalpick(frame, area, pane);
             }
         }
 
@@ -7087,6 +7315,38 @@ impl App {
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).block(self.pane_block("Choose partition", true)),
+            popup,
+        );
+    }
+
+    /// The optical-filesystem chooser overlay (ISO 9660 / HFS side of a hybrid
+    /// disc). Mirrors `draw_commander_partpick` but lists the disc's filesystems.
+    fn draw_commander_opticalpick(&self, frame: &mut Frame, area: Rect, pane: &CmdPane) {
+        let Some(op) = &pane.optical else { return };
+        let mut lines: Vec<Line> = vec![Line::raw("")];
+        for (i, choice) in op.choices.iter().enumerate() {
+            let sel = i == pane.optical_sel;
+            let marker = if sel { "> " } else { "  " };
+            let style = if sel {
+                self.palette
+                    .accent()
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                self.palette.accent()
+            };
+            lines.push(Line::styled(format!("{marker}{}", choice.label), style));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Up/Down select   Enter open   Esc cancel",
+            self.palette.dim(),
+        ));
+        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let popup = centered_rect(52, h, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block("Choose disc filesystem", true)),
             popup,
         );
     }
