@@ -229,6 +229,103 @@ pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn File
     anyhow::bail!("this build was compiled without optical-disc support")
 }
 
+/// One selectable filesystem on an optical disc image: the primary volume
+/// (usually ISO 9660) or a co-resident hybrid Mac (HFS/HFS+) side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpticalFsChoice {
+    /// Display label for the pane's filesystem picker (e.g. `RETRO (ISO 9660)`).
+    pub label: String,
+    /// `None` = the primary filesystem; `Some(i)` = `hybrid_filesystems[i]`.
+    pub hybrid_index: Option<usize>,
+}
+
+/// Turn an opticaldiscs `FilesystemType` debug token + optional volume label
+/// into a friendly picker label. Only the optical build enumerates filesystems.
+#[cfg(feature = "optical")]
+fn optical_fs_label(ty: &str, label: Option<&str>) -> String {
+    let nice = match ty {
+        "Iso9660" => "ISO 9660",
+        "HighSierra" => "High Sierra",
+        "Hfs" => "HFS (Mac)",
+        "HfsPlus" => "HFS+ (Mac)",
+        "Efs" => "IRIX EFS",
+        other => other,
+    };
+    match label {
+        Some(l) if !l.trim().is_empty() => format!("{l} ({nice})"),
+        _ => nice.to_string(),
+    }
+}
+
+/// Enumerate the browsable filesystems of the optical disc image at `path`: the
+/// primary volume plus any hybrid Mac side. Returns an empty vec when `path`
+/// isn't an optical disc image we can open (so the caller falls back to the
+/// partition-table path). This is what lets the Commander pane's picker offer
+/// **both** the ISO 9660 and the HFS side of a hybrid Mac/PC disc.
+#[cfg(feature = "optical")]
+pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
+    use opticaldiscs::detect::DiscImageInfo;
+    let Ok(info) = DiscImageInfo::open(path) else {
+        return Vec::new();
+    };
+    let mut choices = vec![OpticalFsChoice {
+        label: optical_fs_label(
+            &format!("{:?}", info.filesystem),
+            info.volume_label.as_deref(),
+        ),
+        hybrid_index: None,
+    }];
+    for (i, h) in info.hybrid_filesystems.iter().enumerate() {
+        choices.push(OpticalFsChoice {
+            label: optical_fs_label(&format!("{:?}", h.filesystem), h.volume_label.as_deref()),
+            hybrid_index: Some(i),
+        });
+    }
+    choices
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn optical_filesystems(_path: &Path) -> Vec<OpticalFsChoice> {
+    Vec::new()
+}
+
+/// Open the hybrid Mac side (HFS / HFS+) at `hybrid_filesystems[index]` of a
+/// hybrid Mac/PC optical disc image as a read-only filesystem. The primary
+/// (usually ISO 9660) is reached via [`open_optical`]; this reaches the
+/// co-resident Apple volume that the primary hides.
+#[cfg(feature = "optical")]
+pub fn open_optical_hybrid(
+    path: &Path,
+    index: usize,
+    label: Option<String>,
+) -> Result<Box<dyn Filesystem>> {
+    use opticaldiscs::browse::open_hybrid_filesystem;
+    use opticaldiscs::detect::DiscImageInfo;
+    let info = DiscImageInfo::open(path)
+        .map_err(|e| anyhow::anyhow!("open disc image {}: {e:#}", path.display()))?;
+    let ty = info
+        .hybrid_filesystems
+        .get(index)
+        .map(|h| h.filesystem)
+        .ok_or_else(|| anyhow::anyhow!("no hybrid filesystem #{index} on this disc"))?;
+    let inner = open_hybrid_filesystem(&info, index)
+        .map_err(|e| anyhow::anyhow!("open hybrid filesystem: {e}"))?;
+    let fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, format!("{ty:?}"), label)
+        .map_err(|e| anyhow::anyhow!("wrap hybrid filesystem: {e}"))?;
+    Ok(Box::new(fs))
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn open_optical_hybrid(
+    _path: &Path,
+    _index: usize,
+    _label: Option<String>,
+) -> Result<Box<dyn Filesystem>> {
+    anyhow::bail!("this build was compiled without optical-disc support")
+}
+
 /// A recipe to reopen a browsable source *fresh* on a worker thread — for
 /// sources that have no reusable [`BrowseSession`](crate::model::browse_session::BrowseSession)
 /// (a Mac archive opened in-pane, or an inline-expanded disk-image / optical
@@ -253,6 +350,12 @@ pub enum ReopenRecipe {
         path: PathBuf,
         label: Option<String>,
     },
+    /// Reopen the hybrid Mac (HFS/HFS+) side of a hybrid optical disc image.
+    OpticalHybrid {
+        path: PathBuf,
+        index: usize,
+        label: Option<String>,
+    },
 }
 
 impl ReopenRecipe {
@@ -268,6 +371,9 @@ impl ReopenRecipe {
                 open_image_partition(path, first)
             }
             ReopenRecipe::Optical { path, label } => open_optical(path, label.clone()),
+            ReopenRecipe::OpticalHybrid { path, index, label } => {
+                open_optical_hybrid(path, *index, label.clone())
+            }
         }
     }
 }
@@ -292,6 +398,54 @@ mod tests {
         assert_eq!(classify("backup.tgz"), Some(DescendKind::Archive));
         assert_eq!(classify("backup.tar.gz"), Some(DescendKind::Archive));
         assert_eq!(classify("backup.tar.zst"), Some(DescendKind::Archive));
+    }
+
+    /// A hybrid Mac/PC disc must expose BOTH filesystems (ISO 9660 primary +
+    /// the HFS/HFS+ Mac side), each openable via the helper the Commander pane's
+    /// picker uses. This is the fix for "opening a hybrid CD only shows one side
+    /// in the pulldown": before, only the APM Apple_HFS partition surfaced.
+    #[cfg(feature = "optical")]
+    #[test]
+    fn hybrid_disc_lists_and_opens_both_filesystems() {
+        use std::io::{Cursor, Read};
+
+        // Decompress the committed hybrid fixture (ISO 9660 + HFS+ sides).
+        let compressed = std::fs::read("tests/fixtures/optical/hybrid_rsrc.iso.zst")
+            .expect("read hybrid fixture");
+        let mut dec = zstd::stream::read::Decoder::new(Cursor::new(compressed)).unwrap();
+        let mut iso = Vec::new();
+        dec.read_to_end(&mut iso).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disc.iso");
+        std::fs::write(&path, &iso).unwrap();
+
+        let choices = optical_filesystems(&path);
+        assert_eq!(choices.len(), 2, "hybrid disc should list two filesystems");
+        // The primary is the ISO 9660 side; the second is the hybrid Mac side.
+        assert_eq!(choices[0].hybrid_index, None);
+        assert!(
+            choices[0].label.contains("ISO 9660"),
+            "got {:?}",
+            choices[0].label
+        );
+        assert_eq!(choices[1].hybrid_index, Some(0));
+        assert!(
+            choices[1].label.contains("HFS"),
+            "got {:?}",
+            choices[1].label
+        );
+
+        // Both sides open and list a non-empty root through the pane's helpers.
+        for c in &choices {
+            let mut fs = match c.hybrid_index {
+                None => open_optical(&path, None),
+                Some(h) => open_optical_hybrid(&path, h, None),
+            }
+            .unwrap_or_else(|e| panic!("open {}: {e}", c.label));
+            let root = fs.root().unwrap();
+            let kids = fs.list_directory(&root).unwrap();
+            assert!(!kids.is_empty(), "{} root should list entries", c.label);
+        }
     }
 
     #[test]

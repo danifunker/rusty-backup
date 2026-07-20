@@ -33,7 +33,8 @@ use rusty_backup::fs::partition_is_browsable;
 use rusty_backup::model::browse_session::{BrowseOpenStatus, BrowseSession};
 use rusty_backup::model::cache_runner;
 use rusty_backup::model::commander_descend::{
-    classify_entry, open_archive, DescendKind, ReopenRecipe,
+    classify, classify_entry, open_archive, open_optical, open_optical_hybrid, optical_filesystems,
+    DescendKind, OpticalFsChoice, ReopenRecipe,
 };
 use rusty_backup::model::commander_ops::{
     self, ApplyStatus, WrapperExtract, WrapperOpenPlan, WrapperOpenStatus,
@@ -227,6 +228,14 @@ pub(crate) struct CommanderPane {
     /// read-only). Copy-OUT works via the session-less path; the pane rejects
     /// edits and receiving copies, like a wrapper mount or backup.
     archive_source: bool,
+    /// True when the source is an optical disc image opened in-pane
+    /// (`OpticalFilesystem`, read-only). Like `archive_source`, but the pane's
+    /// partition picker instead lists this disc's filesystems (`optical_choices`)
+    /// — e.g. the ISO 9660 and HFS sides of a hybrid Mac/PC disc.
+    optical_source: bool,
+    /// The optical disc's selectable filesystems (primary + any hybrid Mac side);
+    /// drives the picker when `optical_source`. `selected_part` indexes into it.
+    optical_choices: Vec<OpticalFsChoice>,
 }
 
 /// Display cache for a remote pane (addr + what it's browsing). The live engine
@@ -340,6 +349,8 @@ impl CommanderPane {
             last_cwd: String::new(),
             recent: super::super::load_recent_merged(),
             archive_source: false,
+            optical_source: false,
+            optical_choices: Vec::new(),
         }
     }
 
@@ -496,6 +507,30 @@ impl CommanderPane {
                     path: path.clone(),
                     label,
                 }));
+            }
+        }
+        // An optical disc reopens by path + the selected filesystem (the primary
+        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
+        // the same tree the pane shows.
+        if self.optical_source {
+            if let Some(path) = &self.source {
+                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let hybrid = self
+                    .selected_part
+                    .and_then(|i| self.optical_choices.get(i))
+                    .and_then(|c| c.hybrid_index);
+                let recipe = match hybrid {
+                    Some(index) => ReopenRecipe::OpticalHybrid {
+                        path: path.clone(),
+                        index,
+                        label,
+                    },
+                    None => ReopenRecipe::Optical {
+                        path: path.clone(),
+                        label,
+                    },
+                };
+                return Some(commander_ops::StageSource::Reopen(recipe));
             }
         }
         None
@@ -1209,6 +1244,7 @@ impl CommanderPane {
         self.partitions = Vec::new();
         self.resolved_backup = None;
         self.archive_source = false;
+        self.reset_optical();
         self.selected_part = None;
         self.session = None;
         self.queue.clear();
@@ -1381,6 +1417,7 @@ impl CommanderPane {
         self.listing.is_loaded()
             && !self.listing.is_host()
             && (self.archive_source
+                || self.optical_source
                 || self.resolved_backup.is_some()
                 || (self.remote.is_some() && !self.is_remote_image()))
     }
@@ -1489,6 +1526,30 @@ impl CommanderPane {
                     path: path.clone(),
                     label,
                 }));
+            }
+        }
+        // An optical disc reopens by path + the selected filesystem (the primary
+        // ISO 9660, or a hybrid Mac side) so a copy-OUT / checksum worker reads
+        // the same tree the pane shows.
+        if self.optical_source {
+            if let Some(path) = &self.source {
+                let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let hybrid = self
+                    .selected_part
+                    .and_then(|i| self.optical_choices.get(i))
+                    .and_then(|c| c.hybrid_index);
+                let recipe = match hybrid {
+                    Some(index) => ReopenRecipe::OpticalHybrid {
+                        path: path.clone(),
+                        index,
+                        label,
+                    },
+                    None => ReopenRecipe::Optical {
+                        path: path.clone(),
+                        label,
+                    },
+                };
+                return Some(commander_ops::StageSource::Reopen(recipe));
             }
         }
         None
@@ -1888,28 +1949,47 @@ impl CommanderPane {
         // overlapping the New Folder button.
         if self.listing.is_loaded() {
             ui.horizontal_wrapped(|ui| {
-                // Partition dropdown (image panes only; host folders have none).
+                // Filesystem / partition dropdown (image panes only; host
+                // folders have none). An optical disc lists its filesystems
+                // (ISO 9660 + any hybrid Mac side); every other image lists its
+                // partition-table entries.
                 if !self.listing.is_host() {
+                    // (label per index, empty-state text) for the active list.
+                    let labels: Vec<String> = if self.optical_source {
+                        self.optical_choices
+                            .iter()
+                            .map(|c| c.label.clone())
+                            .collect()
+                    } else {
+                        self.partitions.iter().map(partition_label).collect()
+                    };
+                    let empty_text = if self.optical_source {
+                        "(no filesystems)"
+                    } else {
+                        "(no partitions)"
+                    };
                     let current = self
                         .selected_part
-                        .and_then(|i| self.partitions.get(i))
-                        .map(partition_label)
-                        .unwrap_or_else(|| "(no partitions)".to_string());
+                        .and_then(|i| labels.get(i).cloned())
+                        .unwrap_or_else(|| empty_text.to_string());
                     let mut chosen = self.selected_part;
-                    // Cap the width so a long partition label (e.g. a raw-carve
-                    // "Amiga NDOS (no filesystem)") can't overflow into the
-                    // volume readout on the right.
+                    // Cap the width so a long label (e.g. a raw-carve "Amiga
+                    // NDOS (no filesystem)") can't overflow into the volume
+                    // readout on the right.
                     egui::ComboBox::from_id_salt(("commander_part", self.side.idx()))
                         .selected_text(current)
                         .width(210.0)
                         .show_ui(ui, |ui| {
-                            for (i, p) in self.partitions.iter().enumerate() {
-                                ui.selectable_value(&mut chosen, Some(i), partition_label(p));
+                            for (i, label) in labels.iter().enumerate() {
+                                ui.selectable_value(&mut chosen, Some(i), label);
                             }
                         });
                     if chosen != self.selected_part {
                         if let Some(i) = chosen {
-                            if self.queue.is_empty() {
+                            if self.optical_source {
+                                // Optical panes are read-only — no queue to guard.
+                                status = Some(self.open_optical_choice(i));
+                            } else if self.queue.is_empty() {
                                 status = Some(self.open_partition(i));
                             } else {
                                 self.pending_switch = Some(PendingSwitch::Partition(i));
@@ -1972,11 +2052,19 @@ impl CommanderPane {
 
     /// Unload the pane back to the empty state (the "Close" button). The caller
     /// guards this behind the unsaved-edits check; here we just reset.
+    /// Clear the optical-source state. Called wherever a pane switches to a
+    /// non-optical source so a stale `optical_choices` picker can't linger.
+    fn reset_optical(&mut self) {
+        self.optical_source = false;
+        self.optical_choices.clear();
+    }
+
     fn close_source(&mut self) -> String {
         self.source = None;
         self.partitions.clear();
         self.resolved_backup = None;
         self.archive_source = false;
+        self.reset_optical();
         self.cache_store.clear();
         self.selected_part = None;
         self.listing = DirListing::new();
@@ -2081,6 +2169,8 @@ impl CommanderPane {
         self.listing = DirListing::new();
         self.resolved_backup = None;
         self.archive_source = false;
+        self.optical_source = false;
+        self.optical_choices.clear();
         self.cache_store.clear();
         self.pending_open = None;
         self.error = None;
@@ -2093,6 +2183,21 @@ impl CommanderPane {
         // (nonexistent) partition table.
         if is_mac_archive_path(&path) {
             return self.load_archive(path);
+        }
+
+        // An optical disc image (.iso / .cue / .toast / .cdr / …) is browsed
+        // through `opticaldiscs`, not the partition table: a hybrid Mac/PC disc
+        // carries an ISO 9660 volume *and* an HFS side that a plain APM parse
+        // (which sees only the Apple_HFS partition) hides. Route it to the
+        // optical opener so the picker lists both. Content-confirmed: an empty
+        // list (not really an optical disc) falls through to `probe_partitions`.
+        let is_optical_ext = path.file_name().and_then(|n| n.to_str()).and_then(classify)
+            == Some(DescendKind::Optical);
+        if is_optical_ext {
+            let choices = optical_filesystems(&path);
+            if !choices.is_empty() {
+                return self.load_optical(choices);
+            }
         }
 
         match commander_source::probe_partitions(&path) {
@@ -2123,6 +2228,7 @@ impl CommanderPane {
     /// machinery. Copy-OUT (both forks) flows through the session-less path.
     fn load_archive(&mut self, path: PathBuf) -> String {
         self.partitions.clear();
+        self.reset_optical();
         self.selected_part = None;
         self.session = None;
         self.queue.clear();
@@ -2160,6 +2266,77 @@ impl CommanderPane {
         )
     }
 
+    /// Open an optical disc image (`.iso` / `.cue` / `.toast` / …) as a
+    /// read-only in-pane source. `choices` are the disc's filesystems (primary
+    /// ISO 9660 + any hybrid Mac side); the picker lists them and
+    /// `open_optical_choice` opens the selected one. Sessionless, like a Mac
+    /// archive — copy-OUT flows through the session-less path.
+    fn load_optical(&mut self, choices: Vec<OpticalFsChoice>) -> String {
+        self.partitions.clear();
+        self.resolved_backup = None;
+        self.archive_source = false;
+        self.optical_source = true;
+        self.optical_choices = choices;
+        self.session = None;
+        self.queue.clear();
+        // Auto-open the first filesystem (the primary — usually ISO 9660).
+        self.open_optical_choice(0)
+    }
+
+    /// Open the optical filesystem at `optical_choices[idx]` (primary or a
+    /// hybrid Mac side) and load its root. Read-only and sessionless.
+    fn open_optical_choice(&mut self, idx: usize) -> String {
+        let Some(path) = self.source.clone() else {
+            return String::new();
+        };
+        let Some(choice) = self.optical_choices.get(idx).cloned() else {
+            return String::new();
+        };
+        self.selected_part = Some(idx);
+        self.error = None;
+        self.listing = DirListing::new();
+        self.queue.clear();
+        let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+
+        let opened = match choice.hybrid_index {
+            None => open_optical(&path, label),
+            Some(h) => open_optical_hybrid(&path, h, label),
+        };
+        let mut fs = match opened {
+            Ok(fs) => fs,
+            Err(e) => {
+                self.error = Some(format!("{e:#}"));
+                return format!("[{}] cannot open {}: {e}", self.side.label(), choice.label);
+            }
+        };
+        let root = match fs.root() {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(format!("Could not read disc root: {e}"));
+                return format!("[{}] failed to open {}", self.side.label(), choice.label);
+            }
+        };
+        let entries = match fs.list_directory(&root) {
+            Ok(e) => e,
+            Err(e) => {
+                self.error = Some(format!("Could not list disc: {e}"));
+                return format!("[{}] failed to open {}", self.side.label(), choice.label);
+            }
+        };
+        self.volume_label = fs.volume_label().unwrap_or_default().to_string();
+        self.fs_type = fs.fs_type().to_string();
+        // Optical discs report no usable free-space figure; zero the readout.
+        self.total_size = 0;
+        self.used_size = 0;
+        let n = entries.len();
+        self.listing.load_root(fs, root, entries, false);
+        format!(
+            "[{}] opened {} ({n} item(s)).",
+            self.side.label(),
+            choice.label
+        )
+    }
+
     /// Open a backup folder — native rusty-backup *or* Clonezilla (the shared
     /// resolver detects which) — and start browsing its first browsable
     /// partition. The partition dropdown lists the backed-up partitions;
@@ -2169,6 +2346,7 @@ impl CommanderPane {
         self.listing = DirListing::new();
         self.resolved_backup = None;
         self.archive_source = false;
+        self.reset_optical();
         self.cache_store.clear();
         self.partitions.clear();
         self.session = None;
@@ -2209,6 +2387,7 @@ impl CommanderPane {
         self.source = Some(dir.clone());
         self.resolved_backup = None;
         self.archive_source = false;
+        self.reset_optical();
         self.cache_store.clear();
         self.partitions.clear();
         self.selected_part = None;
