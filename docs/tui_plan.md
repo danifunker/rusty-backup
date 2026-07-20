@@ -162,7 +162,11 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - [x] delete (`x`/Del/F8, confirmed) and new folder (`n`, name prompt) on the
   active pane: host = `std::fs`; image = a `DeleteRecursive` / `CreateDirectory`
   staged edit applied through the pane's session. Both refresh after.
-- [ ] multi-select, sort, checksum still deferred (next Commander pass).
+- [x] multi-select (`Space` marks/advances, `*` prefix; copy/delete act on the
+  marks when any are set, else the cursor entry) and sort (`s` cycles the
+  `DirListing::SortColumn`, `S` flips direction) — both over the model's existing
+  `ctrl_click`/`selected_entries`/`resort` that the GUI browse view already uses.
+- [ ] checksum still deferred (next Commander pass).
 - **Verified:** host->image copy put a file into a FAT image (content-identical
   `cmp`); image->image copy left->right through the TUI produced a `SEED.TXT`
   byte-identical to the source; `n`/`x` created then removed a folder on an image

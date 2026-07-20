@@ -1367,6 +1367,27 @@ impl CmdPane {
             _ => None,
         }
     }
+
+    /// The entries a copy/delete should act on: the multi-selection if any is
+    /// marked (Space), else the single entry under the cursor.
+    fn action_entries(&self) -> Vec<FileEntry> {
+        if !self.listing.selection().is_empty() {
+            self.listing
+                .selected_entries()
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            self.selected().into_iter().collect()
+        }
+    }
+
+    /// Toggle the multi-selection state of the entry under the cursor.
+    fn toggle_mark(&mut self) {
+        if let Some(e) = self.selected() {
+            self.listing.ctrl_click(&e.name);
+        }
+    }
 }
 
 /// The Commander dual-pane file manager.
@@ -1380,9 +1401,9 @@ struct CommanderState {
     /// A new-folder name being typed for the active pane, if the mkdir prompt
     /// is showing.
     mkdir_input: Option<String>,
-    /// The `(name, is_dir)` of the active pane's entry pending a delete
-    /// confirmation.
-    confirm_delete: Option<(String, bool)>,
+    /// The noun phrase (e.g. `folder "System"` or `3 items`) of the active
+    /// pane's pending delete, shown in the confirmation prompt.
+    confirm_delete: Option<String>,
 }
 
 impl CommanderState {
@@ -1481,15 +1502,18 @@ impl CommanderState {
             self.is_error = true;
             return;
         }
-        let entry = match src.selected() {
-            Some(e) => e,
-            None => {
-                self.status = Some("Select a file to copy.".to_string());
-                self.is_error = true;
-                return;
-            }
+        let entries = src.action_entries();
+        if entries.is_empty() {
+            self.status = Some("Select a file to copy (Space marks more).".to_string());
+            self.is_error = true;
+            return;
+        }
+        // A short summary of what was copied for the status line.
+        let label = if entries.len() == 1 {
+            entries[0].name.clone()
+        } else {
+            format!("{} items", entries.len())
         };
-        let name = entry.name.clone();
         let result: Result<String, String> = if src.is_host && !dst.is_host {
             let dest_parent = match dst.listing.cwd() {
                 Some(e) => e.clone(),
@@ -1507,12 +1531,9 @@ impl CommanderState {
                     return;
                 }
             };
-            let edits = crate::model::commander_ops::stage_host_to_image(
-                std::slice::from_ref(&entry),
-                &dest_parent,
-            );
+            let edits = crate::model::commander_ops::stage_host_to_image(&entries, &dest_parent);
             with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Copied {name} into the image."))
+                .map(|()| format!("Copied {label} into the image."))
                 .map_err(|e| format!("Copy failed: {e:#}"))
         } else if !src.is_host && dst.is_host {
             let dest_dir = match dst.listing.cwd() {
@@ -1531,17 +1552,20 @@ impl CommanderState {
                     return;
                 }
             };
-            with_stderr_suppressed(|| {
-                crate::fs::fork_export::export_file_with_fork(
-                    fs,
-                    &entry,
-                    &dest_dir,
-                    &name,
-                    RfMode::AppleDouble,
-                )
+            with_stderr_suppressed(|| -> Result<(), String> {
+                for e in &entries {
+                    crate::fs::fork_export::export_file_with_fork(
+                        fs,
+                        e,
+                        &dest_dir,
+                        &e.name,
+                        RfMode::AppleDouble,
+                    )
+                    .map_err(|err| format!("Copy failed on {}: {err:#}", e.name))?;
+                }
+                Ok(())
             })
-            .map(|_| format!("Copied {name} to the host."))
-            .map_err(|e| format!("Copy failed: {e:#}"))
+            .map(|()| format!("Copied {label} to the host."))
         } else if src.is_host && dst.is_host {
             let dest_dir = match dst.listing.cwd() {
                 Some(e) => std::path::PathBuf::from(&e.path),
@@ -1551,12 +1575,17 @@ impl CommanderState {
                     return;
                 }
             };
-            std::fs::copy(std::path::PathBuf::from(&entry.path), dest_dir.join(&name))
-                .map(|_| format!("Copied {name}."))
-                .map_err(|e| format!("Copy failed: {e}"))
+            (|| -> Result<(), String> {
+                for e in &entries {
+                    std::fs::copy(std::path::PathBuf::from(&e.path), dest_dir.join(&e.name))
+                        .map_err(|err| format!("Copy failed on {}: {err}", e.name))?;
+                }
+                Ok(())
+            })()
+            .map(|()| format!("Copied {label}."))
         } else {
-            // image -> image: extract the entry to a temp dir, stage it as an
-            // AddFile on the destination's browse session, then apply. The temp
+            // image -> image: extract the entries to a temp dir, stage them as
+            // AddFiles on the destination's browse session, then apply. The temp
             // dir must outlive apply_edits (the staged edits point into it).
             let dest_parent = match dst.listing.cwd() {
                 Some(e) => e.clone(),
@@ -1587,7 +1616,7 @@ impl CommanderState {
                 let edits = with_stderr_suppressed(|| {
                     crate::model::commander_ops::stage_copy(
                         src_fs,
-                        std::slice::from_ref(&entry),
+                        &entries,
                         &dest_parent,
                         temp.path(),
                         true,
@@ -1598,13 +1627,14 @@ impl CommanderState {
                     crate::model::commander_ops::apply_edits(&session, &edits)
                 })
                 .map_err(|e| format!("Copy failed: {e:#}"))?;
-                Ok(format!("Copied {name} into the image."))
+                Ok(format!("Copied {label} into the image."))
             })()
         };
         // The destination refreshes after the source borrow is released
-        // (host or image, both kinds).
+        // (host or image, both kinds); the source's marks are consumed.
         if result.is_ok() {
             cmd_refresh(dst);
+            src.listing.clear_selection();
         }
         match result {
             Ok(m) => {
@@ -1688,25 +1718,31 @@ impl CommanderState {
     fn delete_selected(&mut self) {
         let side = self.active;
         let pane = self.pane_mut(side);
-        let entry = match pane.selected() {
-            Some(e) => e,
-            None => {
-                self.status = Some("Select a file or folder to delete.".to_string());
-                self.is_error = true;
-                return;
-            }
+        let entries = pane.action_entries();
+        if entries.is_empty() {
+            self.status = Some("Select a file or folder to delete.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let label = if entries.len() == 1 {
+            entries[0].name.clone()
+        } else {
+            format!("{} items", entries.len())
         };
-        let name = entry.name.clone();
-        let is_dir = matches!(entry.entry_type, EntryType::Directory);
         let result: Result<String, String> = if pane.is_host {
-            let path = std::path::PathBuf::from(&entry.path);
-            let r = if is_dir {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            r.map(|()| format!("Deleted {name}."))
-                .map_err(|e| format!("Delete failed: {e}"))
+            (|| -> Result<(), String> {
+                for e in &entries {
+                    let path = std::path::PathBuf::from(&e.path);
+                    let r = if matches!(e.entry_type, EntryType::Directory) {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    r.map_err(|err| format!("Delete failed on {}: {err}", e.name))?;
+                }
+                Ok(())
+            })()
+            .map(|()| format!("Deleted {label}."))
         } else {
             let parent = match pane.listing.cwd() {
                 Some(e) => e.clone(),
@@ -1724,16 +1760,20 @@ impl CommanderState {
                     return;
                 }
             };
-            let edits = vec![crate::model::edit_queue::StagedEdit::DeleteRecursive {
-                parent,
-                entry: entry.clone(),
-            }];
+            let edits: Vec<_> = entries
+                .iter()
+                .map(|e| crate::model::edit_queue::StagedEdit::DeleteRecursive {
+                    parent: parent.clone(),
+                    entry: e.clone(),
+                })
+                .collect();
             with_stderr_suppressed(|| crate::model::commander_ops::apply_edits(&session, &edits))
-                .map(|()| format!("Deleted {name}."))
+                .map(|()| format!("Deleted {label}."))
                 .map_err(|e| format!("Delete failed: {e:#}"))
         };
         if result.is_ok() {
             let p = self.pane_mut(side);
+            p.listing.clear_selection();
             cmd_refresh(p);
             p.sel = p.sel.min(p.rows_len().saturating_sub(1));
         }
@@ -4789,13 +4829,51 @@ impl App {
                 true
             }
             KeyCode::Char('x') | KeyCode::Delete | KeyCode::F(8) => {
-                if let Some(e) = c.pane(active).selected() {
-                    c.confirm_delete =
-                        Some((e.name.clone(), matches!(e.entry_type, EntryType::Directory)));
-                } else {
-                    c.status = Some("Select a file or folder to delete.".to_string());
-                    c.is_error = true;
+                let entries = c.pane(active).action_entries();
+                match entries.len() {
+                    0 => {
+                        c.status = Some("Select a file or folder to delete.".to_string());
+                        c.is_error = true;
+                    }
+                    1 => {
+                        let e = &entries[0];
+                        let kind = if matches!(e.entry_type, EntryType::Directory) {
+                            "folder"
+                        } else {
+                            "file"
+                        };
+                        c.confirm_delete = Some(format!("{kind} \"{}\"", e.name));
+                    }
+                    n => c.confirm_delete = Some(format!("{n} items")),
                 }
+                true
+            }
+            // Space marks/unmarks the entry under the cursor and advances.
+            KeyCode::Char(' ') => {
+                let p = c.pane_mut(active);
+                p.toggle_mark();
+                p.sel = ((p.sel as isize + 1).min(n - 1).max(0)) as usize;
+                true
+            }
+            // `s` cycles the sort column; `S` flips the current direction.
+            KeyCode::Char('s') => {
+                use crate::model::dir_listing::SortColumn::*;
+                let p = c.pane_mut(active);
+                let next = match p.listing.sort_column() {
+                    Name => Size,
+                    Size => Modified,
+                    Modified => Type,
+                    Type => Name,
+                };
+                p.listing.resort(next);
+                c.status = Some(format!("Sorted by {next:?}."));
+                c.is_error = false;
+                true
+            }
+            KeyCode::Char('S') => {
+                let p = c.pane_mut(active);
+                let col = p.listing.sort_column();
+                p.listing.resort(col);
                 true
             }
             _ => false,
@@ -6234,10 +6312,8 @@ impl App {
 
         let status = match &c.status {
             Some(s) => s.clone(),
-            None => {
-                "Tab pane  o host  i image  Enter open  c copy  n new folder  x delete  r refresh"
-                    .to_string()
-            }
+            None => "Tab pane  Enter open  Space mark  c copy  n mkdir  x del  s sort  r refresh"
+                .to_string(),
         };
         let style = if c.is_error {
             self.palette.warn()
@@ -6280,17 +6356,13 @@ impl App {
         }
 
         // Delete confirmation (active pane).
-        if let Some((name, is_dir)) = &c.confirm_delete {
-            let kind = if *is_dir { "folder" } else { "file" };
+        if let Some(phrase) = &c.confirm_delete {
             let cp = centered_rect(60, 5, area);
             frame.render_widget(Clear, cp);
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
                     Line::raw(""),
-                    Line::styled(
-                        format!("  Delete {kind} \"{name}\"?  (y / n)"),
-                        self.palette.warn(),
-                    ),
+                    Line::styled(format!("  Delete {phrase}?  (y / n)"), self.palette.warn()),
                 ]))
                 .block(self.pane_block("Confirm delete", true)),
                 cp,
@@ -6325,13 +6397,18 @@ impl App {
         let mut lines = Vec::new();
         for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
             let on = focused && i == pane.sel;
-            let (text, is_dir) = match row {
-                crate::model::dir_listing::Row::Parent => ("..".to_string(), true),
+            let (text, is_dir, marked) = match row {
+                crate::model::dir_listing::Row::Parent => ("..".to_string(), true, false),
                 crate::model::dir_listing::Row::Entry(e) => {
+                    let marked = pane.listing.is_selected(&e.name);
                     if e.is_directory() {
-                        (format!("{}/", e.name), true)
+                        (format!("{}/", e.name), true, marked)
                     } else {
-                        (format!("{:<28} {:>9}", e.name, format_size(e.size)), false)
+                        (
+                            format!("{:<28} {:>9}", e.name, format_size(e.size)),
+                            false,
+                            marked,
+                        )
                     }
                 }
             };
@@ -6342,10 +6419,14 @@ impl App {
             };
             let style = if on {
                 base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else if marked {
+                base.add_modifier(Modifier::BOLD)
             } else {
                 base
             };
-            lines.push(Line::styled(format!(" {text}"), style));
+            // A leading '*' marks multi-selected entries (Space toggles).
+            let prefix = if marked { "*" } else { " " };
+            lines.push(Line::styled(format!("{prefix}{text}"), style));
         }
         let title = if pane.label.len() > area.width.saturating_sub(4) as usize {
             format!(
