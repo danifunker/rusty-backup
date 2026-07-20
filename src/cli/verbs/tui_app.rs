@@ -145,6 +145,15 @@ struct Explorer {
     mkdir_input: Option<String>,
     /// The `(name, is_dir)` of an entry pending a delete confirmation.
     confirm_delete: Option<(String, bool)>,
+    /// A scrollable fsck check / repair report overlay, when open.
+    fsck_report: Option<FsckReportView>,
+}
+
+/// A scrollable fsck / repair result overlay (title + pre-formatted lines).
+struct FsckReportView {
+    title: String,
+    lines: Vec<String>,
+    scroll: usize,
 }
 
 /// The HFS/HFS+ metadata editor: edit a file's Type, Creator, and modified date.
@@ -2395,6 +2404,7 @@ impl App {
                 confirm_bless: None,
                 mkdir_input: None,
                 confirm_delete: None,
+                fsck_report: None,
             };
             // Expand the root so its subdirectories show in the tree immediately.
             ex.tree_expand();
@@ -2418,6 +2428,35 @@ impl App {
     /// Keys while the Explorer overlay is open (modal). A path prompt (export /
     /// import) and the close confirmation are sub-modes that take priority.
     fn handle_explorer_key(&mut self, code: KeyCode) {
+        // fsck / repair report overlay (modal): scroll, Esc/q/Enter to close.
+        if self
+            .explorer
+            .as_ref()
+            .map(|e| e.fsck_report.is_some())
+            .unwrap_or(false)
+        {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.fsck_report = None;
+                }
+                return;
+            }
+            let page = self.explorer_page();
+            if let Some(rv) = self.explorer.as_mut().and_then(|e| e.fsck_report.as_mut()) {
+                let max = rv.lines.len().saturating_sub(1);
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => rv.scroll = rv.scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => rv.scroll = (rv.scroll + 1).min(max),
+                    KeyCode::PageUp => rv.scroll = rv.scroll.saturating_sub(page),
+                    KeyCode::PageDown => rv.scroll = (rv.scroll + page).min(max),
+                    KeyCode::Home => rv.scroll = 0,
+                    KeyCode::End => rv.scroll = max,
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         // File preview overlay (modal): scroll, Esc/q to close.
         if self
             .explorer
@@ -2722,6 +2761,16 @@ impl App {
                 }
                 return;
             }
+            // Check (fsck) this partition's filesystem.
+            KeyCode::Char('f') => {
+                self.explorer_fsck();
+                return;
+            }
+            // Repair this partition's filesystem in place (with confirmation).
+            KeyCode::Char('F') => {
+                self.explorer_repair();
+                return;
+            }
             // Delete the selected entry (with confirmation).
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(ex) = self.explorer.as_mut() {
@@ -2962,6 +3011,77 @@ impl App {
             Err(e) => {
                 if let Some(m) = self.explorer.as_mut().and_then(|e| e.metadata.as_mut()) {
                     m.error = Some(format!("{e}"));
+                }
+            }
+        }
+    }
+
+    /// Run fsck on the Explorer's open partition and show the result overlay.
+    /// Read-only — checks the already-open filesystem in place.
+    fn explorer_fsck(&mut self) {
+        let Some(ex) = self.explorer.as_mut() else {
+            return;
+        };
+        let lines = match with_stderr_suppressed(|| ex.fs.fsck()) {
+            Some(Ok(result)) => format_fsck_lines(&result),
+            Some(Err(e)) => vec![format!("Check failed: {e:#}")],
+            None => vec![
+                "This filesystem has no integrity checker.".to_string(),
+                String::new(),
+                "(fsck is available for FAT/exFAT, ext*, NTFS, HFS/HFS+, and the".to_string(),
+                " supported retro filesystems.)".to_string(),
+            ],
+        };
+        ex.fsck_report = Some(FsckReportView {
+            title: format!("fsck - {}", ex.part_label),
+            lines,
+            scroll: 0,
+        });
+        ex.status = None;
+    }
+
+    /// Repair the Explorer's open partition in place (reopen read-write via the
+    /// shared repair core), then reopen the view and show a combined
+    /// repair + re-check report.
+    fn explorer_repair(&mut self) {
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let (image_path, selector, part_label, comps) = (
+            ex.image_path.clone(),
+            ex.selector,
+            ex.part_label.clone(),
+            ex.dir_components(),
+        );
+        match with_stderr_suppressed(|| apply_repair(&image_path, selector)) {
+            Ok(report) => {
+                let mut lines = format_repair_lines(&report);
+                self.reopen_explorer(
+                    &image_path,
+                    selector,
+                    part_label.clone(),
+                    &comps,
+                    Some("Repair complete".to_string()),
+                );
+                // Re-check the freshly reopened filesystem to show updated state.
+                if let Some(ex) = self.explorer.as_mut() {
+                    lines.push(String::new());
+                    lines.push("--- re-check after repair ---".to_string());
+                    match with_stderr_suppressed(|| ex.fs.fsck()) {
+                        Some(Ok(result)) => lines.extend(format_fsck_lines(&result)),
+                        Some(Err(e)) => lines.push(format!("Re-check failed: {e:#}")),
+                        None => lines.push("(no checker for re-check)".to_string()),
+                    }
+                    ex.fsck_report = Some(FsckReportView {
+                        title: format!("repair - {part_label}"),
+                        lines,
+                        scroll: 0,
+                    });
+                }
+            }
+            Err(e) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.status = Some(format!("Repair failed: {e:#}"));
                 }
             }
         }
@@ -5165,7 +5285,7 @@ impl App {
             fl.push(Line::styled(format!(" {s}"), self.palette.warn()));
         }
         fl.push(Line::styled(
-            " Tab pane   Enter open/view   e Export  i Import  n New  x Delete  m Meta  b Bless  Esc close",
+            " Enter open  e Export i Import  n New x Del  m Meta b Bless  f Check F Repair  Esc close",
             self.palette.dim(),
         ));
         frame.render_widget(Paragraph::new(Text::from(fl)), rows[2]);
@@ -5173,6 +5293,42 @@ impl App {
         // File preview overlay.
         if let Some(pv) = &ex.preview {
             self.draw_preview(frame, area, pv);
+        }
+
+        // fsck / repair report overlay.
+        if let Some(rv) = &ex.fsck_report {
+            let popup = centered_rect(78, area.height.saturating_sub(4).clamp(8, 22), area);
+            frame.render_widget(Clear, popup);
+            let inner_h = popup.height.saturating_sub(2) as usize;
+            let start = rv.scroll.min(rv.lines.len().saturating_sub(1));
+            let body: Vec<Line> = rv
+                .lines
+                .iter()
+                .skip(start)
+                .take(inner_h.saturating_sub(1))
+                .map(|l| {
+                    let style = if l.contains("CLEAN") || l.trim_start().starts_with('+') {
+                        self.palette.accent()
+                    } else if l.starts_with("Result:")
+                        || l.contains("error")
+                        || l.contains("failed")
+                    {
+                        self.palette.warn()
+                    } else {
+                        self.palette.dim()
+                    };
+                    Line::styled(format!(" {l}"), style)
+                })
+                .collect();
+            let mut lines = body;
+            lines.push(Line::styled(
+                " Up/Down scroll   Esc close",
+                self.palette.dim(),
+            ));
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block(&rv.title, true)),
+                popup,
+            );
         }
 
         // Metadata editor form.
@@ -7695,6 +7851,109 @@ fn apply_metadata_edit(
     drop(fs);
     commit.commit()?;
     Ok(())
+}
+
+/// Open the partition read-write and run the filesystem's in-place repair, then
+/// commit. Mirrors the GUI browse view's repair (open_editable -> repair ->
+/// commit); errors (unsupported fs, CHD source, etc.) bubble up.
+fn apply_repair(
+    image_path: &str,
+    selector: Option<u32>,
+) -> anyhow::Result<crate::fs::RepairReport> {
+    use crate::cli::resolve::resolve_partition_rw_forced;
+    let (file, ctx, commit) =
+        resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
+    let mut efs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("opening filesystem for repair: {e}"))?;
+    let report = efs.repair().map_err(|e| anyhow::anyhow!("repair: {e}"))?;
+    efs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(efs);
+    commit.commit()?;
+    Ok(report)
+}
+
+/// Format an [`FsckResult`](crate::fs::FsckResult) into display lines for the
+/// Explorer's report overlay.
+fn format_fsck_lines(result: &crate::fs::FsckResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    let s = &result.stats;
+    lines.push(format!(
+        "{} files / {} dirs checked",
+        s.files_checked, s.directories_checked
+    ));
+    for (label, value) in &s.extra {
+        lines.push(format!("  {label}: {value}"));
+    }
+    lines.push(String::new());
+    if result.is_clean() {
+        lines.push("Result: CLEAN - no errors found.".to_string());
+    } else {
+        lines.push(format!("Result: {} error(s).", result.errors.len()));
+    }
+    if result.repairable {
+        lines.push("Some errors are repairable - press F to repair.".to_string());
+    }
+    if !result.errors.is_empty() {
+        lines.push(String::new());
+        lines.push("Errors:".to_string());
+        for e in result.errors.iter().filter(|e| !e.debug) {
+            lines.push(format!("  [{}] {}", e.code, e.message));
+        }
+    }
+    if !result.warnings.is_empty() {
+        lines.push(String::new());
+        lines.push("Warnings:".to_string());
+        for w in result.warnings.iter().filter(|w| !w.debug) {
+            lines.push(format!("  [{}] {}", w.code, w.message));
+        }
+    }
+    if !result.orphaned_entries.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Orphaned entries (unrepairable): {}",
+            result.orphaned_entries.len()
+        ));
+        for o in result.orphaned_entries.iter().take(20) {
+            let kind = if o.is_directory { "dir " } else { "file" };
+            lines.push(format!(
+                "  {kind} {} (parent {})",
+                o.name, o.missing_parent_id
+            ));
+        }
+    }
+    lines
+}
+
+/// Format a [`RepairReport`](crate::fs::RepairReport) into display lines.
+fn format_repair_lines(report: &crate::fs::RepairReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Applied {} fix(es); {} failed; {} unrepairable.",
+        report.fixes_applied.len(),
+        report.fixes_failed.len(),
+        report.unrepairable_count
+    ));
+    if !report.fixes_applied.is_empty() {
+        lines.push(String::new());
+        lines.push("Fixes applied:".to_string());
+        for f in &report.fixes_applied {
+            lines.push(format!("  + {f}"));
+        }
+    }
+    if !report.fixes_failed.is_empty() {
+        lines.push(String::new());
+        lines.push("Fixes failed:".to_string());
+        for f in &report.fixes_failed {
+            lines.push(format!("  - {f}"));
+        }
+    }
+    lines
 }
 
 /// Open the partition read-write and bless the directory at `dir_path` as the
