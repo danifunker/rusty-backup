@@ -1405,6 +1405,32 @@ struct ClientDirEntry {
     name: String,
     version: u16,
     fid: u32,
+    /// `File.FP.da` — the LOGICAL page number of the file's header within the
+    /// volume, which is what Cedar dereferences: `FileImpl.Open` builds
+    /// `VolumeFormat.LogicalRun[first: fp.da, size: headerPages]` and hands it
+    /// to `TranslateLogicalRun`. Leaving it 0 points every entry at logical
+    /// page 0 (the volume root), and Cedar rejects the enumeration with
+    /// `FS.Error $badFP` — "File.FP from directory/cache doesn't correspond to
+    /// a local volume" (`FSMainImpl2.mesa`).
+    da: u32,
+}
+
+/// Logical page of a file's run-table leader (its first header page), i.e. the
+/// value Cedar wants in `File.FP.da`. Scans the subvolume for the HEADER page
+/// whose label carries this FileID at file-page 0 — the same identification
+/// `add_file` uses when it stamps that label.
+fn header_lp_for(disk: &Disk, sv: &SubVolumeDesc, fid: u32) -> Option<u32> {
+    (1..sv.n_pages).find(|&lp| {
+        disk.sector(sv.pv_page as usize + lp as usize)
+            .map(|s| {
+                let label = Label::parse(&s.label);
+                label.attributes == attr::HEADER
+                    && label.file_id[0] == (fid & 0xffff) as u16
+                    && label.file_id[1] == (fid >> 16) as u16
+                    && file_page_number(&label) == 0
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Read a `TextRep` (PACKED SEQUENCE length: CARDINAL OF CHAR) at word `wi` in a
@@ -1466,8 +1492,14 @@ fn parse_client_directory(client_data: &[u8]) -> Vec<ClientDirEntry> {
                 let version = rdw(page, entry_w + 1);
                 let name_rp = rdw(page, entry_w + 2) as usize; // word-relative ptr
                 let fid = rdlong(page, entry_w + 5); // fp.id (FileID, 2 words)
+                let da = rdlong(page, entry_w + 7); // fp.da (DA, 2 words)
                 if let Some(name) = read_textrep(page, entry_w + name_rp, page_words) {
-                    out.push(ClientDirEntry { name, version, fid });
+                    out.push(ClientDirEntry {
+                        name,
+                        version,
+                        fid,
+                        da,
+                    });
                 }
             }
             w = entry_w + size; // advance past grPage + entry
@@ -1514,7 +1546,8 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
         wrw(&mut leaf, entry_w + 2, FS_LOCAL_TEXT_WORD as u16); // nameBody rel ptr
         wrw(&mut leaf, entry_w + 3, FS_ENTRY_LOCAL); // type = local
         wrw(&mut leaf, entry_w + 4, 0); // keep
-        wrlong(&mut leaf, entry_w + 5, e.fid); // fp.id (FileID); fp.da left 0
+        wrlong(&mut leaf, entry_w + 5, e.fid); // fp.id (FileID, 2 words)
+        wrlong(&mut leaf, entry_w + 7, e.da); // fp.da (DA, 2 words)
         let text_w = entry_w + FS_LOCAL_TEXT_WORD;
         wrw(&mut leaf, text_w, name_bytes.len() as u16); // char count
         let cbase = (text_w + 1) * 2;
@@ -1596,12 +1629,29 @@ pub fn set_client_directory(
     generation: Generation,
     entries: &[(String, u16, u32)],
 ) -> Result<Disk, FilesystemError> {
+    // Resolve each entry's File.FP.da (the logical page of its header) BEFORE
+    // the B-tree becomes a file itself, so the lookups see exactly the files
+    // being named. An entry whose file cannot be found is dropped rather than
+    // written with a null da: Cedar raises $badFP on the first such entry and
+    // abandons the rest of the enumeration, so one bad entry would cost every
+    // later one.
+    let vol_now = read_volume(disk, generation)?;
+    let sv_now = vol_now
+        .physical_root
+        .sub_volumes
+        .iter()
+        .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+        .cloned()
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
     let dir_entries: Vec<ClientDirEntry> = entries
         .iter()
-        .map(|(name, version, fid)| ClientDirEntry {
-            name: name.clone(),
-            version: *version,
-            fid: *fid,
+        .filter_map(|(name, version, fid)| {
+            header_lp_for(disk, &sv_now, *fid).map(|da| ClientDirEntry {
+                name: name.clone(),
+                version: *version,
+                fid: *fid,
+                da,
+            })
         })
         .collect();
     let btree = build_client_directory(&dir_entries)?;
@@ -2415,16 +2465,19 @@ mod tests {
                 name: "Compiler.bcd".into(),
                 version: 3,
                 fid: 42,
+                da: 11,
             },
             ClientDirEntry {
                 name: "Tioga.bcd".into(),
                 version: 1,
                 fid: 7,
+                da: 12,
             },
             ClientDirEntry {
                 name: "a".into(),
                 version: 1,
                 fid: 99,
+                da: 13,
             }, // odd length
         ];
         let bytes = build_client_directory(&entries).expect("build");
@@ -2437,13 +2490,17 @@ mod tests {
         assert_eq!(rdlong(&bytes, 5), 3, "entryCount in statePage");
 
         let got = parse_client_directory(&bytes);
-        let mut map: std::collections::HashMap<u32, (u16, String)> = Default::default();
+        let mut map: std::collections::HashMap<u32, (u16, String, u32)> = Default::default();
         for e in got {
-            map.insert(e.fid, (e.version, e.name));
+            map.insert(e.fid, (e.version, e.name, e.da));
         }
-        assert_eq!(map[&42], (3, "Compiler.bcd".into()));
-        assert_eq!(map[&7], (1, "Tioga.bcd".into()));
-        assert_eq!(map[&99], (1, "a".into()));
+        // fp.da travels with the entry: Cedar dereferences it as
+        // VolumeFormat.LogicalRun[first: fp.da] to reach the file's header
+        // (FileImpl.Open). It used to be written as 0, which made Cedar reject
+        // the enumeration with FS.Error $badFP.
+        assert_eq!(map[&42], (3, "Compiler.bcd".into(), 11));
+        assert_eq!(map[&7], (1, "Tioga.bcd".into(), 12));
+        assert_eq!(map[&99], (1, "a".into(), 13));
     }
 
     #[test]
@@ -2455,6 +2512,7 @@ mod tests {
                 name: format!("AVeryLongCedarFileName-{i:04}.bcd"),
                 version: 1,
                 fid: 1000 + i,
+                da: 100 + i,
             })
             .collect();
         assert!(matches!(
@@ -2508,6 +2566,27 @@ mod tests {
             ("Othello.boot".to_string(), 2u16, fb),
         ];
         let disk = set_client_directory(&disk, Generation::CedarNucleus, &dir).expect("set dir");
+
+        // Every named file must resolve to a real header page -- the value
+        // set_client_directory records as File.FP.da. A null da points at the
+        // logical-volume root and Cedar rejects the enumeration with
+        // FS.Error $badFP. Regression guard for the 2026-07-20 fix.
+        {
+            let vol = read_volume(&disk, Generation::CedarNucleus).unwrap();
+            let sv = vol
+                .physical_root
+                .sub_volumes
+                .iter()
+                .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+                .cloned()
+                .unwrap();
+            let da_a = header_lp_for(&disk, &sv, fa).expect("file a has a header");
+            let da_b = header_lp_for(&disk, &sv, fb).expect("file b has a header");
+            assert_ne!(da_a, 0, "fp.da must not be the volume root");
+            assert_ne!(da_b, 0, "fp.da must not be the volume root");
+            assert_ne!(da_a, da_b, "each file has its own header page");
+        }
+
         assert_eq!(
             read_volume(&disk, Generation::CedarNucleus)
                 .unwrap()
