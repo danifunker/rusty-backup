@@ -60,6 +60,8 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   source. (Device targets deferred to the elevation pass.)
 - [x] **Bulk** — source folder → format + review list (un-check to skip) → run
   via `bulk_convert_runner::start_bulk_convert` with per-file progress.
+- [x] **Optical (rip)** — local drive list → config (output/format/eject) → run
+  via `optical::rip::run_rip`. Wired; needs a physical drive to verify a full rip.
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -116,14 +118,17 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** converting a 3-image folder to VHD with one file un-checked
   produced exactly the two selected `.vhd` outputs ("Converted 2 ok, 0 failed").
 
-### Step 4 — Optical tab
-- [ ] Drive list via `model::optical_devices::list_rip_devices(&remotes) ->
-  Vec<RipDevice>`.
-- [ ] Rip: build `optical::rip::RipConfig{device,output_path,format,eject_after}`,
-  spawn `optical::rip::run_rip(config, Arc<Mutex<RipProgress>>)`, poll progress.
-- [ ] Reuse the Explorer for browse/extract of an optical image; `optical new` via
-  `cli::verbs::optical::run(OpticalCommand::New{..})` under `with_stderr_suppressed`.
-- **Accept:** enumerate drives; rip or browse an optical image fixture.
+### Step 4 — Optical tab  [rip wired; needs a drive to fully verify]
+- [x] Drive list via `model::optical_devices::list_local_rip_devices()`
+  (`r` rescans; shows "no drives" when none present).
+- [x] Rip: drive -> config (output path / format ISO|BIN-CUE / eject) -> run
+  `optical::rip::run_rip(config, Arc<Mutex<RipProgress>>)` on a worker thread
+  (same threading + progress-bar pattern as Backup/Restore); Esc cancels.
+- [ ] Browse/extract of an optical image and `optical new` (SGI EFS) deferred —
+  optical browse is a distinct code path from the partition Explorer.
+- **Verified here:** drive enumeration + screen render (no drive in CI sandbox).
+  **Needs a physical drive** to verify an end-to-end rip (wired per the CLI's
+  `run_rip` path, so it mirrors a proven flow).
 
 ### Step 5 — Archives tab
 - [ ] Open `.sit/.sea/.cpt/.mar` (+ `.hqx`) via `archive_edit`; list entries.

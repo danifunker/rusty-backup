@@ -1239,6 +1239,61 @@ impl BulkState {
     }
 }
 
+/// The Optical screen (rip): choose a drive -> config (output / format / eject)
+/// -> run `optical::rip::run_rip` on a worker thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpticalStep {
+    Drives,
+    Config,
+    Run,
+}
+
+/// Rip output formats.
+const RIP_FORMATS: &[(&str, crate::optical::rip::RipFormat)] = &[
+    ("ISO (data)", crate::optical::rip::RipFormat::Iso),
+    ("BIN/CUE (raw)", crate::optical::rip::RipFormat::BinCue),
+];
+/// Config-form rows: 0 output, 1 format, 2 eject, 3 "Start".
+const OPTICAL_FIELDS: usize = 4;
+
+struct OpticalState {
+    step: OpticalStep,
+    drives: Vec<crate::model::optical_devices::RipDevice>,
+    drive_sel: usize,
+    device_path: String,
+    device_name: String,
+    output: String,
+    format_sel: usize,
+    eject: bool,
+    field: usize,
+    picker: Option<FilePicker>,
+    run: Option<Arc<Mutex<crate::optical::rip::RipProgress>>>,
+    op: String,
+    result: Option<String>,
+    is_error: bool,
+}
+
+impl Default for OpticalState {
+    fn default() -> Self {
+        OpticalState {
+            step: OpticalStep::Drives,
+            drives: Vec::new(),
+            drive_sel: 0,
+            device_path: String::new(),
+            device_name: String::new(),
+            output: String::new(),
+            format_sel: 0,
+            eject: false,
+            field: 0,
+            picker: None,
+            run: None,
+            op: String::new(),
+            result: None,
+            is_error: false,
+        }
+    }
+}
+
 /// The Settings tab state: the loaded `UpdateConfig` plus a cursor over the
 /// editable preference toggles. Edits save straight back to `config.json` via
 /// `UpdateConfig::save` (the same file the GUI reads/writes).
@@ -1283,6 +1338,8 @@ struct App {
     restore: Option<RestoreState>,
     /// The Bulk convert screen state (lazily created on first visit).
     bulk: Option<BulkState>,
+    /// The Optical (rip) screen state (lazily created on first visit).
+    optical: Option<OpticalState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     show_help: bool,
@@ -1309,6 +1366,7 @@ impl App {
             backup: None,
             restore: None,
             bulk: None,
+            optical: None,
             settings: None,
             show_help: false,
             should_quit: false,
@@ -1424,6 +1482,11 @@ impl App {
 
         // The Bulk convert screen owns most keys on its tab.
         if self.current() == TabId::Bulk && self.handle_bulk_key(key.code) {
+            return Ok(());
+        }
+
+        // The Optical screen owns most keys on its tab.
+        if self.current() == TabId::Optical && self.handle_optical_key(key.code) {
             return Ok(());
         }
 
@@ -2226,6 +2289,11 @@ impl App {
                 s.cancel_requested = true;
             }
         }
+        if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
+            if let Ok(mut p) = run.lock() {
+                p.cancel_requested = true;
+            }
+        }
         self.progress = None;
     }
 
@@ -2256,6 +2324,12 @@ impl App {
         }
         if self.current() == TabId::Bulk && self.bulk.is_none() {
             self.bulk = Some(BulkState::default());
+        }
+        if self.current() == TabId::Optical && self.optical.is_none() {
+            self.optical = Some(OpticalState {
+                drives: crate::model::optical_devices::list_local_rip_devices(),
+                ..OpticalState::default()
+            });
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -3297,6 +3371,218 @@ impl App {
         });
     }
 
+    /// Optical (rip) screen keys. Returns `true` when consumed.
+    fn handle_optical_key(&mut self, code: KeyCode) -> bool {
+        if self.optical.is_none() {
+            self.optical = Some(OpticalState {
+                drives: crate::model::optical_devices::list_local_rip_devices(),
+                ..OpticalState::default()
+            });
+        }
+        // Output-path picker (modal).
+        if self
+            .optical
+            .as_ref()
+            .map(|o| o.picker.is_some())
+            .unwrap_or(false)
+        {
+            let res = self
+                .optical
+                .as_mut()
+                .unwrap()
+                .picker
+                .as_mut()
+                .unwrap()
+                .handle_key(code);
+            match res {
+                Some(PickResult::Cancel) => self.optical.as_mut().unwrap().picker = None,
+                Some(PickResult::Confirm(path)) => {
+                    let o = self.optical.as_mut().unwrap();
+                    o.output = path.to_string_lossy().into_owned();
+                    o.picker = None;
+                }
+                None => {}
+            }
+            return true;
+        }
+
+        let step = self.optical.as_ref().unwrap().step;
+        if step == OpticalStep::Config
+            && code == KeyCode::Enter
+            && self.optical.as_ref().map(|o| o.field).unwrap_or(0) == 3
+        {
+            self.start_optical_rip();
+            return true;
+        }
+
+        let o = self.optical.as_mut().unwrap();
+        match step {
+            OpticalStep::Drives => match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    o.drive_sel = o.drive_sel.saturating_sub(1);
+                    true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    o.drive_sel = (o.drive_sel + 1).min(o.drives.len().saturating_sub(1));
+                    true
+                }
+                KeyCode::Char('r') => {
+                    o.drives = crate::model::optical_devices::list_local_rip_devices();
+                    o.drive_sel = 0;
+                    true
+                }
+                KeyCode::Enter => {
+                    if let Some(d) = o.drives.get(o.drive_sel) {
+                        o.device_path = d.device_path.clone();
+                        o.device_name = d.display_name.clone();
+                        if o.output.is_empty() {
+                            let ext = if o.format_sel == 1 { "cue" } else { "iso" };
+                            let home = dirs::home_dir().unwrap_or_default();
+                            o.output = home.join(format!("disc.{ext}")).display().to_string();
+                        }
+                        o.step = OpticalStep::Config;
+                        o.field = 0;
+                    }
+                    true
+                }
+                _ => false,
+            },
+            OpticalStep::Config => match code {
+                KeyCode::Esc => {
+                    o.step = OpticalStep::Drives;
+                    true
+                }
+                KeyCode::Down => {
+                    o.field = (o.field + 1) % OPTICAL_FIELDS;
+                    true
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    o.field = (o.field + OPTICAL_FIELDS - 1) % OPTICAL_FIELDS;
+                    true
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if o.field == 1 => {
+                    let n = RIP_FORMATS.len();
+                    o.format_sel = if code == KeyCode::Left {
+                        (o.format_sel + n - 1) % n
+                    } else {
+                        (o.format_sel + 1) % n
+                    };
+                    true
+                }
+                KeyCode::Char(' ') if o.field == 2 => {
+                    o.eject = !o.eject;
+                    true
+                }
+                KeyCode::Tab if o.field == 0 => {
+                    let mut p = FilePicker::new(PickKind::Any, "Choose output path");
+                    p.input = o.output.clone();
+                    o.picker = Some(p);
+                    true
+                }
+                KeyCode::Enter => {
+                    o.field = (o.field + 1) % OPTICAL_FIELDS;
+                    true
+                }
+                KeyCode::Backspace if o.field == 0 => {
+                    o.output.pop();
+                    true
+                }
+                KeyCode::Char(c) if !c.is_control() && o.field == 0 => {
+                    o.output.push(c);
+                    true
+                }
+                _ => false,
+            },
+            OpticalStep::Run => match code {
+                KeyCode::Esc => {
+                    let running = o.result.is_none();
+                    if running {
+                        self.cancel_progress();
+                        if let Some(o) = self.optical.as_mut() {
+                            o.result = Some("Cancel requested...".to_string());
+                            o.is_error = true;
+                        }
+                    } else {
+                        self.progress = None;
+                        if let Some(o) = self.optical.as_mut() {
+                            o.run = None;
+                            o.result = None;
+                            o.step = OpticalStep::Config;
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            },
+        }
+    }
+
+    /// Start `optical::rip::run_rip` on a worker thread for the selected drive.
+    fn start_optical_rip(&mut self) {
+        let Some(o) = self.optical.as_ref() else {
+            return;
+        };
+        let output = expand_tilde(o.output.trim());
+        if output.as_os_str().is_empty() {
+            let o = self.optical.as_mut().unwrap();
+            o.result = Some("Enter an output path.".to_string());
+            o.is_error = true;
+            o.step = OpticalStep::Run;
+            return;
+        }
+        let device = match crate::optical::rip::OpticalTarget::resolve(&o.device_path) {
+            Ok(t) => t,
+            Err(e) => {
+                let o = self.optical.as_mut().unwrap();
+                o.result = Some(format!("Cannot open drive: {e:#}"));
+                o.is_error = true;
+                o.step = OpticalStep::Run;
+                return;
+            }
+        };
+        let format = RIP_FORMATS[o.format_sel.min(RIP_FORMATS.len() - 1)].1;
+        let config = crate::optical::rip::RipConfig {
+            device,
+            output_path: output,
+            format,
+            eject_after: o.eject,
+        };
+        let progress = Arc::new(Mutex::new(crate::optical::rip::RipProgress::new()));
+        let worker = Arc::clone(&progress);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::optical::rip::run_rip(config, Arc::clone(&worker))
+            }));
+            if let Ok(mut p) = worker.lock() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if p.error.is_none() {
+                            p.error = Some(format!("{e:#}"));
+                        }
+                    }
+                    Err(_) => {
+                        if p.error.is_none() {
+                            p.error = Some("rip thread panicked".to_string());
+                        }
+                    }
+                }
+                p.finished = true;
+            }
+        });
+        let o = self.optical.as_mut().unwrap();
+        o.run = Some(progress);
+        o.result = None;
+        o.is_error = false;
+        o.op = "Starting...".to_string();
+        o.step = OpticalStep::Run;
+        self.progress = Some(Progress {
+            shared: Arc::new(Mutex::new(ProgressShared::default())),
+            tracker: RateTracker::default(),
+            label: "Ripping".to_string(),
+        });
+    }
+
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
@@ -3418,6 +3704,42 @@ impl App {
                     if done && b.result.is_none() {
                         b.result = Some(format!("Converted {ok} ok, {fail} failed."));
                         b.is_error = fail > 0;
+                    }
+                }
+            }
+        }
+        // Mirror a running optical rip's progress into the visual bar.
+        if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
+            let snap = run.lock().ok().map(|p| {
+                (
+                    p.current_bytes,
+                    p.total_bytes,
+                    p.finished,
+                    p.error.clone(),
+                    p.operation.clone(),
+                )
+            });
+            if let Some((cur, total, done, err, op)) = snap {
+                if let Some(prog) = self.progress.as_ref() {
+                    if let Ok(mut sh) = prog.shared.lock() {
+                        sh.current = cur;
+                        sh.total = total;
+                        sh.done = done;
+                    }
+                }
+                if let Some(o) = self.optical.as_mut() {
+                    o.op = op;
+                    if done && o.result.is_none() {
+                        match err {
+                            Some(e) => {
+                                o.result = Some(format!("Rip failed: {e}"));
+                                o.is_error = true;
+                            }
+                            None => {
+                                o.result = Some("Rip complete.".to_string());
+                                o.is_error = false;
+                            }
+                        }
                     }
                 }
             }
@@ -3874,6 +4196,12 @@ impl App {
         if self.current() == TabId::Bulk {
             if let Some(b) = &self.bulk {
                 self.draw_bulk(frame, area, b);
+                return;
+            }
+        }
+        if self.current() == TabId::Optical {
+            if let Some(o) = &self.optical {
+                self.draw_optical(frame, area, o);
                 return;
             }
         }
@@ -4598,6 +4926,150 @@ impl App {
         }
     }
 
+    /// The Optical rip screen: drive list -> config -> run.
+    fn draw_optical(&self, frame: &mut Frame, area: Rect, o: &OpticalState) {
+        let title = match o.step {
+            OpticalStep::Drives => "Optical  -  step 1/3: drive",
+            OpticalStep::Config => "Optical  -  step 2/3: rip options",
+            OpticalStep::Run => "Optical  -  step 3/3: run",
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        match o.step {
+            OpticalStep::Drives => {
+                lines.push(Line::styled(
+                    "Rip an optical disc. Pick a drive:",
+                    self.palette.accent(),
+                ));
+                lines.push(Line::raw(""));
+                if o.drives.is_empty() {
+                    lines.push(Line::styled(
+                        "  No optical drives detected. Press `r` to rescan.",
+                        self.palette.dim(),
+                    ));
+                } else {
+                    for (i, d) in o.drives.iter().enumerate() {
+                        let sel = i == o.drive_sel;
+                        let marker = if sel { "> " } else { "  " };
+                        let style = if sel {
+                            self.palette
+                                .accent()
+                                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                        } else {
+                            self.palette.accent()
+                        };
+                        lines.push(Line::styled(
+                            format!("{marker}{}  ({})", d.display_name, d.device_path),
+                            style,
+                        ));
+                    }
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Up/Down select   Enter next   r rescan",
+                    self.palette.dim(),
+                ));
+                if let Some(note) = self.device_note() {
+                    lines.push(Line::raw(""));
+                    lines.push(note);
+                }
+            }
+            OpticalStep::Config => {
+                lines.push(Line::from(vec![
+                    Span::styled("Drive: ", self.palette.dim()),
+                    Span::raw(format!("{} ({})", o.device_name, o.device_path)),
+                ]));
+                lines.push(Line::raw(""));
+                let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
+                    let active = o.field == idx;
+                    let cursor = if active && editable {
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
+                    } else {
+                        Span::raw("")
+                    };
+                    let marker = if active { "> " } else { "  " };
+                    let mstyle = if active {
+                        self.palette.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        self.palette.accent()
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{marker}{label:<9}"), mstyle),
+                        Span::raw(val),
+                        cursor,
+                    ])
+                };
+                lines.push(row(0, "Output:", o.output.clone(), true));
+                lines.push(row(
+                    1,
+                    "Format:",
+                    format!("< {} >", RIP_FORMATS[o.format_sel].0),
+                    false,
+                ));
+                lines.push(row(
+                    2,
+                    "Eject:",
+                    format!("[{}]", if o.eject { "x" } else { " " }),
+                    false,
+                ));
+                lines.push(Line::raw(""));
+                let start_sel = o.field == 3;
+                lines.push(Line::styled(
+                    format!("{}[ Start rip ]", if start_sel { "> " } else { "  " }),
+                    if start_sel {
+                        self.palette
+                            .accent()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        self.palette.accent()
+                    },
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Up/Down field   Left/Right format   Space eject   Tab browse (Output)   \
+                     Enter Start   Esc back",
+                    self.palette.dim(),
+                ));
+            }
+            OpticalStep::Run => {
+                lines.push(Line::from(vec![
+                    Span::styled("Drive: ", self.palette.dim()),
+                    Span::raw(o.device_name.clone()),
+                    Span::styled("   Output: ", self.palette.dim()),
+                    Span::raw(o.output.clone()),
+                ]));
+                lines.push(Line::raw(""));
+                if !o.op.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Step: ", self.palette.dim()),
+                        Span::raw(o.op.clone()),
+                    ]));
+                }
+                if let Some(res) = &o.result {
+                    lines.push(Line::raw(""));
+                    let style = if o.is_error {
+                        self.palette.warn()
+                    } else {
+                        self.palette.accent()
+                    };
+                    lines.push(Line::styled(format!("  {res}"), style));
+                    lines.push(Line::styled(
+                        "  Esc to return to options.",
+                        self.palette.dim(),
+                    ));
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block(title, true))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        if let Some(picker) = &o.picker {
+            picker.draw(frame, area, self.palette, self.border);
+        }
+    }
+
     /// The physical-disk chooser overlay used by the Backup source step.
     fn draw_backup_device_pick(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
         let disks = self.disks.as_deref().unwrap_or(&[]);
@@ -4888,6 +5360,24 @@ impl App {
                     ("Up/Dn", "Move"),
                     ("<-/->", "Format"),
                     ("Space", "Toggle"),
+                    ("Enter", "Start"),
+                    ("Esc", "Back"),
+                ],
+                _ => vec![("Esc", "Back")],
+            }
+        } else if self.current() == TabId::Optical {
+            let step = self.optical.as_ref().map(|o| o.step);
+            match step {
+                Some(OpticalStep::Drives) => vec![
+                    ("<-/->", "Tabs"),
+                    ("Up/Dn", "Select"),
+                    ("Enter", "Next"),
+                    ("r", "Rescan"),
+                ],
+                Some(OpticalStep::Config) => vec![
+                    ("Up/Dn", "Field"),
+                    ("<-/->", "Format"),
+                    ("Tab", "Browse"),
                     ("Enter", "Start"),
                     ("Esc", "Back"),
                 ],
