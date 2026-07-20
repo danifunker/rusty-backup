@@ -208,7 +208,7 @@ clap_complete = "4"
 clap_mangen = "0.3"
 globset = "0.4"
 rustyline = { version = "18.0.0", features = ["with-file-history"] }
-crossterm = "0.28"
+crossterm = "0.29"
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"
 lzfse_rust = "0.2.1"

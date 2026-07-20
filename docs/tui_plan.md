@@ -199,7 +199,9 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 ### Step 10 — Polish leftovers
 - [ ] Absorb the `menu` appliance verb as an alias into Backup/Restore.
 - [ ] Elevation-prompt UX in the TUI (design pass; reuse `src/privileged/` + `os::*`).
-- [ ] crossterm dedupe (ratatui 0.30 pulls 0.29; bump `menu`/`cli::tui`/`bless_pick`).
+- [x] crossterm dedupe — bumped our direct dep 0.28 -> 0.29 to match ratatui
+  0.30's transitive `crossterm 0.29`; no API changes needed in `menu`/`cli::tui`/
+  `bless_pick`/`dir_picker`/`setup`/`tui_app`. Tree now has a single crossterm.
 
 ---
 
