@@ -65,13 +65,24 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
 - [x] **Archives** — open a Mac archive, list entries, extract to host (fork
   format cycled with `f`) via `macarchive::extract`.
 - [x] **Commander** — dual-pane (host folder / image partition) browse + copy
-  between panes (host↔image, host↔host) via `dir_listing` + `commander_ops`.
-- [x] **Explorer edits** — `n` new folder, `x` delete (plus the earlier import /
-  metadata / bless), all through the editable-fs commit path.
-- [x] **Command palette** — `:` runs any `rb-cli` verb (alt-screen suspended).
-- [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
-  two persisted toggles (update-check, file-associations); saves to `config.json`
-  preserving all other fields.
+  between panes (host↔image, host↔host, **image↔image**) via `dir_listing` +
+  `commander_ops`; **multi-select** (Space), **sort** (`s`/`S`), **new folder**
+  (`n`), **delete** (`x`, confirmed) — all batch-aware.
+- [x] **Explorer edits** — `n` new folder, `x` delete, import / metadata / bless,
+  **fsck check (`f`) + repair (`F`)**, and a **transform launcher (`t`)** that
+  prefills the palette (convert / resize / expand / partition table).
+- [x] **Command palette** — `:` runs any `rb-cli` verb (alt-screen suspended);
+  also the execution path for the Explorer/Optical/Archives launchers.
+- [x] **Optical / Archives image ops** — `i` on Optical opens a browse/extract/
+  info/convert/new launcher; `c` on Archives prefills `archive create`.
+- [x] **Device targets** — Backup source *and* **Restore target** can be a
+  physical disk (target-type chooser + destructive-write confirmation).
+- [x] **Settings** — `update::UpdateConfig` editor (two persisted toggles) plus
+  **`c` check-for-updates**; `rb-cli update --apply` self-updates (Windows
+  self_replace / Unix temp-file+rename).
+- [x] **`menu` verb** absorbed — opens the full TUI on the Backup tab (slim
+  builds keep the standalone appliance menu).
+- [x] **crossterm** deduped to 0.29 (single version in the tree).
 
 Shared modal pieces already built and reusable: `FilePicker` (path + MRU +
 Tab-to-browse + make-folder), the bottom progress bar (`draw_progress`), scoped
