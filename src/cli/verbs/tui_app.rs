@@ -141,6 +141,10 @@ struct Explorer {
     /// The `(mac_path, leaf_name)` of a folder pending a bless confirmation, if
     /// the "bless?" prompt is showing.
     confirm_bless: Option<(String, String)>,
+    /// A new-folder name being typed, if the mkdir prompt is showing.
+    mkdir_input: Option<String>,
+    /// The `(name, is_dir)` of an entry pending a delete confirmation.
+    confirm_delete: Option<(String, bool)>,
 }
 
 /// The HFS/HFS+ metadata editor: edit a file's Type, Creator, and modified date.
@@ -2111,6 +2115,8 @@ impl App {
                 metadata: None,
                 confirm_close: false,
                 confirm_bless: None,
+                mkdir_input: None,
+                confirm_delete: None,
             };
             // Expand the root so its subdirectories show in the tree immediately.
             ex.tree_expand();
@@ -2317,6 +2323,54 @@ impl App {
             return;
         }
 
+        // New-folder name prompt.
+        let mkdir_pending = self
+            .explorer
+            .as_ref()
+            .map(|e| e.mkdir_input.is_some())
+            .unwrap_or(false);
+        if mkdir_pending {
+            match code {
+                KeyCode::Enter => self.do_mkdir(),
+                KeyCode::Esc => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.mkdir_input = None;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = self.explorer.as_mut().and_then(|e| e.mkdir_input.as_mut()) {
+                        s.pop();
+                    }
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    if let Some(s) = self.explorer.as_mut().and_then(|e| e.mkdir_input.as_mut()) {
+                        s.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Delete confirmation.
+        let delete_pending = self
+            .explorer
+            .as_ref()
+            .map(|e| e.confirm_delete.is_some())
+            .unwrap_or(false);
+        if delete_pending {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.do_delete(),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.confirm_delete = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // `e` (export) / `i` (import) start a path prompt.
         match code {
             KeyCode::Char('e') => {
@@ -2378,6 +2432,30 @@ impl App {
                             ex.status =
                                 Some("Select a folder to bless as the System Folder.".to_string());
                         }
+                    }
+                }
+                return;
+            }
+            // New folder in the current directory.
+            KeyCode::Char('n') => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.mkdir_input = Some(String::new());
+                    ex.status = None;
+                }
+                return;
+            }
+            // Delete the selected entry (with confirmation).
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    match ex.selected_entry() {
+                        Some(e) => {
+                            ex.confirm_delete = Some((
+                                e.name.clone(),
+                                matches!(e.entry_type, EntryType::Directory),
+                            ));
+                            ex.status = None;
+                        }
+                        None => ex.status = Some("Nothing selected to delete.".to_string()),
                     }
                 }
                 return;
@@ -2639,6 +2717,90 @@ impl App {
                 if let Some(ex) = self.explorer.as_mut() {
                     ex.confirm_bless = None;
                     ex.status = Some(format!("Bless failed: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Create the typed folder in the Explorer's current directory, then refresh.
+    fn do_mkdir(&mut self) {
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let name = ex
+            .mkdir_input
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let (image_path, selector, part_label, cur_dir, comps) = (
+            ex.image_path.clone(),
+            ex.selector,
+            ex.part_label.clone(),
+            ex.path_display(),
+            ex.dir_components(),
+        );
+        if name.is_empty() {
+            if let Some(ex) = self.explorer.as_mut() {
+                ex.mkdir_input = None;
+                ex.status = Some("Folder name was empty.".to_string());
+            }
+            return;
+        }
+        match apply_mkdir(&image_path, selector, &cur_dir, &name) {
+            Ok(()) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.mkdir_input = None;
+                }
+                self.reopen_explorer(
+                    &image_path,
+                    selector,
+                    part_label,
+                    &comps,
+                    Some(format!("Created folder {name}")),
+                );
+            }
+            Err(e) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.mkdir_input = None;
+                    ex.status = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Delete the confirmed entry from the Explorer's current directory, refresh.
+    fn do_delete(&mut self) {
+        let Some(ex) = self.explorer.as_ref() else {
+            return;
+        };
+        let Some((name, _)) = ex.confirm_delete.clone() else {
+            return;
+        };
+        let (image_path, selector, part_label, cur_dir, comps) = (
+            ex.image_path.clone(),
+            ex.selector,
+            ex.part_label.clone(),
+            ex.path_display(),
+            ex.dir_components(),
+        );
+        match apply_delete(&image_path, selector, &cur_dir, &name) {
+            Ok(()) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_delete = None;
+                }
+                self.reopen_explorer(
+                    &image_path,
+                    selector,
+                    part_label,
+                    &comps,
+                    Some(format!("Deleted {name}")),
+                );
+            }
+            Err(e) => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.confirm_delete = None;
+                    ex.status = Some(format!("{e:#}"));
                 }
             }
         }
@@ -4616,7 +4778,7 @@ impl App {
             fl.push(Line::styled(format!(" {s}"), self.palette.warn()));
         }
         fl.push(Line::styled(
-            " Tab pane   Enter open/view   e Export   i Import   m Metadata   b Bless   Esc close",
+            " Tab pane   Enter open/view   e Export  i Import  n New  x Delete  m Meta  b Bless  Esc close",
             self.palette.dim(),
         ));
         frame.render_widget(Paragraph::new(Text::from(fl)), rows[2]);
@@ -4738,6 +4900,47 @@ impl App {
             frame.render_widget(Clear, cp);
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(self.pane_block("Confirm bless", true)),
+                cp,
+            );
+        }
+
+        // New-folder name prompt.
+        if let Some(name) = &ex.mkdir_input {
+            let cp = centered_rect(50, 5, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("  Name: ", self.palette.accent()),
+                        Span::raw(name.clone()),
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
+                    ]),
+                    Line::raw(""),
+                    Line::styled("  Enter create   Esc cancel", self.palette.dim()),
+                ]))
+                .block(self.pane_block("New folder", true)),
+                cp,
+            );
+        }
+
+        // Delete confirmation.
+        if let Some((name, is_dir)) = &ex.confirm_delete {
+            let cp = centered_rect(56, 5, area);
+            frame.render_widget(Clear, cp);
+            let what = if *is_dir {
+                "folder (and its contents)"
+            } else {
+                "file"
+            };
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(
+                        format!("  Delete the {what} \"{name}\"?  (y / n)"),
+                        self.palette.warn(),
+                    ),
+                ]))
+                .block(self.pane_block("Confirm delete", true)),
                 cp,
             );
         }
@@ -7092,6 +7295,82 @@ fn apply_bless_folder(
     }
     fs.set_blessed_folder(&entry)
         .map_err(|e| anyhow::anyhow!("set_blessed_folder: {e}"))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    Ok(())
+}
+
+/// Open the partition read-write and create `name` as a subdirectory of the
+/// Explorer's current directory, then commit.
+fn apply_mkdir(
+    image_path: &str,
+    selector: Option<u32>,
+    cur_dir: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    use crate::cli::resolve::resolve_partition_rw_forced;
+    let (file, ctx, commit) =
+        resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let parent = if cur_dir == "/" {
+        fs.root()
+            .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
+    } else {
+        crate::cli::verbs::ls::resolve_path(&mut *fs, cur_dir)?
+    };
+    fs.create_directory(
+        &parent,
+        name,
+        &crate::fs::filesystem::CreateDirectoryOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("create_directory: {e}"))?;
+    fs.sync_metadata()
+        .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
+    drop(fs);
+    commit.commit()?;
+    Ok(())
+}
+
+/// Open the partition read-write and delete `name` from the Explorer's current
+/// directory (recursively for a folder), then commit.
+fn apply_delete(
+    image_path: &str,
+    selector: Option<u32>,
+    cur_dir: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    use crate::cli::resolve::resolve_partition_rw_forced;
+    let (file, ctx, commit) =
+        resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
+    let mut fs = crate::fs::open_editable_filesystem(
+        file,
+        ctx.offset,
+        ctx.type_byte,
+        ctx.type_string.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let parent = if cur_dir == "/" {
+        fs.root()
+            .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
+    } else {
+        crate::cli::verbs::ls::resolve_path(&mut *fs, cur_dir)?
+    };
+    let child_path = if cur_dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{cur_dir}/{name}")
+    };
+    let entry = crate::cli::verbs::ls::resolve_path(&mut *fs, &child_path)?;
+    fs.delete_recursive(&parent, &entry)
+        .map_err(|e| anyhow::anyhow!("delete: {e}"))?;
     fs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
     drop(fs);

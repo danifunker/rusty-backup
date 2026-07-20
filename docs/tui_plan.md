@@ -158,13 +158,16 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** host→image copy through the TUI put a file into a FAT image;
   re-extracting it is content-identical (`cmp`).
 
-### Step 7 — Edit + transform actions (into Inspect/Explorer)
-- [ ] `put`/`rm`/`mkdir`/`chmeta`/`setrsrc`/reformat via `edit_queue` +
-  `container_edit`.
-- [ ] `fsck` check/repair via `fsck_runner`; resize/expand/convert via those
-  runners; `partmap` editor via `partition_editor` write side; CHD metadata in the
-  partition view.
-- **Accept:** run an fsck check and a resize on a fixture from the TUI.
+### Step 7 — Edit + transform actions (into Inspect/Explorer)  [mkdir/rm/put DONE]
+- [x] In the Explorer: `i` import (put), `n` new folder
+  (`EditableFilesystem::create_directory`), `x` / Delete remove a file or folder
+  (`delete_recursive`, with confirmation), plus the earlier `m` metadata edit and
+  `b` bless. All go through `resolve_partition_rw_forced` → `open_editable_
+  filesystem` → op → `sync_metadata` → commit, then reopen the view.
+- [ ] `chmeta`/`setrsrc`/reformat, `fsck` check/repair (`fsck_runner`),
+  resize/expand/convert, the `partmap` editor, and CHD metadata are deferred.
+- **Verified:** created a folder and deleted a file through the Explorer; both
+  reflected by `rb-cli ls`.
 
 ### Step 8 — Command palette / REPL
 - [ ] `:`-style line accepting any `rb-cli` verb: tokenize with
