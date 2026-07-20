@@ -8,14 +8,26 @@
 //! available, plus the download URL for this platform.
 
 use anyhow::Result;
+use clap::Args;
 
-pub fn run() -> Result<()> {
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// After checking, download the newer release and replace this binary in
+    /// place (requires `--features tui-update`). Without it, `update` only
+    /// reports what's available. On macOS/Linux this swaps the running `rb-cli`
+    /// via a temp-file + rename; on Windows it uses the self-replace path.
+    #[arg(long)]
+    pub apply: bool,
+}
+
+pub fn run(args: UpdateArgs) -> Result<()> {
     #[cfg(feature = "tui-update")]
     {
-        run_check_and_report()
+        run_check_and_report(args.apply)
     }
     #[cfg(not(feature = "tui-update"))]
     {
+        let _ = args;
         // The `update` module (config + releases URL) is only compiled with the
         // gui / tui-update features, so this path uses the known default URL.
         crate::cli::logging::log_stderr(
@@ -31,32 +43,76 @@ pub fn run() -> Result<()> {
 }
 
 #[cfg(feature = "tui-update")]
-fn run_check_and_report() -> Result<()> {
+fn run_check_and_report(apply: bool) -> Result<()> {
     let cfg = crate::update::UpdateConfig::load();
     let current = env!("APP_VERSION");
     crate::cli::logging::out_stdout(format!("Current version: {current}"));
-    match crate::update::check_for_updates(&cfg.update_check, current) {
-        Ok(info) => {
-            if info.is_outdated {
-                crate::cli::logging::out_stdout(format!(
-                    "A newer version is available: {}",
-                    info.latest_version
-                ));
-                crate::cli::logging::out_stdout(format!("Release page: {}", info.releases_url));
-                if let Some(url) = info.cli_asset_url.or(info.asset_url) {
-                    crate::cli::logging::out_stdout(format!(
-                        "Download this platform's build: {url}"
-                    ));
-                }
-                crate::cli::logging::out_stdout(
-                    "Automatic in-place replacement is not enabled yet on this platform; \
-                     download and replace the binary/bundle from the link above.",
-                );
-            } else {
-                crate::cli::logging::out_stdout("You are on the latest version.");
-            }
-            Ok(())
-        }
+    let info = match crate::update::check_for_updates(&cfg.update_check, current) {
+        Ok(info) => info,
         Err(e) => anyhow::bail!("update check failed: {e}"),
+    };
+    if !info.is_outdated {
+        crate::cli::logging::out_stdout("You are on the latest version.");
+        return Ok(());
+    }
+    crate::cli::logging::out_stdout(format!(
+        "A newer version is available: {}",
+        info.latest_version
+    ));
+    crate::cli::logging::out_stdout(format!("Release page: {}", info.releases_url));
+    if let Some(url) = info.cli_asset_url.clone().or(info.asset_url.clone()) {
+        crate::cli::logging::out_stdout(format!("Download this platform's build: {url}"));
+    }
+    if !apply {
+        crate::cli::logging::out_stdout(
+            "Re-run with `--apply` to download and replace this binary in place.",
+        );
+        return Ok(());
+    }
+    apply_update(&info)
+}
+
+/// Perform the in-place self-update after a `--apply`. Unix swaps the running
+/// `rb-cli` via temp-file + rename; Windows uses the self-replace path.
+#[cfg(feature = "tui-update")]
+fn apply_update(info: &crate::update::UpdateInfo) -> Result<()> {
+    crate::cli::logging::out_stdout("Downloading and applying update...");
+    let progress = |_downloaded: u64, _total: Option<u64>| {};
+
+    #[cfg(unix)]
+    {
+        match crate::update::download_and_apply_cli_update_unix(info, &progress) {
+            Ok(path) => {
+                crate::cli::logging::out_stdout(format!(
+                    "Updated {} in place. Re-run rb-cli to use the new version.",
+                    path.display()
+                ));
+                Ok(())
+            }
+            Err(e) => anyhow::bail!(
+                "update download/apply failed: {e}\nDownload it manually: {}",
+                info.releases_url
+            ),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match crate::update::download_and_apply_update(info, &progress) {
+            Ok(()) => {
+                crate::cli::logging::out_stdout(
+                    "Update applied. Restart rb-cli to use the new version.",
+                );
+                Ok(())
+            }
+            Err(e) => anyhow::bail!(
+                "update download/apply failed: {e}\nDownload it manually: {}",
+                info.releases_url
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = info;
+        anyhow::bail!("in-place self-update is not supported on this platform")
     }
 }

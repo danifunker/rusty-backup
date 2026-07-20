@@ -72,7 +72,7 @@
 <li><a href="terminal.html"><code>terminal</code></a><span class="desc">Open an interactive rb-cli shell (rustyline-based REPL)</span></li>
 <li><a href="tui.html"><code>tui</code></a><span class="desc">Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal</span></li>
 <li><a href="untar.html"><code>untar</code></a><span class="desc">Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them</span></li>
-<li><a href="update.html"><code>update</code></a><span class="desc">Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero</span></li>
+<li><a href="update.html"><code>update</code></a><span class="desc">Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero. Pass `--apply` to download and replace this binary in place</span></li>
 <li><a href="write.html"><code>write</code></a><span class="desc">Stream an image file onto a block device</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>

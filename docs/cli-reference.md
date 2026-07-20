@@ -1692,11 +1692,15 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 
 ### `update`
 
-Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero
+Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero. Pass `--apply` to download and replace this binary in place
 
 ```
-Usage: update
+Usage: update [OPTIONS]
 ```
+
+**Options**
+
+- `--apply` — After checking, download the newer release and replace this binary in place (requires `--features tui-update`). Without it, `update` only reports what's available. On macOS/Linux this swaps the running `rb-cli` via a temp-file + rename; on Windows it uses the self-replace path
 
 ### `write`
 

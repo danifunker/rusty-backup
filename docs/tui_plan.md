@@ -105,9 +105,13 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   (Original / Minimum, applied to every partition), alignment (Original /
   Modern 1MB). Runs via `restore::run_restore(config, Arc<Mutex<RestoreProgress>>)`
   on a worker thread; progress mirrored into the shared bar; Esc cancels.
-- [ ] Device targets are deferred to the elevation pass (image-file target only
-  for now; `run_restore` opens a device internally but needs elevation + a safety
-  confirmation).
+- [x] Device targets: Tab on the Target field opens a "Restore target" chooser
+  (Image file / Physical device); a device is picked from the shared disk list
+  and shown as `<path> [device]`, setting `RestoreConfig::target_is_device`.
+  Starting a device restore first raises a destructive-write confirmation naming
+  the device + size (with an elevation caution when unelevated); only `y`
+  proceeds. The write itself is code-only (feeds the proven `run_restore`; not
+  exercised against a real disk here).
 - **Verified:** a backup→restore round-trip through the TUI produced an image
   **byte-identical** (`cmp`) to the original source.
 
@@ -217,12 +221,21 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   with `tui-update` still has the checker.
 - [x] With `tui-update`: `update::check_for_updates(&cfg.update_check, ver)`
   reports current / latest / up-to-date-or-newer + the platform download URL.
-- [ ] Auto in-place replace + re-exec (Windows `model::update_runner`; macOS/Linux
-  temp-file+rename) is deferred — destructive and needs a real release to verify;
-  the verb prints the download link instead. The Settings "check now" action is
-  also deferred (needs a `tui-update` build).
+- [x] Auto in-place replace via `rb-cli update --apply` (tui-update): Windows uses
+  the existing `self_replace` path; macOS/Linux use the new
+  `update::download_and_apply_cli_update_unix` — download the CLI asset, extract
+  the `rb-cli` executable (`.zip` / `.tar.gz` / raw ELF/Mach-O), write it beside
+  the running binary, `chmod +x`, and atomically `rename` over it. Conservative:
+  it refuses to replace unless it positively extracted a valid executable, else
+  it errors with the download link (never clobbers the binary).
+- [x] Settings "check now" (`c`): runs `check_for_updates` and reports on the
+  status line (tui-update); explains how to enable it otherwise.
 - **Verified:** default build `rb-cli update` prints the not-built message + URL,
-  exit 2; the `tui-update` build's check path compiles + lints clean.
+  exit 2. tui-update build: `update --apply` against a real (Windows-only) release
+  correctly refused to install a non-matching asset and left the binary intact;
+  5 unit tests exercise the zip/tar.gz/raw extraction + reject paths; Settings `c`
+  hit GitHub live and reported "Update available: ...". The successful in-place
+  swap itself is code-only (needs a matching macOS/Linux release asset to verify).
 
 ### Step 10 — Polish leftovers
 - [x] Absorb the `menu` appliance verb as an alias into Backup/Restore — when
@@ -231,7 +244,11 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   crossterm appliance screen. The old screen stays as the fallback for slim
   builds without `tui` (the i486 appliance), and its `MenuState` unit tests still
   run in the default build.
-- [ ] Elevation-prompt UX in the TUI (design pass; reuse `src/privileged/` + `os::*`).
+- [x] Elevation-prompt UX in the TUI — the device-restore destructive-write
+  confirmation (names the device + size, elevation caution when unelevated) is
+  the interactive gate; the OS auth itself is handled by `os::*` when
+  `run_restore` opens the raw device. Physical-disk ops stay badge-gated + noted
+  when unelevated across Backup/Restore/Optical.
 - [x] crossterm dedupe — bumped our direct dep 0.28 -> 0.29 to match ratatui
   0.30's transitive `crossterm 0.29`; no API changes needed in `menu`/`cli::tui`/
   `bless_pick`/`dir_picker`/`setup`/`tui_app`. Tree now has a single crossterm.

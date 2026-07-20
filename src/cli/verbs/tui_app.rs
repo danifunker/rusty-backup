@@ -3485,7 +3485,49 @@ impl App {
                 self.settings_toggle();
                 true
             }
+            // Check for updates now.
+            KeyCode::Char('c') => {
+                self.settings_check_now();
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// Run an update check against GitHub and report the result on the Settings
+    /// status line. Only functional in a `tui-update` build (which links the
+    /// reqwest client); otherwise it explains how to enable it.
+    fn settings_check_now(&mut self) {
+        #[cfg(feature = "tui-update")]
+        {
+            let repo = self
+                .settings
+                .as_ref()
+                .map(|s| s.config.update_check.clone());
+            let Some(cfg) = repo else { return };
+            let current = env!("APP_VERSION");
+            let msg =
+                match with_stderr_suppressed(|| crate::update::check_for_updates(&cfg, current)) {
+                    Ok(info) if info.is_outdated => format!(
+                        "Update available: {} (current {current}). Run `rb-cli update --apply`.",
+                        info.latest_version
+                    ),
+                    Ok(_) => format!("Up to date (current {current})."),
+                    Err(e) => format!("Update check failed: {e}"),
+                };
+            if let Some(s) = self.settings.as_mut() {
+                s.status = Some(msg);
+            }
+        }
+        #[cfg(not(feature = "tui-update"))]
+        {
+            if let Some(s) = self.settings.as_mut() {
+                s.status = Some(
+                    "Update checking isn't compiled into this build \
+                     (rebuild with `--features tui-update`)."
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -7448,7 +7490,7 @@ impl App {
             lines.push(Line::raw(""));
         }
         lines.push(Line::styled(
-            "Up/Down select   Enter/Space toggle   Left/Right change tab",
+            "Up/Down select   Enter/Space toggle   c check for updates   Left/Right change tab",
             self.palette.dim(),
         ));
 

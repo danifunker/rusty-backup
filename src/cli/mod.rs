@@ -274,8 +274,9 @@ pub enum Command {
 
     /// Check for a newer release and (when built with `--features tui-update`)
     /// self-update. Without that feature it reports that updates weren't compiled
-    /// in and prints the releases URL, exiting non-zero.
-    Update,
+    /// in and prints the releases URL, exiting non-zero. Pass `--apply` to
+    /// download and replace this binary in place.
+    Update(verbs::update::UpdateArgs),
 
     /// Launch the full-screen terminal UI (preview): a menu-driven ratatui
     /// app that runs anywhere rusty-backup does, including serial consoles and
@@ -452,7 +453,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Archive { cmd } => verbs::archive::run(cmd),
         Command::Terminal => verbs::terminal::run(),
-        Command::Update => verbs::update::run(),
+        Command::Update(args) => verbs::update::run(args),
         #[cfg(feature = "tui")]
         Command::Tui => verbs::tui_app::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),

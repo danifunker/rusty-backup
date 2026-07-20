@@ -450,6 +450,133 @@ pub fn download_and_apply_update(
     Ok(())
 }
 
+/// macOS / Linux in-place self-update for the **`rb-cli` binary**, via the
+/// classic temp-file + `rename` swap: download the CLI asset, extract the
+/// `rb-cli` executable, write it beside the running binary, mark it executable,
+/// then atomically `rename` it over the running file. On Unix a running
+/// program keeps its old inode open, so replacing the directory entry is safe;
+/// the new bytes take effect on the next launch (or the re-exec the caller
+/// performs). Returns the path that was replaced.
+///
+/// Conservative by design: it only proceeds when it can positively extract a
+/// non-empty `rb-cli` executable from a recognized asset (`.zip`, `.tar.gz`, or
+/// a raw ELF/Mach-O binary). Anything ambiguous errors out so the caller can
+/// fall back to printing the download link rather than clobbering the binary.
+#[cfg(all(unix, any(feature = "tui-update", feature = "gui")))]
+pub fn download_and_apply_cli_update_unix(
+    info: &UpdateInfo,
+    progress: &dyn Fn(u64, Option<u64>),
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let asset_url = info
+        .cli_asset_url
+        .as_ref()
+        .or(info.asset_url.as_ref())
+        .ok_or("No downloadable rb-cli asset for this platform/arch")?;
+
+    let exe = std::env::current_exe()?;
+    let exe_name = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rb-cli")
+        .to_string();
+    let install_dir = exe
+        .parent()
+        .ok_or("cannot determine the install directory")?
+        .to_path_buf();
+
+    let bytes = download_bytes(asset_url, progress)?;
+    let new_bytes = extract_cli_binary(asset_url, &bytes, &exe_name)?;
+    if new_bytes.len() < 4 || !looks_like_unix_executable(&new_bytes) {
+        return Err("downloaded asset did not contain a valid rb-cli executable".into());
+    }
+
+    // Stage into the install dir (same filesystem) so the final rename is atomic.
+    let tmp = install_dir.join(format!(".{exe_name}.update.tmp"));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        use std::io::Write;
+        f.write_all(&new_bytes)?;
+        f.flush()?;
+        f.sync_all()?;
+        let mut perms = f.metadata()?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp, perms)?;
+    }
+    // Atomic replace of the running binary's directory entry.
+    if let Err(e) = fs::rename(&tmp, &exe) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("could not replace {}: {e}", exe.display()).into());
+    }
+    Ok(exe)
+}
+
+/// Extract the `rb-cli` executable bytes from a downloaded asset. Handles a
+/// `.zip`, a `.tar.gz`/`.tgz`, or a raw binary (the URL has no archive
+/// extension and the bytes carry an ELF / Mach-O magic).
+#[cfg(all(unix, any(feature = "tui-update", feature = "gui")))]
+fn extract_cli_binary(
+    url: &str,
+    bytes: &[u8],
+    exe_name: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let lower = url.to_ascii_lowercase();
+    let matches_name = |name: &str| {
+        let leaf = name.rsplit('/').next().unwrap_or(name);
+        leaf == exe_name || leaf == "rb-cli"
+    };
+    if lower.ends_with(".zip") {
+        let reader = std::io::Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(reader)?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i)?;
+            if entry.is_file() && matches_name(entry.name()) {
+                use std::io::Read;
+                let mut out = Vec::new();
+                entry.read_to_end(&mut out)?;
+                return Ok(out);
+            }
+        }
+        Err("rb-cli not found inside the .zip asset".into())
+    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        let mut tar = tar::Archive::new(gz);
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            if matches_name(&path) {
+                use std::io::Read;
+                let mut out = Vec::new();
+                entry.read_to_end(&mut out)?;
+                return Ok(out);
+            }
+        }
+        Err("rb-cli not found inside the .tar.gz asset".into())
+    } else if looks_like_unix_executable(bytes) {
+        // A bare binary asset.
+        Ok(bytes.to_vec())
+    } else {
+        Err("unrecognized rb-cli asset format (expected .zip, .tar.gz, or a raw binary)".into())
+    }
+}
+
+/// True when `bytes` begins with an ELF (Linux) or Mach-O (macOS) magic number.
+#[cfg(all(unix, any(feature = "tui-update", feature = "gui")))]
+fn looks_like_unix_executable(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 {
+        return false;
+    }
+    let m = &bytes[..4];
+    // ELF: 0x7F 'E' 'L' 'F'. Mach-O (thin/fat, LE/BE): feedface / feedfacf /
+    // cafebabe / cffaedfe / cefaedfe.
+    m == [0x7f, b'E', b'L', b'F']
+        || matches!(
+            u32::from_be_bytes([m[0], m[1], m[2], m[3]]),
+            0xFEED_FACE | 0xFEED_FACF | 0xCAFE_BABE | 0xCFFA_EDFE | 0xCEFA_EDFE
+        )
+}
+
 /// Replace the currently running executable's image with `new_exe`.
 #[cfg(windows)]
 fn replace_running_exe(new_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -496,6 +623,86 @@ pub fn restart_app() -> ! {
         let _ = std::process::Command::new(exe).spawn();
     }
     std::process::exit(0);
+}
+
+/// Tests for the Unix CLI self-replace extraction (the `--apply` core). Gated
+/// to the same cfg as the code under test so `cargo test` (default features
+/// include `gui`) compiles and runs them.
+#[cfg(all(test, unix, any(feature = "tui-update", feature = "gui")))]
+mod cli_update_tests {
+    use super::{extract_cli_binary, looks_like_unix_executable};
+    use std::io::Write;
+
+    /// A minimal ELF header magic + filler so the bytes read as an executable.
+    fn fake_elf() -> Vec<u8> {
+        let mut v = vec![0x7f, b'E', b'L', b'F'];
+        v.extend_from_slice(&[0u8; 60]);
+        v
+    }
+
+    #[test]
+    fn detects_elf_and_macho_magic() {
+        assert!(looks_like_unix_executable(&fake_elf()));
+        assert!(looks_like_unix_executable(&[0xfe, 0xed, 0xfa, 0xcf, 0, 0])); // Mach-O 64
+        assert!(!looks_like_unix_executable(b"PK\x03\x04")); // a zip header
+        assert!(!looks_like_unix_executable(&[0u8; 2]));
+    }
+
+    #[test]
+    fn extracts_rb_cli_from_zip() {
+        let elf = fake_elf();
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("noise.txt", opts).unwrap();
+            zip.write_all(b"ignore me").unwrap();
+            zip.start_file("rb-cli", opts).unwrap();
+            zip.write_all(&elf).unwrap();
+            zip.finish().unwrap();
+        }
+        let got = extract_cli_binary("https://x/Rusty-Backup-linux.zip", &buf, "rb-cli").unwrap();
+        assert_eq!(got, elf);
+    }
+
+    #[test]
+    fn extracts_rb_cli_from_tar_gz() {
+        let elf = fake_elf();
+        let mut gz = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(elf.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "rb-cli", elf.as_slice())
+                .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let got = extract_cli_binary("https://x/rb-cli.tar.gz", &gz, "rb-cli").unwrap();
+        assert_eq!(got, elf);
+    }
+
+    #[test]
+    fn raw_binary_asset_passes_through() {
+        let elf = fake_elf();
+        let got = extract_cli_binary("https://x/rb-cli", &elf, "rb-cli").unwrap();
+        assert_eq!(got, elf);
+    }
+
+    #[test]
+    fn rejects_zip_without_rb_cli() {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("rusty-backup.exe", opts).unwrap();
+            zip.write_all(b"not the cli").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(extract_cli_binary("https://x/win.zip", &buf, "rb-cli").is_err());
+    }
 }
 
 #[cfg(test)]
