@@ -58,6 +58,8 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
 - [x] **Restore** — load a backup folder / `.cbk` → config (target/size/
   alignment) → run via `restore::run_restore`; round-trip byte-identical to the
   source. (Device targets deferred to the elevation pass.)
+- [x] **Bulk** — source folder → format + review list (un-check to skip) → run
+  via `bulk_convert_runner::start_bulk_convert` with per-file progress.
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -100,16 +102,19 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** a backup→restore round-trip through the TUI produced an image
   **byte-identical** (`cmp`) to the original source.
 
-### Step 3 — Bulk tab
-- [ ] Source-folder picker → `bulk_convert_runner::scan_source_folder(source,
-  format) -> Vec<ScannedFile{path,size,selected}>`.
-- [ ] Review list with un-check-to-skip (Space toggles `selected`) + format +
-  extension + optional CHD options.
-- [ ] Run `bulk_convert_runner::start_bulk_convert(files, output, format,
-  extension, chd_options, bincue_multi_bin) -> Arc<Mutex<BulkConvertStatus>>`;
-  each tick read `current_index/total_files/current_bytes`, drain `log_messages`;
-  `cancel_requested = true` on Esc.
-- **Accept:** convert a folder of 2–3 images to one format; check outputs.
+### Step 3 — Bulk tab  [DONE]
+- [x] Source-folder picker → `bulk_convert_runner::scan_source_folder(source,
+  format)` (re-scans when the format changes, since the filter is format-aware).
+- [x] Review list with un-check-to-skip (Space toggles `selected`) over a flat
+  cursor (Format / Output / files / Start); format cycled with Left/Right; output
+  folder Tab-to-browse.
+- [x] Run `bulk_convert_runner::start_bulk_convert(...)` (spawns its own thread);
+  each tick reads `current_index/total_files/current_bytes` into the shared bar
+  and shows the running file; Esc sets `cancel_requested`. (General whole-disk
+  formats — Raw/VHD/VHD-Dynamic/QCOW2/VMDK×2/CHD/DVD-CHD; CD/floppy formats with
+  input constraints stay CLI-only.)
+- **Verified:** converting a 3-image folder to VHD with one file un-checked
+  produced exactly the two selected `.vhd` outputs ("Converted 2 ok, 0 failed").
 
 ### Step 4 — Optical tab
 - [ ] Drive list via `model::optical_devices::list_rip_devices(&remotes) ->

@@ -1152,6 +1152,93 @@ impl Default for RestoreState {
     }
 }
 
+/// The Bulk convert screen: pick a source folder, choose a format, review /
+/// un-check the scanned files, then convert them all via `bulk_convert_runner`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BulkStep {
+    Source,
+    Config,
+    Run,
+}
+
+/// Output formats offered for bulk convert (the general whole-disk formats;
+/// CD/floppy-specific ones with input constraints are left to the CLI).
+const BULK_FORMATS: &[(&str, crate::rbformats::export::ExportFormat)] = &[
+    ("Raw (.img)", crate::rbformats::export::ExportFormat::Raw),
+    ("VHD", crate::rbformats::export::ExportFormat::Vhd),
+    (
+        "VHD Dynamic",
+        crate::rbformats::export::ExportFormat::VhdDynamic,
+    ),
+    ("QCOW2", crate::rbformats::export::ExportFormat::Qcow2),
+    (
+        "VMDK Flat",
+        crate::rbformats::export::ExportFormat::VmdkFlat,
+    ),
+    (
+        "VMDK Sparse",
+        crate::rbformats::export::ExportFormat::VmdkSparse,
+    ),
+    (
+        "CHD (hard disk)",
+        crate::rbformats::export::ExportFormat::Chd,
+    ),
+    ("DVD CHD", crate::rbformats::export::ExportFormat::ChdDvd),
+];
+
+struct BulkState {
+    step: BulkStep,
+    source: String,
+    out_dir: String,
+    files: Vec<crate::model::bulk_convert_runner::ScannedFile>,
+    format_sel: usize,
+    /// Flat cursor over the config rows: 0 = Format, 1 = Output, then one row per
+    /// scanned file, and a final "Start" row.
+    field: usize,
+    picker: Option<FilePicker>,
+    picker_target: bool,
+    run: Option<Arc<Mutex<crate::model::status::BulkConvertStatus>>>,
+    op: String,
+    result: Option<String>,
+    is_error: bool,
+}
+
+impl Default for BulkState {
+    fn default() -> Self {
+        BulkState {
+            step: BulkStep::Source,
+            source: String::new(),
+            out_dir: String::new(),
+            files: Vec::new(),
+            format_sel: 0,
+            field: 0,
+            picker: None,
+            picker_target: false,
+            run: None,
+            op: String::new(),
+            result: None,
+            is_error: false,
+        }
+    }
+}
+
+impl BulkState {
+    fn format(&self) -> crate::rbformats::export::ExportFormat {
+        BULK_FORMATS[self.format_sel.min(BULK_FORMATS.len() - 1)].1
+    }
+    fn start_row(&self) -> usize {
+        2 + self.files.len()
+    }
+    /// The file index at the current cursor, if the cursor is on a file row.
+    fn file_at_cursor(&self) -> Option<usize> {
+        if self.field >= 2 && self.field < 2 + self.files.len() {
+            Some(self.field - 2)
+        } else {
+            None
+        }
+    }
+}
+
 /// The Settings tab state: the loaded `UpdateConfig` plus a cursor over the
 /// editable preference toggles. Edits save straight back to `config.json` via
 /// `UpdateConfig::save` (the same file the GUI reads/writes).
@@ -1194,6 +1281,8 @@ struct App {
     backup: Option<BackupState>,
     /// The Restore screen state (lazily created on first visit).
     restore: Option<RestoreState>,
+    /// The Bulk convert screen state (lazily created on first visit).
+    bulk: Option<BulkState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     show_help: bool,
@@ -1219,6 +1308,7 @@ impl App {
             newdisk: None,
             backup: None,
             restore: None,
+            bulk: None,
             settings: None,
             show_help: false,
             should_quit: false,
@@ -1329,6 +1419,11 @@ impl App {
 
         // The Restore screen owns most keys on its tab.
         if self.current() == TabId::Restore && self.handle_restore_key(key.code) {
+            return Ok(());
+        }
+
+        // The Bulk convert screen owns most keys on its tab.
+        if self.current() == TabId::Bulk && self.handle_bulk_key(key.code) {
             return Ok(());
         }
 
@@ -2126,6 +2221,11 @@ impl App {
                 p.cancel_requested = true;
             }
         }
+        if let Some(run) = self.bulk.as_ref().and_then(|b| b.run.clone()) {
+            if let Ok(mut s) = run.lock() {
+                s.cancel_requested = true;
+            }
+        }
         self.progress = None;
     }
 
@@ -2153,6 +2253,9 @@ impl App {
         }
         if self.current() == TabId::Restore && self.restore.is_none() {
             self.restore = Some(RestoreState::default());
+        }
+        if self.current() == TabId::Bulk && self.bulk.is_none() {
+            self.bulk = Some(BulkState::default());
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -2986,6 +3089,214 @@ impl App {
         });
     }
 
+    /// Bulk convert screen keys. Returns `true` when consumed.
+    fn handle_bulk_key(&mut self, code: KeyCode) -> bool {
+        if self.bulk.is_none() {
+            self.bulk = Some(BulkState::default());
+        }
+        // Source / output folder picker (modal).
+        if self
+            .bulk
+            .as_ref()
+            .map(|b| b.picker.is_some())
+            .unwrap_or(false)
+        {
+            let for_target = self.bulk.as_ref().unwrap().picker_target;
+            let res = self
+                .bulk
+                .as_mut()
+                .unwrap()
+                .picker
+                .as_mut()
+                .unwrap()
+                .handle_key(code);
+            match res {
+                Some(PickResult::Cancel) => self.bulk.as_mut().unwrap().picker = None,
+                Some(PickResult::Confirm(path)) => {
+                    if for_target {
+                        let b = self.bulk.as_mut().unwrap();
+                        b.out_dir = path.to_string_lossy().into_owned();
+                        b.picker = None;
+                    } else {
+                        let b = self.bulk.as_mut().unwrap();
+                        b.picker = None;
+                        b.source = path.to_string_lossy().into_owned();
+                        if b.out_dir.is_empty() {
+                            b.out_dir = b.source.clone();
+                        }
+                        b.step = BulkStep::Config;
+                        b.field = 0;
+                        self.bulk_rescan();
+                    }
+                }
+                None => {}
+            }
+            return true;
+        }
+
+        let step = self.bulk.as_ref().unwrap().step;
+        // Start handled outside the borrow.
+        if step == BulkStep::Config
+            && code == KeyCode::Enter
+            && self
+                .bulk
+                .as_ref()
+                .map(|b| b.field == b.start_row())
+                .unwrap_or(false)
+        {
+            self.start_bulk();
+            return true;
+        }
+        // Format change needs a rescan (borrow released first).
+        if step == BulkStep::Config
+            && self.bulk.as_ref().map(|b| b.field == 0).unwrap_or(false)
+            && matches!(code, KeyCode::Left | KeyCode::Right)
+        {
+            if let Some(b) = self.bulk.as_mut() {
+                let n = BULK_FORMATS.len();
+                b.format_sel = if code == KeyCode::Left {
+                    (b.format_sel + n - 1) % n
+                } else {
+                    (b.format_sel + 1) % n
+                };
+            }
+            self.bulk_rescan();
+            return true;
+        }
+
+        let b = self.bulk.as_mut().unwrap();
+        match step {
+            BulkStep::Source => match code {
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    b.picker = Some(FilePicker::new(PickKind::Dir, "Choose source folder"));
+                    b.picker_target = false;
+                    true
+                }
+                _ => false,
+            },
+            BulkStep::Config => match code {
+                KeyCode::Esc => {
+                    b.step = BulkStep::Source;
+                    true
+                }
+                KeyCode::Down => {
+                    b.field = (b.field + 1).min(b.start_row());
+                    true
+                }
+                KeyCode::Up => {
+                    b.field = b.field.saturating_sub(1);
+                    true
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(i) = b.file_at_cursor() {
+                        b.files[i].selected = !b.files[i].selected;
+                    }
+                    true
+                }
+                KeyCode::Tab if b.field == 1 => {
+                    let mut p = FilePicker::new(PickKind::Dir, "Choose output folder");
+                    p.input = b.out_dir.clone();
+                    b.picker = Some(p);
+                    b.picker_target = true;
+                    true
+                }
+                KeyCode::Enter => {
+                    b.field = (b.field + 1).min(b.start_row());
+                    true
+                }
+                KeyCode::Backspace if b.field == 1 => {
+                    b.out_dir.pop();
+                    true
+                }
+                KeyCode::Char(c) if !c.is_control() && b.field == 1 => {
+                    b.out_dir.push(c);
+                    true
+                }
+                _ => false,
+            },
+            BulkStep::Run => match code {
+                KeyCode::Esc => {
+                    let running = b.result.is_none();
+                    if running {
+                        self.cancel_progress();
+                        if let Some(b) = self.bulk.as_mut() {
+                            b.result = Some("Cancel requested...".to_string());
+                            b.is_error = true;
+                        }
+                    } else {
+                        self.progress = None;
+                        if let Some(b) = self.bulk.as_mut() {
+                            b.run = None;
+                            b.result = None;
+                            b.step = BulkStep::Config;
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            },
+        }
+    }
+
+    /// Rescan the source folder for the currently-chosen format (the filter
+    /// depends on the format), resetting the review list.
+    fn bulk_rescan(&mut self) {
+        let Some(b) = self.bulk.as_mut() else {
+            return;
+        };
+        let src = expand_tilde(b.source.trim());
+        let format = b.format();
+        b.files =
+            crate::model::bulk_convert_runner::scan_source_folder(&src, format).unwrap_or_default();
+        // Keep the cursor on the Format row after a rescan.
+        b.field = b.field.min(b.start_row());
+    }
+
+    /// Start the bulk conversion of the selected files. `start_bulk_convert`
+    /// spawns its own worker thread and returns the shared status handle.
+    fn start_bulk(&mut self) {
+        let Some(b) = self.bulk.as_ref() else {
+            return;
+        };
+        let files: Vec<std::path::PathBuf> = b
+            .files
+            .iter()
+            .filter(|f| f.selected)
+            .map(|f| f.path.clone())
+            .collect();
+        if files.is_empty() {
+            let b = self.bulk.as_mut().unwrap();
+            b.result = Some("No files selected to convert.".to_string());
+            b.is_error = true;
+            b.step = BulkStep::Run;
+            return;
+        }
+        let out_dir = expand_tilde(b.out_dir.trim());
+        if out_dir.as_os_str().is_empty() {
+            let b = self.bulk.as_mut().unwrap();
+            b.result = Some("Enter an output folder.".to_string());
+            b.is_error = true;
+            b.step = BulkStep::Run;
+            return;
+        }
+        let format = b.format();
+        let extension = format.extension().to_string();
+        let run = crate::model::bulk_convert_runner::start_bulk_convert(
+            files, out_dir, format, extension, None, false,
+        );
+        let b = self.bulk.as_mut().unwrap();
+        b.run = Some(run);
+        b.result = None;
+        b.is_error = false;
+        b.op = "Starting...".to_string();
+        b.step = BulkStep::Run;
+        self.progress = Some(Progress {
+            shared: Arc::new(Mutex::new(ProgressShared::default())),
+            tracker: RateTracker::default(),
+            label: "Converting".to_string(),
+        });
+    }
+
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
@@ -3076,6 +3387,37 @@ impl App {
                                 r.is_error = false;
                             }
                         }
+                    }
+                }
+            }
+        }
+        // Mirror a running bulk convert (file-count + per-file byte progress).
+        if let Some(run) = self.bulk.as_ref().and_then(|b| b.run.clone()) {
+            let snap = run.lock().ok().map(|s| {
+                (
+                    s.current_bytes,
+                    s.current_total_bytes,
+                    s.finished,
+                    s.current_index,
+                    s.total_files,
+                    s.current_file.clone(),
+                    s.succeeded,
+                    s.failed,
+                )
+            });
+            if let Some((cur, total, done, idx, n, file, ok, fail)) = snap {
+                if let Some(prog) = self.progress.as_ref() {
+                    if let Ok(mut sh) = prog.shared.lock() {
+                        sh.current = cur;
+                        sh.total = total;
+                        sh.done = done;
+                    }
+                }
+                if let Some(b) = self.bulk.as_mut() {
+                    b.op = format!("{idx}/{n}  {}", basename(&file));
+                    if done && b.result.is_none() {
+                        b.result = Some(format!("Converted {ok} ok, {fail} failed."));
+                        b.is_error = fail > 0;
                     }
                 }
             }
@@ -3526,6 +3868,12 @@ impl App {
         if self.current() == TabId::Restore {
             if let Some(r) = &self.restore {
                 self.draw_restore(frame, area, r);
+                return;
+            }
+        }
+        if self.current() == TabId::Bulk {
+            if let Some(b) = &self.bulk {
+                self.draw_bulk(frame, area, b);
                 return;
             }
         }
@@ -4092,6 +4440,164 @@ impl App {
         }
     }
 
+    /// The Bulk convert screen: source -> config (format + review list) -> run.
+    fn draw_bulk(&self, frame: &mut Frame, area: Rect, b: &BulkState) {
+        let title = match b.step {
+            BulkStep::Source => "Bulk convert  -  step 1/3: source folder",
+            BulkStep::Config => "Bulk convert  -  step 2/3: format & files",
+            BulkStep::Run => "Bulk convert  -  step 3/3: run",
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        match b.step {
+            BulkStep::Source => {
+                lines.push(Line::styled(
+                    "Convert every image in a folder to one format.",
+                    self.palette.accent(),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Enter / o  ", self.palette.accent()),
+                    Span::raw("choose the source folder"),
+                ]));
+            }
+            BulkStep::Config => {
+                let sel_row = |active: bool| {
+                    if active {
+                        self.palette.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        self.palette.accent()
+                    }
+                };
+                // Format row (0).
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}Format:    ", if b.field == 0 { "> " } else { "  " }),
+                        sel_row(b.field == 0),
+                    ),
+                    Span::raw(format!("< {} >", BULK_FORMATS[b.format_sel].0)),
+                ]));
+                // Output row (1).
+                let out_cursor = if b.field == 1 {
+                    Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
+                } else {
+                    Span::raw("")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}Output:    ", if b.field == 1 { "> " } else { "  " }),
+                        sel_row(b.field == 1),
+                    ),
+                    Span::raw(b.out_dir.clone()),
+                    out_cursor,
+                ]));
+                lines.push(Line::raw(""));
+                // File review list.
+                let selected = b.files.iter().filter(|f| f.selected).count();
+                lines.push(Line::styled(
+                    format!(
+                        "Files ({} of {} selected)  -  Space toggles:",
+                        selected,
+                        b.files.len()
+                    ),
+                    self.palette.accent(),
+                ));
+                if b.files.is_empty() {
+                    lines.push(Line::styled(
+                        "  (no matching files in this folder for this format)",
+                        self.palette.dim(),
+                    ));
+                } else {
+                    // Window the list so the cursor stays visible.
+                    let avail = (area.height as usize).saturating_sub(12).max(3);
+                    let cur_file = b.file_at_cursor().unwrap_or(0);
+                    let start = cur_file.saturating_sub(avail.saturating_sub(1));
+                    for (i, f) in b.files.iter().enumerate().skip(start).take(avail) {
+                        let on_row = b.field == i + 2;
+                        let box_ = if f.selected { "[x]" } else { "[ ]" };
+                        let name = basename(&f.path.to_string_lossy());
+                        let style = if on_row {
+                            self.palette
+                                .accent()
+                                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                        } else if f.selected {
+                            self.palette.accent()
+                        } else {
+                            self.palette.dim()
+                        };
+                        lines.push(Line::styled(
+                            format!(
+                                "{}{box_} {:<40} {}",
+                                if on_row { "> " } else { "  " },
+                                name,
+                                format_size(f.size)
+                            ),
+                            style,
+                        ));
+                    }
+                }
+                lines.push(Line::raw(""));
+                let start_sel = b.field == b.start_row();
+                lines.push(Line::styled(
+                    format!(
+                        "{}[ Convert {} file(s) ]",
+                        if start_sel { "> " } else { "  " },
+                        selected
+                    ),
+                    if start_sel {
+                        self.palette
+                            .accent()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        self.palette.accent()
+                    },
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Up/Down move   Left/Right format   Space toggle   Tab browse (Output)   \
+                     Enter Start   Esc back",
+                    self.palette.dim(),
+                ));
+            }
+            BulkStep::Run => {
+                lines.push(Line::from(vec![
+                    Span::styled("Format: ", self.palette.dim()),
+                    Span::raw(BULK_FORMATS[b.format_sel].0.to_string()),
+                    Span::styled("   Output: ", self.palette.dim()),
+                    Span::raw(b.out_dir.clone()),
+                ]));
+                lines.push(Line::raw(""));
+                if !b.op.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Converting: ", self.palette.dim()),
+                        Span::raw(b.op.clone()),
+                    ]));
+                }
+                if let Some(res) = &b.result {
+                    lines.push(Line::raw(""));
+                    let style = if b.is_error {
+                        self.palette.warn()
+                    } else {
+                        self.palette.accent()
+                    };
+                    lines.push(Line::styled(format!("  {res}"), style));
+                    lines.push(Line::styled(
+                        "  Esc to return to options.",
+                        self.palette.dim(),
+                    ));
+                }
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block(title, true))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        if let Some(picker) = &b.picker {
+            picker.draw(frame, area, self.palette, self.border);
+        }
+    }
+
     /// The physical-disk chooser overlay used by the Backup source step.
     fn draw_backup_device_pick(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
         let disks = self.disks.as_deref().unwrap_or(&[]);
@@ -4368,6 +4874,21 @@ impl App {
                     ("<-/->", "Size/Align"),
                     ("Tab", "Browse"),
                     ("Enter", "Next/Start"),
+                    ("Esc", "Back"),
+                ],
+                _ => vec![("Esc", "Back")],
+            }
+        } else if self.current() == TabId::Bulk {
+            let step = self.bulk.as_ref().map(|b| b.step);
+            match step {
+                Some(BulkStep::Source) => {
+                    vec![("<-/->", "Tabs"), ("Enter/o", "Folder"), ("?", "Help")]
+                }
+                Some(BulkStep::Config) => vec![
+                    ("Up/Dn", "Move"),
+                    ("<-/->", "Format"),
+                    ("Space", "Toggle"),
+                    ("Enter", "Start"),
                     ("Esc", "Back"),
                 ],
                 _ => vec![("Esc", "Back")],
