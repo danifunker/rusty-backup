@@ -64,6 +64,8 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   via `optical::rip::run_rip`. Wired; needs a physical drive to verify a full rip.
 - [x] **Archives** — open a Mac archive, list entries, extract to host (fork
   format cycled with `f`) via `macarchive::extract`.
+- [x] **Commander** — dual-pane (host folder / image partition) browse + copy
+  between panes (host↔image, host↔host) via `dir_listing` + `commander_ops`.
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -143,11 +145,18 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** opened a `.mar` (entry list matched `rb-cli archive list`),
   extracted to `.hqx` host files.
 
-### Step 6 — Commander tab
-- [ ] Dual-pane, each pane a host folder OR an image/container, over `dir_listing`.
-- [ ] Copy between panes (image↔image, host↔image) via `commander_ops` +
-  `commander_descend`; multi-select, sort, delete, checksum.
-- **Accept:** copy a file image→host and host→image; verify.
+### Step 6 — Commander tab  [core DONE]
+- [x] Dual-pane, each pane a host folder (`DirListing::load_host_root`) OR an
+  image partition (`commander_source::{probe_partitions, session_for}` +
+  `BrowseSession::open` → `DirListing::load_root`; superfloppy = whole-disk
+  session). Tab switches focus; Enter/Backspace navigate; partition chooser for
+  multi-partition images.
+- [x] Copy the selected entry to the other pane's cwd (`c` / F5): host→image
+  stages + `commander_ops::apply_edits`; image→host via `fork_export`; host→host
+  via `std::fs`. Destination refreshes after.
+- [ ] image→image copy, multi-select, sort, delete/mkdir, checksum deferred.
+- **Verified:** host→image copy through the TUI put a file into a FAT image;
+  re-extracting it is content-identical (`cmp`).
 
 ### Step 7 — Edit + transform actions (into Inspect/Explorer)
 - [ ] `put`/`rm`/`mkdir`/`chmeta`/`setrsrc`/reformat via `edit_queue` +

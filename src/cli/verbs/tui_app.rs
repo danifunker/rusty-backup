@@ -1294,6 +1294,375 @@ impl Default for OpticalState {
     }
 }
 
+/// Which Commander pane has focus.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Side {
+    #[default]
+    Left,
+    Right,
+}
+
+/// One Commander pane: a host folder or an image partition, browsed through the
+/// shared `DirListing`. Image panes keep a `BrowseSession` so a host->image copy
+/// can be applied through `commander_ops::apply_edits`.
+struct CmdPane {
+    listing: crate::model::dir_listing::DirListing,
+    session: Option<crate::model::browse_session::BrowseSession>,
+    is_host: bool,
+    loaded: bool,
+    label: String,
+    sel: usize,
+    /// Open flow: a folder/file picker (host vs image by `picker_host`).
+    picker: Option<FilePicker>,
+    picker_host: bool,
+    /// Partition chooser for a multi-partition image.
+    parts: Vec<crate::partition::PartitionInfo>,
+    part_pick: bool,
+    part_sel: usize,
+    pending_img: Option<std::path::PathBuf>,
+}
+
+impl Default for CmdPane {
+    fn default() -> Self {
+        CmdPane {
+            listing: crate::model::dir_listing::DirListing::new(),
+            session: None,
+            is_host: false,
+            loaded: false,
+            label: String::new(),
+            sel: 0,
+            picker: None,
+            picker_host: false,
+            parts: Vec::new(),
+            part_pick: false,
+            part_sel: 0,
+            pending_img: None,
+        }
+    }
+}
+
+impl CmdPane {
+    fn rows_len(&self) -> usize {
+        self.listing.current_rows().len()
+    }
+    /// The `FileEntry` under the cursor, if the cursor is on a real entry.
+    fn selected(&self) -> Option<FileEntry> {
+        match self.listing.current_rows().get(self.sel) {
+            Some(crate::model::dir_listing::Row::Entry(e)) => Some((*e).clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The Commander dual-pane file manager.
+#[derive(Default)]
+struct CommanderState {
+    left: CmdPane,
+    right: CmdPane,
+    active: Side,
+    status: Option<String>,
+    is_error: bool,
+}
+
+impl CommanderState {
+    fn pane(&self, side: Side) -> &CmdPane {
+        match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+    fn pane_mut(&mut self, side: Side) -> &mut CmdPane {
+        match side {
+            Side::Left => &mut self.left,
+            Side::Right => &mut self.right,
+        }
+    }
+
+    /// Load a host folder into the active pane.
+    fn open_host(&mut self, path: std::path::PathBuf) {
+        let side = self.active;
+        match cmd_load_host(self.pane_mut(side), path) {
+            Ok(()) => {
+                self.status = None;
+                self.is_error = false;
+            }
+            Err(e) => {
+                self.status = Some(e);
+                self.is_error = true;
+            }
+        }
+    }
+
+    /// Open an image file into the active pane: show the partition chooser when
+    /// there's more than one, else load directly (superfloppy = whole disk).
+    fn open_image(&mut self, path: std::path::PathBuf) {
+        let side = self.active;
+        let parts = crate::model::commander_source::probe_partitions(&path).unwrap_or_default();
+        if parts.len() > 1 {
+            let p = self.pane_mut(side);
+            p.parts = parts;
+            p.part_pick = true;
+            p.part_sel = 0;
+            p.pending_img = Some(path);
+        } else {
+            let part = parts.first().cloned();
+            match cmd_load_image(self.pane_mut(side), &path, part.as_ref()) {
+                Ok(()) => {
+                    self.status = None;
+                    self.is_error = false;
+                }
+                Err(e) => {
+                    self.status = Some(e);
+                    self.is_error = true;
+                }
+            }
+        }
+    }
+
+    /// Confirm the partition chooser and open the selected partition.
+    fn choose_partition(&mut self) {
+        let side = self.active;
+        let (path, part) = {
+            let p = self.pane_mut(side);
+            (p.pending_img.clone(), p.parts.get(p.part_sel).cloned())
+        };
+        if let Some(path) = path {
+            match cmd_load_image(self.pane_mut(side), &path, part.as_ref()) {
+                Ok(()) => {
+                    self.status = None;
+                    self.is_error = false;
+                }
+                Err(e) => {
+                    self.status = Some(e);
+                    self.is_error = true;
+                }
+            }
+        }
+    }
+
+    fn refresh_active(&mut self) {
+        let side = self.active;
+        cmd_refresh(self.pane_mut(side));
+        self.status = Some("Refreshed.".to_string());
+        self.is_error = false;
+    }
+
+    /// Copy the selected entry from the active pane to the other pane's cwd.
+    /// host->image stages + applies edits; image->host exports the fork; host->
+    /// host is a plain copy; image->image is not supported here yet.
+    fn copy(&mut self) {
+        let (src, dst) = match self.active {
+            Side::Left => (&mut self.left, &mut self.right),
+            Side::Right => (&mut self.right, &mut self.left),
+        };
+        if !src.loaded || !dst.loaded {
+            self.status = Some("Both panes must be open to copy.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let entry = match src.selected() {
+            Some(e) => e,
+            None => {
+                self.status = Some("Select a file to copy.".to_string());
+                self.is_error = true;
+                return;
+            }
+        };
+        let name = entry.name.clone();
+        let result: Result<String, String> = if src.is_host && !dst.is_host {
+            let dest_parent = match dst.listing.cwd() {
+                Some(e) => e.clone(),
+                None => {
+                    self.status = Some("No destination directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let session = match dst.session.clone() {
+                Some(s) => s,
+                None => {
+                    self.status = Some("Destination has no write session.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let edits = crate::model::commander_ops::stage_host_to_image(
+                std::slice::from_ref(&entry),
+                &dest_parent,
+            );
+            match with_stderr_suppressed(|| {
+                crate::model::commander_ops::apply_edits(&session, &edits)
+            }) {
+                Ok(()) => {
+                    cmd_refresh(dst);
+                    Ok(format!("Copied {name} into the image."))
+                }
+                Err(e) => Err(format!("Copy failed: {e:#}")),
+            }
+        } else if !src.is_host && dst.is_host {
+            let dest_dir = match dst.listing.cwd() {
+                Some(e) => std::path::PathBuf::from(&e.path),
+                None => {
+                    self.status = Some("No destination directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            let fs = match src.listing.fs_mut() {
+                Some(f) => f,
+                None => {
+                    self.status = Some("Source has no filesystem.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            with_stderr_suppressed(|| {
+                crate::fs::fork_export::export_file_with_fork(
+                    fs,
+                    &entry,
+                    &dest_dir,
+                    &name,
+                    RfMode::AppleDouble,
+                )
+            })
+            .map(|_| format!("Copied {name} to the host."))
+            .map_err(|e| format!("Copy failed: {e:#}"))
+        } else if src.is_host && dst.is_host {
+            let dest_dir = match dst.listing.cwd() {
+                Some(e) => std::path::PathBuf::from(&e.path),
+                None => {
+                    self.status = Some("No destination directory.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            };
+            std::fs::copy(std::path::PathBuf::from(&entry.path), dest_dir.join(&name))
+                .map(|_| format!("Copied {name}."))
+                .map_err(|e| format!("Copy failed: {e}"))
+        } else {
+            Err("Image-to-image copy isn't supported here yet.".to_string())
+        };
+        // Host destinations refresh after the source borrow is released.
+        if result.is_ok() && dst.is_host {
+            cmd_refresh(dst);
+        }
+        match result {
+            Ok(m) => {
+                self.status = Some(m);
+                self.is_error = false;
+            }
+            Err(e) => {
+                self.status = Some(e);
+                self.is_error = true;
+            }
+        }
+    }
+}
+
+/// Load a host folder into a Commander pane.
+fn cmd_load_host(pane: &mut CmdPane, path: std::path::PathBuf) -> Result<(), String> {
+    pane.listing
+        .load_host_root(path.clone())
+        .map_err(|e| format!("{e}"))?;
+    pane.session = None;
+    pane.is_host = true;
+    pane.loaded = true;
+    pane.label = format!("host: {}", path.display());
+    pane.sel = 0;
+    Ok(())
+}
+
+/// Build a `BrowseSession` for a partition (or the whole disk when `part` is
+/// `None`, i.e. a superfloppy).
+fn cmd_build_session(
+    path: &std::path::Path,
+    part: Option<&crate::partition::PartitionInfo>,
+) -> crate::model::browse_session::BrowseSession {
+    match part {
+        Some(p) => crate::model::commander_source::session_for(path, p),
+        None => crate::model::browse_session::BrowseSession {
+            source_path: Some(path.to_path_buf()),
+            partition_offset: 0,
+            partition_type: 0,
+            ..Default::default()
+        },
+    }
+}
+
+/// Open an image partition into a Commander pane and list its root.
+fn cmd_load_image(
+    pane: &mut CmdPane,
+    path: &std::path::Path,
+    part: Option<&crate::partition::PartitionInfo>,
+) -> Result<(), String> {
+    let session = cmd_build_session(path, part);
+    let mut fs = session
+        .open()
+        .map_err(|e| format!("opening filesystem: {e}"))?;
+    let root = fs.root().map_err(|e| format!("reading root: {e}"))?;
+    let entries = fs.list_directory(&root).unwrap_or_default();
+    pane.listing.load_root(fs, root, entries, false);
+    pane.session = Some(session);
+    pane.is_host = false;
+    pane.loaded = true;
+    pane.label = format!("img: {}", basename(&path.to_string_lossy()));
+    pane.sel = 0;
+    pane.part_pick = false;
+    pane.parts.clear();
+    pane.pending_img = None;
+    Ok(())
+}
+
+/// Refresh a pane after a write: host panes reload; image panes reopen from the
+/// session and re-navigate to the same directory.
+fn cmd_refresh(pane: &mut CmdPane) {
+    let cwd_path = pane.listing.cwd().map(|e| e.path.clone());
+    if pane.is_host {
+        let _ = pane.listing.reload();
+    } else if let Some(session) = pane.session.clone() {
+        if let Ok(mut fs) = session.open() {
+            if let Ok(root) = fs.root() {
+                let entries = fs.list_directory(&root).unwrap_or_default();
+                pane.listing.load_root(fs, root, entries, false);
+                if let Some(p) = cwd_path {
+                    let _ = pane.listing.navigate_to(&p);
+                }
+            }
+        }
+    }
+    let n = pane.listing.current_rows().len();
+    if pane.sel >= n {
+        pane.sel = n.saturating_sub(1);
+    }
+}
+
+/// Enter the row under a pane's cursor (`..` = up, directory = descend).
+fn cmd_enter(pane: &mut CmdPane) {
+    enum Act {
+        Up,
+        Enter(String),
+        None,
+    }
+    let act = match pane.listing.current_rows().get(pane.sel) {
+        Some(crate::model::dir_listing::Row::Parent) => Act::Up,
+        Some(crate::model::dir_listing::Row::Entry(e)) if e.is_directory() => {
+            Act::Enter(e.name.clone())
+        }
+        _ => Act::None,
+    };
+    match act {
+        Act::Up => {
+            pane.listing.up();
+            pane.sel = 0;
+        }
+        Act::Enter(n) => {
+            let _ = pane.listing.enter(&n);
+            pane.sel = 0;
+        }
+        Act::None => {}
+    }
+}
+
 /// Fork container formats for archive extraction.
 const ARCHIVE_FORK_FORMATS: &[(&str, crate::macarchive::extract::ForkFormat)] = &[
     (
@@ -1378,6 +1747,8 @@ struct App {
     optical: Option<OpticalState>,
     /// The Archives screen state (lazily created on first visit).
     archive: Option<ArchiveState>,
+    /// The Commander dual-pane state (lazily created on first visit).
+    commander: Option<CommanderState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     show_help: bool,
@@ -1406,6 +1777,7 @@ impl App {
             bulk: None,
             optical: None,
             archive: None,
+            commander: None,
             settings: None,
             show_help: false,
             should_quit: false,
@@ -1531,6 +1903,11 @@ impl App {
 
         // The Archives screen owns most keys on its tab.
         if self.current() == TabId::Archives && self.handle_archive_key(key.code) {
+            return Ok(());
+        }
+
+        // The Commander screen owns most keys on its tab.
+        if self.current() == TabId::Commander && self.handle_commander_key(key.code) {
             return Ok(());
         }
 
@@ -2377,6 +2754,9 @@ impl App {
         }
         if self.current() == TabId::Archives && self.archive.is_none() {
             self.archive = Some(ArchiveState::default());
+        }
+        if self.current() == TabId::Commander && self.commander.is_none() {
+            self.commander = Some(CommanderState::default());
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -3827,6 +4207,150 @@ impl App {
         }
     }
 
+    /// Commander screen keys. Returns `true` when consumed.
+    fn handle_commander_key(&mut self, code: KeyCode) -> bool {
+        if self.commander.is_none() {
+            self.commander = Some(CommanderState::default());
+        }
+        let page = self.explorer_page() as isize;
+        let c = self.commander.as_mut().unwrap();
+        let active = c.active;
+
+        // Open picker on the active pane (modal).
+        if c.pane(active).picker.is_some() {
+            let host = c.pane(active).picker_host;
+            let res = c.pane_mut(active).picker.as_mut().unwrap().handle_key(code);
+            match res {
+                Some(PickResult::Cancel) => c.pane_mut(active).picker = None,
+                Some(PickResult::Confirm(path)) => {
+                    c.pane_mut(active).picker = None;
+                    if host {
+                        c.open_host(path);
+                    } else {
+                        c.open_image(path);
+                    }
+                }
+                None => {}
+            }
+            return true;
+        }
+
+        // Partition chooser on the active pane (modal).
+        if c.pane(active).part_pick {
+            let np = c.pane(active).parts.len();
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let p = c.pane_mut(active);
+                    p.part_sel = p.part_sel.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let p = c.pane_mut(active);
+                    p.part_sel = (p.part_sel + 1).min(np.saturating_sub(1));
+                }
+                KeyCode::Esc => {
+                    let p = c.pane_mut(active);
+                    p.part_pick = false;
+                    p.pending_img = None;
+                    p.parts.clear();
+                }
+                KeyCode::Enter => c.choose_partition(),
+                _ => {}
+            }
+            return true;
+        }
+
+        // Tab / BackTab switch the focused pane.
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
+            c.active = match active {
+                Side::Left => Side::Right,
+                Side::Right => Side::Left,
+            };
+            return true;
+        }
+
+        let loaded = c.pane(active).loaded;
+        if !loaded {
+            return match code {
+                KeyCode::Char('o') => {
+                    let p = c.pane_mut(active);
+                    p.picker = Some(FilePicker::new(PickKind::Dir, "Open host folder"));
+                    p.picker_host = true;
+                    true
+                }
+                KeyCode::Char('i') => {
+                    let p = c.pane_mut(active);
+                    p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
+                    p.picker_host = false;
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        let n = c.pane(active).rows_len() as isize;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let p = c.pane_mut(active);
+                p.sel = p.sel.saturating_sub(1);
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let p = c.pane_mut(active);
+                p.sel = ((p.sel as isize + 1).min(n - 1).max(0)) as usize;
+                true
+            }
+            KeyCode::PageUp => {
+                let p = c.pane_mut(active);
+                p.sel = (p.sel as isize - page).max(0) as usize;
+                true
+            }
+            KeyCode::PageDown => {
+                let p = c.pane_mut(active);
+                p.sel = ((p.sel as isize + page).min(n - 1).max(0)) as usize;
+                true
+            }
+            KeyCode::Home => {
+                c.pane_mut(active).sel = 0;
+                true
+            }
+            KeyCode::End => {
+                c.pane_mut(active).sel = (n - 1).max(0) as usize;
+                true
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                cmd_enter(c.pane_mut(active));
+                true
+            }
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                let p = c.pane_mut(active);
+                p.listing.up();
+                p.sel = 0;
+                true
+            }
+            KeyCode::Char('o') => {
+                let p = c.pane_mut(active);
+                p.picker = Some(FilePicker::new(PickKind::Dir, "Open host folder"));
+                p.picker_host = true;
+                true
+            }
+            KeyCode::Char('i') => {
+                let p = c.pane_mut(active);
+                p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
+                p.picker_host = false;
+                true
+            }
+            KeyCode::Char('r') => {
+                c.refresh_active();
+                true
+            }
+            KeyCode::Char('c') | KeyCode::F(5) => {
+                c.copy();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
@@ -4452,6 +4976,12 @@ impl App {
         if self.current() == TabId::Archives {
             if let Some(a) = &self.archive {
                 self.draw_archive(frame, area, a);
+                return;
+            }
+        }
+        if self.current() == TabId::Commander {
+            if let Some(c) = &self.commander {
+                self.draw_commander(frame, area, c);
                 return;
             }
         }
@@ -5176,6 +5706,140 @@ impl App {
         }
     }
 
+    /// The Commander dual-pane file manager.
+    fn draw_commander(&self, frame: &mut Frame, area: Rect, c: &CommanderState) {
+        // Body: two panes over a one-line status.
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(area);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        self.draw_commander_pane(frame, cols[0], c.pane(Side::Left), c.active == Side::Left);
+        self.draw_commander_pane(frame, cols[1], c.pane(Side::Right), c.active == Side::Right);
+
+        let status = match &c.status {
+            Some(s) => s.clone(),
+            None => {
+                "Tab switch pane   o host folder   i image   Enter open   c copy to other   r refresh"
+                    .to_string()
+            }
+        };
+        let style = if c.is_error {
+            self.palette.warn()
+        } else {
+            self.palette.dim()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {status}"), style)),
+            rows[1],
+        );
+
+        // A pane's open picker / partition chooser draws on top.
+        for side in [Side::Left, Side::Right] {
+            let pane = c.pane(side);
+            if let Some(picker) = &pane.picker {
+                picker.draw(frame, area, self.palette, self.border);
+            }
+            if pane.part_pick {
+                self.draw_commander_partpick(frame, area, pane);
+            }
+        }
+    }
+
+    fn draw_commander_pane(&self, frame: &mut Frame, area: Rect, pane: &CmdPane, focused: bool) {
+        if !pane.loaded {
+            let body = Text::from(vec![
+                Line::raw(""),
+                Line::styled("  Empty pane.", self.palette.dim()),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("  o  ", self.palette.accent()),
+                    Span::raw("open a host folder"),
+                ]),
+                Line::from(vec![
+                    Span::styled("  i  ", self.palette.accent()),
+                    Span::raw("open an image file"),
+                ]),
+            ]);
+            frame.render_widget(
+                Paragraph::new(body).block(self.pane_block("(empty)", focused)),
+                area,
+            );
+            return;
+        }
+        let rows = pane.listing.current_rows();
+        let visible = area.height.saturating_sub(2) as usize;
+        let start = pane.sel.saturating_sub(visible.saturating_sub(1));
+        let mut lines = Vec::new();
+        for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
+            let on = focused && i == pane.sel;
+            let (text, is_dir) = match row {
+                crate::model::dir_listing::Row::Parent => ("..".to_string(), true),
+                crate::model::dir_listing::Row::Entry(e) => {
+                    if e.is_directory() {
+                        (format!("{}/", e.name), true)
+                    } else {
+                        (format!("{:<28} {:>9}", e.name, format_size(e.size)), false)
+                    }
+                }
+            };
+            let base = if is_dir {
+                self.palette.accent()
+            } else {
+                Style::default()
+            };
+            let style = if on {
+                base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                base
+            };
+            lines.push(Line::styled(format!(" {text}"), style));
+        }
+        let title = if pane.label.len() > area.width.saturating_sub(4) as usize {
+            format!(
+                "...{}",
+                &pane.label[pane.label.len().saturating_sub(area.width as usize - 8)..]
+            )
+        } else {
+            pane.label.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, focused)),
+            area,
+        );
+    }
+
+    fn draw_commander_partpick(&self, frame: &mut Frame, area: Rect, pane: &CmdPane) {
+        let mut lines: Vec<Line> = vec![Line::raw("")];
+        for (i, _p) in pane.parts.iter().enumerate() {
+            let sel = i == pane.part_sel;
+            let marker = if sel { "> " } else { "  " };
+            let style = if sel {
+                self.palette
+                    .accent()
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                self.palette.accent()
+            };
+            lines.push(Line::styled(format!("{marker}Partition {}", i + 1), style));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "Up/Down select   Enter open   Esc cancel",
+            self.palette.dim(),
+        ));
+        let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let popup = centered_rect(46, h, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(self.pane_block("Choose partition", true)),
+            popup,
+        );
+    }
+
     /// The Archives screen: open a Mac archive, list its entries, extract.
     fn draw_archive(&self, frame: &mut Frame, area: Rect, a: &ArchiveState) {
         let mut lines: Vec<Line> = Vec::new();
@@ -5721,6 +6385,14 @@ impl App {
             } else {
                 vec![("<-/->", "Tabs"), ("Enter/o", "Open"), ("?", "Help")]
             }
+        } else if self.current() == TabId::Commander {
+            vec![
+                ("Tab", "Pane"),
+                ("Enter", "Open"),
+                ("o/i", "Host/Img"),
+                ("c", "Copy"),
+                ("q", "Quit"),
+            ]
         } else if self.current() == TabId::NewDisk {
             let step = self.newdisk.as_ref().map(|w| w.step);
             match step {
