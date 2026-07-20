@@ -178,10 +178,19 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   (`delete_recursive`, with confirmation), plus the earlier `m` metadata edit and
   `b` bless. All go through `resolve_partition_rw_forced` → `open_editable_
   filesystem` → op → `sync_metadata` → commit, then reopen the view.
-- [ ] `chmeta`/`setrsrc`/reformat, `fsck` check/repair (`fsck_runner`),
-  resize/expand/convert, the `partmap` editor, and CHD metadata are deferred.
-- **Verified:** created a folder and deleted a file through the Explorer; both
-  reflected by `rb-cli ls`.
+- [x] `fsck` check (`f`) + repair (`F`): `f` runs `fs.fsck()` on the open
+  partition and shows a scrollable report; `F` reopens read-write through the
+  shared repair core (`resolve_partition_rw_forced` -> `open_editable_filesystem`
+  -> `repair` -> commit) and shows a repair + re-check report.
+- [x] whole-image transforms (`t`): a launcher menu (Convert / Resize / Expand /
+  Partition table) prefills the `:` command palette with the right verb + the
+  current image path, then runs through the shared CLI `dispatch` — the palette
+  is the proven execution path, so the Explorer doesn't reimplement four wizards.
+- [ ] `chmeta`/`setrsrc`/`reformat` and `partmap` edits remain palette-served
+  (all are CLI verbs the `:` palette already runs); CHD metadata deferred.
+- **Verified:** created + deleted through the Explorer (reflected by `rb-cli ls`);
+  `f` shows CLEAN FAT12 stats and `F` runs + re-checks (image stays fsck-clean,
+  file byte-identical); `t` -> Convert produced a readable `.vhd` via the palette.
 
 ### Step 8 — Command palette / REPL  [DONE]
 - [x] `:` opens an input line; the text is tokenized with `shell_words::split`,

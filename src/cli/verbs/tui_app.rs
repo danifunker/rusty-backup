@@ -147,7 +147,35 @@ struct Explorer {
     confirm_delete: Option<(String, bool)>,
     /// A scrollable fsck check / repair report overlay, when open.
     fsck_report: Option<FsckReportView>,
+    /// The whole-image "Transform" launcher menu (selected index), when open.
+    /// Its entries prefill the `:` command palette with a verb for this image.
+    transform_menu: Option<usize>,
 }
+
+/// Whole-image / partition-table transforms offered by the Explorer's `t`
+/// launcher. Each is executed through the `:` command palette (the shared CLI
+/// `dispatch`), prefilled with the current image path — the palette is the
+/// proven execution path, so the Explorer doesn't reimplement these wizards.
+/// `(label, verb-template)`; `{IMG}` / `{STEM}` are substituted at launch.
+const TRANSFORMS: &[(&str, &str)] = &[
+    // `convert`'s second argument is a destination *folder* (created if absent);
+    // the converted file lands inside it with the input's stem + new extension.
+    (
+        "Convert to another format",
+        "convert \"{IMG}\" \"{STEM}-converted\" --format vhd",
+    ),
+    (
+        "Resize a partition in place",
+        "resize --size <SIZE> \"{IMG}\"",
+    ),
+    (
+        "Expand into a larger new image",
+        "expand --size <SIZE> --output \"{STEM}-expanded.img\" \"{IMG}\"",
+    ),
+    // `partmap` is edit-only (add/resize/move/delete/set-type/set-bootable);
+    // `inspect` shows the table to start from, then edit via `:` partmap ...
+    ("Partition table (inspect / partmap)", "inspect \"{IMG}\""),
+];
 
 /// A scrollable fsck / repair result overlay (title + pre-formatted lines).
 struct FsckReportView {
@@ -2405,6 +2433,7 @@ impl App {
                 mkdir_input: None,
                 confirm_delete: None,
                 fsck_report: None,
+                transform_menu: None,
             };
             // Expand the root so its subdirectories show in the tree immediately.
             ex.tree_expand();
@@ -2453,6 +2482,40 @@ impl App {
                     KeyCode::End => rv.scroll = max,
                     _ => {}
                 }
+            }
+            return;
+        }
+
+        // Transform launcher menu (modal): pick a verb to prefill the palette.
+        if self
+            .explorer
+            .as_ref()
+            .map(|e| e.transform_menu.is_some())
+            .unwrap_or(false)
+        {
+            let sel = self
+                .explorer
+                .as_ref()
+                .and_then(|e| e.transform_menu)
+                .unwrap_or(0);
+            match code {
+                KeyCode::Esc => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.transform_menu = None;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.transform_menu = Some(sel.saturating_sub(1));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(ex) = self.explorer.as_mut() {
+                        ex.transform_menu = Some((sel + 1).min(TRANSFORMS.len() - 1));
+                    }
+                }
+                KeyCode::Enter => self.launch_transform(sel),
+                _ => {}
             }
             return;
         }
@@ -2771,6 +2834,14 @@ impl App {
                 self.explorer_repair();
                 return;
             }
+            // Whole-image transform launcher (convert / resize / expand / partmap).
+            KeyCode::Char('t') => {
+                if let Some(ex) = self.explorer.as_mut() {
+                    ex.transform_menu = Some(0);
+                    ex.status = None;
+                }
+                return;
+            }
             // Delete the selected entry (with confirmation).
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(ex) = self.explorer.as_mut() {
@@ -3014,6 +3085,27 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Close the transform menu and prefill the `:` command palette with the
+    /// chosen verb template, substituting the current image path. The user
+    /// completes any `<SIZE>` placeholder and presses Enter to run it through the
+    /// shared CLI dispatch (the same suspended-alt-screen path `:` uses).
+    fn launch_transform(&mut self, sel: usize) {
+        let Some(ex) = self.explorer.as_mut() else {
+            return;
+        };
+        ex.transform_menu = None;
+        let img = ex.image_path.clone();
+        let stem = std::path::Path::new(&img)
+            .with_extension("")
+            .to_string_lossy()
+            .into_owned();
+        let template = TRANSFORMS.get(sel).map(|t| t.1).unwrap_or("");
+        let cmd = template.replace("{IMG}", &img).replace("{STEM}", &stem);
+        // Hand off to the palette modal (checked before the Explorer in
+        // handle_events), so the user can edit and run it.
+        self.palette_input = Some(cmd);
     }
 
     /// Run fsck on the Explorer's open partition and show the result overlay.
@@ -5285,7 +5377,7 @@ impl App {
             fl.push(Line::styled(format!(" {s}"), self.palette.warn()));
         }
         fl.push(Line::styled(
-            " Enter open  e Export i Import  n New x Del  m Meta b Bless  f Check F Repair  Esc close",
+            " Enter open  e Exp i Imp  n New x Del  m Meta b Bless  f Chk F Rep  t Transform  Esc close",
             self.palette.dim(),
         ));
         frame.render_widget(Paragraph::new(Text::from(fl)), rows[2]);
@@ -5327,6 +5419,35 @@ impl App {
             ));
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(self.pane_block(&rv.title, true)),
+                popup,
+            );
+        }
+
+        // Transform launcher menu.
+        if let Some(sel) = ex.transform_menu {
+            let mut lines: Vec<Line> = vec![Line::raw("")];
+            for (i, (label, _)) in TRANSFORMS.iter().enumerate() {
+                let on = i == sel;
+                let marker = if on { "> " } else { "  " };
+                let style = if on {
+                    self.palette
+                        .accent()
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    self.palette.accent()
+                };
+                lines.push(Line::styled(format!("{marker}{label}"), style));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  Enter -> prefills the command line; edit and run.  Esc cancel",
+                self.palette.dim(),
+            ));
+            let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let popup = centered_rect(66, h, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block("Transform image", true)),
                 popup,
             );
         }
