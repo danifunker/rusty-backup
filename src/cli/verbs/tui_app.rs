@@ -1755,6 +1755,11 @@ struct App {
     commander: Option<CommanderState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
+    /// The `:` command-palette input line being typed, if open.
+    palette_input: Option<String>,
+    /// A command-palette line ready to run (the run loop suspends the TUI,
+    /// executes it, and re-enters).
+    pending_palette: Option<String>,
     show_help: bool,
     should_quit: bool,
 }
@@ -1783,6 +1788,8 @@ impl App {
             archive: None,
             commander: None,
             settings: None,
+            palette_input: None,
+            pending_palette: None,
             show_help: false,
             should_quit: false,
         };
@@ -1820,7 +1827,33 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.draw(frame))?;
             self.handle_events()?;
+            if let Some(cmd) = self.pending_palette.take() {
+                self.run_palette(terminal, &cmd)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Suspend the alt-screen, run a `rb-cli` verb line to the real terminal,
+    /// wait for a keypress, then re-enter the TUI. This is the command palette's
+    /// escape hatch to any flat CLI verb.
+    fn run_palette(&mut self, terminal: &mut DefaultTerminal, input: &str) -> Result<()> {
+        use crossterm::terminal::{
+            disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        };
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), LeaveAlternateScreen);
+        println!("$ rb-cli {input}\n");
+        match run_palette_command(input) {
+            Ok(()) => {}
+            Err(e) => eprintln!("error: {e:#}"),
+        }
+        println!("\n[Press Enter to return to the TUI]");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let _ = enable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), EnterAlternateScreen);
+        let _ = terminal.clear();
         Ok(())
     }
 
@@ -1856,6 +1889,31 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter | KeyCode::F(1)
             ) {
                 self.show_help = false;
+            }
+            return Ok(());
+        }
+
+        // The `:` command palette input is modal while open.
+        if self.palette_input.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    let cmd = self.palette_input.take().unwrap_or_default();
+                    if !cmd.trim().is_empty() {
+                        self.pending_palette = Some(cmd);
+                    }
+                }
+                KeyCode::Esc => self.palette_input = None,
+                KeyCode::Backspace => {
+                    if let Some(s) = self.palette_input.as_mut() {
+                        s.pop();
+                    }
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    if let Some(s) = self.palette_input.as_mut() {
+                        s.push(c);
+                    }
+                }
+                _ => {}
             }
             return Ok(());
         }
@@ -1922,6 +1980,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
+            KeyCode::Char(':') => self.palette_input = Some(String::new()),
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.on_back(),
             // Left / Right (and Tab, and vim h/l) change tabs ("windows").
@@ -4713,6 +4772,26 @@ impl App {
         }
         if self.show_help {
             self.draw_help(frame, area);
+        }
+        if let Some(input) = &self.palette_input {
+            let cp = centered_rect(70, 5, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("  : ", self.palette.accent()),
+                        Span::raw(input.clone()),
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
+                    ]),
+                    Line::raw(""),
+                    Line::styled(
+                        "  Any rb-cli verb (e.g. `ls disk.img @1`).  Enter run   Esc cancel",
+                        self.palette.dim(),
+                    ),
+                ]))
+                .block(self.pane_block("Command palette", true)),
+                cp,
+            );
         }
     }
 
@@ -7540,6 +7619,24 @@ fn basename(path: &str) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
+}
+
+/// Parse a `rb-cli` verb line and dispatch it (the command palette). Reuses the
+/// same `no_binary_name` clap wrapper the interactive `terminal` REPL uses.
+fn run_palette_command(input: &str) -> anyhow::Result<()> {
+    use clap::Parser;
+    #[derive(Parser)]
+    #[command(name = "", no_binary_name = true, disable_help_subcommand = true)]
+    struct PaletteCli {
+        #[command(subcommand)]
+        command: crate::cli::Command,
+    }
+    let argv = shell_words::split(input)?;
+    if argv.is_empty() {
+        return Ok(());
+    }
+    let parsed = PaletteCli::try_parse_from(&argv)?;
+    crate::cli::dispatch(parsed.command)
 }
 
 /// Run `f` with the process's stdout AND stderr redirected to the null device,

@@ -66,6 +66,9 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
   format cycled with `f`) via `macarchive::extract`.
 - [x] **Commander** — dual-pane (host folder / image partition) browse + copy
   between panes (host↔image, host↔host) via `dir_listing` + `commander_ops`.
+- [x] **Explorer edits** — `n` new folder, `x` delete (plus the earlier import /
+  metadata / bless), all through the editable-fs commit path.
+- [x] **Command palette** — `:` runs any `rb-cli` verb (alt-screen suspended).
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -169,13 +172,15 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** created a folder and deleted a file through the Explorer; both
   reflected by `rb-cli ls`.
 
-### Step 8 — Command palette / REPL
-- [ ] `:`-style line accepting any `rb-cli` verb: tokenize with
-  `shell_words::split`, parse into `rusty_backup::cli::Command` (a
-  `no_binary_name` clap wrapper), run via `rusty_backup::cli::dispatch(cmd)`.
-- [ ] Suspend the alt-screen around the call (leave raw mode / alt-screen, run,
-  wait for a keypress, re-enter) so verb output is visible, not corrupted.
-- **Accept:** run `ls <img> @1` from the palette and see its output.
+### Step 8 — Command palette / REPL  [DONE]
+- [x] `:` opens an input line; the text is tokenized with `shell_words::split`,
+  parsed into `crate::cli::Command` via a `no_binary_name` clap wrapper, and run
+  through `crate::cli::dispatch`.
+- [x] The run loop suspends the alt-screen (disable raw mode + LeaveAlternate
+  Screen), runs the verb to the real terminal, prints `[Press Enter to return]`,
+  waits for a keypress, then re-enters (`terminal.clear()`).
+- **Verified:** `ls <img>` from the palette printed the partition table + file
+  listing on the suspended screen, then returned cleanly to the TUI.
 
 ### Step 9 — `rb-cli update` verb + updater (gated, `tui-update` feature)
 - [ ] Add the `update` verb: when `tui-update` is off, print "not built" + the
