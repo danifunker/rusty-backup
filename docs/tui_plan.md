@@ -197,7 +197,12 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   exit 2; the `tui-update` build's check path compiles + lints clean.
 
 ### Step 10 — Polish leftovers
-- [ ] Absorb the `menu` appliance verb as an alias into Backup/Restore.
+- [x] Absorb the `menu` appliance verb as an alias into Backup/Restore — when
+  the `tui` feature is compiled in, `rb-cli menu` opens the full TUI on the
+  Backup tab (`tui_app::run_on(BACKUP_TAB, ..)`) instead of the standalone
+  crossterm appliance screen. The old screen stays as the fallback for slim
+  builds without `tui` (the i486 appliance), and its `MenuState` unit tests still
+  run in the default build.
 - [ ] Elevation-prompt UX in the TUI (design pass; reuse `src/privileged/` + `os::*`).
 - [x] crossterm dedupe — bumped our direct dep 0.28 -> 0.29 to match ratatui
   0.30's transitive `crossterm 0.29`; no API changes needed in `menu`/`cli::tui`/

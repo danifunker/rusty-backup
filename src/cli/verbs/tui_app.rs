@@ -879,16 +879,27 @@ const DEFAULT_TAB: usize = 2;
 /// and always restores the terminal (ratatui installs a panic hook that does
 /// the same on an unwind).
 pub fn run() -> Result<()> {
+    run_on(DEFAULT_TAB, "rb-cli tui")
+}
+
+/// Launch the TUI opened on a specific tab. `menu` uses this to absorb the old
+/// appliance verb: `rb-cli menu` opens the full TUI on the Backup tab (the
+/// appliance's backup/restore focus) instead of running a separate screen.
+/// `label` names the entry verb for the interactive-TTY guard message.
+pub fn run_on(initial_tab: usize, label: &'static str) -> Result<()> {
     crate::cli::tui::require_interactive_tty(
-        "rb-cli tui",
+        label,
         "run it directly in a terminal, not from a pipe or CI",
     )?;
 
     let mut terminal = ratatui::init();
-    let outcome = App::new().run(&mut terminal);
+    let outcome = App::new_on(initial_tab).run(&mut terminal);
     ratatui::restore();
     outcome
 }
+
+/// Tab index of the Backup screen (used by the `menu` alias entry).
+pub const BACKUP_TAB: usize = 0;
 
 /// The New Disk creation wizard: a three-step form (media class → filesystem →
 /// path/size/name) that creates a blank image through the shared `new` verb
@@ -1765,12 +1776,13 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new_on(initial_tab: usize) -> Self {
+        let active = initial_tab.min(TABS.len() - 1);
         let mut app = App {
             palette: Palette::detect(),
             border: choose_border_set(),
             elevated: crate::os::is_elevated(),
-            active: DEFAULT_TAB,
+            active,
             scroll: 0,
             selection: 0,
             detail: None,
