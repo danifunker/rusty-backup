@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical du</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <span>du</span></nav>
+<h1><code>rb-cli optical du</code></h1>
+<p>Recursive both-fork (data + resource) disk usage of paths on an optical disc image — the disc counterpart of the top-level `du` verb, for hybrid Mac discs whose apps keep code in the resource fork</p>
+<h2>Usage</h2>
+<pre><code>Usage: du [OPTIONS] &lt;SOURCE&gt; [PATH]...</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Optical disc image (.iso, .cue, .chd)</dd>
+<dt><code>&lt;PATHS&gt;</code></dt>
+<dd>One or more paths inside the disc filesystem (use `/` as the separator). Defaults to the volume root when none are given</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--depth</code></dt>
+<dd>Report subdirectory totals down to this many levels below each PATH (`0`, the default, prints only the totals for the path itself). The full subtree is always summed regardless</dd>
+<dt><code>--json</code></dt>
+<dd>Emit machine-readable JSON. Shorthand for `--format json`</dd>
+<dt><code>--format</code></dt>
+<dd>Output format</dd>
+<dt><code>--filesystem</code></dt>
+<dd>Which filesystem to measure on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side — the one carrying resource forks. See `optical info` for what a disc holds</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

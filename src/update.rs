@@ -279,6 +279,24 @@ impl UpdateConfig {
     }
 }
 
+/// Load the persisted recent-files list for `mode` (newest-first). A thin
+/// convenience over `UpdateConfig::load` shared by every front-end (GUI, TUI).
+pub fn load_recent(mode: RecentMode) -> Vec<String> {
+    UpdateConfig::load().recent_files.list(mode).to_vec()
+}
+
+/// Record `path` as the most-recently-opened entry for `mode` (move-to-front,
+/// deduped, capped), persist it, and return the updated newest-first list.
+/// The single place any front-end should call on a successful open, so the MRU
+/// always reflects the *most* recently opened, not a static order.
+pub fn push_recent(mode: RecentMode, path: &str) -> Vec<String> {
+    let mut cfg = UpdateConfig::load();
+    cfg.remember_file(mode, path);
+    let list = cfg.recent_files.list(mode).to_vec();
+    let _ = cfg.save();
+    list
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateInfo {
     pub current_version: String,

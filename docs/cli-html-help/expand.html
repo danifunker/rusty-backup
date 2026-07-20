@@ -7,7 +7,7 @@
 <body>
 <nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>expand</span></nav>
 <h1><code>rb-cli expand</code></h1>
-<p>Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (<code>--to-hfv</code>). Accepts APM-wrapped sources or raw single-partition HFS images.</p>
+<p>Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images</p>
 <h2>Usage</h2>
 <pre><code>Usage: expand [OPTIONS] --size &lt;SIZE&gt; --output &lt;OUTPUT&gt; &lt;IMAGE&gt;</code></pre>
 <h2>Arguments</h2>
@@ -22,7 +22,9 @@
 <dt><code>--block-size</code></dt>
 <dd>Allocation block size in bytes. One of: 4096, 8192, 16384, 32768, 65536. If omitted, picks the smallest block size whose 65535-block ceiling can hold `--size`</dd>
 <dt><code>--output</code></dt>
-<dd>Destination path for the new APM disk image. Created (or truncated)</dd>
+<dd>Destination path for the new image. Created (or truncated)</dd>
+<dt><code>--to-hfv</code></dt>
+<dd>Write a flat BasiliskII HFV (bare classic-HFS volume, no partition table) instead of an APM disk image. Capped at 2047 MB. Use this to produce a `.hfv` for BasiliskII / SheepShaver</dd>
 </dl>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

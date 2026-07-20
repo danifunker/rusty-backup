@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new hd x68k</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <a href="new-hd.html">hd</a> &raquo; <span>x68k</span></nav>
+<h1><code>rb-cli new hd x68k</code></h1>
+<p>Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a blank or donor-cloned Human68k partition</p>
+<h2>Usage</h2>
+<pre><code>Usage: x68k [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disk size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `8M`, `16M`). Defaults to `16M` — large enough for a full Human68k system clone plus room for user files</dd>
+<dt><code>--variant</code></dt>
+<dd>Sharp HDD controller convention to emit</dd>
+<dt><code>--stub</code></dt>
+<dd>Which byte-0 IPL stub to write. `print` (default) renders a status banner via IOCS; `halt` is the bare minimum 2-byte halt loop</dd>
+<dt><code>--partitions</code></dt>
+<dd>Number of Human68k partitions to carve out (1-8). The disk's data area is split equally; partition 1 (slot 0) is the one that gets `--system-disk` files and the optional `--boot-sector-donor` overlay. Other partitions are formatted blank FAT12/16. Defaults to 1 — multi-partition only matters when you want separate volumes for system / games / scratch on the same HDD</dd>
+<dt><code>--system-disk</code></dt>
+<dd>Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation</dd>
+<dt><code>--boot-sector-donor</code></dt>
+<dd>Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:&gt;` on every power-on</dd>
+<dt><code>--builtin-boot-sector</code></dt>
+<dd>Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli make-bootable</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>make-bootable</span></nav>
+<h1><code>rb-cli make-bootable</code></h1>
+<p>Auto-detect what a Mac disk needs to boot and apply only the missing pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a `--boot-from` donor), and a blessed System Folder. Idempotent; a flat HFV is kept flat. Works on flat HFVs and full APM disks alike</p>
+<h2>Usage</h2>
+<pre><code>Usage: make-bootable [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Disk image to make bootable, in place</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--boot-from</code></dt>
+<dd>Bootable donor disk to copy boot blocks from, if the target lacks them (its classic-HFS volume is auto-located and `'LK'`-validated). Without it, missing boot blocks are reported but not synthesized</dd>
+<dt><code>--driver-from</code></dt>
+<dd>For a full (APM) disk missing a SCSI driver: extract it from a donor Apple-formatted disk instead of using the bundled driver</dd>
+<dt><code>--bless</code></dt>
+<dd>Absolute Mac path of the folder to bless (e.g. `/System Folder`). Defaults to auto-blessing a root folder named &quot;System Folder&quot;</dd>
+<dt><code>--dry-run</code></dt>
+<dd>Report what would change without writing anything</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

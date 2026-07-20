@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli put-macbinary</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>put-macbinary</span></nav>
+<h1><code>rb-cli put-macbinary</code></h1>
+<p>Put a MacBinary I / II archive: both forks + full Finder info in one shot (HFS; on MFS both forks + type/creator, extended Finder flags/dates skipped)</p>
+<h2>Usage</h2>
+<pre><code>Usage: put-macbinary [OPTIONS] &lt;IMAGE&gt; &lt;HOST_FILE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N`)</dd>
+<dt><code>&lt;HOST_FILE&gt;</code></dt>
+<dd>MacBinary I / II archive on the host</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--dst-dir</code></dt>
+<dd>Destination directory inside the filesystem (`/` for root). The filename comes from the MacBinary header. Defaults to `/`</dd>
+<dt><code>--rename</code></dt>
+<dd>Override the filename from the MacBinary header</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing entry at the destination path</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

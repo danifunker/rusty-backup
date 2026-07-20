@@ -32,7 +32,7 @@ rb-cli show devices --format json | jq '.result[] | select(.removable)'
 ## Create + populate an HFS floppy
 
 ```bash
-rb-cli new disk.dsk --fs hfs --size 800K --name "Boot Disk"
+rb-cli new volume hfs disk.dsk --size 800K --name "Boot Disk"
 
 # Copy a host file in with its 4-char type/creator codes
 rb-cli put disk.dsk ./Finder /System/Finder --type FNDR --creator MACS
@@ -52,10 +52,10 @@ rb-cli put disk.dsk --boot ./bootblocks.bin
 
 ```bash
 # Auto geometry (cluster size chosen from the volume size, 512-byte sectors)
-rb-cli new disk.img --fs ntfs --size 64M --name DATA
+rb-cli new volume ntfs disk.img --size 64M --name DATA
 
 # Pick the cluster and sector size explicitly
-rb-cli new disk.img --fs ntfs --size 1G --cluster-size 64K --sector-size 4096
+rb-cli new volume ntfs disk.img --size 1G --cluster-size 64K --sector-size 4096
 ```
 
 The result is a bare single-partition NTFS superfloppy (no MBR/GPT), validated

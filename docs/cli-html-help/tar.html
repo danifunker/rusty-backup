@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli tar</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>tar</span></nav>
+<h1><code>rb-cli tar</code></h1>
+<p>Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case</p>
+<h2>Usage</h2>
+<pre><code>Usage: tar [OPTIONS] &lt;IMAGE&gt; &lt;SRC&gt; &lt;OUT&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;SRC&gt;</code></dt>
+<dd>Source path inside the filesystem to archive — a directory (archived recursively) or a single file. Use `/` for the whole volume</dd>
+<dt><code>&lt;OUT&gt;</code></dt>
+<dd>Output archive path. Compression is inferred from the extension (`.tar` = none, `.tar.zst` = zstd, otherwise gzip) unless one of `--gzip` / `--zstd` / `--no-compress` is given</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--exclude</code></dt>
+<dd>Exclude entries whose path matches this glob (a directory match prunes its whole subtree). Repeatable</dd>
+<dt><code>--gzip</code></dt>
+<dd>Force gzip (`.tar.gz`)</dd>
+<dt><code>--zstd</code></dt>
+<dd>Force zstd (`.tar.zst`)</dd>
+<dt><code>--no-compress</code></dt>
+<dd>Force no compression (`.tar`)</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite OUT if it already exists</dd>
+<dt><code>--ignore-case</code></dt>
+<dd>Match `--exclude` globs case-insensitively (default follows the filesystem's native rule)</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>Match `--exclude` globs case-sensitively (default follows the filesystem's native rule)</dd>
+<dt><code>--password</code></dt>
+<dd>Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)</dd>
+<dt><code>--inside</code></dt>
+<dd>For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Ignored for non-zip sources</dd>
+<dt><code>--fs-type</code></dt>
+<dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga &quot;NDOS&quot; disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

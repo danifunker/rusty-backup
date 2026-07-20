@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli reformat</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>reformat</span></nav>
+<h1><code>rb-cli reformat</code></h1>
+<p>Reformat a partition in place, leaving the partition table intact (HFS only today)</p>
+<h2>Usage</h2>
+<pre><code>Usage: reformat [OPTIONS] --fs &lt;FS&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N`)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--fs</code></dt>
+<dd>Filesystem to format the partition with. Only `hfs` is supported today</dd>
+<dt><code>--name</code></dt>
+<dd>New volume name. HFS: up to 27 Mac Roman bytes</dd>
+<dt><code>--block-size</code></dt>
+<dd>HFS allocation block size in bytes (non-zero multiple of 512). Defaults to the smallest size that keeps total_blocks &lt;= 65535</dd>
+<dt><code>--catalog-size</code></dt>
+<dd>HFS Catalog B-tree initial size in bytes. Defaults to hformat-style scaling (~0.5% of the partition)</dd>
+<dt><code>--extents-size</code></dt>
+<dd>HFS Extents-overflow B-tree initial size in bytes. Defaults to ~half the catalog size</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

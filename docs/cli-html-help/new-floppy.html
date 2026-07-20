@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new floppy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <span>floppy</span></nav>
+<h1><code>rb-cli new floppy</code></h1>
+<p>Blank floppy-geometry single volume (bare, no partition table): FAT / HFS and the fixed-geometry retro filesystems</p>
+<h2>Usage</h2>
+<pre><code>Usage: floppy [OPTIONS] &lt;FS&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;FS&gt;</code></dt>
+<dd>Filesystem to format (see the per-value help above)</dd>
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Volume size (bytes or `K`/`M`/`G` suffixes). Ignored by the fixed-geometry filesystems. Defaults to 800K</dd>
+<dt><code>--name</code></dt>
+<dd>Volume label/name. Defaults to `rusty-backup`</dd>
+<dt><code>--block-size</code></dt>
+<dd>HFS allocation block size in bytes (multiple of 512). Auto when unset</dd>
+<dt><code>--catalog-size</code></dt>
+<dd>HFS Catalog B-tree initial size in bytes. Auto when unset</dd>
+<dt><code>--extents-size</code></dt>
+<dd>HFS Extents-overflow B-tree initial size in bytes. Auto when unset</dd>
+<dt><code>--cpm-preset</code></dt>
+<dd>CP/M disk-parameter-block preset (required with `cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

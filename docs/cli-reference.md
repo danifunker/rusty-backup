@@ -1,11 +1,11 @@
 # `rb-cli` reference
 
-_Auto-generated from the clap argument definitions in `src/cli/`.  Re-run `cargo run --example generate_cli_reference` after grammar changes._
+_Auto-generated from the clap argument definitions in `src/cli/`.  Re-run `cargo run --example generate_cli_docs` after grammar changes._
 
 ## Synopsis
 
 ```
-Usage: rb-cli [OPTIONS] <COMMAND>
+Usage: rb-cli [OPTIONS] [COMMAND]
 ```
 
 ## Global options
@@ -882,58 +882,48 @@ Usage: mkdir [OPTIONS] <IMAGE> <PATH>
 
 ### `new`
 
-Create a blank single-partition image (superfloppy or, in Phase D, partition-table-wrapped)
+Create a blank image, grouped by media class: `new floppy <fs>`, `new volume <fs>` (bare superfloppy), or `new hd {x68k|sgi-efs}` (partition-table-wrapped, bootable). CD-ROM images are under `optical new`; multi-partition images go through `batch`
 
 ```
-Usage: new [OPTIONS] --fs <FS> <IMAGE>
+Usage: new <COMMAND>
+```
+
+### `new floppy`
+
+Blank floppy-geometry single volume (bare, no partition table): FAT / HFS and the fixed-geometry retro filesystems
+
+```
+Usage: floppy [OPTIONS] <FS> <IMAGE>
 ```
 
 **Arguments**
 
+- `<FS>` — Filesystem to format (see the per-value help above)
 - `<IMAGE>` — Image file to create. Overwritten if it already exists
 
 **Options**
 
-- `--fs` — Filesystem to format. One of: hfs, hfsplus, hfv, fat, efs, affs, ntfs, ext (alias ext2), ext3, ext4, prodos, atari, apple-dos (alias appledos / dos33), cpm, os9 (alias nitros9 / rbf), minix (alias minix1), minix2, minix3, ucsd (alias pascal / psystem), trdos (alias beta / betadisk / zx), ti99 (alias ti99_4a / ti994a), mfs (alias macintosh), adfs (alias acorn)
-- `--size` — Volume size, accepting plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes (e.g. `800K`, `5M`). Defaults to 800K (an 800 KiB floppy)
-- `--name` — Volume label/name. Defaults to `rusty-backup`. HFS: up to 27 Mac Roman bytes. FAT: up to 11 chars (uppercased; non-ASCII → `_`). EFS: 6-byte fname/fpack. AFFS: up to 30 bytes
-- `--block-size` — HFS allocation block size in bytes. Must be a non-zero multiple of 512. When unset, the smallest size that keeps `total_blocks <= 65535` is chosen automatically. Ignored for other filesystems
-- `--catalog-size` — HFS Catalog B-tree initial size in bytes (rounded up to a whole allocation block). When unset, scales with volume size like hformat (~0.5%, clump-aligned, 24-block floor). Ignored for other filesystems
-- `--extents-size` — HFS Extents-overflow B-tree initial size in bytes (rounded up to a whole allocation block). When unset, ~half the catalog size. Ignored for other filesystems
-- `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume instead of the default case-insensitive HFS+. Ignored for other filesystems
-- `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor, rounded up to whole 4096-byte nodes). Set this *small* to make the catalog easy to outgrow and exercise the fork grow-on-full path. Ignored for other filesystems
-- `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
-- `--cpm-preset` — CP/M disk-parameter-block preset (required with `--fs cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3
-- `--inodes` — EFS only: approximate total inode count. The formatter scales its cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`; default density is ~1 inode/4 KiB
-- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes), floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
-- `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`, or a plain byte count. A power of two from 512 to 2 MiB and at least the sector size. When unset, chosen automatically from the volume size (the classic mkntfs default-by-size table). Ignored for other filesystems
-- `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512. Ignored for other filesystems
+- `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Ignored by the fixed-geometry filesystems. Defaults to 800K
+- `--name` — Volume label/name. Defaults to `rusty-backup`
+- `--block-size` — HFS allocation block size in bytes (multiple of 512). Auto when unset
+- `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
+- `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
+- `--cpm-preset` — CP/M disk-parameter-block preset (required with `cpm`). One of: amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm, altair_8in, altair_cf, multicomp, zxplus3
 
-### `new-sgi-cdrom`
+### `new hd`
 
-Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with `put IMG@1 host/file /file`
+Partition-table-wrapped, self-bootable hard-disk image
 
 ```
-Usage: new-sgi-cdrom [OPTIONS] <IMAGE>
+Usage: hd <COMMAND>
 ```
 
-**Arguments**
+### `new hd sgi-efs`
 
-- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
-
-**Options**
-
-- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)
-- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
-- `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
-- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
-
-### `new-sgi-hdd`
-
-Build a dvh-wrapped IRIX hard-disk image: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM superfloppy). Populate it with `put IMG@1 host/file /file`
+dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5
 
 ```
-Usage: new-sgi-hdd [OPTIONS] <IMAGE>
+Usage: sgi-efs [OPTIONS] <IMAGE>
 ```
 
 **Arguments**
@@ -950,12 +940,12 @@ Usage: new-sgi-hdd [OPTIONS] <IMAGE>
 - `--inodes` — Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB
 - `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
-### `new-x68k-hdd`
+### `new hd x68k`
 
-Build a self-bootable Sharp X68000 HDD image (SASI / SCSI) with an X68K partition table + IPL stub + Human68k partition, optionally pre-populated by cloning a Human68k donor floppy
+Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a blank or donor-cloned Human68k partition
 
 ```
-Usage: new-x68k-hdd [OPTIONS] <IMAGE>
+Usage: x68k [OPTIONS] <IMAGE>
 ```
 
 **Arguments**
@@ -971,6 +961,34 @@ Usage: new-x68k-hdd [OPTIONS] <IMAGE>
 - `--system-disk` — Optional donor Human68k system floppy (flat `.img` or `.dim` / `.D88` / `.xdf` / `.hdm` container). When present, the builder recursively clones every file and subdirectory from the donor into the output partition. Without this flag, three seed text files (`HELLO.TXT`, `MISTER.TXT`, `README.TXT`) are written for engine validation
 - `--boot-sector-donor` — Optional donor *real* Sharp X68000 SCSI HDD whose Human68k partition boot sector (Sharp IPL Copyright 1990 SHARP) we'll extract and overlay onto the output partition. Eliminates the post-build `SWITCH.X /HD` step — the HDD self-boots straight to `C:>` on every power-on
 - `--builtin-boot-sector` — Use the **in-tree Hero Soft V1.10 boot sector** (1024 bytes, SHA1 `3e88955020de2191441e5829ee5a6e95890a3212`) instead of requiring `--boot-sector-donor PATH`. SCSI only
+
+### `new volume`
+
+Blank bare single volume of arbitrary size (a "superfloppy"): the larger filesystems (NTFS, ext, HFS+, EFS, AFFS, …). No partition table
+
+```
+Usage: volume [OPTIONS] <FS> <IMAGE>
+```
+
+**Arguments**
+
+- `<FS>` — Filesystem to format (see the per-value help above)
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--size` — Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K
+- `--name` — Volume label/name. Defaults to `rusty-backup`
+- `--block-size` — HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset
+- `--catalog-size` — HFS Catalog B-tree initial size in bytes. Auto when unset
+- `--extents-size` — HFS Extents-overflow B-tree initial size in bytes. Auto when unset
+- `--case-sensitive` — HFS+ only: format a case-sensitive (HFSX) volume
+- `--min-catalog` — HFS+ only: minimum catalog B-tree size in bytes (a floor)
+- `--affs-variant` — AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)
+- `--inodes` — EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`
+- `--bytes-per-inode` — EFS only: inode density in bytes per inode (smaller = more inodes)
+- `--cluster-size` — NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset
+- `--sector-size` — NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512
 
 ### `optical`
 
@@ -1070,6 +1088,26 @@ Usage: drives [OPTIONS]
 
 - `--remote` — Also query these daemons for their optical drives (repeatable), e.g. `--remote mister.local:7341`. Remote rows print an `rb://...` device arg you can pass straight to `optical rip --device`
 
+### `optical du`
+
+Recursive both-fork (data + resource) disk usage of paths on an optical disc image — the disc counterpart of the top-level `du` verb, for hybrid Mac discs whose apps keep code in the resource fork
+
+```
+Usage: du [OPTIONS] <SOURCE> [PATH]...
+```
+
+**Arguments**
+
+- `<SOURCE>` — Optical disc image (.iso, .cue, .chd)
+- `<PATHS>` — One or more paths inside the disc filesystem (use `/` as the separator). Defaults to the volume root when none are given
+
+**Options**
+
+- `--depth` — Report subdirectory totals down to this many levels below each PATH (`0`, the default, prints only the totals for the path itself). The full subtree is always summed regardless
+- `--json` — Emit machine-readable JSON. Shorthand for `--format json`
+- `--format` — Output format
+- `--filesystem` — Which filesystem to measure on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side — the one carrying resource forks. See `optical info` for what a disc holds
+
 ### `optical extract`
 
 Extract files from an optical disc image into a host folder
@@ -1104,6 +1142,33 @@ Usage: info [OPTIONS] <SOURCE>
 **Options**
 
 - `--format` — Output format: `text` (default), `json`, or `yaml`
+
+### `optical new`
+
+Create a blank CD-ROM disc image
+
+```
+Usage: new <COMMAND>
+```
+
+### `optical new sgi-efs`
+
+IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with `put IMG@1 host/file /file`. (Formerly `new-sgi-cdrom`.)
+
+```
+Usage: sgi-efs [OPTIONS] <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image file to create (conventionally `.iso`). Overwritten if it exists
+
+**Options**
+
+- `--size` — Disc size (plain bytes or `K`/`M`/`G` suffixes, e.g. `600M`). Rounded up to a whole 32-sector CD cylinder. Defaults to 600M (a CD-R). Keep it at or below your target media (~650-700 MiB for a CD)
+- `--name` — EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`
+- `--inodes` — Approximate total inode count for the EFS filesystem. Mutually exclusive with `--bytes-per-inode`. Default density is ~1 inode/4 KiB; real IRIX CDs are sparser (~32 KiB/inode), so pass a larger `--bytes-per-inode` (or fewer `--inodes`) if you only have a handful of large files
+- `--bytes-per-inode` — EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`
 
 ### `optical rip`
 
@@ -1592,6 +1657,14 @@ Open an interactive rb-cli shell (rustyline-based REPL)
 
 ```
 Usage: terminal
+```
+
+### `tui`
+
+Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal
+
+```
+Usage: tui
 ```
 
 ### `untar`

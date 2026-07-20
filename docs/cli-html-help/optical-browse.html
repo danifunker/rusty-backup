@@ -9,11 +9,20 @@
 <h1><code>rb-cli optical browse</code></h1>
 <p>List the file tree on an optical disc image</p>
 <h2>Usage</h2>
-<pre><code>Usage: browse &lt;SOURCE&gt;</code></pre>
+<pre><code>Usage: browse [OPTIONS] &lt;SOURCE&gt;</code></pre>
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;SOURCE&gt;</code></dt>
 <dd>Optical disc image (.iso, .cue, .chd)</dd>
 </dl>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--format</code></dt>
+<dd>Output format. `text` (default) prints the human file tree unchanged; `json` / `yaml` emit a machine-readable, deterministically path-sorted listing</dd>
+<dt><code>--hash</code></dt>
+<dd>Per-file content hash to attach to each file entry. Structured output only (`--format json`). Currently only `sha256`</dd>
+<dt><code>--filesystem</code></dt>
+<dd>Which filesystem to browse on a hybrid Mac/PC disc. `auto` (default) opens the primary (ISO 9660); `hfs` opens the Apple HFS side; `iso` forces the ISO 9660 tree. See `optical info` to see what a disc carries</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

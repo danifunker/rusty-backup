@@ -7,17 +7,42 @@
 <body>
 <nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>get</span></nav>
 <h1><code>rb-cli get</code></h1>
-<p>Extract a file from a filesystem to the host</p>
+<p>Extract a file, directory tree, or glob match from a filesystem to the host</p>
 <h2>Usage</h2>
-<pre><code>Usage: get &lt;IMAGE&gt; &lt;SRC&gt; &lt;DST&gt;</code></pre>
+<pre><code>Usage: get [OPTIONS] &lt;IMAGE&gt; &lt;SRC&gt; &lt;DST&gt;</code></pre>
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;IMAGE&gt;</code></dt>
 <dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
 <dt><code>&lt;SRC&gt;</code></dt>
-<dd>Source path inside the filesystem</dd>
+<dd>Source path or glob inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and extract every match. Pass `--literal` to extract a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)</dd>
 <dt><code>&lt;DST&gt;</code></dt>
-<dd>Destination path on the host</dd>
+<dd>Destination path on the host. Single-match: the literal target file. Multi-match or directory source: a directory under which matched entries are laid out (created if it doesn't exist)</dd>
 </dl>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>-r / --recursive</code></dt>
+<dd>Recursively extract directories (literal dir source or glob match against a directory). Without this flag, matched directories are skipped with a warning</dd>
+<dt><code>--exclude</code></dt>
+<dd>Exclude paths matching this glob. Repeatable. Exclude always wins over `--include` / the positional source</dd>
+<dt><code>-L / --literal</code></dt>
+<dd>Treat the source as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`</dd>
+<dt><code>--ignore-case</code></dt>
+<dd>Match case-insensitively regardless of the target's native rule</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>Match case-sensitively regardless of the target's native rule</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite existing host files. Mutually exclusive with `--skip-existing`</dd>
+<dt><code>--skip-existing</code></dt>
+<dd>Skip silently when a host file already exists. Mutually exclusive with `--force`. Without either flag, an existing destination is a hard error</dd>
+<dt><code>--password</code></dt>
+<dd>Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)</dd>
+<dt><code>--inside</code></dt>
+<dd>For a `.zip` holding more than one disk image, the archive entry to open (e.g. `--inside backup.img`). Matched by exact name, then case- insensitively, then by basename. Ignored for non-zip sources</dd>
+<dt><code>--fs-type</code></dt>
+<dd>Force a specific filesystem dispatch. The main use is `cpm:&lt;preset&gt;` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga &quot;NDOS&quot; disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

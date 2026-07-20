@@ -8,6 +8,7 @@
 //! - `convert` — re-encode an optical image (ISO ↔ BIN/CUE ↔ CHD)
 //! - `browse` — list files on an optical image (ISO9660 / Joliet / HFS)
 //! - `extract` — extract files from an optical image to a host folder
+//! - `new` — create a blank CD-ROM disc image (e.g. `new sgi-efs`)
 //!
 //! The GUI's interactive drive picker has no terminal equivalent; run
 //! `rb-cli optical drives` to find a drive path, then pass it as
@@ -50,11 +51,29 @@ pub enum OpticalCommand {
     Info(InfoArgs),
     /// Extract files from an optical disc image into a host folder.
     Extract(ExtractArgs),
+    /// Create a blank CD-ROM disc image.
+    New {
+        #[command(subcommand)]
+        cmd: OpticalNewCommand,
+    },
     /// Work with El Torito boot images (extract / replace).
     Boot {
         #[command(subcommand)]
         cmd: BootCommand,
     },
+}
+
+/// `optical new <target> IMG` — build a blank CD-ROM disc image. Split out from
+/// `new` because CD geometry and volume-header conventions differ from the
+/// hard-disk / floppy targets.
+#[derive(Debug, Subcommand)]
+pub enum OpticalNewCommand {
+    /// IRIX EFS CD-ROM (`.iso`): an SGI volume header with the EFS filesystem
+    /// in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD geometry.
+    /// Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with
+    /// `put IMG@1 host/file /file`. (Formerly `new-sgi-cdrom`.)
+    #[command(name = "sgi-efs")]
+    SgiEfs(super::new_sgi_cdrom::NewSgiCdromArgs),
 }
 
 pub fn run(cmd: OpticalCommand) -> Result<()> {
@@ -66,7 +85,14 @@ pub fn run(cmd: OpticalCommand) -> Result<()> {
         OpticalCommand::Du(a) => run_du_verb(a),
         OpticalCommand::Info(a) => run_info_verb(a),
         OpticalCommand::Extract(a) => run_extract_verb(a),
+        OpticalCommand::New { cmd } => run_new(cmd),
         OpticalCommand::Boot { cmd } => run_boot(cmd),
+    }
+}
+
+fn run_new(cmd: OpticalNewCommand) -> Result<()> {
+    match cmd {
+        OpticalNewCommand::SgiEfs(a) => super::new_sgi_cdrom::run(a),
     }
 }
 

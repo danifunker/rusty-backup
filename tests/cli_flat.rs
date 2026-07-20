@@ -68,7 +68,7 @@ fn new_hfs_put_get_mkdir_rm_round_trip() {
     // entries which is fine for the legacy tests in tests/cli_hfs.rs
     // but not for this mkdir + multiple-files scenario.
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "50M", "--name", "FlatRT",
+        "new", "volume", "hfs", img_s, "--size", "50M", "--name", "FlatRT",
     ]);
 
     // Library can re-open it.
@@ -190,7 +190,7 @@ fn put_boot_writes_exact_bytes() {
     let img_s = img.to_str().unwrap();
 
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "800K", "--name", "BootTest",
+        "new", "volume", "hfs", img_s, "--size", "800K", "--name", "BootTest",
     ]);
 
     let bb = dir.path().join("bb.bin");
@@ -210,7 +210,7 @@ fn show_fs_info_json_envelope_shape() {
     let img_s = img.to_str().unwrap();
 
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "800K", "--name", "JsonTest",
+        "new", "volume", "hfs", img_s, "--size", "800K", "--name", "JsonTest",
     ]);
 
     let out = run(&["show", "fs-info", img_s, "--format", "json"]);
@@ -282,7 +282,7 @@ fn rm_nonexistent_returns_nonzero() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "800K", "--name", "Test",
+        "new", "volume", "hfs", img_s, "--size", "800K", "--name", "Test",
     ]);
     run_expect_fail(&["rm", img_s, "/nope"]);
 }
@@ -355,7 +355,7 @@ fn ls_and_rm_support_glob_patterns() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GlobTest",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GlobTest",
     ]);
 
     let a = dir.path().join("a.txt");
@@ -399,7 +399,7 @@ fn get_glob_extracts_each_match_under_destination() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetGlob",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GetGlob",
     ]);
 
     // Populate three files. Distinct content per file so we can spot
@@ -438,7 +438,7 @@ fn get_recursive_extracts_subdir_tree() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetRecur",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GetRecur",
     ]);
 
     // Populate /Apps/ with one direct file + one nested dir + nested file.
@@ -472,7 +472,7 @@ fn get_literal_directory_without_recursive_is_an_error() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetNoR",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GetNoR",
     ]);
     run(&["mkdir", img_s, "/Empty"]);
 
@@ -492,7 +492,7 @@ fn get_force_overwrites_existing_host_file() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetForce",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GetForce",
     ]);
 
     let host_src = dir.path().join("src.txt");
@@ -522,7 +522,7 @@ fn get_skip_existing_leaves_old_content_alone() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "5M", "--name", "GetSkip",
+        "new", "volume", "hfs", img_s, "--size", "5M", "--name", "GetSkip",
     ]);
 
     let host_src = dir.path().join("src.txt");
@@ -547,7 +547,7 @@ fn get_glob_exclude_filters_matches() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "10M", "--name", "GetExcl",
+        "new", "volume", "hfs", img_s, "--size", "10M", "--name", "GetExcl",
     ]);
 
     for name in &["a.txt", "b.txt", "c.txt"] {
@@ -585,9 +585,9 @@ fn backup_then_restore_round_trip_file_to_file() {
     // Build a small HFS image so the backup has something to chew.
     run(&[
         "new",
-        src_s,
-        "--fs",
+        "volume",
         "hfs",
+        src_s,
         "--size",
         "5M",
         "--name",
@@ -636,9 +636,9 @@ fn write_requires_yes_flag() {
     let img_s = img.to_str().unwrap();
     run(&[
         "new",
-        img_s,
-        "--fs",
+        "volume",
         "hfs",
+        img_s,
         "--size",
         "800K",
         "--name",
@@ -657,7 +657,7 @@ fn batch_applies_mkdir_put_rm_in_one_pass() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "10M", "--name", "Batch",
+        "new", "volume", "hfs", img_s, "--size", "10M", "--name", "Batch",
     ]);
 
     let host_a = dir.path().join("a.bin");
@@ -868,7 +868,7 @@ fn inspect_text_runs_on_raw_hfs_image() {
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "800K", "--name", "InsTest",
+        "new", "volume", "hfs", img_s, "--size", "800K", "--name", "InsTest",
     ]);
 
     let out = run(&["inspect", img_s]);

@@ -1,4 +1,4 @@
-//! End-to-end CLI test for `new-sgi-hdd`: synthesize a dvh-wrapped EFS IRIX
+//! End-to-end CLI test for `new hd sgi-efs`: synthesize a dvh-wrapped EFS IRIX
 //! hard disk, then drive the ordinary verbs against its EFS root partition —
 //! the workflow that packages an IRIX toolbox binary for the IRIS emulator
 //! (`put disk.img@1 ./bstoolbox /bstoolbox`).
@@ -39,7 +39,9 @@ fn sgi_efs_hdd_create_put_fsck_get_roundtrip() {
 
     // 1. Synthesize a 50 MiB SGI/EFS hard disk. 50 MiB → a ~48 MiB EFS root,
     //    which exercises the scaled-firstcg path (> 32 MiB).
-    run(&["new-sgi-hdd", img_s, "--size", "50M", "--name", "TOOLBOX"]);
+    run(&[
+        "new", "hd", "sgi-efs", img_s, "--size", "50M", "--name", "TOOLBOX",
+    ]);
     // The image is rounded up to a whole number of 1008-sector (504 KiB)
     // cylinders — at least the request, and an exact cylinder multiple.
     let disk_len = std::fs::metadata(&img).unwrap().len();
@@ -93,7 +95,9 @@ fn sgi_efs_cdrom_create_put_get_roundtrip() {
 
     // EFS CD-ROM: dvh + slot-7 SYSV EFS + 1x32 CD geometry (the IRIX EFS-CD
     // shape). 64 MiB keeps the test quick; the image is sparse on disk.
-    run(&["new-sgi-cdrom", iso_s, "--size", "64M", "--name", "IRIXCD"]);
+    run(&[
+        "optical", "new", "sgi-efs", iso_s, "--size", "64M", "--name", "IRIXCD",
+    ]);
     let len = std::fs::metadata(&iso).unwrap().len();
     assert_eq!(
         len % 2048,

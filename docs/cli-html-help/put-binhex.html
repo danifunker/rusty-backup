@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli put-binhex</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>put-binhex</span></nav>
+<h1><code>rb-cli put-binhex</code></h1>
+<p>Decode a BinHex 4.0 (.hqx) file and write it (both forks + Finder info) into a filesystem</p>
+<h2>Usage</h2>
+<pre><code>Usage: put-binhex [OPTIONS] &lt;IMAGE&gt; &lt;HOST_FILE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N`)</dd>
+<dt><code>&lt;HOST_FILE&gt;</code></dt>
+<dd>BinHex 4.0 (`.hqx`) file on the host</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--dst-dir</code></dt>
+<dd>Destination directory inside the filesystem (`/` for root). The filename comes from the BinHex header. Defaults to `/`. A literal `/` in a directory name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data). Defaults to `/`</dd>
+<dt><code>--rename</code></dt>
+<dd>Override the filename from the BinHex header</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite an existing entry at the destination path</dd>
+<dt><code>--clear-inited</code></dt>
+<dd>Clear the `hasBeenInited` Finder flag (0x0100) on the written file. Use when injecting an app onto a fresh disk so the Finder re-reads its `BNDL` and registers real icons (a file copied with `hasBeenInited` already set is treated as already-catalogued, so it shows a generic icon until a desktop rebuild). Mirrors what a MacBinary install does to byte 73</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

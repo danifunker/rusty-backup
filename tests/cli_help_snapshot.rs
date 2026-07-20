@@ -108,8 +108,41 @@ fn fsck_modes_present() {
 }
 
 #[test]
-fn new_fs_choice_present() {
+fn new_media_subcommands_present() {
     let h = help(&["new"]);
-    assert!(h.contains("--fs"), "`new` missing --fs");
-    assert!(h.contains("hfs"), "`new` missing hfs in --fs values");
+    for sub in &["floppy", "volume", "hd"] {
+        assert!(
+            h.contains(sub),
+            "`new` help missing media class {sub:?}:\n{h}"
+        );
+    }
+}
+
+#[test]
+fn new_floppy_fs_choice_present() {
+    let h = help(&["new", "floppy"]);
+    assert!(
+        h.contains("hfs"),
+        "`new floppy` missing hfs in fs values:\n{h}"
+    );
+}
+
+#[test]
+fn new_volume_fs_choice_present() {
+    let h = help(&["new", "volume"]);
+    assert!(
+        h.contains("ext4"),
+        "`new volume` missing ext4 in fs values:\n{h}"
+    );
+}
+
+#[test]
+fn new_hd_targets_present() {
+    let h = help(&["new", "hd"]);
+    for sub in &["x68k", "sgi-efs"] {
+        assert!(
+            h.contains(sub),
+            "`new hd` help missing target {sub:?}:\n{h}"
+        );
+    }
 }

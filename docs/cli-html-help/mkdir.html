@@ -9,13 +9,18 @@
 <h1><code>rb-cli mkdir</code></h1>
 <p>Create a directory inside a filesystem</p>
 <h2>Usage</h2>
-<pre><code>Usage: mkdir &lt;IMAGE&gt; &lt;PATH&gt;</code></pre>
+<pre><code>Usage: mkdir [OPTIONS] &lt;IMAGE&gt; &lt;PATH&gt;</code></pre>
 <h2>Arguments</h2>
 <dl class="args">
 <dt><code>&lt;IMAGE&gt;</code></dt>
 <dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
 <dt><code>&lt;PATH&gt;</code></dt>
-<dd>Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B)</dd>
+<dd>Directory path to create. The parent must exist (no `-p`-style auto-creation in Phase B). A literal `/` in the new name is written `\/`; on HFS / HFS+ a `:`-separated path also works</dd>
 </dl>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>-L / --literal</code></dt>
+<dd>Accepted for consistency with `ls`/`get`/`rm`; `mkdir` always treats the path as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

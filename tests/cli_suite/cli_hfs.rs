@@ -171,7 +171,7 @@ fn du_counts_both_forks_and_distinguishes_missing_from_empty() {
     let img_s = img.to_str().unwrap();
 
     run(&[
-        "new", img_s, "--fs", "hfs", "--size", "4M", "--name", "DuTest",
+        "new", "volume", "hfs", img_s, "--size", "4M", "--name", "DuTest",
     ]);
     run(&["mkdir", img_s, "/App"]);
 
@@ -260,7 +260,7 @@ fn du_on_hfsplus_counts_resource_fork_and_rounds_to_block() {
     let img_s = img.to_str().unwrap();
 
     run(&[
-        "new", img_s, "--fs", "hfsplus", "--size", "32M", "--name", "Plus",
+        "new", "volume", "hfsplus", img_s, "--size", "32M", "--name", "Plus",
     ]);
     run(&["mkdir", img_s, "/App"]);
 
