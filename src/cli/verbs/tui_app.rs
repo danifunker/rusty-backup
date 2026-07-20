@@ -1520,6 +1520,17 @@ struct CommanderState {
     /// The noun phrase (e.g. `folder "System"` or `3 items`) of the active
     /// pane's pending delete, shown in the confirmation prompt.
     confirm_delete: Option<String>,
+    /// A running checksum job (CRC32/MD5/SHA1/SHA256 of the marked files),
+    /// polled each `tick`. `None` when idle.
+    checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
+    /// The scrollable checksum-results overlay once a job completes.
+    checksum_report: Option<ChecksumReportView>,
+}
+
+/// A scrollable checksum-results overlay (per-file SHA256 + CRC32).
+struct ChecksumReportView {
+    lines: Vec<String>,
+    scroll: usize,
 }
 
 impl CommanderState {
@@ -1667,6 +1678,52 @@ impl CommanderState {
         let side = self.active;
         cmd_refresh(self.pane_mut(side));
         self.status = Some("Refreshed.".to_string());
+        self.is_error = false;
+    }
+
+    /// Start hashing the active pane's marked files (CRC32/MD5/SHA1/SHA256) on a
+    /// worker thread; `tick` polls it and shows the results overlay when done.
+    /// Directories in the selection are skipped.
+    fn start_checksum(&mut self) {
+        if self.checksum.is_some() {
+            self.status = Some("A checksum is already running.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let side = self.active;
+        let pane = self.pane(side);
+        if !pane.loaded {
+            self.status = Some("Open a source first.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let entries: Vec<FileEntry> = pane
+            .action_entries()
+            .into_iter()
+            .filter(|e| matches!(e.entry_type, EntryType::File))
+            .collect();
+        if entries.is_empty() {
+            self.status =
+                Some("Select one or more files to checksum (Space marks more).".to_string());
+            self.is_error = true;
+            return;
+        }
+        let n = entries.len();
+        let job = if pane.is_host {
+            crate::model::checksum::ChecksumJob::Host { entries }
+        } else {
+            match cmd_checksum_source(pane) {
+                Some(source) => crate::model::checksum::ChecksumJob::Image { source, entries },
+                None => {
+                    self.status = Some("Source volume is not open.".to_string());
+                    self.is_error = true;
+                    return;
+                }
+            }
+        };
+        self.checksum = Some(crate::model::checksum::spawn(job));
+        self.checksum_report = None;
+        self.status = Some(format!("Hashing {n} file(s)..."));
         self.is_error = false;
     }
 
@@ -2020,6 +2077,34 @@ fn cmd_load_image(
     pane.optical = None;
     pane.optical_pick = false;
     Ok(())
+}
+
+/// Build a reopen-able [`StageSource`](crate::model::commander_ops::StageSource)
+/// for a non-host pane, so a checksum worker can read its files off a fresh
+/// handle. A session image reopens by session; an optical pane reopens the
+/// selected filesystem (primary / hybrid). `None` for a host pane or an
+/// unopened source.
+fn cmd_checksum_source(pane: &CmdPane) -> Option<crate::model::commander_ops::StageSource> {
+    use crate::model::commander_ops::StageSource;
+    if let Some(op) = &pane.optical {
+        let label = op
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let recipe = match op.choices.get(op.sel).and_then(|c| c.hybrid_index) {
+            Some(index) => crate::model::commander_descend::ReopenRecipe::OpticalHybrid {
+                path: op.path.clone(),
+                index,
+                label,
+            },
+            None => crate::model::commander_descend::ReopenRecipe::Optical {
+                path: op.path.clone(),
+                label,
+            },
+        };
+        return Some(StageSource::Reopen(recipe));
+    }
+    pane.session.clone().map(StageSource::Session)
 }
 
 /// True when `path` names an optical disc image (by extension) we can browse via
@@ -5340,6 +5425,23 @@ impl App {
             return true;
         }
 
+        // Checksum results overlay (modal): scroll, Esc/q/Enter to close.
+        if let Some(rv) = c.checksum_report.as_mut() {
+            let page = page.max(1) as usize;
+            let max = rv.lines.len().saturating_sub(1);
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => c.checksum_report = None,
+                KeyCode::Up | KeyCode::Char('k') => rv.scroll = rv.scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => rv.scroll = (rv.scroll + 1).min(max),
+                KeyCode::PageUp => rv.scroll = rv.scroll.saturating_sub(page),
+                KeyCode::PageDown => rv.scroll = (rv.scroll + page).min(max),
+                KeyCode::Home => rv.scroll = 0,
+                KeyCode::End => rv.scroll = max,
+                _ => {}
+            }
+            return true;
+        }
+
         // New-folder name prompt (modal).
         if c.mkdir_input.is_some() {
             match code {
@@ -5524,6 +5626,11 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::F(5) => {
                 c.copy();
+                true
+            }
+            // Checksum the marked files (CRC32 / SHA256), shown in an overlay.
+            KeyCode::Char('#') => {
+                c.start_checksum();
                 true
             }
             KeyCode::Char('n') => {
@@ -5748,6 +5855,33 @@ impl App {
         if let Some(p) = &mut self.progress {
             let cur = p.shared.lock().map(|s| s.current).unwrap_or(0);
             p.tracker.record(cur, &p.label);
+        }
+        // Poll a running Commander checksum job: mirror progress to the status
+        // line while it runs, and pop the results overlay when it finishes.
+        if let Some(job) = self.commander.as_ref().and_then(|c| c.checksum.clone()) {
+            let (done, report, progress_msg) = match job.lock() {
+                Ok(s) if s.finished => (true, Some(build_checksum_lines(&s)), None),
+                Ok(s) => (
+                    false,
+                    None,
+                    Some(format!(
+                        "Hashing {}/{} - {}",
+                        s.done_files, s.total_files, s.current_file
+                    )),
+                ),
+                Err(_) => (false, None, None),
+            };
+            if let Some(c) = self.commander.as_mut() {
+                if done {
+                    c.checksum = None;
+                    c.checksum_report = report.map(|lines| ChecksumReportView { lines, scroll: 0 });
+                    c.status = None;
+                    c.is_error = false;
+                } else if let Some(m) = progress_msg {
+                    c.status = Some(m);
+                    c.is_error = false;
+                }
+            }
         }
     }
 
@@ -7157,7 +7291,7 @@ impl App {
         let status = match &c.status {
             Some(s) => s.clone(),
             None => {
-                "Tab pane  Enter open  Space mark  c copy  n mkdir  x del  s sort  p fs  r refresh"
+                "Tab pane  Enter open  Space mark  c copy  # hash  n mkdir  x del  s sort  p fs  r refresh"
                     .to_string()
             }
         };
@@ -7215,6 +7349,40 @@ impl App {
                 ]))
                 .block(self.pane_block("Confirm delete", true)),
                 cp,
+            );
+        }
+
+        // Checksum results overlay (scrollable).
+        if let Some(rv) = &c.checksum_report {
+            let popup = centered_rect(84, area.height.saturating_sub(4).clamp(8, 24), area);
+            frame.render_widget(Clear, popup);
+            let inner_h = popup.height.saturating_sub(2) as usize;
+            let start = rv.scroll.min(rv.lines.len().saturating_sub(1));
+            let mut lines: Vec<Line> = rv
+                .lines
+                .iter()
+                .skip(start)
+                .take(inner_h.saturating_sub(1))
+                .map(|l| {
+                    let style = if l.trim_start().starts_with("SHA256")
+                        || l.trim_start().starts_with("CRC32")
+                    {
+                        self.palette.accent()
+                    } else if l.contains("failed") || l.starts_with("Error") {
+                        self.palette.warn()
+                    } else {
+                        self.palette.dim()
+                    };
+                    Line::styled(format!(" {l}"), style)
+                })
+                .collect();
+            lines.push(Line::styled(
+                " Up/Down scroll   Esc close",
+                self.palette.dim(),
+            ));
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block("Checksums", true)),
+                popup,
             );
         }
     }
@@ -8714,6 +8882,32 @@ fn format_repair_lines(report: &crate::fs::RepairReport) -> Vec<String> {
         lines.push("Fixes failed:".to_string());
         for f in &report.fixes_failed {
             lines.push(format!("  - {f}"));
+        }
+    }
+    lines
+}
+
+/// Format a finished [`ChecksumStatus`](crate::model::checksum::ChecksumStatus)
+/// into display lines for the Commander's results overlay: each file's SHA256
+/// and CRC32 (or the error that stopped it), plus any fatal job error.
+fn build_checksum_lines(status: &crate::model::checksum::ChecksumStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(e) = &status.error {
+        lines.push(format!("Error: {e}"));
+        lines.push(String::new());
+    }
+    let ok = status.results.iter().filter(|r| r.set.is_some()).count();
+    lines.push(format!("Hashed {ok}/{} file(s).", status.results.len()));
+    for r in &status.results {
+        lines.push(String::new());
+        lines.push(format!("{}  ({})", r.name, format_size(r.size)));
+        match (&r.set, &r.error) {
+            (Some(set), _) => {
+                lines.push(format!("  SHA256  {}", set.sha256_hex()));
+                lines.push(format!("  CRC32   {}", set.crc32_hex()));
+            }
+            (None, Some(err)) => lines.push(format!("  failed: {err}")),
+            (None, None) => lines.push("  (no result)".to_string()),
         }
     }
     lines

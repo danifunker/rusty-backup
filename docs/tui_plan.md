@@ -189,11 +189,16 @@ Each step names the screen, the shared code to wire, and the acceptance check.
   marks when any are set, else the cursor entry) and sort (`s` cycles the
   `DirListing::SortColumn`, `S` flips direction) — both over the model's existing
   `ctrl_click`/`selected_entries`/`resort` that the GUI browse view already uses.
-- [ ] checksum still deferred (next Commander pass).
+- [x] checksum (`#`): hashes the marked files (else the cursor file) on a worker
+  thread via the shared `model::checksum` (`ChecksumJob::Host` for a host pane,
+  `Image { source: StageSource }` for an image / optical pane), polled each
+  `tick`; results (SHA256 + CRC32 per file) show in a scrollable overlay.
 - **Verified:** host->image copy put a file into a FAT image (content-identical
   `cmp`); image->image copy left->right through the TUI produced a `SEED.TXT`
   byte-identical to the source; `n`/`x` created then removed a folder on an image
-  pane; both images `fsck`-clean afterwards.
+  pane; both images `fsck`-clean afterwards. `#` on a FAT-image file showed a
+  SHA256 + CRC32 matching `shasum -a 256` / `zlib.crc32`; a host-pane checksum
+  matched too.
 
 ### Step 7 — Edit + transform actions (into Inspect/Explorer)  [mkdir/rm/put DONE]
 - [x] In the Explorer: `i` import (put), `n` new folder
