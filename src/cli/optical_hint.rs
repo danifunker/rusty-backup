@@ -66,6 +66,42 @@ fn optical_redirect_hint(path: &Path) -> Option<String> {
     }
 }
 
+/// True when `path` is an NKit-processed GameCube/Wii image (the `NKIT` magic
+/// sits at byte 0x200). NKit *identifies* as a normal GC/Wii disc — its header
+/// is intact — but it scrubs and rearranges the partition data, which the `nod`
+/// reader behind `opticaldiscs` can't reconstruct, so browse/extract are refused
+/// for these. Detecting them lets us replace the opaque "Unsupported filesystem"
+/// error with something actionable.
+pub fn is_nkit_image(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.seek(SeekFrom::Start(0x200)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == b"NKIT"
+}
+
+/// If `path` is an NKit image, wrap `err` with a clear explanation + the
+/// conversion the user needs; otherwise return `err` unchanged. Call on the
+/// failure branch of an optical open so a normal disc is never intercepted.
+pub fn with_nkit_hint(err: anyhow::Error, path: &Path) -> anyhow::Error {
+    if is_nkit_image(path) {
+        anyhow::anyhow!(
+            "{} is an NKit-scrubbed GameCube/Wii image. NKit removes and rearranges the \
+             disc data (keeping only the header), and the underlying reader can't \
+             reconstruct the filesystem — so it can't be browsed or extracted directly. \
+             Convert it back to a full image first (a `.iso` or `.rvz`, e.g. with the NKit \
+             tool or Dolphin's \"Convert File\"), then open that.",
+            path.display()
+        )
+    } else {
+        err
+    }
+}
+
 /// Human label for the disc's primary filesystem (optical builds only).
 #[cfg(feature = "optical")]
 fn fs_label(info: &opticaldiscs::detect::DiscImageInfo) -> String {
@@ -85,4 +121,47 @@ fn has_optical_extension(path: &Path) -> bool {
         ext.as_deref(),
         Some("iso" | "cue" | "nrg" | "mdf" | "mds" | "ccd" | "cdi" | "toc")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn detects_nkit_by_magic_at_0x200() {
+        let dir = tempfile::tempdir().unwrap();
+        // NKit image: real GC header up front, "NKIT" magic at byte 0x200.
+        let nkit = dir.path().join("game.nkit.iso");
+        let mut buf = vec![0u8; 0x210];
+        buf[0x200..0x204].copy_from_slice(b"NKIT");
+        buf[0x204..0x208].copy_from_slice(b" v01");
+        std::fs::File::create(&nkit)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        assert!(is_nkit_image(&nkit));
+
+        // A plain image (zeros at 0x200) is not NKit.
+        let plain = dir.path().join("game.iso");
+        std::fs::write(&plain, vec![0u8; 0x210]).unwrap();
+        assert!(!is_nkit_image(&plain));
+
+        // Too-short file: not NKit, no panic.
+        let tiny = dir.path().join("tiny.iso");
+        std::fs::write(&tiny, vec![0u8; 16]).unwrap();
+        assert!(!is_nkit_image(&tiny));
+
+        // The hint fires only for NKit paths.
+        let base = anyhow::anyhow!("Unsupported filesystem");
+        assert!(
+            with_nkit_hint(anyhow::anyhow!("Unsupported filesystem"), &nkit)
+                .to_string()
+                .contains("NKit-scrubbed")
+        );
+        assert_eq!(
+            with_nkit_hint(base, &plain).to_string(),
+            "Unsupported filesystem"
+        );
+    }
 }

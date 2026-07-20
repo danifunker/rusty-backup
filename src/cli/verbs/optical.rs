@@ -567,7 +567,14 @@ fn open_selected_filesystem(
     let primary = || {
         open_disc_filesystem(info)
             .map(|fs| (fs, info.filesystem))
-            .map_err(|e| anyhow::anyhow!("opening disc filesystem: {e}"))
+            .map_err(|e| {
+                // NKit-scrubbed GC/Wii images can't be reconstructed by `nod`;
+                // replace the opaque "Unsupported filesystem" with a fix.
+                crate::cli::optical_hint::with_nkit_hint(
+                    anyhow::anyhow!("opening disc filesystem: {e}"),
+                    &info.path,
+                )
+            })
     };
 
     match select {
