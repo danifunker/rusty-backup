@@ -55,6 +55,9 @@ draws it and feeds it keys. Main file: `src/cli/verbs/tui_app.rs`.
 - [x] **Backup** — source (image file or physical disk) → config (output/name/
   format/checksum) → run on a worker thread via `backup::run_backup` with the
   live progress bar; output identical to the `rb-cli backup` verb.
+- [x] **Restore** — load a backup folder / `.cbk` → config (target/size/
+  alignment) → run via `restore::run_restore`; round-trip byte-identical to the
+  source. (Device targets deferred to the elevation pass.)
 - [x] **Settings** — interactive `update::UpdateConfig` editor: environment info +
   two persisted toggles (update-check, file-associations); saves to `config.json`
   preserving all other fields.
@@ -82,12 +85,20 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** backing up a FAT image through the TUI produces a backup folder
   byte-identical to the `rb-cli backup` verb (metadata.json + partition-N + sha256).
 
-### Step 2 — Restore tab
-- [ ] Load a backup folder / `.cbk` with `model::backup_loader::load_backup`
-  (reuse the Inspect open path).
-- [ ] Partition-sizing choice (original / minimum / custom) + target picker.
-- [ ] Run via the `restore` runner; progress bar; elevation gate for device targets.
-- **Accept:** restore a backup to a new image file; `ls` the result.
+### Step 2 — Restore tab  [DONE]
+- [x] Load a backup folder (via `model::backup_loader::load_backup`) or a `.cbk`
+  (materialized with `rbformats::cbk::materialize_cbk_to_folder`, temp-dir guard
+  moved into the worker so it outlives the restore). Reads `source_size_bytes` +
+  partition count from the metadata for defaults.
+- [x] Config form: target image path (Tab-to-browse), size policy
+  (Original / Minimum, applied to every partition), alignment (Original /
+  Modern 1MB). Runs via `restore::run_restore(config, Arc<Mutex<RestoreProgress>>)`
+  on a worker thread; progress mirrored into the shared bar; Esc cancels.
+- [ ] Device targets are deferred to the elevation pass (image-file target only
+  for now; `run_restore` opens a device internally but needs elevation + a safety
+  confirmation).
+- **Verified:** a backup→restore round-trip through the TUI produced an image
+  **byte-identical** (`cmp`) to the original source.
 
 ### Step 3 — Bulk tab
 - [ ] Source-folder picker → `bulk_convert_runner::scan_source_folder(source,

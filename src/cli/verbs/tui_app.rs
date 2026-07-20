@@ -1086,6 +1086,72 @@ impl Default for BackupState {
     }
 }
 
+/// The Restore screen: source (backup folder / `.cbk`) -> config (target /
+/// sizing / alignment) -> run, driving `restore::run_restore` on a worker
+/// thread. Mirrors the Backup screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreStep {
+    Source,
+    Config,
+    Run,
+}
+
+/// Partition-sizing policy applied to every partition (a first cut; per-partition
+/// custom sizing is a later phase). Index into these must match `start_restore`.
+const RESTORE_SIZE_LABELS: &[&str] = &["Original", "Minimum"];
+/// Restore alignment choices; index must match `start_restore`.
+const RESTORE_ALIGN_LABELS: &[&str] = &["Original", "Modern 1MB"];
+/// Config-form rows: 0 target, 1 size, 2 alignment, 3 "Start".
+const RESTORE_FIELDS: usize = 4;
+
+struct RestoreState {
+    step: RestoreStep,
+    /// The loaded backup folder (a native folder, or a temp dir from a `.cbk`).
+    backup_folder: String,
+    /// Original disk size from the backup metadata (default target size).
+    source_size: u64,
+    part_count: usize,
+    loaded: bool,
+    /// Shared picker; `picker_target` says whether a confirm sets the target.
+    picker: Option<FilePicker>,
+    picker_target: bool,
+    /// Config form.
+    target: String,
+    size_sel: usize,
+    align_sel: usize,
+    field: usize,
+    /// A running restore's shared progress, once started.
+    run: Option<Arc<Mutex<crate::restore::RestoreProgress>>>,
+    op: String,
+    result: Option<String>,
+    is_error: bool,
+    /// Keeps a `.cbk` temp dir alive until a restore from it finishes.
+    cbk_guard: Option<tempfile::TempDir>,
+}
+
+impl Default for RestoreState {
+    fn default() -> Self {
+        RestoreState {
+            step: RestoreStep::Source,
+            backup_folder: String::new(),
+            source_size: 0,
+            part_count: 0,
+            loaded: false,
+            picker: None,
+            picker_target: false,
+            target: String::new(),
+            size_sel: 0,
+            align_sel: 0,
+            field: 0,
+            run: None,
+            op: String::new(),
+            result: None,
+            is_error: false,
+            cbk_guard: None,
+        }
+    }
+}
+
 /// The Settings tab state: the loaded `UpdateConfig` plus a cursor over the
 /// editable preference toggles. Edits save straight back to `config.json` via
 /// `UpdateConfig::save` (the same file the GUI reads/writes).
@@ -1126,6 +1192,8 @@ struct App {
     newdisk: Option<NewWizard>,
     /// The Backup screen state (lazily created on first visit).
     backup: Option<BackupState>,
+    /// The Restore screen state (lazily created on first visit).
+    restore: Option<RestoreState>,
     /// The Settings tab state (lazily loaded on first visit).
     settings: Option<SettingsState>,
     show_help: bool,
@@ -1150,6 +1218,7 @@ impl App {
             disks: None,
             newdisk: None,
             backup: None,
+            restore: None,
             settings: None,
             show_help: false,
             should_quit: false,
@@ -1255,6 +1324,11 @@ impl App {
 
         // The Backup screen owns most keys on its tab.
         if self.current() == TabId::Backup && self.handle_backup_key(key.code) {
+            return Ok(());
+        }
+
+        // The Restore screen owns most keys on its tab.
+        if self.current() == TabId::Restore && self.handle_restore_key(key.code) {
             return Ok(());
         }
 
@@ -2041,8 +2115,13 @@ impl App {
                 s.cancel = true;
             }
         }
-        // Also signal a running backup to stop.
+        // Also signal a running backup / restore to stop.
         if let Some(run) = self.backup.as_ref().and_then(|b| b.run.clone()) {
+            if let Ok(mut p) = run.lock() {
+                p.cancel_requested = true;
+            }
+        }
+        if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
             if let Ok(mut p) = run.lock() {
                 p.cancel_requested = true;
             }
@@ -2071,6 +2150,9 @@ impl App {
             if self.disks.is_none() {
                 self.disks = Some(enumerate_devices());
             }
+        }
+        if self.current() == TabId::Restore && self.restore.is_none() {
+            self.restore = Some(RestoreState::default());
         }
         if self.current() == TabId::Settings && self.settings.is_none() {
             self.settings = Some(SettingsState {
@@ -2612,6 +2694,298 @@ impl App {
         });
     }
 
+    /// Restore screen keys. Returns `true` when consumed.
+    fn handle_restore_key(&mut self, code: KeyCode) -> bool {
+        if self.restore.is_none() {
+            self.restore = Some(RestoreState::default());
+        }
+        // Source / target picker (modal).
+        if self
+            .restore
+            .as_ref()
+            .map(|r| r.picker.is_some())
+            .unwrap_or(false)
+        {
+            let for_target = self.restore.as_ref().unwrap().picker_target;
+            let res = self
+                .restore
+                .as_mut()
+                .unwrap()
+                .picker
+                .as_mut()
+                .unwrap()
+                .handle_key(code);
+            match res {
+                Some(PickResult::Cancel) => self.restore.as_mut().unwrap().picker = None,
+                Some(PickResult::Confirm(path)) => {
+                    if for_target {
+                        let r = self.restore.as_mut().unwrap();
+                        r.target = path.to_string_lossy().into_owned();
+                        r.picker = None;
+                    } else {
+                        self.restore.as_mut().unwrap().picker = None;
+                        self.load_restore_source(path);
+                    }
+                }
+                None => {}
+            }
+            return true;
+        }
+
+        let step = self.restore.as_ref().unwrap().step;
+        // Start handled outside the borrow.
+        if step == RestoreStep::Config
+            && code == KeyCode::Enter
+            && self.restore.as_ref().map(|r| r.field).unwrap_or(0) == 3
+        {
+            self.start_restore();
+            return true;
+        }
+
+        let r = self.restore.as_mut().unwrap();
+        match step {
+            RestoreStep::Source => match code {
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    let recent = crate::update::load_recent(crate::update::RecentMode::Restore);
+                    r.picker = Some(
+                        FilePicker::new(PickKind::Any, "Choose backup folder or .cbk")
+                            .with_recent(recent),
+                    );
+                    r.picker_target = false;
+                    true
+                }
+                _ => false,
+            },
+            RestoreStep::Config => match code {
+                KeyCode::Esc => {
+                    r.step = RestoreStep::Source;
+                    true
+                }
+                KeyCode::Down => {
+                    r.field = (r.field + 1) % RESTORE_FIELDS;
+                    true
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    r.field = (r.field + RESTORE_FIELDS - 1) % RESTORE_FIELDS;
+                    true
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 1 => {
+                    let n = RESTORE_SIZE_LABELS.len();
+                    r.size_sel = if code == KeyCode::Left {
+                        (r.size_sel + n - 1) % n
+                    } else {
+                        (r.size_sel + 1) % n
+                    };
+                    true
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if r.field == 2 => {
+                    let n = RESTORE_ALIGN_LABELS.len();
+                    r.align_sel = if code == KeyCode::Left {
+                        (r.align_sel + n - 1) % n
+                    } else {
+                        (r.align_sel + 1) % n
+                    };
+                    true
+                }
+                KeyCode::Tab if r.field == 0 => {
+                    let mut p = FilePicker::new(PickKind::Any, "Choose target image path");
+                    p.input = r.target.clone();
+                    r.picker = Some(p);
+                    r.picker_target = true;
+                    true
+                }
+                KeyCode::Enter => {
+                    r.field = (r.field + 1) % RESTORE_FIELDS;
+                    true
+                }
+                KeyCode::Backspace if r.field == 0 => {
+                    r.target.pop();
+                    true
+                }
+                KeyCode::Char(c) if !c.is_control() && r.field == 0 => {
+                    r.target.push(c);
+                    true
+                }
+                _ => false,
+            },
+            RestoreStep::Run => match code {
+                KeyCode::Esc => {
+                    let running = r.result.is_none();
+                    if running {
+                        self.cancel_progress();
+                        if let Some(r) = self.restore.as_mut() {
+                            r.result = Some("Cancel requested...".to_string());
+                            r.is_error = true;
+                        }
+                    } else {
+                        self.progress = None;
+                        if let Some(r) = self.restore.as_mut() {
+                            r.run = None;
+                            r.result = None;
+                            r.step = RestoreStep::Config;
+                        }
+                    }
+                    true
+                }
+                _ => true,
+            },
+        }
+    }
+
+    /// Load a chosen backup source (native folder or `.cbk`), read its metadata
+    /// for defaults, and advance to the config form. Errors show on the source
+    /// screen.
+    fn load_restore_source(&mut self, path: std::path::PathBuf) {
+        // Materialize a .cbk container to a temp folder we keep alive.
+        let (folder, guard): (std::path::PathBuf, Option<tempfile::TempDir>) =
+            if path.is_file() && crate::rbformats::cbk::is_cbk(&path) {
+                match tempfile::TempDir::new().and_then(|tmp| {
+                    crate::rbformats::cbk::materialize_cbk_to_folder(&path, tmp.path())
+                        .map(|_| tmp)
+                        .map_err(std::io::Error::other)
+                }) {
+                    Ok(tmp) => (tmp.path().to_path_buf(), Some(tmp)),
+                    Err(e) => {
+                        if let Some(r) = self.restore.as_mut() {
+                            r.result = Some(format!("Cannot open .cbk: {e}"));
+                            r.is_error = true;
+                        }
+                        return;
+                    }
+                }
+            } else {
+                (path.clone(), None)
+            };
+
+        match crate::model::backup_loader::load_backup(&folder) {
+            Ok(crate::model::backup_loader::LoadOutcome::Backup(b)) => {
+                crate::update::push_recent(
+                    crate::update::RecentMode::Restore,
+                    &path.to_string_lossy(),
+                );
+                let default_target = folder
+                    .parent()
+                    .map(|par| {
+                        par.join(format!(
+                            "{}_restored.img",
+                            folder
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "restore".to_string())
+                        ))
+                        .display()
+                        .to_string()
+                    })
+                    .unwrap_or_default();
+                if let Some(r) = self.restore.as_mut() {
+                    r.backup_folder = folder.display().to_string();
+                    r.source_size = b.metadata.source_size_bytes;
+                    r.part_count = b.partitions.len();
+                    r.loaded = true;
+                    r.cbk_guard = guard;
+                    if r.target.is_empty() {
+                        r.target = default_target;
+                    }
+                    r.step = RestoreStep::Config;
+                    r.field = 0;
+                    r.result = None;
+                    r.is_error = false;
+                }
+            }
+            Ok(crate::model::backup_loader::LoadOutcome::Clonezilla(_)) => {
+                if let Some(r) = self.restore.as_mut() {
+                    r.result = Some(
+                        "Clonezilla images: restore via the CLI (`rb-cli restore`) for now."
+                            .to_string(),
+                    );
+                    r.is_error = true;
+                }
+            }
+            Err(e) => {
+                if let Some(r) = self.restore.as_mut() {
+                    r.result = Some(format!("Not a rusty-backup folder: {e}"));
+                    r.is_error = true;
+                }
+            }
+        }
+    }
+
+    /// Validate the config and start `restore::run_restore` on a worker thread.
+    fn start_restore(&mut self) {
+        let Some(r) = self.restore.as_ref() else {
+            return;
+        };
+        let target = expand_tilde(r.target.trim());
+        if target.as_os_str().is_empty() {
+            let r = self.restore.as_mut().unwrap();
+            r.result = Some("Enter a target image path.".to_string());
+            r.is_error = true;
+            r.step = RestoreStep::Run;
+            return;
+        }
+        let partition_sizes = if r.size_sel == 1 {
+            (0..r.part_count)
+                .map(|i| crate::restore::RestorePartitionSize {
+                    index: i,
+                    size_choice: crate::restore::RestoreSizeChoice::Minimum,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let alignment = if r.align_sel == 1 {
+            crate::restore::RestoreAlignment::Modern1MB
+        } else {
+            crate::restore::RestoreAlignment::Original
+        };
+        let config = crate::restore::RestoreConfig {
+            backup_folder: std::path::PathBuf::from(&r.backup_folder),
+            target_path: target,
+            target_is_device: false,
+            target_size: r.source_size,
+            alignment,
+            partition_sizes,
+            write_zeros_to_unused: false,
+        };
+        let progress = Arc::new(Mutex::new(crate::restore::RestoreProgress::new()));
+        let worker = Arc::clone(&progress);
+        // Move the .cbk temp-dir guard into the worker so it outlives the restore.
+        let guard = self.restore.as_mut().and_then(|r| r.cbk_guard.take());
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::restore::run_restore(config, Arc::clone(&worker))
+            }));
+            if let Ok(mut p) = worker.lock() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if p.error.is_none() {
+                            p.error = Some(format!("{e:#}"));
+                        }
+                    }
+                    Err(_) => {
+                        if p.error.is_none() {
+                            p.error = Some("restore thread panicked".to_string());
+                        }
+                    }
+                }
+                p.finished = true;
+            }
+        });
+        let r = self.restore.as_mut().unwrap();
+        r.run = Some(progress);
+        r.result = None;
+        r.is_error = false;
+        r.op = "Starting...".to_string();
+        r.step = RestoreStep::Run;
+        self.progress = Some(Progress {
+            shared: Arc::new(Mutex::new(ProgressShared::default())),
+            tracker: RateTracker::default(),
+            label: "Restoring".to_string(),
+        });
+    }
+
     /// Whether the Inspect tab is showing its top-level selectable disk list.
     fn inspect_list_active(&self) -> bool {
         self.current() == TabId::Inspect && self.detail.is_none() && self.opened.is_none()
@@ -2664,6 +3038,42 @@ impl App {
                             None => {
                                 b.result = Some("Backup complete.".to_string());
                                 b.is_error = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Mirror a running restore's progress into the visual bar (same shape).
+        if let Some(run) = self.restore.as_ref().and_then(|r| r.run.clone()) {
+            let snap = run.lock().ok().map(|p| {
+                (
+                    p.current_bytes,
+                    p.total_bytes,
+                    p.finished,
+                    p.error.clone(),
+                    p.operation.clone(),
+                )
+            });
+            if let Some((cur, total, done, err, op)) = snap {
+                if let Some(prog) = self.progress.as_ref() {
+                    if let Ok(mut sh) = prog.shared.lock() {
+                        sh.current = cur;
+                        sh.total = total;
+                        sh.done = done;
+                    }
+                }
+                if let Some(r) = self.restore.as_mut() {
+                    r.op = op;
+                    if done && r.result.is_none() {
+                        match err {
+                            Some(e) => {
+                                r.result = Some(format!("Restore failed: {e}"));
+                                r.is_error = true;
+                            }
+                            None => {
+                                r.result = Some("Restore complete.".to_string());
+                                r.is_error = false;
                             }
                         }
                     }
@@ -3113,6 +3523,12 @@ impl App {
                 return;
             }
         }
+        if self.current() == TabId::Restore {
+            if let Some(r) = &self.restore {
+                self.draw_restore(frame, area, r);
+                return;
+            }
+        }
         if self.current() == TabId::Settings {
             if let Some(s) = &self.settings {
                 self.draw_settings_tab(frame, area, s);
@@ -3532,6 +3948,150 @@ impl App {
         }
     }
 
+    /// The Restore screen: source -> config -> run. The progress bar overlay
+    /// sits on top during the Run step.
+    fn draw_restore(&self, frame: &mut Frame, area: Rect, r: &RestoreState) {
+        let title = match r.step {
+            RestoreStep::Source => "Restore  -  step 1/3: backup",
+            RestoreStep::Config => "Restore  -  step 2/3: options",
+            RestoreStep::Run => "Restore  -  step 3/3: run",
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        match r.step {
+            RestoreStep::Source => {
+                lines.push(Line::styled(
+                    "Choose a backup to restore:",
+                    self.palette.accent(),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::from(vec![
+                    Span::styled("  Enter / o  ", self.palette.accent()),
+                    Span::raw("choose a backup folder or .cbk file"),
+                ]));
+                if let Some(res) = &r.result {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::styled(format!("  {res}"), self.palette.warn()));
+                }
+            }
+            RestoreStep::Config => {
+                lines.push(Line::from(vec![
+                    Span::styled("Backup: ", self.palette.dim()),
+                    Span::raw(r.backup_folder.clone()),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Contents: ", self.palette.dim()),
+                    Span::raw(format!(
+                        "{} partition(s), original size {}",
+                        r.part_count,
+                        format_size(r.source_size)
+                    )),
+                ]));
+                lines.push(Line::raw(""));
+                let row = |idx: usize, label: &str, val: String, editable: bool| -> Line<'static> {
+                    let active = r.field == idx;
+                    let cursor = if active && editable {
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED))
+                    } else {
+                        Span::raw("")
+                    };
+                    let marker = if active { "> " } else { "  " };
+                    let mstyle = if active {
+                        self.palette.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        self.palette.accent()
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{marker}{label:<11}"), mstyle),
+                        Span::raw(val),
+                        cursor,
+                    ])
+                };
+                let tgt_disp = if r.target.is_empty() && r.field != 0 {
+                    "(target image path)".to_string()
+                } else {
+                    r.target.clone()
+                };
+                lines.push(row(0, "Target:", tgt_disp, true));
+                lines.push(row(
+                    1,
+                    "Size:",
+                    format!("< {} >", RESTORE_SIZE_LABELS[r.size_sel]),
+                    false,
+                ));
+                lines.push(row(
+                    2,
+                    "Alignment:",
+                    format!("< {} >", RESTORE_ALIGN_LABELS[r.align_sel]),
+                    false,
+                ));
+                lines.push(Line::raw(""));
+                let start_sel = r.field == 3;
+                let start_style = if start_sel {
+                    self.palette
+                        .accent()
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    self.palette.accent()
+                };
+                lines.push(Line::styled(
+                    format!("{}[ Start restore ]", if start_sel { "> " } else { "  " }),
+                    start_style,
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "Up/Down field   Left/Right change Size/Alignment   Tab browse (Target)   \
+                     Enter next / Start   Esc back",
+                    self.palette.dim(),
+                ));
+            }
+            RestoreStep::Run => {
+                lines.push(Line::from(vec![
+                    Span::styled("Backup: ", self.palette.dim()),
+                    Span::raw(r.backup_folder.clone()),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Target: ", self.palette.dim()),
+                    Span::raw(format!(
+                        "{}  ({}, {} align)",
+                        r.target,
+                        RESTORE_SIZE_LABELS[r.size_sel],
+                        RESTORE_ALIGN_LABELS[r.align_sel]
+                    )),
+                ]));
+                lines.push(Line::raw(""));
+                if !r.op.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Step: ", self.palette.dim()),
+                        Span::raw(r.op.clone()),
+                    ]));
+                }
+                if let Some(res) = &r.result {
+                    lines.push(Line::raw(""));
+                    let style = if r.is_error {
+                        self.palette.warn()
+                    } else {
+                        self.palette.accent()
+                    };
+                    lines.push(Line::styled(format!("  {res}"), style));
+                    lines.push(Line::styled(
+                        "  Esc to return to options.",
+                        self.palette.dim(),
+                    ));
+                }
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(self.pane_block(title, true))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        if let Some(picker) = &r.picker {
+            picker.draw(frame, area, self.palette, self.border);
+        }
+    }
+
     /// The physical-disk chooser overlay used by the Backup source step.
     fn draw_backup_device_pick(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
         let disks = self.disks.as_deref().unwrap_or(&[]);
@@ -3791,6 +4351,21 @@ impl App {
                 Some(BackupStep::Config) => vec![
                     ("Up/Dn", "Field"),
                     ("<-/->", "Format"),
+                    ("Tab", "Browse"),
+                    ("Enter", "Next/Start"),
+                    ("Esc", "Back"),
+                ],
+                _ => vec![("Esc", "Back")],
+            }
+        } else if self.current() == TabId::Restore {
+            let step = self.restore.as_ref().map(|r| r.step);
+            match step {
+                Some(RestoreStep::Source) => {
+                    vec![("<-/->", "Tabs"), ("Enter/o", "Backup"), ("?", "Help")]
+                }
+                Some(RestoreStep::Config) => vec![
+                    ("Up/Dn", "Field"),
+                    ("<-/->", "Size/Align"),
                     ("Tab", "Browse"),
                     ("Enter", "Next/Start"),
                     ("Esc", "Back"),
