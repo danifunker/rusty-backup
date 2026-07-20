@@ -1179,6 +1179,17 @@ struct RestoreState {
     is_error: bool,
     /// Keeps a `.cbk` temp dir alive until a restore from it finishes.
     cbk_guard: Option<tempfile::TempDir>,
+    /// The "Target type" chooser (Image file / Physical device) opened with Tab
+    /// on the target field; its selected index when open.
+    target_type_menu: Option<usize>,
+    /// Physical-device target chooser (modal) + its selection.
+    device_pick: bool,
+    device_sel: usize,
+    /// True when `target` names a physical disk (restore writes to the raw
+    /// device, `RestoreConfig::target_is_device`) rather than an image file.
+    target_is_device: bool,
+    /// The device path + label pending a destructive-write confirmation.
+    confirm_device: Option<(String, String)>,
 }
 
 impl Default for RestoreState {
@@ -1200,6 +1211,11 @@ impl Default for RestoreState {
             result: None,
             is_error: false,
             cbk_guard: None,
+            target_type_menu: None,
+            device_pick: false,
+            device_sel: 0,
+            target_is_device: false,
+            confirm_device: None,
         }
     }
 }
@@ -4014,13 +4030,116 @@ impl App {
             return true;
         }
 
+        // "Target type" chooser (modal): Image file vs Physical device.
+        if self
+            .restore
+            .as_ref()
+            .map(|r| r.target_type_menu.is_some())
+            .unwrap_or(false)
+        {
+            let sel = self
+                .restore
+                .as_ref()
+                .and_then(|r| r.target_type_menu)
+                .unwrap_or(0);
+            match code {
+                KeyCode::Esc => self.restore.as_mut().unwrap().target_type_menu = None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.restore.as_mut().unwrap().target_type_menu = Some(sel.saturating_sub(1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.restore.as_mut().unwrap().target_type_menu = Some((sel + 1).min(1));
+                }
+                KeyCode::Enter => {
+                    let r = self.restore.as_mut().unwrap();
+                    r.target_type_menu = None;
+                    if sel == 0 {
+                        // Image file: open the shared path picker.
+                        let mut p = FilePicker::new(PickKind::Any, "Choose target image path");
+                        p.input = if r.target_is_device {
+                            String::new()
+                        } else {
+                            r.target.clone()
+                        };
+                        r.picker = Some(p);
+                        r.picker_target = true;
+                        r.target_is_device = false;
+                    } else {
+                        // Physical device: open the device chooser.
+                        r.device_pick = true;
+                        r.device_sel = 0;
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Physical-device target chooser (modal).
+        if self
+            .restore
+            .as_ref()
+            .map(|r| r.device_pick)
+            .unwrap_or(false)
+        {
+            let ndisks = self.disks.as_ref().map_or(0, |d| d.len());
+            let r = self.restore.as_mut().unwrap();
+            match code {
+                KeyCode::Up | KeyCode::Char('k') => r.device_sel = r.device_sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    r.device_sel = (r.device_sel + 1).min(ndisks.saturating_sub(1))
+                }
+                KeyCode::Esc => r.device_pick = false,
+                KeyCode::Enter => {
+                    let sel = r.device_sel;
+                    let dev = self
+                        .disks
+                        .as_ref()
+                        .and_then(|d| d.get(sel))
+                        .map(|d| d.path.display().to_string());
+                    if let Some(path) = dev {
+                        let r = self.restore.as_mut().unwrap();
+                        r.device_pick = false;
+                        r.target = path;
+                        r.target_is_device = true;
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        // Destructive device-write confirmation (modal): only `y` proceeds.
+        if self
+            .restore
+            .as_ref()
+            .map(|r| r.confirm_device.is_some())
+            .unwrap_or(false)
+        {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(r) = self.restore.as_mut() {
+                        r.confirm_device = None;
+                    }
+                    self.start_restore_confirmed();
+                }
+                _ => {
+                    if let Some(r) = self.restore.as_mut() {
+                        r.confirm_device = None;
+                    }
+                }
+            }
+            return true;
+        }
+
         let step = self.restore.as_ref().unwrap().step;
-        // Start handled outside the borrow.
+        // Start handled outside the borrow. A device target routes through a
+        // destructive-write confirmation first; an image target starts directly.
         if step == RestoreStep::Config
             && code == KeyCode::Enter
             && self.restore.as_ref().map(|r| r.field).unwrap_or(0) == 3
         {
-            self.start_restore();
+            self.request_restore_start();
             return true;
         }
 
@@ -4069,11 +4188,12 @@ impl App {
                     };
                     true
                 }
+                // Tab on the target field opens the "Target type" chooser
+                // (Image file vs Physical device), so the destructive device
+                // path is an explicit, discoverable choice — not a keystroke
+                // that collides with typing a path.
                 KeyCode::Tab if r.field == 0 => {
-                    let mut p = FilePicker::new(PickKind::Any, "Choose target image path");
-                    p.input = r.target.clone();
-                    r.picker = Some(p);
-                    r.picker_target = true;
+                    r.target_type_menu = Some(0);
                     true
                 }
                 KeyCode::Enter => {
@@ -4082,10 +4202,12 @@ impl App {
                 }
                 KeyCode::Backspace if r.field == 0 => {
                     r.target.pop();
+                    r.target_is_device = false;
                     true
                 }
                 KeyCode::Char(c) if !c.is_control() && r.field == 0 => {
                     r.target.push(c);
+                    r.target_is_device = false;
                     true
                 }
                 _ => false,
@@ -4193,11 +4315,45 @@ impl App {
     }
 
     /// Validate the config and start `restore::run_restore` on a worker thread.
-    fn start_restore(&mut self) {
+    /// Handle the "Start" action: an image-file target starts the restore
+    /// directly; a physical-device target first raises a destructive-write
+    /// confirmation (naming the device) that `start_restore_confirmed` clears.
+    fn request_restore_start(&mut self) {
         let Some(r) = self.restore.as_ref() else {
             return;
         };
-        let target = expand_tilde(r.target.trim());
+        if r.target_is_device {
+            if r.target.trim().is_empty() {
+                let r = self.restore.as_mut().unwrap();
+                r.result = Some("Choose a target device.".to_string());
+                r.is_error = true;
+                r.step = RestoreStep::Run;
+                return;
+            }
+            // Name the device (with its media label if we have it) in the prompt.
+            let path = r.target.clone();
+            let label = self
+                .disks
+                .as_ref()
+                .and_then(|d| d.iter().find(|dev| dev.path.display().to_string() == path))
+                .map(|dev| dev.display_name())
+                .unwrap_or_else(|| path.clone());
+            self.restore.as_mut().unwrap().confirm_device = Some((path, label));
+        } else {
+            self.start_restore_confirmed();
+        }
+    }
+
+    fn start_restore_confirmed(&mut self) {
+        let Some(r) = self.restore.as_ref() else {
+            return;
+        };
+        let is_device = r.target_is_device;
+        let target = if is_device {
+            std::path::PathBuf::from(r.target.trim())
+        } else {
+            expand_tilde(r.target.trim())
+        };
         if target.as_os_str().is_empty() {
             let r = self.restore.as_mut().unwrap();
             r.result = Some("Enter a target image path.".to_string());
@@ -4223,7 +4379,7 @@ impl App {
         let config = crate::restore::RestoreConfig {
             backup_folder: std::path::PathBuf::from(&r.backup_folder),
             target_path: target,
-            target_is_device: false,
+            target_is_device: is_device,
             target_size: r.source_size,
             alignment,
             partition_sizes,
@@ -6401,11 +6557,13 @@ impl App {
                     ])
                 };
                 let tgt_disp = if r.target.is_empty() && r.field != 0 {
-                    "(target image path)".to_string()
+                    "(target image path, or `d` for a device)".to_string()
+                } else if r.target_is_device {
+                    format!("{}  [device]", r.target)
                 } else {
                     r.target.clone()
                 };
-                lines.push(row(0, "Target:", tgt_disp, true));
+                lines.push(row(0, "Target:", tgt_disp, !r.target_is_device));
                 lines.push(row(
                     1,
                     "Size:",
@@ -6433,10 +6591,15 @@ impl App {
                 ));
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Up/Down field   Left/Right change Size/Alignment   Tab browse (Target)   \
-                     Enter next / Start   Esc back",
+                    "Up/Down field   Left/Right Size/Align   Tab choose target (file/device)   \
+                     Enter Start   Esc back",
                     self.palette.dim(),
                 ));
+                if r.target_is_device {
+                    if let Some(note) = self.device_note() {
+                        lines.push(note);
+                    }
+                }
             }
             RestoreStep::Run => {
                 lines.push(Line::from(vec![
@@ -6483,6 +6646,74 @@ impl App {
         );
         if let Some(picker) = &r.picker {
             picker.draw(frame, area, self.palette, self.border);
+        }
+        // "Target type" chooser overlay (Image file / Physical device).
+        if let Some(sel) = r.target_type_menu {
+            let opts = [
+                "Image file (write to a .img / container)",
+                "Physical device (raw disk)",
+            ];
+            let mut ml: Vec<Line> = vec![Line::raw("")];
+            for (i, label) in opts.iter().enumerate() {
+                let on = i == sel;
+                let marker = if on { "> " } else { "  " };
+                let style = if on {
+                    self.palette
+                        .accent()
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    self.palette.accent()
+                };
+                ml.push(Line::styled(format!("{marker}{label}"), style));
+            }
+            ml.push(Line::raw(""));
+            ml.push(Line::styled(
+                "  Enter choose   Esc cancel",
+                self.palette.dim(),
+            ));
+            let h = (ml.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let popup = centered_rect(60, h, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(ml)).block(self.pane_block("Restore target", true)),
+                popup,
+            );
+        }
+        // Physical-device target chooser overlay.
+        if r.device_pick {
+            self.draw_device_pick(frame, area, r.device_sel, "Pick a target device (RESTORE)");
+        }
+        // Destructive device-write confirmation overlay.
+        if let Some((path, label)) = &r.confirm_device {
+            let mut cl = vec![
+                Line::raw(""),
+                Line::styled(
+                    "  Restore will OVERWRITE the entire device:",
+                    self.palette.warn(),
+                ),
+                Line::styled(format!("    {label}"), self.palette.accent()),
+                Line::styled(format!("    {path}"), self.palette.dim()),
+                Line::raw(""),
+                Line::styled(
+                    "  All existing data on it will be lost.  Proceed?  (y / n)",
+                    self.palette.warn(),
+                ),
+            ];
+            if !self.elevated {
+                cl.push(Line::raw(""));
+                cl.push(Line::styled(
+                    "  Note: writing a device needs elevation; you may be prompted, \
+                     or it may fail if unavailable.",
+                    self.palette.dim(),
+                ));
+            }
+            let h = (cl.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let popup = centered_rect(74, h, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(cl)).block(self.pane_block("Confirm device write", true)),
+                popup,
+            );
         }
     }
 
@@ -7069,13 +7300,18 @@ impl App {
 
     /// The physical-disk chooser overlay used by the Backup source step.
     fn draw_backup_device_pick(&self, frame: &mut Frame, area: Rect, b: &BackupState) {
+        self.draw_device_pick(frame, area, b.device_sel, "Pick a physical disk");
+    }
+
+    /// Shared physical-disk chooser overlay (Backup source + Restore target).
+    fn draw_device_pick(&self, frame: &mut Frame, area: Rect, device_sel: usize, title: &str) {
         let disks = self.disks.as_deref().unwrap_or(&[]);
         let mut lines: Vec<Line> = Vec::new();
         if disks.is_empty() {
             lines.push(Line::raw("  No disks detected."));
         } else {
             for (i, d) in disks.iter().enumerate() {
-                let sel = i == b.device_sel;
+                let sel = i == device_sel;
                 let marker = if sel { "> " } else { "  " };
                 let style = if sel {
                     self.palette
@@ -7109,7 +7345,7 @@ impl App {
         let popup = centered_rect(72, h, area);
         frame.render_widget(Clear, popup);
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block("Pick a physical disk", true)),
+            Paragraph::new(Text::from(lines)).block(self.pane_block(title, true)),
             popup,
         );
     }
