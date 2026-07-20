@@ -59,4 +59,5 @@ pub mod terminal;
 #[cfg(feature = "tui")]
 pub mod tui_app;
 pub mod untar;
+pub mod update;
 pub mod write;

@@ -18,7 +18,8 @@ pub mod rbformats;
 #[cfg(feature = "remote")]
 pub mod remote;
 pub mod restore;
-// Update checker uses reqwest, which is GUI-feature-only — the slim
-// rb-cli-mini build skips both. The desktop binary still self-updates.
-#[cfg(feature = "gui")]
+// Update checker uses reqwest, pulled in by either the GUI or the opt-in
+// `tui-update` feature (the `rb-cli update` self-updater). The slim
+// rb-cli-mini build has neither and skips it.
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 pub mod update;

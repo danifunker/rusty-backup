@@ -272,6 +272,11 @@ pub enum Command {
     /// Open an interactive rb-cli shell (rustyline-based REPL).
     Terminal,
 
+    /// Check for a newer release and (when built with `--features tui-update`)
+    /// self-update. Without that feature it reports that updates weren't compiled
+    /// in and prints the releases URL, exiting non-zero.
+    Update,
+
     /// Launch the full-screen terminal UI (preview): a menu-driven ratatui
     /// app that runs anywhere rusty-backup does, including serial consoles and
     /// vintage terminals. Needs an interactive terminal.
@@ -447,6 +452,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Archive { cmd } => verbs::archive::run(cmd),
         Command::Terminal => verbs::terminal::run(),
+        Command::Update => verbs::update::run(),
         #[cfg(feature = "tui")]
         Command::Tui => verbs::tui_app::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),

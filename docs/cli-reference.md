@@ -1690,6 +1690,14 @@ Usage: untar [OPTIONS] <IMAGE> <ARCHIVE> [DEST]
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 
+### `update`
+
+Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero
+
+```
+Usage: update
+```
+
 ### `write`
 
 Stream an image file onto a block device

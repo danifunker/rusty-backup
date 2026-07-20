@@ -182,15 +182,19 @@ Each step names the screen, the shared code to wire, and the acceptance check.
 - **Verified:** `ls <img>` from the palette printed the partition table + file
   listing on the suspended screen, then returned cleanly to the TUI.
 
-### Step 9 — `rb-cli update` verb + updater (gated, `tui-update` feature)
-- [ ] Add the `update` verb: when `tui-update` is off, print "not built" + the
-  releases URL and exit non-zero.
-- [ ] When on: `update::check_for_updates(&cfg, ver)`, download this OS/arch asset,
-  atomic self-replace, re-exec. Windows via `model::update_runner`; macOS/Linux via
-  temp-file + rename. Fall back to printing the URL when unresolved.
-- [ ] Wire a "Check for updates now" action into the Settings tab (only when built).
-- **Accept:** `rb-cli update` off-feature prints the message + non-zero exit;
-  on-feature reports up-to-date / newer available.
+### Step 9 — `rb-cli update` verb + updater (gated, `tui-update` feature)  [verb DONE]
+- [x] `Command::Update` always exists. Without `tui-update` it prints "not built
+  into this build" + the releases URL and exits non-zero (exit 2). Also fixed the
+  `update` module gate to `any(gui, tui-update)` so a gui-less appliance build
+  with `tui-update` still has the checker.
+- [x] With `tui-update`: `update::check_for_updates(&cfg.update_check, ver)`
+  reports current / latest / up-to-date-or-newer + the platform download URL.
+- [ ] Auto in-place replace + re-exec (Windows `model::update_runner`; macOS/Linux
+  temp-file+rename) is deferred — destructive and needs a real release to verify;
+  the verb prints the download link instead. The Settings "check now" action is
+  also deferred (needs a `tui-update` build).
+- **Verified:** default build `rb-cli update` prints the not-built message + URL,
+  exit 2; the `tui-update` build's check path compiles + lints clean.
 
 ### Step 10 — Polish leftovers
 - [ ] Absorb the `menu` appliance verb as an alias into Backup/Restore.
