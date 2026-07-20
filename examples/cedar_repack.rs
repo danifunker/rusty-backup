@@ -102,6 +102,33 @@ fn main() {
         }
     }
 
+    // Report what the volume will actually show. set_client_directory drops
+    // entries whose file it cannot resolve to a header page (writing a null
+    // File.FP.da instead would make Cedar abandon the whole enumeration with
+    // $badFP), so the number of names offered is not the number that land.
+    {
+        let mut fs = PilotFilesystem::open(disk.clone(), Generation::CedarNucleus)
+            .expect("reopen new volume");
+        let root = fs.root().expect("new root");
+        let listed = fs.list_directory(&root).expect("list new volume");
+        let real = listed
+            .iter()
+            .filter(|e| !e.name.starts_with("LV0_"))
+            .count();
+        println!(
+            "directory: offered {} names, {real} resolved and listed{}",
+            names.len(),
+            if real < names.len() {
+                format!(
+                    " ({} dropped: no resolvable header page)",
+                    names.len() - real
+                )
+            } else {
+                String::new()
+            }
+        );
+    }
+
     let out = pilot::write_pdi(&disk, Generation::CedarNucleus);
     fs::write(new_path, out).expect("write new PDI");
     println!(
