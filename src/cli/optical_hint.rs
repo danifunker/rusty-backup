@@ -68,10 +68,10 @@ fn optical_redirect_hint(path: &Path) -> Option<String> {
 
 /// True when `path` is an NKit-processed GameCube/Wii image (the `NKIT` magic
 /// sits at byte 0x200). NKit *identifies* as a normal GC/Wii disc — its header
-/// is intact — but it scrubs and rearranges the partition data, which the `nod`
-/// reader behind `opticaldiscs` can't reconstruct, so browse/extract are refused
-/// for these. Detecting them lets us replace the opaque "Unsupported filesystem"
-/// error with something actionable.
+/// is intact — but it scrubs and rearranges the partition data. opticaldiscs
+/// reconstructs standalone **v1** ISOs on the fly (so those open normally);
+/// detecting the marker here lets [`with_nkit_hint`] give an actionable message
+/// for the cases it can't reconstruct (NKit v2 / a partial or corrupt image).
 pub fn is_nkit_image(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
