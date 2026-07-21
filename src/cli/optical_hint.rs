@@ -84,18 +84,24 @@ pub fn is_nkit_image(path: &Path) -> bool {
     f.read_exact(&mut magic).is_ok() && &magic == b"NKIT"
 }
 
-/// If `path` is an NKit image, wrap `err` with a clear explanation + the
-/// conversion the user needs; otherwise return `err` unchanged. Call on the
-/// failure branch of an optical open so a normal disc is never intercepted.
+/// If `path` is an NKit image, append an explanation + the conversion the user
+/// needs to `err` (preserving the specific reason it failed); otherwise return
+/// `err` unchanged. Call on the failure branch of an optical open so a normal
+/// disc is never intercepted.
+///
+/// Standalone **NKit v1** GameCube ISOs are reconstructed and browsed directly
+/// (opticaldiscs `NkitIsoReader`), so this hint only fires when that
+/// reconstruction fails — i.e. an NKit **v2** marker (v2 exists only embedded in
+/// an RVZ/WBFS/CISO block map, never as a standalone ISO) or a partial / corrupt
+/// image — where converting back to a full image is the fix.
 pub fn with_nkit_hint(err: anyhow::Error, path: &Path) -> anyhow::Error {
     if is_nkit_image(path) {
         anyhow::anyhow!(
-            "{} is an NKit-scrubbed GameCube/Wii image. NKit removes and rearranges the \
-             disc data (keeping only the header), and the underlying reader can't \
-             reconstruct the filesystem — so it can't be browsed or extracted directly. \
-             Convert it back to a full image first (a `.iso` or `.rvz`, e.g. with the NKit \
-             tool or Dolphin's \"Convert File\"), then open that.",
-            path.display()
+            "{err}\n\nThis is an NKit image. Standalone NKit v1 GameCube ISOs open \
+             directly, so this one likely uses NKit v2 (only valid embedded in an \
+             RVZ/WBFS/CISO, not as a standalone ISO) or is a partial / corrupt image. \
+             Convert it back to a full image (a `.iso` or `.rvz`, e.g. with the NKit tool \
+             or Dolphin's \"Convert File\"), then open that."
         )
     } else {
         err
@@ -152,13 +158,18 @@ mod tests {
         std::fs::write(&tiny, vec![0u8; 16]).unwrap();
         assert!(!is_nkit_image(&tiny));
 
-        // The hint fires only for NKit paths.
-        let base = anyhow::anyhow!("Unsupported filesystem");
+        // The hint fires only for NKit paths, appending the advice while keeping
+        // the specific underlying reason.
+        let hinted =
+            with_nkit_hint(anyhow::anyhow!("NKit reconstruction failed"), &nkit).to_string();
+        assert!(hinted.contains("NKit v1"), "got: {hinted}");
+        assert!(hinted.contains("Convert it back"), "got: {hinted}");
         assert!(
-            with_nkit_hint(anyhow::anyhow!("Unsupported filesystem"), &nkit)
-                .to_string()
-                .contains("NKit-scrubbed")
+            hinted.contains("NKit reconstruction failed"),
+            "the specific reason must be preserved, got: {hinted}"
         );
+        // A non-NKit path is returned unchanged.
+        let base = anyhow::anyhow!("Unsupported filesystem");
         assert_eq!(
             with_nkit_hint(base, &plain).to_string(),
             "Unsupported filesystem"

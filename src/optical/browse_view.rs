@@ -128,11 +128,11 @@ impl OpticalDiscBrowseView {
                         self.active = true;
                     }
                     Err(e) => {
-                        // An NKit-scrubbed GC/Wii disc identifies as a normal
-                        // disc (so we reach here) but can't be reconstructed by
-                        // the reader — replace the opaque "Unsupported filesystem"
-                        // with the actionable convert-it-first hint, matching the
-                        // Commander and `optical browse` paths.
+                        // Standalone NKit v1 discs open fine (opticaldiscs
+                        // reconstructs them); if an NKit image reaches here it
+                        // couldn't be reconstructed (v2 / corrupt), so append the
+                        // convert-it-first hint to the specific reader error,
+                        // matching the Commander and `optical browse` paths.
                         let msg = crate::cli::optical_hint::with_nkit_hint(
                             anyhow::anyhow!("Cannot open filesystem: {e}"),
                             path,
@@ -1294,16 +1294,18 @@ mod nkit_hint_tests {
     use super::*;
     use std::io::Write;
 
-    /// Opening an NKit-scrubbed GC/Wii image in the GUI Optical browser must
-    /// surface the actionable "convert it first" hint, not the bare
-    /// "Unsupported filesystem" error. Regression for the GUI Optical tab, which
-    /// called `open_disc_filesystem` without the hint the Commander/CLI paths use.
+    /// A standalone NKit v1 GameCube ISO opens directly (opticaldiscs 0.12+
+    /// reconstructs it); an NKit image that CAN'T be reconstructed (v2 / corrupt
+    /// — here a truncated stub) must surface the actionable "convert it" hint in
+    /// the GUI Optical browser, not a bare reader error. Regression for the
+    /// Optical tab, which called `open_disc_filesystem` without the hint the
+    /// Commander/CLI paths apply.
     #[test]
-    fn open_nkit_iso_shows_actionable_hint() {
+    fn open_unreconstructable_nkit_iso_shows_actionable_hint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("game.nkit.iso");
-        // GameCube magic at 0x1C so DiscImageInfo::open identifies it as a
-        // Nintendo disc (reaching open_disc_filesystem), + NKIT marker at 0x200.
+        // GameCube magic at 0x1C so it identifies as a Nintendo disc, + the NKIT
+        // marker at 0x200 — but no real reconstructable body, so the reader fails.
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         buf[0x1C..0x20].copy_from_slice(&[0xC2, 0x33, 0x9F, 0x3D]);
         buf[0x200..0x204].copy_from_slice(b"NKIT");
@@ -1314,14 +1316,16 @@ mod nkit_hint_tests {
 
         let mut view = OpticalDiscBrowseView::default();
         view.open(&path);
-        let err = view.error.expect("an NKit image must report an error");
+        let err = view
+            .error
+            .expect("an unreconstructable NKit image must report an error");
         assert!(
-            err.contains("NKit-scrubbed"),
+            err.contains("NKit v1"),
             "expected the NKit hint, got: {err}"
         );
         assert!(
-            !err.contains("Unsupported filesystem"),
-            "the bare error should be replaced by the hint, got: {err}"
+            err.contains("Convert it back"),
+            "expected actionable advice, got: {err}"
         );
     }
 }
