@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli optical boot replace</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="optical.html">optical</a> &raquo; <a href="optical-boot.html">boot</a> &raquo; <span>replace</span></nav>
+<h1><code>rb-cli optical boot replace</code></h1>
+<p>Replace a boot image with the bytes of a (edited) disk-image file. Raw `.iso` only; same-size replaces in place, a grown image relocates</p>
+<h2>Usage</h2>
+<pre><code>Usage: replace [OPTIONS] --from &lt;FROM&gt; &lt;SOURCE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SOURCE&gt;</code></dt>
+<dd>Bootable optical image to edit — raw `.iso` only</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--from</code></dt>
+<dd>Disk-image file whose bytes become the new boot image</dd>
+<dt><code>--index</code></dt>
+<dd>Which boot entry to replace (default 0)</dd>
+<dt><code>--media</code></dt>
+<dd>Override the emulation/media type (default: keep the entry's current one). One of `floppy1.2` / `floppy1.44` / `floppy2.88` / `no-emulation` / `harddisk`</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -54,7 +54,7 @@ fn cp_single_file_between_images() {
 
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "4M",
@@ -64,7 +64,7 @@ fn cp_single_file_between_images() {
     ]);
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "4M",
@@ -94,7 +94,7 @@ fn cp_recursive_whole_volume_into_subdir() {
 
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "4M",
@@ -104,7 +104,7 @@ fn cp_recursive_whole_volume_into_subdir() {
     ]);
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "4M",
@@ -143,7 +143,7 @@ fn cp_preflight_refuses_when_too_big() {
 
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "8M",
@@ -153,7 +153,7 @@ fn cp_preflight_refuses_when_too_big() {
     ]);
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "2M",
@@ -183,7 +183,7 @@ fn cp_rejects_same_image() {
     std::fs::write(&host, b"x").unwrap();
     run(&[
         "new",
-        "--fs",
+        "volume",
         "fat",
         "--size",
         "4M",

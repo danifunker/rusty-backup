@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli cp</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>cp</span></nav>
+<h1><code>rb-cli cp</code></h1>
+<p>Copy files / directory trees between two disk images without staging through the host. SRC may be a glob; DST follows `cp` semantics (into an existing directory, or rename to a target)</p>
+<h2>Usage</h2>
+<pre><code>Usage: cp [OPTIONS] &lt;SRC_IMAGE&gt; &lt;SRC&gt; &lt;DST_IMAGE&gt; &lt;DST&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;SRC_IMAGE&gt;</code></dt>
+<dd>Source image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;SRC&gt;</code></dt>
+<dd>Source path or glob inside the source filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and copy every match</dd>
+<dt><code>&lt;DST_IMAGE&gt;</code></dt>
+<dd>Destination image reference (`path` or `path@N`)</dd>
+<dt><code>&lt;DST&gt;</code></dt>
+<dd>Destination path inside the destination filesystem. Copying into an existing directory (or a path ending in `/`) keeps the source basename; otherwise the destination is the literal target name</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>-r / --recursive</code></dt>
+<dd>Recursively copy directories. Without this, directory sources / matches are skipped with a warning</dd>
+<dt><code>--force</code></dt>
+<dd>Overwrite existing destination entries. Mutually exclusive with `--skip-existing`</dd>
+<dt><code>--skip-existing</code></dt>
+<dd>Skip when a destination entry already exists. Mutually exclusive with `--force`. Without either, an existing destination is an error</dd>
+<dt><code>--exclude</code></dt>
+<dd>Exclude source paths matching this glob. Repeatable. Exclude wins</dd>
+<dt><code>--ignore-case</code></dt>
+<dd>Match the source case-insensitively regardless of its native rule</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>Match the source case-sensitively regardless of its native rule</dd>
+<dt><code>--names</code></dt>
+<dd>Policy for source names the destination filesystem rejects (too long / illegal characters). Default: truncate</dd>
+<dt><code>--attrs</code></dt>
+<dd>Whether to carry FS-specific attributes (type/creator, Unix perms, DOS attribute bits, Amiga bits). Default: preserve</dd>
+<dt><code>--flatten</code></dt>
+<dd>Collapse a source tree into the destination directory when the destination filesystem has no subdirectories (CP/M, DFS, CBM, …)</dd>
+<dt><code>--parents</code></dt>
+<dd>Auto-create missing destination parent directories</dd>
+<dt><code>--password</code></dt>
+<dd>Password for an encrypted source container (WinImage IMZ) or an encrypted source filesystem (APFS FileVault — the volume password or personal recovery key)</dd>
+<dt><code>--src-fs-type</code></dt>
+<dd>Force a specific filesystem dispatch for the SOURCE (e.g. `cpm:amstrad_data`). See `get --fs-type`</dd>
+<dt><code>--dst-fs-type</code></dt>
+<dd>Force a specific filesystem dispatch for the DESTINATION</dd>
+<dt><code>--carve-full</code></dt>
+<dd>Scan the entire source image for recoverable text in the synthetic carve view (NDOS disks). Source-side only</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

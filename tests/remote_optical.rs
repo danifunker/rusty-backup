@@ -22,7 +22,7 @@ fn spawn_daemon() -> (String, tempfile::TempDir) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, root, None);
+        let _ = serve_on(listener, root, None, true);
     });
     (addr, dir)
 }

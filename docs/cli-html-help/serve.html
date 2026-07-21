@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli serve</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>serve</span></nav>
+<h1><code>rb-cli serve</code></h1>
+<p>Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander) can browse, read, and write files inside images this host holds (`rb://host:port/img@N`) and on its host filesystem. Writable under the serve root by default; pass `--read-only` for a browse-only daemon. See docs/remote_transfer_plan.md</p>
+<h2>Usage</h2>
+<pre><code>Usage: serve [OPTIONS] [COMMAND]</code></pre>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--bind</code></dt>
+<dd>Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341). Ignored by the `service` / `setup` subcommands (those read `rb-daemon.ini`)</dd>
+<dt><code>--root</code></dt>
+<dd>Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory</dd>
+<dt><code>--staging-dir</code></dt>
+<dd>Directory for per-session upload staging blobs (write path). Defaults to the system temp dir. On a MiSTer point this at a roomy writable mount, never tmpfs — large uploads would fill RAM</dd>
+<dt><code>--read-only</code></dt>
+<dd>Serve reads only: clients can browse and copy *out* of the daemon, but every write (image edit, restore-to-target, host upload / mkdir) is refused. Without this the daemon is writable under its serve root</dd>
+</dl>
+<h2>Subcommands</h2>
+<ul class="verbs">
+<li><a href="serve-service.html"><code>service</code></a><span class="desc">Manage the boot service (start/stop/restart/status/install/uninstall)</span></li>
+<li><a href="serve-setup.html"><code>setup</code></a><span class="desc">Open the interactive setup console (the MiSTer Scripts-menu screen)</span></li>
+</ul>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

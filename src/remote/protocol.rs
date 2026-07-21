@@ -140,6 +140,22 @@ pub enum Request {
     /// The host-FS analog of `ReadFile` — for copying a file off the remote, or
     /// the file browser's preview.
     ReadHostFile { path: String },
+    /// Create a directory on the daemon's host filesystem (sandboxed to root).
+    /// The write analog of `ListHostDir` — for copying a folder tree *onto* the
+    /// remote. Idempotent (an existing directory is fine). Refused with an error
+    /// when the daemon runs read-only. Reply: `Ok` or `Error`.
+    MkdirHost { path: String },
+    /// Write a file to the daemon's host filesystem (sandboxed to root). The file
+    /// body follows **immediately** as a chunk stream (client -> server) after
+    /// this frame, exactly like `StageUpload`, then the daemon replies `Ok`. The
+    /// write analog of `ReadHostFile` — for copying a file *onto* the remote.
+    /// `force` overwrites an existing file (without it, an existing target is an
+    /// error). Refused when the daemon runs read-only. Reply: `Ok` or `Error`.
+    WriteHostFile {
+        path: String,
+        size: u64,
+        force: bool,
+    },
 
     // --- block tier (v2): a host image file kept OPEN on the daemon for ---
     // --- seekable ranged reads, so the desktop engine parses partitions / ---

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli repack</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>repack</span></nav>
+<h1><code>rb-cli repack</code></h1>
+<p>Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place resizer can't (it keeps cluster byte-offsets)</p>
+<h2>Usage</h2>
+<pre><code>Usage: repack [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>New filesystem size in bytes (default: the partition's current size). Accepts suffixes (`K`, `M`, `G`). Must not exceed the partition capacity</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

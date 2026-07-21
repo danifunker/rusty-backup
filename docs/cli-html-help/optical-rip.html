@@ -13,7 +13,7 @@
 <h2>Options</h2>
 <dl class="args">
 <dt><code>--device</code></dt>
-<dd>Source drive (e.g. `/dev/sr0`, `disk6`, `\\.\E:`). See `rb-cli show devices`</dd>
+<dd>Source drive: a local path (e.g. `/dev/sr0`, `disk6`, `\\.\E:`) or a remote daemon's drive as `rb://host:port/dev/sr0` (the daemon issues the SCSI reads; this side does the encoding). `rb-cli optical drives` lists local drives</dd>
 <dt><code>--output</code></dt>
 <dd>Output path: `.iso` for `--format iso`, `.cue` for `--format bincue`</dd>
 <dt><code>--format</code></dt>
@@ -21,5 +21,5 @@
 <dt><code>--eject</code></dt>
 <dd>Eject the disc after a successful rip</dd>
 </dl>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

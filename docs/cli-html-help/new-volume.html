@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new volume</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <span>volume</span></nav>
+<h1><code>rb-cli new volume</code></h1>
+<p>Blank bare single volume of arbitrary size (a &quot;superfloppy&quot;): the larger filesystems (NTFS, ext, HFS+, EFS, AFFS, …). No partition table</p>
+<h2>Usage</h2>
+<pre><code>Usage: volume [OPTIONS] &lt;FS&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;FS&gt;</code></dt>
+<dd>Filesystem to format (see the per-value help above)</dd>
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K</dd>
+<dt><code>--name</code></dt>
+<dd>Volume label/name. Defaults to `rusty-backup`</dd>
+<dt><code>--block-size</code></dt>
+<dd>HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset</dd>
+<dt><code>--catalog-size</code></dt>
+<dd>HFS Catalog B-tree initial size in bytes. Auto when unset</dd>
+<dt><code>--extents-size</code></dt>
+<dd>HFS Extents-overflow B-tree initial size in bytes. Auto when unset</dd>
+<dt><code>--case-sensitive</code></dt>
+<dd>HFS+ only: format a case-sensitive (HFSX) volume</dd>
+<dt><code>--min-catalog</code></dt>
+<dd>HFS+ only: minimum catalog B-tree size in bytes (a floor)</dd>
+<dt><code>--affs-variant</code></dt>
+<dd>AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl, 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS)</dd>
+<dt><code>--inodes</code></dt>
+<dd>EFS only: approximate total inode count. Mutually exclusive with `--bytes-per-inode`</dd>
+<dt><code>--bytes-per-inode</code></dt>
+<dd>EFS only: inode density in bytes per inode (smaller = more inodes)</dd>
+<dt><code>--cluster-size</code></dt>
+<dd>NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset</dd>
+<dt><code>--sector-size</code></dt>
+<dd>NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

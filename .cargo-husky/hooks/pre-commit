@@ -5,12 +5,14 @@
 # installed copy from here on the next `cargo build` / `cargo test`.
 #
 # Runs the general Rust cleanup tasks before each commit:
-#   1. cargo fmt    — auto-format and re-stage (always; cheap)
-#   2. cargo check  — type-check the whole workspace
-#   3. cargo clippy — lint with warnings denied
+#   1. cargo fmt      — auto-format and re-stage (always; cheap)
+#   2. cargo check    — type-check the whole workspace
+#   3. cargo clippy   — lint with warnings denied
+#   4. gen-cli-docs   — regenerate + re-stage the CLI docs when src/cli changed
 #
-# Steps 2 & 3 only run when the commit touches Rust sources or Cargo
-# manifests, so docs-only commits stay fast. Any failure aborts the commit.
+# Steps 2-4 only run when the commit touches Rust sources or Cargo manifests,
+# so docs-only commits stay fast; step 4 further narrows to `src/cli/` changes.
+# Any failure aborts the commit.
 
 set -e
 
@@ -36,5 +38,21 @@ cargo check --all-targets
 # --- 3. Lint (warnings denied) ---------------------------------------------
 echo "pre-commit: cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
+
+# --- 4. Regenerate CLI docs when the grammar may have changed ---------------
+# The reference (docs/cli-reference.md) and HTML bundle (docs/cli-html-help/)
+# are generated from the clap definitions under src/cli/. Regenerate and
+# re-stage them so they can never drift from the code in the same commit.
+staged_cli=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '^src/cli/|^example/generate_cli_' || true)
+
+if [ -n "$staged_cli" ]; then
+  echo "pre-commit: src/cli changed — regenerating CLI docs"
+  # Pure-Rust, cross-platform generator (prunes stale pages, writes both the
+  # Markdown reference and the HTML bundle). See example/generate_cli_docs.rs.
+  cargo run --quiet --example generate_cli_docs
+  # -A so pruned pages (renamed/removed subcommands) are staged as deletions.
+  git add -A docs/cli-reference.md docs/cli-html-help
+fi
 
 echo "pre-commit: all checks passed"

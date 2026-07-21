@@ -9,6 +9,12 @@
 //! Follows the `bless pick` conventions: a terminal-free state core
 //! ([`MenuState`], unit-tested below) under a thin crossterm shell, ASCII-only,
 //! TTY-guarded, with an RAII guard that restores the terminal.
+//!
+//! When the `tui` feature is on, the full-screen TUI absorbs this verb (see
+//! [`run`]) and the appliance shell below is unused — but it still compiles and
+//! its `MenuState` unit tests still run, so we tolerate the dead code in that
+//! configuration rather than gate the whole implementation out.
+#![cfg_attr(feature = "tui", allow(dead_code, unused_imports))]
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -200,6 +206,27 @@ impl MenuState {
 // ---------------------------------------------------------------------------
 
 pub fn run(_args: MenuArgs) -> Result<()> {
+    // The full-screen TUI supersedes this appliance menu: when it's compiled in,
+    // `rb-cli menu` is just an alias that opens the TUI on the Backup tab (the
+    // appliance's backup/restore focus). The standalone crossterm menu below is
+    // the fallback for slim builds without the `tui` feature (e.g. the i486
+    // appliance image built with `--no-default-features`).
+    #[cfg(feature = "tui")]
+    {
+        crate::cli::verbs::tui_app::run_on(crate::cli::verbs::tui_app::BACKUP_TAB, "rb-cli menu")
+    }
+
+    #[cfg(not(feature = "tui"))]
+    {
+        run_appliance_menu()
+    }
+}
+
+/// The standalone crossterm appliance menu (disk list -> Inspect/Backup/Restore).
+/// Only reachable in builds without the `tui` feature; the full TUI absorbs it
+/// otherwise (see [`run`]).
+#[cfg(not(feature = "tui"))]
+fn run_appliance_menu() -> Result<()> {
     require_interactive_tty(
         "rb-cli menu",
         "use the `inspect` / `backup` / `restore` verbs directly for scripts",

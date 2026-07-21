@@ -218,8 +218,14 @@ pub fn open_image_partition(path: &Path, part: &PartitionInfo) -> Result<Box<dyn
 /// data file must sit next to `path`.
 #[cfg(feature = "optical")]
 pub fn open_optical(path: &Path, label: Option<String>) -> Result<Box<dyn Filesystem>> {
-    let fs = crate::fs::optical_fs::OpticalFilesystem::open(path, label)
-        .map_err(|e| anyhow::anyhow!("open optical image {}: {e}", path.display()))?;
+    let fs = crate::fs::optical_fs::OpticalFilesystem::open(path, label).map_err(|e| {
+        // NKit-scrubbed GC/Wii images identify as a normal disc but can't be
+        // reconstructed by `nod`; give the user an actionable message.
+        crate::cli::optical_hint::with_nkit_hint(
+            anyhow::anyhow!("open optical image {}: {e}", path.display()),
+            path,
+        )
+    })?;
     Ok(Box::new(fs))
 }
 
@@ -227,6 +233,156 @@ pub fn open_optical(path: &Path, label: Option<String>) -> Result<Box<dyn Filesy
 #[cfg(not(feature = "optical"))]
 pub fn open_optical(_path: &Path, _label: Option<String>) -> Result<Box<dyn Filesystem>> {
     anyhow::bail!("this build was compiled without optical-disc support")
+}
+
+/// One selectable filesystem on an optical disc image: the primary volume
+/// (usually ISO 9660) or a co-resident hybrid Mac (HFS/HFS+) side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpticalFsChoice {
+    /// Display label for the pane's filesystem picker (e.g. `RETRO (ISO 9660)`).
+    pub label: String,
+    /// `None` = the primary filesystem; `Some(i)` = `hybrid_filesystems[i]`.
+    pub hybrid_index: Option<usize>,
+}
+
+/// Turn an opticaldiscs `FilesystemType` debug token + optional volume label
+/// into a friendly picker label. Only the optical build enumerates filesystems.
+#[cfg(feature = "optical")]
+fn optical_fs_label(ty: &str, label: Option<&str>) -> String {
+    let nice = match ty {
+        "Iso9660" => "ISO 9660",
+        "HighSierra" => "High Sierra",
+        "Hfs" => "HFS (Mac)",
+        "HfsPlus" => "HFS+ (Mac)",
+        "Efs" => "IRIX EFS",
+        other => other,
+    };
+    match label {
+        Some(l) if !l.trim().is_empty() => format!("{l} ({nice})"),
+        _ => nice.to_string(),
+    }
+}
+
+/// Enumerate the browsable filesystems of the optical disc image at `path`: the
+/// primary volume plus any hybrid Mac side. Returns an empty vec when `path`
+/// isn't an optical disc image we can open (so the caller falls back to the
+/// partition-table path). This is what lets the Commander pane's picker offer
+/// **both** the ISO 9660 and the HFS side of a hybrid Mac/PC disc.
+#[cfg(feature = "optical")]
+pub fn optical_filesystems(path: &Path) -> Vec<OpticalFsChoice> {
+    use opticaldiscs::detect::DiscImageInfo;
+    let Ok(info) = DiscImageInfo::open(path) else {
+        return Vec::new();
+    };
+    let mut choices = vec![OpticalFsChoice {
+        label: optical_fs_label(
+            &format!("{:?}", info.filesystem),
+            info.volume_label.as_deref(),
+        ),
+        hybrid_index: None,
+    }];
+    for (i, h) in info.hybrid_filesystems.iter().enumerate() {
+        choices.push(OpticalFsChoice {
+            label: optical_fs_label(&format!("{:?}", h.filesystem), h.volume_label.as_deref()),
+            hybrid_index: Some(i),
+        });
+    }
+    choices
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn optical_filesystems(_path: &Path) -> Vec<OpticalFsChoice> {
+    Vec::new()
+}
+
+/// Open the hybrid Mac side (HFS / HFS+) at `hybrid_filesystems[index]` of a
+/// hybrid Mac/PC optical disc image as a read-only filesystem. The primary
+/// (usually ISO 9660) is reached via [`open_optical`]; this reaches the
+/// co-resident Apple volume that the primary hides.
+#[cfg(feature = "optical")]
+pub fn open_optical_hybrid(
+    path: &Path,
+    index: usize,
+    label: Option<String>,
+) -> Result<Box<dyn Filesystem>> {
+    use opticaldiscs::browse::open_hybrid_filesystem;
+    use opticaldiscs::detect::DiscImageInfo;
+    let info = DiscImageInfo::open(path)
+        .map_err(|e| anyhow::anyhow!("open disc image {}: {e:#}", path.display()))?;
+    let ty = info
+        .hybrid_filesystems
+        .get(index)
+        .map(|h| h.filesystem)
+        .ok_or_else(|| anyhow::anyhow!("no hybrid filesystem #{index} on this disc"))?;
+    let inner = open_hybrid_filesystem(&info, index)
+        .map_err(|e| anyhow::anyhow!("open hybrid filesystem: {e}"))?;
+    let fs = crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, format!("{ty:?}"), label)
+        .map_err(|e| anyhow::anyhow!("wrap hybrid filesystem: {e}"))?;
+    Ok(Box::new(fs))
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn open_optical_hybrid(
+    _path: &Path,
+    _index: usize,
+    _label: Option<String>,
+) -> Result<Box<dyn Filesystem>> {
+    anyhow::bail!("this build was compiled without optical-disc support")
+}
+
+/// Open an optical disc image as a Commander in-pane mount, plus the recipe to
+/// reopen it fresh on a worker thread. A disc with a single filesystem opens
+/// that one directly (a plain [`OpticalFilesystem`](crate::fs::optical_fs)); a
+/// hybrid Mac/PC disc with more than one opens as a
+/// [`MultiVolumeFilesystem`](crate::model::multi_volume_fs) whose root lists
+/// each filesystem as a node to descend into. For two-file formats (bin/cue,
+/// mdf/mds) the sibling data file must sit next to `path`.
+#[cfg(feature = "optical")]
+pub fn open_optical_mount(
+    path: PathBuf,
+    label: Option<String>,
+) -> Result<(Box<dyn Filesystem>, ReopenRecipe)> {
+    use crate::model::multi_volume_fs::MultiVolumeFilesystem;
+    let choices = optical_filesystems(&path);
+    if choices.len() > 1 {
+        let fs = MultiVolumeFilesystem::optical_from_choices(&path, choices, label.clone());
+        Ok((Box::new(fs), ReopenRecipe::OpticalMulti { path, label }))
+    } else {
+        let fs = open_optical(&path, label.clone())?;
+        Ok((fs, ReopenRecipe::Optical { path, label }))
+    }
+}
+
+/// Stub for builds without the `optical` feature.
+#[cfg(not(feature = "optical"))]
+pub fn open_optical_mount(
+    _path: PathBuf,
+    _label: Option<String>,
+) -> Result<(Box<dyn Filesystem>, ReopenRecipe)> {
+    anyhow::bail!("this build was compiled without optical-disc support")
+}
+
+/// Open a partitioned disk image as a Commander in-pane mount, plus the recipe
+/// to reopen it fresh on a worker thread. An image with a single browsable
+/// partition opens that one directly; one with several opens as a
+/// [`MultiVolumeFilesystem`](crate::model::multi_volume_fs) whose root lists
+/// each partition as a node to descend into.
+pub fn open_diskimage_mount(path: PathBuf) -> Result<(Box<dyn Filesystem>, ReopenRecipe)> {
+    use crate::model::multi_volume_fs::MultiVolumeFilesystem;
+    let parts = browsable_partitions(&path)?;
+    match parts.len() {
+        0 => anyhow::bail!("'{}' has no browsable volumes", path.display()),
+        1 => {
+            let fs = open_image_partition(&path, &parts[0].1)?;
+            Ok((fs, ReopenRecipe::DiskImage { path }))
+        }
+        _ => {
+            let fs = MultiVolumeFilesystem::disk_image_from_parts(&path, parts);
+            Ok((Box::new(fs), ReopenRecipe::DiskImageMulti { path }))
+        }
+    }
 }
 
 /// A recipe to reopen a browsable source *fresh* on a worker thread — for
@@ -248,8 +404,25 @@ pub enum ReopenRecipe {
     },
     /// Reopen a disk-image container's first browsable volume by path.
     DiskImage { path: PathBuf },
+    /// Reopen a multi-partition disk image as a [`MultiVolumeFilesystem`]
+    /// (`crate::model::multi_volume_fs`) presenting each browsable partition as a
+    /// root node.
+    DiskImageMulti { path: PathBuf },
     /// Reopen an optical disc image by path.
     Optical {
+        path: PathBuf,
+        label: Option<String>,
+    },
+    /// Reopen the hybrid Mac (HFS/HFS+) side of a hybrid optical disc image.
+    OpticalHybrid {
+        path: PathBuf,
+        index: usize,
+        label: Option<String>,
+    },
+    /// Reopen a hybrid optical disc as a [`MultiVolumeFilesystem`]
+    /// (`crate::model::multi_volume_fs`) presenting each filesystem as a root
+    /// node.
+    OpticalMulti {
         path: PathBuf,
         label: Option<String>,
     },
@@ -267,9 +440,94 @@ impl ReopenRecipe {
                 })?;
                 open_image_partition(path, first)
             }
+            ReopenRecipe::DiskImageMulti { path } => Ok(Box::new(
+                crate::model::multi_volume_fs::MultiVolumeFilesystem::disk_image(path)?,
+            )),
             ReopenRecipe::Optical { path, label } => open_optical(path, label.clone()),
+            ReopenRecipe::OpticalHybrid { path, index, label } => {
+                open_optical_hybrid(path, *index, label.clone())
+            }
+            ReopenRecipe::OpticalMulti { path, label } => {
+                #[cfg(feature = "optical")]
+                {
+                    Ok(Box::new(
+                        crate::model::multi_volume_fs::MultiVolumeFilesystem::optical(
+                            path,
+                            label.clone(),
+                        ),
+                    ))
+                }
+                #[cfg(not(feature = "optical"))]
+                {
+                    let _ = (path, label);
+                    anyhow::bail!("this build was compiled without optical-disc support")
+                }
+            }
         }
     }
+}
+
+/// Test-only: build a raw disk image with an MBR at sector 0 pointing at two
+/// FAT12 partitions, each holding one file (`ONE.TXT` / `TWO.TXT`). This is the
+/// minimal multi-partition image the "partitions as root nodes" path is built
+/// for; shared by the `commander_descend` and `wrapper_tree` tests.
+#[cfg(test)]
+pub(crate) fn build_two_partition_fat_image() -> (tempfile::TempDir, PathBuf) {
+    use crate::fs::filesystem::CreateFileOptions;
+    use crate::fs::{fat, open_editable_filesystem};
+    use std::fs::OpenOptions;
+
+    fn set_entry(img: &mut [u8], i: usize, start: usize, p_size: usize) {
+        let o = 446 + i * 16;
+        img[o + 4] = 0x01; // FAT12
+        img[o + 8..o + 12].copy_from_slice(&((start / 512) as u32).to_le_bytes());
+        img[o + 12..o + 16].copy_from_slice(&((p_size / 512) as u32).to_le_bytes());
+    }
+
+    let p1_off: usize = 1024 * 1024;
+    let p_size: usize = 2 * 1024 * 1024;
+    let p2_off: usize = p1_off + p_size;
+    let total = p2_off + p_size;
+
+    let mut img = vec![0u8; total];
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    set_entry(&mut img, 0, p1_off, p_size);
+    set_entry(&mut img, 1, p2_off, p_size);
+
+    let fat1 = fat::create_blank_fat(p_size as u64, Some("ONE")).unwrap();
+    img[p1_off..p1_off + fat1.len()].copy_from_slice(&fat1);
+    let fat2 = fat::create_blank_fat(p_size as u64, Some("TWO")).unwrap();
+    img[p2_off..p2_off + fat2.len()].copy_from_slice(&fat2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("twopart.img");
+    std::fs::write(&path, &img).unwrap();
+
+    for (off, name, data) in [
+        (p1_off, "ONE.TXT", &b"one"[..]),
+        (p2_off, "TWO.TXT", &b"two"[..]),
+    ] {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut efs = open_editable_filesystem(f, off as u64, 0x01, None).unwrap();
+        let root = efs.root().unwrap();
+        let mut d = data;
+        efs.create_file(
+            &root,
+            name,
+            &mut d,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap();
+        efs.sync_metadata().unwrap();
+    }
+
+    (dir, path)
 }
 
 #[cfg(test)]
@@ -292,6 +550,54 @@ mod tests {
         assert_eq!(classify("backup.tgz"), Some(DescendKind::Archive));
         assert_eq!(classify("backup.tar.gz"), Some(DescendKind::Archive));
         assert_eq!(classify("backup.tar.zst"), Some(DescendKind::Archive));
+    }
+
+    /// A hybrid Mac/PC disc must expose BOTH filesystems (ISO 9660 primary +
+    /// the HFS/HFS+ Mac side), each openable via the helper the Commander pane's
+    /// picker uses. This is the fix for "opening a hybrid CD only shows one side
+    /// in the pulldown": before, only the APM Apple_HFS partition surfaced.
+    #[cfg(feature = "optical")]
+    #[test]
+    fn hybrid_disc_lists_and_opens_both_filesystems() {
+        use std::io::{Cursor, Read};
+
+        // Decompress the committed hybrid fixture (ISO 9660 + HFS+ sides).
+        let compressed = std::fs::read("tests/fixtures/optical/hybrid_rsrc.iso.zst")
+            .expect("read hybrid fixture");
+        let mut dec = zstd::stream::read::Decoder::new(Cursor::new(compressed)).unwrap();
+        let mut iso = Vec::new();
+        dec.read_to_end(&mut iso).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disc.iso");
+        std::fs::write(&path, &iso).unwrap();
+
+        let choices = optical_filesystems(&path);
+        assert_eq!(choices.len(), 2, "hybrid disc should list two filesystems");
+        // The primary is the ISO 9660 side; the second is the hybrid Mac side.
+        assert_eq!(choices[0].hybrid_index, None);
+        assert!(
+            choices[0].label.contains("ISO 9660"),
+            "got {:?}",
+            choices[0].label
+        );
+        assert_eq!(choices[1].hybrid_index, Some(0));
+        assert!(
+            choices[1].label.contains("HFS"),
+            "got {:?}",
+            choices[1].label
+        );
+
+        // Both sides open and list a non-empty root through the pane's helpers.
+        for c in &choices {
+            let mut fs = match c.hybrid_index {
+                None => open_optical(&path, None),
+                Some(h) => open_optical_hybrid(&path, h, None),
+            }
+            .unwrap_or_else(|e| panic!("open {}: {e}", c.label));
+            let root = fs.root().unwrap();
+            let kids = fs.list_directory(&root).unwrap();
+            assert!(!kids.is_empty(), "{} root should list entries", c.label);
+        }
     }
 
     #[test]
@@ -410,5 +716,83 @@ mod tests {
             "reopened volume lists its file: {:?}",
             kids.iter().map(|e| &e.name).collect::<Vec<_>>()
         );
+    }
+
+    /// A multi-partition image mounts as a `MultiVolumeFilesystem`: its root
+    /// lists one node per browsable partition, and each descends into the right
+    /// partition's files. This is the disk-image half of "volumes as root
+    /// nodes".
+    #[test]
+    fn diskimage_mount_multi_lists_partitions_as_root_nodes() {
+        let (_guard, path) = build_two_partition_fat_image();
+        let (mut fs, recipe) = open_diskimage_mount(path.clone()).unwrap();
+        assert!(
+            matches!(recipe, ReopenRecipe::DiskImageMulti { .. }),
+            "a multi-partition image should reopen as DiskImageMulti"
+        );
+
+        let root = fs.root().unwrap();
+        let vols = fs.list_directory(&root).unwrap();
+        assert_eq!(vols.len(), 2, "two browsable partitions => two root nodes");
+        assert!(vols.iter().all(|v| v.is_directory()));
+
+        let k0 = fs.list_directory(&vols[0]).unwrap();
+        let one = k0
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("ONE.TXT"))
+            .expect("partition 1 lists ONE.TXT");
+        assert!(one.path.starts_with("/0/"));
+        assert_eq!(fs.read_file(one, usize::MAX).unwrap(), b"one");
+
+        let k1 = fs.list_directory(&vols[1]).unwrap();
+        let two = k1
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("TWO.TXT"))
+            .expect("partition 2 lists TWO.TXT");
+        assert_eq!(fs.read_file(two, usize::MAX).unwrap(), b"two");
+
+        // A worker rebuilds it from the recipe and reads a captured deep entry.
+        let mut fresh = recipe.open().unwrap();
+        assert_eq!(fresh.read_file(two, usize::MAX).unwrap(), b"two");
+    }
+
+    /// A single-partition (superfloppy) image opens straight into its one volume
+    /// — no root-node layer — so ordinary single-volume browsing is unchanged.
+    #[test]
+    fn diskimage_mount_single_opens_the_volume_directly() {
+        use crate::fs::filesystem::CreateFileOptions;
+        use crate::fs::{fat, open_editable_filesystem};
+
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("one.img");
+        std::fs::write(
+            &img,
+            fat::create_blank_fat(2 * 1024 * 1024, Some("SOLO")).unwrap(),
+        )
+        .unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut efs = open_editable_filesystem(f, 0, 0x01, None).unwrap();
+            let root = efs.root().unwrap();
+            let mut d = &b"solo"[..];
+            efs.create_file(&root, "SOLO.TXT", &mut d, 4, &CreateFileOptions::default())
+                .unwrap();
+            efs.sync_metadata().unwrap();
+        }
+
+        let (mut fs, recipe) = open_diskimage_mount(img).unwrap();
+        assert!(
+            matches!(recipe, ReopenRecipe::DiskImage { .. }),
+            "a single-volume image should reopen as plain DiskImage"
+        );
+        let root = fs.root().unwrap();
+        let kids = fs.list_directory(&root).unwrap();
+        // The file is at the volume root directly — not behind a "/0" node.
+        assert!(kids.iter().any(|e| e.name.eq_ignore_ascii_case("SOLO.TXT")));
+        assert!(!kids.iter().any(|e| e.path.starts_with("/0")));
     }
 }

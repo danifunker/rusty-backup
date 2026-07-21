@@ -24,6 +24,7 @@ pub mod file_types;
 pub mod fsck_runner;
 pub mod hfs_expand_runner;
 pub mod min_size_runner;
+pub mod multi_volume_fs;
 #[cfg(feature = "optical")]
 pub mod optical_devices;
 pub mod partition_editor;

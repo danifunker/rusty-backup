@@ -51,6 +51,12 @@ path = "example/generate_cli_reference.rs"
 name = "generate_cli_html_help"
 path = "example/generate_cli_html_help.rs"
 
+# One-shot regeneration of every rb-cli doc artifact (reference + HTML bundle).
+# Pure Rust, cross-platform; run by the pre-commit hook.
+[[example]]
+name = "generate_cli_docs"
+path = "example/generate_cli_docs.rs"
+
 [[example]]
 name = "decrypt_real_imz"
 path = "example/decrypt_real_imz.rs"
@@ -67,7 +73,7 @@ required-features = ["mock_gui"]
 # The desktop release ships every feature on. The slim rb-cli-mini build is
 # `cargo build --bin rb-cli --no-default-features` (optionally `--features chd`
 # / `--features optical` if you want one of those without the GUI).
-default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "remote"]
+default = ["gui", "chd", "optical", "audio", "native-zlib", "native-zstd", "remote", "tui"]
 # Pull in eframe / egui / rfd plus the update-checker's reqwest client. Also
 # pulls in `remote` (dep-free) so Commander Mode's remote pane is always present
 # in a GUI build.
@@ -118,8 +124,23 @@ audio = ["dep:rodio", "gui", "optical", "chd"]
 # `--no-default-features` and leave `remote` out of the feature list.
 # See docs/remote_transfer_plan.md.
 remote = []
+# Full-screen terminal UI (`rb-cli tui`). Pure-Rust ratatui over the crossterm
+# backend we already depend on — no C libraries and no OS-version floor beyond
+# what the Rust toolchain itself imposes, so it builds and runs on the vintage
+# targets (macOS, MiSTer/serial console, i486/i586 appliance) as well as modern
+# desktops. Cheap enough to keep in `default`; drop it from slim builds with
+# `--no-default-features` (leave `tui` out of the feature list).
+tui = ["dep:ratatui"]
+# In-app self-update for `rb-cli update` (CLI + TUI). Pulls the reqwest client
+# (rustls, no OpenSSL). OFF by default and left OUT of the slim / appliance /
+# MiSTer builds so they link no networking; desktop packagers opt in. When the
+# feature is absent, `rb-cli update` reports that updates weren't built in.
+tui-update = ["dep:reqwest"]
 
 [dependencies]
+# Full-screen TUI (`tui` feature). ratatui renders through crossterm, which is
+# already a non-optional dependency below, so this adds no new C/native code.
+ratatui = { version = "0.30", optional = true }
 # Optional, gated behind feature flags. See [features] above.
 eframe = { version = "0.34", features = ["glow"], optional = true }
 egui = { version = "0.34", optional = true }
@@ -130,7 +151,7 @@ libchdman-rs = { version = "0.288.9", features = ["prebuilt"], optional = true }
 # (it's behind `gui`).
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"], optional = true }
 webbrowser = { version = "1.0", optional = true }
-opticaldiscs = { version = "0.11.1", features = ["drives"], optional = true }
+opticaldiscs = { version = "0.12.0", features = ["drives"], optional = true }
 cd-da-reader = { git = "https://github.com/danifunker/rust-cd-da-reader", branch = "file-backend-on-1.0", optional = true }
 # In-app CD-DA playback (Optical tab). Pinned <0.20 for the
 # OutputStream::try_default / Sink::try_new API used in gui/optical_audio.rs.
@@ -187,7 +208,7 @@ clap_complete = "4"
 clap_mangen = "0.3"
 globset = "0.4"
 rustyline = { version = "18.0.0", features = ["with-file-history"] }
-crossterm = "0.28"
+crossterm = "0.29"
 shell-words = "1.1.1"
 lzma-rs = "0.3.0"
 lzfse_rust = "0.2.1"

@@ -23,7 +23,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use cd_da_reader::{lba_to_msf, AudioSectorReader, Toc, Track};
+use cd_da_reader::{lba_to_msf, open_track_stream_at, AudioSectorReader, Toc, Track};
 use libchdman_rs::cd::{extract_to_cue, list_tracks, TrackType};
 use libchdman_rs::Chd;
 use opticaldiscs::bincue::{self, BinTrack};
@@ -135,7 +135,8 @@ fn read_tracks_chd(path: &Path) -> Result<Vec<CdTrack>, String> {
 }
 
 /// Stream a CHD audio track's PCM. Extracts the whole disc to a temp BIN, then
-/// reads the track's sector range in one shot and emits it in ~1 s batches.
+/// streams the track's sector range in ~1 s (75-sector) chunks so playback can
+/// start immediately and never holds the whole track in memory.
 fn extract_audio_pcm_chd<F>(
     path: &Path,
     track_number: u32,
@@ -180,15 +181,20 @@ where
     if end_lba <= start_lba {
         return Err(format!("track {track_number}: bad TOC bounds"));
     }
-    let pcm = disc
-        .read_audio_sectors(start_lba, end_lba - start_lba)
-        .map_err(|e| format!("read track {track_number}: {e}"))?;
+    let sectors = end_lba - start_lba;
 
-    // Batch ~1 second of audio per callback: 1176 i16 per CD frame x 75 frames/s.
-    const BYTES_PER_BATCH: usize = 1176 * 75 * 2;
+    // Stream the gapless [start_lba, start_lba + sectors) we just computed.
+    // open_track_stream_at bypasses TOC bounds entirely, so the CD-Extra rule
+    // never runs — the reason we avoid read_track. 75 sectors = 1 s of CD audio,
+    // matching the previous ~1 s callback cadence.
+    let mut stream = open_track_stream_at(&disc, start_lba, sectors).with_sectors_per_chunk(75);
+
     let mut total = 0u64;
-    for chunk in pcm.chunks(BYTES_PER_BATCH) {
-        let samples = pcm_le_i16(chunk);
+    while let Some(chunk) = stream
+        .next_chunk()
+        .map_err(|e| format!("read track {track_number}: {e}"))?
+    {
+        let samples = pcm_le_i16(&chunk);
         total += samples.len() as u64;
         on_samples(&samples);
     }
@@ -311,7 +317,9 @@ fn read_tracks_bincue(path: &Path) -> Result<Vec<CdTrack>, String> {
 }
 
 /// Stream a BIN/CUE audio track's PCM straight from the `.bin`. Audio sectors are
-/// already little-endian 2352-B raw PCM, so no decode — just seek and read.
+/// already little-endian 2352-B raw PCM, so no decode — the track is exposed as an
+/// [`AudioSectorReader`] and pulled through the same [`AudioTrackStream`] that
+/// drives CHD playback.
 fn extract_audio_pcm_bincue<F>(
     path: &Path,
     track_number: u32,
@@ -331,27 +339,57 @@ where
     }
     let frames = bincue_frames(track)?;
 
-    let mut f = std::fs::File::open(&track.bin_path)
-        .map_err(|e| format!("open {}: {e}", track.bin_path.display()))?;
-    f.seek(SeekFrom::Start(track.file_byte_offset))
-        .map_err(|e| format!("seek {}: {e}", track.bin_path.display()))?;
+    // Expose the track's sectors to cd-da-reader as an AudioSectorReader (sector 0
+    // = the track's first sector) so BIN/CUE and CHD share the same streaming
+    // reader. The track's absolute LBA is irrelevant: the backing maps sector 0 to
+    // `file_byte_offset`, so open_track_stream_at(.., 0, frames) covers exactly
+    // this track — no TOC lookup and no CD-Extra rule, the same reason the CHD path
+    // uses it.
+    let reader = BinCueTrackReader {
+        bin_path: track.bin_path.clone(),
+        file_byte_offset: track.file_byte_offset,
+    };
+    let mut stream =
+        open_track_stream_at(&reader, 0, frames).with_sectors_per_chunk(SECTORS_PER_SECOND);
 
-    // Emit ~1 s (75 sectors) per callback so the player starts quickly and never
-    // holds the whole track in memory.
-    let mut buf = vec![0u8; SECTORS_PER_SECOND as usize * BYTES_PER_SECTOR];
-    let mut remaining = frames;
     let mut total = 0u64;
-    while remaining > 0 {
-        let n = remaining.min(SECTORS_PER_SECOND);
-        let bytes = n as usize * BYTES_PER_SECTOR;
-        f.read_exact(&mut buf[..bytes])
-            .map_err(|e| format!("read track {track_number}: {e}"))?;
-        let samples = pcm_le_i16(&buf[..bytes]);
+    while let Some(chunk) = stream
+        .next_chunk()
+        .map_err(|e| format!("read track {track_number}: {e}"))?
+    {
+        let samples = pcm_le_i16(&chunk);
         total += samples.len() as u64;
         on_samples(&samples);
-        remaining -= n;
     }
     Ok(total)
+}
+
+/// A single BIN/CUE audio track exposed to `cd-da-reader` via [`AudioSectorReader`]:
+/// sector 0 is the track's first sector, mapped to `file_byte_offset` in `bin_path`.
+///
+/// Like [`ChdDisc`], this re-opens the BIN per read so the reader stays `&self`;
+/// that's one file open per ~1 s chunk during playback — negligible for a local
+/// image, and it keeps both audio backings on the identical positioned-read shape.
+struct BinCueTrackReader {
+    /// The `.bin` this track's sectors live in (each cue track names its own file,
+    /// so multi-BIN layouts just point different tracks at different paths).
+    bin_path: PathBuf,
+    /// Byte offset of the track's first sector (sector 0) within `bin_path`.
+    file_byte_offset: u64,
+}
+
+impl AudioSectorReader for BinCueTrackReader {
+    type Error = std::io::Error;
+
+    fn read_audio_sectors(&self, start_lba: u32, count: u32) -> Result<Vec<u8>, Self::Error> {
+        let mut f = std::fs::File::open(&self.bin_path)?;
+        f.seek(SeekFrom::Start(
+            self.file_byte_offset + u64::from(start_lba) * BYTES_PER_SECTOR as u64,
+        ))?;
+        let mut buf = vec![0u8; count as usize * BYTES_PER_SECTOR];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
 }
 
 /// Frames (sectors) in a BIN/CUE track. opticaldiscs derives this from adjacent

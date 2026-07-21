@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli locate</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>locate</span></nav>
+<h1><code>rb-cli locate</code></h1>
+<p>Print the absolute byte offset and length of a file inside an image (HFS only today). Output is JSON so build scripts that patch disk offsets into boot blocks can parse it with `jq`</p>
+<h2>Usage</h2>
+<pre><code>Usage: locate [OPTIONS] &lt;IMAGE&gt; &lt;PATH&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N` for the 1-based partition index)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Path inside the filesystem. `/` is the separator; a literal `/` in a name is written `\/`. You may instead use `:` as the separator (the native classic-Mac convention), in which case `/` is plain data — e.g. `:System Folder:Oxyd b/w`</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--format</code></dt>
+<dd>Output format. `json` is the default because the load-bearing consumer is a build script</dd>
+<dt><code>-L / --literal</code></dt>
+<dd>Accepted for consistency with `ls`/`get`/`rm`; `locate` always treats the path as an exact literal path (it never globs), so glob metacharacters in a name are addressed verbatim with or without it</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

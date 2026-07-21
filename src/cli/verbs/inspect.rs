@@ -55,7 +55,17 @@ pub fn run(args: InspectArgs) -> Result<()> {
         pw_bytes,
         args.inside.as_deref(),
     )?;
-    let pt = PartitionTable::detect(&mut reader)?;
+    let pt = PartitionTable::detect(&mut reader).map_err(|e| {
+        // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT, so
+        // detection fails with a cryptic "invalid boot signature". Point the user
+        // at the `optical` verbs, or give NKit images the convert-it-first hint.
+        let base = anyhow::anyhow!("detecting partition table: {e}");
+        if crate::cli::optical_hint::is_nkit_image(&args.image) {
+            crate::cli::optical_hint::with_nkit_hint(base, &args.image)
+        } else {
+            crate::cli::optical_hint::with_optical_hint(base, &args.image)
+        }
+    })?;
     let partitions = pt.partitions();
     let ext = args
         .image

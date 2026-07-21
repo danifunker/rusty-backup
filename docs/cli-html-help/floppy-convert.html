@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli floppy convert</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="floppy.html">floppy</a> &raquo; <span>convert</span></nav>
+<h1><code>rb-cli floppy convert</code></h1>
+<p>Convert a floppy image between XDF / HDM / DIM / D88 formats. The output format is inferred from the destination extension</p>
+<h2>Usage</h2>
+<pre><code>Usage: convert [OPTIONS] &lt;INPUT&gt; &lt;OUTPUT&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;INPUT&gt;</code></dt>
+<dd>Source floppy image (.xdf, .hdm, .dim, .d88) — or a directory of floppy images when paired with `--to`</dd>
+<dt><code>&lt;OUTPUT&gt;</code></dt>
+<dd>Destination path. For a file input the target format is taken from the extension; for a directory input pass a directory here and use `--to &lt;fmt&gt;` to pick the output format</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--to</code></dt>
+<dd>Output format for directory (bulk) mode. Required when `input` is a directory; ignored for single-file mode (extension wins there)</dd>
+<dt><code>--recursive</code></dt>
+<dd>Walk the input directory recursively. Only meaningful in bulk mode</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

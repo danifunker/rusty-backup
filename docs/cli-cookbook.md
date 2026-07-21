@@ -127,10 +127,10 @@ rb-cli expand ~/Basilisk/old.hfv@1 --size 1G --to-hfv \
     --output ~/Basilisk/old-1gb.hfv
 ```
 
-To create a *blank* HFV from scratch, use `new --fs hfv`:
+To create a *blank* HFV from scratch, use `new volume hfv`:
 
 ```bash
-rb-cli new ~/Basilisk/scratch.hfv --fs hfv --size 100M --name "Mac HD"
+rb-cli new volume hfv ~/Basilisk/scratch.hfv --size 100M --name "Mac HD"
 ```
 
 A backup of an `.hfv` restores straight back to a byte-identical `.hfv`
@@ -177,7 +177,7 @@ hand-edit if needed, then `batch` to apply.
 
 ```bash
 # 1. Create the blank target volume (no GUI required).
-rb-cli new ~/Builds/boot.dsk --fs hfs --size 80M --name "Boot Disk"
+rb-cli new volume hfs ~/Builds/boot.dsk --size 80M --name "Boot Disk"
 
 # 2. Generate a script that mirrors a host folder into the target.
 rb-cli batch-template ~/Builds/contents \
@@ -271,7 +271,7 @@ check it into git.
 
 ```bash
 # Build the target image first, then apply.
-rb-cli new out/boot.dsk --fs hfs --size 4M --name "CI Build"
+rb-cli new volume hfs out/boot.dsk --size 4M --name "CI Build"
 rb-cli batch ci-populate.json --continue-on-error
 ```
 

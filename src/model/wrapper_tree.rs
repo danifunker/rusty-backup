@@ -311,9 +311,11 @@ fn sorted(mut entries: Vec<FileEntry>) -> Vec<FileEntry> {
     entries
 }
 
-/// Open a wrapper's bytes as a mount. Archives open directly; images open their
-/// first browsable volume (with a note when more than one exists — a richer
-/// per-volume tree is a follow-up).
+/// Open a wrapper's bytes as a mount. Archives open directly; a disk image or
+/// optical disc with a single volume opens straight into it, while one with
+/// several volumes (a multi-partition image, or a hybrid Mac/PC disc carrying
+/// ISO 9660 + HFS/HFS+) opens as a `MultiVolumeFilesystem` whose root lists each
+/// volume as a node to descend into.
 fn open_mount(
     source: WrapperSource,
     file_name: &str,
@@ -339,44 +341,33 @@ fn open_mount(
             ))
         }
         DescendKind::DiskImage => {
-            // Images open by path (the partition probe + readers seek a file).
+            // Images open by path (the partition probe + readers seek a file). A
+            // single browsable partition opens directly; several open as a
+            // MultiVolumeFilesystem whose root lists each partition as a node.
             let (temp, path) = source.into_path(file_name)?;
-            let parts = commander_descend::browsable_partitions(&path)?;
-            let (_, first) = parts
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("'{file_name}' has no browsable volumes"))?;
-            let fs = commander_descend::open_image_partition(&path, first)?;
-            let note = (parts.len() > 1).then(|| {
-                format!(
-                    "showing volume '{}' (1 of {})",
-                    first.type_name,
-                    parts.len()
-                )
-            });
-            let reopen = Some(commander_descend::ReopenRecipe::DiskImage { path });
+            let (fs, reopen) = commander_descend::open_diskimage_mount(path)?;
             Ok((
                 Mount {
                     fs,
                     _temp: temp,
-                    reopen,
+                    reopen: Some(reopen),
                 },
-                note,
+                None,
             ))
         }
         DescendKind::Optical => {
             // Optical formats open by path; bin/cue and mdf/mds need the sibling
-            // data file, which the `Path` source preserves.
+            // data file, which the `Path` source preserves. A single-filesystem
+            // disc opens directly; a hybrid Mac/PC disc opens as a
+            // MultiVolumeFilesystem whose root lists each filesystem as a node.
             let (temp, path) = source.into_path(file_name)?;
-            let fs = commander_descend::open_optical(&path, Some(file_name.to_string()))?;
-            let reopen = Some(commander_descend::ReopenRecipe::Optical {
-                path,
-                label: Some(file_name.to_string()),
-            });
+            let (fs, reopen) =
+                commander_descend::open_optical_mount(path, Some(file_name.to_string()))?;
             Ok((
                 Mount {
                     fs,
                     _temp: temp,
-                    reopen,
+                    reopen: Some(reopen),
                 },
                 None,
             ))
@@ -486,5 +477,44 @@ mod tests {
         // Archive mounts read from an in-memory buffer with no path, so there is
         // no reopen recipe — those copies stay on the synchronous path.
         assert!(tree.mount_reopen("/a.sit").is_none());
+    }
+
+    /// Expanding a multi-partition disk image in the inline tree shows one
+    /// root node per partition (not just the first volume), and expanding a
+    /// partition node reveals its files one level deeper. This is the whole
+    /// point of routing multi-volume images through `MultiVolumeFilesystem`.
+    #[test]
+    fn multi_partition_image_expands_to_partition_root_nodes() {
+        let (_guard, path) = crate::model::commander_descend::build_two_partition_fat_image();
+
+        let mut tree = WrapperTree::new();
+        tree.expand_wrapper(
+            "/twopart.img",
+            "twopart.img",
+            DescendKind::DiskImage,
+            WrapperSource::Path(path),
+        )
+        .unwrap();
+
+        let rows = tree.subtree_rows("/twopart.img", 1);
+        let nodes: Vec<_> = rows.iter().filter(|r| r.depth == 1).collect();
+        assert_eq!(nodes.len(), 2, "two partitions => two root nodes");
+        assert!(
+            nodes.iter().all(|r| r.entry.is_directory() && r.expandable),
+            "each partition node is an expandable directory"
+        );
+
+        // Expand the first partition node; its file appears at depth 2.
+        let first_id = nodes[0].node_id.clone();
+        tree.expand_folder(&first_id);
+        let rows = tree.subtree_rows("/twopart.img", 1);
+        assert!(
+            rows.iter()
+                .any(|r| r.depth == 2 && r.entry.name.eq_ignore_ascii_case("ONE.TXT")),
+            "expanded partition should reveal its file: {:?}",
+            rows.iter()
+                .map(|r| (r.entry.name.clone(), r.depth))
+                .collect::<Vec<_>>()
+        );
     }
 }

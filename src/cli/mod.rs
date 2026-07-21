@@ -54,34 +54,19 @@ pub struct Cli {
     pub globals: logging::GlobalFlags,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a blank single-partition image (superfloppy or, in Phase
-    /// D, partition-table-wrapped).
-    New(verbs::new::NewArgs),
-
-    /// Build a self-bootable Sharp X68000 HDD image (SASI / SCSI) with
-    /// an X68K partition table + IPL stub + Human68k partition,
-    /// optionally pre-populated by cloning a Human68k donor floppy.
-    #[command(name = "new-x68k-hdd")]
-    NewX68kHdd(verbs::new_x68k_hdd::NewX68kHddArgs),
-
-    /// Build a dvh-wrapped IRIX hard-disk image: an SGI volume header +
-    /// partition table wrapping a formatted EFS root partition, mountable
-    /// by IRIX 5.3-6.5 (vs `new --fs efs`, which makes a bare EFS CD-ROM
-    /// superfloppy). Populate it with `put IMG@1 host/file /file`.
-    #[command(name = "new-sgi-hdd")]
-    NewSgiHdd(verbs::new_sgi_hdd::NewSgiHddArgs),
-
-    /// Build an IRIX EFS CD-ROM image (`.iso`): an SGI volume header with the
-    /// EFS filesystem in slot 7 (typed SYSV, the IRIX EFS-CD convention) and CD
-    /// geometry. Mounts on IRIX with `mount -t efs <dev>s7`. Populate it with
-    /// `put IMG@1 host/file /file`.
-    #[command(name = "new-sgi-cdrom")]
-    NewSgiCdrom(verbs::new_sgi_cdrom::NewSgiCdromArgs),
+    /// Create a blank image, grouped by media class: `new floppy <fs>`,
+    /// `new volume <fs>` (bare superfloppy), or `new hd {x68k|sgi-efs}`
+    /// (partition-table-wrapped, bootable). CD-ROM images are under
+    /// `optical new`; multi-partition images go through `batch`.
+    New {
+        #[command(subcommand)]
+        cmd: verbs::new::NewCommand,
+    },
 
     /// Install an Apple SCSI driver + Driver Descriptor Record into an APM
     /// disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI.
@@ -210,9 +195,11 @@ pub enum Command {
     /// summary + CHD metadata when applicable).
     Inspect(verbs::inspect::InspectArgs),
 
-    /// Run the network daemon so a remote `rb-cli` can browse and read
-    /// files inside images this host holds (`rb://host:port/img@N`).
-    /// Family F read-only (Phase 0). See docs/remote_transfer_plan.md.
+    /// Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander)
+    /// can browse, read, and write files inside images this host holds
+    /// (`rb://host:port/img@N`) and on its host filesystem. Writable under the
+    /// serve root by default; pass `--read-only` for a browse-only daemon. See
+    /// docs/remote_transfer_plan.md.
     #[cfg(feature = "remote")]
     Serve(verbs::serve::ServeArgs),
 
@@ -287,6 +274,18 @@ pub enum Command {
     /// Open an interactive rb-cli shell (rustyline-based REPL).
     Terminal,
 
+    /// Check for a newer release and (when built with `--features tui-update`)
+    /// self-update. Without that feature it reports that updates weren't compiled
+    /// in and prints the releases URL, exiting non-zero. Pass `--apply` to
+    /// download and replace this binary in place.
+    Update(verbs::update::UpdateArgs),
+
+    /// Launch the full-screen terminal UI (preview): a menu-driven ratatui
+    /// app that runs anywhere rusty-backup does, including serial consoles and
+    /// vintage terminals. Needs an interactive terminal.
+    #[cfg(feature = "tui")]
+    Tui,
+
     /// Emit a shell-completion script to stdout.
     #[command(name = "completions")]
     Completions(verbs::completions::EmitArgs),
@@ -311,7 +310,98 @@ pub enum Command {
 /// [`crate::cli::exit`].
 pub fn run(cli: Cli) -> Result<()> {
     logging::install(&cli.globals)?;
-    dispatch(cli.command)
+    match cli.command {
+        Some(command) => dispatch(command),
+        None => no_command(),
+    }
+}
+
+/// Handle `rb-cli` with no subcommand. On an interactive terminal this offers to
+/// launch the TUI (respecting the `[tui] launch` config preference); otherwise —
+/// or when the `tui` feature isn't built — it prints the help text, so a bare
+/// `rb-cli` in a script or pipe still behaves like `--help`.
+fn no_command() -> Result<()> {
+    #[cfg(feature = "tui")]
+    {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return match tui_launch_pref() {
+                TuiLaunch::Never => print_help(),
+                TuiLaunch::Always => verbs::tui_app::run(),
+                TuiLaunch::Ask => prompt_and_launch_tui(),
+            };
+        }
+    }
+    print_help()
+}
+
+/// Print the top-level `--help` text (used when there's no subcommand and no
+/// interactive launch).
+fn print_help() -> Result<()> {
+    use clap::CommandFactory;
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
+}
+
+/// The `[tui] launch` preference: `ask` (default), `always`, or `never`.
+#[cfg(feature = "tui")]
+enum TuiLaunch {
+    Ask,
+    Always,
+    Never,
+}
+
+#[cfg(feature = "tui")]
+fn tui_launch_pref() -> TuiLaunch {
+    let val = config::default_path().and_then(|p| {
+        config::Config::load(&p)
+            .ok()
+            .and_then(|c| c.get("tui", "launch").map(|s| s.to_ascii_lowercase()))
+    });
+    match val.as_deref() {
+        Some("never") | Some("off") | Some("false") => TuiLaunch::Never,
+        Some("always") | Some("on") | Some("true") => TuiLaunch::Always,
+        _ => TuiLaunch::Ask,
+    }
+}
+
+/// Ask whether to launch the TUI. Enter / `y` launches it; `n` prints help;
+/// `never` persists `[tui] launch = never` and prints help (so a bare `rb-cli`
+/// will show help from then on).
+#[cfg(feature = "tui")]
+fn prompt_and_launch_tui() -> Result<()> {
+    use std::io::Write;
+
+    eprintln!(
+        "rusty-backup {} — interactive terminal UI",
+        env!("APP_VERSION")
+    );
+    eprint!("Launch the TUI now? [Y/n]  (type 'never' to stop asking): ");
+    std::io::stderr().flush().ok();
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        // EOF (e.g. stdin closed): fall back to help.
+        return print_help();
+    }
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => verbs::tui_app::run(),
+        "never" => {
+            if let Some(path) = config::default_path() {
+                match config::append_setting(&path, "tui", "launch", "never") {
+                    Ok(()) => eprintln!(
+                        "Saved: bare `rb-cli` will show help. Run `rb-cli tui` to open the UI, \
+                         or set `[tui] launch = ask` in {} to be asked again.",
+                        path.display()
+                    ),
+                    Err(e) => eprintln!("warning: could not save preference: {e:#}"),
+                }
+            }
+            print_help()
+        }
+        _ => print_help(),
+    }
 }
 
 /// Dispatch one parsed `Command` to its verb. Separated from `run` so the
@@ -319,10 +409,7 @@ pub fn run(cli: Cli) -> Result<()> {
 /// re-installing logging.
 pub fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::New(args) => verbs::new::run(args),
-        Command::NewX68kHdd(args) => verbs::new_x68k_hdd::run(args),
-        Command::NewSgiHdd(args) => verbs::new_sgi_hdd::run(args),
-        Command::NewSgiCdrom(args) => verbs::new_sgi_cdrom::run(args),
+        Command::New { cmd } => verbs::new::run(cmd),
         Command::MacScsiBless(args) => verbs::mac_scsi_bless::run(args),
         Command::MakeBootable(args) => verbs::make_bootable::run(args),
         Command::Ls(args) => verbs::ls::run(args),
@@ -368,6 +455,9 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Partmap { cmd } => verbs::partmap::run(cmd),
         Command::Archive { cmd } => verbs::archive::run(cmd),
         Command::Terminal => verbs::terminal::run(),
+        Command::Update(args) => verbs::update::run(args),
+        #[cfg(feature = "tui")]
+        Command::Tui => verbs::tui_app::run(),
         Command::Completions(args) => verbs::completions::run_emit(args),
         Command::InstallCompletions(args) => verbs::completions::run_install(args),
         Command::Api { group } => api::run(group),

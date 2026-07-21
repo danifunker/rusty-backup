@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli mac-scsi-bless</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>mac-scsi-bless</span></nav>
+<h1><code>rb-cli mac-scsi-bless</code></h1>
+<p>Install an Apple SCSI driver + Driver Descriptor Record into an APM disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI. Operates in place; partition data is never moved. (This registers the driver so the ROM can read the disk — it does not change HFS boot-block behavior.)</p>
+<h2>Usage</h2>
+<pre><code>Usage: mac-scsi-bless [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>APM disk image to make SCSI-bootable, in place</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--driver-from</code></dt>
+<dd>Extract the driver from a donor Apple-formatted disk's `Apple_Driver*` partition (most faithful — carries that disk's exact boot metadata)</dd>
+<dt><code>--driver</code></dt>
+<dd>Use a raw driver image file (advanced; `pmBootCksum` is unknown for an arbitrary driver, so it is written as 0 — see `--force-cksum-zero`)</dd>
+<dt><code>--builtin-driver</code></dt>
+<dd>Use the bundled known-good Apple SCSI driver (this is the default when no driver source is given)</dd>
+<dt><code>--force-cksum-zero</code></dt>
+<dd>Force `pmBootCksum = 0`. Some ROMs skip checksum verification then</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

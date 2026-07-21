@@ -52,7 +52,9 @@ fn literal_addresses_paths_with_glob_metacharacters() {
     let parent = "/Stuff ][ 1";
     let names = ["file[a].txt", "cur{b}.txt", "star*.txt", "quest?.txt"];
 
-    run(&["new", "--fs", "hfs", img_s, "--size", "4M", "--name", "Lit"]);
+    run(&[
+        "new", "volume", "hfs", img_s, "--size", "4M", "--name", "Lit",
+    ]);
 
     // mkdir / put are always-literal, so they create the metachar names
     // verbatim (and accept --literal for scripting symmetry).
@@ -143,7 +145,9 @@ fn literal_conflicts_with_exclude() {
     let dir = tempfile::tempdir().expect("tempdir");
     let img = dir.path().join("disk.dsk");
     let img_s = img.to_str().unwrap();
-    run(&["new", "--fs", "hfs", img_s, "--size", "4M", "--name", "Lit"]);
+    run(&[
+        "new", "volume", "hfs", img_s, "--size", "4M", "--name", "Lit",
+    ]);
 
     // --literal addresses one exact path; --exclude only makes sense for a
     // glob walk, so the two are mutually exclusive.

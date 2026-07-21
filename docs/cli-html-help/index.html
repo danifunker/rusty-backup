@@ -26,34 +26,54 @@
 <h2>Verbs</h2>
 <ul class="verbs">
 <li><a href="api.html"><code>api</code></a><span class="desc">Unstable scratch namespace for low-level operations. Kept as a deprecated alias for the flat verbs above; grammar inside `api` is expected to churn — do not depend on it from durable scripts</span></li>
+<li><a href="archive.html"><code>archive</code></a><span class="desc">Read/write classic Mac archives (list / extract / create; accepts .sit, .sea, .cpt, .mar, and their BinHex-wrapped .hqx forms)</span></li>
 <li><a href="backup.html"><code>backup</code></a><span class="desc">Back up a disk image or device to a backup folder</span></li>
 <li><a href="batch.html"><code>batch</code></a><span class="desc">Apply a JSON-described sequence of FS operations to an image as one transaction-like batch</span></li>
 <li><a href="batch-template.html"><code>batch-template</code></a><span class="desc">Generate a starter `batch` JSON script from a host directory</span></li>
-<li><a href="bless.html"><code>bless</code></a><span class="desc">Mark an HFS / HFS+ folder as the bootable System Folder</span></li>
+<li><a href="bless.html"><code>bless</code></a><span class="desc">Inspect or set the bootable System Folder on an HFS / HFS+ volume (`set` / `show` / `pick`)</span></li>
+<li><a href="cbk.html"><code>cbk</code></a><span class="desc">Pack a backup folder into a single `.cbk` container, or unpack one (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly</span></li>
 <li><a href="chmeta.html"><code>chmeta</code></a><span class="desc">Change the type and/or creator code on an existing HFS / HFS+ / ProDOS file</span></li>
 <li><a href="completions.html"><code>completions</code></a><span class="desc">Emit a shell-completion script to stdout</span></li>
 <li><a href="config.html"><code>config</code></a><span class="desc">Manage the rbcli.conf config file</span></li>
 <li><a href="convert.html"><code>convert</code></a><span class="desc">Re-encode one or more disk images into a chosen output format</span></li>
-<li><a href="expand.html"><code>expand</code></a><span class="desc">Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (<code>--to-hfv</code>). Accepts APM-wrapped sources or raw single-partition HFS images.</span></li>
+<li><a href="cp.html"><code>cp</code></a><span class="desc">Copy files / directory trees between two disk images without staging through the host. SRC may be a glob; DST follows `cp` semantics (into an existing directory, or rename to a target)</span></li>
+<li><a href="du.html"><code>du</code></a><span class="desc">Recursive both-fork (data + resource) disk usage of paths inside a filesystem. Unlike `ls`, which reports data-fork sizes only, `du` counts the resource fork too — essential for classic-Mac apps whose code lives in a resource fork over a 0-byte data fork</span></li>
+<li><a href="expand.html"><code>expand</code></a><span class="desc">Expand a classic-HFS volume to a new size + allocation block size by cloning into a fresh APM disk image (default) or a bare HFS image (`--to-hfv`). Accepts APM-wrapped sources or raw single- partition HFS images</span></li>
+<li><a href="floppy.html"><code>floppy</code></a><span class="desc">Floppy-container verbs (convert / info) for XDF, HDM, DIM, D88</span></li>
 <li><a href="fsck.html"><code>fsck</code></a><span class="desc">Check (and optionally repair) a filesystem</span></li>
-<li><a href="get.html"><code>get</code></a><span class="desc">Extract a file from a filesystem to the host</span></li>
+<li><a href="get.html"><code>get</code></a><span class="desc">Extract a file, directory tree, or glob match from a filesystem to the host</span></li>
+<li><a href="get-binhex.html"><code>get-binhex</code></a><span class="desc">Extract a file and encode it as BinHex 4.0 (.hqx), preserving both forks and the type/creator codes</span></li>
 <li><a href="grow.html"><code>grow</code></a><span class="desc">Grow a disk image by `--add SIZE` of trailing zero-padding so a subsequent `partmap` edit can place a new partition</span></li>
 <li><a href="inspect.html"><code>inspect</code></a><span class="desc">Whole-disk aggregate read-only view (partition table + per-partition summary + CHD metadata when applicable)</span></li>
 <li><a href="install-completions.html"><code>install-completions</code></a><span class="desc">Install shell completions to the user-scoped canonical location</span></li>
+<li><a href="locate.html"><code>locate</code></a><span class="desc">Print the absolute byte offset and length of a file inside an image (HFS only today). Output is JSON so build scripts that patch disk offsets into boot blocks can parse it with `jq`</span></li>
 <li><a href="ls.html"><code>ls</code></a><span class="desc">List a directory inside a filesystem</span></li>
+<li><a href="mac-scsi-bless.html"><code>mac-scsi-bless</code></a><span class="desc">Install an Apple SCSI driver + Driver Descriptor Record into an APM disk so a classic-Mac ROM (e.g. Quadra 800) registers it over SCSI. Operates in place; partition data is never moved. (This registers the driver so the ROM can read the disk — it does not change HFS boot-block behavior.)</span></li>
+<li><a href="make-bootable.html"><code>make-bootable</code></a><span class="desc">Auto-detect what a Mac disk needs to boot and apply only the missing pieces: SCSI driver + DDR (full APM disks), boot blocks (copied from a `--boot-from` donor), and a blessed System Folder. Idempotent; a flat HFV is kept flat. Works on flat HFVs and full APM disks alike</span></li>
+<li><a href="menu.html"><code>menu</code></a><span class="desc">Interactive backup/restore menu (the appliance UI): pick a disk, then Inspect / Backup / Restore. Needs an interactive terminal</span></li>
 <li><a href="mkdir.html"><code>mkdir</code></a><span class="desc">Create a directory inside a filesystem</span></li>
-<li><a href="new.html"><code>new</code></a><span class="desc">Create a blank single-partition image (superfloppy or, in Phase D, partition-table-wrapped)</span></li>
-<li><a href="optical.html"><code>optical</code></a><span class="desc">Optical-media verbs (rip / convert / browse / extract)</span></li>
+<li><a href="new.html"><code>new</code></a><span class="desc">Create a blank image, grouped by media class: `new floppy &lt;fs&gt;`, `new volume &lt;fs&gt;` (bare superfloppy), or `new hd {x68k|sgi-efs}` (partition-table-wrapped, bootable). CD-ROM images are under `optical new`; multi-partition images go through `batch`</span></li>
+<li><a href="optical.html"><code>optical</code></a><span class="desc">Optical-media verbs (drives / rip / convert / browse / extract)</span></li>
 <li><a href="partmap.html"><code>partmap</code></a><span class="desc">Edit the partition table (add / resize / delete / set-type / set-bootable). Partition *data* is never moved</span></li>
 <li><a href="put.html"><code>put</code></a><span class="desc">Copy a host file (or zero-fill / write boot blocks) into a filesystem</span></li>
+<li><a href="put-binhex.html"><code>put-binhex</code></a><span class="desc">Decode a BinHex 4.0 (.hqx) file and write it (both forks + Finder info) into a filesystem</span></li>
+<li><a href="put-macbinary.html"><code>put-macbinary</code></a><span class="desc">Put a MacBinary I / II archive: both forks + full Finder info in one shot (HFS; on MFS both forks + type/creator, extended Finder flags/dates skipped)</span></li>
+<li><a href="reformat.html"><code>reformat</code></a><span class="desc">Reformat a partition in place, leaving the partition table intact (HFS only today)</span></li>
+<li><a href="repack.html"><code>repack</code></a><span class="desc">Defragment a Human68k (X68000) partition in place: clone it into a fresh, contiguously-packed volume and write that back. Reclaims holes the in-place resizer can't (it keeps cluster byte-offsets)</span></li>
 <li><a href="resize.html"><code>resize</code></a><span class="desc">Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</span></li>
 <li><a href="restore.html"><code>restore</code></a><span class="desc">Restore a backup folder to a target image or device</span></li>
 <li><a href="rm.html"><code>rm</code></a><span class="desc">Delete a file or directory from a filesystem</span></li>
-<li><a href="setrsrc.html"><code>setrsrc</code></a><span class="desc">Write the resource fork of an existing HFS / HFS+ file from a host file</span></li>
+<li><a href="serve.html"><code>serve</code></a><span class="desc">Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander) can browse, read, and write files inside images this host holds (`rb://host:port/img@N`) and on its host filesystem. Writable under the serve root by default; pass `--read-only` for a browse-only daemon. See docs/remote_transfer_plan.md</span></li>
+<li><a href="setrsrc.html"><code>setrsrc</code></a><span class="desc">Write the resource fork of an existing HFS / HFS+ / MFS file from a host file</span></li>
+<li><a href="setvolname.html"><code>setvolname</code></a><span class="desc">Rename the volume at IMG[@N] (HFS only today)</span></li>
 <li><a href="show.html"><code>show</code></a><span class="desc">Focused read-only queries</span></li>
 <li><a href="shrink.html"><code>shrink</code></a><span class="desc">Re-encode a disk image into a CHD with trailing zero padding dropped (SGI/IRIX today)</span></li>
+<li><a href="tar.html"><code>tar</code></a><span class="desc">Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case</span></li>
 <li><a href="terminal.html"><code>terminal</code></a><span class="desc">Open an interactive rb-cli shell (rustyline-based REPL)</span></li>
+<li><a href="tui.html"><code>tui</code></a><span class="desc">Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal</span></li>
+<li><a href="untar.html"><code>untar</code></a><span class="desc">Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them</span></li>
+<li><a href="update.html"><code>update</code></a><span class="desc">Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero. Pass `--apply` to download and replace this binary in place</span></li>
 <li><a href="write.html"><code>write</code></a><span class="desc">Stream an image file onto a block device</span></li>
 </ul>
-<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_html_help</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

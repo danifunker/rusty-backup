@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli archive create</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="archive.html">archive</a> &raquo; <span>create</span></nav>
+<h1><code>rb-cli archive create</code></h1>
+<p>Create a StuffIt or MAR archive from host files (.hqx / .bin / plain)</p>
+<h2>Usage</h2>
+<pre><code>Usage: create [OPTIONS] &lt;OUTPUT&gt; &lt;INPUTS&gt;...</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;OUTPUT&gt;</code></dt>
+<dd>Output path. `.sit` writes a raw StuffIt archive; `.hqx` BinHex-wraps it (the classic `.sit.hqx` format); `.mar` writes a stored MAR archive (a single file, or several wrapped in a folder named after the output)</dd>
+<dt><code>&lt;INPUTS&gt;</code></dt>
+<dd>Input files. Each may be a BinHex `.hqx`, a MacBinary `.bin`, or a plain file (with an optional `._name` / `.rsrc` sidecar)</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--rle</code></dt>
+<dd>Compress forks with RLE90 (method 1) instead of storing uncompressed</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

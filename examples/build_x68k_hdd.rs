@@ -17,7 +17,7 @@
 //! Most callers should use the shipping CLI verb at parity instead:
 //!
 //! ```text
-//! rb-cli new-x68k-hdd out.hdf --size 16M [--scsi] [--system-disk PATH.DIM]
+//! rb-cli new hd x68k out.hdf --size 16M [--scsi] [--system-disk PATH.DIM]
 //! ```
 //!
 //! This example exists for ad-hoc Phase A-D verification (it wires the

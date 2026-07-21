@@ -1,10 +1,22 @@
-//! `rb-cli new IMG --fs {hfs|fat|efs|affs}` — create a blank
-//! single-partition image (superfloppy). Phase D will add `--pt
-//! apm|mbr|gpt` for partition-table-wrapped single-partition images;
-//! multi-partition images go through the `batch` verb.
+//! `rb-cli new` — create blank images, grouped by media class:
+//!
+//! * `new floppy <fs> IMG`  — a bare single-volume image at floppy geometry
+//!   (the fixed-geometry retro filesystems plus small FAT/HFS).
+//! * `new volume <fs> IMG`  — a bare single-volume image of arbitrary size
+//!   (a "superfloppy": NTFS, ext4, HFS+, EFS, …). No partition table.
+//! * `new hd {x68k|sgi-efs} IMG` — a partition-table-wrapped, bootable
+//!   hard-disk image.
+//!
+//! CD-ROM images live under `optical new` (e.g. `optical new sgi-efs`).
+//! Multi-partition images go through the `batch` verb.
+//!
+//! Each class exposes only the filesystems and flags valid for it, so
+//! `new floppy --help` no longer lists NTFS/ext4 and `--cpm-preset` only
+//! appears where CP/M can be formatted. All three ultimately funnel through
+//! the shared [`FsKind`] dispatch in [`format_image`].
 
 use anyhow::{Context, Result};
-use clap::{Args, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::cli::logging::log_stderr;
@@ -112,6 +124,308 @@ pub enum FsKind {
     Adfs,
 }
 
+/// The three media classes `new` creates. CD-ROM images are not here —
+/// they live under `optical new`.
+#[derive(Debug, Subcommand)]
+pub enum NewCommand {
+    /// Blank floppy-geometry single volume (bare, no partition table):
+    /// FAT / HFS and the fixed-geometry retro filesystems.
+    Floppy(FloppyArgs),
+
+    /// Blank bare single volume of arbitrary size (a "superfloppy"): the
+    /// larger filesystems (NTFS, ext, HFS+, EFS, AFFS, …). No partition table.
+    Volume(VolumeArgs),
+
+    /// Partition-table-wrapped, self-bootable hard-disk image.
+    Hd {
+        #[command(subcommand)]
+        cmd: HdCommand,
+    },
+}
+
+/// Bootable hard-disk targets — each wraps a platform partition table around
+/// a formatted root, so the "filesystem" here is really the platform. Reuses
+/// the standalone builders (formerly `new-x68k-hdd` / `new-sgi-hdd`).
+#[derive(Debug, Subcommand)]
+pub enum HdCommand {
+    /// Sharp X68000 HDD (SASI / SCSI): X68K partition table + IPL stub + a
+    /// blank or donor-cloned Human68k partition.
+    X68k(super::new_x68k_hdd::NewX68kHddArgs),
+
+    /// dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a
+    /// formatted EFS root partition, mountable by IRIX 5.3-6.5.
+    #[command(name = "sgi-efs")]
+    SgiEfs(super::new_sgi_hdd::NewSgiHddArgs),
+}
+
+/// Filesystems offered under `new floppy`. Converts to the master [`FsKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FloppyFs {
+    /// FAT12 / FAT16 (auto by cluster count at floppy sizes).
+    Fat,
+    /// Classic HFS (Mac OS Standard) — a 400/800 KB Mac floppy.
+    Hfs,
+    /// Atari DOS 2.0S (Atari 8-bit) — 90 KB single-density.
+    Atari,
+    /// Apple DOS 3.3 (Apple II) — 140 KB 5.25".
+    #[value(alias = "appledos", alias = "dos33")]
+    AppleDos,
+    /// CP/M (Amstrad / PCW, Einstein, SV-328, Altair, MultiComp, ZX +3) —
+    /// geometry from `--cpm-preset`.
+    Cpm,
+    /// OS-9 / NitrOS-9 RBF (Tandy CoCo, Dragon) — 35-track floppy.
+    #[value(alias = "nitros9", alias = "rbf")]
+    Os9,
+    /// UCSD p-System (UCSD Pascal) — defaults to a 140 KB Apple II floppy.
+    #[value(alias = "pascal", alias = "psystem")]
+    Ucsd,
+    /// TR-DOS (ZX Spectrum Beta Disk) — 160/320/640 KB.
+    #[value(alias = "beta", alias = "betadisk", alias = "zx")]
+    Trdos,
+    /// TI-99/4A disk (flat V9T9 `.dsk`) — 90/180/360 KB.
+    #[value(alias = "ti99_4a", alias = "ti994a")]
+    Ti99,
+    /// MFS (Macintosh File System) — 400/800 KB pre-HFS floppy.
+    #[value(alias = "macintosh")]
+    Mfs,
+    /// Acorn ADFS E-format (Archimedes / RISC OS) — 800 KB.
+    #[value(alias = "acorn")]
+    Adfs,
+    /// Minix V1 — classic 30-char-name filesystem, `mkfs.minix -1` geometry.
+    #[value(alias = "minix1")]
+    Minix,
+}
+
+impl FloppyFs {
+    fn to_fs_kind(self) -> FsKind {
+        match self {
+            FloppyFs::Fat => FsKind::Fat,
+            FloppyFs::Hfs => FsKind::Hfs,
+            FloppyFs::Atari => FsKind::Atari,
+            FloppyFs::AppleDos => FsKind::AppleDos,
+            FloppyFs::Cpm => FsKind::Cpm,
+            FloppyFs::Os9 => FsKind::Os9,
+            FloppyFs::Ucsd => FsKind::Ucsd,
+            FloppyFs::Trdos => FsKind::Trdos,
+            FloppyFs::Ti99 => FsKind::Ti99,
+            FloppyFs::Mfs => FsKind::Mfs,
+            FloppyFs::Adfs => FsKind::Adfs,
+            FloppyFs::Minix => FsKind::Minix,
+        }
+    }
+}
+
+/// Filesystems offered under `new volume`. Converts to the master [`FsKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VolumeFs {
+    /// Classic HFS (Mac OS Standard).
+    Hfs,
+    /// HFS+ / HFSX (Mac OS Extended). Use --case-sensitive for HFSX.
+    Hfsplus,
+    /// BasiliskII HFV — a flat classic-HFS volume, capped at 2047 MB.
+    Hfv,
+    /// FAT12 / FAT16 / FAT32, auto-selected by size.
+    Fat,
+    /// NTFS (Windows NT / 2000 / XP). Tune with --cluster-size / --sector-size.
+    Ntfs,
+    /// ext2 (Linux) — plain rev-1, no journal or checksums.
+    #[value(alias = "ext2")]
+    Ext,
+    /// ext3 (Linux) — ext2 plus an empty jbd2 journal.
+    Ext3,
+    /// ext4 (Linux) — extents + metadata_csum (crc32c) + a jbd2 journal.
+    Ext4,
+    /// Amiga FFS / OFS (variant via --affs-variant).
+    Affs,
+    /// ProDOS (Apple II / IIgs) — up to ~32 MiB.
+    Prodos,
+    /// IRIX EFS (single cylinder group) — a bare EFS superfloppy.
+    Efs,
+    /// Minix V2 — 32-bit zone pointers, `mkfs.minix -2`.
+    Minix2,
+    /// Minix V3 — 60-char names, `mkfs.minix -3`.
+    Minix3,
+}
+
+impl VolumeFs {
+    fn to_fs_kind(self) -> FsKind {
+        match self {
+            VolumeFs::Hfs => FsKind::Hfs,
+            VolumeFs::Hfsplus => FsKind::Hfsplus,
+            VolumeFs::Hfv => FsKind::Hfv,
+            VolumeFs::Fat => FsKind::Fat,
+            VolumeFs::Ntfs => FsKind::Ntfs,
+            VolumeFs::Ext => FsKind::Ext,
+            VolumeFs::Ext3 => FsKind::Ext3,
+            VolumeFs::Ext4 => FsKind::Ext4,
+            VolumeFs::Affs => FsKind::Affs,
+            VolumeFs::Prodos => FsKind::Prodos,
+            VolumeFs::Efs => FsKind::Efs,
+            VolumeFs::Minix2 => FsKind::Minix2,
+            VolumeFs::Minix3 => FsKind::Minix3,
+        }
+    }
+}
+
+/// `new floppy <fs> IMG` — a bare floppy-geometry volume.
+#[derive(Debug, Args)]
+pub struct FloppyArgs {
+    /// Filesystem to format (see the per-value help above).
+    #[arg(value_enum)]
+    pub fs: FloppyFs,
+
+    /// Image file to create. Overwritten if it already exists.
+    pub image: PathBuf,
+
+    /// Volume size (bytes or `K`/`M`/`G` suffixes). Ignored by the
+    /// fixed-geometry filesystems. Defaults to 800K.
+    #[arg(long, default_value = "800K")]
+    pub size: String,
+
+    /// Volume label/name. Defaults to `rusty-backup`.
+    #[arg(long, default_value = "rusty-backup")]
+    pub name: String,
+
+    /// HFS allocation block size in bytes (multiple of 512). Auto when unset.
+    #[arg(long = "block-size")]
+    pub block_size: Option<u32>,
+
+    /// HFS Catalog B-tree initial size in bytes. Auto when unset.
+    #[arg(long = "catalog-size")]
+    pub catalog_size: Option<String>,
+
+    /// HFS Extents-overflow B-tree initial size in bytes. Auto when unset.
+    #[arg(long = "extents-size")]
+    pub extents_size: Option<String>,
+
+    /// CP/M disk-parameter-block preset (required with `cpm`). One of:
+    /// amstrad_data, amstrad_sys, amstrad_pcw, einstein, svi328_cpm,
+    /// altair_8in, altair_cf, multicomp, zxplus3.
+    #[arg(long = "cpm-preset")]
+    pub cpm_preset: Option<String>,
+}
+
+impl FloppyArgs {
+    fn into_new_args(self) -> NewArgs {
+        NewArgs {
+            image: self.image,
+            fs: self.fs.to_fs_kind(),
+            size: self.size,
+            name: self.name,
+            block_size: self.block_size,
+            catalog_size: self.catalog_size,
+            extents_size: self.extents_size,
+            case_sensitive: false,
+            min_catalog: None,
+            affs_variant: 1,
+            cpm_preset: self.cpm_preset,
+            inodes: None,
+            bytes_per_inode: None,
+            cluster_size: None,
+            sector_size: None,
+        }
+    }
+}
+
+/// `new volume <fs> IMG` — a bare single volume of arbitrary size.
+#[derive(Debug, Args)]
+pub struct VolumeArgs {
+    /// Filesystem to format (see the per-value help above).
+    #[arg(value_enum)]
+    pub fs: VolumeFs,
+
+    /// Image file to create. Overwritten if it already exists.
+    pub image: PathBuf,
+
+    /// Volume size (bytes or `K`/`M`/`G` suffixes). Defaults to 800K.
+    #[arg(long, default_value = "800K")]
+    pub size: String,
+
+    /// Volume label/name. Defaults to `rusty-backup`.
+    #[arg(long, default_value = "rusty-backup")]
+    pub name: String,
+
+    /// HFS/HFS+ allocation block size in bytes (multiple of 512). Auto when unset.
+    #[arg(long = "block-size")]
+    pub block_size: Option<u32>,
+
+    /// HFS Catalog B-tree initial size in bytes. Auto when unset.
+    #[arg(long = "catalog-size")]
+    pub catalog_size: Option<String>,
+
+    /// HFS Extents-overflow B-tree initial size in bytes. Auto when unset.
+    #[arg(long = "extents-size")]
+    pub extents_size: Option<String>,
+
+    /// HFS+ only: format a case-sensitive (HFSX) volume.
+    #[arg(long = "case-sensitive")]
+    pub case_sensitive: bool,
+
+    /// HFS+ only: minimum catalog B-tree size in bytes (a floor).
+    #[arg(long = "min-catalog")]
+    pub min_catalog: Option<String>,
+
+    /// AFFS variant byte (0=OFS, 1=FFS, 2=OFS+intl, 3=FFS+intl,
+    /// 4=OFS+dircache, 5=FFS+dircache). Defaults to 1 (FFS).
+    #[arg(long = "affs-variant", default_value = "1")]
+    pub affs_variant: u8,
+
+    /// EFS only: approximate total inode count. Mutually exclusive with
+    /// `--bytes-per-inode`.
+    #[arg(long, conflicts_with = "bytes_per_inode")]
+    pub inodes: Option<u64>,
+
+    /// EFS only: inode density in bytes per inode (smaller = more inodes).
+    #[arg(long)]
+    pub bytes_per_inode: Option<u64>,
+
+    /// NTFS only: cluster (allocation unit) size, e.g. `4K`, `64K`. Auto when unset.
+    #[arg(long = "cluster-size")]
+    pub cluster_size: Option<String>,
+
+    /// NTFS only: bytes per sector — 512, 1024, 2048 or 4096. Defaults to 512.
+    #[arg(long = "sector-size")]
+    pub sector_size: Option<u32>,
+}
+
+impl VolumeArgs {
+    fn into_new_args(self) -> NewArgs {
+        NewArgs {
+            image: self.image,
+            fs: self.fs.to_fs_kind(),
+            size: self.size,
+            name: self.name,
+            block_size: self.block_size,
+            catalog_size: self.catalog_size,
+            extents_size: self.extents_size,
+            case_sensitive: self.case_sensitive,
+            min_catalog: self.min_catalog,
+            affs_variant: self.affs_variant,
+            cpm_preset: None,
+            inodes: self.inodes,
+            bytes_per_inode: self.bytes_per_inode,
+            cluster_size: self.cluster_size,
+            sector_size: self.sector_size,
+        }
+    }
+}
+
+/// Dispatch a parsed `new` subcommand to its formatter.
+pub fn run(cmd: NewCommand) -> Result<()> {
+    match cmd {
+        NewCommand::Floppy(args) => format_image(args.into_new_args()),
+        NewCommand::Volume(args) => format_image(args.into_new_args()),
+        NewCommand::Hd { cmd } => match cmd {
+            HdCommand::X68k(args) => super::new_x68k_hdd::run(args),
+            HdCommand::SgiEfs(args) => super::new_sgi_hdd::run(args),
+        },
+    }
+}
+
+/// Internal plumbing struct: the union of every `new` flag, built from a
+/// class-specific arg struct and dispatched by [`format_image`]. Still derives
+/// `Args` so its field attributes stay valid, but it is never wired to a
+/// top-level command — the class subcommands construct it directly.
 #[derive(Debug, Args)]
 pub struct NewArgs {
     /// Image file to create. Overwritten if it already exists.
@@ -203,7 +517,9 @@ pub struct NewArgs {
     pub sector_size: Option<u32>,
 }
 
-pub fn run(args: NewArgs) -> Result<()> {
+/// Shared formatter: validate cross-flag/fs constraints, then dispatch on
+/// [`FsKind`]. Fed by the class subcommands via `into_new_args`.
+fn format_image(args: NewArgs) -> Result<()> {
     if (args.inodes.is_some() || args.bytes_per_inode.is_some()) && args.fs != FsKind::Efs {
         anyhow::bail!("--inodes / --bytes-per-inode are only valid with --fs efs");
     }

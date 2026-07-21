@@ -572,6 +572,9 @@ fn spawn_daemon(paths: &ServicePaths, cfg: &DaemonConfig) -> Result<u32> {
     if let Some(staging) = &cfg.staging_dir {
         cmd.arg("--staging-dir").arg(staging);
     }
+    if !cfg.writable {
+        cmd.arg("--read-only");
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli new hd sgi-efs</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="new.html">new</a> &raquo; <a href="new-hd.html">hd</a> &raquo; <span>sgi-efs</span></nav>
+<h1><code>rb-cli new hd sgi-efs</code></h1>
+<p>dvh-wrapped IRIX HDD: an SGI volume header + partition table wrapping a formatted EFS root partition, mountable by IRIX 5.3-6.5</p>
+<h2>Usage</h2>
+<pre><code>Usage: sgi-efs [OPTIONS] &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--size</code></dt>
+<dd>Disk size (plain bytes or `K`/`KiB`/`M`/`MiB`/`G`/`GiB` suffixes, e.g. `50M`). Rounded up to a whole cylinder. Defaults to 50M</dd>
+<dt><code>--name</code></dt>
+<dd>EFS volume label (up to 6 bytes; longer is truncated). Defaults to `rusty`</dd>
+<dt><code>--fs</code></dt>
+<dd>Root filesystem to format. Only `efs` is supported today</dd>
+<dt><code>--heads</code></dt>
+<dd>Heads (tracks per cylinder). Must match the geometry the target drive reports over SCSI: IRIX `fx` rejects the volume header if its geometry disagrees with the drive, which stops the disk from mounting. The IRIS emulator and typical SGI SCSI HDDs report 16 heads; change this only for a drive you know reports otherwise</dd>
+<dt><code>--sectors</code></dt>
+<dd>Sectors per track (512-byte sectors). Like `--heads`, must match the drive's reported geometry or IRIX `fx` rejects the label. Default 63 (the IRIS emulator's value; 16 × 63 = 1008-sector cylinders)</dd>
+<dt><code>--inodes</code></dt>
+<dd>Approximate total inode count for the EFS root. The formatter scales the cylinder groups to hit roughly this many inodes. Mutually exclusive with `--bytes-per-inode`. When neither is given the density is ~1 inode/4 KiB</dd>
+<dt><code>--bytes-per-inode</code></dt>
+<dd>EFS inode density, in bytes per inode (smaller = more inodes). Floored at one inode per 512-byte block. Mutually exclusive with `--inodes`</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

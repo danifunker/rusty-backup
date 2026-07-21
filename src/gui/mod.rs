@@ -107,17 +107,13 @@ fn physical_devices_available() -> bool {
 /// value. Loading + saving on every open is cheap (a small JSON file) and keeps
 /// the history durable across runs without an eframe `save()` hook.
 pub(crate) fn push_recent(mode: RecentMode, path: &std::path::Path) -> Vec<String> {
-    let mut cfg = UpdateConfig::load();
-    cfg.remember_file(mode, &path.display().to_string());
-    let list = cfg.recent_files.list(mode).to_vec();
-    let _ = cfg.save();
-    list
+    rusty_backup::update::push_recent(mode, &path.display().to_string())
 }
 
 /// The persisted recent-files list for `mode` (newest first). Used to seed a
 /// tab's in-memory mirror at construction.
 pub(crate) fn load_recent(mode: RecentMode) -> Vec<String> {
-    UpdateConfig::load().recent_files.list(mode).to_vec()
+    rusty_backup::update::load_recent(mode)
 }
 
 /// A merged recent list for Commander: the newest 3 entries from each mode's
@@ -1237,6 +1233,14 @@ impl eframe::App for RustyBackupApp {
         if let Some(path) = self.inspect_tab.take_open_archive_request() {
             self.archives_tab.open_path(path);
             self.active_tab = Tab::Archives;
+        }
+
+        // Likewise, an optical disc opened in Inspect (an ISO 9660 CD, a hybrid
+        // Mac disc, an NKit v1 GameCube image, ...) has no partition table — the
+        // open worker flags it, so open it in the Optical tab and switch there.
+        if let Some(path) = self.inspect_tab.take_open_optical_request() {
+            self.optical_tab.open_image(path);
+            self.active_tab = Tab::Optical;
         }
 
         // Show settings dialog if open

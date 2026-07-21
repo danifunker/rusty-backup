@@ -95,6 +95,26 @@ impl Config {
     }
 }
 
+/// Append a `[section] key = value` setting to the config file, creating the
+/// file (and its parent directory) if needed. Append-only on purpose: the INI
+/// parser lets a later `[section]` merge into the same map and a later key win,
+/// so this preserves any existing content and hand-written comments. Used to
+/// persist small user choices (e.g. suppressing the no-args TUI prompt) without
+/// a full rewrite that would drop the template's comments.
+pub fn append_setting(path: &Path, section: &str, key: &str, value: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\n[{section}]\n{key} = {value}\n"));
+    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))
+}
+
 /// Canonical config-file location for the host OS. `None` if neither
 /// `$HOME` nor `%APPDATA%` is set.
 pub fn default_path() -> Option<PathBuf> {
@@ -146,6 +166,13 @@ pub const TEMPLATE: &str = "\
 
 [optical]
 # resource-forks = appledouble  # data-only|native|appledouble|separate-rsrc|macbinary
+
+[tui]
+# What a bare `rb-cli` (no subcommand) does on an interactive terminal:
+#   ask     - prompt whether to launch the TUI (default)
+#   always  - launch the TUI immediately
+#   never   - just print help (answering the prompt with `never` sets this)
+# launch = ask
 ";
 
 #[cfg(test)]

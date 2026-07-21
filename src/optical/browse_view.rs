@@ -41,6 +41,11 @@ pub struct OpticalDiscBrowseView {
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_paths: HashSet<String>,
     selected_entry: Option<FileEntry>,
+    /// Checkbox-marked entries for multi-select export to a single archive,
+    /// keyed by path. Independent of the single-click `selected_entry` preview.
+    marked: std::collections::BTreeMap<String, FileEntry>,
+    /// Chosen output format for the "Export selected" pulldown.
+    export_format: crate::fs::export_selection::ExportFormat,
     content: Option<FileContent>,
     view_mode: ViewMode,
     error: Option<String>,
@@ -76,6 +81,8 @@ impl Default for OpticalDiscBrowseView {
             directory_cache: HashMap::new(),
             expanded_paths: HashSet::new(),
             selected_entry: None,
+            marked: std::collections::BTreeMap::new(),
+            export_format: crate::fs::export_selection::ExportFormat::MacArchive,
             content: None,
             view_mode: ViewMode::Auto,
             error: None,
@@ -121,7 +128,16 @@ impl OpticalDiscBrowseView {
                         self.active = true;
                     }
                     Err(e) => {
-                        self.error = Some(format!("Cannot open filesystem: {e}"));
+                        // Standalone NKit v1 discs open fine (opticaldiscs
+                        // reconstructs them); if an NKit image reaches here it
+                        // couldn't be reconstructed (v2 / corrupt), so append the
+                        // convert-it-first hint to the specific reader error,
+                        // matching the Commander and `optical browse` paths.
+                        let msg = crate::cli::optical_hint::with_nkit_hint(
+                            anyhow::anyhow!("Cannot open filesystem: {e}"),
+                            path,
+                        );
+                        self.error = Some(format!("{msg:#}"));
                         self.active = true;
                     }
                 }
@@ -142,6 +158,7 @@ impl OpticalDiscBrowseView {
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
+        self.marked.clear();
         self.content = None;
         self.error = None;
         self.active = false;
@@ -203,6 +220,7 @@ impl OpticalDiscBrowseView {
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
+        self.marked.clear();
         self.content = None;
         self.error = None;
         match self.open_fs() {
@@ -326,6 +344,7 @@ impl OpticalDiscBrowseView {
             ui.vertical(|ui| {
                 ui.set_width(tree_width);
                 ui.set_min_height(panel_height);
+                self.render_selection_bar(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("optical_browse_tree")
                     .max_height(panel_height)
@@ -354,21 +373,46 @@ impl OpticalDiscBrowseView {
                 let path = entry.path.clone();
                 let has_children = self.directory_cache.contains_key(&path);
 
-                let header = egui::CollapsingHeader::new(&entry.name)
-                    .id_salt(&path)
-                    .default_open(path == "/")
-                    .show(ui, |ui| {
-                        if let Some(children) = self.directory_cache.get(&path).cloned() {
-                            for child in &children {
-                                self.render_tree_entry(ui, child);
-                            }
-                        } else {
-                            ui.label("Loading...");
+                let is_selected = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|s| s.path == entry.path)
+                    .unwrap_or(false);
+
+                // A CollapsingState (toggle triangle + a separately clickable
+                // label) rather than a plain CollapsingHeader, so a directory —
+                // the disc root included — can be *selected* for "Extract
+                // Folder..." while the triangle still expands it. display_name()
+                // renders the empty-named root as "/".
+                let id = ui.make_persistent_id(&path);
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    path == "/",
+                );
+
+                let header_res = ui.horizontal(|ui| {
+                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    self.mark_checkbox(ui, entry);
+                    if ui
+                        .selectable_label(is_selected, display_name(entry))
+                        .clicked()
+                    {
+                        self.select_dir(entry);
+                    }
+                });
+
+                state.show_body_indented(&header_res.response, ui, |ui| {
+                    if let Some(children) = self.directory_cache.get(&path).cloned() {
+                        for child in &children {
+                            self.render_tree_entry(ui, child);
                         }
-                    });
+                    } else {
+                        ui.label("Loading...");
+                    }
+                });
 
-                let is_now_open = header.body_returned.is_some();
-
+                let is_now_open = state.is_open();
                 if is_now_open {
                     if !has_children {
                         self.load_directory(entry);
@@ -391,9 +435,12 @@ impl OpticalDiscBrowseView {
                     None => format!("{}  ({})", entry.name, size_str),
                 };
 
-                if ui.selectable_label(is_selected, &label).clicked() {
-                    self.select_file(entry);
-                }
+                ui.horizontal(|ui| {
+                    self.mark_checkbox(ui, entry);
+                    if ui.selectable_label(is_selected, &label).clicked() {
+                        self.select_file(entry);
+                    }
+                });
             }
         }
     }
@@ -429,6 +476,173 @@ impl OpticalDiscBrowseView {
                     self.error = Some(format!("Failed to read file: {e}"));
                 }
             }
+        }
+    }
+
+    /// Select a directory (for "Extract Folder..."). A directory has no content
+    /// to preview, so just record the selection and clear any stale content.
+    fn select_dir(&mut self, entry: &FileEntry) {
+        self.selected_entry = Some(entry.clone());
+        self.content = None;
+        self.error = None;
+    }
+
+    /// Render the multi-select checkbox for `entry`, toggling its mark. Marked
+    /// entries feed the "Export selected..." bar; independent of the single-click
+    /// `selected_entry` preview.
+    fn mark_checkbox(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+        let mut marked = self.marked.contains_key(&entry.path);
+        if ui
+            .checkbox(&mut marked, "")
+            .on_hover_text("Mark for multi-select export")
+            .changed()
+        {
+            if marked {
+                self.marked.insert(entry.path.clone(), entry.clone());
+            } else {
+                self.marked.remove(&entry.path);
+            }
+        }
+    }
+
+    /// Marked entries to export, with any entry that lives under another marked
+    /// directory dropped — that ancestor's recursive walk already includes it, so
+    /// nothing is archived twice.
+    fn marked_export_entries(&self) -> Vec<FileEntry> {
+        fn is_ancestor(a: &str, p: &str) -> bool {
+            if a == p {
+                return false;
+            }
+            if a == "/" {
+                return p.len() > 1 && p.starts_with('/');
+            }
+            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
+        }
+        let marked_paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
+        self.marked
+            .iter()
+            .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Bar shown above the tree when entries are checkbox-marked: the count, a
+    /// format pulldown, an Export button, and Clear.
+    fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::fs::export_selection::ExportFormat;
+        if self.marked.is_empty() {
+            return;
+        }
+        let mut fmt = self.export_format;
+        let mut do_export = false;
+        let mut clear = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} selected", self.marked.len()));
+            ui.label("Export as:");
+            egui::ComboBox::from_id_salt("optical_export_fmt")
+                .selected_text(fmt.label())
+                .show_ui(ui, |ui| {
+                    for f in ExportFormat::ALL {
+                        ui.selectable_value(&mut fmt, f, f.label());
+                    }
+                });
+            if ui.button("Export...").clicked() {
+                do_export = true;
+            }
+            if ui.button("Clear").clicked() {
+                clear = true;
+            }
+        });
+        ui.separator();
+        self.export_format = fmt;
+        if clear {
+            self.marked.clear();
+        }
+        if do_export {
+            self.export_marked(fmt);
+        }
+    }
+
+    /// Export the checkbox-marked entries together as one `format` output. The CD
+    /// browser holds opticaldiscs' own FileEntry, so it wraps the live filesystem
+    /// in a rusty-backup `OpticalFilesystem` (which resolves entries by path) and
+    /// runs the shared multi-entry `export_selection` engine over the translated
+    /// entries — giving the same format list as the Inspect tab, forks included.
+    /// Foreground execution; classic-Mac payloads are typically small.
+    fn export_marked(&mut self, format: crate::fs::export_selection::ExportFormat) {
+        use crate::fs::export_selection::{export_to_file, export_to_folder};
+        let entries = self.marked_export_entries();
+        if entries.is_empty() {
+            self.error = Some("Nothing selected to export.".into());
+            return;
+        }
+        let fork_mode = self.resource_fork_mode;
+        let rb_entries: Vec<crate::fs::entry::FileEntry> = entries
+            .iter()
+            .map(crate::fs::optical_fs::translate)
+            .collect();
+        let fs_type = self
+            .selected_fs_type()
+            .map(|t| format!("{t:?}"))
+            .unwrap_or_default();
+        let noop = |_: &str, _: usize, _: u64| {};
+        let nocancel = || false;
+
+        let (path, is_folder) = if format.is_single_file() {
+            let ext = format
+                .file_extension()
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let name = format!("selection{ext}");
+            match rfd::FileDialog::new()
+                .set_title("Export selection")
+                .set_file_name(&name)
+                .save_file()
+            {
+                Some(p) => (p, false),
+                None => return,
+            }
+        } else {
+            match rfd::FileDialog::new()
+                .set_title("Export selection to folder")
+                .pick_folder()
+            {
+                Some(p) => (p, true),
+                None => return,
+            }
+        };
+
+        let result = (|| -> Result<crate::fs::export_selection::ExportSummary, String> {
+            let inner = self.open_fs().map_err(|e| e.to_string())?;
+            let mut rb_fs =
+                crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, fs_type, None)
+                    .map_err(|e| e.to_string())?;
+            if is_folder {
+                export_to_folder(
+                    &mut rb_fs,
+                    &rb_entries,
+                    &path,
+                    format,
+                    fork_mode,
+                    &noop,
+                    &nocancel,
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                export_to_file(&mut rb_fs, &rb_entries, &path, format, &noop, &nocancel)
+                    .map_err(|e| e.to_string())
+            }
+        })();
+
+        match result {
+            Ok(s) => {
+                self.extraction_result = Some(format!(
+                    "Exported {} item(s) to {}",
+                    s.files,
+                    path.display()
+                ));
+            }
+            Err(e) => self.error = Some(format!("Export failed: {e}")),
         }
     }
 
@@ -469,7 +683,7 @@ impl OpticalDiscBrowseView {
                 let entry = entry.clone();
 
                 // File info header
-                ui.label(egui::RichText::new(&entry.name).strong());
+                ui.label(egui::RichText::new(display_name(&entry)).strong());
                 ui.horizontal(|ui| {
                     ui.label(format!("Size: {}", entry.size_string()));
                     if let Some(tc) = entry.type_code_string() {
@@ -697,7 +911,11 @@ impl OpticalDiscBrowseView {
             if let Ok(mut p) = progress.lock() {
                 p.finished = true;
                 if let Err(e) = result {
-                    p.error = Some(format!("{e}"));
+                    let msg = crate::cli::optical_hint::with_nkit_hint(
+                        anyhow::anyhow!("{e}"),
+                        &disc_path,
+                    );
+                    p.error = Some(format!("{msg:#}"));
                 }
             }
         });
@@ -964,6 +1182,17 @@ fn extract_entry(
     Ok(())
 }
 
+/// User-facing name for an entry: opticaldiscs names the disc root "" (empty),
+/// so surface it as "/". Scoped to the root (empty name AND path "/"), so a
+/// future opticaldiscs that names the root passes its real name through unchanged.
+fn display_name(entry: &FileEntry) -> &str {
+    if entry.name.is_empty() && entry.path == "/" {
+        "/"
+    } else {
+        &entry.name
+    }
+}
+
 /// Human-friendly size string.
 fn format_size(bytes: u64) -> String {
     match bytes {
@@ -1058,4 +1287,45 @@ fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace),
     );
+}
+
+#[cfg(test)]
+mod nkit_hint_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A standalone NKit v1 GameCube ISO opens directly (opticaldiscs 0.12+
+    /// reconstructs it); an NKit image that CAN'T be reconstructed (v2 / corrupt
+    /// — here a truncated stub) must surface the actionable "convert it" hint in
+    /// the GUI Optical browser, not a bare reader error. Regression for the
+    /// Optical tab, which called `open_disc_filesystem` without the hint the
+    /// Commander/CLI paths apply.
+    #[test]
+    fn open_unreconstructable_nkit_iso_shows_actionable_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.nkit.iso");
+        // GameCube magic at 0x1C so it identifies as a Nintendo disc, + the NKIT
+        // marker at 0x200 — but no real reconstructable body, so the reader fails.
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        buf[0x1C..0x20].copy_from_slice(&[0xC2, 0x33, 0x9F, 0x3D]);
+        buf[0x200..0x204].copy_from_slice(b"NKIT");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+
+        let mut view = OpticalDiscBrowseView::default();
+        view.open(&path);
+        let err = view
+            .error
+            .expect("an unreconstructable NKit image must report an error");
+        assert!(
+            err.contains("NKit v1"),
+            "expected the NKit hint, got: {err}"
+        );
+        assert!(
+            err.contains("Convert it back"),
+            "expected actionable advice, got: {err}"
+        );
+    }
 }
