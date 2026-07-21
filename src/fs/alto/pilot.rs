@@ -1563,62 +1563,149 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
             .then(a.version.cmp(&b.version))
     });
 
-    let mut state = vec![0u8; BTREE_PAGE_BYTES];
-    let mut leaf = vec![0u8; BTREE_PAGE_BYTES];
+    // Serialize one entry's ClientEntry words (everything AFTER the 1-word
+    // grPage): [size, version, nameBodyRelPtr, type, keep, fid(2), da(2),
+    // nameLen, name chars packed 2/word, char[0] in the high byte]. Identical
+    // bytes to the single-leaf writer, just addressable so it can go in any
+    // page (leaf or the promoted separators in an internal node).
+    fn entry_words(e: &ClientDirEntry) -> Vec<u16> {
+        let name = e.name.as_bytes();
+        let text_words = 1 + name.len().div_ceil(2);
+        let size = FS_LOCAL_TEXT_WORD + text_words;
+        let mut v = vec![0u16; size];
+        v[0] = size as u16;
+        v[1] = e.version;
+        v[2] = FS_LOCAL_TEXT_WORD as u16;
+        v[3] = FS_ENTRY_LOCAL;
+        v[4] = 0; // keep
+        v[5] = (e.fid & 0xffff) as u16;
+        v[6] = (e.fid >> 16) as u16;
+        v[7] = (e.da & 0xffff) as u16;
+        v[8] = (e.da >> 16) as u16;
+        v[FS_LOCAL_TEXT_WORD] = name.len() as u16;
+        for (i, &b) in name.iter().enumerate() {
+            let wi = FS_LOCAL_TEXT_WORD + 1 + i / 2;
+            if i & 1 == 0 {
+                v[wi] |= (b as u16) << 8;
+            } else {
+                v[wi] |= b as u16;
+            }
+        }
+        v
+    }
 
-    // Root leaf page: freeWords(0), minPage(1) = nil, then packed local entries.
-    let mut w = 2usize;
-    for e in &sorted {
-        let name_bytes = e.name.as_bytes();
-        let text_words = 1 + name_bytes.len().div_ceil(2); // length word + chars
-        let entry_words = FS_LOCAL_TEXT_WORD + text_words;
-        let total = 1 + entry_words; // grPage + entry
-        if w + total > BTREE_PAGE_WORDS {
+    // Lay a page: word 0 freeWords, word 1 minPage, then (grPage, entry) items.
+    fn write_node(min_page: u16, items: &[(u16, &[u16])]) -> Vec<u8> {
+        let mut page = vec![0u8; BTREE_PAGE_BYTES];
+        wrw(&mut page, 1, min_page);
+        let mut w = 2usize;
+        for (gr, words) in items {
+            wrw(&mut page, w, *gr);
+            for (k, word) in words.iter().enumerate() {
+                wrw(&mut page, w + 1 + k, *word);
+            }
+            w += 1 + words.len();
+        }
+        wrw(&mut page, 0, (BTREE_PAGE_WORDS - w) as u16);
+        page
+    }
+
+    let words: Vec<Vec<u16>> = sorted.iter().map(entry_words).collect();
+
+    // Greedily pack entries into leaves; the entry that overflows a full leaf
+    // is PROMOTED as the separator between it and the next leaf (a B-tree keeps
+    // each entry exactly once — separators live in the internal node, not in a
+    // leaf), and the next leaf starts after it.
+    const LEAF_CAP: usize = BTREE_PAGE_WORDS - 2; // minus freeWords, minPage
+    let mut leaves: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut separators: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        let slot = 1 + w.len(); // grPage + entry
+        if slot > LEAF_CAP {
             return Err(FilesystemError::DiskFull(format!(
-                "Pilot: Cedar name directory of {} entries exceeds one B-tree page \
-                 (multi-page trees not yet written)",
+                "Pilot: name {:?} is too long for one B-tree page",
+                sorted[i].name
+            )));
+        }
+        if used + slot > LEAF_CAP && !leaves.last().unwrap().is_empty() {
+            separators.push(i);
+            leaves.push(Vec::new());
+            used = 0;
+        } else {
+            leaves.last_mut().unwrap().push(i);
+            used += slot;
+        }
+    }
+
+    let n_leaves = leaves.len();
+    let mut state = vec![0u8; BTREE_PAGE_BYTES];
+    wrw(&mut state, 0, BTREE_SEAL);
+    wrw(&mut state, 1, BTREE_PAGE_WORDS as u16);
+    wrlong(&mut state, 5, sorted.len() as u32);
+
+    // Leaf pages: page numbers 1..=n_leaves. Every leaf entry has grPage = nil.
+    let nil = BTREE_NIL_PAGE;
+    let mut leaf_pages: Vec<Vec<u8>> = Vec::with_capacity(n_leaves);
+    for leaf in &leaves {
+        let items: Vec<(u16, &[u16])> = leaf.iter().map(|&i| (nil, words[i].as_slice())).collect();
+        leaf_pages.push(write_node(nil, &items));
+    }
+
+    let (root_page, reserved_start, depth): (u16, u16, u16);
+    let root: Option<Vec<u8>>;
+    if n_leaves == 1 {
+        // Single leaf is the root (depth 1), as before.
+        root_page = 1;
+        reserved_start = 2;
+        depth = 1;
+        root = None;
+    } else {
+        // Internal root at page n_leaves+1: minPage = leaf 1 (page 1), then one
+        // separator per gap with grPage pointing at the leaf to its right.
+        let items: Vec<(u16, &[u16])> = separators
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| ((k as u16) + 2, words[i].as_slice()))
+            .collect();
+        let root_words: usize = 2 + items.iter().map(|(_, w)| 1 + w.len()).sum::<usize>();
+        if root_words > BTREE_PAGE_WORDS {
+            return Err(FilesystemError::DiskFull(format!(
+                "Pilot: {} names need a 3-level B-tree (only 2 levels written)",
                 sorted.len()
             )));
         }
-        let entry_w = w + 1;
-        wrw(&mut leaf, w, BTREE_NIL_PAGE); // grPage = nil (leaf)
-        wrw(&mut leaf, entry_w, entry_words as u16); // size
-        wrw(&mut leaf, entry_w + 1, e.version); // version
-        wrw(&mut leaf, entry_w + 2, FS_LOCAL_TEXT_WORD as u16); // nameBody rel ptr
-        wrw(&mut leaf, entry_w + 3, FS_ENTRY_LOCAL); // type = local
-        wrw(&mut leaf, entry_w + 4, 0); // keep
-        wrlong(&mut leaf, entry_w + 5, e.fid); // fp.id (FileID, 2 words)
-        wrlong(&mut leaf, entry_w + 7, e.da); // fp.da (DA, 2 words)
-        let text_w = entry_w + FS_LOCAL_TEXT_WORD;
-        wrw(&mut leaf, text_w, name_bytes.len() as u16); // char count
-        let cbase = (text_w + 1) * 2;
-        leaf[cbase..cbase + name_bytes.len()].copy_from_slice(name_bytes);
-        w = entry_w + entry_words;
+        root_page = n_leaves as u16 + 1;
+        reserved_start = n_leaves as u16 + 2;
+        depth = 2;
+        root = Some(write_node(1, &items));
     }
-    wrw(&mut leaf, 0, (BTREE_PAGE_WORDS - w) as u16); // freeWords
-    wrw(&mut leaf, 1, BTREE_NIL_PAGE); // minPage = nil (leaf)
-
-    // statePage (TreeState).
-    wrw(&mut state, 0, BTREE_SEAL);
-    wrw(&mut state, 1, BTREE_PAGE_WORDS as u16); // pageSize (words)
-    wrw(&mut state, 2, 1); // rootPage = BTree page 1
-    wrw(&mut state, 3, 1 + BTREE_RESERVED_FREE_PAGES); // greatestPage
-    wrw(&mut state, 4, 2); // firstFreePage
-    wrlong(&mut state, 5, sorted.len() as u32); // entryCount
-    wrw(&mut state, 7, 1); // depth = 1 (single leaf)
+    wrw(&mut state, 2, root_page);
+    wrw(
+        &mut state,
+        3,
+        reserved_start - 1 + BTREE_RESERVED_FREE_PAGES,
+    );
+    wrw(&mut state, 4, reserved_start);
+    wrw(&mut state, 7, depth);
 
     let mut out = state;
-    out.extend_from_slice(&leaf);
-    /* Free B-tree pages are linked through minPage.  Their freeWords marker
-     * is BTreeInternal.freePageMarker; Cedar removes one from this chain when
-     * a local cache name needs the directory to grow. */
-    for page in 2..=1 + BTREE_RESERVED_FREE_PAGES {
+    for leaf in &leaf_pages {
+        out.extend_from_slice(leaf);
+    }
+    if let Some(root) = &root {
+        out.extend_from_slice(root);
+    }
+    // Free B-tree pages, chained through minPage (Cedar unlinks one when the
+    // local cache needs the directory to grow).
+    let last_free = reserved_start + BTREE_RESERVED_FREE_PAGES - 1;
+    for page in reserved_start..=last_free {
         let mut free = vec![0u8; BTREE_PAGE_BYTES];
         wrw(&mut free, 0, BTREE_FREE_MARKER);
         wrw(
             &mut free,
             1,
-            if page == 1 + BTREE_RESERVED_FREE_PAGES {
+            if page == last_free {
                 BTREE_NIL_PAGE
             } else {
                 page + 1
@@ -1627,9 +1714,7 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
         out.extend_from_slice(&free);
     }
     // FSFileOpsImpl creates its client directory/cache backing file at this
-    // fixed size.  BTreeVM reads and writes four-file-page buffers, including
-    // currently unused cache pages, so the implicit zero tail is real file
-    // storage rather than absent sectors.
+    // fixed size; the implicit zero tail is real (unused cache) file storage.
     out.resize(BTREE_INITIAL_FILE_PAGES * PAGE_BYTES, 0);
     Ok(out)
 }
@@ -2545,9 +2630,12 @@ mod tests {
     }
 
     #[test]
-    fn client_directory_overflows_one_page_errors() {
-        // A single root leaf is ~1022 words; many long names must error cleanly
-        // rather than silently truncate (multi-page trees are a future extension).
+    fn client_directory_spans_multiple_pages() {
+        // Far more names than one ~1022-word leaf holds: the writer must build a
+        // 2-level B-tree (root + several leaves), and parse_client_directory --
+        // which walks every tree page -- must recover every entry exactly once,
+        // with its FileID and fp.da intact. Regression guard for the multi-page
+        // writer (2026-07-20); before it, this returned DiskFull.
         let entries: Vec<ClientDirEntry> = (0..200)
             .map(|i| ClientDirEntry {
                 name: format!("AVeryLongCedarFileName-{i:04}.bcd"),
@@ -2556,10 +2644,21 @@ mod tests {
                 da: 100 + i,
             })
             .collect();
-        assert!(matches!(
-            build_client_directory(&entries),
-            Err(FilesystemError::DiskFull(_))
-        ));
+        let bytes = build_client_directory(&entries).expect("multi-page build");
+        // depth must be 2 and the root must not be page 1 (a single leaf).
+        assert_eq!(rdw(&bytes, 7), 2, "expected a 2-level tree");
+        assert!(rdw(&bytes, 2) > 1, "root should be an internal page");
+        let got = parse_client_directory(&bytes);
+        let mut map: std::collections::HashMap<u32, (String, u32)> = Default::default();
+        for e in got {
+            map.insert(e.fid, (e.name, e.da));
+        }
+        assert_eq!(map.len(), 200, "every entry recovered exactly once");
+        for i in 0..200u32 {
+            let (name, da) = &map[&(1000 + i)];
+            assert_eq!(name, &format!("AVeryLongCedarFileName-{i:04}.bcd"));
+            assert_eq!(*da, 100 + i, "fp.da preserved across pages");
+        }
     }
 
     #[test]

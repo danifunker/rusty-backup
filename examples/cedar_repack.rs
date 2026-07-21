@@ -2,13 +2,67 @@
 //! a Cedar-valid volume while preserving as many user files and names as fit.
 //!
 //! Usage:
-//!   cedar_repack <old.pdi> <germ> <boot> <new.pdi> [max-files]
+//!   cedar_repack <old.pdi> <germ> <boot> <new.pdi> [max-files] [--names <dir>]
+//!
+//! `--names <dir>` recovers filenames by CONTENT: many Cedar corpus volumes
+//! carry a file's bytes but not its name (the historical writer named only a
+//! handful of headliners). If a copied file's content -- padded up to a page
+//! boundary -- matches a file under <dir>, that file's base name is used. The
+//! payload came from an archive of real files, so this is exact, not fuzzy.
 
+use std::collections::HashMap;
 use std::fs;
 
 use rusty_backup::fs::alto::pdi;
 use rusty_backup::fs::alto::pilot::{self, Generation, PilotFilesystem, PvBootFile};
 use rusty_backup::fs::filesystem::Filesystem;
+
+/// Index of <dir>'s files by exact byte length -> [(basename, content)]. A
+/// corpus file is the archive file padded with zeros to a 512-byte page, so a
+/// match is `corpus[..L] == archive` with an all-zero tail and `L` within one
+/// page of the corpus length.
+fn build_name_index(dir: &str) -> HashMap<usize, Vec<(String, Vec<u8>)>> {
+    let mut idx: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    while let Some(p) = stack.pop() {
+        let rd = match fs::read_dir(&p) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(b) = fs::read(&path) {
+                if b.is_empty() {
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy();
+                let base = name.split('!').next().unwrap_or(&name).to_string();
+                idx.entry(b.len()).or_default().push((base, b));
+            }
+        }
+    }
+    idx
+}
+
+/// Recover `data`'s name from the content index, or None.
+fn recover_name(data: &[u8], idx: &HashMap<usize, Vec<(String, Vec<u8>)>>) -> Option<String> {
+    let p = data.len();
+    for l in (p.saturating_sub(511)..=p).rev() {
+        if let Some(cands) = idx.get(&l) {
+            if data[l..].iter().any(|&b| b != 0) {
+                continue;
+            }
+            for (base, content) in cands {
+                if &data[..l] == content.as_slice() {
+                    return Some(base.clone());
+                }
+            }
+        }
+    }
+    None
+}
 
 const VOLUME_PAGES: u16 = 65535;
 
@@ -17,7 +71,20 @@ fn is_old_boot_payload(name: &str) -> bool {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let names_dir = args.iter().position(|a| a == "--names").map(|i| {
+        let d = args.get(i + 1).expect("--names needs a directory").clone();
+        args.drain(i..=i + 1);
+        d
+    });
+    let name_index = names_dir.as_deref().map(build_name_index);
+    if let Some(idx) = &name_index {
+        println!(
+            "name index: {} files under {}",
+            idx.values().map(|v| v.len()).sum::<usize>(),
+            names_dir.as_deref().unwrap()
+        );
+    }
     if args.len() != 4 && args.len() != 5 {
         eprintln!("usage: cedar_repack <old.pdi> <germ> <boot> <new.pdi> [max-files]");
         std::process::exit(2);
@@ -74,6 +141,10 @@ fn main() {
                 copied += 1;
                 if !entry.name.starts_with("LV0_") {
                     names.push((entry.name.clone(), 1, fid));
+                } else if let Some(idx) = &name_index {
+                    if let Some(name) = recover_name(&data, idx) {
+                        names.push((name, 1, fid));
+                    }
                 }
             }
             Err(_) => skipped += 1,
