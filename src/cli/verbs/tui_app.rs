@@ -123,6 +123,9 @@ struct Explorer {
     /// Right pane: the selected directory's entries, and the selected row.
     list: Vec<FileEntry>,
     list_sel: usize,
+    /// Space-marked rows in the current listing (by name), for multi-select
+    /// export to a single `.mar`. Cleared when the listing changes.
+    marked: std::collections::HashSet<String>,
     focus: ExFocus,
     /// A one-line result of the last export/import, shown in the footer area.
     status: Option<String>,
@@ -2732,6 +2735,7 @@ impl App {
                 tree_sel: 0,
                 list,
                 list_sel: 0,
+                marked: std::collections::HashSet::new(),
                 focus: ExFocus::Tree,
                 status: None,
                 picker: None,
@@ -3202,6 +3206,7 @@ impl App {
                     KeyCode::End => ex.list_last(),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => ex.list_enter(),
                     KeyCode::Left | KeyCode::Char('h') => ex.focus = ExFocus::Tree,
+                    KeyCode::Char(' ') => ex.toggle_mark(),
                     _ => {}
                 },
             },
@@ -3271,33 +3276,41 @@ impl App {
                     ))
                 }
                 ExportFormat::Mar => {
-                    if is_dir {
-                        anyhow::bail!(".mar export supports a single file (for now)");
-                    }
-                    let data = ex.fs.read_file(&entry, usize::MAX)?;
-                    let mut rsrc = Vec::new();
-                    let _ = ex.fs.write_resource_fork_to(&entry, &mut rsrc);
-                    let input = crate::macarchive::stuffit::StuffItInput {
-                        name: name.clone(),
-                        type_code: entry.type_code.unwrap_or(*b"????"),
-                        creator_code: entry.creator_code.unwrap_or(*b"????"),
-                        finder_flags: entry.finder_flags.unwrap_or(0),
-                        create_date: entry.mac_dates.map(|d| d.0).unwrap_or(0),
-                        mod_date: entry.mac_dates.map(|d| d.1).unwrap_or(0),
-                        data_fork: data,
-                        resource_fork: rsrc,
+                    // Multi-select: every Space-marked row goes into one .mar (a
+                    // marked folder walks recursively) via the shared export
+                    // engine, which also lifts the old single-file-only limit.
+                    // Falls back to the highlighted entry when nothing is marked.
+                    let entries: Vec<FileEntry> = if ex.marked.is_empty() {
+                        vec![entry.clone()]
+                    } else {
+                        ex.list
+                            .iter()
+                            .filter(|e| ex.marked.contains(&e.name))
+                            .cloned()
+                            .collect()
                     };
-                    let stem = std::path::Path::new(&name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&name);
-                    let bytes = crate::macarchive::mar::build_archive(
-                        stem,
-                        &[crate::macarchive::stuffit::StuffItInputNode::File(input)],
+                    if entries.is_empty() {
+                        anyhow::bail!("nothing selected");
+                    }
+                    let out_name = if entries.len() == 1 {
+                        format!("{}.mar", entries[0].name)
+                    } else {
+                        "selection.mar".to_string()
+                    };
+                    let out_path = dest.join(&out_name);
+                    let summary = crate::fs::export_selection::export_to_file(
+                        &mut *ex.fs,
+                        &entries,
+                        &out_path,
+                        crate::fs::export_selection::ExportFormat::MacArchive,
+                        &|_: &str, _: usize, _: u64| {},
+                        &|| false,
                     )?;
-                    let out_path = dest.join(format!("{name}.mar"));
-                    std::fs::write(&out_path, &bytes)?;
-                    Ok(format!("Exported {name}.mar to {}", out_path.display()))
+                    Ok(format!(
+                        "Exported {} item(s) to {}",
+                        summary.files,
+                        out_path.display()
+                    ))
                 }
             }
         })();
@@ -6313,14 +6326,23 @@ impl App {
                 } else {
                     Style::default()
                 };
-                let style = if i == ex.list_sel && focused {
+                let marked = ex.marked.contains(&e.name);
+                let mut style = if i == ex.list_sel && focused {
                     base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
                 } else if i == ex.list_sel {
                     base.add_modifier(Modifier::BOLD)
                 } else {
                     base
                 };
-                lines.push(Line::styled(format!("{name_col:<24.24} {detail}"), style));
+                if marked {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                // A leading '*' marks Space-selected rows (multi-select export).
+                let mark = if marked { "*" } else { " " };
+                lines.push(Line::styled(
+                    format!("{mark}{name_col:<23.23} {detail}"),
+                    style,
+                ));
             }
         }
         let dir = ex.current_dir();
@@ -8015,6 +8037,7 @@ impl App {
                 ("Tab", "Pane"),
                 ("Up/Dn", "Move"),
                 ("Enter", "Open/View"),
+                ("Space", "Mark"),
                 ("e/i", "Export/Import"),
                 ("Esc", "Close"),
             ]
@@ -8584,6 +8607,20 @@ impl Explorer {
         sort_entries(&mut list);
         self.list = list;
         self.list_sel = 0;
+        // Marks are per-listing (keyed by name); a new directory starts fresh.
+        self.marked.clear();
+    }
+
+    /// Toggle the Space-mark on the highlighted list row, then advance the
+    /// cursor so a run of files can be marked with repeated Space presses.
+    fn toggle_mark(&mut self) {
+        if let Some(e) = self.list.get(self.list_sel) {
+            let name = e.name.clone();
+            if !self.marked.remove(&name) {
+                self.marked.insert(name);
+            }
+        }
+        self.list_move(1);
     }
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
