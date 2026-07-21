@@ -567,6 +567,91 @@ mod tests {
     }
 
     #[test]
+    fn export_nested_directory_all_formats() {
+        // folder-in-folder: SUB/SUBSUB/DEEP.TXT. Every other test only exercises
+        // one directory level; real folders nest, so exercise a marked folder
+        // that contains a subfolder across every single-file archive format.
+        let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("EXP")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("v.img");
+        std::fs::write(&img, &flat).unwrap();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&img)
+                .unwrap();
+            let mut efs = crate::fs::open_editable_filesystem(file, 0, 0, None).unwrap();
+            let root = efs.root().unwrap();
+            let sub = efs
+                .create_directory(&root, "SUB", &Default::default())
+                .unwrap();
+            let subsub = efs
+                .create_directory(&sub, "SUBSUB", &Default::default())
+                .unwrap();
+            put_file(&mut *efs, &subsub, "DEEP.TXT", b"deep");
+            efs.sync_metadata().unwrap();
+        }
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = crate::fs::open_filesystem(file, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        let sub = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "SUB")
+            .expect("SUB");
+        let out = tempfile::tempdir().unwrap();
+        for (fmt, ext) in [
+            (ExportFormat::MacArchive, "mar"),
+            (ExportFormat::StuffIt, "sit"),
+            (ExportFormat::Zip, "zip"),
+            (ExportFormat::Tar, "tar"),
+        ] {
+            let path = out.path().join(format!("nested.{ext}"));
+            let s = export_to_file(
+                &mut *fs,
+                std::slice::from_ref(&sub),
+                &path,
+                fmt,
+                &noprog,
+                &never,
+            )
+            .unwrap_or_else(|e| panic!("{fmt:?} failed on a nested folder: {e}"));
+            assert_eq!(s.files, 1, "{fmt:?} should archive DEEP.TXT");
+        }
+    }
+
+    #[test]
+    fn export_lone_directory_via_fresh_fs_recurses() {
+        // Mirrors the GUI: a directory entry is captured from the live browse
+        // fs, then export opens a *fresh* fs instance (take_or_open_fs) and hands
+        // it that captured entry. Exporting the folder alone must still recurse.
+        let (_fs, entries, g) = fixture();
+        let sub = entries
+            .iter()
+            .find(|e| e.name == "SUB")
+            .cloned()
+            .expect("SUB dir");
+        assert!(sub.is_directory());
+
+        let file = std::fs::File::open(g.path().join("v.img")).unwrap();
+        let mut fs2 = crate::fs::open_filesystem(file, 0, 0, None).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("folder.mar");
+        let s = export_to_file(
+            &mut *fs2,
+            &[sub],
+            &path,
+            ExportFormat::MacArchive,
+            &noprog,
+            &never,
+        )
+        .unwrap();
+        assert_eq!(s.files, 1, "the folder's INNER.TXT should be archived");
+    }
+
+    #[test]
     fn gzip_per_file_round_trips() {
         let (mut fs, entries, _g) = fixture();
         let out = tempfile::tempdir().unwrap();
