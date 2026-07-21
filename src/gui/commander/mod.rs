@@ -547,6 +547,41 @@ impl CommanderMode {
         let dest_host = dest.is_host_pane();
         let other = from.other().label();
 
+        // Remote host destination: upload over the wire (immediate, like a local
+        // host copy). A remote host pane is a `ListingSource::Image`, so
+        // `is_host_pane()` is false — intercept it here, before the local
+        // `(src_host, dest_host)` match would misroute it to the image path.
+        if dest.is_remote_host() {
+            let Some(dest_addr) = dest.remote_addr() else {
+                return "The remote connection is unavailable; reconnect first.".to_string();
+            };
+            let dest_parent_path = dest_parent.path.clone();
+            let job = if src_host {
+                HostCopyJob::HostToRemoteHost {
+                    entries,
+                    dest_addr,
+                    dest_parent: dest_parent_path,
+                }
+            } else if let Some(source) = src.copy_stage_source() {
+                HostCopyJob::ImageToRemoteHost {
+                    source,
+                    entries,
+                    dest_addr,
+                    dest_parent: dest_parent_path,
+                    fork_mode,
+                }
+            } else {
+                // A '+'-expanded wrapper mount has no reopenable handle; uploading
+                // it over the wire isn't wired yet.
+                return "This source can't be uploaded to a remote folder yet — \
+                        copy it to a local folder first."
+                    .to_string();
+            };
+            self.pending_host_copy =
+                Some((Some(from.other()), commander_ops::spawn_host_copy(job)));
+            return format!("Uploading to the {other} (remote) folder...");
+        }
+
         match (src_host, dest_host) {
             // host -> image: stage real host paths (no temp extraction).
             (true, false) => {

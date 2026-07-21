@@ -117,6 +117,22 @@ impl RemoteConnection {
         self.session.read_host_file(path, sink)
     }
 
+    /// Create a directory on the daemon's host filesystem (fails if read-only).
+    pub fn mkdir_host(&mut self, path: &str) -> Result<()> {
+        self.session.mkdir_host(path)
+    }
+
+    /// Write `host_file`'s bytes to `path` on the daemon's host filesystem
+    /// (fails if read-only). `force` overwrites an existing target.
+    pub fn write_host_file(
+        &mut self,
+        path: &str,
+        host_file: &std::path::Path,
+        force: bool,
+    ) -> Result<()> {
+        self.session.write_host_file(path, host_file, force)
+    }
+
     /// Open a host image as a raw block device kept open on the daemon; returns
     /// `(handle, size)`. The block reader's first call.
     pub fn open_block(&mut self, path: &str) -> Result<(u64, u64)> {

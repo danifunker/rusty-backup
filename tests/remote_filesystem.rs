@@ -129,7 +129,7 @@ fn remote_filesystem_browses_and_reads_over_loopback() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // --- drive RemoteFilesystem over the wire ---
@@ -230,7 +230,7 @@ fn family_f_reads_resource_fork_and_size_over_wire() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let (mut rfs, root_entry, _children) = RemoteFilesystem::open(&addr, "/mac.img", None).unwrap();
@@ -290,7 +290,7 @@ fn family_f_write_stages_file_and_dir_into_remote_image() {
     let serve_root = root.clone();
     let serve_staging = staging.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, Some(serve_staging));
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
     });
 
     // --- drive the Family F write path (exactly what remote_apply does) ---
@@ -365,7 +365,7 @@ fn remote_source_stage_copy_extracts_subtree_over_wire() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // What the GUI copies is the pane's selected entries — here the root's
@@ -472,7 +472,7 @@ fn remote_source_host_copy_extracts_tree_over_wire() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // The pane's selected entries, listed over the wire.
@@ -543,7 +543,7 @@ fn two_images_open_on_one_connection_without_reconnect() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // ONE connection; open BOTH images on it as distinct handles — no reconnect.
@@ -615,7 +615,7 @@ fn browser_core_opens_switches_and_closes_on_one_connection() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // Connect -> the host browser sees both images, no handles open yet.
@@ -681,7 +681,7 @@ fn fsck_runs_over_block_reader() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
@@ -708,7 +708,7 @@ fn browse_session_opens_remote_image_over_block_tier() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
@@ -839,7 +839,7 @@ fn restore_to_remote_image_round_trips() {
     let addr = listener.local_addr().unwrap().to_string();
     let sr = serve_root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, sr, None);
+        let _ = serve_on(listener, sr, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -925,7 +925,7 @@ fn resize_remote_image_over_block_tier() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
@@ -1012,7 +1012,7 @@ fn edit_remote_image_over_block_tier() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
@@ -1135,7 +1135,7 @@ fn repair_remote_image_over_block_tier() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -1242,7 +1242,7 @@ fn block_reader_parses_remote_partition_table_and_filesystem() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
@@ -1364,7 +1364,7 @@ fn run_backup_pulls_remote_image_byte_exact() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -1453,7 +1453,7 @@ fn list_devices_round_trips_and_open_device_reads() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -1540,7 +1540,7 @@ fn backup_remote_core_lists_and_loads_partitions() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // connect + list devices in one call (devices may be empty in CI).
@@ -1629,7 +1629,7 @@ fn run_backup_chd_materializes_remote_and_round_trips() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -1724,7 +1724,7 @@ fn family_b_binary_handshake_over_loopback() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // --- binary Family-B client (what cb-dos sends): 8 bytes out, 8 bytes in ---
@@ -1810,7 +1810,7 @@ fn family_b_chunk_put_assembles_cbk_over_loopback() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // --- the bytes NETPUT sends ---
@@ -2015,7 +2015,7 @@ fn family_b_chunk_put_resumes_after_drop() {
     let serve_root = root.clone();
     let serve_staging = staging.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, Some(serve_staging));
+        let _ = serve_on(listener, serve_root, Some(serve_staging), true);
     });
 
     // --- connection 1: send mbr + the first 2 of 4 partition spans, then drop ---
@@ -2136,7 +2136,7 @@ fn family_b_get_serves_cbk_members_over_loopback() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
 
     // Read a BE length-delimited member stream ([u32 n][n bytes]… [u32 0]).
@@ -2228,7 +2228,7 @@ fn remote_min_size_calc_over_block_tier() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -2296,7 +2296,7 @@ fn run_backup_pulls_remote_superfloppy_byte_exact() {
     let addr = listener.local_addr().unwrap().to_string();
     let serve_root = root.clone();
     std::thread::spawn(move || {
-        let _ = serve_on(listener, serve_root, None);
+        let _ = serve_on(listener, serve_root, None, true);
     });
     let conn = RemoteConnection::connect_shared(&addr).unwrap();
 
@@ -2352,5 +2352,302 @@ fn run_backup_pulls_remote_superfloppy_byte_exact() {
     assert_eq!(
         captured, disk_final,
         "captured superfloppy is byte-exact vs the source"
+    );
+}
+
+/// Family F host-write path (the write analog of the host-FS browser): a client
+/// creates a directory and uploads a file onto the daemon's host filesystem
+/// under the serve root, reads it back byte-exact, and the overwrite (`force`)
+/// and sandbox rules hold. Runs against a writable loopback daemon.
+#[test]
+fn host_write_round_trip_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    // A local file to upload (spans several wire chunks).
+    let src = tempfile::tempdir().unwrap();
+    let src_file = src.path().join("payload.bin");
+    let payload = vec![0xABu8; 4096 + 7];
+    std::fs::write(&src_file, &payload).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, true);
+    });
+
+    let mut conn = RemoteConnection::connect(&addr).unwrap();
+
+    // Create a directory, then upload a file into it.
+    conn.mkdir_host("/uploads").unwrap();
+    conn.write_host_file("/uploads/payload.bin", &src_file, false)
+        .unwrap();
+
+    // The bytes landed on the daemon host FS, byte-exact...
+    let landed = std::fs::read(root.join("uploads/payload.bin")).unwrap();
+    assert_eq!(
+        landed, payload,
+        "uploaded bytes must be byte-exact on the host"
+    );
+    // ...and read back over the wire.
+    let mut got = Vec::new();
+    conn.read_host_file("/uploads/payload.bin", &mut got)
+        .unwrap();
+    assert_eq!(got, payload);
+
+    // mkdir is idempotent.
+    conn.mkdir_host("/uploads").unwrap();
+
+    // Overwrite without force is refused; with force it succeeds.
+    let src2 = src.path().join("payload2.bin");
+    std::fs::write(&src2, b"second").unwrap();
+    assert!(
+        conn.write_host_file("/uploads/payload.bin", &src2, false)
+            .is_err(),
+        "overwriting an existing file without force must fail"
+    );
+    conn.write_host_file("/uploads/payload.bin", &src2, true)
+        .unwrap();
+    assert_eq!(
+        std::fs::read(root.join("uploads/payload.bin")).unwrap(),
+        b"second"
+    );
+
+    // Sandbox: a path escaping the serve root is refused, and — because the
+    // handler drains the body on that failure — the connection stays framed.
+    assert!(
+        conn.write_host_file("/../escape.bin", &src_file, true)
+            .is_err(),
+        "a path escaping the serve root must be refused"
+    );
+    conn.mkdir_host("/after").unwrap();
+    assert!(
+        root.join("after").is_dir(),
+        "connection usable after a refusal"
+    );
+}
+
+/// A read-only daemon (`serve --read-only`) serves browse + copy-out but refuses
+/// every host write, and the connection survives each refusal (bodies drained).
+#[test]
+fn read_only_daemon_refuses_host_writes_but_serves_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("readme.txt"), b"hello").unwrap();
+
+    let src = tempfile::tempdir().unwrap();
+    let src_file = src.path().join("x.bin");
+    std::fs::write(&src_file, b"nope").unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, false); // read-only
+    });
+
+    let mut conn = RemoteConnection::connect(&addr).unwrap();
+
+    // Reads still work.
+    let entries = conn.list_host_dir("/").unwrap();
+    assert!(entries.iter().any(|e| e.name == "readme.txt"));
+    let mut got = Vec::new();
+    conn.read_host_file("/readme.txt", &mut got).unwrap();
+    assert_eq!(got, b"hello");
+
+    // Writes are refused, and nothing is created.
+    assert!(
+        conn.mkdir_host("/nope").is_err(),
+        "read-only daemon must refuse mkdir"
+    );
+    assert!(
+        conn.write_host_file("/nope.bin", &src_file, true).is_err(),
+        "read-only daemon must refuse host writes"
+    );
+    assert!(!root.join("nope").exists());
+    assert!(!root.join("nope.bin").exists());
+
+    // The connection survived the write refusals (bodies drained) — reads work.
+    let mut again = Vec::new();
+    conn.read_host_file("/readme.txt", &mut again).unwrap();
+    assert_eq!(again, b"hello");
+}
+
+/// Slice-2 engine: uploading a local host tree onto a remote daemon's host FS
+/// via `HostCopyJob::HostToRemoteHost`, recursing directories, over a writable
+/// loopback daemon. Verifies the files land byte-exact under `dest_parent`.
+#[test]
+fn upload_host_tree_to_remote_host_over_the_wire() {
+    use rusty_backup::fs::entry::FileEntry;
+    use rusty_backup::model::commander_ops::{self, HostCopyJob};
+
+    // Local source tree: top.txt + sub/inner.txt.
+    let src = tempfile::tempdir().unwrap();
+    std::fs::create_dir(src.path().join("sub")).unwrap();
+    std::fs::write(src.path().join("top.txt"), b"top-data").unwrap();
+    std::fs::write(src.path().join("sub/inner.txt"), b"inner-data").unwrap();
+
+    // Remote serve root with a pre-existing destination dir + writable daemon.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("dest")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, true);
+    });
+
+    let entries = vec![
+        FileEntry::new_directory(
+            "sub".into(),
+            src.path().join("sub").to_string_lossy().into_owned(),
+            0,
+        ),
+        FileEntry::new_file(
+            "top.txt".into(),
+            src.path().join("top.txt").to_string_lossy().into_owned(),
+            8,
+            0,
+        ),
+    ];
+    let status = commander_ops::spawn_host_copy(HostCopyJob::HostToRemoteHost {
+        entries,
+        dest_addr: addr,
+        dest_parent: "/dest".into(),
+    });
+    wait_host_copy(&status);
+
+    assert_eq!(
+        std::fs::read(root.join("dest/top.txt")).unwrap(),
+        b"top-data"
+    );
+    assert_eq!(
+        std::fs::read(root.join("dest/sub/inner.txt")).unwrap(),
+        b"inner-data"
+    );
+}
+
+/// Slice-2 engine: uploading a local disk-image subtree onto a remote daemon's
+/// host FS via `HostCopyJob::ImageToRemoteHost` — the source image is reopened
+/// on the worker through a `ReopenRecipe`, its files streamed to the daemon.
+#[test]
+fn upload_image_subtree_to_remote_host_over_the_wire() {
+    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use rusty_backup::model::commander_descend::ReopenRecipe;
+    use rusty_backup::model::commander_ops::{self, HostCopyJob, StageSource};
+
+    // Local source image with /TOP.BIN and /SUB/INNER.BIN.
+    let src_dir = tempfile::tempdir().unwrap();
+    let img = src_dir.path().join("src.img");
+    let top = b"top-payload-in-image";
+    let inner = b"inner-payload-in-image";
+    make_fat_image_with_subtree(&img, top, inner);
+
+    // Capture the root entries a pane would select for copy.
+    let mut sfs = ReopenRecipe::DiskImage { path: img.clone() }
+        .open()
+        .unwrap();
+    let sroot = sfs.root().unwrap();
+    let entries = sfs.list_directory(&sroot).unwrap();
+    assert!(entries
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case("TOP.BIN")));
+    drop(sfs);
+
+    // Remote writable daemon.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, true);
+    });
+
+    let status = commander_ops::spawn_host_copy(HostCopyJob::ImageToRemoteHost {
+        source: StageSource::Reopen(ReopenRecipe::DiskImage { path: img.clone() }),
+        entries,
+        dest_addr: addr,
+        dest_parent: "/".into(),
+        fork_mode: ResourceForkMode::DataForkOnly,
+    });
+    wait_host_copy(&status);
+
+    assert_eq!(std::fs::read(root.join("TOP.BIN")).unwrap(), top);
+    assert_eq!(std::fs::read(root.join("SUB/INNER.BIN")).unwrap(), inner);
+}
+
+/// Block until a `spawn_host_copy` worker finishes; assert it succeeded.
+fn wait_host_copy(
+    status: &std::sync::Arc<std::sync::Mutex<rusty_backup::model::commander_ops::HostCopyStatus>>,
+) {
+    for _ in 0..2000 {
+        {
+            let g = status.lock().unwrap();
+            if g.finished {
+                assert!(g.error.is_none(), "host copy failed: {:?}", g.error);
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("host copy did not finish in time");
+}
+
+/// The synchronous upload entry points the TUI copy path uses
+/// (`upload_host_entries_to_remote` / `upload_fs_entries_to_remote`) push a host
+/// tree and an image subtree onto a writable loopback daemon, byte-exact.
+#[test]
+fn sync_upload_helpers_push_to_remote_host() {
+    use rusty_backup::fs::entry::FileEntry;
+    use rusty_backup::fs::resource_fork::ResourceForkMode;
+    use rusty_backup::model::commander_descend::ReopenRecipe;
+    use rusty_backup::model::commander_ops;
+
+    // Writable daemon with two pre-existing destination dirs.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("h")).unwrap();
+    std::fs::create_dir(root.join("i")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, true);
+    });
+
+    // (1) Host-source upload.
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("a.txt"), b"aaa").unwrap();
+    let host_entries = vec![FileEntry::new_file(
+        "a.txt".into(),
+        src.path().join("a.txt").to_string_lossy().into_owned(),
+        3,
+        0,
+    )];
+    commander_ops::upload_host_entries_to_remote(&host_entries, &addr, "/h").unwrap();
+    assert_eq!(std::fs::read(root.join("h/a.txt")).unwrap(), b"aaa");
+
+    // (2) Image-source upload (read through a Filesystem).
+    let src_dir = tempfile::tempdir().unwrap();
+    let img = src_dir.path().join("src.img");
+    make_fat_image_with_subtree(&img, b"top!", b"inner!");
+    let mut fs = ReopenRecipe::DiskImage { path: img }.open().unwrap();
+    let sroot = fs.root().unwrap();
+    let entries = fs.list_directory(&sroot).unwrap();
+    commander_ops::upload_fs_entries_to_remote(
+        fs.as_mut(),
+        &entries,
+        &addr,
+        "/i",
+        ResourceForkMode::DataForkOnly,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(root.join("i/TOP.BIN")).unwrap(), b"top!");
+    assert_eq!(
+        std::fs::read(root.join("i/SUB/INNER.BIN")).unwrap(),
+        b"inner!"
     );
 }

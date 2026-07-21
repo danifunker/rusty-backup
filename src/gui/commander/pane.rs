@@ -1322,7 +1322,7 @@ impl CommanderPane {
 
     /// True when this pane is browsing a remote daemon's *host* filesystem (the
     /// file browser), where a file can be opened as an image.
-    fn is_remote_host(&self) -> bool {
+    pub(crate) fn is_remote_host(&self) -> bool {
         matches!(
             self.remote,
             Some(RemoteConn {
@@ -1333,8 +1333,9 @@ impl CommanderPane {
     }
 
     /// True when this pane is browsing a disk image on a remote daemon. Such a
-    /// pane can *receive* a copy (writes go over the daemon's Family-F write
-    /// path); a remote *host* pane can't (no host-write verb yet).
+    /// pane receives a copy over the daemon's Family-F image write path
+    /// (OpenSession/StageUpload/Apply); a remote *host* pane receives over the
+    /// host-write path (MkdirHost/WriteHostFile) instead.
     fn is_remote_image(&self) -> bool {
         matches!(
             self.remote,
@@ -1343,6 +1344,12 @@ impl CommanderPane {
                 ..
             })
         )
+    }
+
+    /// The daemon address (`host:port`) this pane is connected to, if remote.
+    /// Used to open a fresh connection for an upload worker.
+    pub(crate) fn remote_addr(&self) -> Option<String> {
+        self.remote.as_ref().map(|r| r.addr.clone())
     }
 
     fn render_switch_guard(&mut self, ctx: &egui::Context) -> Option<String> {
@@ -1400,26 +1407,23 @@ impl CommanderPane {
             && self.pending_remote.is_none()
             && self.resolved_backup.is_none()
             && !self.archive_source
-            // Local panes always OK. A remote pane can receive a copy only when
-            // it's an image: writes go to the daemon's OpenSession/StageUpload/
-            // Apply path. A remote *host* folder has no host-write verb yet, so
-            // it stays copy-out-only.
-            && (self.remote.is_none() || self.is_remote_image())
+        // Both remote destinations can now receive: a remote image via the
+        // daemon's OpenSession/StageUpload/Apply path, and a remote host folder
+        // via MkdirHost/WriteHostFile. A read-only daemon refuses the write with
+        // a clear error at copy time (the client can't know its policy up front).
     }
 
     /// True when this pane's source is read-only media that can never receive a
-    /// copy — a Mac archive, a backup folder, or a remote host folder (no
-    /// host-write verb yet). Distinct from `can_receive`, which is also false
-    /// for transient states (mid-open/apply); this reflects the *medium*, so the
-    /// pane header can show a "Read-only" badge. Host folders and writable image
-    /// volumes are not read-only.
+    /// copy — a Mac archive, an optical disc, or a backup folder. Distinct from
+    /// `can_receive`, which is also false for transient states (mid-open/apply);
+    /// this reflects the *medium*, so the pane header can show a "Read-only"
+    /// badge. Host folders, writable image volumes, and remote panes (host or
+    /// image — both writable, subject to the daemon's read-only policy) are not
+    /// read-only.
     pub(crate) fn is_read_only(&self) -> bool {
         self.listing.is_loaded()
             && !self.listing.is_host()
-            && (self.archive_source
-                || self.optical_source
-                || self.resolved_backup.is_some()
-                || (self.remote.is_some() && !self.is_remote_image()))
+            && (self.archive_source || self.optical_source || self.resolved_backup.is_some())
     }
 
     /// A short reason a copy into this pane is refused, for the copy button's
@@ -1429,8 +1433,6 @@ impl CommanderPane {
             Some("the archive is read-only")
         } else if self.resolved_backup.is_some() {
             Some("the backup is read-only")
-        } else if self.remote.is_some() && !self.is_remote_image() {
-            Some("a remote host folder can't receive copies yet")
         } else {
             None
         }

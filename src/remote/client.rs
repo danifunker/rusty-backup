@@ -322,6 +322,46 @@ impl RemoteSession {
         }
     }
 
+    /// Create a directory on the daemon's host filesystem (the write analog of
+    /// [`RemoteSession::list_host_dir`]). Idempotent. Fails if the daemon runs
+    /// read-only.
+    pub fn mkdir_host(&mut self, path: &str) -> Result<()> {
+        write_control(
+            &mut self.writer,
+            &Request::MkdirHost {
+                path: path.to_string(),
+            },
+        )?;
+        self.expect_ok("MkdirHost")
+    }
+
+    /// Write `host_file`'s bytes to `path` on the daemon's host filesystem (the
+    /// write analog of [`RemoteSession::read_host_file`]). `force` overwrites an
+    /// existing target. Fails if the daemon runs read-only.
+    pub fn write_host_file(&mut self, path: &str, host_file: &Path, force: bool) -> Result<()> {
+        let size = std::fs::metadata(host_file)
+            .with_context(|| format!("stat {}", host_file.display()))?
+            .len();
+        write_control(
+            &mut self.writer,
+            &Request::WriteHostFile {
+                path: path.to_string(),
+                size,
+                force,
+            },
+        )?;
+        // The body follows immediately as a chunk stream.
+        let mut f = std::fs::File::open(host_file)
+            .with_context(|| format!("open {}", host_file.display()))?;
+        {
+            let mut cw = ChunkWriter::new(&mut self.writer);
+            std::io::copy(&mut f, &mut cw)
+                .with_context(|| format!("uploading {}", host_file.display()))?;
+            cw.finish()?;
+        }
+        self.expect_ok("WriteHostFile")
+    }
+
     /// Open a host image file as a raw block device on the daemon — it stays
     /// open for the session. Returns `(handle, size)`. The block-reader's first
     /// call.

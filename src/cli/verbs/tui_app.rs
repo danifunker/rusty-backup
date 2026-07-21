@@ -1437,6 +1437,11 @@ struct CmdPane {
     /// The optical-filesystem chooser modal (ISO 9660 vs HFS side) + its cursor.
     optical_pick: bool,
     optical_sel: usize,
+    /// Set when this pane is browsing a remote daemon (host FS or an image on
+    /// it). The listing reads over the wire; uploads go to the daemon. `None`
+    /// for local panes.
+    #[cfg(feature = "remote")]
+    remote: Option<crate::model::remote_browser::RemoteBrowser>,
 }
 
 /// An optical disc image opened in a Commander pane: the path, its selectable
@@ -1467,6 +1472,8 @@ impl Default for CmdPane {
             optical: None,
             optical_pick: false,
             optical_sel: 0,
+            #[cfg(feature = "remote")]
+            remote: None,
         }
     }
 }
@@ -1520,6 +1527,28 @@ impl CmdPane {
         self.optical_pick = true;
         self.optical_sel = 0;
     }
+
+    /// True when this pane is browsing a remote daemon (host FS or an image).
+    #[cfg(feature = "remote")]
+    fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// True when this pane is browsing a remote daemon's *host* filesystem
+    /// (vs. an image opened on it).
+    #[cfg(feature = "remote")]
+    fn is_remote_host(&self) -> bool {
+        matches!(
+            self.remote.as_ref().map(|b| b.mode()),
+            Some(crate::model::remote_browser::BrowseMode::Host)
+        )
+    }
+
+    /// The daemon address (`host:port`) this pane is connected to, if remote.
+    #[cfg(feature = "remote")]
+    fn remote_addr(&self) -> Option<String> {
+        self.remote.as_ref().map(|b| b.addr().to_string())
+    }
 }
 
 /// The Commander dual-pane file manager.
@@ -1541,6 +1570,32 @@ struct CommanderState {
     checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
     /// The scrollable checksum-results overlay once a job completes.
     checksum_report: Option<ChecksumReportView>,
+    /// A `host:port` being typed in the "Connect to remote" prompt, if showing.
+    #[cfg(feature = "remote")]
+    connect_input: Option<String>,
+    /// An in-flight daemon connection (blocking, so it runs on a worker and is
+    /// polled each `tick`); carries the side to install the result into.
+    #[cfg(feature = "remote")]
+    pending_connect: Option<(Side, Arc<Mutex<ConnectStatus>>)>,
+}
+
+/// Result of a background [`RemoteBrowser::connect`]: the browser plus its first
+/// browse target, or an error string.
+#[cfg(feature = "remote")]
+type ConnectResult = Result<
+    (
+        crate::model::remote_browser::RemoteBrowser,
+        crate::model::remote_browser::BrowseTarget,
+    ),
+    String,
+>;
+
+/// Shared state for a background connect, polled in `tick`.
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct ConnectStatus {
+    finished: bool,
+    result: Option<ConnectResult>,
 }
 
 /// A scrollable checksum-results overlay (per-file SHA256 + CRC32).
@@ -1743,9 +1798,42 @@ impl CommanderState {
         self.is_error = false;
     }
 
+    /// Begin connecting the active pane to a daemon at `addr` (a bare host uses
+    /// the default port). Blocking, so it runs on a worker thread; `tick`
+    /// installs the resulting remote listing into the pane.
+    #[cfg(feature = "remote")]
+    fn start_connect(&mut self, addr: String) {
+        if self.pending_connect.is_some() {
+            self.status = Some("A connection is already in progress.".to_string());
+            self.is_error = true;
+            return;
+        }
+        let side = self.active;
+        let addr = if addr.contains(':') {
+            addr
+        } else {
+            format!("{addr}:{}", crate::remote::protocol::DEFAULT_PORT)
+        };
+        let status = Arc::new(Mutex::new(ConnectStatus::default()));
+        let st = Arc::clone(&status);
+        let addr_worker = addr.clone();
+        std::thread::spawn(move || {
+            let r = crate::model::remote_browser::RemoteBrowser::connect(&addr_worker, "/")
+                .map_err(|e| format!("{e:#}"));
+            if let Ok(mut g) = st.lock() {
+                g.result = Some(r);
+                g.finished = true;
+            }
+        });
+        self.pending_connect = Some((side, status));
+        self.status = Some(format!("Connecting to {addr}..."));
+        self.is_error = false;
+    }
+
     /// Copy the selected entry from the active pane to the other pane's cwd.
     /// host->image stages + applies edits; image->host exports the fork; host->
-    /// host is a plain copy; image->image is not supported here yet.
+    /// host is a plain copy; image->image extracts+stages. A remote destination
+    /// uploads over the wire.
     fn copy(&mut self) {
         let (src, dst) = match self.active {
             Side::Left => (&mut self.left, &mut self.right),
@@ -1768,6 +1856,68 @@ impl CommanderState {
         } else {
             format!("{} items", entries.len())
         };
+
+        // Remote destination: upload over the wire (a remote pane has
+        // is_host == false, so it would otherwise misroute to the image path,
+        // which needs a local write session it doesn't have). Downloads FROM a
+        // remote pane fall through to the normal image-source branches below,
+        // which already read over the wire via the boxed remote filesystem.
+        #[cfg(feature = "remote")]
+        if dst.is_remote() {
+            let result: Result<String, String> = (|| {
+                let addr = dst
+                    .remote_addr()
+                    .ok_or_else(|| "the remote connection is unavailable".to_string())?;
+                if !dst.is_remote_host() {
+                    return Err(
+                        "uploading into a remote image isn't supported in the TUI yet".to_string(),
+                    );
+                }
+                let dest_parent = dst
+                    .listing
+                    .cwd()
+                    .map(|e| e.path.clone())
+                    .ok_or_else(|| "no destination directory".to_string())?;
+                if src.is_host {
+                    crate::model::commander_ops::upload_host_entries_to_remote(
+                        &entries,
+                        &addr,
+                        &dest_parent,
+                    )
+                    .map_err(|e| format!("Upload failed: {e:#}"))?;
+                } else {
+                    let fs = src
+                        .listing
+                        .fs_mut()
+                        .ok_or_else(|| "source has no filesystem".to_string())?;
+                    crate::model::commander_ops::upload_fs_entries_to_remote(
+                        fs,
+                        &entries,
+                        &addr,
+                        &dest_parent,
+                        RfMode::AppleDouble,
+                    )
+                    .map_err(|e| format!("Upload failed: {e:#}"))?;
+                }
+                Ok(format!("Uploaded {label} to the remote."))
+            })();
+            if result.is_ok() {
+                cmd_refresh(dst);
+                src.listing.clear_selection();
+            }
+            match result {
+                Ok(m) => {
+                    self.status = Some(m);
+                    self.is_error = false;
+                }
+                Err(e) => {
+                    self.status = Some(e);
+                    self.is_error = true;
+                }
+            }
+            return;
+        }
+
         let result: Result<String, String> = if src.is_host && !dst.is_host {
             let dest_parent = match dst.listing.cwd() {
                 Some(e) => e.clone(),
@@ -2181,6 +2331,13 @@ fn cmd_load_optical(
 /// session and re-navigate to the same directory.
 fn cmd_refresh(pane: &mut CmdPane) {
     let cwd_path = pane.listing.cwd().map(|e| e.path.clone());
+    #[cfg(feature = "remote")]
+    if pane.is_remote() {
+        // A remote pane reads over the wire through the boxed filesystem in its
+        // listing; a plain reload re-lists the current directory (no session).
+        let _ = pane.listing.reload();
+        return;
+    }
     if pane.is_host {
         let _ = pane.listing.reload();
     } else if let Some(op) = pane.optical.clone() {
@@ -2223,10 +2380,12 @@ fn cmd_refresh(pane: &mut CmdPane) {
 }
 
 /// Enter the row under a pane's cursor (`..` = up, directory = descend).
-fn cmd_enter(pane: &mut CmdPane) {
+fn cmd_enter(pane: &mut CmdPane) -> Option<Result<String, String>> {
     enum Act {
         Up,
         Enter(String),
+        #[cfg(feature = "remote")]
+        OpenRemoteImage(String, String),
         None,
     }
     let act = match pane.listing.current_rows().get(pane.sel) {
@@ -2234,19 +2393,76 @@ fn cmd_enter(pane: &mut CmdPane) {
         Some(crate::model::dir_listing::Row::Entry(e)) if e.is_directory() => {
             Act::Enter(e.name.clone())
         }
+        // On a remote *host* pane, Enter on a file opens it as a disk image on
+        // the same daemon connection (no reconnect) — the TUI half of "browse
+        // remote disk images".
+        #[cfg(feature = "remote")]
+        Some(crate::model::dir_listing::Row::Entry(e)) if e.is_file() && pane.is_remote_host() => {
+            Act::OpenRemoteImage(e.path.clone(), e.name.clone())
+        }
         _ => Act::None,
     };
     match act {
         Act::Up => {
             pane.listing.up();
             pane.sel = 0;
+            None
         }
         Act::Enter(n) => {
             let _ = pane.listing.enter(&n);
             pane.sel = 0;
+            None
         }
-        Act::None => {}
+        #[cfg(feature = "remote")]
+        Act::OpenRemoteImage(path, name) => Some(cmd_open_remote_image(pane, &path, &name)),
+        Act::None => None,
     }
+}
+
+/// Open the remote host file at `path` as a disk image on the pane's existing
+/// daemon connection, replacing the pane's listing with the image's root.
+#[cfg(feature = "remote")]
+fn cmd_open_remote_image(pane: &mut CmdPane, path: &str, name: &str) -> Result<String, String> {
+    let cwd = pane
+        .listing
+        .cwd()
+        .map(|e| e.path.clone())
+        .unwrap_or_else(|| "/".to_string());
+    let browser = pane
+        .remote
+        .as_mut()
+        .ok_or_else(|| "the remote connection is unavailable".to_string())?;
+    let target = browser
+        .open_image(path, None, &cwd)
+        .map_err(|e| format!("{name} is not a disk image we can open: {e:#}"))?;
+    let label = format!("remote img: {name} [{}]", target.fs_type);
+    pane.listing
+        .load_root(target.fs, target.root, target.entries, false);
+    pane.label = label;
+    pane.sel = 0;
+    Ok(format!("Opened {name} on the remote."))
+}
+
+/// Step a remote-image pane back out to the daemon's host file browser (the TUI
+/// analog of the GUI's "close image"). Returns true when it handled the step
+/// (the pane was a remote image at its root); the caller falls back to a normal
+/// `up()` otherwise.
+#[cfg(feature = "remote")]
+fn cmd_remote_up(pane: &mut CmdPane) -> bool {
+    if !pane.is_remote() || pane.is_remote_host() || !pane.listing.at_root() {
+        return false;
+    }
+    if let Some(browser) = pane.remote.as_mut() {
+        if let Ok(target) = browser.close_image() {
+            let addr = browser.addr().to_string();
+            pane.listing
+                .load_root(target.fs, target.root, target.entries, false);
+            pane.label = format!("remote {addr}: /");
+            pane.sel = 0;
+            return true;
+        }
+    }
+    false
 }
 
 /// Fork container formats for archive extraction.
@@ -5485,6 +5701,36 @@ impl App {
             return true;
         }
 
+        // Connect-to-remote host:port prompt (modal).
+        #[cfg(feature = "remote")]
+        if c.connect_input.is_some() {
+            match code {
+                KeyCode::Esc => c.connect_input = None,
+                KeyCode::Enter => {
+                    let addr = c.connect_input.take().unwrap_or_default();
+                    let addr = addr.trim().to_string();
+                    if addr.is_empty() {
+                        c.status = Some("Enter a host:port to connect.".to_string());
+                        c.is_error = true;
+                    } else {
+                        c.start_connect(addr);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = c.connect_input.as_mut() {
+                        s.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(s) = c.connect_input.as_mut() {
+                        s.push(ch);
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // Delete confirmation (modal).
         if c.confirm_delete.is_some() {
             match code {
@@ -5563,6 +5809,16 @@ impl App {
             return true;
         }
 
+        // Connect the active pane to a remote daemon (works whether or not a
+        // source is already open — it replaces the pane's source).
+        #[cfg(feature = "remote")]
+        if code == KeyCode::Char('R') {
+            c.connect_input = Some(String::new());
+            c.status = None;
+            c.is_error = false;
+            return true;
+        }
+
         let loaded = c.pane(active).loaded;
         if !loaded {
             return match code {
@@ -5613,10 +5869,27 @@ impl App {
                 true
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                cmd_enter(c.pane_mut(active));
+                if let Some(r) = cmd_enter(c.pane_mut(active)) {
+                    match r {
+                        Ok(m) => {
+                            c.status = Some(m);
+                            c.is_error = false;
+                        }
+                        Err(e) => {
+                            c.status = Some(e);
+                            c.is_error = true;
+                        }
+                    }
+                }
                 true
             }
             KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                // In a remote image at its root, step back out to the daemon's
+                // host browser (close the image); otherwise navigate up normally.
+                #[cfg(feature = "remote")]
+                if cmd_remote_up(c.pane_mut(active)) {
+                    return true;
+                }
                 let p = c.pane_mut(active);
                 p.listing.up();
                 p.sel = 0;
@@ -5900,6 +6173,49 @@ impl App {
                 } else if let Some(m) = progress_msg {
                     c.status = Some(m);
                     c.is_error = false;
+                }
+            }
+        }
+        // Poll a background Commander connect: install the remote listing into
+        // the target pane when it lands, or surface the error.
+        #[cfg(feature = "remote")]
+        {
+            let pending = self
+                .commander
+                .as_ref()
+                .and_then(|c| c.pending_connect.as_ref().map(|(s, j)| (*s, Arc::clone(j))));
+            if let Some((side, job)) = pending {
+                let outcome: Option<ConnectResult> = match job.lock() {
+                    Ok(mut g) if g.finished => g.result.take(),
+                    _ => None,
+                };
+                if let Some(result) = outcome {
+                    if let Some(c) = self.commander.as_mut() {
+                        c.pending_connect = None;
+                        match result {
+                            Ok((browser, target)) => {
+                                let addr = browser.addr().to_string();
+                                let p = c.pane_mut(side);
+                                p.session = None;
+                                p.is_host = false;
+                                p.optical = None;
+                                p.parts.clear();
+                                p.pending_img = None;
+                                p.listing
+                                    .load_root(target.fs, target.root, target.entries, false);
+                                p.remote = Some(browser);
+                                p.loaded = true;
+                                p.sel = 0;
+                                p.label = format!("remote {addr}: /");
+                                c.status = Some(format!("Connected to {addr}."));
+                                c.is_error = false;
+                            }
+                            Err(e) => {
+                                c.status = Some(format!("Connect failed: {e}"));
+                                c.is_error = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7374,6 +7690,26 @@ impl App {
                     Line::styled("  Enter create   Esc cancel", self.palette.dim()),
                 ]))
                 .block(self.pane_block("New folder", true)),
+                cp,
+            );
+        }
+
+        // Connect-to-remote host:port prompt (active pane).
+        #[cfg(feature = "remote")]
+        if let Some(addr) = &c.connect_input {
+            let cp = centered_rect(56, 5, area);
+            frame.render_widget(Clear, cp);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(vec![
+                        Span::styled("  Host:port: ", self.palette.accent()),
+                        Span::raw(addr.clone()),
+                        Span::styled(" ", self.palette.accent().add_modifier(Modifier::REVERSED)),
+                    ]),
+                    Line::raw(""),
+                    Line::styled("  Enter connect   Esc cancel", self.palette.dim()),
+                ]))
+                .block(self.pane_block("Connect to remote", true)),
                 cp,
             );
         }

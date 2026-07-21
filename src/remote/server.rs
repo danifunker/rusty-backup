@@ -61,6 +61,12 @@ pub struct ServeConfig {
     /// dir. On a MiSTer this should point at a roomy writable mount, never tmpfs
     /// (plan §6) — multi-hundred-MB uploads would OOM `/tmp`.
     pub staging_dir: Option<PathBuf>,
+    /// When false the daemon serves reads only: every write entry point
+    /// (`OpenSession`, `OpenBlockRw`, `OpenWriteTarget`, `MkdirHost`,
+    /// `WriteHostFile`) is refused with an error, so a client can browse and copy
+    /// *out* but never modify the host. Defaults to true (`rb-cli serve
+    /// --read-only` flips it).
+    pub writable: bool,
 }
 
 /// One staged edit awaiting `Apply` (the relocated `StagedEdit`, plan §2.4).
@@ -109,15 +115,28 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         "rb-cli serve: listening on {bound} (root {})",
         root.display()
     );
-    eprintln!("rb-cli serve: Family F read+write (stage->apply). Ctrl-C to stop.");
-    serve_on(listener, root, cfg.staging_dir)
+    eprintln!(
+        "rb-cli serve: Family F {} (stage->apply). Ctrl-C to stop.",
+        if cfg.writable {
+            "read+write"
+        } else {
+            "read-only"
+        }
+    );
+    serve_on(listener, root, cfg.staging_dir, cfg.writable)
 }
 
 /// Run the accept loop on an already-bound listener. `root` must already be
-/// canonicalized (the sandbox check compares paths against it). Blocks until the
+/// canonicalized (the sandbox check compares paths against it). `writable` gates
+/// every write entry point (see [`ServeConfig::writable`]). Blocks until the
 /// process exits. Exposed so integration tests can bind a port-0 listener and
 /// drive the daemon without guessing a port.
-pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBuf>) -> Result<()> {
+pub fn serve_on(
+    listener: TcpListener,
+    root: PathBuf,
+    staging_dir: Option<PathBuf>,
+    writable: bool,
+) -> Result<()> {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -129,7 +148,7 @@ pub fn serve_on(listener: TcpListener, root: PathBuf, staging_dir: Option<PathBu
                         .map(|a| a.to_string())
                         .unwrap_or_else(|_| "?".into());
                     eprintln!("rb-cli serve: {peer} connected");
-                    match handle_conn(stream, &root, staging_dir.as_deref()) {
+                    match handle_conn(stream, &root, staging_dir.as_deref(), writable) {
                         Ok(()) => eprintln!("rb-cli serve: {peer} disconnected"),
                         Err(e) => eprintln!("rb-cli serve: {peer} ended: {e:#}"),
                     }
@@ -748,7 +767,12 @@ fn validate_member_name(name: &str) -> Result<()> {
 }
 
 /// Serve one connection until the peer says `Bye` or hangs up.
-fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Result<()> {
+fn handle_conn(
+    stream: TcpStream,
+    root: &Path,
+    staging_dir: Option<&Path>,
+    writable: bool,
+) -> Result<()> {
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream.try_clone().context("cloning socket")?);
     let mut writer = BufWriter::new(stream);
@@ -904,6 +928,18 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
             }
 
             // --- write path (Phase 1) ---
+            // Read-only daemon: refuse the no-body write entry points up front.
+            // (WriteHostFile carries a body and is refused in its own arm, which
+            // must still drain that body to keep the stream framed.)
+            Request::OpenSession { .. }
+            | Request::OpenBlockRw { .. }
+            | Request::OpenWriteTarget { .. }
+            | Request::MkdirHost { .. }
+                if !writable =>
+            {
+                reply_err(&mut writer, READ_ONLY_MSG.to_string())?;
+            }
+
             Request::OpenSession {
                 image_path,
                 partition,
@@ -1022,6 +1058,41 @@ fn handle_conn(stream: TcpStream, root: &Path, staging_dir: Option<&Path>) -> Re
                     }
                 },
             },
+
+            // Read-only refusal for MkdirHost is handled by the grouped guard
+            // arm above; this is the writable path.
+            Request::MkdirHost { path } => match mkdir_host(root, &path) {
+                Ok(()) => write_control(&mut writer, &Response::Ok)?,
+                Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
+            },
+
+            Request::WriteHostFile { path, force, .. } => {
+                // The body follows as a chunk stream and MUST be consumed on
+                // every path (read-only refusal, sandbox error, or success) or
+                // the framing desyncs. `host_write_target` resolves + opens the
+                // destination before the body; on that failure we drain to sink
+                // and reply an error. Once the target is open we commit to the
+                // stream (a mid-body error drops the connection, matching
+                // ReadHostFile's contract).
+                let target = if !writable {
+                    Err(anyhow!("{READ_ONLY_MSG}"))
+                } else {
+                    host_write_target(root, &path, force)
+                };
+                match target {
+                    Ok(mut f) => {
+                        read_chunks(&mut reader, &mut f)
+                            .map_err(|e| anyhow!("writing host file {path}: {e}"))?;
+                        f.flush()
+                            .map_err(|e| anyhow!("flushing host file {path}: {e}"))?;
+                        write_control(&mut writer, &Response::Ok)?;
+                    }
+                    Err(e) => {
+                        let _ = read_chunks(&mut reader, &mut std::io::sink());
+                        reply_err(&mut writer, format!("{e:#}"))?;
+                    }
+                }
+            }
 
             Request::OpenBlock { path } => match open_block(root, &path) {
                 Err(e) => reply_err(&mut writer, format!("{e:#}"))?,
@@ -1892,6 +1963,38 @@ fn host_stat(root: &Path, rel: &str) -> Result<(bool, bool)> {
         }
         Err(_) => Ok((false, false)),
     }
+}
+
+/// Message returned when a write is attempted on a read-only daemon.
+const READ_ONLY_MSG: &str = "daemon is read-only; restart it without --read-only to allow writes";
+
+/// Create a directory on the host FS under the serve root (the `MkdirHost`
+/// handler). Idempotent — an existing directory is success. The parent must
+/// already exist, which the copy engine guarantees by creating a tree top-down
+/// (and which `sandbox_join_create` requires anyway).
+fn mkdir_host(root: &Path, rel: &str) -> Result<()> {
+    let full = sandbox_join_create(root, rel)?;
+    match std::fs::create_dir(&full) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && full.is_dir() => Ok(()),
+        Err(e) => Err(anyhow!("creating directory {rel:?}: {e}")),
+    }
+}
+
+/// Resolve and open a host-FS write target under the serve root, ready to
+/// receive a `WriteHostFile` body. Fails **before any body is read** when the
+/// path escapes the sandbox, its parent is missing, it is an existing directory,
+/// or it already exists and `force` is false — the caller drains the body on
+/// that failure to keep the stream framed.
+fn host_write_target(root: &Path, rel: &str, force: bool) -> Result<std::fs::File> {
+    let full = sandbox_join_create(root, rel)?;
+    if full.is_dir() {
+        bail!("{rel} is a directory");
+    }
+    if full.exists() && !force {
+        bail!("{rel} already exists");
+    }
+    std::fs::File::create(&full).with_context(|| format!("creating host file {rel}"))
 }
 
 /// Like `sandbox_join` but allows the root itself (empty `rel`) — for browsing

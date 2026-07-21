@@ -1479,7 +1479,7 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 
 ### `serve`
 
-Run the network daemon so a remote `rb-cli` can browse and read files inside images this host holds (`rb://host:port/img@N`). Family F read-only (Phase 0). See docs/remote_transfer_plan.md
+Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander) can browse, read, and write files inside images this host holds (`rb://host:port/img@N`) and on its host filesystem. Writable under the serve root by default; pass `--read-only` for a browse-only daemon. See docs/remote_transfer_plan.md
 
 ```
 Usage: serve [OPTIONS] [COMMAND]
@@ -1490,6 +1490,7 @@ Usage: serve [OPTIONS] [COMMAND]
 - `--bind` — Address to bind, `host:port`. Default binds all interfaces on the rusty-backup port (7341). Ignored by the `service` / `setup` subcommands (those read `rb-daemon.ini`)
 - `--root` — Root directory images are served from. Every `rb://` path a client opens is sandboxed under this directory
 - `--staging-dir` — Directory for per-session upload staging blobs (write path). Defaults to the system temp dir. On a MiSTer point this at a roomy writable mount, never tmpfs — large uploads would fill RAM
+- `--read-only` — Serve reads only: clients can browse and copy *out* of the daemon, but every write (image edit, restore-to-target, host upload / mkdir) is refused. Without this the daemon is writable under its serve root
 
 ### `serve service`
 

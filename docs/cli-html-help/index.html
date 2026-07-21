@@ -63,7 +63,7 @@
 <li><a href="resize.html"><code>resize</code></a><span class="desc">Resize the filesystem at IMG@N to a new size (FAT/NTFS/exFAT/HFS+/ ext/btrfs/SFS/PFS3/AFFS/EFS — whichever magic matches)</span></li>
 <li><a href="restore.html"><code>restore</code></a><span class="desc">Restore a backup folder to a target image or device</span></li>
 <li><a href="rm.html"><code>rm</code></a><span class="desc">Delete a file or directory from a filesystem</span></li>
-<li><a href="serve.html"><code>serve</code></a><span class="desc">Run the network daemon so a remote `rb-cli` can browse and read files inside images this host holds (`rb://host:port/img@N`). Family F read-only (Phase 0). See docs/remote_transfer_plan.md</span></li>
+<li><a href="serve.html"><code>serve</code></a><span class="desc">Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander) can browse, read, and write files inside images this host holds (`rb://host:port/img@N`) and on its host filesystem. Writable under the serve root by default; pass `--read-only` for a browse-only daemon. See docs/remote_transfer_plan.md</span></li>
 <li><a href="setrsrc.html"><code>setrsrc</code></a><span class="desc">Write the resource fork of an existing HFS / HFS+ / MFS file from a host file</span></li>
 <li><a href="setvolname.html"><code>setvolname</code></a><span class="desc">Rename the volume at IMG[@N] (HFS only today)</span></li>
 <li><a href="show.html"><code>show</code></a><span class="desc">Focused read-only queries</span></li>

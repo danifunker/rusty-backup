@@ -260,8 +260,13 @@ rb-cli serve service uninstall   # remove the boot entry
 
 Defaults (editable in `/media/fat/Scripts/rb-daemon.ini`) serve the whole
 `/media/fat` card on `0.0.0.0:7341`, writable. From the desktop, connect to
-`rb://<mister-ip>:7341/`. The daemon design lives in
-[`docs/remote_transfer_plan.md`](docs/remote_transfer_plan.md).
+`rb://<mister-ip>:7341/`. Both Commander clients reach a daemon **both ways** —
+browse its files and copy *out*, and copy files/folders back *in* (a remote host
+folder or an image on it): in the **GUI Commander** point a pane at it via "Open"
+-> "Connect to Remote...", and in the **`rb-cli tui` Commander** press **`R`** and
+enter `host:port`. For a browse-only daemon that refuses every write, start it
+with `rb-cli serve --read-only` (or set `writable = no` in `rb-daemon.ini`). The
+daemon design lives in [`docs/remote_transfer_plan.md`](docs/remote_transfer_plan.md).
 
 ### Bootable backup appliances (boot the metal, no host OS)
 

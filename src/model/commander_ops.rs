@@ -27,6 +27,8 @@ use crate::model::browse_session::BrowseSession;
 use crate::model::commander_descend::DescendKind;
 use crate::model::edit_queue::{apply_edit, StagedEdit};
 use crate::model::wrapper_tree::{PreparedMount, WrapperSource, WrapperTree};
+#[cfg(feature = "remote")]
+use crate::remote::RemoteConnection;
 
 /// Apply `edits` to the source described by `session`, in order.
 ///
@@ -560,6 +562,26 @@ pub enum HostCopyJob {
         entries: Vec<FileEntry>,
         dest_dir: PathBuf,
     },
+    /// Upload image-volume `entries` onto a remote daemon's host filesystem
+    /// under `dest_parent`, preserving resource forks per `fork_mode`. `source`
+    /// reopens the image (local or remote) on the worker; a fresh connection to
+    /// `dest_addr` receives the files. The remote analog of `ImageToHost`.
+    #[cfg(feature = "remote")]
+    ImageToRemoteHost {
+        source: StageSource,
+        entries: Vec<FileEntry>,
+        dest_addr: String,
+        dest_parent: String,
+        fork_mode: ResourceForkMode,
+    },
+    /// Upload host `entries` (local paths) onto a remote daemon's host
+    /// filesystem under `dest_parent`. The remote analog of `HostToHost`.
+    #[cfg(feature = "remote")]
+    HostToRemoteHost {
+        entries: Vec<FileEntry>,
+        dest_addr: String,
+        dest_parent: String,
+    },
     /// Export image-volume `entries` to the host in `format` — loose files / a
     /// per-file-compressed tree into a folder, or one tar/zip/sit archive file.
     /// `dest` is the folder or the archive file per `format.is_single_file()`.
@@ -645,6 +667,46 @@ fn run_host_copy(job: HostCopyJob, status: &Arc<Mutex<HostCopyStatus>>) -> Resul
                 g.bytes_total = bytes_total;
             }
             copy_host_entries_to_host(&entries, &dest_dir, status)
+        }
+        #[cfg(feature = "remote")]
+        HostCopyJob::ImageToRemoteHost {
+            source,
+            entries,
+            dest_addr,
+            dest_parent,
+            fork_mode,
+        } => {
+            let mut fs = source.open()?;
+            let (files_total, bytes_total) = scan_image_entries(fs.as_mut(), &entries)?;
+            if let Ok(mut g) = status.lock() {
+                g.files_total = files_total;
+                g.bytes_total = bytes_total;
+            }
+            let mut conn = RemoteConnection::connect(&dest_addr)
+                .context("connecting to the destination daemon")?;
+            upload_image_entries_to_remote_host(
+                fs.as_mut(),
+                &entries,
+                &mut conn,
+                &dest_parent,
+                fork_mode,
+                status,
+            )
+        }
+        #[cfg(feature = "remote")]
+        HostCopyJob::HostToRemoteHost {
+            entries,
+            dest_addr,
+            dest_parent,
+        } => {
+            let (files_total, bytes_total) = scan_host_entries(&entries);
+            if let Ok(mut g) = status.lock() {
+                g.files_total = files_total;
+                g.bytes_total = bytes_total;
+            }
+            let mut conn = RemoteConnection::connect(&dest_addr)
+                .context("connecting to the destination daemon")?;
+            upload_host_entries_to_remote_host(&entries, &mut conn, &dest_parent, status)
         }
         HostCopyJob::ExportSelection(job) => run_export(*job, status),
     }
@@ -892,6 +954,203 @@ fn copy_host_dir(
         }
     }
     Ok(())
+}
+
+/// Join a `/`-rooted remote parent path with a child name.
+#[cfg(feature = "remote")]
+fn join_remote(parent: &str, name: &str) -> String {
+    if parent.is_empty() || parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", parent.trim_end_matches('/'))
+    }
+}
+
+/// Upload image-volume `entries` onto a remote daemon's host filesystem under
+/// `dest_parent`, recursing directories and preserving resource forks per
+/// `fork_mode`. Each file is materialized locally with [`export_file_with_fork`]
+/// (so every fork mode — AppleDouble sidecar, MacBinary, BinHex, … — is
+/// honored) and its produced file(s) are streamed to the daemon. The remote
+/// analog of [`copy_image_entries_to_host`]. `dest_parent` must already exist on
+/// the daemon (it is the pane's current directory); nested dirs are created as
+/// the walk descends.
+#[cfg(feature = "remote")]
+fn upload_image_entries_to_remote_host(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+    conn: &mut RemoteConnection,
+    dest_parent: &str,
+    fork_mode: ResourceForkMode,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<usize> {
+    let mut count = 0;
+    for entry in entries {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
+        if entry.is_directory() {
+            let sub = join_remote(dest_parent, &entry.name);
+            conn.mkdir_host(&sub)
+                .with_context(|| format!("creating remote directory '{}'", entry.name))?;
+            let children = fs
+                .list_directory(entry)
+                .with_context(|| format!("listing '{}'", entry.name))?;
+            count +=
+                upload_image_entries_to_remote_host(fs, &children, conn, &sub, fork_mode, status)?;
+        } else if entry.is_file() {
+            if let Ok(mut g) = status.lock() {
+                g.current_file = entry.path.clone();
+            }
+            // Materialize the file (+ any fork sidecar) locally, then stream
+            // whatever export produced to the daemon.
+            let temp = tempfile::tempdir().context("staging remote upload")?;
+            export_file_with_fork(fs, entry, temp.path(), &safe_name(entry), fork_mode)
+                .with_context(|| format!("encoding '{}'", entry.name))?;
+            upload_dir_files_to_remote(conn, temp.path(), dest_parent)?;
+            count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = count;
+                g.bytes_done = g.bytes_done.saturating_add(entry.size);
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Upload every regular file directly inside `dir` to `dest_parent` on the
+/// daemon. Non-recursive: [`export_file_with_fork`] writes a flat set (the data
+/// fork plus at most one sidecar) into a fresh temp dir.
+#[cfg(feature = "remote")]
+fn upload_dir_files_to_remote(
+    conn: &mut RemoteConnection,
+    dir: &Path,
+    dest_parent: &str,
+) -> Result<()> {
+    for dent in std::fs::read_dir(dir)?.flatten() {
+        if dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let name = dent.file_name().to_string_lossy().into_owned();
+            let dest = join_remote(dest_parent, &name);
+            conn.write_host_file(&dest, &dent.path(), true)
+                .with_context(|| format!("uploading '{name}'"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Upload host `entries` (local paths) onto the daemon's host FS under
+/// `dest_parent`, recursing directories. The remote analog of
+/// [`copy_host_entries_to_host`]. Local host files are plain (no fork encoding);
+/// any AppleDouble `._name` siblings already on disk copy through as files.
+#[cfg(feature = "remote")]
+fn upload_host_entries_to_remote_host(
+    entries: &[FileEntry],
+    conn: &mut RemoteConnection,
+    dest_parent: &str,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<usize> {
+    let mut count = 0;
+    for entry in entries {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
+        let src = PathBuf::from(&entry.path);
+        let dest = join_remote(dest_parent, &entry.name);
+        if entry.is_directory() {
+            conn.mkdir_host(&dest)
+                .with_context(|| format!("creating remote directory '{}'", entry.name))?;
+            upload_host_dir_to_remote(&src, &dest, conn, &mut count, status)?;
+        } else if entry.is_file() {
+            if let Ok(mut g) = status.lock() {
+                g.current_file = entry.path.clone();
+            }
+            conn.write_host_file(&dest, &src, true)
+                .with_context(|| format!("uploading '{}'", entry.name))?;
+            count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = count;
+                g.bytes_done = g.bytes_done.saturating_add(entry.size);
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Recurse a local directory `src`, mirroring its tree under the remote `dest`
+/// path. Mirrors [`copy_host_dir`] over the wire; `count` is the single running
+/// file total the progress modal reads.
+#[cfg(feature = "remote")]
+fn upload_host_dir_to_remote(
+    src: &Path,
+    dest: &str,
+    conn: &mut RemoteConnection,
+    count: &mut usize,
+    status: &Arc<Mutex<HostCopyStatus>>,
+) -> Result<()> {
+    for dent in std::fs::read_dir(src)
+        .with_context(|| format!("reading {}", src.display()))?
+        .flatten()
+    {
+        if is_cancelled(status) {
+            return Err(cancelled_err());
+        }
+        let meta = match dent.path().symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = meta.file_type();
+        let name = dent.file_name().to_string_lossy().into_owned();
+        let child_dest = join_remote(dest, &name);
+        if ft.is_dir() {
+            conn.mkdir_host(&child_dest)
+                .with_context(|| format!("creating remote directory '{name}'"))?;
+            upload_host_dir_to_remote(&dent.path(), &child_dest, conn, count, status)?;
+        } else if ft.is_file() {
+            if let Ok(mut g) = status.lock() {
+                g.current_file = dent.path().display().to_string();
+            }
+            conn.write_host_file(&child_dest, &dent.path(), true)
+                .with_context(|| format!("uploading {}", dent.path().display()))?;
+            *count += 1;
+            if let Ok(mut g) = status.lock() {
+                g.copied = *count;
+                g.bytes_done = g.bytes_done.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Synchronously upload host `entries` (local paths) onto the daemon at `addr`
+/// under `dest_parent`, recursing directories. The blocking entry point the TUI
+/// uses (the GUI drives the async [`HostCopyJob::HostToRemoteHost`] job instead).
+#[cfg(feature = "remote")]
+pub fn upload_host_entries_to_remote(
+    entries: &[FileEntry],
+    addr: &str,
+    dest_parent: &str,
+) -> Result<usize> {
+    let mut conn =
+        RemoteConnection::connect(addr).context("connecting to the destination daemon")?;
+    let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+    upload_host_entries_to_remote_host(entries, &mut conn, dest_parent, &status)
+}
+
+/// Synchronously upload image-volume `entries` (read through `fs`) onto the
+/// daemon at `addr` under `dest_parent`, preserving resource forks per
+/// `fork_mode`. The blocking entry point the TUI uses (the GUI drives the async
+/// [`HostCopyJob::ImageToRemoteHost`] job instead).
+#[cfg(feature = "remote")]
+pub fn upload_fs_entries_to_remote(
+    fs: &mut dyn Filesystem,
+    entries: &[FileEntry],
+    addr: &str,
+    dest_parent: &str,
+    fork_mode: ResourceForkMode,
+) -> Result<usize> {
+    let mut conn =
+        RemoteConnection::connect(addr).context("connecting to the destination daemon")?;
+    let status = Arc::new(Mutex::new(HostCopyStatus::default()));
+    upload_image_entries_to_remote_host(fs, entries, &mut conn, dest_parent, fork_mode, &status)
 }
 
 /// Shared state between the GUI and the [`spawn_apply`] worker.

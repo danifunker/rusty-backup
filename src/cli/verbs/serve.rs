@@ -37,6 +37,12 @@ pub struct ServeArgs {
     #[arg(long = "staging-dir")]
     pub staging_dir: Option<PathBuf>,
 
+    /// Serve reads only: clients can browse and copy *out* of the daemon, but
+    /// every write (image edit, restore-to-target, host upload / mkdir) is
+    /// refused. Without this the daemon is writable under its serve root.
+    #[arg(long = "read-only")]
+    pub read_only: bool,
+
     #[command(subcommand)]
     pub command: Option<ServeCommand>,
 }
@@ -78,6 +84,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
             bind: args.bind,
             root: args.root,
             staging_dir: args.staging_dir,
+            writable: !args.read_only,
         }),
         Some(ServeCommand::Setup) => crate::cli::verbs::setup::run(),
         Some(ServeCommand::Service(service)) => run_service(service.action),

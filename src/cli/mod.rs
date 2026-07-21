@@ -195,9 +195,11 @@ pub enum Command {
     /// summary + CHD metadata when applicable).
     Inspect(verbs::inspect::InspectArgs),
 
-    /// Run the network daemon so a remote `rb-cli` can browse and read
-    /// files inside images this host holds (`rb://host:port/img@N`).
-    /// Family F read-only (Phase 0). See docs/remote_transfer_plan.md.
+    /// Run the network daemon so a remote `rb-cli` (or the GUI / TUI Commander)
+    /// can browse, read, and write files inside images this host holds
+    /// (`rb://host:port/img@N`) and on its host filesystem. Writable under the
+    /// serve root by default; pass `--read-only` for a browse-only daemon. See
+    /// docs/remote_transfer_plan.md.
     #[cfg(feature = "remote")]
     Serve(verbs::serve::ServeArgs),
 
