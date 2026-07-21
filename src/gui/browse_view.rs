@@ -57,6 +57,11 @@ pub struct BrowseView {
     expanded_paths: HashSet<String>,
     /// Currently selected file entry.
     selected_entry: Option<FileEntry>,
+    /// Checkbox-marked entries for multi-select export (independent of the
+    /// single-click `selected_entry` preview), keyed by path. The entry is stored
+    /// so export can read it without re-walking the tree. Fed to the shared
+    /// `export_selection` engine by the "Export selected..." bar.
+    marked: std::collections::BTreeMap<String, FileEntry>,
     /// Cached content of the selected file.
     content: Option<FileContent>,
     /// View mode for file content.
@@ -380,6 +385,7 @@ impl Default for BrowseView {
             directory_cache: HashMap::new(),
             expanded_paths: HashSet::new(),
             selected_entry: None,
+            marked: std::collections::BTreeMap::new(),
             content: None,
             view_mode: ViewMode::Auto,
             error: None,
@@ -633,6 +639,7 @@ impl BrowseView {
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
+        self.marked.clear();
         self.content = None;
         self.error = None;
         self.active = false;
@@ -1215,6 +1222,7 @@ impl BrowseView {
             ui.vertical(|ui| {
                 ui.set_width(tree_width);
                 ui.set_min_height(panel_height);
+                self.render_selection_bar(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("browse_tree")
                     .max_height(panel_height)
@@ -1285,6 +1293,9 @@ impl BrowseView {
 
                 let header_res = ui.horizontal(|ui| {
                     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    if !pending_del {
+                        self.mark_checkbox(ui, entry);
+                    }
                     if pending_del {
                         let text = egui::RichText::new(&dir_label)
                             .color(dimmed)
@@ -1371,20 +1382,24 @@ impl BrowseView {
                     // blue so the user sees what they've changed before Apply.
                     let meta_changed =
                         self.edit_mode && self.staged_edits.has_pending_metadata(&entry.path);
-                    let rich = if meta_changed {
-                        egui::RichText::new(&label).color(egui::Color32::from_rgb(150, 190, 255))
-                    } else {
-                        egui::RichText::new(&label)
-                    };
-                    let resp = ui.selectable_label(is_selected, rich);
-                    let resp = if let Some(h) = hover_text {
-                        resp.on_hover_text(h)
-                    } else {
-                        resp
-                    };
-                    if resp.clicked() {
-                        self.select_file(entry);
-                    }
+                    ui.horizontal(|ui| {
+                        self.mark_checkbox(ui, entry);
+                        let rich = if meta_changed {
+                            egui::RichText::new(&label)
+                                .color(egui::Color32::from_rgb(150, 190, 255))
+                        } else {
+                            egui::RichText::new(&label)
+                        };
+                        let resp = ui.selectable_label(is_selected, rich);
+                        let resp = if let Some(h) = hover_text {
+                            resp.on_hover_text(h)
+                        } else {
+                            resp
+                        };
+                        if resp.clicked() {
+                            self.select_file(entry);
+                        }
+                    });
                 }
             }
             EntryType::Symlink => {
@@ -1423,6 +1438,160 @@ impl BrowseView {
                 }
             }
         }
+    }
+
+    /// Render the multi-select checkbox for `entry`, toggling its mark. Marked
+    /// entries feed the "Export selected..." bar; independent of the single-click
+    /// `selected_entry` preview.
+    fn mark_checkbox(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+        let mut marked = self.marked.contains_key(&entry.path);
+        if ui
+            .checkbox(&mut marked, "")
+            .on_hover_text("Mark for multi-select export")
+            .changed()
+        {
+            if marked {
+                self.marked.insert(entry.path.clone(), entry.clone());
+            } else {
+                self.marked.remove(&entry.path);
+            }
+        }
+    }
+
+    /// Marked entries to export, with any entry that lives under another marked
+    /// directory dropped — that ancestor's recursive walk already includes it, so
+    /// nothing is archived twice.
+    fn marked_export_entries(&self) -> Vec<FileEntry> {
+        fn is_ancestor(a: &str, p: &str) -> bool {
+            if a == p {
+                return false;
+            }
+            if a == "/" {
+                return p.len() > 1 && p.starts_with('/');
+            }
+            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
+        }
+        let marked_paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
+        self.marked
+            .iter()
+            .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Compact bar shown above the tree when entries are checkbox-marked: the
+    /// count, an "Export selected as..." format menu (the shared `export_selection`
+    /// engine, so `.mar` and the other formats come for free), and Clear.
+    fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let mut chosen: Option<rusty_backup::fs::export_selection::ExportFormat> = None;
+        let mut clear = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} selected", self.marked.len()));
+            ui.menu_button("Export selected as...", |ui| {
+                for fmt in rusty_backup::fs::export_selection::ExportFormat::ALL {
+                    if ui.button(fmt.label()).clicked() {
+                        chosen = Some(fmt);
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("Clear").clicked() {
+                clear = true;
+            }
+        });
+        ui.separator();
+        if clear {
+            self.marked.clear();
+        }
+        if let Some(fmt) = chosen {
+            self.export_marked(fmt);
+        }
+    }
+
+    /// Export the checkbox-marked entries together as one `format` output, reusing
+    /// the shared multi-entry engine (the same path Commander uses). Foreground
+    /// execution; classic-Mac payloads are typically small.
+    fn export_marked(&mut self, format: rusty_backup::fs::export_selection::ExportFormat) {
+        use rusty_backup::fs::export_selection::{export_to_file, export_to_folder};
+        let entries = self.marked_export_entries();
+        if entries.is_empty() {
+            self.edit_result = Some("Nothing selected to export.".into());
+            return;
+        }
+        let fork_mode = self.resource_fork_mode;
+        let noop_progress = |_: &str, _: usize, _: u64| {};
+        let never_cancel = || false;
+
+        if format.is_single_file() {
+            let ext = format
+                .file_extension()
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let default_name = format!("selection{ext}");
+            let Some(path) = super::file_dialog()
+                .set_title("Export selection")
+                .set_file_name(&default_name)
+                .save_file()
+            else {
+                return;
+            };
+            let Some(mut fs) = self.take_or_open_fs() else {
+                self.edit_result = Some("Filesystem not open.".into());
+                return;
+            };
+            let res = export_to_file(
+                &mut *fs,
+                &entries,
+                &path,
+                format,
+                &noop_progress,
+                &never_cancel,
+            );
+            self.return_fs(fs);
+            self.report_export(res, &path);
+        } else {
+            let Some(dir) = super::file_dialog()
+                .set_title("Export selection to folder")
+                .pick_folder()
+            else {
+                return;
+            };
+            let Some(mut fs) = self.take_or_open_fs() else {
+                self.edit_result = Some("Filesystem not open.".into());
+                return;
+            };
+            let res = export_to_folder(
+                &mut *fs,
+                &entries,
+                &dir,
+                format,
+                fork_mode,
+                &noop_progress,
+                &never_cancel,
+            );
+            self.return_fs(fs);
+            self.report_export(res, &dir);
+        }
+    }
+
+    /// Fold an export result into the status line.
+    fn report_export(
+        &mut self,
+        res: anyhow::Result<rusty_backup::fs::export_selection::ExportSummary>,
+        path: &Path,
+    ) {
+        self.edit_result = Some(match res {
+            Ok(s) => format!(
+                "Exported {} item(s), {} to {}",
+                s.files,
+                partition::format_size(s.bytes),
+                path.display()
+            ),
+            Err(e) => format!("Export failed: {e}"),
+        });
     }
 
     /// Render a pending-add entry with green "+" prefix (not selectable for content).
