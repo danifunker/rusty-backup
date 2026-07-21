@@ -354,7 +354,17 @@ impl OpticalDiscBrowseView {
                 let path = entry.path.clone();
                 let has_children = self.directory_cache.contains_key(&path);
 
-                let header = egui::CollapsingHeader::new(&entry.name)
+                // opticaldiscs names the disc root "" (empty); show it as "/" so
+                // the root is a visible, expandable node instead of a bare
+                // triangle with nothing to click. Scoped to the empty-named root,
+                // so if opticaldiscs is later fixed to name the root, that real
+                // name shows through unchanged.
+                let label = if entry.name.is_empty() && path == "/" {
+                    "/"
+                } else {
+                    entry.name.as_str()
+                };
+                let header = egui::CollapsingHeader::new(label)
                     .id_salt(&path)
                     .default_open(path == "/")
                     .show(ui, |ui| {

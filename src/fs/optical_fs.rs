@@ -148,19 +148,25 @@ impl OpticalFilesystem {
 /// resource-fork size and Finder type/creator/flags. (opticaldiscs' browse API
 /// has no date field, so the Modified column stays blank for optical discs.)
 fn translate(e: &OptEntry) -> FileEntry {
+    // opticaldiscs names its root entry "" (empty) with path "/", but rusty-backup's
+    // convention — FileEntry::root() and every native fs driver — gives the root the
+    // name "/", which the browse/Commander tree renders as its clickable root row.
+    // Passing the empty name straight through leaves the optical root a blank,
+    // unselectable label, so the user can't act on the disc root (e.g. export the
+    // whole disc). Normalize it here, at the single choke point that turns
+    // opticaldiscs entries into ours; only the root has an empty name.
+    let name = if e.name.is_empty() && e.path == "/" {
+        "/".to_string()
+    } else {
+        e.name.clone()
+    };
     let mut fe = match e.entry_type {
-        OptType::Directory => FileEntry::new_directory(e.name.clone(), e.path.clone(), e.location),
+        OptType::Directory => FileEntry::new_directory(name, e.path.clone(), e.location),
         OptType::File => {
             if let Some(target) = &e.symlink_target {
-                FileEntry::new_symlink(
-                    e.name.clone(),
-                    e.path.clone(),
-                    e.size,
-                    e.location,
-                    target.clone(),
-                )
+                FileEntry::new_symlink(name, e.path.clone(), e.size, e.location, target.clone())
             } else {
-                FileEntry::new_file(e.name.clone(), e.path.clone(), e.size, e.location)
+                FileEntry::new_file(name, e.path.clone(), e.size, e.location)
             }
         }
     };
@@ -445,5 +451,37 @@ mod tests {
             matches!(err, FilesystemError::NotFound(ref p) if p == "/sub/ghost"),
             "a path that does not exist should still be NotFound, got {err:?}"
         );
+    }
+
+    #[test]
+    fn root_entry_is_labelled_slash_not_blank() {
+        // opticaldiscs hands us a root with an empty name (path "/"). The browse /
+        // Commander tree renders a node by its name, so a blank label leaves the
+        // disc root unselectable — the user can't export the whole disc. root()
+        // must surface it as "/", matching every native fs.
+        let mut fs = fresh(mock_disc());
+        let root = fs.root().expect("root");
+        assert_eq!(
+            root.name, "/",
+            "optical root must be labelled '/', not blank"
+        );
+        assert_eq!(root.path, "/");
+        assert!(root.is_directory());
+    }
+
+    #[test]
+    fn translate_only_relabels_the_blank_root() {
+        // The "" -> "/" rewrite is scoped to the root (empty name AND path "/"),
+        // so it stays forward-compatible: if opticaldiscs is later fixed to name
+        // the root itself, we pass that name through untouched, and no ordinary
+        // named entry is ever rewritten.
+        let blank_root = OptEntry::new_directory("".into(), "/".into(), 0);
+        assert_eq!(translate(&blank_root).name, "/");
+
+        let named_root = OptEntry::new_directory("CD_LABEL".into(), "/".into(), 0);
+        assert_eq!(translate(&named_root).name, "CD_LABEL");
+
+        let child = OptEntry::new_file("deep.txt".into(), "/sub/deep.txt".into(), 5, 2);
+        assert_eq!(translate(&child).name, "deep.txt");
     }
 }
