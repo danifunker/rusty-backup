@@ -121,6 +121,63 @@ fn main() {
             fs::write(&args[1], pilot::write_pdi(&disk, gen)).expect("write pdi");
             println!("Deleted FileID {fid} from {}", args[1]);
         }
+        Some("trim") if args.len() == 4 => {
+            // trim <source.pdi> <out.pdi> <keep-normal-files>
+            // Keep boot FileIDs 2/3 plus the first N ordinary files, freeing
+            // the rest in-place so PV/LV layout and installed boot state stay
+            // intact.
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let keep_normal: usize = args[3].parse().expect("keep-normal-files");
+            let fs_view = PilotFilesystem::open(disk.clone(), gen).expect("open fs");
+            let files = fs_view.file_ids();
+            let mut kept = 0usize;
+            let mut remove = Vec::new();
+            for (_, fid) in &files {
+                if *fid == 2 || *fid == 3 {
+                    continue;
+                }
+                if kept < keep_normal {
+                    kept += 1;
+                } else {
+                    remove.push(*fid);
+                }
+            }
+            let mut trimmed = disk;
+            for fid in remove {
+                trimmed = pilot::delete_file(&trimmed, fid)
+                    .unwrap_or_else(|e| panic!("delete FileID {fid}: {e}"));
+            }
+            fs::write(&args[2], pilot::write_pdi(&trimmed, gen)).expect("write pdi");
+            println!(
+                "Trimmed {} to {}: retained boot files + {kept} ordinary files",
+                args[1], args[2]
+            );
+        }
+        Some("drop-range") if args.len() == 5 => {
+            // drop-range <source.pdi> <out.pdi> <first-id> <last-id>
+            // Targeted in-place reclamation for a known full Cedar volume:
+            // preserve its boot/root structures and delete only an explicit
+            // application FileID interval.
+            let bytes = fs::read(&args[1]).expect("read pdi");
+            let mut disk = open_pack(&bytes).expect("open_pack");
+            let gen = pdi_generation(&bytes);
+            let first: u32 = args[3].parse().expect("first FileID");
+            let last: u32 = args[4].parse().expect("last FileID");
+            let mut removed = 0;
+            for fid in first..=last {
+                if let Ok(next) = pilot::delete_file(&disk, fid) {
+                    disk = next;
+                    removed += 1;
+                }
+            }
+            fs::write(&args[2], pilot::write_pdi(&disk, gen)).expect("write pdi");
+            println!(
+                "Dropped {removed} files in FileID range {first}..{last} -> {}",
+                args[2]
+            );
+        }
         Some("add") if args.len() == 3 => {
             // add <pdi> <hostfile>  (rewrites the PDI in place with the file added)
             let bytes = fs::read(&args[1]).expect("read pdi");
@@ -136,7 +193,7 @@ fn main() {
                 args[1]
             );
         }
-        Some("set-dir") if args.len() >= 3 => {
+        Some("set-dir") if args.len() >= 2 => {
             // set-dir <pdi> <name>=<fileID-decimal> [<name>=<fileID> ...]
             //
             // Build the Cedar `client` name directory (FS B-tree) from the given

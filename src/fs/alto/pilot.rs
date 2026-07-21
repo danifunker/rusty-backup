@@ -62,11 +62,19 @@ pub mod attr {
     pub const FREE_PAGE_CLASSIC: u16 = 6;
 }
 
-/// True if a label `attributes`/`type` word marks a free page in either the
-/// Cedar-nucleus scheme ([`attr::FREE_PAGE`]) or the classic Pilot scheme
-/// ([`attr::FREE_PAGE_CLASSIC`]).
-fn is_free_page_attr(a: u16) -> bool {
-    a == attr::FREE_PAGE || a == attr::FREE_PAGE_CLASSIC
+/// PilotDisk.mc clears the low three file-flag bits in its private label after
+/// the first sector of a file run. Thus a Cedar continuation sector has the
+/// `freePage` Attributes value but retains a non-volume RelID. A genuinely
+/// free page has both the logical volume's AbsID and that Attributes value.
+fn is_free_label(label: &Label, volume_id: [u16; 5], generation: Generation) -> bool {
+    match generation {
+        Generation::CedarNucleus => {
+            label.attributes == attr::FREE_PAGE && label.file_id == volume_id
+        }
+        Generation::OriginalPilot => {
+            label.attributes == attr::FREE_PAGE || label.attributes == attr::FREE_PAGE_CLASSIC
+        }
+    }
 }
 
 const VOLUME_LABEL_LEN: usize = 40;
@@ -79,6 +87,34 @@ const ROOT_PAGE_NUMBER: u32 = 0;
 /// boot-microcode region). The first subvolume — and logical page 0, the LV
 /// root — starts at this page. (Empty for a non-boot blank volume.)
 const OTHELLO_PV_RESERVE: usize = 3 * 28; // 84
+
+/// `FSPropertiesImpl.validation` — the seal Cedar requires at the start of a
+/// file's property storage (its second header page). Cedar computes it as
+/// `GVBasics.MakeKey["August 19, 1983 1:16 pm"]` (the source marks that stamp
+/// "DON'T CHANGE THIS!!!"), and every property accessor — `GetProps`,
+/// `SetProps`, `GetNameBodyAndVersion` — checks `pPtr.validation = validation`
+/// first, treating a mismatch as "invalid property page". A file whose
+/// property page is blank is therefore skipped by directory enumeration
+/// ("Property page of a local file has a bad property page"), even though its
+/// name and contents are perfectly good.
+///
+/// Rather than reimplement Grapevine's key hash, these are the four words as
+/// written by Cedar 6.1 itself, read back from files it created during a live
+/// install (identical across every such file).
+const PROPERTIES_VALIDATION: [u16; 4] = [53958, 60644, 54392, 64546];
+
+/// Word layout of `FSPropertiesImpl.PropertiesObject`, which occupies the
+/// second header page:
+///   0..3  validation (GVBasics.Password)
+///   4..5  bytes      (INT, low word first)
+///   6     keep       (CARDINAL)
+///   7..8  created    (BasicTime.GMT)
+///   9     version    (FSBackdoor.Version)
+///   10    nameBody   TextRep length in chars, characters follow 2/word
+const PROP_BYTES_WORD: usize = 4;
+const PROP_KEEP_WORD: usize = 6;
+const PROP_VERSION_WORD: usize = 9;
+const PROP_NAME_WORD: usize = 10;
 
 /// Well-known 32-bit FileID of the Volume Allocation Map file (Cedar nucleus
 /// `VolumeFile::VAM` = root-file slot 7). We allocate it first, so user files
@@ -93,10 +129,12 @@ const ROOTFILE_VAM_WORD: usize = 85 + 7 * 6;
 /// `fp.id` (2-word 32-bit FileID) sits at the slot's word 0.
 const ROOTFILE_CLIENT_WORD: usize = 85 + 8 * 6;
 
-/// Words of VAM data for a volume of `volume_size` pages: `rover`(2) + `size`(2)
-/// + one bit per page.
+/// Words of VAM data for a volume of `volume_size` pages.  Cedar's
+/// `LogicalVolumeImpl.VAMWords` rounds the bitmap to 65,536-page chunks:
+/// `rover`(2) + `size`(2) + 4096 words per nonempty chunk.  Tight-packing the
+/// final chunk makes the file shorter than Cedar's `ReadVAM` request.
 fn vam_data_words(volume_size: u32) -> usize {
-    4 + (volume_size as usize).div_ceil(16)
+    4 + (volume_size as usize).div_ceil(1 << 16) * 4096
 }
 /// Pages the VAM bitmap occupies (256 words each).
 fn vam_data_pages(volume_size: u32) -> usize {
@@ -131,13 +169,14 @@ impl Generation {
 /// 80-bit UID, distinct from a Cedar `File.FP` (whose word 4 is fill = 0).
 const PILOT_UID_CREATOR: [u16; 3] = [0x5242, 0x0000, 0x0001]; // "RB" + v1
 
-/// Build a label `fileID` from a per-volume counter `n`, per generation:
-/// Cedar nucleus = `File.FP` (FileID + null DA hint + fill); original Pilot =
-/// 80-bit `UniversalID` (counter + creator prefix).
-fn make_file_id(generation: Generation, n: u32) -> [u16; 5] {
+/// Build a label `fileID` from a per-volume counter and a file's run-table
+/// leader.  DiskFace.mesa defines Cedar's `RelID` as four words, i.e. the
+/// complete `File.FP` (`FileID` plus `DA`), not merely the two-word FileID.
+/// Original Pilot instead keeps its five-word UniversalID unchanged.
+fn make_file_id(generation: Generation, n: u32, da: u32) -> [u16; 5] {
     let (lo, hi) = ((n & 0xffff) as u16, (n >> 16) as u16);
     match generation {
-        Generation::CedarNucleus => [lo, hi, 0, 0, 0],
+        Generation::CedarNucleus => [lo, hi, (da & 0xffff) as u16, (da >> 16) as u16, 0],
         Generation::OriginalPilot => [
             lo,
             hi,
@@ -452,7 +491,7 @@ pub fn read_volume(disk: &Disk, generation: Generation) -> Result<PilotVolume, F
     for lp in 0..root_sv.n_pages as usize {
         let vda = root_sv.pv_page as usize + lp;
         if let Some(s) = disk.sector(vda) {
-            if is_free_page_attr(Label::parse(&s.label).attributes) {
+            if is_free_label(&Label::parse(&s.label), logical_root.v_id, generation) {
                 free_pages += 1;
             }
         }
@@ -503,8 +542,12 @@ pub fn create_blank(
     }
 
     // Deterministic non-null volume ids (a real installer would allocate UIDs).
-    let pv_id: [u16; 5] = [0x0001, 0, 0, 0, 0];
-    let lv_id: [u16; 5] = [0x0002, 0, 0, 0, 0];
+    /* Volume IDs are absolute five-word UIDs.  They must not alias a Cedar
+     * two-word FileID (the first boot file is FileID 2), because continuation
+     * sectors carry freePage in word 7 and are distinguished from true free
+     * pages by this ID. */
+    let pv_id: [u16; 5] = [0x5044, 0x0001, 0, 0, 0]; // "PD"
+    let lv_id: [u16; 5] = [0x4c56, 0x0001, 0, 0, 0]; // "LV"
 
     let marker_page = total - 1;
     let sv_pv_page = OTHELLO_PV_RESERVE as u32;
@@ -567,7 +610,7 @@ pub fn create_blank(
     // --- remaining logical pages: free ---
     for lp in 1..sv_n_pages as usize {
         let vda = OTHELLO_PV_RESERVE + lp;
-        sectors[vda].label = Label::new([0; 5], lp as u32, attr::FREE_PAGE).bytes();
+        sectors[vda].label = Label::new(lv_id, lp as u32, attr::FREE_PAGE).bytes();
     }
 
     // --- subvolume end marker (last physical page) ---
@@ -585,8 +628,7 @@ pub fn create_blank(
 
     let mut disk = Disk { geometry, sectors };
     // Install the VAM file (root-file slot 7) and fill its bitmap from labels.
-    install_vam(&mut disk, &sub);
-    let _ = generation; // generation affects only fileID interpretation of files
+    install_vam(&mut disk, &sub, generation);
     Ok(disk)
 }
 
@@ -594,30 +636,53 @@ pub fn create_blank(
 /// pages 1.. of the subvolume: a `header` page (run table) plus `data` pages
 /// holding the `VAMObject` bitmap, with `rootFile[VAM]` and `lastFileID` set in
 /// the LV root. The bitmap is then filled from the page labels.
-fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc) {
+fn install_vam(disk: &mut Disk, sv: &SubVolumeDesc, generation: Generation) {
     let pv = sv.pv_page as usize;
     let n_data = vam_data_pages(sv.lv_size);
     let header_lp = 1usize;
-    let data_lp0 = 2usize;
+    let header_pages = 2usize; // run-table page + property page
+    let data_lp0 = header_lp + header_pages;
 
     // Header page: a single run covering the VAM's data pages.
     {
         let s = &mut disk.sectors[pv + header_lp];
-        s.label = Label::new(VAM_FILE_ID, 0, attr::HEADER).bytes();
+        s.label = Label::new(
+            make_file_id(generation, 1, header_lp as u32),
+            0,
+            attr::HEADER,
+        )
+        .bytes();
         let d = &mut s.data;
         for b in d.iter_mut() {
             *b = 0;
         }
-        wrw(d, 0, 1); // headerPages
-        wrw(d, 1, 1); // maxRuns
-        wrlong(d, RunTable::RUNS_BASE, data_lp0 as u32);
-        wrw(d, RunTable::RUNS_BASE + 2, n_data as u16);
+        wrw(d, 0, header_pages as u16);
+        wrw(d, 1, RunTable::RUNS_PER_PAGE as u16); // table capacity
+        wrlong(d, RunTable::RUNS_BASE, header_lp as u32);
+        wrw(d, RunTable::RUNS_BASE + 2, (header_pages + n_data) as u16);
         wrlong(d, RunTable::RUNS_BASE + 3, LAST_LOGICAL_RUN);
+    }
+    // PilotDisk.mc clears header's low flag bits after the first sector in a
+    // run, so the second property page carries freePage plus the same RelID.
+    {
+        let s = &mut disk.sectors[pv + header_lp + 1];
+        s.label = Label::new(
+            make_file_id(generation, 1, header_lp as u32),
+            1,
+            attr::FREE_PAGE,
+        )
+        .bytes();
+        s.data.fill(0);
     }
     // Data pages (bitmap content written by rebuild_vam).
     for i in 0..n_data {
         let s = &mut disk.sectors[pv + data_lp0 + i];
-        s.label = Label::new(VAM_FILE_ID, (i + 1) as u32, attr::DATA).bytes();
+        s.label = Label::new(
+            make_file_id(generation, 1, header_lp as u32),
+            i as u32,
+            if i == 0 { attr::DATA } else { attr::FREE_PAGE },
+        )
+        .bytes();
         for b in s.data.iter_mut() {
             *b = 0;
         }
@@ -652,26 +717,26 @@ fn rebuild_vam(disk: &mut Disk, sv: &SubVolumeDesc) {
     let mut header_lp = None;
     for lp in 1..sv.n_pages as usize {
         let l = Label::parse(&disk.sectors[pv + lp].label);
-        if l.attributes == attr::HEADER && l.file_id == VAM_FILE_ID {
+        if l.attributes == attr::HEADER && l.file_id[..2] == VAM_FILE_ID[..2] {
             header_lp = Some(lp);
             break;
         }
     }
     let Some(hlp) = header_lp else { return };
     let run = RunTable::parse(&disk.sectors[pv + hlp].data);
-    let mut data_lps = Vec::new();
-    for (first, count) in run.runs {
-        for p in 0..count {
-            data_lps.push((first + p) as usize);
-        }
-    }
+    let data_lps = run.data_logical_pages();
 
     // Build the bitmap words: rover(0..1)=0, size(2..3), then 1 bit per page.
+    let volume_id = match LogicalRoot::parse(&disk.sectors[pv].data) {
+        Ok(root) => root.v_id,
+        Err(_) => return,
+    };
     let mut words = vec![0u16; vam_data_words(sv.lv_size)];
     words[2] = (vsize & 0xffff) as u16;
     words[3] = (vsize >> 16) as u16;
     for lp in 0..vsize {
-        let in_use = Label::parse(&disk.sectors[pv + lp].label).attributes != attr::FREE_PAGE;
+        let label = Label::parse(&disk.sectors[pv + lp].label);
+        let in_use = !is_free_label(&label, volume_id, Generation::CedarNucleus);
         if in_use {
             words[4 + lp / 16] |= 1 << (lp % 16);
         }
@@ -695,18 +760,13 @@ fn vam_free_pages(disk: &Disk, sv: &SubVolumeDesc) -> Option<u32> {
     let mut hlp = None;
     for lp in 1..sv.n_pages as usize {
         let l = Label::parse(&disk.sector(pv + lp)?.label);
-        if l.attributes == attr::HEADER && l.file_id == VAM_FILE_ID {
+        if l.attributes == attr::HEADER && l.file_id[..2] == VAM_FILE_ID[..2] {
             hlp = Some(lp);
             break;
         }
     }
     let run = RunTable::parse(&disk.sector(pv + hlp?)?.data);
-    let mut data_lps = Vec::new();
-    for (first, count) in run.runs {
-        for p in 0..count {
-            data_lps.push((first + p) as usize);
-        }
-    }
+    let data_lps = run.data_logical_pages();
     let word = |wi: usize| -> u16 {
         let page = wi / PAGE_WORDS;
         let off = wi % PAGE_WORDS;
@@ -740,6 +800,7 @@ pub struct RunTable {
 
 impl RunTable {
     const RUNS_BASE: usize = 5; // word offset of the `runs` sequence
+    const RUNS_PER_PAGE: usize = (PAGE_WORDS - Self::RUNS_BASE) / 3;
 
     fn parse(data: &[u8]) -> Self {
         let header_pages = rdw(data, 0);
@@ -760,6 +821,23 @@ impl RunTable {
         }
         RunTable { header_pages, runs }
     }
+
+    /// Expand only the data portion of the file.  Runs describe the complete
+    /// file, beginning with negative file pages for its header; data file page
+    /// zero starts after `header_pages` logical pages have been skipped.
+    fn data_logical_pages(&self) -> Vec<usize> {
+        let mut file_page = -(self.header_pages as i64);
+        let mut pages = Vec::new();
+        for &(first, count) in &self.runs {
+            for p in 0..count {
+                if file_page >= 0 {
+                    pages.push((first + p) as usize);
+                }
+                file_page += 1;
+            }
+        }
+        pages
+    }
 }
 
 /// Logical page number from a label, masking the classic page-0 flag bits
@@ -769,15 +847,6 @@ fn file_page_number(l: &Label) -> u32 {
     let lo = l.file_page & 0xffff;
     let hi = (l.file_page >> 16) & 0x7f;
     (hi << 16) | lo
-}
-
-/// True if a page's label `attributes`/`type` word marks it as a **user-file
-/// data page** — i.e. not free, not a volume-structure page (physicalRoot..
-/// scavengerLog = 0..9), and not a Cedar run-table `header` (9729) or `freePage`
-/// (9728). This admits Cedar `data` (9730) and classic file types (`tempFileList`
-/// 10, `vmBackingFile` 12, `anonymousFile` 15, client types >= 256, ...).
-fn is_user_data_page(a: u16) -> bool {
-    a != attr::FREE_PAGE && a != attr::HEADER && !matches!(a, 0..=9)
 }
 
 /// Short label for a page `File.Type`/attribute, used in synthesized names.
@@ -932,11 +1001,67 @@ impl PilotFilesystem {
             })
             .collect()
     }
+
+    /// Cedar-nucleus file IDs paired with their current display names.  This
+    /// is intentionally a narrow maintenance API for volume trimming tools;
+    /// callers can retain boot files while releasing ordinary cached content.
+    pub fn file_ids(&self) -> Vec<(String, u32)> {
+        self.files
+            .iter()
+            .filter_map(|f| {
+                (self.generation == Generation::CedarNucleus && f.file_id[4] == 0).then_some((
+                    f.name.clone(),
+                    u32::from(f.file_id[0]) | (u32::from(f.file_id[1]) << 16),
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Scan every subvolume's page labels and group user-file data pages by `fileID`
 /// into a sorted, deduplicated file table.
 fn build_files(disk: &Disk, volume: &PilotVolume) -> Vec<PilotFile> {
+    if volume.generation == Generation::CedarNucleus {
+        let mut files = Vec::new();
+        for (svidx, sv) in volume.physical_root.sub_volumes.iter().enumerate() {
+            let pv = sv.pv_page as usize;
+            for lp in 1..sv.n_pages as usize {
+                let Some(sector) = disk.sector(pv + lp) else {
+                    continue;
+                };
+                let label = Label::parse(&sector.label);
+                if label.attributes != attr::HEADER || label.file_id[..2] == VAM_FILE_ID[..2] {
+                    continue;
+                }
+                let run = RunTable::parse(&sector.data);
+                let pages: Vec<(u32, usize)> = run
+                    .data_logical_pages()
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(file_page, logical)| {
+                        (logical < sv.n_pages as usize).then_some((file_page as u32, pv + logical))
+                    })
+                    .collect();
+                if pages.is_empty() {
+                    continue;
+                }
+                files.push(PilotFile {
+                    name: format!(
+                        "LV{svidx}_{:04X}{:04X}_data",
+                        label.file_id[0], label.file_id[1]
+                    ),
+                    file_id: label.file_id,
+                    size: pages.len() as u64 * PAGE_BYTES as u64,
+                    pages,
+                    has_leader: false,
+                });
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        dedup_names(&mut files);
+        return files;
+    }
+
     // Per file ID: its type word plus its `(logical page, absolute VDA)` pages.
     type FileGroup = (u16, Vec<(u32, usize)>);
     let mut files: Vec<PilotFile> = Vec::new();
@@ -947,8 +1072,9 @@ fn build_files(disk: &Disk, volume: &PilotVolume) -> Vec<PilotFile> {
             let vda = pv + lp;
             let Some(s) = disk.sector(vda) else { continue };
             let l = Label::parse(&s.label);
-            if !is_user_data_page(l.attributes)
-                || l.file_id == VAM_FILE_ID
+            if is_free_label(&l, volume.logical_root.v_id, volume.generation)
+                || matches!(l.attributes, 1..=5)
+                || l.file_id[..2] == VAM_FILE_ID[..2]
                 || l.file_id == [0; 5]
                 || l.file_id == [0xffff; 5]
             {
@@ -1064,12 +1190,11 @@ impl Filesystem for PilotFilesystem {
 }
 
 /// Append a file to a Pilot volume (Cedar nucleus generation), returning the
-/// new disk and the allocated 32-bit `FileID`. The file occupies one `header`
-/// page (carrying its run table) plus `ceil(len/512)` `data` pages, allocated
-/// from a contiguous run of free logical pages; `lastFileID` in the LV root is
-/// advanced. Pages are page-granular (no byte-exact length yet — the real Pilot
-/// keeps that in file properties; see the module doc), so a read-back returns
-/// the data zero-padded to the next page boundary.
+/// new disk and the allocated 32-bit `FileID`. A normal Cedar file has two
+/// header pages (one run-table page plus one property page), followed by
+/// `ceil(len/512)` data pages. `lastFileID` in the LV root is advanced. Pages
+/// are page-granular (the byte length belongs in file properties), so a
+/// read-back returns data zero-padded to the next page boundary.
 ///
 /// Allocation marks page labels (`freePage` -> `header`/`data`), which is the
 /// authoritative free/used state; a VAM-file rebuild is a separate refinement.
@@ -1088,7 +1213,8 @@ pub fn add_file(
         .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
 
     let n_data = data.len().div_ceil(PAGE_BYTES).max(1);
-    let need = 1 + n_data; // header + data pages
+    const HEADER_PAGES: usize = 2;
+    let need = HEADER_PAGES + n_data;
 
     // Collect free logical pages (logical 0 is the LV root; the marker lives
     // past the subvolume, so [1..n_pages) is fair game). First-fit, allowing a
@@ -1098,7 +1224,7 @@ pub fn add_file(
     let free: Vec<u32> = (1..n_pages)
         .filter(|&lp| {
             disk.sector(pv_page + lp)
-                .map(|s| Label::parse(&s.label).attributes == attr::FREE_PAGE)
+                .map(|s| is_free_label(&Label::parse(&s.label), vol.logical_root.v_id, generation))
                 .unwrap_or(false)
         })
         .map(|lp| lp as u32)
@@ -1111,17 +1237,32 @@ pub fn add_file(
         )));
     }
 
-    let header_lp = free[0];
-    let data_lps = &free[1..1 + n_data];
-    // Group the (sorted) data pages into contiguous runs for the run table.
+    let header_at = free
+        .windows(HEADER_PAGES)
+        .position(|w| w[1] == w[0] + 1)
+        .ok_or_else(|| {
+            FilesystemError::DiskFull(
+                "Pilot: no adjacent pair of pages for a normal file header".into(),
+            )
+        })?;
+    let header_lps = [free[header_at], free[header_at + 1]];
+    let data_lps: Vec<u32> = free
+        .iter()
+        .copied()
+        .filter(|lp| !header_lps.contains(lp))
+        .take(n_data)
+        .collect();
+    // Runs describe the complete file in file-page order: both (negative)
+    // header pages first, then data page zero onward.
+    let allocated_lps = header_lps.into_iter().chain(data_lps.iter().copied());
     let mut runs: Vec<(u32, u32)> = Vec::new();
-    for &lp in data_lps {
+    for lp in allocated_lps {
         match runs.last_mut() {
             Some((first, len)) if *first + *len == lp => *len += 1,
             _ => runs.push((lp, 1)),
         }
     }
-    if RunTable::RUNS_BASE + runs.len() * 3 + 3 >= PAGE_WORDS {
+    if runs.len() + 1 > RunTable::RUNS_PER_PAGE {
         return Err(FilesystemError::DiskFull(
             "Pilot: file too fragmented for a single-page run table".into(),
         ));
@@ -1132,18 +1273,18 @@ pub fn add_file(
     // Allocate a FileID (advance the LV-root counter at word 253).
     let lv_root_vda = pv_page; // logical page 0
     let fid = rdlong(&disk.sectors[lv_root_vda].data, 253).wrapping_add(1);
-    let file_id = make_file_id(generation, fid);
+    let file_id = make_file_id(generation, fid, header_lps[0]);
 
-    // Header page: run table describing the data extents.
+    // First header page: run table describing headers and data extents.
     {
-        let s = &mut disk.sectors[pv_page + header_lp as usize];
+        let s = &mut disk.sectors[pv_page + header_lps[0] as usize];
         s.label = Label::new(file_id, 0, attr::HEADER).bytes();
         let d = &mut s.data;
         for b in d.iter_mut() {
             *b = 0;
         }
-        wrw(d, 0, 1); // headerPages
-        wrw(d, 1, runs.len() as u16); // maxRuns
+        wrw(d, 0, HEADER_PAGES as u16);
+        wrw(d, 1, RunTable::RUNS_PER_PAGE as u16); // table capacity
         let mut wi = RunTable::RUNS_BASE;
         for &(first, len) in &runs {
             wrlong(d, wi, first); // LogicalRun.first
@@ -1153,10 +1294,41 @@ pub fn add_file(
         wrlong(d, wi, LAST_LOGICAL_RUN); // terminator
     }
 
-    // Data pages (filePage numbered 1.. within the file).
+    // Second header page: property storage. It must carry Cedar's validation
+    // seal, or every FS property accessor rejects the file and directory
+    // enumeration silently skips it. `bytes` is the payload length Cedar
+    // reports in a listing; `created` is left null (Cedar prints "??") and the
+    // name body empty, since neither is known at this level -- the name is
+    // applied later through the client directory.
+    {
+        let s = &mut disk.sectors[pv_page + header_lps[1] as usize];
+        s.label = Label::new(file_id, 1, attr::FREE_PAGE).bytes();
+        s.data.fill(0);
+        let d = &mut s.data;
+        for (i, w) in PROPERTIES_VALIDATION.iter().enumerate() {
+            wrw(d, i, *w);
+        }
+        wrlong(d, PROP_BYTES_WORD, data.len() as u32);
+        wrw(d, PROP_KEEP_WORD, 0);
+        wrw(d, PROP_VERSION_WORD, 1);
+        wrw(d, PROP_NAME_WORD, 0); // empty nameBody TextRep
+    }
+
+    // Data pages (filePage numbered 0.. within the file).
     for (i, &lp) in data_lps.iter().enumerate() {
         let s = &mut disk.sectors[pv_page + lp as usize];
-        s.label = Label::new(file_id, (i + 1) as u32, attr::DATA).bytes();
+        // PilotDisk.mc/KSectorDone clears the low file-flag bits in its
+        // reusable client label after the first successful sector.  The
+        // following operation therefore presents freePage Attributes even
+        // across a physical run boundary; the RelID and filePage identify
+        // the continuation sector.  A non-volume RelID keeps these pages
+        // allocated (is_free_label deliberately checks both fields).
+        s.label = Label::new(
+            file_id,
+            i as u32,
+            if i == 0 { attr::DATA } else { attr::FREE_PAGE },
+        )
+        .bytes();
         let off = i * PAGE_BYTES;
         let end = (off + PAGE_BYTES).min(data.len());
         let chunk = &data[off..end];
@@ -1194,9 +1366,11 @@ pub fn delete_file(disk: &Disk, fid: u32) -> Result<Disk, FilesystemError> {
     for lp in 1..sv.n_pages as usize {
         let vda = pv_page + lp;
         let label = Label::parse(&disk.sectors[vda].label);
-        let is_file_page = matches!(label.attributes, attr::HEADER | attr::DATA);
+        let is_file_page = !is_free_label(&label, vol.logical_root.v_id, Generation::CedarNucleus)
+            && !matches!(label.attributes, 1..=5);
         if is_file_page && label.file_id[0] == target[0] && label.file_id[1] == target[1] {
-            disk.sectors[vda].label = Label::new([0; 5], lp as u32, attr::FREE_PAGE).bytes();
+            disk.sectors[vda].label =
+                Label::new(vol.logical_root.v_id, lp as u32, attr::FREE_PAGE).bytes();
             for b in disk.sectors[vda].data.iter_mut() {
                 *b = 0;
             }
@@ -1255,6 +1429,15 @@ const FS_ENTRY_LOCAL: u16 = 0;
 /// Word offset of the `local` entry's TextRep (after size, version, nameBody,
 /// type, keep, fp = id(2) + da(2) = words 0..8), so nameBody's relative pointer.
 const FS_LOCAL_TEXT_WORD: usize = 9;
+/// Keep expandable pages behind the initial client-directory leaf.  Cedar
+/// creates local names for cached remote files; a tree with firstFreePage=NIL
+/// reports "No more free names" even when the Pilot volume itself has space.
+const BTREE_RESERVED_FREE_PAGES: u16 = 4;
+/// FSFileOpsImpl opens the client directory/cache B-tree with four Pilot
+/// pages per B-tree page, 32 buffers, and `initialPages = 4 * 32`.
+const BTREE_FILE_PAGES_PER_BUFFER: usize = 4;
+const BTREE_INITIAL_BUFFERS: usize = 32;
+const BTREE_INITIAL_FILE_PAGES: usize = BTREE_FILE_PAGES_PER_BUFFER * BTREE_INITIAL_BUFFERS;
 
 /// One decoded name-directory entry: a human name, its FName version, and the
 /// 32-bit Cedar `FileID` it maps to.
@@ -1263,6 +1446,32 @@ struct ClientDirEntry {
     name: String,
     version: u16,
     fid: u32,
+    /// `File.FP.da` — the LOGICAL page number of the file's header within the
+    /// volume, which is what Cedar dereferences: `FileImpl.Open` builds
+    /// `VolumeFormat.LogicalRun[first: fp.da, size: headerPages]` and hands it
+    /// to `TranslateLogicalRun`. Leaving it 0 points every entry at logical
+    /// page 0 (the volume root), and Cedar rejects the enumeration with
+    /// `FS.Error $badFP` — "File.FP from directory/cache doesn't correspond to
+    /// a local volume" (`FSMainImpl2.mesa`).
+    da: u32,
+}
+
+/// Logical page of a file's run-table leader (its first header page), i.e. the
+/// value Cedar wants in `File.FP.da`. Scans the subvolume for the HEADER page
+/// whose label carries this FileID at file-page 0 — the same identification
+/// `add_file` uses when it stamps that label.
+fn header_lp_for(disk: &Disk, sv: &SubVolumeDesc, fid: u32) -> Option<u32> {
+    (1..sv.n_pages).find(|&lp| {
+        disk.sector(sv.pv_page as usize + lp as usize)
+            .map(|s| {
+                let label = Label::parse(&s.label);
+                label.attributes == attr::HEADER
+                    && label.file_id[0] == (fid & 0xffff) as u16
+                    && label.file_id[1] == (fid >> 16) as u16
+                    && file_page_number(&label) == 0
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Read a `TextRep` (PACKED SEQUENCE length: CARDINAL OF CHAR) at word `wi` in a
@@ -1324,8 +1533,14 @@ fn parse_client_directory(client_data: &[u8]) -> Vec<ClientDirEntry> {
                 let version = rdw(page, entry_w + 1);
                 let name_rp = rdw(page, entry_w + 2) as usize; // word-relative ptr
                 let fid = rdlong(page, entry_w + 5); // fp.id (FileID, 2 words)
+                let da = rdlong(page, entry_w + 7); // fp.da (DA, 2 words)
                 if let Some(name) = read_textrep(page, entry_w + name_rp, page_words) {
-                    out.push(ClientDirEntry { name, version, fid });
+                    out.push(ClientDirEntry {
+                        name,
+                        version,
+                        fid,
+                        da,
+                    });
                 }
             }
             w = entry_w + size; // advance past grPage + entry
@@ -1348,52 +1563,181 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
             .then(a.version.cmp(&b.version))
     });
 
-    let mut state = vec![0u8; BTREE_PAGE_BYTES];
-    let mut leaf = vec![0u8; BTREE_PAGE_BYTES];
+    // Serialize one entry's ClientEntry words (everything AFTER the 1-word
+    // grPage): [size, version, nameBodyRelPtr, type, keep, fid(2), da(2),
+    // nameLen, name chars packed 2/word, char[0] in the high byte]. Identical
+    // bytes to the single-leaf writer, just addressable so it can go in any
+    // page (leaf or the promoted separators in an internal node).
+    fn entry_words(e: &ClientDirEntry) -> Vec<u16> {
+        let name = e.name.as_bytes();
+        let text_words = 1 + name.len().div_ceil(2);
+        let size = FS_LOCAL_TEXT_WORD + text_words;
+        let mut v = vec![0u16; size];
+        v[0] = size as u16;
+        v[1] = e.version;
+        v[2] = FS_LOCAL_TEXT_WORD as u16;
+        v[3] = FS_ENTRY_LOCAL;
+        v[4] = 0; // keep
+        v[5] = (e.fid & 0xffff) as u16;
+        v[6] = (e.fid >> 16) as u16;
+        v[7] = (e.da & 0xffff) as u16;
+        v[8] = (e.da >> 16) as u16;
+        v[FS_LOCAL_TEXT_WORD] = name.len() as u16;
+        for (i, &b) in name.iter().enumerate() {
+            let wi = FS_LOCAL_TEXT_WORD + 1 + i / 2;
+            if i & 1 == 0 {
+                v[wi] |= (b as u16) << 8;
+            } else {
+                v[wi] |= b as u16;
+            }
+        }
+        v
+    }
 
-    // Root leaf page: freeWords(0), minPage(1) = nil, then packed local entries.
-    let mut w = 2usize;
-    for e in &sorted {
-        let name_bytes = e.name.as_bytes();
-        let text_words = 1 + name_bytes.len().div_ceil(2); // length word + chars
-        let entry_words = FS_LOCAL_TEXT_WORD + text_words;
-        let total = 1 + entry_words; // grPage + entry
-        if w + total > BTREE_PAGE_WORDS {
+    // Lay a page: word 0 freeWords, word 1 minPage, then (grPage, entry) items.
+    fn write_node(min_page: u16, items: &[(u16, &[u16])]) -> Vec<u8> {
+        let mut page = vec![0u8; BTREE_PAGE_BYTES];
+        wrw(&mut page, 1, min_page);
+        let mut w = 2usize;
+        for (gr, words) in items {
+            wrw(&mut page, w, *gr);
+            for (k, word) in words.iter().enumerate() {
+                wrw(&mut page, w + 1 + k, *word);
+            }
+            w += 1 + words.len();
+        }
+        wrw(&mut page, 0, (BTREE_PAGE_WORDS - w) as u16);
+        page
+    }
+
+    let words: Vec<Vec<u16>> = sorted.iter().map(entry_words).collect();
+
+    // Greedily pack entries into leaves; the entry that overflows a full leaf
+    // is PROMOTED as the separator between it and the next leaf (a B-tree keeps
+    // each entry exactly once — separators live in the internal node, not in a
+    // leaf), and the next leaf starts after it.
+    const LEAF_CAP: usize = BTREE_PAGE_WORDS - 2; // minus freeWords, minPage
+    let mut leaves: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut separators: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        let slot = 1 + w.len(); // grPage + entry
+        if slot > LEAF_CAP {
             return Err(FilesystemError::DiskFull(format!(
-                "Pilot: Cedar name directory of {} entries exceeds one B-tree page \
-                 (multi-page trees not yet written)",
+                "Pilot: name {:?} is too long for one B-tree page",
+                sorted[i].name
+            )));
+        }
+        if used + slot > LEAF_CAP && !leaves.last().unwrap().is_empty() {
+            separators.push(i);
+            leaves.push(Vec::new());
+            used = 0;
+        } else {
+            leaves.last_mut().unwrap().push(i);
+            used += slot;
+        }
+    }
+
+    let n_leaves = leaves.len();
+    let mut state = vec![0u8; BTREE_PAGE_BYTES];
+    wrw(&mut state, 0, BTREE_SEAL);
+    wrw(&mut state, 1, BTREE_PAGE_WORDS as u16);
+    wrlong(&mut state, 5, sorted.len() as u32);
+
+    // Leaf pages: page numbers 1..=n_leaves. Every leaf entry has grPage = nil.
+    let nil = BTREE_NIL_PAGE;
+    let mut leaf_pages: Vec<Vec<u8>> = Vec::with_capacity(n_leaves);
+    for leaf in &leaves {
+        let items: Vec<(u16, &[u16])> = leaf.iter().map(|&i| (nil, words[i].as_slice())).collect();
+        leaf_pages.push(write_node(nil, &items));
+    }
+
+    let (root_page, reserved_start, depth): (u16, u16, u16);
+    let root: Option<Vec<u8>>;
+    if n_leaves == 1 {
+        // Single leaf is the root (depth 1), as before.
+        root_page = 1;
+        reserved_start = 2;
+        depth = 1;
+        root = None;
+    } else {
+        // Internal root at page n_leaves+1: minPage = leaf 1 (page 1), then one
+        // separator per gap with grPage pointing at the leaf to its right.
+        let items: Vec<(u16, &[u16])> = separators
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| ((k as u16) + 2, words[i].as_slice()))
+            .collect();
+        let root_words: usize = 2 + items.iter().map(|(_, w)| 1 + w.len()).sum::<usize>();
+        if root_words > BTREE_PAGE_WORDS {
+            return Err(FilesystemError::DiskFull(format!(
+                "Pilot: {} names need a 3-level B-tree (only 2 levels written)",
                 sorted.len()
             )));
         }
-        let entry_w = w + 1;
-        wrw(&mut leaf, w, BTREE_NIL_PAGE); // grPage = nil (leaf)
-        wrw(&mut leaf, entry_w, entry_words as u16); // size
-        wrw(&mut leaf, entry_w + 1, e.version); // version
-        wrw(&mut leaf, entry_w + 2, FS_LOCAL_TEXT_WORD as u16); // nameBody rel ptr
-        wrw(&mut leaf, entry_w + 3, FS_ENTRY_LOCAL); // type = local
-        wrw(&mut leaf, entry_w + 4, 0); // keep
-        wrlong(&mut leaf, entry_w + 5, e.fid); // fp.id (FileID); fp.da left 0
-        let text_w = entry_w + FS_LOCAL_TEXT_WORD;
-        wrw(&mut leaf, text_w, name_bytes.len() as u16); // char count
-        let cbase = (text_w + 1) * 2;
-        leaf[cbase..cbase + name_bytes.len()].copy_from_slice(name_bytes);
-        w = entry_w + entry_words;
+        root_page = n_leaves as u16 + 1;
+        reserved_start = n_leaves as u16 + 2;
+        depth = 2;
+        root = Some(write_node(1, &items));
     }
-    wrw(&mut leaf, 0, (BTREE_PAGE_WORDS - w) as u16); // freeWords
-    wrw(&mut leaf, 1, BTREE_NIL_PAGE); // minPage = nil (leaf)
-
-    // statePage (TreeState).
-    wrw(&mut state, 0, BTREE_SEAL);
-    wrw(&mut state, 1, BTREE_PAGE_WORDS as u16); // pageSize (words)
-    wrw(&mut state, 2, 1); // rootPage = BTree page 1
-    wrw(&mut state, 3, 1); // greatestPage
-    wrw(&mut state, 4, BTREE_NIL_PAGE); // firstFreePage = nil
-    wrlong(&mut state, 5, sorted.len() as u32); // entryCount
-    wrw(&mut state, 7, 1); // depth = 1 (single leaf)
+    wrw(&mut state, 2, root_page);
+    wrw(
+        &mut state,
+        3,
+        reserved_start - 1 + BTREE_RESERVED_FREE_PAGES,
+    );
+    wrw(&mut state, 4, reserved_start);
+    wrw(&mut state, 7, depth);
 
     let mut out = state;
-    out.extend_from_slice(&leaf);
+    for leaf in &leaf_pages {
+        out.extend_from_slice(leaf);
+    }
+    if let Some(root) = &root {
+        out.extend_from_slice(root);
+    }
+    // Free B-tree pages, chained through minPage (Cedar unlinks one when the
+    // local cache needs the directory to grow).
+    let last_free = reserved_start + BTREE_RESERVED_FREE_PAGES - 1;
+    for page in reserved_start..=last_free {
+        let mut free = vec![0u8; BTREE_PAGE_BYTES];
+        wrw(&mut free, 0, BTREE_FREE_MARKER);
+        wrw(
+            &mut free,
+            1,
+            if page == last_free {
+                BTREE_NIL_PAGE
+            } else {
+                page + 1
+            },
+        );
+        out.extend_from_slice(&free);
+    }
+    // FSFileOpsImpl creates its client directory/cache backing file at this
+    // fixed size; the implicit zero tail is real (unused cache) file storage.
+    out.resize(BTREE_INITIAL_FILE_PAGES * PAGE_BYTES, 0);
     Ok(out)
+}
+
+/// PilotDisk.mc clears `Lab.fileFlags` after each completed sector.  Cedar's
+/// FS B-tree transfers its backing file in `bufferSize = 4` page operations
+/// (FSFileOpsImpl), so the first label in every four-page buffer has the
+/// `data` flag and its three continuation labels have `freePage` flags.  The
+/// non-volume RelID still makes those continuation pages allocated.
+fn set_cedar_btree_label_flags(disk: &mut Disk, file_id: [u16; 5]) {
+    for sector in &mut disk.sectors {
+        let mut label = Label::parse(&sector.label);
+        if label.file_id != file_id || label.attributes == attr::HEADER {
+            continue;
+        }
+        let file_page = file_page_number(&label) as usize;
+        label.attributes = if file_page.is_multiple_of(BTREE_FILE_PAGES_PER_BUFFER) {
+            attr::DATA
+        } else {
+            attr::FREE_PAGE
+        };
+        sector.label = label.bytes();
+    }
 }
 
 /// Install (or replace) the Cedar `client` name directory: build the FS B-tree
@@ -1402,24 +1746,64 @@ fn build_client_directory(entries: &[ClientDirEntry]) -> Result<Vec<u8>, Filesys
 /// FileIDs already present on the volume (e.g. from prior [`add_file`] calls).
 /// Returns the updated disk.
 ///
-/// `rootFile[client].fp.da` / `.page` are left 0: our reader resolves the
-/// directory file by FileID via the page-label scan. A faithful Cedar FS would
-/// also want the disk-address hint, but it is not needed to round-trip here.
+/// Cedar opens a root file through `fp.da`, so both disk-address hints must
+/// identify the directory file's run-table leader.  A zero hint happens to
+/// round-trip through our label-scanning reader, but makes Cedar interpret the
+/// logical-volume root (page 0) as the client file's leader.
 pub fn set_client_directory(
     disk: &Disk,
     generation: Generation,
     entries: &[(String, u16, u32)],
 ) -> Result<Disk, FilesystemError> {
+    // Resolve each entry's File.FP.da (the logical page of its header) BEFORE
+    // the B-tree becomes a file itself, so the lookups see exactly the files
+    // being named. An entry whose file cannot be found is dropped rather than
+    // written with a null da: Cedar raises $badFP on the first such entry and
+    // abandons the rest of the enumeration, so one bad entry would cost every
+    // later one.
+    let vol_now = read_volume(disk, generation)?;
+    let sv_now = vol_now
+        .physical_root
+        .sub_volumes
+        .iter()
+        .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+        .cloned()
+        .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
     let dir_entries: Vec<ClientDirEntry> = entries
         .iter()
-        .map(|(name, version, fid)| ClientDirEntry {
-            name: name.clone(),
-            version: *version,
-            fid: *fid,
+        .filter_map(|(name, version, fid)| {
+            header_lp_for(disk, &sv_now, *fid).map(|da| ClientDirEntry {
+                name: name.clone(),
+                version: *version,
+                fid: *fid,
+                da,
+            })
         })
         .collect();
     let btree = build_client_directory(&dir_entries)?;
     let (mut disk, client_fid) = add_file(disk, generation, &btree)?;
+
+    if generation == Generation::CedarNucleus {
+        let vol = read_volume(&disk, generation)?;
+        let sv = vol
+            .physical_root
+            .sub_volumes
+            .iter()
+            .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+            .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
+        let header_lp = (1..sv.n_pages)
+            .find(|&lp| {
+                let label = Label::parse(&disk.sectors[sv.pv_page as usize + lp as usize].label);
+                label.attributes == attr::HEADER
+                    && label.file_id[0] == (client_fid & 0xffff) as u16
+                    && label.file_id[1] == (client_fid >> 16) as u16
+                    && file_page_number(&label) == 0
+            })
+            .ok_or_else(|| {
+                FilesystemError::Parse("Pilot: client directory has no run-table leader".into())
+            })?;
+        set_cedar_btree_label_flags(&mut disk, make_file_id(generation, client_fid, header_lp));
+    }
 
     let vol = read_volume(&disk, generation)?;
     let sv = vol
@@ -1430,8 +1814,21 @@ pub fn set_client_directory(
         .cloned()
         .ok_or_else(|| FilesystemError::Parse("Pilot: no root subvolume".into()))?;
     let lv_root_vda = sv.pv_page as usize;
+    let header_lp = (1..sv.n_pages)
+        .find(|&lp| {
+            let label = Label::parse(&disk.sectors[lv_root_vda + lp as usize].label);
+            label.attributes == attr::HEADER
+                && label.file_id[0] == (client_fid & 0xffff) as u16
+                && label.file_id[1] == (client_fid >> 16) as u16
+                && file_page_number(&label) == 0
+        })
+        .ok_or_else(|| {
+            FilesystemError::Parse("Pilot: client directory has no run-table leader".into())
+        })?;
     let d = &mut disk.sectors[lv_root_vda].data;
     wrlong(d, ROOTFILE_CLIENT_WORD, client_fid); // rootFile[client].fp.id
+    wrlong(d, ROOTFILE_CLIENT_WORD + 2, header_lp); // fp.da
+    wrlong(d, ROOTFILE_CLIENT_WORD + 4, header_lp); // RootFile.page
     set_page_checksum(d);
     Ok(disk)
 }
@@ -1507,6 +1904,15 @@ fn apply_client_names(disk: &Disk, volume: &PilotVolume, files: &mut Vec<PilotFi
 /// `ARRAY File.VolumeFile[checkpoint..bootFile] OF BootFile.DiskFileID`. This is
 /// the fixed PV-root offset the disk-boot microcode reads each boot stage from.
 pub const BOOTING_INFO_BASE: usize = 8;
+/// Word offset of `bootingInfo` in the LOGICAL volume root (`37B`), an
+/// `ARRAY File.VolumeFile[checkpoint..debuggee] OF BootFile.DiskFileID` — what
+/// Pilot's soft boot (BootTool volume buttons, Booting.Boot) reads.
+pub const LV_BOOTING_INFO_BASE: usize = 31;
+/// Word offset of `rootFile` in the logical volume root (`125B`), an
+/// `ARRAY File.VolumeFile[0..16) OF RECORD[fp: File.FP, page: File.PageNumber]`.
+pub const LV_ROOT_FILE_BASE: usize = 85;
+/// Words per `LogicalRoot.rootFile` entry: `fp`(4: id 2 + da 2) + `page`(2).
+pub const ROOT_FILE_WORDS: usize = 6;
 /// Words per `BootFile.DiskFileID`: `fID`(5) + `firstPage`(INT, 2) +
 /// `firstLink`(`DiskFace.DontCare`/`DiskAddress`, 2).
 pub const DISK_FILE_ID_WORDS: usize = 9;
@@ -1559,17 +1965,22 @@ impl PvBootFile {
     }
 }
 
-/// Encode a flat virtual disk address (VDA) as a 2-word `DiskFace.DontCare` /
-/// `DiskAddress`, low word first. In the PDI logical-sector model the disk
-/// address *is* the VDA; a geometry-accurate consumer maps VDA <-> (cylinder,
-/// head, sector) for its pack, exactly as it regenerates ECC (PDI stores logical
-/// sectors, not physical geometry). Used for both the `bootChainLink` and the
-/// `bootingInfo` `firstLink`.
-fn da_words(vda: u32) -> [u16; 2] {
-    [(vda & 0xffff) as u16, (vda >> 16) as u16]
+/* PilotDiskDefs.mc specifies drive 0 as an Alto-compatible disk with 28
+ * sectors and 4,075 virtual cylinders. Its DiskAddress is [cylinder,
+ * head,,sector], with the virtual head ignored. A PDI page number is not a
+ * DiskAddress: storing a flat VDA aliases distinct cylinder/sector pairs at
+ * a boot-chain run boundary. */
+const BOOT_DISK_SECTORS: u32 = 28;
+
+fn boot_da_words(vda: u32) -> [u16; 2] {
+    [
+        (vda / BOOT_DISK_SECTORS) as u16,
+        (vda % BOOT_DISK_SECTORS) as u16,
+    ]
 }
-fn da_from_words(w: [u16; 2]) -> u32 {
-    (w[0] as u32) | ((w[1] as u32) << 16)
+fn boot_vda_from_da(w: [u16; 2]) -> u32 {
+    let sector = (w[1] & 0x00ff) as u32;
+    (w[0] as u32) * BOOT_DISK_SECTORS + sector
 }
 
 /// A parsed PV-root `bootingInfo` slot (`BootFile.DiskFileID`).
@@ -1610,7 +2021,7 @@ pub fn boot_file_entry(disk: &Disk, slot: PvBootFile) -> Result<BootFileEntry, F
         slot,
         file_id,
         first_page: rdlong(d, w + 5),
-        first_link: da_from_words([rdw(d, w + 7), rdw(d, w + 8)]),
+        first_link: boot_vda_from_da([rdw(d, w + 7), rdw(d, w + 8)]),
     })
 }
 
@@ -1643,26 +2054,34 @@ pub fn install_boot_file(
     let n_pages = sv.n_pages as usize;
     let n = bytes.len().div_ceil(PAGE_BYTES).max(1);
 
-    // Free logical pages (logical 0 is the LV root). First-fit, ascending; a
-    // fresh volume yields one contiguous run, but a fragmented free list is fine
-    // — the boot chain records run breaks.
-    let free: Vec<u32> = (1..n_pages)
+    /* Keep boot files append-only so a later boot file cannot alter an earlier
+     * boot chain's terminating sector. */
+    let high_water = (1..n_pages)
+        .rev()
+        .find(|&lp| {
+            disk.sector(pv_page + lp)
+                .map(|s| !is_free_label(&Label::parse(&s.label), vol.logical_root.v_id, generation))
+                .unwrap_or(true)
+        })
+        .unwrap_or(0);
+    let free: Vec<u32> = ((high_water + 1)..n_pages)
         .filter(|&lp| {
             disk.sector(pv_page + lp)
-                .map(|s| Label::parse(&s.label).attributes == attr::FREE_PAGE)
+                .map(|s| is_free_label(&Label::parse(&s.label), vol.logical_root.v_id, generation))
                 .unwrap_or(false)
         })
         .map(|lp| lp as u32)
         .collect();
-    if free.len() < n {
+    let slots_needed = n;
+    if free.len() < slots_needed {
         return Err(FilesystemError::DiskFull(format!(
-            "Pilot: need {n} free pages to install the {} boot file ({} bytes), have {}",
+            "Pilot: need {slots_needed} free pages to install the {} boot file ({} bytes), have {}",
             slot.label(),
             bytes.len(),
             free.len()
         )));
     }
-    let pages = &free[..n];
+    let pages = free[..n].to_vec();
     let vdas: Vec<u32> = pages.iter().map(|&lp| pv_page as u32 + lp).collect();
 
     let mut disk = disk.clone();
@@ -1670,19 +2089,33 @@ pub fn install_boot_file(
     // Allocate a FileID for the boot file (advance the LV-root counter).
     let lv_root_vda = pv_page;
     let fid = rdlong(&disk.sectors[lv_root_vda].data, 253).wrapping_add(1);
-    let file_id = make_file_id(generation, fid);
+    let file_id = make_file_id(generation, fid, 0);
+
+    /* PilotDisk.mc clears the low file-flag bits after every successful
+     * sector.  BootChannelDisk's two reusable operations start their first
+     * data transfer at file page 0 and the second at page 2; subsequent
+     * labels retain their RelID/filePage but carry `freePage` flags. */
 
     // Lay the pages and thread the boot chain through the labels' `dontCare`.
     for (i, (&lp, &vda)) in pages.iter().zip(&vdas).enumerate() {
+        let ends_run = i + 1 == n;
         let dont_care = if i + 1 == n {
             BOOT_CHAIN_EOF // last page of the file
-        } else if vdas[i + 1] != vda + 1 {
-            da_words(vdas[i + 1]) // run break: point at the next run's first page
+        } else if ends_run || vdas[i + 1] != vda + 1 {
+            boot_da_words(vdas[i + 1]) // next physical run's first page
         } else {
             [0, 0] // interior of a contiguous run (link unused)
         };
         let s = &mut disk.sectors[pv_page + lp as usize];
-        let mut label = Label::new(file_id, i as u32, attr::DATA);
+        let mut label = Label::new(
+            file_id,
+            i as u32,
+            if i == 0 || i == 2 {
+                attr::DATA
+            } else {
+                attr::FREE_PAGE
+            },
+        );
         label.dont_care = dont_care;
         s.label = label.bytes();
         let off = i * PAGE_BYTES;
@@ -1695,6 +2128,7 @@ pub fn install_boot_file(
     }
 
     // Record the DiskFileID in the PV-root bootingInfo slot.
+    let first = boot_da_words(vdas[0]);
     {
         let d = &mut disk.sectors[0].data;
         let w = slot.root_word();
@@ -1702,10 +2136,33 @@ pub fn install_boot_file(
             wrw(d, w + k, v);
         }
         wrlong(d, w + 5, 0); // firstPage
-        let first = da_words(vdas[0]);
         wrw(d, w + 7, first[0]);
         wrw(d, w + 8, first[1]);
         set_page_checksum(d);
+    }
+
+    /* Record the same file in the LOGICAL volume root. Pilot's soft boot
+     * (BootTool's herald volume buttons, Booting.Boot, RollBack) resolves the
+     * target volume's boot files through `LogicalRoot.bootingInfo` (37B) and
+     * `LogicalRoot.rootFile` (125B) -- File.SetRoot/RecordRootFile write both
+     * on a real Othello install (FileImpl.mesa). Without these a boot button
+     * raises an uncaught File.Error from FileImpl. Same VolumeFile ordinals
+     * as the PV array; rootFile is RECORD[fp: File.FP{id(2), da(2)}, page(2)]
+     * with fp mirroring the label fileID words and page 0 (boot chain start). */
+    {
+        let d = &mut disk.sectors[lv_root_vda].data;
+        let bw = LV_BOOTING_INFO_BASE + slot.ordinal() * DISK_FILE_ID_WORDS;
+        for (k, &v) in file_id.iter().enumerate() {
+            wrw(d, bw + k, v);
+        }
+        wrlong(d, bw + 5, 0); // firstPage
+        wrw(d, bw + 7, first[0]);
+        wrw(d, bw + 8, first[1]);
+        let rw = LV_ROOT_FILE_BASE + slot.ordinal() * ROOT_FILE_WORDS;
+        for (k, &v) in file_id.iter().take(4).enumerate() {
+            wrw(d, rw + k, v); // fp.id + fp.da = label fileID words
+        }
+        wrlong(d, rw + 4, 0); // page
     }
 
     // Persist the advanced FileID, re-checksum the LV root, refresh the VAM.
@@ -1736,7 +2193,8 @@ pub fn read_boot_file(disk: &Disk, slot: PvBootFile) -> Result<Option<Vec<u8>>, 
         let l = Label::parse(&s.label);
         if l.file_id != entry.file_id {
             return Err(FilesystemError::Parse(format!(
-                "Pilot: boot chain page {vda} fileID mismatch"
+                "Pilot: boot chain page {vda} fileID mismatch: have {:?}, want {:?}",
+                l.file_id, entry.file_id
             )));
         }
         if l.file_page != expected_page {
@@ -1752,7 +2210,7 @@ pub fn read_boot_file(disk: &Disk, slot: PvBootFile) -> Result<Option<Vec<u8>>, 
         vda = if l.dont_care == [0, 0] {
             vda + 1
         } else {
-            da_from_words(l.dont_care)
+            boot_vda_from_da(l.dont_care)
         };
     }
     Err(FilesystemError::Parse(
@@ -1817,11 +2275,11 @@ mod tests {
         assert_eq!(vol.physical_root.sub_volumes.len(), 1);
 
         // volume_size = total - OTHELLO_PV_RESERVE - 1 (marker). The LV root
-        // and the VAM file (1 header + bitmap data pages) are in use; the rest
+        // and the VAM file (2 headers + bitmap data pages) are in use; the rest
         // are free, and the VAM bitmap must agree with the label scan.
         let expected_size = 256 - OTHELLO_PV_RESERVE as u32 - 1;
         assert_eq!(vol.volume_size, expected_size);
-        let vam_pages = 1 + vam_data_pages(expected_size) as u32;
+        let vam_pages = 2 + vam_data_pages(expected_size) as u32;
         assert_eq!(vol.free_pages, expected_size - 1 - vam_pages);
         assert_eq!(vol.vam_free_pages, Some(vol.free_pages));
     }
@@ -1848,15 +2306,36 @@ mod tests {
             .unwrap()
             .free_pages;
 
-        // A 700-byte file -> 2 data pages + 1 header = 3 pages consumed.
+        // A 700-byte file -> 2 data pages + 2 headers = 4 pages consumed.
         let payload: Vec<u8> = (0..700u32).map(|i| (i % 251) as u8).collect();
         let (disk, fid) = add_file(&blank, Generation::CedarNucleus, &payload).expect("add_file");
         assert_eq!(fid, 2); // FileID 1 is reserved for the VAM
 
         let vol = read_volume(&disk, Generation::CedarNucleus).unwrap();
-        assert_eq!(vol.free_pages, free_before - 3);
+        assert_eq!(vol.free_pages, free_before - 4);
         // The VAM bitmap was rebuilt and agrees with the labels.
         assert_eq!(vol.vam_free_pages, Some(vol.free_pages));
+
+        // DiskFace.mesa defines a Cedar relID as the full File.FP: the
+        // two-word FileID followed by the header's two-word DA.  Cedar's
+        // verified disk reads reject a label that carries only the FileID.
+        let sv = &vol.physical_root.sub_volumes[0];
+        let header = (1..sv.n_pages as usize)
+            .map(|lp| {
+                (
+                    lp,
+                    Label::parse(&disk.sectors[sv.pv_page as usize + lp].label),
+                )
+            })
+            .find(|(_, l)| l.attributes == attr::HEADER && l.file_id[..2] == [fid as u16, 0])
+            .expect("new file header");
+        assert_eq!(header.1.file_id[2], header.0 as u16);
+        assert_eq!(header.1.file_id[3], 0);
+        let free = (1..sv.n_pages as usize)
+            .map(|lp| Label::parse(&disk.sectors[sv.pv_page as usize + lp].label))
+            .find(|l| is_free_label(l, vol.logical_root.v_id, Generation::CedarNucleus))
+            .expect("free page");
+        assert_eq!(free.file_id, vol.logical_root.v_id);
 
         let mut fs = PilotFilesystem::open(disk, Generation::CedarNucleus).expect("open");
         let root = fs.root().unwrap();
@@ -1886,21 +2365,21 @@ mod tests {
         let (d1, fa) = add_file(&blank, Generation::CedarNucleus, &a).unwrap();
         let (d2, _fb) = add_file(&d1, Generation::CedarNucleus, &b).unwrap();
         assert_eq!(fa, 2); // FileID 1 is reserved for the VAM
-                           // Each file = 1 header + 1 data = 2 pages; 4 consumed.
+                           // Each file = 2 headers + 1 data = 3 pages; 6 consumed.
         assert_eq!(
             read_volume(&d2, Generation::CedarNucleus)
                 .unwrap()
                 .free_pages,
-            free0 - 4
+            free0 - 6
         );
 
-        // Delete A: frees its 2 pages, leaving a gap before B's pages.
+        // Delete A: frees its 3 pages, leaving a gap before B's pages.
         let d3 = delete_file(&d2, fa).unwrap();
         assert_eq!(
             read_volume(&d3, Generation::CedarNucleus)
                 .unwrap()
                 .free_pages,
-            free0 - 2
+            free0 - 3
         );
 
         // A 3-data-page file must now reuse the freed gap + later free pages,
@@ -1945,7 +2424,7 @@ mod tests {
         let mut found = None;
         for lp in 1..sv.n_pages as usize {
             let l = Label::parse(&disk.sector(sv.pv_page as usize + lp).unwrap().label);
-            if l.attributes == attr::HEADER && l.file_id != VAM_FILE_ID {
+            if l.attributes == attr::HEADER && l.file_id[..2] != VAM_FILE_ID[..2] {
                 found = Some(l.file_id);
             }
         }
@@ -2026,12 +2505,39 @@ mod tests {
         // The volume still parses and the VAM agrees with the labels.
         let vol = read_volume(&back, Generation::CedarNucleus).unwrap();
         assert_eq!(vol.vam_free_pages, Some(vol.free_pages));
+
+        // The LOGICAL volume root mirrors each installed slot: bootingInfo (37B)
+        // carries the same DiskFileID words as the PV slot, and rootFile (125B)
+        // carries fp = the label fileID words + page 0 -- what Pilot's soft boot
+        // (BootTool volume buttons) resolves. The root page checksum still
+        // verifies after the in-place update.
+        let sv = &read_volume(&back, Generation::CedarNucleus)
+            .unwrap()
+            .physical_root
+            .sub_volumes[0];
+        let lv = back.sector(sv.pv_page as usize).unwrap().data.as_slice();
+        for slot in [PvBootFile::Germ, PvBootFile::BootFile] {
+            let pv = back.sector(0).unwrap().data.as_slice();
+            let pw = slot.root_word();
+            let bw = LV_BOOTING_INFO_BASE + slot.ordinal() * DISK_FILE_ID_WORDS;
+            for k in 0..DISK_FILE_ID_WORDS {
+                assert_eq!(rdw(lv, bw + k), rdw(pv, pw + k), "LV bootingInfo word {k}");
+            }
+            let rw = LV_ROOT_FILE_BASE + slot.ordinal() * ROOT_FILE_WORDS;
+            for k in 0..4 {
+                assert_eq!(rdw(lv, rw + k), rdw(pv, pw + k), "LV rootFile fp word {k}");
+            }
+            assert_eq!(rdw(lv, rw + 4), 0);
+            assert_eq!(rdw(lv, rw + 5), 0);
+        }
+        let words: Vec<u16> = (0..PAGE_WORDS - 1).map(|i| rdw(lv, i)).collect();
+        assert_eq!(rdw(lv, PAGE_WORDS - 1), pilot_checksum(&words));
     }
 
     #[test]
-    fn boot_chain_follows_run_breaks() {
-        // Force a fragmented free list so the installed boot file spans a run
-        // break, exercising the non-trivial `bootChainLink` path.
+    fn boot_chain_append_avoids_old_run_breaks() {
+        // A boot installer appends after the high-water mark rather than
+        // consuming an earlier file's chain-break gaps.
         let geo = pilot_geometry(160);
         let blank = create_blank(geo, Generation::CedarNucleus, "Frag").expect("create");
 
@@ -2056,8 +2562,8 @@ mod tests {
             .expect("present");
         assert_eq!(&got[..payload.len()], &payload[..]);
 
-        // Confirm at least one page actually carried a forward link (not just the
-        // [-1,-1] terminator) — i.e. the run break was exercised.
+        // Confirm append allocation did not repurpose the earlier gaps as a
+        // new boot-chain run.
         let entry = boot_file_entry(&disk, PvBootFile::Germ).unwrap();
         let mut vda = entry.first_link;
         let mut saw_link = false;
@@ -2068,15 +2574,12 @@ mod tests {
             }
             if l.dont_care != [0, 0] {
                 saw_link = true;
-                vda = da_from_words(l.dont_care);
+                vda = boot_vda_from_da(l.dont_care);
             } else {
                 vda += 1;
             }
         }
-        assert!(
-            saw_link,
-            "expected a non-trivial bootChainLink across the hole"
-        );
+        assert!(!saw_link, "append allocation should remain contiguous");
     }
 
     #[test]
@@ -2088,48 +2591,74 @@ mod tests {
                 name: "Compiler.bcd".into(),
                 version: 3,
                 fid: 42,
+                da: 11,
             },
             ClientDirEntry {
                 name: "Tioga.bcd".into(),
                 version: 1,
                 fid: 7,
+                da: 12,
             },
             ClientDirEntry {
                 name: "a".into(),
                 version: 1,
                 fid: 99,
+                da: 13,
             }, // odd length
         ];
         let bytes = build_client_directory(&entries).expect("build");
-        assert_eq!(bytes.len(), BTREE_PAGE_BYTES * 2, "statePage + one leaf");
+        assert_eq!(
+            bytes.len(),
+            PAGE_BYTES * BTREE_INITIAL_FILE_PAGES,
+            "FS's fixed initial directory/cache backing file"
+        );
         assert_eq!(rdw(&bytes, 0), BTREE_SEAL);
         assert_eq!(rdlong(&bytes, 5), 3, "entryCount in statePage");
 
         let got = parse_client_directory(&bytes);
-        let mut map: std::collections::HashMap<u32, (u16, String)> = Default::default();
+        let mut map: std::collections::HashMap<u32, (u16, String, u32)> = Default::default();
         for e in got {
-            map.insert(e.fid, (e.version, e.name));
+            map.insert(e.fid, (e.version, e.name, e.da));
         }
-        assert_eq!(map[&42], (3, "Compiler.bcd".into()));
-        assert_eq!(map[&7], (1, "Tioga.bcd".into()));
-        assert_eq!(map[&99], (1, "a".into()));
+        // fp.da travels with the entry: Cedar dereferences it as
+        // VolumeFormat.LogicalRun[first: fp.da] to reach the file's header
+        // (FileImpl.Open). It used to be written as 0, which made Cedar reject
+        // the enumeration with FS.Error $badFP.
+        assert_eq!(map[&42], (3, "Compiler.bcd".into(), 11));
+        assert_eq!(map[&7], (1, "Tioga.bcd".into(), 12));
+        assert_eq!(map[&99], (1, "a".into(), 13));
     }
 
     #[test]
-    fn client_directory_overflows_one_page_errors() {
-        // A single root leaf is ~1022 words; many long names must error cleanly
-        // rather than silently truncate (multi-page trees are a future extension).
+    fn client_directory_spans_multiple_pages() {
+        // Far more names than one ~1022-word leaf holds: the writer must build a
+        // 2-level B-tree (root + several leaves), and parse_client_directory --
+        // which walks every tree page -- must recover every entry exactly once,
+        // with its FileID and fp.da intact. Regression guard for the multi-page
+        // writer (2026-07-20); before it, this returned DiskFull.
         let entries: Vec<ClientDirEntry> = (0..200)
             .map(|i| ClientDirEntry {
                 name: format!("AVeryLongCedarFileName-{i:04}.bcd"),
                 version: 1,
                 fid: 1000 + i,
+                da: 100 + i,
             })
             .collect();
-        assert!(matches!(
-            build_client_directory(&entries),
-            Err(FilesystemError::DiskFull(_))
-        ));
+        let bytes = build_client_directory(&entries).expect("multi-page build");
+        // depth must be 2 and the root must not be page 1 (a single leaf).
+        assert_eq!(rdw(&bytes, 7), 2, "expected a 2-level tree");
+        assert!(rdw(&bytes, 2) > 1, "root should be an internal page");
+        let got = parse_client_directory(&bytes);
+        let mut map: std::collections::HashMap<u32, (String, u32)> = Default::default();
+        for e in got {
+            map.insert(e.fid, (e.name, e.da));
+        }
+        assert_eq!(map.len(), 200, "every entry recovered exactly once");
+        for i in 0..200u32 {
+            let (name, da) = &map[&(1000 + i)];
+            assert_eq!(name, &format!("AVeryLongCedarFileName-{i:04}.bcd"));
+            assert_eq!(*da, 100 + i, "fp.da preserved across pages");
+        }
     }
 
     #[test]
@@ -2137,7 +2666,8 @@ mod tests {
         use super::super::pdi;
         use crate::fs::filesystem::Filesystem;
 
-        let geo = pilot_geometry(160);
+        // FSFileOpsImpl reserves a 128-page client directory/cache file.
+        let geo = pilot_geometry(512);
         let blank = create_blank(geo, Generation::CedarNucleus, "Named").expect("create");
 
         // Two user files; FileID 1 is the VAM, so these get 2 and 3.
@@ -2176,12 +2706,41 @@ mod tests {
             ("Othello.boot".to_string(), 2u16, fb),
         ];
         let disk = set_client_directory(&disk, Generation::CedarNucleus, &dir).expect("set dir");
+
+        // Every named file must resolve to a real header page -- the value
+        // set_client_directory records as File.FP.da. A null da points at the
+        // logical-volume root and Cedar rejects the enumeration with
+        // FS.Error $badFP. Regression guard for the 2026-07-20 fix.
+        {
+            let vol = read_volume(&disk, Generation::CedarNucleus).unwrap();
+            let sv = vol
+                .physical_root
+                .sub_volumes
+                .iter()
+                .find(|s| s.lv_page == ROOT_PAGE_NUMBER)
+                .cloned()
+                .unwrap();
+            let da_a = header_lp_for(&disk, &sv, fa).expect("file a has a header");
+            let da_b = header_lp_for(&disk, &sv, fb).expect("file b has a header");
+            assert_ne!(da_a, 0, "fp.da must not be the volume root");
+            assert_ne!(da_b, 0, "fp.da must not be the volume root");
+            assert_ne!(da_a, da_b, "each file has its own header page");
+        }
+
         assert_eq!(
             read_volume(&disk, Generation::CedarNucleus)
                 .unwrap()
                 .logical_root
                 .client_fid,
             Some(4), // VAM=1, files 2 & 3, directory file = 4
+        );
+        let lv_root = &disk.sectors[84].data;
+        let client_da = rdlong(lv_root, ROOTFILE_CLIENT_WORD + 2);
+        assert_ne!(client_da, 0, "Cedar client root needs a leader hint");
+        assert_eq!(
+            rdlong(lv_root, ROOTFILE_CLIENT_WORD + 4),
+            client_da,
+            "RootFile.page and fp.da identify the same leader"
         );
 
         // Through a PDI round trip, the browse view shows the real names (the
