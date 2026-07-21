@@ -309,11 +309,12 @@ The app has five tabs:
 - **Inspect** — pick any supported source and browse the partition table,
   filesystem info, and file listings. Several actions live here:
   - **Browse** filesystem contents read-only (per partition). A checkbox
-    column multi-selects files and folders to **Export selected** as one
-    archive — a Mac Archive (`.mar`) everywhere, plus StuffIt / Zip / tar /
-    loose files in the Inspect tab and Commander. The Optical disc browser
-    and the `rb-cli tui` Explorer (Space to mark) export the same way, and
-    Commander has done so all along.
+    column (Space to mark in the TUI) multi-selects files and folders; pick a
+    format from the **Export as** pulldown and click **Export** to bundle the
+    whole selection into a single archive — Mac Archive (`.mar`), StuffIt
+    (`.sit`), Zip, or tar (gzip / zstd). Available in the Inspect tab, the
+    Optical disc browser, Commander, and the `rb-cli tui` Explorer; all four
+    run the same `export_selection` engine.
   - **Edit Partition Table…** to add / resize / delete / retype
     partition entries on raw disks, image files, and devices. Writers
     cover MBR, GPT, APM, SGI, and RDB-bootable-flag.

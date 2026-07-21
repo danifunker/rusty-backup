@@ -147,7 +147,7 @@ impl OpticalFilesystem {
 /// `/`-rooted convention). Carries the HFS-on-CD metadata opticaldiscs exposes:
 /// resource-fork size and Finder type/creator/flags. (opticaldiscs' browse API
 /// has no date field, so the Modified column stays blank for optical discs.)
-fn translate(e: &OptEntry) -> FileEntry {
+pub(crate) fn translate(e: &OptEntry) -> FileEntry {
     // opticaldiscs names its root entry "" (empty) with path "/", but rusty-backup's
     // convention — FileEntry::root() and every native fs driver — gives the root the
     // name "/", which the browse/Commander tree renders as its clickable root row.

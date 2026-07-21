@@ -238,14 +238,14 @@ enum ExportFormat {
     /// A single file, written into the destination dir via the shared
     /// `fork_export::export_file_with_fork` (data / AppleDouble / MacBinary / …).
     Fork(crate::fs::resource_fork::ResourceForkMode),
-    /// A `.tar[.gz/.zst]` archive of the selection (file or directory subtree).
-    Tar(crate::fs::tar_export::TarCompression),
-    /// A `.mar` (Mac Archive) of the selected file (both forks + type/creator).
-    Mar,
+    /// The whole selection bundled into one archive (or folder) via the shared
+    /// `export_selection` engine — tar / zip / StuffIt / MacArchive, etc. Every
+    /// Space-marked row is included (folders walk recursively).
+    Archive(crate::fs::export_selection::ExportFormat),
 }
 
+use crate::fs::export_selection::ExportFormat as EsFormat;
 use crate::fs::resource_fork::ResourceForkMode as RfMode;
-use crate::fs::tar_export::TarCompression as TarComp;
 
 /// The formats offered by the "Export as" menu.
 const EXPORT_FORMATS: &[(&str, ExportFormat)] = &[
@@ -260,9 +260,21 @@ const EXPORT_FORMATS: &[(&str, ExportFormat)] = &[
         "Separate .rsrc sidecar",
         ExportFormat::Fork(RfMode::SeparateRsrc),
     ),
-    ("tar archive (.tar)", ExportFormat::Tar(TarComp::None)),
-    ("tar + gzip (.tar.gz)", ExportFormat::Tar(TarComp::Gzip)),
-    ("Mac Archive (.mar)", ExportFormat::Mar),
+    ("tar archive (.tar)", ExportFormat::Archive(EsFormat::Tar)),
+    (
+        "tar + gzip (.tar.gz)",
+        ExportFormat::Archive(EsFormat::TarGz),
+    ),
+    (
+        "tar + zstd (.tar.zst)",
+        ExportFormat::Archive(EsFormat::TarZstd),
+    ),
+    ("Zip (.zip)", ExportFormat::Archive(EsFormat::Zip)),
+    ("StuffIt (.sit)", ExportFormat::Archive(EsFormat::StuffIt)),
+    (
+        "Mac Archive (.mar)",
+        ExportFormat::Archive(EsFormat::MacArchive),
+    ),
 ];
 
 /// A scrollable file view (text lines, or a hex dump for binary content).
@@ -3249,37 +3261,11 @@ impl App {
                         dest.display()
                     ))
                 }
-                ExportFormat::Tar(comp) => {
-                    let ext = match comp {
-                        TarComp::Gzip => "tar.gz",
-                        TarComp::Zstd => "tar.zst",
-                        TarComp::None => "tar",
-                    };
-                    let out_path = dest.join(format!("{name}.{ext}"));
-                    let out = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
-                    // A directory roots its entries under its own name.
-                    let prefix = if is_dir { name.clone() } else { String::new() };
-                    let opts = crate::fs::tar_export::TarExportOptions::default();
-                    crate::fs::tar_export::export_tar(
-                        &mut *ex.fs,
-                        &entry,
-                        &prefix,
-                        out,
-                        comp,
-                        &opts,
-                        &|_| {},
-                    )?;
-                    Ok(format!(
-                        "Exported {} to {}",
-                        basename(&out_path.to_string_lossy()),
-                        out_path.display()
-                    ))
-                }
-                ExportFormat::Mar => {
-                    // Multi-select: every Space-marked row goes into one .mar (a
-                    // marked folder walks recursively) via the shared export
-                    // engine, which also lifts the old single-file-only limit.
-                    // Falls back to the highlighted entry when nothing is marked.
+                ExportFormat::Archive(fmt) => {
+                    // The whole selection into one archive via the shared engine:
+                    // every Space-marked row (a marked folder walks recursively),
+                    // or the highlighted entry when nothing is marked.
+                    use crate::fs::export_selection::{export_to_file, export_to_folder};
                     let entries: Vec<FileEntry> = if ex.marked.is_empty() {
                         vec![entry.clone()]
                     } else {
@@ -3292,25 +3278,48 @@ impl App {
                     if entries.is_empty() {
                         anyhow::bail!("nothing selected");
                     }
-                    let out_name = if entries.len() == 1 {
-                        format!("{}.mar", entries[0].name)
+                    let noop = |_: &str, _: usize, _: u64| {};
+                    let nocancel = || false;
+                    if fmt.is_single_file() {
+                        let ext = fmt
+                            .file_extension()
+                            .map(|e| format!(".{e}"))
+                            .unwrap_or_default();
+                        let out_name = if entries.len() == 1 {
+                            format!("{}{ext}", entries[0].name)
+                        } else {
+                            format!("selection{ext}")
+                        };
+                        let out_path = dest.join(&out_name);
+                        let summary = export_to_file(
+                            &mut *ex.fs,
+                            &entries,
+                            &out_path,
+                            fmt,
+                            &noop,
+                            &nocancel,
+                        )?;
+                        Ok(format!(
+                            "Exported {} item(s) to {}",
+                            summary.files,
+                            out_path.display()
+                        ))
                     } else {
-                        "selection.mar".to_string()
-                    };
-                    let out_path = dest.join(&out_name);
-                    let summary = crate::fs::export_selection::export_to_file(
-                        &mut *ex.fs,
-                        &entries,
-                        &out_path,
-                        crate::fs::export_selection::ExportFormat::MacArchive,
-                        &|_: &str, _: usize, _: u64| {},
-                        &|| false,
-                    )?;
-                    Ok(format!(
-                        "Exported {} item(s) to {}",
-                        summary.files,
-                        out_path.display()
-                    ))
+                        let summary = export_to_folder(
+                            &mut *ex.fs,
+                            &entries,
+                            dest,
+                            fmt,
+                            RfMode::AppleDouble,
+                            &noop,
+                            &nocancel,
+                        )?;
+                        Ok(format!(
+                            "Exported {} item(s) to {}",
+                            summary.files,
+                            dest.display()
+                        ))
+                    }
                 }
             }
         })();

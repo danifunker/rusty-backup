@@ -62,6 +62,8 @@ pub struct BrowseView {
     /// so export can read it without re-walking the tree. Fed to the shared
     /// `export_selection` engine by the "Export selected..." bar.
     marked: std::collections::BTreeMap<String, FileEntry>,
+    /// Chosen output format for the "Export selected" pulldown.
+    export_format: rusty_backup::fs::export_selection::ExportFormat,
     /// Cached content of the selected file.
     content: Option<FileContent>,
     /// View mode for file content.
@@ -386,6 +388,7 @@ impl Default for BrowseView {
             expanded_paths: HashSet::new(),
             selected_entry: None,
             marked: std::collections::BTreeMap::new(),
+            export_format: rusty_backup::fs::export_selection::ExportFormat::MacArchive,
             content: None,
             view_mode: ViewMode::Auto,
             error: None,
@@ -1486,27 +1489,33 @@ impl BrowseView {
         if self.marked.is_empty() {
             return;
         }
-        let mut chosen: Option<rusty_backup::fs::export_selection::ExportFormat> = None;
+        use rusty_backup::fs::export_selection::ExportFormat;
+        let mut fmt = self.export_format;
+        let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{} selected", self.marked.len()));
-            ui.menu_button("Export selected as...", |ui| {
-                for fmt in rusty_backup::fs::export_selection::ExportFormat::ALL {
-                    if ui.button(fmt.label()).clicked() {
-                        chosen = Some(fmt);
-                        ui.close();
+            ui.label("Export as:");
+            egui::ComboBox::from_id_salt("browse_export_fmt")
+                .selected_text(fmt.label())
+                .show_ui(ui, |ui| {
+                    for f in ExportFormat::ALL {
+                        ui.selectable_value(&mut fmt, f, f.label());
                     }
-                }
-            });
+                });
+            if ui.button("Export...").clicked() {
+                do_export = true;
+            }
             if ui.button("Clear").clicked() {
                 clear = true;
             }
         });
         ui.separator();
+        self.export_format = fmt;
         if clear {
             self.marked.clear();
         }
-        if let Some(fmt) = chosen {
+        if do_export {
             self.export_marked(fmt);
         }
     }

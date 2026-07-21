@@ -41,9 +41,11 @@ pub struct OpticalDiscBrowseView {
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_paths: HashSet<String>,
     selected_entry: Option<FileEntry>,
-    /// Checkbox-marked entries for multi-select export to a single `.mar`, keyed
-    /// by path. Independent of the single-click `selected_entry` preview.
+    /// Checkbox-marked entries for multi-select export to a single archive,
+    /// keyed by path. Independent of the single-click `selected_entry` preview.
     marked: std::collections::BTreeMap<String, FileEntry>,
+    /// Chosen output format for the "Export selected" pulldown.
+    export_format: crate::fs::export_selection::ExportFormat,
     content: Option<FileContent>,
     view_mode: ViewMode,
     error: Option<String>,
@@ -80,6 +82,7 @@ impl Default for OpticalDiscBrowseView {
             expanded_paths: HashSet::new(),
             selected_entry: None,
             marked: std::collections::BTreeMap::new(),
+            export_format: crate::fs::export_selection::ExportFormat::MacArchive,
             content: None,
             view_mode: ViewMode::Auto,
             error: None,
@@ -514,83 +517,123 @@ impl OpticalDiscBrowseView {
             .collect()
     }
 
-    /// Bar shown above the tree when entries are checkbox-marked: the count, an
-    /// "Export selected as MAR (.mar)..." action, and Clear.
+    /// Bar shown above the tree when entries are checkbox-marked: the count, a
+    /// format pulldown, an Export button, and Clear.
     fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::fs::export_selection::ExportFormat;
         if self.marked.is_empty() {
             return;
         }
-        let mut export = false;
+        let mut fmt = self.export_format;
+        let mut do_export = false;
         let mut clear = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{} selected", self.marked.len()));
-            if ui.button("Export selected as MAR (.mar)...").clicked() {
-                export = true;
+            ui.label("Export as:");
+            egui::ComboBox::from_id_salt("optical_export_fmt")
+                .selected_text(fmt.label())
+                .show_ui(ui, |ui| {
+                    for f in ExportFormat::ALL {
+                        ui.selectable_value(&mut fmt, f, f.label());
+                    }
+                });
+            if ui.button("Export...").clicked() {
+                do_export = true;
             }
             if ui.button("Clear").clicked() {
                 clear = true;
             }
         });
         ui.separator();
+        self.export_format = fmt;
         if clear {
             self.marked.clear();
         }
-        if export {
-            self.export_marked_mar();
+        if do_export {
+            self.export_marked(fmt);
         }
     }
 
-    /// Bundle the checkbox-marked entries into one `.mar`. Reads forks straight
-    /// from the opticaldiscs filesystem into a StuffIt input tree (folders walk
-    /// recursively) and writes via the shared MAR writer. Foreground execution;
-    /// classic-Mac payloads are typically small.
-    fn export_marked_mar(&mut self) {
+    /// Export the checkbox-marked entries together as one `format` output. The CD
+    /// browser holds opticaldiscs' own FileEntry, so it wraps the live filesystem
+    /// in a rusty-backup `OpticalFilesystem` (which resolves entries by path) and
+    /// runs the shared multi-entry `export_selection` engine over the translated
+    /// entries — giving the same format list as the Inspect tab, forks included.
+    /// Foreground execution; classic-Mac payloads are typically small.
+    fn export_marked(&mut self, format: crate::fs::export_selection::ExportFormat) {
+        use crate::fs::export_selection::{export_to_file, export_to_folder};
         let entries = self.marked_export_entries();
         if entries.is_empty() {
             self.error = Some("Nothing selected to export.".into());
             return;
         }
-        let default_name = if entries.len() == 1 {
-            format!("{}.mar", display_name(&entries[0]))
+        let fork_mode = self.resource_fork_mode;
+        let rb_entries: Vec<crate::fs::entry::FileEntry> = entries
+            .iter()
+            .map(crate::fs::optical_fs::translate)
+            .collect();
+        let fs_type = self
+            .selected_fs_type()
+            .map(|t| format!("{t:?}"))
+            .unwrap_or_default();
+        let noop = |_: &str, _: usize, _: u64| {};
+        let nocancel = || false;
+
+        let (path, is_folder) = if format.is_single_file() {
+            let ext = format
+                .file_extension()
+                .map(|e| format!(".{e}"))
+                .unwrap_or_default();
+            let name = format!("selection{ext}");
+            match rfd::FileDialog::new()
+                .set_title("Export selection")
+                .set_file_name(&name)
+                .save_file()
+            {
+                Some(p) => (p, false),
+                None => return,
+            }
         } else {
-            "selection.mar".to_string()
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Export selection as MAR")
-            .set_file_name(&default_name)
-            .save_file()
-        else {
-            return;
+            match rfd::FileDialog::new()
+                .set_title("Export selection to folder")
+                .pick_folder()
+            {
+                Some(p) => (p, true),
+                None => return,
+            }
         };
 
-        let result = (|| -> Result<(), String> {
-            let mut fs = self.open_fs().map_err(|e| e.to_string())?;
-            let mut nodes: Vec<crate::macarchive::stuffit::StuffItInputNode> = Vec::new();
-            for e in &entries {
-                nodes.extend(walk_optical_to_input_nodes(&mut *fs, e)?);
+        let result = (|| -> Result<crate::fs::export_selection::ExportSummary, String> {
+            let inner = self.open_fs().map_err(|e| e.to_string())?;
+            let mut rb_fs =
+                crate::fs::optical_fs::OpticalFilesystem::from_inner(inner, fs_type, None)
+                    .map_err(|e| e.to_string())?;
+            if is_folder {
+                export_to_folder(
+                    &mut rb_fs,
+                    &rb_entries,
+                    &path,
+                    format,
+                    fork_mode,
+                    &noop,
+                    &nocancel,
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                export_to_file(&mut rb_fs, &rb_entries, &path, format, &noop, &nocancel)
+                    .map_err(|e| e.to_string())
             }
-            if nodes.is_empty() {
-                return Err("nothing to archive (empty selection)".into());
-            }
-            let root_name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("selection");
-            let bytes = crate::macarchive::mar::build_archive(root_name, &nodes)
-                .map_err(|e| e.to_string())?;
-            std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-            Ok(())
         })();
 
         match result {
-            Ok(()) => {
+            Ok(s) => {
                 self.extraction_result = Some(format!(
                     "Exported {} item(s) to {}",
-                    entries.len(),
+                    s.files,
                     path.display()
                 ));
             }
-            Err(e) => self.error = Some(format!("MAR export failed: {e}")),
+            Err(e) => self.error = Some(format!("Export failed: {e}")),
         }
     }
 
@@ -1124,54 +1167,6 @@ fn extract_entry(
     }
 
     Ok(())
-}
-
-/// Walk an opticaldiscs entry into a StuffIt input tree for MAR export, reading
-/// data + resource forks straight from the disc filesystem. Mirrors rusty-backup's
-/// `walk_fs_to_input_nodes`; a directory at the volume root ("/") expands to its
-/// children directly, so the archive isn't wrapped in a strangely-named outer
-/// folder. Dates / finder flags are left 0, matching that sibling walker.
-fn walk_optical_to_input_nodes(
-    fs: &mut dyn Filesystem,
-    entry: &FileEntry,
-) -> Result<Vec<crate::macarchive::stuffit::StuffItInputNode>, String> {
-    use crate::macarchive::stuffit::{StuffItInput, StuffItInputNode};
-    if entry.is_directory() {
-        let children = fs.list_directory(entry).map_err(|e| e.to_string())?;
-        let mut inner = Vec::new();
-        for child in &children {
-            inner.extend(walk_optical_to_input_nodes(fs, child)?);
-        }
-        if entry.path == "/" {
-            return Ok(inner);
-        }
-        Ok(vec![StuffItInputNode::Folder {
-            name: entry.name.clone(),
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            children: inner,
-        }])
-    } else if entry.is_file() {
-        let data = fs.read_file(entry).map_err(|e| e.to_string())?;
-        let rsrc = fs
-            .read_resource_fork(entry)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        Ok(vec![StuffItInputNode::File(StuffItInput {
-            name: entry.name.clone(),
-            type_code: entry.type_code.unwrap_or([0; 4]),
-            creator_code: entry.creator_code.unwrap_or([0; 4]),
-            finder_flags: 0,
-            create_date: 0,
-            mod_date: 0,
-            data_fork: data,
-            resource_fork: rsrc,
-        })])
-    } else {
-        Ok(Vec::new())
-    }
 }
 
 /// User-facing name for an entry: opticaldiscs names the disc root "" (empty),
