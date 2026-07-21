@@ -353,7 +353,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
  "x11rb",
 ]
 
@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "cd-da-reader"
 version = "0.4.1"
-source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-backend-on-1.0#7de4522e8c45f7df43dbe79240e5bffe140334e0"
+source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-backend-on-1.0#70f37567f37c05aa4c40578f0a353669f5bd2814"
 dependencies = [
  "cc",
  "libc",
@@ -4878,7 +4878,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
