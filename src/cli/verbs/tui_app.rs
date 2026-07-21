@@ -123,9 +123,10 @@ struct Explorer {
     /// Right pane: the selected directory's entries, and the selected row.
     list: Vec<FileEntry>,
     list_sel: usize,
-    /// Space-marked rows in the current listing (by name), for multi-select
-    /// export to a single `.mar`. Cleared when the listing changes.
-    marked: std::collections::HashSet<String>,
+    /// Space-marked entries for multi-select export, keyed by path. Markable in
+    /// both panes (a directory in the left tree, a file or folder in the right
+    /// list) and kept across navigation so a selection can span directories.
+    marked: std::collections::BTreeMap<String, FileEntry>,
     focus: ExFocus,
     /// A one-line result of the last export/import, shown in the footer area.
     status: Option<String>,
@@ -2747,7 +2748,7 @@ impl App {
                 tree_sel: 0,
                 list,
                 list_sel: 0,
-                marked: std::collections::HashSet::new(),
+                marked: std::collections::BTreeMap::new(),
                 focus: ExFocus::Tree,
                 status: None,
                 picker: None,
@@ -3206,6 +3207,7 @@ impl App {
                     KeyCode::End => ex.tree_last(),
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => ex.tree_expand(),
                     KeyCode::Left | KeyCode::Char('h') => ex.tree_collapse(),
+                    KeyCode::Char(' ') => ex.toggle_mark_tree(),
                     _ => {}
                 },
                 // Right pane: navigate the listing; Enter opens dir / views file.
@@ -3269,11 +3271,7 @@ impl App {
                     let entries: Vec<FileEntry> = if ex.marked.is_empty() {
                         vec![entry.clone()]
                     } else {
-                        ex.list
-                            .iter()
-                            .filter(|e| ex.marked.contains(&e.name))
-                            .cloned()
-                            .collect()
+                        ex.marked_entries()
                     };
                     if entries.is_empty() {
                         anyhow::bail!("nothing selected");
@@ -6272,17 +6270,28 @@ impl App {
             } else {
                 format!("{}/", n.dir.name)
             };
-            let style = if i == ex.tree_sel {
+            // A leading '*' marks Space-selected folders (multi-select export).
+            let marked = ex.marked.contains_key(&n.dir.path);
+            let selm = if marked { "*" } else { " " };
+            let mut style = if i == ex.tree_sel {
                 self.palette
                     .accent()
                     .add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
                 self.palette.accent()
             };
-            lines.push(Line::styled(format!("{indent}{mark}{name}"), style));
+            if marked {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            lines.push(Line::styled(format!("{selm}{indent}{mark}{name}"), style));
         }
+        let title = if ex.marked.is_empty() {
+            "Tree".to_string()
+        } else {
+            format!("Tree ({} marked)", ex.marked.len())
+        };
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).block(self.pane_block("Tree", focused)),
+            Paragraph::new(Text::from(lines)).block(self.pane_block(&title, focused)),
             area,
         );
     }
@@ -6335,7 +6344,7 @@ impl App {
                 } else {
                     Style::default()
                 };
-                let marked = ex.marked.contains(&e.name);
+                let marked = ex.marked.contains_key(&e.path);
                 let mut style = if i == ex.list_sel && focused {
                     base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
                 } else if i == ex.list_sel {
@@ -8609,27 +8618,57 @@ impl Explorer {
             }
         }
     }
-    /// Reload the right pane for the selected tree directory.
+    /// Reload the right pane for the selected tree directory. Marks are kept
+    /// (keyed by path), so a selection can span directories as you navigate.
     fn reload_list(&mut self) {
         let dir = self.current_dir().clone();
         let mut list = self.fs.list_directory(&dir).unwrap_or_default();
         sort_entries(&mut list);
         self.list = list;
         self.list_sel = 0;
-        // Marks are per-listing (keyed by name); a new directory starts fresh.
-        self.marked.clear();
     }
 
-    /// Toggle the Space-mark on the highlighted list row, then advance the
-    /// cursor so a run of files can be marked with repeated Space presses.
+    /// Toggle the Space-mark on the highlighted list row (a file or a folder),
+    /// then advance the cursor so a run can be marked with repeated Space presses.
     fn toggle_mark(&mut self) {
         if let Some(e) = self.list.get(self.list_sel) {
-            let name = e.name.clone();
-            if !self.marked.remove(&name) {
-                self.marked.insert(name);
+            let (path, entry) = (e.path.clone(), e.clone());
+            if self.marked.remove(&path).is_none() {
+                self.marked.insert(path, entry);
             }
         }
         self.list_move(1);
+    }
+
+    /// Toggle the Space-mark on the selected directory in the left tree pane,
+    /// so folders can be multi-selected for export without descending into them.
+    fn toggle_mark_tree(&mut self) {
+        if let Some(n) = self.tree.get(self.tree_sel) {
+            let (path, entry) = (n.dir.path.clone(), n.dir.clone());
+            if self.marked.remove(&path).is_none() {
+                self.marked.insert(path, entry);
+            }
+        }
+    }
+
+    /// Marked entries for export, dropping any entry that lives under another
+    /// marked directory (that ancestor's recursive walk already includes it).
+    fn marked_entries(&self) -> Vec<FileEntry> {
+        fn is_ancestor(a: &str, p: &str) -> bool {
+            if a == p {
+                return false;
+            }
+            if a == "/" {
+                return p.len() > 1 && p.starts_with('/');
+            }
+            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
+        }
+        let paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
+        self.marked
+            .iter()
+            .filter(|(p, _)| !paths.iter().any(|a| is_ancestor(a, p)))
+            .map(|(_, e)| e.clone())
+            .collect()
     }
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
