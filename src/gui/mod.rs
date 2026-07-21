@@ -1235,6 +1235,14 @@ impl eframe::App for RustyBackupApp {
             self.active_tab = Tab::Archives;
         }
 
+        // Likewise, an optical disc opened in Inspect (an ISO 9660 CD, a hybrid
+        // Mac disc, an NKit v1 GameCube image, ...) has no partition table — the
+        // open worker flags it, so open it in the Optical tab and switch there.
+        if let Some(path) = self.inspect_tab.take_open_optical_request() {
+            self.optical_tab.open_image(path);
+            self.active_tab = Tab::Optical;
+        }
+
         // Show settings dialog if open
         self.settings_dialog.show(ctx);
 

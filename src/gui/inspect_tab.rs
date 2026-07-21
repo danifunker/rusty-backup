@@ -122,6 +122,10 @@ pub struct InspectTab {
     /// consumes this to switch to the Archives tab instead of inspecting it as
     /// a disk image. `None` when nothing is pending.
     pending_open_archive: Option<PathBuf>,
+    /// An optical disc image the open worker found has no partition table but IS
+    /// browsable optically — the app consumes this to switch to the Optical tab
+    /// and open it there. `None` when nothing is pending.
+    pending_open_optical: Option<PathBuf>,
     /// Filesystem browser
     browse_view: BrowseView,
     /// "Connect to Remote..." — an inline panel browsing an `rb-cli serve`
@@ -282,6 +286,7 @@ impl Default for InspectTab {
             prev_backup_path: None,
             pending_source_change: None,
             pending_open_archive: None,
+            pending_open_optical: None,
             browse_view: BrowseView::default(),
             remote_browser: super::remote_browser::RemoteBrowsePanel::default(),
             remote_inspect: None,
@@ -370,6 +375,12 @@ impl InspectTab {
     /// disk image, so inspecting it would just fail).
     pub fn take_open_archive_request(&mut self) -> Option<PathBuf> {
         self.pending_open_archive.take()
+    }
+
+    /// An optical disc image the open worker couldn't parse as a partitioned disk
+    /// but which IS browsable optically. The app routes it to the Optical tab.
+    pub fn take_open_optical_request(&mut self) -> Option<PathBuf> {
+        self.pending_open_optical.take()
     }
 
     pub fn load_backup(&mut self, path: &PathBuf) {
@@ -2574,7 +2585,15 @@ impl InspectTab {
         }
 
         if status.finished {
-            if let Some(err) = &status.error {
+            if let Some(path) = status.redirect_to_optical.take() {
+                // Not a partitioned disk but a browsable optical disc — hand it to
+                // the Optical tab (the app switches there on the next frame).
+                ctx.log.info(format!(
+                    "{} is an optical disc — opening the Optical tab.",
+                    path.display()
+                ));
+                self.pending_open_optical = Some(path);
+            } else if let Some(err) = &status.error {
                 let msg = format!("Inspect failed: {err}");
                 ctx.log.error(&msg);
                 self.last_error = Some(msg);
@@ -3039,6 +3058,7 @@ impl InspectTab {
             format_label: None,
             device_file: None,
             device_guard: None,
+            redirect_to_optical: None,
         }));
         self.inspect_status = Some(Arc::clone(&status));
 
@@ -3712,18 +3732,32 @@ impl InspectTab {
                     }
                 }
                 Err(e) => {
-                    // A `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT, so
-                    // partition detection fails with a cryptic "invalid boot
-                    // signature". Redirect optical images to the Optical tab, and
-                    // give NKit images the actionable convert-it-first hint,
-                    // instead of the raw parse error.
-                    let base = anyhow::anyhow!("Failed to parse partition table: {e}");
-                    let hinted = if rusty_backup::cli::optical_hint::is_nkit_image(&path) {
-                        rusty_backup::cli::optical_hint::with_nkit_hint(base, &path)
+                    // No MBR/GPT. If this is a local optical disc opticaldiscs can
+                    // browse (an ISO 9660 CD, a hybrid Mac disc, an NKit v1
+                    // GameCube image, ...), redirect to the Optical tab — the
+                    // partition path can't read optical media. Only a *recognized*
+                    // optical filesystem redirects, so a genuine headerless disk
+                    // image (Unknown to opticaldiscs) still falls through to the
+                    // error + hint below.
+                    if remote.is_none()
+                        && rusty_backup::cli::optical_hint::is_browsable_optical(&path)
+                    {
+                        if let Ok(mut s) = status.lock() {
+                            s.redirect_to_optical = Some(path.clone());
+                            s.finished = true;
+                        }
                     } else {
-                        rusty_backup::cli::optical_hint::with_optical_hint(base, &path)
-                    };
-                    finish_err(format!("{hinted:#}"));
+                        // A `.iso` with no recognized optical FS (raw disk dump,
+                        // NKit v2 / corrupt): keep the cryptic parse error but add
+                        // the NKit / optical-redirect hint.
+                        let base = anyhow::anyhow!("Failed to parse partition table: {e}");
+                        let hinted = if rusty_backup::cli::optical_hint::is_nkit_image(&path) {
+                            rusty_backup::cli::optical_hint::with_nkit_hint(base, &path)
+                        } else {
+                            rusty_backup::cli::optical_hint::with_optical_hint(base, &path)
+                        };
+                        finish_err(format!("{hinted:#}"));
+                    }
                 }
             }
         });

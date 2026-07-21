@@ -50,6 +50,11 @@ pub struct InspectStatus {
     /// The `TempFileGuard` that holds the DiskClaim / temp file alive.
     /// Kept here so the main thread can decide when to release it.
     pub device_guard: Option<TempFileGuard>,
+    /// Set instead of `error` when the image has no partition table but IS an
+    /// optical disc the `opticaldiscs` path can browse (e.g. an ISO 9660 CD or an
+    /// NKit v1 GameCube image). The GUI switches to the Optical tab and opens it
+    /// there rather than reporting a partition-table failure.
+    pub redirect_to_optical: Option<PathBuf>,
 }
 
 /// Status of a background seekable cache creation (native zstd backups).

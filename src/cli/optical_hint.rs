@@ -66,6 +66,27 @@ fn optical_redirect_hint(path: &Path) -> Option<String> {
     }
 }
 
+/// True when `path` is an optical disc image opticaldiscs recognizes with a real
+/// on-disc filesystem (ISO 9660 / HFS / GameCube / Wii / UDF / …) — NOT
+/// `Unknown`, which a *raw disk image* saved with an optical extension (e.g. a
+/// headerless `.iso` dump of a hard disk) would report. Lets a caller redirect an
+/// image the partition-table path can't parse to the optical open path without
+/// hijacking a genuine (headerless) disk image. Always `false` without the
+/// `optical` feature.
+pub fn is_browsable_optical(path: &Path) -> bool {
+    #[cfg(feature = "optical")]
+    {
+        opticaldiscs::detect::DiscImageInfo::open(path)
+            .map(|i| i.filesystem != opticaldiscs::formats::FilesystemType::Unknown)
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "optical"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// True when `path` is an NKit-processed GameCube/Wii image (the `NKIT` magic
 /// sits at byte 0x200). NKit *identifies* as a normal GC/Wii disc — its header
 /// is intact — but it scrubs and rearranges the partition data. opticaldiscs
@@ -173,6 +194,36 @@ mod tests {
         assert_eq!(
             with_nkit_hint(base, &plain).to_string(),
             "Unsupported filesystem"
+        );
+    }
+
+    /// The Inspect->Optical redirect decision: a real optical disc is
+    /// browsable-optical; a headerless raw blob saved as `.iso` is NOT (so it
+    /// stays in Inspect rather than being hijacked to the Optical tab).
+    #[cfg(feature = "optical")]
+    #[test]
+    fn is_browsable_optical_distinguishes_disc_from_raw() {
+        use std::io::{Cursor, Read};
+
+        let compressed = std::fs::read("tests/fixtures/optical/hybrid_rsrc.iso.zst")
+            .expect("read hybrid fixture");
+        let mut dec = zstd::stream::read::Decoder::new(Cursor::new(compressed)).unwrap();
+        let mut iso = Vec::new();
+        dec.read_to_end(&mut iso).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let disc = dir.path().join("disc.iso");
+        std::fs::write(&disc, &iso).unwrap();
+        assert!(
+            is_browsable_optical(&disc),
+            "a real ISO 9660 disc must be browsable-optical"
+        );
+
+        // A headerless blob (no recognized optical filesystem) must NOT redirect.
+        let raw = dir.path().join("raw.iso");
+        std::fs::write(&raw, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        assert!(
+            !is_browsable_optical(&raw),
+            "a headerless blob must not be treated as an optical disc"
         );
     }
 }
