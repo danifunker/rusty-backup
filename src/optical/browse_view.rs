@@ -354,31 +354,45 @@ impl OpticalDiscBrowseView {
                 let path = entry.path.clone();
                 let has_children = self.directory_cache.contains_key(&path);
 
-                // opticaldiscs names the disc root "" (empty); show it as "/" so
-                // the root is a visible, expandable node instead of a bare
-                // triangle with nothing to click. Scoped to the empty-named root,
-                // so if opticaldiscs is later fixed to name the root, that real
-                // name shows through unchanged.
-                let label = if entry.name.is_empty() && path == "/" {
-                    "/"
-                } else {
-                    entry.name.as_str()
-                };
-                let header = egui::CollapsingHeader::new(label)
-                    .id_salt(&path)
-                    .default_open(path == "/")
-                    .show(ui, |ui| {
-                        if let Some(children) = self.directory_cache.get(&path).cloned() {
-                            for child in &children {
-                                self.render_tree_entry(ui, child);
-                            }
-                        } else {
-                            ui.label("Loading...");
+                let is_selected = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|s| s.path == entry.path)
+                    .unwrap_or(false);
+
+                // A CollapsingState (toggle triangle + a separately clickable
+                // label) rather than a plain CollapsingHeader, so a directory —
+                // the disc root included — can be *selected* for "Extract
+                // Folder..." while the triangle still expands it. display_name()
+                // renders the empty-named root as "/".
+                let id = ui.make_persistent_id(&path);
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    path == "/",
+                );
+
+                let header_res = ui.horizontal(|ui| {
+                    state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    if ui
+                        .selectable_label(is_selected, display_name(entry))
+                        .clicked()
+                    {
+                        self.select_dir(entry);
+                    }
+                });
+
+                state.show_body_indented(&header_res.response, ui, |ui| {
+                    if let Some(children) = self.directory_cache.get(&path).cloned() {
+                        for child in &children {
+                            self.render_tree_entry(ui, child);
                         }
-                    });
+                    } else {
+                        ui.label("Loading...");
+                    }
+                });
 
-                let is_now_open = header.body_returned.is_some();
-
+                let is_now_open = state.is_open();
                 if is_now_open {
                     if !has_children {
                         self.load_directory(entry);
@@ -442,6 +456,14 @@ impl OpticalDiscBrowseView {
         }
     }
 
+    /// Select a directory (for "Extract Folder..."). A directory has no content
+    /// to preview, so just record the selection and clear any stale content.
+    fn select_dir(&mut self, entry: &FileEntry) {
+        self.selected_entry = Some(entry.clone());
+        self.content = None;
+        self.error = None;
+    }
+
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
         // Extraction progress bar
         if let Some(progress) = &self.extraction_progress {
@@ -479,7 +501,7 @@ impl OpticalDiscBrowseView {
                 let entry = entry.clone();
 
                 // File info header
-                ui.label(egui::RichText::new(&entry.name).strong());
+                ui.label(egui::RichText::new(display_name(&entry)).strong());
                 ui.horizontal(|ui| {
                     ui.label(format!("Size: {}", entry.size_string()));
                     if let Some(tc) = entry.type_code_string() {
@@ -972,6 +994,17 @@ fn extract_entry(
     }
 
     Ok(())
+}
+
+/// User-facing name for an entry: opticaldiscs names the disc root "" (empty),
+/// so surface it as "/". Scoped to the root (empty name AND path "/"), so a
+/// future opticaldiscs that names the root passes its real name through unchanged.
+fn display_name(entry: &FileEntry) -> &str {
+    if entry.name.is_empty() && entry.path == "/" {
+        "/"
+    } else {
+        &entry.name
+    }
 }
 
 /// Human-friendly size string.
