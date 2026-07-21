@@ -124,7 +124,12 @@ fn main() {
     };
     let bytes = fs::read(Path::new(arg)).expect("read");
     let disk = open_pack(&bytes).expect("open_pack");
-    let vol = pilot::read_volume(&disk, Generation::OriginalPilot).expect("read_volume");
+    let generation = if arg.to_ascii_lowercase().ends_with(".pdi") {
+        Generation::CedarNucleus
+    } else {
+        Generation::OriginalPilot
+    };
+    let vol = pilot::read_volume(&disk, generation).expect("read_volume");
     println!(
         "PV '{}' : {} subvolumes",
         vol.pv_label,
@@ -141,7 +146,7 @@ fn main() {
 
     // Exercise the actual Filesystem-trait path the GUI/CLI use: list + read.
     println!("\n  === Filesystem trait (list + extract) ===");
-    let mut fs = PilotFilesystem::open(disk, Generation::OriginalPilot).expect("open fs");
+    let mut fs = PilotFilesystem::open(disk, generation).expect("open fs");
     let root = fs.root().expect("root");
     let entries = fs.list_directory(&root).expect("list");
     let named = entries.iter().filter(|e| !e.name.starts_with("LV")).count();
@@ -150,6 +155,12 @@ fn main() {
         entries.len(),
         entries.len() - named
     );
+    if named != 0 {
+        println!("  named files:");
+        for e in entries.iter().filter(|e| !e.name.starts_with("LV")) {
+            println!("    {}", e.name);
+        }
+    }
     let mut by_size: Vec<_> = entries.iter().collect();
     by_size.sort_by_key(|e| std::cmp::Reverse(e.size));
     for e in by_size.iter().take(8) {
