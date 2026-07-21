@@ -2651,3 +2651,52 @@ fn sync_upload_helpers_push_to_remote_host() {
         b"inner!"
     );
 }
+
+/// The TUI's remote-image upload entry point: stage a host file into a remote
+/// disk image and apply over the wire via
+/// `commander_ops::apply_edits_to_remote_image`, then read it back byte-exact
+/// through a RemoteFilesystem. This is the "upload INTO a remote image" path.
+#[test]
+fn sync_apply_edits_to_remote_image_uploads_a_file() {
+    use rusty_backup::fs::entry::FileEntry;
+    use rusty_backup::model::commander_ops;
+
+    // Writable daemon serving a dir with an 8 MiB FAT image.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let img = root.join("disk.img");
+    make_fat_image_with_subtree(&img, b"seed-top", b"seed-inner");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_root = root.clone();
+    std::thread::spawn(move || {
+        let _ = serve_on(listener, serve_root, None, true);
+    });
+
+    // A local host file to upload into the image root.
+    let src = tempfile::tempdir().unwrap();
+    let host_file = src.path().join("UP.TXT");
+    std::fs::write(&host_file, b"uploaded-into-image").unwrap();
+
+    // Stage host -> image and apply over the wire to /disk.img.
+    let image_root = FileEntry::new_directory("/".into(), "/".into(), 0);
+    let entries = vec![FileEntry::new_file(
+        "UP.TXT".into(),
+        host_file.to_string_lossy().into_owned(),
+        19,
+        0,
+    )];
+    let edits = commander_ops::stage_host_to_image(&entries, &image_root);
+    commander_ops::apply_edits_to_remote_image(&addr, "/disk.img", None, &edits).unwrap();
+
+    // Read it back through a fresh RemoteFilesystem view of the image.
+    let (mut rfs, root_entry, _kids) = RemoteFilesystem::open(&addr, "/disk.img", None).unwrap();
+    let listed = rfs.list_directory(&root_entry).unwrap();
+    let up = listed
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("UP.TXT"))
+        .expect("uploaded file present in the remote image");
+    let mut got = Vec::new();
+    rfs.write_file_to(up, &mut got).unwrap();
+    assert_eq!(got, b"uploaded-into-image");
+}

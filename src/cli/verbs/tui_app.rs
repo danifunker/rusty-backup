@@ -1549,6 +1549,18 @@ impl CmdPane {
     fn remote_addr(&self) -> Option<String> {
         self.remote.as_ref().map(|b| b.addr().to_string())
     }
+
+    /// The remote image `(image_path, partition)` this pane is browsing, if it
+    /// is inside a disk image on the daemon (vs. the host file browser).
+    #[cfg(feature = "remote")]
+    fn remote_image_target(&self) -> Option<(String, Option<u32>)> {
+        match self.remote.as_ref().map(|b| b.mode()) {
+            Some(crate::model::remote_browser::BrowseMode::Image { path, partition }) => {
+                Some((path.clone(), *partition))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The Commander dual-pane file manager.
@@ -1864,40 +1876,81 @@ impl CommanderState {
         // which already read over the wire via the boxed remote filesystem.
         #[cfg(feature = "remote")]
         if dst.is_remote() {
+            use crate::model::commander_ops;
             let result: Result<String, String> = (|| {
                 let addr = dst
                     .remote_addr()
                     .ok_or_else(|| "the remote connection is unavailable".to_string())?;
-                if !dst.is_remote_host() {
-                    return Err(
-                        "uploading into a remote image isn't supported in the TUI yet".to_string(),
-                    );
-                }
                 let dest_parent = dst
                     .listing
                     .cwd()
-                    .map(|e| e.path.clone())
+                    .cloned()
                     .ok_or_else(|| "no destination directory".to_string())?;
-                if src.is_host {
-                    crate::model::commander_ops::upload_host_entries_to_remote(
-                        &entries,
-                        &addr,
-                        &dest_parent,
-                    )
-                    .map_err(|e| format!("Upload failed: {e:#}"))?;
+                if dst.is_remote_host() {
+                    // Remote host filesystem: upload files/dirs directly.
+                    if src.is_host {
+                        commander_ops::upload_host_entries_to_remote(
+                            &entries,
+                            &addr,
+                            &dest_parent.path,
+                        )
+                        .map_err(|e| format!("Upload failed: {e:#}"))?;
+                    } else {
+                        let fs = src
+                            .listing
+                            .fs_mut()
+                            .ok_or_else(|| "source has no filesystem".to_string())?;
+                        commander_ops::upload_fs_entries_to_remote(
+                            fs,
+                            &entries,
+                            &addr,
+                            &dest_parent.path,
+                            RfMode::AppleDouble,
+                        )
+                        .map_err(|e| format!("Upload failed: {e:#}"))?;
+                    }
                 } else {
-                    let fs = src
-                        .listing
-                        .fs_mut()
-                        .ok_or_else(|| "source has no filesystem".to_string())?;
-                    crate::model::commander_ops::upload_fs_entries_to_remote(
-                        fs,
-                        &entries,
-                        &addr,
-                        &dest_parent,
-                        RfMode::AppleDouble,
-                    )
-                    .map_err(|e| format!("Upload failed: {e:#}"))?;
+                    // Remote disk image: stage AddFile/CreateDirectory edits and
+                    // apply them over the daemon's Family-F write path.
+                    let (image_path, partition) = dst
+                        .remote_image_target()
+                        .ok_or_else(|| "the remote image target is unavailable".to_string())?;
+                    if src.is_host {
+                        let edits = commander_ops::stage_host_to_image(&entries, &dest_parent);
+                        commander_ops::apply_edits_to_remote_image(
+                            &addr,
+                            &image_path,
+                            partition,
+                            &edits,
+                        )
+                        .map_err(|e| format!("Upload failed: {e:#}"))?;
+                    } else {
+                        // image -> remote image: extract to a temp dir, stage the
+                        // AddFiles (which point into it), then apply. The temp dir
+                        // must outlive the apply.
+                        let src_fs = src
+                            .listing
+                            .fs_mut()
+                            .ok_or_else(|| "source has no filesystem".to_string())?;
+                        let temp = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
+                        let edits = with_stderr_suppressed(|| {
+                            commander_ops::stage_copy(
+                                src_fs,
+                                &entries,
+                                &dest_parent,
+                                temp.path(),
+                                true,
+                            )
+                        })
+                        .map_err(|e| format!("Copy failed: {e:#}"))?;
+                        commander_ops::apply_edits_to_remote_image(
+                            &addr,
+                            &image_path,
+                            partition,
+                            &edits,
+                        )
+                        .map_err(|e| format!("Upload failed: {e:#}"))?;
+                    }
                 }
                 Ok(format!("Uploaded {label} to the remote."))
             })();

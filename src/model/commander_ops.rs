@@ -1293,6 +1293,20 @@ fn remote_apply(
     staged
 }
 
+/// Synchronously apply `edits` (AddFile / CreateDirectory) to the remote image
+/// at `(image_path, partition)` on the daemon at `addr`, over the Family-F
+/// stage->apply path. The blocking entry point the TUI uses; the GUI drives the
+/// worker-threaded [`spawn_remote_apply`] instead.
+#[cfg(feature = "remote")]
+pub fn apply_edits_to_remote_image(
+    addr: &str,
+    image_path: &str,
+    partition: Option<u32>,
+    edits: &[StagedEdit],
+) -> Result<()> {
+    remote_apply(addr, image_path, partition, edits, |_| {})
+}
+
 /// Run [`remote_apply`] on a worker thread, reusing [`ApplyStatus`] so the pane
 /// polls it exactly like a local apply.
 #[cfg(feature = "remote")]
