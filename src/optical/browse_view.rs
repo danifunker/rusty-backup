@@ -41,6 +41,9 @@ pub struct OpticalDiscBrowseView {
     directory_cache: HashMap<String, Vec<FileEntry>>,
     expanded_paths: HashSet<String>,
     selected_entry: Option<FileEntry>,
+    /// Checkbox-marked entries for multi-select export to a single `.mar`, keyed
+    /// by path. Independent of the single-click `selected_entry` preview.
+    marked: std::collections::BTreeMap<String, FileEntry>,
     content: Option<FileContent>,
     view_mode: ViewMode,
     error: Option<String>,
@@ -76,6 +79,7 @@ impl Default for OpticalDiscBrowseView {
             directory_cache: HashMap::new(),
             expanded_paths: HashSet::new(),
             selected_entry: None,
+            marked: std::collections::BTreeMap::new(),
             content: None,
             view_mode: ViewMode::Auto,
             error: None,
@@ -142,6 +146,7 @@ impl OpticalDiscBrowseView {
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
+        self.marked.clear();
         self.content = None;
         self.error = None;
         self.active = false;
@@ -203,6 +208,7 @@ impl OpticalDiscBrowseView {
         self.directory_cache.clear();
         self.expanded_paths.clear();
         self.selected_entry = None;
+        self.marked.clear();
         self.content = None;
         self.error = None;
         match self.open_fs() {
@@ -326,6 +332,7 @@ impl OpticalDiscBrowseView {
             ui.vertical(|ui| {
                 ui.set_width(tree_width);
                 ui.set_min_height(panel_height);
+                self.render_selection_bar(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("optical_browse_tree")
                     .max_height(panel_height)
@@ -374,6 +381,7 @@ impl OpticalDiscBrowseView {
 
                 let header_res = ui.horizontal(|ui| {
                     state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
+                    self.mark_checkbox(ui, entry);
                     if ui
                         .selectable_label(is_selected, display_name(entry))
                         .clicked()
@@ -415,9 +423,12 @@ impl OpticalDiscBrowseView {
                     None => format!("{}  ({})", entry.name, size_str),
                 };
 
-                if ui.selectable_label(is_selected, &label).clicked() {
-                    self.select_file(entry);
-                }
+                ui.horizontal(|ui| {
+                    self.mark_checkbox(ui, entry);
+                    if ui.selectable_label(is_selected, &label).clicked() {
+                        self.select_file(entry);
+                    }
+                });
             }
         }
     }
@@ -462,6 +473,125 @@ impl OpticalDiscBrowseView {
         self.selected_entry = Some(entry.clone());
         self.content = None;
         self.error = None;
+    }
+
+    /// Render the multi-select checkbox for `entry`, toggling its mark. Marked
+    /// entries feed the "Export selected..." bar; independent of the single-click
+    /// `selected_entry` preview.
+    fn mark_checkbox(&mut self, ui: &mut egui::Ui, entry: &FileEntry) {
+        let mut marked = self.marked.contains_key(&entry.path);
+        if ui
+            .checkbox(&mut marked, "")
+            .on_hover_text("Mark for multi-select export")
+            .changed()
+        {
+            if marked {
+                self.marked.insert(entry.path.clone(), entry.clone());
+            } else {
+                self.marked.remove(&entry.path);
+            }
+        }
+    }
+
+    /// Marked entries to export, with any entry that lives under another marked
+    /// directory dropped — that ancestor's recursive walk already includes it, so
+    /// nothing is archived twice.
+    fn marked_export_entries(&self) -> Vec<FileEntry> {
+        fn is_ancestor(a: &str, p: &str) -> bool {
+            if a == p {
+                return false;
+            }
+            if a == "/" {
+                return p.len() > 1 && p.starts_with('/');
+            }
+            p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')
+        }
+        let marked_paths: Vec<&str> = self.marked.keys().map(String::as_str).collect();
+        self.marked
+            .iter()
+            .filter(|(p, _)| !marked_paths.iter().any(|a| is_ancestor(a, p)))
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Bar shown above the tree when entries are checkbox-marked: the count, an
+    /// "Export selected as MAR (.mar)..." action, and Clear.
+    fn render_selection_bar(&mut self, ui: &mut egui::Ui) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let mut export = false;
+        let mut clear = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} selected", self.marked.len()));
+            if ui.button("Export selected as MAR (.mar)...").clicked() {
+                export = true;
+            }
+            if ui.button("Clear").clicked() {
+                clear = true;
+            }
+        });
+        ui.separator();
+        if clear {
+            self.marked.clear();
+        }
+        if export {
+            self.export_marked_mar();
+        }
+    }
+
+    /// Bundle the checkbox-marked entries into one `.mar`. Reads forks straight
+    /// from the opticaldiscs filesystem into a StuffIt input tree (folders walk
+    /// recursively) and writes via the shared MAR writer. Foreground execution;
+    /// classic-Mac payloads are typically small.
+    fn export_marked_mar(&mut self) {
+        let entries = self.marked_export_entries();
+        if entries.is_empty() {
+            self.error = Some("Nothing selected to export.".into());
+            return;
+        }
+        let default_name = if entries.len() == 1 {
+            format!("{}.mar", display_name(&entries[0]))
+        } else {
+            "selection.mar".to_string()
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export selection as MAR")
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        let result = (|| -> Result<(), String> {
+            let mut fs = self.open_fs().map_err(|e| e.to_string())?;
+            let mut nodes: Vec<crate::macarchive::stuffit::StuffItInputNode> = Vec::new();
+            for e in &entries {
+                nodes.extend(walk_optical_to_input_nodes(&mut *fs, e)?);
+            }
+            if nodes.is_empty() {
+                return Err("nothing to archive (empty selection)".into());
+            }
+            let root_name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("selection");
+            let bytes = crate::macarchive::mar::build_archive(root_name, &nodes)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.extraction_result = Some(format!(
+                    "Exported {} item(s) to {}",
+                    entries.len(),
+                    path.display()
+                ));
+            }
+            Err(e) => self.error = Some(format!("MAR export failed: {e}")),
+        }
     }
 
     fn render_content_panel(&mut self, ui: &mut egui::Ui, panel_height: f32) {
@@ -994,6 +1124,54 @@ fn extract_entry(
     }
 
     Ok(())
+}
+
+/// Walk an opticaldiscs entry into a StuffIt input tree for MAR export, reading
+/// data + resource forks straight from the disc filesystem. Mirrors rusty-backup's
+/// `walk_fs_to_input_nodes`; a directory at the volume root ("/") expands to its
+/// children directly, so the archive isn't wrapped in a strangely-named outer
+/// folder. Dates / finder flags are left 0, matching that sibling walker.
+fn walk_optical_to_input_nodes(
+    fs: &mut dyn Filesystem,
+    entry: &FileEntry,
+) -> Result<Vec<crate::macarchive::stuffit::StuffItInputNode>, String> {
+    use crate::macarchive::stuffit::{StuffItInput, StuffItInputNode};
+    if entry.is_directory() {
+        let children = fs.list_directory(entry).map_err(|e| e.to_string())?;
+        let mut inner = Vec::new();
+        for child in &children {
+            inner.extend(walk_optical_to_input_nodes(fs, child)?);
+        }
+        if entry.path == "/" {
+            return Ok(inner);
+        }
+        Ok(vec![StuffItInputNode::Folder {
+            name: entry.name.clone(),
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            children: inner,
+        }])
+    } else if entry.is_file() {
+        let data = fs.read_file(entry).map_err(|e| e.to_string())?;
+        let rsrc = fs
+            .read_resource_fork(entry)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        Ok(vec![StuffItInputNode::File(StuffItInput {
+            name: entry.name.clone(),
+            type_code: entry.type_code.unwrap_or([0; 4]),
+            creator_code: entry.creator_code.unwrap_or([0; 4]),
+            finder_flags: 0,
+            create_date: 0,
+            mod_date: 0,
+            data_fork: data,
+            resource_fork: rsrc,
+        })])
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// User-facing name for an entry: opticaldiscs names the disc root "" (empty),
