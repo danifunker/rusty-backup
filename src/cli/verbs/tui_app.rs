@@ -3041,7 +3041,18 @@ impl App {
                 self.explorer = Some(ex);
                 self.status = None;
             }
-            Err(e) => self.status = Some(format!("Cannot browse: {e}")),
+            Err(e) => {
+                // An optical `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT,
+                // so it fails here with a cryptic parse error. Give NKit images
+                // the convert-it-first hint and other optical images a redirect
+                // to the Commander's optical open / the `optical` verbs.
+                let hinted = if crate::cli::optical_hint::is_nkit_image(path) {
+                    crate::cli::optical_hint::with_nkit_hint(e, path)
+                } else {
+                    crate::cli::optical_hint::with_optical_hint(e, path)
+                };
+                self.status = Some(format!("Cannot browse: {hinted:#}"));
+            }
         }
     }
 

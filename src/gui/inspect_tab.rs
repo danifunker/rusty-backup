@@ -3712,7 +3712,18 @@ impl InspectTab {
                     }
                 }
                 Err(e) => {
-                    finish_err(format!("Failed to parse partition table: {e}"));
+                    // A `.iso` (incl. NKit-scrubbed GC/Wii) has no MBR/GPT, so
+                    // partition detection fails with a cryptic "invalid boot
+                    // signature". Redirect optical images to the Optical tab, and
+                    // give NKit images the actionable convert-it-first hint,
+                    // instead of the raw parse error.
+                    let base = anyhow::anyhow!("Failed to parse partition table: {e}");
+                    let hinted = if rusty_backup::cli::optical_hint::is_nkit_image(&path) {
+                        rusty_backup::cli::optical_hint::with_nkit_hint(base, &path)
+                    } else {
+                        rusty_backup::cli::optical_hint::with_optical_hint(base, &path)
+                    };
+                    finish_err(format!("{hinted:#}"));
                 }
             }
         });
