@@ -618,6 +618,12 @@ fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek))
         return Some("TI-99".to_string());
     }
 
+    // Oric Jasmin (flat 256-byte-sector .dsk). Exact SS/DS size + free-map
+    // format markers at block 340.
+    if crate::fs::oric::looks_like_oric_jasmin(reader, 0) {
+        return Some("Oric Jasmin".to_string());
+    }
+
     None
 }
 

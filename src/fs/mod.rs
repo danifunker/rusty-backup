@@ -69,6 +69,7 @@ pub mod ntfs_fsck;
 mod ntfs_tables;
 #[cfg(feature = "optical")]
 pub mod optical_fs;
+pub mod oric;
 pub mod os9;
 pub mod patch;
 pub mod pfs3;
@@ -220,6 +221,11 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     // first via the super block (sector 16) + spare block (sector 17) magics.
     if hpfs::looks_like_hpfs(reader, partition_offset) {
         return "hpfs";
+    }
+    // Oric Jasmin: exact 178432/356864-byte flat 256-byte-sector image with the
+    // free-map format markers at block 340. Very specific, so probe early.
+    if oric::looks_like_oric_jasmin(reader, partition_offset) {
+        return "oric_jasmin";
     }
     // FAT boot sectors begin with a JMP (0xEB short or 0xE9 near). But a JMP
     // opcode alone is a weak signal: syslinux/extlinux install their boot code
@@ -1425,6 +1431,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "oric_jasmin" => Ok(Box::new(oric::OricFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1816,6 +1826,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "hpfs" => Ok(Box::new(hpfs::HpfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "oric_jasmin" => Ok(Box::new(oric::OricFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
@@ -2611,6 +2625,7 @@ pub fn is_checkable_retro_fs(ptype: u8, type_string: Option<&str>, type_name: &s
                 | "TI-99"
                 | "MFS"
                 | "ADFS"
+                | "Oric Jasmin"
         )
 }
 

@@ -57,6 +57,9 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   big-endian; every write cross-validated against BOTH MAME's `imgtool` reader
   and an independent clean-room oracle, fsck = bitmap-vs-directory-walk
   reconciliation),
+  Oric Jasmin (read + edit + create + fsck, flat 256-byte-sector `.dsk`
+  SS 178 KB / DS 356 KB; free map + chained directory + sector-list inodes;
+  modeled on MAME's `fs_oric_jasmin` and cross-validated against `floptool`),
   ANDOS (detect-only scaffold), and the optical-disc filesystems (ISO 9660
   + Joliet / Rock Ridge, High Sierra, UDF, HFS, HFS+, SGI EFS, UFS/FFS,
   VMS ODS-2, plus the video-game console filesystems Nintendo GameCube / Wii,
@@ -135,7 +138,7 @@ Legend for the **Support** column:
 | TRS-80 | Tandy TRS-80 | Floppy (JV1) | TRSDOS / LDOS / NEWDOS | **No** |
 | Atari800 | Atari 8-bit | Floppy, ltd HDD | Atari DOS (DOS 2.x) | **Yes** — `fs::atari_dos` reads + writes + creates + fscks Atari DOS 2.0S/2.5 (VTOC@360 bit-set-free bitmap, 64-file directory @361-368, linked-sector files). Single + enhanced density `.atr` / `.xfd`; `rb-cli new floppy atari` formats a blank SD disk, and fsck reconciles the VTOC bitmap + free-count against the directory chains. Read validated byte-exact against a real DOS 2.0S system disk + an independent clean-room reader; write validated the same way; fsck validated clean on the real fixture. |
 | TI-99_4A | TI-99/4A | Floppy | TI floppy FS (VIB/FDIR) | **Yes** — full quartet on the V9T9 `.dsk` (read + edit + create + fsck) |
-| Oric | Tangerine Oric | Floppy | Sedoric / Oric DOS | **No** |
+| Oric | Tangerine Oric | Floppy | Jasmin (read+edit+create+fsck); Sedoric pending | **Partial** |
 | SharpMZ | Sharp MZ | Floppy, Tape | Sharp MZ FD format | **No** |
 | PC88 | NEC PC-8801 mkII SR | Floppy | N88-BASIC Disk BASIC | **No** |
 | SAM-Coupe | SAM Coupe | Floppy | SAM DOS / MasterDOS | **No** |
@@ -203,7 +206,7 @@ convert only.
 | **Atari DOS** | Atari800 | S-M | DOS 2.x family on .atr. |
 | **TI-99 FS** | TI-99_4A | M | VIB + FDIR sector scheme on .dsk. |
 | **TRS-80 DOS** | TRS-80 | M | TRSDOS/LDOS/NEWDOS variants on JV1 sector dumps. |
-| **Sedoric / Oric DOS** | Oric | S-M | Needs **EDSK container**. |
+| **Sedoric** (Oric DOS) | Oric | S-M | Jasmin DONE (`src/fs/oric.rs`); Sedoric still pending. |
 | **N88-BASIC** | PC88 | M | Needs **.d88 container** (shared with X68000). |
 | **Sharp MZ FD** | SharpMZ | S-M | Per-machine floppy format. |
 | **EOS** | ColecoAdam | S-M | Block-based, read-only in the core -> read/browse only. |
@@ -328,7 +331,8 @@ or ported with attribution under our AGPL.
 | QDOS | QL | No | Ground-up |
 | OS-9 RBF / RS-DOS / DragonDOS | CoCo2, CoCo3 | No | Ground-up |
 | TRS-80 (TRSDOS/LDOS) | TRS-80 | No | Ground-up |
-| Sedoric / Oric DOS | Oric | No | Ground-up |
+| Oric Jasmin | Oric | Yes | Done (`src/fs/oric.rs`) |
+| Sedoric (Oric DOS) | Oric | No | Ground-up |
 | N88-BASIC | PC88 | No | Ground-up |
 | Sharp MZ FD | SharpMZ | No | Ground-up |
 | EOS | ColecoAdam | No | Ground-up (read-only) |

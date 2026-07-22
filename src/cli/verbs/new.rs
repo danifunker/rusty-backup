@@ -113,6 +113,11 @@ pub enum FsKind {
     /// (SSSD), 180 KB (DSSD), or 360 KB (DSDD, the default and maximum).
     #[value(alias = "ti99_4a", alias = "ti994a")]
     Ti99,
+    /// Oric Jasmin (Oric-1 / Atmos / Telestrat). A flat 256-byte-sector image
+    /// with an empty directory. Single-sided (178432 bytes / 697 blocks);
+    /// `--name` sets the 8-char volume name. `--size` is ignored.
+    #[value(alias = "jasmin")]
+    Oric,
     /// MFS (Macintosh File System — Mac 128K / 512K / Plus). A flat, pre-HFS
     /// 400 KB / 800 KB floppy volume: zeroed boot blocks, an MDB, an all-free
     /// allocation map, and an empty directory. `--name` sets the volume label
@@ -189,6 +194,9 @@ pub enum FloppyFs {
     /// TI-99/4A disk (flat V9T9 `.dsk`) — 90/180/360 KB.
     #[value(alias = "ti99_4a", alias = "ti994a")]
     Ti99,
+    /// Oric Jasmin (Oric-1 / Atmos / Telestrat) — 178 KB single-sided.
+    #[value(alias = "jasmin")]
+    Oric,
     /// MFS (Macintosh File System) — 400/800 KB pre-HFS floppy.
     #[value(alias = "macintosh")]
     Mfs,
@@ -212,6 +220,7 @@ impl FloppyFs {
             FloppyFs::Ucsd => FsKind::Ucsd,
             FloppyFs::Trdos => FsKind::Trdos,
             FloppyFs::Ti99 => FsKind::Ti99,
+            FloppyFs::Oric => FsKind::Oric,
             FloppyFs::Mfs => FsKind::Mfs,
             FloppyFs::Adfs => FsKind::Adfs,
             FloppyFs::Minix => FsKind::Minix,
@@ -699,6 +708,9 @@ fn format_image(args: NewArgs) -> Result<()> {
         FsKind::Ucsd => write_blank_ucsd_image(&args.image, &args.size, &args.name),
         FsKind::Trdos => write_blank_trdos_image(&args.image, &args.size, &args.name),
         FsKind::Ti99 => write_blank_ti99_image(&args.image, &args.size, &args.name),
+        FsKind::Oric => format_and_write(&args.image, &args.size, &args.name, |_size, name| {
+            Ok(crate::fs::oric::create_blank_oric(false, name))
+        }),
         FsKind::Mfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
             crate::fs::mfs::create_blank_mfs(size, name).map_err(|e| anyhow::anyhow!("{e}"))
         }),
