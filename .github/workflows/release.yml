@@ -1606,10 +1606,18 @@ jobs:
           otool -l "$BIN" | grep -A2 LC_VERSION_MIN_MACOSX
           otool -l "$BIN" | grep -q "version 10.7" \
             || { echo "::error::deployment target is not 10.7 (won't load on Lion)"; exit 1; }
-          # clock_gettime (10.12) / os_unfair_lock (10.12) / __ulock (10.12) would
-          # fail to resolve on Lion. TLS (__tlv_*) is native to 10.7 and fine.
-          if nm -u "$BIN" | grep -qE "clock_gettime|os_unfair_lock|__ulock"; then
-            echo "::error::binary imports a post-10.7 symbol"; exit 1
+          # Known post-10.7 symbols that link fine against the modern SDK but
+          # dyld-trap on Lion at launch:
+          #  - libSystem: clock_gettime / os_unfair_lock / __ulock (all 10.12).
+          #  - frameworks: kIOMainPortDefault is the macOS-12 rename of IOKit's
+          #    kIOMasterPortDefault and is absent pre-12 (caught only by a real
+          #    hardware run — this grep guards against a regression).
+          # TLS (__tlv_*) is native to 10.7 and fine. This list is not exhaustive;
+          # a real 10.7 boot is the ground truth.
+          if nm -u "$BIN" | grep -qE "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"; then
+            echo "::error::binary imports a known post-10.7 symbol"
+            nm -u "$BIN" | grep -E "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"
+            exit 1
           fi
 
       - name: Ad-hoc sign (no notarization — Gatekeeper doesn't exist pre-10.14)

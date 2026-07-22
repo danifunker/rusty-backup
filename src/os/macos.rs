@@ -27,7 +27,7 @@ use objc2_disk_arbitration::{
     DADiskClaimReleaseCallback, DADiskUnmountCallback, DADissenter, DASession,
 };
 use objc2_io_kit::{
-    kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
+    IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
     IOServiceGetMatchingServices, IOServiceMatching,
 };
 
@@ -175,7 +175,12 @@ fn iokit_enumerate_media() -> Vec<IOMediaEntry> {
 
         let mut iterator: u32 = 0;
         let kr = IOServiceGetMatchingServices(
-            kIOMainPortDefault,
+            // MACH_PORT_NULL (0) == the default I/O Kit port. We pass the literal
+            // rather than the `kIOMainPortDefault` constant because that symbol is
+            // the macOS 12+ rename of `kIOMasterPortDefault` and is absent from
+            // pre-12 IOKit — referencing it dyld-traps the vintage 10.7 build at
+            // launch. 0 behaves identically on every macOS version.
+            0,
             // IOServiceGetMatchingServices consumes the matching dict (takes CFRetained).
             // We need to convert CFRetained<CFMutableDictionary> to Option<CFRetained<CFDictionary>>.
             Some(objc2_core_foundation::CFRetained::cast_unchecked(matching)),
