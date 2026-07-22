@@ -893,19 +893,17 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
                     cat.children.entry(obj_id).or_default().push(child);
                 }
             }
-            APFS_TYPE_FILE_EXTENT => {
-                // key: j_key(8) + logical_addr u64 @8; obj_id == the file's
-                // data-stream id (private_id).
-                if key.len() >= 16 && val.len() >= 16 {
-                    let logical_addr = rd_u64(key, 8);
-                    let length = rd_u64(val, 0) & J_FILE_EXTENT_LEN_MASK;
-                    let phys_block = rd_u64(val, 8);
-                    cat.extents.entry(obj_id).or_default().push(Extent {
-                        logical_addr,
-                        length,
-                        phys_block,
-                    });
-                }
+            // key: j_key(8) + logical_addr u64 @8; obj_id == the file's
+            // data-stream id (private_id).
+            APFS_TYPE_FILE_EXTENT if key.len() >= 16 && val.len() >= 16 => {
+                let logical_addr = rd_u64(key, 8);
+                let length = rd_u64(val, 0) & J_FILE_EXTENT_LEN_MASK;
+                let phys_block = rd_u64(val, 8);
+                cat.extents.entry(obj_id).or_default().push(Extent {
+                    logical_addr,
+                    length,
+                    phys_block,
+                });
             }
             APFS_TYPE_XATTR => {
                 if let Some(target) = decode_symlink_xattr(key, val) {
