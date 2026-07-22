@@ -27,7 +27,7 @@ use objc2_disk_arbitration::{
     DADiskClaimReleaseCallback, DADiskUnmountCallback, DADissenter, DASession,
 };
 use objc2_io_kit::{
-    kIOMainPortDefault, IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
+    IOIteratorNext, IOObjectRelease, IORegistryEntryCreateCFProperties,
     IOServiceGetMatchingServices, IOServiceMatching,
 };
 
@@ -147,11 +147,27 @@ struct IOMediaEntry {
 }
 
 /// Enumerate all IOMedia entries via IOKit and return their basic properties.
+// The IOKit "IOMedia" class name as a C-string pointer. `c"…"` literals need
+// rustc 1.77, so the vintage macOS 10.7 build (Rust 1.73) uses a nul-terminated
+// byte string. The modern `c"…"` form lives in its OWN FILE (macos_iomedia.rs):
+// a `c"…"` token is a lexer-level feature, so 1.73 would reject it even inside a
+// cfg'd-out block in the same file — an unloaded `#[cfg] mod` is never lexed.
+#[cfg(not(feature = "rust173-polyfill"))]
+#[path = "macos_iomedia.rs"]
+mod iomedia;
+#[cfg(not(feature = "rust173-polyfill"))]
+use iomedia::iomedia_class_name;
+
+#[cfg(feature = "rust173-polyfill")]
+fn iomedia_class_name() -> *const std::os::raw::c_char {
+    b"IOMedia\0".as_ptr() as *const std::os::raw::c_char
+}
+
 fn iokit_enumerate_media() -> Vec<IOMediaEntry> {
     let mut entries = Vec::new();
 
     unsafe {
-        let matching = IOServiceMatching(c"IOMedia".as_ptr());
+        let matching = IOServiceMatching(iomedia_class_name());
         let matching = match matching {
             Some(m) => m,
             None => return entries,
@@ -159,7 +175,12 @@ fn iokit_enumerate_media() -> Vec<IOMediaEntry> {
 
         let mut iterator: u32 = 0;
         let kr = IOServiceGetMatchingServices(
-            kIOMainPortDefault,
+            // MACH_PORT_NULL (0) == the default I/O Kit port. We pass the literal
+            // rather than the `kIOMainPortDefault` constant because that symbol is
+            // the macOS 12+ rename of `kIOMasterPortDefault` and is absent from
+            // pre-12 IOKit — referencing it dyld-traps the vintage 10.7 build at
+            // launch. 0 behaves identically on every macOS version.
+            0,
             // IOServiceGetMatchingServices consumes the matching dict (takes CFRetained).
             // We need to convert CFRetained<CFMutableDictionary> to Option<CFRetained<CFDictionary>>.
             Some(objc2_core_foundation::CFRetained::cast_unchecked(matching)),

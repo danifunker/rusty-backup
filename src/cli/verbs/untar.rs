@@ -11,6 +11,8 @@
 //! Conflicts: by default an existing destination name is an error; `--force`
 //! overwrites, `--skip-existing` skips.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{anyhow, bail, Result};
 use clap::Args;
 use std::path::PathBuf;
@@ -79,7 +81,7 @@ pub fn run(args: UntarArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for writing: {e}"))?;
 
-    let dest = super::ls::resolve_path(&mut *fs, &args.dest)
+    let dest = super::ls::resolve_path(fs.as_filesystem_mut(), &args.dest)
         .map_err(|e| anyhow!("resolving destination {:?}: {e}", args.dest))?;
     if !dest.is_directory() {
         bail!("destination {:?} is not a directory", args.dest);

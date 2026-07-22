@@ -322,7 +322,7 @@ impl Read for ChdReader {
         }
         self.chd
             .read_bytes(self.position, &mut buf[..to_read])
-            .map_err(|e| io::Error::other(format!("CHD read error: {:?}", e)))?;
+            .map_err(|e| crate::compat::io_other(format!("CHD read error: {:?}", e)))?;
         self.position += to_read as u64;
         Ok(to_read)
     }

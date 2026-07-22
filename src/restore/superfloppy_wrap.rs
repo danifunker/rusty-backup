@@ -9,6 +9,8 @@
 //! The transform is one-way: there is no helper here to collapse a partitioned
 //! image back into a superfloppy.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context, Result};

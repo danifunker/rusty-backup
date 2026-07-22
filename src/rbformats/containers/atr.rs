@@ -16,6 +16,8 @@
 //! back up. Single-density (128-byte) is the common Atari800 case; the
 //! body is uniform so no per-sector fix-up is needed.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Result};
 
 /// 16-byte ATR header length.

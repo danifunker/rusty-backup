@@ -4,6 +4,8 @@
 //! filesystem metadata blocks (boot sector, FAT table, directory entries) in
 //! memory and decompresses file data blocks on demand from the partclone stream.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -143,12 +145,12 @@ impl PartcloneBlockCache {
         let reader = self
             .decompressor
             .as_mut()
-            .ok_or_else(|| io::Error::other("no decompressor available"))?;
+            .ok_or_else(|| crate::compat::io_other("no decompressor available"))?;
 
         let bitmap = self
             .bitmap
             .as_ref()
-            .ok_or_else(|| io::Error::other("no bitmap available"))?;
+            .ok_or_else(|| crate::compat::io_other("no bitmap available"))?;
 
         let mut current_block = self.decompressor_next_partition_block;
         let total = self.total_blocks;
@@ -208,7 +210,7 @@ impl PartcloneBlockCache {
     /// Reopen the decompressor from scratch, positioned at the start of block data.
     fn reopen_decompressor(&mut self) -> io::Result<()> {
         let (header, bitmap, decoder) = partclone::open_partclone_raw(&self.partclone_files)
-            .map_err(|e| io::Error::other(format!("failed to reopen partclone: {e}")))?;
+            .map_err(|e| crate::compat::io_other(format!("failed to reopen partclone: {e}")))?;
 
         self.bitmap = Some(bitmap);
         self.block_size = header.block_size;
@@ -234,7 +236,7 @@ impl PartcloneBlockCache {
     pub fn save_to_file(&self, path: &Path) -> io::Result<()> {
         let bitmap = match &self.bitmap {
             Some(b) => b,
-            None => return Err(io::Error::other("no bitmap to save")),
+            None => return Err(crate::compat::io_other("no bitmap to save")),
         };
 
         let file = std::fs::File::create(path)?;
@@ -278,12 +280,12 @@ impl PartcloneBlockCache {
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
         if &magic != b"RBMC" {
-            return Err(io::Error::other("invalid cache magic"));
+            return Err(crate::compat::io_other("invalid cache magic"));
         }
 
         let version = r.read_u32::<LittleEndian>()?;
         if version != 1 {
-            return Err(io::Error::other(format!(
+            return Err(crate::compat::io_other(format!(
                 "unsupported cache version: {version}"
             )));
         }
@@ -365,7 +367,7 @@ impl Read for PartcloneBlockReader {
         let mut cache = self
             .cache
             .lock()
-            .map_err(|e| io::Error::other(format!("cache lock poisoned: {e}")))?;
+            .map_err(|e| crate::compat::io_other(format!("cache lock poisoned: {e}")))?;
 
         let block_size = cache.block_size as u64;
         if block_size == 0 {

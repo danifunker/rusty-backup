@@ -8,6 +8,8 @@
 //! tag data (12 bytes per sector for 800K GCR disks, unused for MFM disks).
 //! The sector data is in logical order — no interleaving needed.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::Read;
 
 /// Header size in bytes.

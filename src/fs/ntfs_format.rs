@@ -16,6 +16,8 @@
 //! the clean-room provenance, the supported geometry and the cluster-size
 //! defaults. No `mkntfs.c` / `ntfs-3g` source (GPL-2) was read or translated.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Seek, SeekFrom, Write};
 
 use super::filesystem::FilesystemError;

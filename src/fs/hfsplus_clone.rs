@@ -16,6 +16,8 @@
 //! `is_dir_inode = true`. Replay (Step 21) emits each directory inode
 //! once and points each link at it.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, Write};
 
 use byteorder::{BigEndian, ByteOrder};

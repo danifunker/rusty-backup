@@ -16,6 +16,8 @@
 //! any per-filesystem branches. Repair is not implemented in this step;
 //! every issue is flagged as non-repairable.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 

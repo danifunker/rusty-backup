@@ -1,0 +1,165 @@
+# Vintage rb-cli manifest — a SECOND, self-contained top-level package that
+# reuses the shared engine sources under ../src/ but freezes its own pinned,
+# 1.73-compatible dependency set. The main Cargo.toml is never touched.
+#
+# Why this exists: Rust 1.73.0 is the last toolchain whose prebuilt
+# x86_64-apple-darwin std targets macOS 10.7 (1.74+ jumped the floor to 10.12).
+# The desktop tree resolves against rustc 1.96 and pulls edition-2024 / high-MSRV
+# crates (ratatui 0.30 -> ratatui-core, libzstd-bitexact-rs, clap_complete 4.6)
+# that 1.73 cannot even parse. Rather than drag the main manifest backward, this
+# manifest pins the older-but-equivalent versions (ratatui 0.29, crossterm 0.28,
+# C zstd instead of pure-zstd) and is built with its OWN lockfile:
+#
+#   MACOSX_DEPLOYMENT_TARGET=10.7 \
+#     cargo +1.73.0 build --release --bin rb-cli \
+#       --manifest-path rb-cli-vintage/Cargo.toml \
+#       --target x86_64-apple-darwin \
+#       --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+#       --ignore-rust-version
+#
+# The empty [workspace] table below makes this its own workspace root, so it
+# resolves independently (rb-cli-vintage/Cargo.lock) and does NOT get pulled
+# into the parent package's build.
+[workspace]
+
+[package]
+name = "rb-cli-vintage"
+version = "0.1.0"
+edition = "2021"
+# Drives the MSRV-aware resolver (cargo >= 1.84 with
+# resolver.incompatible-rust-versions = "fallback") to prefer crate versions
+# whose declared rust-version is <= 1.73 — auto-avoiding edition-2024 / high-MSRV
+# releases so we don't hand-pin every transitive. Crates that don't declare a
+# rust-version still need the explicit pins in [dependencies] below.
+rust-version = "1.73"
+license = "AGPL-3.0"
+build = "../build.rs"
+
+# Reuse the shared engine as a library, exactly like the main crate does.
+[lib]
+name = "rusty_backup"
+path = "../src/lib.rs"
+
+# Only the CLI binary — the GUI (eframe/egui) can't run on this hardware anyway.
+[[bin]]
+name = "rb-cli"
+path = "../src/bin/rb_cli.rs"
+
+[features]
+# Only the features a vintage CLI+TUI build needs. Everything else in the shared
+# source is #[cfg]-gated and simply compiles out (gui / chd / optical / audio /
+# tui-update / pure-zstd are intentionally absent here).
+default = []
+# C libzstd, compiled from source by zstd-sys — honors MACOSX_DEPLOYMENT_TARGET,
+# unlike the CHD/optical *prebuilts*. MSRV 1.64, so it builds on 1.73.
+native-zstd = ["dep:zstd"]
+# rb-cli serve daemon + rb:// refs. Pure std::net + serde_json, no extra dep.
+remote = []
+# Full-screen ratatui TUI. ratatui 0.29 (below) builds on 1.73; `ratatui-legacy`
+# switches the one 0.30-vs-0.29 API difference (border::Set lifetime) in the
+# shared source over to the 0.29 form.
+tui = ["dep:ratatui", "ratatui-legacy"]
+ratatui-legacy = []
+# Std-API polyfills for Rust 1.73 (is_multiple_of etc.). Always on for the
+# vintage build — the whole engine (fs drivers) needs it, not just the TUI.
+rust173-polyfill = []
+# `windows` crate 0.58 API shim (Windows 7/8 build only). Passed on the Windows
+# vintage build command; harmless (unused) on the macOS 10.7 build.
+windows-legacy = []
+
+[dependencies]
+# --- TUI (pinned to the last 1.73-buildable line) ---
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
+
+# --- zstd backend (C, from source) ---
+zstd = { version = "0.13", optional = true }
+
+# --- always-on engine deps (mirror of the main manifest) ---
+anyhow = "1"
+thiserror = "2"
+clap = { version = ">=4.4, <4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+byteorder = "1"
+encoding_rs = "0.8"
+log = "0.4"
+env_logger = "0.11"
+# aes/cbc/des intentionally absent: the `crypto` feature (APFS FileVault,
+# encrypted DMG, AES-CBC IMZ) is not enabled here, so that code compiles out.
+# zip's own aes-crypto still supplies the (edition-2021) aes 0.8 it needs.
+sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
+crc32c = "0.6"
+crc32fast = "1"
+chrono = "0.4"
+tempfile = ">=3, <3.13"
+# image: GUI-only (gui/mod.rs, main.rs) — not compiled in the vintage rb-cli build.
+dirs = "6"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lz4_flex = ">=0.10, <0.11"
+tar = "0.4"
+bzip2 = "=0.5.2"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate", "aes-crypto"] }
+base64 = "0.22"
+serde_yml = "=0.0.12"
+csv = "1"
+clap_complete = ">=4.4, <4.5"
+globset = ">=0.4, <0.4.17"
+rustyline = { version = ">=12, <15", features = ["with-file-history"] }
+# 0.28 dedupes with ratatui 0.29's transitive crossterm.
+crossterm = "0.28"
+shell-words = "1.1.1"
+lzma-rs = "0.3.0"
+lzfse_rust = "0.2.1"
+
+# --- Transitive pins (not used directly; listed only to hold the resolver to
+# the last edition-2021 / MSRV<=1.73 release of each, since 1.73's resolver is
+# not MSRV-aware and would otherwise pick edition-2024 versions that it can't
+# even parse). getrandom=0.2 also forces jobserver/zip/tempfile onto their
+# getrandom-0.2 lines and keeps the wasm wit-bindgen chain out of the lock. ---
+indexmap = "=2.5.0"
+hashbrown = "=0.14.5"
+zeroize = "=1.8.1"
+home = "=0.5.9"
+zeroize_derive = "=1.4.2"
+jobserver = "=0.1.31"
+crc = "=3.3.0"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["fs", "mount", "user"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-io-kit = { version = "0.3", default-features = false, features = ["libc", "pwr_mgt"] }
+objc2-disk-arbitration = { version = "0.3", default-features = false, features = ["DASession", "DADisk", "DADissenter", "libc"] }
+objc2-core-foundation = { version = "0.3", features = ["CFString", "CFDictionary", "CFNumber", "CFRunLoop", "CFURL"] }
+objc2-foundation = { version = "0.3", features = ["NSBundle", "NSString"] }
+
+# --- Windows 7 / 8 / 8.1 vintage target ---
+# Same Rust 1.73 toolchain that targets macOS 10.7 also targets Windows 7 (Rust
+# dropped pre-Win10 in 1.76; 1.75 was the last tier-1 with Win7). `windows` 0.62
+# needs rustc 1.82, so pin to 0.58 (MSRV 1.70) — our os/windows.rs uses only the
+# stable low-level Win32 paths (DeviceIoControl, Storage::FileSystem, Security,
+# UI::Shell), which are source-compatible across 0.58..0.62. winreg / self-replace
+# already build on 1.73.
+[target.'cfg(target_os = "windows")'.dependencies]
+self-replace = "1"
+winreg = "0.56"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+    "Win32_System_Power",
+] }
+
+[build-dependencies]
+# Only used under cfg(windows) in build.rs; harmless (and ancient) elsewhere.
+winres = "0.1"

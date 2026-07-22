@@ -517,7 +517,7 @@ fn read_upto<R: std::io::Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usi
 }
 
 fn to_io(e: anyhow::Error) -> std::io::Error {
-    std::io::Error::other(e.to_string())
+    crate::compat::io_other(e.to_string())
 }
 
 impl CbkLazyReader {
@@ -1236,6 +1236,10 @@ pub fn open_peeled_read_with_entry(
     // decryption, so peel the encryption here — this is the layer that carries
     // the password. The decrypted stream is a plaintext disk image that then
     // flows through the normal partition/FS detection.
+    // Encrypted-DMG decryption requires the `crypto` feature (block ciphers). The
+    // vintage macOS 10.7 build omits it; encrypted images are simply unsupported
+    // there and fall through to normal detection.
+    #[cfg(feature = "crypto")]
     {
         let mut probe = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut head = [0u8; 8];

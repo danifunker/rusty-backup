@@ -170,7 +170,7 @@ where
     ));
 
     let mut tmp = tempfile::tempfile().map_err(|e| {
-        FilesystemError::Io(io::Error::other(format!(
+        FilesystemError::Io(crate::compat::io_other(format!(
             "create tempfile for NTFS clone: {e}"
         )))
     })?;

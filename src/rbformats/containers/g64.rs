@@ -38,6 +38,8 @@
 //! - **Data block** (260 decoded bytes): `[0x07, data[256], cksum, 0, 0]`,
 //!   `cksum = XOR of the 256 data bytes`.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{anyhow, bail, Context, Result};
 
 pub const G64_SIGNATURE: &[u8; 8] = b"GCR-1541";
@@ -436,7 +438,7 @@ pub fn encode_g64_from_d64(d64: &[u8], tracks: u8) -> Result<Vec<u8>> {
             // Pad to max track size + the 2-byte length prefix.
             let padded = MAX_TRACK_SIZE + 2;
             let cur = 2 + gcr.len();
-            blob_area.extend(std::iter::repeat_n(0u8, padded - cur));
+            blob_area.extend(crate::compat::repeat_n(0u8, padded - cur));
         }
     }
     // Track-offset table.

@@ -163,9 +163,9 @@ impl RemoteBlockReader {
             let mut c = self
                 .conn
                 .lock()
-                .map_err(|_| io::Error::other("remote connection lock poisoned"))?;
+                .map_err(|_| crate::compat::io_other("remote connection lock poisoned"))?;
             c.read_block(self.handle, start, want as u32)
-                .map_err(io::Error::other)?
+                .map_err(crate::compat::io_other)?
         };
         self.cache_start = start;
         self.cache = buf;
@@ -222,9 +222,9 @@ impl Write for RemoteBlockReader {
             let mut c = self
                 .conn
                 .lock()
-                .map_err(|_| io::Error::other("remote connection lock poisoned"))?;
+                .map_err(|_| crate::compat::io_other("remote connection lock poisoned"))?;
             c.write_block(self.handle, pos, &buf[..n])
-                .map_err(io::Error::other)?;
+                .map_err(crate::compat::io_other)?;
         }
         // Keep the read cache consistent with what we just wrote.
         self.patch_cache(pos, &buf[..n]);
@@ -241,8 +241,8 @@ impl Write for RemoteBlockReader {
         let mut c = self
             .conn
             .lock()
-            .map_err(|_| io::Error::other("remote connection lock poisoned"))?;
-        c.flush_block(self.handle).map_err(io::Error::other)
+            .map_err(|_| crate::compat::io_other("remote connection lock poisoned"))?;
+        c.flush_block(self.handle).map_err(crate::compat::io_other)
     }
 }
 

@@ -964,7 +964,7 @@ Usage: x68k [OPTIONS] <IMAGE>
 
 ### `new volume`
 
-Blank bare single volume of arbitrary size (a "superfloppy"): the larger filesystems (NTFS, HPFS, ext, HFS+, EFS, AFFS, …). No partition table
+Blank bare single volume of arbitrary size (a "superfloppy"): the larger filesystems (NTFS, ext, HFS+, EFS, AFFS, …). No partition table
 
 ```
 Usage: volume [OPTIONS] <FS> <IMAGE>

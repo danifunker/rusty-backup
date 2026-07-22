@@ -1204,6 +1204,12 @@ fn parse_file_type(opts: &CreateFileOptions, name: &str) -> (u8, u16) {
 // ─────────────────────────────── EditableFilesystem ──────────────────────────
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ProDosFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,
@@ -1545,7 +1551,7 @@ impl<R: Read + Seek> Read for CompactProDosReader<R> {
                 self.partition_offset + self.current_block as u64 * BLOCK_SIZE + self.block_pos;
             self.reader
                 .seek(SeekFrom::Start(offset))
-                .map_err(std::io::Error::other)?;
+                .map_err(crate::compat::io_other)?;
             self.reader.read(&mut buf[..to_read])?
         } else {
             // Free block — zero fill so free space compresses away.

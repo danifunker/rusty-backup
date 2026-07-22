@@ -28,6 +28,10 @@
 //! - Reserved blocks (dirblocks, indexblocks, anodeblocks, etc.) span
 //!   `rscluster = reserved_blksize / 512` HW sectors.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::OptionIsNoneOr as _;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -3109,6 +3113,12 @@ fn append_to_linknode_chain<R: Read + Write + Seek>(
 }
 
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Pfs3Filesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

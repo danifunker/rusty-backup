@@ -1309,11 +1309,11 @@ fn extract_entries_to_host(
             std::fs::create_dir_all(&target)?;
             let children = src_fs
                 .list_directory(e)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
+                .map_err(|err| rusty_backup::compat::io_other(err.to_string()))?;
             count += extract_entries_to_host(src_fs, &children, &target, fork_mode)?;
         } else {
             export_file_with_fork(src_fs, e, dest_dir, &safe_name(e), fork_mode)
-                .map_err(|err| std::io::Error::other(format!("{err:#}")))?;
+                .map_err(|err| rusty_backup::compat::io_other(format!("{err:#}")))?;
             count += 1;
         }
     }

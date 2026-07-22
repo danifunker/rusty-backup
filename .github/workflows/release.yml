@@ -1542,6 +1542,380 @@ jobs:
             crusty-backup/dist/cbdos-freedos-${{ needs.generate-version.outputs.version }}.img
             crusty-backup/dist/cbdos-${{ needs.generate-version.outputs.version }}.iso
 
+  # Vintage rb-cli (CLI + full TUI) for macOS 10.7 Lion and up. Built on a normal
+  # (Apple-silicon) macOS runner — NO emulation: it *cross-compiles* to x86_64
+  # with Rust 1.73.0 (the last toolchain whose prebuilt x86_64-apple-darwin std
+  # targets 10.7; 1.74 raised the floor to 10.12). The engine compiles on 1.73
+  # via the rb-cli-vintage/ manifest (frozen dep set) + the rust173-polyfill
+  # feature. One artifact covers 10.7 / 10.8 / 10.9 / 10.10 / 10.11 (a 10.7-min
+  # binary runs on any newer macOS). See docs/add_10_7_macos.md.
+  build-macos-vintage:
+    name: Build rb-cli (macOS 10.7+ Intel, Rust 1.73)
+    # Skipped only when a manual run unticks "desktop"; every push builds it.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
+    needs: generate-version
+    # Pinned like build-macos (not `macos-latest`) for a deterministic image
+    # during GitHub's macos-15 -> macos-26 migration. Any modern image works —
+    # MACOSX_DEPLOYMENT_TARGET forces the 10.7 floor regardless of the host SDK.
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    # Non-fatal: a broken vintage build must not hold up the desktop release.
+    continue-on-error: true
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.73.0 (last toolchain targeting macOS 10.7)
+        uses: dtolnay/rust-toolchain@1.73.0
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-vintage173-registry-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: rb-cli-vintage/target
+          key: ${{ runner.os }}-vintage173-macos-build-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
+
+      - name: Build rb-cli (10.7 floor, CLI + TUI, slim)
+        env:
+          # Stamps the binary's minimum-OS load command to 10.7; without it the
+          # linker uses the runner's modern SDK version and the binary won't load
+          # on Lion. (1.73's x86_64 std is already compiled for the 10.7 floor.)
+          MACOSX_DEPLOYMENT_TARGET: "10.7"
+        run: |
+          # `--locked` uses the committed rb-cli-vintage/Cargo.lock (a frozen,
+          # 1.73-resolvable dep set). `--ignore-rust-version` lets conservatively-
+          # declared crates (ratatui 0.29 says 1.74 but compiles on 1.73) through.
+          cargo +1.73.0 build --release --bin rb-cli \
+            --manifest-path rb-cli-vintage/Cargo.toml \
+            --target x86_64-apple-darwin \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+            --ignore-rust-version --locked
+
+      - name: Verify 10.7 floor + no post-10.7 symbols
+        run: |
+          set -e
+          BIN=rb-cli-vintage/target/x86_64-apple-darwin/release/rb-cli
+          file "$BIN"
+          otool -l "$BIN" | grep -A2 LC_VERSION_MIN_MACOSX
+          otool -l "$BIN" | grep -q "version 10.7" \
+            || { echo "::error::deployment target is not 10.7 (won't load on Lion)"; exit 1; }
+          # Known post-10.7 symbols that link fine against the modern SDK but
+          # dyld-trap on Lion at launch:
+          #  - libSystem: clock_gettime / os_unfair_lock / __ulock (all 10.12).
+          #  - frameworks: kIOMainPortDefault is the macOS-12 rename of IOKit's
+          #    kIOMasterPortDefault and is absent pre-12 (caught only by a real
+          #    hardware run — this grep guards against a regression).
+          # TLS (__tlv_*) is native to 10.7 and fine. This list is not exhaustive;
+          # a real 10.7 boot is the ground truth.
+          if nm -u "$BIN" | grep -qE "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"; then
+            echo "::error::binary imports a known post-10.7 symbol"
+            nm -u "$BIN" | grep -E "clock_gettime|os_unfair_lock|__ulock|kIOMainPortDefault"
+            exit 1
+          fi
+
+      - name: Ad-hoc sign (no notarization — Gatekeeper doesn't exist pre-10.14)
+        run: |
+          # Hardened-runtime / notarization assumes newer-OS behavior and can make
+          # the binary fail to launch on Lion. Ad-hoc signing only. Users run
+          # `xattr -dr com.apple.quarantine ./rb-cli` on first launch.
+          codesign --force --sign - rb-cli-vintage/target/x86_64-apple-darwin/release/rb-cli
+
+      - name: Package CLI
+        run: |
+          ZIP="rb-cli-macos-vintage-x64-${{ needs.generate-version.outputs.version }}.zip"
+          # ditto so it extracts to a plainly-named ./rb-cli
+          ditto -c -k rb-cli-vintage/target/x86_64-apple-darwin/release/rb-cli "$ZIP"
+          ls -lh "$ZIP"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rb-cli-macos-vintage-x64-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-macos-vintage-x64-${{ needs.generate-version.outputs.version }}.zip
+
+  # Vintage rb-cli (CLI + full TUI) for Windows 7 / 8 / 8.1. Built on a normal
+  # windows-latest runner — again NO emulation: x86_64-pc-windows-msvc is native
+  # and i686-pc-windows-msvc is a native 32-bit cross (MSVC's x64 host builds
+  # 32-bit directly). Rust 1.73.0 is used because Rust dropped pre-Windows-10 in
+  # 1.76 (1.75 was the last tier-1 with Win7). `+crt-static` links the CRT/UCRT
+  # into the exe so it runs on a stock Win7 with no KB2999226 UCRT update. The
+  # windows crate is pinned to 0.58 in rb-cli-vintage/ (0.62 needs rustc 1.82),
+  # with the `windows-legacy` feature shimming the 0.58-vs-0.62 API diffs.
+  build-windows-vintage:
+    name: Build rb-cli (Windows 7/8 MSVC ${{ matrix.arch }}, Rust 1.73)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
+    needs: generate-version
+    runs-on: windows-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: i686-pc-windows-msvc
+            arch: x86
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      # Statically link the MSVC runtime + UCRT so the .exe runs on a vanilla
+      # Windows 7 (no Universal CRT update required). Set per-TARGET (not global
+      # RUSTFLAGS) so it never applies to host proc-macros, which can't be built
+      # with crt-static.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+      CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.73.0 (last toolchain supporting Windows 7)
+        uses: dtolnay/rust-toolchain@1.73.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-vintage173-registry-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: rb-cli-vintage/target
+          key: ${{ runner.os }}-vintage173-${{ matrix.target }}-build-${{ hashFiles('rb-cli-vintage/Cargo.lock') }}
+
+      - name: Build rb-cli (Win7 floor, CLI + TUI, slim)
+        shell: bash
+        run: |
+          cargo +1.73.0 build --release --bin rb-cli \
+            --manifest-path rb-cli-vintage/Cargo.toml \
+            --target ${{ matrix.target }} \
+            --no-default-features --features native-zstd,remote,tui,rust173-polyfill,windows-legacy \
+            --ignore-rust-version --locked
+
+      - name: Report PE imports (Win7 sanity — no UCRT/WinRT hard deps expected)
+        shell: bash
+        run: |
+          BIN="rb-cli-vintage/target/${{ matrix.target }}/release/rb-cli.exe"
+          ls -lh "$BIN"
+          # dumpbin ships with the MSVC toolchain on the runner.
+          dumpbin //dependents "$BIN" || true
+
+      - name: Package CLI
+        shell: bash
+        run: |
+          ZIP="rb-cli-win7-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip"
+          7z a "$ZIP" "./rb-cli-vintage/target/${{ matrix.target }}/release/rb-cli.exe"
+          ls -lh "$ZIP"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rb-cli-win7-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-win7-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+  # Fully-static musl rb-cli (CLI + TUI). No dynamic deps at all, so it runs on
+  # ANY Linux regardless of glibc/distro age. Two flavours:
+  #  - Modern portability arches (x86_64, aarch64): a plain modern-Rust musl build
+  #    (handy for containers / obscure userlands).
+  #  - Vintage arches: 32-bit x86 (i586 Pentium+, i686 Pentium-Pro+) and PowerPC
+  #    (ppc64 G5/POWER, ppc32 G3/G4) — the "drop onto an old Linux box" builds.
+  #    These complement the Buildroot appliance (which boots the metal) by being a
+  #    standalone binary for an existing old userland; today they only ship inside
+  #    the appliance ISO.
+  # A self-contained musl target bundles libc + CRT, so a plain apt GNU cross-gcc
+  # just drives the link — no musl-specific toolchain (the trick from
+  # docker/cross-i586-musl.Dockerfile). ppc32-musl is tier-3 (no prebuilt std),
+  # so that one leg uses nightly + -Z build-std. Slim feature set is all pure Rust
+  # (flate2 rust_backend + pure-zstd), so every arch links cleanly.
+  build-rb-cli-musl:
+    name: Build rb-cli (static musl ${{ matrix.arch }} - any Linux)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.desktop }}
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x64
+            runs-on: ubuntu-latest
+            toolchain: stable
+            prebuilt: "yes"
+            apt: musl-tools
+            strip: strip
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+            toolchain: stable
+            prebuilt: "yes"
+            apt: musl-tools
+            strip: strip
+          - target: i586-unknown-linux-musl
+            arch: i586
+            runs-on: ubuntu-latest
+            toolchain: stable
+            prebuilt: "yes"
+            apt: gcc-i686-linux-gnu
+            linker_env: CARGO_TARGET_I586_UNKNOWN_LINUX_MUSL_LINKER
+            linker: i686-linux-gnu-gcc
+            strip: i686-linux-gnu-strip
+          - target: i686-unknown-linux-musl
+            arch: i686
+            runs-on: ubuntu-latest
+            toolchain: stable
+            prebuilt: "yes"
+            apt: gcc-i686-linux-gnu
+            linker_env: CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER
+            linker: i686-linux-gnu-gcc
+            strip: i686-linux-gnu-strip
+          # PowerPC (big-endian) musl via `cargo zigbuild`: Zig bundles a generic
+          # musl libc for powerpc / powerpc64 and its linker emits the correct ELF
+          # ABI (ELFv2 for ppc64). That fixes both problems the GNU toolchain hit —
+          # the ELFv1-only `ld` (ppc64) and the missing musl libc / undefined
+          # `log2` (ppc32) — with a reliable single download (unlike the
+          # firewalled musl.cc). Both are best-effort legs.
+          - target: powerpc64-unknown-linux-musl
+            arch: ppc64
+            runs-on: ubuntu-latest
+            toolchain: stable
+            prebuilt: "yes"
+            zigbuild: "yes"
+            apt: binutils-powerpc64-linux-gnu
+            strip: powerpc64-linux-gnu-strip
+          # ppc32 (PowerMac G3 / G4 / 604e) is Rust tier-3 (no prebuilt std) ->
+          # nightly + build-std for the Rust std. Zig only offers a 32-bit PPC musl
+          # libc under its float-tagged name `musleabihf` (not the plain `-musl`
+          # cargo-zigbuild derives), so drive `zig cc -target
+          # powerpc-linux-musleabihf` directly as the linker. Whether the eabihf
+          # float/calling ABI matches Rust's powerpc-unknown-linux-musl codegen is
+          # the open question this leg is testing.
+          - target: powerpc-unknown-linux-musl
+            arch: ppc32
+            runs-on: ubuntu-latest
+            toolchain: nightly
+            prebuilt: "no"
+            zig_cc: powerpc-linux-musleabihf
+            apt: binutils-powerpc-linux-gnu
+            strip: powerpc-linux-gnu-strip
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          # Tier-2 arches pull the prebuilt std; the tier-3 ppc32 leg gets rust-src
+          # and recompiles std via -Z build-std in the build step.
+          targets: ${{ matrix.prebuilt == 'yes' && matrix.target || '' }}
+          components: ${{ matrix.prebuilt == 'yes' && '' || 'rust-src' }}
+
+      - name: Install cross linker + binutils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }} binutils file
+
+      - name: Point cargo at the cross-linker
+        # Self-contained musl targets bundle libc+CRT; the GNU cross-gcc only
+        # drives ld. Native x86_64/aarch64 and the zig (PowerPC) legs have no
+        # linker_env and skip this.
+        if: ${{ matrix.linker_env != '' }}
+        run: echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Install zig (PowerPC musl libc)
+        if: ${{ matrix.zigbuild == 'yes' || matrix.zig_cc != '' }}
+        run: pip3 install --break-system-packages ziglang
+
+      - name: Install cargo-zigbuild (ppc64)
+        if: ${{ matrix.zigbuild == 'yes' }}
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Set up zig cc wrapper as the linker (ppc32)
+        if: ${{ matrix.zig_cc != '' }}
+        run: |
+          # cargo-zigbuild derives `powerpc-linux-musl`, which zig has no libc for;
+          # it only ships `musleabihf`. Drive zig cc at that target directly.
+          cat > "$RUNNER_TEMP/zig-cc.sh" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang cc -target ${{ matrix.zig_cc }} "\$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/zig-cc.sh"
+          LK_VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$LK_VAR=$RUNNER_TEMP/zig-cc.sh" >> "$GITHUB_ENV"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-${{ matrix.target }}-musl-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-${{ matrix.target }}-musl-build-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build static rb-cli (slim, pure-Rust, CLI + TUI)
+        run: |
+          # pure-zstd + flate2 rust_backend = zero C, so the musl link is fully
+          # self-contained; the GNU cross-gcc only drives ld. `tui` = the
+          # full-screen terminal UI on old boxes.
+          BUILD_STD=""
+          if [ "${{ matrix.prebuilt }}" != "yes" ]; then
+            # tier-3 target (ppc32-musl): recompile std from source.
+            BUILD_STD="-Z build-std=std,panic_abort"
+          fi
+          if [ "${{ matrix.zigbuild }}" = "yes" ]; then
+            # ppc64: cargo-zigbuild wires zig cc in as the linker (musl libc + ELFv2).
+            cargo zigbuild --release --bin rb-cli \
+              --no-default-features --features pure-zstd,remote,tui \
+              --target ${{ matrix.target }} $BUILD_STD
+          else
+            # Native/GNU-cross legs, and ppc32 (linker = the zig cc wrapper above).
+            cargo build --release --bin rb-cli \
+              --no-default-features --features pure-zstd,remote,tui \
+              --target ${{ matrix.target }} $BUILD_STD
+          fi
+
+      - name: Verify the binary is fully static
+        run: |
+          set -e
+          BIN=target/${{ matrix.target }}/release/rb-cli
+          file "$BIN"
+          # "static-pie linked" (x86_64/ppc64 default) is just as static as the
+          # classic "statically linked" (i586/i686/aarch64) — both are accepted.
+          file "$BIN" | grep -qE "statically linked|static-pie linked" \
+            || { echo "::error::musl binary is not statically linked"; exit 1; }
+          # readelf reads any arch (ldd can't run a foreign-arch binary). A static
+          # binary has no NEEDED shared libraries.
+          if readelf -d "$BIN" 2>/dev/null | grep -q "(NEEDED)"; then
+            echo "::error::musl binary has dynamic library dependencies"; readelf -d "$BIN"; exit 1
+          fi
+
+      - name: Strip binary
+        run: ${{ matrix.strip }} target/${{ matrix.target }}/release/rb-cli
+
+      - name: Package CLI
+        run: |
+          TGZ="rb-cli-linux-musl-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$TGZ" rb-cli
+          ls -lh "$TGZ"
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rb-cli-linux-musl-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: rb-cli-linux-musl-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
   release:
     name: Create Release
     # `!cancelled()` lets this run even when a non-fatal `needs` job is skipped
@@ -1584,6 +1958,12 @@ jobs:
       # continue-on-error-failed) appliance pass through without blocking.
       - build-appliance
       - build-cb-dos
+      # Vintage rb-cli for legacy OSes (macOS 10.7+ Intel, Windows 7/8 x64/x86).
+      # continue-on-error like the other exotic legs — waited on, never blocking.
+      - build-macos-vintage
+      - build-windows-vintage
+      # Fully-static musl rb-cli that runs on any Linux (any glibc/distro age).
+      - build-rb-cli-musl
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -1635,6 +2015,11 @@ jobs:
             "rb-cli-mini-armv7-linux-${VER}.tar.gz" \
             "rb-cli-linux-ppc64-${VER}.tar.gz" "rb-cli-linux-ppc32-${VER}.tar.gz" \
             "rb-cli-linux-riscv64-${VER}.tar.gz" "rb-cli-windows-arm64-${VER}.zip" \
+            "rb-cli-macos-vintage-x64-${VER}.zip" \
+            "rb-cli-win7-x64-${VER}.zip" "rb-cli-win7-x86-${VER}.zip" \
+            "rb-cli-linux-musl-x64-${VER}.tar.gz" "rb-cli-linux-musl-arm64-${VER}.tar.gz" \
+            "rb-cli-linux-musl-i586-${VER}.tar.gz" "rb-cli-linux-musl-i686-${VER}.tar.gz" \
+            "rb-cli-linux-musl-ppc64-${VER}.tar.gz" "rb-cli-linux-musl-ppc32-${VER}.tar.gz" \
             "rb-cli-mini-armv7" "rb-daemon.sh" "rusty-backup.json.zip" \
             "rusty-backup-appliance-i586-${VER}.iso" "rusty-backup-appliance-i686-${VER}.iso" \
             "rusty-backup-appliance-pxe-i586-${VER}.tar.gz" "rusty-backup-appliance-pxe-i686-${VER}.tar.gz" \
@@ -1672,6 +2057,24 @@ jobs:
           | **Linux** (glibc >= 2.39) | PowerPC 32-bit, big-endian (G3 / G4) | [rb-cli](${BASE}/rb-cli-linux-ppc32-${VER}.tar.gz) |
 
           <sub>These PowerPC builds use the same **glibc 2.39** (Ubuntu 24.04) baseline as the x64/arm64 \`rb-cli\`, and each download contains a single \`rb-cli\` executable. (Windows ARM64 and RISC-V 64 now ship a full desktop app — see the main table above.)</sub>
+
+          ### Older operating systems (\`rb-cli\`, headless)
+
+          For vintage Intel Macs and Windows 7-era PCs the desktop GUI can't reach, the headless **\`rb-cli\`** — including its full-screen \`rb-cli tui\` terminal UI — is built with an older Rust toolchain that still targets those OSes. Slim feature set (no CHD / physical optical), but every filesystem, \`.zst\` / \`.raw\` / \`.vhd\` / \`.img\`, backup/restore, and the TUI all work.
+
+          | Platform | Architecture | Command line (\`rb-cli\`) |
+          |---|---|---|
+          | **macOS 10.7 – 10.11** (Lion → El Capitan) | Intel x64 | [rb-cli](${BASE}/rb-cli-macos-vintage-x64-${VER}.zip) |
+          | **Windows 7 / 8 / 8.1** | x64 | [rb-cli](${BASE}/rb-cli-win7-x64-${VER}.zip) |
+          | **Windows 7 / 8 / 8.1** | x86 (32-bit) | [rb-cli](${BASE}/rb-cli-win7-x86-${VER}.zip) |
+          | **Any Linux** (static musl — *any* glibc / distro age) | x64 | [rb-cli](${BASE}/rb-cli-linux-musl-x64-${VER}.tar.gz) |
+          | **Any Linux** (static musl) | arm64 | [rb-cli](${BASE}/rb-cli-linux-musl-arm64-${VER}.tar.gz) |
+          | **Old 32-bit x86 Linux** (static musl) | i586 (Pentium+) | [rb-cli](${BASE}/rb-cli-linux-musl-i586-${VER}.tar.gz) |
+          | **Old 32-bit x86 Linux** (static musl) | i686 (Pentium Pro+) | [rb-cli](${BASE}/rb-cli-linux-musl-i686-${VER}.tar.gz) |
+          | **PowerPC Linux** (static musl — *any* glibc, incl. old distros) | ppc64 (G5 / POWER, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc64-${VER}.tar.gz) |
+          | **PowerPC Linux** (static musl — *any* glibc) | ppc32 (G3 / G4, big-endian) | [rb-cli](${BASE}/rb-cli-linux-musl-ppc32-${VER}.tar.gz) |
+
+          <sub>**macOS / Windows** are built with **Rust 1.73** — the last toolchain that still targets macOS 10.7 and Windows 7. The single macOS artifact runs on **10.7 through 10.11** (a 10.7-minimum binary loads on any newer macOS too). · **macOS:** ad-hoc signed, not notarized — run \`xattr -dr com.apple.quarantine ./rb-cli\` on first launch. · **Windows:** the CRT is statically linked, so it runs on a stock Windows 7 with no Universal CRT (KB2999226) update. 32-bit \`x86\` also covers the last 32-bit-only Win7 machines. · **Linux (musl):** fully-static binaries with **zero** dynamic dependencies — drop one on any Linux and it just runs, no matter how old the glibc (unlike the glibc \`rb-cli\` above, which needs glibc ≥ 2.39). Covers modern x64/arm64 plus **vintage** arches: 32-bit x86 (**i586** = Pentium/MMX/K6/Cyrix and up, **i686** = Pentium Pro and up) and big-endian **PowerPC** (**ppc64** = G5/POWER, **ppc32** = G3/G4) — ideal for an old Mac or PC running Linux. These same binaries also ship inside the Buildroot appliance ISO; here they're standalone. (ppc32 is a best-effort leg — a Rust tier-3 target built from std source.)</sub>
 
           ### Install on a MiSTer FPGA (one line, auto-updating)
 

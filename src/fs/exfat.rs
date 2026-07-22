@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Result};
@@ -1322,6 +1324,12 @@ impl<R: Read + Write + Seek> ExfatFilesystem<R> {
 // =============================================================================
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExfatFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         super::exfat_fsck::repair_exfat(self)
     }
@@ -1829,11 +1837,11 @@ impl<R: Read + Seek> Read for CompactExfatReader<R> {
 
                     self.source
                         .seek(SeekFrom::Start(src_offset))
-                        .map_err(io::Error::other)?;
+                        .map_err(crate::compat::io_other)?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
                     self.source
                         .read_exact(&mut self.cluster_buf)
-                        .map_err(io::Error::other)?;
+                        .map_err(crate::compat::io_other)?;
                 }
 
                 let avail = self.cluster_size as usize - within_cluster;

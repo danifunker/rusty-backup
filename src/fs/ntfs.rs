@@ -2845,6 +2845,12 @@ fn find_entry_by_name(entries_data: &[u8], target_name: &str) -> Option<(usize, 
 // =============================================================================
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for NtfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,
@@ -3327,11 +3333,11 @@ impl<R: Read + Seek> Read for CompactNtfsReader<R> {
                     let src_offset = self.partition_offset + src_cluster * self.cluster_size;
                     self.source
                         .seek(SeekFrom::Start(src_offset))
-                        .map_err(io::Error::other)?;
+                        .map_err(crate::compat::io_other)?;
                     self.cluster_buf.resize(self.cluster_size as usize, 0);
                     self.source
                         .read_exact(&mut self.cluster_buf)
-                        .map_err(io::Error::other)?;
+                        .map_err(crate::compat::io_other)?;
                 }
 
                 let avail = self.cluster_size as usize - within_cluster;

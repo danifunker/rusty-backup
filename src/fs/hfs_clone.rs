@@ -5,6 +5,8 @@
 //! survive the copy so later steps can replay it onto a freshly-formatted
 //! target volume.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 

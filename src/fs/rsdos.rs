@@ -49,6 +49,8 @@
 //! - **File size** = `full_granules*2304 + (S-1)*256 + last_sector_size`,
 //!   where `S` is the last granule's sector count from its FAT byte.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -671,6 +673,12 @@ impl<R: Read + Write + Seek + Send> RsdosFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for RsdosFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

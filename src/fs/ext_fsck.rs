@@ -31,6 +31,8 @@
 //! still withheld. Multiply-claimed blocks are surfaced only (they need the
 //! editor to relocate data).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, Write};
 
 use super::ext::{ExtFilesystem, ExtGeom, ExtGroup};

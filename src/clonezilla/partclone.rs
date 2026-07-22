@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::PathBuf;
@@ -110,7 +112,7 @@ impl Read for MultiPartReader {
             }
 
             let file = File::open(&self.files[self.current_index]).map_err(|e| {
-                io::Error::other(format!(
+                crate::compat::io_other(format!(
                     "failed to open {}: {e}",
                     self.files[self.current_index].display()
                 ))

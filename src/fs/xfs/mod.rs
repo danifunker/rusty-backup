@@ -34,6 +34,8 @@ pub mod symlink;
 pub mod types;
 pub mod v5_crc;
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};

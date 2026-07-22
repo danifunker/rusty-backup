@@ -526,7 +526,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                 // Sparse block — fill with zeros
                 let chunk = self.block_size as usize;
                 let need = (limit - data.len()).min(chunk);
-                data.extend(std::iter::repeat_n(0u8, need));
+                data.extend(crate::compat::repeat_n(0u8, need));
             } else {
                 let block_data = self.read_block(block_num)?;
                 let need = (limit - data.len()).min(block_data.len());
@@ -626,7 +626,7 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                     }
                 } else {
                     // Sparse — push zeros for the whole range
-                    blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block));
+                    blocks.extend(crate::compat::repeat_n(0u64, ptrs_per_block));
                 }
             }
         }
@@ -647,11 +647,14 @@ impl<R: Read + Seek + Send> ExtFilesystem<R> {
                                 blocks.push(le32(&ind3, k * 4) as u64);
                             }
                         } else {
-                            blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block));
+                            blocks.extend(crate::compat::repeat_n(0u64, ptrs_per_block));
                         }
                     }
                 } else {
-                    blocks.extend(std::iter::repeat_n(0u64, ptrs_per_block * ptrs_per_block));
+                    blocks.extend(crate::compat::repeat_n(
+                        0u64,
+                        ptrs_per_block * ptrs_per_block,
+                    ));
                 }
             }
         }
@@ -2102,6 +2105,12 @@ impl<R: Read + Write + Seek + Send> ExtFilesystem<R> {
 // ---- EditableFilesystem implementation ----
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for ExtFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         super::ext_fsck::repair_ext(self)
     }

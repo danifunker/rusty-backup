@@ -32,6 +32,10 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+// FileVault (encrypted-volume) support needs the block ciphers behind the
+// `crypto` feature. Without it (vintage macOS 10.7 build) unencrypted APFS
+// browse still works; encrypted volumes report as locked.
+#[cfg(feature = "crypto")]
 use super::apfs_crypto;
 use super::entry::FileEntry;
 use super::filesystem::{Filesystem, FilesystemError};
@@ -136,9 +140,12 @@ const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
 /// container keybag); `KB_TAG_VOLUME_UNLOCK_RECORDS` holds a `prange` to the
 /// volume keybag (in the container keybag) or a crypto user's KEK blob (in the
 /// volume keybag).
+#[cfg(feature = "crypto")]
 const KB_TAG_VOLUME_KEY: u16 = 2;
+#[cfg(feature = "crypto")]
 const KB_TAG_VOLUME_UNLOCK_RECORDS: u16 = 3;
 /// APFS keybags use 512-byte AES-XTS data units, like the rest of the volume.
+#[cfg(feature = "crypto")]
 const XTS_UNIT: usize = 512;
 
 // ---------------------------------------------------------------------------
@@ -633,12 +640,16 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
         }
 
         // Unlock the active (browsed) volume if it is encrypted and a
-        // passphrase was supplied.
+        // passphrase was supplied. Encrypted-volume unlock needs the `crypto`
+        // feature; without it, encrypted volumes stay locked (vek = None).
+        #[cfg(feature = "crypto")]
         if fs.active_volume().map(|v| v.encrypted).unwrap_or(false) {
             if let Some(pass) = passphrase {
                 fs.vek = Some(fs.unlock_active_volume(pass)?);
             }
         }
+        #[cfg(not(feature = "crypto"))]
+        let _ = passphrase;
         Ok(fs)
     }
 
@@ -646,6 +657,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
     /// chain: container keybag (keyed by the container UUID) → the wrapped VEK
     /// and the volume keybag location → volume keybag (keyed by the volume
     /// UUID) → the crypto user's KEK blob → PBKDF2 → unwrap KEK → unwrap VEK.
+    #[cfg(feature = "crypto")]
     fn unlock_active_volume(&mut self, passphrase: &str) -> Result<[u8; 32], FilesystemError> {
         let vol = self
             .active_volume()
@@ -705,6 +717,7 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
 
     /// Read and AES-XTS-decrypt a keybag at physical block `paddr`, keyed by
     /// `uuid` (`UUID‖UUID`), then parse its entries.
+    #[cfg(feature = "crypto")]
     fn read_keybag(
         &mut self,
         paddr: u64,
@@ -1024,7 +1037,9 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
             self.reader.seek(SeekFrom::Start(pos))?;
             self.reader.read_exact(&mut buf[..read_bytes])?;
             // On an encrypted volume, decrypt each data block with the VEK,
-            // tweak = the block's physical sector index.
+            // tweak = the block's physical sector index. (`vek` is always None
+            // without the `crypto` feature, so this never runs there.)
+            #[cfg(feature = "crypto")]
             if let Some(vek) = self.vek {
                 let units = bs / XTS_UNIT as u64;
                 for j in 0..need_blocks {
@@ -1060,7 +1075,9 @@ impl<R: Read + Seek + Send> ApfsFilesystem<R> {
     /// is unlocked-encrypted. Used for FS-tree (catalog) nodes, which are
     /// ciphered on FileVault volumes; a no-op otherwise.
     fn read_block_decrypted(&mut self, paddr: u64) -> Result<Vec<u8>, FilesystemError> {
+        #[cfg_attr(not(feature = "crypto"), allow(unused_mut))]
         let mut buf = self.read_block(paddr)?;
+        #[cfg(feature = "crypto")]
         if let Some(vek) = self.vek {
             let first_sector = paddr * (self.block_size as u64 / XTS_UNIT as u64);
             apfs_crypto::xts_decrypt(&vek, first_sector as u128, XTS_UNIT, &mut buf);
@@ -1198,6 +1215,7 @@ fn decode_drec(key: &[u8], val: &[u8], hashed: bool) -> Option<ChildRec> {
 // ---------------------------------------------------------------------------
 
 /// One decrypted keybag entry (`keybag_entry_t`).
+#[cfg(feature = "crypto")]
 struct KeybagEntry {
     uuid: [u8; 16],
     tag: u16,
@@ -1207,6 +1225,7 @@ struct KeybagEntry {
 /// Parse a decrypted keybag block (`kb_locker` at obj_phys offset 32) into its
 /// entries. Each `keybag_entry_t` is `uuid[16] tag:u16 keylen:u16 pad[4]
 /// keydata[keylen]`, padded to a 16-byte boundary.
+#[cfg(feature = "crypto")]
 fn parse_keybag(block: &[u8]) -> Vec<KeybagEntry> {
     let mut out = Vec::new();
     if block.len() < 48 {
@@ -1232,6 +1251,7 @@ fn parse_keybag(block: &[u8]) -> Vec<KeybagEntry> {
 
 /// Minimal BER/DER TLV split: return each top-level `(tag, value)` in `b`.
 /// APFS KEK/VEK blobs use only definite-length short/long forms.
+#[cfg(feature = "crypto")]
 fn der_children(b: &[u8]) -> Vec<(u8, &[u8])> {
     let mut out = Vec::new();
     let mut p = 0usize;
@@ -1258,13 +1278,18 @@ fn der_children(b: &[u8]) -> Vec<(u8, &[u8])> {
 }
 
 /// The DER context tag holding the inner KEK/VEK record inside the blob.
+#[cfg(feature = "crypto")]
 const DER_TAG_KEY_RECORD: u8 = 0xa3;
 /// Field tags within the KEK/VEK record.
+#[cfg(feature = "crypto")]
 const DER_TAG_WRAPPED_KEY: u8 = 0x83;
+#[cfg(feature = "crypto")]
 const DER_TAG_ITERATIONS: u8 = 0x84;
+#[cfg(feature = "crypto")]
 const DER_TAG_SALT: u8 = 0x85;
 
 /// Descend a KEK/VEK blob to the inner record (`0x30` SEQUENCE → `0xA3`).
+#[cfg(feature = "crypto")]
 fn key_record(blob: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
     let outer = der_children(blob)
         .into_iter()
@@ -1285,6 +1310,7 @@ fn key_record(blob: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
 }
 
 /// Parse a KEK blob → `(wrapped_kek, salt, iterations)`.
+#[cfg(feature = "crypto")]
 fn parse_kek_blob(blob: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u32)> {
     let fields = key_record(blob)?;
     let get = |tag: u8| {
@@ -1304,6 +1330,7 @@ fn parse_kek_blob(blob: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u32)> {
 }
 
 /// Parse a VEK blob → the wrapped VEK (unwrapped by the KEK, no PBKDF2).
+#[cfg(feature = "crypto")]
 fn parse_vek_blob(blob: &[u8]) -> Option<Vec<u8>> {
     let fields = key_record(blob)?;
     fields

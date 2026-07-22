@@ -422,7 +422,7 @@ fn decide_dest_target(
     parents: bool,
 ) -> Result<(FileEntry, String)> {
     let trailing = dst_path.ends_with('/');
-    match super::ls::resolve_path(dst, dst_path) {
+    match super::ls::resolve_path(dst.as_filesystem_mut(), dst_path) {
         Ok(e) if e.is_directory() => Ok((e, src_entry.name.clone())),
         Ok(_) => {
             // Destination exists as a file.
@@ -466,7 +466,7 @@ fn resolve_or_create_dest_dir(
     path: &str,
     parents: bool,
 ) -> Result<FileEntry> {
-    match super::ls::resolve_path(dst, path) {
+    match super::ls::resolve_path(dst.as_filesystem_mut(), path) {
         Ok(e) if e.is_directory() => Ok(e),
         Ok(_) => bail!("destination {path} is a file, not a directory"),
         Err(_) => {
@@ -482,7 +482,7 @@ fn resolve_or_create_dest_dir(
 /// Resolve an existing directory on the destination, erroring if it's a
 /// file or missing.
 fn resolve_existing_dir(dst: &mut dyn EditableFilesystem, path: &str) -> Result<FileEntry> {
-    let e = super::ls::resolve_path(dst, path)
+    let e = super::ls::resolve_path(dst.as_filesystem_mut(), path)
         .with_context(|| format!("resolving destination directory {path:?}"))?;
     if !e.is_directory() {
         bail!("destination parent {path} is not a directory");

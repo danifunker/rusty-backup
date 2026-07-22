@@ -45,6 +45,8 @@
 //! * NetBSD `usr.sbin/makefs/ffs/ffs.c` for the writer that produces our
 //!   test fixtures (`tests/fixtures/test_ufs{1,2}.img.zst`).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::entry::FileEntry;
@@ -946,7 +948,7 @@ impl<R: Read + Seek + Send> UfsFilesystem<R> {
             let want = (self.bsize as usize).min(remaining);
             let block_frag = self.resolve_logical_block(inode, lbn)?;
             if block_frag == 0 {
-                out.extend(std::iter::repeat_n(0u8, want));
+                out.extend(crate::compat::repeat_n(0u8, want));
             } else {
                 let byte = self.partition_offset + block_frag * self.fsize;
                 self.reader.seek(SeekFrom::Start(byte))?;
@@ -1926,6 +1928,12 @@ impl<R: Read + Write + Seek + Send> UfsFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for UfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

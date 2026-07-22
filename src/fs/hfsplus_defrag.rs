@@ -19,6 +19,8 @@
 //! emit engine) are wired up; the round-trip integration test lands in
 //! 22e.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 

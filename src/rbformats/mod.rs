@@ -66,13 +66,13 @@ pub mod chd {
 
     impl Read for ChdReader {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
     impl Seek for ChdReader {
         fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
@@ -93,13 +93,13 @@ pub mod chd {
 
     impl Read for CdCookedReader {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
     impl Seek for CdCookedReader {
         fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
@@ -141,22 +141,22 @@ pub mod chd_edit {
 
     impl Read for ChdEditHandle {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
     impl Seek for ChdEditHandle {
         fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
     impl Write for ChdEditHandle {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::other("chd feature not built"))
+            Err(crate::compat::io_other("chd feature not built"))
         }
     }
 
@@ -170,6 +170,7 @@ pub mod containers;
 pub mod dart;
 pub mod dc42;
 pub mod dmg;
+#[cfg(feature = "crypto")]
 pub mod dmg_crypto;
 pub mod export;
 pub mod gho;
@@ -1508,6 +1509,10 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
     //      source path (`source_reader::open_peeled_read_with_entry`); this
     //      format-detection path has no password, so surface a clear error
     //      instead of falling through to a cryptic "Invalid MBR" on ciphertext.
+    // Encrypted-DMG detection needs the block ciphers (`crypto` feature). Without
+    // it (e.g. the vintage macOS 10.7 build), an encrypted image just falls through
+    // to normal partition/FS detection and fails later — there's no decrypt path.
+    #[cfg(feature = "crypto")]
     if file_size >= 8 {
         file.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; 8];

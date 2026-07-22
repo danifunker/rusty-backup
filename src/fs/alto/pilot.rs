@@ -23,6 +23,8 @@
 //! Sources: `VolumeFormat.mesa`, `DiskFace.mesa`, `File.mesa`, `Checksum.mesa`,
 //! `PilotDiskDefs.mc`, and the Othello `PhysicalVolumeScavenger` (placement).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
 
 use super::super::entry::FileEntry;

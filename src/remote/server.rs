@@ -1623,7 +1623,7 @@ fn apply_session(sess: &Session) -> Result<u64> {
                 type_code,
                 creator_code,
             } => {
-                let parent = resolve_path(&mut *fs, dest_parent)?;
+                let parent = resolve_path(fs.as_filesystem_mut(), dest_parent)?;
                 if !parent.is_directory() {
                     bail!("parent is not a directory: {dest_parent}");
                 }
@@ -1651,7 +1651,7 @@ fn apply_session(sess: &Session) -> Result<u64> {
                 count += 1;
             }
             StagedEdit::Mkdir { parent, name } => {
-                let parent_entry = resolve_path(&mut *fs, parent)?;
+                let parent_entry = resolve_path(fs.as_filesystem_mut(), parent)?;
                 if !parent_entry.is_directory() {
                     bail!("parent is not a directory: {parent}");
                 }

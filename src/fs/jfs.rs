@@ -2410,6 +2410,12 @@ impl<R: Read + Seek + Send> Filesystem for JfsFilesystem<R> {
 // milestone, so they return `Unsupported` and the GUI/CLI gate them.
 // `free_space` and `sync_metadata` are real.
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for JfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         _parent: &FileEntry,

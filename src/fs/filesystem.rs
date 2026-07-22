@@ -346,6 +346,20 @@ pub trait EditableFilesystem: Filesystem {
     /// is a no-op.
     fn end_bulk(&mut self) {}
 
+    /// Upcast to a read-only [`Filesystem`] trait object.
+    ///
+    /// A hand-rolled substitute for trait-upcasting coercion
+    /// (`&dyn EditableFilesystem` -> `&dyn Filesystem`), which is unstable
+    /// before Rust 1.86 — so the vintage macOS 10.7 build (Rust 1.73) can't rely
+    /// on the coercion and calls this instead. Every impl is a trivial `{ self }`
+    /// (the concrete type is `Sized` and already `Filesystem`, so the unsizing
+    /// coercion applies there). Modern builds could use the coercion directly,
+    /// but routing through this keeps a single code path.
+    fn as_filesystem(&self) -> &dyn Filesystem;
+
+    /// Mutable form of [`as_filesystem`](Self::as_filesystem).
+    fn as_filesystem_mut(&mut self) -> &mut dyn Filesystem;
+
     /// Create a file in the given parent directory.
     ///
     /// `data` is a reader providing the file contents; `data_len` is the total size.

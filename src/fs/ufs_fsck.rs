@@ -31,6 +31,8 @@
 //! Geometry damage and double-allocations are surfaced for diagnosis
 //! only — they need the editor's free-extent allocator to fix.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Seek};
 

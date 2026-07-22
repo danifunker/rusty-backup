@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use rusty_backup::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};

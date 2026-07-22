@@ -30,8 +30,10 @@
 //!   so its contents are dropped during clone. This is expected
 //!   behavior — communicate it to the user via the returned warnings.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use super::entry::FileEntry;
@@ -369,7 +371,7 @@ where
     // I/O ring instead of the whole target image. The tempfile is
     // unlinked when dropped — drained into `dst` first.
     let mut tmp = tempfile::tempfile().map_err(|e| {
-        FilesystemError::Io(io::Error::other(format!(
+        FilesystemError::Io(crate::compat::io_other(format!(
             "create tempfile for PFS3 clone: {e}"
         )))
     })?;

@@ -50,6 +50,8 @@
 //!   set; a leading `0x00` marks a deleted slot) + 3-byte FD LSN. The first
 //!   two live entries are conventionally `..` (parent) and `.` (self).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -987,6 +989,12 @@ fn merge_segments(segs: &mut Vec<(u64, u64)>, new: Vec<(u64, u64)>) {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for Os9Filesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

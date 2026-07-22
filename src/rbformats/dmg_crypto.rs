@@ -57,6 +57,8 @@
 //! unwrap cipher; it is wired but has not been verified against a real vintage
 //! image (modern `hdiutil` wraps with AES-192 even for AES-128 volumes).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use aes::{Aes128, Aes192, Aes256};
@@ -356,7 +358,7 @@ impl<R: Read + Seek> EncryptedDmgReader<R> {
         self.source.read_exact(&mut buf)?;
         self.ctx
             .decrypt_block(block, &mut buf)
-            .map_err(io::Error::other)?;
+            .map_err(crate::compat::io_other)?;
         self.cache_block = Some(block);
         self.cache_data = buf;
         Ok(())

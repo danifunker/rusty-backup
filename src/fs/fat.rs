@@ -3,6 +3,8 @@
 // callbacks, cancel checks).
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -1702,6 +1704,12 @@ fn validate_fat_name(name: &str) -> Result<(), FilesystemError> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for FatFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn repair(&mut self) -> Result<super::fsck::RepairReport, FilesystemError> {
         super::fat_fsck::repair_fat(self)
     }

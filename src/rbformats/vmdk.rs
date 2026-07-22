@@ -42,6 +42,8 @@
 //! quotes around the filename, and a trailing `offset_sectors` (defaulting to
 //! 0). Unknown extent types (`SPARSE`, `VMFS`, `VMFSSPARSE`, …) error at open.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -713,7 +715,7 @@ mod tests {
         r.read_exact(&mut buf).unwrap();
         let mut expected = Vec::new();
         expected.extend_from_slice(&a);
-        expected.extend(std::iter::repeat_n(0u8, 1024));
+        expected.extend(crate::compat::repeat_n(0u8, 1024));
         expected.extend_from_slice(&b);
         assert_eq!(buf, expected);
     }

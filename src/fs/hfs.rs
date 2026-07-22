@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2891,6 +2893,12 @@ impl<R: Read + Seek + Send> Filesystem for HfsFilesystem<R> {
 const CATALOG_DIR_THREAD: i8 = 3;
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn begin_bulk(&mut self) {
         self.bulk_mode = true;
     }
@@ -3755,7 +3763,7 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
             let offset = self.partition_offset + self.pre_alloc_pos;
             self.reader
                 .seek(SeekFrom::Start(offset))
-                .map_err(std::io::Error::other)?;
+                .map_err(crate::compat::io_other)?;
             let n = self.reader.read(&mut buf[..to_read])?;
             self.pre_alloc_pos += n as u64;
             return Ok(n);
@@ -3790,7 +3798,7 @@ impl<R: Read + Seek> Read for CompactHfsReader<R> {
                 + self.block_pos;
             self.reader
                 .seek(SeekFrom::Start(offset))
-                .map_err(std::io::Error::other)?;
+                .map_err(crate::compat::io_other)?;
             self.reader.read(&mut buf[..to_read])?
         } else {
             // Free run — emit zeros so free space compresses to nothing.

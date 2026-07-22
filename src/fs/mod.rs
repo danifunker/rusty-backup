@@ -5,6 +5,7 @@ pub mod affs_fsck;
 pub mod alto;
 pub mod andos;
 pub mod apfs;
+#[cfg(feature = "crypto")]
 pub mod apfs_crypto;
 pub mod apple_dos;
 pub mod archive_fs;

@@ -35,7 +35,7 @@ impl ZstdStreamCache {
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let decoder = crate::rbformats::zstd_compat::decoder(file)
-            .map_err(|e| io::Error::other(format!("zstd decoder: {e}")))?;
+            .map_err(|e| crate::compat::io_other(format!("zstd decoder: {e}")))?;
         Ok(Self {
             data: Vec::new(),
             decoder: Some(decoder),
@@ -119,7 +119,7 @@ impl Read for ZstdStreamReader {
         let mut cache = self
             .cache
             .lock()
-            .map_err(|e| io::Error::other(format!("cache lock: {e}")))?;
+            .map_err(|e| crate::compat::io_other(format!("cache lock: {e}")))?;
 
         cache.fill_to(end)?;
 
@@ -149,7 +149,7 @@ impl Seek for ZstdStreamReader {
                 let cache = self
                     .cache
                     .lock()
-                    .map_err(|e| io::Error::other(format!("cache lock: {e}")))?;
+                    .map_err(|e| crate::compat::io_other(format!("cache lock: {e}")))?;
                 cache.data.len() as i64 + offset
             }
             SeekFrom::Current(offset) => self.position as i64 + offset,
