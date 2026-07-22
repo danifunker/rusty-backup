@@ -1785,16 +1785,24 @@ jobs:
             linker_env: CARGO_TARGET_POWERPC64_UNKNOWN_LINUX_MUSL_LINKER
             linker: powerpc64-linux-gnu-gcc
             strip: powerpc64-linux-gnu-strip
-          # tier-3: no prebuilt std -> nightly + build-std (best-effort leg).
+            # Rust's ppc64-musl std is ELFv2; the big-endian GNU gcc defaults to
+            # ELFv1 output -> "ABI version 2 not compatible with version 1". Tell
+            # the linker to emit ELFv2 to match.
+            rustflags: "-C link-arg=-mabi=elfv2"
+          # ppc32-musl is Rust tier-3: no prebuilt std AND no bundled musl libc,
+          # so the GNU (glibc) cross-gcc can't satisfy the link (undefined `log2`
+          # etc.). Use a real powerpc-linux-musl toolchain from musl.cc for libc,
+          # plus nightly + build-std for the Rust std. Best-effort leg.
           - target: powerpc-unknown-linux-musl
             arch: ppc32
             runs-on: ubuntu-latest
             toolchain: nightly
             prebuilt: "no"
-            apt: gcc-powerpc-linux-gnu
+            apt: ""
+            musl_cc: powerpc-linux-musl
             linker_env: CARGO_TARGET_POWERPC_UNKNOWN_LINUX_MUSL_LINKER
-            linker: powerpc-linux-gnu-gcc
-            strip: powerpc-linux-gnu-strip
+            linker: powerpc-linux-musl-gcc
+            strip: powerpc-linux-musl-strip
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
@@ -1813,6 +1821,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }} binutils file
+
+      - name: Fetch real musl cross toolchain (tier-3 arches with no bundled libc)
+        if: ${{ matrix.musl_cc != '' }}
+        run: |
+          # ppc32-musl has no prebuilt Rust std AND no self-contained musl libc,
+          # so we need a genuine powerpc-linux-musl gcc (libc + linker), not the
+          # glibc GNU cross. musl.cc ships these prebuilt.
+          curl -fL --retry 5 --retry-connrefused \
+            "https://musl.cc/${{ matrix.musl_cc }}-cross.tgz" -o /tmp/musl-cc.tgz
+          sudo tar -xzf /tmp/musl-cc.tgz -C /opt
+          echo "/opt/${{ matrix.musl_cc }}-cross/bin" >> "$GITHUB_PATH"
 
       - name: Point cargo at the cross-linker
         # Self-contained musl targets bundle libc+CRT; the GNU cross-gcc only
@@ -1842,6 +1861,12 @@ jobs:
             # tier-3 target (ppc32-musl): recompile std from source.
             BUILD_STD="-Z build-std=std,panic_abort"
           fi
+          # Per-TARGET rustflags (e.g. ppc64's -mabi=elfv2) — never global RUSTFLAGS,
+          # so host proc-macro builds aren't affected.
+          if [ -n "${{ matrix.rustflags }}" ]; then
+            RF_VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
+            export "$RF_VAR=${{ matrix.rustflags }}"
+          fi
           cargo build --release --bin rb-cli \
             --no-default-features --features pure-zstd,remote,tui \
             --target ${{ matrix.target }} $BUILD_STD
@@ -1851,7 +1876,9 @@ jobs:
           set -e
           BIN=target/${{ matrix.target }}/release/rb-cli
           file "$BIN"
-          file "$BIN" | grep -q "statically linked" \
+          # "static-pie linked" (x86_64/ppc64 default) is just as static as the
+          # classic "statically linked" (i586/i686/aarch64) — both are accepted.
+          file "$BIN" | grep -qE "statically linked|static-pie linked" \
             || { echo "::error::musl binary is not statically linked"; exit 1; }
           # readelf reads any arch (ldd can't run a foreign-arch binary). A static
           # binary has no NEEDED shared libraries.
