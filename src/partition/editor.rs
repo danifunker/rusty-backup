@@ -202,6 +202,9 @@ pub fn apply_edits(
         PartitionTable::X68k { .. } => {
             bail!("X68000 partition-table editing is not yet implemented")
         }
+        PartitionTable::Sun(_) => {
+            bail!("Sun disk-label editing is not yet implemented (read / browse / back up only)")
+        }
         PartitionTable::None { .. } => bail!("cannot edit partition table on a superfloppy"),
         PartitionTable::Dsd { .. } => {
             bail!("cannot edit partition table on a double-sided DFS (.dsd) image")

@@ -8,6 +8,7 @@ pub mod rdb;
 pub mod resize;
 pub mod sgi;
 pub mod sgi_hdd_builder;
+pub mod sun;
 pub mod x68k;
 pub mod x68k_hdd_builder;
 pub mod x68k_ipl;
@@ -21,6 +22,7 @@ use gpt::Gpt;
 use mbr::Mbr;
 use rdb::{Rdb, RDSK_SIGNATURE};
 use sgi::{SgiVolumeHeader, SGI_TYPE_BYTE_EFS, SGI_TYPE_BYTE_XFS, SGI_VOLHDR_MAGIC};
+use sun::SunDiskLabel;
 use x68k::X68kPartitionTable;
 
 pub use alignment::{detect_alignment, AlignmentType, PartitionAlignment};
@@ -41,6 +43,9 @@ pub enum PartitionTable {
     /// plus a volume directory of standalone executables (`sash`, `ide`,
     /// `/unix`); see `src/partition/sgi.rs`.
     Sgi(SgiVolumeHeader),
+    /// Sun disk label (SMI VTOC) — SPARC Solaris / SunOS disks. 8 slices,
+    /// big-endian, magic `0xDABE` at byte 508; see `src/partition/sun.rs`.
+    Sun(SunDiskLabel),
     /// Atari HD File System Driver — MBR-equivalent for Atari ST / TT / Falcon
     /// hard-disk images. 4 primary slots + XGM extended chains, big-endian,
     /// no boot signature; see `src/partition/atari.rs`.
@@ -654,6 +659,14 @@ impl PartitionTable {
             return Err(SgiVolumeHeader::parse(&mbr_data).unwrap_err());
         }
 
+        // Sun disk label (SPARC Solaris / SunOS): magic 0xDABE at byte 508 plus
+        // a valid XOR checksum. Checked before MBR — the magic sits at a
+        // different offset than the MBR 0xAA55 (byte 510) and the checksum
+        // makes a false positive on a real MBR effectively impossible.
+        if SunDiskLabel::detect(&mbr_data) {
+            return Ok(PartitionTable::Sun(SunDiskLabel::parse(&mbr_data)?));
+        }
+
         // Check for APM (Driver Descriptor Record signature 0x4552 at offset 0)
         let ddr_sig = u16::from_be_bytes([mbr_data[0], mbr_data[1]]);
         if ddr_sig == 0x4552 {
@@ -1005,6 +1018,28 @@ impl PartitionTable {
                     })
                     .collect()
             }
+            PartitionTable::Sun(label) => label
+                .browsable_slices()
+                .map(|(i, s)| PartitionInfo {
+                    index: i,
+                    // Slices are UFS on Solaris/SunOS; leave the type byte at 0
+                    // so `open_filesystem` auto-detects (finds the UFS super
+                    // block, big-endian SPARC variant included). Swap / other
+                    // slices simply won't resolve to a browsable filesystem.
+                    type_name: format!("Sun {} (UFS?)", s.tag_name()),
+                    partition_type_byte: 0,
+                    start_lba: s.start_sector,
+                    start_byte: None,
+                    size_bytes: s.size_bytes(),
+                    bootable: false,
+                    is_logical: false,
+                    is_extended_container: false,
+                    partition_type_string: None,
+                    hfs_block_size: None,
+                    rdb_part_block: None,
+                    drv_name: None,
+                })
+                .collect(),
             PartitionTable::Rdb(rdb) => rdb
                 .partitions
                 .iter()
@@ -1222,6 +1257,7 @@ impl PartitionTable {
             PartitionTable::Apm(_) => "APM",
             PartitionTable::Rdb(_) => "RDB",
             PartitionTable::Sgi(_) => "SGI",
+            PartitionTable::Sun(_) => "Sun",
             PartitionTable::Ahdi(_) => "AHDI",
             PartitionTable::X68k { .. } => "X68k",
             PartitionTable::None { .. } => "None",
@@ -1238,6 +1274,7 @@ impl PartitionTable {
             PartitionTable::Apm(_)
             | PartitionTable::Rdb(_)
             | PartitionTable::Sgi(_)
+            | PartitionTable::Sun(_)
             | PartitionTable::Ahdi(_)
             | PartitionTable::X68k { .. }
             | PartitionTable::None { .. }

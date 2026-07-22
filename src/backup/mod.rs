@@ -929,6 +929,22 @@ fn run_backup_inner(
             );
             bail!("backing up SGI disks is not yet supported (browse only)");
         }
+        PartitionTable::Sun(label) => {
+            // Mirror the SGI sidecar: record the slice layout in sun.json, but
+            // defer the per-slice data backup (the data path needs Sun-label
+            // sizing). Browse / inspect / extract already work via the slice
+            // list + the existing UFS reader.
+            let json = serde_json::to_string_pretty(label)
+                .context("failed to serialize Sun disk label to JSON")?;
+            std::fs::write(backup_folder.join("sun.json"), json)
+                .context("failed to write sun.json")?;
+            log(
+                &progress,
+                LogLevel::Info,
+                "Exported Sun disk label (sun.json) — partition data backup not yet supported",
+            );
+            bail!("backing up Sun-labeled disks is not yet supported (browse only)");
+        }
         PartitionTable::Ahdi(table) => {
             // Mirror the RDB / SGI sidecar shape: emit ahdi.json so a future
             // restore knows the AHDI primary slots, XGM chain, and disk-size
