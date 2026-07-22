@@ -48,6 +48,7 @@ pub mod hfsplus_fsck;
 pub mod hfsplus_journal;
 pub mod hfsplus_wrapper_clone;
 pub mod hfv;
+pub mod hpfs;
 pub mod human68k;
 pub mod human68k_clone;
 pub mod jfs;
@@ -213,6 +214,12 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     }
     if &sector0[3..11] == b"EXFAT   " {
         return "exfat";
+    }
+    // OS/2 HPFS: its boot block also begins with a JMP and a plausible 512/1
+    // BPB, so it would be misclassified by the FAT heuristic below. Detect it
+    // first via the super block (sector 16) + spare block (sector 17) magics.
+    if hpfs::looks_like_hpfs(reader, partition_offset) {
+        return "hpfs";
     }
     // FAT boot sectors begin with a JMP (0xEB short or 0xE9 near). But a JMP
     // opcode alone is a weak signal: syslinux/extlinux install their boot code
@@ -588,6 +595,10 @@ fn detect_0x07_type<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> &'
         "ntfs"
     } else if &sector0[3..11] == b"EXFAT   " {
         "exfat"
+    } else if hpfs::looks_like_hpfs(reader, partition_offset) {
+        // OS/2 HPFS: type 0x07 shares NTFS/exFAT; confirmed by the super block
+        // (sector 16) + spare block (sector 17) magics.
+        "hpfs"
     } else {
         "unknown"
     }
@@ -1082,7 +1093,7 @@ pub fn fs_name_for(partition_type: u8, partition_type_string: Option<&str>) -> &
         0xAF => "HFS/HFS+",
         0x83 => "ext/btrfs/xfs/reiserfs/UFS/JFS",
         0xA8 => "ProDOS",
-        0x07 => "NTFS/exFAT",
+        0x07 => "NTFS/exFAT/HPFS",
         0x01 | 0x04 | 0x06 | 0x0E | 0x14 | 0x16 | 0x1E | 0x0B | 0x0C | 0x1B | 0x1C => "FAT",
         // SGI synthetic type bytes (PartitionTable::Sgi).
         0xA0 => "XFS",
@@ -1410,6 +1421,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "hpfs" => Ok(Box::new(hpfs::HpfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1559,8 +1574,12 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "hpfs" => Ok(Box::new(hpfs::HpfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
-                    "type 0x07 partition is neither NTFS nor exFAT".into(),
+                    "type 0x07 partition is neither NTFS, exFAT, nor HPFS".into(),
                 )),
             }
         }
@@ -1921,8 +1940,11 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "hpfs" => Err(FilesystemError::Unsupported(
+                    "HPFS editing is not yet supported (browse / backup only)".into(),
+                )),
                 _ => Err(FilesystemError::Unsupported(
-                    "type 0x07 partition is neither NTFS nor exFAT".into(),
+                    "type 0x07 partition is neither NTFS, exFAT, nor HPFS".into(),
                 )),
             }
         }
@@ -2539,9 +2561,11 @@ pub fn is_checkable_type(ptype: u8, type_str: Option<&str>) -> bool {
 /// (its resolved name is `"NTFS"` / `"NTFS 3.1"`).
 pub fn is_checkable_fs_name(type_name: &str) -> bool {
     let n = type_name.to_ascii_uppercase();
-    ["HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS"]
-        .iter()
-        .any(|tok| n.contains(tok))
+    [
+        "HFS", "EFS", "UFS", "XFS", "JFS", "FAT", "EXT", "NTFS", "HPFS",
+    ]
+    .iter()
+    .any(|tok| n.contains(tok))
 }
 
 /// True for the retro superfloppy / X68k filesystems whose driver implements
