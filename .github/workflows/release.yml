@@ -1787,17 +1787,22 @@ jobs:
             runs-on: ubuntu-latest
             toolchain: stable
             prebuilt: "yes"
-            zig: "yes"
+            zigbuild: "yes"
             apt: binutils-powerpc64-linux-gnu
             strip: powerpc64-linux-gnu-strip
           # ppc32 (PowerMac G3 / G4 / 604e) is Rust tier-3 (no prebuilt std) ->
-          # nightly + build-std for the Rust std; zig supplies the musl libc.
+          # nightly + build-std for the Rust std. Zig only offers a 32-bit PPC musl
+          # libc under its float-tagged name `musleabihf` (not the plain `-musl`
+          # cargo-zigbuild derives), so drive `zig cc -target
+          # powerpc-linux-musleabihf` directly as the linker. Whether the eabihf
+          # float/calling ABI matches Rust's powerpc-unknown-linux-musl codegen is
+          # the open question this leg is testing.
           - target: powerpc-unknown-linux-musl
             arch: ppc32
             runs-on: ubuntu-latest
             toolchain: nightly
             prebuilt: "no"
-            zig: "yes"
+            zig_cc: powerpc-linux-musleabihf
             apt: binutils-powerpc-linux-gnu
             strip: powerpc-linux-gnu-strip
     env:
@@ -1826,13 +1831,26 @@ jobs:
         if: ${{ matrix.linker_env != '' }}
         run: echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
-      - name: Install zig + cargo-zigbuild (PowerPC musl libc)
-        if: ${{ matrix.zig == 'yes' }}
+      - name: Install zig (PowerPC musl libc)
+        if: ${{ matrix.zigbuild == 'yes' || matrix.zig_cc != '' }}
+        run: pip3 install --break-system-packages ziglang
+
+      - name: Install cargo-zigbuild (ppc64)
+        if: ${{ matrix.zigbuild == 'yes' }}
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Set up zig cc wrapper as the linker (ppc32)
+        if: ${{ matrix.zig_cc != '' }}
         run: |
-          # Zig ships a generic musl libc for powerpc/powerpc64 and links with the
-          # right ELF ABI; cargo-zigbuild wires `zig cc` in as the target linker.
-          pip3 install --break-system-packages ziglang
-          cargo install cargo-zigbuild --locked
+          # cargo-zigbuild derives `powerpc-linux-musl`, which zig has no libc for;
+          # it only ships `musleabihf`. Drive zig cc at that target directly.
+          cat > "$RUNNER_TEMP/zig-cc.sh" <<EOF
+          #!/bin/sh
+          exec python3 -m ziglang cc -target ${{ matrix.zig_cc }} "\$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/zig-cc.sh"
+          LK_VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER"
+          echo "$LK_VAR=$RUNNER_TEMP/zig-cc.sh" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -1856,12 +1874,13 @@ jobs:
             # tier-3 target (ppc32-musl): recompile std from source.
             BUILD_STD="-Z build-std=std,panic_abort"
           fi
-          if [ "${{ matrix.zig }}" = "yes" ]; then
-            # PowerPC: zig cc supplies the musl libc + correct ELF ABI.
+          if [ "${{ matrix.zigbuild }}" = "yes" ]; then
+            # ppc64: cargo-zigbuild wires zig cc in as the linker (musl libc + ELFv2).
             cargo zigbuild --release --bin rb-cli \
               --no-default-features --features pure-zstd,remote,tui \
               --target ${{ matrix.target }} $BUILD_STD
           else
+            # Native/GNU-cross legs, and ppc32 (linker = the zig cc wrapper above).
             cargo build --release --bin rb-cli \
               --no-default-features --features pure-zstd,remote,tui \
               --target ${{ matrix.target }} $BUILD_STD
