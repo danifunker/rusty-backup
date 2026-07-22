@@ -33,6 +33,8 @@
 //! their allocation blocks all lie in `[0..S)` and stay at the same
 //! source byte offsets.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};

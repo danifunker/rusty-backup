@@ -7,6 +7,8 @@
 //!
 //! Split out of `hfs_fsck.rs` per §8 of `docs/codecleanup.md`.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 

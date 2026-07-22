@@ -25,6 +25,8 @@
 //! - **Tags required.** DiskCopy versions after 4.2 strip tags; such an image
 //!   can't be browsed (detection fails cleanly).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 

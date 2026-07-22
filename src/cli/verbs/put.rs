@@ -167,7 +167,7 @@ pub fn run(args: PutArgs) -> Result<()> {
 
     // Resolve parent + leaf with the shared escape / colon grammar so a file
     // whose name contains a literal `/` can be written.
-    let (parent, name) = super::ls::resolve_parent(&mut *fs, &dst)?;
+    let (parent, name) = super::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     if name.is_empty() {
         bail!("destination path has no filename");
     }

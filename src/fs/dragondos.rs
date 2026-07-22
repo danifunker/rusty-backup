@@ -55,6 +55,8 @@
 //!   `total_sectors` is the sum of every extent's `count` and
 //!   `last_sector_bytes` comes from the final entry's byte `0x18`.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -718,6 +720,12 @@ fn group_extents(lsns: &[u64]) -> Vec<Extent> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for DragonDosFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

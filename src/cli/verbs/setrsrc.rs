@@ -33,7 +33,7 @@ pub fn run(args: SetRsrcArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let entry = super::ls::resolve_path(&mut *fs, &args.path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     let meta = std::fs::metadata(&args.from_file)
         .with_context(|| format!("stat {}", args.from_file.display()))?;
     let len = meta.len();

@@ -31,6 +31,15 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
+
+// `symbols::border::Set` gained a lifetime parameter in ratatui 0.30
+// (`Set<'a>`); the vintage macOS 10.7 build pins ratatui 0.29, where it's a
+// plain `Set`. This alias lets the same source compile against both — the
+// `ratatui-legacy` feature is enabled only by the vintage manifest's `tui`.
+#[cfg(feature = "ratatui-legacy")]
+type BorderSet = border::Set;
+#[cfg(not(feature = "ratatui-legacy"))]
+type BorderSet = border::Set<'static>;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{DefaultTerminal, Frame};
@@ -677,7 +686,7 @@ impl FilePicker {
         }
     }
 
-    fn draw(&self, frame: &mut Frame, area: Rect, pal: Palette, border: border::Set<'static>) {
+    fn draw(&self, frame: &mut Frame, area: Rect, pal: Palette, border: BorderSet) {
         if self.browse {
             self.draw_browse(frame, area, pal, border);
         } else {
@@ -685,13 +694,7 @@ impl FilePicker {
         }
     }
 
-    fn draw_input(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        pal: Palette,
-        border: border::Set<'static>,
-    ) {
+    fn draw_input(&self, frame: &mut Frame, area: Rect, pal: Palette, border: BorderSet) {
         let list_rows = self.recent.len().min(8) as u16;
         let has_recent = !self.recent.is_empty();
         // Content lines: Path + error + hint (3), plus "Recent:" header + list
@@ -735,13 +738,7 @@ impl FilePicker {
         );
     }
 
-    fn draw_browse(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        pal: Palette,
-        border: border::Set<'static>,
-    ) {
+    fn draw_browse(&self, frame: &mut Frame, area: Rect, pal: Palette, border: BorderSet) {
         let popup = centered_rect(72, area.height.saturating_sub(4).clamp(8, 20), area);
         let visible = popup.height.saturating_sub(4) as usize;
         let start = self.sel.saturating_sub(visible.saturating_sub(1));
@@ -838,7 +835,7 @@ const MIN_HEIGHT: u16 = 18;
 /// degrade gracefully" convention. Modern UTF-8 terminals get clean rounded
 /// box-drawing (as lazygit / k9s / htop use); terminals we can't trust with
 /// UTF-8 fall back to [`ASCII_BORDER`]. `RB_TUI_ASCII=1` forces the fallback.
-fn choose_border_set() -> border::Set<'static> {
+fn choose_border_set() -> BorderSet {
     if std::env::var_os("RB_TUI_ASCII").is_some() {
         return ASCII_BORDER;
     }
@@ -1325,6 +1322,7 @@ impl BulkState {
 
 /// The Optical screen (rip): choose a drive -> config (output / format / eject)
 /// -> run `optical::rip::run_rip` on a worker thread.
+#[cfg(feature = "optical")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpticalStep {
     Drives,
@@ -1333,11 +1331,13 @@ enum OpticalStep {
 }
 
 /// Rip output formats.
+#[cfg(feature = "optical")]
 const RIP_FORMATS: &[(&str, crate::optical::rip::RipFormat)] = &[
     ("ISO (data)", crate::optical::rip::RipFormat::Iso),
     ("BIN/CUE (raw)", crate::optical::rip::RipFormat::BinCue),
 ];
 /// Config-form rows: 0 output, 1 format, 2 eject, 3 "Start".
+#[cfg(feature = "optical")]
 const OPTICAL_FIELDS: usize = 4;
 
 /// Optical *image* operations (as opposed to ripping a physical drive), offered
@@ -1346,6 +1346,7 @@ const OPTICAL_FIELDS: usize = 4;
 /// partition Explorer — so, like the Explorer's transforms, they're launched
 /// through the `:` command palette (shared CLI `dispatch`) with a template the
 /// user completes. `(label, verb-template)`.
+#[cfg(feature = "optical")]
 const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
     ("Browse an optical image", "optical browse \"<IMAGE.iso>\""),
     (
@@ -1363,6 +1364,7 @@ const OPTICAL_IMAGE_OPS: &[(&str, &str)] = &[
     ),
 ];
 
+#[cfg(feature = "optical")]
 struct OpticalState {
     step: OpticalStep,
     drives: Vec<crate::model::optical_devices::RipDevice>,
@@ -1382,6 +1384,7 @@ struct OpticalState {
     image_menu: Option<usize>,
 }
 
+#[cfg(feature = "optical")]
 impl Default for OpticalState {
     fn default() -> Self {
         OpticalState {
@@ -2568,7 +2571,7 @@ const SETTINGS_TOGGLES: usize = 2;
 
 struct App {
     palette: Palette,
-    border: border::Set<'static>,
+    border: BorderSet,
     /// Whether we're running with elevated privileges (root / admin). Device
     /// operations (raw backup / restore / write) require it.
     elevated: bool,
@@ -2599,6 +2602,7 @@ struct App {
     /// The Bulk convert screen state (lazily created on first visit).
     bulk: Option<BulkState>,
     /// The Optical (rip) screen state (lazily created on first visit).
+    #[cfg(feature = "optical")]
     optical: Option<OpticalState>,
     /// The Archives screen state (lazily created on first visit).
     archive: Option<ArchiveState>,
@@ -2636,6 +2640,7 @@ impl App {
             backup: None,
             restore: None,
             bulk: None,
+            #[cfg(feature = "optical")]
             optical: None,
             archive: None,
             commander: None,
@@ -2811,6 +2816,7 @@ impl App {
         }
 
         // The Optical screen owns most keys on its tab.
+        #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.handle_optical_key(key.code) {
             return Ok(());
         }
@@ -3973,6 +3979,7 @@ impl App {
                 s.cancel_requested = true;
             }
         }
+        #[cfg(feature = "optical")]
         if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
             if let Ok(mut p) = run.lock() {
                 p.cancel_requested = true;
@@ -4009,6 +4016,7 @@ impl App {
         if self.current() == TabId::Bulk && self.bulk.is_none() {
             self.bulk = Some(BulkState::default());
         }
+        #[cfg(feature = "optical")]
         if self.current() == TabId::Optical && self.optical.is_none() {
             self.optical = Some(OpticalState {
                 drives: crate::model::optical_devices::list_local_rip_devices(),
@@ -4857,7 +4865,7 @@ impl App {
                 match tempfile::TempDir::new().and_then(|tmp| {
                     crate::rbformats::cbk::materialize_cbk_to_folder(&path, tmp.path())
                         .map(|_| tmp)
-                        .map_err(std::io::Error::other)
+                        .map_err(crate::compat::io_other)
                 }) {
                     Ok(tmp) => (tmp.path().to_path_buf(), Some(tmp)),
                     Err(e) => {
@@ -5244,6 +5252,7 @@ impl App {
     }
 
     /// Optical (rip) screen keys. Returns `true` when consumed.
+    #[cfg(feature = "optical")]
     fn handle_optical_key(&mut self, code: KeyCode) -> bool {
         if self.optical.is_none() {
             self.optical = Some(OpticalState {
@@ -5426,6 +5435,7 @@ impl App {
     }
 
     /// Start `optical::rip::run_rip` on a worker thread for the selected drive.
+    #[cfg(feature = "optical")]
     fn start_optical_rip(&mut self) {
         let Some(o) = self.optical.as_ref() else {
             return;
@@ -6174,6 +6184,7 @@ impl App {
             }
         }
         // Mirror a running optical rip's progress into the visual bar.
+        #[cfg(feature = "optical")]
         if let Some(run) = self.optical.as_ref().and_then(|o| o.run.clone()) {
             let snap = run.lock().ok().map(|p| {
                 (
@@ -6880,6 +6891,7 @@ impl App {
                 return;
             }
         }
+        #[cfg(feature = "optical")]
         if self.current() == TabId::Optical {
             if let Some(o) = &self.optical {
                 self.draw_optical(frame, area, o);
@@ -8036,6 +8048,7 @@ impl App {
     }
 
     /// The Optical rip screen: drive list -> config -> run.
+    #[cfg(feature = "optical")]
     fn draw_optical(&self, frame: &mut Frame, area: Rect, o: &OpticalState) {
         let title = match o.step {
             OpticalStep::Drives => "Optical  -  step 1/3: drive",
@@ -8407,8 +8420,11 @@ impl App {
             ('\u{2588}', '\u{2591}') // full block / light shade
         };
         let filled = (ratio * inner_w as f64).round() as usize;
-        let bar: String = std::iter::repeat_n(full, filled)
-            .chain(std::iter::repeat_n(empty, inner_w.saturating_sub(filled)))
+        let bar: String = crate::compat::repeat_n(full, filled)
+            .chain(crate::compat::repeat_n(
+                empty,
+                inner_w.saturating_sub(filled),
+            ))
             .collect();
 
         let stats = format!(
@@ -8510,22 +8526,31 @@ impl App {
                 _ => vec![("Esc", "Back")],
             }
         } else if self.current() == TabId::Optical {
-            let step = self.optical.as_ref().map(|o| o.step);
-            match step {
-                Some(OpticalStep::Drives) => vec![
-                    ("<-/->", "Tabs"),
-                    ("Up/Dn", "Select"),
-                    ("Enter", "Next"),
-                    ("r", "Rescan"),
-                ],
-                Some(OpticalStep::Config) => vec![
-                    ("Up/Dn", "Field"),
-                    ("<-/->", "Format"),
-                    ("Tab", "Browse"),
-                    ("Enter", "Start"),
-                    ("Esc", "Back"),
-                ],
-                _ => vec![("Esc", "Back")],
+            #[cfg(feature = "optical")]
+            {
+                let step = self.optical.as_ref().map(|o| o.step);
+                match step {
+                    Some(OpticalStep::Drives) => vec![
+                        ("<-/->", "Tabs"),
+                        ("Up/Dn", "Select"),
+                        ("Enter", "Next"),
+                        ("r", "Rescan"),
+                    ],
+                    Some(OpticalStep::Config) => vec![
+                        ("Up/Dn", "Field"),
+                        ("<-/->", "Format"),
+                        ("Tab", "Browse"),
+                        ("Enter", "Start"),
+                        ("Esc", "Back"),
+                    ],
+                    _ => vec![("Esc", "Back")],
+                }
+            }
+            // Optical support not compiled in (e.g. vintage build): the tab shows
+            // an explanatory stub, so only the tab-navigation hints apply.
+            #[cfg(not(feature = "optical"))]
+            {
+                vec![("<-/->", "Tabs"), ("?", "Help")]
             }
         } else if self.current() == TabId::Archives {
             let loaded = self
@@ -9254,7 +9279,7 @@ fn apply_metadata_edit(
         ctx.type_string.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
-    let entry = crate::cli::verbs::ls::resolve_path(&mut *fs, &dst)?;
+    let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &dst)?;
     fs.set_type_creator(&entry, type_code, creator)
         .map_err(|e| anyhow::anyhow!("set type/creator: {e}"))?;
     if let Some(modify) = modify_mac {
@@ -9417,7 +9442,7 @@ fn apply_bless_folder(
         ctx.type_string.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
-    let entry = crate::cli::verbs::ls::resolve_path(&mut *fs, dir_path)?;
+    let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), dir_path)?;
     if !entry.is_directory() {
         anyhow::bail!("{dir_path} is not a directory");
     }
@@ -9452,7 +9477,7 @@ fn apply_mkdir(
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
     } else {
-        crate::cli::verbs::ls::resolve_path(&mut *fs, cur_dir)?
+        crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), cur_dir)?
     };
     fs.create_directory(
         &parent,
@@ -9489,14 +9514,14 @@ fn apply_delete(
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
     } else {
-        crate::cli::verbs::ls::resolve_path(&mut *fs, cur_dir)?
+        crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), cur_dir)?
     };
     let child_path = if cur_dir == "/" {
         format!("/{name}")
     } else {
         format!("{cur_dir}/{name}")
     };
-    let entry = crate::cli::verbs::ls::resolve_path(&mut *fs, &child_path)?;
+    let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &child_path)?;
     fs.delete_recursive(&parent, &entry)
         .map_err(|e| anyhow::anyhow!("delete: {e}"))?;
     fs.sync_metadata()
@@ -9537,7 +9562,7 @@ fn import_host_file(
     )
     .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
 
-    let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(&mut *fs, &dst)?;
+    let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     if !parent.is_directory() {
         anyhow::bail!("parent is not a directory");
     }
@@ -9650,7 +9675,7 @@ fn parse_partitions(path: &std::path::Path, total: u64) -> Vec<PartRow> {
 /// A bordered pane block with the given (already-resolved) palette + border set.
 /// The free-function form so shared components (e.g. [`FilePicker`]) can build
 /// blocks without an `App` receiver.
-fn pane_block_with(title: &str, pal: Palette, border: border::Set<'static>) -> Block<'static> {
+fn pane_block_with(title: &str, pal: Palette, border: BorderSet) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_set(border)

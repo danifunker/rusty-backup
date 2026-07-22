@@ -22,6 +22,8 @@
 //! `GD[gt]` (u32 sector offset) → that GT's host sector; `GT[gt][gte]` (u32
 //! sector offset) → the grain's host sector, or `0` for an unallocated grain.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::{bail, Context, Result};
@@ -292,7 +294,7 @@ impl<R: Read + Seek> Read for VmdkSparseReader<R> {
 
         let grain_sector = match self
             .load_gt(gt_index)
-            .map_err(|e| std::io::Error::other(format!("VMDK sparse: load GT: {e}")))?
+            .map_err(|e| crate::compat::io_other(format!("VMDK sparse: load GT: {e}")))?
         {
             Some(gt) => gt.get(gte_index).copied().unwrap_or(0),
             None => 0,
@@ -386,7 +388,7 @@ impl<R: Read + Write + Seek> Write for VmdkSparseReader<R> {
         // Look up current host sector.
         let grain_sector = match self
             .load_gt(gt_index)
-            .map_err(|e| std::io::Error::other(format!("VMDK sparse: load GT for write: {e}")))?
+            .map_err(|e| crate::compat::io_other(format!("VMDK sparse: load GT for write: {e}")))?
         {
             Some(gt) => gt.get(gte_index).copied().unwrap_or(0),
             None => 0,
@@ -791,7 +793,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&grain0);
         expected.extend_from_slice(&grain1);
-        expected.extend(std::iter::repeat_n(0u8, 2 * 512));
+        expected.extend(crate::compat::repeat_n(0u8, 2 * 512));
         assert_eq!(got, expected);
     }
 

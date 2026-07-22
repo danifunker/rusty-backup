@@ -62,7 +62,7 @@ pub fn apply_bless(image: &ImageRef, path: &str) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let entry = super::ls::resolve_path(&mut *fs, path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), path)?;
     if !entry.is_directory() {
         bail!("bless: {path} is not a directory");
     }

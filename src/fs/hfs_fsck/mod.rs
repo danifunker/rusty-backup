@@ -6,6 +6,8 @@
 //! 3. Catalog consistency (threads ↔ records, counts)
 //! 4. Extent/allocation bitmap cross-check (including extents overflow)
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
 
 use super::fsck::{FsckIssue, FsckResult, FsckStats, RepairReport};

@@ -313,7 +313,12 @@ pub struct UpdateInfo {
     pub cli_asset_url: Option<String>,
 }
 
-/// Check for updates from GitHub releases
+/// Check for updates from GitHub releases.
+///
+/// Uses reqwest, so it's gated on `gui` / `tui-update`. A plain-`tui` build
+/// (e.g. the vintage macOS 10.7 CLI) compiles the MRU/config parts of this
+/// module but not this network check.
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 pub fn check_for_updates(
     config: &UpdateCheckConfig,
     current_version: &str,
@@ -363,7 +368,9 @@ pub fn check_for_updates(
 }
 
 /// Download a release asset into memory, reporting progress as
-/// `(downloaded_bytes, total_bytes_if_known)`.
+/// `(downloaded_bytes, total_bytes_if_known)`. reqwest-backed, so gated with the
+/// rest of the network updater.
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 fn download_bytes(
     url: &str,
     progress: &dyn Fn(u64, Option<u64>),
@@ -420,6 +427,7 @@ fn extract_zip_flat(
 /// Windows-only: the in-place running-exe replacement uses `self_replace`.
 /// On other platforms this returns an error (macOS/Linux update via DMG /
 /// AppImage instead).
+#[cfg(any(feature = "gui", feature = "tui-update"))]
 pub fn download_and_apply_update(
     info: &UpdateInfo,
     progress: &dyn Fn(u64, Option<u64>),
@@ -592,7 +600,9 @@ fn replace_running_exe(_new_exe: &std::path::Path) -> Result<(), Box<dyn std::er
 }
 
 /// Download a fresh `rb-cli.exe` next to the installed one. Best-effort.
-#[cfg(windows)]
+/// reqwest-backed (via download_bytes), so gated with the rest of the updater —
+/// the vintage Win7 build (no gui / tui-update) uses the stub below.
+#[cfg(all(windows, any(feature = "gui", feature = "tui-update")))]
 fn update_sidecar_cli(cli_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let exe = std::env::current_exe()?;
     let install_dir = exe.parent().ok_or("cannot determine install directory")?;
@@ -610,7 +620,7 @@ fn update_sidecar_cli(cli_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, any(feature = "gui", feature = "tui-update"))))]
 fn update_sidecar_cli(_cli_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }

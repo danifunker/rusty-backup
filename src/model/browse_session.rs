@@ -110,7 +110,7 @@ impl BrowseSession {
         #[cfg(feature = "remote")]
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open(Arc::clone(conn), rpath)
-                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
             return fs::open_filesystem_with_passphrase(
                 reader,
                 self.partition_offset,
@@ -409,7 +409,7 @@ impl BrowseSession {
 
         if is_seekable_zst {
             // Native (C) zstd has a seekable random-access decoder (zeekstd).
-            #[cfg(feature = "native-zstd")]
+            #[cfg(feature = "seekable-zstd")]
             {
                 let file = File::open(path).map_err(FilesystemError::Io)?;
                 let decoder = match zeekstd::Decoder::new(file) {
@@ -423,6 +423,32 @@ impl BrowseSession {
                 };
                 return fs::open_filesystem(
                     decoder,
+                    self.partition_offset,
+                    self.partition_type,
+                    self.partition_type_string.as_deref(),
+                );
+            }
+            // Native (C) zstd WITHOUT the seekable decoder (e.g. vintage macOS
+            // 10.7 build: zeekstd is edition-2024). A .seekable.zst is still a
+            // valid zstd stream (+ a skippable seek-table frame), so fully
+            // decompress it to a tempfile giving Read + Seek. Correct, just not
+            // random-access.
+            #[cfg(all(feature = "native-zstd", not(feature = "seekable-zstd")))]
+            {
+                let file = File::open(path).map_err(FilesystemError::Io)?;
+                let mut dec =
+                    zstd::stream::read::Decoder::new(file).map_err(FilesystemError::Io)?;
+                let mut tmp = tempfile::tempfile().map_err(FilesystemError::Io)?;
+                if let Err(e) = std::io::copy(&mut dec, &mut tmp) {
+                    let _ = std::fs::remove_file(path);
+                    return Err(FilesystemError::Parse(format!(
+                        "stale seekable zstd cache removed ({e}). Click Browse again to rebuild."
+                    )));
+                }
+                std::io::Seek::seek(&mut tmp, std::io::SeekFrom::Start(0))
+                    .map_err(FilesystemError::Io)?;
+                return fs::open_filesystem(
+                    tmp,
                     self.partition_offset,
                     self.partition_type,
                     self.partition_type_string.as_deref(),
@@ -619,7 +645,7 @@ impl BrowseSession {
         #[cfg(feature = "remote")]
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
-                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
             let fs = fs::open_editable_filesystem(
                 reader,
                 self.partition_offset,

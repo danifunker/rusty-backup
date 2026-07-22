@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -1700,7 +1702,7 @@ mod tests {
             if let Some(data) = b {
                 assert_eq!(data.len(), block_size);
                 bat[i] = next_sector as u32;
-                blocks_region.extend(std::iter::repeat_n(0xFFu8, bitmap_size));
+                blocks_region.extend(crate::compat::repeat_n(0xFFu8, bitmap_size));
                 blocks_region.extend_from_slice(data);
                 next_sector += ((bitmap_size + block_size) as u64) / 512;
             }

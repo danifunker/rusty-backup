@@ -651,6 +651,12 @@ fn validate_qdos_name(name: &str) -> Result<(), FilesystemError> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for QdosFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

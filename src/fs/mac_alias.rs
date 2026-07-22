@@ -10,6 +10,8 @@
 //!
 //! We do not attempt to follow the alias; the target may no longer exist.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
 
 /// Finder flag bit indicating the file is an alias.

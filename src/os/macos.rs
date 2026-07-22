@@ -147,11 +147,27 @@ struct IOMediaEntry {
 }
 
 /// Enumerate all IOMedia entries via IOKit and return their basic properties.
+// The IOKit "IOMedia" class name as a C-string pointer. `c"…"` literals need
+// rustc 1.77, so the vintage macOS 10.7 build (Rust 1.73) uses a nul-terminated
+// byte string. The modern `c"…"` form lives in its OWN FILE (macos_iomedia.rs):
+// a `c"…"` token is a lexer-level feature, so 1.73 would reject it even inside a
+// cfg'd-out block in the same file — an unloaded `#[cfg] mod` is never lexed.
+#[cfg(not(feature = "rust173-polyfill"))]
+#[path = "macos_iomedia.rs"]
+mod iomedia;
+#[cfg(not(feature = "rust173-polyfill"))]
+use iomedia::iomedia_class_name;
+
+#[cfg(feature = "rust173-polyfill")]
+fn iomedia_class_name() -> *const std::os::raw::c_char {
+    b"IOMedia\0".as_ptr() as *const std::os::raw::c_char
+}
+
 fn iokit_enumerate_media() -> Vec<IOMediaEntry> {
     let mut entries = Vec::new();
 
     unsafe {
-        let matching = IOServiceMatching(c"IOMedia".as_ptr());
+        let matching = IOServiceMatching(iomedia_class_name());
         let matching = match matching {
             Some(m) => m,
             None => return entries,

@@ -102,7 +102,7 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
     // `--dst-dir` is the destination *directory* (the filename comes from the
     // BinHex header), resolved with the shared escape / colon grammar so a
     // donor folder named with a literal `/` is addressable.
-    let parent = super::ls::resolve_path(&mut *fs, &args.dst_dir)?;
+    let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &args.dst_dir)?;
     if !parent.is_directory() {
         bail!("destination is not a directory: {}", args.dst_dir);
     }

@@ -15,6 +15,8 @@ pub mod win_install;
 
 pub mod wakelock;
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -161,6 +163,10 @@ unsafe impl<R: Send> Send for SectorAlignedReader<R> {}
 // Windows-specific aligned buffer implementation
 #[cfg(target_os = "windows")]
 mod aligned_buffer {
+    // Nested module — the parent module's polyfill import doesn't reach here, so
+    // bring the 1.73 `is_multiple_of` shim into this scope too.
+    #[cfg(feature = "rust173-polyfill")]
+    use crate::rust173_compat::IntIsMultipleOf as _;
     use std::alloc::{self, Layout};
     use std::ptr;
 

@@ -263,7 +263,7 @@ fn copy_match(out: &mut Vec<u8>, distance: usize, len: usize, max_size: usize) {
     if distance == 0 || distance > out.len() {
         // Invalid distance — fill with zeros rather than crashing
         let fill = len.min(max_size - out.len());
-        out.extend(std::iter::repeat_n(0u8, fill));
+        out.extend(crate::compat::repeat_n(0u8, fill));
         return;
     }
     let start = out.len() - distance;
@@ -334,46 +334,53 @@ impl DmgReader {
             METHOD_COPY => {
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut buf = vec![0u8; block.pack_size as usize];
-                self.source.read_exact(&mut buf).map_err(io::Error::other)?;
+                self.source
+                    .read_exact(&mut buf)
+                    .map_err(crate::compat::io_other)?;
                 buf
             }
             METHOD_ZLIB => {
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut compressed = vec![0u8; block.pack_size as usize];
                 self.source
                     .read_exact(&mut compressed)
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut decoder = flate2::read::ZlibDecoder::new(Cursor::new(compressed));
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
-                decoder.read_to_end(&mut out).map_err(io::Error::other)?;
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(crate::compat::io_other)?;
                 out
             }
             METHOD_BZIP2 => {
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut compressed = vec![0u8; block.pack_size as usize];
                 self.source
                     .read_exact(&mut compressed)
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut decoder = bzip2::read::BzDecoder::new(Cursor::new(compressed));
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
-                decoder.read_to_end(&mut out).map_err(io::Error::other)?;
+                decoder
+                    .read_to_end(&mut out)
+                    .map_err(crate::compat::io_other)?;
                 out
             }
             METHOD_ADC => {
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut compressed = vec![0u8; block.pack_size as usize];
                 self.source
                     .read_exact(&mut compressed)
-                    .map_err(io::Error::other)?;
-                decompress_adc(&compressed, block.unpack_size as usize).map_err(io::Error::other)?
+                    .map_err(crate::compat::io_other)?;
+                decompress_adc(&compressed, block.unpack_size as usize)
+                    .map_err(crate::compat::io_other)?
             }
             METHOD_LZFSE => {
                 // ULFO: each chunk is a self-contained LZFSE block stream
@@ -381,11 +388,11 @@ impl DmgReader {
                 // See README.md for the big-endian (PowerPC) decode caveat.
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut compressed = vec![0u8; block.pack_size as usize];
                 self.source
                     .read_exact(&mut compressed)
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
                 lzfse_rust::decode_bytes(&compressed, &mut out).map_err(|e| {
                     io::Error::new(io::ErrorKind::InvalidData, format!("LZFSE decode: {e}"))
@@ -396,11 +403,11 @@ impl DmgReader {
                 // ULMO: each chunk is a complete XZ stream (`.7zXZ` magic).
                 self.source
                     .seek(SeekFrom::Start(block.pack_pos))
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut compressed = vec![0u8; block.pack_size as usize];
                 self.source
                     .read_exact(&mut compressed)
-                    .map_err(io::Error::other)?;
+                    .map_err(crate::compat::io_other)?;
                 let mut out = Vec::with_capacity(block.unpack_size as usize);
                 let mut input = io::BufReader::new(Cursor::new(compressed));
                 lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| {

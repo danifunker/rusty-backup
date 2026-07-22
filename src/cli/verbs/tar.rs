@@ -14,6 +14,8 @@
 //! `.tar.zst` = zstd, otherwise gzip) unless forced with `--gzip` /
 //! `--zstd` / `--no-compress`.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use std::path::PathBuf;

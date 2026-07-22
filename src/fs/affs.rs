@@ -14,6 +14,8 @@
 //! size from the DosEnv. This module currently requires `block_size == 512`
 //! and rejects others — every real-world AFFS volume uses 512.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1131,6 +1133,12 @@ impl<R: Read + Seek + Send> Filesystem for AffsFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for AffsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

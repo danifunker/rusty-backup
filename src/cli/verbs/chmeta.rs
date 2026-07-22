@@ -37,7 +37,7 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
     )
     .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
-    let entry = super::ls::resolve_path(&mut *fs, &args.path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     // Default the un-overridden half to the file's current code (display form;
     // chmeta's `set_type_creator` API is text-based).
     let entry_type = entry.type_code_display();

@@ -387,7 +387,7 @@ impl<R: Read + Seek + Send> AppleDosFilesystem<R> {
                 }
                 if dt == 0 {
                     // Sparse hole — 256 zeros.
-                    data.extend(std::iter::repeat_n(0u8, APPLE_II_SECTOR_BYTES));
+                    data.extend(crate::compat::repeat_n(0u8, APPLE_II_SECTOR_BYTES));
                     continue;
                 }
                 let sec = read_sector(&mut self.reader, self.partition_offset, dt, ds)?;
@@ -903,6 +903,12 @@ impl<R: Read + Write + Seek + Send> AppleDosFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for AppleDosFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

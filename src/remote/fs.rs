@@ -28,8 +28,9 @@ use crate::remote::protocol::{WireEntry, WireKind};
 fn lock_conn(
     conn: &Arc<Mutex<RemoteConnection>>,
 ) -> Result<std::sync::MutexGuard<'_, RemoteConnection>, FilesystemError> {
-    conn.lock()
-        .map_err(|_| FilesystemError::Io(std::io::Error::other("remote connection lock poisoned")))
+    conn.lock().map_err(|_| {
+        FilesystemError::Io(crate::compat::io_other("remote connection lock poisoned"))
+    })
 }
 
 /// A live remote image — one opened-image handle on a shared [`RemoteConnection`].
@@ -190,7 +191,7 @@ impl Drop for RemoteFilesystem {
 }
 
 fn wire_err(e: anyhow::Error) -> FilesystemError {
-    FilesystemError::Io(std::io::Error::other(e.to_string()))
+    FilesystemError::Io(crate::compat::io_other(e.to_string()))
 }
 
 /// A [`Filesystem`] over the daemon's **host** filesystem — the remote *file

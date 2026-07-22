@@ -32,6 +32,8 @@
 //!   `target.create_file`. Peak buffer is one file's data. The streaming
 //!   wrapper keeps the target image in a tempfile, not RAM.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
@@ -193,7 +195,7 @@ where
     // Tempfile keeps peak memory bounded by one source-file buffer plus the
     // I/O ring instead of the whole target image.
     let mut tmp = tempfile::tempfile().map_err(|e| {
-        FilesystemError::Io(io::Error::other(format!(
+        FilesystemError::Io(crate::compat::io_other(format!(
             "create tempfile for exFAT clone: {e}"
         )))
     })?;

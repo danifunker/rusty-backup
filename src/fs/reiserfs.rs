@@ -46,6 +46,8 @@
 //! 100 s_label[16]                 null-padded volume label
 //! ```
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom};
 
 use super::entry::FileEntry;
@@ -744,7 +746,7 @@ impl<R: Read + Seek + Send> Filesystem for ReiserFsFilesystem<R> {
                         let take = (self.block_size as usize).min(remaining);
                         if block_num == 0 {
                             // Sparse block — emit `take` zeros.
-                            data.extend(std::iter::repeat_n(0u8, take));
+                            data.extend(crate::compat::repeat_n(0u8, take));
                         } else {
                             let block = self.read_tree_block(block_num)?;
                             data.extend_from_slice(&block[..take]);

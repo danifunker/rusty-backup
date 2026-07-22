@@ -29,6 +29,8 @@
 //! big-endian u32 words with the MSB representing the lowest block in
 //! that word.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -2372,6 +2374,12 @@ fn check_no_duplicate<R: Read + Seek + Send>(
 }
 
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for SfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

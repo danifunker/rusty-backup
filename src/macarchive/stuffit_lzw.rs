@@ -7,6 +7,8 @@
 //! clear the encoder pads to an 8-code boundary (the well-known `compress`
 //! quirk).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use anyhow::{bail, Result};
 
 /// LSB-first bit cursor over the compressed bytes.

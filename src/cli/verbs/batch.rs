@@ -753,7 +753,7 @@ fn apply_op(
 }
 
 fn apply_bless(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &str) -> Result<()> {
-    let entry = super::ls::resolve_path(&mut *fs, path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), path)?;
     if !entry.is_directory() {
         bail!("bless: {path} is not a directory");
     }
@@ -769,7 +769,7 @@ fn apply_chmeta(
     if op.type_code.is_none() && op.creator.is_none() {
         bail!("chmeta: pass at least one of type / creator");
     }
-    let entry = super::ls::resolve_path(&mut *fs, &op.path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &op.path)?;
     // Default the un-overridden half to the file's current code (display form;
     // `set_type_creator` is text-based).
     let entry_type = entry.type_code_display();
@@ -793,7 +793,7 @@ fn apply_setrsrc(
     fs: &mut dyn crate::fs::filesystem::EditableFilesystem,
     op: &SetrsrcOp,
 ) -> Result<()> {
-    let entry = super::ls::resolve_path(&mut *fs, &op.path)?;
+    let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &op.path)?;
     let meta =
         std::fs::metadata(&op.from).map_err(|e| anyhow!("stat {}: {e}", op.from.display()))?;
     let len = meta.len();
@@ -809,7 +809,7 @@ fn apply_mkdir(fs: &mut dyn crate::fs::filesystem::EditableFilesystem, path: &st
     if name.is_empty() {
         bail!("mkdir: empty basename for {path:?}");
     }
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &parent_path)?;
     fs.create_directory(&parent, &name, &CreateDirectoryOptions::default())
         .map_err(|e| anyhow!("{e}"))?;
     Ok(())
@@ -824,7 +824,7 @@ fn apply_put(
     if name.is_empty() {
         bail!("put: empty basename for {:?}", op.dst);
     }
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &parent_path)?;
     let force = op.force || defaults.force.unwrap_or(false);
 
     let existing = fs
@@ -878,7 +878,7 @@ fn apply_rm(
     recursive: bool,
 ) -> Result<()> {
     let (parent_path, name) = split_mac_path(path)?;
-    let parent = super::ls::resolve_path(&mut *fs, &parent_path)?;
+    let parent = super::ls::resolve_path(fs.as_filesystem_mut(), &parent_path)?;
     let entry = fs
         .list_directory(&parent)
         .map_err(|e| anyhow!("list_directory: {e}"))?

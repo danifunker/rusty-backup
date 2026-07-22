@@ -51,6 +51,8 @@
 //! parsed entry. Length limits are counted in Shift-JIS bytes (18 for the
 //! name, 3 for the extension).
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use anyhow::Context as _;
@@ -1219,6 +1221,12 @@ impl<R: Read + Write + Seek + Send> Human68kFilesystem<R> {
 }
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for Human68kFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

@@ -57,7 +57,7 @@ pub fn run(args: MkdirArgs) -> Result<()> {
 
     // Resolve parent + leaf with the shared escape / colon grammar so a new
     // directory whose name contains a literal `/` can be created.
-    let (parent, name) = super::ls::resolve_parent(&mut *fs, &args.path)?;
+    let (parent, name) = super::ls::resolve_parent(fs.as_filesystem_mut(), &args.path)?;
     if name.is_empty() {
         bail!("directory path has no basename");
     }

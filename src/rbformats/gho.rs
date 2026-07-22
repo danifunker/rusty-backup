@@ -1895,7 +1895,7 @@ impl GhoReader {
         cache_buf.clear();
         cache_buf.resize(GHO_BLOCK_DECOMPRESSED_SIZE + 1024, 0);
         let n = decode_block_into(&mut self.inner, block, *compression, cache_buf)
-            .map_err(|e| std::io::Error::other(format!("GHO block {}: {:#}", idx, e)))?;
+            .map_err(|e| crate::compat::io_other(format!("GHO block {}: {:#}", idx, e)))?;
         debug_assert_eq!(
             n as u32, block.decompressed_len,
             "block {} decompressed to {} bytes, index says {}",
@@ -3592,7 +3592,7 @@ impl<'a, R: Read + Seek> GhoFileContentReader<'a, R> {
         self.next_idx += 1;
         self.reader
             .seek(SeekFrom::Start(body_start))
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::compat::io_other)?;
         let body = &mut self.body_buf[..body_len as usize];
         self.reader.read_exact(body)?;
         let n = match self.compression {
@@ -5122,10 +5122,10 @@ impl<'a, R: Read + Seek> NtfsDecompressingReader<'a, R> {
         let mut comp_buf = vec![0u8; comp_size];
         self.inner
             .seek(SeekFrom::Start(block.file_offset))
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::compat::io_other)?;
         self.inner
             .read_exact(&mut comp_buf)
-            .map_err(std::io::Error::other)?;
+            .map_err(crate::compat::io_other)?;
 
         self.state.cache_buf.clear();
         self.state
@@ -5148,10 +5148,10 @@ impl<'a, R: Read + Seek> NtfsDecompressingReader<'a, R> {
             }
             GhoCompression::Fast => {
                 fast_lz_decompress(&comp_buf, comp_size, &mut self.state.cache_buf)
-                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?
+                    .map_err(|e| crate::compat::io_other(format!("{e:#}")))?
             }
             _ => {
-                return Err(std::io::Error::other("unsupported compression"));
+                return Err(crate::compat::io_other("unsupported compression"));
             }
         };
         self.state.cache_buf.truncate(n);
@@ -7972,7 +7972,7 @@ fn read_ntfs_file_aware_into(
 
     inner
         .seek(SeekFrom::Start(file_offset))
-        .map_err(std::io::Error::other)?;
+        .map_err(crate::compat::io_other)?;
     let n = inner.read(&mut out[..to_read])?;
     Ok(n)
 }
@@ -8607,7 +8607,7 @@ mod tests {
         let mut input = vec![2u8, 0, 0, 0]; // prefix, type byte != 1
         input.extend_from_slice(&[0x00, 0x00]); // control word: all literals
         input.extend_from_slice(b"ABCDEFGHIJKLMNOP"); // 16 literals
-        input.extend(std::iter::repeat_n(0u8, 64)); // pad past near_end window
+        input.extend(crate::compat::repeat_n(0u8, 64)); // pad past near_end window
 
         let mut dst = vec![0u8; FAST_LZ_BLOCK_SIZE + 1024];
         let n = fast_lz_decompress(&input, input.len(), &mut dst).unwrap();

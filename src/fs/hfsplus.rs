@@ -1,3 +1,5 @@
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -4010,6 +4012,12 @@ fn find_last_set_bit(bitmap: &[u8], max_bits: u32) -> Option<u32> {
 // --- EditableFilesystem implementation ---
 
 impl<R: Read + Write + Seek + Send> EditableFilesystem for HfsPlusFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

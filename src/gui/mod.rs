@@ -387,7 +387,7 @@ pub fn open_disk_image_for_reading(
     path: &std::path::Path,
 ) -> std::io::Result<Box<dyn rusty_backup::rbformats::ReadSeek>> {
     rusty_backup::model::source_reader::open_read(path)
-        .map_err(|e| std::io::Error::other(format!("{e:#}")))
+        .map_err(|e| rusty_backup::compat::io_other(format!("{e:#}")))
 }
 
 #[cfg(test)]

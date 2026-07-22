@@ -82,7 +82,7 @@ impl<W: Write> Write for ZstdEncoder<W> {
 
 #[cfg(all(not(feature = "native-zstd"), feature = "pure-zstd"))]
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::other(e.to_string())
+    crate::compat::io_other(e.to_string())
 }
 
 #[cfg(all(not(feature = "native-zstd"), feature = "pure-zstd"))]

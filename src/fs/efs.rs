@@ -16,6 +16,8 @@
 //! - `~/xfs-efs/refs/efs-linux-5.15/efs/` — Linux kernel v5.15 EFS sources.
 //! - `docs/SGI_Filesystems.md` — implementation plan and on-disk notes.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use byteorder::{BigEndian, ByteOrder};
@@ -1241,6 +1243,12 @@ fn entry_from_inode(name: &str, parent_path: &str, ino: &EfsInode) -> FileEntry 
 }
 
 impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for EfsFilesystem<R> {
+    fn as_filesystem(&self) -> &dyn crate::fs::filesystem::Filesystem {
+        self
+    }
+    fn as_filesystem_mut(&mut self) -> &mut dyn crate::fs::filesystem::Filesystem {
+        self
+    }
     fn create_file(
         &mut self,
         parent: &FileEntry,

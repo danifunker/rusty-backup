@@ -130,9 +130,9 @@ impl ChdEditSession {
             let lba = self
                 .cached_lba
                 .expect("dirty buffer must have a cached_lba");
-            self.hd
-                .write_sector(lba, &self.buf)
-                .map_err(|e| io::Error::other(format!("CHD write_sector(lba={lba}): {e:?}")))?;
+            self.hd.write_sector(lba, &self.buf).map_err(|e| {
+                crate::compat::io_other(format!("CHD write_sector(lba={lba}): {e:?}"))
+            })?;
             self.dirty = false;
         }
         Ok(())
@@ -145,7 +145,7 @@ impl ChdEditSession {
         self.flush_cached()?;
         self.hd
             .read_sector(lba, &mut self.buf)
-            .map_err(|e| io::Error::other(format!("CHD read_sector(lba={lba}): {e:?}")))?;
+            .map_err(|e| crate::compat::io_other(format!("CHD read_sector(lba={lba}): {e:?}")))?;
         self.cached_lba = Some(lba);
         Ok(())
     }

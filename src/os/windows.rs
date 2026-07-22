@@ -154,10 +154,16 @@ pub fn is_elevated() -> bool {
         let mut admin_sid_size = admin_sid_buffer.len() as u32;
         let admin_sid = PSID(admin_sid_buffer.as_mut_ptr() as *mut c_void);
 
+        // windows 0.61 wrapped this nullable pointer param in `Option`; 0.58
+        // (vintage Win7 build) takes the bare `PSID`.
+        #[cfg(not(feature = "windows-legacy"))]
+        let sid_arg = Some(admin_sid);
+        #[cfg(feature = "windows-legacy")]
+        let sid_arg = admin_sid;
         if CreateWellKnownSid(
             WinBuiltinAdministratorsSid,
             None,
-            Some(admin_sid),
+            sid_arg,
             &mut admin_sid_size,
         )
         .is_err()
@@ -205,8 +211,14 @@ pub fn request_elevation() -> Result<()> {
 /// ShellExecuteExW is actually ShellExecuteW in the windows crate.
 /// This wrapper provides the correct signature.
 unsafe fn shell_execute_ex_w(info: *mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
+    // windows 0.61 made the hwnd param `Option<HWND>`; 0.58 (vintage Win7) takes
+    // the bare `HWND`.
+    #[cfg(not(feature = "windows-legacy"))]
+    let hwnd_arg = Some((*info).hwnd);
+    #[cfg(feature = "windows-legacy")]
+    let hwnd_arg = (*info).hwnd;
     let result = ShellExecuteW(
-        Some((*info).hwnd),
+        hwnd_arg,
         PCWSTR((*info).lpVerb.0),
         PCWSTR((*info).lpFile.0),
         PCWSTR((*info).lpParameters.0),

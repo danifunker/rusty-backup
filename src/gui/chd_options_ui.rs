@@ -13,6 +13,8 @@ use libchdman_rs::{
 use rusty_backup::rbformats::chd_options::{
     codec_label, codec_long_name, is_codec_supported, ChdOptions, ChdProfile,
 };
+#[cfg(feature = "rust173-polyfill")]
+use rusty_backup::rust173_compat::IntIsMultipleOf as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChdOptionsMode {

@@ -35,7 +35,9 @@
 //!   via `target.create_file`. Peak buffer is one file's data. X68000 HDD
 //!   payloads (games, dev tools) are comfortably within RAM budgets.
 
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use super::entry::FileEntry;
@@ -232,7 +234,7 @@ where
     // Tempfile keeps peak memory bounded by one source-file buffer plus
     // the I/O ring instead of the whole target image.
     let mut tmp = tempfile::tempfile().map_err(|e| {
-        FilesystemError::Io(io::Error::other(format!(
+        FilesystemError::Io(crate::compat::io_other(format!(
             "create tempfile for Human68k clone: {e}"
         )))
     })?;

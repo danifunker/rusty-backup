@@ -78,7 +78,7 @@ pub fn run(args: RmArgs) -> Result<()> {
 
     // `--literal` (or a colon-grammar path on HFS / HFS+) forces the exact
     // single-path delete even for names that contain glob metacharacters.
-    let colon = super::ls::colon_mode(&*fs, &args.path);
+    let colon = super::ls::colon_mode(fs.as_filesystem(), &args.path);
     if !args.literal && !colon && (has_glob_chars(&args.path) || !args.exclude.is_empty()) {
         // Glob path — collect everything, sort deepest-first so we delete
         // children before parents, then apply.
@@ -87,7 +87,7 @@ pub fn run(args: RmArgs) -> Result<()> {
         for ex in &args.exclude {
             excludes.extend(compile_patterns(ex, case_insensitive)?);
         }
-        let mut matches = collect_matches(&mut *fs, &includes, &excludes)?;
+        let mut matches = collect_matches(fs.as_filesystem_mut(), &includes, &excludes)?;
         // Deepest-first: more slashes = deeper.
         matches.sort_by_key(|m| std::cmp::Reverse(m.2.matches('/').count()));
         if matches.is_empty() {
@@ -122,7 +122,7 @@ pub fn run(args: RmArgs) -> Result<()> {
 
     // Literal-path single delete. Resolve parent + leaf with the shared escape
     // / colon grammar so a name containing a literal `/` is addressable.
-    let (parent, name) = super::ls::resolve_parent(&mut *fs, &args.path)?;
+    let (parent, name) = super::ls::resolve_parent(fs.as_filesystem_mut(), &args.path)?;
     if name.is_empty() {
         bail!("path has no basename");
     }

@@ -14,16 +14,24 @@
 //! narrative. Files that present as encrypted but don't follow that
 //! framing (or where the password is wrong) surface as an explicit error.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use aes::Aes128;
 use anyhow::{anyhow, bail, Context, Result};
+// The WinImage AES-CBC path needs the block ciphers, behind the `crypto` feature
+// (the vintage macOS 10.7 build omits it — encrypted IMZ then falls back to
+// zip's own ZipCrypto / WinZip-AES via `by_index_decrypt`).
 // `cipher` crate 0.6 split the old `BlockDecryptMut` trait into
 // `BlockModeDecrypt` (for block-mode types like cbc::Decryptor) and
 // `BlockCipherDecrypt` (for the raw cipher). For CBC we want the former.
+#[cfg(feature = "crypto")]
+use aes::Aes128;
+#[cfg(feature = "crypto")]
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
+#[cfg(any(feature = "crypto", test))]
 use md5::{Digest, Md5};
 
 /// IMZ magic = ZIP local file header signature.
@@ -103,6 +111,7 @@ fn pick_entry_index<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<
 /// AES-128 key derivation per the WinImage IMZ spec:
 /// `K = MD5(password.encode("utf-16-le"))`.
 /// Password bytes are encoded as UTF-16LE *without* a trailing nul.
+#[cfg(any(feature = "crypto", test))]
 fn derive_winimage_key(password: &[u8]) -> [u8; 16] {
     // Treat the input as UTF-8; on decode failure (rare for "password"-style
     // ASCII inputs) fall back to interpreting each byte as a code point so we
@@ -134,6 +143,7 @@ fn derive_winimage_key(password: &[u8]) -> [u8; 16] {
 /// end-4   u32 LE    real un-padded plaintext byte count of the last chunk
 /// ```
 /// Each chunk is AES-128-CBC with IV = 16 zeros (reset per chunk).
+#[cfg(feature = "crypto")]
 fn decrypt_winimage_body(body: &[u8], password: &[u8]) -> Result<Vec<u8>> {
     type Aes128CbcDec = cbc::Decryptor<Aes128>;
     const PREFIX: usize = 8;
@@ -217,21 +227,25 @@ fn open_entry<'a>(
     path: &Path,
 ) -> Result<(Box<dyn Read + 'a>, String, u64)> {
     if let Some(pw) = password {
-        // Capture the entry's raw (still-encrypted) body up front. Almost all
-        // password-protected IMZ files in the wild use WinImage's proprietary
-        // scheme (see docs/imz_encryption.md); the `zip` crate's built-in
-        // ZipCrypto / WinZip-AES paths are kept as a fallback in case
-        // someone ever produces a standards-compliant encrypted IMZ.
-        let (csz, name, size) = {
-            let raw = archive.by_index_raw(idx)?;
-            (raw.compressed_size(), raw.name().to_string(), raw.size())
-        };
-        let mut raw_body = Vec::with_capacity(csz as usize);
-        archive.by_index_raw(idx)?.read_to_end(&mut raw_body)?;
+        // WinImage's proprietary AES-CBC scheme (see docs/imz_encryption.md) is
+        // the common case, but it needs the block ciphers behind the `crypto`
+        // feature. When that's compiled out (vintage macOS 10.7 build), skip
+        // straight to the fallback below, which uses zip's OWN ZipCrypto /
+        // WinZip-AES and so still decrypts standards-compliant encrypted IMZ.
+        #[cfg(feature = "crypto")]
+        {
+            // Capture the entry's raw (still-encrypted) body up front.
+            let (csz, name, size) = {
+                let raw = archive.by_index_raw(idx)?;
+                (raw.compressed_size(), raw.name().to_string(), raw.size())
+            };
+            let mut raw_body = Vec::with_capacity(csz as usize);
+            archive.by_index_raw(idx)?.read_to_end(&mut raw_body)?;
 
-        if let Ok(deflate_bytes) = decrypt_winimage_body(&raw_body, pw) {
-            let dec = flate2::read::DeflateDecoder::new(Cursor::new(deflate_bytes));
-            return Ok((Box::new(dec) as Box<dyn Read + 'a>, name, size));
+            if let Ok(deflate_bytes) = decrypt_winimage_body(&raw_body, pw) {
+                let dec = flate2::read::DeflateDecoder::new(Cursor::new(deflate_bytes));
+                return Ok((Box::new(dec) as Box<dyn Read + 'a>, name, size));
+            }
         }
         // Fall back to standards-compliant ZipCrypto / WinZip-AES.
         let entry = archive.by_index_decrypt(idx, pw).map_err(|e| {
@@ -505,6 +519,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "crypto")]
     fn winimage_decrypt_roundtrips_a_synthetic_body() {
         // Build a small WinImage-format body around a known plaintext, then
         // feed it through decrypt_winimage_body and confirm we get the

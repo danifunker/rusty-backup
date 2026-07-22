@@ -14,6 +14,8 @@
 //! blob layout) were confirmed against a real macOS-encrypted fixture — see
 //! `tests/fixtures/apfs/ENCRYPTED_FIXTURE.md`.
 
+#[cfg(feature = "rust173-polyfill")]
+use crate::rust173_compat::IntIsMultipleOf as _;
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
 use sha2::{Digest, Sha256};

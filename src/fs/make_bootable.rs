@@ -332,7 +332,7 @@ fn bless_folder_at(
     let (type_byte, type_string) = kind.fs_dispatch();
     let f = open_rw(path)?;
     let mut fs = crate::fs::open_editable_filesystem(f, offset, type_byte, type_string)?;
-    let entry = resolve_dir(&mut *fs, mac_path)?;
+    let entry = resolve_dir(fs.as_filesystem_mut(), mac_path)?;
     if !entry.is_directory() {
         return Err(FilesystemError::InvalidData(format!(
             "{mac_path} is not a directory"
