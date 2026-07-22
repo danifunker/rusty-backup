@@ -7,7 +7,8 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
 
 ## What Rusty Backup supports today
 
-- **Filesystems:** FAT12/16/32, exFAT, NTFS, HFS, HFS+/HFSX,
+- **Filesystems:** FAT12/16/32, exFAT, NTFS, HPFS (OS/2; read + edit + create +
+  fsck), HFS, HFS+/HFSX,
   APFS (read-only browse + extract, incl. FileVault via password / recovery
   key; no snapshots),
   ext2/3/4, XFS,
@@ -100,7 +101,7 @@ Legend for the **Support** column:
 
 | Core | System | Media | Filesystem(s) | Rusty Backup support |
 |---|---|---|---|---|
-| ao486 | 486DX33 PC | Floppy, HDD, CD | FAT12 / FAT16/32 (MBR) / ISO9660 | **Yes** |
+| ao486 | 486DX33 PC | Floppy, HDD, CD | FAT12 / FAT16/32 (MBR) / HPFS (OS/2) / ISO9660 | **Yes** |
 | PCXT | IBM PC/XT | Floppy, HDD | FAT12 / FAT12-16 (MBR) | **Yes** |
 | MSX | MSX/MSX2/TurboR | Floppy, HDD | FAT12 / FAT16 (Nextor VHD) | **Yes** |
 | MSX1 | Microsoft MSX1 | Floppy, HDD | FAT12 / FAT12-16 | **Yes** |

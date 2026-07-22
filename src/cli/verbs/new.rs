@@ -46,6 +46,10 @@ pub enum FsKind {
     /// NTFS (Windows NT / 2000 / XP). Cluster and sector size via
     /// --cluster-size / --sector-size; both auto-selected when unset.
     Ntfs,
+    /// HPFS (OS/2 High Performance File System). A bare single volume with
+    /// boot/super/spare blocks, free-space bitmaps, a directory band, and an
+    /// empty root directory. `--name` sets the volume label.
+    Hpfs,
     /// ext2 (Linux). A plain rev-1 ext2 volume (128-byte inodes, no journal or
     /// checksums); block size auto-selected (1 KiB below 8 MiB, else 4 KiB).
     #[value(alias = "ext2")]
@@ -228,6 +232,8 @@ pub enum VolumeFs {
     Fat,
     /// NTFS (Windows NT / 2000 / XP). Tune with --cluster-size / --sector-size.
     Ntfs,
+    /// HPFS (OS/2). A bare volume with an empty root directory.
+    Hpfs,
     /// ext2 (Linux) — plain rev-1, no journal or checksums.
     #[value(alias = "ext2")]
     Ext,
@@ -255,6 +261,7 @@ impl VolumeFs {
             VolumeFs::Hfv => FsKind::Hfv,
             VolumeFs::Fat => FsKind::Fat,
             VolumeFs::Ntfs => FsKind::Ntfs,
+            VolumeFs::Hpfs => FsKind::Hpfs,
             VolumeFs::Ext => FsKind::Ext,
             VolumeFs::Ext3 => FsKind::Ext3,
             VolumeFs::Ext4 => FsKind::Ext4,
@@ -639,6 +646,9 @@ fn format_image(args: NewArgs) -> Result<()> {
                 &args.name,
             )
         }
+        FsKind::Hpfs => format_and_write(&args.image, &args.size, &args.name, |size, name| {
+            Ok(crate::fs::hpfs::create_blank_hpfs(size, name)?)
+        }),
         FsKind::Ext => write_blank_ext_image(&args.image, &args.size, &args.name, "ext2"),
         FsKind::Ext3 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext3"),
         FsKind::Ext4 => write_blank_ext_image(&args.image, &args.size, &args.name, "ext4"),

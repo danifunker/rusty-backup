@@ -125,8 +125,16 @@ pub struct HpfsFilesystem<R> {
     /// Per-band free-space bitmap sector numbers (from the bitmap directory).
     pub(crate) band_bmp: Vec<u32>,
     volume_label: String,
-    /// Free-sector count cached at open (refreshed by `free_space`).
+    /// Free-sector count (kept in sync with `bands`).
     free_sectors: u64,
+    /// Per-band free-space bitmaps (2048 bytes each), cached for fast
+    /// free-counting and in-place editing. Bit set = free.
+    bands: Vec<Vec<u8>>,
+    /// Directory-band dnode bitmap (2048 bytes; bit set = free).
+    dmap_data: Vec<u8>,
+    /// Band indices whose cached bitmap changed since the last flush.
+    dirty_bands: HashSet<usize>,
+    dmap_dirty: bool,
 }
 
 impl<R: Read + Seek> HpfsFilesystem<R> {
@@ -172,7 +180,28 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
             }
         }
 
-        let mut fs = HpfsFilesystem {
+        // Cache the free-space bitmaps + the dnode bitmap for fast
+        // free-counting and in-place editing.
+        let mut bands = Vec::with_capacity(n_bands);
+        for &base in &band_bmp {
+            if base >= 0x12 && base as u64 + 4 <= total_sectors as u64 {
+                bands.push(read_run(&mut reader, partition_offset, base, 4)?);
+            } else {
+                bands.push(vec![0u8; 4 * SECTOR as usize]); // treat as all-used
+            }
+        }
+        let dmap_data = if dmap >= 0x12 && dmap as u64 + 4 <= total_sectors as u64 {
+            read_run(&mut reader, partition_offset, dmap, 4)?
+        } else {
+            vec![0u8; 4 * SECTOR as usize]
+        };
+        let free_sectors = bands
+            .iter()
+            .flat_map(|b| b.chunks_exact(4))
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).count_ones() as u64)
+            .sum();
+
+        Ok(HpfsFilesystem {
             reader,
             partition_offset,
             total_sectors,
@@ -182,10 +211,12 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
             dmap,
             band_bmp,
             volume_label,
-            free_sectors: 0,
-        };
-        fs.free_sectors = fs.count_free_sectors().unwrap_or(0);
-        Ok(fs)
+            free_sectors,
+            bands,
+            dmap_data,
+            dirty_bands: HashSet::new(),
+            dmap_dirty: false,
+        })
     }
 
     fn read_sectors(&mut self, sector: u32, count: u32) -> Result<Vec<u8>, FilesystemError> {
@@ -406,20 +437,9 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
     }
 
     /// Count free sectors = set bits across all band bitmaps.
-    pub(crate) fn count_free_sectors(&mut self) -> Result<u64, FilesystemError> {
-        let mut free = 0u64;
-        let bands = self.band_bmp.clone();
-        for base in bands {
-            if base < 0x12 || base as u64 + 4 > self.total_sectors as u64 {
-                continue;
-            }
-            let buf = self.read_sectors(base, 4)?;
-            for chunk in buf.chunks_exact(4) {
-                free += u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).count_ones()
-                    as u64;
-            }
-        }
-        Ok(free)
+    /// Free-sector count, maintained in sync with the cached `bands` bitmaps.
+    pub(crate) fn count_free_sectors(&self) -> u64 {
+        self.free_sectors
     }
 
     fn dirent_to_entry(&self, de: &Dirent, parent_path: &str) -> FileEntry {
@@ -498,6 +518,18 @@ fn read_sector_at<R: Read + Seek>(
     sector: u32,
 ) -> Result<[u8; SECTOR as usize], FilesystemError> {
     let mut buf = [0u8; SECTOR as usize];
+    reader.seek(SeekFrom::Start(partition_offset + sector as u64 * SECTOR))?;
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn read_run<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    sector: u32,
+    count: u32,
+) -> Result<Vec<u8>, FilesystemError> {
+    let mut buf = vec![0u8; count as usize * SECTOR as usize];
     reader.seek(SeekFrom::Start(partition_offset + sector as u64 * SECTOR))?;
     reader.read_exact(&mut buf)?;
     Ok(buf)
@@ -1009,7 +1041,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         // in the free-space bitmap.
         let mut allocated_but_free = 0u32;
         for &s in &owned {
-            if self.bitmap_is_free(s)? {
+            if self.bitmap_is_free(s) {
                 allocated_but_free += 1;
             }
         }
@@ -1026,7 +1058,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         let band_hi = self.dirband_start + self.dirband_size;
         let mut dnode_free_mismatch = 0u32;
         for &dno in &dnode_starts {
-            if dno >= band_lo && dno < band_hi && self.dnode_bitmap_is_free(dno)? {
+            if dno >= band_lo && dno < band_hi && self.dnode_bitmap_is_free(dno) {
                 dnode_free_mismatch += 1;
             }
         }
@@ -1037,7 +1069,7 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
             ));
         }
 
-        let free = self.count_free_sectors()?;
+        let free = self.count_free_sectors();
         let stats = FsckStats {
             files_checked,
             directories_checked: dirs_checked,
@@ -1119,26 +1151,1097 @@ impl<R: Read + Seek> HpfsFilesystem<R> {
         Ok(children)
     }
 
-    fn bitmap_is_free(&mut self, s: u32) -> Result<bool, FilesystemError> {
+    fn bitmap_is_free(&self, s: u32) -> bool {
         let band = (s >> 14) as usize;
-        if band >= self.band_bmp.len() {
-            return Ok(false);
+        if band >= self.bands.len() {
+            return false;
         }
-        let base = self.band_bmp[band];
         let word_idx = ((s & 0x3fff) >> 5) as usize;
-        let buf = self.read_sectors(base, 4)?;
-        let w = u32le(&buf, word_idx * 4);
-        Ok((w >> (s & 0x1f)) & 1 == 1)
+        let w = u32le(&self.bands[band], word_idx * 4);
+        (w >> (s & 0x1f)) & 1 == 1
     }
 
     /// True when the dnode at sector `dno` (dir-band relative) has its bit set
     /// (free) in the dnode bitmap. `dno` must be within the directory band.
-    fn dnode_bitmap_is_free(&mut self, dno: u32) -> Result<bool, FilesystemError> {
+    fn dnode_bitmap_is_free(&self, dno: u32) -> bool {
         let d = (dno - self.dirband_start) / 4;
-        let buf = self.read_sectors(self.dmap, 4)?;
-        let w = u32le(&buf, (d as usize >> 5) * 4);
-        Ok((w >> (d & 0x1f)) & 1 == 1)
+        let w = u32le(&self.dmap_data, (d as usize >> 5) * 4);
+        (w >> (d & 0x1f)) & 1 == 1
     }
+}
+
+// ============================= editing =============================
+
+impl<R: Read + Write + Seek> HpfsFilesystem<R> {
+    fn write_sectors(&mut self, sector: u32, data: &[u8]) -> Result<(), FilesystemError> {
+        self.reader.seek(SeekFrom::Start(
+            self.partition_offset + sector as u64 * SECTOR,
+        ))?;
+        self.reader.write_all(data)?;
+        Ok(())
+    }
+
+    // ---- free-space + dnode bitmap mutation (cached; flushed on sync) ----
+    fn mark_used(&mut self, s: u32) {
+        let band = (s >> 14) as usize;
+        if band >= self.bands.len() {
+            return;
+        }
+        let widx = ((s & 0x3fff) >> 5) as usize * 4;
+        let mut w = u32le(&self.bands[band], widx);
+        if (w >> (s & 0x1f)) & 1 == 1 {
+            w &= !(1u32 << (s & 0x1f));
+            put_u32(&mut self.bands[band], widx, w);
+            self.dirty_bands.insert(band);
+            self.free_sectors = self.free_sectors.saturating_sub(1);
+        }
+    }
+
+    fn mark_free(&mut self, s: u32) {
+        let band = (s >> 14) as usize;
+        if band >= self.bands.len() {
+            return;
+        }
+        let widx = ((s & 0x3fff) >> 5) as usize * 4;
+        let mut w = u32le(&self.bands[band], widx);
+        if (w >> (s & 0x1f)) & 1 == 0 {
+            w |= 1u32 << (s & 0x1f);
+            put_u32(&mut self.bands[band], widx, w);
+            self.dirty_bands.insert(band);
+            self.free_sectors += 1;
+        }
+    }
+
+    fn dmap_set_used(&mut self, dno: u32) {
+        let d = (dno - self.dirband_start) / 4;
+        let widx = (d as usize >> 5) * 4;
+        let mut w = u32le(&self.dmap_data, widx);
+        w &= !(1u32 << (d & 0x1f));
+        put_u32(&mut self.dmap_data, widx, w);
+        self.dmap_dirty = true;
+    }
+
+    fn dmap_set_free(&mut self, dno: u32) {
+        let d = (dno - self.dirband_start) / 4;
+        let widx = (d as usize >> 5) * 4;
+        let mut w = u32le(&self.dmap_data, widx);
+        w |= 1u32 << (d & 0x1f);
+        put_u32(&mut self.dmap_data, widx, w);
+        self.dmap_dirty = true;
+    }
+
+    /// Allocate `n` contiguous free sectors near `near` (align 1). First-fit
+    /// from `near` forward, then wrapping to the start of the data area.
+    fn alloc_run(&mut self, near: u32, n: u32) -> Option<u32> {
+        let start = near.max(0x14).min(self.total_sectors);
+        for (lo, hi) in [(start, self.total_sectors), (0x14, start)] {
+            let mut run_start = 0u32;
+            let mut run_len = 0u32;
+            for s in lo..hi {
+                if self.bitmap_is_free(s) {
+                    if run_len == 0 {
+                        run_start = s;
+                    }
+                    run_len += 1;
+                    if run_len == n {
+                        for x in run_start..run_start + n {
+                            self.mark_used(x);
+                        }
+                        return Some(run_start);
+                    }
+                } else {
+                    run_len = 0;
+                }
+            }
+        }
+        None
+    }
+
+    /// Allocate a 4-sector dnode: prefer a free slot in the directory band
+    /// (tracked by the dnode bitmap), else a 4-aligned run elsewhere.
+    fn alloc_dnode(&mut self, near: u32) -> Option<u32> {
+        let n_dnodes = self.dirband_size / 4;
+        for d in 0..n_dnodes {
+            let dno = self.dirband_start + d * 4;
+            if self.dnode_bitmap_is_free(dno) && self.bitmap_is_free(dno) {
+                // (dir-band sectors are marked used in the main bitmap already,
+                //  but guard anyway) mark used in the dnode bitmap.
+                self.dmap_set_used(dno);
+                return Some(dno);
+            }
+            // Dir-band sector is normally allocated in the main bitmap; the
+            // dnode bitmap is the real free indicator there.
+            if self.dnode_bitmap_is_free(dno) {
+                self.dmap_set_used(dno);
+                return Some(dno);
+            }
+        }
+        // Band full: allocate 4 contiguous, 4-aligned sectors elsewhere.
+        let start = near.max(0x14);
+        for (lo, hi) in [(start, self.total_sectors), (0x14, start)] {
+            let mut s = lo.div_ceil(4) * 4;
+            while s + 4 <= hi {
+                if (s..s + 4).all(|x| self.bitmap_is_free(x)) {
+                    for x in s..s + 4 {
+                        self.mark_used(x);
+                    }
+                    return Some(s);
+                }
+                s += 4;
+            }
+        }
+        None
+    }
+
+    fn free_run(&mut self, start: u32, n: u32) {
+        for s in start..start + n {
+            self.mark_free(s);
+        }
+    }
+
+    fn free_dnode(&mut self, dno: u32) {
+        if dno >= self.dirband_start && dno < self.dirband_start + self.dirband_size {
+            self.dmap_set_free(dno);
+        } else {
+            self.free_run(dno, 4);
+        }
+    }
+
+    fn read_dnode(&mut self, dno: u32) -> Result<Vec<u8>, FilesystemError> {
+        self.read_sectors(dno, 4)
+    }
+
+    fn dnode_up(d: &[u8]) -> u32 {
+        u32le(d, 12)
+    }
+
+    // ---- fnode writers ----
+    fn write_file_fnode(
+        &mut self,
+        fno: u32,
+        up: u32,
+        name: &[u8],
+        size: u32,
+        extents: &[(u32, u32, u32)],
+    ) -> Result<(), FilesystemError> {
+        let mut f = vec![0u8; SECTOR as usize];
+        put_u32(&mut f, 0, FNODE_MAGIC);
+        let nm = &name[..name.len().min(15)];
+        f[12] = nm.len() as u8;
+        f[13..13 + nm.len()].copy_from_slice(nm);
+        put_u32(&mut f, 28, up);
+        put_u16(&mut f, 184, 0xC4);
+        let n_used = extents.len();
+        f[60] = (8 - n_used) as u8;
+        f[61] = n_used as u8;
+        put_u16(&mut f, 62, (8 + n_used * 12) as u16);
+        for (i, &(fs, ln, ds)) in extents.iter().enumerate() {
+            let b = 64 + i * 12;
+            put_u32(&mut f, b, fs);
+            put_u32(&mut f, b + 4, ln);
+            put_u32(&mut f, b + 8, ds);
+        }
+        put_u32(&mut f, 160, size);
+        self.write_sectors(fno, &f)
+    }
+
+    fn write_dir_fnode(
+        &mut self,
+        fno: u32,
+        up: u32,
+        name: &[u8],
+        root_dno: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut f = vec![0u8; SECTOR as usize];
+        put_u32(&mut f, 0, FNODE_MAGIC);
+        let nm = &name[..name.len().min(15)];
+        f[12] = nm.len() as u8;
+        f[13..13 + nm.len()].copy_from_slice(nm);
+        put_u32(&mut f, 28, up);
+        put_u16(&mut f, 54, FNODE_FLAG_DIR);
+        f[60] = 7;
+        f[61] = 1;
+        put_u16(&mut f, 62, 0x14);
+        put_u32(&mut f, 64, 0xFFFF_FFFF);
+        put_u32(&mut f, 72, root_dno);
+        put_u16(&mut f, 184, 0xC4);
+        self.write_sectors(fno, &f)
+    }
+
+    fn set_dir_root_dnode(&mut self, dir_fnode: u32, new_dno: u32) -> Result<(), FilesystemError> {
+        let mut f = self.read_sectors(dir_fnode, 1)?;
+        put_u32(&mut f, 72, new_dno);
+        self.write_sectors(dir_fnode, &f)
+    }
+
+    /// Set children's `up` pointers to `dno` after they were moved under it.
+    fn fix_up_ptrs(&mut self, dno: u32) -> Result<(), FilesystemError> {
+        let d = self.read_dnode(dno)?;
+        let ff = u32le(&d, 4) as usize;
+        let mut off = 20;
+        let mut kids = Vec::new();
+        while off < ff {
+            let len = u16le(&d, off) as usize;
+            if d[off + 2] & DE_DOWN != 0 {
+                kids.push(u32le(&d, off + len - 4));
+            }
+            off += len;
+        }
+        for child in kids {
+            let mut c = self.read_dnode(child)?;
+            if u32le(&c, 12) != dno || c[8] & 1 != 0 {
+                put_u32(&mut c, 12, dno);
+                c[8] &= !1;
+                self.write_sectors(child, &c[..DNODE_BYTES])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert a dirent (name + metadata template) into a directory's dnode
+    /// tree, descending to the correct leaf then splitting upward as needed.
+    fn add_dirent(
+        &mut self,
+        dir_fnode: u32,
+        name: &[u8],
+        meta: &[u8],
+    ) -> Result<(), FilesystemError> {
+        use std::cmp::Ordering;
+        let root_dno = self.dir_root_dnode(dir_fnode)?;
+        // Descend to the leaf dnode where `name` belongs.
+        let mut dno = root_dno;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                return Err(FilesystemError::Parse("HPFS: dnode descent cycle".into()));
+            }
+            let d = self.read_dnode(dno)?;
+            let ff = u32le(&d, 4) as usize;
+            let mut off = 20;
+            let mut descend = None;
+            let mut found_dup = false;
+            while off < ff {
+                let len = u16le(&d, off) as usize;
+                let last = d[off + 2] & DE_LAST != 0;
+                match compare_names(name, de_name_at(&d, off), last) {
+                    Ordering::Equal => {
+                        found_dup = true;
+                        break;
+                    }
+                    Ordering::Less => {
+                        if d[off + 2] & DE_DOWN != 0 {
+                            descend = Some(u32le(&d, off + len - 4));
+                        }
+                        break;
+                    }
+                    Ordering::Greater => {}
+                }
+                off += len;
+            }
+            if found_dup {
+                return Err(FilesystemError::AlreadyExists(
+                    String::from_utf8_lossy(name).into_owned(),
+                ));
+            }
+            match descend {
+                Some(child) => dno = child,
+                None => break,
+            }
+        }
+        self.add_to_dnode(dir_fnode, dno, name.to_vec(), meta.to_vec(), 0)
+    }
+
+    /// Add a dirent to `dno`, splitting the dnode tree upward when full.
+    /// Mirrors kernel `hpfs_add_to_dnode`.
+    fn add_to_dnode(
+        &mut self,
+        dir_fnode: u32,
+        mut dno: u32,
+        mut name: Vec<u8>,
+        mut meta: Vec<u8>,
+        mut down_ptr: u32,
+    ) -> Result<(), FilesystemError> {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                return Err(FilesystemError::Parse("HPFS: dnode split cycle".into()));
+            }
+            let mut d = self.read_dnode(dno)?;
+            let ff = u32le(&d, 4) as usize;
+            if ff + de_size(name.len(), down_ptr != 0) <= DNODE_BYTES {
+                let off = dn_add_de(&mut d, &name, down_ptr);
+                dn_copy_meta(&mut d, off, &meta);
+                d.truncate(DNODE_BYTES);
+                self.write_sectors(dno, &d)?;
+                return Ok(());
+            }
+
+            // ---- split ----
+            let d_up = Self::dnode_up(&d);
+            let root_dnode = d[8] & 1 != 0;
+            let mut nd = d.clone();
+            let off = dn_add_de(&mut nd, &name, down_ptr);
+            dn_copy_meta(&mut nd, off, &meta);
+            let nd_ff = u32le(&nd, 4) as usize;
+            let last_off = dn_last_off(&nd);
+            let h = last_off / 2 + 10;
+
+            let adno = self
+                .alloc_dnode(d_up)
+                .ok_or_else(|| FilesystemError::DiskFull("HPFS: no free dnode".into()))?;
+            let mut ad = blank_dnode(adno, d_up);
+
+            // Move dirents [20, median) into `ad`.
+            let mut cur = 20;
+            loop {
+                let len = u16le(&nd, cur) as usize;
+                if cur + len >= h {
+                    break;
+                }
+                let child = if nd[cur + 2] & DE_DOWN != 0 {
+                    u32le(&nd, cur + len - 4)
+                } else {
+                    0
+                };
+                let nm = de_name_at(&nd, cur).to_vec();
+                let ao = dn_add_de(&mut ad, &nm, child);
+                dn_copy_meta(&mut ad, ao, &nd[cur..]);
+                cur += len;
+            }
+            // `cur` = median dirent (goes up to the parent).
+            let med_len = u16le(&nd, cur) as usize;
+            let med_name = de_name_at(&nd, cur).to_vec();
+            let med_meta = nd[cur..cur + 30].to_vec();
+            let med_down = if nd[cur + 2] & DE_DOWN != 0 {
+                u32le(&nd, cur + med_len - 4)
+            } else {
+                0
+            };
+            dn_set_last_pointer(&mut ad, med_down);
+
+            // Remaining dirents (after the median) become the right half `d`.
+            let after = cur + med_len;
+            let tail_len = nd_ff - after;
+            let mut newd = vec![0u8; DNODE_BYTES];
+            newd[..20].copy_from_slice(&nd[..20]);
+            newd[20..20 + tail_len].copy_from_slice(&nd[after..nd_ff]);
+            put_u32(&mut newd, 4, (20 + tail_len) as u32);
+            d = newd;
+
+            ad.truncate(DNODE_BYTES);
+            self.write_sectors(adno, &ad)?;
+            self.fix_up_ptrs(adno)?;
+
+            if !root_dnode {
+                self.write_sectors(dno, &d)?;
+                name = med_name;
+                meta = med_meta;
+                down_ptr = adno;
+                dno = d_up;
+                continue;
+            }
+
+            // Root split: create a new root dnode `rd`.
+            let rdno = self
+                .alloc_dnode(d_up)
+                .ok_or_else(|| FilesystemError::DiskFull("HPFS: no free dnode".into()))?;
+            let mut rd = blank_dnode(rdno, d_up);
+            rd[8] |= 1; // root_dnode
+            self.set_dir_root_dnode(dir_fnode, rdno)?;
+            put_u32(&mut d, 12, rdno);
+            d[8] &= !1;
+            put_u32(&mut ad, 12, rdno);
+            ad[8] &= !1;
+            self.write_sectors(adno, &ad[..DNODE_BYTES])?;
+            self.write_sectors(dno, &d)?;
+            dn_set_last_pointer(&mut rd, dno); // rd's rightmost child = right half
+            rd.truncate(DNODE_BYTES);
+            self.write_sectors(rdno, &rd)?;
+            name = med_name;
+            meta = med_meta;
+            down_ptr = adno;
+            dno = rdno;
+        }
+    }
+
+    // ---- file/dir creation ----
+    fn alloc_file_data(
+        &mut self,
+        near: u32,
+        data: &mut dyn Read,
+        size: u64,
+    ) -> Result<Vec<(u32, u32, u32)>, FilesystemError> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let n_sec = size.div_ceil(SECTOR) as u32;
+        let mut extents = Vec::new();
+        // Prefer a single contiguous run.
+        let starts = if let Some(start) = self.alloc_run(near, n_sec) {
+            vec![(start, n_sec)]
+        } else {
+            // Fragmented fallback: up to 8 runs (fnode leaf capacity).
+            let mut runs = Vec::new();
+            let mut remaining = n_sec;
+            while remaining > 0 {
+                let mut got = None;
+                let mut take = remaining;
+                while take > 0 {
+                    if let Some(s) = self.alloc_run(near, take) {
+                        got = Some((s, take));
+                        break;
+                    }
+                    take -= 1;
+                }
+                let (s, t) = got.ok_or_else(|| {
+                    FilesystemError::DiskFull("HPFS: not enough free space".into())
+                })?;
+                runs.push((s, t));
+                remaining -= t;
+                if runs.len() > 8 {
+                    for (s, t) in &runs {
+                        self.free_run(*s, *t);
+                    }
+                    return Err(FilesystemError::DiskFull(
+                        "HPFS: file too fragmented (writer emits <=8 extents)".into(),
+                    ));
+                }
+            }
+            runs
+        };
+        // Write data into the runs.
+        let mut file_sec = 0u32;
+        let mut buf = vec![0u8; SECTOR as usize];
+        for (start, len) in starts {
+            for i in 0..len {
+                buf.iter_mut().for_each(|b| *b = 0);
+                let mut filled = 0;
+                while filled < SECTOR as usize {
+                    let r = data.read(&mut buf[filled..])?;
+                    if r == 0 {
+                        break;
+                    }
+                    filled += r;
+                }
+                self.write_sectors(start + i, &buf)?;
+            }
+            extents.push((file_sec, len, start));
+            file_sec += len;
+        }
+        Ok(extents)
+    }
+
+    fn create_entry(
+        &mut self,
+        parent_fnode: u32,
+        name: &str,
+        is_dir: bool,
+        data: &mut dyn Read,
+        size: u64,
+    ) -> Result<u32, FilesystemError> {
+        validate_hpfs_name(name)?;
+        let nb = name.as_bytes().to_vec();
+        // Duplicate check up front (avoids leaking allocations on conflict).
+        let root_dno = self.dir_root_dnode(parent_fnode)?;
+        if self
+            .walk_dir(root_dno)?
+            .iter()
+            .any(|de| compare_names(&nb, de.name.as_bytes(), false) == std::cmp::Ordering::Equal)
+        {
+            return Err(FilesystemError::AlreadyExists(name.to_string()));
+        }
+
+        let mut attrib = if is_dir { AT_DIRECTORY } else { AT_ARCHIVE };
+        if name.starts_with('.') {
+            attrib |= AT_HIDDEN;
+        }
+
+        if is_dir {
+            let fno = self
+                .alloc_run(parent_fnode, 1)
+                .ok_or_else(|| FilesystemError::DiskFull("HPFS: no free sector".into()))?;
+            let dno = self
+                .alloc_dnode(parent_fnode)
+                .ok_or_else(|| FilesystemError::DiskFull("HPFS: no free dnode".into()))?;
+            self.write_dir_fnode(fno, parent_fnode, &nb, dno)?;
+            // Empty dir dnode: \001\001 (first) + \377.
+            let mut d = blank_dnode(dno, fno);
+            d[8] |= 1; // root_dnode
+            let off = dn_add_de(&mut d, b"\x01\x01", 0);
+            let mut m = de_meta_template(fno, 0, AT_DIRECTORY);
+            m[2] = DE_FIRST;
+            dn_copy_meta(&mut d, off, &m);
+            d.truncate(DNODE_BYTES);
+            self.write_sectors(dno, &d)?;
+            let meta = de_meta_template(fno, 0, attrib);
+            self.add_dirent(parent_fnode, &nb, &meta)?;
+            Ok(fno)
+        } else {
+            let extents = self.alloc_file_data(parent_fnode, data, size)?;
+            let fno = match self.alloc_run(parent_fnode, 1) {
+                Some(f) => f,
+                None => {
+                    for (_, ln, ds) in &extents {
+                        self.free_run(*ds, *ln);
+                    }
+                    return Err(FilesystemError::DiskFull("HPFS: no free sector".into()));
+                }
+            };
+            self.write_file_fnode(fno, parent_fnode, &nb, size as u32, &extents)?;
+            let meta = de_meta_template(fno, size as u32, attrib);
+            self.add_dirent(parent_fnode, &nb, &meta)?;
+            Ok(fno)
+        }
+    }
+
+    // ---- deletion ----
+    /// Free a file's data extents (and any anode tree) plus its fnode.
+    fn free_file_fnode(&mut self, fno: u32) -> Result<(), FilesystemError> {
+        let (_, extents) = self.fnode_extents(fno)?;
+        for e in extents {
+            self.free_run(e.disk_secno, e.length);
+        }
+        // Free any anode sectors referenced by an internal fnode btree.
+        let f = self.read_sectors(fno, 1)?;
+        if f[56] & 0x80 != 0 {
+            let n_used = f[61] as usize;
+            for i in 0..n_used {
+                let down = u32le(&f, 64 + i * 8 + 4);
+                self.free_anode_tree(down)?;
+            }
+        }
+        self.free_run(fno, 1);
+        Ok(())
+    }
+
+    fn free_anode_tree(&mut self, ano: u32) -> Result<(), FilesystemError> {
+        if ano < 0x12 || ano as u64 >= self.total_sectors as u64 {
+            return Ok(());
+        }
+        let a = self.read_sectors(ano, 1)?;
+        if u32le(&a, 0) != ANODE_MAGIC {
+            return Ok(());
+        }
+        if a[12] & 0x80 != 0 {
+            let n_used = a[13] as usize;
+            for i in 0..n_used {
+                let down = u32le(&a, 20 + i * 8 + 4);
+                self.free_anode_tree(down)?;
+            }
+        }
+        self.free_run(ano, 1);
+        Ok(())
+    }
+
+    /// Free all dnodes of an (already-empty) directory tree.
+    /// Mirrors kernel `hpfs_remove_dtree` for the common shapes.
+    fn free_dtree(&mut self, root_dno: u32) -> Result<(), FilesystemError> {
+        let mut stack = vec![root_dno];
+        let mut seen = HashSet::new();
+        while let Some(dno) = stack.pop() {
+            if !seen.insert(dno) {
+                continue;
+            }
+            let d = self.read_dnode(dno)?;
+            let ff = u32le(&d, 4) as usize;
+            let mut off = 20;
+            while off < ff {
+                let len = u16le(&d, off) as usize;
+                if d[off + 2] & DE_DOWN != 0 {
+                    stack.push(u32le(&d, off + len - 4));
+                }
+                off += len;
+            }
+            self.free_dnode(dno);
+        }
+        Ok(())
+    }
+
+    /// Locate the (dnode, offset) of `name` in a directory tree, or None.
+    fn find_dirent_loc(
+        &mut self,
+        dir_fnode: u32,
+        name: &[u8],
+    ) -> Result<Option<(u32, usize)>, FilesystemError> {
+        use std::cmp::Ordering;
+        let mut dno = self.dir_root_dnode(dir_fnode)?;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                return Ok(None);
+            }
+            let d = self.read_dnode(dno)?;
+            let ff = u32le(&d, 4) as usize;
+            let mut off = 20;
+            let mut descend = None;
+            let mut hit = None;
+            while off < ff {
+                let len = u16le(&d, off) as usize;
+                let last = d[off + 2] & DE_LAST != 0;
+                match compare_names(name, de_name_at(&d, off), last) {
+                    Ordering::Equal => {
+                        hit = Some(off);
+                        break;
+                    }
+                    Ordering::Less => {
+                        if d[off + 2] & DE_DOWN != 0 {
+                            descend = Some(u32le(&d, off + len - 4));
+                        }
+                        break;
+                    }
+                    Ordering::Greater => {}
+                }
+                off += len;
+            }
+            if let Some(off) = hit {
+                return Ok(Some((dno, off)));
+            }
+            match descend {
+                Some(child) => dno = child,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Remove a dirent (identified by name) from a directory tree, rebalancing.
+    /// Mirrors kernel `hpfs_remove_dirent` + `move_to_top` + delete-empty.
+    fn remove_dirent(&mut self, dir_fnode: u32, name: &[u8]) -> Result<(), FilesystemError> {
+        let Some((dno, off)) = self.find_dirent_loc(dir_fnode, name)? else {
+            return Err(FilesystemError::NotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        };
+        let mut d = self.read_dnode(dno)?;
+        let len = u16le(&d, off) as usize;
+        let down = if d[off + 2] & DE_DOWN != 0 {
+            u32le(&d, off + len - 4)
+        } else {
+            0
+        };
+        dn_delete_de(&mut d, off);
+        self.write_sectors(dno, &d[..DNODE_BYTES])?;
+        if down != 0 {
+            let a = self.move_to_top(dir_fnode, dno, down)?;
+            if a != 0 {
+                self.delete_empty_dnode(dir_fnode, a)?;
+            }
+        } else {
+            self.delete_empty_dnode(dir_fnode, dno)?;
+        }
+        Ok(())
+    }
+
+    /// Pull the largest dirent out of the `from` subtree up into `to`, filling
+    /// the hole left by a deleted internal dirent. Returns the dnode the entry
+    /// came from (to be checked for emptiness), or 0 on failure.
+    /// Mirrors kernel `move_to_top`.
+    fn move_to_top(&mut self, dir_fnode: u32, to: u32, from: u32) -> Result<u32, FilesystemError> {
+        // Descend to the rightmost leaf of `from`.
+        let mut dno = from;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 10_000 {
+                return Ok(0);
+            }
+            let d = self.read_dnode(dno)?;
+            let last = dn_last_off(&d);
+            if d[last + 2] & DE_DOWN == 0 {
+                break;
+            }
+            dno = u32le(&d, last + u16le(&d, last) as usize - 4);
+        }
+        // Walk up while the current dnode has only the \377 sentinel.
+        let mut d = self.read_dnode(dno)?;
+        loop {
+            let pre_last = dnode_pre_last_off(&d);
+            if pre_last.is_some() {
+                break;
+            }
+            // dnode holds only \377: free it and drop the parent's down-pointer.
+            let up = Self::dnode_up(&d);
+            self.free_dnode(dno);
+            if up == to {
+                return Ok(to);
+            }
+            let mut ud = self.read_dnode(up)?;
+            let last = dn_last_off(&ud);
+            if ud[last + 2] & DE_DOWN == 0 {
+                return Ok(0);
+            }
+            let shrunk = u16le(&ud, last) - 4;
+            put_u16(&mut ud, last, shrunk);
+            ud[last + 2] &= !DE_DOWN;
+            let ff2 = u32le(&ud, 4) - 4;
+            put_u32(&mut ud, 4, ff2);
+            self.write_sectors(up, &ud[..DNODE_BYTES])?;
+            dno = up;
+            d = self.read_dnode(dno)?;
+        }
+        // `d` (dno) has a real pre-last dirent; move it up to `to`.
+        let de_off = dnode_pre_last_off(&d).unwrap();
+        let de_len = u16le(&d, de_off) as usize;
+        let nde = d[de_off..de_off + de_len].to_vec();
+        let ddown = if d[de_off + 2] & DE_DOWN != 0 {
+            u32le(&d, de_off + de_len - 4)
+        } else {
+            0
+        };
+        dn_delete_de(&mut d, de_off);
+        let mut dv = d.clone();
+        dn_set_last_pointer(&mut dv, ddown);
+        dv.truncate(DNODE_BYTES);
+        self.write_sectors(dno, &dv)?;
+        // Re-insert into `to` with down_ptr = `from`.
+        let nl = nde[30] as usize;
+        let nname = nde[31..31 + nl].to_vec();
+        self.add_to_dnode(dir_fnode, to, nname, nde, from)?;
+        Ok(dno)
+    }
+
+    /// Collapse a dnode that has become (near) empty, mirroring the common
+    /// paths of kernel `delete_empty_dnode`.
+    fn delete_empty_dnode(&mut self, dir_fnode: u32, dno: u32) -> Result<(), FilesystemError> {
+        let d = self.read_dnode(dno)?;
+        let ff = u32le(&d, 4) as usize;
+        if ff > 56 {
+            return Ok(());
+        }
+        if ff != 52 && ff != 56 {
+            return Ok(());
+        }
+        let root = d[8] & 1 != 0;
+        let up = Self::dnode_up(&d);
+        // The single remaining dirent is at offset 20 (the \377, possibly with
+        // a down pointer to a lone child subtree).
+        let first_len = u16le(&d, 20) as usize;
+        let down = if d[20 + 2] & DE_DOWN != 0 {
+            u32le(&d, 20 + first_len - 4)
+        } else {
+            0
+        };
+        self.free_dnode(dno);
+        if root {
+            // Root dnode emptied: promote its single child, or reset fnode.
+            if down != 0 {
+                let mut c = self.read_dnode(down)?;
+                put_u32(&mut c, 12, up);
+                c[8] |= 1;
+                self.write_sectors(down, &c[..DNODE_BYTES])?;
+                self.set_dir_root_dnode(dir_fnode, down)?;
+            }
+            return Ok(());
+        }
+        // Non-root: find and drop the parent's pointer to `dno`.
+        let mut ud = self.read_dnode(up)?;
+        let uff = u32le(&ud, 4) as usize;
+        let mut off = 20;
+        let mut found = None;
+        while off < uff {
+            let len = u16le(&ud, off) as usize;
+            if ud[off + 2] & DE_DOWN != 0 && u32le(&ud, off + len - 4) == dno {
+                found = Some(off);
+                break;
+            }
+            off += len;
+        }
+        let Some(off) = found else {
+            return Ok(());
+        };
+        let len = u16le(&ud, off) as usize;
+        if down == 0 {
+            // Drop the down-pointer from the parent's dirent.
+            ud[off + 2] &= !DE_DOWN;
+            put_u16(&mut ud, off, (len - 4) as u16);
+            let new_ff = uff - 4;
+            ud.copy_within(off + len..uff, off + len - 4);
+            for b in &mut ud[new_ff..uff] {
+                *b = 0;
+            }
+            put_u32(&mut ud, 4, new_ff as u32);
+        } else {
+            // Re-point the parent's dirent at the lone child, and fix its up.
+            put_u32(&mut ud, off + len - 4, down);
+            let mut c = self.read_dnode(down)?;
+            put_u32(&mut c, 12, up);
+            self.write_sectors(down, &c[..DNODE_BYTES])?;
+        }
+        self.write_sectors(up, &ud[..DNODE_BYTES])?;
+        Ok(())
+    }
+
+    fn flush_bitmaps(&mut self) -> Result<(), FilesystemError> {
+        let dirty: Vec<usize> = self.dirty_bands.iter().copied().collect();
+        for band in dirty {
+            let base = self.band_bmp[band];
+            let data = self.bands[band].clone();
+            self.write_sectors(base, &data)?;
+        }
+        self.dirty_bands.clear();
+        if self.dmap_dirty {
+            let data = self.dmap_data.clone();
+            self.write_sectors(self.dmap, &data)?;
+            self.dmap_dirty = false;
+        }
+        self.reader.flush().map_err(FilesystemError::Io)?;
+        Ok(())
+    }
+}
+
+/// The offset of the second-to-last dirent, or None if the dnode holds only
+/// the `\377` sentinel. Mirrors kernel `dnode_pre_last_de`.
+fn dnode_pre_last_off(d: &[u8]) -> Option<usize> {
+    let ff = u32le(d, 4) as usize;
+    let mut off = 20;
+    let mut prev = None;
+    let mut cur = None;
+    while off < ff {
+        prev = cur;
+        cur = Some(off);
+        off += u16le(d, off) as usize;
+    }
+    prev
+}
+
+impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for HpfsFilesystem<R> {
+    fn create_file(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        data: &mut dyn Read,
+        data_len: u64,
+        _options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let parent_fnode = if parent.path == "/" {
+            self.root_fnode
+        } else {
+            parent.location as u32
+        };
+        let fno = self.create_entry(parent_fnode, name, false, data, data_len)?;
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        Ok(FileEntry::new_file(
+            name.to_string(),
+            path,
+            data_len,
+            fno as u64,
+        ))
+    }
+
+    fn create_directory(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        _options: &super::filesystem::CreateDirectoryOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        let parent_fnode = if parent.path == "/" {
+            self.root_fnode
+        } else {
+            parent.location as u32
+        };
+        let mut empty = std::io::empty();
+        let fno = self.create_entry(parent_fnode, name, true, &mut empty, 0)?;
+        let path = if parent.path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{}", parent.path, name)
+        };
+        Ok(FileEntry::new_directory(name.to_string(), path, fno as u64))
+    }
+
+    fn delete_entry(
+        &mut self,
+        parent: &FileEntry,
+        entry: &FileEntry,
+    ) -> Result<(), FilesystemError> {
+        let parent_fnode = if parent.path == "/" {
+            self.root_fnode
+        } else {
+            parent.location as u32
+        };
+        let fno = entry.location as u32;
+        if entry.is_directory() {
+            // Must be empty.
+            let root_dno = self.dir_root_dnode(fno)?;
+            if !self.walk_dir(root_dno)?.is_empty() {
+                return Err(FilesystemError::InvalidData(format!(
+                    "directory not empty: {}",
+                    entry.path
+                )));
+            }
+            self.free_dtree(root_dno)?;
+            self.free_run(fno, 1);
+        } else {
+            self.free_file_fnode(fno)?;
+        }
+        self.remove_dirent(parent_fnode, entry.name.as_bytes())?;
+        Ok(())
+    }
+
+    fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
+        self.flush_bitmaps()
+    }
+
+    fn free_space(&mut self) -> Result<u64, FilesystemError> {
+        Ok(self.free_sectors * SECTOR)
+    }
+}
+
+// ============================= edit helpers =============================
+
+#[inline]
+fn upcase(c: u8) -> u8 {
+    if c.is_ascii_lowercase() {
+        c - 0x20
+    } else {
+        c
+    }
+}
+
+/// HPFS case-insensitive name comparison (mirrors kernel `hpfs_compare_names`).
+/// `n2_last` is the `\377` sentinel, which sorts after every real name.
+fn compare_names(n1: &[u8], n2: &[u8], n2_last: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if n2_last {
+        return Ordering::Less;
+    }
+    let l = n1.len().min(n2.len());
+    for i in 0..l {
+        let (c1, c2) = (upcase(n1[i]), upcase(n2[i]));
+        if c1 != c2 {
+            return c1.cmp(&c2);
+        }
+    }
+    n1.len().cmp(&n2.len())
+}
+
+/// dnode dirent name at offset `off`.
+fn de_name_at(d: &[u8], off: usize) -> &[u8] {
+    let nl = d[off + 30] as usize;
+    &d[off + 31..off + 31 + nl]
+}
+
+/// The offset of the last dirent (the `\377` sentinel) in a dnode.
+fn dn_last_off(d: &[u8]) -> usize {
+    let ff = u32le(d, 4) as usize;
+    let mut off = 20;
+    let mut last = 20;
+    while off < ff {
+        last = off;
+        off += u16le(d, off) as usize;
+    }
+    last
+}
+
+/// Insert a dirent (name + optional down pointer) into a dnode buffer in sorted
+/// order, returning the new dirent's offset. Grows `d` if needed (used with an
+/// over-2048 scratch buffer during splits); callers guaranteeing fit pass a
+/// plain 2048-byte dnode. Metadata (fnode/dates/size/attr) is filled by a
+/// subsequent [`dn_copy_meta`]. Mirrors kernel `hpfs_add_de`.
+fn dn_add_de(d: &mut Vec<u8>, name: &[u8], down_ptr: u32) -> usize {
+    use std::cmp::Ordering;
+    let dsize = de_size(name.len(), down_ptr != 0);
+    let ff = u32le(d, 4) as usize;
+    let mut off = 20;
+    while off < ff {
+        let last = d[off + 2] & DE_LAST != 0;
+        if compare_names(name, de_name_at(d, off), last) == Ordering::Less {
+            break;
+        }
+        off += u16le(d, off) as usize;
+    }
+    if d.len() < ff + dsize {
+        d.resize(ff + dsize, 0);
+    }
+    d.copy_within(off..ff, off + dsize);
+    for b in &mut d[off..off + dsize] {
+        *b = 0;
+    }
+    put_u16(d, off, dsize as u16);
+    if down_ptr != 0 {
+        put_u32(d, off + dsize - 4, down_ptr);
+        d[off + 2] |= DE_DOWN;
+    }
+    d[off + 30] = name.len() as u8;
+    d[off + 31..off + 31 + name.len()].copy_from_slice(name);
+    if is_name_long(name) {
+        d[off + 3] |= 0x40; // not_8x3
+    }
+    put_u32(d, 4, (ff + dsize) as u32);
+    off
+}
+
+/// Copy a dirent's 28 metadata bytes (offsets 2..30 — flags/attr/fnode/dates/
+/// size/ea) from `src[0..30]` into the dirent at `dst`, preserving the
+/// destination's own `down` and `not_8x3` bits. Mirrors kernel `copy_de`.
+fn dn_copy_meta(d: &mut [u8], dst: usize, src: &[u8]) {
+    let down = d[dst + 2] & DE_DOWN;
+    let not8 = d[dst + 3] & 0x40;
+    d[dst + 2..dst + 30].copy_from_slice(&src[2..30]);
+    d[dst + 2] = (d[dst + 2] & !DE_DOWN) | down;
+    d[dst + 3] = (d[dst + 3] & !0x40) | not8;
+}
+
+/// Remove the dirent at `off` from a dnode, shifting later dirents down.
+/// Mirrors kernel `hpfs_delete_de`.
+fn dn_delete_de(d: &mut [u8], off: usize) {
+    let len = u16le(d, off) as usize;
+    let ff = u32le(d, 4) as usize;
+    d.copy_within(off + len..ff, off);
+    for b in &mut d[ff - len..ff] {
+        *b = 0;
+    }
+    put_u32(d, 4, (ff - len) as u32);
+}
+
+/// Give the last (`\377`) dirent a down pointer (rightmost subtree child).
+/// Mirrors kernel `set_last_pointer`.
+fn dn_set_last_pointer(d: &mut Vec<u8>, ptr: u32) {
+    if ptr == 0 {
+        return;
+    }
+    let last = dn_last_off(d);
+    let ff = u32le(d, 4) as usize;
+    if d.len() < ff + 4 {
+        d.resize(ff + 4, 0);
+    }
+    put_u16(d, last, 36);
+    d[last + 2] |= DE_DOWN;
+    put_u32(d, last + 32, ptr);
+    put_u32(d, 4, (ff + 4) as u32);
+}
+
+/// Build a fresh (empty) dnode buffer: magic, `\377` sentinel, self, up.
+/// Mirrors kernel `hpfs_alloc_dnode` initialization.
+fn blank_dnode(dno: u32, up: u32) -> Vec<u8> {
+    let mut d = vec![0u8; DNODE_BYTES];
+    put_u32(&mut d, 0, DNODE_MAGIC);
+    put_u32(&mut d, 4, 52);
+    d[20] = 32; // \377 dirent length
+    d[22] = DE_LAST;
+    d[50] = 1; // namelen
+    d[51] = 0xff; // name[0]
+    put_u32(&mut d, 12, up);
+    put_u32(&mut d, 16, dno);
+    d
+}
+
+/// Build a 32-byte dirent metadata template for [`dn_copy_meta`].
+fn de_meta_template(fnode: u32, size: u32, attrib: u8) -> [u8; 32] {
+    let mut m = [0u8; 32];
+    m[3] = attrib;
+    put_u32(&mut m, 4, fnode);
+    put_u32(&mut m, 8, FIXED_TIME);
+    put_u32(&mut m, 12, size);
+    put_u32(&mut m, 16, FIXED_TIME);
+    put_u32(&mut m, 20, FIXED_TIME);
+    m
 }
 
 /// Validate a filename against HPFS rules (mirrors kernel `hpfs_chk_name`).
@@ -1364,5 +2467,250 @@ mod tests {
         assert!(validate_hpfs_name(".").is_err());
         assert!(validate_hpfs_name("bad/slash").is_err());
         assert!(validate_hpfs_name("bad:colon").is_err());
+    }
+
+    // ---- editing ----
+    use super::super::filesystem::{CreateDirectoryOptions, CreateFileOptions, EditableFilesystem};
+
+    fn blank_fs(mb: u64, label: &str) -> HpfsFilesystem<Cursor<Vec<u8>>> {
+        let img = create_blank_hpfs(mb * 1024 * 1024, label).unwrap();
+        HpfsFilesystem::open(Cursor::new(img), 0).unwrap()
+    }
+
+    fn mkfile(
+        fs: &mut HpfsFilesystem<Cursor<Vec<u8>>>,
+        parent: &FileEntry,
+        name: &str,
+        data: &[u8],
+    ) {
+        let mut cur = Cursor::new(data.to_vec());
+        fs.create_file(
+            parent,
+            name,
+            &mut cur,
+            data.len() as u64,
+            &CreateFileOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("create {name}: {e}"));
+    }
+
+    /// Run the clean-room oracle over the current image bytes: fsck must pass,
+    /// and every expected name must appear in the oracle's recursive listing.
+    fn oracle_cross_check(img: &[u8], expected_names: &[&str]) {
+        let Some(script) = oracle() else { return };
+        if !have_python() {
+            return;
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rb_hpfs_edit_{}_{}.img", std::process::id(), uniq));
+        std::fs::write(&path, img).unwrap();
+        let fsck = Command::new("python3")
+            .arg(&script)
+            .args(["fsck", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let ls = Command::new("python3")
+            .arg(&script)
+            .args(["ls", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            fsck.status.success(),
+            "oracle fsck rejected our edited image: {}",
+            String::from_utf8_lossy(&fsck.stdout)
+        );
+        let listing = String::from_utf8_lossy(&ls.stdout);
+        for n in expected_names {
+            assert!(
+                listing.contains(&format!("\"{n}\"")),
+                "oracle listing missing {n}\n{listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_create_read_roundtrip() {
+        let mut fs = blank_fs(4, "EDIT1");
+        let root = fs.root().unwrap();
+        mkfile(&mut fs, &root, "HELLO.TXT", b"hello hpfs\n");
+        mkfile(&mut fs, &root, "BINARY.DAT", &vec![0xABu8; 5000]);
+        let sub = fs
+            .create_directory(&root, "SUBDIR", &CreateDirectoryOptions::default())
+            .unwrap();
+        mkfile(&mut fs, &sub, "NESTED.TXT", b"deep\n");
+        fs.sync_metadata().unwrap();
+
+        // Reopen from the edited bytes.
+        let img = fs.reader.get_ref().clone();
+        let mut fs2 = HpfsFilesystem::open(Cursor::new(img.clone()), 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let mut names: Vec<String> = fs2
+            .list_directory(&root2)
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["BINARY.DAT", "HELLO.TXT", "SUBDIR"]);
+        let hello = fs2
+            .list_directory(&root2)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "HELLO.TXT")
+            .unwrap();
+        assert_eq!(fs2.read_file(&hello, usize::MAX).unwrap(), b"hello hpfs\n");
+        let subdir = fs2
+            .list_directory(&root2)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "SUBDIR")
+            .unwrap();
+        let nested = fs2.list_directory(&subdir).unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].name, "NESTED.TXT");
+
+        assert!(fs2.fsck().unwrap().unwrap().is_clean());
+        oracle_cross_check(&img, &["HELLO.TXT", "BINARY.DAT", "SUBDIR", "NESTED.TXT"]);
+    }
+
+    #[test]
+    fn edit_forces_dnode_split() {
+        // ~46 short-named dirents fill a 2048-byte dnode; 120 forces multiple
+        // splits and a multi-level tree.
+        let mut fs = blank_fs(8, "SPLIT");
+        let root = fs.root().unwrap();
+        for i in 0..120 {
+            mkfile(
+                &mut fs,
+                &root,
+                &format!("FILE{i:04}.TXT"),
+                format!("body {i}\n").as_bytes(),
+            );
+        }
+        fs.sync_metadata().unwrap();
+        let img = fs.reader.get_ref().clone();
+
+        let mut fs2 = HpfsFilesystem::open(Cursor::new(img.clone()), 0).unwrap();
+        let root2 = fs2.root().unwrap();
+        let listing = fs2.list_directory(&root2).unwrap();
+        assert_eq!(listing.len(), 120, "expected 120 files after splits");
+        // Spot-check contents survive the tree reshaping.
+        let f77 = listing.iter().find(|e| e.name == "FILE0077.TXT").unwrap();
+        assert_eq!(fs2.read_file(f77, usize::MAX).unwrap(), b"body 77\n");
+        let result = fs2.fsck().unwrap().unwrap();
+        assert!(result.is_clean(), "fsck after splits: {:?}", result.errors);
+
+        // Oracle must read the split tree too.
+        oracle_cross_check(&img, &["FILE0000.TXT", "FILE0077.TXT", "FILE0119.TXT"]);
+    }
+
+    #[test]
+    fn edit_delete_files() {
+        let mut fs = blank_fs(4, "DELF");
+        let root = fs.root().unwrap();
+        mkfile(&mut fs, &root, "KEEP1.TXT", b"a");
+        mkfile(&mut fs, &root, "GONE.DAT", &vec![0x11u8; 3000]);
+        mkfile(&mut fs, &root, "KEEP2.TXT", b"b");
+        fs.sync_metadata().unwrap();
+        let free_before = fs.free_space().unwrap();
+
+        let root = fs.root().unwrap();
+        let gone = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "GONE.DAT")
+            .unwrap();
+        fs.delete_entry(&root, &gone).unwrap();
+        fs.sync_metadata().unwrap();
+
+        // Freed the 3000-byte file's data + fnode.
+        assert!(fs.free_space().unwrap() > free_before);
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        assert_eq!(names, vec!["KEEP1.TXT", "KEEP2.TXT"]);
+        assert!(fs.fsck().unwrap().unwrap().is_clean());
+        let img = fs.reader.get_ref().clone();
+        oracle_cross_check(&img, &["KEEP1.TXT", "KEEP2.TXT"]);
+    }
+
+    #[test]
+    fn edit_delete_with_rebalance() {
+        // Build a multi-dnode tree, then delete most entries (exercising
+        // move_to_top / delete_empty_dnode), and verify the survivors.
+        let mut fs = blank_fs(8, "REBAL");
+        let root = fs.root().unwrap();
+        for i in 0..90 {
+            mkfile(
+                &mut fs,
+                &root,
+                &format!("R{i:03}.BIN"),
+                format!("{i}").as_bytes(),
+            );
+        }
+        // Delete every entry whose number is not a multiple of 7.
+        let root = fs.root().unwrap();
+        let victims: Vec<FileEntry> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                let n: u32 = e.name[1..4].parse().unwrap();
+                !n.is_multiple_of(7)
+            })
+            .collect();
+        for v in &victims {
+            fs.delete_entry(&root, v).unwrap();
+        }
+        fs.sync_metadata().unwrap();
+
+        let mut survivors: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect();
+        survivors.sort();
+        let expected: Vec<String> = (0u32..90)
+            .filter(|n| n.is_multiple_of(7))
+            .map(|n| format!("R{n:03}.BIN"))
+            .collect();
+        assert_eq!(survivors, expected, "survivors after rebalance");
+        let result = fs.fsck().unwrap().unwrap();
+        assert!(
+            result.is_clean(),
+            "fsck after rebalance: {:?}",
+            result.errors
+        );
+        let img = fs.reader.get_ref().clone();
+        oracle_cross_check(&img, &["R000.BIN", "R070.BIN"]);
+    }
+
+    #[test]
+    fn edit_rejects_duplicate_and_bad_name() {
+        let mut fs = blank_fs(4, "DUP");
+        let root = fs.root().unwrap();
+        mkfile(&mut fs, &root, "A.TXT", b"x");
+        let mut cur = Cursor::new(b"y".to_vec());
+        assert!(fs
+            .create_file(&root, "A.TXT", &mut cur, 1, &CreateFileOptions::default())
+            .is_err());
+        let mut cur2 = Cursor::new(b"z".to_vec());
+        assert!(fs
+            .create_file(
+                &root,
+                "bad/name",
+                &mut cur2,
+                1,
+                &CreateFileOptions::default()
+            )
+            .is_err());
     }
 }

@@ -338,7 +338,7 @@ The app has five tabs:
     **Bulk Convert** dialog, which now lists the same four formats
     as output targets.
   - **Check** (`fsck`) + **Repair** on every filesystem whose driver
-    implements it. From the Inspect grid: HFS / HFS+, FAT / exFAT / NTFS,
+    implements it. From the Inspect grid: HFS / HFS+, FAT / exFAT / NTFS / HPFS,
     ext2/3/4, SGI EFS, UFS, XFS, JFS, AmigaDOS OFS/FFS (Disk Validator) /
     PFS3 / SFS, and the retro floppies CBM DOS / DragonDOS / RS-DOS /
     Acorn DFS / Human68k. From the browse view: Alto BFS/TFS (their packs
@@ -392,7 +392,7 @@ The app has five tabs:
     lower-level pieces are also available on their own: `rb-cli put IMG[@N]
     --boot-from DONOR`, `rb-cli bless set`, and the browse-view
     **Boot Blocks...** / **Bless Folder** buttons.
-  - **Edit mode** on FAT, NTFS, exFAT, ext, HFS, HFS+, AFFS, PFS3, SFS,
+  - **Edit mode** on FAT, NTFS, exFAT, HPFS, ext, HFS, HFS+, AFFS, PFS3, SFS,
     ProDOS, Apple DOS 3.3, MacPlus MFS, EFS, UFS, CP/M (multi-DPB),
     Human68k, and XFS (v4 + v5): stage create-file / new-folder /
     drag-and-drop / delete edits, then Apply atomically with snapshot
@@ -564,6 +564,7 @@ inspect-tab Edit Mode.
 | FAT32          | Yes    | Yes  | Yes             | Yes (check + repair) | Windows 95 OSR2+ through XP, vintage Linux. `rb-cli backup --defrag` repacks files contiguously (boot-aware). fsck reconciles FAT chains + mirror copies; see FAT12. |
 | exFAT          | Yes    | Yes  | Yes (in-place + defragmenting clone) | Yes (check + repair) | Modern removable media (e.g. MiSTer SD cards). In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks allocated clusters into a fresh, smaller volume, so a fragmented card backs up to ~its real data size. fsck reconciles the allocation bitmap against the directory tree (lost / cross-linked clusters), checks the boot-region checksum + backup, and clears the VolumeDirty flag; repair rebuilds the bitmap and resyncs the boot regions, validated against `fsck_exfat`. |
 | NTFS           | Yes    | Yes  | Yes (in-place + defragmenting clone) | Yes (check + repair) | Windows NT / 2000 / XP. In-place resize trims trailing free space; the defragmenting clone (Compact Space toggle / shrink-to-minimum) repacks into a fresh, smaller NTFS volume (from-scratch clean-room formatter, validated to mount under ntfs-3g). Create blank volumes with `rb-cli new volume ntfs` (selectable `--cluster-size` / `--sector-size`, 512 B–2 MiB clusters); the defragmenting clone inherits the source volume's cluster and sector size. fsck reconciles `$Bitmap` against the MFT walk, resyncs `$MFTMirr` and the backup boot sector, and clears the VolumeDirty flag; repair rewrites these metadata structures, validated against Windows `chkdsk`. |
+| HPFS           | Yes    | Yes  | —               | Yes (check) | OS/2 High Performance File System (OS/2 1.2 → Warp 4, eComStation, ArcaOS) — the defining OS/2 filesystem, shares MBR type `0x07` with NTFS/exFAT and is told apart by the super/spare-block magics. Browse + backup + edit (create / delete files and directories, including the B-tree dnode split + delete-rebalance) + create blank volumes with `rb-cli new volume hpfs`. fsck walks the dnode B-tree and fnode/anode allocation trees, detects cross-links, and reconciles the per-band free-space bitmaps + the directory-band dnode bitmap. Cross-validated against a clean-room reference (`scripts/hpfs-oracle.py`) modeled on the Linux kernel `fs/hpfs` on-disk structures; resize/shrink is future work. |
 | ext2 / ext3 / ext4 | Yes | Yes | Yes (backup-compaction group shrink) | Yes (check + repair, incl. ext4 `metadata_csum`) | Early Linux installs onward. Create blank volumes with `rb-cli new volume ext` (plain ext2), `volume ext3` (adds a jbd2 journal), or `volume ext4` (extents + `metadata_csum` + journal); all `e2fsck`-clean. fsck reconciles the block + inode bitmaps and free counts (Pass-5 style) and repairs them, validated against `e2fsck`. On `metadata_csum` (ext4) volumes the crc32c on the superblock, descriptors, bitmaps, inodes, and directory blocks is verified and recomputed — so fsck-repair and in-place edits (create/delete/rename) keep the volume `e2fsck`-clean. The backup compactor packs a volume into fewer block groups (`resize2fs`-grade: flex_bg metadata migration, dropping the resize inode, and relocating the journal + multi-block files as contiguous runs), so a lightly-used real-world ext4 backs up to ~its real data size. Restoring at original size grows it back by adding block groups (the mirror `resize2fs`-grade grow) to fill the partition; both directions verify `e2fsck`-clean. (A grow whose GDT would need more blocks — e.g. a 1 KiB-block sub-512 MiB volume gaining groups — is left for `resize2fs`; 4 KiB-block ext4 up to 8 TB grows in place.) |
 | HFS (Mac OS Standard) | Yes | Yes | Yes         | Yes (check + repair: replica copy, bitmap fixup, lost+found for orphans) | Classic Mac OS 68k / early PowerPC. Includes block-size expansion via clone (`Expand HFS Volume…`). Volumes written by rusty-backup are `fsck_hfs`-clean and mountable on real Mac OS (verified on Mac OS X 10.4). |
 | HFS+ / HFSX    | Yes    | Yes  | Yes (defrag clone) | Yes (check + repair) | Mac OS Extended; hardlink resolution. Create blank volumes with `rb-cli new volume hfsplus` (`--case-sensitive` for HFSX). The catalog / extents-overflow / attributes B-trees grow their backing fork on demand, so an under-sized or foreign catalog fills in place without a spurious "disk full"; all written volumes are `fsck_hfs`-clean and mountable on macOS. |
@@ -707,7 +708,7 @@ cores) lives in [`docs/full_MiSTer_support_status.md`](docs/full_MiSTer_support_
 
 | MiSTer core | Filesystem(s) | Media path |
 |---|---|---|
-| **ao486** (486 PC)             | FAT12 / FAT16 / FAT32 (MBR), ISO9660 | Floppy, HDD, CD |
+| **ao486** (486 PC)             | FAT12 / FAT16 / FAT32 (MBR), HPFS (OS/2), ISO9660 | Floppy, HDD, CD |
 | **PCXT**                       | FAT12 / FAT16 (MBR) | Floppy, HDD |
 | **MSX / MSX1 / TurboR**        | FAT12 / FAT16 (Nextor VHD) | Floppy, HDD |
 | **ZXNext** (ZX Spectrum Next)  | FAT32 / FAT16 / FAT12 | SD / HDD (VHD) |

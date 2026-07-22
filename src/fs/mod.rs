@@ -1815,6 +1815,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "hpfs" => Ok(Box::new(hpfs::HpfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
                     reader,
                     partition_offset,
@@ -1940,9 +1944,10 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
-                "hpfs" => Err(FilesystemError::Unsupported(
-                    "HPFS editing is not yet supported (browse / backup only)".into(),
-                )),
+                "hpfs" => Ok(Box::new(hpfs::HpfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 _ => Err(FilesystemError::Unsupported(
                     "type 0x07 partition is neither NTFS, exFAT, nor HPFS".into(),
                 )),
