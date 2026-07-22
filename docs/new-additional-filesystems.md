@@ -17,12 +17,25 @@ read-first cases (ZFS). Every write path is validated against an independent
   `scripts/trdos-oracle.py`, `scripts/ti99-oracle.py`.
 
 ## Priority order
-1. **OS/2 — HPFS**
+1. **OS/2 — HPFS** — DONE (full quartet: `src/fs/hpfs.rs`)
 2. **Atari 8-bit — SpartaDOS / MyDOS / DOS 3** (extends existing `src/fs/atari_dos.rs`)
-3. **ZFS** (read-first)
+3. ~~**ZFS** (read-first)~~ — **DROPPED.** ZFS is a *pool*, not a single-disk
+   filesystem; a multi-disk pool can't be one `.img` at all, so only the
+   single-disk-pool sliver would ever fit rusty-backup's model — and even that
+   carries the full pooling machinery (MOS/DSL/DMU/block-pointers/compression/
+   CoW) for browse-only value on a modern (Solaris 11+, 2011) FS the retro
+   audience rarely has. The preservation-worthy Sun disks (SunOS 4 → Solaris 10)
+   are **UFS on a Sun disk label**, which we already read — see the **Sun disk
+   label (SMI VTOC)** work below, done in its place (`src/partition/sun.rs`).
 4. TRSDOS / LDOS / NEWDOS (TRS-80)
-5. Sedoric / Oric DOS (Oric)
+5. **Sedoric / Oric DOS (Oric)** — Jasmin variant DONE (`src/fs/oric.rs`); Sedoric pending
 6. N88-BASIC (NEC PC-8801)
+
+**Also shipped (Sun-lineage, replaces ZFS):** Sun disk label / SMI VTOC
+partition scheme (`src/partition/sun.rs`) — parses the 8 big-endian slices on a
+SPARC Solaris / SunOS disk image and routes them to the existing UFS reader
+(browse / inspect / extract). Spec = local kernel `block/partitions/sun.c`;
+oracle = `fdisk`/`sfdisk` (non-sudo). Full-disk backup + label editing deferred.
 
 ---
 
@@ -74,7 +87,12 @@ read-first cases (ZFS). Every write path is validated against an independent
 
 ---
 
-## 3. ZFS (read-first) — PRIORITY 3
+## 3. ZFS (read-first) — ~~PRIORITY 3~~ DROPPED
+> **Dropped** — see the Priority-order note above. ZFS is a pool, not a
+> single-disk filesystem (model conflict), it's browse-only, and it's a modern
+> (Solaris 11+) FS the retro audience rarely has. Replaced by the **Sun disk
+> label (SMI VTOC)** parser, which unlocks the *actually* common Sun disk:
+> UFS on a Sun-labeled SPARC image. The notes below are retained for reference.
 - **Systems / era:** Solaris/OpenSolaris/illumos, FreeBSD, Linux (OpenZFS). The
   Sun → Oracle NAS/workstation FS.
 - **Why it matters:** Workstation & NAS image preservation; biggest Oracle-lineage gap.

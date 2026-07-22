@@ -647,6 +647,7 @@ PC Engine CD, CD32, GameCube, Wii, CD-i, and 3DO.
 | APM    | Yes   | Yes  | Apple Partition Map (68k / PowerPC Macs). |
 | RDB    | Yes   | Bootable flag only | Amiga `RDSK`. Full RDB editing deferred until the DosEnv geometry story is settled. |
 | SGI    | Yes   | Yes  | SGI Volume Header (IRIX). 16 fixed slots; checksum recomputed on every write; geometry (`vh_dp`) preserved across edits. `rb-cli new hd sgi-efs` synthesizes a dvh + EFS-root hard disk from scratch (IRIX 5.3-6.5). |
+| Sun    | Yes   | No (browse) | Sun disk label / SMI VTOC (SPARC Solaris / SunOS). 8 big-endian slices (magic `0xDABE`), geometry-derived offsets; the whole-disk "backup" slice is excluded from the list. Surfaces the UFS slices to the existing big-endian-SPARC UFS reader (browse / inspect / extract). Parser cross-validated against `fdisk`/`sfdisk`; full-disk backup + label editing are future work. |
 | None (superfloppy) | Yes — auto-detects the filesystem at sector 0 (FAT / HFS / HFS+ / Apple DOS 3.3 / CBM DOS / Atari DOS / RS-DOS / OS-9 RBF / DragonDOS / Acorn DFS / ADFS / TR-DOS / TI-99 / QDOS / Human68k / Alto BFS / Pilot/Cedar / Apple Lisa FS / …) | — | Standard floppy / disk sizes are recognised even without a partition table. Xerox Alto packs (`.pdi` / `.bfs` / CopyDisk / Salto `.dsk`), Pilot/Cedar PDIs (`fsFamily=2`), Dwarf 6085 `.zdisk` images, and tag-bearing Apple Lisa DiskCopy 4.2 / DART disks are detected by content and presented as a single browsable volume. |
 
 The Clonezilla image format is also parsed as a source (MBR, GPT, partclone
