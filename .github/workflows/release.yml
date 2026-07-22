@@ -1776,33 +1776,30 @@ jobs:
             linker_env: CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER
             linker: i686-linux-gnu-gcc
             strip: i686-linux-gnu-strip
+          # PowerPC (big-endian) musl via `cargo zigbuild`: Zig bundles a generic
+          # musl libc for powerpc / powerpc64 and its linker emits the correct ELF
+          # ABI (ELFv2 for ppc64). That fixes both problems the GNU toolchain hit —
+          # the ELFv1-only `ld` (ppc64) and the missing musl libc / undefined
+          # `log2` (ppc32) — with a reliable single download (unlike the
+          # firewalled musl.cc). Both are best-effort legs.
           - target: powerpc64-unknown-linux-musl
             arch: ppc64
             runs-on: ubuntu-latest
             toolchain: stable
             prebuilt: "yes"
-            apt: gcc-powerpc64-linux-gnu
-            linker_env: CARGO_TARGET_POWERPC64_UNKNOWN_LINUX_MUSL_LINKER
-            linker: powerpc64-linux-gnu-gcc
+            zig: "yes"
+            apt: binutils-powerpc64-linux-gnu
             strip: powerpc64-linux-gnu-strip
-            # Rust's ppc64-musl std is ELFv2; the big-endian GNU gcc defaults to
-            # ELFv1 output -> "ABI version 2 not compatible with version 1". Tell
-            # the linker to emit ELFv2 to match.
-            rustflags: "-C link-arg=-mabi=elfv2"
-          # ppc32-musl is Rust tier-3: no prebuilt std AND no bundled musl libc,
-          # so the GNU (glibc) cross-gcc can't satisfy the link (undefined `log2`
-          # etc.). Use a real powerpc-linux-musl toolchain from musl.cc for libc,
-          # plus nightly + build-std for the Rust std. Best-effort leg.
+          # ppc32 (PowerMac G3 / G4 / 604e) is Rust tier-3 (no prebuilt std) ->
+          # nightly + build-std for the Rust std; zig supplies the musl libc.
           - target: powerpc-unknown-linux-musl
             arch: ppc32
             runs-on: ubuntu-latest
             toolchain: nightly
             prebuilt: "no"
-            apt: ""
-            musl_cc: powerpc-linux-musl
-            linker_env: CARGO_TARGET_POWERPC_UNKNOWN_LINUX_MUSL_LINKER
-            linker: powerpc-linux-musl-gcc
-            strip: powerpc-linux-musl-strip
+            zig: "yes"
+            apt: binutils-powerpc-linux-gnu
+            strip: powerpc-linux-gnu-strip
     env:
       RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
     steps:
@@ -1822,22 +1819,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt }} binutils file
 
-      - name: Fetch real musl cross toolchain (tier-3 arches with no bundled libc)
-        if: ${{ matrix.musl_cc != '' }}
-        run: |
-          # ppc32-musl has no prebuilt Rust std AND no self-contained musl libc,
-          # so we need a genuine powerpc-linux-musl gcc (libc + linker), not the
-          # glibc GNU cross. musl.cc ships these prebuilt.
-          curl -fL --retry 5 --retry-connrefused \
-            "https://musl.cc/${{ matrix.musl_cc }}-cross.tgz" -o /tmp/musl-cc.tgz
-          sudo tar -xzf /tmp/musl-cc.tgz -C /opt
-          echo "/opt/${{ matrix.musl_cc }}-cross/bin" >> "$GITHUB_PATH"
-
       - name: Point cargo at the cross-linker
         # Self-contained musl targets bundle libc+CRT; the GNU cross-gcc only
-        # drives ld. Native x86_64/aarch64 legs have no linker_env and skip this.
+        # drives ld. Native x86_64/aarch64 and the zig (PowerPC) legs have no
+        # linker_env and skip this.
         if: ${{ matrix.linker_env != '' }}
         run: echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Install zig + cargo-zigbuild (PowerPC musl libc)
+        if: ${{ matrix.zig == 'yes' }}
+        run: |
+          # Zig ships a generic musl libc for powerpc/powerpc64 and links with the
+          # right ELF ABI; cargo-zigbuild wires `zig cc` in as the target linker.
+          pip3 install --break-system-packages ziglang
+          cargo install cargo-zigbuild --locked
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -1861,15 +1856,16 @@ jobs:
             # tier-3 target (ppc32-musl): recompile std from source.
             BUILD_STD="-Z build-std=std,panic_abort"
           fi
-          # Per-TARGET rustflags (e.g. ppc64's -mabi=elfv2) — never global RUSTFLAGS,
-          # so host proc-macro builds aren't affected.
-          if [ -n "${{ matrix.rustflags }}" ]; then
-            RF_VAR="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_RUSTFLAGS"
-            export "$RF_VAR=${{ matrix.rustflags }}"
+          if [ "${{ matrix.zig }}" = "yes" ]; then
+            # PowerPC: zig cc supplies the musl libc + correct ELF ABI.
+            cargo zigbuild --release --bin rb-cli \
+              --no-default-features --features pure-zstd,remote,tui \
+              --target ${{ matrix.target }} $BUILD_STD
+          else
+            cargo build --release --bin rb-cli \
+              --no-default-features --features pure-zstd,remote,tui \
+              --target ${{ matrix.target }} $BUILD_STD
           fi
-          cargo build --release --bin rb-cli \
-            --no-default-features --features pure-zstd,remote,tui \
-            --target ${{ matrix.target }} $BUILD_STD
 
       - name: Verify the binary is fully static
         run: |
