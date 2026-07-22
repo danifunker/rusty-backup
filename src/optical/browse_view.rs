@@ -33,6 +33,12 @@ struct ExtractionProgress {
 pub struct OpticalDiscBrowseView {
     disc_path: Option<PathBuf>,
     disc_info: Option<DiscImageInfo>,
+    /// True when `disc_path` is a drive's device node rather than an image file.
+    /// Every re-open has to go back through the device-backed reader: the
+    /// file-based one re-derives its reader from `disc_info.path`, which on macOS
+    /// is `EBUSY` while the disc is mounted — that silently produced empty
+    /// directories rather than an error.
+    physical: bool,
     /// Selected filesystem on a hybrid disc: `0` = the primary, `N` =
     /// `disc_info.hybrid_filesystems[N - 1]` (the Mac HFS side). Always `0` for
     /// an ordinary single-filesystem disc.
@@ -76,6 +82,7 @@ impl Default for OpticalDiscBrowseView {
         Self {
             disc_path: None,
             disc_info: None,
+            physical: false,
             selected_fs: 0,
             root: None,
             directory_cache: HashMap::new(),
@@ -97,15 +104,43 @@ impl Default for OpticalDiscBrowseView {
 }
 
 impl OpticalDiscBrowseView {
-    /// Open a disc image for browsing.
+    /// Open a disc image file for browsing.
     pub fn open(&mut self, path: &Path) {
+        self.open_source(path, false);
+    }
+
+    /// Open the disc in a physical drive for browsing.
+    ///
+    /// `path` is a device path (e.g. `/dev/disk6`), not an image file.
+    pub fn open_physical(&mut self, path: &Path) {
+        self.open_source(path, true);
+    }
+
+    /// Shared open path. `physical` selects the device-backed reader: a drive is
+    /// not a file, so the container sniffing in [`DiscImageInfo::open`] does not
+    /// apply to it, and on macOS the buffered `/dev/diskN` node is `EBUSY` while
+    /// the disc is mounted. The physical route reads the raw node as the flat run
+    /// of cooked sectors that a data CD / DVD / Blu-ray is.
+    fn open_source(&mut self, path: &Path, physical: bool) {
         self.close();
         self.disc_path = Some(path.to_path_buf());
+        self.physical = physical;
         self.selected_fs = 0;
 
-        match DiscImageInfo::open(path) {
+        let probe = if physical {
+            DiscImageInfo::open_physical(path)
+        } else {
+            DiscImageInfo::open(path)
+        };
+
+        match probe {
             Ok(info) => {
-                match open_disc_filesystem(&info) {
+                let opened = if physical {
+                    opticaldiscs::browse::open_physical_filesystem(path)
+                } else {
+                    open_disc_filesystem(&info)
+                };
+                match opened {
                     Ok(mut fs) => {
                         match fs.root() {
                             Ok(root) => {
@@ -152,6 +187,7 @@ impl OpticalDiscBrowseView {
 
     pub fn close(&mut self) {
         self.disc_path = None;
+        self.physical = false;
         self.disc_info = None;
         self.selected_fs = 0;
         self.root = None;
@@ -180,6 +216,15 @@ impl OpticalDiscBrowseView {
             .disc_info
             .as_ref()
             .ok_or_else(|| FilesystemError::Parse("no disc info available".into()))?;
+        if self.physical {
+            // A drive has no hybrid-filesystem selection to honour: the device
+            // reader always presents the primary volume.
+            let path = self
+                .disc_path
+                .as_ref()
+                .ok_or_else(|| FilesystemError::Parse("no device path available".into()))?;
+            return opticaldiscs::browse::open_physical_filesystem(path);
+        }
         if self.selected_fs == 0 {
             open_disc_filesystem(info)
         } else {
@@ -446,14 +491,21 @@ impl OpticalDiscBrowseView {
     }
 
     fn load_directory(&mut self, entry: &FileEntry) {
-        if let Ok(mut fs) = self.open_fs() {
-            match fs.list_directory(entry) {
-                Ok(entries) => {
-                    self.directory_cache.insert(entry.path.clone(), entries);
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to read {}: {e}", entry.path));
-                }
+        // Report a failed re-open instead of dropping it: swallowing this made a
+        // directory that could not be read look simply empty.
+        let mut fs = match self.open_fs() {
+            Ok(fs) => fs,
+            Err(e) => {
+                self.error = Some(format!("Failed to reopen disc for {}: {e}", entry.path));
+                return;
+            }
+        };
+        match fs.list_directory(entry) {
+            Ok(entries) => {
+                self.directory_cache.insert(entry.path.clone(), entries);
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to read {}: {e}", entry.path));
             }
         }
     }
@@ -872,6 +924,10 @@ impl OpticalDiscBrowseView {
         let entry = entry.clone();
         let disc_path = self.disc_path.clone().unwrap();
         let resource_fork_mode = self.resource_fork_mode;
+        // The extraction thread re-opens the disc from scratch, so it needs the
+        // same device-vs-file distinction the UI thread makes — a file-based
+        // re-open of a drive is EBUSY while the disc is mounted.
+        let physical = self.physical;
 
         let progress = Arc::new(Mutex::new(ExtractionProgress {
             current_bytes: 0,
@@ -890,10 +946,21 @@ impl OpticalDiscBrowseView {
         std::thread::spawn(move || {
             let _wake = crate::os::wakelock::acquire("Rusty Backup: extract optical disc files");
             let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                let info = DiscImageInfo::open(&disc_path)?;
+                let info = if physical {
+                    DiscImageInfo::open_physical(&disc_path)?
+                } else {
+                    DiscImageInfo::open(&disc_path)?
+                };
+                let reopen = || {
+                    if physical {
+                        opticaldiscs::browse::open_physical_filesystem(&disc_path)
+                    } else {
+                        open_disc_filesystem(&info)
+                    }
+                };
 
                 // Count files and bytes for progress
-                let mut counting_fs = open_disc_filesystem(&info)?;
+                let mut counting_fs = reopen()?;
                 let (total_files, total_bytes) = count_entry(&mut *counting_fs, &entry)?;
                 if let Ok(mut p) = progress.lock() {
                     p.total_files = total_files;
@@ -902,7 +969,7 @@ impl OpticalDiscBrowseView {
                 drop(counting_fs);
 
                 // Open a fresh filesystem for extraction
-                let mut fs = open_disc_filesystem(&info)?;
+                let mut fs = reopen()?;
                 extract_entry(&mut *fs, &entry, &dest, resource_fork_mode, &progress)?;
 
                 Ok(())
@@ -1194,7 +1261,7 @@ fn display_name(entry: &FileEntry) -> &str {
 }
 
 /// Human-friendly size string.
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     match bytes {
         s if s < 1_024 => format!("{} B", s),
         s if s < 1_024 * 1_024 => format!("{:.1} KB", s as f64 / 1_024.0),

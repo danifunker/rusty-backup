@@ -6,6 +6,7 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -555,6 +556,40 @@ unsafe extern "C-unwind" fn claim_release_deny(
 ///
 /// Non-fatal: returns `Ok(None)` if the claim fails.
 fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
+    // Fast path: the main run loop, which the GUI pumps. Short deadline — if
+    // nobody is pumping it (rb-cli, rb-cli tui), the callback will never arrive
+    // and waiting the full timeout just stalls the caller for nothing.
+    match da_claim_disk_on(bsd_name, RunLoopTarget::Main, Duration::from_secs(1)) {
+        Ok(Some(claim)) => return Ok(Some(claim)),
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
+
+    // Fallback: schedule on *this* thread's run loop and pump it ourselves, so a
+    // binary with no main-loop pump still gets a real claim instead of silently
+    // running shared. The trade-off is that this loop is not pumped during the
+    // blocking reads that follow, so the release-denial callback cannot fire —
+    // another DA client could take the disk mid-read. That is strictly better
+    // than holding no claim at all, which is what the timeout used to leave us
+    // with.
+    log::debug!("DA: main run loop is not being pumped — claiming on this thread instead");
+    da_claim_disk_on(bsd_name, RunLoopTarget::Current, Duration::from_secs(5))
+}
+
+/// Which run loop a claim's callbacks are delivered on.
+#[derive(Clone, Copy, PartialEq)]
+enum RunLoopTarget {
+    /// The process main run loop — correct when something pumps it (the GUI).
+    Main,
+    /// The calling thread's run loop, pumped inline while awaiting the claim.
+    Current,
+}
+
+fn da_claim_disk_on(
+    bsd_name: &str,
+    target: RunLoopTarget,
+    timeout: Duration,
+) -> Result<Option<DiskClaim>> {
     let session =
         unsafe { DASession::new(None) }.context("failed to create DiskArbitration session")?;
 
@@ -568,9 +603,14 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
     }
     .context(format!("failed to create DADisk for {}", bsd_name))?;
 
-    // Schedule on the MAIN run loop so the release-denial callback fires
-    // even while the worker thread does blocking disk I/O.
-    let main_run_loop = CFRunLoop::main().context("failed to get main CFRunLoop")?;
+    // The main run loop keeps the release-denial callback live even while a
+    // worker thread does blocking disk I/O — the reason it is preferred.
+    let main_run_loop = match target {
+        RunLoopTarget::Main => CFRunLoop::main().context("failed to get main CFRunLoop")?,
+        RunLoopTarget::Current => {
+            CFRunLoop::current().context("failed to get current CFRunLoop")?
+        }
+    };
     let mode = unsafe { kCFRunLoopDefaultMode.unwrap() };
     unsafe { session.schedule_with_run_loop(&main_run_loop, mode) };
 
@@ -602,22 +642,36 @@ fn da_claim_disk(bsd_name: &str) -> Result<Option<DiskClaim>> {
         );
     }
 
-    // Spin-wait for the claim completion callback (fires on main run loop,
-    // which is pumped by the GUI thread).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Await the claim completion callback. On the main loop we can only wait for
+    // whoever pumps it; on our own loop we pump it ourselves.
+    let deadline = std::time::Instant::now() + timeout;
     while !unsafe { &*state }.done.load(Ordering::SeqCst) {
         if std::time::Instant::now() >= deadline {
             unsafe {
+                // The request may still land after we stop waiting; unclaim so a
+                // late success cannot leave the disk claimed by a session we are
+                // about to drop.
+                disk.unclaim();
                 session.unschedule_from_run_loop(&main_run_loop, mode);
                 let _ = Box::from_raw(state);
             }
-            log::warn!(
-                "DA claim of {} timed out — proceeding without exclusive access",
-                bsd_name
-            );
+            match target {
+                RunLoopTarget::Main => log::debug!(
+                    "DA claim of {bsd_name} saw no main-loop callback within {timeout:?}"
+                ),
+                RunLoopTarget::Current => log::warn!(
+                    "DA claim of {bsd_name} timed out — proceeding without exclusive access"
+                ),
+            }
             return Ok(None);
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        match target {
+            RunLoopTarget::Current => {
+                // Pumping is what makes the callback arrive here at all.
+                CFRunLoop::run_in_mode(Some(mode), 0.05, false);
+            }
+            RunLoopTarget::Main => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
     }
 
     let state = unsafe { Box::from_raw(state) };
@@ -1043,5 +1097,96 @@ pub fn open_source_for_reading(path: &Path) -> Result<ElevatedSource> {
             temp_path: None,
             disk_claim: None,
         })
+    }
+}
+
+/// Convert a device path to its raw character-device form
+/// (`/dev/disk6` -> `/dev/rdisk6`). Mirrors the spellings `cd-da-reader`
+/// accepts, so the path we escalate is the same node it would have opened.
+fn raw_device_path(device_path: &str) -> String {
+    if device_path.starts_with("/dev/rdisk") {
+        device_path.to_string()
+    } else if let Some(rest) = device_path.strip_prefix("/dev/") {
+        format!("/dev/r{rest}")
+    } else if device_path.starts_with("rdisk") {
+        format!("/dev/{device_path}")
+    } else {
+        format!("/dev/r{device_path}")
+    }
+}
+
+/// Open an optical drive's raw device node for reading, escalating via
+/// `authopen`.
+///
+/// The optical stack (`cd-da-reader`) opens `/dev/rdiskN` itself and has no
+/// privilege escalation of its own, so an unprivileged app — notably the GUI,
+/// which unlike a terminal has no Full Disk Access — just gets `EPERM` and the
+/// user sees "failed to open drive" with no prompt and no way forward. This is
+/// the same fallback [`open_source_for_reading`] performs for whole-disk
+/// backups: `authopen` shows the native macOS authorization dialog and passes
+/// the descriptor back over `SCM_RIGHTS`.
+///
+/// The flags match what `cd-da-reader` would have used on its own open, so the
+/// descriptor behaves identically to the unescalated path. `O_RDONLY` is
+/// deliberate: [`open_source_for_reading`] asks for `O_RDWR` because a backup
+/// may later write, but a write-capable open of an optical device demands
+/// exclusivity we neither need nor want for reading — and it would fail
+/// outright on read-only media.
+/// Take exclusive use of an optical drive for the duration of a read.
+///
+/// Unmounts the disc and claims it through DiskArbitration, so nothing else on
+/// the system competes for the drive — Spotlight indexing, Finder, or another DA
+/// client. That matters more on optical media than anywhere else: every stolen
+/// read costs a physical seek, and the drive has only one head.
+///
+/// Reading itself does **not** require this. The raw `/dev/rdiskN` node reads
+/// fine while the disc is mounted, which is exactly why the device-backed reader
+/// works. This is purely about not sharing the head.
+///
+/// Deliberately non-fatal: a disc that will not unmount (a file still open on
+/// the volume) or will not claim still reads correctly, just with competition.
+/// The returned guard releases the claim on drop; `None` means we are proceeding
+/// without exclusivity.
+pub(crate) fn claim_optical_disc(device_path: &str) -> Option<DiskClaim> {
+    let bsd = bsd_name_from_path(Path::new(device_path));
+
+    if let Err(e) = da_unmount_disk(bsd) {
+        log::info!("{device_path}: could not unmount before claiming ({e}) — continuing shared");
+    }
+
+    match da_claim_disk(bsd) {
+        Ok(Some(claim)) => {
+            log::info!("{device_path}: claimed for exclusive use");
+            Some(claim)
+        }
+        Ok(None) => {
+            log::info!("{device_path}: exclusive claim declined — continuing shared");
+            None
+        }
+        Err(e) => {
+            log::info!("{device_path}: exclusive claim failed ({e}) — continuing shared");
+            None
+        }
+    }
+}
+
+pub fn authopen_optical_device(device_path: &str) -> Result<File> {
+    authopen_device(
+        &raw_device_path(device_path),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+    )
+}
+
+#[cfg(test)]
+mod optical_device_path_tests {
+    use super::raw_device_path;
+
+    #[test]
+    fn maps_every_spelling_to_the_raw_node() {
+        assert_eq!(raw_device_path("/dev/disk6"), "/dev/rdisk6");
+        // Already raw — must not gain a second "r".
+        assert_eq!(raw_device_path("/dev/rdisk6"), "/dev/rdisk6");
+        assert_eq!(raw_device_path("disk6"), "/dev/rdisk6");
+        assert_eq!(raw_device_path("rdisk6"), "/dev/rdisk6");
     }
 }

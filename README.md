@@ -146,6 +146,12 @@ What's in the MiSTer build:
   `optical rip --device /dev/sr0 --format iso|bincue`), plus `optical
   convert` (ISO ↔ BIN/CUE ↔ CD-CHD) and `optical browse` / `extract`. For
   devices with a CD/DVD drive such as the SuperStation One.
+  **Data DVD and Blu-ray discs rip too** — to `iso` only, since the raw
+  2352-byte sector formats `bincue` and CD-CHD need are CD-only concepts.
+  Console discs (Wii, GameCube, original Xbox) can *not* be ripped from a
+  standard drive: their media is proprietary and stock drive firmware will not
+  read it. Dump those on the console itself and open the resulting image here —
+  Wii/GameCube images (including NKit) and Xbox XDVDFS are fully supported.
 - **Machine-readable optical inspection:** `optical browse --format json`
   emits a deterministic, path-sorted file listing (add `--hash sha256` for
   per-file content hashes), and `optical info --format json` reports
