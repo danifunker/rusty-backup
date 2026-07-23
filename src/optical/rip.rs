@@ -197,11 +197,49 @@ pub fn run_rip(config: RipConfig, progress: Arc<Mutex<RipProgress>>) -> Result<(
     Ok(())
 }
 
+/// Open a locally-attached drive, picking the reader the medium actually needs.
+///
+/// `cd-da-reader` speaks MMC/SCSI pass-through, which is the only way to read a
+/// CD (2352-byte sectors, audio tracks, Mode 2 forms) but is *CD-only*: those
+/// commands fail on DVD and Blu-ray media — on macOS with `ENOTTY` from
+/// `DKIOCCDREADTOC`, before a single sector is read. So the pass-through reader
+/// is tried first and kept whenever it can see a TOC, and a DVD/BD falls through
+/// to [`PhysicalDiscSource`], which reads the medium as flat 2048-byte cooked
+/// sectors.
+///
+/// The TOC read is what discriminates, rather than asking the OS what media is
+/// loaded: it is the exact capability the rip depends on, so it cannot
+/// misclassify a disc the reader would then choke on.
+fn open_local_source(path: &str) -> Result<Box<dyn OpticalSource>> {
+    // Claim the drive once, up front, and hand it to whichever reader wins.
+    // Letting each reader claim for itself made a DVD unmount/claim/release/
+    // re-claim, since the CD reader is always constructed first to probe.
+    let claim = crate::optical::source::claim_drive(path);
+
+    match LocalCdReader::with_retry_unclaimed(path, Default::default()) {
+        Ok(mut reader) if reader.read_toc().is_ok() => {
+            reader.set_claim(claim);
+            return Ok(Box::new(reader));
+        }
+        Ok(_) => {
+            log::info!("{path}: no CD table of contents — treating as DVD/Blu-ray media");
+        }
+        Err(e) => {
+            log::info!("{path}: CD reader unavailable ({e:#}) — trying DVD/Blu-ray media");
+        }
+    }
+
+    let mut source = crate::optical::source::PhysicalDiscSource::open_unclaimed(path)
+        .with_context(|| format!("{path} could not be read as either CD or DVD/Blu-ray media"))?;
+    source.set_claim(claim);
+    Ok(Box::new(source))
+}
+
 /// Build the [`OpticalSource`] for this rip — a local drive or a network proxy
 /// to a remote daemon's drive (see `docs/remote_ripping.md`).
 fn open_optical_source(config: &RipConfig) -> Result<Box<dyn OpticalSource>> {
     match &config.device {
-        OpticalTarget::Local(path) => Ok(Box::new(LocalCdReader::open(path)?)),
+        OpticalTarget::Local(path) => Ok(open_local_source(path)?),
         #[cfg(feature = "remote")]
         OpticalTarget::Remote { conn, device_path } => {
             Ok(Box::new(crate::optical::source::RemoteCdReader::open(

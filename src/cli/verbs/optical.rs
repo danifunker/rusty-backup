@@ -283,7 +283,15 @@ fn run_drives_verb(args: DrivesArgs) -> Result<()> {
     }
     log_stderr(format!("Found {} optical drive(s):", devices.len()));
     for d in &devices {
-        println!("{}  {}", d.cli_device_arg(), d.display_name);
+        // A connected drive with an empty tray has no device node to rip from
+        // yet (macOS only creates /dev/diskN once a disc is loaded). Print a "-"
+        // placeholder so the column never comes out blank, and say why.
+        let arg = d.cli_device_arg();
+        if arg.is_empty() {
+            println!("-  {}  (no disc)", d.display_name);
+        } else {
+            println!("{}  {}", arg, d.display_name);
+        }
     }
     Ok(())
 }

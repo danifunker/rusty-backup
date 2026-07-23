@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use opticaldiscs::detect::DiscImageInfo;
@@ -403,6 +403,40 @@ impl OpticalTab {
                                 self.rip_devices.len()
                             ));
                         }
+
+                        // Eject the selected local drive. Remote drives are the
+                        // daemon's to control, and a drive with no disc has no
+                        // device path to act on.
+                        let ejectable = self
+                            .selected_drive_idx
+                            .and_then(|idx| self.rip_devices.get(idx))
+                            .filter(|d| !d.is_remote() && !d.device_path.is_empty())
+                            .map(|d| d.device_path.clone());
+                        ui.add_enabled_ui(ejectable.is_some(), |ui| {
+                            if ui
+                                .button("Eject")
+                                .on_disabled_hover_text(
+                                    "Select a local drive with a disc in it to eject.",
+                                )
+                                .clicked()
+                            {
+                                if let Some(path) = ejectable {
+                                    match rusty_backup::optical::source::eject_disc(
+                                        std::path::Path::new(&path),
+                                    ) {
+                                        Ok(()) => {
+                                            log.info(format!("Ejected {path}"));
+                                            // The disc is gone: drop anything
+                                            // still pointing at it, then re-scan
+                                            // so the drive shows as empty.
+                                            self.close_disc();
+                                            self.refresh_drives();
+                                        }
+                                        Err(e) => log.warn(format!("Eject failed: {e:#}")),
+                                    }
+                                }
+                            }
+                        });
                     });
                 }
                 SourceMode::ImageFile => {
@@ -460,7 +494,7 @@ impl OpticalTab {
                 }
                 if was_browsing && self.disc_info.is_some() {
                     if let Some(path) = self.get_browsable_path() {
-                        self.browse_view.open(&path);
+                        self.open_browse(&path);
                     }
                 }
             }
@@ -475,6 +509,15 @@ impl OpticalTab {
                 ui.label(format!("FS: {}", info.filesystem.display_name()));
                 if let Some(ref label) = info.volume_label {
                     ui.label(format!("Volume: {label}"));
+                }
+                // Physical media only: the drive's reported capacity, so the
+                // user can see what a full rip will cost before starting one.
+                if let Some(bytes) = info.media_size_bytes {
+                    ui.label(format!(
+                        "Size: {} ({} sectors)",
+                        rusty_backup::optical::browse_view::format_size(bytes),
+                        bytes / 2048
+                    ));
                 }
                 if let Some(g) = &info.game {
                     ui.label(format!(
@@ -495,7 +538,7 @@ impl OpticalTab {
                 ui.add_space(60.0);
                 if !self.browse_view.is_active() && ui.button("Browse Contents").clicked() {
                     if let Some(path) = self.get_browsable_path() {
-                        self.browse_view.open(&path);
+                        self.open_browse(&path);
                     }
                 }
                 if ui.button("Close Disc").clicked() {
@@ -735,6 +778,17 @@ impl OpticalTab {
         }
     }
 
+    /// Open the browse view against the current source, picking the
+    /// device-backed reader for a physical drive (see
+    /// [`OpticalDiscBrowseView::open_physical`]).
+    fn open_browse(&mut self, path: &Path) {
+        if self.source_mode == SourceMode::PhysicalDrive {
+            self.browse_view.open_physical(path);
+        } else {
+            self.browse_view.open(path);
+        }
+    }
+
     fn close_disc(&mut self) {
         self.browse_view.close();
         self.disc_info = None;
@@ -756,7 +810,17 @@ impl OpticalTab {
             None => return,
         };
 
-        match DiscImageInfo::open(&path) {
+        // A drive is not a file: `DiscImageInfo::open` sniffs a container format
+        // from the path and opens it as one, and on macOS the buffered
+        // /dev/diskN node is EBUSY while the disc is mounted. `open_physical`
+        // reads the raw node as flat cooked sectors instead, which is what a
+        // data CD / DVD / Blu-ray actually is.
+        let probe = match self.source_mode {
+            SourceMode::PhysicalDrive => DiscImageInfo::open_physical(&path),
+            SourceMode::ImageFile => DiscImageInfo::open(&path),
+        };
+
+        match probe {
             Ok(info) => {
                 log.info(format!(
                     "Detected disc: {} / {} {}",

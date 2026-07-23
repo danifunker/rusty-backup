@@ -1044,7 +1044,7 @@ dependencies = [
 [[package]]
 name = "cd-da-reader"
 version = "0.4.1"
-source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-backend-on-1.0#70f37567f37c05aa4c40578f0a353669f5bd2814"
+source = "git+https://github.com/danifunker/rust-cd-da-reader?branch=file-backend-on-1.0#5c3b8a4f9ccf583351b2600884c5836418fc5a08"
 dependencies = [
  "cc",
  "libc",
@@ -4302,13 +4302,14 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "opticaldiscs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d250b3d3580f584a145e6d47c9a44b48d7b41a93a8e71b86ef65f815a55b09c"
+checksum = "23983217ba7ba56e3b8a9bda8c3e7bf7dec9cc2ee279502063dc422f79f90906"
 dependencies = [
  "cue_sheet",
  "encoding_rs",
  "flate2",
+ "libc",
  "libchdman-rs",
  "log",
  "nod",

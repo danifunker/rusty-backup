@@ -38,12 +38,21 @@ pub struct RipDevice {
 impl RipDevice {
     /// Label for a GUI pulldown: local shows `name (path)`; remote prefixes the
     /// daemon as `[host:port] name (path)`.
+    ///
+    /// A connected drive with an empty tray has no device node yet (macOS only
+    /// creates `/dev/diskN` once a disc is loaded), so it is labelled
+    /// `name (no disc)` rather than with an empty pair of parentheses.
     pub fn picker_label(&self) -> String {
+        let path = if self.device_path.is_empty() {
+            "no disc"
+        } else {
+            &self.device_path
+        };
         match &self.location {
-            DeviceLocation::Local => format!("{} ({})", self.display_name, self.device_path),
+            DeviceLocation::Local => format!("{} ({})", self.display_name, path),
             #[cfg(feature = "remote")]
             DeviceLocation::Remote { label, .. } => {
-                format!("[{}] {} ({})", label, self.display_name, self.device_path)
+                format!("[{}] {} ({})", label, self.display_name, path)
             }
         }
     }
@@ -173,5 +182,17 @@ mod tests {
             #[cfg(feature = "remote")]
             _ => panic!("expected a local target"),
         }
+    }
+
+    #[test]
+    fn empty_tray_drive_labels_as_no_disc() {
+        // macOS only publishes /dev/diskN once a disc is loaded, so a connected
+        // but empty drive arrives with no device path.
+        let d = RipDevice {
+            display_name: "HL-DT-ST DVDRAM GP65NW60".to_string(),
+            device_path: String::new(),
+            location: DeviceLocation::Local,
+        };
+        assert_eq!(d.picker_label(), "HL-DT-ST DVDRAM GP65NW60 (no disc)");
     }
 }
