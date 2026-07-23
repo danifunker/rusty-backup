@@ -235,9 +235,16 @@ All dispatch lives in `src/fs/mod.rs`. A new FS touches, in order:
 Medium: ADFS write/`.dsd` (DONE), AIX JFS1 (detected-not-read,
 `src/fs/jfs.rs:15-17`), Veritas VxFS, Tru64 AdvFS, Solaris QFS, OpenVMS ODS-2 on
 raw disk (optical-only today), Apple SOS / DOS 3.2 / Pascal, optical UDF 2.50+.
+Medium also: **SquashFS write** — browse/extract shipped (`src/fs/squashfs.rs`:
+v4.0, gzip/XZ/LZMA/LZ4/zstd; LZO refused by name) for AppImages (we ship one),
+Raspberry Pi OS / DietPi / Buildroot, live-media `filesystem.squashfs`,
+OpenWrt, SteamOS. Edit is rebuild-only by construction and fsck/resize don't
+decompose the usual way — read the SquashFS scoping note in
+`docs/filesystem_coverage_audit.md` §6 and the plan in `docs/squashfs_edit.md`
+before touching it.
 Low: finish ANDOS + QL Microdrive scaffolds (`src/fs/andos.rs`,
 `src/fs/qdos_mdv.rs`), CSIDOS, MicroDOS (Vector-06C), Specialist-MX; Reiser4 /
 NILFS / F2FS / bcachefs / HAMMER (browse-only where magics collide).
-Out of scope: flash-translation FS (JFFS2/YAFFS/UBIFS), packing FS
-(SquashFS/cramfs), network/clustered (NFS/SMB/Ceph/OCFS2/ZFS-as-pool),
-pseudo/virtual (procfs/sysfs/tmpfs), mainframe (z/OS VSAM), Windows ReFS.
+Out of scope: flash-translation FS (JFFS2/YAFFS/UBIFS), cramfs,
+network/clustered (NFS/SMB/Ceph/OCFS2/ZFS-as-pool), pseudo/virtual
+(procfs/sysfs/tmpfs), mainframe (z/OS VSAM), Windows ReFS.
