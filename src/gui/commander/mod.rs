@@ -33,7 +33,8 @@ use rusty_backup::partition::format_size;
 
 use super::file_detail::{self, FileContent};
 use super::metadata_editor::{
-    self, ExtPermsEditorState, HfsDatesEditorState, HfsTypeEditorState, ProdosTypeEditorState,
+    self, ExtPermsEditorState, HfsDatesEditorState, HfsTypeEditorState, OwnerEditorState,
+    ProdosTypeEditorState, XattrEditorState,
 };
 
 mod pane;
@@ -79,6 +80,11 @@ struct DetailWindow {
     prodos_editor: Option<ProdosTypeEditorState>,
     dates_editor: Option<HfsDatesEditorState>,
     perms_editor: Option<ExtPermsEditorState>,
+    owner_editor: Option<OwnerEditorState>,
+    xattr_editor: Option<XattrEditorState>,
+    /// The entry's on-disk extended attributes, read when the window opened.
+    /// Empty on filesystems without xattr support.
+    xattrs: Vec<rusty_backup::fs::xattr::Xattr>,
     /// Last staging status, shown in the window.
     result: Option<String>,
 }
@@ -1095,6 +1101,7 @@ impl CommanderMode {
             return format!("[{}] could not open File Info for '{name}'.", from.label());
         };
         let content = bytes.map(|data| file_detail::detect_content_type(&entry, &data));
+        let xattrs = pane.detail_xattrs(&entry);
         let title = entry.name.clone();
         self.detail = Some(DetailWindow {
             side: from,
@@ -1106,6 +1113,9 @@ impl CommanderMode {
             prodos_editor: None,
             dates_editor: None,
             perms_editor: None,
+            owner_editor: None,
+            xattr_editor: None,
+            xattrs,
             result: None,
         });
         format!("File Info: {title}")
@@ -1135,7 +1145,8 @@ impl CommanderMode {
         let is_hfs = matches!(fs, "HFS" | "HFS+" | "HFSX");
         let is_classic_hfs = fs == "HFS";
         let is_prodos = fs == "ProDOS";
-        let is_ext = fs.starts_with("ext");
+        // (Unix permission / owner / xattr rows gate on the entry carrying a
+        // POSIX mode, not on the filesystem name — see below.)
         // Writable image panes get the editors; host folders and backups are
         // read-only display.
         let edit_mode = win.editable;
@@ -1185,7 +1196,10 @@ impl CommanderMode {
                         &mut win.result,
                     );
                 }
-                if is_ext {
+                // Unix permissions / owner / xattrs. Gated on the entry actually
+                // carrying a POSIX mode rather than on the filesystem name, so
+                // every Unix volume gets them (this used to be ext-only).
+                if win.entry.mode.is_some() {
                     ui.separator();
                     metadata_editor::render_ext_permissions_row(
                         ui,
@@ -1195,6 +1209,26 @@ impl CommanderMode {
                         &mut win.perms_editor,
                         &mut win.result,
                     );
+                    metadata_editor::render_owner_row(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        None,
+                        queue,
+                        &mut win.owner_editor,
+                        &mut win.result,
+                    );
+                    let xattrs = std::mem::take(&mut win.xattrs);
+                    metadata_editor::render_xattr_section(
+                        ui,
+                        &win.entry,
+                        edit_mode,
+                        &xattrs,
+                        queue,
+                        &mut win.xattr_editor,
+                        &mut win.result,
+                    );
+                    win.xattrs = xattrs;
                 }
 
                 if let Some(msg) = &win.result {
