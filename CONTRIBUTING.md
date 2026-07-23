@@ -48,6 +48,7 @@ cargo build --all-targets      # Must produce zero warnings
 2. `cargo test --lib` is green (604+ tests as of this writing).
 3. `cargo fmt` has been run (the pre-commit hook handles this; don't bypass it with `--no-verify`).
 4. **No Unicode glyphs in user-visible strings.** The default egui font has no emoji/symbol coverage — `✓ ✗ ⚠ ← → • ✖ ℹ` render as blank boxes. Use plain ASCII (`OK`, `Skipped`, `Warning`, `->`, `-`, `X`, `Info:`) in log lines, button labels, dialog text. The only exception is content read from a filesystem we're displaying verbatim.
+5. **The shared engine must compile on Rust 1.73.** Everything under `src/` is also built by the vintage macOS-10.7 / Windows-7 target (`rb-cli-vintage/`), which pins **Rust 1.73**. Do not use a std API newer than 1.73 in engine code — route the common offenders through the `compat` / `rust173_compat` shims instead. See **[Rust 1.73 floor for engine code](#rust-173-floor-for-engine-code)** below; this is the single easiest way to redden a build that `cargo build` on your machine says is fine.
 
 ---
 
@@ -297,6 +298,33 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 
 - We don't enforce a hard limit, but if a single file passes ~3000 lines you should ask whether it has multiple responsibilities. The refactor split 4 files past that threshold; the model+view separation is what unblocks it most often.
 
+### Rust 1.73 floor for engine code
+
+Everything under `src/` is compiled twice: by the normal desktop toolchain, **and** by the vintage build (`rb-cli-vintage/`, a second top-level manifest that reuses the same `../src/` sources for the macOS 10.7 / Windows 7 targets). That build pins **Rust 1.73** — the last toolchain whose prebuilt std targets those OSes. So an engine file may only use std APIs available in 1.73.
+
+This is a trap because **your local `cargo build` cannot see it.** You're on a modern toolchain where the newer API exists, so it compiles clean and even passes `cargo clippy -D warnings`. It fails only on the 1.73 build, which usually means only in CI (or when someone builds the vintage target). Worse, **clippy actively pushes you into it**: its auto-fixes suggest `x.is_multiple_of(n)`, `io::Error::other(e)`, `iter::repeat_n(..)` — all of which postdate 1.73. Accepting a clippy suggestion in engine code is the most common way this breaks.
+
+The two shim modules exist to resolve the tension — they let one call site satisfy both toolchains:
+
+- **`src/compat.rs`** — *always compiled.* Each helper is `#[cfg]`-split so the modern build uses the current clippy-clean std API and only the vintage build falls back. Use `crate::compat::io_other(e)` instead of `io::Error::other(e)` (1.74); `crate::compat::repeat_n(..)` instead of `iter::repeat_n(..)`. This is where a discouraged-but-1.73-safe form is quarantined so the desktop tree stays lint-clean.
+- **`src/rust173_compat.rs`** — *compiled only under the `rust173-polyfill` feature* (the vintage manifest enables it; the desktop never does). Extension traits that add a method 1.73 lacks entirely — `is_multiple_of` (1.87), `Option::is_none_or` (1.82) — so the identical `x.is_multiple_of(n)` call syntax resolves on both. Bring the trait into scope with `#[cfg(feature = "rust173-polyfill")] use crate::rust173_compat::IntIsMultipleOf as _;` at the top of the file. If the only use is in `#[cfg(test)]` code, scope the import `#[cfg(all(test, feature = "rust173-polyfill"))]` so it isn't an unused import on the vintage *library* build.
+
+Known-safe within the floor (no shim needed): `div_ceil` / `next_multiple_of` (1.73.0), `is_some_and` (1.70). When unsure whether an API predates 1.73, check its "Stable since" in the std docs before using it in `src/`.
+
+**Verify before you push.** Your normal build won't catch a violation; do one of:
+
+```bash
+# Compile the shared source under the vintage feature/dep set. Runs on the
+# modern toolchain but exercises the compat/polyfill wiring. Expect a pile of
+# unused-import warnings for the polyfill trait — those are the modern compiler
+# seeing the inherent method and are benign; a hard ERROR is the real signal.
+cargo build --manifest-path rb-cli-vintage/Cargo.toml \
+  --no-default-features --features native-zstd,remote,tui,rust173-polyfill \
+  --ignore-rust-version
+```
+
+The definitive check is an actual `rustup toolchain install 1.73.0` build of that manifest; the command above is the cheap proxy that catches the wiring mistakes (wrong shim path, raw `io::Error::other` left in, unused imports).
+
 ---
 
 ## Commit & PR guidelines
@@ -304,7 +332,7 @@ If you think one of these *now* makes sense for new work, that's fine — but th
 - Write commit messages that explain the **why**, not the **what** — the diff shows what changed.
 - Reference an issue or doc section if applicable (e.g. `docs/OPEN-WORK.md §2.1`).
 - One logical change per commit. The pre-commit hook runs `cargo fmt`, so don't bundle formatting noise.
-- Before opening a PR: `cargo build --all-targets` (zero warnings), `cargo test --lib` (green), `cargo clippy` (no new warnings on touched files).
+- Before opening a PR: `cargo build --all-targets` (zero warnings), `cargo test --lib` (green), `cargo clippy` (no new warnings on touched files). If you touched engine code under `src/`, also run the vintage-feature build from **[Rust 1.73 floor for engine code](#rust-173-floor-for-engine-code)** — a modern-toolchain green does not imply a 1.73 green.
 - PR description: what changed, why, and any architectural decisions worth flagging (especially if you went near a "considered and rejected" pattern).
 
 ---
