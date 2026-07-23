@@ -876,3 +876,95 @@ fn inspect_text_runs_on_raw_hfs_image() {
     // Raw HFS at byte 0 has no partition table.
     assert!(text.contains("Partition table: None"));
 }
+
+/// `put` must not silently make every added file root:root 0644.
+///
+/// Until `fs::attrs` landed, nothing set `CreateFileOptions`'s mode/uid/gid, so
+/// each driver's `unwrap_or` decided — and replacing a 0600 secret with a
+/// world-readable host copy quietly widened it. This pins the precedence:
+/// explicit flags win, and a replace inherits from the file it replaces.
+#[test]
+fn put_resolves_posix_attributes_rather_than_defaulting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("e.img");
+    let img_s = img.to_str().unwrap();
+    run(&["new", "volume", "ext4", img_s, "--size", "16M"]);
+
+    // A deliberately private file, created with explicit attributes.
+    let host = dir.path().join("s.txt");
+    std::fs::write(&host, b"secret\n").unwrap();
+    let out = run(&[
+        "put",
+        img_s,
+        host.to_str().unwrap(),
+        "/secret",
+        "--mode",
+        "600",
+        "--uid",
+        "0",
+        "--gid",
+        "42",
+    ]);
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        log.contains("mode 0600 (explicit)") && log.contains("gid 42 (explicit)"),
+        "put did not report the explicit attributes it applied:\n{log}"
+    );
+
+    // Now overwrite it from a world-readable host file with NO flags. The
+    // replaced file's 0600 root:42 must win over the host's 0644.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let out = run(&["put", img_s, host.to_str().unwrap(), "/secret", "--force"]);
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        log.contains("mode 0600 (from replaced file)"),
+        "replacing a 0600 file must not widen it to the host's 0644:\n{log}"
+    );
+    assert!(
+        log.contains("gid 42 (from replaced file)"),
+        "replacing a file must keep its ownership:\n{log}"
+    );
+
+    // And it must actually be on disk, not just in the log: export to tar and
+    // read the mode back out of the archive header.
+    let tar = dir.path().join("e.tar");
+    run(&["tar", img_s, "/", tar.to_str().unwrap()]);
+    let bytes = std::fs::read(&tar).unwrap();
+    let hdr = find_tar_header(&bytes, "secret").expect("secret not found in tar");
+    // ustar: mode at offset 100 (8 bytes octal), gid at 116.
+    let mode = octal_field(&hdr[100..108]);
+    let gid = octal_field(&hdr[116..124]);
+    assert_eq!(mode & 0o7777, 0o600, "on-disk mode should be 0600");
+    assert_eq!(gid, 42, "on-disk gid should be 42");
+}
+
+/// Find the 512-byte ustar header whose name ends with `name`.
+fn find_tar_header<'a>(bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let mut off = 0;
+    while off + 512 <= bytes.len() {
+        let hdr = &bytes[off..off + 512];
+        let end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
+        let entry = String::from_utf8_lossy(&hdr[..end]).into_owned();
+        if entry.trim_end_matches('/').ends_with(name) {
+            return Some(hdr);
+        }
+        // Skip the header plus this entry's (512-rounded) payload.
+        let size = octal_field(&hdr[124..136]) as usize;
+        off += 512 + size.div_ceil(512) * 512;
+    }
+    None
+}
+
+/// Decode a NUL/space-terminated octal tar header field.
+fn octal_field(f: &[u8]) -> u32 {
+    let s: String = f
+        .iter()
+        .take_while(|&&b| (b'0'..=b'7').contains(&b))
+        .map(|&b| b as char)
+        .collect();
+    u32::from_str_radix(&s, 8).unwrap_or(0)
+}

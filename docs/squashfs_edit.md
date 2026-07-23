@@ -220,3 +220,55 @@ Existing read-side fixture: the Ubuntu 12.04 PowerPC live CD, via
 - **D5 — LZO stays refused, for write indefinitely.** Reading an LZO image is
   a decoder away; *writing* one needs an LZO compressor, and no pure-Rust crate
   provides one at the maturity of the decoders.
+- **D6 — added files inherit their POSIX attributes; they are never defaulted
+  silently.** Resolution lives in `src/fs/attrs.rs` and is shared by every
+  filesystem and front end. See §8.
+
+---
+
+## 8. Where an added file's mode / uid / gid come from
+
+Not a SquashFS question — a whole-tree one, surfaced by this work. Every
+editable Unix filesystem (ext, UFS, XFS, EFS, Minix) already honoured
+`CreateFileOptions`'s `mode` / `uid` / `gid`, but **nothing ever set them**:
+`rb-cli put` left all three `None`, so each driver's own `unwrap_or` made every
+added file **root:root 0644**. Replacing a `0600` secret with a world-readable
+host copy silently widened it.
+
+`src/fs/attrs.rs` is now the single place that decides, so CLI, GUI and TUI
+cannot drift. Highest priority first:
+
+| Attribute | Precedence |
+|---|---|
+| `mode` | explicit flag -> file being replaced -> host file's own bits -> fallback |
+| `uid` | explicit flag -> file being replaced -> parent directory -> 0 |
+| `gid` | explicit flag -> file being replaced -> parent directory -> 0 |
+
+**Replacing inherits from the replaced file**, because that is the common edit
+and the file already carries the answer. **A new file takes ownership from its
+parent directory.** The host file's *permission bits* are consulted for `mode`
+(macOS carries those faithfully) but its **uid/gid never are** — a macOS 501:20
+is meaningless inside a Linux image. Every resolved value records where it came
+from and the operation logs it, so nothing is decided silently.
+
+### Bulk imports
+
+`AttrOverrides` is a plain `Copy` struct, so one decision covers a whole import
+— pass the same value to every member rather than re-deriving per file. The
+flags live on the verb (`--mode` / `--uid` / `--gid`), not per-file.
+
+### Directories
+
+Two differences, both deliberate:
+
+- a new directory inherits its mode from the **parent directory**, not from a
+  blanket `0755`, so a subdirectory created inside a `0700` tree stays `0700`;
+- any non-explicit directory mode gets `add_execute_where_read` applied — the
+  `chmod a+X` rule — because a directory's execute bit means "may be
+  traversed", and a directory that can be read but not entered is useless.
+
+Note what this deliberately does *not* do: it never grants execute to a class
+that has no read. Forcing `o+x` on every directory would widen `/root` (0700),
+`~/.ssh` (0700) and `/etc/ssl/private` — a security regression, not a
+convenience. An explicit `--mode` is obeyed verbatim either way; silently
+"fixing" what the caller asked for is worse than honouring a strange request.

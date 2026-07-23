@@ -1336,6 +1336,9 @@ Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
 - `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
 - `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
 - `--force` — Overwrite an existing entry at the destination path
+- `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
+- `--uid` — Owner UID for the new file. Unix filesystems only
+- `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`
 - `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
 - `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem

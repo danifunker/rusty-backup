@@ -37,6 +37,12 @@
 <dd>4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`</dd>
 <dt><code>--force</code></dt>
 <dd>Overwrite an existing entry at the destination path</dd>
+<dt><code>--mode</code></dt>
+<dd>Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept</dd>
+<dt><code>--uid</code></dt>
+<dd>Owner UID for the new file. Unix filesystems only</dd>
+<dt><code>--gid</code></dt>
+<dd>Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`</dd>
 <dt><code>--print-offset</code></dt>
 <dd>After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe</dd>
 <dt><code>--fs-type</code></dt>

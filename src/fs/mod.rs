@@ -10,6 +10,7 @@ pub mod apfs_crypto;
 pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
+pub mod attrs;
 pub mod binhex;
 pub mod btrfs;
 pub mod carve;
