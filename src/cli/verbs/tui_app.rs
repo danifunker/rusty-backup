@@ -46,7 +46,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::cli::verbs::new::{FloppyArgs, FloppyFs, NewCommand, VolumeArgs, VolumeFs};
+use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
 use crate::device::{enumerate_devices, DiskDevice};
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::model::rate_tracker::RateTracker;
@@ -966,11 +966,13 @@ enum WizStep {
 enum DiskClass {
     Floppy,
     Volume,
+    Hd,
 }
 
-/// The two media classes the wizard can create end-to-end. `new hd` (x68k /
-/// sgi-efs) and CD-ROM (`optical new`) need donor / partition options, so they
-/// stay CLI-driven for now and are surfaced as a note, not a class.
+/// The media classes the wizard can create end-to-end. The hard-disk targets
+/// build with their defaults (path + size is enough); their donor / custom
+/// partition options — `--system-disk`, `--boot-sector-donor`, `--partitions`,
+/// EFS geometry — remain CLI-only. CD-ROM (`optical new`) is still CLI-driven.
 const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     (
         "Floppy",
@@ -982,6 +984,25 @@ const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
         DiskClass::Volume,
         "Bare single volume of any size (a superfloppy): NTFS, ext, HFS+, EFS, ...",
     ),
+    (
+        "Hard disk",
+        DiskClass::Hd,
+        "Partition-table-wrapped, self-bootable HDD image (Sharp X68000, SGI IRIX).",
+    ),
+];
+
+/// Bootable hard-disk platforms offered under the "Hard disk" class. Each
+/// builds with its defaults; donor-cloning and custom partition layouts stay on
+/// the CLI (`rb-cli new hd ...`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HdPlatform {
+    X68k,
+    SgiEfs,
+}
+
+const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
+    ("Sharp X68000 (Human68k)", HdPlatform::X68k),
+    ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -1060,16 +1081,35 @@ impl NewWizard {
     fn class_label(&self) -> &'static str {
         NEW_CLASSES[self.class_sel.min(NEW_CLASSES.len() - 1)].0
     }
+    /// Re-seed the size field with a sensible default for the selected class,
+    /// but only while it still holds another class's default — so a size the
+    /// user typed is never clobbered by arrowing through the class list.
+    fn seed_size_for_class(&mut self) {
+        const DEFAULTS: [&str; 3] = ["800K", "64M", "32M"];
+        let cur = self.size.trim();
+        if cur.is_empty() || DEFAULTS.contains(&cur) {
+            self.size = match self.class() {
+                DiskClass::Floppy => DEFAULTS[0],
+                DiskClass::Volume => DEFAULTS[1],
+                DiskClass::Hd => DEFAULTS[2],
+            }
+            .to_string();
+        }
+    }
+
     fn fs_count(&self) -> usize {
         match self.class() {
             DiskClass::Floppy => FLOPPY_FS.len(),
             DiskClass::Volume => VOLUME_FS.len(),
+            // The "filesystem" step picks the target platform for a hard disk.
+            DiskClass::Hd => HD_PLATFORMS.len(),
         }
     }
     fn fs_label(&self, i: usize) -> &'static str {
         match self.class() {
             DiskClass::Floppy => FLOPPY_FS[i.min(FLOPPY_FS.len() - 1)].0,
             DiskClass::Volume => VOLUME_FS[i.min(VOLUME_FS.len() - 1)].0,
+            DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
         }
     }
 }
@@ -4383,11 +4423,13 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     w.class_sel = w.class_sel.saturating_sub(1);
                     w.fs_sel = 0;
+                    w.seed_size_for_class();
                     true
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     w.class_sel = (w.class_sel + 1).min(NEW_CLASSES.len() - 1);
                     w.fs_sel = 0;
+                    w.seed_size_for_class();
                     true
                 }
                 KeyCode::Enter => {
@@ -4505,6 +4547,42 @@ impl App {
                 cluster_size: None,
                 sector_size: None,
             }),
+            // Hard disks build with their defaults; the donor-clone and custom
+            // partition-layout options stay on the CLI (`rb-cli new hd ...`).
+            DiskClass::Hd => {
+                let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
+                NewCommand::Hd {
+                    cmd: match platform {
+                        // Same defaults the CLI's clap definitions carry:
+                        // SASI variant, the printing IPL stub, one partition.
+                        HdPlatform::X68k => {
+                            HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
+                                image: path.clone(),
+                                size,
+                                variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
+                                stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
+                                partitions: 1,
+                                system_disk: None,
+                                boot_sector_donor: None,
+                                builtin_boot_sector: false,
+                            })
+                        }
+                        HdPlatform::SgiEfs => {
+                            HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
+                                image: path.clone(),
+                                size,
+                                name,
+                                fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
+                                heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+                                sectors:
+                                    crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+                                inodes: None,
+                                bytes_per_inode: None,
+                            })
+                        }
+                    },
+                }
+            }
         };
         // `new::run` prints advisories to stdout/stderr, which would land on the
         // alt-screen; run it with both streams redirected to null.
@@ -7316,8 +7394,9 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disk (x68k / sgi-efs) and CD-ROM images: use the CLI \
-                     (`rb-cli new hd ...`) or the Optical tab.",
+                    "Hard disks build with their defaults; donor-cloning and custom \
+                     partition layouts need the CLI (`rb-cli new hd ...`). \
+                     CD-ROM images: the Optical tab.",
                     self.palette.dim(),
                 ));
                 lines.push(Line::raw(""));
