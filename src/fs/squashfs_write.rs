@@ -204,6 +204,22 @@ impl BuildNode {
         }
     }
 
+    /// The full Unix mode: the `S_IF*` type bits implied by this node's kind,
+    /// OR'd with its stored permission bits. The inverse of what the writer
+    /// stores on disk (permission bits only).
+    pub fn unix_mode(&self) -> u32 {
+        let type_bits: u32 = match self.kind {
+            BuildKind::Dir(_) => 0o040_000,
+            BuildKind::File(_) => 0o100_000,
+            BuildKind::Symlink(_) => 0o120_000,
+            BuildKind::BlockDev { .. } => 0o060_000,
+            BuildKind::CharDev { .. } => 0o020_000,
+            BuildKind::Fifo => 0o010_000,
+            BuildKind::Socket => 0o140_000,
+        };
+        type_bits | (self.mode as u32 & 0o7777)
+    }
+
     /// Build a tree from a host directory, as `mksquashfs DIR IMAGE` does.
     ///
     /// Permissions and mtimes come from the host; **ownership does not**. Every
@@ -445,6 +461,16 @@ impl MetadataWriter {
         self.flush_block()?;
         Ok(self.out)
     }
+}
+
+/// Whether the writer has an encoder for `compressor`. An editor should check
+/// this at open time so it refuses an LZO / LZ4 / legacy-LZMA image with a
+/// clear "can't rebuild this compressor" message rather than failing mid-write.
+pub fn compressor_is_writable(compressor: Compressor) -> bool {
+    matches!(
+        compressor,
+        Compressor::Gzip | Compressor::Xz | Compressor::Zstd
+    )
 }
 
 /// Compress one block with the image's codec.

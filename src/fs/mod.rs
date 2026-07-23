@@ -87,6 +87,7 @@ pub mod rsdos;
 pub mod sfs;
 pub mod sfs_fsck;
 pub mod squashfs;
+pub mod squashfs_edit;
 pub mod squashfs_write;
 pub mod tar_export;
 pub mod tar_import;
@@ -1855,6 +1856,13 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     partition_offset,
                 )?)),
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                // SquashFS is read-only on disk, so "editing" is a whole-image
+                // rebuild: the editor reads the tree into memory, mutates it,
+                // and rebuilds on sync. See `squashfs_edit`.
+                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open(
                     reader,
                     partition_offset,
                 )?)),

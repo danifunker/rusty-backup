@@ -175,8 +175,8 @@ work by fragment when planning reuse.
 | **1b** | Fragment packing (compression-ratio parity with mksquashfs). | **done** — 1.004 size ratio on real /etc |
 | **2a** | `FileContent` seam: stream content, don't hold the whole image in RAM. | **done** — host files stream |
 | **2b** | Source→tree bridge: read an image into an editable tree. | **done** — 2513-node rebuild round-trip |
-| **2c** | `EditableFilesystem` over bare `.squashfs` + partitions: an overlay of pending edits, rebuild on sync, with the §2 size prompt and D6 attribute + xattr inheritance. | **next** |
-| **2d** | In-place commit (temp + size check + atomic rename) and dispatch/CLI wiring. | |
+| **2c** | `EditableFilesystem` over bare `.squashfs`: create/delete/mkdir/rename/symlink over an in-memory tree, rebuild on sync, D6 attributes. Wired into the edit dispatch + CLI. | **done** — `rb-cli put` edits a real image; `unsquashfs`-accepted |
+| **2d** | Partition-hosted images + the §2 size-budget prompt; in-place commit (temp + size check + atomic rename); xattr-inheritance-on-replace. | **next** |
 | **2-opt** | Lazy `FileContent::Source` streaming + verbatim block reuse. Not needed for correctness; bounds rebuild memory and cost. | deferred |
 | **3** | ISO 9660 and AppImage containers. | |
 | **4** | `rb-cli new volume squashfs` (create blank) and a structural verifier (§6 of the audit: there is no repair to be had). | |

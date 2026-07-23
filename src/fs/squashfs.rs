@@ -407,6 +407,25 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         Ok(fs)
     }
 
+    /// The [`BuildOptions`](super::squashfs_write::BuildOptions) that reproduce
+    /// this image's compression: its compressor, block size and mod-time,
+    /// fragments on. A rebuild passes these so an edit doesn't silently re-tune
+    /// compression (decision D3).
+    pub fn source_build_options(&self) -> super::squashfs_write::BuildOptions {
+        super::squashfs_write::BuildOptions {
+            compressor: self.sb.compressor,
+            block_size: self.sb.block_size,
+            mod_time: self.sb.mod_time,
+            use_fragments: true,
+        }
+    }
+
+    /// Consume the filesystem and return the underlying reader — so an editor
+    /// can read the tree, then reclaim the handle to write the rebuild back.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     /// Does `reader` hold a SquashFS image at `offset`?
     ///
     /// Checks the magic *and* parses the superblock, so a chance 4-byte match in
