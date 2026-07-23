@@ -413,6 +413,15 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         }
     }
 
+    /// The superblock's `bytes_used` — how much of the image is meaningful.
+    ///
+    /// Same value as the `Filesystem::total_size` impl reports, but reachable
+    /// without the trait's `Send` bound, which the editor cannot assume of the
+    /// handle it is about to write through.
+    pub fn bytes_used(&self) -> u64 {
+        self.sb.bytes_used
+    }
+
     /// Consume the filesystem and return the underlying reader — so an editor
     /// can read the tree, then reclaim the handle to write the rebuild back.
     pub fn into_inner(self) -> R {

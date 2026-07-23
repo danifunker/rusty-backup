@@ -79,6 +79,16 @@ const FLAG_NO_XATTRS: u16 = 0x0200;
 /// Images are padded out to this boundary, matching `mksquashfs`.
 const PAD_TO: u64 = 4096;
 
+/// What an image whose superblock reports `bytes_used` actually occupies —
+/// `bytes_used` rounded up to the [`PAD_TO`] boundary.
+///
+/// Size budgeting has to compare like with like: [`write_squashfs`] *returns*
+/// `bytes_used` but *writes* the padded length, so a ceiling derived from a
+/// superblock would reject a byte-identical rebuild without this.
+pub fn image_footprint(bytes_used: u64) -> u64 {
+    bytes_used.div_ceil(PAD_TO) * PAD_TO
+}
+
 /// Maximum entries sharing one directory header.
 const DIR_HEADER_MAX_ENTRIES: usize = 256;
 

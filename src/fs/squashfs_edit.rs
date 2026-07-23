@@ -27,15 +27,26 @@
 //! the backing store once the whole rebuild has succeeded, so a mid-rebuild
 //! failure leaves the original image intact.
 //!
-//! # Scope
+//! # Where the image lives, and how big it may get
 //!
-//! This slice targets the **bare superfloppy** (offset 0): a standalone
-//! `.squashfs`, the shape appliance and AppImage-extracted images take. The
-//! size-budget prompt (`docs/squashfs_edit.md` §2) and partition-hosted images
-//! are the next slice; here the file simply grows to fit, so `free_space`
-//! reports the format's practical ceiling rather than a partition limit.
+//! A rebuild produces a whole new image, so the question "does it still fit?"
+//! has to be asked explicitly — there is no allocator to ask. Two numbers
+//! answer it (`docs/squashfs_edit.md` §2):
+//!
+//! - the **container capacity**: how many bytes the image may occupy where it
+//!   sits. `None` for a bare `.squashfs` at offset 0 — the file *is* the
+//!   filesystem, so it simply grows. `Some(len)` for a partition, where
+//!   overrunning the end would scribble over the next one.
+//! - the **[`SizeBudget`]**: an additional ceiling the user asked for.
+//!
+//! The lower of the two is enforced twice: once at open, so an impossible
+//! request is named before any edit is made, and once after the rebuild but
+//! **before anything is overwritten**, so a rebuild that turned out too large
+//! leaves the original image intact.
 
 use std::io::{Read, Seek, SeekFrom, Write};
+
+use crate::partition::format_size;
 
 use super::attrs::{resolve_attrs, resolve_dir_attrs, AttrOverrides};
 use super::entry::{EntryType, FileEntry};
@@ -44,14 +55,82 @@ use super::filesystem::{
 };
 use super::squashfs::SquashfsFilesystem;
 use super::squashfs_write::{
-    compressor_is_writable, write_squashfs, BuildKind, BuildNode, BuildOptions, FileContent,
+    compressor_is_writable, image_footprint, write_squashfs, BuildKind, BuildNode, BuildOptions,
+    FileContent,
 };
+
+/// How large the rebuilt image is allowed to be (`docs/squashfs_edit.md` §2).
+///
+/// This is **not** slack inside the filesystem — padding a SquashFS with zeroes
+/// buys nothing, since you cannot allocate into it later without another full
+/// rebuild. It is the ceiling on the region the image occupies, and the slack
+/// it implies lives *between the end of the image and the end of its
+/// container*, so a future rebuild can grow without re-cutting the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeBudget {
+    /// Accept whatever the rebuild produces. Still bounded by the container.
+    Fit,
+    /// The rebuilt image must be at most this many bytes.
+    Limit(u64),
+}
+
+impl SizeBudget {
+    /// `--grow N`: the current image size plus `headroom` bytes.
+    pub fn headroom(current_len: u64, headroom: u64) -> Self {
+        Self::Limit(current_len.saturating_add(headroom))
+    }
+
+    /// The ceiling this budget imposes, if any.
+    pub fn ceiling(&self) -> Option<u64> {
+        match *self {
+            Self::Fit => None,
+            Self::Limit(n) => Some(n),
+        }
+    }
+}
+
+/// A projection of what the rebuilt image will occupy
+/// (`docs/squashfs_edit.md` §2.5).
+///
+/// SquashFS cannot answer "will this fit?" the way a bitmap-backed filesystem
+/// can — the true answer only exists once the rebuild has run. This is the
+/// informed estimate that turns "how much room do you want?" into a question
+/// the user can actually answer, and it is deliberately a **range**: the
+/// anchor (the source image's own size) is exact, the delta is not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizeProjection {
+    /// Best estimate of the rebuilt image size, in bytes.
+    pub estimate: u64,
+    /// Lower bound — added content turns out to compress unusually well.
+    pub low: u64,
+    /// Upper bound — added content turns out to be incompressible.
+    pub high: u64,
+    /// The source image's observed ratio (image bytes / file content bytes).
+    pub ratio: f64,
+}
+
+/// Ratio assumed for added content in the optimistic bound — roughly what a
+/// well-compressing text tree achieves.
+const BEST_CASE_RATIO: f64 = 0.02;
+/// Ratio assumed for added content in the pessimistic bound: already-compressed
+/// input stores verbatim, plus a little per-block bookkeeping.
+const WORST_CASE_RATIO: f64 = 1.02;
 
 /// An editable SquashFS image backed by an in-memory tree.
 pub struct SquashfsEditor<RW: Read + Write + Seek> {
     rw: RW,
     /// Byte offset of the image within `rw` (0 for a bare superfloppy).
     offset: u64,
+    /// Bytes the image may occupy in its container, or `None` when it can grow
+    /// freely (a bare `.squashfs` file). Always enforced, budget or not.
+    capacity: Option<u64>,
+    /// The user's requested ceiling, on top of `capacity`.
+    budget: SizeBudget,
+    /// Footprint of the image we opened, for `--grow` and for the projection's
+    /// anchor.
+    source_len: u64,
+    /// Sum of file content bytes in the source tree, for the observed ratio.
+    source_content_len: u64,
     /// The editable tree; the root node's name is empty by convention.
     root: BuildNode,
     /// Compression settings carried from the source (D3).
@@ -59,9 +138,31 @@ pub struct SquashfsEditor<RW: Read + Write + Seek> {
 }
 
 impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
+    /// Open a bare `.squashfs` at `offset` for editing, free to grow.
+    ///
+    /// Equivalent to [`open_within`](Self::open_within) with no container
+    /// capacity and no budget. Use that instead for a partition-hosted image.
+    pub fn open(rw: RW, offset: u64) -> Result<Self, FilesystemError> {
+        Self::open_within(rw, offset, None, SizeBudget::Fit)
+    }
+
     /// Open `rw` (a whole SquashFS image at `offset`) for editing: read the tree
     /// into memory and reclaim the handle for the eventual rebuild.
-    pub fn open(rw: RW, offset: u64) -> Result<Self, FilesystemError> {
+    ///
+    /// `capacity` is how many bytes the image may occupy where it lives — the
+    /// partition length for a partition-hosted image, `None` for a bare file.
+    /// `budget` is any further ceiling the user asked for; the two are enforced
+    /// together, so `SizeBudget::Fit` never means "may overrun the partition".
+    ///
+    /// Refuses here (stage 1 of §2.4) when the requested budget is larger than
+    /// the container can hold: that is a decision the user should revisit
+    /// *before* making edits, not after a multi-minute rebuild.
+    pub fn open_within(
+        rw: RW,
+        offset: u64,
+        capacity: Option<u64>,
+        budget: SizeBudget,
+    ) -> Result<Self, FilesystemError> {
         let mut src = SquashfsFilesystem::open(rw, offset)?;
         let opts = src.source_build_options();
         if !compressor_is_writable(opts.compressor) {
@@ -71,14 +172,103 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
                 opts.compressor.name()
             )));
         }
+        // What the image occupies is `bytes_used` padded out, and the padded
+        // figure is what a ceiling has to be compared against.
+        let source_len = image_footprint(src.bytes_used());
         let root = src.read_build_tree()?;
         let rw = src.into_inner();
+        let source_content_len = Self::content_len(&root);
+
+        // §2.3. At offset 0 the file is the filesystem and simply grows. Any
+        // other offset means the image is hosted inside something; when the
+        // caller did not say how much room that leaves, fall back to the image's
+        // own size — a shrinking edit still works, and a growing one is refused
+        // by name instead of overwriting whatever follows.
+        let capacity = match (capacity, offset) {
+            (Some(c), _) => Some(c),
+            (None, 0) => None,
+            (None, _) => Some(source_len),
+        };
+
+        if let (Some(cap), Some(want)) = (capacity, budget.ceiling()) {
+            if want > cap {
+                return Err(FilesystemError::Unsupported(format!(
+                    "squashfs: a size budget of {} exceeds the {} this image has \
+                     to live in — lower the budget, or make room after it first",
+                    format_size(want),
+                    format_size(cap)
+                )));
+            }
+        }
+
         Ok(Self {
             rw,
             offset,
+            capacity,
+            budget,
+            source_len,
+            source_content_len,
             root,
             opts,
         })
+    }
+
+    /// The effective ceiling on a rebuild, and why it applies. `None` means the
+    /// image may grow freely.
+    fn ceiling(&self) -> Option<(u64, &'static str)> {
+        match (self.capacity, self.budget.ceiling()) {
+            (None, None) => None,
+            (Some(c), None) => Some((c, "the room available where this image lives")),
+            (None, Some(b)) => Some((b, "the requested size budget")),
+            (Some(c), Some(b)) if b < c => Some((b, "the requested size budget")),
+            (Some(c), Some(_)) => Some((c, "the room available where this image lives")),
+        }
+    }
+
+    /// The size the image occupied when it was opened. `--grow N` is
+    /// `SizeBudget::headroom(this, N)`.
+    pub fn source_len(&self) -> u64 {
+        self.source_len
+    }
+
+    /// Total file content bytes under `node`, following the tree.
+    fn content_len(node: &BuildNode) -> u64 {
+        match &node.kind {
+            BuildKind::Dir(children) => children.iter().map(Self::content_len).sum(),
+            BuildKind::File(c) => c.len(),
+            _ => 0,
+        }
+    }
+
+    /// Project what a rebuild would occupy right now (`§2.5`).
+    ///
+    /// Anchored on the source image's actual size rather than re-estimating the
+    /// whole tree, because the common edit touches a sliver of a large image:
+    /// only the content *delta* is guessed, at the ratio this image itself was
+    /// built at. That leaves two sources of error, both small and both inside
+    /// the reported range — how the added bytes actually compress, and the
+    /// sub-percent difference between our encoder's output and the original's.
+    pub fn project_size(&self) -> SizeProjection {
+        let content = Self::content_len(&self.root);
+        let ratio = if self.source_content_len == 0 {
+            1.0
+        } else {
+            (self.source_len as f64 / self.source_content_len as f64).clamp(0.001, 1.5)
+        };
+        let added = content.saturating_sub(self.source_content_len) as f64;
+        let removed = self.source_content_len.saturating_sub(content) as f64;
+        let anchor = self.source_len as f64;
+
+        let clamp = |v: f64| v.max(0.0).min(u64::MAX as f64) as u64;
+        let estimate = clamp(anchor + (added - removed) * ratio);
+        let low = clamp(anchor + added * BEST_CASE_RATIO - removed);
+        let high = clamp(anchor + added * WORST_CASE_RATIO - removed * BEST_CASE_RATIO);
+        SizeProjection {
+            estimate,
+            low: low.min(estimate),
+            high: high.max(estimate),
+            ratio,
+        }
     }
 
     /// Split a filesystem path into its non-empty components.
@@ -270,13 +460,16 @@ impl<RW: Read + Write + Seek + Send> Filesystem for SquashfsEditor<RW> {
     }
 
     fn total_size(&self) -> u64 {
-        // A rebuild-only filesystem has no stable "size" until it is written;
-        // report the current backing length as a reasonable stand-in.
-        0
+        // What the image is allowed to occupy. Absent any ceiling it can grow
+        // freely, and the honest stand-in is what it occupies today.
+        self.ceiling().map(|(c, _)| c).unwrap_or(self.source_len)
     }
 
     fn used_size(&self) -> u64 {
-        0
+        // Everything in a SquashFS is live by construction, so "used" is the
+        // whole image — projected, since the real figure only exists after a
+        // rebuild.
+        self.project_size().estimate
     }
 }
 
@@ -521,6 +714,22 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
         write_squashfs(&mut buf, &self.root, &self.opts)?;
         let image = buf.into_inner();
 
+        // Stage 2 of §2.4. The rebuild has succeeded but nothing has been
+        // overwritten yet, so a too-large result costs the user their time and
+        // nothing else. Report both numbers: "too big" without them leaves no
+        // way to pick a budget that would have worked.
+        if let Some((ceiling, why)) = self.ceiling() {
+            if image.len() as u64 > ceiling {
+                return Err(FilesystemError::DiskFull(format!(
+                    "squashfs: the rebuilt image is {} but {why} is {} — the \
+                     original image is unchanged. Delete something, or allow \
+                     the image to grow.",
+                    format_size(image.len() as u64),
+                    format_size(ceiling)
+                )));
+            }
+        }
+
         self.rw
             .seek(SeekFrom::Start(self.offset))
             .map_err(FilesystemError::Io)?;
@@ -534,10 +743,13 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
-        // A bare superfloppy simply grows; there is no fixed free-space figure.
-        // The size budget (phase 2c size prompt) supersedes this for the
-        // partition-hosted case.
-        Ok(u64::MAX)
+        // An estimate, necessarily: the true figure does not exist until the
+        // rebuild runs, and `sync_metadata` is what actually enforces the
+        // ceiling. A bare file with no ceiling simply grows.
+        Ok(match self.ceiling() {
+            Some((ceiling, _)) => ceiling.saturating_sub(self.project_size().estimate),
+            None => u64::MAX,
+        })
     }
 }
 
@@ -595,6 +807,271 @@ mod tests {
 
     fn open_editor(bytes: Vec<u8>) -> SquashfsEditor<Cursor<Vec<u8>>> {
         SquashfsEditor::open(Cursor::new(bytes), 0).expect("open editor")
+    }
+
+    /// Incompressible bytes, so a size-budget test measures the budget rather
+    /// than the compressor. A plain LCG: no rand dependency, and reproducible.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// A starter image planted at `offset` inside a larger backing store, as a
+    /// partition would be, with `slack` spare bytes after it.
+    fn hosted_image(offset: u64, slack: u64) -> (Vec<u8>, u64) {
+        let img = starter_image();
+        let partition_len = img.len() as u64 + slack;
+        let mut disk = vec![0u8; (offset + partition_len) as usize];
+        disk[offset as usize..offset as usize + img.len()].copy_from_slice(&img);
+        (disk, partition_len)
+    }
+
+    /// The point of the whole size budget: a rebuild that outgrows its
+    /// partition is refused, and the original image survives intact.
+    #[test]
+    fn a_rebuild_that_overflows_its_partition_is_refused() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, partition_len) = hosted_image(OFFSET, 64 * 1024);
+        let before = disk.clone();
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+        )
+        .expect("open hosted");
+
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(2 << 20)),
+            2 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+
+        let err = ed.sync_metadata().expect_err("must refuse to overflow");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rebuilt image is") && msg.contains("unchanged"),
+            "expected an actual-vs-budget refusal, got: {msg}"
+        );
+
+        // Nothing was written: the backing store still holds the original image,
+        // and everything after the partition is still zero.
+        let after = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        assert_eq!(after, before, "a refused rebuild still touched the disk");
+    }
+
+    /// The same edit against a partition with room to hold it goes through, and
+    /// stays inside the partition.
+    #[test]
+    fn a_rebuild_that_fits_its_partition_is_written_at_the_offset() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, partition_len) = hosted_image(OFFSET, 4 << 20);
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+        )
+        .expect("open hosted");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "added",
+            &mut Cursor::new(b"added\n".to_vec()),
+            6,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        ed.sync_metadata().expect("sync must fit");
+
+        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        assert_eq!(
+            disk.len() as u64,
+            OFFSET + partition_len,
+            "the rebuild grew the backing store past the partition"
+        );
+        let mut fs = SquashfsFilesystem::open(Cursor::new(disk), OFFSET).expect("reopen at offset");
+        let root = fs.root().unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"added".to_string()), "got: {names:?}");
+    }
+
+    /// Deleting into a partition too small to hold a *grown* image still works
+    /// — the ceiling constrains the result, not the operation.
+    #[test]
+    fn a_shrinking_edit_fits_a_tight_partition() {
+        const OFFSET: u64 = 512 * 1024;
+        // No slack at all: only an image at most as large as the original fits.
+        let (disk, partition_len) = hosted_image(OFFSET, 0);
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+        )
+        .expect("open hosted");
+        let root = ed.root().expect("root");
+        let readme = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "readme")
+            .unwrap();
+        ed.delete_entry(&root, &readme).expect("delete");
+        ed.sync_metadata().expect("a smaller image must still fit");
+    }
+
+    /// Stage 1 of the two-stage enforcement: a budget the container cannot hold
+    /// is named at open, before the user makes any edits.
+    #[test]
+    fn a_budget_larger_than_the_container_is_refused_at_open() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, partition_len) = hosted_image(OFFSET, 64 * 1024);
+        let err = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Limit(partition_len * 4),
+        )
+        .err()
+        .expect("must refuse a budget it cannot honour");
+        assert!(
+            err.to_string().contains("size budget"),
+            "expected a budget-vs-container refusal, got: {err}"
+        );
+    }
+
+    /// A budget *below* the container is the binding ceiling, and says so.
+    #[test]
+    fn an_explicit_budget_below_the_container_is_what_binds() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, partition_len) = hosted_image(OFFSET, 8 << 20);
+        let img_len = partition_len - (8 << 20);
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::headroom(img_len, 8 * 1024),
+        )
+        .expect("open hosted");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(1 << 20)),
+            1 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        let err = ed.sync_metadata().expect_err("must refuse");
+        assert!(
+            err.to_string().contains("requested size budget"),
+            "the budget, not the partition, should be named: {err}"
+        );
+    }
+
+    /// An image at a non-zero offset whose container size nobody declared may
+    /// not grow — we cannot know what follows it.
+    #[test]
+    fn an_undeclared_container_caps_growth_at_the_current_size() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, _) = hosted_image(OFFSET, 8 << 20);
+        let mut ed = SquashfsEditor::open_within(Cursor::new(disk), OFFSET, None, SizeBudget::Fit)
+            .expect("open hosted");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(1 << 20)),
+            1 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        ed.sync_metadata()
+            .expect_err("growth past an unknown boundary must be refused");
+    }
+
+    /// A bare `.squashfs` at offset 0 is the file itself, so it grows freely.
+    #[test]
+    fn a_bare_image_grows_freely() {
+        let mut ed = open_editor(starter_image());
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(1 << 20)),
+            1 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        assert_eq!(ed.free_space().unwrap(), u64::MAX, "a bare file has no cap");
+        ed.sync_metadata().expect("a bare file simply grows");
+        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        assert!(
+            bytes.len() > 1 << 20,
+            "the added megabyte did not land: {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// The projection has to move with the tree, and bracket its own estimate.
+    #[test]
+    fn the_projection_tracks_added_content() {
+        let mut ed = open_editor(starter_image());
+        let before = ed.project_size();
+        assert_eq!(
+            before.estimate,
+            ed.source_len(),
+            "an untouched tree should project its own size"
+        );
+
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(1 << 20)),
+            1 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        let after = ed.project_size();
+        assert!(
+            after.estimate > before.estimate,
+            "adding a megabyte did not move the projection"
+        );
+        assert!(
+            after.low <= after.estimate && after.estimate <= after.high,
+            "estimate outside its own range: {after:?}"
+        );
+
+        // Incompressible content: the true size lands near the pessimistic end,
+        // and the range must contain it.
+        ed.sync_metadata().expect("sync");
+        let actual = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new()))
+            .into_inner()
+            .len() as u64;
+        assert!(
+            actual >= after.low && actual <= after.high,
+            "actual {actual} outside the projected range {}..={}",
+            after.low,
+            after.high
+        );
     }
 
     #[test]

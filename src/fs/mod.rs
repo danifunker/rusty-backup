@@ -1701,11 +1701,37 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
 /// Open a filesystem for editing (read + write access).
 ///
 /// Same dispatch logic as `open_filesystem` but requires a writable reader and
-/// returns a `Box<dyn EditableFilesystem>`. Currently only FAT is supported;
-/// other filesystems will be added in subsequent phases.
+/// returns a `Box<dyn EditableFilesystem>`.
+///
+/// The partition's length is not passed, so filesystems that need to know where
+/// their container ends fall back to a conservative assumption. Prefer
+/// [`open_editable_filesystem_within`] when the caller knows it — today only
+/// SquashFS consumes it, because it is the only driver that rewrites its whole
+/// image and so can grow past the partition it was read from.
 pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
+    reader: R,
+    partition_offset: u64,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    open_editable_filesystem_within(
+        reader,
+        partition_offset,
+        None,
+        partition_type,
+        partition_type_string,
+    )
+}
+
+/// [`open_editable_filesystem`], told how many bytes the partition holds.
+///
+/// `partition_len` bounds what a driver may write, for the drivers that can
+/// produce an image of a different size than the one they read. `None` means
+/// "unknown", which is what the plain opener passes.
+pub fn open_editable_filesystem_within<R: Read + Write + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
+    partition_len: Option<u64>,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
@@ -1864,9 +1890,20 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 // SquashFS is read-only on disk, so "editing" is a whole-image
                 // rebuild: the editor reads the tree into memory, mutates it,
                 // and rebuilds on sync. See `squashfs_edit`.
-                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open(
+                //
+                // A bare `.squashfs` at offset 0 is the file itself and may
+                // grow, so it gets no capacity; reaching this arm at a non-zero
+                // offset means the image is hosted in something, and then the
+                // declared length is a hard boundary.
+                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open_within(
                     reader,
                     partition_offset,
+                    if partition_offset == 0 {
+                        None
+                    } else {
+                        partition_len
+                    },
+                    squashfs_edit::SizeBudget::Fit,
                 )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
@@ -2010,6 +2047,16 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 "fat" => Ok(Box::new(fat::FatFilesystem::open(
                     reader,
                     partition_offset,
+                )?)),
+                // Appliance images ship their SquashFS root in a plain 0x83
+                // partition. Editing rebuilds the whole image, so the partition
+                // length is a real boundary here, not a formality — see
+                // `squashfs_edit::SquashfsEditor::open_within`.
+                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open_within(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                    squashfs_edit::SizeBudget::Fit,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,
