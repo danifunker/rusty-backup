@@ -967,6 +967,159 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         }
         Ok(out)
     }
+
+    /// Read a regular file's bytes given its already-decoded inode. Shared by
+    /// the [`Filesystem::read_file`] path and the rebuild bridge; the whole-
+    /// block-then-fragment-tail logic lives in one place.
+    fn read_regular_file(
+        &mut self,
+        inode: &Inode,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        let want = (inode.file_size as usize).min(max_bytes);
+        let mut out = Vec::with_capacity(want);
+
+        // Whole blocks first, laid end to end from the file's start offset.
+        let mut pos = inode.file_start;
+        for &size_field in &inode.block_sizes {
+            if out.len() >= want {
+                break;
+            }
+            let block = self.read_data_block(pos, size_field)?;
+            let take = (want - out.len()).min(block.len());
+            out.extend_from_slice(&block[..take]);
+            pos += (size_field & 0x00FF_FFFF) as u64;
+        }
+
+        // Then the tail, if it was packed into a shared fragment.
+        if out.len() < want && inode.fragment_index != 0xFFFF_FFFF {
+            let frag = self
+                .fragments
+                .get(inode.fragment_index as usize)
+                .copied()
+                .ok_or_else(|| {
+                    FilesystemError::InvalidData(format!(
+                        "squashfs: fragment {} out of range",
+                        inode.fragment_index
+                    ))
+                })?;
+            let block = self.read_data_block(frag.start, frag.size)?;
+            let from = inode.fragment_offset as usize;
+            let take = (want - out.len()).min(block.len().saturating_sub(from));
+            if take > 0 {
+                out.extend_from_slice(&block[from..from + take]);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Read the entire image into an editable [`BuildNode`] tree — the bridge
+    /// from the read side to the rebuild side (`docs/squashfs_edit.md` phase 2).
+    ///
+    /// Every field a faithful rebuild needs is carried across: mode, uid, gid
+    /// (resolved through the ID table), mtime, symlink targets, device
+    /// major/minor, and extended attributes. This is the whole reason phase 0
+    /// retained that metadata rather than keeping only what browsing showed.
+    ///
+    /// **Memory:** file contents are read eagerly into `FileContent::Bytes`, so
+    /// peak use is the decompressed image. Fine for AppImages and typical
+    /// appliance images; lazy per-file streaming and verbatim block reuse are
+    /// the noted phase-2b optimization, and land behind the same `FileContent`
+    /// seam without changing this signature.
+    pub fn read_build_tree(&mut self) -> Result<super::squashfs_write::BuildNode, FilesystemError> {
+        let root_ref = self.sb.root_inode_ref;
+        let mut root = self.build_node(String::new(), root_ref)?;
+        // The tree's root name is conventionally empty; the writer ignores it.
+        root.name = String::new();
+        Ok(root)
+    }
+
+    /// Read only the subtree at `path` (slash-separated, relative to the image
+    /// root) into a fresh-root [`BuildNode`]. Navigates the directory table so
+    /// it decompresses only what that subtree needs, rather than the whole image
+    /// — the difference between seconds and minutes on a distro rootfs.
+    ///
+    /// `path` must name a directory. Primarily for tests and for tooling that
+    /// rebuilds a portion; a full edit rebuild uses [`Self::read_build_tree`].
+    pub fn read_build_subtree(
+        &mut self,
+        path: &str,
+    ) -> Result<super::squashfs_write::BuildNode, FilesystemError> {
+        let mut reference = self.sb.root_inode_ref;
+        for component in path.split('/').filter(|c| !c.is_empty()) {
+            let inode = self.read_inode(reference)?;
+            if !matches!(inode.kind, INODE_DIR | INODE_EXT_DIR) {
+                return Err(FilesystemError::NotADirectory(path.to_string()));
+            }
+            let entries = self.read_dir_entries(&inode)?;
+            reference = entries
+                .into_iter()
+                .find(|(name, _, _)| name == component)
+                .map(|(_, r, _)| r)
+                .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
+        }
+        let mut node = self.build_node(String::new(), reference)?;
+        node.name = String::new();
+        Ok(node)
+    }
+
+    /// Recursively turn the inode at `reference` into a [`BuildNode`].
+    fn build_node(
+        &mut self,
+        name: String,
+        reference: u64,
+    ) -> Result<super::squashfs_write::BuildNode, FilesystemError> {
+        use super::squashfs_write::{BuildKind, FileContent};
+
+        let inode = self.read_inode(reference)?;
+        let xattrs = self.read_xattrs(inode.xattr_idx)?;
+        let mode = inode.mode & 0o7777;
+        let uid = self.resolve_id(inode.uid_idx);
+        let gid = self.resolve_id(inode.gid_idx);
+        let mtime = inode.mtime;
+
+        let kind = match inode.kind {
+            INODE_DIR | INODE_EXT_DIR => {
+                let entries = self.read_dir_entries(&inode)?;
+                let mut children = Vec::with_capacity(entries.len());
+                for (child_name, child_ref, _kind) in entries {
+                    children.push(self.build_node(child_name, child_ref)?);
+                }
+                BuildKind::Dir(children)
+            }
+            INODE_FILE | INODE_EXT_FILE => {
+                let data = self.read_regular_file(&inode, usize::MAX)?;
+                BuildKind::File(FileContent::Bytes(data))
+            }
+            INODE_SYMLINK | INODE_EXT_SYMLINK => BuildKind::Symlink(inode.symlink_target.clone()),
+            INODE_BLKDEV | INODE_EXT_BLKDEV => BuildKind::BlockDev {
+                major: inode.dev_major,
+                minor: inode.dev_minor,
+            },
+            INODE_CHRDEV | INODE_EXT_CHRDEV => BuildKind::CharDev {
+                major: inode.dev_major,
+                minor: inode.dev_minor,
+            },
+            INODE_FIFO | INODE_EXT_FIFO => BuildKind::Fifo,
+            INODE_SOCKET | INODE_EXT_SOCKET => BuildKind::Socket,
+            other => {
+                return Err(FilesystemError::InvalidData(format!(
+                    "squashfs: cannot rebuild unknown inode type {other}"
+                )))
+            }
+        };
+
+        Ok(super::squashfs_write::BuildNode {
+            name,
+            mode,
+            uid,
+            gid,
+            mtime,
+            xattrs,
+            kind,
+        })
+    }
 }
 
 impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
@@ -1042,43 +1195,7 @@ impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
                 )))
             }
         }
-
-        let want = (inode.file_size as usize).min(max_bytes);
-        let mut out = Vec::with_capacity(want);
-
-        // Whole blocks first, laid end to end from the file's start offset.
-        let mut pos = inode.file_start;
-        for &size_field in &inode.block_sizes {
-            if out.len() >= want {
-                break;
-            }
-            let block = self.read_data_block(pos, size_field)?;
-            let take = (want - out.len()).min(block.len());
-            out.extend_from_slice(&block[..take]);
-            pos += (size_field & 0x00FF_FFFF) as u64;
-        }
-
-        // Then the tail, if it was packed into a shared fragment.
-        if out.len() < want && inode.fragment_index != 0xFFFF_FFFF {
-            let frag = self
-                .fragments
-                .get(inode.fragment_index as usize)
-                .copied()
-                .ok_or_else(|| {
-                    FilesystemError::InvalidData(format!(
-                        "squashfs: fragment {} out of range",
-                        inode.fragment_index
-                    ))
-                })?;
-            let block = self.read_data_block(frag.start, frag.size)?;
-            let from = inode.fragment_offset as usize;
-            let take = (want - out.len()).min(block.len().saturating_sub(from));
-            if take > 0 {
-                out.extend_from_slice(&block[from..from + take]);
-            }
-        }
-
-        Ok(out)
+        self.read_regular_file(&inode, max_bytes)
     }
 
     fn volume_label(&self) -> Option<&str> {

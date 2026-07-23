@@ -1847,6 +1847,184 @@ mod tests {
         let _ = err;
     }
 
+    /// **The phase-2 bridge round-trip.** Read a real image into a tree, rebuild
+    /// it, read the rebuild back, and prove the two trees are identical.
+    ///
+    /// This drives the whole reader -> `read_build_tree` -> writer ->
+    /// `read_build_tree` path over a real mksquashfs image (the Ubuntu 12.04
+    /// live CD's `casper/filesystem.squashfs`). It compares the in-memory source
+    /// tree against the tree read back from our rebuild, field for field: name,
+    /// mode, uid, gid, symlink target, device major/minor, xattrs, and every
+    /// regular file's bytes.
+    ///
+    /// The reader is independently trustworthy here — it is oracle-validated
+    /// against `unsquashfs` at 123k entries elsewhere — so "the rebuild reads
+    /// back identical" is a real fidelity check on the *writer*, not two halves
+    /// agreeing on a shared mistake: a writer that dropped a file, corrupted
+    /// content or rewrote a mode produces a tree that differs from the source.
+    #[test]
+    fn rebuilds_a_real_image_faithfully() {
+        use crate::fs::squashfs::SquashfsFilesystem;
+
+        let path = std::env::var("RB_SQUASHFS_ISO").unwrap_or_else(|_| {
+            "/Users/dani/Downloads/ubuntu-12.04-desktop-powerpc.iso".to_string()
+        });
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            eprintln!("{path} absent — skipping bridge round-trip");
+            return;
+        };
+        let Some(offset) = find_squashfs_offset_for_test(&mut file) else {
+            eprintln!("no squashfs in {path} — skipping");
+            return;
+        };
+
+        // Rebuild a representative subtree rather than the whole 558 MB image:
+        // /etc is ~1500 files with modes, symlinks and nested directories.
+        // `read_build_subtree` decompresses only /etc, not the whole rootfs.
+        let mut fs = SquashfsFilesystem::open(file, offset).expect("open source");
+        let etc = fs.read_build_subtree("etc").expect("image has no /etc");
+
+        let mut cur = Cursor::new(Vec::new());
+        write_squashfs(&mut cur, &etc, &BuildOptions::default()).expect("rebuild");
+
+        let mut rebuilt = SquashfsFilesystem::open(cur, 0).expect("open rebuild");
+        let round = rebuilt.read_build_tree().expect("read rebuild tree");
+
+        // The rebuild's root name is empty; `etc`'s is "/". Compare their
+        // children.
+        let mut checked = 0usize;
+        compare_trees(&etc, &round, "/", &mut checked);
+        eprintln!("bridge round-trip: {checked} nodes identical after rebuild");
+        assert!(
+            checked > 200,
+            "only compared {checked} nodes — the walk did not cover /etc"
+        );
+    }
+
+    /// Recursively assert two build trees are identical. Children are matched by
+    /// name (directory order is an implementation detail), so a missing or extra
+    /// node fails as a count mismatch at its parent.
+    fn compare_trees(a: &BuildNode, b: &BuildNode, path: &str, checked: &mut usize) {
+        assert_eq!(a.mode, b.mode, "mode differs at {path}");
+        assert_eq!(a.uid, b.uid, "uid differs at {path}");
+        assert_eq!(a.gid, b.gid, "gid differs at {path}");
+        assert_eq!(a.mtime, b.mtime, "mtime differs at {path}");
+        assert_eq!(a.xattrs, b.xattrs, "xattrs differ at {path}");
+        *checked += 1;
+
+        match (&a.kind, &b.kind) {
+            (BuildKind::Dir(ac), BuildKind::Dir(bc)) => {
+                assert_eq!(
+                    ac.len(),
+                    bc.len(),
+                    "child count differs at {path}: {} vs {}",
+                    ac.len(),
+                    bc.len()
+                );
+                let by_name = |v: &[BuildNode]| {
+                    let mut m: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for (i, c) in v.iter().enumerate() {
+                        m.insert(c.name.clone(), i);
+                    }
+                    m
+                };
+                let bmap = by_name(bc);
+                for child in ac {
+                    let j = *bmap
+                        .get(&child.name)
+                        .unwrap_or_else(|| panic!("{path}/{} missing after rebuild", child.name));
+                    compare_trees(child, &bc[j], &format!("{path}/{}", child.name), checked);
+                }
+            }
+            (BuildKind::File(fa), BuildKind::File(fb)) => {
+                let ba = read_content(fa);
+                let bb = read_content(fb);
+                assert_eq!(ba.len(), bb.len(), "file length differs at {path}");
+                assert_eq!(ba, bb, "file content differs at {path}");
+            }
+            (BuildKind::Symlink(ta), BuildKind::Symlink(tb)) => {
+                assert_eq!(ta, tb, "symlink target differs at {path}");
+            }
+            (
+                BuildKind::BlockDev {
+                    major: ma,
+                    minor: na,
+                },
+                BuildKind::BlockDev {
+                    major: mb,
+                    minor: nb,
+                },
+            )
+            | (
+                BuildKind::CharDev {
+                    major: ma,
+                    minor: na,
+                },
+                BuildKind::CharDev {
+                    major: mb,
+                    minor: nb,
+                },
+            ) => {
+                assert_eq!((ma, na), (mb, nb), "device numbers differ at {path}");
+            }
+            (BuildKind::Fifo, BuildKind::Fifo) | (BuildKind::Socket, BuildKind::Socket) => {}
+            (x, y) => panic!(
+                "node kind differs at {path}: {} vs {}",
+                kind_name(x),
+                kind_name(y)
+            ),
+        }
+    }
+
+    fn read_content(c: &FileContent) -> Vec<u8> {
+        match c {
+            FileContent::Bytes(b) => b.clone(),
+            FileContent::HostFile { path, .. } => std::fs::read(path).expect("read host file"),
+        }
+    }
+
+    fn kind_name(k: &BuildKind) -> &'static str {
+        match k {
+            BuildKind::Dir(_) => "dir",
+            BuildKind::File(_) => "file",
+            BuildKind::Symlink(_) => "symlink",
+            BuildKind::BlockDev { .. } => "blockdev",
+            BuildKind::CharDev { .. } => "chardev",
+            BuildKind::Fifo => "fifo",
+            BuildKind::Socket => "socket",
+        }
+    }
+
+    /// Scan a file for the `hsqs` magic at a 4-byte boundary.
+    fn find_squashfs_offset_for_test(file: &mut std::fs::File) -> Option<u64> {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut base = 0u64;
+        let mut carry = Vec::new();
+        loop {
+            let n = file.read(&mut buf).ok()?;
+            if n == 0 {
+                return None;
+            }
+            let mut hay = carry.clone();
+            hay.extend_from_slice(&buf[..n]);
+            let mut i = 0;
+            while i + 4 <= hay.len() {
+                if &hay[i..i + 4] == b"hsqs" {
+                    let off = base + i as u64 - carry.len() as u64;
+                    if off.is_multiple_of(4) {
+                        return Some(off);
+                    }
+                }
+                i += 1;
+            }
+            carry = hay[hay.len().saturating_sub(3)..].to_vec();
+            base += n as u64;
+        }
+    }
+
     /// A codec we can read but not encode must be refused up front, before any
     /// bytes are written — never silently substituted with a different one.
     #[test]
