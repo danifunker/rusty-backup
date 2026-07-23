@@ -1513,6 +1513,261 @@ mod tests {
         }
     }
 
+    /// True when `unsquashfs` is on PATH (Homebrew formula `squashfs`), so a
+    /// machine without squashfs-tools skips rather than fails.
+    ///
+    /// Unlike `qemu-img --version`, `unsquashfs -version` **exits 1** while
+    /// still printing its banner, so the exit status can't be the probe — match
+    /// the banner text on stdout instead.
+    fn unsquashfs_available() -> bool {
+        std::process::Command::new("unsquashfs")
+            .arg("-version")
+            .output()
+            .map(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.contains("unsquashfs version")
+            })
+            .unwrap_or(false)
+    }
+
+    /// One entry of an `unsquashfs -lls` listing, normalized for comparison.
+    #[derive(Debug, PartialEq, Eq)]
+    struct OracleEntry {
+        mode: u32,
+        size: u64,
+        /// `Some((major, minor))` for device nodes, whose size column is a
+        /// major/minor pair rather than a byte count.
+        dev: Option<(u32, u32)>,
+        symlink: Option<String>,
+    }
+
+    /// Parse `unsquashfs -lls` output into path -> entry.
+    ///
+    /// Lines look like:
+    /// ```text
+    /// -rwxr-xr-x root/root   900772 2012-04-03 12:32 squashfs-root/bin/bash
+    /// lrwxrwxrwx root/root        6 2011-12-15 01:16 squashfs-root/bin/bzcmp -> bzdiff
+    /// crw-rw---- root/44      10,175 2012-04-23 07:37 squashfs-root/dev/agpgart
+    /// ```
+    fn parse_oracle(text: &str) -> HashMap<String, OracleEntry> {
+        let mut out = HashMap::new();
+        for line in text.lines() {
+            let perms = line.split_whitespace().next().unwrap_or("");
+            if perms.len() != 10 || !"-dlbcps".contains(&perms[0..1]) {
+                continue;
+            }
+            let Some(rest) = line.split_once(' ') else {
+                continue;
+            };
+            // owner/group, then either "SIZE" or "MAJ, MIN" (the comma form can
+            // carry padding spaces), then date, time, path.
+            let mut toks = rest.1.split_whitespace();
+            let _owner = toks.next();
+            let joined: Vec<&str> = toks.collect();
+            // Walk forward to the date token (YYYY-MM-DD); everything before it
+            // is the size / device columns.
+            let date_at = joined
+                .iter()
+                .position(|t| t.len() == 10 && t.as_bytes()[4] == b'-');
+            let Some(date_at) = date_at else { continue };
+            let size_part = joined[..date_at].join("");
+            // path is everything after date + time
+            let tail = joined[date_at + 2..].join(" ");
+            let (path_part, symlink) = match tail.split_once(" -> ") {
+                Some((p, t)) => (p.to_string(), Some(t.to_string())),
+                None => (tail, None),
+            };
+            let path = path_part
+                .trim_start_matches("squashfs-root")
+                .trim_end()
+                .to_string();
+            let path = if path.is_empty() { "/".into() } else { path };
+
+            let (size, dev) = if let Some((maj, min)) = size_part.split_once(',') {
+                (
+                    0,
+                    Some((
+                        maj.trim().parse().unwrap_or(0),
+                        min.trim().parse().unwrap_or(0),
+                    )),
+                )
+            } else {
+                (size_part.trim().parse().unwrap_or(0), None)
+            };
+
+            out.insert(
+                path,
+                OracleEntry {
+                    mode: mode_from_perm_string(perms),
+                    size,
+                    dev,
+                    symlink,
+                },
+            );
+        }
+        out
+    }
+
+    /// Turn `-rwxr-xr-x` / `crw-rw----` into the numeric mode (type + perms).
+    fn mode_from_perm_string(p: &str) -> u32 {
+        let b = p.as_bytes();
+        let type_bits: u32 = match b[0] {
+            b'd' => 0o040_000,
+            b'l' => 0o120_000,
+            b'b' => 0o060_000,
+            b'c' => 0o020_000,
+            b'p' => 0o010_000,
+            b's' => 0o140_000,
+            _ => 0o100_000,
+        };
+        let mut perms = 0u32;
+        for (i, chunk) in [1usize, 4, 7].iter().enumerate() {
+            let shift = 6 - i * 3;
+            if b[*chunk] == b'r' {
+                perms |= 4 << shift;
+            }
+            if b[chunk + 1] == b'w' {
+                perms |= 2 << shift;
+            }
+            match b[chunk + 2] {
+                b'x' => perms |= 1 << shift,
+                // setuid / setgid / sticky replace the x column.
+                b's' | b't' => {
+                    perms |= 1 << shift;
+                    perms |= match i {
+                        0 => 0o4000,
+                        1 => 0o2000,
+                        _ => 0o1000,
+                    };
+                }
+                b'S' | b'T' => {
+                    perms |= match i {
+                        0 => 0o4000,
+                        1 => 0o2000,
+                        _ => 0o1000,
+                    }
+                }
+                _ => {}
+            }
+        }
+        type_bits | perms
+    }
+
+    /// **The phase-0 oracle test.** Walk the whole fixture image with our
+    /// reader and diff every entry against `unsquashfs -lls`.
+    ///
+    /// The other phase-0 tests assert *plausible* shapes (root is 0755, /bin is
+    /// root-owned). This one asserts *ground truth* for mode, size, symlink
+    /// target and device major/minor across every inode in a 123k-entry real
+    /// image — which is what actually establishes that a rebuild driven off
+    /// this metadata would be faithful.
+    #[test]
+    fn matches_unsquashfs_listing_entry_for_entry() {
+        let Some(mut fs) = open_real_image() else {
+            return;
+        };
+        if !unsquashfs_available() {
+            eprintln!("unsquashfs not on PATH — skipping oracle comparison");
+            return;
+        }
+        let path = std::env::var("RB_SQUASHFS_ISO").unwrap_or_else(|_| {
+            "/Users/dani/Downloads/ubuntu-12.04-desktop-powerpc.iso".to_string()
+        });
+        let offset = {
+            let mut f = std::fs::File::open(&path).unwrap();
+            find_squashfs_offset(&mut f).unwrap()
+        };
+
+        let out = std::process::Command::new("unsquashfs")
+            .arg("-o")
+            .arg(offset.to_string())
+            .arg("-lls")
+            .arg(&path)
+            .output()
+            .expect("run unsquashfs");
+        assert!(
+            out.status.success(),
+            "unsquashfs failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let oracle = parse_oracle(&String::from_utf8_lossy(&out.stdout));
+        assert!(
+            oracle.len() > 1000,
+            "oracle listing looks too small ({} entries) — parser drifted?",
+            oracle.len()
+        );
+
+        // Walk our reader over the same tree.
+        let root = fs.root().expect("root");
+        let mut queue = vec![root];
+        let mut checked = 0usize;
+        let mut mismatches: Vec<String> = Vec::new();
+        while let Some(dir) = queue.pop() {
+            let Ok(children) = fs.list_directory(&dir) else {
+                continue;
+            };
+            for child in children {
+                if let Some(exp) = oracle.get(&child.path) {
+                    checked += 1;
+                    let got_mode = child.mode.unwrap_or(0);
+                    if got_mode != exp.mode {
+                        mismatches.push(format!(
+                            "{}: mode {:o} != oracle {:o}",
+                            child.path, got_mode, exp.mode
+                        ));
+                    }
+                    if exp.dev.is_none()
+                        && child.entry_type == EntryType::File
+                        && child.size != exp.size
+                    {
+                        mismatches.push(format!(
+                            "{}: size {} != oracle {}",
+                            child.path, child.size, exp.size
+                        ));
+                    }
+                    if let Some(t) = &exp.symlink {
+                        if child.symlink_target.as_deref() != Some(t.as_str()) {
+                            mismatches.push(format!(
+                                "{}: symlink {:?} != oracle {:?}",
+                                child.path, child.symlink_target, t
+                            ));
+                        }
+                    }
+                    if let Some((maj, min)) = exp.dev {
+                        let label = child.special_type.clone().unwrap_or_default();
+                        let want = format!("({maj}, {min})");
+                        if !label.contains(&want) {
+                            mismatches.push(format!(
+                                "{}: device {:?} does not carry oracle {}",
+                                child.path, label, want
+                            ));
+                        }
+                    }
+                }
+                if child.entry_type == EntryType::Directory {
+                    queue.push(child);
+                }
+            }
+        }
+
+        eprintln!("compared {checked} entries against unsquashfs");
+        assert!(
+            checked > 1000,
+            "only compared {checked} entries — the walk did not cover the image"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches vs unsquashfs, first 20:\n{}",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
     /// Fixture-gated stress read of the same real image. The shallow test above
     /// barely touches the data path; this walks a few thousand entries and reads
     /// files in full, which is what actually exercises multi-block files,
