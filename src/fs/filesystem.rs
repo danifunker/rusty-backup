@@ -168,6 +168,24 @@ pub trait Filesystem: Send {
     fn uses_colon_paths(&self) -> bool {
         false
     }
+
+    /// Whether this filesystem stores POSIX extended attributes (`user.*`,
+    /// `security.*`, …). True on ext / XFS / SquashFS; false on filesystems with
+    /// no xattr concept (Minix, EFS, FAT, HFS). The UI uses this to show or hide
+    /// the xattr section rather than probing every file.
+    fn supports_xattrs(&self) -> bool {
+        false
+    }
+
+    /// Read the extended attributes on `entry`. Default: none. Override on
+    /// xattr-bearing filesystems. Returning an empty list is normal — most files
+    /// carry no xattrs even where the filesystem supports them.
+    fn list_xattrs(
+        &mut self,
+        _entry: &FileEntry,
+    ) -> Result<Vec<super::xattr::Xattr>, FilesystemError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Aggregate fragmentation counts for a volume's user data forks.
@@ -436,6 +454,44 @@ pub trait EditableFilesystem: Filesystem {
     fn set_permissions(&mut self, _entry: &FileEntry, _mode: u32) -> Result<(), FilesystemError> {
         Err(FilesystemError::Unsupported(
             "set_permissions not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Set the owning uid and gid on an entry. Override on every Unix filesystem
+    /// (they all carry these inode fields); others return `Unsupported` so the
+    /// UI can gate the control.
+    fn set_owner(
+        &mut self,
+        _entry: &FileEntry,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_owner not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Set (create or replace) an extended attribute on an entry. Override on
+    /// xattr-bearing filesystems (ext / XFS / SquashFS); others return
+    /// `Unsupported`. `name` must carry a valid namespace prefix
+    /// ([`crate::fs::xattr::has_valid_namespace`]).
+    fn set_xattr(
+        &mut self,
+        _entry: &FileEntry,
+        _name: &str,
+        _value: &[u8],
+    ) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "set_xattr not supported for this filesystem".into(),
+        ))
+    }
+
+    /// Remove an extended attribute from an entry. Override on xattr-bearing
+    /// filesystems; others return `Unsupported`. Removing an absent attribute is
+    /// not an error.
+    fn remove_xattr(&mut self, _entry: &FileEntry, _name: &str) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Unsupported(
+            "remove_xattr not supported for this filesystem".into(),
         ))
     }
 

@@ -320,17 +320,10 @@ struct FragmentEntry {
     size: u32,
 }
 
-/// One extended attribute, with the on-disk prefix already applied to `name`
-/// (SquashFS stores `security.capability` as prefix-id 2 + `"capability"`).
-///
-/// Appliance images encode Linux capabilities here — `security.capability` on
-/// `ping`, `dumpcap` and friends — so these have to survive a rebuild or the
-/// image boots with subtly broken binaries. See `docs/squashfs_edit.md` D4.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Xattr {
-    pub name: String,
-    pub value: Vec<u8>,
-}
+// One extended attribute. SquashFS stores `security.capability` as prefix-id 2 +
+// `"capability"`; we reassemble the full name. The type is shared across every
+// xattr-bearing filesystem — see `super::xattr`.
+pub use super::xattr::Xattr;
 
 /// One 16-byte entry in the xattr ID table: where an inode's attribute list
 /// lives, and how big it is.

@@ -117,6 +117,21 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
         }
     }
 
+    /// Mutable node lookup by absolute path (`"/"` is the root itself).
+    fn node_at_mut(&mut self, path: &str) -> Result<&mut BuildNode, FilesystemError> {
+        let mut node = &mut self.root;
+        for comp in Self::components(path) {
+            let BuildKind::Dir(children) = &mut node.kind else {
+                return Err(FilesystemError::NotADirectory(path.to_string()));
+            };
+            node = children
+                .iter_mut()
+                .find(|c| c.name == comp)
+                .ok_or_else(|| FilesystemError::NotFound(path.to_string()))?;
+        }
+        Ok(node)
+    }
+
     /// Build a browse `FileEntry` for `node` at `path`.
     fn to_entry(node: &BuildNode, path: &str) -> FileEntry {
         let mut fe = match &node.kind {
@@ -234,6 +249,20 @@ impl<RW: Read + Write + Seek + Send> Filesystem for SquashfsEditor<RW> {
 
     fn volume_label(&self) -> Option<&str> {
         None
+    }
+
+    fn supports_xattrs(&self) -> bool {
+        true
+    }
+
+    fn list_xattrs(
+        &mut self,
+        entry: &FileEntry,
+    ) -> Result<Vec<super::xattr::Xattr>, FilesystemError> {
+        Ok(self
+            .node_at(&entry.path)
+            .map(|n| n.xattrs.clone())
+            .unwrap_or_default())
     }
 
     fn fs_type(&self) -> &str {
@@ -436,6 +465,52 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             children.last().unwrap(),
             &Self::child_path(&parent.path, name),
         ))
+    }
+
+    fn set_permissions(&mut self, entry: &FileEntry, mode: u32) -> Result<(), FilesystemError> {
+        self.node_at_mut(&entry.path)?.mode = (mode & 0o7777) as u16;
+        Ok(())
+    }
+
+    fn set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) -> Result<(), FilesystemError> {
+        let node = self.node_at_mut(&entry.path)?;
+        node.uid = uid;
+        node.gid = gid;
+        Ok(())
+    }
+
+    fn set_xattr(
+        &mut self,
+        entry: &FileEntry,
+        name: &str,
+        value: &[u8],
+    ) -> Result<(), FilesystemError> {
+        if !super::xattr::has_valid_namespace(name) {
+            return Err(FilesystemError::InvalidData(format!(
+                "xattr {name:?} has no representable namespace prefix \
+                 (user. / trusted. / security. / system.)"
+            )));
+        }
+        let node = self.node_at_mut(&entry.path)?;
+        // Replace an existing attribute of the same name, else append — matches
+        // setxattr(2) without XATTR_CREATE / XATTR_REPLACE flags.
+        if let Some(x) = node.xattrs.iter_mut().find(|x| x.name == name) {
+            x.value = value.to_vec();
+        } else {
+            node.xattrs.push(super::xattr::Xattr {
+                name: name.to_string(),
+                value: value.to_vec(),
+            });
+        }
+        Ok(())
+    }
+
+    fn remove_xattr(&mut self, entry: &FileEntry, name: &str) -> Result<(), FilesystemError> {
+        // Removing an absent attribute is a no-op, not an error.
+        self.node_at_mut(&entry.path)?
+            .xattrs
+            .retain(|x| x.name != name);
+        Ok(())
     }
 
     fn sync_metadata(&mut self) -> Result<(), FilesystemError> {
@@ -673,6 +748,78 @@ mod tests {
         let ping = ed.list_directory(&bin).unwrap().into_iter().next().unwrap();
         ed.delete_entry(&bin, &ping).expect("delete ping");
         ed.delete_entry(&root, &bin).expect("delete now-empty bin");
+    }
+
+    /// set_permissions / set_owner / set_xattr / remove_xattr must all mutate
+    /// the tree and survive a rebuild.
+    #[test]
+    fn metadata_edits_survive_rebuild() {
+        let mut ed = open_editor(starter_image());
+        let root = ed.root().expect("root");
+        let readme = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "readme")
+            .unwrap();
+
+        ed.set_permissions(&readme, 0o640).expect("chmod");
+        ed.set_owner(&readme, 33, 44).expect("chown");
+        ed.set_xattr(&readme, "user.mime_type", b"text/plain")
+            .expect("setfattr");
+        assert!(ed.supports_xattrs());
+
+        // Also drop the capability xattr off /bin/ping via remove_xattr.
+        let bin = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "bin")
+            .unwrap();
+        let ping = ed.list_directory(&bin).unwrap().into_iter().next().unwrap();
+        assert_eq!(ed.list_xattrs(&ping).unwrap().len(), 1);
+        ed.remove_xattr(&ping, "security.capability")
+            .expect("rm xattr");
+        assert!(ed.list_xattrs(&ping).unwrap().is_empty());
+
+        ed.sync_metadata().expect("sync");
+        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let tree = fs.read_build_tree().expect("read tree");
+        let BK::Dir(top) = &tree.kind else { panic!() };
+        let readme = top.iter().find(|n| n.name == "readme").unwrap();
+        assert_eq!(readme.mode & 0o7777, 0o640, "mode not persisted");
+        assert_eq!((readme.uid, readme.gid), (33, 44), "owner not persisted");
+        assert_eq!(
+            readme.xattrs,
+            vec![Xattr {
+                name: "user.mime_type".into(),
+                value: b"text/plain".to_vec(),
+            }],
+            "xattr not persisted"
+        );
+        let bin = top.iter().find(|n| n.name == "bin").unwrap();
+        let BK::Dir(binc) = &bin.kind else { panic!() };
+        let ping = binc.iter().find(|n| n.name == "ping").unwrap();
+        assert!(ping.xattrs.is_empty(), "removed xattr came back");
+    }
+
+    /// An xattr with no valid namespace prefix is refused (it can't be
+    /// represented on disk).
+    #[test]
+    fn set_xattr_rejects_bad_namespace() {
+        let mut ed = open_editor(starter_image());
+        let root = ed.root().expect("root");
+        let readme = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "readme")
+            .unwrap();
+        let err = ed
+            .set_xattr(&readme, "bogus.attr", b"x")
+            .expect_err("bad namespace must fail");
+        assert!(err.to_string().contains("namespace"), "got: {err}");
     }
 
     #[test]

@@ -99,6 +99,7 @@ pub mod ucsd;
 pub mod ufs;
 pub mod ufs_fsck;
 pub mod unix_common;
+pub mod xattr;
 pub mod xfs;
 pub mod zstd_stream;
 

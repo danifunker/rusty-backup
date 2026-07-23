@@ -101,6 +101,11 @@ fn edit_label(edit: &StagedEdit) -> String {
             format!("Set type/creator: {}", entry.path)
         }
         StagedEdit::SetPermissions { entry, .. } => format!("Set permissions: {}", entry.path),
+        StagedEdit::SetOwner { entry, .. } => format!("Set owner: {}", entry.path),
+        StagedEdit::SetXattr { entry, name, .. } => format!("Set xattr {name}: {}", entry.path),
+        StagedEdit::RemoveXattr { entry, name } => {
+            format!("Remove xattr {name}: {}", entry.path)
+        }
         StagedEdit::SetDates { entry, .. } => format!("Set dates: {}", entry.path),
     }
 }

@@ -120,11 +120,30 @@ pub enum StagedEdit {
         creator_code: [u8; 4],
     },
     /// Set Unix permission bits (`st_mode`) on an existing entry. Applied via
-    /// [`EditableFilesystem::set_permissions`]; ext-only today (other Unix
-    /// filesystems return `Unsupported`).
+    /// [`EditableFilesystem::set_permissions`].
     SetPermissions {
         entry: FileEntry,
         mode: u32,
+    },
+    /// Set the owning uid/gid on an existing entry. Applied via
+    /// [`EditableFilesystem::set_owner`]; every Unix filesystem supports it.
+    SetOwner {
+        entry: FileEntry,
+        uid: u32,
+        gid: u32,
+    },
+    /// Create or replace an extended attribute. Applied via
+    /// [`EditableFilesystem::set_xattr`]; ext / XFS / SquashFS only.
+    SetXattr {
+        entry: FileEntry,
+        name: String,
+        value: Vec<u8>,
+    },
+    /// Remove an extended attribute. Applied via
+    /// [`EditableFilesystem::remove_xattr`].
+    RemoveXattr {
+        entry: FileEntry,
+        name: String,
     },
     /// Set HFS/HFS+ creation/modification/backup dates on an existing entry.
     /// Values are Mac epoch seconds (since 1904-01-01 UTC); applied via
@@ -135,6 +154,17 @@ pub enum StagedEdit {
         modify: u32,
         backup: u32,
     },
+}
+
+/// True when `edit` is a set/remove xattr op for `path` + `name` — the
+/// supersede predicate shared by [`EditQueue::replace_set_xattr`] and
+/// [`EditQueue::replace_remove_xattr`].
+fn xattr_edit_targets(edit: &StagedEdit, path: &str, name: &str) -> bool {
+    match edit {
+        StagedEdit::SetXattr { entry, name: n, .. }
+        | StagedEdit::RemoveXattr { entry, name: n } => entry.path == path && n == name,
+        _ => false,
+    }
 }
 
 /// Walk an editable filesystem from the root to the directory at `path`,
@@ -278,6 +308,9 @@ pub fn apply_edit(
             &String::from_utf8_lossy(creator_code),
         ),
         StagedEdit::SetPermissions { entry, mode } => efs.set_permissions(entry, *mode),
+        StagedEdit::SetOwner { entry, uid, gid } => efs.set_owner(entry, *uid, *gid),
+        StagedEdit::SetXattr { entry, name, value } => efs.set_xattr(entry, name, value),
+        StagedEdit::RemoveXattr { entry, name } => efs.remove_xattr(entry, name),
         StagedEdit::SetDates {
             entry,
             create,
@@ -359,6 +392,15 @@ impl EditQueue {
                 StagedEdit::SetPermissions { entry, mode } => {
                     format!("Permissions: {} -> {:o}", entry.path, mode & 0o7777)
                 }
+                StagedEdit::SetOwner { entry, uid, gid } => {
+                    format!("Owner: {} -> {uid}:{gid}", entry.path)
+                }
+                StagedEdit::SetXattr { entry, name, .. } => {
+                    format!("Xattr set: {} {name}", entry.path)
+                }
+                StagedEdit::RemoveXattr { entry, name } => {
+                    format!("Xattr remove: {} {name}", entry.path)
+                }
                 StagedEdit::SetDates { entry, .. } => format!("Dates: {}", entry.path),
             })
             .collect()
@@ -422,6 +464,9 @@ impl EditQueue {
             | StagedEdit::SetProdosType { entry, .. }
             | StagedEdit::SetProdosAccess { entry, .. }
             | StagedEdit::SetDates { entry, .. }
+            | StagedEdit::SetOwner { entry, .. }
+            | StagedEdit::SetXattr { entry, .. }
+            | StagedEdit::RemoveXattr { entry, .. }
             | StagedEdit::SetPermissions { entry, .. } => entry.path == entry_path,
             _ => false,
         })
@@ -736,6 +781,71 @@ impl EditQueue {
             StagedEdit::SetPermissions { entry, mode } if entry.path == entry_path => Some(*mode),
             _ => None,
         })
+    }
+
+    /// Push a `SetOwner` edit, replacing any prior one for the same path.
+    pub fn replace_set_owner(&mut self, entry: &FileEntry, uid: u32, gid: u32) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| match e {
+            StagedEdit::SetOwner { entry: e2, .. } => e2.path != path,
+            _ => true,
+        });
+        self.edits.push(StagedEdit::SetOwner {
+            entry: entry.clone(),
+            uid,
+            gid,
+        });
+    }
+
+    /// Return the (uid, gid) the user has staged for `entry_path`, if any.
+    pub fn pending_owner_for(&self, entry_path: &str) -> Option<(u32, u32)> {
+        self.edits.iter().rev().find_map(|edit| match edit {
+            StagedEdit::SetOwner { entry, uid, gid } if entry.path == entry_path => {
+                Some((*uid, *gid))
+            }
+            _ => None,
+        })
+    }
+
+    /// Stage a `SetXattr` (create/replace), superseding any pending set/remove of
+    /// the same name on the same path so the queue holds one op per (path, name).
+    pub fn replace_set_xattr(&mut self, entry: &FileEntry, name: &str, value: Vec<u8>) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| !xattr_edit_targets(e, &path, name));
+        self.edits.push(StagedEdit::SetXattr {
+            entry: entry.clone(),
+            name: name.to_string(),
+            value,
+        });
+    }
+
+    /// Stage a `RemoveXattr`, superseding any pending set/remove of the same
+    /// name on the same path.
+    pub fn replace_remove_xattr(&mut self, entry: &FileEntry, name: &str) {
+        let path = entry.path.clone();
+        self.edits.retain(|e| !xattr_edit_targets(e, &path, name));
+        self.edits.push(StagedEdit::RemoveXattr {
+            entry: entry.clone(),
+            name: name.to_string(),
+        });
+    }
+
+    /// The pending xattr edits for `entry_path`: `(name, Some(value))` for a
+    /// staged set, `(name, None)` for a staged remove. Lets the UI overlay the
+    /// on-disk xattrs with what the user has queued.
+    pub fn pending_xattrs_for(&self, entry_path: &str) -> Vec<(String, Option<Vec<u8>>)> {
+        self.edits
+            .iter()
+            .filter_map(|edit| match edit {
+                StagedEdit::SetXattr { entry, name, value } if entry.path == entry_path => {
+                    Some((name.clone(), Some(value.clone())))
+                }
+                StagedEdit::RemoveXattr { entry, name } if entry.path == entry_path => {
+                    Some((name.clone(), None))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Push a `SetDates` edit, replacing any prior one targeting the same
