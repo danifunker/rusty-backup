@@ -11,7 +11,7 @@
 //! 96                      file data blocks, back to back
 //! inode_table_start       inode table      (metadata blocks)
 //! directory_table_start   directory table  (metadata blocks)
-//! fragment_table_start    fragment table   (absent here — see below)
+//! fragment_table_start    fragment table   (metadata blocks + index)
 //! id_table_start          ID table         (metadata blocks + index)
 //! xattr_id_table_start    xattr tables     (kv blocks, id blocks, header+index)
 //!                         pad to 4 KiB
@@ -19,12 +19,18 @@
 //!
 //! # Scope
 //!
-//! **No fragments.** A file's tail is written as its own (short) data block
-//! rather than packed with other tails into a shared fragment, and the image
-//! carries `NO_FRAGMENTS`. `mksquashfs -no-fragments` produces exactly this
-//! shape, so it is ordinary SquashFS and every reader accepts it — it is merely
-//! a little larger. Fragment packing (and with it verbatim block reuse from a
-//! source image) is phase 1b.
+//! **Fragments are packed** (phase 1b), as `mksquashfs` does by default: a file
+//! tail shorter than a block shares a block with other files' tails. The win is
+//! compression ratio rather than padding — SquashFS already stores each data
+//! block at its compressed length, so a 10-byte file never wasted a whole
+//! block; what it wasted was *context*, since compressing tens of thousands of
+//! tiny files as separate streams gives the codec nothing to work across.
+//! `BuildOptions::use_fragments = false` reproduces `mksquashfs -no-fragments`.
+//!
+//! **Not yet: verbatim block reuse.** Rebuilding from a source image still
+//! recompresses everything. Copying an unchanged file's already-compressed
+//! blocks straight across is what makes a rebuild cost scale with the edit
+//! rather than the image, and it needs the source-to-tree bridge from phase 2.
 //!
 //! **Compressors: gzip, XZ and Zstandard.** These are the three the read side
 //! supports that also have an encoder available in-tree. LZ4 needs the
@@ -136,13 +142,24 @@ impl BuildNode {
 }
 
 /// Knobs for the emitted image. Defaults match `mksquashfs`: gzip, 128 KiB
-/// blocks — but a rebuild should pass the *source* image's settings so an edit
-/// doesn't silently re-tune compression (decision D3).
+/// blocks, tails packed into fragments — but a rebuild should pass the *source*
+/// image's settings so an edit doesn't silently re-tune compression (D3).
 pub struct BuildOptions {
     pub compressor: Compressor,
     pub block_size: u32,
     /// Stamped into the superblock's `mod_time`.
     pub mod_time: u32,
+    /// Pack file tails shorter than a block into shared **fragment** blocks.
+    ///
+    /// On by default, as in `mksquashfs`. The win is compression ratio, not
+    /// padding: SquashFS data blocks are already stored at their compressed
+    /// length, so a 10-byte file never wasted a whole block. What it *did* waste
+    /// is context — compressing fifty thousand tiny files as fifty thousand
+    /// separate streams gives the codec nothing to work with, whereas packing
+    /// their tails into shared 128 KiB blocks lets it compress across them.
+    ///
+    /// Setting this false reproduces `mksquashfs -no-fragments`.
+    pub use_fragments: bool,
 }
 
 impl Default for BuildOptions {
@@ -151,7 +168,39 @@ impl Default for BuildOptions {
             compressor: Compressor::Gzip,
             block_size: 131_072,
             mod_time: 0,
+            use_fragments: true,
         }
+    }
+}
+
+/// Accumulates file tails into shared fragment blocks.
+///
+/// A tail is handed over with `Builder::push_tail`, which returns the
+/// `(index, offset)` pair the file's inode records. The block itself is not
+/// written until it fills or the build ends, so the index is assigned eagerly
+/// (it is simply how many blocks have already been flushed) while the entry's
+/// on-disk position is filled in at flush time — which is why `entries` holds
+/// positions rather than the blocks themselves.
+struct FragmentWriter {
+    /// The block being accumulated.
+    buf: Vec<u8>,
+    /// Flushed blocks: `(start, size_field)`, in index order.
+    entries: Vec<(u64, u32)>,
+    block_size: usize,
+}
+
+impl FragmentWriter {
+    fn new(block_size: u32) -> Self {
+        Self {
+            buf: Vec::new(),
+            entries: Vec::new(),
+            block_size: block_size as usize,
+        }
+    }
+
+    /// Room left in the block currently being filled.
+    fn room(&self) -> usize {
+        self.block_size - self.buf.len()
     }
 }
 
@@ -381,6 +430,7 @@ struct Builder<'a, W: Write + Seek> {
     dirs: MetadataWriter,
     ids: IdTable,
     xattrs: XattrBuilder,
+    frags: FragmentWriter,
     next_inode: u32,
     /// Current write position for data blocks.
     data_pos: u64,
@@ -389,28 +439,81 @@ struct Builder<'a, W: Write + Seek> {
 impl<'a, W: Write + Seek> Builder<'a, W> {
     /// Write a file's data blocks, returning where they start and each block's
     /// size field (bit 24 set = stored uncompressed).
-    fn write_file_data(&mut self, data: &[u8]) -> Result<(u64, Vec<u32>), FilesystemError> {
+    fn write_file_data(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(u64, Vec<u32>, u32, u32), FilesystemError> {
         let start = self.data_pos;
         let mut sizes = Vec::new();
         if data.is_empty() {
-            return Ok((start, sizes));
+            return Ok((start, sizes, SQUASHFS_INVALID_XATTR, 0));
         }
-        for chunk in data.chunks(self.opts.block_size as usize) {
-            let packed = compress(self.opts.compressor, chunk)?;
-            let (payload, stored): (&[u8], bool) = if packed.len() < chunk.len() {
-                (&packed, false)
-            } else {
-                (chunk, true)
-            };
-            self.out.write_all(payload).map_err(FilesystemError::Io)?;
-            self.data_pos += payload.len() as u64;
-            let mut field = payload.len() as u32;
-            if stored {
-                field |= 0x0100_0000;
-            }
+
+        // With fragments on, only whole blocks reach the data area; a short tail
+        // is packed with other files' tails instead. A file that is an exact
+        // multiple of the block size has no tail, and so no fragment.
+        let bs = self.opts.block_size as usize;
+        let (whole, tail) = if self.opts.use_fragments {
+            data.split_at(data.len() - data.len() % bs)
+        } else {
+            (data, &data[data.len()..])
+        };
+
+        for chunk in whole.chunks(bs) {
+            let field = self.emit_data_block(chunk)?;
             sizes.push(field);
         }
-        Ok((start, sizes))
+
+        if tail.is_empty() {
+            Ok((start, sizes, SQUASHFS_INVALID_XATTR, 0))
+        } else {
+            let (index, offset) = self.push_tail(tail)?;
+            Ok((start, sizes, index, offset))
+        }
+    }
+
+    /// Compress one block and append it to the data area, returning its size
+    /// field (bit 24 set = stored uncompressed, because compressing it did not
+    /// help).
+    fn emit_data_block(&mut self, chunk: &[u8]) -> Result<u32, FilesystemError> {
+        let packed = compress(self.opts.compressor, chunk)?;
+        let (payload, stored): (&[u8], bool) = if packed.len() < chunk.len() {
+            (&packed, false)
+        } else {
+            (chunk, true)
+        };
+        self.out.write_all(payload).map_err(FilesystemError::Io)?;
+        self.data_pos += payload.len() as u64;
+        let mut field = payload.len() as u32;
+        if stored {
+            field |= 0x0100_0000;
+        }
+        Ok(field)
+    }
+
+    /// Flush the fragment block currently being accumulated, recording where it
+    /// landed. Called when a block fills, and once more at the end of the build.
+    fn flush_fragment(&mut self) -> Result<(), FilesystemError> {
+        if self.frags.buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.frags.buf);
+        let start = self.data_pos;
+        let field = self.emit_data_block(&buf)?;
+        self.frags.entries.push((start, field));
+        Ok(())
+    }
+
+    /// Hand a file's tail to the fragment writer, returning the
+    /// `(index, offset)` pair its inode records.
+    fn push_tail(&mut self, tail: &[u8]) -> Result<(u32, u32), FilesystemError> {
+        if tail.len() > self.frags.room() {
+            self.flush_fragment()?;
+        }
+        let index = self.frags.entries.len() as u32;
+        let offset = self.frags.buf.len() as u32;
+        self.frags.buf.extend_from_slice(tail);
+        Ok((index, offset))
     }
 
     /// Emit one node (post-order: a directory's children are written before the
@@ -465,7 +568,7 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 })
             }
             BuildKind::File(data) => {
-                let (start, sizes) = self.write_file_data(data)?;
+                let (start, sizes, frag_index, frag_offset) = self.write_file_data(data)?;
                 let inode_number = self.take_inode_number();
                 let inode_ref = self.inodes.current_ref();
                 let needs_ext =
@@ -479,16 +582,16 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                 self.push_common(&mut b, kind, node, uid_idx, gid_idx, inode_number);
                 if kind == INODE_FILE {
                     b.extend_from_slice(&(start as u32).to_le_bytes());
-                    b.extend_from_slice(&SQUASHFS_INVALID_XATTR.to_le_bytes()); // no fragment
-                    b.extend_from_slice(&0u32.to_le_bytes()); // fragment offset
+                    b.extend_from_slice(&frag_index.to_le_bytes());
+                    b.extend_from_slice(&frag_offset.to_le_bytes());
                     b.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 } else {
                     b.extend_from_slice(&start.to_le_bytes());
                     b.extend_from_slice(&(data.len() as u64).to_le_bytes());
                     b.extend_from_slice(&0u64.to_le_bytes()); // sparse
                     b.extend_from_slice(&1u32.to_le_bytes()); // nlink
-                    b.extend_from_slice(&SQUASHFS_INVALID_XATTR.to_le_bytes());
-                    b.extend_from_slice(&0u32.to_le_bytes());
+                    b.extend_from_slice(&frag_index.to_le_bytes());
+                    b.extend_from_slice(&frag_offset.to_le_bytes());
                     b.extend_from_slice(&xattr_idx.to_le_bytes());
                 }
                 for s in &sizes {
@@ -709,11 +812,15 @@ pub fn write_squashfs<W: Write + Seek>(
         dirs: MetadataWriter::new(opts.compressor),
         ids: IdTable::default(),
         xattrs: XattrBuilder::new(opts.compressor),
+        frags: FragmentWriter::new(opts.block_size),
         next_inode: 1,
         data_pos: SUPERBLOCK_SIZE as u64,
     };
 
     let root_written = builder.write_node(root)?;
+    // The last partly-filled fragment block still has to land in the data area,
+    // before any of the tables are written after it.
+    builder.flush_fragment()?;
     let inode_count = builder.next_inode - 1;
 
     let Builder {
@@ -722,6 +829,7 @@ pub fn write_squashfs<W: Write + Seek>(
         dirs,
         ids,
         xattrs,
+        frags,
         data_pos,
         ..
     } = builder;
@@ -739,6 +847,39 @@ pub fn write_squashfs<W: Write + Seek>(
     out.write_all(&dir_blob).map_err(FilesystemError::Io)?;
 
     let mut pos = directory_table_start + dir_blob.len() as u64;
+
+    // ---- fragment table: 16-byte entries in metadata blocks, then an index ----
+    let fragment_count = frags.entries.len() as u32;
+    let fragment_table_start = if fragment_count == 0 {
+        // No fragments at all: the format spells an absent table as -1.
+        u64::MAX
+    } else {
+        let mut fw = MetadataWriter::new(opts.compressor);
+        let mut block_starts = Vec::new();
+        for (i, (start, size)) in frags.entries.iter().enumerate() {
+            // 8192 / 16 = 512 entries per metadata block.
+            if i % 512 == 0 {
+                block_starts.push(fw.current_block_start());
+            }
+            let mut e = Vec::with_capacity(16);
+            e.extend_from_slice(&start.to_le_bytes());
+            e.extend_from_slice(&size.to_le_bytes());
+            e.extend_from_slice(&0u32.to_le_bytes()); // unused
+            fw.write(&e)?;
+        }
+        let blob = fw.finish()?;
+        let blocks_at = pos;
+        out.write_all(&blob).map_err(FilesystemError::Io)?;
+        pos += blob.len() as u64;
+
+        let index_at = pos;
+        for s in &block_starts {
+            out.write_all(&(blocks_at + s).to_le_bytes())
+                .map_err(FilesystemError::Io)?;
+        }
+        pos += (block_starts.len() * 8) as u64;
+        index_at
+    };
 
     // ---- ID table: metadata blocks, then an index of pointers to them ----
     let mut id_writer = MetadataWriter::new(opts.compressor);
@@ -806,7 +947,10 @@ pub fn write_squashfs<W: Write + Seek>(
     let bytes_used = pos;
 
     // ---- superblock ----
-    let mut flags = FLAG_NO_FRAGMENTS | FLAG_DUPLICATES;
+    let mut flags = FLAG_DUPLICATES;
+    if fragment_count == 0 {
+        flags |= FLAG_NO_FRAGMENTS;
+    }
     if !had_xattrs {
         flags |= FLAG_NO_XATTRS;
     }
@@ -815,7 +959,7 @@ pub fn write_squashfs<W: Write + Seek>(
     sb[4..8].copy_from_slice(&inode_count.to_le_bytes());
     sb[8..12].copy_from_slice(&opts.mod_time.to_le_bytes());
     sb[12..16].copy_from_slice(&opts.block_size.to_le_bytes());
-    sb[16..20].copy_from_slice(&0u32.to_le_bytes()); // fragment count
+    sb[16..20].copy_from_slice(&fragment_count.to_le_bytes());
     sb[20..22].copy_from_slice(&compressor_id(opts.compressor).to_le_bytes());
     sb[22..24].copy_from_slice(&(opts.block_size.trailing_zeros() as u16).to_le_bytes());
     sb[24..26].copy_from_slice(&flags.to_le_bytes());
@@ -828,8 +972,7 @@ pub fn write_squashfs<W: Write + Seek>(
     sb[56..64].copy_from_slice(&xattr_id_table_start.to_le_bytes());
     sb[64..72].copy_from_slice(&inode_table_start.to_le_bytes());
     sb[72..80].copy_from_slice(&directory_table_start.to_le_bytes());
-    // No fragments: the table is absent, which the format spells as -1.
-    sb[80..88].copy_from_slice(&u64::MAX.to_le_bytes());
+    sb[80..88].copy_from_slice(&fragment_table_start.to_le_bytes());
     // No NFS export table.
     sb[88..96].copy_from_slice(&u64::MAX.to_le_bytes());
 
@@ -940,6 +1083,7 @@ mod tests {
                 compressor,
                 block_size: 131_072,
                 mod_time: 1_700_000_000,
+                use_fragments: true,
             });
             let mut fs = SquashfsFilesystem::open(Cursor::new(img), 0)
                 .unwrap_or_else(|e| panic!("{}: open failed: {e}", compressor.name()));
@@ -1026,6 +1170,7 @@ mod tests {
                 compressor,
                 block_size: 131_072,
                 mod_time: 1_700_000_000,
+                use_fragments: true,
             });
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("out.squashfs");
@@ -1171,6 +1316,156 @@ mod tests {
             "unsquashfs did not attribute the xattr to the right file:\n{txt}"
         );
         eprintln!("unsquashfs decoded security.capability on /sub/capped");
+    }
+
+    /// A tree of many small files — the shape fragments exist for. A real
+    /// rootfs is tens of thousands of these.
+    fn many_small_files(count: usize) -> BuildNode {
+        let children = (0..count)
+            .map(|i| {
+                BuildNode::file(
+                    &format!("f{i:05}"),
+                    0o644,
+                    format!("small file number {i}, with some repetitive filler text\n")
+                        .into_bytes(),
+                )
+            })
+            .collect();
+        BuildNode::dir("/", 0o755, children)
+    }
+
+    /// Packing tails into shared blocks must actually compress better than
+    /// compressing each tiny file as its own stream — that is the entire reason
+    /// fragments exist, so measure it rather than assume it.
+    #[test]
+    fn fragments_compress_small_files_better_than_separate_blocks() {
+        let tree = many_small_files(400);
+        let mut with = Cursor::new(Vec::new());
+        let used_with = write_squashfs(
+            &mut with,
+            &tree,
+            &BuildOptions {
+                use_fragments: true,
+                ..Default::default()
+            },
+        )
+        .expect("build with fragments");
+        let mut without = Cursor::new(Vec::new());
+        let used_without = write_squashfs(
+            &mut without,
+            &tree,
+            &BuildOptions {
+                use_fragments: false,
+                ..Default::default()
+            },
+        )
+        .expect("build without fragments");
+
+        eprintln!("400 small files: {used_with} bytes with fragments, {used_without} without");
+        assert!(
+            used_with < used_without,
+            "fragments should shrink an image full of small files: \
+             {used_with} vs {used_without}"
+        );
+    }
+
+    /// Both fragment settings must produce images our reader and `unsquashfs`
+    /// agree on, with file contents intact.
+    #[test]
+    fn fragmented_and_unfragmented_images_both_round_trip() {
+        for use_fragments in [true, false] {
+            let tree = many_small_files(40);
+            let mut cur = Cursor::new(Vec::new());
+            write_squashfs(
+                &mut cur,
+                &tree,
+                &BuildOptions {
+                    use_fragments,
+                    ..Default::default()
+                },
+            )
+            .expect("build");
+            let img = cur.into_inner();
+
+            let mut fs = SquashfsFilesystem::open(Cursor::new(img.clone()), 0)
+                .unwrap_or_else(|e| panic!("fragments={use_fragments}: open: {e}"));
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            assert_eq!(entries.len(), 40, "fragments={use_fragments}: entry count");
+            for (i, e) in entries.iter().enumerate() {
+                let got = fs.read_file(e, 4096).expect("read");
+                let want = format!("small file number {i}, with some repetitive filler text\n");
+                assert_eq!(
+                    String::from_utf8_lossy(&got),
+                    want,
+                    "fragments={use_fragments}: content of {}",
+                    e.name
+                );
+            }
+
+            if !unsquashfs_available() {
+                continue;
+            }
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("f.squashfs");
+            std::fs::write(&path, &img).expect("write");
+            let out = std::process::Command::new("unsquashfs")
+                .arg("-no-xattrs")
+                .arg("-d")
+                .arg(dir.path().join("x"))
+                .arg(&path)
+                .output()
+                .expect("run unsquashfs");
+            assert!(
+                out.status.success(),
+                "fragments={use_fragments}: unsquashfs failed:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let sample = std::fs::read(dir.path().join("x/f00007")).expect("extracted f00007");
+            assert_eq!(
+                String::from_utf8_lossy(&sample),
+                "small file number 7, with some repetitive filler text\n",
+                "fragments={use_fragments}: unsquashfs extracted the wrong bytes"
+            );
+        }
+    }
+
+    /// A file that is an exact multiple of the block size has no tail, so it
+    /// must carry no fragment even when fragments are on — getting this wrong
+    /// writes a zero-length fragment the reader would misread.
+    #[test]
+    fn exact_block_multiple_files_use_no_fragment() {
+        let bs = 4096usize;
+        let tree = BuildNode::dir(
+            "/",
+            0o755,
+            vec![
+                BuildNode::file("exact", 0o644, vec![0xAB; bs * 2]),
+                BuildNode::file("ragged", 0o644, vec![0xCD; bs * 2 + 7]),
+            ],
+        );
+        let mut cur = Cursor::new(Vec::new());
+        write_squashfs(
+            &mut cur,
+            &tree,
+            &BuildOptions {
+                block_size: bs as u32,
+                ..Default::default()
+            },
+        )
+        .expect("build");
+
+        let mut fs = SquashfsFilesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let exact = entries.iter().find(|e| e.name == "exact").unwrap();
+        let ragged = entries.iter().find(|e| e.name == "ragged").unwrap();
+        assert_eq!(fs.read_file(exact, 1 << 20).unwrap(), vec![0xAB; bs * 2]);
+        assert_eq!(
+            fs.read_file(ragged, 1 << 20).unwrap(),
+            vec![0xCD; bs * 2 + 7]
+        );
     }
 
     /// A codec we can read but not encode must be refused up front, before any
