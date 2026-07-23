@@ -26,6 +26,9 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     "vhd",
     "img",
     "raw",
+    // A bare SquashFS root (Buildroot and other appliance images ship one
+    // alongside the disk image); opens as a superfloppy via its `hsqs` magic.
+    "squashfs",
     "bin",
     "iso",
     "dd",
@@ -440,6 +443,17 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), picker.len(), "picker has duplicates");
+    }
+
+    #[test]
+    fn squashfs_extension_present() {
+        // A standalone SquashFS root has to stay pickable: the engine reads it
+        // (src/fs/squashfs.rs), so dropping the extension would make a
+        // supported filesystem unopenable from the GUI for no reason.
+        assert!(
+            DISK_IMAGE_EXTS.contains(&"squashfs"),
+            "missing squashfs disk-image extension"
+        );
     }
 
     #[test]

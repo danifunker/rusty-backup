@@ -289,8 +289,11 @@ images, with a MiSTer-FPGA lean** — the gaps sort into four bands.
 Not disk images of vintage machines — no plan to support:
 
 - **Modern flash translation FS** — JFFS2, YAFFS, UBIFS, F2FS
-- **Read-only Linux packing FS** — SquashFS, cramfs (possible exception: the
-  Buildroot appliance images, if ever needed)
+- **Read-only Linux packing FS** — cramfs. (**SquashFS is now supported
+  read-only** — the Buildroot-appliance exception this list anticipated. See
+  `src/fs/squashfs.rs`: v4.0, gzip/XZ/LZMA/LZ4/zstd, browse + read. LZO images
+  are refused by name. There is deliberately no editable implementation —
+  SquashFS is built offline by `mksquashfs` and has no in-place write story.)
 - **Network / distributed / clustered** — NFS, SMB/CIFS, AFS, Ceph, Lustre,
   GlusterFS, GFS2, OCFS2, ZFS-as-pool
 - **Pseudo / virtual** — procfs, sysfs, tmpfs, overlayfs, FUSE shims

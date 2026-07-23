@@ -12,6 +12,10 @@ support the disk types (floppy / hard disk / CD-ROM) of the outstanding cores.
   APFS (read-only browse + extract, incl. FileVault via password / recovery
   key; no snapshots),
   ext2/3/4, XFS,
+  SquashFS v4.0 (read-only browse + extract; gzip [fixture-tested] / XZ / LZMA / LZ4 / zstd —
+  the read-only root filesystem of Buildroot and other appliance images, and
+  of `casper/filesystem.squashfs` inside live-CD ISOs; no edit or resize by
+  design, since it is built offline by `mksquashfs`),
   JFS, ReiserFS, UFS1/UFS2, btrfs, Minix V1/V2/V3 (read + edit + create + fsck),
   ProDOS (read + edit + create + fsck),
   Apple DOS 3.3 (read + edit + create + fsck),
