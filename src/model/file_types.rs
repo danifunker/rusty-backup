@@ -356,6 +356,10 @@ mod tests {
             ("coco disk", &["dsk", "jvc", "vdk"]),
             // TR-DOS (ZX Spectrum Beta Disk) flat .trd (ZX-Spectrum core).
             ("trdos disk", &["trd"]),
+            // VM disk containers — read, edit in place, and write as backup.
+            // `.qcow` is the extensionless-era alias qemu still accepts; UTM
+            // writes `.qcow2` for its classic-Mac disks.
+            ("vm container", &["qcow2", "qcow", "vmdk"]),
         ];
         let exts = association_exts();
         for (family, must) in families {

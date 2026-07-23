@@ -47,6 +47,17 @@ pub fn is_chd_path(path: &Path) -> bool {
     matches!(f.read(&mut magic), Ok(n) if n == 8) && &magic == b"MComprHD"
 }
 
+/// Cheap magic sniff: returns true when `path` starts with `QFI\xFB`. The
+/// signature is unambiguous, so no extension check is needed — UTM writes
+/// `.qcow2`, but qemu happily produces extensionless / `.img`-named QCOW2s.
+pub fn is_qcow2_path(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == crate::rbformats::qcow2::QCOW2_MAGIC
+}
+
 /// Cheap sniff: returns true when `path` looks like a WinImage IMZ
 /// archive. IMZ is just a ZIP, so the bare magic (`PK\x03\x04`) would
 /// false-positive on arbitrary ZIPs — we additionally require the

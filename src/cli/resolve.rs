@@ -266,6 +266,18 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit)>
     if let Some(chd) = try_open_chd_rw(path)? {
         return Ok(chd);
     }
+    if source_reader::is_qcow2_path(path) {
+        // QCOW2 edits in place: `Qcow2Reader` is itself `Read + Write + Seek`,
+        // allocating host clusters on demand, so there's nothing to re-encode
+        // on commit. Without this branch the raw `File` below would be handed
+        // to partition detection, which reads the QCOW2 header as sector 0 and
+        // reports a bogus "Invalid MBR". Snapshot-bearing images open fine and
+        // refuse at the first write with a message naming the reason.
+        let file = open_image_rw(path)?;
+        let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
+            .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
+        return Ok((Box::new(reader), RwCommit::None));
+    }
     if source_reader::is_editable_container_path(path) {
         // Floppy / gzip / WOZ container: decode to a temp flat, edit that,
         // re-encode on commit. open_image_rw on the temp gives the same File

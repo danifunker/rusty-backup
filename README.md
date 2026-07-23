@@ -505,7 +505,7 @@ readable.
 | Raw            | `.img`, `.raw`, `.hda` | Yes     | Yes             | Sparse zero-skipping; optional splitting |
 | Fixed VHD      | `.vhd`          | Yes            | Yes             | 512-byte footer; also used for VHD export |
 | Dynamic VHD    | `.vhd`          | Yes            | Yes             | Sparse, allocate-on-write |
-| QCOW2 (QEMU)   | `.qcow2`        | Yes            | Yes (create / edit) | v2 + v3 |
+| QCOW2 (QEMU)   | `.qcow2`, `.qcow` | Yes          | Yes (create / edit) | v2 + v3, including UTM's classic-Mac disks. An image carrying **internal snapshots** opens read-only — UTM parks its VM suspend state in one, so this is the common case; flatten it (`qemu-img snapshot -d <name>`) to edit. Backing files, compressed clusters, external data files, extended L2 (subclusters) and encryption are refused at open with a message naming the reason |
 | VMDK (VMware)  | `.vmdk`         | Yes            | Yes (create / edit) | Flat and monolithic-sparse |
 | Zstd stream    | `.zst`          | Yes            | Yes             | Good general compression, splittable |
 | Gzip stream    | `.gz`           | Yes            | Yes             | DEFLATE per-partition member; the codec shared with crusty-backup (`cb-dos`) so DOS-side backups restore + resize here unchanged. `--format gzip` |
