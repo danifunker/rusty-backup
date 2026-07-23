@@ -168,13 +168,18 @@ work by fragment when planning reuse.
 
 ## 5. Phasing
 
-| Phase | Scope |
-|---|---|
-| **0** | Extend the reader per §3 — full inode metadata, ID table, device nodes, link counts. Verifiable on its own against `unsquashfs -lls`. |
-| **1** | Writer: emit a valid image from an in-memory tree. Validated by `unsquashfs` + `mksquashfs`-produced references. |
-| **2** | `EditableFilesystem` over bare `.squashfs` files + partitions, with the §2 size prompt. Block reuse. |
-| **3** | ISO 9660 and AppImage containers. |
-| **4** | `rb-cli new volume squashfs` (create blank) and a structural verifier (§6 of the audit: there is no repair to be had). |
+| Phase | Scope | State |
+|---|---|---|
+| **0** | Extend the reader per §3 — full inode metadata, ID table, device nodes, link counts. Verifiable on its own against `unsquashfs -lls`. | **done** — oracle-diffed at 123k entries |
+| **1a** | Writer: emit a valid image from an in-memory tree. Validated by `unsquashfs` + `mksquashfs`-produced references. | **done** — gzip/xz/zstd accepted by `unsquashfs` |
+| **1b** | Fragment packing (compression-ratio parity with mksquashfs). | **done** — 1.004 size ratio on real /etc |
+| **2a** | `FileContent` seam: stream content, don't hold the whole image in RAM. | **done** — host files stream |
+| **2b** | Source→tree bridge: read an image into an editable tree. | **done** — 2513-node rebuild round-trip |
+| **2c** | `EditableFilesystem` over bare `.squashfs` + partitions: an overlay of pending edits, rebuild on sync, with the §2 size prompt and D6 attribute + xattr inheritance. | **next** |
+| **2d** | In-place commit (temp + size check + atomic rename) and dispatch/CLI wiring. | |
+| **2-opt** | Lazy `FileContent::Source` streaming + verbatim block reuse. Not needed for correctness; bounds rebuild memory and cost. | deferred |
+| **3** | ISO 9660 and AppImage containers. | |
+| **4** | `rb-cli new volume squashfs` (create blank) and a structural verifier (§6 of the audit: there is no repair to be had). | |
 
 ---
 
