@@ -212,7 +212,11 @@ fn write_roots<W: Write>(
     progress: &dyn Fn(&TarExportStats),
 ) -> Result<()> {
     for root in roots {
-        export_into(fs, root, &root.name, builder, opts, stats, progress)?;
+        // A selected volume root has no member name of its own — its children
+        // land at the archive top level. `archive_name` is what decides that;
+        // `root.name` would be the literal "/" every driver uses.
+        let prefix = root.archive_name().unwrap_or("");
+        export_into(fs, root, prefix, builder, opts, stats, progress)?;
     }
     Ok(())
 }
@@ -226,6 +230,10 @@ fn export_into<W: Write>(
     stats: &mut TarExportStats,
     progress: &dyn Fn(&TarExportStats),
 ) -> Result<()> {
+    // A prefix of "/" is a volume root spelled the way the drivers spell it;
+    // treat it as the whole-volume case rather than emitting a "//" member,
+    // which tar refuses outright.
+    let archive_prefix = archive_prefix.trim_matches('/');
     match root.entry_type {
         EntryType::Directory => {
             // For a subtree export, emit the root directory itself so the
@@ -482,9 +490,9 @@ mod tests {
         (files, meta)
     }
 
-    fn export_blank_fat_volume() -> (HashMap<String, Vec<u8>>, Vec<TarMeta>, TarExportStats) {
-        // Build a FAT volume with a couple of files + a subdir via the
-        // editable FS API, then tar-export the whole volume.
+    /// A small FAT volume holding two files and a subdirectory. Returns the
+    /// tempdir (keep it alive) and the image path.
+    fn populated_fat_image() -> (tempfile::TempDir, std::path::PathBuf) {
         let flat = crate::fs::fat::create_blank_fat(2 * 1024 * 1024, Some("TARTEST")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("v.img");
@@ -508,7 +516,13 @@ mod tests {
             put_file(&mut *efs, &sub, "INNER.TXT", b"nested file");
             efs.sync_metadata().unwrap();
         }
+        (dir, img)
+    }
 
+    fn export_blank_fat_volume() -> (HashMap<String, Vec<u8>>, Vec<TarMeta>, TarExportStats) {
+        // Build a FAT volume with a couple of files + a subdir via the
+        // editable FS API, then tar-export the whole volume.
+        let (_dir, img) = populated_fat_image();
         let file = std::fs::File::open(&img).unwrap();
         let mut fs = crate::fs::open_filesystem(file, 0, 0, None).unwrap();
         let root = fs.root().unwrap();
@@ -526,6 +540,64 @@ mod tests {
         .unwrap();
         let (files, meta) = read_targz(&out);
         (files, meta, stats)
+    }
+
+    /// Selecting the volume root and exporting it — the shape a "select all in
+    /// the browser, export to tar.gz" click produces — used to die with
+    /// `append dir /`: every driver names its root `"/"`, `write_roots` took
+    /// that as the archive prefix, and tar refuses an absolute member path.
+    /// The root has no member of its own; its children sit at the top level.
+    #[test]
+    fn a_selected_volume_root_exports_its_children_not_a_slash_member() {
+        let (_dir, img) = populated_fat_image();
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = crate::fs::open_filesystem(file, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        assert_eq!(root.name, "/", "fixture assumption: roots are named '/'");
+
+        let mut out = Vec::new();
+        let opts = TarExportOptions::default();
+        export_tar_multi(
+            &mut *fs,
+            std::slice::from_ref(&root),
+            &mut out,
+            TarCompression::Gzip,
+            &opts,
+            &|_| {},
+        )
+        .expect("exporting a selected volume root must not fail");
+
+        let (files, meta) = read_targz(&out);
+        assert!(files.contains_key("HELLO.TXT"), "paths: {:?}", files.keys());
+        assert_eq!(files["SUB/INNER.TXT"], b"nested file");
+        assert!(
+            !meta.iter().any(|(p, _, _)| p.starts_with('/') || p == "//"),
+            "an absolute member leaked into the archive: {meta:?}"
+        );
+    }
+
+    /// The same normalization on the single-root entry point, for a caller that
+    /// passes the root's name straight through as the prefix.
+    #[test]
+    fn a_slash_archive_prefix_means_whole_volume() {
+        let (_dir, img) = populated_fat_image();
+        let file = std::fs::File::open(&img).unwrap();
+        let mut fs = crate::fs::open_filesystem(file, 0, 0, None).unwrap();
+        let root = fs.root().unwrap();
+        let mut out = Vec::new();
+        let opts = TarExportOptions::default();
+        export_tar(
+            &mut *fs,
+            &root,
+            "/",
+            &mut out,
+            TarCompression::Gzip,
+            &opts,
+            &|_| {},
+        )
+        .expect("a '/' prefix must mean the whole volume");
+        let (files, _) = read_targz(&out);
+        assert!(files.contains_key("HELLO.TXT"), "paths: {:?}", files.keys());
     }
 
     #[test]

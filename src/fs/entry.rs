@@ -270,6 +270,28 @@ impl FileEntry {
         }
     }
 
+    /// The name this entry should carry inside an archive or an extraction
+    /// folder — or `None` when it is a volume root, which contributes its
+    /// *children* rather than a member of its own.
+    ///
+    /// Every driver names the volume root `"/"` (the optical drivers map their
+    /// empty root name onto it too), and that is not a usable member name:
+    /// tar and zip both reject absolute paths, and `Path::join("/")` silently
+    /// throws away the destination directory and hands back the **host** root.
+    /// So an exporter handed a whole volume must ask here rather than reach for
+    /// `name` — the answer is "this has no name, recurse into it at the same
+    /// level", which is also what `tar -C / .` does.
+    pub fn archive_name(&self) -> Option<&str> {
+        let trimmed = self.name.trim_matches('/');
+        // ".." would escape the destination on extraction, "." names the
+        // directory an archive is already rooted at; neither is a member.
+        if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
     pub fn is_directory(&self) -> bool {
         self.entry_type == EntryType::Directory
     }
