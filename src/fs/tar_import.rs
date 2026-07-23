@@ -357,7 +357,12 @@ impl TarImportPreflight {
         let mut w = Vec::new();
         if self.symlinks_dropped > 0 {
             w.push(format!(
-                "{} symlink(s) will be DROPPED - this filesystem can't store symbolic links.",
+                // Deliberately about the *driver*, not the format: several
+                // filesystems we can read symlinks from we cannot yet write
+                // them to, and claiming the format can't hold them sends the
+                // user looking for a problem that isn't there.
+                "{} symlink(s) will be DROPPED - writing symbolic links is not \
+                 supported for this filesystem.",
                 self.symlinks_dropped
             ));
         }
