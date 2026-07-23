@@ -85,6 +85,7 @@ pub mod resource_fork;
 pub mod rsdos;
 pub mod sfs;
 pub mod sfs_fsck;
+pub mod squashfs;
 pub mod tar_export;
 pub mod tar_import;
 pub mod ti99;
@@ -216,6 +217,12 @@ fn detect_filesystem_type<R: Read + Seek>(reader: &mut R, partition_offset: u64)
     }
     if &sector0[3..11] == b"EXFAT   " {
         return "exfat";
+    }
+    // SquashFS: "hsqs" at offset 0. Probed early because the magic is
+    // distinctive and sits where a boot sector's JMP would be, so leaving it
+    // until after the FAT heuristics risks a misclassification.
+    if &sector0[0..4] == b"hsqs" {
+        return "squashfs";
     }
     // OS/2 HPFS: its boot block also begins with a JMP and a plausible 512/1
     // BPB, so it would be misclassified by the FAT heuristic below. Detect it
@@ -582,6 +589,9 @@ pub fn probe_0x83_fs_type<R: Read + Seek>(
         "reiserfs" => Some("ReiserFS"),
         "ufs" => Some("UFS"),
         "jfs" => Some("JFS2"),
+        // Appliance images (Buildroot and friends) ship a SquashFS root in a
+        // plain 0x83 partition.
+        "squashfs" => Some("SquashFS"),
         _ => None,
     }
 }
@@ -1452,6 +1462,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                "squashfs" => Ok(Box::new(squashfs::SquashfsFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
                 "btrfs" => Ok(Box::new(btrfs::BtrfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1601,6 +1615,10 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
             let fs_type = detect_filesystem_type(&mut reader, partition_offset);
             match fs_type {
                 "ext" => Ok(Box::new(ext::ExtFilesystem::open(
+                    reader,
+                    partition_offset,
+                )?)),
+                "squashfs" => Ok(Box::new(squashfs::SquashfsFilesystem::open(
                     reader,
                     partition_offset,
                 )?)),
