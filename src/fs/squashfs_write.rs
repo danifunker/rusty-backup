@@ -42,6 +42,13 @@
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 
+// `off.is_multiple_of(4)` in the test-only offset scanner is an inherent method
+// only since Rust 1.87; the vintage 1.73 build gets it from this trait. Scoped
+// to `test` so it isn't an unused import on the vintage *library* build (which
+// doesn't compile the test module).
+#[cfg(all(test, feature = "rust173-polyfill"))]
+use crate::rust173_compat::IntIsMultipleOf as _;
+
 use super::filesystem::FilesystemError;
 use super::squashfs::{
     Compressor, Xattr, INODE_DIR, INODE_EXT_DIR, INODE_EXT_FILE, INODE_EXT_SYMLINK, INODE_FILE,
@@ -450,14 +457,14 @@ fn compress(compressor: Compressor, data: &[u8]) -> Result<Vec<u8>, FilesystemEr
             use flate2::Compression;
             let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(9));
             enc.write_all(data)
-                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))?;
+                .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
             enc.finish()
-                .map_err(|e| FilesystemError::Io(std::io::Error::other(e.to_string())))
+                .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))
         }
         Compressor::Xz => {
             let mut out = Vec::new();
             lzma_rs::xz_compress(&mut std::io::Cursor::new(data), &mut out).map_err(|e| {
-                FilesystemError::Io(std::io::Error::other(format!("xz compress: {e:?}")))
+                FilesystemError::Io(crate::compat::io_other(format!("xz compress: {e:?}")))
             })?;
             Ok(out)
         }
@@ -472,7 +479,7 @@ fn compress(compressor: Compressor, data: &[u8]) -> Result<Vec<u8>, FilesystemEr
 
 fn compress_zstd(data: &[u8]) -> Result<Vec<u8>, FilesystemError> {
     crate::rbformats::zstd_compat::encode_all(data, 15)
-        .map_err(|e| FilesystemError::Io(std::io::Error::other(format!("zstd compress: {e}"))))
+        .map_err(|e| FilesystemError::Io(crate::compat::io_other(format!("zstd compress: {e}"))))
 }
 
 /// Interns uid/gid values into the image's ID pool. Inodes reference IDs by a
