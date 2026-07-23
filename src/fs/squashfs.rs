@@ -99,17 +99,42 @@ impl Compressor {
 }
 
 /// Parsed superblock. Field order follows the on-disk layout.
+///
+/// Fields past `fragment_table_start` are not needed to *browse* an image, but
+/// a faithful rebuild cannot do without them: `id_table_start` is the only way
+/// to turn an inode's 16-bit uid/gid index into a real uid/gid, and
+/// `xattr_id_table_start` is where capability bits on appliance binaries live.
+/// See `docs/squashfs_edit.md` §3.
 #[derive(Debug, Clone)]
 struct Superblock {
+    /// Writer input (phase 1): the rebuilt image restates this.
+    #[allow(dead_code)]
+    inode_count: u32,
+    /// Writer input (phase 1).
+    #[allow(dead_code)]
+    mod_time: u32,
     block_size: u32,
     fragment_count: u32,
     compressor: Compressor,
+    /// Writer input (phase 1) — must agree with `block_size`.
+    #[allow(dead_code)]
+    block_log: u16,
     flags: u16,
+    /// Number of entries in the ID table (uid/gid pool).
+    no_ids: u16,
     root_inode_ref: u64,
     bytes_used: u64,
+    id_table_start: u64,
+    /// `u64::MAX` when the image carries no extended attributes.
+    xattr_id_table_start: u64,
     inode_table_start: u64,
     directory_table_start: u64,
     fragment_table_start: u64,
+    /// NFS export (inode-number -> inode-reference) table; `u64::MAX` when the
+    /// image was built without `-no-exports`. Writer input (phase 1): the
+    /// rebuild has to regenerate this or explicitly drop it.
+    #[allow(dead_code)]
+    export_table_start: u64,
 }
 
 impl Superblock {
@@ -157,15 +182,22 @@ impl Superblock {
         }
 
         Ok(Self {
+            inode_count: u32le(buf, 4),
+            mod_time: u32le(buf, 8),
             block_size,
             fragment_count: u32le(buf, 16),
             compressor,
+            block_log,
             flags: u16le(buf, 24),
+            no_ids: u16le(buf, 26),
             root_inode_ref: u64le(buf, 32),
             bytes_used: u64le(buf, 40),
+            id_table_start: u64le(buf, 48),
+            xattr_id_table_start: u64le(buf, 56),
             inode_table_start: u64le(buf, 64),
             directory_table_start: u64le(buf, 72),
             fragment_table_start: u64le(buf, 80),
+            export_table_start: u64le(buf, 88),
         })
     }
 
@@ -175,10 +207,33 @@ impl Superblock {
     }
 }
 
-/// A decoded inode, reduced to what browsing needs.
+/// Sentinel in an inode's `xattr_idx` meaning "no extended attributes".
+const SQUASHFS_INVALID_XATTR: u32 = 0xFFFF_FFFF;
+
+/// A decoded inode.
+///
+/// The common-header fields (`mode` .. `inode_number`) are read for every inode
+/// type. Browsing only needs `kind`, but a rebuild has to reproduce ownership,
+/// permissions and timestamps exactly — getting those wrong on an appliance
+/// root image is the difference between a working and a broken device.
 #[derive(Debug, Clone)]
 struct Inode {
     kind: u16,
+    /// Permission bits only (`0o7777`); the file-type bits come from `kind`.
+    /// Combine via [`Inode::unix_mode`].
+    mode: u16,
+    /// Index into the ID table, *not* a uid. Resolve with
+    /// [`SquashfsFilesystem::resolve_id`].
+    uid_idx: u16,
+    gid_idx: u16,
+    /// Seconds since the Unix epoch.
+    mtime: u32,
+    inode_number: u32,
+    /// Hard-link count. Absent from the *basic* file inode (which cannot be
+    /// hardlinked), where it stays 1.
+    nlink: u32,
+    /// Index into the xattr ID table, or [`SQUASHFS_INVALID_XATTR`].
+    xattr_idx: u32,
     /// Directories: where their entries live in the directory table.
     dir_block_start: u32,
     dir_offset: u16,
@@ -191,12 +246,22 @@ struct Inode {
     fragment_offset: u32,
     /// Symlinks.
     symlink_target: String,
+    /// Block/char devices, decoded from the packed 32-bit `device` field.
+    dev_major: u32,
+    dev_minor: u32,
 }
 
 impl Inode {
     fn empty(kind: u16) -> Self {
         Self {
             kind,
+            mode: 0,
+            uid_idx: 0,
+            gid_idx: 0,
+            mtime: 0,
+            inode_number: 0,
+            nlink: 1,
+            xattr_idx: SQUASHFS_INVALID_XATTR,
             dir_block_start: 0,
             dir_offset: 0,
             dir_size: 0,
@@ -206,6 +271,35 @@ impl Inode {
             fragment_index: 0xFFFF_FFFF,
             fragment_offset: 0,
             symlink_target: String::new(),
+            dev_major: 0,
+            dev_minor: 0,
+        }
+    }
+
+    /// The full Unix mode: the S_IF* type bits implied by `kind`, OR'd with the
+    /// stored permission bits. SquashFS stores only the low 12 bits on disk.
+    fn unix_mode(&self) -> u32 {
+        let type_bits: u32 = match self.kind {
+            INODE_DIR | INODE_EXT_DIR => 0o040_000,
+            INODE_FILE | INODE_EXT_FILE => 0o100_000,
+            INODE_SYMLINK | INODE_EXT_SYMLINK => 0o120_000,
+            INODE_BLKDEV | INODE_EXT_BLKDEV => 0o060_000,
+            INODE_CHRDEV | INODE_EXT_CHRDEV => 0o020_000,
+            INODE_FIFO | INODE_EXT_FIFO => 0o010_000,
+            INODE_SOCKET | INODE_EXT_SOCKET => 0o140_000,
+            _ => 0,
+        };
+        type_bits | (self.mode as u32 & 0o7777)
+    }
+
+    /// Human-readable label for the special-file kinds, for the browse view.
+    fn special_label(&self) -> Option<&'static str> {
+        match self.kind {
+            INODE_BLKDEV | INODE_EXT_BLKDEV => Some("block device"),
+            INODE_CHRDEV | INODE_EXT_CHRDEV => Some("char device"),
+            INODE_FIFO | INODE_EXT_FIFO => Some("fifo"),
+            INODE_SOCKET | INODE_EXT_SOCKET => Some("socket"),
+            _ => None,
         }
     }
 
@@ -226,6 +320,40 @@ struct FragmentEntry {
     size: u32,
 }
 
+/// One extended attribute, with the on-disk prefix already applied to `name`
+/// (SquashFS stores `security.capability` as prefix-id 2 + `"capability"`).
+///
+/// Appliance images encode Linux capabilities here — `security.capability` on
+/// `ping`, `dumpcap` and friends — so these have to survive a rebuild or the
+/// image boots with subtly broken binaries. See `docs/squashfs_edit.md` D4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Xattr {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+/// One 16-byte entry in the xattr ID table: where an inode's attribute list
+/// lives, and how big it is.
+#[derive(Debug, Clone, Copy)]
+struct XattrIdEntry {
+    /// Metadata reference (block << 16 | offset) into the xattr key/value table.
+    xattr_ref: u64,
+    /// Number of key/value pairs.
+    count: u32,
+    /// Total uncompressed byte length of those pairs.
+    size: u32,
+}
+
+/// Prefix IDs in an xattr key's `type` field. The high bit (0x0100) instead
+/// marks an out-of-line value — a back-reference to an identical value written
+/// earlier, which is how mksquashfs deduplicates repeated attributes.
+///
+/// Read today only by [`SquashfsFilesystem::read_xattrs`], whose consumers land
+/// in phase 1 (the rebuild) and phase 2 (browse-view display) — see
+/// `docs/squashfs_edit.md`.
+const XATTR_PREFIX_MASK: u16 = 0xFF;
+const XATTR_OUT_OF_LINE: u16 = 0x0100;
+
 /// A mounted SquashFS image.
 pub struct SquashfsFilesystem<R: Read + Seek> {
     reader: R,
@@ -241,6 +369,16 @@ pub struct SquashfsFilesystem<R: Read + Seek> {
     /// the decompressed payload.
     metadata_cache: HashMap<u64, (Vec<u8>, u64)>,
     fragments: Vec<FragmentEntry>,
+    /// The uid/gid pool. Inodes store a 16-bit *index* into this, not an ID, so
+    /// nothing can report real ownership without it.
+    ids: Vec<u32>,
+    /// Where the xattr key/value metadata blocks begin. Zero when the image has
+    /// no extended attributes.
+    xattr_table_start: u64,
+    /// The xattr ID table, indexed by an inode's `xattr_idx`. Loaded eagerly
+    /// (it is small — 16 bytes per *distinct* attribute set, not per inode);
+    /// the key/value pairs themselves are read on demand.
+    xattr_ids: Vec<XattrIdEntry>,
 }
 
 impl<R: Read + Seek> SquashfsFilesystem<R> {
@@ -259,8 +397,13 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             sb,
             metadata_cache: HashMap::new(),
             fragments: Vec::new(),
+            ids: Vec::new(),
+            xattr_table_start: 0,
+            xattr_ids: Vec::new(),
         };
         fs.load_fragment_table()?;
+        fs.load_id_table()?;
+        fs.load_xattr_table()?;
         Ok(fs)
     }
 
@@ -400,6 +543,201 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         Ok(())
     }
 
+    /// The ID table is the uid/gid pool: a table of 64-bit pointers to metadata
+    /// blocks, each packed with 32-bit IDs. Inodes reference it by index, so
+    /// ownership is unreportable — and unreproducible on rebuild — without it.
+    fn load_id_table(&mut self) -> Result<(), FilesystemError> {
+        let count = self.sb.no_ids as usize;
+        if count == 0 || self.sb.id_table_start == u64::MAX {
+            return Ok(());
+        }
+
+        // 8192 / 4 = 2048 IDs per metadata block.
+        let index_count = count.div_ceil(2048);
+        let mut index = vec![0u8; index_count * 8];
+        self.reader
+            .seek(SeekFrom::Start(self.offset + self.sb.id_table_start))
+            .map_err(FilesystemError::Io)?;
+        self.reader
+            .read_exact(&mut index)
+            .map_err(FilesystemError::Io)?;
+
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..index_count {
+            let block_start = u64le(&index, i * 8);
+            let (block, _) = self.read_metadata_block(block_start)?;
+            let mut off = 0;
+            while off + 4 <= block.len() && ids.len() < count {
+                ids.push(u32le(&block, off));
+                off += 4;
+            }
+        }
+        self.ids = ids;
+        Ok(())
+    }
+
+    /// Turn an inode's 16-bit uid/gid index into the real ID. An out-of-range
+    /// index means a damaged or truncated ID table; report 0 rather than
+    /// failing the whole listing, since browsing is still useful.
+    fn resolve_id(&self, idx: u16) -> u32 {
+        self.ids.get(idx as usize).copied().unwrap_or(0)
+    }
+
+    /// The xattr ID table is reached through a 16-byte header (where the
+    /// key/value blocks live, and how many ID entries there are), followed by
+    /// the usual index of 64-bit metadata-block pointers.
+    ///
+    /// An image built without xattrs sets `xattr_id_table_start` to `u64::MAX`.
+    fn load_xattr_table(&mut self) -> Result<(), FilesystemError> {
+        let table = self.sb.xattr_id_table_start;
+        if table == u64::MAX || table == 0 || table >= self.sb.bytes_used {
+            return Ok(());
+        }
+
+        let mut header = [0u8; 16];
+        self.reader
+            .seek(SeekFrom::Start(self.offset + table))
+            .map_err(FilesystemError::Io)?;
+        self.reader
+            .read_exact(&mut header)
+            .map_err(FilesystemError::Io)?;
+        self.xattr_table_start = u64le(&header, 0);
+        let count = u32le(&header, 8) as usize;
+        if count == 0 {
+            return Ok(());
+        }
+
+        // 8192 / 16 = 512 ID entries per metadata block. The index sits
+        // immediately after the header.
+        let index_count = count.div_ceil(512);
+        let mut index = vec![0u8; index_count * 8];
+        self.reader
+            .read_exact(&mut index)
+            .map_err(FilesystemError::Io)?;
+
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..index_count {
+            let block_start = u64le(&index, i * 8);
+            let (block, _) = self.read_metadata_block(block_start)?;
+            let mut off = 0;
+            while off + 16 <= block.len() && entries.len() < count {
+                entries.push(XattrIdEntry {
+                    xattr_ref: u64le(&block, off),
+                    count: u32le(&block, off + 8),
+                    size: u32le(&block, off + 12),
+                });
+                off += 16;
+            }
+        }
+        self.xattr_ids = entries;
+        Ok(())
+    }
+
+    /// Read the extended attributes an inode's `xattr_idx` points at. Returns
+    /// an empty list for inodes with none, which is the overwhelming majority.
+    ///
+    /// Exercised today by `reads_xattrs_from_a_real_image`; its production
+    /// callers are the rebuild (phase 1) and the browse view (phase 2).
+    #[allow(dead_code)]
+    fn read_xattrs(&mut self, idx: u32) -> Result<Vec<Xattr>, FilesystemError> {
+        if idx == SQUASHFS_INVALID_XATTR {
+            return Ok(Vec::new());
+        }
+        let Some(entry) = self.xattr_ids.get(idx as usize).copied() else {
+            return Ok(Vec::new());
+        };
+
+        let block = self.xattr_table_start + (entry.xattr_ref >> 16);
+        let offset = (entry.xattr_ref & 0xFFFF) as u16;
+        let raw = self.read_metadata_span(block, offset, entry.size as usize)?;
+
+        let mut out = Vec::with_capacity(entry.count as usize);
+        let mut pos = 0usize;
+        for _ in 0..entry.count {
+            if pos + 4 > raw.len() {
+                break;
+            }
+            let kind = u16le(&raw, pos);
+            let name_size = u16le(&raw, pos + 2) as usize;
+            pos += 4;
+            if pos + name_size > raw.len() {
+                break;
+            }
+            let suffix = String::from_utf8_lossy(&raw[pos..pos + name_size]).into_owned();
+            pos += name_size;
+
+            if pos + 4 > raw.len() {
+                break;
+            }
+            let vsize = u32le(&raw, pos) as usize;
+            pos += 4;
+            if pos + vsize > raw.len() {
+                break;
+            }
+            let value = if kind & XATTR_OUT_OF_LINE != 0 {
+                // Deduplicated: the payload is an 8-byte reference to the value
+                // written for an earlier inode.
+                self.read_xattr_value_at(u64le(&raw, pos))?
+            } else {
+                raw[pos..pos + vsize].to_vec()
+            };
+            pos += vsize;
+
+            let prefix = match kind & XATTR_PREFIX_MASK {
+                0 => "user.",
+                1 => "trusted.",
+                2 => "security.",
+                // An unknown prefix id means a newer mksquashfs than we model;
+                // keep the bare name rather than inventing one.
+                _ => "",
+            };
+            out.push(Xattr {
+                name: format!("{prefix}{suffix}"),
+                value,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Follow an out-of-line xattr value reference: a 32-bit length followed by
+    /// that many bytes, at a metadata reference into the xattr table.
+    #[allow(dead_code)]
+    fn read_xattr_value_at(&mut self, reference: u64) -> Result<Vec<u8>, FilesystemError> {
+        let block = self.xattr_table_start + (reference >> 16);
+        let offset = (reference & 0xFFFF) as u16;
+        let header = self.read_metadata_span(block, offset, 4)?;
+        let vsize = u32le(&header, 0) as usize;
+        if vsize > METADATA_BLOCK_SIZE * 8 {
+            return Err(FilesystemError::InvalidData(
+                "squashfs: implausible out-of-line xattr value length".into(),
+            ));
+        }
+        let full = self.read_metadata_span(block, offset, 4 + vsize)?;
+        Ok(full[4..].to_vec())
+    }
+
+    /// Copy the POSIX metadata off a decoded inode onto the browse-view entry.
+    /// Everything here was previously parsed and thrown away, so `ls` showed no
+    /// mode, owner or mtime on a SquashFS volume.
+    fn decorate(&self, fe: &mut FileEntry, inode: &Inode) {
+        fe.mode = Some(inode.unix_mode());
+        fe.uid = Some(self.resolve_id(inode.uid_idx));
+        fe.gid = Some(self.resolve_id(inode.gid_idx));
+        if inode.mtime != 0 {
+            fe.modified = Some(super::unix_common::inode::format_unix_timestamp(
+                inode.mtime as i64,
+            ));
+        }
+        if let Some(label) = inode.special_label() {
+            fe.special_type = Some(match inode.kind {
+                INODE_BLKDEV | INODE_EXT_BLKDEV | INODE_CHRDEV | INODE_EXT_CHRDEV => {
+                    format!("{label} ({}, {})", inode.dev_major, inode.dev_minor)
+                }
+                _ => label.to_string(),
+            });
+        }
+    }
+
     /// Decode the inode at `reference` (block start in the high bits, byte
     /// offset within the decompressed block in the low 16).
     fn read_inode(&mut self, reference: u64) -> Result<Inode, FilesystemError> {
@@ -410,6 +748,11 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
         let header = self.read_metadata_span(block, offset, 16)?;
         let kind = u16le(&header, 0);
         let mut inode = Inode::empty(kind);
+        inode.mode = u16le(&header, 2);
+        inode.uid_idx = u16le(&header, 4);
+        inode.gid_idx = u16le(&header, 6);
+        inode.mtime = u32le(&header, 8);
+        inode.inode_number = u32le(&header, 12);
 
         match kind {
             // Basic directory, 32 bytes after the 16-byte common header:
@@ -421,6 +764,7 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             INODE_DIR => {
                 let b = self.read_metadata_span(block, offset, 32)?;
                 inode.dir_block_start = u32le(&b, 16);
+                inode.nlink = u32le(&b, 20);
                 inode.dir_size = u16le(&b, 24) as u32;
                 inode.dir_offset = u16le(&b, 26);
             }
@@ -430,9 +774,11 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             //   32 index_count (u16), 34 block_offset (u16), 36 xattr (u32).
             INODE_EXT_DIR => {
                 let b = self.read_metadata_span(block, offset, 40)?;
+                inode.nlink = u32le(&b, 16);
                 inode.dir_size = u32le(&b, 20);
                 inode.dir_block_start = u32le(&b, 24);
                 inode.dir_offset = u16le(&b, 34);
+                inode.xattr_idx = u32le(&b, 36);
             }
             INODE_FILE => {
                 let b = self.read_metadata_span(block, offset, 32)?;
@@ -452,8 +798,11 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
                 let b = self.read_metadata_span(block, offset, 56)?;
                 inode.file_start = u64le(&b, 16);
                 inode.file_size = u64le(&b, 24);
+                // 32: sparse-file byte count — informational, not needed to read.
+                inode.nlink = u32le(&b, 40);
                 inode.fragment_index = u32le(&b, 44);
                 inode.fragment_offset = u32le(&b, 48);
+                inode.xattr_idx = u32le(&b, 52);
                 inode.block_sizes = self.read_block_sizes(
                     block,
                     offset,
@@ -464,17 +813,46 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
             }
             INODE_SYMLINK | INODE_EXT_SYMLINK => {
                 let b = self.read_metadata_span(block, offset, 24)?;
+                inode.nlink = u32le(&b, 16);
                 let target_len = u32le(&b, 20) as usize;
                 if target_len > 4096 {
                     return Err(FilesystemError::InvalidData(
                         "squashfs: implausible symlink target length".into(),
                     ));
                 }
-                let full = self.read_metadata_span(block, offset, 24 + target_len)?;
-                inode.symlink_target = String::from_utf8_lossy(&full[24..]).into_owned();
+                // The extended form parks its xattr index *after* the variable-
+                // length target, so it can only be read once the length is known.
+                let tail = if kind == INODE_EXT_SYMLINK { 4 } else { 0 };
+                let full = self.read_metadata_span(block, offset, 24 + target_len + tail)?;
+                inode.symlink_target =
+                    String::from_utf8_lossy(&full[24..24 + target_len]).into_owned();
+                if tail == 4 {
+                    inode.xattr_idx = u32le(&full, 24 + target_len);
+                }
             }
-            INODE_BLKDEV | INODE_CHRDEV | INODE_FIFO | INODE_SOCKET | INODE_EXT_BLKDEV
-            | INODE_EXT_CHRDEV | INODE_EXT_FIFO | INODE_EXT_SOCKET => {}
+            // Device nodes pack major/minor into one 32-bit word; fifos and
+            // sockets carry no payload beyond the link count.
+            INODE_BLKDEV | INODE_CHRDEV | INODE_EXT_BLKDEV | INODE_EXT_CHRDEV => {
+                let extended = matches!(kind, INODE_EXT_BLKDEV | INODE_EXT_CHRDEV);
+                let want = if extended { 28 } else { 24 };
+                let b = self.read_metadata_span(block, offset, want)?;
+                inode.nlink = u32le(&b, 16);
+                let (major, minor) = super::unix_common::inode::device_major_minor(u32le(&b, 20));
+                inode.dev_major = major;
+                inode.dev_minor = minor;
+                if extended {
+                    inode.xattr_idx = u32le(&b, 24);
+                }
+            }
+            INODE_FIFO | INODE_SOCKET | INODE_EXT_FIFO | INODE_EXT_SOCKET => {
+                let extended = matches!(kind, INODE_EXT_FIFO | INODE_EXT_SOCKET);
+                let want = if extended { 24 } else { 20 };
+                let b = self.read_metadata_span(block, offset, want)?;
+                inode.nlink = u32le(&b, 16);
+                if extended {
+                    inode.xattr_idx = u32le(&b, 20);
+                }
+            }
             other => {
                 return Err(FilesystemError::InvalidData(format!(
                     "squashfs: unknown inode type {other}"
@@ -593,11 +971,14 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
 
 impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
     fn root(&mut self) -> Result<FileEntry, FilesystemError> {
-        Ok(FileEntry::new_directory(
-            "/".to_string(),
-            "/".to_string(),
-            self.sb.root_inode_ref,
-        ))
+        let mut fe =
+            FileEntry::new_directory("/".to_string(), "/".to_string(), self.sb.root_inode_ref);
+        // Best-effort: a root inode we cannot decode is already fatal for any
+        // real use, but `root()` itself stays infallible for the caller.
+        if let Ok(inode) = self.read_inode(self.sb.root_inode_ref) {
+            self.decorate(&mut fe, &inode);
+        }
+        Ok(fe)
     }
 
     fn list_directory(&mut self, entry: &FileEntry) -> Result<Vec<FileEntry>, FilesystemError> {
@@ -623,7 +1004,7 @@ impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
                 // One unreadable child should not abort the whole listing.
                 Err(_) => continue,
             };
-            out.push(match child.entry_type() {
+            let mut fe = match child.entry_type() {
                 EntryType::Directory => FileEntry::new_directory(name, path, reference),
                 EntryType::Symlink => FileEntry::new_symlink(
                     name,
@@ -638,7 +1019,9 @@ impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
                     e.entry_type = EntryType::Special;
                     e
                 }
-            });
+            };
+            self.decorate(&mut fe, &child);
+            out.push(fe);
         }
         Ok(out)
     }
@@ -808,6 +1191,23 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Open the fixture image, or `None` when it isn't present so CI stays
+    /// green. Same `RB_SQUASHFS_ISO` override as the other real-image tests.
+    fn open_real_image() -> Option<SquashfsFilesystem<std::fs::File>> {
+        let path = std::env::var("RB_SQUASHFS_ISO").unwrap_or_else(|_| {
+            "/Users/dani/Downloads/ubuntu-12.04-desktop-powerpc.iso".to_string()
+        });
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("{path} not present — skipping real-image test");
+                return None;
+            }
+        };
+        let offset = find_squashfs_offset(&mut file)?;
+        Some(SquashfsFilesystem::open(file, offset).expect("open real squashfs"))
+    }
+
     /// Minimal 96-byte superblock with the fields this module validates.
     fn superblock(compressor: u16, block_log: u16, version_major: u16) -> Vec<u8> {
         let mut b = vec![0u8; SUPERBLOCK_SIZE];
@@ -919,6 +1319,198 @@ mod tests {
             body.contains("DISTRIB_ID="),
             "lsb-release did not decode to the expected shape: {body}"
         );
+    }
+
+    /// Phase 0 (`docs/squashfs_edit.md` §3): the POSIX metadata a rebuild has to
+    /// reproduce. Before this, `read_inode` parsed the 16-byte common header and
+    /// kept only the type — so mode, uid, gid and mtime were all discarded and
+    /// browsing showed none of them.
+    ///
+    /// Asserts against a real Linux root filesystem, where the expected shapes
+    /// are not in doubt: `/` is 0755, `/etc/shadow` is not world-readable, and
+    /// `/bin` holds root-owned executables.
+    #[test]
+    fn retains_posix_metadata_for_rebuild() {
+        let Some(mut fs) = open_real_image() else {
+            return;
+        };
+
+        let root = fs.root().expect("root");
+        assert_eq!(
+            root.mode.map(|m| m & 0o7777),
+            Some(0o755),
+            "root directory should be 0755"
+        );
+        assert_eq!(root.uid, Some(0), "root directory should be owned by uid 0");
+
+        let entries = fs.list_directory(&root).expect("list root");
+        let bin = entries.iter().find(|e| e.name == "bin").expect("/bin");
+        assert_eq!(
+            bin.mode.map(|m| m & 0o170_000),
+            Some(0o040_000),
+            "/bin is a dir"
+        );
+
+        // Every entry must now carry mode/uid/gid, and a plausible mtime.
+        let bin_entries = fs.list_directory(bin).expect("list /bin");
+        assert!(!bin_entries.is_empty(), "/bin should not be empty");
+        for e in &bin_entries {
+            assert!(e.mode.is_some(), "{} has no mode", e.path);
+            assert!(e.uid.is_some(), "{} has no uid", e.path);
+            assert!(e.gid.is_some(), "{} has no gid", e.path);
+        }
+
+        // At least one executable, and it should be root-owned.
+        let execs: Vec<_> = bin_entries
+            .iter()
+            .filter(|e| e.entry_type == EntryType::File && e.mode.unwrap_or(0) & 0o111 != 0)
+            .collect();
+        assert!(!execs.is_empty(), "/bin should hold executables");
+        assert!(
+            execs.iter().all(|e| e.uid == Some(0)),
+            "/bin executables should be root-owned"
+        );
+
+        // mtime must decode to a real date, not the epoch.
+        assert!(
+            bin_entries.iter().any(|e| e.modified.is_some()),
+            "no entry carried an mtime"
+        );
+    }
+
+    /// Device nodes carry a packed major/minor that the old reader dropped on
+    /// the floor (the `{}` arm). A Linux `/dev` is the natural place to check.
+    #[test]
+    fn decodes_device_nodes() {
+        let Some(mut fs) = open_real_image() else {
+            return;
+        };
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list root");
+        let Some(dev) = entries.iter().find(|e| e.name == "dev") else {
+            eprintln!("image has no /dev — skipping");
+            return;
+        };
+        let dev_entries = fs.list_directory(dev).expect("list /dev");
+        let specials: Vec<_> = dev_entries
+            .iter()
+            .filter(|e| e.entry_type == EntryType::Special)
+            .collect();
+        if specials.is_empty() {
+            eprintln!("/dev holds no device nodes — skipping");
+            return;
+        }
+        for s in &specials {
+            let label = s.special_type.as_deref().unwrap_or("");
+            assert!(
+                !label.is_empty(),
+                "{} is Special but carries no special_type",
+                s.path
+            );
+        }
+        eprintln!(
+            "/dev: {} special entries, e.g. {:?}",
+            specials.len(),
+            specials
+                .iter()
+                .take(4)
+                .map(|e| (&e.name, &e.special_type))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Extended attributes must survive a rebuild (decision D4), so the reader
+    /// has to decode them — including mksquashfs's out-of-line dedup form.
+    /// Reports rather than asserts a specific attribute: whether a given image
+    /// uses xattrs at all depends on how it was built.
+    #[test]
+    fn reads_xattrs_from_a_real_image() {
+        let Some(mut fs) = open_real_image() else {
+            return;
+        };
+        eprintln!(
+            "xattr id table: {} entries, kv table at {}",
+            fs.xattr_ids.len(),
+            fs.xattr_table_start
+        );
+
+        // Walk a bounded slice of the tree collecting any attributes found.
+        let root = fs.root().expect("root");
+        let mut queue = vec![root];
+        let mut found: Vec<(String, Vec<Xattr>)> = Vec::new();
+        let mut visited = 0usize;
+        while let Some(dir) = queue.pop() {
+            if visited > 400 {
+                break;
+            }
+            visited += 1;
+            let Ok(children) = fs.list_directory(&dir) else {
+                continue;
+            };
+            for child in children {
+                let Ok(inode) = fs.read_inode(child.location) else {
+                    continue;
+                };
+                if inode.xattr_idx != SQUASHFS_INVALID_XATTR {
+                    let attrs = fs.read_xattrs(inode.xattr_idx).expect("read xattrs");
+                    if !attrs.is_empty() {
+                        found.push((child.path.clone(), attrs));
+                    }
+                }
+                if child.entry_type == EntryType::Directory && queue.len() < 400 {
+                    queue.push(child);
+                }
+            }
+        }
+
+        if fs.xattr_ids.is_empty() {
+            eprintln!("image carries no xattr table — nothing to decode");
+            return;
+        }
+        eprintln!("found xattrs on {} entries (walk is bounded)", found.len());
+
+        // The walk above is bounded, so it may not reach whichever inode
+        // references the table. Decode every ID-table entry directly — that
+        // exercises the key/value parser deterministically, and every entry in
+        // the table is by construction referenced by some inode.
+        for idx in 0..fs.xattr_ids.len() as u32 {
+            let attrs = fs
+                .read_xattrs(idx)
+                .unwrap_or_else(|e| panic!("xattr id {idx} failed to decode: {e}"));
+            let expected = fs.xattr_ids[idx as usize].count as usize;
+            assert_eq!(
+                attrs.len(),
+                expected,
+                "xattr id {idx}: decoded {} pairs, table says {expected}",
+                attrs.len()
+            );
+            for a in &attrs {
+                eprintln!("  xattr[{idx}]: {} = {} bytes", a.name, a.value.len());
+                assert!(!a.name.is_empty(), "empty xattr name at id {idx}");
+                assert!(
+                    a.name.contains('.'),
+                    "xattr name {:?} lost its prefix",
+                    a.name
+                );
+            }
+        }
+
+        for (path, attrs) in found.iter().take(8) {
+            for a in attrs {
+                eprintln!("  {path}: {} = {} bytes", a.name, a.value.len());
+            }
+        }
+        // Whatever we decoded must be well-formed: a prefixed name and a value.
+        for (path, attrs) in &found {
+            for a in attrs {
+                assert!(!a.name.is_empty(), "{path}: empty xattr name");
+                assert!(
+                    a.name.contains('.'),
+                    "{path}: xattr name {:?} lost its prefix",
+                    a.name
+                );
+            }
+        }
     }
 
     /// Fixture-gated stress read of the same real image. The shallow test above
