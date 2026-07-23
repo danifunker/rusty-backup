@@ -28,7 +28,10 @@ use rusty_backup::rbformats::chd_edit::{
 };
 
 use super::file_detail::{self, FileContent};
-use super::metadata_editor::{self, HfsTypeEditorState, ProdosTypeEditorState};
+use super::metadata_editor::{
+    self, ExtPermsEditorState, HfsTypeEditorState, OwnerEditorState, ProdosTypeEditorState,
+    XattrEditorState,
+};
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
@@ -177,6 +180,15 @@ pub struct BrowseView {
     /// "Set" we encode and stage. `None` means the editor is closed for that
     /// entry; on first open we seed from current FInfo or the dictionary.
     hfs_type_editor: Option<HfsTypeEditorState>,
+    /// Inline Unix permissions / owner / xattr editor state, keyed by entry
+    /// path. Reset when the selection changes.
+    ext_perms_editor: Option<ExtPermsEditorState>,
+    owner_editor: Option<OwnerEditorState>,
+    xattr_editor: Option<XattrEditorState>,
+    /// On-disk xattrs of the selected entry, cached by path (read once per
+    /// selection on an xattr-bearing filesystem). Rebuilt when the selection
+    /// changes; `None` = not yet read for this selection.
+    xattr_cache: Option<(String, Vec<rusty_backup::fs::xattr::Xattr>)>,
     /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
     /// `show_staging_errors` drives a modal dialog listing each failure.
     staging_errors: Vec<(PathBuf, String)>,
@@ -437,6 +449,10 @@ impl Default for BrowseView {
             pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
+            ext_perms_editor: None,
+            owner_editor: None,
+            xattr_editor: None,
+            xattr_cache: None,
             staging_errors: Vec::new(),
             show_staging_errors: false,
             pending_extraction: None,
@@ -651,6 +667,7 @@ impl BrowseView {
         self.marked.clear();
         self.content = None;
         self.id_names = None;
+        self.xattr_cache = None;
         self.error = None;
         self.active = false;
         self.fs_type.clear();
@@ -1876,6 +1893,60 @@ impl BrowseView {
                             );
                         }
                     }
+                }
+
+                // Unix permissions / owner / xattrs. Shown on any filesystem
+                // whose entries carry POSIX metadata (the entry having a `mode`
+                // is the signal). Read-only labels normally; octal / uid-gid /
+                // xattr editors when in edit mode.
+                if entry.mode.is_some() {
+                    metadata_editor::render_ext_permissions_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        &mut self.staged_edits,
+                        &mut self.ext_perms_editor,
+                        &mut self.edit_result,
+                    );
+                    metadata_editor::render_owner_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        self.id_names.as_ref(),
+                        &mut self.staged_edits,
+                        &mut self.owner_editor,
+                        &mut self.edit_result,
+                    );
+
+                    // Extended attributes: read the on-disk set once per
+                    // selection on an xattr-bearing filesystem, then let the
+                    // section overlay any staged edits.
+                    let want_xattrs =
+                        self.xattr_cache.as_ref().map(|(p, _)| p) != Some(&entry.path);
+                    if want_xattrs {
+                        let read = self
+                            .session
+                            .open()
+                            .ok()
+                            .filter(|fs| fs.supports_xattrs())
+                            .and_then(|mut fs| fs.list_xattrs(&entry).ok())
+                            .unwrap_or_default();
+                        self.xattr_cache = Some((entry.path.clone(), read));
+                    }
+                    let xattrs = self
+                        .xattr_cache
+                        .as_ref()
+                        .map(|(_, x)| x.as_slice())
+                        .unwrap_or(&[]);
+                    metadata_editor::render_xattr_section(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        xattrs,
+                        &mut self.staged_edits,
+                        &mut self.xattr_editor,
+                        &mut self.edit_result,
+                    );
                 }
 
                 // Extract controls row
