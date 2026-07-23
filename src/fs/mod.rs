@@ -86,6 +86,7 @@ pub mod rsdos;
 pub mod sfs;
 pub mod sfs_fsck;
 pub mod squashfs;
+pub mod squashfs_write;
 pub mod tar_export;
 pub mod tar_import;
 pub mod ti99;

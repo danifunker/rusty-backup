@@ -37,34 +37,34 @@ use super::entry::{EntryType, FileEntry};
 use super::filesystem::{Filesystem, FilesystemError};
 
 /// `hsqs` little-endian — a SquashFS superblock always starts here.
-const SQUASHFS_MAGIC: u32 = 0x7371_7368;
+pub(crate) const SQUASHFS_MAGIC: u32 = 0x7371_7368;
 
 /// Metadata blocks decompress to at most 8 KiB.
-const METADATA_BLOCK_SIZE: usize = 8192;
+pub(crate) const METADATA_BLOCK_SIZE: usize = 8192;
 
 /// Superblock length in bytes.
-const SUPERBLOCK_SIZE: usize = 96;
+pub(crate) const SUPERBLOCK_SIZE: usize = 96;
 
 /// Inode types. 1-7 are the "basic" forms; 8-14 are the extended forms that add
 /// fields (hard-link counts, sparse-file support, xattr indices).
-const INODE_DIR: u16 = 1;
-const INODE_FILE: u16 = 2;
-const INODE_SYMLINK: u16 = 3;
-const INODE_BLKDEV: u16 = 4;
-const INODE_CHRDEV: u16 = 5;
-const INODE_FIFO: u16 = 6;
-const INODE_SOCKET: u16 = 7;
-const INODE_EXT_DIR: u16 = 8;
-const INODE_EXT_FILE: u16 = 9;
-const INODE_EXT_SYMLINK: u16 = 10;
-const INODE_EXT_BLKDEV: u16 = 11;
-const INODE_EXT_CHRDEV: u16 = 12;
-const INODE_EXT_FIFO: u16 = 13;
-const INODE_EXT_SOCKET: u16 = 14;
+pub(crate) const INODE_DIR: u16 = 1;
+pub(crate) const INODE_FILE: u16 = 2;
+pub(crate) const INODE_SYMLINK: u16 = 3;
+pub(crate) const INODE_BLKDEV: u16 = 4;
+pub(crate) const INODE_CHRDEV: u16 = 5;
+pub(crate) const INODE_FIFO: u16 = 6;
+pub(crate) const INODE_SOCKET: u16 = 7;
+pub(crate) const INODE_EXT_DIR: u16 = 8;
+pub(crate) const INODE_EXT_FILE: u16 = 9;
+pub(crate) const INODE_EXT_SYMLINK: u16 = 10;
+pub(crate) const INODE_EXT_BLKDEV: u16 = 11;
+pub(crate) const INODE_EXT_CHRDEV: u16 = 12;
+pub(crate) const INODE_EXT_FIFO: u16 = 13;
+pub(crate) const INODE_EXT_SOCKET: u16 = 14;
 
 /// Which compressor the image's blocks use.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Compressor {
+pub enum Compressor {
     Gzip,
     Lzma,
     Lzo,
@@ -74,7 +74,7 @@ enum Compressor {
 }
 
 impl Compressor {
-    fn from_id(id: u16) -> Option<Self> {
+    pub fn from_id(id: u16) -> Option<Self> {
         match id {
             1 => Some(Self::Gzip),
             2 => Some(Self::Lzma),
@@ -86,7 +86,7 @@ impl Compressor {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Gzip => "gzip",
             Self::Lzma => "lzma",
@@ -208,7 +208,7 @@ impl Superblock {
 }
 
 /// Sentinel in an inode's `xattr_idx` meaning "no extended attributes".
-const SQUASHFS_INVALID_XATTR: u32 = 0xFFFF_FFFF;
+pub(crate) const SQUASHFS_INVALID_XATTR: u32 = 0xFFFF_FFFF;
 
 /// A decoded inode.
 ///
