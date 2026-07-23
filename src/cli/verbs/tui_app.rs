@@ -1585,6 +1585,12 @@ struct CommanderState {
     checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
     /// The scrollable checksum-results overlay once a job completes.
     checksum_report: Option<ChecksumReportView>,
+    /// The File Info overlay for the active pane's cursor entry (`i`), holding
+    /// the rendered attribute lines. `None` when closed.
+    info: Option<InfoView>,
+    /// An attribute edit being typed from the info overlay: which field, and the
+    /// text so far. `None` when no prompt is showing.
+    attr_input: Option<AttrPrompt>,
     /// A `host:port` being typed in the "Connect to remote" prompt, if showing.
     #[cfg(feature = "remote")]
     connect_input: Option<String>,
@@ -1592,6 +1598,45 @@ struct CommanderState {
     /// polled each `tick`); carries the side to install the result into.
     #[cfg(feature = "remote")]
     pending_connect: Option<(Side, Arc<Mutex<ConnectStatus>>)>,
+}
+
+/// The File Info overlay: the entry it describes plus its rendered lines.
+struct InfoView {
+    /// The entry being described (re-resolved on each edit so staged changes
+    /// show immediately).
+    entry: crate::fs::entry::FileEntry,
+    /// On-disk extended attributes, read when the overlay opened.
+    xattrs: Vec<crate::fs::xattr::Xattr>,
+    /// uid/gid -> name map from the image's own account files, if any.
+    id_names: crate::fs::id_names::IdNameMap,
+}
+
+/// Which attribute the user is typing a new value for, from the info overlay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttrField {
+    /// Octal permission bits.
+    Mode,
+    /// `uid:gid`.
+    Owner,
+    /// `name=value` (value may be `0x`-hex); an empty value deletes.
+    Xattr,
+}
+
+impl AttrField {
+    /// The prompt label shown above the input line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "New permissions (octal, e.g. 755):",
+            Self::Owner => "New owner (uid:gid, e.g. 0:0):",
+            Self::Xattr => "Xattr as name=value (0x.. for hex; empty value deletes):",
+        }
+    }
+}
+
+/// An in-progress attribute edit typed in the info overlay.
+struct AttrPrompt {
+    field: AttrField,
+    text: String,
 }
 
 /// Result of a background [`RemoteBrowser::connect`]: the browser plus its first
@@ -2170,6 +2215,174 @@ impl CommanderState {
             cmd_refresh(self.pane_mut(side));
         }
         self.set_result(result);
+    }
+
+    /// Open the File Info overlay on the active pane's cursor entry, reading its
+    /// extended attributes and the image's uid/gid name map. Best-effort: an
+    /// entry with no POSIX metadata still opens, just with fewer lines.
+    fn open_info(&mut self) {
+        let side = self.active;
+        let pane = self.pane_mut(side);
+        let Some(entry) = pane.selected() else {
+            self.status = Some("Nothing selected.".to_string());
+            self.is_error = true;
+            return;
+        };
+        // Read xattrs + the account maps through the pane's filesystem when it
+        // has one (a host-folder pane has none; the overlay still shows size and
+        // name).
+        let (xattrs, id_names) = match pane.session.clone() {
+            Some(session) => with_stderr_suppressed(|| {
+                let mut fs = match session.open() {
+                    Ok(fs) => fs,
+                    Err(_) => return (Vec::new(), Default::default()),
+                };
+                let x = if fs.supports_xattrs() {
+                    fs.list_xattrs(&entry).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let names = crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs);
+                (x, names)
+            }),
+            None => (Vec::new(), Default::default()),
+        };
+        self.info = Some(InfoView {
+            entry,
+            xattrs,
+            id_names,
+        });
+    }
+
+    /// The rendered lines of the info overlay.
+    fn info_lines(&self) -> Vec<String> {
+        let Some(info) = &self.info else {
+            return Vec::new();
+        };
+        let e = &info.entry;
+        let mut out = vec![
+            format!("Name:  {}", e.name),
+            format!("Path:  {}", e.path),
+            format!("Size:  {}", e.size),
+        ];
+        if let Some(m) = e.mode {
+            out.push(format!(
+                "Mode:  {}  ({:04o})",
+                e.mode_string().unwrap_or_default(),
+                m & 0o7777
+            ));
+        }
+        if let (Some(u), Some(g)) = (e.uid, e.gid) {
+            out.push(format!("Owner: {}", info.id_names.format_owner(u, g)));
+        }
+        if let Some(t) = &e.symlink_target {
+            out.push(format!("Link:  -> {t}"));
+        }
+        if let Some(s) = &e.special_type {
+            out.push(format!("Type:  {s}"));
+        }
+        if let Some(m) = &e.modified {
+            out.push(format!("Mtime: {m}"));
+        }
+        if !info.xattrs.is_empty() {
+            out.push(String::new());
+            out.push("Extended attributes:".to_string());
+            for x in &info.xattrs {
+                out.push(format!("  {} = {}", x.name, x.value_display()));
+            }
+        }
+        out
+    }
+
+    /// Apply the attribute edit typed in the info overlay's prompt.
+    fn apply_attr_edit(&mut self, field: AttrField, text: &str) {
+        let side = self.active;
+        let Some(info) = &self.info else { return };
+        let entry = info.entry.clone();
+        let Some(session) = self.pane_mut(side).session.clone() else {
+            self.set_result(Err("Pane has no write session.".to_string()));
+            return;
+        };
+        let text = text.trim();
+
+        let edit = match field {
+            AttrField::Mode => match u32::from_str_radix(text, 8) {
+                Ok(m) if m <= 0o7777 => crate::model::edit_queue::StagedEdit::SetPermissions {
+                    entry: entry.clone(),
+                    // The drivers take the complete mode; keep the entry's type
+                    // bits and replace only the permission bits.
+                    mode: (entry.mode.unwrap_or(0) & !0o7777) | m,
+                },
+                _ => {
+                    self.set_result(Err(format!(
+                        "Bad octal mode {text:?} (1-4 digits, <= 7777)"
+                    )));
+                    return;
+                }
+            },
+            AttrField::Owner => {
+                let parsed = text
+                    .split_once(':')
+                    .and_then(|(u, g)| Some((u.trim().parse().ok()?, g.trim().parse().ok()?)));
+                match parsed {
+                    Some((uid, gid)) => crate::model::edit_queue::StagedEdit::SetOwner {
+                        entry: entry.clone(),
+                        uid,
+                        gid,
+                    },
+                    None => {
+                        self.set_result(Err(format!("Bad owner {text:?} (want uid:gid)")));
+                        return;
+                    }
+                }
+            }
+            AttrField::Xattr => {
+                let (name, value) = match text.split_once('=') {
+                    Some((n, v)) => (n.trim().to_string(), v),
+                    None => {
+                        self.set_result(Err("Want name=value (empty value deletes)".to_string()));
+                        return;
+                    }
+                };
+                if !crate::fs::xattr::has_valid_namespace(&name) {
+                    self.set_result(Err(format!(
+                        "Xattr {name:?} needs a user. / trusted. / security. / system. prefix"
+                    )));
+                    return;
+                }
+                if value.trim().is_empty() {
+                    crate::model::edit_queue::StagedEdit::RemoveXattr {
+                        entry: entry.clone(),
+                        name,
+                    }
+                } else {
+                    match crate::fs::xattr::parse_value(value) {
+                        Ok(v) => crate::model::edit_queue::StagedEdit::SetXattr {
+                            entry: entry.clone(),
+                            name,
+                            value: v,
+                        },
+                        Err(e) => {
+                            self.set_result(Err(e));
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        let result = with_stderr_suppressed(|| {
+            crate::model::commander_ops::apply_edits(&session, std::slice::from_ref(&edit))
+        })
+        .map(|()| "Attribute updated.".to_string())
+        .map_err(|e| format!("Attribute edit failed: {e:#}"));
+        let ok = result.is_ok();
+        self.set_result(result);
+        if ok {
+            cmd_refresh(self.pane_mut(side));
+            // Re-read so the overlay reflects what actually landed.
+            self.open_info();
+        }
     }
 
     /// Delete the active pane's selected entry (host: `remove_file` /
@@ -5735,6 +5948,50 @@ impl App {
             return true;
         }
 
+        // Attribute-edit prompt from the info overlay (modal, innermost).
+        if let Some(p) = c.attr_input.as_mut() {
+            match code {
+                KeyCode::Esc => c.attr_input = None,
+                KeyCode::Enter => {
+                    let p = c.attr_input.take().unwrap();
+                    c.apply_attr_edit(p.field, &p.text);
+                }
+                KeyCode::Backspace => {
+                    p.text.pop();
+                }
+                KeyCode::Char(ch) => p.text.push(ch),
+                _ => {}
+            }
+            return true;
+        }
+
+        // File Info overlay (modal): m/o/x start an attribute edit, Esc closes.
+        if c.info.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => c.info = None,
+                KeyCode::Char('m') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Mode,
+                        text: String::new(),
+                    })
+                }
+                KeyCode::Char('o') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Owner,
+                        text: String::new(),
+                    })
+                }
+                KeyCode::Char('x') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Xattr,
+                        text: String::new(),
+                    })
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // Checksum results overlay (modal): scroll, Esc/q/Enter to close.
         if let Some(rv) = c.checksum_report.as_mut() {
             let page = page.max(1) as usize;
@@ -5979,6 +6236,12 @@ impl App {
                 let p = c.pane_mut(active);
                 p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
                 p.picker_host = false;
+                true
+            }
+            // File Info overlay: permissions / owner / xattrs, with m/o/x to
+            // edit them. F3 mirrors the Midnight Commander "View" key.
+            KeyCode::Char('v') | KeyCode::F(3) => {
+                c.open_info();
                 true
             }
             KeyCode::Char('r') => {
@@ -7723,7 +7986,7 @@ impl App {
         let status = match &c.status {
             Some(s) => s.clone(),
             None => {
-                "Tab pane  Enter open  Space mark  c copy  # hash  n mkdir  x del  s sort  p fs  r refresh"
+                "Tab pane  Enter open  Space mark  c copy  v info  # hash  n mkdir  x del  s sort  p fs  r refresh"
                     .to_string()
             }
         };
@@ -7834,6 +8097,50 @@ impl App {
             ));
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(self.pane_block("Checksums", true)),
+                popup,
+            );
+        }
+
+        // File Info overlay: attributes, with the edit keys along the bottom.
+        if c.info.is_some() {
+            let body = c.info_lines();
+            let h = (body.len() as u16 + 4).clamp(8, area.height.saturating_sub(2));
+            let popup = centered_rect(76, h, area);
+            frame.render_widget(Clear, popup);
+            let mut lines: Vec<Line> = body
+                .iter()
+                .map(|l| {
+                    let style = if l.starts_with("Extended attributes") {
+                        self.palette.accent()
+                    } else {
+                        self.palette.dim()
+                    };
+                    Line::styled(format!(" {l}"), style)
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " m mode   o owner   x xattr   Esc close",
+                self.palette.dim(),
+            ));
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block("File Info", true)),
+                popup,
+            );
+        }
+
+        // Attribute-edit prompt (innermost overlay).
+        if let Some(p) = &c.attr_input {
+            let popup = centered_rect(66, 6, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(format!("  {}", p.field.label()), self.palette.dim()),
+                    Line::styled(format!("  > {}", p.text), self.palette.accent()),
+                    Line::styled("  Enter apply   Esc cancel", self.palette.dim()),
+                ]))
+                .block(self.pane_block("Edit attribute", true)),
                 popup,
             );
         }
