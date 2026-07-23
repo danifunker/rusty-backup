@@ -53,6 +53,7 @@ pub mod hfv;
 pub mod hpfs;
 pub mod human68k;
 pub mod human68k_clone;
+pub mod id_names;
 pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;

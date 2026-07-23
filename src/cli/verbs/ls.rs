@@ -56,6 +56,12 @@ pub struct LsArgs {
     #[arg(long, conflicts_with = "ignore_case")]
     pub case_sensitive: bool,
 
+    /// Show each entry's Unix permissions and owner. On a Linux/Unix image the
+    /// owner ids are resolved to names via the image's own `/etc/passwd` and
+    /// `/etc/group` (falling back to the raw numbers where there's no entry).
+    #[arg(short = 'o', long = "owner")]
+    pub owner: bool,
+
     /// Password for encrypted containers (WinImage IMZ, password-protected
     /// `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume
     /// password or personal recovery key).
@@ -126,6 +132,15 @@ pub fn run(args: LsArgs) -> Result<()> {
         _ => true,
     };
 
+    // `--owner`: build the uid/gid → name map once from the image's own account
+    // files. Cheap and best-effort; an image with no `/etc/passwd` yields an
+    // empty map and we fall back to raw numbers.
+    let id_names = if args.owner {
+        crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs)
+    } else {
+        crate::fs::id_names::IdNameMap::default()
+    };
+
     // `--literal` forces the exact-path branch even when the name contains
     // glob metacharacters. A colon-grammar path (HFS / HFS+ with `:`) is always
     // an exact path — it addresses a literal `/`-bearing name — so it never globs.
@@ -142,7 +157,7 @@ pub fn run(args: LsArgs) -> Result<()> {
         }
         let matches = collect_matches(&mut *fs, &includes, &excludes)?;
         for (_, entry, full) in matches {
-            print_entry(&entry, &full);
+            print_entry(&entry, &full, args.owner.then_some(&id_names));
         }
         return Ok(());
     }
@@ -156,7 +171,7 @@ pub fn run(args: LsArgs) -> Result<()> {
         .list_directory(&entry)
         .map_err(|e| anyhow!("list_directory: {e}"))?;
     for c in children {
-        print_entry(&c, &c.name);
+        print_entry(&c, &c.name, args.owner.then_some(&id_names));
     }
     Ok(())
 }
@@ -212,8 +227,26 @@ fn print_wire_entry(entry: &crate::remote::protocol::WireEntry) {
     ));
 }
 
-fn print_entry(entry: &crate::fs::entry::FileEntry, display_name: &str) {
+fn print_entry(
+    entry: &crate::fs::entry::FileEntry,
+    display_name: &str,
+    id_names: Option<&crate::fs::id_names::IdNameMap>,
+) {
     let kind = if entry.is_directory() { "DIR " } else { "FILE" };
+    // `--owner`: lead with permissions + resolved owner instead of the
+    // Mac type/creator columns, which are empty on a Unix image anyway.
+    if let Some(names) = id_names {
+        let perms = entry.mode_string().unwrap_or_else(|| "---------".into());
+        let owner = match (entry.uid, entry.gid) {
+            (Some(u), Some(g)) => names.format_owner(u, g),
+            _ => "-".into(),
+        };
+        out_stdout(format!(
+            "{kind}  {perms}  {:>18}  {:>10}  {display_name}",
+            owner, entry.size
+        ));
+        return;
+    }
     let t = entry.type_code_display();
     let cr = entry.creator_code_display();
     let t = t.as_deref().unwrap_or("    ");

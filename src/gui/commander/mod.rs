@@ -1147,8 +1147,10 @@ impl CommanderMode {
             .default_width(620.0)
             .show(ctx, |ui| {
                 // Read-only metadata rows (HFS/ProDOS suppress inline type/creator
-                // — they render it in a dedicated editor row below).
-                file_detail::render_metadata_rows(ui, &win.entry, is_hfs || is_prodos);
+                // — they render it in a dedicated editor row below). Owner-name
+                // resolution (id_names) is Inspect-only for now; Commander shows
+                // raw uid:gid.
+                file_detail::render_metadata_rows(ui, &win.entry, is_hfs || is_prodos, None);
 
                 let queue = pane.queue_mut();
                 if is_hfs && win.entry.is_file() {

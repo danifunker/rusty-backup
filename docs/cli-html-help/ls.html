@@ -27,6 +27,8 @@
 <dd>Treat case-insensitively, regardless of the target's native rule</dd>
 <dt><code>--case-sensitive</code></dt>
 <dd>Treat case-sensitively, regardless of the target's native rule</dd>
+<dt><code>-o / --owner</code></dt>
+<dd>Show each entry's Unix permissions and owner. On a Linux/Unix image the owner ids are resolved to names via the image's own `/etc/passwd` and `/etc/group` (falling back to the raw numbers where there's no entry)</dd>
 <dt><code>--password</code></dt>
 <dd>Password for encrypted containers (WinImage IMZ, password-protected `.zip` disks) or an encrypted filesystem (APFS FileVault — the volume password or personal recovery key)</dd>
 <dt><code>--inside</code></dt>

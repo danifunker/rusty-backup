@@ -73,6 +73,11 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
+    /// Cached uid/gid -> name map from the image's own `/etc/passwd` +
+    /// `/etc/group`, built lazily the first time File Info shows an owner and
+    /// reused thereafter. `None` = not yet built; a built-but-empty map (a
+    /// non-Linux image) is still cached so we don't retry every frame.
+    id_names: Option<rusty_backup::fs::id_names::IdNameMap>,
     /// Volume total / used bytes (cached at open) for the header free-space
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
@@ -393,6 +398,7 @@ impl Default for BrowseView {
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
+            id_names: None,
             volume_total: 0,
             volume_used: 0,
             carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
@@ -644,6 +650,7 @@ impl BrowseView {
         self.selected_entry = None;
         self.marked.clear();
         self.content = None;
+        self.id_names = None;
         self.error = None;
         self.active = false;
         self.fs_type.clear();
@@ -1784,6 +1791,25 @@ impl BrowseView {
             }
         }
 
+        // Lazily build the uid/gid -> name map the first time we're about to
+        // show an owner on a Unix filesystem (the selected entry carrying a uid
+        // is the signal). Cached even when empty so we don't reopen every frame.
+        if self.id_names.is_none()
+            && self
+                .selected_entry
+                .as_ref()
+                .map(|e| e.uid.is_some())
+                .unwrap_or(false)
+        {
+            let map = self
+                .session
+                .open()
+                .ok()
+                .map(|mut fs| rusty_backup::fs::id_names::IdNameMap::from_filesystem(&mut *fs))
+                .unwrap_or_default();
+            self.id_names = Some(map);
+        }
+
         match &self.selected_entry {
             None => {
                 ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
@@ -1794,7 +1820,12 @@ impl BrowseView {
                 // HFS/HFS+ and ProDOS suppress the inline Type/Creator labels —
                 // they render those in a dedicated editor row below.
                 let suppress_type_creator = self.is_hfs_type() || self.is_prodos_type();
-                file_detail::render_metadata_rows(ui, &entry, suppress_type_creator);
+                file_detail::render_metadata_rows(
+                    ui,
+                    &entry,
+                    suppress_type_creator,
+                    self.id_names.as_ref(),
+                );
 
                 // HFS/HFS+ type/creator row — read-only labels normally, full
                 // editor (text fields + dictionary pulldown) when in edit mode.

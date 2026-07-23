@@ -180,7 +180,12 @@ pub fn render_hex_view(ui: &mut egui::Ui, data: &[u8]) {
 /// `suppress_type_creator` hides the inline Type/Creator labels for
 /// filesystems (HFS/HFS+, ProDOS) that render those in a dedicated editor row
 /// instead.
-pub fn render_metadata_rows(ui: &mut egui::Ui, entry: &FileEntry, suppress_type_creator: bool) {
+pub fn render_metadata_rows(
+    ui: &mut egui::Ui,
+    entry: &FileEntry,
+    suppress_type_creator: bool,
+    id_names: Option<&rusty_backup::fs::id_names::IdNameMap>,
+) {
     // File info header
     ui.label(egui::RichText::new(&entry.name).strong());
     ui.horizontal(|ui| {
@@ -210,7 +215,13 @@ pub fn render_metadata_rows(ui: &mut egui::Ui, entry: &FileEntry, suppress_type_
             ui.label(format!("Permissions: {mode_str}"));
         }
         if let (Some(uid), Some(gid)) = (entry.uid, entry.gid) {
-            ui.label(format!("Owner: {uid}:{gid}"));
+            // Resolve to names via the image's own /etc/passwd + /etc/group when
+            // available (e.g. "root:wheel (0:0)"); otherwise raw numbers.
+            let owner = match id_names {
+                Some(names) => names.format_owner(uid, gid),
+                None => format!("{uid}:{gid}"),
+            };
+            ui.label(format!("Owner: {owner}"));
         }
         if let Some(ref target) = entry.symlink_target {
             ui.label(format!("Target: {target}"));
