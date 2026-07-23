@@ -271,11 +271,26 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit)>
         // allocating host clusters on demand, so there's nothing to re-encode
         // on commit. Without this branch the raw `File` below would be handed
         // to partition detection, which reads the QCOW2 header as sector 0 and
-        // reports a bogus "Invalid MBR". Snapshot-bearing images open fine and
-        // refuse at the first write with a message naming the reason.
+        // reports a bogus "Invalid MBR".
         let file = open_image_rw(path)?;
         let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
             .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
+        // Fail fast with the root cause: a snapshot-bearing image opens
+        // read-only (shared clusters, no copy-on-write). The common case is a
+        // UTM suspended-VM state, which also leaves the guest filesystem dirty
+        // — so surfacing the snapshot here beats a downstream "dirty journal"
+        // message that names the symptom instead.
+        if reader.is_read_only() {
+            anyhow::bail!(
+                "QCOW2 {} has {} internal snapshot(s) and opens read-only \
+                 (a UTM suspended-VM state is the usual one). Editing could \
+                 corrupt them. Shut the VM down cleanly in UTM, or drop the \
+                 snapshot (`qemu-img snapshot -d <name> {}`), then retry.",
+                path.display(),
+                reader.snapshot_count(),
+                path.display(),
+            );
+        }
         return Ok((Box::new(reader), RwCommit::None));
     }
     if source_reader::is_editable_container_path(path) {
