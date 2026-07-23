@@ -75,10 +75,67 @@ const PAD_TO: u64 = 4096;
 /// Maximum entries sharing one directory header.
 const DIR_HEADER_MAX_ENTRIES: usize = 256;
 
+/// Where a file's bytes come from at write time.
+///
+/// A whole-image rebuild must not hold every file's content in RAM at once — a
+/// 558 MB rootfs would need 558 MB of `Vec<u8>`. So content is a *source* the
+/// writer pulls one block at a time, never materializing more than one block
+/// beyond what a `Bytes` variant already holds.
+///
+/// This is also the seam where verbatim block reuse will land (phase 2b): an
+/// `FileContent::Source` variant that copies an unchanged file's
+/// already-compressed blocks straight across, instead of decompress →
+/// recompress. Not here yet; the enum is shaped to grow that variant without
+/// touching callers.
+pub enum FileContent {
+    /// Content already in memory — a new or edited file, usually small.
+    Bytes(Vec<u8>),
+    /// Streamed from a host file, so a large added file never fully loads.
+    HostFile { path: std::path::PathBuf, len: u64 },
+}
+
+impl FileContent {
+    /// In-memory content.
+    pub fn bytes(data: Vec<u8>) -> Self {
+        Self::Bytes(data)
+    }
+
+    /// A host file, streamed at write time. Stats it now so the length is known
+    /// without holding the bytes.
+    pub fn host_file(path: std::path::PathBuf) -> Result<Self, FilesystemError> {
+        let len = std::fs::metadata(&path).map_err(FilesystemError::Io)?.len();
+        Ok(Self::HostFile { path, len })
+    }
+
+    /// The content length in bytes — known without reading the content.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Bytes(b) => b.len() as u64,
+            Self::HostFile { len, .. } => *len,
+        }
+    }
+
+    /// True when the file is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Open a fresh reader over the content.
+    fn open(&self) -> Result<Box<dyn std::io::Read>, FilesystemError> {
+        match self {
+            Self::Bytes(b) => Ok(Box::new(std::io::Cursor::new(b.clone()))),
+            Self::HostFile { path, .. } => {
+                let f = std::fs::File::open(path).map_err(FilesystemError::Io)?;
+                Ok(Box::new(std::io::BufReader::new(f)))
+            }
+        }
+    }
+}
+
 /// What a node in the tree to be written actually is.
 pub enum BuildKind {
     Dir(Vec<BuildNode>),
-    File(Vec<u8>),
+    File(FileContent),
     Symlink(String),
     BlockDev { major: u32, minor: u32 },
     CharDev { major: u32, minor: u32 },
@@ -114,7 +171,7 @@ impl BuildNode {
         }
     }
 
-    /// A regular file node with sensible defaults.
+    /// A regular file node with in-memory content and sensible defaults.
     pub fn file(name: &str, mode: u16, data: Vec<u8>) -> Self {
         Self {
             name: name.to_string(),
@@ -123,7 +180,7 @@ impl BuildNode {
             gid: 0,
             mtime: 0,
             xattrs: Vec::new(),
-            kind: BuildKind::File(data),
+            kind: BuildKind::File(FileContent::Bytes(data)),
         }
     }
 
@@ -159,6 +216,18 @@ impl BuildNode {
         node.mtime = host_mtime(root);
         Ok(node)
     }
+}
+
+/// Fill `buf` exactly, turning a short read into a clear error rather than a
+/// silent truncation — a content source that reports a length longer than it
+/// can produce would otherwise corrupt the image.
+fn read_exact_from(r: &mut dyn std::io::Read, buf: &mut [u8]) -> Result<(), FilesystemError> {
+    r.read_exact(buf).map_err(|e| {
+        FilesystemError::Io(std::io::Error::new(
+            e.kind(),
+            format!("squashfs: file content ended early: {e}"),
+        ))
+    })
 }
 
 /// Host permission bits, on platforms that have them.
@@ -205,7 +274,9 @@ fn collect_dir(dir: &std::path::Path) -> Result<Vec<BuildNode>, FilesystemError>
         } else if meta.is_dir() {
             BuildKind::Dir(collect_dir(&path)?)
         } else if meta.is_file() {
-            BuildKind::File(std::fs::read(&path).map_err(FilesystemError::Io)?)
+            // Stream from disk at write time rather than reading every file into
+            // RAM up front — a distro rootfs is far too big for that.
+            BuildKind::File(FileContent::host_file(path.clone())?)
         } else {
             // Socket / FIFO / device node -- see `from_host_dir`.
             continue;
@@ -520,37 +591,52 @@ struct Builder<'a, W: Write + Seek> {
 }
 
 impl<'a, W: Write + Seek> Builder<'a, W> {
-    /// Write a file's data blocks, returning where they start and each block's
-    /// size field (bit 24 set = stored uncompressed).
+    /// Stream a file's data, returning where its blocks start, each block's
+    /// size field, and the fragment its tail landed in (if any).
+    ///
+    /// Content is pulled one block at a time from the source, so a multi-hundred
+    /// -MB file never fully materializes. With fragments on, only whole blocks
+    /// reach the data area; a short tail is packed with other files' tails. A
+    /// file that is an exact multiple of the block size has no tail and so no
+    /// fragment.
     fn write_file_data(
         &mut self,
-        data: &[u8],
+        content: &FileContent,
     ) -> Result<(u64, Vec<u32>, u32, u32), FilesystemError> {
         let start = self.data_pos;
         let mut sizes = Vec::new();
-        if data.is_empty() {
+        let total = content.len();
+        if total == 0 {
             return Ok((start, sizes, SQUASHFS_INVALID_XATTR, 0));
         }
 
-        // With fragments on, only whole blocks reach the data area; a short tail
-        // is packed with other files' tails instead. A file that is an exact
-        // multiple of the block size has no tail, and so no fragment.
-        let bs = self.opts.block_size as usize;
-        let (whole, tail) = if self.opts.use_fragments {
-            data.split_at(data.len() - data.len() % bs)
+        let bs = self.opts.block_size as u64;
+        // The tail is packed into a fragment only when fragments are on; with
+        // them off it is written as its own (short) trailing data block, so
+        // treat the whole file as blocks.
+        let tail_len = if self.opts.use_fragments {
+            (total % bs) as usize
         } else {
-            (data, &data[data.len()..])
+            0
         };
+        let whole_bytes = total - tail_len as u64;
 
-        for chunk in whole.chunks(bs) {
-            let field = self.emit_data_block(chunk)?;
+        let mut reader = content.open()?;
+        let mut buf = vec![0u8; bs as usize];
+        let mut done = 0u64;
+        while done < whole_bytes {
+            let n = (whole_bytes - done).min(bs) as usize;
+            read_exact_from(&mut reader, &mut buf[..n])?;
+            let field = self.emit_data_block(&buf[..n])?;
             sizes.push(field);
+            done += n as u64;
         }
 
-        if tail.is_empty() {
+        if tail_len == 0 {
             Ok((start, sizes, SQUASHFS_INVALID_XATTR, 0))
         } else {
-            let (index, offset) = self.push_tail(tail)?;
+            read_exact_from(&mut reader, &mut buf[..tail_len])?;
+            let (index, offset) = self.push_tail(&buf[..tail_len])?;
             Ok((start, sizes, index, offset))
         }
     }
@@ -650,12 +736,12 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                     dir_type: DIR_TYPE_DIR,
                 })
             }
-            BuildKind::File(data) => {
-                let (start, sizes, frag_index, frag_offset) = self.write_file_data(data)?;
+            BuildKind::File(content) => {
+                let file_len = content.len();
+                let (start, sizes, frag_index, frag_offset) = self.write_file_data(content)?;
                 let inode_number = self.take_inode_number();
                 let inode_ref = self.inodes.current_ref();
-                let needs_ext =
-                    has_xattr || data.len() as u64 > u32::MAX as u64 || start > u32::MAX as u64;
+                let needs_ext = has_xattr || file_len > u32::MAX as u64 || start > u32::MAX as u64;
                 let kind = if needs_ext {
                     INODE_EXT_FILE
                 } else {
@@ -667,10 +753,10 @@ impl<'a, W: Write + Seek> Builder<'a, W> {
                     b.extend_from_slice(&(start as u32).to_le_bytes());
                     b.extend_from_slice(&frag_index.to_le_bytes());
                     b.extend_from_slice(&frag_offset.to_le_bytes());
-                    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    b.extend_from_slice(&(file_len as u32).to_le_bytes());
                 } else {
                     b.extend_from_slice(&start.to_le_bytes());
-                    b.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                    b.extend_from_slice(&file_len.to_le_bytes());
                     b.extend_from_slice(&0u64.to_le_bytes()); // sparse
                     b.extend_from_slice(&1u32.to_le_bytes()); // nlink
                     b.extend_from_slice(&frag_index.to_le_bytes());
@@ -1135,7 +1221,7 @@ mod tests {
                                 name: "security.capability".into(),
                                 value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
                             }],
-                            kind: BuildKind::File(b"has an xattr\n".to_vec()),
+                            kind: BuildKind::File(FileContent::Bytes(b"has an xattr\n".to_vec())),
                         },
                     ],
                 ),
@@ -1678,6 +1764,87 @@ mod tests {
             std::fs::write(src.join(format!("big{n}.bin")), big).unwrap();
         }
         src
+    }
+
+    /// A file whose content is a host path must stream in and come back
+    /// byte-exact — the multi-block, large-file path that must not hold the
+    /// whole file in RAM.
+    #[test]
+    fn host_file_content_streams_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Several blocks plus a ragged tail, with enough entropy that it won't
+        // all collapse to one stored block.
+        let big: Vec<u8> = (0..500_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let host = dir.path().join("payload.bin");
+        std::fs::write(&host, &big).unwrap();
+
+        let tree = BuildNode {
+            name: "/".into(),
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: Vec::new(),
+            kind: BuildKind::Dir(vec![BuildNode {
+                name: "payload.bin".into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: Vec::new(),
+                kind: BuildKind::File(
+                    FileContent::host_file(host.clone()).expect("stat host file"),
+                ),
+            }]),
+        };
+
+        let mut cur = Cursor::new(Vec::new());
+        write_squashfs(&mut cur, &tree, &BuildOptions::default()).expect("build");
+        let mut fs = SquashfsFilesystem::open(cur, 0).expect("open");
+        let root = fs.root().expect("root");
+        let entry = fs.list_directory(&root).expect("list")[0].clone();
+        assert_eq!(entry.size, big.len() as u64);
+        let got = fs.read_file(&entry, big.len() + 1).expect("read");
+        assert_eq!(got, big, "streamed host file did not round-trip byte-exact");
+    }
+
+    /// A content source that reports a longer length than it can produce must
+    /// fail loudly, not silently truncate the file in the image.
+    #[test]
+    fn short_content_source_is_an_error_not_a_truncation() {
+        // A host file we delete after the node is built, so its stat'd length
+        // outlives its bytes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("vanishes.bin");
+        std::fs::write(&host, vec![0u8; 200_000]).unwrap();
+        let content = FileContent::host_file(host.clone()).expect("stat");
+        std::fs::remove_file(&host).unwrap();
+
+        let tree = BuildNode {
+            name: "/".into(),
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            xattrs: Vec::new(),
+            kind: BuildKind::Dir(vec![BuildNode {
+                name: "vanishes.bin".into(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                xattrs: Vec::new(),
+                kind: BuildKind::File(content),
+            }]),
+        };
+        let mut cur = Cursor::new(Vec::new());
+        let err = write_squashfs(&mut cur, &tree, &BuildOptions::default())
+            .expect_err("a vanished source must fail the build");
+        // Either the open fails (file gone) or the read ends early — both are
+        // errors, never a silently short image.
+        let _ = err;
     }
 
     /// A codec we can read but not encode must be refused up front, before any
