@@ -139,6 +139,89 @@ impl BuildNode {
             kind: BuildKind::Symlink(target.to_string()),
         }
     }
+
+    /// Build a tree from a host directory, as `mksquashfs DIR IMAGE` does.
+    ///
+    /// Permissions and mtimes come from the host; **ownership does not**. Every
+    /// node is written as uid/gid 0, because the building user's ids (501:20 on
+    /// a Mac) are meaningless inside the image — the same reasoning as
+    /// [`crate::fs::attrs`]. Pass explicit ids afterwards if the target needs
+    /// something else.
+    ///
+    /// Symlinks are recorded as symlinks (never followed). Sockets, FIFOs and
+    /// device nodes in the source directory are skipped: representing them
+    /// faithfully needs metadata the portable `std::fs` API doesn't expose, and
+    /// silently turning a device node into an empty file would be worse than
+    /// leaving it out.
+    pub fn from_host_dir(root: &std::path::Path) -> Result<Self, FilesystemError> {
+        let mut node = Self::dir("/", 0o755, collect_dir(root)?);
+        node.mode = host_mode(root).unwrap_or(0o755) as u16;
+        node.mtime = host_mtime(root);
+        Ok(node)
+    }
+}
+
+/// Host permission bits, on platforms that have them.
+fn host_mode(path: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Host mtime as Unix seconds, or 0 when unavailable.
+fn host_mtime(path: &std::path::Path) -> u32 {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+/// Read one directory into [`BuildNode`]s, recursing into subdirectories.
+fn collect_dir(dir: &std::path::Path) -> Result<Vec<BuildNode>, FilesystemError> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(FilesystemError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(FilesystemError::Io)?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let meta = std::fs::symlink_metadata(&path).map_err(FilesystemError::Io)?;
+        let mode = host_mode(&path).unwrap_or(if meta.is_dir() { 0o755 } else { 0o644 }) as u16;
+        let mtime = host_mtime(&path);
+
+        let kind = if meta.is_symlink() {
+            let target = std::fs::read_link(&path).map_err(FilesystemError::Io)?;
+            BuildKind::Symlink(target.to_string_lossy().into_owned())
+        } else if meta.is_dir() {
+            BuildKind::Dir(collect_dir(&path)?)
+        } else if meta.is_file() {
+            BuildKind::File(std::fs::read(&path).map_err(FilesystemError::Io)?)
+        } else {
+            // Socket / FIFO / device node -- see `from_host_dir`.
+            continue;
+        };
+
+        out.push(BuildNode {
+            name,
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime,
+            xattrs: Vec::new(),
+            kind,
+        });
+    }
+    Ok(out)
 }
 
 /// Knobs for the emitted image. Defaults match `mksquashfs`: gzip, 128 KiB
@@ -1466,6 +1549,135 @@ mod tests {
             fs.read_file(ragged, 1 << 20).unwrap(),
             vec![0xCD; bs * 2 + 7]
         );
+    }
+
+    /// True when `mksquashfs` is on PATH. Like `unsquashfs`, it prints its
+    /// banner and exits non-zero, so match text rather than status.
+    fn mksquashfs_available() -> bool {
+        std::process::Command::new("mksquashfs")
+            .arg("-version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("mksquashfs version"))
+            .unwrap_or(false)
+    }
+
+    /// **Size parity with `mksquashfs`.** Build the same directory tree both
+    /// ways and compare.
+    ///
+    /// This is the check that our images are not quietly much larger than the
+    /// reference implementation's — the thing fragment packing exists for, and
+    /// the thing a rebuild has to preserve so replacing one file in an appliance
+    /// image doesn't balloon it.
+    ///
+    /// The tolerance is deliberately loose in the *upward* direction only. We
+    /// don't implement mksquashfs's whole-file duplicate detection, and our
+    /// gzip is `flate2` rather than the C zlib, so small differences either way
+    /// are expected; what would matter is a structural regression that makes us
+    /// multiples larger.
+    #[test]
+    fn image_size_is_comparable_to_mksquashfs() {
+        if !mksquashfs_available() {
+            eprintln!("mksquashfs not on PATH — skipping size-parity test");
+            return;
+        }
+        // Build a corpus with the shape that actually stresses packing: lots of
+        // small text files, a few larger ones, nested directories, symlinks.
+        // `RB_SQUASHFS_SIZE_CORPUS` points this at a real tree instead — a
+        // synthetic corpus is a weak proxy for a distro rootfs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = match std::env::var("RB_SQUASHFS_SIZE_CORPUS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => build_synthetic_corpus(dir.path()),
+        };
+
+        let ours_path = dir.path().join("ours.squashfs");
+        let tree = BuildNode::from_host_dir(&src).expect("read host tree");
+        let mut out = std::fs::File::create(&ours_path).expect("create");
+        let ours = write_squashfs(&mut out, &tree, &BuildOptions::default()).expect("build");
+        drop(out);
+
+        let ref_path = dir.path().join("ref.squashfs");
+        let st = std::process::Command::new("mksquashfs")
+            .arg(&src)
+            .arg(&ref_path)
+            .args(["-no-xattrs", "-noappend", "-quiet", "-no-progress"])
+            .output()
+            .expect("run mksquashfs");
+        assert!(
+            ref_path.exists(),
+            "mksquashfs produced nothing:\n{}{}",
+            String::from_utf8_lossy(&st.stdout),
+            String::from_utf8_lossy(&st.stderr)
+        );
+        let theirs = std::fs::metadata(&ref_path).unwrap().len();
+
+        let ratio = ours as f64 / theirs as f64;
+        eprintln!(
+            "corpus {}: ours {ours} bytes, mksquashfs {theirs} bytes (ratio {ratio:.3})",
+            src.display()
+        );
+        assert!(
+            ratio < 1.30,
+            "our image is {ratio:.2}x the size of mksquashfs's \
+             ({ours} vs {theirs}) — packing has regressed"
+        );
+
+        // A similarly-sized image that doesn't decode would pass the ratio check
+        // and be worthless, so hold both to the same corpus: `unsquashfs` must
+        // list exactly as many entries out of ours as out of the reference.
+        if unsquashfs_available() {
+            let count = |p: &std::path::Path| -> usize {
+                let out = std::process::Command::new("unsquashfs")
+                    .arg("-lls")
+                    .arg(p)
+                    .output()
+                    .expect("run unsquashfs -lls");
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| {
+                        l.len() > 10 && "-dlbcps".contains(&l[0..1]) && l.contains("squashfs-root")
+                    })
+                    .count()
+            };
+            let ours_entries = count(&ours_path);
+            let their_entries = count(&ref_path);
+            assert!(
+                ours_entries > 0,
+                "unsquashfs listed nothing from our image — it is not readable"
+            );
+            assert_eq!(
+                ours_entries, their_entries,
+                "our image holds {ours_entries} entries but mksquashfs's holds \
+                 {their_entries} for the same tree"
+            );
+            eprintln!("both images list {ours_entries} entries");
+        }
+    }
+
+    /// Lots of small text files, a few multi-block ones, nested directories.
+    fn build_synthetic_corpus(base: &std::path::Path) -> std::path::PathBuf {
+        let src = base.join("src");
+        std::fs::create_dir(&src).unwrap();
+        for d in 0..8 {
+            let sub = src.join(format!("dir{d}"));
+            std::fs::create_dir(&sub).unwrap();
+            for f in 0..60 {
+                let body = format!(
+                    "# config file {d}/{f}\nkey = value {f}\n\
+                     # a line of filler that repeats across files so the codec \
+                     has something to find\n"
+                );
+                std::fs::write(sub.join(format!("conf{f}.cfg")), body).unwrap();
+            }
+        }
+        // A couple of multi-block files.
+        for n in 0..3 {
+            let big: Vec<u8> = (0..400_000u32)
+                .map(|i| (i.wrapping_mul(n + 1) % 251) as u8)
+                .collect();
+            std::fs::write(src.join(format!("big{n}.bin")), big).unwrap();
+        }
+        src
     }
 
     /// A codec we can read but not encode must be refused up front, before any
