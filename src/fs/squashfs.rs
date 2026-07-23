@@ -774,28 +774,17 @@ fn decompress(
     }
 }
 
-#[cfg(feature = "native-zstd")]
+/// Route through the [`zstd_compat`](crate::rbformats::zstd_compat) shim rather
+/// than naming a zstd crate directly, so the backend follows the cargo feature
+/// (`native-zstd` = C libzstd, `pure-zstd` = libzstd-bitexact-rs for the slim /
+/// cross builds). The shim `compile_error!`s when neither is enabled, so there
+/// is no "no backend" arm to write here.
 fn decompress_zstd(input: &[u8], max_out: usize) -> Result<Vec<u8>, FilesystemError> {
-    zstd::bulk::decompress(input, max_out).map_err(|e| {
+    let mut out = crate::rbformats::zstd_compat::decode_all(input).map_err(|e| {
         FilesystemError::InvalidData(format!("squashfs: zstd decompression failed: {e}"))
-    })
-}
-
-#[cfg(all(not(feature = "native-zstd"), feature = "pure-zstd"))]
-fn decompress_zstd(input: &[u8], max_out: usize) -> Result<Vec<u8>, FilesystemError> {
-    let mut out = Vec::with_capacity(max_out);
-    libzstd_bitexact_rs::decode_all(&mut std::io::Cursor::new(input), &mut out).map_err(|e| {
-        FilesystemError::InvalidData(format!("squashfs: zstd decompression failed: {e:?}"))
     })?;
     out.truncate(max_out);
     Ok(out)
-}
-
-#[cfg(all(not(feature = "native-zstd"), not(feature = "pure-zstd")))]
-fn decompress_zstd(_input: &[u8], _max_out: usize) -> Result<Vec<u8>, FilesystemError> {
-    Err(FilesystemError::Unsupported(
-        "squashfs: this build has no zstd backend".into(),
-    ))
 }
 
 // ── Little-endian readers ─────────────────────────────────────────────────────
