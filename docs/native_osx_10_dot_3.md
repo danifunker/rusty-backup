@@ -3,6 +3,12 @@
 Status: **PLAN ONLY — not started.** A design to revisit later. Scope is
 deliberately limited to `rb-cli`; the GUI is a separate question (see the end).
 
+> **§3 was materially corrected on 2026-07-23** against the mrustc source. Two
+> claims that shaped this plan — that PPC needs the rustc 1.54 baseline, and that
+> proc macros are a hard stop — turned out to be wrong. The single-`no_std`-core
+> architecture in §5 was a consequence of those claims, so **read §3 before
+> treating §5 as settled.**
+
 ## 1. Goal
 
 Ship a native PowerPC `rb-cli` that runs on Mac OS X Panther (10.3), Tiger
@@ -35,35 +41,83 @@ the toolchain works end-to-end.
 
 ## 3. The version problem (and the discipline it forces)
 
-We build on **rustc 1.96, edition 2021**. mrustc supports older baselines, and
-on **PPC specifically** the confirmed-good range is narrower than mrustc's
-general ceiling:
+> **Corrected 2026-07-23** by reading the local mrustc clone
+> (`/Users/dani/repos/mrustc`) directly, instead of the second-hand summary this
+> section previously rested on. **Two load-bearing claims here were wrong** — they
+> are what pushed this plan toward a 1.54 / edition-2018 `no_std` core. Both
+> corrections are inline below.
 
-- **rustc 1.54** — safest `@catap`-confirmed baseline on `powerpc-apple-darwin`.
-- **rustc 1.74** — partial on PPC.
-- **rustc 1.90+** — actively broken on PPC.
+We build on **rustc 1.96, edition 2021**. mrustc's own README states its
+baselines:
 
-So the core targets the **1.54 language subset** (not 1.74) to stay on the
-confirmed-good baseline. Two layers of gap:
+- **1.90.0** — currently tested to *fully bootstrap*, binary-equal against
+  1.91.1. This is upstream's headline version.
+- **1.19.0 / 1.29.0 / 1.39.0 / 1.54.0 / 1.74.0** — also supported, "might still
+  bootstrap (assuming the right environment)".
+- mrustc's default `rust-version` is **1.29.0**, and the tree ships
+  `rustc-1.74.0-{src.patch,overrides.toml}` and `rustc-1.90.0-*` next to the
+  older ones.
 
-- **Language/std gap (manageable).** Edition 2021 needs rustc >= 1.56, so if we
-  pin the core to the 1.54 baseline the core crate itself likely wants
-  **edition 2018**. Whatever the pin, the discipline is the same: the core uses
-  only features available at the chosen baseline. We keep developing the desktop
-  on 1.96 (backward-compatible, daily builds unaffected); mrustc consumes the
-  same source at the older baseline. This is worth nailing down in Phase 0 —
-  pick the exact rustc pin and edition for the core crate.
-- **Dependency graph (the real wall).** mrustc must compile everything
-  transitively. Our `[dependencies]` is 112 crates — eframe/egui/wgpu, every
-  proc-macro (`serde_derive`, `clap` derive, `thiserror`), build scripts, `nix`,
-  the `windows` crate, `libchdman-rs`. **None of that transpiles.** Proc macros
-  are a hard stop.
+**CORRECTION 1 — the version wall is far lower than previously written here.**
+The earlier revision claimed "1.54 safest, 1.74 partial, 1.90+ actively broken on
+PPC" and concluded the core must target the **1.54 language subset**. That table
+reflects `@catap`'s older PPC-Darwin experience, not upstream mrustc today.
+**1.74 is a supported baseline** — and it is one minor version above
+[`rb-cli-vintage/`](../rb-cli-vintage/), which already compiles the *entire shared
+engine* at **rustc 1.73 / edition 2021**. That is a vastly smaller gap than
+edition 2018.
 
-Conclusion: **we never transpile the app.** We transpile a tiny, `#![no_std]`,
-near-zero-dependency **core** and hand-write everything else in C. `no_std` also
-sidesteps mrustc's weak Darwin *std* port entirely — we only need `core` +
-`alloc` with a malloc-backed `GlobalAlloc` (which is literally what
-[`ppc-tiger/malloc_wrapper.c`](../ppc-tiger/malloc_wrapper.c) already is).
+For scale, here is what the abandoned 1.54 plan would have cost, measured across
+`src/` (340k lines, 406 files): **1,530** inline-format-arg sites (1.58), **450**
+`let … else` (1.65), **355** `div_ceil` (1.73), **22** `is_some_and` (1.70), plus
+dropping the whole tree to edition 2018. Library gaps are shimmable —
+[`src/rust173_compat.rs`](../src/rust173_compat.rs) already does exactly that for
+1.87's `is_multiple_of` — but **syntax and edition gaps are not**. Do not go down
+this path.
+
+**CORRECTION 2 — proc macros are NOT a hard stop.** The earlier revision stated
+"Proc macros are a hard stop" and used it to justify never transpiling the app.
+mrustc implements them: `src/expand/proc_macro.cpp` is **2,094 lines** (it builds
+the macro crate for the host and drives it over a token-stream pipe). The 108
+`Serialize`/`Deserialize` derives, 93 `clap` derives and 4 `thiserror` in this
+tree are therefore not automatically fatal.
+
+### The gap that actually matters: libstd for `powerpc-apple-darwin`
+
+mrustc's README lists its **CI-tested libstd targets**: x86-64 Linux GNU and
+x86-64 Windows MSVC, with x86-64 / arm64 macOS as secondary.
+**PowerPC-Darwin is not on that list.**
+
+The *target spec* exists and is well-formed — `src/trans/target.cpp:632` defines
+`powerpc-apple-darwin` as `ARCH_POWERPC`, `CodegenMode::Gnu11`, with
+`m_emulated_i128 = true` (set for 32-bit PPC; clear on the `powerpc64-apple-darwin`
+entry directly below it). But a target descriptor is the cheap part. A working
+`std` — libc bindings, threads, filesystem, process — on Mach-O/PPC is the
+project, and nobody upstream validates it.
+
+Ordered blockers, then:
+
+1. **libstd on `powerpc-apple-darwin`** — untested upstream. This is the real
+   work, and it is precisely what `no_std` was proposed to dodge.
+2. **A PPC-Darwin C toolchain** — MacPorts gcc + MacportsLegacySupport, not stock
+   `gcc-4.0.1` (see §2).
+3. **`-sys` crates** — `zstd-sys` compiles real C for the target, so it inherits
+   blocker 2. Note that `rb-cli-vintage`'s feature set
+   (`native-zstd,remote,tui`) already excludes `chd`: **libchdman is C++**, which
+   mrustc cannot help with at all.
+
+### What this means for the plan below
+
+The `no_std` core in §5 is **no longer forced** by proc macros. It may still be
+the right shape — it sidesteps blocker 1, the expensive one — but it is now a
+*choice*, and the alternative deserves a fair hearing: point mrustc at rustc-1.74
+and try to build `rb-cli-vintage` roughly as-is.
+
+**Cheapest next experiment**, and it costs no changes to this repo: build mrustc,
+point it at the 1.74 source, and try `--target powerpc-apple-darwin` on a
+hello-world. That answers the single unknown which decides between the two
+shapes. If libstd collapses immediately, the `no_std` core is vindicated; if it
+survives, the whole `no_std` restructuring may be unnecessary.
 
 ## 4. Target scope
 
@@ -96,6 +150,12 @@ The other ~42 rb-cli verbs and their machinery: `fsck` (all filesystems),
 it gets added deliberately, not by default.
 
 ## 5. Architecture
+
+> **Conditional on §3.** This shape was chosen when proc macros looked like a
+> hard stop and 1.54 looked mandatory. Neither holds. It remains a reasonable
+> design *if* mrustc's `powerpc-apple-darwin` libstd proves unusable — which is
+> the experiment §3 ends with. If libstd works, transpiling `rb-cli-vintage`
+> largely as-is is the cheaper route and this whole section is moot.
 
 ```
 rusty-backup-core     (#![no_std] + alloc, 1.74 subset, deps ~= none)
@@ -216,15 +276,33 @@ mrustc setup + no_std carve-out is real work for little marginal gain. The
 tie-breaker is Phase 0: if standing up mrustc is painful, that alone argues for
 staying hand-C.
 
+> **The payoff changes if libstd works (§3).** This gate was written assuming the
+> only option was carving out a `no_std` core — i.e. paying real effort to
+> single-source just the FAT/partition kernels, which is a thin prize when that
+> logic is stable. If mrustc's `powerpc-apple-darwin` libstd turns out usable,
+> the prize is not two kernels but **the whole of `rb-cli-vintage`** — every
+> filesystem driver, every verb — with no carve-out at all. That is a
+> categorically better deal, and it is why the hello-world experiment should run
+> before this gate is answered.
+
 ## 10. Risks / open questions
 
-- **rustc 1.54 baseline vs any feature we can't live without** in the carved
-  core. Need to inventory the exact language features `partition/` + `fat.rs`
-  use against the 1.54 baseline. (Likely fine — they're old-school byte code.)
-- **mrustc Darwin/Mach-O output maturity.** Lower risk than it looks: `@catap`'s
-  MacPorts port already runs mrustc's C on PPC via MacPorts gcc, so the chain is
-  known-good. Phase 0 re-confirms it for our crate + the C11/`<stdatomic.h>`
-  dependency.
+- **libstd for `powerpc-apple-darwin` — the top risk, and previously understated
+  here.** mrustc's README lists its CI-tested libstd targets (x86-64 Linux /
+  Windows, secondary x86-64 + arm64 macOS); **PPC-Darwin is absent.** The target
+  spec at `src/trans/target.cpp:632` is well-formed, but that is the descriptor,
+  not a std port. The earlier text called Darwin output "lower risk than it
+  looks" on the grounds that `@catap`'s MacPorts port runs mrustc-emitted C on
+  PPC — note that establishes the *C toolchain* works, which is blocker 2, and
+  says nothing about whether libstd builds and runs for this target. Settle this
+  first (§3's hello-world experiment); everything else is downstream of it.
+- **Language baseline** in whatever we transpile. Against the **1.74** baseline
+  (not 1.54 — see §3) `partition/` + `fat.rs` are old-school byte code and
+  almost certainly fine; `rb-cli-vintage` already builds the whole engine at
+  1.73. Inventory only if the `no_std` core route is actually taken.
+- **C++ dependencies are a genuine hard stop** (unlike proc macros, which are
+  not). `libchdman-rs` is C++; mrustc cannot help. Any transpiled configuration
+  must leave `chd` off, as `rb-cli-vintage`'s feature set already does.
 - **Cross vs on-device build** ergonomics (Section 7).
 - **HashMap iteration-order** differences if we swap to BTreeMap could change
   output byte-for-byte — must be checked in the Phase 2 differential test.
