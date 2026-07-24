@@ -4,7 +4,7 @@ Pick-up notes for finishing the SquashFS work. The plan and every design
 decision live in [`squashfs_edit.md`](squashfs_edit.md); this file is the
 "where we stopped and what's left" companion.
 
-**Branch:** `edit-squashfs` — **not pushed**. ~25 commits ahead of `main`.
+**Branch:** `edit-squashfs` — **not pushed**. ~32 commits ahead of `main`.
 
 ---
 
@@ -13,7 +13,8 @@ decision live in [`squashfs_edit.md`](squashfs_edit.md); this file is the
 > Continue the SquashFS work on branch `edit-squashfs`. Read
 > `docs/squashfs_resume.md` for state and `docs/squashfs_edit.md` for the plan
 > and decisions D1–D6. Phases 0 through 2c are done and oracle-validated against
-> real `squashfs-tools`; **start with item A (stale doc), then phase 2d.**
+> real `squashfs-tools`; 2d is **half done** — the size budget and partition
+> capacity have landed, so **start at 2d item 3 (temp + atomic rename)**.
 > Per-slice commits. Every commit must keep `cargo build --all-targets` at zero
 > warnings, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --lib`
 > green, and the Rust 1.73 vintage build compiling (see CONTRIBUTING.md
@@ -44,33 +45,39 @@ live CD at `~/Downloads/ubuntu-12.04-desktop-powerpc.iso`, overridable with
 
 ## Pending work, in the order I'd do it
 
-### A. Stale doc — do this first, it's small and it's a rule violation
+### A. Stale doc — **DONE** (`61cf404`)
 
-`docs/full_MiSTer_support_status.md:15-18` still says SquashFS is
-*"read-only browse + extract … no edit or resize by design, since it is built
-offline by `mksquashfs`"*. Untrue since 2c. CLAUDE.md's pre-commit doc-sync
-requires this file be walked whenever filesystem capability changes; it was
-missed. README's Filesystems table **was** updated (Edit = "Yes (whole-image
-rebuild)"), so the two now disagree.
+`docs/full_MiSTer_support_status.md` claimed SquashFS was read-only "by design",
+contradicting the README. Rewritten to read + edit.
 
-### B. Phase 2d — the main remaining plan item
+### B. Phase 2d — half done
 
-1. **Partition-hosted images.** `SquashfsEditor` targets a bare superfloppy
-   (offset 0). It already carries an `offset` field and writes at it, but this
-   is untested for a SquashFS inside a partition, and a rebuild that grows past
-   the partition must be refused rather than scribbling over the next one.
-2. **The size-budget prompt** (`squashfs_edit.md` §2 — the piece with no
-   analogue elsewhere in the tree). Modes `fit` / absolute / `--grow N`;
-   per-container defaults (bare file → `fit`; partition → current partition
-   size); **two-stage enforcement** (pre-flight refusal, then post-rebuild
-   size check before anything is replaced); and the §2.5 projection, which can
-   be near-exact because unchanged files' compressed sizes are known.
-   Surfaces: GUI dialog, `--size`/`--grow` on the CLI, TUI.
-3. **Commit as temp + rename (D2).** `sync_metadata` currently rebuilds into a
-   RAM buffer and overwrites in place — safe against a *failed* rebuild, but it
-   neither truncates (a shrunk image leaves trailing bytes past `bytes_used`;
-   valid, but untidy) nor gives atomic replacement. Wire the temp + fsync +
-   atomic-rename path.
+1. **Partition-hosted images — DONE** (`6746e07`, `1aaf509`). `SquashfsEditor`
+   now carries a container `capacity` alongside its `offset`, the `0x83`
+   editable arm routes SquashFS (it previously had no arm at all, so partition
+   editing was unreachable), and reaching the editor at a non-zero offset with
+   no declared capacity caps growth at the image's current size rather than
+   assuming it may grow. `open_editable_filesystem_within` carries the
+   partition length; `PartitionContext::open_editable` (CLI) and
+   `BrowseSession::partition_size` (GUI) supply it.
+2. **The size budget — core DONE** (`6746e07`), surfaces still to do.
+   `SizeBudget::{Fit, Limit}` plus `SizeBudget::headroom` for `--grow`, both
+   stages of §2.4 enforcement (pre-flight refusal at open when the budget
+   exceeds the container; post-rebuild size check before anything is
+   overwritten), and the §2.5 projection anchored on the source image's real
+   size. **Still missing: the user-facing surfaces** — `--size` / `--grow`
+   flags on the CLI edit verbs, a `rb-cli squashfs plan` verb, the GUI dialog,
+   the TUI equivalent. The dispatch passes `SizeBudget::Fit`, so today a user
+   cannot request a budget tighter than the container.
+   Note the projection is *not* the near-exact one §2.5 describes: that needs
+   per-file compressed sizes, which only exist once phase 2-opt lands block
+   reuse. Today it anchors on the source size and estimates the content delta
+   at the image's own observed ratio, reported as a range.
+3. **Commit as temp + rename (D2) — NEXT.** `sync_metadata` still rebuilds into
+   a RAM buffer and overwrites in place. Safe against a *failed* rebuild and now
+   against an *oversized* one, but it neither truncates (a shrunk image leaves
+   trailing bytes past `bytes_used`; valid, but untidy) nor gives atomic
+   replacement. Wire the temp + fsync + atomic-rename path.
 4. **xattr-inheritance-on-replace** — the one known fidelity gap (D4). Replacing
    a file (delete + create) loses its xattrs, because `CreateFileOptions` has no
    channel to carry them. Narrow (only capability-bearing binaries, only when
@@ -86,6 +93,12 @@ on other filesystems:
 - `set_owner`: **squashfs only**. Needed on ext, UFS, XFS, EFS, Minix — all
   carry uid/gid inode fields.
 - `set_permissions`: **ext + squashfs only**. Same list.
+- `create_symlink` was the same shape of gap and is partly closed: EFS
+  (`9ab650f`), Minix and UFS (`bb60b1a`) now write symlinks, joining PFS3 and
+  SquashFS. Still missing on **ext** (needs the inline fast-symlink form real
+  volumes use for nearly every link), **AFFS** (a distinct `ST_SOFTLINK` block
+  type, not a mode bit), **HFS+** (`slnk`/`rhap` files) and **XFS** (no
+  `EditableFilesystem` impl at all).
 - `supports_xattrs` / `list_xattrs` / `set_xattr` / `remove_xattr`:
   **squashfs only**. Should also cover **ext** and **XFS** (the other
   xattr-capable filesystems). Minix and EFS have no xattr concept — leave them
