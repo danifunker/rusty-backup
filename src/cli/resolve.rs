@@ -45,6 +45,12 @@ pub struct PartitionContext {
     /// Human-readable label, intended for `eprintln!` so the user can
     /// confirm which partition the verb is operating on.
     pub label: String,
+    /// Set only when the read-write handle is the image file itself *and* the
+    /// filesystem occupies all of it — a plain image opened in place, not a
+    /// decoded container temp, a CHD/QCOW2 session, or a partition inside a
+    /// larger disk. Lets a driver that rewrites its whole image commit by
+    /// atomic replacement. See [`crate::fs::EditContext::whole_file_path`].
+    pub whole_file_path: Option<PathBuf>,
 }
 
 impl PartitionContext {
@@ -65,12 +71,15 @@ impl PartitionContext {
         Box<dyn crate::fs::EditableFilesystem>,
         crate::fs::filesystem::FilesystemError,
     > {
-        crate::fs::open_editable_filesystem_within(
+        crate::fs::open_editable_filesystem_with(
             handle,
             self.offset,
-            // A zero size means the resolver had nothing to report, not a
-            // zero-length partition; pass "unknown" rather than "no room".
-            (self.size > 0).then_some(self.size),
+            crate::fs::EditContext {
+                // A zero size means the resolver had nothing to report, not a
+                // zero-length partition; pass "unknown" rather than "no room".
+                partition_len: (self.size > 0).then_some(self.size),
+                whole_file_path: self.whole_file_path.as_deref(),
+            },
             self.type_byte,
             self.type_string.as_deref(),
         )
@@ -281,7 +290,15 @@ pub fn resolve_partition_rw_forced(
     // Open the whole image read-write (decoding CHD / container as needed),
     // then resolve which partition inside it the caller wants.
     let (mut reader, commit) = resolve_image_rw(path)?;
-    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    let mut ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    // `RwCommit::None` is the raw-image branch: the handle is `path` itself,
+    // nothing was decoded to a temp. Combined with a filesystem at byte 0, that
+    // makes the file and the filesystem the same thing, so a whole-image
+    // rewrite may be committed by replacing it. Every other commit shape wraps
+    // a temp or a session whose original must not be renamed over.
+    if matches!(commit, RwCommit::None) && ctx.offset == 0 {
+        ctx.whole_file_path = Some(path.to_path_buf());
+    }
     Ok((reader, ctx, commit))
 }
 
@@ -500,6 +517,10 @@ fn resolve_with_override<R: Read + Seek>(
                     type_string: None,
                     size: total,
                     label: "Partition: raw filesystem @ byte 0 (forced via --fs-type)".to_string(),
+                    // `resolve` works from a reader and doesn't know whether it
+                    // came from the image file or a decoded temp; the read-write
+                    // resolver fills this in once it knows which branch it took.
+                    whole_file_path: None,
                 });
             }
             return Err(anyhow!("detecting partition table: {e}"));
@@ -521,6 +542,7 @@ fn resolve_with_override<R: Read + Seek>(
             type_string: None,
             size: total,
             label: format!("Partition: raw filesystem @ byte 0 ({})", pt.type_name()),
+            whole_file_path: None,
         });
     }
 
@@ -546,6 +568,7 @@ fn resolve_with_override<R: Read + Seek>(
         type_string: info.partition_type_string.clone(),
         size: info.size_bytes,
         label: format_label(&info, pt.type_name()),
+        whole_file_path: None,
     })
 }
 

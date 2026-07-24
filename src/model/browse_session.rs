@@ -651,10 +651,13 @@ impl BrowseSession {
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
                 .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
-            let fs = fs::open_editable_filesystem_within(
+            let fs = fs::open_editable_filesystem_with(
                 reader,
                 self.partition_offset,
-                self.partition_size,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -666,10 +669,13 @@ impl BrowseSession {
         // is opened.
         if let Some(arc) = &self.chd_edit_session {
             let handle = ChdEditHandle::from_arc(Arc::clone(arc));
-            let fs = fs::open_editable_filesystem_within(
+            let fs = fs::open_editable_filesystem_with(
                 handle,
                 self.partition_offset,
-                self.partition_size,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -731,10 +737,13 @@ impl BrowseSession {
                 .write(true)
                 .open(session.flat_path())
                 .map_err(FilesystemError::Io)?;
-            let fs = fs::open_editable_filesystem_within(
+            let fs = fs::open_editable_filesystem_with(
                 file,
                 self.partition_offset,
-                self.partition_size,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -777,10 +786,13 @@ impl BrowseSession {
                     reader.snapshot_count()
                 )));
             }
-            let fs = fs::open_editable_filesystem_within(
+            let fs = fs::open_editable_filesystem_with(
                 reader,
                 self.partition_offset,
-                self.partition_size,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -793,10 +805,19 @@ impl BrowseSession {
             .open(path)
             .map_err(FilesystemError::Io)?;
 
-        let fs = fs::open_editable_filesystem_within(
+        // The last branch: a plain file opened directly, no container decode in
+        // between. When the filesystem also starts at byte 0 it *is* the whole
+        // file, so a driver that rewrites its image wholesale (SquashFS) may
+        // commit by atomic replacement instead of overwriting in place. Every
+        // earlier branch returned a temp / session / remote handle, where
+        // renaming over `path` would destroy the surrounding image.
+        let fs = fs::open_editable_filesystem_with(
             file,
             self.partition_offset,
-            self.partition_size,
+            fs::EditContext {
+                partition_len: self.partition_size,
+                whole_file_path: (self.partition_offset == 0).then_some(path.as_path()),
+            },
             self.partition_type,
             self.partition_type_string.as_deref(),
         )?;

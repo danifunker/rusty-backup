@@ -1786,43 +1786,65 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
     }
 }
 
+/// What a caller knows about *where* a filesystem lives, beyond its offset.
+///
+/// Almost every driver writes surgically inside structures it read from the
+/// partition, and needs none of this. The ones that rewrite their whole image
+/// do: SquashFS has no in-place write at all, so committing an edit means
+/// replacing every byte, and that raises two questions an offset cannot answer
+/// — how far it may grow, and whether there is a file it could be swapped in
+/// for atomically instead of overwritten in place.
+///
+/// Every field defaults to "unknown", which is always the safe reading.
+#[derive(Default, Clone, Copy)]
+pub struct EditContext<'a> {
+    /// Bytes the filesystem may occupy where it sits. `None` when the caller
+    /// doesn't know, which a driver must treat as "assume it may not grow".
+    pub partition_len: Option<u64>,
+    /// Path of the backing file, set **only** when the handle is a plain file
+    /// on disk *and* the filesystem occupies all of it — so replacing the file
+    /// replaces exactly the filesystem and nothing else.
+    ///
+    /// Leave it `None` for a partition inside a larger image, a decoded
+    /// container temp, a CHD/QCOW2 session, or a remote handle: renaming over
+    /// any of those would destroy the surrounding image.
+    pub whole_file_path: Option<&'a std::path::Path>,
+}
+
 /// Open a filesystem for editing (read + write access).
 ///
 /// Same dispatch logic as `open_filesystem` but requires a writable reader and
 /// returns a `Box<dyn EditableFilesystem>`.
 ///
-/// The partition's length is not passed, so filesystems that need to know where
-/// their container ends fall back to a conservative assumption. Prefer
-/// [`open_editable_filesystem_within`] when the caller knows it — today only
-/// SquashFS consumes it, because it is the only driver that rewrites its whole
-/// image and so can grow past the partition it was read from.
+/// Nothing is known about the surrounding container, so a driver that needs
+/// that falls back to its safest assumption. Prefer
+/// [`open_editable_filesystem_with`] when the caller can fill in an
+/// [`EditContext`].
 pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
     reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
-    open_editable_filesystem_within(
+    open_editable_filesystem_with(
         reader,
         partition_offset,
-        None,
+        EditContext::default(),
         partition_type,
         partition_type_string,
     )
 }
 
-/// [`open_editable_filesystem`], told how many bytes the partition holds.
-///
-/// `partition_len` bounds what a driver may write, for the drivers that can
-/// produce an image of a different size than the one they read. `None` means
-/// "unknown", which is what the plain opener passes.
-pub fn open_editable_filesystem_within<R: Read + Write + Seek + Send + 'static>(
+/// [`open_editable_filesystem`], told what the caller knows about the
+/// filesystem's surroundings. See [`EditContext`].
+pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
     mut reader: R,
     partition_offset: u64,
-    partition_len: Option<u64>,
+    edit_ctx: EditContext<'_>,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    let partition_len = edit_ctx.partition_len;
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
@@ -1992,6 +2014,7 @@ pub fn open_editable_filesystem_within<R: Read + Write + Seek + Send + 'static>(
                         partition_len
                     },
                     squashfs_edit::SizeBudget::Fit,
+                    edit_ctx.whole_file_path,
                 )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
@@ -2140,11 +2163,14 @@ pub fn open_editable_filesystem_within<R: Read + Write + Seek + Send + 'static>(
                 // partition. Editing rebuilds the whole image, so the partition
                 // length is a real boundary here, not a formality — see
                 // `squashfs_edit::SquashfsEditor::open_within`.
+                // A partition is never the whole file, so no atomic-rename path
+                // is offered here even if the caller named one.
                 "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open_within(
                     reader,
                     partition_offset,
                     partition_len,
                     squashfs_edit::SizeBudget::Fit,
+                    None,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,

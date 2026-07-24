@@ -131,6 +131,10 @@ pub struct SquashfsEditor<RW: Read + Write + Seek> {
     source_len: u64,
     /// Sum of file content bytes in the source tree, for the observed ratio.
     source_content_len: u64,
+    /// Path of the backing file when it holds nothing but this image, enabling
+    /// the atomic-replacement commit (D2). `None` for a partition, a container
+    /// temp, or an in-memory handle, all of which are written in place.
+    backing_file: Option<std::path::PathBuf>,
     /// The editable tree; the root node's name is empty by convention.
     root: BuildNode,
     /// Compression settings carried from the source (D3).
@@ -143,7 +147,7 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// Equivalent to [`open_within`](Self::open_within) with no container
     /// capacity and no budget. Use that instead for a partition-hosted image.
     pub fn open(rw: RW, offset: u64) -> Result<Self, FilesystemError> {
-        Self::open_within(rw, offset, None, SizeBudget::Fit)
+        Self::open_within(rw, offset, None, SizeBudget::Fit, None)
     }
 
     /// Open `rw` (a whole SquashFS image at `offset`) for editing: read the tree
@@ -157,11 +161,16 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// Refuses here (stage 1 of §2.4) when the requested budget is larger than
     /// the container can hold: that is a decision the user should revisit
     /// *before* making edits, not after a multi-minute rebuild.
+    ///
+    /// `backing_file` names the file on disk when it holds nothing but this
+    /// image, which lets the commit be an atomic replacement rather than an
+    /// overwrite (D2). Pass `None` for anything else.
     pub fn open_within(
         rw: RW,
         offset: u64,
         capacity: Option<u64>,
         budget: SizeBudget,
+        backing_file: Option<&std::path::Path>,
     ) -> Result<Self, FilesystemError> {
         let mut src = SquashfsFilesystem::open(rw, offset)?;
         let opts = src.source_build_options();
@@ -208,6 +217,11 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
             budget,
             source_len,
             source_content_len,
+            // Only a whole-file image at offset 0 can be swapped out wholesale;
+            // anywhere else the file holds more than this filesystem.
+            backing_file: backing_file
+                .filter(|_| offset == 0)
+                .map(|p| p.to_path_buf()),
             root,
             opts,
         })
@@ -238,6 +252,90 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
             BuildKind::File(c) => c.len(),
             _ => 0,
         }
+    }
+
+    /// Commit by writing a sibling temp and renaming it over the original
+    /// (D2).
+    ///
+    /// Committing a SquashFS edit means replacing *every* byte of the image, so
+    /// an in-place overwrite has a window in which a crash leaves a half-written
+    /// file and the previous contents are already gone — on the format whose
+    /// main use is the one bootable root filesystem of an appliance. Writing a
+    /// sibling first and renaming closes it: either the rename happened and the
+    /// new image is complete, or it didn't and the old one is untouched.
+    ///
+    /// The temp is created in the original's own directory so the rename stays
+    /// within one filesystem (across filesystems it would degrade to a copy,
+    /// which is exactly the non-atomic thing we're avoiding), and is fsynced
+    /// before the rename so the rename cannot become visible ahead of the bytes
+    /// it points at.
+    ///
+    /// Note `self.rw` still refers to the *replaced* file afterwards. Nothing
+    /// reads through it — every read this editor serves comes from the
+    /// in-memory tree — and a second sync writes a fresh temp and renames
+    /// again, so the stale handle never matters. It is not reopened only
+    /// because `RW` is generic and there is nothing to reopen it *as*.
+    fn commit_by_replacing(
+        &mut self,
+        path: &std::path::Path,
+        image: &[u8],
+    ) -> Result<(), FilesystemError> {
+        use std::io::Write as _;
+
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".rb-squashfs-")
+            .tempfile_in(dir)
+            .map_err(FilesystemError::Io)?;
+        tmp.write_all(image).map_err(FilesystemError::Io)?;
+        tmp.flush().map_err(FilesystemError::Io)?;
+        tmp.as_file().sync_all().map_err(FilesystemError::Io)?;
+        // Carry the original's permissions across; a fresh temp is 0600, and an
+        // image that was world-readable should stay so.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
+        }
+        tmp.persist(path).map_err(|e| {
+            FilesystemError::Io(crate::compat::io_other(format!(
+                "replacing {} with the rebuilt image: {e}",
+                path.display()
+            )))
+        })?;
+        Ok(())
+    }
+
+    /// Commit by overwriting at `offset` — a partition, a container temp, or an
+    /// in-memory handle, none of which can be swapped out from under their
+    /// surroundings.
+    ///
+    /// A rebuild that came out *smaller* leaves the bytes past its end behind.
+    /// A reader stops at the superblock's `bytes_used` so the image is still
+    /// valid, but the remains of the previous image are not ours to leave
+    /// lying around — they would be carried into a backup and could be
+    /// mistaken for live data by anything scanning for magic bytes. Zero them.
+    fn commit_in_place(&mut self, image: &[u8]) -> Result<(), FilesystemError> {
+        self.rw
+            .seek(SeekFrom::Start(self.offset))
+            .map_err(FilesystemError::Io)?;
+        self.rw.write_all(image).map_err(FilesystemError::Io)?;
+
+        let written = image.len() as u64;
+        if written < self.source_len {
+            let mut remaining = self.source_len - written;
+            let zeros = vec![0u8; 64 * 1024];
+            while remaining > 0 {
+                let n = remaining.min(zeros.len() as u64) as usize;
+                self.rw
+                    .write_all(&zeros[..n])
+                    .map_err(FilesystemError::Io)?;
+                remaining -= n as u64;
+            }
+        }
+        self.rw.flush().map_err(FilesystemError::Io)?;
+        Ok(())
     }
 
     /// Project what a rebuild would occupy right now (`§2.5`).
@@ -730,16 +828,10 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             }
         }
 
-        self.rw
-            .seek(SeekFrom::Start(self.offset))
-            .map_err(FilesystemError::Io)?;
-        self.rw.write_all(&image).map_err(FilesystemError::Io)?;
-        self.rw.flush().map_err(FilesystemError::Io)?;
-        // Note: if the new image is shorter than the old backing file, trailing
-        // bytes remain past `bytes_used`. SquashFS readers stop at the
-        // superblock's `bytes_used`, so this is still a valid image; exact
-        // truncation is a commit-side concern (temp + rename, phase 2d).
-        Ok(())
+        if let Some(path) = self.backing_file.clone() {
+            return self.commit_by_replacing(&path, &image);
+        }
+        self.commit_in_place(&image)
     }
 
     fn free_space(&mut self) -> Result<u64, FilesystemError> {
@@ -845,6 +937,7 @@ mod tests {
             OFFSET,
             Some(partition_len),
             SizeBudget::Fit,
+            None,
         )
         .expect("open hosted");
 
@@ -882,6 +975,7 @@ mod tests {
             OFFSET,
             Some(partition_len),
             SizeBudget::Fit,
+            None,
         )
         .expect("open hosted");
         let root = ed.root().expect("root");
@@ -924,6 +1018,7 @@ mod tests {
             OFFSET,
             Some(partition_len),
             SizeBudget::Fit,
+            None,
         )
         .expect("open hosted");
         let root = ed.root().expect("root");
@@ -948,6 +1043,7 @@ mod tests {
             OFFSET,
             Some(partition_len),
             SizeBudget::Limit(partition_len * 4),
+            None,
         )
         .err()
         .expect("must refuse a budget it cannot honour");
@@ -968,6 +1064,7 @@ mod tests {
             OFFSET,
             Some(partition_len),
             SizeBudget::headroom(img_len, 8 * 1024),
+            None,
         )
         .expect("open hosted");
         let root = ed.root().expect("root");
@@ -992,8 +1089,9 @@ mod tests {
     fn an_undeclared_container_caps_growth_at_the_current_size() {
         const OFFSET: u64 = 1 << 20;
         let (disk, _) = hosted_image(OFFSET, 8 << 20);
-        let mut ed = SquashfsEditor::open_within(Cursor::new(disk), OFFSET, None, SizeBudget::Fit)
-            .expect("open hosted");
+        let mut ed =
+            SquashfsEditor::open_within(Cursor::new(disk), OFFSET, None, SizeBudget::Fit, None)
+                .expect("open hosted");
         let root = ed.root().expect("root");
         ed.create_file(
             &root,
@@ -1027,6 +1125,202 @@ mod tests {
             bytes.len() > 1 << 20,
             "the added megabyte did not land: {} bytes",
             bytes.len()
+        );
+    }
+
+    /// D2: committing to a bare `.squashfs` replaces the file rather than
+    /// overwriting it, so a crash mid-write cannot leave a half-written image
+    /// where the user's only copy used to be.
+    ///
+    /// Observable through the inode number: an overwrite keeps it, a rename
+    /// brings a new one. The permission bits have to survive too — a fresh
+    /// tempfile is 0600, and an image that was world-readable must not quietly
+    /// stop being so.
+    // Inode identity is the observable difference between a replace and an
+    // overwrite, and `MetadataExt::ino` is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_file_is_committed_by_replacement_not_overwrite() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.squashfs");
+        std::fs::write(&path, starter_image()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before_ino = std::fs::metadata(&path).unwrap().ino();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut ed = SquashfsEditor::open_within(file, 0, None, SizeBudget::Fit, Some(&path))
+            .expect("open with a backing path");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "added",
+            &mut Cursor::new(b"added\n".to_vec()),
+            6,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        ed.sync_metadata().expect("sync");
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            meta.ino(),
+            before_ino,
+            "the file was overwritten in place, not replaced"
+        );
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o644,
+            "the replacement did not inherit the original's permissions"
+        );
+        // No temp left behind.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "root.squashfs")
+            .collect();
+        assert!(strays.is_empty(), "left temps behind: {strays:?}");
+
+        // And it is a real image with the edit in it.
+        let mut fs = SquashfsFilesystem::open(std::fs::File::open(&path).unwrap(), 0)
+            .expect("reopen replaced file");
+        let root = fs.root().unwrap();
+        let names: Vec<String> = fs
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"added".to_string()), "got: {names:?}");
+    }
+
+    /// A partition-hosted image must never take the rename path, whatever the
+    /// caller passed: the file holds a whole disk, and replacing it would
+    /// destroy every other partition on it.
+    // Inode identity is the observable difference between a replace and an
+    // overwrite, and `MetadataExt::ino` is Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_partition_hosted_image_is_never_replaced_wholesale() {
+        const OFFSET: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        let (disk, partition_len) = hosted_image(OFFSET, 4 << 20);
+        std::fs::write(&path, &disk).unwrap();
+        let before_ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Deliberately hand it a path it must ignore.
+        let mut ed = SquashfsEditor::open_within(
+            file,
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+            Some(&path),
+        )
+        .expect("open hosted");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "added",
+            &mut Cursor::new(b"x".to_vec()),
+            1,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        ed.sync_metadata().expect("sync");
+
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                before_ino,
+                "a partition-hosted image was committed by replacing the whole disk"
+            );
+        }
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(after.len(), disk.len(), "the disk changed size");
+        assert_eq!(
+            &after[..OFFSET as usize],
+            &disk[..OFFSET as usize],
+            "everything before the partition must be untouched"
+        );
+    }
+
+    /// A rebuild that comes out smaller leaves the tail of the previous image
+    /// behind when written in place. A reader stops at `bytes_used` so the
+    /// image is valid either way, but the leftovers are not ours to leave —
+    /// they would ride along into a backup and can be mistaken for live data.
+    #[test]
+    fn a_shrunk_in_place_image_zeroes_what_it_no_longer_uses() {
+        const OFFSET: u64 = 1 << 20;
+        let (disk, partition_len) = hosted_image(OFFSET, 4 << 20);
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+            None,
+        )
+        .expect("open hosted");
+        let root = ed.root().expect("root");
+        // Grow it first, so the second commit has something to shrink away from.
+        ed.create_file(
+            &root,
+            "bulk",
+            &mut Cursor::new(incompressible(512 * 1024)),
+            512 * 1024,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        ed.sync_metadata().expect("first sync");
+        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+
+        // Reopen: `source_len` is measured at open, so this is the grown
+        // image's real footprint — the region the shrink has to clean up.
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(disk),
+            OFFSET,
+            Some(partition_len),
+            SizeBudget::Fit,
+            None,
+        )
+        .expect("reopen hosted");
+        let grown_len = ed.source_len();
+        let root = ed.root().expect("root");
+        let bulk = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "bulk")
+            .unwrap();
+        ed.delete_entry(&root, &bulk).expect("delete");
+        ed.sync_metadata().expect("second sync");
+
+        let disk = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let fs = SquashfsFilesystem::open(Cursor::new(disk.clone()), OFFSET).expect("reopen");
+        let used = image_footprint(fs.bytes_used());
+        assert!(used < grown_len, "the image did not actually shrink");
+        // Everything between the new end and where the old image reached must
+        // be zero.
+        let tail_start = (OFFSET + used) as usize;
+        let tail_end = (OFFSET + grown_len) as usize;
+        assert!(
+            disk[tail_start..tail_end].iter().all(|&b| b == 0),
+            "stale bytes from the previous image survived past the new one"
         );
     }
 
