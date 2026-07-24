@@ -1809,6 +1809,13 @@ pub struct EditContext<'a> {
     /// container temp, a CHD/QCOW2 session, or a remote handle: renaming over
     /// any of those would destroy the surrounding image.
     pub whole_file_path: Option<&'a std::path::Path>,
+    /// A ceiling the *user* asked for, on top of whatever the container
+    /// imposes. `None` means "no request" — the container still binds.
+    ///
+    /// Unlike the other two fields this is a preference rather than a fact
+    /// about placement, and it exists for the same reason they do: only a
+    /// driver that rewrites its whole image can meaningfully be given one.
+    pub rebuild_budget: Option<squashfs_edit::SizeBudget>,
 }
 
 /// Open a filesystem for editing (read + write access).
@@ -2013,7 +2020,9 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     } else {
                         partition_len
                     },
-                    squashfs_edit::SizeBudget::Fit,
+                    edit_ctx
+                        .rebuild_budget
+                        .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     edit_ctx.whole_file_path,
                 )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
@@ -2169,7 +2178,9 @@ pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                     partition_len,
-                    squashfs_edit::SizeBudget::Fit,
+                    edit_ctx
+                        .rebuild_budget
+                        .unwrap_or(squashfs_edit::SizeBudget::Fit),
                     None,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(

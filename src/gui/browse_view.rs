@@ -166,6 +166,10 @@ pub struct BrowseView {
     pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Queued edit operations awaiting "Apply Edits".
     staged_edits: EditQueue,
+    /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
+    /// a SquashFS volume and choosing a ceiling. See
+    /// [`super::squashfs_budget_dialog`].
+    squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
     /// When true, a successful Discard/Apply from the unsaved dialog should
@@ -458,6 +462,7 @@ impl Default for BrowseView {
             pending_extraction: None,
             chd_edit: None,
             chd_flatten_progress: None,
+            squashfs_budget_dialog: None,
             tar_export_progress: None,
             pending_tar_import: None,
             pending_tar_add: None,
@@ -981,18 +986,14 @@ impl BrowseView {
                         if self.edit_mode && !self.staged_edits.is_empty() {
                             self.show_unsaved_dialog = true;
                         } else if !self.edit_mode {
-                            // Probe the editable open up-front so guards like
-                            // the journaled-HFS+ refusal surface as a toast
-                            // instead of being deferred to the first edit.
-                            match self.session.open_editable() {
-                                // Probe only: discard the fs + commit guard
-                                // (no mutation, so a container is left intact).
-                                Ok((_efs, _commit)) => {
-                                    self.edit_mode = true;
-                                }
-                                Err(e) => {
-                                    self.error = Some(format!("Cannot enter edit mode: {e}"));
-                                }
+                            // SquashFS has to declare a size budget before any
+                            // edit is made — it has no free space to consult and
+                            // no in-place write, so "will this still fit?" can
+                            // only be answered as a ceiling chosen up front.
+                            // The dialog answers it and re-runs this entry when
+                            // the user commits. See docs/squashfs_edit.md §2.
+                            if !self.open_squashfs_budget_dialog() {
+                                self.enter_direct_edit_mode();
                             }
                         } else {
                             self.edit_mode = false;
@@ -1152,6 +1153,9 @@ impl BrowseView {
                 ui.ctx().request_repaint();
             }
         }
+
+        // The SquashFS size-budget dialog, and the edit-mode entry it gates.
+        self.poll_squashfs_budget_dialog(ui);
 
         // Background tar-export progress (Export to .tar.gz...).
         self.poll_tar_export(ui);
@@ -2809,6 +2813,75 @@ impl BrowseView {
 
     /// Poll the background tar-export worker: show a spinner while running,
     /// and surface the result when it finishes.
+    /// Enter Edit Mode on a raw image / device, probing the editable open
+    /// up-front so guards like the journaled-HFS+ refusal surface here rather
+    /// than being deferred to the first edit.
+    fn enter_direct_edit_mode(&mut self) {
+        match self.session.open_editable() {
+            // Probe only: discard the fs + commit guard (no mutation, so a
+            // container is left intact).
+            Ok((_efs, _commit)) => {
+                self.edit_mode = true;
+            }
+            Err(e) => {
+                self.error = Some(format!("Cannot enter edit mode: {e}"));
+            }
+        }
+    }
+
+    /// Open the size-budget dialog when this volume is a SquashFS that hasn't
+    /// been given a budget yet. Returns true when the dialog took over, meaning
+    /// the caller must not enter Edit Mode — [`Self::poll_squashfs_budget_dialog`]
+    /// does that once the user has chosen.
+    ///
+    /// Measuring walks the directory tree for file sizes only (no content is
+    /// decompressed), so this stays cheap even on a distro rootfs.
+    fn open_squashfs_budget_dialog(&mut self) -> bool {
+        if self.fs_type != "SquashFS" || self.session.rebuild_budget.is_some() {
+            return false;
+        }
+        let mut fs = match self.session.open() {
+            Ok(fs) => fs,
+            Err(e) => {
+                self.error = Some(format!("Cannot measure this image: {e}"));
+                return true;
+            }
+        };
+        let image_len = rusty_backup::fs::squashfs_write::image_footprint(fs.total_size());
+        // A partition bounds the image; a bare file at byte 0 is the image.
+        let capacity = (self.session.partition_offset != 0)
+            .then_some(self.session.partition_size)
+            .flatten();
+        match rusty_backup::fs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
+            Ok(plan) => {
+                self.squashfs_budget_dialog = Some(Box::new(
+                    super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
+                ));
+            }
+            Err(e) => self.error = Some(format!("Cannot measure this image: {e}")),
+        }
+        true
+    }
+
+    /// Draw the budget dialog and act on its outcome: a chosen budget is
+    /// installed on the session and Edit Mode is entered; cancelling just
+    /// closes, leaving the volume read-only.
+    fn poll_squashfs_budget_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.squashfs_budget_dialog.as_mut() else {
+            return;
+        };
+        dialog.show(ui.ctx());
+        let outcome = dialog.take_outcome();
+        let closed = dialog.is_closed();
+        if let Some(budget) = outcome {
+            self.session.rebuild_budget = budget;
+            self.squashfs_budget_dialog = None;
+            self.enter_direct_edit_mode();
+        } else if closed {
+            self.squashfs_budget_dialog = None;
+        }
+    }
+
     fn poll_tar_export(&mut self, ui: &mut egui::Ui) {
         let arc = match &self.tar_export_progress {
             Some(p) => Arc::clone(p),

@@ -145,6 +145,14 @@ pub enum Command {
     /// ProDOS file.
     Chmeta(verbs::chmeta::ChmetaArgs),
 
+    /// SquashFS edits with an explicit size budget (`plan` / `put` / `rm`).
+    /// The format has no in-place write, so committing rebuilds the whole
+    /// image and its final size can only be bounded, never predicted.
+    Squashfs {
+        #[command(subcommand)]
+        cmd: verbs::squashfs::SquashfsCommand,
+    },
+
     /// Read or edit a file's extended attributes (`list` / `set` / `rm`) —
     /// the scriptable form of the GUI and TUI File Info panel. SquashFS
     /// today; other xattr-bearing filesystems as their write side lands.
@@ -434,6 +442,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Shrink(args) => verbs::shrink::run(args),
         Command::Bless { cmd } => verbs::bless::run(cmd),
         Command::Chmeta(args) => verbs::chmeta::run(args),
+        Command::Squashfs { cmd } => verbs::squashfs::run(cmd),
         Command::Xattr { cmd } => verbs::xattr::run(cmd),
         Command::Setrsrc(args) => verbs::setrsrc::run(args),
         Command::Setvolname(args) => verbs::setvolname::run(args),

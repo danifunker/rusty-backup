@@ -72,6 +72,13 @@ pub enum SizeBudget {
     Fit,
     /// The rebuilt image must be at most this many bytes.
     Limit(u64),
+    /// The rebuilt image may exceed its current size by at most this much
+    /// (`--grow N`).
+    ///
+    /// Kept symbolic rather than folded into `Limit` at parse time because the
+    /// current size isn't known until the image is opened — a command line can
+    /// say "64 MiB more than whatever this is" without first measuring it.
+    Grow(u64),
 }
 
 impl SizeBudget {
@@ -80,11 +87,13 @@ impl SizeBudget {
         Self::Limit(current_len.saturating_add(headroom))
     }
 
-    /// The ceiling this budget imposes, if any.
-    pub fn ceiling(&self) -> Option<u64> {
+    /// The ceiling this budget imposes on an image currently `current_len`
+    /// bytes, if any.
+    pub fn ceiling_for(&self, current_len: u64) -> Option<u64> {
         match *self {
             Self::Fit => None,
             Self::Limit(n) => Some(n),
+            Self::Grow(n) => Some(current_len.saturating_add(n)),
         }
     }
 }
@@ -115,6 +124,96 @@ const BEST_CASE_RATIO: f64 = 0.02;
 /// Ratio assumed for added content in the pessimistic bound: already-compressed
 /// input stores verbatim, plus a little per-block bookkeeping.
 const WORST_CASE_RATIO: f64 = 1.02;
+
+/// What the size prompt needs to show before any edit is made
+/// (`docs/squashfs_edit.md` §2.6): where the image stands, what it may grow
+/// into, and the ratio a projection is built on.
+///
+/// Produced by [`plan_size`] from a **read-only** filesystem, so the GUI can
+/// open the dialog, and `rb-cli squashfs plan` can answer, without loading the
+/// whole tree into memory the way opening an editor does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizePlan {
+    /// What the image occupies today, padded as it sits on disk.
+    pub image_len: u64,
+    /// What it may occupy where it lives — the partition length. `None` for a
+    /// bare file, which simply grows.
+    pub capacity: Option<u64>,
+    /// Sum of file content bytes, uncompressed.
+    pub content_len: u64,
+    /// `image_len / content_len` — how well this image's own contents
+    /// compressed, and the prior a projection uses for anything added.
+    pub ratio: f64,
+    /// Room between the end of the image and the end of its container.
+    pub headroom: Option<u64>,
+}
+
+impl SizePlan {
+    /// How this image's contents compressed, as a sentence — or a note that the
+    /// question doesn't have a useful answer here.
+    ///
+    /// A ratio over 1.0 doesn't mean the compressor made things bigger: it
+    /// means the image is mostly *not* file content. Metadata tables, the
+    /// superblock and the 4 KiB pad are a fixed cost, and on a small image they
+    /// dwarf what little data there is. Reporting "compressed to 219% of its
+    /// contents" from that is arithmetic masquerading as insight, and the
+    /// advice built on it ("adding N bytes adds 219% of N") is simply wrong.
+    pub fn describe_ratio(&self) -> String {
+        if self.ratio > 1.0 {
+            "mostly fixed overhead (tables + padding), not file data".to_string()
+        } else {
+            format!("{:.1}% of its contents", self.ratio * 100.0)
+        }
+    }
+
+    /// The prior to use for content *added* to this image, or `None` when the
+    /// observed ratio is too distorted by fixed overhead to be one.
+    pub fn added_content_ratio(&self) -> Option<f64> {
+        (self.ratio <= 1.0).then_some(self.ratio)
+    }
+}
+
+/// Measure an image for the size prompt without loading its tree.
+///
+/// Walks the directory structure for file sizes — metadata only, no content is
+/// decompressed — so this stays cheap on a rootfs where reading every file
+/// would mean gigabytes. `capacity` is the container length, `None` for a bare
+/// file.
+pub fn plan_size(
+    fs: &mut dyn Filesystem,
+    image_len: u64,
+    capacity: Option<u64>,
+) -> Result<SizePlan, FilesystemError> {
+    fn walk(
+        fs: &mut dyn Filesystem,
+        dir: &FileEntry,
+        total: &mut u64,
+    ) -> Result<(), FilesystemError> {
+        for child in fs.list_directory(dir)? {
+            match child.entry_type {
+                EntryType::Directory => walk(fs, &child, total)?,
+                EntryType::File => *total = total.saturating_add(child.size),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    let root = fs.root()?;
+    let mut content_len = 0u64;
+    walk(fs, &root, &mut content_len)?;
+    let ratio = if content_len == 0 {
+        1.0
+    } else {
+        image_len as f64 / content_len as f64
+    };
+    Ok(SizePlan {
+        image_len,
+        capacity,
+        content_len,
+        ratio,
+        headroom: capacity.map(|c| c.saturating_sub(image_len)),
+    })
+}
 
 /// An editable SquashFS image backed by an in-memory tree.
 pub struct SquashfsEditor<RW: Read + Write + Seek> {
@@ -199,7 +298,7 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
             (None, _) => Some(source_len),
         };
 
-        if let (Some(cap), Some(want)) = (capacity, budget.ceiling()) {
+        if let (Some(cap), Some(want)) = (capacity, budget.ceiling_for(source_len)) {
             if want > cap {
                 return Err(FilesystemError::Unsupported(format!(
                     "squashfs: a size budget of {} exceeds the {} this image has \
@@ -230,7 +329,7 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
     /// The effective ceiling on a rebuild, and why it applies. `None` means the
     /// image may grow freely.
     fn ceiling(&self) -> Option<(u64, &'static str)> {
-        match (self.capacity, self.budget.ceiling()) {
+        match (self.capacity, self.budget.ceiling_for(self.source_len)) {
             (None, None) => None,
             (Some(c), None) => Some((c, "the room available where this image lives")),
             (None, Some(b)) => Some((b, "the requested size budget")),
@@ -239,8 +338,8 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
         }
     }
 
-    /// The size the image occupied when it was opened. `--grow N` is
-    /// `SizeBudget::headroom(this, N)`.
+    /// The size the image occupied when it was opened — the anchor `--grow N`
+    /// and the projection are both measured from.
     pub fn source_len(&self) -> u64 {
         self.source_len
     }
@@ -1325,6 +1424,69 @@ mod tests {
             disk[tail_start..tail_end].iter().all(|&b| b == 0),
             "stale bytes from the previous image survived past the new one"
         );
+    }
+
+    /// `--grow N` cannot be folded into an absolute limit on the command line,
+    /// because the size it is relative to isn't known until the image is
+    /// opened. It has to stay symbolic until then.
+    #[test]
+    fn grow_resolves_against_the_image_it_is_applied_to() {
+        let ed = open_editor(starter_image());
+        let current = ed.source_len();
+        assert_eq!(
+            SizeBudget::Grow(4096).ceiling_for(current),
+            Some(current + 4096)
+        );
+        assert_eq!(SizeBudget::Limit(999).ceiling_for(current), Some(999));
+        assert_eq!(SizeBudget::Fit.ceiling_for(current), None);
+
+        // And it binds: a megabyte of incompressible content against 8 KiB of
+        // headroom is refused, with the budget named as the reason.
+        let mut ed = SquashfsEditor::open_within(
+            Cursor::new(starter_image()),
+            0,
+            None,
+            SizeBudget::Grow(8 * 1024),
+            None,
+        )
+        .expect("open");
+        let root = ed.root().expect("root");
+        ed.create_file(
+            &root,
+            "big.bin",
+            &mut Cursor::new(incompressible(1 << 20)),
+            1 << 20,
+            &CreateFileOptions::default(),
+        )
+        .expect("create");
+        let err = ed.sync_metadata().expect_err("must refuse");
+        assert!(
+            err.to_string().contains("requested size budget"),
+            "got: {err}"
+        );
+    }
+
+    /// The plan the size prompt is built from, measured without loading the
+    /// tree — the GUI dialog and `rb-cli squashfs plan` both read these numbers.
+    #[test]
+    fn plan_size_measures_without_loading_content() {
+        let img = starter_image();
+        let image_len = image_footprint(img.len() as u64);
+        let mut fs = SquashfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let plan = plan_size(&mut fs, image_len, Some(image_len * 4)).expect("plan");
+
+        // The starter image holds "original readme\n" (16) + "ping binary\n" (12).
+        assert_eq!(plan.content_len, 28, "content bytes wrong");
+        assert_eq!(plan.image_len, image_len);
+        assert_eq!(plan.capacity, Some(image_len * 4));
+        assert_eq!(plan.headroom, Some(image_len * 3));
+        assert!(plan.ratio > 0.0, "ratio must be usable as a prior");
+
+        // A bare file has no capacity, so no headroom to report either.
+        let mut fs = SquashfsFilesystem::open(Cursor::new(starter_image()), 0).expect("open");
+        let plan = plan_size(&mut fs, image_len, None).expect("plan");
+        assert_eq!(plan.capacity, None);
+        assert_eq!(plan.headroom, None);
     }
 
     /// The projection has to move with the tree, and bracket its own estimate.

@@ -1628,6 +1628,84 @@ Usage: shrink <INPUT> <OUTPUT>
 - `<INPUT>` — Source image (raw `.img` or `.chd`). Must contain an SGI volume header at sector 0
 - `<OUTPUT>` — Destination CHD path. Must end in `.chd`, must not already exist, and must not resolve to the same file as `input`
 
+### `squashfs`
+
+SquashFS edits with an explicit size budget (`plan` / `put` / `rm`). The format has no in-place write, so committing rebuilds the whole image and its final size can only be bounded, never predicted
+
+```
+Usage: squashfs <COMMAND>
+```
+
+### `squashfs plan`
+
+Report what the image occupies, what it may grow into, and how well it compressed — the numbers a size budget is chosen from. Writes nothing
+
+```
+Usage: plan <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+
+### `squashfs put`
+
+Copy a host file into the image, rebuilding it within a size budget
+
+```
+Usage: put [OPTIONS] <IMAGE> [HOST_FILE] [DST]
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<HOST_FILE>` — Host file to copy. Required when not using `--zero` or `--boot`
+- `<DST>` — Destination path inside the filesystem (cp-like positional). A literal `/` in the name is written `\/`; on HFS / HFS+ a `:`-separated path also works (so `/` is plain data)
+
+**Options**
+
+- `-L` / `--literal` — Accepted for consistency with `ls`/`get`/`rm`; `put` always treats the destination as an exact literal path (it never globs), so glob metacharacters in a name are used verbatim with or without it
+- `--zero` — Pre-allocate N zero bytes instead of copying a host file. Pair with `--dst`
+- `--dst` — Explicit destination flag; use this with `--zero` where the positional `DST` slot is awkward
+- `--boot` — Write the 1024-byte boot-block region of the image verbatim. HFS-only today
+- `--boot-from` — Copy the 1024-byte boot-block region from a donor disk that already boots (`path` or `path@N`), instead of from a raw file. The donor's classic-HFS volume is auto-located (flat `.hfv`/`.dsk` at byte 0, or an `Apple_HFS` partition) and its `'LK'` signature validated. The region is written to the *target partition's* first sector, so this works on a flat HFV and on the HFS partition of a full (APM) disk alike — target the HFS partition with `IMG@N` (the DDR / partition map / drivers ahead of it are never touched). Use it to make a bare HFS volume (e.g. an edited infinite-mac disk) bootable. HFS-only today
+- `--type` — 4-character type code (HFS / HFS+ / ProDOS). Falls back to `[put] type` from the config file, then — on HFS / HFS+ / MFS — to the file extension (same list as the GUI's type/creator picker), and finally to `BINA` for names the list doesn't recognize
+- `--creator` — 4-character creator code (HFS / HFS+ only). Falls back to `[put] creator` from the config file, then to the file extension, and finally to `????`
+- `--force` — Overwrite an existing entry at the destination path
+- `--mode` — Unix permission bits for the new file, as octal (e.g. `755`, `0644`). Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS); ignored on FAT / HFS / exFAT, which have no such concept
+- `--uid` — Owner UID for the new file. Unix filesystems only
+- `--gid` — Owning GID for the new file. Unix filesystems only. Same precedence as `--uid`
+- `--print-offset` — After writing the file, also print the same JSON envelope `locate` would have produced — absolute byte offset, length, fragmented flag. One-shot for build scripts that need to patch disk offsets immediately after placing a payload. HFS-only, matches the locate verb's scope; ignored (with a warning) for the `--zero` and `--boot` shapes since there's no host file to describe
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+- `--size` — Ceiling on the rebuilt image, e.g. `512M`. `fit` accepts whatever the rebuild produces. Omitted, the container decides: a bare `.squashfs` grows freely, a partition-hosted image may not outgrow its partition
+- `--grow` — Allow the rebuilt image to exceed its *current* size by at most this much, e.g. `64M`. Resolved against the image once it is opened
+
+### `squashfs rm`
+
+Delete a path from the image, rebuilding it within a size budget
+
+```
+Usage: rm [OPTIONS] <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N` for the 1-based partition index)
+- `<PATH>` — Path or glob pattern inside the filesystem. Patterns containing `*`, `?`, `[`, or `{` walk the volume and delete every match. Pass `--literal` to delete a single path verbatim when its name contains those characters. A literal `/` in a name is written `\/` (or use a `:`-separated path on HFS / HFS+, which also forces literal)
+
+**Options**
+
+- `-r` / `--recursive` — Recursively delete directories (matches will include directories without this flag, but they get rejected unless --recursive)
+- `--exclude` — Exclude paths matching this glob from deletion. Repeatable. Exclude always wins over the positional pattern
+- `-L` / `--literal` — Treat the path as an exact, literal path: never interpret `*`, `?`, `[`, `]`, `{`, `}` as glob metacharacters. Use for names that contain those characters. Conflicts with `--exclude`
+- `--ignore-case` — Match case-insensitively regardless of the target's native rule
+- `--case-sensitive` — Match case-sensitively regardless of the target's native rule
+- `--fs-type` — Force a specific filesystem dispatch. The main use is `cpm:<preset>` for CP/M images (which have no on-disk signature). Valid CP/M presets: `amstrad_data`, `amstrad_sys`, `amstrad_pcw`, `einstein`, `svi328_cpm`, `altair_8in`, `altair_cf`, `multicomp`, `zxplus3`. Other strings (e.g. `human68k`, `qdos`) are also accepted and forwarded to the partition_type_string dispatch
+- `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
+- `--size` — Ceiling on the rebuilt image, e.g. `512M`. `fit` accepts whatever the rebuild produces. Omitted, the container decides: a bare `.squashfs` grows freely, a partition-hosted image may not outgrow its partition
+- `--grow` — Allow the rebuilt image to exceed its *current* size by at most this much, e.g. `64M`. Resolved against the image once it is opened
+
 ### `tar`
 
 Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case

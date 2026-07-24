@@ -154,6 +154,16 @@ fn parse_octal_mode(s: &str) -> Result<u32, String> {
 }
 
 pub fn run(args: PutArgs) -> Result<()> {
+    run_with_budget(args, None)
+}
+
+/// As [`run`], with a size ceiling for the filesystems that rebuild their whole
+/// image on commit (SquashFS). `rb-cli squashfs put` is the only caller that
+/// passes one; see [`super::squashfs`].
+pub fn run_with_budget(
+    args: PutArgs,
+    budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+) -> Result<()> {
     if let Some(bb_file) = args.boot {
         // Boot-block write: 1024 bytes at the *partition's* first
         // sector, not the image's. For raw superfloppies that's byte 0;
@@ -204,6 +214,7 @@ pub fn run(args: PutArgs) -> Result<()> {
         args.fs_override.fs_type.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
+    ctx.rebuild_budget = budget;
     log_stderr(&ctx.label);
     let mut fs = ctx
         .open_editable(file)

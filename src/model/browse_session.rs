@@ -40,6 +40,10 @@ pub struct BrowseSession {
     /// than they read (SquashFS rebuilds wholesale), which need to know where
     /// they must stop. `None` leaves them to assume the worst.
     pub partition_size: Option<u64>,
+    /// A size ceiling the user asked for before entering Edit Mode, for those
+    /// same whole-image-rewrite drivers. Set by the GUI's size-budget dialog;
+    /// `None` means no request, and the container still binds.
+    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
     /// Partition type byte (MBR-style).
     pub partition_type: u8,
     /// Partition type string for table types that carry one (APM, GPT GUID).
@@ -656,6 +660,7 @@ impl BrowseSession {
                 self.partition_offset,
                 fs::EditContext {
                     partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
                     ..Default::default()
                 },
                 self.partition_type,
@@ -674,6 +679,7 @@ impl BrowseSession {
                 self.partition_offset,
                 fs::EditContext {
                     partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
                     ..Default::default()
                 },
                 self.partition_type,
@@ -742,6 +748,7 @@ impl BrowseSession {
                 self.partition_offset,
                 fs::EditContext {
                     partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
                     ..Default::default()
                 },
                 self.partition_type,
@@ -791,6 +798,7 @@ impl BrowseSession {
                 self.partition_offset,
                 fs::EditContext {
                     partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
                     ..Default::default()
                 },
                 self.partition_type,
@@ -817,6 +825,7 @@ impl BrowseSession {
             fs::EditContext {
                 partition_len: self.partition_size,
                 whole_file_path: (self.partition_offset == 0).then_some(path.as_path()),
+                rebuild_budget: self.rebuild_budget,
             },
             self.partition_type,
             self.partition_type_string.as_deref(),

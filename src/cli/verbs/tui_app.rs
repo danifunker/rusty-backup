@@ -1649,6 +1649,10 @@ struct InfoView {
     xattrs: Vec<crate::fs::xattr::Xattr>,
     /// uid/gid -> name map from the image's own account files, if any.
     id_names: crate::fs::id_names::IdNameMap,
+    /// For a SquashFS volume viewed at its root: what the image occupies and
+    /// what it may grow into (`docs/squashfs_edit.md` §2.6 — the GUI budget
+    /// dialog's content, ASCII-only). `None` for anything else.
+    size_plan: Option<crate::fs::squashfs_edit::SizePlan>,
 }
 
 /// Which attribute the user is typing a new value for, from the info overlay.
@@ -2271,26 +2275,39 @@ impl CommanderState {
         // Read xattrs + the account maps through the pane's filesystem when it
         // has one (a host-folder pane has none; the overlay still shows size and
         // name).
-        let (xattrs, id_names) = match pane.session.clone() {
+        let (xattrs, id_names, size_plan) = match pane.session.clone() {
             Some(session) => with_stderr_suppressed(|| {
                 let mut fs = match session.open() {
                     Ok(fs) => fs,
-                    Err(_) => return (Vec::new(), Default::default()),
+                    Err(_) => return (Vec::new(), Default::default(), None),
                 };
                 let x = if fs.supports_xattrs() {
                     fs.list_xattrs(&entry).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
+                // Only for the volume root: measuring walks the whole directory
+                // tree, and "how big is this image" is a question about the
+                // volume, not about a file inside it.
+                let plan = if fs.fs_type() == "SquashFS" && entry.path == "/" {
+                    let image_len = crate::fs::squashfs_write::image_footprint(fs.total_size());
+                    let capacity = (session.partition_offset != 0)
+                        .then_some(session.partition_size)
+                        .flatten();
+                    crate::fs::squashfs_edit::plan_size(&mut *fs, image_len, capacity).ok()
+                } else {
+                    None
+                };
                 let names = crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs);
-                (x, names)
+                (x, names, plan)
             }),
-            None => (Vec::new(), Default::default()),
+            None => (Vec::new(), Default::default(), None),
         };
         self.info = Some(InfoView {
             entry,
             xattrs,
             id_names,
+            size_plan,
         });
     }
 
@@ -2330,6 +2347,30 @@ impl CommanderState {
             for x in &info.xattrs {
                 out.push(format!("  {} = {}", x.name, x.value_display()));
             }
+        }
+        if let Some(p) = &info.size_plan {
+            use crate::partition::format_size;
+            out.push(String::new());
+            out.push("SquashFS size budget:".to_string());
+            out.push(format!("  Image occupies {}", format_size(p.image_len)));
+            out.push(format!(
+                "  Content        {} uncompressed",
+                format_size(p.content_len)
+            ));
+            out.push(format!("  Compressed to  {}", p.describe_ratio()));
+            match (p.capacity, p.headroom) {
+                (Some(cap), Some(head)) => out.push(format!(
+                    "  Room available {} ({} unused)",
+                    format_size(cap),
+                    format_size(head)
+                )),
+                _ => {
+                    out.push("  Room available unbounded - this file is the filesystem".to_string())
+                }
+            }
+            // Saving an edit rebuilds the whole image, so the ceiling is the
+            // only thing that can be promised in advance.
+            out.push("  Set a ceiling with: rb-cli squashfs put|rm --size|--grow".to_string());
         }
         out
     }

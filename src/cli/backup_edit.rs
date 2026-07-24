@@ -324,6 +324,7 @@ fn partition_context(part: &PartitionMetadata, size: u64) -> PartitionContext {
         // The handle is a temp decompressed out of the backup archive, not a
         // file anyone may replace — the commit recompresses it back instead.
         whole_file_path: None,
+        rebuild_budget: None,
     }
 }
 

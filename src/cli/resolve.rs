@@ -51,6 +51,10 @@ pub struct PartitionContext {
     /// larger disk. Lets a driver that rewrites its whole image commit by
     /// atomic replacement. See [`crate::fs::EditContext::whole_file_path`].
     pub whole_file_path: Option<PathBuf>,
+    /// A size ceiling the user asked for, for the drivers that rewrite their
+    /// whole image. Set by the verbs that expose `--size` / `--grow`; `None`
+    /// everywhere else means "no request", and the container still binds.
+    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
 }
 
 impl PartitionContext {
@@ -79,6 +83,7 @@ impl PartitionContext {
                 // zero-length partition; pass "unknown" rather than "no room".
                 partition_len: (self.size > 0).then_some(self.size),
                 whole_file_path: self.whole_file_path.as_deref(),
+                rebuild_budget: self.rebuild_budget,
             },
             self.type_byte,
             self.type_string.as_deref(),
@@ -521,6 +526,7 @@ fn resolve_with_override<R: Read + Seek>(
                     // came from the image file or a decoded temp; the read-write
                     // resolver fills this in once it knows which branch it took.
                     whole_file_path: None,
+                    rebuild_budget: None,
                 });
             }
             return Err(anyhow!("detecting partition table: {e}"));
@@ -543,6 +549,7 @@ fn resolve_with_override<R: Read + Seek>(
             size: total,
             label: format!("Partition: raw filesystem @ byte 0 ({})", pt.type_name()),
             whole_file_path: None,
+            rebuild_budget: None,
         });
     }
 
@@ -569,6 +576,7 @@ fn resolve_with_override<R: Read + Seek>(
         size: info.size_bytes,
         label: format_label(&info, pt.type_name()),
         whole_file_path: None,
+        rebuild_budget: None,
     })
 }
 
