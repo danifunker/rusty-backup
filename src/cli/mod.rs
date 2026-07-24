@@ -145,6 +145,14 @@ pub enum Command {
     /// ProDOS file.
     Chmeta(verbs::chmeta::ChmetaArgs),
 
+    /// Read or edit a file's extended attributes (`list` / `set` / `rm`) —
+    /// the scriptable form of the GUI and TUI File Info panel. SquashFS
+    /// today; other xattr-bearing filesystems as their write side lands.
+    Xattr {
+        #[command(subcommand)]
+        cmd: verbs::xattr::XattrCommand,
+    },
+
     /// Write the resource fork of an existing HFS / HFS+ / MFS file from a
     /// host file.
     Setrsrc(verbs::setrsrc::SetRsrcArgs),
@@ -426,6 +434,7 @@ pub fn dispatch(command: Command) -> Result<()> {
         Command::Shrink(args) => verbs::shrink::run(args),
         Command::Bless { cmd } => verbs::bless::run(cmd),
         Command::Chmeta(args) => verbs::chmeta::run(args),
+        Command::Xattr { cmd } => verbs::xattr::run(cmd),
         Command::Setrsrc(args) => verbs::setrsrc::run(args),
         Command::Setvolname(args) => verbs::setvolname::run(args),
         Command::Reformat(args) => verbs::reformat::run(args),

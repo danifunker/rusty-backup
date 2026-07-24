@@ -1287,6 +1287,49 @@ mod tests {
         cur.into_inner()
     }
 
+    /// The reader parses the xattr table (a rebuild depends on it) but for a
+    /// long time never surfaced it through `Filesystem`, so anything looking at
+    /// a *browsed* image — the GUI File Info panel, `rb-cli xattr list` — was
+    /// told SquashFS has no extended attributes at all. Backwards for the one
+    /// filesystem whose appliance images lean on `security.capability`.
+    #[test]
+    fn the_read_only_filesystem_surfaces_xattrs_through_the_trait() {
+        let img = build(BuildOptions::default());
+        let mut fs = SquashfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        assert!(
+            fs.supports_xattrs(),
+            "the reader parses xattrs; it must say so"
+        );
+        let root = fs.root().expect("root");
+        let sub = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "sub")
+            .expect("sub");
+        let capped = fs
+            .list_directory(&sub)
+            .expect("list sub")
+            .into_iter()
+            .find(|e| e.name == "capped")
+            .expect("fixture has a file carrying an xattr");
+        let attrs = fs.list_xattrs(&capped).expect("list_xattrs");
+        assert_eq!(
+            attrs.len(),
+            1,
+            "expected the fixture's one xattr, got {attrs:?}"
+        );
+        assert_eq!(attrs[0].name, "security.capability");
+        // A file with none answers empty rather than erroring.
+        let hello = fs
+            .list_directory(&root)
+            .expect("list")
+            .into_iter()
+            .find(|e| e.name == "hello.txt")
+            .expect("hello.txt");
+        assert!(fs.list_xattrs(&hello).expect("list_xattrs").is_empty());
+    }
+
     /// Round-trip through **our own** reader: every field we wrote comes back.
     #[test]
     fn round_trips_through_our_reader() {

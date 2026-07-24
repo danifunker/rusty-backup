@@ -103,13 +103,19 @@ on other filesystems:
   **squashfs only**. Should also cover **ext** and **XFS** (the other
   xattr-capable filesystems). Minix and EFS have no xattr concept — leave them
   returning `Unsupported`, which correctly hides the UI section.
+  The xattr side now has a CLI surface too (`rb-cli xattr list|set|rm`), which
+  is how the read-only reader's missing `supports_xattrs` / `list_xattrs`
+  override came to light — a *browsed* SquashFS reported no xattrs at all, so
+  the GUI File Info panel had been hiding them outside edit mode.
 - **HFS+ is a special case worth a look.** It has real xattr storage, but via
   *inherent* CNID-keyed methods (`hfsplus.rs:1206`, `:4144`, `:4168`) — not the
   new `FileEntry`-keyed trait methods. So HFS+ xattrs exist and the new UI won't
   show them. A thin entry→CNID adapter would surface them.
 - **The UI was compile-verified, not driven.** Nobody has clicked through the
   Inspect rows or keyed the TUI overlay (`v` / F3, then `m`/`o`/`x`). Worth a
-  real run.
+  real run — and the reader bug above is exactly the kind of thing that survives
+  a compile-only check, so treat the permissions and owner rows with the same
+  suspicion until someone has actually driven them.
 
 ### D. Phase 2-opt — deferred, but the memory ceiling is real
 

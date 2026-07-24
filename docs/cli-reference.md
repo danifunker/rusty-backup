@@ -1725,3 +1725,57 @@ Usage: write [OPTIONS] <IMAGE> <DEVICE>
 - `--yes` — Required confirmation. Skips the prompt but never the safety summary printed on stderr
 - `--write-to-system-disk` — Allow writing to the system boot disk (refused by default)
 
+### `xattr`
+
+Read or edit a file's extended attributes (`list` / `set` / `rm`) — the scriptable form of the GUI and TUI File Info panel. SquashFS today; other xattr-bearing filesystems as their write side lands
+
+```
+Usage: xattr <COMMAND>
+```
+
+### `xattr list`
+
+List the extended attributes on a file
+
+```
+Usage: list <IMAGE> <PATH>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute path of the file inside the filesystem
+
+### `xattr rm`
+
+Remove one extended attribute
+
+```
+Usage: rm <IMAGE> <PATH> <NAME>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute path of the file inside the filesystem
+- `<NAME>` — Fully-qualified attribute name to remove
+
+### `xattr set`
+
+Set (or replace) one extended attribute
+
+```
+Usage: set [OPTIONS] <IMAGE> <PATH> <NAME> [VALUE]
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
+- `<PATH>` — Absolute path of the file inside the filesystem
+- `<NAME>` — Fully-qualified attribute name, including its namespace prefix — `user.` / `trusted.` / `security.` / `system.` (e.g. `security.capability`). A name without one cannot be stored and is refused
+- `<VALUE>` — Attribute value. A `0x`-prefixed string is decoded as raw hex bytes (what a capability struct needs); anything else is stored as its UTF-8 bytes. Mutually exclusive with `--value-file`
+
+**Options**
+
+- `--value-file` — Read the value verbatim from a host file instead, for a binary value too awkward to hex-encode on a command line
+

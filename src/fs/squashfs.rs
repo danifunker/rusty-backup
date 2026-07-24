@@ -657,9 +657,8 @@ impl<R: Read + Seek> SquashfsFilesystem<R> {
     /// Read the extended attributes an inode's `xattr_idx` points at. Returns
     /// an empty list for inodes with none, which is the overwhelming majority.
     ///
-    /// Exercised today by `reads_xattrs_from_a_real_image`; its production
-    /// callers are the rebuild (phase 1) and the browse view (phase 2).
-    #[allow(dead_code)]
+    /// Reached from the rebuild (phase 1), the browse view (phase 2), and the
+    /// `Filesystem::list_xattrs` impl below.
     fn read_xattrs(&mut self, idx: u32) -> Result<Vec<Xattr>, FilesystemError> {
         if idx == SQUASHFS_INVALID_XATTR {
             return Ok(Vec::new());
@@ -1222,6 +1221,22 @@ impl<R: Read + Seek + Send> Filesystem for SquashfsFilesystem<R> {
     fn volume_label(&self) -> Option<&str> {
         // SquashFS has no volume label field.
         None
+    }
+
+    fn supports_xattrs(&self) -> bool {
+        true
+    }
+
+    /// The read side of what [`Self::read_build_tree`] already collects.
+    ///
+    /// The reader has parsed the xattr table since phase 0 — a rebuild depends
+    /// on it — but never surfaced it through the trait, so anything looking at
+    /// a *browsed* (rather than edited) image was told SquashFS has no
+    /// extended attributes at all. That is exactly backwards for the one
+    /// filesystem whose appliance images lean on `security.capability`.
+    fn list_xattrs(&mut self, entry: &FileEntry) -> Result<Vec<Xattr>, FilesystemError> {
+        let inode = self.read_inode(entry.location)?;
+        self.read_xattrs(inode.xattr_idx)
     }
 
     fn fs_type(&self) -> &str {

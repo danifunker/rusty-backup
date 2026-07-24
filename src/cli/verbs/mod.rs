@@ -61,3 +61,4 @@ pub mod tui_app;
 pub mod untar;
 pub mod update;
 pub mod write;
+pub mod xattr;
