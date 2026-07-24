@@ -338,6 +338,15 @@ impl<RW: Read + Write + Seek> SquashfsEditor<RW> {
         }
     }
 
+    /// Consume the editor and return the handle it wrote through.
+    ///
+    /// The counterpart of [`SquashfsFilesystem::into_inner`], for a caller that
+    /// wrapped the handle itself — an AppImage's payload window, say — and
+    /// wants it back to inspect what landed.
+    pub fn into_backing(self) -> RW {
+        self.rw
+    }
+
     /// The size the image occupied when it was opened — the anchor `--grow N`
     /// and the projection are both measured from.
     pub fn source_len(&self) -> u64 {

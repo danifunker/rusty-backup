@@ -307,7 +307,7 @@ fn apply_batch(
 
     // Apply for real on a read-write handle (decoding a CHD / container as
     // needed; commit flattens / re-encodes on success).
-    let (mut file, commit) = crate::cli::resolve::resolve_image_rw(image)?;
+    let (mut file, commit, _shape) = crate::cli::resolve::resolve_image_rw(image)?;
     let mut log_cb = |s: &str| log_stderr(format!("  {s}"));
     apply_edits(&mut file, &table, &edits, disk_size, &mut log_cb)
         .map_err(|e| anyhow::anyhow!("apply_edits: {e}"))?;

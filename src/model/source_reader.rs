@@ -942,7 +942,20 @@ fn open_read_dispatch(
     password: Option<&[u8]>,
     inside: Option<&str>,
 ) -> Result<Box<dyn ReadSeek>> {
-    if is_chd_path(path) {
+    if crate::rbformats::appimage::is_squashfs_appimage(path) {
+        // An AppImage is an ELF stub with a SquashFS appended, so there is
+        // nothing to decode — present the payload as a window whose byte 0 is
+        // the filesystem, and every layer above treats it as a bare image.
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut probe = file
+            .try_clone()
+            .with_context(|| format!("open {}", path.display()))?;
+        let offset = crate::rbformats::appimage::squashfs_payload_offset(&mut probe)
+            .ok_or_else(|| anyhow::anyhow!("no SquashFS payload in AppImage {}", path.display()))?;
+        Ok(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::tail(file, offset),
+        ))
+    } else if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
     } else if crate::rbformats::cbk::is_cbk(path) {
@@ -1382,7 +1395,8 @@ pub fn is_editable_container_path(path: &Path) -> bool {
 /// "what counts as a container" list lives in one place instead of being
 /// re-listed (and drifting) at every call site.
 pub fn is_container_path(path: &Path) -> bool {
-    is_chd_path(path)
+    crate::rbformats::appimage::is_squashfs_appimage(path)
+        || is_chd_path(path)
         || crate::rbformats::cbk::is_cbk(path)
         || is_gho_path(path)
         || is_imz_path(path)

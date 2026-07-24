@@ -29,6 +29,11 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     // A bare SquashFS root (Buildroot and other appliance images ship one
     // alongside the disk image); opens as a superfloppy via its `hsqs` magic.
     "squashfs",
+    // An AppImage is an ELF stub with a SquashFS appended; the payload opens
+    // in place. Listed in both cases because the tooling ships them
+    // capitalised and the picker matches literally.
+    "appimage",
+    "AppImage",
     "bin",
     "iso",
     "dd",
@@ -458,6 +463,15 @@ mod tests {
             DISK_IMAGE_EXTS.contains(&"squashfs"),
             "missing squashfs disk-image extension"
         );
+        // An AppImage's payload is a SquashFS the engine opens in place
+        // (src/rbformats/appimage.rs). Both cases, because the tooling ships
+        // them capitalised and the picker matches literally.
+        for ext in ["appimage", "AppImage"] {
+            assert!(
+                DISK_IMAGE_EXTS.contains(&ext),
+                "missing {ext} disk-image extension"
+            );
+        }
     }
 
     #[test]

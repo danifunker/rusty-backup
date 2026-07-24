@@ -62,7 +62,7 @@ pub fn run(args: MacScsiBlessArgs) -> Result<()> {
 
     // Open the target read-write (decoding a CHD / container as needed; commit
     // flattens / re-encodes on success).
-    let (mut f, commit) = crate::cli::resolve::resolve_image_rw(&args.image)?;
+    let (mut f, commit, _shape) = crate::cli::resolve::resolve_image_rw(&args.image)?;
     let disk_len = f.seek(SeekFrom::End(0))?;
     f.rewind()?;
 
