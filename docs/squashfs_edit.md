@@ -179,7 +179,7 @@ work by fragment when planning reuse.
 | **2d** | Partition-hosted images + the §2 size-budget prompt; in-place commit (temp + size check + atomic rename); xattr-inheritance-on-replace. | **next** |
 | **2-opt** | Lazy `FileContent::Source` streaming + verbatim block reuse. Not needed for correctness; bounds rebuild memory and cost. | deferred |
 | **3** | ISO 9660 and AppImage containers. | **done** — AppImage browse+edit, ISO browse+extract |
-| **4** | `rb-cli new volume squashfs` (create blank) and a structural verifier (§6 of the audit: there is no repair to be had). | |
+| **4** | `rb-cli squashfs create` (from a host dir) and `squashfs verify` (structural; §6 of the audit — no repair to be had). | **done** (`b4e2cbb`) |
 
 ---
 

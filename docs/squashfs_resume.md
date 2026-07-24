@@ -12,10 +12,11 @@ decision live in [`squashfs_edit.md`](squashfs_edit.md); this file is the
 
 > Continue the SquashFS work on branch `edit-squashfs`. Read
 > `docs/squashfs_resume.md` for state and `docs/squashfs_edit.md` for the plan
-> and decisions D1–D6. **Phases 0 through 3 are done** and oracle-validated
-> against real `squashfs-tools`, so pick up at **phase 4 (`rb-cli new volume
-> squashfs` + a structural verifier)** — or 2-opt first if a big image's rebuild
-> memory is biting.
+> and decisions D1–D6. **Phases 0 through 4 are done** and oracle-validated
+> against real `squashfs-tools`. The only remaining plan item is **2-opt** (lazy
+> streaming + verbatim block reuse) — a deferred *optimization*, not a
+> correctness gap; start there only if a big image's rebuild memory is biting,
+> and read section D first for its true (multi-layer, corruption-risk) shape.
 > Per-slice commits. Every commit must keep `cargo build --all-targets` at zero
 > warnings, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --lib`
 > green, and the Rust 1.73 vintage build compiling (see CONTRIBUTING.md
@@ -81,8 +82,8 @@ contradicting the README. Rewritten to read + edit.
    captures before the delete, `CreateFileOptions::xattrs` carries them to the
    replacement; used by `put --force` and tar-import overwrite.
 
-**Phases 2d and 3 are complete.** Next is phase 4 (create + verify) or 2-opt
-(lazy streaming / block reuse) — see below.
+**Phases 0 through 4 are complete.** The only remaining plan item is 2-opt
+(lazy streaming / block reuse) — a deferred *optimization*, section D below.
 
 ### C. Attribute-editing breadth (spun out of the GUI work; not in the original plan)
 
@@ -117,17 +118,36 @@ on other filesystems:
   a compile-only check, so treat the permissions and owner rows with the same
   suspicion until someone has actually driven them.
 
-### D. Phase 2-opt — deferred, but the memory ceiling is real
+### D. Phase 2-opt — deferred, but the memory ceiling is real (the ONLY item left)
 
-Lazy `FileContent::Source` streaming + verbatim block reuse. Today
-`read_build_tree` reads every file eagerly into `FileContent::Bytes`, so a
-whole-image rebuild peaks at the decompressed image — **~1.5 GB for the 558 MB
-Ubuntu rootfs**. Fine for AppImages and appliance images; not fine as routine.
-Block reuse (copying an unchanged file's already-compressed blocks instead of
-decompress→recompress) is what makes rebuild cost scale with the *edit* rather
-than the image, and it slots in behind the existing `FileContent` seam without
-changing signatures. Watch out: a tail sharing a **fragment** with other files
-can't be copied verbatim in isolation — group reuse by fragment.
+Everything else in this plan has shipped; this is the sole remaining piece, and
+it is an **optimization, not a correctness gap**. It is bigger and riskier than
+the one-liner "slots in behind the `FileContent` seam" suggests — it is really
+*three* changes, and the last carries silent-corruption risk, which is why it
+was not tacked onto the end of the phase-4 session:
+
+1. **Lazy input** (`FileContent::Source`). `read_build_tree` reads every file
+   eagerly into `FileContent::Bytes`, so the tree alone peaks at the whole
+   decompressed image (**~1.5 GB for the 558 MB Ubuntu rootfs**). A `Source`
+   variant would keep the source `SquashfsFilesystem` open and stream each
+   unchanged file at write time — but the editor currently `into_inner`s the
+   reader, so this means the editor holding the source (Arc<Mutex<…>>) for its
+   whole lifetime and the tree referencing back into it.
+2. **Output streaming.** `sync_metadata` builds into a RAM `Cursor` (so the
+   original is safe until the rebuild succeeds). Even with lazy input, that
+   output buffer is the whole *compressed* image (~558 MB). Writing
+   `write_squashfs` straight to the sibling temp `commit_by_replacing` already
+   uses — then stat + budget-check + rename — removes it while keeping the
+   "original untouched until success" guarantee. This half is clean and safe on
+   its own; if you only do one, do this.
+3. **Verbatim block reuse** (the risky one). Copy an unchanged file's
+   already-compressed blocks byte-for-byte instead of decompress→recompress.
+   Makes cost scale with the *edit*, and makes the §2.5 projection exact. Watch
+   out: a tail sharing a **fragment** with other files
+   can't be copied verbatim in isolation — a fragment is shared, so it may be
+   copied only when *every* file whose tail lands in it is unchanged. Group
+   reuse by fragment; get this wrong and you get a valid-looking image with
+   wrong file contents, which no verifier can catch (no checksums).
 
 ### E. Phase 3 — containers — **DONE** (`ddef88a` AppImage, `73ca347` ISO)
 
@@ -155,14 +175,18 @@ needs a capacity signal that fights the `offset==0 → grow freely` shortcut in
 the squashfs dispatch arm (`fs/mod.rs`); deferred as marginal since growth is
 impossible and extract-then-rebuild is the real workflow.
 
-### F. Phase 4 — create + verify
+### F. Phase 4 — create + verify — **DONE** (`b4e2cbb`)
 
-- `rb-cli new volume squashfs` — `BuildNode::from_host_dir` already does the
-  tree-building half, so this is mostly CLI wiring.
-- A structural verifier ("does every metadata block, inode, dirent and data
-  block decompress and cross-reference"). Note this is **not** an fsck: SquashFS
-  carries no checksums, so corruption shows up as a decompression failure and
-  there is nothing to repair *from*.
+Both under the `squashfs` verb group (the honest home — create is `mksquashfs
+DIR IMG`, not a sized-empty `new volume`):
+
+- `rb-cli squashfs create DIR IMG` (gzip / XZ / zstd, `--block-size`) — writes to
+  a sibling temp + rename; images accepted by `unsquashfs`.
+- `rb-cli squashfs verify` (`src/fs/squashfs_verify.rs`) — a full traversal that
+  decompresses every metadata block, inode, dirent and data block and
+  cross-references them. **Not** an fsck: no checksums, so it catches broken
+  *structure* (decompression / reference failures), not altered bytes in a
+  stored block — and the test says so rather than pretending otherwise.
 
 ### G. LZO — optional, currently refused for both read and write
 
