@@ -47,6 +47,36 @@ pub struct PartitionContext {
     pub label: String,
 }
 
+impl PartitionContext {
+    /// Open this partition's filesystem for editing.
+    ///
+    /// Every mutating verb goes through here rather than calling
+    /// [`crate::fs::open_editable_filesystem`] itself, so they all pass the
+    /// partition's **length** as well as its offset. Most drivers do not care
+    /// — they write inside a structure they read from the partition. SquashFS
+    /// does: it rebuilds the whole image, so without a declared length it has
+    /// no way to know that growing would run into the next partition.
+    /// Errors are returned raw so each verb keeps its own wording ("for write",
+    /// "for repair", "destination filesystem …").
+    pub fn open_editable<R: Read + std::io::Write + Seek + Send + 'static>(
+        &self,
+        handle: R,
+    ) -> std::result::Result<
+        Box<dyn crate::fs::EditableFilesystem>,
+        crate::fs::filesystem::FilesystemError,
+    > {
+        crate::fs::open_editable_filesystem_within(
+            handle,
+            self.offset,
+            // A zero size means the resolver had nothing to report, not a
+            // zero-length partition; pass "unknown" rather than "no room".
+            (self.size > 0).then_some(self.size),
+            self.type_byte,
+            self.type_string.as_deref(),
+        )
+    }
+}
+
 /// Open `path` read-only and resolve which partition to use.
 ///
 /// - When `selector` is `None` and the image has no partition table,

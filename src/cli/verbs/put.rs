@@ -205,13 +205,9 @@ pub fn run(args: PutArgs) -> Result<()> {
     )?;
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     // Resolve parent + leaf with the shared escape / colon grammar so a file
     // whose name contains a literal `/` can be written.

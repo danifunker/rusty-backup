@@ -47,13 +47,9 @@ pub fn run(args: MkdirArgs) -> Result<()> {
 
     let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     // Resolve parent + leaf with the shared escape / colon grammar so a new
     // directory whose name contains a literal `/` can be created.

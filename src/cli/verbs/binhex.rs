@@ -91,13 +91,9 @@ pub fn run_put(args: PutBinHexArgs) -> Result<()> {
 
     let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     // `--dst-dir` is the destination *directory* (the filename comes from the
     // BinHex header), resolved with the shared escape / colon grammar so a

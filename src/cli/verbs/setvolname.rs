@@ -23,13 +23,9 @@ pub struct SetVolNameArgs {
 pub fn run(args: SetVolNameArgs) -> Result<()> {
     let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     fs.set_volume_name(&args.name)
         .map_err(|e| anyhow!("set_volume_name: {e}"))?;

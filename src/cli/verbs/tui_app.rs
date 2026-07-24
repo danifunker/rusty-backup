@@ -9658,13 +9658,9 @@ fn apply_metadata_edit(
     };
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &dst)?;
     fs.set_type_creator(&entry, type_code, creator)
         .map_err(|e| anyhow::anyhow!("set type/creator: {e}"))?;
@@ -9690,13 +9686,9 @@ fn apply_repair(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut efs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for repair: {e}"))?;
+    let mut efs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for repair: {e}"))?;
     let report = efs.repair().map_err(|e| anyhow::anyhow!("repair: {e}"))?;
     efs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
@@ -9821,13 +9813,9 @@ fn apply_bless_folder(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), dir_path)?;
     if !entry.is_directory() {
         anyhow::bail!("{dir_path} is not a directory");
@@ -9852,13 +9840,9 @@ fn apply_mkdir(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -9889,13 +9873,9 @@ fn apply_delete(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -9940,13 +9920,9 @@ fn import_host_file(
 
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
 
     let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     if !parent.is_directory() {

@@ -35,6 +35,11 @@ pub struct BrowseSession {
     pub source_path: Option<PathBuf>,
     /// Byte offset into the source where this partition starts.
     pub partition_offset: u64,
+    /// Length of the partition in bytes, when known. Only consulted for
+    /// editing, and only by drivers that can emit an image of a different size
+    /// than they read (SquashFS rebuilds wholesale), which need to know where
+    /// they must stop. `None` leaves them to assume the worst.
+    pub partition_size: Option<u64>,
     /// Partition type byte (MBR-style).
     pub partition_type: u8,
     /// Partition type string for table types that carry one (APM, GPT GUID).
@@ -646,9 +651,10 @@ impl BrowseSession {
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
                 .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_within(
                 reader,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -660,9 +666,10 @@ impl BrowseSession {
         // is opened.
         if let Some(arc) = &self.chd_edit_session {
             let handle = ChdEditHandle::from_arc(Arc::clone(arc));
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_within(
                 handle,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -724,9 +731,10 @@ impl BrowseSession {
                 .write(true)
                 .open(session.flat_path())
                 .map_err(FilesystemError::Io)?;
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_within(
                 file,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -769,9 +777,10 @@ impl BrowseSession {
                     reader.snapshot_count()
                 )));
             }
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_within(
                 reader,
                 self.partition_offset,
+                self.partition_size,
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -784,9 +793,10 @@ impl BrowseSession {
             .open(path)
             .map_err(FilesystemError::Io)?;
 
-        let fs = fs::open_editable_filesystem(
+        let fs = fs::open_editable_filesystem_within(
             file,
             self.partition_offset,
+            self.partition_size,
             self.partition_type,
             self.partition_type_string.as_deref(),
         )?;
