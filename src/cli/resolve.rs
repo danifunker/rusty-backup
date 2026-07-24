@@ -359,6 +359,22 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, 
             HandleShape::Wrapped,
         ));
     }
+    if source_reader::is_squashfs_bearing_iso(path) {
+        // A SquashFS inside an ISO 9660 is a contiguous file wedged between
+        // other files on the disc, so it cannot grow — and a SquashFS edit is a
+        // whole-image rebuild whose size can't be promised in advance. Rather
+        // than offer an edit that would refuse the moment a rebuild came out
+        // even slightly larger, decline it up front and point at the paths that
+        // do work. (Browse and extract are unaffected — they go through the
+        // read path.)
+        bail!(
+            "{} holds a SquashFS inside an ISO 9660, which can be browsed and \
+             extracted but not edited in place: it cannot grow, since other \
+             files sit after it on the disc. Extract it (`rb-cli tar` / `get`) \
+             and rebuild the ISO, or edit the AppImage form, which can grow.",
+            path.display()
+        );
+    }
     if let Some((handle, commit)) = try_open_chd_rw(path)? {
         return Ok((handle, commit, HandleShape::Wrapped));
     }

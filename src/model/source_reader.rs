@@ -955,6 +955,14 @@ fn open_read_dispatch(
         Ok(Box::new(
             crate::rbformats::payload_slice::PayloadSlice::tail(file, offset),
         ))
+    } else if let Some((offset, len)) = squashfs_bearing_iso_payload(path) {
+        // A live CD's `casper/filesystem.squashfs`: a contiguous file inside a
+        // plain ISO, presented as a bounded window at its extent. Bounded, not
+        // tail, because the payload sits between other files on the disc.
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        Ok(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::bounded(file, offset, len),
+        ))
     } else if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
@@ -1394,8 +1402,33 @@ pub fn is_editable_container_path(path: &Path) -> bool {
 /// to route through `open_read` instead of opening the file raw, so the
 /// "what counts as a container" list lives in one place instead of being
 /// re-listed (and drifting) at every call site.
+/// The SquashFS payload inside a plain ISO as `(offset, len)`, or `None`.
+/// Always `None` in a build without the `optical` feature (which cannot read
+/// ISOs at all), so callers need no `#[cfg]` of their own. A plain tuple rather
+/// than the `optical`-gated `IsoSquashfs` type, so this signature is the same in
+/// both builds.
+fn squashfs_bearing_iso_payload(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(feature = "optical")]
+    {
+        crate::rbformats::iso_squashfs::find_squashfs(path).map(|i| (i.offset, i.len))
+    }
+    #[cfg(not(feature = "optical"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether `path` is a plain ISO carrying a SquashFS payload — browsable and
+/// extractable, but (unlike an AppImage) not editable in place, since the
+/// payload cannot grow. The edit resolvers use this to refuse cleanly.
+pub fn is_squashfs_bearing_iso(path: &Path) -> bool {
+    squashfs_bearing_iso_payload(path).is_some()
+}
+
 pub fn is_container_path(path: &Path) -> bool {
     crate::rbformats::appimage::is_squashfs_appimage(path)
+        || squashfs_bearing_iso_payload(path).is_some()
         || is_chd_path(path)
         || crate::rbformats::cbk::is_cbk(path)
         || is_gho_path(path)

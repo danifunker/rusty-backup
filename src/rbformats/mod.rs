@@ -180,6 +180,7 @@ pub mod gz_index;
 pub mod gzip;
 pub mod imz;
 pub mod interleave;
+pub mod iso_squashfs;
 pub mod lz4;
 pub mod lzhuf;
 pub mod moof;
