@@ -12,9 +12,10 @@ decision live in [`squashfs_edit.md`](squashfs_edit.md); this file is the
 
 > Continue the SquashFS work on branch `edit-squashfs`. Read
 > `docs/squashfs_resume.md` for state and `docs/squashfs_edit.md` for the plan
-> and decisions D1–D6. **Phases 0 through 2d are done** and oracle-validated
-> against real `squashfs-tools`, so pick up at **phase 3 (ISO 9660 / AppImage
-> containers)** — or 2-opt first if a big image's rebuild memory is biting.
+> and decisions D1–D6. **Phases 0 through 3 are done** and oracle-validated
+> against real `squashfs-tools`, so pick up at **phase 4 (`rb-cli new volume
+> squashfs` + a structural verifier)** — or 2-opt first if a big image's rebuild
+> memory is biting.
 > Per-slice commits. Every commit must keep `cargo build --all-targets` at zero
 > warnings, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --lib`
 > green, and the Rust 1.73 vintage build compiling (see CONTRIBUTING.md
@@ -80,8 +81,8 @@ contradicting the README. Rewritten to read + edit.
    captures before the delete, `CreateFileOptions::xattrs` carries them to the
    replacement; used by `put --force` and tar-import overwrite.
 
-**Phase 2d is complete.** Next is phase 3 (containers) or 2-opt (lazy
-streaming / block reuse) — see below.
+**Phases 2d and 3 are complete.** Next is phase 4 (create + verify) or 2-opt
+(lazy streaming / block reuse) — see below.
 
 ### C. Attribute-editing breadth (spun out of the GUI work; not in the original plan)
 
@@ -128,11 +129,31 @@ than the image, and it slots in behind the existing `FileContent` seam without
 changing signatures. Watch out: a tail sharing a **fragment** with other files
 can't be copied verbatim in isolation — group reuse by fragment.
 
-### E. Phase 3 — containers
+### E. Phase 3 — containers — **DONE** (`ddef88a` AppImage, `73ca347` ISO)
 
-SquashFS inside **ISO 9660** (`casper/filesystem.squashfs` on every live CD) and
-**AppImage** (ELF stub + appended filesystem — the squashfs is the tail, so it
-can grow). Both need the size budget from 2d first.
+Both landed on `src/rbformats/payload_slice.rs`, a read/write window whose byte
+0 is the payload, so every layer above stays unaware of the wrapper. Two shapes:
+a **tail** (AppImage — the appended squashfs may grow the file) and a
+**bounded** window (ISO — the payload sits between other files and cannot grow).
+
+- **AppImage** (`src/rbformats/appimage.rs`): full browse + edit. Detected by the
+  `AI\x02` ELF marker; payload offset = `e_shoff + e_shentsize*e_shnum`,
+  *verified* by a superblock parse. Type-1 (ISO payload) recognised, not opened.
+- **ISO 9660** (`src/rbformats/iso_squashfs.rs`, `optical`-gated): browse +
+  extract only. Locator enumerates the disc via opticaldiscs (Rock Ridge names)
+  and picks the file whose extent begins with a squashfs superblock; plain `.iso`
+  only (offset = LBA*2048). Edit refused up front — the payload can't grow.
+
+Gotcha this shook out (`resolve_image_rw` now returns a `HandleShape`): a payload
+window is `RwCommit::None` just like a raw file, and the resolver had inferred
+"whole file → atomic-rename-replace" from that — which replaced an entire
+AppImage with only its payload, deleting the ELF stub. The shape is now stated,
+not inferred.
+
+**Follow-up if wanted:** ISO edit *is* achievable (shrink-or-equal only) but
+needs a capacity signal that fights the `offset==0 → grow freely` shortcut in
+the squashfs dispatch arm (`fs/mod.rs`); deferred as marginal since growth is
+impossible and extract-then-rebuild is the real workflow.
 
 ### F. Phase 4 — create + verify
 

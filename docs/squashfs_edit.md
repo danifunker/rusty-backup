@@ -65,8 +65,8 @@ The right default is a property of where the image lives:
 |---|---|---|
 | Bare `.squashfs` file (superfloppy) | Freely — the file *is* the FS | `fit` |
 | Partition in a disk image | Only into free space after it | the partition's current size |
-| Inside ISO 9660 (live CDs) | Not practically | *phase 3* |
-| AppImage (ELF stub + appended FS) | Yes, it is the tail | *phase 3* |
+| Inside ISO 9660 (live CDs) | Not practically | browse + extract (`73ca347`); edit refused |
+| AppImage (ELF stub + appended FS) | Yes, it is the tail | browse + edit (`ddef88a`) |
 
 For a partition, defaulting to "must still fit where it is" means the common
 case (replace a config file, delete something) never prompts for a decision the
@@ -178,7 +178,7 @@ work by fragment when planning reuse.
 | **2c** | `EditableFilesystem` over bare `.squashfs`: create/delete/mkdir/rename/symlink over an in-memory tree, rebuild on sync, D6 attributes. Wired into the edit dispatch + CLI. | **done** — `rb-cli put` edits a real image; `unsquashfs`-accepted |
 | **2d** | Partition-hosted images + the §2 size-budget prompt; in-place commit (temp + size check + atomic rename); xattr-inheritance-on-replace. | **next** |
 | **2-opt** | Lazy `FileContent::Source` streaming + verbatim block reuse. Not needed for correctness; bounds rebuild memory and cost. | deferred |
-| **3** | ISO 9660 and AppImage containers. | |
+| **3** | ISO 9660 and AppImage containers. | **done** — AppImage browse+edit, ISO browse+extract |
 | **4** | `rb-cli new volume squashfs` (create blank) and a structural verifier (§6 of the audit: there is no repair to be had). | |
 
 ---
