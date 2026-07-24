@@ -180,7 +180,95 @@ pub fn resize_filesystem_for(
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
+}
+
+/// Whether [`resize_filesystem_for`] can actually patch what lives at
+/// `partition_offset`.
+///
+/// Every per-FS resizer silently no-ops when its magic doesn't match, which is
+/// what makes that function safe to call blind — but it also means a caller
+/// cannot tell "patched" from "did nothing". A partition resize that moves the
+/// table entry while leaving the filesystem's own idea of its size behind
+/// produces a volume whose two halves disagree, so a destructive caller has to
+/// ask *first*.
+pub enum InPlaceResize {
+    /// A filesystem [`resize_filesystem_for`] will patch.
+    Supported(&'static str),
+    /// A filesystem we recognise but have no in-place resizer for. Resizing
+    /// the partition around it would leave it inconsistent.
+    Unsupported(&'static str),
+    /// Nothing recognisable — a raw / swap / boot-blob partition (the MiSTer's
+    /// 0xA2 SPL region, say). There is no filesystem metadata to fall out of
+    /// step, so resizing the table entry alone is safe.
+    NoFilesystem,
+}
+
+/// Filesystems `resize_filesystem_for` knows how to patch, by the name
+/// [`detect_filesystem_type`] reports. Amiga SFS / PFS3 are not detected by
+/// magic at the partition offset — they arrive with an RDB type string, which
+/// [`in_place_resize_support`] checks separately.
+const IN_PLACE_RESIZABLE: &[&str] = &[
+    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "qdos", "affs", "prodos",
+];
+
+/// Classify the filesystem at `partition_offset` for in-place resizing.
+///
+/// `partition_type_string` is the RDB / APM type when the caller has one; the
+/// Amiga filesystems are identified that way rather than by a superblock magic
+/// at the partition's first sector.
+pub fn in_place_resize_support<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> InPlaceResize {
+    if let Some(s) = partition_type_string {
+        if is_amiga_dos_type(s) {
+            return InPlaceResize::Supported("AFFS");
+        }
+        if is_amiga_pfs3_type(s) {
+            return InPlaceResize::Supported("PFS3");
+        }
+        if is_amiga_sfs_type(s) {
+            return InPlaceResize::Supported("SFS");
+        }
+    }
+    let detected = detect_filesystem_type(reader, partition_offset);
+    if detected == "unknown" {
+        return InPlaceResize::NoFilesystem;
+    }
+    if IN_PLACE_RESIZABLE.contains(&detected) {
+        // The pretty name if we have one, else the detector's own token.
+        return InPlaceResize::Supported(fs_display_name(detected));
+    }
+    InPlaceResize::Unsupported(fs_display_name(detected))
+}
+
+/// A human-facing name for a `detect_filesystem_type` token, for messages.
+fn fs_display_name(detected: &str) -> &'static str {
+    match detected {
+        "fat" => "FAT",
+        "ntfs" => "NTFS",
+        "exfat" => "exFAT",
+        "hfs" => "HFS",
+        "hfsplus" => "HFS+",
+        "ext" => "ext2/3/4",
+        "btrfs" => "btrfs",
+        "efs" => "SGI EFS",
+        "qdos" => "QDOS",
+        "affs" => "AFFS",
+        "prodos" => "ProDOS",
+        "xfs" => "XFS",
+        "jfs" => "JFS",
+        "reiserfs" => "ReiserFS",
+        "ufs" => "UFS",
+        "hpfs" => "HPFS",
+        "apfs" => "APFS",
+        "squashfs" => "SquashFS",
+        "mfs" => "MFS",
+        _ => "an unsupported filesystem",
+    }
 }
 
 /// Result of filesystem compaction.
