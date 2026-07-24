@@ -278,6 +278,17 @@ pub struct CreateFileOptions {
     pub aux_type: Option<u16>,
     /// Optional resource fork data source (HFS/HFS+ only).
     pub resource_fork: Option<ResourceForkSource>,
+    /// Extended attributes to stamp on the new file, on filesystems that store
+    /// them. Ignored elsewhere.
+    ///
+    /// Exists mainly so an **overwrite** can keep them. Replacing a file is
+    /// delete-then-create, and the create otherwise knows nothing about what it
+    /// displaced — so a binary carrying `security.capability` came back without
+    /// it and silently stopped working. Mode and ownership already survive a
+    /// replace via [`crate::fs::attrs::resolve_attrs`]; this is the same rule
+    /// for the attributes that don't live in the inode. See
+    /// [`crate::fs::attrs::inherited_xattrs`].
+    pub xattrs: Vec<super::xattr::Xattr>,
     /// AmigaDOS protection bits (`access` word) for AFFS/FFS. The
     /// on-disk default of 0 displays as `----rwed`. Ignored on
     /// non-Amiga filesystems.

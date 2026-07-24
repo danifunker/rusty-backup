@@ -225,6 +225,9 @@ pub fn run(args: PutArgs) -> Result<()> {
         .map_err(|e| anyhow!("list_directory: {e}"))?
         .into_iter()
         .find(|e| e.name == name);
+    // Capture before the delete: afterwards there is nothing left to ask.
+    let inherited_xattrs =
+        crate::fs::attrs::inherited_xattrs(fs.as_filesystem_mut(), existing.as_ref());
     if let Some(ref e) = existing {
         if !args.force {
             bail!("{dst} already exists (pass --force to overwrite)");
@@ -293,12 +296,19 @@ pub fn run(args: PutArgs) -> Result<()> {
         log_stderr(format!("Attributes: {}", attrs.describe()));
     }
 
+    if !inherited_xattrs.is_empty() {
+        log_stderr(format!(
+            "Carrying {} extended attribute(s) over from the replaced file",
+            inherited_xattrs.len()
+        ));
+    }
     let options = CreateFileOptions {
         type_code,
         creator_code: creator,
         mode: Some(attrs.file_mode()),
         uid: Some(attrs.uid),
         gid: Some(attrs.gid),
+        xattrs: inherited_xattrs,
         ..Default::default()
     };
 

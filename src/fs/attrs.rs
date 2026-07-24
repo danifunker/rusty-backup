@@ -198,6 +198,38 @@ pub fn add_execute_where_read(mode: u32) -> u32 {
     out
 }
 
+/// The extended attributes a replacement file should inherit from the file it
+/// displaces.
+///
+/// The counterpart of [`resolve_attrs`] for the attributes that don't live in
+/// the inode. Overwriting is delete-then-create, and the create knows nothing
+/// about what was there — so on a filesystem that stores xattrs, replacing a
+/// binary that carried `security.capability` produced one without it: a file
+/// that still runs, still looks right, and no longer has the privilege it needs.
+/// The mode and ownership rules already say a replacement inherits from what it
+/// replaces; this applies the same rule to xattrs.
+///
+/// Pass the result to [`CreateFileOptions::xattrs`](
+/// crate::fs::filesystem::CreateFileOptions::xattrs). Returns empty for a new
+/// file, or on a filesystem that stores no xattrs — both correctly meaning
+/// "nothing to carry over".
+///
+/// Note the caller must capture this **before** deleting the old entry.
+pub fn inherited_xattrs(
+    fs: &mut dyn crate::fs::filesystem::Filesystem,
+    replacing: Option<&FileEntry>,
+) -> Vec<crate::fs::xattr::Xattr> {
+    let Some(entry) = replacing else {
+        return Vec::new();
+    };
+    if !fs.supports_xattrs() {
+        return Vec::new();
+    }
+    // A file we cannot read attributes off is not a reason to abort the write;
+    // the worst case is the status quo, which is that they are dropped.
+    fs.list_xattrs(entry).unwrap_or_default()
+}
+
 /// Resolve the POSIX attributes for a **directory** about to be created.
 ///
 /// Differs from [`resolve_attrs`] in two ways that matter:

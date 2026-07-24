@@ -237,6 +237,8 @@ fn import_tar_inner<R: Read>(
         // (from the on-disk listing — empty for a directory we just created),
         // then consult/update it per entry so the check is O(1).
         let parent_key = parent.path.clone();
+        // Populated only when this entry overwrites an existing one.
+        let mut inherited_xattrs = Vec::new();
         if !dir_children.contains_key(&parent_key) {
             let existing: HashSet<String> = efs
                 .list_directory(&parent)
@@ -259,6 +261,13 @@ fn import_tar_inner<R: Read>(
                 }
                 ImportConflict::Overwrite => {
                     if let Some(existing) = find_child(efs, &parent, name)? {
+                        // Before the delete: a replacement inherits the
+                        // extended attributes of what it displaces, the same
+                        // way it inherits mode and ownership.
+                        inherited_xattrs = crate::fs::attrs::inherited_xattrs(
+                            efs.as_filesystem_mut(),
+                            Some(&existing),
+                        );
                         efs.delete_entry(&parent, &existing)
                             .map_err(|e| anyhow!("overwrite delete {}: {e}", raw_path.display()))?;
                     }
@@ -295,8 +304,12 @@ fn import_tar_inner<R: Read>(
 
         if etype.is_file() {
             let size = entry.size();
+            let create_opts = crate::fs::filesystem::CreateFileOptions {
+                xattrs: inherited_xattrs,
+                ..Default::default()
+            };
             let new_entry = efs
-                .create_file(&parent, name, &mut entry, size, &Default::default())
+                .create_file(&parent, name, &mut entry, size, &create_opts)
                 .map_err(|e| anyhow!("create_file {}: {e}", raw_path.display()))?;
             dir_children
                 .get_mut(&parent_key)

@@ -13,10 +13,10 @@
 //! **extended attributes** — including the `security.capability` bits that make
 //! an appliance binary work. The rebuild preserves the source's compressor and
 //! block size (decision D3). New files get their POSIX attributes through the
-//! shared [`crate::fs::attrs`] resolver (D6). The one gap in this slice: a file
-//! that is *replaced* (deleted then recreated) loses its xattrs, because
-//! `CreateFileOptions` has no channel to carry them — noted, and narrow (only
-//! the handful of capability-bearing binaries, and only when overwritten).
+//! shared [`crate::fs::attrs`] resolver (D6), and a file that is *replaced*
+//! keeps the extended attributes of the file it displaced — see
+//! [`crate::fs::attrs::inherited_xattrs`], which the caller must consult before
+//! deleting the old entry.
 //!
 //! # Memory & safety
 //!
@@ -625,7 +625,10 @@ impl<RW: Read + Write + Seek + Send> EditableFilesystem for SquashfsEditor<RW> {
             uid: attrs.uid,
             gid: attrs.gid,
             mtime: 0,
-            xattrs: Vec::new(),
+            // Carried from the file being replaced, when the caller captured
+            // them (D4) — otherwise a replaced binary loses its
+            // `security.capability` and quietly stops working.
+            xattrs: options.xattrs.clone(),
             kind: BuildKind::File(FileContent::Bytes(bytes)),
         });
         Ok(Self::to_entry(
@@ -1573,6 +1576,71 @@ mod tests {
         let BK::Dir(binc) = &bin.kind else { panic!() };
         let ping = binc.iter().find(|n| n.name == "ping").unwrap();
         assert!(ping.xattrs.is_empty(), "removed xattr came back");
+    }
+
+    /// D4's last gap: **replacing** a file used to lose its extended
+    /// attributes, because a replace is delete-then-create and the create knew
+    /// nothing about what it displaced. Narrow but nasty — the files that carry
+    /// xattrs on an appliance image are the capability-bearing binaries, and one
+    /// that comes back without its `security.capability` still runs, still looks
+    /// right, and no longer has the privilege it needs.
+    #[test]
+    fn replacing_a_file_carries_its_xattrs_onto_the_replacement() {
+        let mut ed = open_editor(starter_image());
+        let root = ed.root().expect("root");
+        let bin = ed
+            .list_directory(&root)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "bin")
+            .unwrap();
+        let ping = ed.list_directory(&bin).unwrap().into_iter().next().unwrap();
+        assert_eq!(ed.list_xattrs(&ping).unwrap().len(), 1, "fixture check");
+
+        // Exactly what `put --force` does: capture, delete, create.
+        let carried = crate::fs::attrs::inherited_xattrs(ed.as_filesystem_mut(), Some(&ping));
+        ed.delete_entry(&bin, &ping).expect("delete");
+        ed.create_file(
+            &bin,
+            "ping",
+            &mut Cursor::new(b"a newer ping\n".to_vec()),
+            13,
+            &CreateFileOptions {
+                xattrs: carried,
+                ..Default::default()
+            },
+        )
+        .expect("create replacement");
+        ed.sync_metadata().expect("sync");
+
+        let bytes = std::mem::replace(&mut ed.rw, Cursor::new(Vec::new())).into_inner();
+        let mut fs = SquashfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let tree = fs.read_build_tree().expect("read tree");
+        let BK::Dir(top) = &tree.kind else { panic!() };
+        let bin = top.iter().find(|n| n.name == "bin").expect("bin");
+        let BK::Dir(binc) = &bin.kind else { panic!() };
+        let ping = binc.iter().find(|n| n.name == "ping").expect("ping");
+        assert_eq!(
+            ping.xattrs,
+            vec![Xattr {
+                name: "security.capability".into(),
+                value: vec![1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+            }],
+            "the replacement lost the capability the original carried"
+        );
+        // And it really is the new content, not the old file surviving.
+        let BK::File(FileContent::Bytes(data)) = &ping.kind else {
+            panic!("not a file")
+        };
+        assert_eq!(data, b"a newer ping\n");
+    }
+
+    /// A genuinely new file has nothing to inherit, and a filesystem that
+    /// stores no xattrs answers empty rather than erroring.
+    #[test]
+    fn inherited_xattrs_is_empty_for_a_new_file() {
+        let mut ed = open_editor(starter_image());
+        assert!(crate::fs::attrs::inherited_xattrs(ed.as_filesystem_mut(), None).is_empty());
     }
 
     /// An xattr with no valid namespace prefix is refused (it can't be
