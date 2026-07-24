@@ -12,9 +12,9 @@ decision live in [`squashfs_edit.md`](squashfs_edit.md); this file is the
 
 > Continue the SquashFS work on branch `edit-squashfs`. Read
 > `docs/squashfs_resume.md` for state and `docs/squashfs_edit.md` for the plan
-> and decisions D1–D6. Phases 0 through 2c are done and oracle-validated against
-> real `squashfs-tools`; 2d is **half done** — the size budget and partition
-> capacity have landed, so **start at 2d item 3 (temp + atomic rename)**.
+> and decisions D1–D6. **Phases 0 through 2d are done** and oracle-validated
+> against real `squashfs-tools`, so pick up at **phase 3 (ISO 9660 / AppImage
+> containers)** — or 2-opt first if a big image's rebuild memory is biting.
 > Per-slice commits. Every commit must keep `cargo build --all-targets` at zero
 > warnings, `cargo clippy --all-targets -- -D warnings` clean, `cargo test --lib`
 > green, and the Rust 1.73 vintage build compiling (see CONTRIBUTING.md
@@ -60,29 +60,28 @@ contradicting the README. Rewritten to read + edit.
    assuming it may grow. `open_editable_filesystem_within` carries the
    partition length; `PartitionContext::open_editable` (CLI) and
    `BrowseSession::partition_size` (GUI) supply it.
-2. **The size budget — core DONE** (`6746e07`), surfaces still to do.
-   `SizeBudget::{Fit, Limit}` plus `SizeBudget::headroom` for `--grow`, both
-   stages of §2.4 enforcement (pre-flight refusal at open when the budget
-   exceeds the container; post-rebuild size check before anything is
-   overwritten), and the §2.5 projection anchored on the source image's real
-   size. **Still missing: the user-facing surfaces** — `--size` / `--grow`
-   flags on the CLI edit verbs, a `rb-cli squashfs plan` verb, the GUI dialog,
-   the TUI equivalent. The dispatch passes `SizeBudget::Fit`, so today a user
-   cannot request a budget tighter than the container.
+2. **The size budget — DONE** (`6746e07` core, `4fbd39d` surfaces).
+   `SizeBudget::{Fit, Limit, Grow}`, both stages of §2.4 enforcement, the §2.5
+   projection, and all three surfaces: `rb-cli squashfs plan|put|rm` with
+   `--size` / `--grow`, a GUI dialog before entering Edit Mode, and the same
+   numbers in the TUI File Info overlay on a SquashFS root.
    Note the projection is *not* the near-exact one §2.5 describes: that needs
    per-file compressed sizes, which only exist once phase 2-opt lands block
    reuse. Today it anchors on the source size and estimates the content delta
-   at the image's own observed ratio, reported as a range.
-3. **Commit as temp + rename (D2) — NEXT.** `sync_metadata` still rebuilds into
-   a RAM buffer and overwrites in place. Safe against a *failed* rebuild and now
-   against an *oversized* one, but it neither truncates (a shrunk image leaves
-   trailing bytes past `bytes_used`; valid, but untidy) nor gives atomic
-   replacement. Wire the temp + fsync + atomic-rename path.
-4. **xattr-inheritance-on-replace** — the one known fidelity gap (D4). Replacing
-   a file (delete + create) loses its xattrs, because `CreateFileOptions` has no
-   channel to carry them. Narrow (only capability-bearing binaries, only when
-   overwritten) but real. Either add an xattrs field to `CreateFileOptions` or
-   have the editor capture-and-restore across a replace.
+   at the image's own observed ratio, reported as a range — and on a small
+   image that ratio is withheld entirely, because fixed overhead dwarfs the
+   file data and the number would be worse than no number.
+3. **Commit as temp + rename (D2) — DONE** (`2292b0e`). A bare `.squashfs`
+   commits by sibling temp + fsync + atomic rename, gated on
+   `EditContext::whole_file_path` so a partition or container temp is never
+   renamed over. Everything else commits in place and now zero-fills what a
+   shrunk rebuild no longer occupies.
+4. **xattr-inheritance-on-replace — DONE** (`e4d1fef`). `attrs::inherited_xattrs`
+   captures before the delete, `CreateFileOptions::xattrs` carries them to the
+   replacement; used by `put --force` and tar-import overwrite.
+
+**Phase 2d is complete.** Next is phase 3 (containers) or 2-opt (lazy
+streaming / block reuse) — see below.
 
 ### C. Attribute-editing breadth (spun out of the GUI work; not in the original plan)
 
