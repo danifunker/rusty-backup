@@ -1636,6 +1636,24 @@ SquashFS edits with an explicit size budget (`plan` / `put` / `rm`). The format 
 Usage: squashfs <COMMAND>
 ```
 
+### `squashfs create`
+
+Build a new SquashFS image from a host directory, as `mksquashfs` does
+
+```
+Usage: create [OPTIONS] <DIR> <IMAGE>
+```
+
+**Arguments**
+
+- `<DIR>` — Host directory to pack. Its *contents* become the image root, like `mksquashfs DIR IMAGE` (the directory itself is not a top-level entry)
+- `<IMAGE>` — Image file to create. Overwritten if it already exists
+
+**Options**
+
+- `--compressor` — Compressor for the new image. `mksquashfs` defaults to gzip; we match it
+- `--block-size` — Data block size (a power of two, 4 KiB..=1 MiB). `mksquashfs`'s default is 128 KiB
+
 ### `squashfs plan`
 
 Report what the image occupies, what it may grow into, and how well it compressed — the numbers a size budget is chosen from. Writes nothing
@@ -1705,6 +1723,18 @@ Usage: rm [OPTIONS] <IMAGE> <PATH>
 - `--carve-full` — Scan the **entire** image for recoverable text in the synthetic carve view (used for disks with no recognized filesystem — e.g. custom bootblock Amiga "NDOS" disks). By default the carve view only scans the first 10 MB. No effect on disks with a real filesystem
 - `--size` — Ceiling on the rebuilt image, e.g. `512M`. `fit` accepts whatever the rebuild produces. Omitted, the container decides: a bare `.squashfs` grows freely, a partition-hosted image may not outgrow its partition
 - `--grow` — Allow the rebuilt image to exceed its *current* size by at most this much, e.g. `64M`. Resolved against the image once it is opened
+
+### `squashfs verify`
+
+Structurally verify an image: walk every inode, dirent and data block, decompressing everything. Not an fsck — SquashFS has no checksums, so this finds broken structure, not altered content
+
+```
+Usage: verify <IMAGE>
+```
+
+**Arguments**
+
+- `<IMAGE>` — Image reference (`path` or `path@N`)
 
 ### `tar`
 

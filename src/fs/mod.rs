@@ -89,6 +89,7 @@ pub mod sfs;
 pub mod sfs_fsck;
 pub mod squashfs;
 pub mod squashfs_edit;
+pub mod squashfs_verify;
 pub mod squashfs_write;
 pub mod tar_export;
 pub mod tar_import;
