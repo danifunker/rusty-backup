@@ -19,7 +19,8 @@ use crate::partition::{PartitionInfo, PartitionTable};
 use crate::rbformats::{BoxReadSeek, BoxRwSeek};
 use std::path::PathBuf; // used by RwCommit::Cbk regardless of the chd feature
 
-#[cfg(feature = "chd")]
+// Unconditional since the AppImage branch logs its payload offset; it used to
+// be `chd`-only, which the vintage build (no `chd` feature) catches at once.
 use crate::cli::logging::log_stderr;
 #[cfg(feature = "chd")]
 use crate::rbformats::chd_edit;
@@ -45,6 +46,50 @@ pub struct PartitionContext {
     /// Human-readable label, intended for `eprintln!` so the user can
     /// confirm which partition the verb is operating on.
     pub label: String,
+    /// Set only when the read-write handle is the image file itself *and* the
+    /// filesystem occupies all of it — a plain image opened in place, not a
+    /// decoded container temp, a CHD/QCOW2 session, or a partition inside a
+    /// larger disk. Lets a driver that rewrites its whole image commit by
+    /// atomic replacement. See [`crate::fs::EditContext::whole_file_path`].
+    pub whole_file_path: Option<PathBuf>,
+    /// A size ceiling the user asked for, for the drivers that rewrite their
+    /// whole image. Set by the verbs that expose `--size` / `--grow`; `None`
+    /// everywhere else means "no request", and the container still binds.
+    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+}
+
+impl PartitionContext {
+    /// Open this partition's filesystem for editing.
+    ///
+    /// Every mutating verb goes through here rather than calling
+    /// [`crate::fs::open_editable_filesystem`] itself, so they all pass the
+    /// partition's **length** as well as its offset. Most drivers do not care
+    /// — they write inside a structure they read from the partition. SquashFS
+    /// does: it rebuilds the whole image, so without a declared length it has
+    /// no way to know that growing would run into the next partition.
+    /// Errors are returned raw so each verb keeps its own wording ("for write",
+    /// "for repair", "destination filesystem …").
+    pub fn open_editable<R: Read + std::io::Write + Seek + Send + 'static>(
+        &self,
+        handle: R,
+    ) -> std::result::Result<
+        Box<dyn crate::fs::EditableFilesystem>,
+        crate::fs::filesystem::FilesystemError,
+    > {
+        crate::fs::open_editable_filesystem_with(
+            handle,
+            self.offset,
+            crate::fs::EditContext {
+                // A zero size means the resolver had nothing to report, not a
+                // zero-length partition; pass "unknown" rather than "no room".
+                partition_len: (self.size > 0).then_some(self.size),
+                whole_file_path: self.whole_file_path.as_deref(),
+                rebuild_budget: self.rebuild_budget,
+            },
+            self.type_byte,
+            self.type_string.as_deref(),
+        )
+    }
 }
 
 /// Open `path` read-only and resolve which partition to use.
@@ -250,8 +295,13 @@ pub fn resolve_partition_rw_forced(
 
     // Open the whole image read-write (decoding CHD / container as needed),
     // then resolve which partition inside it the caller wants.
-    let (mut reader, commit) = resolve_image_rw(path)?;
-    let ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    let (mut reader, commit, shape) = resolve_image_rw(path)?;
+    let mut ctx = resolve_with_override(&mut reader, selector, fs_override)?;
+    // Only a handle that *is* the file, holding a filesystem that starts at its
+    // first byte, may be committed by replacing the file — see [`HandleShape`].
+    if shape == HandleShape::WholeFile && ctx.offset == 0 {
+        ctx.whole_file_path = Some(path.to_path_buf());
+    }
     Ok((reader, ctx, commit))
 }
 
@@ -262,9 +312,98 @@ pub fn resolve_partition_rw_forced(
 /// [`resolve_partition_rw`] this does NOT resolve a partition — the caller
 /// works in absolute image offsets. Used by whole-disk verbs (`partmap`,
 /// `mac_scsi_bless`) so they edit a CHD / container the same way `put` does.
-pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit)> {
-    if let Some(chd) = try_open_chd_rw(path)? {
-        return Ok(chd);
+/// Whether a read-write handle covers its file byte-for-byte.
+///
+/// `WholeFile` means position 0 of the handle is byte 0 of the path *and* the
+/// file holds nothing but the image — the only shape in which replacing the
+/// file is the same act as replacing the image. Everything else is `Wrapped`: a
+/// decoded temp flat, a CHD or QCOW2 session, or a window onto part of a larger
+/// file such as an AppImage's appended payload.
+///
+/// Stated rather than inferred, because the inference is subtly wrong and the
+/// consequence is silent. `RwCommit::None` looks like it means "the raw file",
+/// and it doesn't — an AppImage's payload window also needs no re-encoding on
+/// commit, so it is `RwCommit::None` too, and treating that as a whole-file
+/// handle led SquashFS to atomically replace an entire AppImage with just its
+/// payload, deleting the ELF stub that makes it runnable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleShape {
+    /// The handle is the file, entirely.
+    WholeFile,
+    /// The handle is a decode, a session, or a window into something larger.
+    Wrapped,
+}
+
+pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit, HandleShape)> {
+    if crate::rbformats::appimage::is_squashfs_appimage(path) {
+        // An AppImage's SquashFS is appended to an ELF stub and runs to the end
+        // of the file, so editing it is a write through a window at the payload
+        // offset — nothing is decoded, and nothing needs re-encoding on commit.
+        // The payload being the *tail* is what lets a rebuild grow: the file
+        // simply gets longer, and the stub in front finds its payload by the
+        // same arithmetic either way.
+        let file = open_image_rw(path)?;
+        let mut probe = file
+            .try_clone()
+            .with_context(|| format!("opening {}", path.display()))?;
+        let offset = crate::rbformats::appimage::squashfs_payload_offset(&mut probe)
+            .ok_or_else(|| anyhow!("no SquashFS payload in AppImage {}", path.display()))?;
+        log_stderr(format!(
+            "AppImage: editing the SquashFS payload at offset {offset}"
+        ));
+        return Ok((
+            Box::new(crate::rbformats::payload_slice::PayloadSlice::tail(
+                file, offset,
+            )),
+            RwCommit::None,
+            HandleShape::Wrapped,
+        ));
+    }
+    if source_reader::is_squashfs_bearing_iso(path) {
+        // A SquashFS inside an ISO 9660 is a contiguous file wedged between
+        // other files on the disc, so it cannot grow — and a SquashFS edit is a
+        // whole-image rebuild whose size can't be promised in advance. Rather
+        // than offer an edit that would refuse the moment a rebuild came out
+        // even slightly larger, decline it up front and point at the paths that
+        // do work. (Browse and extract are unaffected — they go through the
+        // read path.)
+        bail!(
+            "{} holds a SquashFS inside an ISO 9660, which can be browsed and \
+             extracted but not edited in place: it cannot grow, since other \
+             files sit after it on the disc. Extract it (`rb-cli tar` / `get`) \
+             and rebuild the ISO, or edit the AppImage form, which can grow.",
+            path.display()
+        );
+    }
+    if let Some((handle, commit)) = try_open_chd_rw(path)? {
+        return Ok((handle, commit, HandleShape::Wrapped));
+    }
+    if source_reader::is_qcow2_path(path) {
+        // QCOW2 edits in place: `Qcow2Reader` is itself `Read + Write + Seek`,
+        // allocating host clusters on demand, so there's nothing to re-encode
+        // on commit. Without this branch the raw `File` below would be handed
+        // to partition detection, which reads the QCOW2 header as sector 0 and
+        // reports a bogus "Invalid MBR".
+        let file = open_image_rw(path)?;
+        let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
+            .with_context(|| format!("opening QCOW2 {} for edit", path.display()))?;
+        // Fail fast with the root cause: a snapshot-bearing image opens
+        // read-only (shared clusters, no copy-on-write). The common case is a
+        // UTM suspended-VM state, which also leaves the guest filesystem dirty
+        // — so surfacing the snapshot here beats a downstream "dirty journal"
+        // message that names the symptom instead.
+        if reader.is_read_only() {
+            anyhow::bail!(
+                "QCOW2 {} has {} internal snapshot(s) and opens read-only \
+                 (a UTM suspended-VM state is the usual one). Editing could \
+                 corrupt them. Shut the VM down cleanly in UTM, or drop the \
+                 snapshot (`qemu-img snapshot -d <name> {}`), then retry.",
+                path.display(),
+                reader.snapshot_count(),
+                path.display(),
+            );
+        }
+        return Ok((Box::new(reader), RwCommit::None, HandleShape::Wrapped));
     }
     if source_reader::is_editable_container_path(path) {
         // Floppy / gzip / WOZ container: decode to a temp flat, edit that,
@@ -273,10 +412,15 @@ pub fn resolve_image_rw(path: &std::path::Path) -> Result<(BoxRwSeek, RwCommit)>
         let session = crate::model::container_edit::ContainerEditSession::open(path)
             .map_err(|e| anyhow!("opening container for edit: {e:#}"))?;
         let file = open_image_rw(session.flat_path())?;
-        Ok((Box::new(file), RwCommit::Container(session)))
+        Ok((
+            Box::new(file),
+            RwCommit::Container(session),
+            HandleShape::Wrapped,
+        ))
     } else {
         let file = open_image_rw(path)?;
-        Ok((Box::new(file), RwCommit::None))
+        // The only branch where the handle really is the file.
+        Ok((Box::new(file), RwCommit::None, HandleShape::WholeFile))
     }
 }
 
@@ -443,6 +587,11 @@ fn resolve_with_override<R: Read + Seek>(
                     type_string: None,
                     size: total,
                     label: "Partition: raw filesystem @ byte 0 (forced via --fs-type)".to_string(),
+                    // `resolve` works from a reader and doesn't know whether it
+                    // came from the image file or a decoded temp; the read-write
+                    // resolver fills this in once it knows which branch it took.
+                    whole_file_path: None,
+                    rebuild_budget: None,
                 });
             }
             return Err(anyhow!("detecting partition table: {e}"));
@@ -464,6 +613,8 @@ fn resolve_with_override<R: Read + Seek>(
             type_string: None,
             size: total,
             label: format!("Partition: raw filesystem @ byte 0 ({})", pt.type_name()),
+            whole_file_path: None,
+            rebuild_budget: None,
         });
     }
 
@@ -489,6 +640,8 @@ fn resolve_with_override<R: Read + Seek>(
         type_string: info.partition_type_string.clone(),
         size: info.size_bytes,
         label: format_label(&info, pt.type_name()),
+        whole_file_path: None,
+        rebuild_budget: None,
     })
 }
 

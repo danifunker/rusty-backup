@@ -265,6 +265,12 @@ images, with a MiSTer-FPGA lean** — the gaps sort into four bands.
 
 ### Medium value (niche machine or workstation)
 
+- **SquashFS write** (browse / extract shipped — `src/fs/squashfs.rs`) — the
+  one modern-Linux filesystem that reaches our users: AppImages (we ship one),
+  Raspberry Pi OS / DietPi / Buildroot images, live-media
+  `filesystem.squashfs`, OpenWrt, SteamOS. Read landed; the remaining gap is
+  edit, which is rebuild-only by construction — read the scoping note below
+  before planning it, the caveats are not the usual ones
 - **ADFS write completion + double-sided `.dsd`** (upgrade the existing Partial)
 - **SAM DOS / MasterDOS** (SAM Coupé), **Sharp MZ FD**, **Coleco EOS**,
   **Atom DOS** — each a MiSTer core in the floppy long-tail
@@ -289,16 +295,61 @@ images, with a MiSTer-FPGA lean** — the gaps sort into four bands.
 Not disk images of vintage machines — no plan to support:
 
 - **Modern flash translation FS** — JFFS2, YAFFS, UBIFS, F2FS
-- **Read-only Linux packing FS** — cramfs. (**SquashFS is now supported
-  read-only** — the Buildroot-appliance exception this list anticipated. See
-  `src/fs/squashfs.rs`: v4.0, gzip/XZ/LZMA/LZ4/zstd, browse + read. LZO images
-  are refused by name. There is deliberately no editable implementation —
-  SquashFS is built offline by `mksquashfs` and has no in-place write story.)
+- **cramfs** — superseded by SquashFS everywhere it mattered; no demand.
+  (**SquashFS itself is no longer in this list** — the Buildroot-appliance
+  exception it anticipated. Read-only support shipped: see `src/fs/squashfs.rs`
+  — v4.0, gzip/XZ/LZMA/LZ4/zstd, browse + read; LZO images are refused by name.
+  Write is not in-place under any implementation — see the scoping note below.)
 - **Network / distributed / clustered** — NFS, SMB/CIFS, AFS, Ceph, Lustre,
   GlusterFS, GFS2, OCFS2, ZFS-as-pool
 - **Pseudo / virtual** — procfs, sysfs, tmpfs, overlayfs, FUSE shims
 - **Mainframe** — z/OS VTOC/VSAM, VM/CMS, and other non-sector-image stores
 - **Windows Server modern** — ReFS
+
+### Scoping note — SquashFS
+
+SquashFS sat in "explicitly out of scope" until read-only support shipped
+(`src/fs/squashfs.rs`). It's the only modern-Linux filesystem our users
+routinely hit. But "full support" does **not** decompose the way it does for
+every other driver in the tree, so the four README columns are answered
+separately here.
+
+**Browse / extract / backup — shipped.** v4.0, stable since 2009 and completely
+specified. Four of the five compressors were already in-tree deps: gzip
+(`flate2`), zstd, lz4 (`lz4_flex`), xz/lzma (`lzma-rs`). **LZO** is the gap —
+rare outside old OpenWrt firmware, refused by name; `lzokay` (MIT, Rust 1.81)
+or `lzo` (MIT, 1.85) would close it. Backup works via the raw whole-partition
+path; smart compaction is a no-op win (the image is already compressed).
+
+**Edit — rebuild-only, never in place.** This is inherent to the format, not an
+implementation shortcut: there is no free-space bitmap, no allocation metadata,
+and everything is densely packed and sorted. `mksquashfs` rewrites the whole
+image even to append one file. The pattern already exists here
+(`ContainerEditSession` decode-to-temp / re-encode-on-commit, plus
+`archive_fs` / `mem_archive` presenting archives as `Filesystem`), so
+`EditableFilesystem` is reachable — with caveats that have no analogue
+elsewhere in the tree:
+
+- commit is O(image size), not O(edit);
+- **a rebuilt image is not byte-identical to the original even with zero
+  edits** — block packing, fragment packing, dedup and compressor tuning all
+  differ per mksquashfs version. For a tool whose pitch is fidelity that is a
+  real behavioural break from every other filesystem here;
+- the rebuilt image's *size* is not knowable before the rebuild runs, because
+  everything is compressed. That is what forces the size prompt described in
+  `docs/squashfs_edit.md` — unlike every other editable filesystem here, we
+  cannot answer "will this file fit?" from a free-space counter.
+
+**fsck — a verifier, not a repairer.** There is no upstream squashfs fsck; a
+read-only filesystem can't go inconsistent through normal use. And squashfs
+carries **no checksums anywhere**, so corruption surfaces only as a
+decompression failure and there is no redundancy to repair *from*. What's
+buildable is a structural validator ("does every metadata block, inode, dirent
+and data block decompress and cross-reference"). Useful; not repair.
+
+**Shrink / expand — not meaningful in the in-place sense.** The image already
+*is* its minimum size, so `defragmented_minimum_size` ≈ `total_size`; growing
+means rebuilding.
 
 ---
 

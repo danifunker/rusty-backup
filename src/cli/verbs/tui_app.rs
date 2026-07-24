@@ -46,7 +46,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::cli::verbs::new::{FloppyArgs, FloppyFs, NewCommand, VolumeArgs, VolumeFs};
+use crate::cli::verbs::new::{FloppyArgs, FloppyFs, HdCommand, NewCommand, VolumeArgs, VolumeFs};
 use crate::device::{enumerate_devices, DiskDevice};
 use crate::fs::entry::{EntryType, FileEntry};
 use crate::model::rate_tracker::RateTracker;
@@ -966,11 +966,13 @@ enum WizStep {
 enum DiskClass {
     Floppy,
     Volume,
+    Hd,
 }
 
-/// The two media classes the wizard can create end-to-end. `new hd` (x68k /
-/// sgi-efs) and CD-ROM (`optical new`) need donor / partition options, so they
-/// stay CLI-driven for now and are surfaced as a note, not a class.
+/// The media classes the wizard can create end-to-end. The hard-disk targets
+/// build with their defaults (path + size is enough); their donor / custom
+/// partition options — `--system-disk`, `--boot-sector-donor`, `--partitions`,
+/// EFS geometry — remain CLI-only. CD-ROM (`optical new`) is still CLI-driven.
 const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
     (
         "Floppy",
@@ -982,6 +984,25 @@ const NEW_CLASSES: &[(&str, DiskClass, &str)] = &[
         DiskClass::Volume,
         "Bare single volume of any size (a superfloppy): NTFS, ext, HFS+, EFS, ...",
     ),
+    (
+        "Hard disk",
+        DiskClass::Hd,
+        "Partition-table-wrapped, self-bootable HDD image (Sharp X68000, SGI IRIX).",
+    ),
+];
+
+/// Bootable hard-disk platforms offered under the "Hard disk" class. Each
+/// builds with its defaults; donor-cloning and custom partition layouts stay on
+/// the CLI (`rb-cli new hd ...`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HdPlatform {
+    X68k,
+    SgiEfs,
+}
+
+const HD_PLATFORMS: &[(&str, HdPlatform)] = &[
+    ("Sharp X68000 (Human68k)", HdPlatform::X68k),
+    ("SGI IRIX (EFS, dvh)", HdPlatform::SgiEfs),
 ];
 
 /// Filesystems offered under `new floppy` in the wizard. CP/M is omitted here
@@ -1060,16 +1081,35 @@ impl NewWizard {
     fn class_label(&self) -> &'static str {
         NEW_CLASSES[self.class_sel.min(NEW_CLASSES.len() - 1)].0
     }
+    /// Re-seed the size field with a sensible default for the selected class,
+    /// but only while it still holds another class's default — so a size the
+    /// user typed is never clobbered by arrowing through the class list.
+    fn seed_size_for_class(&mut self) {
+        const DEFAULTS: [&str; 3] = ["800K", "64M", "32M"];
+        let cur = self.size.trim();
+        if cur.is_empty() || DEFAULTS.contains(&cur) {
+            self.size = match self.class() {
+                DiskClass::Floppy => DEFAULTS[0],
+                DiskClass::Volume => DEFAULTS[1],
+                DiskClass::Hd => DEFAULTS[2],
+            }
+            .to_string();
+        }
+    }
+
     fn fs_count(&self) -> usize {
         match self.class() {
             DiskClass::Floppy => FLOPPY_FS.len(),
             DiskClass::Volume => VOLUME_FS.len(),
+            // The "filesystem" step picks the target platform for a hard disk.
+            DiskClass::Hd => HD_PLATFORMS.len(),
         }
     }
     fn fs_label(&self, i: usize) -> &'static str {
         match self.class() {
             DiskClass::Floppy => FLOPPY_FS[i.min(FLOPPY_FS.len() - 1)].0,
             DiskClass::Volume => VOLUME_FS[i.min(VOLUME_FS.len() - 1)].0,
+            DiskClass::Hd => HD_PLATFORMS[i.min(HD_PLATFORMS.len() - 1)].0,
         }
     }
 }
@@ -1585,6 +1625,12 @@ struct CommanderState {
     checksum: Option<Arc<Mutex<crate::model::checksum::ChecksumStatus>>>,
     /// The scrollable checksum-results overlay once a job completes.
     checksum_report: Option<ChecksumReportView>,
+    /// The File Info overlay for the active pane's cursor entry (`i`), holding
+    /// the rendered attribute lines. `None` when closed.
+    info: Option<InfoView>,
+    /// An attribute edit being typed from the info overlay: which field, and the
+    /// text so far. `None` when no prompt is showing.
+    attr_input: Option<AttrPrompt>,
     /// A `host:port` being typed in the "Connect to remote" prompt, if showing.
     #[cfg(feature = "remote")]
     connect_input: Option<String>,
@@ -1592,6 +1638,49 @@ struct CommanderState {
     /// polled each `tick`); carries the side to install the result into.
     #[cfg(feature = "remote")]
     pending_connect: Option<(Side, Arc<Mutex<ConnectStatus>>)>,
+}
+
+/// The File Info overlay: the entry it describes plus its rendered lines.
+struct InfoView {
+    /// The entry being described (re-resolved on each edit so staged changes
+    /// show immediately).
+    entry: crate::fs::entry::FileEntry,
+    /// On-disk extended attributes, read when the overlay opened.
+    xattrs: Vec<crate::fs::xattr::Xattr>,
+    /// uid/gid -> name map from the image's own account files, if any.
+    id_names: crate::fs::id_names::IdNameMap,
+    /// For a SquashFS volume viewed at its root: what the image occupies and
+    /// what it may grow into (`docs/squashfs_edit.md` §2.6 — the GUI budget
+    /// dialog's content, ASCII-only). `None` for anything else.
+    size_plan: Option<crate::fs::squashfs_edit::SizePlan>,
+}
+
+/// Which attribute the user is typing a new value for, from the info overlay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttrField {
+    /// Octal permission bits.
+    Mode,
+    /// `uid:gid`.
+    Owner,
+    /// `name=value` (value may be `0x`-hex); an empty value deletes.
+    Xattr,
+}
+
+impl AttrField {
+    /// The prompt label shown above the input line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "New permissions (octal, e.g. 755):",
+            Self::Owner => "New owner (uid:gid, e.g. 0:0):",
+            Self::Xattr => "Xattr as name=value (0x.. for hex; empty value deletes):",
+        }
+    }
+}
+
+/// An in-progress attribute edit typed in the info overlay.
+struct AttrPrompt {
+    field: AttrField,
+    text: String,
 }
 
 /// Result of a background [`RemoteBrowser::connect`]: the browser plus its first
@@ -2170,6 +2259,211 @@ impl CommanderState {
             cmd_refresh(self.pane_mut(side));
         }
         self.set_result(result);
+    }
+
+    /// Open the File Info overlay on the active pane's cursor entry, reading its
+    /// extended attributes and the image's uid/gid name map. Best-effort: an
+    /// entry with no POSIX metadata still opens, just with fewer lines.
+    fn open_info(&mut self) {
+        let side = self.active;
+        let pane = self.pane_mut(side);
+        let Some(entry) = pane.selected() else {
+            self.status = Some("Nothing selected.".to_string());
+            self.is_error = true;
+            return;
+        };
+        // Read xattrs + the account maps through the pane's filesystem when it
+        // has one (a host-folder pane has none; the overlay still shows size and
+        // name).
+        let (xattrs, id_names, size_plan) = match pane.session.clone() {
+            Some(session) => with_stderr_suppressed(|| {
+                let mut fs = match session.open() {
+                    Ok(fs) => fs,
+                    Err(_) => return (Vec::new(), Default::default(), None),
+                };
+                let x = if fs.supports_xattrs() {
+                    fs.list_xattrs(&entry).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                // Only for the volume root: measuring walks the whole directory
+                // tree, and "how big is this image" is a question about the
+                // volume, not about a file inside it.
+                let plan = if fs.fs_type() == "SquashFS" && entry.path == "/" {
+                    let image_len = crate::fs::squashfs_write::image_footprint(fs.total_size());
+                    let capacity = (session.partition_offset != 0)
+                        .then_some(session.partition_size)
+                        .flatten();
+                    crate::fs::squashfs_edit::plan_size(&mut *fs, image_len, capacity).ok()
+                } else {
+                    None
+                };
+                let names = crate::fs::id_names::IdNameMap::from_filesystem(&mut *fs);
+                (x, names, plan)
+            }),
+            None => (Vec::new(), Default::default(), None),
+        };
+        self.info = Some(InfoView {
+            entry,
+            xattrs,
+            id_names,
+            size_plan,
+        });
+    }
+
+    /// The rendered lines of the info overlay.
+    fn info_lines(&self) -> Vec<String> {
+        let Some(info) = &self.info else {
+            return Vec::new();
+        };
+        let e = &info.entry;
+        let mut out = vec![
+            format!("Name:  {}", e.name),
+            format!("Path:  {}", e.path),
+            format!("Size:  {}", e.size),
+        ];
+        if let Some(m) = e.mode {
+            out.push(format!(
+                "Mode:  {}  ({:04o})",
+                e.mode_string().unwrap_or_default(),
+                m & 0o7777
+            ));
+        }
+        if let (Some(u), Some(g)) = (e.uid, e.gid) {
+            out.push(format!("Owner: {}", info.id_names.format_owner(u, g)));
+        }
+        if let Some(t) = &e.symlink_target {
+            out.push(format!("Link:  -> {t}"));
+        }
+        if let Some(s) = &e.special_type {
+            out.push(format!("Type:  {s}"));
+        }
+        if let Some(m) = &e.modified {
+            out.push(format!("Mtime: {m}"));
+        }
+        if !info.xattrs.is_empty() {
+            out.push(String::new());
+            out.push("Extended attributes:".to_string());
+            for x in &info.xattrs {
+                out.push(format!("  {} = {}", x.name, x.value_display()));
+            }
+        }
+        if let Some(p) = &info.size_plan {
+            use crate::partition::format_size;
+            out.push(String::new());
+            out.push("SquashFS size budget:".to_string());
+            out.push(format!("  Image occupies {}", format_size(p.image_len)));
+            out.push(format!(
+                "  Content        {} uncompressed",
+                format_size(p.content_len)
+            ));
+            out.push(format!("  Compressed to  {}", p.describe_ratio()));
+            match (p.capacity, p.headroom) {
+                (Some(cap), Some(head)) => out.push(format!(
+                    "  Room available {} ({} unused)",
+                    format_size(cap),
+                    format_size(head)
+                )),
+                _ => {
+                    out.push("  Room available unbounded - this file is the filesystem".to_string())
+                }
+            }
+            // Saving an edit rebuilds the whole image, so the ceiling is the
+            // only thing that can be promised in advance.
+            out.push("  Set a ceiling with: rb-cli squashfs put|rm --size|--grow".to_string());
+        }
+        out
+    }
+
+    /// Apply the attribute edit typed in the info overlay's prompt.
+    fn apply_attr_edit(&mut self, field: AttrField, text: &str) {
+        let side = self.active;
+        let Some(info) = &self.info else { return };
+        let entry = info.entry.clone();
+        let Some(session) = self.pane_mut(side).session.clone() else {
+            self.set_result(Err("Pane has no write session.".to_string()));
+            return;
+        };
+        let text = text.trim();
+
+        let edit = match field {
+            AttrField::Mode => match u32::from_str_radix(text, 8) {
+                Ok(m) if m <= 0o7777 => crate::model::edit_queue::StagedEdit::SetPermissions {
+                    entry: entry.clone(),
+                    // The drivers take the complete mode; keep the entry's type
+                    // bits and replace only the permission bits.
+                    mode: (entry.mode.unwrap_or(0) & !0o7777) | m,
+                },
+                _ => {
+                    self.set_result(Err(format!(
+                        "Bad octal mode {text:?} (1-4 digits, <= 7777)"
+                    )));
+                    return;
+                }
+            },
+            AttrField::Owner => {
+                let parsed = text
+                    .split_once(':')
+                    .and_then(|(u, g)| Some((u.trim().parse().ok()?, g.trim().parse().ok()?)));
+                match parsed {
+                    Some((uid, gid)) => crate::model::edit_queue::StagedEdit::SetOwner {
+                        entry: entry.clone(),
+                        uid,
+                        gid,
+                    },
+                    None => {
+                        self.set_result(Err(format!("Bad owner {text:?} (want uid:gid)")));
+                        return;
+                    }
+                }
+            }
+            AttrField::Xattr => {
+                let (name, value) = match text.split_once('=') {
+                    Some((n, v)) => (n.trim().to_string(), v),
+                    None => {
+                        self.set_result(Err("Want name=value (empty value deletes)".to_string()));
+                        return;
+                    }
+                };
+                if !crate::fs::xattr::has_valid_namespace(&name) {
+                    self.set_result(Err(format!(
+                        "Xattr {name:?} needs a user. / trusted. / security. / system. prefix"
+                    )));
+                    return;
+                }
+                if value.trim().is_empty() {
+                    crate::model::edit_queue::StagedEdit::RemoveXattr {
+                        entry: entry.clone(),
+                        name,
+                    }
+                } else {
+                    match crate::fs::xattr::parse_value(value) {
+                        Ok(v) => crate::model::edit_queue::StagedEdit::SetXattr {
+                            entry: entry.clone(),
+                            name,
+                            value: v,
+                        },
+                        Err(e) => {
+                            self.set_result(Err(e));
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        let result = with_stderr_suppressed(|| {
+            crate::model::commander_ops::apply_edits(&session, std::slice::from_ref(&edit))
+        })
+        .map(|()| "Attribute updated.".to_string())
+        .map_err(|e| format!("Attribute edit failed: {e:#}"));
+        let ok = result.is_ok();
+        self.set_result(result);
+        if ok {
+            cmd_refresh(self.pane_mut(side));
+            // Re-read so the overlay reflects what actually landed.
+            self.open_info();
+        }
     }
 
     /// Delete the active pane's selected entry (host: `remove_file` /
@@ -4170,11 +4464,13 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     w.class_sel = w.class_sel.saturating_sub(1);
                     w.fs_sel = 0;
+                    w.seed_size_for_class();
                     true
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     w.class_sel = (w.class_sel + 1).min(NEW_CLASSES.len() - 1);
                     w.fs_sel = 0;
+                    w.seed_size_for_class();
                     true
                 }
                 KeyCode::Enter => {
@@ -4292,6 +4588,42 @@ impl App {
                 cluster_size: None,
                 sector_size: None,
             }),
+            // Hard disks build with their defaults; the donor-clone and custom
+            // partition-layout options stay on the CLI (`rb-cli new hd ...`).
+            DiskClass::Hd => {
+                let platform = HD_PLATFORMS[w.fs_sel.min(HD_PLATFORMS.len() - 1)].1;
+                NewCommand::Hd {
+                    cmd: match platform {
+                        // Same defaults the CLI's clap definitions carry:
+                        // SASI variant, the printing IPL stub, one partition.
+                        HdPlatform::X68k => {
+                            HdCommand::X68k(crate::cli::verbs::new_x68k_hdd::NewX68kHddArgs {
+                                image: path.clone(),
+                                size,
+                                variant: crate::cli::verbs::new_x68k_hdd::CliVariant::Sasi,
+                                stub: crate::cli::verbs::new_x68k_hdd::CliStub::Print,
+                                partitions: 1,
+                                system_disk: None,
+                                boot_sector_donor: None,
+                                builtin_boot_sector: false,
+                            })
+                        }
+                        HdPlatform::SgiEfs => {
+                            HdCommand::SgiEfs(crate::cli::verbs::new_sgi_hdd::NewSgiHddArgs {
+                                image: path.clone(),
+                                size,
+                                name,
+                                fs: crate::cli::verbs::new_sgi_hdd::SgiFs::Efs,
+                                heads: crate::partition::sgi_hdd_builder::DEFAULT_HEADS,
+                                sectors:
+                                    crate::partition::sgi_hdd_builder::DEFAULT_SECTORS_PER_TRACK,
+                                inodes: None,
+                                bytes_per_inode: None,
+                            })
+                        }
+                    },
+                }
+            }
         };
         // `new::run` prints advisories to stdout/stderr, which would land on the
         // alt-screen; run it with both streams redirected to null.
@@ -5735,6 +6067,50 @@ impl App {
             return true;
         }
 
+        // Attribute-edit prompt from the info overlay (modal, innermost).
+        if let Some(p) = c.attr_input.as_mut() {
+            match code {
+                KeyCode::Esc => c.attr_input = None,
+                KeyCode::Enter => {
+                    let p = c.attr_input.take().unwrap();
+                    c.apply_attr_edit(p.field, &p.text);
+                }
+                KeyCode::Backspace => {
+                    p.text.pop();
+                }
+                KeyCode::Char(ch) => p.text.push(ch),
+                _ => {}
+            }
+            return true;
+        }
+
+        // File Info overlay (modal): m/o/x start an attribute edit, Esc closes.
+        if c.info.is_some() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => c.info = None,
+                KeyCode::Char('m') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Mode,
+                        text: String::new(),
+                    })
+                }
+                KeyCode::Char('o') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Owner,
+                        text: String::new(),
+                    })
+                }
+                KeyCode::Char('x') => {
+                    c.attr_input = Some(AttrPrompt {
+                        field: AttrField::Xattr,
+                        text: String::new(),
+                    })
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // Checksum results overlay (modal): scroll, Esc/q/Enter to close.
         if let Some(rv) = c.checksum_report.as_mut() {
             let page = page.max(1) as usize;
@@ -5979,6 +6355,12 @@ impl App {
                 let p = c.pane_mut(active);
                 p.picker = Some(FilePicker::new(PickKind::File, "Open image file"));
                 p.picker_host = false;
+                true
+            }
+            // File Info overlay: permissions / owner / xattrs, with m/o/x to
+            // edit them. F3 mirrors the Midnight Commander "View" key.
+            KeyCode::Char('v') | KeyCode::F(3) => {
+                c.open_info();
                 true
             }
             KeyCode::Char('r') => {
@@ -7053,8 +7435,9 @@ impl App {
                 }
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "Hard disk (x68k / sgi-efs) and CD-ROM images: use the CLI \
-                     (`rb-cli new hd ...`) or the Optical tab.",
+                    "Hard disks build with their defaults; donor-cloning and custom \
+                     partition layouts need the CLI (`rb-cli new hd ...`). \
+                     CD-ROM images: the Optical tab.",
                     self.palette.dim(),
                 ));
                 lines.push(Line::raw(""));
@@ -7723,7 +8106,7 @@ impl App {
         let status = match &c.status {
             Some(s) => s.clone(),
             None => {
-                "Tab pane  Enter open  Space mark  c copy  # hash  n mkdir  x del  s sort  p fs  r refresh"
+                "Tab pane  Enter open  Space mark  c copy  v info  # hash  n mkdir  x del  s sort  p fs  r refresh"
                     .to_string()
             }
         };
@@ -7834,6 +8217,50 @@ impl App {
             ));
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(self.pane_block("Checksums", true)),
+                popup,
+            );
+        }
+
+        // File Info overlay: attributes, with the edit keys along the bottom.
+        if c.info.is_some() {
+            let body = c.info_lines();
+            let h = (body.len() as u16 + 4).clamp(8, area.height.saturating_sub(2));
+            let popup = centered_rect(76, h, area);
+            frame.render_widget(Clear, popup);
+            let mut lines: Vec<Line> = body
+                .iter()
+                .map(|l| {
+                    let style = if l.starts_with("Extended attributes") {
+                        self.palette.accent()
+                    } else {
+                        self.palette.dim()
+                    };
+                    Line::styled(format!(" {l}"), style)
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                " m mode   o owner   x xattr   Esc close",
+                self.palette.dim(),
+            ));
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(self.pane_block("File Info", true)),
+                popup,
+            );
+        }
+
+        // Attribute-edit prompt (innermost overlay).
+        if let Some(p) = &c.attr_input {
+            let popup = centered_rect(66, 6, area);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::raw(""),
+                    Line::styled(format!("  {}", p.field.label()), self.palette.dim()),
+                    Line::styled(format!("  > {}", p.text), self.palette.accent()),
+                    Line::styled("  Enter apply   Esc cancel", self.palette.dim()),
+                ]))
+                .block(self.pane_block("Edit attribute", true)),
                 popup,
             );
         }
@@ -9272,13 +9699,9 @@ fn apply_metadata_edit(
     };
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), &dst)?;
     fs.set_type_creator(&entry, type_code, creator)
         .map_err(|e| anyhow::anyhow!("set type/creator: {e}"))?;
@@ -9304,13 +9727,9 @@ fn apply_repair(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut efs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for repair: {e}"))?;
+    let mut efs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for repair: {e}"))?;
     let report = efs.repair().map_err(|e| anyhow::anyhow!("repair: {e}"))?;
     efs.sync_metadata()
         .map_err(|e| anyhow::anyhow!("sync_metadata: {e}"))?;
@@ -9435,13 +9854,9 @@ fn apply_bless_folder(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let entry = crate::cli::verbs::ls::resolve_path(fs.as_filesystem_mut(), dir_path)?;
     if !entry.is_directory() {
         anyhow::bail!("{dir_path} is not a directory");
@@ -9466,13 +9881,9 @@ fn apply_mkdir(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -9503,13 +9914,9 @@ fn apply_delete(
     use crate::cli::resolve::resolve_partition_rw_forced;
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
     let parent = if cur_dir == "/" {
         fs.root()
             .map_err(|e| anyhow::anyhow!("reading root: {e}"))?
@@ -9554,13 +9961,9 @@ fn import_host_file(
 
     let (file, ctx, commit) =
         resolve_partition_rw_forced(std::path::Path::new(image_path), selector, None)?;
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow::anyhow!("opening filesystem for write: {e}"))?;
 
     let (parent, leaf) = crate::cli::verbs::ls::resolve_parent(fs.as_filesystem_mut(), &dst)?;
     if !parent.is_directory() {

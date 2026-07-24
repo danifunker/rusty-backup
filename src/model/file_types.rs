@@ -29,6 +29,11 @@ pub const DISK_IMAGE_EXTS: &[&str] = &[
     // A bare SquashFS root (Buildroot and other appliance images ship one
     // alongside the disk image); opens as a superfloppy via its `hsqs` magic.
     "squashfs",
+    // An AppImage is an ELF stub with a SquashFS appended; the payload opens
+    // in place. Listed in both cases because the tooling ships them
+    // capitalised and the picker matches literally.
+    "appimage",
+    "AppImage",
     "bin",
     "iso",
     "dd",
@@ -356,6 +361,10 @@ mod tests {
             ("coco disk", &["dsk", "jvc", "vdk"]),
             // TR-DOS (ZX Spectrum Beta Disk) flat .trd (ZX-Spectrum core).
             ("trdos disk", &["trd"]),
+            // VM disk containers — read, edit in place, and write as backup.
+            // `.qcow` is the extensionless-era alias qemu still accepts; UTM
+            // writes `.qcow2` for its classic-Mac disks.
+            ("vm container", &["qcow2", "qcow", "vmdk"]),
         ];
         let exts = association_exts();
         for (family, must) in families {
@@ -454,6 +463,15 @@ mod tests {
             DISK_IMAGE_EXTS.contains(&"squashfs"),
             "missing squashfs disk-image extension"
         );
+        // An AppImage's payload is a SquashFS the engine opens in place
+        // (src/rbformats/appimage.rs). Both cases, because the tooling ships
+        // them capitalised and the picker matches literally.
+        for ext in ["appimage", "AppImage"] {
+            assert!(
+                DISK_IMAGE_EXTS.contains(&ext),
+                "missing {ext} disk-image extension"
+            );
+        }
     }
 
     #[test]

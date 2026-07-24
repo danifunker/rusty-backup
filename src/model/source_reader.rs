@@ -47,6 +47,17 @@ pub fn is_chd_path(path: &Path) -> bool {
     matches!(f.read(&mut magic), Ok(n) if n == 8) && &magic == b"MComprHD"
 }
 
+/// Cheap magic sniff: returns true when `path` starts with `QFI\xFB`. The
+/// signature is unambiguous, so no extension check is needed — UTM writes
+/// `.qcow2`, but qemu happily produces extensionless / `.img`-named QCOW2s.
+pub fn is_qcow2_path(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    matches!(f.read(&mut magic), Ok(n) if n == 4) && &magic == crate::rbformats::qcow2::QCOW2_MAGIC
+}
+
 /// Cheap sniff: returns true when `path` looks like a WinImage IMZ
 /// archive. IMZ is just a ZIP, so the bare magic (`PK\x03\x04`) would
 /// false-positive on arbitrary ZIPs — we additionally require the
@@ -931,7 +942,28 @@ fn open_read_dispatch(
     password: Option<&[u8]>,
     inside: Option<&str>,
 ) -> Result<Box<dyn ReadSeek>> {
-    if is_chd_path(path) {
+    if crate::rbformats::appimage::is_squashfs_appimage(path) {
+        // An AppImage is an ELF stub with a SquashFS appended, so there is
+        // nothing to decode — present the payload as a window whose byte 0 is
+        // the filesystem, and every layer above treats it as a bare image.
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut probe = file
+            .try_clone()
+            .with_context(|| format!("open {}", path.display()))?;
+        let offset = crate::rbformats::appimage::squashfs_payload_offset(&mut probe)
+            .ok_or_else(|| anyhow::anyhow!("no SquashFS payload in AppImage {}", path.display()))?;
+        Ok(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::tail(file, offset),
+        ))
+    } else if let Some((offset, len)) = squashfs_bearing_iso_payload(path) {
+        // A live CD's `casper/filesystem.squashfs`: a contiguous file inside a
+        // plain ISO, presented as a bounded window at its extent. Bounded, not
+        // tail, because the payload sits between other files on the disc.
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        Ok(Box::new(
+            crate::rbformats::payload_slice::PayloadSlice::bounded(file, offset, len),
+        ))
+    } else if is_chd_path(path) {
         let chd = ChdReader::open(path).with_context(|| format!("open CHD {}", path.display()))?;
         Ok(Box::new(chd))
     } else if crate::rbformats::cbk::is_cbk(path) {
@@ -1370,8 +1402,34 @@ pub fn is_editable_container_path(path: &Path) -> bool {
 /// to route through `open_read` instead of opening the file raw, so the
 /// "what counts as a container" list lives in one place instead of being
 /// re-listed (and drifting) at every call site.
+/// The SquashFS payload inside a plain ISO as `(offset, len)`, or `None`.
+/// Always `None` in a build without the `optical` feature (which cannot read
+/// ISOs at all), so callers need no `#[cfg]` of their own. A plain tuple rather
+/// than the `optical`-gated `IsoSquashfs` type, so this signature is the same in
+/// both builds.
+fn squashfs_bearing_iso_payload(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(feature = "optical")]
+    {
+        crate::rbformats::iso_squashfs::find_squashfs(path).map(|i| (i.offset, i.len))
+    }
+    #[cfg(not(feature = "optical"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether `path` is a plain ISO carrying a SquashFS payload — browsable and
+/// extractable, but (unlike an AppImage) not editable in place, since the
+/// payload cannot grow. The edit resolvers use this to refuse cleanly.
+pub fn is_squashfs_bearing_iso(path: &Path) -> bool {
+    squashfs_bearing_iso_payload(path).is_some()
+}
+
 pub fn is_container_path(path: &Path) -> bool {
-    is_chd_path(path)
+    crate::rbformats::appimage::is_squashfs_appimage(path)
+        || squashfs_bearing_iso_payload(path).is_some()
+        || is_chd_path(path)
         || crate::rbformats::cbk::is_cbk(path)
         || is_gho_path(path)
         || is_imz_path(path)

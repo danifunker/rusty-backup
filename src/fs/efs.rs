@@ -29,6 +29,11 @@ pub(crate) const EFS_BLOCKSIZE: u64 = 512;
 const EFS_INODESIZE: u64 = 128;
 const EFS_INODES_PER_BLOCK: u64 = EFS_BLOCKSIZE / EFS_INODESIZE; // 4
 const EFS_DIRECTEXTENTS: usize = 12;
+
+/// IRIX `MAXPATHLEN`. A symlink target is an ordinary path, and EFS stores it
+/// as file data, so this — not the 255-byte directory-entry limit — is the
+/// bound that applies to one.
+const EFS_MAXPATHLEN: usize = 1024;
 /// Public alias of the 12-extent hard cap. Used by the fsck verifier
 /// and any other cross-module callers.
 pub const EFS_DIRECTEXTENTS_MAX: usize = EFS_DIRECTEXTENTS;
@@ -1299,6 +1304,82 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             self.sb.lastialloc = inum;
             self.sb_dirty = true;
             Ok(entry_from_inode(name, &parent.path, &new_ino))
+        })();
+
+        self.staged_bitmap = Some(bm);
+        res
+    }
+
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
+    /// EFS keeps a symlink's target in the inode's ordinary data blocks —
+    /// there is no inline "fast symlink" form — so this is [`Self::create_file`]
+    /// with the target as the content and `S_IFLNK` in the mode. That is
+    /// exactly what the read side already assumes when it runs
+    /// `read_inode_data` over an `is_symlink` inode.
+    fn create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        if target.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "EFS: a symlink target may not be empty".into(),
+            ));
+        }
+        if target.len() > EFS_MAXPATHLEN {
+            return Err(FilesystemError::InvalidData(format!(
+                "EFS: symlink target is {} bytes, past IRIX's {EFS_MAXPATHLEN}-byte path limit",
+                target.len()
+            )));
+        }
+        let parent_inum = parent.location as u32;
+
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let mut bm = match self.staged_bitmap.take() {
+            Some(b) => b,
+            None => self.read_bitmap()?,
+        };
+
+        let res = (|| -> Result<FileEntry, FilesystemError> {
+            let inum = self.allocate_inode()?;
+            let mut new_ino = EfsInode::empty(inum);
+            // Symlinks are conventionally 0777 on IRIX. An explicit mode's
+            // permission bits are honoured, but the type bits are ours to set
+            // — a caller passing a full 0o120777 must not double-stamp them.
+            new_ino.mode = (0o120000 | (options.mode.unwrap_or(0o777) & 0o7777)) as u16;
+            new_ino.nlink = 1;
+            new_ino.uid = options.uid.unwrap_or(0) as u16;
+            new_ino.gid = options.gid.unwrap_or(0) as u16;
+
+            let mut data = target.as_bytes();
+            let len = data.len() as u64;
+            self.write_file_data(&mut bm, &mut new_ino, &mut data, len)?;
+            self.write_inode(&new_ino)?;
+
+            let mut parent_ino = self.read_inode(parent_inum)?;
+            self.dir_insert(&mut parent_ino, &mut bm, name_bytes, inum)?;
+            self.write_inode(&parent_ino)?;
+
+            self.sb.tinode = self.sb.tinode.saturating_sub(1);
+            self.sb.lastialloc = inum;
+            self.sb_dirty = true;
+            let mut e = entry_from_inode(name, &parent.path, &new_ino);
+            e.symlink_target = Some(target.to_string());
+            Ok(e)
         })();
 
         self.staged_bitmap = Some(bm);
@@ -2757,6 +2838,78 @@ mod tests {
     /// A freshly formatted EFS root directory begins with "." and ".." (both
     /// pointing at the root inode). Regression guard: without them IRIX mounts
     /// the volume but shows an empty root. Subdirectories already got them via
+    /// EFS holds symlinks — every real IRIX volume is full of them, and our own
+    /// reader resolves their targets. Writing one had simply never been
+    /// implemented, so `supports_symlinks()` fell through to the trait default
+    /// and a tar import warned that "this filesystem can't store symbolic
+    /// links" while restoring an archive that had come *out* of an EFS disc.
+    #[test]
+    fn symlinks_round_trip_through_create_and_read() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        let img = create_blank_efs(8 * 1024 * 1024, "LINKS").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        assert!(
+            fs.supports_symlinks(),
+            "EFS must advertise symlink support, or importers drop them up front"
+        );
+        let root = fs.root().expect("root");
+        let link = fs
+            .create_symlink(
+                &root,
+                "init",
+                "/usr/sbin/init",
+                &CreateFileOptions::default(),
+            )
+            .expect("create symlink");
+        assert_eq!(link.symlink_target.as_deref(), Some("/usr/sbin/init"));
+        // A long target still fits: EFS stores it as ordinary file data, so it
+        // spans blocks rather than being capped at a directory-entry length.
+        let long = format!("/{}", "d/".repeat(300));
+        fs.create_symlink(&root, "deep", &long, &CreateFileOptions::default())
+            .expect("create long symlink");
+        fs.sync_metadata().expect("sync");
+
+        // Reopen through the read path — the one the browser and tar export use.
+        let img = fs.reader_into_inner().into_inner();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("reopen");
+        let root = fs.root().expect("root");
+        let entries = fs.list_directory(&root).expect("list");
+        let init = entries.iter().find(|e| e.name == "init").expect("init");
+        assert_eq!(
+            init.entry_type,
+            EntryType::Symlink,
+            "not typed as a symlink"
+        );
+        assert_eq!(init.symlink_target.as_deref(), Some("/usr/sbin/init"));
+        assert_eq!(
+            init.mode.map(|m| m & 0o170000),
+            Some(0o120000),
+            "S_IFLNK not stamped into the mode"
+        );
+        let deep = entries.iter().find(|e| e.name == "deep").expect("deep");
+        assert_eq!(deep.symlink_target.as_deref(), Some(long.as_str()));
+    }
+
+    /// A target past IRIX's MAXPATHLEN is refused rather than silently cut.
+    #[test]
+    fn an_overlong_symlink_target_is_refused() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        let img = create_blank_efs(8 * 1024 * 1024, "LINKS").expect("format");
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let err = fs
+            .create_symlink(
+                &root,
+                "toolong",
+                &"x".repeat(EFS_MAXPATHLEN + 1),
+                &CreateFileOptions::default(),
+            )
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("path limit"), "got: {err}");
+    }
+
     /// `create_directory`; this covers `create_blank_efs`'s root.
     #[test]
     fn blank_efs_root_has_dot_and_dotdot() {

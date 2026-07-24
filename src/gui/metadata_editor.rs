@@ -585,3 +585,247 @@ pub fn render_ext_permissions_row(
         *result = Some(format!("Staged permissions {mode:o} on '{}'", entry.name));
     }
 }
+
+/// Inline editor state for an entry's owning uid/gid.
+#[derive(Default)]
+pub struct OwnerEditorState {
+    entry_path: String,
+    uid: String,
+    gid: String,
+}
+
+/// Render the owner (uid/gid) row: read-only text when not in edit mode
+/// (resolved to names via `id_names` when available), two numeric fields + Set
+/// when editing. Stages a [`StagedEdit::SetOwner`]. Unix filesystems only.
+pub fn render_owner_row(
+    ui: &mut egui::Ui,
+    entry: &FileEntry,
+    edit_mode: bool,
+    id_names: Option<&rusty_backup::fs::id_names::IdNameMap>,
+    queue: &mut EditQueue,
+    editor: &mut Option<OwnerEditorState>,
+    result: &mut Option<String>,
+) {
+    // A staged owner edit wins over the on-disk value.
+    let (cur_uid, cur_gid) = queue
+        .pending_owner_for(&entry.path)
+        .or_else(|| Some((entry.uid?, entry.gid?)))
+        .unwrap_or((0, 0));
+
+    if !edit_mode {
+        let shown = match id_names {
+            Some(n) => n.format_owner(cur_uid, cur_gid),
+            None => format!("{cur_uid}:{cur_gid}"),
+        };
+        ui.label(format!("Owner: {shown}"));
+        return;
+    }
+
+    let needs_seed = editor
+        .as_ref()
+        .map(|s| s.entry_path != entry.path)
+        .unwrap_or(true);
+    if needs_seed {
+        *editor = Some(OwnerEditorState {
+            entry_path: entry.path.clone(),
+            uid: cur_uid.to_string(),
+            gid: cur_gid.to_string(),
+        });
+    }
+
+    let mut stage: Option<(u32, u32)> = None;
+    let mut reset = false;
+    if let Some(state) = editor.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label("Owner uid:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.uid)
+                    .desired_width(64.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.label("gid:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.gid)
+                    .desired_width(64.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            let parsed = state
+                .uid
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .zip(state.gid.trim().parse::<u32>().ok());
+            let changed = parsed.map(|p| p != (cur_uid, cur_gid)).unwrap_or(false);
+            if ui
+                .add_enabled(parsed.is_some() && changed, egui::Button::new("Set"))
+                .clicked()
+            {
+                stage = parsed;
+            }
+            if ui.button("Reset").clicked() {
+                reset = true;
+            }
+            if parsed.is_none() {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "numbers");
+            }
+        });
+    }
+
+    if reset {
+        if let Some(state) = editor.as_mut() {
+            state.uid = cur_uid.to_string();
+            state.gid = cur_gid.to_string();
+        }
+    }
+    if let Some((uid, gid)) = stage {
+        queue.replace_set_owner(entry, uid, gid);
+        *result = Some(format!("Staged owner {uid}:{gid} on '{}'", entry.name));
+    }
+}
+
+/// Inline editor state for an entry's extended attributes: a per-name scratch
+/// value being edited, plus the "add new" name/value fields.
+#[derive(Default)]
+pub struct XattrEditorState {
+    entry_path: String,
+    /// name -> the value string currently in its edit field (hex or text).
+    values: std::collections::HashMap<String, String>,
+    new_name: String,
+    new_value: String,
+}
+
+/// Render the extended-attributes section: a list of `name = value` rows
+/// (read-only), and in edit mode a hex/text value field + Set + Delete per
+/// attribute plus an Add row. `xattrs` is the on-disk set; pending staged edits
+/// are overlaid so the user sees their queued changes. Stages
+/// [`StagedEdit::SetXattr`] / [`StagedEdit::RemoveXattr`].
+pub fn render_xattr_section(
+    ui: &mut egui::Ui,
+    entry: &FileEntry,
+    edit_mode: bool,
+    xattrs: &[rusty_backup::fs::xattr::Xattr],
+    queue: &mut EditQueue,
+    editor: &mut Option<XattrEditorState>,
+    result: &mut Option<String>,
+) {
+    use rusty_backup::fs::xattr::{self, Xattr};
+
+    // Overlay: start from on-disk, apply pending sets/removes.
+    let pending = queue.pending_xattrs_for(&entry.path);
+    let mut effective: Vec<Xattr> = xattrs.to_vec();
+    for (name, val) in &pending {
+        effective.retain(|x| &x.name != name);
+        if let Some(v) = val {
+            effective.push(Xattr {
+                name: name.clone(),
+                value: v.clone(),
+            });
+        }
+    }
+    effective.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if effective.is_empty() && !edit_mode {
+        return;
+    }
+
+    ui.separator();
+    ui.label(egui::RichText::new("Extended attributes").strong());
+
+    if !edit_mode {
+        for x in &effective {
+            ui.label(format!("  {} = {}", x.name, x.value_display()));
+        }
+        return;
+    }
+
+    // Seed per-entry scratch when the selection changes.
+    let needs_seed = editor
+        .as_ref()
+        .map(|s| s.entry_path != entry.path)
+        .unwrap_or(true);
+    if needs_seed {
+        let mut values = std::collections::HashMap::new();
+        for x in &effective {
+            values.insert(x.name.clone(), x.value_display());
+        }
+        *editor = Some(XattrEditorState {
+            entry_path: entry.path.clone(),
+            values,
+            new_name: String::new(),
+            new_value: String::new(),
+        });
+    }
+
+    let mut stage_set: Option<(String, Vec<u8>)> = None;
+    let mut stage_remove: Option<String> = None;
+    let mut err: Option<String> = None;
+
+    if let Some(state) = editor.as_mut() {
+        for x in &effective {
+            ui.horizontal(|ui| {
+                ui.monospace(&x.name);
+                let field = state
+                    .values
+                    .entry(x.name.clone())
+                    .or_insert_with(|| x.value_display());
+                ui.add(
+                    egui::TextEdit::singleline(field)
+                        .desired_width(240.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if ui.button("Set").clicked() {
+                    match xattr::parse_value(field) {
+                        Ok(v) => stage_set = Some((x.name.clone(), v)),
+                        Err(e) => err = Some(e),
+                    }
+                }
+                if ui.button("Delete").clicked() {
+                    stage_remove = Some(x.name.clone());
+                }
+            });
+        }
+        // Add-new row.
+        ui.horizontal(|ui| {
+            ui.label("Add:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.new_name)
+                    .hint_text("user.name")
+                    .desired_width(160.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut state.new_value)
+                    .hint_text("value or 0xHEX")
+                    .desired_width(180.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            let name_ok = xattr::has_valid_namespace(state.new_name.trim());
+            if ui
+                .add_enabled(name_ok, egui::Button::new("Add"))
+                .on_hover_text("Name must start with user. / trusted. / security. / system.")
+                .clicked()
+            {
+                match xattr::parse_value(&state.new_value) {
+                    Ok(v) => stage_set = Some((state.new_name.trim().to_string(), v)),
+                    Err(e) => err = Some(e),
+                }
+            }
+        });
+        if let Some(e) = &err {
+            ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+        }
+    }
+
+    if let Some((name, value)) = stage_set {
+        queue.replace_set_xattr(entry, &name, value);
+        *result = Some(format!("Staged xattr {name} on '{}'", entry.name));
+        if let Some(state) = editor.as_mut() {
+            state.new_name.clear();
+            state.new_value.clear();
+        }
+    }
+    if let Some(name) = stage_remove {
+        queue.replace_remove_xattr(entry, &name);
+        *result = Some(format!("Staged xattr removal {name} on '{}'", entry.name));
+    }
+}

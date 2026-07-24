@@ -26,6 +26,7 @@ mod restore_tab;
 mod settings_dialog;
 mod size_mode_row;
 mod source_picker;
+mod squashfs_budget_dialog;
 pub mod ui_logger;
 
 use archives_tab::ArchivesTab;

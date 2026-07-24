@@ -35,6 +35,15 @@ pub struct BrowseSession {
     pub source_path: Option<PathBuf>,
     /// Byte offset into the source where this partition starts.
     pub partition_offset: u64,
+    /// Length of the partition in bytes, when known. Only consulted for
+    /// editing, and only by drivers that can emit an image of a different size
+    /// than they read (SquashFS rebuilds wholesale), which need to know where
+    /// they must stop. `None` leaves them to assume the worst.
+    pub partition_size: Option<u64>,
+    /// A size ceiling the user asked for before entering Edit Mode, for those
+    /// same whole-image-rewrite drivers. Set by the GUI's size-budget dialog;
+    /// `None` means no request, and the container still binds.
+    pub rebuild_budget: Option<crate::fs::squashfs_edit::SizeBudget>,
     /// Partition type byte (MBR-style).
     pub partition_type: u8,
     /// Partition type string for table types that carry one (APM, GPT GUID).
@@ -646,9 +655,14 @@ impl BrowseSession {
         if let Some((conn, rpath)) = &self.remote {
             let reader = crate::remote::RemoteBlockReader::open_rw(Arc::clone(conn), rpath)
                 .map_err(|e| FilesystemError::Io(crate::compat::io_other(e.to_string())))?;
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_with(
                 reader,
                 self.partition_offset,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -660,9 +674,14 @@ impl BrowseSession {
         // is opened.
         if let Some(arc) = &self.chd_edit_session {
             let handle = ChdEditHandle::from_arc(Arc::clone(arc));
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_with(
                 handle,
                 self.partition_offset,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -724,9 +743,14 @@ impl BrowseSession {
                 .write(true)
                 .open(session.flat_path())
                 .map_err(FilesystemError::Io)?;
-            let fs = fs::open_editable_filesystem(
+            let fs = fs::open_editable_filesystem_with(
                 file,
                 self.partition_offset,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
+                    ..Default::default()
+                },
                 self.partition_type,
                 self.partition_type_string.as_deref(),
             )?;
@@ -738,15 +762,71 @@ impl BrowseSession {
             ));
         }
 
+        // QCOW2: the reader is itself `Read + Write + Seek`, allocating host
+        // clusters on demand, so edits land in place with no re-encode on
+        // commit — mirror the CLI's `resolve_image_rw`. Without this branch the
+        // raw file below is handed to the partition/FS resolver, which reads the
+        // QCOW2 header as sector 0 and fails with a misleading error (e.g.
+        // "unrecognized Apple_HFS variant" on a Mac disk). `self.partition_offset`
+        // was computed against the decoded virtual disk, so it applies directly
+        // to the wrapped reader.
+        if crate::model::source_reader::is_qcow2_path(path) {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(FilesystemError::Io)?;
+            let reader = crate::rbformats::qcow2::Qcow2Reader::open(file)
+                .map_err(|e| FilesystemError::Parse(format!("opening QCOW2 for edit: {e:#}")))?;
+            // Surface the root cause up front. A snapshot-bearing QCOW2 opens
+            // read-only (its clusters are shared, and we do no copy-on-write) —
+            // and this is the common UTM case, where a *suspended* VM leaves
+            // both a "suspend" snapshot and a dirty guest journal. Without this
+            // the user would instead hit the downstream "dirty journaled HFS+"
+            // message, which points at the symptom, not the cause.
+            if reader.is_read_only() {
+                return Err(FilesystemError::Unsupported(format!(
+                    "this QCOW2 has {} internal snapshot(s) and opens read-only \
+                     (a UTM suspended-VM state is the usual one). Editing could \
+                     corrupt them. Shut the VM down cleanly in UTM, or drop the \
+                     snapshot (`qemu-img snapshot -d <name> <file>`), then retry.",
+                    reader.snapshot_count()
+                )));
+            }
+            let fs = fs::open_editable_filesystem_with(
+                reader,
+                self.partition_offset,
+                fs::EditContext {
+                    partition_len: self.partition_size,
+                    rebuild_budget: self.rebuild_budget,
+                    ..Default::default()
+                },
+                self.partition_type,
+                self.partition_type_string.as_deref(),
+            )?;
+            return Ok((fs, ContainerEditCommit { session: None }));
+        }
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(FilesystemError::Io)?;
 
-        let fs = fs::open_editable_filesystem(
+        // The last branch: a plain file opened directly, no container decode in
+        // between. When the filesystem also starts at byte 0 it *is* the whole
+        // file, so a driver that rewrites its image wholesale (SquashFS) may
+        // commit by atomic replacement instead of overwriting in place. Every
+        // earlier branch returned a temp / session / remote handle, where
+        // renaming over `path` would destroy the surrounding image.
+        let fs = fs::open_editable_filesystem_with(
             file,
             self.partition_offset,
+            fs::EditContext {
+                partition_len: self.partition_size,
+                whole_file_path: (self.partition_offset == 0).then_some(path.as_path()),
+                rebuild_budget: self.rebuild_budget,
+            },
             self.partition_type,
             self.partition_type_string.as_deref(),
         )?;

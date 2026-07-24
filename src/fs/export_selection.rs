@@ -179,12 +179,21 @@ fn folder_recurse(
         }
         match e.entry_type {
             EntryType::Directory => {
-                let sub = dest_dir.join(&e.name);
-                std::fs::create_dir_all(&sub)
-                    .with_context(|| format!("creating {}", sub.display()))?;
                 let children = fs
                     .list_directory(e)
                     .with_context(|| format!("listing '{}'", e.name))?;
+                // A volume root has no name of its own — extract its contents
+                // straight into `dest_dir`. Joining its literal "/" name would
+                // discard `dest_dir` entirely and target the host root.
+                let sub = match e.archive_name() {
+                    Some(name) => {
+                        let sub = dest_dir.join(name);
+                        std::fs::create_dir_all(&sub)
+                            .with_context(|| format!("creating {}", sub.display()))?;
+                        sub
+                    }
+                    None => dest_dir.to_path_buf(),
+                };
                 folder_recurse(
                     fs, &children, &sub, format, fork_mode, progress, cancelled, summary,
                 )?;
@@ -357,15 +366,20 @@ fn zip_recurse<W: Write + std::io::Seek>(
         if cancelled() {
             return Err(cancelled_err());
         }
-        let arch = if prefix.is_empty() {
-            e.name.clone()
-        } else {
-            format!("{prefix}/{}", e.name)
+        // A volume root contributes its children at the current level; zip, like
+        // tar, has no member name for it (its literal name is "/").
+        let member = e.archive_name();
+        let arch = match (prefix.is_empty(), member) {
+            (_, None) => prefix.to_string(),
+            (true, Some(n)) => n.to_string(),
+            (false, Some(n)) => format!("{prefix}/{n}"),
         };
         match e.entry_type {
             EntryType::Directory => {
-                zw.add_directory(format!("{arch}/"), opts)
-                    .with_context(|| format!("zip dir '{arch}'"))?;
+                if member.is_some() {
+                    zw.add_directory(format!("{arch}/"), opts)
+                        .with_context(|| format!("zip dir '{arch}'"))?;
+                }
                 let children = fs
                     .list_directory(e)
                     .with_context(|| format!("listing '{}'", e.name))?;
@@ -448,13 +462,18 @@ fn sit_nodes(
                     .with_context(|| format!("listing '{}'", e.name))?;
                 let (create, modify) = sit_dates(e);
                 let inner = sit_nodes(fs, &children, progress, cancelled, summary)?;
-                nodes.push(StuffItInputNode::Folder {
-                    name: e.name.clone(),
-                    finder_flags: e.finder_flags.unwrap_or(0),
-                    create_date: create,
-                    mod_date: modify,
-                    children: inner,
-                });
+                match e.archive_name() {
+                    // A volume root becomes the archive's own top level rather
+                    // than a folder literally named "/".
+                    None => nodes.extend(inner),
+                    Some(name) => nodes.push(StuffItInputNode::Folder {
+                        name: name.to_string(),
+                        finder_flags: e.finder_flags.unwrap_or(0),
+                        create_date: create,
+                        mod_date: modify,
+                        children: inner,
+                    }),
+                }
             }
             EntryType::File => {
                 let data = read_data_fork(fs, e)?;
@@ -562,6 +581,59 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(out.path().join("SUB/INNER.TXT")).unwrap(),
+            b"nested file"
+        );
+    }
+
+    /// Exporting a *selected volume root* — what "select everything, export"
+    /// produces — must lay the root's children at the top of the archive.
+    ///
+    /// Every driver names its root `"/"`, and taking that literally broke each
+    /// format differently: tar and zip reject an absolute member outright, and
+    /// the loose-file path was worse than an error — `Path::join("/")` discards
+    /// the destination and yields the **host** root, so the export would have
+    /// aimed at `/`.
+    #[test]
+    fn a_selected_volume_root_exports_its_children_in_every_format() {
+        let (mut fs, _entries, _g) = fixture();
+        let root = fs.root().unwrap();
+        assert_eq!(root.name, "/", "fixture assumption: roots are named '/'");
+        let sel = std::slice::from_ref(&root);
+        let out = tempfile::tempdir().unwrap();
+
+        for (fmt, ext) in [
+            (ExportFormat::Tar, "tar"),
+            (ExportFormat::TarGz, "tar.gz"),
+            (ExportFormat::Zip, "zip"),
+            (ExportFormat::MacArchive, "mar"),
+            (ExportFormat::StuffIt, "sit"),
+        ] {
+            let path = out.path().join(format!("whole.{ext}"));
+            let s = export_to_file(&mut *fs, sel, &path, fmt, &noprog, &never)
+                .unwrap_or_else(|e| panic!("{fmt:?} failed on a selected root: {e}"));
+            assert_eq!(s.files, 3, "{fmt:?} should archive all three files");
+        }
+
+        // Loose files: the contents land in the chosen folder, and nothing is
+        // created at the host root.
+        let loose = tempfile::tempdir().unwrap();
+        let s = export_to_folder(
+            &mut *fs,
+            sel,
+            loose.path(),
+            ExportFormat::LooseFiles,
+            ResourceForkMode::Native,
+            &noprog,
+            &never,
+        )
+        .expect("loose export of a selected root");
+        assert_eq!(s.files, 3);
+        assert_eq!(
+            std::fs::read(loose.path().join("HELLO.TXT")).unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            std::fs::read(loose.path().join("SUB/INNER.TXT")).unwrap(),
             b"nested file"
         );
     }

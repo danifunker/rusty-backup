@@ -1699,6 +1699,19 @@ impl CommanderPane {
     /// The filesystem type to show in File Info: the mounted wrapper's type
     /// when a tree selection is active (e.g. "HFS" for a file inside a `.toast`
     /// opened through a `.sit`), else the base pane's type.
+    /// The on-disk extended attributes of `entry`, for the File Info window.
+    /// Empty on a filesystem without xattr support (or when unreadable) — this
+    /// is display metadata, never a hard failure.
+    pub(crate) fn detail_xattrs(
+        &mut self,
+        entry: &FileEntry,
+    ) -> Vec<rusty_backup::fs::xattr::Xattr> {
+        self.fs_mut()
+            .filter(|fs| fs.supports_xattrs())
+            .and_then(|fs| fs.list_xattrs(entry).ok())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn detail_fs_type(&mut self) -> String {
         if let Some((mount, _)) = self.tree_selection() {
             if let Some(fs) = self.wrapper_tree.mount_fs(&mount) {

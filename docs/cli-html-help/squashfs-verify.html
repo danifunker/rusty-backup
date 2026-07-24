@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli squashfs verify</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="squashfs.html">squashfs</a> &raquo; <span>verify</span></nav>
+<h1><code>rb-cli squashfs verify</code></h1>
+<p>Structurally verify an image: walk every inode, dirent and data block, decompressing everything. Not an fsck — SquashFS has no checksums, so this finds broken structure, not altered content</p>
+<h2>Usage</h2>
+<pre><code>Usage: verify &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N`)</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

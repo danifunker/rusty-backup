@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli squashfs</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <span>squashfs</span></nav>
+<h1><code>rb-cli squashfs</code></h1>
+<p>SquashFS edits with an explicit size budget (`plan` / `put` / `rm`). The format has no in-place write, so committing rebuilds the whole image and its final size can only be bounded, never predicted</p>
+<h2>Usage</h2>
+<pre><code>Usage: squashfs &lt;COMMAND&gt;</code></pre>
+<h2>Subcommands</h2>
+<ul class="verbs">
+<li><a href="squashfs-plan.html"><code>plan</code></a><span class="desc">Report what the image occupies, what it may grow into, and how well it compressed — the numbers a size budget is chosen from. Writes nothing</span></li>
+<li><a href="squashfs-put.html"><code>put</code></a><span class="desc">Copy a host file into the image, rebuilding it within a size budget</span></li>
+<li><a href="squashfs-rm.html"><code>rm</code></a><span class="desc">Delete a path from the image, rebuilding it within a size budget</span></li>
+<li><a href="squashfs-create.html"><code>create</code></a><span class="desc">Build a new SquashFS image from a host directory, as `mksquashfs` does</span></li>
+<li><a href="squashfs-verify.html"><code>verify</code></a><span class="desc">Structurally verify an image: walk every inode, dirent and data block, decompressing everything. Not an fsck — SquashFS has no checksums, so this finds broken structure, not altered content</span></li>
+</ul>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

@@ -68,12 +68,14 @@
 <li><a href="setvolname.html"><code>setvolname</code></a><span class="desc">Rename the volume at IMG[@N] (HFS only today)</span></li>
 <li><a href="show.html"><code>show</code></a><span class="desc">Focused read-only queries</span></li>
 <li><a href="shrink.html"><code>shrink</code></a><span class="desc">Re-encode a disk image into a CHD with trailing zero padding dropped (SGI/IRIX today)</span></li>
+<li><a href="squashfs.html"><code>squashfs</code></a><span class="desc">SquashFS edits with an explicit size budget (`plan` / `put` / `rm`). The format has no in-place write, so committing rebuilds the whole image and its final size can only be bounded, never predicted</span></li>
 <li><a href="tar.html"><code>tar</code></a><span class="desc">Archive a filesystem (or a subtree) to a single `.tar.gz` / `.tar.zst` / `.tar`. Preserves exact case-sensitive names and real symlinks, so extracting on a case-insensitive host won't clobber files that differ only in case</span></li>
 <li><a href="terminal.html"><code>terminal</code></a><span class="desc">Open an interactive rb-cli shell (rustyline-based REPL)</span></li>
 <li><a href="tui.html"><code>tui</code></a><span class="desc">Launch the full-screen terminal UI (preview): a menu-driven ratatui app that runs anywhere rusty-backup does, including serial consoles and vintage terminals. Needs an interactive terminal</span></li>
 <li><a href="untar.html"><code>untar</code></a><span class="desc">Import a `.tar.gz` / `.tar.zst` / `.tar` archive's contents INTO a filesystem in an image (the inverse of `tar`). Recreates the tree, streams files in, and recreates symlinks where the target FS supports them</span></li>
 <li><a href="update.html"><code>update</code></a><span class="desc">Check for a newer release and (when built with `--features tui-update`) self-update. Without that feature it reports that updates weren't compiled in and prints the releases URL, exiting non-zero. Pass `--apply` to download and replace this binary in place</span></li>
 <li><a href="write.html"><code>write</code></a><span class="desc">Stream an image file onto a block device</span></li>
+<li><a href="xattr.html"><code>xattr</code></a><span class="desc">Read or edit a file's extended attributes (`list` / `set` / `rm`) — the scriptable form of the GUI and TUI File Info panel. SquashFS today; other xattr-bearing filesystems as their write side lands</span></li>
 </ul>
 <footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
 </body></html>

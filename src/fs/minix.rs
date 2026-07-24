@@ -1467,6 +1467,69 @@ impl<R: Read + Write + Seek + Send> EditableFilesystem for MinixFilesystem<R> {
         Ok(self.entry_from_inode(name, &parent.path, &ino))
     }
 
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
+    /// A Minix symlink is an inode with `S_IFLNK` whose data zone holds the
+    /// target — the same shape as a regular file, which is why this is
+    /// [`Self::create_file`] with a different mode.
+    ///
+    /// `write_file_data` zero-fills the tail of the zone it allocates, so the
+    /// target lands NUL-terminated exactly as `minix_symlink` writes it, and
+    /// `i_size` excludes that terminator (Linux's `page_symlink` convention).
+    fn create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        options: &CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        self.validate_name(name)?;
+        if target.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "Minix: a symlink target may not be empty".into(),
+            ));
+        }
+        // Linux's minix_symlink refuses `strlen(target) + 1 > blocksize`: the
+        // target plus its NUL has to fit one block, because that is all the
+        // kernel's readlink will look at.
+        let max = self.sb.block_size as usize - 1;
+        if target.len() > max {
+            return Err(FilesystemError::InvalidData(format!(
+                "Minix: symlink target is {} bytes; one block holds at most {max}",
+                target.len()
+            )));
+        }
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if !options.skip_name_checks && self.dir_find(&parent_inode, name.as_bytes())?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let inum = self.alloc_inode()?;
+        let mut ino = MinixInode::empty(inum);
+        // 0777 is the convention for a symlink; an explicit mode contributes
+        // its permission bits only, never the type.
+        ino.mode = 0xA000 | (options.mode.unwrap_or(0o777) & 0o7777) as u16;
+        ino.nlinks = 1;
+        ino.uid = options.uid.unwrap_or(0) as u16;
+        ino.gid = options.gid.unwrap_or(0) as u16;
+        let mut data = target.as_bytes();
+        let len = data.len() as u64;
+        self.write_file_data(&mut ino, &mut data, len)?;
+        self.write_inode(&ino)?;
+
+        let mut parent_inode = self.read_inode(parent_inum)?;
+        self.dir_add(&mut parent_inode, name.as_bytes(), inum)?;
+        self.write_inode(&parent_inode)?;
+
+        Ok(self.entry_from_inode(name, &parent.path, &ino))
+    }
+
     fn create_directory(
         &mut self,
         parent: &FileEntry,
@@ -2200,6 +2263,82 @@ mod tests {
                 "fresh {mver:?} root should be empty"
             );
         }
+    }
+
+    /// Minix stores a symlink's target in its data zone, exactly like a file's
+    /// contents — so writing one is `create_file` with `S_IFLNK`. Until this
+    /// landed, `supports_symlinks()` fell through to the trait default of
+    /// false and a tar import dropped every symlink up front.
+    #[test]
+    fn symlinks_round_trip_through_create_and_read() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        let dir = tempfile::tempdir().unwrap();
+        for mver in [MinixVersion::V1, MinixVersion::V2, MinixVersion::V3] {
+            let path = dir.path().join(format!("{mver:?}.img"));
+            std::fs::write(
+                &path,
+                create_blank_minix(2 * 1024 * 1024, mver).expect("blank"),
+            )
+            .unwrap();
+
+            {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                let mut fs = MinixFilesystem::open(file, 0).expect("open");
+                assert!(fs.supports_symlinks(), "{mver:?} must advertise symlinks");
+                let root = fs.root().expect("root");
+                let link = fs
+                    .create_symlink(&root, "init", "/sbin/init", &CreateFileOptions::default())
+                    .unwrap_or_else(|e| panic!("{mver:?} create_symlink: {e}"));
+                assert_eq!(link.symlink_target.as_deref(), Some("/sbin/init"));
+                // A relative target is just as opaque to the filesystem.
+                fs.create_symlink(&root, "rel", "../lib/x", &CreateFileOptions::default())
+                    .expect("relative symlink");
+                fs.sync_metadata().expect("sync");
+            }
+
+            let mut fs =
+                MinixFilesystem::open(std::fs::File::open(&path).unwrap(), 0).expect("reopen");
+            let root = fs.root().expect("root");
+            let entries = fs.list_directory(&root).expect("list");
+            let init = entries
+                .iter()
+                .find(|e| e.name == "init")
+                .unwrap_or_else(|| panic!("{mver:?}: init missing"));
+            assert_eq!(
+                init.entry_type,
+                EntryType::Symlink,
+                "{mver:?}: not typed as a symlink"
+            );
+            assert_eq!(
+                init.symlink_target.as_deref(),
+                Some("/sbin/init"),
+                "{mver:?}: wrong target"
+            );
+            let rel = entries.iter().find(|e| e.name == "rel").expect("rel");
+            assert_eq!(rel.symlink_target.as_deref(), Some("../lib/x"));
+        }
+    }
+
+    /// Linux's `minix_symlink` refuses a target whose length plus its NUL
+    /// exceeds one block, because that is all readlink will look at. Refuse it
+    /// here too rather than writing a link that silently points elsewhere.
+    #[test]
+    fn an_overlong_symlink_target_is_refused() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem};
+
+        let img = create_blank_minix(2 * 1024 * 1024, MinixVersion::V3).expect("blank");
+        let mut fs = MinixFilesystem::open(Cursor::new(img), 0).expect("open");
+        let root = fs.root().expect("root");
+        let too_long = "x".repeat(fs.sb.block_size as usize);
+        let err = fs
+            .create_symlink(&root, "big", &too_long, &CreateFileOptions::default())
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("one block holds"), "got: {err}");
     }
 
     fn fsck_clean(fsck: &PathBuf, img: &std::path::Path) -> Result<(), String> {

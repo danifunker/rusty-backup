@@ -164,6 +164,7 @@ pub mod chd_edit {
         bail!("chd feature not built into this binary")
     }
 }
+pub mod appimage;
 pub mod cbk;
 pub mod compress;
 pub mod containers;
@@ -179,10 +180,12 @@ pub mod gz_index;
 pub mod gzip;
 pub mod imz;
 pub mod interleave;
+pub mod iso_squashfs;
 pub mod lz4;
 pub mod lzhuf;
 pub mod moof;
 pub mod ndif;
+pub mod payload_slice;
 pub mod qcow2;
 #[cfg(test)]
 pub(crate) mod qemu_img_test;
@@ -1535,17 +1538,19 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         if file.read_exact(&mut head).is_ok() && &head[0..4] == qcow2::QCOW2_MAGIC {
             if let Some(p) = path {
                 // Re-open through the reader so a malformed header rejects
-                // here, not later during browse.
-                if let Ok(reader) = qcow2::Qcow2Reader::open(File::open(p)?) {
-                    let logical_size = reader.len();
-                    let version = reader.version();
-                    drop(reader);
-                    return Ok(ImageFormat::Qcow2 {
-                        path: p.to_path_buf(),
-                        logical_size,
-                        version,
-                    });
-                }
+                // here, not later during browse. `QFI\xFB` is unambiguous, so a
+                // rejection is final — propagate the reader's precise reason
+                // ("backing file", "encrypted", ...) instead of falling through
+                // to a cryptic "Invalid MBR" on the still-encoded bytes.
+                let reader = qcow2::Qcow2Reader::open(File::open(p)?)?;
+                let logical_size = reader.len();
+                let version = reader.version();
+                drop(reader);
+                return Ok(ImageFormat::Qcow2 {
+                    path: p.to_path_buf(),
+                    logical_size,
+                    version,
+                });
             }
         }
     }
@@ -1559,14 +1564,15 @@ pub fn detect_image_format_with_path(file: File, path: Option<&Path>) -> Result<
         let mut head = [0u8; 4];
         if file.read_exact(&mut head).is_ok() && &head == vmdk_sparse::VMDK_SPARSE_MAGIC {
             if let Some(p) = path {
-                if let Ok(reader) = vmdk_sparse::VmdkSparseReader::open(File::open(p)?) {
-                    let logical_size = reader.len();
-                    drop(reader);
-                    return Ok(ImageFormat::VmdkSparse {
-                        path: p.to_path_buf(),
-                        logical_size,
-                    });
-                }
+                // Same treatment as QCOW2 above: `KDMV` is unambiguous, so
+                // surface the reader's reason rather than falling through.
+                let reader = vmdk_sparse::VmdkSparseReader::open(File::open(p)?)?;
+                let logical_size = reader.len();
+                drop(reader);
+                return Ok(ImageFormat::VmdkSparse {
+                    path: p.to_path_buf(),
+                    logical_size,
+                });
             }
         }
     }

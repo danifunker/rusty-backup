@@ -29,13 +29,9 @@ pub fn run(args: ChmetaArgs) -> Result<()> {
     }
     let (file, ctx, commit) = resolve_partition_rw(&args.image.path, args.image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), &args.path)?;
     // Default the un-overridden half to the file's current code (display form;

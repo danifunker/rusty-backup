@@ -54,13 +54,9 @@ pub fn run(cmd: BlessCommand) -> Result<()> {
 pub fn apply_bless(image: &ImageRef, path: &str) -> Result<()> {
     let (file, ctx, commit) = resolve_partition_rw(&image.path, image.partition)?;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     let entry = super::ls::resolve_path(fs.as_filesystem_mut(), path)?;
     if !entry.is_directory() {

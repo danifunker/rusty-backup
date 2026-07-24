@@ -109,6 +109,10 @@ pub(crate) const ROOT_INODE: u32 = 2;
 const UFS_NDADDR: usize = 12; // direct disk-block pointers per inode
 const UFS_NIADDR: usize = 3; // indirect disk-block pointers per inode
 
+/// BSD `MAXPATHLEN`. A symlink target is a path, and one longer than this
+/// could not be followed on the systems these volumes come from.
+const UFS_MAXPATHLEN: usize = 1024;
+
 /// UFS1 on-disk dinode is exactly 128 bytes.
 const DINODE1_SIZE: u64 = 128;
 /// UFS2 on-disk dinode is exactly 256 bytes.
@@ -2002,6 +2006,110 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Uf
 
         if create_result.is_err() {
             // Roll back: free any allocated data blocks, free the inode.
+            let _ = self.free_inode_blocks(&new_inode);
+            let _ = self.free_inode(new_inum);
+        }
+        create_result
+    }
+
+    fn supports_symlinks(&self) -> bool {
+        true
+    }
+
+    /// UFS stores a symlink two ways, and which one is correct depends on the
+    /// target's length: a **fast symlink** (target <= `fs_maxsymlinklen`, 60 on
+    /// UFS1 / 120 on UFS2) keeps it inline in the dinode's pointer area and
+    /// owns no disk blocks at all; anything longer goes in data blocks like a
+    /// regular file. Both forms are what the reader already expects
+    /// ([`Self::read_symlink_target`]), and a real BSD would produce the fast
+    /// form for practically every symlink on a volume.
+    fn create_symlink(
+        &mut self,
+        parent: &FileEntry,
+        name: &str,
+        target: &str,
+        options: &super::filesystem::CreateFileOptions,
+    ) -> Result<FileEntry, FilesystemError> {
+        if !parent.is_directory() {
+            return Err(FilesystemError::NotADirectory(parent.path.clone()));
+        }
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+        if target.is_empty() {
+            return Err(FilesystemError::InvalidData(
+                "UFS: a symlink target may not be empty".into(),
+            ));
+        }
+        if target.len() > UFS_MAXPATHLEN {
+            return Err(FilesystemError::InvalidData(format!(
+                "UFS: symlink target is {} bytes, past the {UFS_MAXPATHLEN}-byte path limit",
+                target.len()
+            )));
+        }
+        let parent_inum = parent.location as u32;
+        let parent_inode = self.read_inode(parent_inum)?;
+        if self.dir_find(&parent_inode, name_bytes)?.is_some() {
+            return Err(FilesystemError::AlreadyExists(name.into()));
+        }
+
+        let new_inum = self.alloc_inode(parent_inum / self.ipg)?;
+        // 0777 by convention; an explicit mode contributes permission bits
+        // only, never the type.
+        let mode = 0o120_000 | (options.mode.unwrap_or(0o777) & 0o7777);
+        let mut new_inode = UfsInode {
+            inum: new_inum,
+            mode,
+            nlink: 1,
+            uid: options.uid.unwrap_or(0),
+            gid: options.gid.unwrap_or(0),
+            size: 0,
+            mtime: 0,
+            direct: [0; UFS_NDADDR],
+            indirect: [0; UFS_NIADDR],
+            inline_payload: Vec::new(),
+        };
+
+        let create_result = (|| -> Result<FileEntry, FilesystemError> {
+            let bytes = target.as_bytes();
+            if self.maxsymlinklen > 0 && bytes.len() as u32 <= self.maxsymlinklen {
+                // Fast symlink: the target overlays the pointer area, and the
+                // pointers stay zero so nothing thinks it owns a block.
+                new_inode.inline_payload = bytes.to_vec();
+                new_inode.size = bytes.len() as u64;
+            } else {
+                let mut src = bytes;
+                self.write_file_data(&mut new_inode, &mut src, bytes.len() as u64)?;
+            }
+            self.write_inode(new_inum, &new_inode)?;
+
+            let mut parent_inode = self.read_inode(parent_inum)?;
+            self.dir_insert(
+                &mut parent_inode,
+                name_bytes,
+                new_inum,
+                mode_to_dirent_type(mode),
+            )?;
+            self.write_inode(parent_inum, &parent_inode)?;
+
+            let parent_path = if parent.path == "/" {
+                String::new()
+            } else {
+                parent.path.clone()
+            };
+            let mut entry = FileEntry::new_symlink(
+                name.to_string(),
+                format!("{parent_path}/{name}"),
+                new_inode.size,
+                new_inum as u64,
+                target.to_string(),
+            );
+            entry.mode = Some(new_inode.mode);
+            entry.uid = Some(new_inode.uid);
+            entry.gid = Some(new_inode.gid);
+            Ok(entry)
+        })();
+
+        if create_result.is_err() {
             let _ = self.free_inode_blocks(&new_inode);
             let _ = self.free_inode(new_inum);
         }
@@ -4089,6 +4197,96 @@ mod tests {
             "fsck reported errors after create_file: {:?}",
             result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
         );
+    }
+
+    /// Both UFS symlink forms, against the real UFS1 fixture, checked by its
+    /// own fsck.
+    ///
+    /// Which form is correct depends on length: at or under `fs_maxsymlinklen`
+    /// (60 on UFS1) the target lives inline in the dinode's pointer area and
+    /// the symlink owns no blocks; past it, the target goes in data blocks like
+    /// a file's contents. Getting that wrong is exactly what fsck catches — an
+    /// inline symlink whose pointer area is read as block numbers claims wild
+    /// blocks, and a block-backed one whose blocks aren't accounted leaks them.
+    ///
+    /// Until this landed, `supports_symlinks()` fell through to the trait
+    /// default of false and a tar import dropped every symlink up front.
+    #[test]
+    fn symlinks_round_trip_in_both_forms_and_stay_fsck_clean() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+
+        // A target that fits inline, and one that cannot.
+        let short = "/sbin/init";
+        let long = format!("/{}", "verylongdirectoryname/".repeat(12));
+
+        {
+            let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+            assert!(fs.supports_symlinks(), "UFS must advertise symlink support");
+            assert!(
+                short.len() as u32 <= fs.maxsymlinklen,
+                "fixture assumption: {short:?} should take the inline form"
+            );
+            assert!(
+                long.len() as u32 > fs.maxsymlinklen,
+                "fixture assumption: the long target should take the block form"
+            );
+            let root = fs.root().expect("root");
+            let e = fs
+                .create_symlink(&root, "fastlink", short, &CreateFileOptions::default())
+                .expect("fast symlink");
+            assert_eq!(e.symlink_target.as_deref(), Some(short));
+            fs.create_symlink(&root, "slowlink", &long, &CreateFileOptions::default())
+                .expect("slow symlink");
+        }
+
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("re-open");
+        let root = fs.root().expect("root");
+        let kids = fs.list_directory(&root).expect("list");
+        let fast = kids
+            .iter()
+            .find(|e| e.name == "fastlink")
+            .expect("fastlink");
+        assert_eq!(
+            fast.entry_type,
+            EntryType::Symlink,
+            "not typed as a symlink"
+        );
+        assert_eq!(fast.symlink_target.as_deref(), Some(short));
+        let slow = kids
+            .iter()
+            .find(|e| e.name == "slowlink")
+            .expect("slowlink");
+        assert_eq!(slow.entry_type, EntryType::Symlink);
+        assert_eq!(slow.symlink_target.as_deref(), Some(long.as_str()));
+
+        let result = fs.fsck().expect("supports fsck").expect("runs");
+        assert!(
+            result.is_clean(),
+            "fsck reported errors after creating symlinks: {:?}",
+            result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    /// A target past MAXPATHLEN is refused rather than written as a link that
+    /// no BSD could follow.
+    #[test]
+    fn an_overlong_symlink_target_is_refused() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture("test_ufs1.img.zst");
+        let mut backing = img;
+        let mut fs = UfsFilesystem::open(Cursor::new(&mut backing), 0).expect("open");
+        let root = fs.root().expect("root");
+        let err = fs
+            .create_symlink(
+                &root,
+                "toolong",
+                &"x".repeat(UFS_MAXPATHLEN + 1),
+                &CreateFileOptions::default(),
+            )
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("path limit"), "got: {err}");
     }
 
     /// Regression: the mod.rs edit dispatch must route an auto-detected

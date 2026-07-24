@@ -10,6 +10,7 @@ pub mod apfs_crypto;
 pub mod apple_dos;
 pub mod archive_fs;
 pub mod atari_dos;
+pub mod attrs;
 pub mod binhex;
 pub mod btrfs;
 pub mod carve;
@@ -52,6 +53,7 @@ pub mod hfv;
 pub mod hpfs;
 pub mod human68k;
 pub mod human68k_clone;
+pub mod id_names;
 pub mod jfs;
 pub mod jfs_fsck;
 pub mod layout_preserving;
@@ -86,6 +88,9 @@ pub mod rsdos;
 pub mod sfs;
 pub mod sfs_fsck;
 pub mod squashfs;
+pub mod squashfs_edit;
+pub mod squashfs_verify;
+pub mod squashfs_write;
 pub mod tar_export;
 pub mod tar_import;
 pub mod ti99;
@@ -95,6 +100,7 @@ pub mod ucsd;
 pub mod ufs;
 pub mod ufs_fsck;
 pub mod unix_common;
+pub mod xattr;
 pub mod xfs;
 pub mod zstd_stream;
 
@@ -175,7 +181,95 @@ pub fn resize_filesystem_for(
     affs::resize_affs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     efs_resize::resize_efs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     qdos::resize_qdos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
+    prodos::resize_prodos_in_place(file, partition_offset, new_size_bytes, log_cb)?;
     Ok(())
+}
+
+/// Whether [`resize_filesystem_for`] can actually patch what lives at
+/// `partition_offset`.
+///
+/// Every per-FS resizer silently no-ops when its magic doesn't match, which is
+/// what makes that function safe to call blind — but it also means a caller
+/// cannot tell "patched" from "did nothing". A partition resize that moves the
+/// table entry while leaving the filesystem's own idea of its size behind
+/// produces a volume whose two halves disagree, so a destructive caller has to
+/// ask *first*.
+pub enum InPlaceResize {
+    /// A filesystem [`resize_filesystem_for`] will patch.
+    Supported(&'static str),
+    /// A filesystem we recognise but have no in-place resizer for. Resizing
+    /// the partition around it would leave it inconsistent.
+    Unsupported(&'static str),
+    /// Nothing recognisable — a raw / swap / boot-blob partition (the MiSTer's
+    /// 0xA2 SPL region, say). There is no filesystem metadata to fall out of
+    /// step, so resizing the table entry alone is safe.
+    NoFilesystem,
+}
+
+/// Filesystems `resize_filesystem_for` knows how to patch, by the name
+/// [`detect_filesystem_type`] reports. Amiga SFS / PFS3 are not detected by
+/// magic at the partition offset — they arrive with an RDB type string, which
+/// [`in_place_resize_support`] checks separately.
+const IN_PLACE_RESIZABLE: &[&str] = &[
+    "fat", "ntfs", "exfat", "hfs", "hfsplus", "ext", "btrfs", "efs", "qdos", "affs", "prodos",
+];
+
+/// Classify the filesystem at `partition_offset` for in-place resizing.
+///
+/// `partition_type_string` is the RDB / APM type when the caller has one; the
+/// Amiga filesystems are identified that way rather than by a superblock magic
+/// at the partition's first sector.
+pub fn in_place_resize_support<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+    partition_type_string: Option<&str>,
+) -> InPlaceResize {
+    if let Some(s) = partition_type_string {
+        if is_amiga_dos_type(s) {
+            return InPlaceResize::Supported("AFFS");
+        }
+        if is_amiga_pfs3_type(s) {
+            return InPlaceResize::Supported("PFS3");
+        }
+        if is_amiga_sfs_type(s) {
+            return InPlaceResize::Supported("SFS");
+        }
+    }
+    let detected = detect_filesystem_type(reader, partition_offset);
+    if detected == "unknown" {
+        return InPlaceResize::NoFilesystem;
+    }
+    if IN_PLACE_RESIZABLE.contains(&detected) {
+        // The pretty name if we have one, else the detector's own token.
+        return InPlaceResize::Supported(fs_display_name(detected));
+    }
+    InPlaceResize::Unsupported(fs_display_name(detected))
+}
+
+/// A human-facing name for a `detect_filesystem_type` token, for messages.
+fn fs_display_name(detected: &str) -> &'static str {
+    match detected {
+        "fat" => "FAT",
+        "ntfs" => "NTFS",
+        "exfat" => "exFAT",
+        "hfs" => "HFS",
+        "hfsplus" => "HFS+",
+        "ext" => "ext2/3/4",
+        "btrfs" => "btrfs",
+        "efs" => "SGI EFS",
+        "qdos" => "QDOS",
+        "affs" => "AFFS",
+        "prodos" => "ProDOS",
+        "xfs" => "XFS",
+        "jfs" => "JFS",
+        "reiserfs" => "ReiserFS",
+        "ufs" => "UFS",
+        "hpfs" => "HPFS",
+        "apfs" => "APFS",
+        "squashfs" => "SquashFS",
+        "mfs" => "MFS",
+        _ => "an unsupported filesystem",
+    }
 }
 
 /// Result of filesystem compaction.
@@ -1693,17 +1787,72 @@ pub fn open_filesystem_with_passphrase<R: Read + Seek + Send + 'static>(
     }
 }
 
+/// What a caller knows about *where* a filesystem lives, beyond its offset.
+///
+/// Almost every driver writes surgically inside structures it read from the
+/// partition, and needs none of this. The ones that rewrite their whole image
+/// do: SquashFS has no in-place write at all, so committing an edit means
+/// replacing every byte, and that raises two questions an offset cannot answer
+/// — how far it may grow, and whether there is a file it could be swapped in
+/// for atomically instead of overwritten in place.
+///
+/// Every field defaults to "unknown", which is always the safe reading.
+#[derive(Default, Clone, Copy)]
+pub struct EditContext<'a> {
+    /// Bytes the filesystem may occupy where it sits. `None` when the caller
+    /// doesn't know, which a driver must treat as "assume it may not grow".
+    pub partition_len: Option<u64>,
+    /// Path of the backing file, set **only** when the handle is a plain file
+    /// on disk *and* the filesystem occupies all of it — so replacing the file
+    /// replaces exactly the filesystem and nothing else.
+    ///
+    /// Leave it `None` for a partition inside a larger image, a decoded
+    /// container temp, a CHD/QCOW2 session, or a remote handle: renaming over
+    /// any of those would destroy the surrounding image.
+    pub whole_file_path: Option<&'a std::path::Path>,
+    /// A ceiling the *user* asked for, on top of whatever the container
+    /// imposes. `None` means "no request" — the container still binds.
+    ///
+    /// Unlike the other two fields this is a preference rather than a fact
+    /// about placement, and it exists for the same reason they do: only a
+    /// driver that rewrites its whole image can meaningfully be given one.
+    pub rebuild_budget: Option<squashfs_edit::SizeBudget>,
+}
+
 /// Open a filesystem for editing (read + write access).
 ///
 /// Same dispatch logic as `open_filesystem` but requires a writable reader and
-/// returns a `Box<dyn EditableFilesystem>`. Currently only FAT is supported;
-/// other filesystems will be added in subsequent phases.
+/// returns a `Box<dyn EditableFilesystem>`.
+///
+/// Nothing is known about the surrounding container, so a driver that needs
+/// that falls back to its safest assumption. Prefer
+/// [`open_editable_filesystem_with`] when the caller can fill in an
+/// [`EditContext`].
 pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
-    mut reader: R,
+    reader: R,
     partition_offset: u64,
     partition_type: u8,
     partition_type_string: Option<&str>,
 ) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    open_editable_filesystem_with(
+        reader,
+        partition_offset,
+        EditContext::default(),
+        partition_type,
+        partition_type_string,
+    )
+}
+
+/// [`open_editable_filesystem`], told what the caller knows about the
+/// filesystem's surroundings. See [`EditContext`].
+pub fn open_editable_filesystem_with<R: Read + Write + Seek + Send + 'static>(
+    mut reader: R,
+    partition_offset: u64,
+    edit_ctx: EditContext<'_>,
+    partition_type: u8,
+    partition_type_string: Option<&str>,
+) -> Result<Box<dyn EditableFilesystem>, FilesystemError> {
+    let partition_len = edit_ctx.partition_len;
     // Check string-based type first (APM partitions)
     if let Some(type_str) = partition_type_string {
         match type_str {
@@ -1856,6 +2005,27 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                     reader,
                     partition_offset,
                 )?)),
+                // SquashFS is read-only on disk, so "editing" is a whole-image
+                // rebuild: the editor reads the tree into memory, mutates it,
+                // and rebuilds on sync. See `squashfs_edit`.
+                //
+                // A bare `.squashfs` at offset 0 is the file itself and may
+                // grow, so it gets no capacity; reaching this arm at a non-zero
+                // offset means the image is hosted in something, and then the
+                // declared length is a hard boundary.
+                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open_within(
+                    reader,
+                    partition_offset,
+                    if partition_offset == 0 {
+                        None
+                    } else {
+                        partition_len
+                    },
+                    edit_ctx
+                        .rebuild_budget
+                        .unwrap_or(squashfs_edit::SizeBudget::Fit),
+                    edit_ctx.whole_file_path,
+                )?)),
                 "hfs" => Ok(Box::new(hfs::HfsFilesystem::open(
                     reader,
                     partition_offset,
@@ -1998,6 +2168,21 @@ pub fn open_editable_filesystem<R: Read + Write + Seek + Send + 'static>(
                 "fat" => Ok(Box::new(fat::FatFilesystem::open(
                     reader,
                     partition_offset,
+                )?)),
+                // Appliance images ship their SquashFS root in a plain 0x83
+                // partition. Editing rebuilds the whole image, so the partition
+                // length is a real boundary here, not a formality — see
+                // `squashfs_edit::SquashfsEditor::open_within`.
+                // A partition is never the whole file, so no atomic-rename path
+                // is offered here even if the caller named one.
+                "squashfs" => Ok(Box::new(squashfs_edit::SquashfsEditor::open_within(
+                    reader,
+                    partition_offset,
+                    partition_len,
+                    edit_ctx
+                        .rebuild_budget
+                        .unwrap_or(squashfs_edit::SizeBudget::Fit),
+                    None,
                 )?)),
                 "xfs" => Ok(Box::new(xfs::XfsFilesystem::open(
                     reader,

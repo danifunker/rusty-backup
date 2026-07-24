@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli squashfs create</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="squashfs.html">squashfs</a> &raquo; <span>create</span></nav>
+<h1><code>rb-cli squashfs create</code></h1>
+<p>Build a new SquashFS image from a host directory, as `mksquashfs` does</p>
+<h2>Usage</h2>
+<pre><code>Usage: create [OPTIONS] &lt;DIR&gt; &lt;IMAGE&gt;</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;DIR&gt;</code></dt>
+<dd>Host directory to pack. Its *contents* become the image root, like `mksquashfs DIR IMAGE` (the directory itself is not a top-level entry)</dd>
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image file to create. Overwritten if it already exists</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--compressor</code></dt>
+<dd>Compressor for the new image. `mksquashfs` defaults to gzip; we match it</dd>
+<dt><code>--block-size</code></dt>
+<dd>Data block size (a power of two, 4 KiB..=1 MiB). `mksquashfs`'s default is 128 KiB</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>

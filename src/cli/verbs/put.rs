@@ -91,6 +91,29 @@ pub struct PutArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Unix permission bits for the new file, as octal (e.g. `755`, `0644`).
+    /// Unix filesystems only (ext / UFS / XFS / EFS / Minix / SquashFS);
+    /// ignored on FAT / HFS / exFAT, which have no such concept.
+    ///
+    /// When omitted the mode is inherited from the file being replaced, then
+    /// from the host file's own bits, then `0644`. Replacing a file therefore
+    /// keeps its permissions -- overwriting a `0600` secret does not widen it.
+    #[arg(long = "mode", value_parser = parse_octal_mode)]
+    pub mode: Option<u32>,
+
+    /// Owner UID for the new file. Unix filesystems only.
+    ///
+    /// When omitted it is inherited from the file being replaced, then from the
+    /// parent directory, then `0`. The *host* file's owner is deliberately
+    /// never used -- a macOS 501 means nothing inside a Linux image.
+    #[arg(long = "uid")]
+    pub uid: Option<u32>,
+
+    /// Owning GID for the new file. Unix filesystems only. Same precedence as
+    /// `--uid`.
+    #[arg(long = "gid")]
+    pub gid: Option<u32>,
+
     /// After writing the file, also print the same JSON envelope
     /// `locate` would have produced — absolute byte offset, length,
     /// fragmented flag. One-shot for build scripts that need to patch
@@ -105,7 +128,42 @@ pub struct PutArgs {
     pub fs_override: FsDispatchOverride,
 }
 
+/// Parse `--mode` as octal, with or without a leading `0`/`0o`.
+///
+/// Octal is the only sane reading of a Unix mode, so `755` means `0o755` — a
+/// decimal reading would silently produce `0o1363`. Rejects anything above
+/// `0o7777`, which is the whole permission space including setuid/setgid/sticky.
+fn parse_octal_mode(s: &str) -> Result<u32, String> {
+    let body = s
+        .strip_prefix("0o")
+        .or_else(|| s.strip_prefix("0O"))
+        .unwrap_or(s);
+    if body.is_empty() || !body.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err(format!(
+            "invalid mode {s:?}: expected octal permission bits, e.g. 755 or 0644"
+        ));
+    }
+    let v = u32::from_str_radix(body, 8).map_err(|e| format!("invalid mode {s:?}: {e}"))?;
+    if v > 0o7777 {
+        return Err(format!(
+            "invalid mode {s:?}: {v:o} exceeds 7777 (permission bits only; \
+             the file-type bits are not yours to set)"
+        ));
+    }
+    Ok(v)
+}
+
 pub fn run(args: PutArgs) -> Result<()> {
+    run_with_budget(args, None)
+}
+
+/// As [`run`], with a size ceiling for the filesystems that rebuild their whole
+/// image on commit (SquashFS). `rb-cli squashfs put` is the only caller that
+/// passes one; see [`super::squashfs`].
+pub fn run_with_budget(
+    args: PutArgs,
+    budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+) -> Result<()> {
     if let Some(bb_file) = args.boot {
         // Boot-block write: 1024 bytes at the *partition's* first
         // sector, not the image's. For raw superfloppies that's byte 0;
@@ -156,14 +214,11 @@ pub fn run(args: PutArgs) -> Result<()> {
         args.fs_override.fs_type.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
+    ctx.rebuild_budget = budget;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     // Resolve parent + leaf with the shared escape / colon grammar so a file
     // whose name contains a literal `/` can be written.
@@ -181,6 +236,9 @@ pub fn run(args: PutArgs) -> Result<()> {
         .map_err(|e| anyhow!("list_directory: {e}"))?
         .into_iter()
         .find(|e| e.name == name);
+    // Capture before the delete: afterwards there is nothing left to ask.
+    let inherited_xattrs =
+        crate::fs::attrs::inherited_xattrs(fs.as_filesystem_mut(), existing.as_ref());
     if let Some(ref e) = existing {
         if !args.force {
             bail!("{dst} already exists (pass --force to overwrite)");
@@ -216,9 +274,52 @@ pub fn run(args: PutArgs) -> Result<()> {
                 .map(|s| s.to_string())
         })
         .or_else(|| (!auto_from_extension).then(|| "????".to_string()));
+    // POSIX attributes. Every editable Unix filesystem honours these; until now
+    // nothing set them, so each driver's `unwrap_or` silently made every added
+    // file root:root 0644. Resolution (and its precedence rules) lives in
+    // `fs::attrs` so the GUI and TUI cannot drift from the CLI.
+    let host_mode = args.host_file.as_ref().and_then(|p| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).ok().map(|m| m.permissions().mode())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = p;
+            None
+        }
+    });
+    let attrs = crate::fs::attrs::resolve_attrs(
+        &crate::fs::attrs::AttrOverrides {
+            mode: args.mode,
+            uid: args.uid,
+            gid: args.gid,
+        },
+        existing.as_ref(),
+        Some(&parent),
+        host_mode,
+        0o644,
+    );
+    // Only worth a line when the filesystem actually stores these; on FAT/HFS
+    // it would be noise about fields that go nowhere.
+    if parent.mode.is_some() || existing.as_ref().map(|e| e.mode.is_some()) == Some(true) {
+        log_stderr(format!("Attributes: {}", attrs.describe()));
+    }
+
+    if !inherited_xattrs.is_empty() {
+        log_stderr(format!(
+            "Carrying {} extended attribute(s) over from the replaced file",
+            inherited_xattrs.len()
+        ));
+    }
     let options = CreateFileOptions {
         type_code,
         creator_code: creator,
+        mode: Some(attrs.file_mode()),
+        uid: Some(attrs.uid),
+        gid: Some(attrs.gid),
+        xattrs: inherited_xattrs,
         ..Default::default()
     };
 

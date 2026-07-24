@@ -220,13 +220,9 @@ pub fn run(args: CpArgs) -> Result<()> {
         dst_ctx.label = format!("{} [--dst-fs-type {t}]", dst_ctx.label);
     }
     log_stderr(format!("destination: {}", dst_ctx.label));
-    let mut dst = crate::fs::open_editable_filesystem(
-        file,
-        dst_ctx.offset,
-        dst_ctx.type_byte,
-        dst_ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening destination filesystem for write: {e}"))?;
+    let mut dst = dst_ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening destination filesystem for write: {e}"))?;
 
     // --- Selection + copy ------------------------------------------------
     let stats = if has_glob_chars(&args.src) || !args.exclude.is_empty() {

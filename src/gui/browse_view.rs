@@ -28,7 +28,10 @@ use rusty_backup::rbformats::chd_edit::{
 };
 
 use super::file_detail::{self, FileContent};
-use super::metadata_editor::{self, HfsTypeEditorState, ProdosTypeEditorState};
+use super::metadata_editor::{
+    self, ExtPermsEditorState, HfsTypeEditorState, OwnerEditorState, ProdosTypeEditorState,
+    XattrEditorState,
+};
 
 const MAX_PREVIEW_SIZE: usize = 1024 * 1024; // 1 MB max file preview
 
@@ -73,6 +76,11 @@ pub struct BrowseView {
     error: Option<String>,
     /// Filesystem info.
     fs_type: String,
+    /// Cached uid/gid -> name map from the image's own `/etc/passwd` +
+    /// `/etc/group`, built lazily the first time File Info shows an owner and
+    /// reused thereafter. `None` = not yet built; a built-but-empty map (a
+    /// non-Linux image) is still cached so we don't retry every frame.
+    id_names: Option<rusty_backup::fs::id_names::IdNameMap>,
     /// Volume total / used bytes (cached at open) for the header free-space
     /// line. `volume_total == 0` means "unknown / not loaded".
     volume_total: u64,
@@ -158,6 +166,10 @@ pub struct BrowseView {
     pending_tree: Option<Arc<Mutex<TreeStatus>>>,
     /// Queued edit operations awaiting "Apply Edits".
     staged_edits: EditQueue,
+    /// The SquashFS size-budget dialog, open only between clicking Edit Mode on
+    /// a SquashFS volume and choosing a ceiling. See
+    /// [`super::squashfs_budget_dialog`].
+    squashfs_budget_dialog: Option<Box<super::squashfs_budget_dialog::SquashfsBudgetDialog>>,
     /// Whether to show the "unsaved changes" confirmation dialog.
     show_unsaved_dialog: bool,
     /// When true, a successful Discard/Apply from the unsaved dialog should
@@ -172,6 +184,15 @@ pub struct BrowseView {
     /// "Set" we encode and stage. `None` means the editor is closed for that
     /// entry; on first open we seed from current FInfo or the dictionary.
     hfs_type_editor: Option<HfsTypeEditorState>,
+    /// Inline Unix permissions / owner / xattr editor state, keyed by entry
+    /// path. Reset when the selection changes.
+    ext_perms_editor: Option<ExtPermsEditorState>,
+    owner_editor: Option<OwnerEditorState>,
+    xattr_editor: Option<XattrEditorState>,
+    /// On-disk xattrs of the selected entry, cached by path (read once per
+    /// selection on an xattr-bearing filesystem). Rebuilt when the selection
+    /// changes; `None` = not yet read for this selection.
+    xattr_cache: Option<(String, Vec<rusty_backup::fs::xattr::Xattr>)>,
     /// Files that failed to stage (bad name, IO error, etc.). When non-empty,
     /// `show_staging_errors` drives a modal dialog listing each failure.
     staging_errors: Vec<(PathBuf, String)>,
@@ -393,6 +414,7 @@ impl Default for BrowseView {
             view_mode: ViewMode::Auto,
             error: None,
             fs_type: String::new(),
+            id_names: None,
             volume_total: 0,
             volume_used: 0,
             carve_full_scan: rusty_backup::fs::carve::full_scan_enabled(),
@@ -431,11 +453,16 @@ impl Default for BrowseView {
             pending_close: false,
             prodos_type_editor: None,
             hfs_type_editor: None,
+            ext_perms_editor: None,
+            owner_editor: None,
+            xattr_editor: None,
+            xattr_cache: None,
             staging_errors: Vec::new(),
             show_staging_errors: false,
             pending_extraction: None,
             chd_edit: None,
             chd_flatten_progress: None,
+            squashfs_budget_dialog: None,
             tar_export_progress: None,
             pending_tar_import: None,
             pending_tar_add: None,
@@ -644,6 +671,8 @@ impl BrowseView {
         self.selected_entry = None;
         self.marked.clear();
         self.content = None;
+        self.id_names = None;
+        self.xattr_cache = None;
         self.error = None;
         self.active = false;
         self.fs_type.clear();
@@ -957,18 +986,14 @@ impl BrowseView {
                         if self.edit_mode && !self.staged_edits.is_empty() {
                             self.show_unsaved_dialog = true;
                         } else if !self.edit_mode {
-                            // Probe the editable open up-front so guards like
-                            // the journaled-HFS+ refusal surface as a toast
-                            // instead of being deferred to the first edit.
-                            match self.session.open_editable() {
-                                // Probe only: discard the fs + commit guard
-                                // (no mutation, so a container is left intact).
-                                Ok((_efs, _commit)) => {
-                                    self.edit_mode = true;
-                                }
-                                Err(e) => {
-                                    self.error = Some(format!("Cannot enter edit mode: {e}"));
-                                }
+                            // SquashFS has to declare a size budget before any
+                            // edit is made — it has no free space to consult and
+                            // no in-place write, so "will this still fit?" can
+                            // only be answered as a ceiling chosen up front.
+                            // The dialog answers it and re-runs this entry when
+                            // the user commits. See docs/squashfs_edit.md §2.
+                            if !self.open_squashfs_budget_dialog() {
+                                self.enter_direct_edit_mode();
                             }
                         } else {
                             self.edit_mode = false;
@@ -1128,6 +1153,9 @@ impl BrowseView {
                 ui.ctx().request_repaint();
             }
         }
+
+        // The SquashFS size-budget dialog, and the edit-mode entry it gates.
+        self.poll_squashfs_budget_dialog(ui);
 
         // Background tar-export progress (Export to .tar.gz...).
         self.poll_tar_export(ui);
@@ -1784,6 +1812,25 @@ impl BrowseView {
             }
         }
 
+        // Lazily build the uid/gid -> name map the first time we're about to
+        // show an owner on a Unix filesystem (the selected entry carrying a uid
+        // is the signal). Cached even when empty so we don't reopen every frame.
+        if self.id_names.is_none()
+            && self
+                .selected_entry
+                .as_ref()
+                .map(|e| e.uid.is_some())
+                .unwrap_or(false)
+        {
+            let map = self
+                .session
+                .open()
+                .ok()
+                .map(|mut fs| rusty_backup::fs::id_names::IdNameMap::from_filesystem(&mut *fs))
+                .unwrap_or_default();
+            self.id_names = Some(map);
+        }
+
         match &self.selected_entry {
             None => {
                 ui.colored_label(egui::Color32::GRAY, "Select a file to view its contents.");
@@ -1794,7 +1841,12 @@ impl BrowseView {
                 // HFS/HFS+ and ProDOS suppress the inline Type/Creator labels —
                 // they render those in a dedicated editor row below.
                 let suppress_type_creator = self.is_hfs_type() || self.is_prodos_type();
-                file_detail::render_metadata_rows(ui, &entry, suppress_type_creator);
+                file_detail::render_metadata_rows(
+                    ui,
+                    &entry,
+                    suppress_type_creator,
+                    self.id_names.as_ref(),
+                );
 
                 // HFS/HFS+ type/creator row — read-only labels normally, full
                 // editor (text fields + dictionary pulldown) when in edit mode.
@@ -1845,6 +1897,60 @@ impl BrowseView {
                             );
                         }
                     }
+                }
+
+                // Unix permissions / owner / xattrs. Shown on any filesystem
+                // whose entries carry POSIX metadata (the entry having a `mode`
+                // is the signal). Read-only labels normally; octal / uid-gid /
+                // xattr editors when in edit mode.
+                if entry.mode.is_some() {
+                    metadata_editor::render_ext_permissions_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        &mut self.staged_edits,
+                        &mut self.ext_perms_editor,
+                        &mut self.edit_result,
+                    );
+                    metadata_editor::render_owner_row(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        self.id_names.as_ref(),
+                        &mut self.staged_edits,
+                        &mut self.owner_editor,
+                        &mut self.edit_result,
+                    );
+
+                    // Extended attributes: read the on-disk set once per
+                    // selection on an xattr-bearing filesystem, then let the
+                    // section overlay any staged edits.
+                    let want_xattrs =
+                        self.xattr_cache.as_ref().map(|(p, _)| p) != Some(&entry.path);
+                    if want_xattrs {
+                        let read = self
+                            .session
+                            .open()
+                            .ok()
+                            .filter(|fs| fs.supports_xattrs())
+                            .and_then(|mut fs| fs.list_xattrs(&entry).ok())
+                            .unwrap_or_default();
+                        self.xattr_cache = Some((entry.path.clone(), read));
+                    }
+                    let xattrs = self
+                        .xattr_cache
+                        .as_ref()
+                        .map(|(_, x)| x.as_slice())
+                        .unwrap_or(&[]);
+                    metadata_editor::render_xattr_section(
+                        ui,
+                        &entry,
+                        self.edit_mode,
+                        xattrs,
+                        &mut self.staged_edits,
+                        &mut self.xattr_editor,
+                        &mut self.edit_result,
+                    );
                 }
 
                 // Extract controls row
@@ -2707,6 +2813,75 @@ impl BrowseView {
 
     /// Poll the background tar-export worker: show a spinner while running,
     /// and surface the result when it finishes.
+    /// Enter Edit Mode on a raw image / device, probing the editable open
+    /// up-front so guards like the journaled-HFS+ refusal surface here rather
+    /// than being deferred to the first edit.
+    fn enter_direct_edit_mode(&mut self) {
+        match self.session.open_editable() {
+            // Probe only: discard the fs + commit guard (no mutation, so a
+            // container is left intact).
+            Ok((_efs, _commit)) => {
+                self.edit_mode = true;
+            }
+            Err(e) => {
+                self.error = Some(format!("Cannot enter edit mode: {e}"));
+            }
+        }
+    }
+
+    /// Open the size-budget dialog when this volume is a SquashFS that hasn't
+    /// been given a budget yet. Returns true when the dialog took over, meaning
+    /// the caller must not enter Edit Mode — [`Self::poll_squashfs_budget_dialog`]
+    /// does that once the user has chosen.
+    ///
+    /// Measuring walks the directory tree for file sizes only (no content is
+    /// decompressed), so this stays cheap even on a distro rootfs.
+    fn open_squashfs_budget_dialog(&mut self) -> bool {
+        if self.fs_type != "SquashFS" || self.session.rebuild_budget.is_some() {
+            return false;
+        }
+        let mut fs = match self.session.open() {
+            Ok(fs) => fs,
+            Err(e) => {
+                self.error = Some(format!("Cannot measure this image: {e}"));
+                return true;
+            }
+        };
+        let image_len = rusty_backup::fs::squashfs_write::image_footprint(fs.total_size());
+        // A partition bounds the image; a bare file at byte 0 is the image.
+        let capacity = (self.session.partition_offset != 0)
+            .then_some(self.session.partition_size)
+            .flatten();
+        match rusty_backup::fs::squashfs_edit::plan_size(fs.as_mut(), image_len, capacity) {
+            Ok(plan) => {
+                self.squashfs_budget_dialog = Some(Box::new(
+                    super::squashfs_budget_dialog::SquashfsBudgetDialog::new(plan),
+                ));
+            }
+            Err(e) => self.error = Some(format!("Cannot measure this image: {e}")),
+        }
+        true
+    }
+
+    /// Draw the budget dialog and act on its outcome: a chosen budget is
+    /// installed on the session and Edit Mode is entered; cancelling just
+    /// closes, leaving the volume read-only.
+    fn poll_squashfs_budget_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.squashfs_budget_dialog.as_mut() else {
+            return;
+        };
+        dialog.show(ui.ctx());
+        let outcome = dialog.take_outcome();
+        let closed = dialog.is_closed();
+        if let Some(budget) = outcome {
+            self.session.rebuild_budget = budget;
+            self.squashfs_budget_dialog = None;
+            self.enter_direct_edit_mode();
+        } else if closed {
+            self.squashfs_budget_dialog = None;
+        }
+    }
+
     fn poll_tar_export(&mut self, ui: &mut egui::Ui) {
         let arc = match &self.tar_export_progress {
             Some(p) => Arc::clone(p),

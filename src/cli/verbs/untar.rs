@@ -73,13 +73,9 @@ pub fn run(args: UntarArgs) -> Result<()> {
     args.fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
 
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for writing: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for writing: {e}"))?;
 
     let dest = super::ls::resolve_path(fs.as_filesystem_mut(), &args.dest)
         .map_err(|e| anyhow!("resolving destination {:?}: {e}", args.dest))?;

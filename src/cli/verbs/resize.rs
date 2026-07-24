@@ -12,7 +12,9 @@
 //! Each per-FS resize is a no-op when the on-disk magic doesn't match,
 //! so we never need to know up front which filesystem we're growing or
 //! shrinking. The supported set follows `fs::resize_filesystem_for`:
-//! FAT, NTFS, exFAT, HFS, HFS+, ext{2,3,4}, btrfs, SFS, PFS3, AFFS, EFS.
+//! FAT, Human68k, NTFS, exFAT, HFS, HFS+, ext{2,3,4}, btrfs, SFS, PFS3,
+//! AFFS, EFS, QDOS, ProDOS — the same list the GUI's "Resize Partitions..."
+//! now uses, so the two surfaces cannot drift apart again.
 
 use anyhow::{Context, Result};
 use clap::Args;

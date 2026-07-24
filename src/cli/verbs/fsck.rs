@@ -196,13 +196,9 @@ fn repair_mode(
         resolve_partition_rw_forced(&image.path, image.partition, fs_override.fs_type.as_deref())?;
     fs_override.apply(&mut ctx);
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for repair: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for repair: {e}"))?;
 
     let report = match fs.fsck() {
         Some(r) => r.map_err(|e| anyhow!("fsck: {e}"))?,

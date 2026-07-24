@@ -245,6 +245,19 @@ fn probe_apm_without_ddr(reader: &mut (impl Read + Seek)) -> Option<Apm> {
 /// Returns `Some(fs_hint)` where `fs_hint` is `"FAT"`, `"HFS"`, `"HFS+"`,
 /// or `None` if not a superfloppy.
 fn detect_superfloppy(first_sector: &[u8; 512], reader: &mut (impl Read + Seek)) -> Option<String> {
+    // SquashFS: "hsqs" at offset 0. Appliance and live images ship a bare
+    // SquashFS root with no partition table (Buildroot, Raspberry Pi OS,
+    // `casper/filesystem.squashfs` carved out of a live CD). Probed first: the
+    // 4-byte magic is unambiguous, and `detect` additionally parses the whole
+    // superblock, so a chance match is never reported as a filesystem.
+    if first_sector[0..4] == [b'h', b's', b'q', b's']
+        && crate::fs::squashfs::SquashfsFilesystem::detect(reader, 0)
+    {
+        let _ = reader.seek(SeekFrom::Start(0));
+        return Some("squashfs".to_string());
+    }
+    let _ = reader.seek(SeekFrom::Start(0));
+
     // Xerox Alto disk packs are label-bearing disks held in one of two
     // whole-file containers, neither of which is a flat sector image: a PARC
     // Disk Image (magic "PARCDISK") or a CopyDisk stream (which opens with a

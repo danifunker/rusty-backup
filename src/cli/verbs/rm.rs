@@ -55,20 +55,27 @@ pub struct RmArgs {
 }
 
 pub fn run(args: RmArgs) -> Result<()> {
+    run_with_budget(args, None)
+}
+
+/// As [`run`], with a size ceiling for the filesystems that rebuild their whole
+/// image on commit (SquashFS). `rb-cli squashfs rm` is the only caller that
+/// passes one; see [`super::squashfs`].
+pub fn run_with_budget(
+    args: RmArgs,
+    budget: Option<crate::fs::squashfs_edit::SizeBudget>,
+) -> Result<()> {
     let (file, mut ctx, commit) = resolve_partition_rw_forced(
         &args.image.path,
         args.image.partition,
         args.fs_override.fs_type.as_deref(),
     )?;
     args.fs_override.apply(&mut ctx);
+    ctx.rebuild_budget = budget;
     log_stderr(&ctx.label);
-    let mut fs = crate::fs::open_editable_filesystem(
-        file,
-        ctx.offset,
-        ctx.type_byte,
-        ctx.type_string.as_deref(),
-    )
-    .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
+    let mut fs = ctx
+        .open_editable(file)
+        .map_err(|e| anyhow!("opening filesystem for write: {e}"))?;
 
     let case_insensitive = match (args.ignore_case, args.case_sensitive) {
         (true, _) => true,

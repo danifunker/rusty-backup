@@ -132,6 +132,13 @@ pub struct Qcow2Reader<R: Read + Seek> {
     /// lands when `free_clusters` is empty. Initialised to the file length at
     /// open time; advanced by `cluster_size` per host-end alloc.
     host_end: u64,
+    /// `nb_snapshots` from the header. Reading is unaffected — the active L1
+    /// table alone describes the current disk state, and snapshot L1 tables live
+    /// elsewhere. **Writing** is refused: a cluster shared with a snapshot has
+    /// refcount > 1 and needs copy-on-write, which the in-place editor does not
+    /// do. UTM stores its suspend state as a snapshot, so this is the common
+    /// case for classic-Mac VM disks.
+    snapshot_count: u32,
 }
 
 impl<R: Read + Seek> Qcow2Reader<R> {
@@ -178,10 +185,11 @@ impl<R: Read + Seek> Qcow2Reader<R> {
         }
         let l1_size = u32::from_be_bytes(head[36..40].try_into().unwrap());
         let l1_table_offset = u64::from_be_bytes(head[40..48].try_into().unwrap());
-        let nb_snapshots = u32::from_be_bytes(head[60..64].try_into().unwrap());
-        if nb_snapshots != 0 {
-            bail!("QCOW2 with snapshots is not supported");
-        }
+        // Snapshots don't affect the read path: the header's L1 table describes
+        // the *active* disk state on its own, and each snapshot's L1 table is a
+        // separate structure we never follow. Remember the count so the editor
+        // can refuse to write (shared clusters need copy-on-write) and open.
+        let snapshot_count = u32::from_be_bytes(head[60..64].try_into().unwrap());
 
         if version == 3 {
             if total_len < 104 {
@@ -279,6 +287,7 @@ impl<R: Read + Seek> Qcow2Reader<R> {
             refcount_table_capacity,
             free_clusters: None,
             host_end: total_len,
+            snapshot_count,
         })
     }
 
@@ -295,6 +304,18 @@ impl<R: Read + Seek> Qcow2Reader<R> {
     /// Header version (2 or 3) — exposed for diagnostics + the inspect summary.
     pub fn version(&self) -> u32 {
         self.header.version
+    }
+
+    /// Number of internal snapshots in the header. Non-zero means the image
+    /// opens read-only: see [`Self::snapshot_count`]'s field docs.
+    pub fn snapshot_count(&self) -> u32 {
+        self.snapshot_count
+    }
+
+    /// True when in-place edits are refused because the image carries internal
+    /// snapshots (their clusters are shared and we have no copy-on-write path).
+    pub fn is_read_only(&self) -> bool {
+        self.snapshot_count != 0
     }
 
     /// Load (and cache) the L2 table at `host_offset`.
@@ -412,6 +433,21 @@ impl<R: Read + Write + Seek> Write for Qcow2Reader<R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        // Clusters reachable from a snapshot's L1 table carry refcount > 1;
+        // overwriting one in place would rewrite history inside the snapshot.
+        // Proper support means copy-on-write on every refcount>1 cluster, which
+        // the editor doesn't implement — so refuse rather than corrupt.
+        if self.snapshot_count != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "QCOW2 image has {} internal snapshot(s) and opens read-only; \
+                     flatten it first (qemu-img snapshot -d <name>, or \
+                     qemu-img convert -O qcow2 in.qcow2 out.qcow2)",
+                    self.snapshot_count
+                ),
+            ));
         }
         if self.pos >= self.header.size {
             return Err(std::io::Error::new(
@@ -1089,11 +1125,12 @@ mod tests {
     fn rejects_unsupported_header_features() {
         let cluster_bits = 9;
         // (byte offset, field width, big-endian value, expected error substring).
-        // The 4-byte fields are crypt_method@32 / nb_snapshots@60; the 8-byte
-        // fields are incompatible_features@72 / backing_file_offset@8.
+        // The 4-byte field is crypt_method@32; the 8-byte fields are
+        // incompatible_features@72 / backing_file_offset@8. nb_snapshots@60 is
+        // deliberately absent — snapshots open fine and only block writes, see
+        // `snapshots_read_fine_but_refuse_writes`.
         let cases: &[(usize, usize, u64, &str)] = &[
             (32, 4, 1, "encrypted"),
-            (60, 4, 3, "snapshot"),
             (72, 8, 1 << 5, "unknown incompatible_features"),
             (72, 8, 1 << 2, "external data file"),
             (72, 8, 1 << 4, "extended L2"),
@@ -1109,6 +1146,41 @@ mod tests {
                 "expected {msg:?}, got: {err}"
             );
         }
+    }
+
+    /// UTM parks the VM's suspend state in an internal snapshot, so nearly every
+    /// classic-Mac `.qcow2` in the wild has `nb_snapshots > 0`. Snapshots leave
+    /// the active L1 table alone, so reads must work; only the in-place editor
+    /// has to stand down (shared clusters would need copy-on-write).
+    #[test]
+    fn snapshots_read_fine_but_refuse_writes() {
+        let cluster_bits = 9;
+        let cluster_size = 1u64 << cluster_bits;
+        let payload = make_pattern(cluster_size as usize);
+        let mut img =
+            build_minimal_qcow2(3, cluster_bits, cluster_size, &[], &[(0, payload.clone())]);
+        // nb_snapshots@60 = 2, snapshots_offset@64 = somewhere plausible. Neither
+        // is followed on the read path.
+        img[60..64].copy_from_slice(&2u32.to_be_bytes());
+        img[64..72].copy_from_slice(&(3 * cluster_size).to_be_bytes());
+
+        let mut r = Qcow2Reader::open(Cursor::new(img)).unwrap();
+        assert_eq!(r.snapshot_count(), 2);
+        assert!(r.is_read_only());
+        let mut buf = vec![0u8; cluster_size as usize];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(
+            buf, payload,
+            "snapshots must not disturb the active L1 read"
+        );
+
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let err = r.write(&[0xAB; 16]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("snapshot"),
+            "expected a snapshot-specific message, got: {err}"
+        );
     }
 
     #[test]

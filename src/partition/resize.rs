@@ -251,6 +251,10 @@ pub fn apply_resize(
     progress_cb: &mut impl FnMut(u64, u64),
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
+    // Step 0: refuse before writing anything if we can't keep a filesystem's
+    // own size in step with its partition entry.
+    preflight_resizable(file, plans, table, log_cb)?;
+
     // Calculate new disk size: find the furthest end of any partition
     let new_data_end = plans
         .iter()
@@ -385,22 +389,16 @@ pub fn apply_resize(
         }
 
         let partition_offset = plan.new_start_lba * 512;
-        let fs_type = crate::restore::detect_partition_fs_type(file, partition_offset);
 
         if was_resized {
-            patch_filesystem_size(
-                file,
-                &fs_type,
-                partition_offset,
-                plan.new_size_bytes,
-                log_cb,
-            )?;
+            patch_filesystem_size(file, partition_offset, plan.new_size_bytes, log_cb)?;
         }
 
         if was_moved {
-            patch_filesystem_hidden_sectors(
+            // A no-op for every filesystem without a hidden-sectors field, so
+            // no type gate is needed here either.
+            crate::fs::patch_hidden_sectors_for(
                 file,
-                &fs_type,
                 partition_offset,
                 plan.new_start_lba,
                 log_cb,
@@ -437,91 +435,70 @@ pub fn apply_resize(
     Ok(())
 }
 
-/// Patch filesystem size metadata after a partition resize.
-fn patch_filesystem_size(
+/// Refuse the whole operation when any partition being resized holds a
+/// filesystem [`crate::fs::resize_filesystem_for`] cannot patch.
+///
+/// Called before a single byte is written. Without it, an unrecognised
+/// filesystem used to be *logged and skipped*: the partition entry took the new
+/// size, the filesystem kept the old one, and the volume was left with its two
+/// halves disagreeing — the one case that could corrupt was the one that said
+/// least. A partition with no filesystem at all (raw, swap, a boot blob) is
+/// allowed through: there is no metadata to fall out of step.
+fn preflight_resizable(
     file: &mut (impl Read + Write + Seek),
-    fs_type: &crate::restore::PartitionFsType,
-    partition_offset: u64,
-    new_size_bytes: u64,
+    plans: &[PartitionResizePlan],
+    table: &PartitionTable,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::restore::PartitionFsType;
+    use crate::fs::InPlaceResize;
 
-    match fs_type {
-        PartitionFsType::Fat => {
-            let new_sectors = (new_size_bytes / 512) as u32;
-            crate::fs::fat::resize_fat_in_place(file, partition_offset, new_sectors, log_cb)?;
+    let infos = table.partitions();
+    for plan in plans {
+        if plan.new_size_bytes == plan.old_size_bytes {
+            continue;
         }
-        PartitionFsType::Ntfs => {
-            let new_sectors = new_size_bytes / 512;
-            crate::fs::ntfs::resize_ntfs_in_place(file, partition_offset, new_sectors, log_cb)?;
-        }
-        PartitionFsType::Exfat => {
-            let new_sectors = new_size_bytes / 512;
-            crate::fs::exfat::resize_exfat_in_place(file, partition_offset, new_sectors, log_cb)?;
-        }
-        PartitionFsType::Ext => {
-            crate::fs::ext::resize_ext_in_place(file, partition_offset, new_size_bytes, log_cb)?;
-        }
-        PartitionFsType::Btrfs => {
-            crate::fs::btrfs::resize_btrfs_in_place(
-                file,
-                partition_offset,
-                new_size_bytes,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Hfs => {
-            crate::fs::hfs::resize_hfs_in_place(file, partition_offset, new_size_bytes, log_cb)?;
-        }
-        PartitionFsType::HfsPlus => {
-            crate::fs::hfsplus::resize_hfsplus_in_place(
-                file,
-                partition_offset,
-                new_size_bytes,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::ProDos => {
-            crate::fs::prodos::resize_prodos_in_place(
-                file,
-                partition_offset,
-                new_size_bytes,
-                log_cb,
-            )?;
-        }
-        PartitionFsType::Unknown => {
-            log_cb("Unknown filesystem type — skipping resize metadata patch");
+        let type_string = infos
+            .iter()
+            .find(|p| p.index == plan.index)
+            .and_then(|p| p.partition_type_string.clone());
+        // Probe where the partition is *now* — the data has not moved yet.
+        let offset = plan.old_start_lba * 512;
+        match crate::fs::in_place_resize_support(file, offset, type_string.as_deref()) {
+            InPlaceResize::Supported(name) => {
+                log_cb(&format!("Partition {}: {name}, resizable", plan.index));
+            }
+            InPlaceResize::Unsupported(name) => {
+                bail!(
+                    "Partition {} holds {name}, which cannot be resized in place. \
+                     Resizing the partition around it would leave the filesystem \
+                     claiming its old size. Nothing has been written.",
+                    plan.index
+                );
+            }
+            InPlaceResize::NoFilesystem => {
+                log_cb(&format!(
+                    "Partition {}: no filesystem detected; resizing the table entry only",
+                    plan.index
+                ));
+            }
         }
     }
     Ok(())
 }
 
-/// Patch filesystem hidden-sectors field after a partition move.
-fn patch_filesystem_hidden_sectors(
+/// Patch filesystem size metadata after a partition resize.
+///
+/// Delegates to the one list of in-place resizers rather than keeping a second
+/// one keyed on `restore::PartitionFsType`. The two had drifted: this path knew
+/// ProDOS but not EFS, SFS, PFS3, AFFS, QDOS or Human68k, so the GUI's resize
+/// silently skipped six filesystems the CLI's `resize` handled.
+fn patch_filesystem_size(
     file: &mut (impl Read + Write + Seek),
-    fs_type: &crate::restore::PartitionFsType,
     partition_offset: u64,
-    new_start_lba: u64,
+    new_size_bytes: u64,
     log_cb: &mut impl FnMut(&str),
 ) -> Result<()> {
-    use crate::restore::PartitionFsType;
-
-    match fs_type {
-        PartitionFsType::Fat
-        | PartitionFsType::Ntfs
-        | PartitionFsType::Exfat
-        | PartitionFsType::Hfs
-        | PartitionFsType::HfsPlus => {
-            crate::fs::patch_hidden_sectors_for(file, partition_offset, new_start_lba, log_cb)?;
-        }
-        // ext, btrfs, prodos have no hidden sectors field
-        PartitionFsType::Ext
-        | PartitionFsType::Btrfs
-        | PartitionFsType::ProDos
-        | PartitionFsType::Unknown => {}
-    }
-    Ok(())
+    crate::fs::resize_filesystem_for(file, partition_offset, new_size_bytes, log_cb)
 }
 
 /// Grow a raw or VHD image file by `add_bytes` of zero-padding at the end.
@@ -597,6 +574,79 @@ pub fn expand_image_file(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// The GUI's "Resize Partitions..." used to dispatch on its own
+    /// `restore::PartitionFsType` enum, which knew ProDOS but not EFS, SFS,
+    /// PFS3, AFFS, QDOS or Human68k — six filesystems `rb-cli resize` handled.
+    /// An unrecognised one was logged and skipped, so the partition entry took
+    /// the new size while the filesystem kept the old one. This pins the
+    /// classification both halves now share.
+    #[test]
+    fn in_place_resize_support_classifies_efs_xfs_and_raw() {
+        use crate::fs::InPlaceResize;
+
+        // SGI EFS — the one that prompted the audit.
+        let efs = crate::fs::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
+        match crate::fs::in_place_resize_support(&mut Cursor::new(efs), 0, None) {
+            InPlaceResize::Supported(name) => assert_eq!(name, "SGI EFS"),
+            _ => panic!("EFS must be resizable in place"),
+        }
+
+        // XFS is recognised but has no in-place resizer: it must be refused,
+        // not silently skipped.
+        let mut xfs = vec![0u8; 64 * 1024];
+        xfs[0..4].copy_from_slice(b"XFSB");
+        match crate::fs::in_place_resize_support(&mut Cursor::new(xfs), 0, None) {
+            InPlaceResize::Unsupported(name) => assert_eq!(name, "XFS"),
+            _ => panic!("XFS has no in-place resizer and must say so"),
+        }
+
+        // A raw / swap / boot-blob partition has no metadata to fall out of
+        // step, so resizing the table entry around it stays allowed.
+        let raw = vec![0u8; 64 * 1024];
+        assert!(matches!(
+            crate::fs::in_place_resize_support(&mut Cursor::new(raw), 0, None),
+            InPlaceResize::NoFilesystem
+        ));
+
+        // Amiga filesystems arrive by RDB type string, not by magic here.
+        let blank = vec![0u8; 64 * 1024];
+        assert!(matches!(
+            crate::fs::in_place_resize_support(&mut Cursor::new(blank), 0, Some("PFS\\3")),
+            InPlaceResize::Supported("PFS3")
+        ));
+    }
+
+    /// The delegation itself: the GUI resize path must now patch an EFS
+    /// superblock rather than log "unknown filesystem" and move on.
+    #[test]
+    fn patch_filesystem_size_reaches_efs() {
+        let img = crate::fs::efs::create_blank_efs(8 * 1024 * 1024, "T").expect("format EFS");
+        let before = crate::fs::efs::EfsSuperblock::parse(
+            &img[512..512 + crate::fs::efs::EFS_SUPERBLOCK_SIZE],
+        )
+        .expect("parse")
+        .fs_size;
+
+        // Grow: a shrink has its own conservative floor and cylinder-group
+        // rules, which are efs_resize's business, not this path's.
+        const NEW_SIZE: u64 = 12 * 1024 * 1024;
+        let mut cur = Cursor::new(img);
+        let mut log = |_: &str| {};
+        patch_filesystem_size(&mut cur, 0, NEW_SIZE, &mut log).expect("patch");
+
+        let img = cur.into_inner();
+        let after = crate::fs::efs::EfsSuperblock::parse(
+            &img[512..512 + crate::fs::efs::EFS_SUPERBLOCK_SIZE],
+        )
+        .expect("parse")
+        .fs_size;
+        assert!(
+            after > before,
+            "the EFS superblock was not patched ({before} -> {after}) — \
+             the GUI resize path still skips it"
+        );
+    }
 
     fn make_partitions(specs: &[(usize, u64, u64, bool)]) -> Vec<PartitionInfo> {
         specs

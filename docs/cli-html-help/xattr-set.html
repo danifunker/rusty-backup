@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<title>rb-cli xattr set</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="breadcrumb"><a href="index.html">rb-cli</a> &raquo; <a href="xattr.html">xattr</a> &raquo; <span>set</span></nav>
+<h1><code>rb-cli xattr set</code></h1>
+<p>Set (or replace) one extended attribute</p>
+<h2>Usage</h2>
+<pre><code>Usage: set [OPTIONS] &lt;IMAGE&gt; &lt;PATH&gt; &lt;NAME&gt; [VALUE]</code></pre>
+<h2>Arguments</h2>
+<dl class="args">
+<dt><code>&lt;IMAGE&gt;</code></dt>
+<dd>Image reference (`path` or `path@N`)</dd>
+<dt><code>&lt;PATH&gt;</code></dt>
+<dd>Absolute path of the file inside the filesystem</dd>
+<dt><code>&lt;NAME&gt;</code></dt>
+<dd>Fully-qualified attribute name, including its namespace prefix — `user.` / `trusted.` / `security.` / `system.` (e.g. `security.capability`). A name without one cannot be stored and is refused</dd>
+<dt><code>&lt;VALUE&gt;</code></dt>
+<dd>Attribute value. A `0x`-prefixed string is decoded as raw hex bytes (what a capability struct needs); anything else is stored as its UTF-8 bytes. Mutually exclusive with `--value-file`</dd>
+</dl>
+<h2>Options</h2>
+<dl class="args">
+<dt><code>--value-file</code></dt>
+<dd>Read the value verbatim from a host file instead, for a binary value too awkward to hex-encode on a command line</dd>
+</dl>
+<footer>Auto-generated from the clap argument definitions in <code>src/cli/</code>. Re-run <code>cargo run --example generate_cli_docs</code> after grammar changes. rb-cli version reflects the binary built when this bundle was generated.</footer>
+</body></html>
