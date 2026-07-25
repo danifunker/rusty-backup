@@ -858,7 +858,7 @@ Usage: make-bootable [OPTIONS] <IMAGE>
 
 ### `menu`
 
-Interactive backup/restore menu (the appliance UI): pick a disk, then Inspect / Backup / Restore. Needs an interactive terminal
+Open the interactive terminal UI on its Backup screen. Needs an interactive terminal
 
 ```
 Usage: menu

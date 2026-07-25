@@ -16,10 +16,126 @@ use std::io::{Read, Seek, Write};
 #[cfg(test)]
 use byteorder::ByteOrder;
 
-use super::efs::{EfsFilesystem, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX};
+use super::efs::{EfsFilesystem, EfsSuperblock, EFS_BLOCKSIZE, EFS_DIRECTEXTENTS_MAX};
 use super::filesystem::FilesystemError;
 
 const EFS_BLOCKSIZE_USIZE: usize = EFS_BLOCKSIZE as usize;
+
+/// How a volume of N 512-byte blocks is laid out, per the invariant
+/// `create_blank_efs` documents (`efs.rs`) and every real IRIX disk we
+/// have parsed exhibits:
+///
+/// * `fs_size == firstcg + ncg * cgfsize` — the addressable region is
+///   exactly the cylinder groups, so a size that isn't a whole number
+///   of groups rounds DOWN (mkfs_efs does the same).
+/// * `replsb == total_blocks - 1` — the replica lives in the volume's
+///   LAST block, past `fs_size`, where the allocator can never reach it.
+///
+/// Both resize directions have to maintain all three fields together.
+/// Scaling `fs_size` on its own — which is what they used to do — left
+/// the cylinder-group region hanging past the end of a shrunk volume
+/// (fsck's `CgRegionPastFsSize`, which aborted every real shrink) and
+/// put the replica past the end of a grown one (a write beyond the
+/// partition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VolumeFit {
+    /// Blocks the filesystem may address: `[0, fs_size)`.
+    fs_size: u32,
+    /// Cylinder groups that fit. Callers clamp this to their direction
+    /// of travel: grow only ever appends groups, shrink only ever drops
+    /// trailing ones.
+    ncg: u32,
+    /// Replica block — the volume's last block, just past `fs_size`.
+    replsb: u32,
+}
+
+/// Fit a volume of `total_blocks` 512-byte blocks to `sb`'s geometry.
+/// `firstcg` and `cgfsize` are fixed by the original format and are
+/// never renegotiated by a resize, so the only free variable is how
+/// many whole cylinder groups fit below the replica's block.
+fn fit_volume(sb: &EfsSuperblock, total_blocks: u32) -> Result<VolumeFit, FilesystemError> {
+    if sb.cgfsize == 0 {
+        return Err(FilesystemError::InvalidData(
+            "EFS resize: superblock declares cgfsize 0".into(),
+        ));
+    }
+    // Reserve the last block for the replica; the groups fill what's
+    // below it. Matches `mkfs_efs`'s `replsb = total_blocks - 1`.
+    let last = total_blocks.checked_sub(1).ok_or_else(|| {
+        FilesystemError::InvalidData("EFS resize: target size is 0 blocks".into())
+    })?;
+    let ncg = (last.saturating_sub(sb.firstcg) / sb.cgfsize).min(u16::MAX as u32);
+    if ncg == 0 {
+        return Err(FilesystemError::InvalidData(format!(
+            "EFS resize: {total_blocks} blocks is too small for this volume's geometry \
+             (the first cylinder group starts at block {} and each group is {} blocks, \
+              so the smallest possible volume is {} blocks)",
+            sb.firstcg,
+            sb.cgfsize,
+            sb.firstcg + sb.cgfsize + 1
+        )));
+    }
+    Ok(VolumeFit {
+        fs_size: sb.firstcg + ncg * sb.cgfsize,
+        ncg,
+        replsb: last,
+    })
+}
+
+/// Cylinder groups that have to survive a shrink whose in-use data
+/// reaches `floor`: dropping a group drops its inode table, so any
+/// group the floor reaches into must be kept whole. Always at least
+/// one (the root inode lives in CG 0), never more than the volume has.
+fn required_cgs_for_floor(sb: &EfsSuperblock, floor: u32) -> u32 {
+    if sb.cgfsize == 0 {
+        return sb.ncg as u32;
+    }
+    floor
+        .saturating_sub(sb.firstcg)
+        .div_ceil(sb.cgfsize)
+        .max(1)
+        .min(sb.ncg as u32)
+}
+
+/// The smallest volume, in 512-byte blocks, a conservative shrink can
+/// actually produce: the conservative floor rounded up to a whole
+/// cylinder group, plus the replica's block.
+///
+/// The GUI's shrink-to-minimum picker and the restore resize plan both
+/// reach this through `Filesystem::last_data_byte`, so they need this
+/// number rather than the raw floor — proposing the floor itself would
+/// hand [`shrink_efs_conservative`] a size it has to refuse.
+pub(crate) fn minimum_shrink_blocks<R: Read + Seek>(
+    fs: &mut EfsFilesystem<R>,
+) -> Result<u32, FilesystemError> {
+    let sb = fs.sb_clone();
+    let floor = compute_conservative_floor(fs)?;
+    if sb.cgfsize == 0 {
+        return Ok(floor);
+    }
+    Ok(sb
+        .firstcg
+        .saturating_add(required_cgs_for_floor(&sb, floor).saturating_mul(sb.cgfsize))
+        .saturating_add(1))
+}
+
+/// Mark every bit at or above `fs_size` as in-use, the way
+/// `create_blank_efs` marks its trailing zone.
+///
+/// This matters because [`EfsFilesystem::alloc_contiguous_in_bitmap`]
+/// scans the WHOLE bitmap, not `[0, fs_size)` — the bitmap routinely
+/// has more bits than the volume has blocks (`bmsize` is a whole number
+/// of bytes, and a shrink leaves the original oversized bitmap in
+/// place). Leaving the out-of-volume tail marked free would let the
+/// allocator hand out blocks past the end of the volume.
+fn reserve_above_fs_size(bm: &mut [u8], fs_size: u32) {
+    let total_bits = (bm.len() as u64 * 8).min(u32::MAX as u64) as u32;
+    for blk in fs_size..total_bits {
+        let by = (blk / 8) as usize;
+        let bb = 7 - (blk % 8);
+        bm[by] &= !(1u8 << bb); // set bit = free, so clear = in use
+    }
+}
 
 /// Unified entry point matching the `resize_filesystem_for` dispatch
 /// pattern: probe the EFS magic at sector 1 of the partition, and if
@@ -52,19 +168,33 @@ pub fn resize_efs_in_place(
     }
 
     let new_size_blocks = (new_size_bytes / 512) as u32;
-    // Open just to read the current size; we'll re-open inside the
+    // Open just to read the current geometry; we'll re-open inside the
     // grow/shrink path so they own the writable handle for the full
     // mutation.
-    let cur_size = {
+    let (cur_size, fitted, cgfsize) = {
         let fs = EfsFilesystem::open(&mut *file, partition_offset)
             .map_err(|e| anyhow::anyhow!("EFS resize: {e}"))?;
-        fs.sb_clone().fs_size
+        let sb = fs.sb_clone();
+        let fitted = fit_volume(&sb, new_size_blocks).map_err(|e| anyhow::anyhow!("{e}"))?;
+        (sb.fs_size, fitted.fs_size, sb.cgfsize)
     };
-    if new_size_blocks == cur_size {
-        log("EFS resize: target equals current size, no-op");
+    // Compare the FITTED size, not the raw request: an EFS volume holds
+    // a whole number of cylinder groups, so the request rounds down —
+    // and a volume already filling its partition is asked for its own
+    // size on every "resize to the whole partition".
+    if fitted == cur_size {
+        if new_size_blocks > cur_size {
+            log(&format!(
+                "EFS resize: {new_size_blocks} blocks requested, but a cylinder group on this \
+                 volume is {cgfsize} blocks and only whole groups can be added — it already \
+                 holds every group that fits, so its size is unchanged"
+            ));
+        } else {
+            log("EFS resize: target equals current size, no-op");
+        }
         return Ok(());
     }
-    let result = if new_size_blocks > cur_size {
+    let result = if fitted > cur_size {
         grow_efs(file, partition_offset, new_size_blocks, log)
     } else {
         shrink_efs_conservative(file, partition_offset, new_size_blocks, log)
@@ -85,11 +215,12 @@ pub fn resize_efs_in_place(
 ///     but not in this initial slice.
 ///   - Post-grow fsck reports any errors.
 ///
-/// The replica superblock's position scales with `fs_size`: if the
-/// original layout had `replsb = fs_size + N` for some small N, we
-/// preserve N and write the new replica at `new_size_blocks + N`.
-/// The old replica block becomes orphaned but harmless — it's outside
-/// the new bitmap region by construction.
+/// `new_size_blocks` is the volume's new CAPACITY (normally the
+/// partition's), not the new `fs_size`: the replica is placed in its
+/// last block and `fs_size` stops just below, per [`fit_volume`]. The
+/// old replica block becomes orphaned but harmless — it's inside the
+/// grown volume's free space and gets marked free with the rest of the
+/// new tail.
 pub fn grow_efs<R: Read + Write + Seek>(
     reader: R,
     partition_offset: u64,
@@ -99,16 +230,17 @@ pub fn grow_efs<R: Read + Write + Seek>(
     let mut fs = EfsFilesystem::open(reader, partition_offset)?;
     let sb = fs.sb_clone();
     let old_size = sb.fs_size;
-    if new_size_blocks <= old_size {
+    let fit = fit_volume(&sb, new_size_blocks)?;
+    if fit.fs_size <= old_size {
         return Err(FilesystemError::InvalidData(format!(
             "EFS grow: new size {new_size_blocks} blocks is not larger than old size {old_size}"
         )));
     }
-    let delta = new_size_blocks - old_size;
+    let delta = fit.fs_size - old_size;
     log(&format!(
         "EFS grow: {} -> {} blocks (+{} blocks, +{} KiB)",
         old_size,
-        new_size_blocks,
+        fit.fs_size,
         delta,
         delta as u64 / 2
     ));
@@ -119,10 +251,14 @@ pub fn grow_efs<R: Read + Write + Seek>(
     // sectors below would destroy live file data. We reserve them
     // (mark in-use) BEFORE bitmap relocation so the relocate's
     // contiguous-free-run search avoids them.
-    let added_cgs_preview = delta / sb.cgfsize;
-    if added_cgs_preview > 0 {
+    //
+    // A grow only ever adds whole cylinder groups (`fit.fs_size` is a
+    // whole number of them by construction), so the count is simply the
+    // difference — no group can straddle the end of the volume.
+    let added_cgs = fit.ncg.saturating_sub(sb.ncg as u32);
+    if added_cgs > 0 {
         let bm = fs.staged_bitmap_mut()?;
-        for new_cg_index in 0..added_cgs_preview {
+        for new_cg_index in 0..added_cgs {
             let cg = sb.ncg as u32 + new_cg_index;
             let cg_start = sb.firstcg + cg * sb.cgfsize;
             for blk in cg_start..cg_start + sb.cgisize as u32 {
@@ -131,6 +267,13 @@ pub fn grow_efs<R: Read + Write + Seek>(
                     // Past the current bitmap's coverage — relocation
                     // will grow the buffer; reservation deferred.
                     break;
+                }
+                if blk >= old_size {
+                    // Outside the OLD volume, so no file can own it: the
+                    // trailing zone past `fs_size` is marked in-use on
+                    // purpose (mkfs_efs does it, and so does our shrink),
+                    // and it is already reserved by that very fact.
+                    continue;
                 }
                 let bb = 7 - (blk % 8);
                 // set bit = free, so in-use means the bit is CLEAR.
@@ -152,10 +295,10 @@ pub fn grow_efs<R: Read + Write + Seek>(
     // it is. Otherwise find a free contiguous run in the current
     // volume (now with new CG inode regions reserved) and relocate.
     let bitmap_bits = sb.bmsize as u64 * 8;
-    let sb = if (new_size_blocks as u64) <= bitmap_bits {
+    let sb = if (fit.fs_size as u64) <= bitmap_bits {
         sb
     } else {
-        relocate_bitmap(&mut fs, &sb, new_size_blocks, log)?
+        relocate_bitmap(&mut fs, &sb, fit.fs_size, log)?
     };
 
     // Mark the new tail blocks as free in the bitmap. Per the doc,
@@ -163,7 +306,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
     // the "free" state. Convention: set bit = free.
     {
         let bm = fs.staged_bitmap_mut()?;
-        for blk in old_size..new_size_blocks {
+        for blk in old_size..fit.fs_size {
             let by = (blk / 8) as usize;
             if by >= bm.len() {
                 break;
@@ -171,13 +314,12 @@ pub fn grow_efs<R: Read + Write + Seek>(
             let bb = 7 - (blk % 8);
             bm[by] |= 1u8 << bb;
         }
+        // ...then take back everything past the volume, replica included.
+        reserve_above_fs_size(bm, fit.fs_size);
     }
 
-    // Split the delta into N full new CGs + an optional fractional tail.
-    let added_cgs = delta / sb.cgfsize;
-    let _fractional = delta - added_cgs * sb.cgfsize; // covered by the
-                                                      // "mark new blocks
-                                                      // free" step above
+    // The delta buys `added_cgs` full new CGs (computed above); any
+    // fractional tail is covered by the "mark new blocks free" step.
     if added_cgs > 0 {
         log(&format!(
             "EFS grow: appending {added_cgs} new cylinder group(s) of {} blocks each",
@@ -214,26 +356,22 @@ pub fn grow_efs<R: Read + Write + Seek>(
         }
     }
 
-    // Preserve the relative position of the replica past fs_size.
+    // Seat the replica in the volume's last block (see `fit_volume`).
     let mut new_sb = sb.clone();
-    let trailing_zone = sb.replsb.saturating_sub(old_size);
-    new_sb.fs_size = new_size_blocks;
-    new_sb.replsb = new_size_blocks.saturating_add(trailing_zone);
+    new_sb.fs_size = fit.fs_size;
+    new_sb.replsb = fit.replsb;
     new_sb.ncg = sb.ncg.saturating_add(added_cgs as u16);
     let inodes_per_cg = sb.cgisize as u32 * 4; // 4 inodes per 512-byte block
     new_sb.tinode = new_sb
         .tinode
         .saturating_add(added_cgs.saturating_mul(inodes_per_cg));
-    // Free data blocks added: total new blocks minus the inode-region
-    // blocks we marked in-use.
-    let inode_region_blocks_added = added_cgs.saturating_mul(sb.cgisize as u32);
-    new_sb.tfree = new_sb
-        .tfree
-        .saturating_add(delta.saturating_sub(inode_region_blocks_added));
+    // `tfree` is not adjusted here: `do_sync_metadata` recomputes it from
+    // the staged bitmap, so the new tail, the new CGs' inode tables and
+    // any drift the volume already carried all settle in one place.
 
     log(&format!(
-        "EFS grow: replica moves {} -> {} (trailing zone {}), ncg {} -> {}",
-        sb.replsb, new_sb.replsb, trailing_zone, sb.ncg, new_sb.ncg
+        "EFS grow: replica moves {} -> {} (volume's last block, of {}), ncg {} -> {}",
+        sb.replsb, new_sb.replsb, new_size_blocks, sb.ncg, new_sb.ncg
     ));
 
     fs.set_sb(new_sb);
@@ -263,7 +401,7 @@ pub fn grow_efs<R: Read + Write + Seek>(
 
     fs.do_sync_metadata()?;
     log("EFS grow: committed new superblock pair");
-    Ok(new_size_blocks)
+    Ok(fit.fs_size)
 }
 
 /// Find a free contiguous run inside the current volume large enough
@@ -340,8 +478,11 @@ fn relocate_bitmap<R: Read + Write + Seek>(
 /// new size in blocks on success.
 ///
 /// Pre-checks compute the conservative floor by walking the inode
-/// table. If `new_size_blocks` is below the floor, errors with the
-/// floor in the message so the caller can surface a useful dialog.
+/// table, then round it up to a whole number of cylinder groups —
+/// dropping a group means dropping its inode table, so a group holding
+/// any in-use inode has to survive whole. If `new_size_blocks` is below
+/// that rounded-up minimum, errors with the minimum in the message so
+/// the caller can surface a useful dialog.
 ///
 /// This is the resize counterpart most useful during restore: pick a
 /// smaller partition, EFS shrinks itself to the floor or beyond if
@@ -355,55 +496,82 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
     let mut fs = EfsFilesystem::open(reader, partition_offset)?;
     let sb = fs.sb_clone();
     let old_size = sb.fs_size;
-    if new_size_blocks >= old_size {
+    let fit = fit_volume(&sb, new_size_blocks)?;
+    if fit.fs_size >= old_size {
         return Err(FilesystemError::InvalidData(format!(
             "EFS shrink: new size {new_size_blocks} blocks is not smaller than old size {old_size}"
         )));
     }
 
-    // Conservative floor: every block in [0..new_size_blocks) must
-    // not be claimed by any in-use inode. Build the set of allocated
-    // blocks and find the highest one — that's the floor.
+    // Conservative floor: every block in [0..fs_size) must not be
+    // claimed by any in-use inode. Build the set of allocated blocks
+    // and find the highest one — that's the floor.
     let floor = compute_conservative_floor(&mut fs)?;
     log(&format!(
         "EFS shrink: conservative floor = {floor} blocks ({} KiB)",
         floor as u64 / 2
     ));
 
-    if new_size_blocks < floor {
+    // The floor is a block number, but the volume can only give back
+    // whole cylinder groups: `ncg` has to come down with `fs_size` or
+    // the CG region hangs past the end of the volume (fsck's
+    // `CgRegionPastFsSize`). So round the floor up to a group boundary
+    // and add the replica's block — that, not the raw floor, is the
+    // smallest volume this shrink can produce.
+    let required_ncg = required_cgs_for_floor(&sb, floor);
+    // Saturating: `ncg * cgfsize` is bounded by the volume on any sane
+    // superblock, but a corrupt one shouldn't panic a debug build.
+    let min_blocks = sb
+        .firstcg
+        .saturating_add(required_ncg.saturating_mul(sb.cgfsize))
+        .saturating_add(1);
+    if new_size_blocks < min_blocks {
         return Err(FilesystemError::InvalidData(format!(
-            "EFS shrink: requested size {new_size_blocks} below conservative floor {floor}. \
-             Pick a size >= {floor} blocks ({} KiB).",
-            floor as u64 / 2
+            "EFS shrink: requested size {new_size_blocks} blocks is below the smallest size \
+             this volume can shrink to. In-use data reaches block {floor}, which needs \
+             {required_ncg} of the volume's {} cylinder group(s) ({} blocks each) kept whole. \
+             Pick a size >= {min_blocks} blocks ({} KiB).",
+            sb.ncg,
+            sb.cgfsize,
+            min_blocks as u64 / 2
         )));
     }
 
-    // Reset the bits for blocks [new_size_blocks..old_size) in the
-    // bitmap to "free" (they're now outside the volume; mark them
-    // consistently so a later grow doesn't observe stray in-use bits).
-    // Convention: set bit = free.
+    // Only ever drop trailing groups — `fit.ncg` is what fits in the
+    // new volume, but a volume whose `fs_size` ran ahead of its CG
+    // region could "fit" more groups than it has, and shrinking is not
+    // the place to conjure new ones.
+    let new_ncg = fit.ncg.min(sb.ncg as u32);
+    let dropped_cgs = sb.ncg as u32 - new_ncg;
+    let new_fs_size = sb.firstcg + new_ncg * sb.cgfsize;
+
+    // Everything from the new end of the volume upwards is out of
+    // bounds now — mark it in-use so the allocator (which scans the
+    // whole bitmap, not just `[0, fs_size)`) can't place a file past
+    // the end of the shrunk volume. A later grow re-frees the range it
+    // takes back.
     {
         let bm = fs.staged_bitmap_mut()?;
-        for blk in new_size_blocks..old_size {
-            let by = (blk / 8) as usize;
-            if by >= bm.len() {
-                break;
-            }
-            let bb = 7 - (blk % 8);
-            bm[by] |= 1u8 << bb;
-        }
+        reserve_above_fs_size(bm, new_fs_size);
     }
 
-    // Replica scales with fs_size — preserve the trailing-zone offset.
     let mut new_sb = sb.clone();
-    let trailing_zone = sb.replsb.saturating_sub(old_size);
-    new_sb.fs_size = new_size_blocks;
-    new_sb.replsb = new_size_blocks.saturating_add(trailing_zone);
-    let removed_blocks = old_size - new_size_blocks;
-    new_sb.tfree = new_sb.tfree.saturating_sub(removed_blocks);
+    new_sb.fs_size = new_fs_size;
+    new_sb.replsb = fit.replsb;
+    new_sb.ncg = new_ncg as u16;
+    // Every inode in a dropped group is free by construction (the
+    // required-CG check above kept every group holding an in-use inode),
+    // so the free-inode count simply loses those slots.
+    let inodes_per_cg = sb.cgisize as u32 * 4; // 4 inodes per 512-byte block
+    new_sb.tinode = new_sb
+        .tinode
+        .saturating_sub(dropped_cgs.saturating_mul(inodes_per_cg));
+    // `tfree` is not adjusted here: `do_sync_metadata` recomputes it from
+    // the staged bitmap, which is the only way to get it right when whole
+    // cylinder groups (inode tables included) leave the volume.
     log(&format!(
-        "EFS shrink: replica moves {} -> {} (trailing zone {})",
-        sb.replsb, new_sb.replsb, trailing_zone
+        "EFS shrink: {} -> {} blocks, ncg {} -> {}, replica at {} (volume's last block, of {})",
+        old_size, new_fs_size, sb.ncg, new_ncg, fit.replsb, new_size_blocks
     ));
 
     fs.set_sb(new_sb);
@@ -424,7 +592,7 @@ pub fn shrink_efs_conservative<R: Read + Write + Seek>(
 
     fs.do_sync_metadata()?;
     log("EFS shrink: committed new superblock pair");
-    Ok(new_size_blocks)
+    Ok(new_fs_size)
 }
 
 /// Shrink an EFS volume aggressively: renumber in-use inodes into the
@@ -724,37 +892,55 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Blocks per cylinder group in the synthetic volume.
+    const T_CGFSIZE: u32 = 64;
+    /// Inode-table blocks per cylinder group (4 inodes each).
+    const T_CGISIZE: u16 = 2;
+    /// First cylinder group's starting block.
+    const T_FIRSTCG: u32 = 18;
+    /// Cylinder groups in the freshly-built volume.
+    const T_NCG: u32 = 7;
+    /// Root directory's single data block (first data block of CG 0).
+    const T_ROOT_DIRBLOCK: u32 = 25;
+
     /// Build a writable EFS volume populated with a small file so the
     /// shrink path has something below the floor to preserve.
+    ///
+    /// Shaped the way `mkfs_efs` shapes a volume — `fs_size ==
+    /// firstcg + ncg * cgfsize`, replica in the last block — because
+    /// that invariant is what the resize paths have to maintain. The
+    /// earlier fixture declared `fs_size` far beyond its single
+    /// cylinder group, which meant no test could ever observe the
+    /// cylinder-group region running past the end of a shrunk volume.
     fn build_test_volume() -> Vec<u8> {
-        // 512 blocks total, with one file at the start of the data
-        // region and lots of free tail. Lets us shrink down without
-        // hitting the floor.
+        // 512 blocks total: bitmap region, 7 cylinder groups of 64
+        // (blocks 18..466), then a free tail holding the replica. One
+        // file near the start of the data region leaves plenty of room
+        // to shrink without hitting the floor.
         let mut img = vec![0u8; 512 * 512];
         let sb_off = 512;
         let total_blocks = (img.len() / 512) as u32;
         let sb = EfsSuperblock {
-            fs_size: total_blocks,
-            firstcg: 18,
-            cgfsize: 64,
-            cgisize: 2,
+            fs_size: T_FIRSTCG + T_NCG * T_CGFSIZE,
+            firstcg: T_FIRSTCG,
+            cgfsize: T_CGFSIZE,
+            cgisize: T_CGISIZE,
             sectors: 63,
             heads: 1,
-            ncg: 1,
+            ncg: T_NCG as u16,
             dirty: 0,
             fs_time: 0,
             magic: 0x0007_2959, // EFS_MAGIC_OLD
             fname: *b"resize",
             fpack: *b"resize",
             // Bigger-than-fs_size bitmap so grow has room to extend
-            // without relocation (the bitmap covers 32 * 8 = 256
-            // bits; fs_size is 512. Insufficient! Make it 96 bytes =
-            // 768 bits, covering up to 768 blocks.)
+            // without relocation: 96 bytes = 768 bits, covering up to
+            // 768 blocks.
             bmsize: 96,
             tfree: 0,
             tinode: 0,
             bmblock: 2,
-            replsb: total_blocks + 4,
+            replsb: total_blocks - 1,
             lastialloc: 2,
             checksum: 0,
         };
@@ -762,15 +948,30 @@ mod tests {
 
         // Bitmap: set bit = free, clear bit = in use (matches real
         // IRIX EFS). Pre-fill `bmsize` bytes with 0xFF (all free), then
-        // CLEAR bits for reserved/in-use blocks.
+        // CLEAR bits for reserved/in-use blocks: boot + superblock, the
+        // bitmap region, every CG's inode table, the root dirblock, and
+        // everything past `fs_size`.
         let bm_off = 2 * 512;
         for b in 0..sb.bmsize as usize {
             img[bm_off + b] = 0xFF;
         }
-        for b in [0u32, 1, 2, 3, 4, 18, 19, 25] {
+        let mark_in_use = |img: &mut Vec<u8>, b: u32| {
             let by = (b / 8) as usize;
             let bb = 7 - (b % 8);
             img[bm_off + by] &= !(1 << bb);
+        };
+        for b in 0..T_FIRSTCG {
+            mark_in_use(&mut img, b);
+        }
+        for cg in 0..T_NCG {
+            let cg_start = T_FIRSTCG + cg * T_CGFSIZE;
+            for b in cg_start..cg_start + T_CGISIZE as u32 {
+                mark_in_use(&mut img, b);
+            }
+        }
+        mark_in_use(&mut img, T_ROOT_DIRBLOCK);
+        for b in sb.fs_size..sb.bmsize * 8 {
+            mark_in_use(&mut img, b);
         }
         // Root inode (2) — same shape as the efs.rs synthetic tests.
         let ino2_off = 18 * 512 + 2 * 128;
@@ -822,30 +1023,39 @@ mod tests {
         img
     }
 
+    /// The `fs_size` a volume of `total_blocks` settles on: whole
+    /// cylinder groups below the replica's block, per `fit_volume`.
+    fn expect_fs_size(total_blocks: u32) -> u32 {
+        let ncg = (total_blocks - 1 - T_FIRSTCG) / T_CGFSIZE;
+        T_FIRSTCG + ncg * T_CGFSIZE
+    }
+
     #[test]
     fn grow_extends_within_bitmap_capacity() {
-        // Volume is 512 blocks, cgfsize=64. Stay below the
-        // append-new-CGs threshold by growing 32 blocks → 544.
+        // 512 -> 544 blocks. The volume's 7 CGs become 8 (block 543,
+        // the last, is the replica's, so 8 groups of 64 from block 18
+        // is all that fits); `fs_size` follows the groups.
         let img = build_test_volume();
         let cur = Cursor::new(img);
         let mut log_lines: Vec<String> = Vec::new();
         let new_size = grow_efs(cur, 0, 544, &mut |s| log_lines.push(s.into())).expect("grow");
-        assert_eq!(new_size, 544);
+        assert_eq!(new_size, expect_fs_size(544));
+        assert_eq!(new_size, T_FIRSTCG + 8 * T_CGFSIZE);
         assert!(log_lines.iter().any(|l| l.contains("committed")));
     }
 
     #[test]
     fn grow_appends_new_cylinder_groups() {
-        // 640 - 512 = 128 = 2 * cgfsize → 2 new CGs appended at the
-        // tail. cgisize=2 inode-table blocks per CG, so the new
-        // inode region for CG 1 sits at 82..84 and for CG 2 at
-        // 146..148. After grow: ncg=3, fs_size=640.
+        // 512 -> 640 blocks: 7 CGs become 9, so two are appended at
+        // the tail. cgisize=2 inode-table blocks per CG, so the new
+        // inode regions sit at 466..468 and 530..532.
         let img = build_test_volume();
         let cur = Cursor::new(img);
         let mut log_lines: Vec<String> = Vec::new();
         let new_size =
             grow_efs(cur, 0, 640, &mut |s| log_lines.push(s.into())).expect("append-new-CGs grow");
-        assert_eq!(new_size, 640);
+        assert_eq!(new_size, expect_fs_size(640));
+        assert_eq!(new_size, T_FIRSTCG + 9 * T_CGFSIZE);
         assert!(
             log_lines
                 .iter()
@@ -862,21 +1072,24 @@ mod tests {
         use super::super::filesystem::EditableFilesystem;
         let img = build_test_volume();
         let mut buf = img;
-        // 512 -> 576 = +64 = exactly one new CG (cgfsize).
+        // 512 -> 576 blocks = room for one more cylinder group.
         grow_efs(Cursor::new(&mut buf), 0, 576, &mut |_| {}).expect("grow");
 
         let mut fs = EfsFilesystem::open(Cursor::new(buf), 0).expect("reopen");
         let sb = fs.sb_clone();
-        assert_eq!(sb.fs_size, 576);
-        assert_eq!(sb.ncg, 2);
+        assert_eq!(sb.fs_size, expect_fs_size(576));
+        assert_eq!(sb.ncg as u32, T_NCG + 1);
+        // The replica sits in the volume's last block, never past it.
+        assert_eq!(sb.replsb, 575);
         // tinode was 0 in the test volume; the new CG adds cgisize*4
         // = 8 inode slots, all currently free.
         assert_eq!(sb.tinode, 8);
 
         // The newly-allocated inode slots should read as mode==0 (free).
-        // Inode region for CG 1 spans blocks 82..84, holding inums 8..16
-        // (cgisize*4 = 8 inodes per CG).
-        for inum in 8..16 {
+        // The appended CG is index 7, holding the 8 inums after the 56
+        // (7 CGs * cgisize * 4) the volume already had.
+        let first_new_inum = T_NCG * T_CGISIZE as u32 * 4;
+        for inum in first_new_inum..first_new_inum + 8 {
             let ino = fs.read_inode(inum).expect("read");
             assert_eq!(ino.mode, 0, "new-CG inum {inum} should be free");
         }
@@ -888,14 +1101,14 @@ mod tests {
     #[test]
     fn grow_relocates_bitmap_when_beyond_capacity() {
         // Volume 512, bitmap 768 bits. Grow to 1000 → exceeds
-        // bitmap capacity AND adds 7 new CGs. The relocate path
+        // bitmap capacity AND adds 8 new CGs. The relocate path
         // moves the bitmap to a fresh location with enough bits.
         let img = build_test_volume();
         let cur = Cursor::new(img);
         let mut log_lines: Vec<String> = Vec::new();
         let new_size = grow_efs(cur, 0, 1000, &mut |s| log_lines.push(s.into()))
             .expect("grow with bitmap relocation");
-        assert_eq!(new_size, 1000);
+        assert_eq!(new_size, expect_fs_size(1000));
         assert!(
             log_lines.iter().any(|l| l.contains("relocating bitmap")),
             "missing relocate log line in: {log_lines:?}"
@@ -912,7 +1125,7 @@ mod tests {
         grow_efs(Cursor::new(&mut buf), 0, 1000, &mut |_| {}).expect("grow + relocate");
         let mut fs = EfsFilesystem::open(Cursor::new(buf), 0).expect("reopen");
         let sb = fs.sb_clone();
-        assert_eq!(sb.fs_size, 1000);
+        assert_eq!(sb.fs_size, expect_fs_size(1000));
         assert!(
             (sb.bmsize as u64) * 8 >= sb.fs_size as u64,
             "new bitmap ({} bits) does not cover new fs_size {}",
@@ -929,6 +1142,57 @@ mod tests {
         let cur = Cursor::new(img);
         let err = grow_efs(cur, 0, 512, &mut |_| {}).expect_err("not growing");
         assert!(matches!(err, FilesystemError::InvalidData(_)));
+    }
+
+    /// Regression: a grow used to scale `replsb` off `fs_size` while
+    /// `fs_size` took the caller's size verbatim, so the replica landed
+    /// PAST the end of the volume — on a real disk that write lands in
+    /// whatever follows the partition.
+    #[test]
+    fn grow_keeps_replica_inside_the_volume() {
+        for total in [544u32, 576, 640, 1000] {
+            let mut buf = build_test_volume();
+            grow_efs(Cursor::new(&mut buf), 0, total, &mut |_| {}).expect("grow");
+            let fs = EfsFilesystem::open(Cursor::new(&mut buf), 0).expect("reopen");
+            let sb = fs.sb_clone();
+            assert_eq!(
+                sb.replsb,
+                total - 1,
+                "replica should be the last block of a {total}-block volume"
+            );
+            assert!(
+                sb.fs_size <= sb.replsb,
+                "fs_size {} overlaps the replica at {}",
+                sb.fs_size,
+                sb.replsb
+            );
+            assert_eq!(
+                sb.firstcg + sb.ncg as u32 * sb.cgfsize,
+                sb.fs_size,
+                "cylinder-group region must cover exactly fs_size"
+            );
+        }
+    }
+
+    /// Regression: a shrink used to leave `ncg` untouched, so the
+    /// cylinder-group region kept describing the OLD volume and every
+    /// real shrink aborted on fsck's `CgRegionPastFsSize`.
+    #[test]
+    fn shrink_drops_trailing_cylinder_groups() {
+        let mut buf = build_test_volume();
+        let new_size = shrink_efs_conservative(Cursor::new(&mut buf), 0, 200, &mut |_| {})
+            .expect("shrink to 200 blocks");
+        assert_eq!(new_size, expect_fs_size(200));
+        let fs = EfsFilesystem::open(Cursor::new(&mut buf), 0).expect("reopen");
+        let sb = fs.sb_clone();
+        assert_eq!(sb.ncg as u32, (200 - 1 - T_FIRSTCG) / T_CGFSIZE);
+        assert!(
+            (sb.ncg as u32) < T_NCG,
+            "groups should have been dropped, still {}",
+            sb.ncg
+        );
+        assert_eq!(sb.firstcg + sb.ncg as u32 * sb.cgfsize, sb.fs_size);
+        assert_eq!(sb.replsb, 199);
     }
 
     #[test]
@@ -958,20 +1222,23 @@ mod tests {
 
         let bytes = fs.reader_into_inner().into_inner();
 
-        // First-fit allocator places the file at block 26 (next after
-        // root dir at 25 + reserved-region bits 0..19). So the
-        // floor should be 27. Try to shrink to 20 → rejected.
+        // The file lands in CG 0's data region, so the floor sits well
+        // below the first group's end. Shrinking to 20 blocks is under
+        // even one cylinder group → rejected.
         let err = shrink_efs_conservative(Cursor::new(bytes.clone()), 0, 20, &mut |_| {})
             .expect_err("below floor");
         assert!(matches!(err, FilesystemError::InvalidData(_)));
 
-        // Shrinking to 100 (well above floor) works.
+        // Shrinking to 100 blocks (one whole cylinder group, well above
+        // the floor) works. `fs_size` rounds down to the group boundary
+        // the way mkfs_efs rounds, so the result is 82, not 100.
         let mut log_lines: Vec<String> = Vec::new();
         let new_size = shrink_efs_conservative(Cursor::new(bytes), 0, 100, &mut |s| {
             log_lines.push(s.into())
         })
         .expect("shrink");
-        assert_eq!(new_size, 100);
+        assert_eq!(new_size, expect_fs_size(100));
+        assert_eq!(new_size, T_FIRSTCG + T_CGFSIZE);
     }
 
     #[test]
@@ -1003,25 +1270,29 @@ mod tests {
         }
         EditableFilesystem::sync_metadata(&mut fs).expect("sync");
 
-        // Now manually delete a file from CG 0 to create a low-inum
-        // free slot, AND ensure at least one file landed in CG 1.
-        // With the first-fit inode allocator + sb.lastialloc starting
-        // at 2, files allocate 3, 4, 5, 6, 7, 8, 9. Inum 8 lives in CG 1.
-        // After deleting f0 (inum 3), CG 1 still has inum 8 in use.
-        // The aggressive shrink should renumber 8 -> 3 to drop CG 1.
-        let kids: Vec<_> = fs
-            .list_directory(&root)
-            .expect("list")
-            .into_iter()
-            .filter(|e| e.name.starts_with("f"))
-            .collect();
-        // Delete the LOWEST-named file so the freed inum is reused.
-        let to_del = kids
-            .iter()
-            .min_by_key(|e| e.location)
-            .expect("at least one file");
-        fs.delete_entry(&root, to_del).expect("delete");
-        EditableFilesystem::sync_metadata(&mut fs).expect("sync after delete");
+        // Now delete files from CG 0 to open up low-inum slots, so the
+        // survivors all fit in CG 0 once renumbered. With the first-fit
+        // inode allocator + sb.lastialloc starting at 2, the files take
+        // inums 3..10, and inums 8+ live in CG 1 (cgisize*4 = 8 inodes
+        // per group, so CG 0 holds 0..8 with 0/1 reserved and 2 = root).
+        // Deleting two leaves root + 5 files = 6 in-use inodes, exactly
+        // what CG 0's slots 2..8 hold — so the aggressive shrink can
+        // renumber CG 1 empty and drop it.
+        for _ in 0..2 {
+            let kids: Vec<_> = fs
+                .list_directory(&root)
+                .expect("list")
+                .into_iter()
+                .filter(|e| e.name.starts_with("f"))
+                .collect();
+            // Delete the LOWEST-named file so the freed inum is reused.
+            let to_del = kids
+                .iter()
+                .min_by_key(|e| e.location)
+                .expect("at least one file");
+            fs.delete_entry(&root, to_del).expect("delete");
+            EditableFilesystem::sync_metadata(&mut fs).expect("sync after delete");
+        }
 
         // Locate the highest in-use inum to verify renumber lowers it.
         let highest_before = (2..fs.total_inodes_readonly())
@@ -1044,14 +1315,27 @@ mod tests {
             compute_conservative_floor(&mut fs2).expect("floor")
         };
 
+        // A shrink gives back whole cylinder groups, so the interesting
+        // target is a ONE-group volume. Before renumbering, in-use
+        // inodes still live in CG 1, so the conservative path can't get
+        // there; the aggressive path can, which is the whole point of
+        // renumbering.
+        let target_blocks = T_FIRSTCG + T_CGFSIZE + 1;
+        assert!(
+            conservative_floor > T_FIRSTCG + T_CGFSIZE,
+            "expected the pre-renumber floor ({conservative_floor}) to reach into CG 1"
+        );
+        assert!(
+            shrink_efs_conservative(Cursor::new(bytes.clone()), 0, target_blocks, &mut |_| {})
+                .is_err(),
+            "conservative shrink should not reach {target_blocks} blocks before renumbering"
+        );
+
         let mut log_lines: Vec<String> = Vec::new();
         let mut buf2 = bytes;
-        let new_size = shrink_efs_aggressive(
-            Cursor::new(&mut buf2),
-            0,
-            conservative_floor.saturating_sub(0), // floor itself
-            &mut |s| log_lines.push(s.into()),
-        )
+        let new_size = shrink_efs_aggressive(Cursor::new(&mut buf2), 0, target_blocks, &mut |s| {
+            log_lines.push(s.into())
+        })
         .expect("aggressive shrink");
         assert!(
             log_lines.iter().any(|l| l.contains("renumbering")),

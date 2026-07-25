@@ -5,5 +5,6 @@
 //! near-identical structure. Gathering them under one `tests/<dir>/main.rs`
 //! target links the `rusty-backup` rlib once instead of twice.
 
+mod efs_gui_resize;
 mod ql_resize;
 mod x68000_resize;

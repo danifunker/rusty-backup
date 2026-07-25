@@ -886,12 +886,17 @@ jobs:
           # (>=0.4.5) reuses the SAME libchdman-rs 0.288.5 prebuilt as `chd` (deduped
           # to one copy), which ships an armv7 build. Lets a device with a CD drive
           # (e.g. SuperStation One) rip discs.
+          # `tui` = the full-screen `rb-cli tui` (and the `rb-cli menu` alias,
+          # which without this feature falls back to the backup/restore-only
+          # appliance screen). Pure-Rust ratatui over the crossterm we already
+          # depend on — no C, no extra glibc floor — and it is exactly the shape
+          # a MiSTer's Scripts-menu / serial console wants.
           cross build \
             --bin rb-cli \
             --release \
             --target armv7-unknown-linux-gnueabihf \
             --no-default-features \
-            --features chd,pure-zstd,remote,optical
+            --features chd,pure-zstd,remote,optical,tui
 
       - name: Strip binary
         run: |
@@ -1084,12 +1089,16 @@ jobs:
         run: echo "${{ matrix.linker_env }}=${{ matrix.gnu_prefix }}-gcc" >> "$GITHUB_ENV"
 
       - name: Build rb-cli (pure-Rust slim — no GUI / CHD / optical)
+        # `tui` is in the slim set: ratatui is pure Rust over the crossterm we
+        # already depend on, so it cross-compiles for free and gives these
+        # headless targets the full-screen UI (and keeps `rb-cli menu` from
+        # degrading to the backup/restore-only appliance screen).
         run: |
           cargo build \
             --release \
             --bin rb-cli \
             --no-default-features \
-            --features pure-zstd,remote \
+            --features pure-zstd,remote,tui \
             --target ${{ matrix.target }}
 
       - name: Strip binary
@@ -2045,11 +2054,11 @@ jobs:
           | **Linux** (glibc >= 2.39) | RISC-V 64-bit (\`riscv64gc\`) | [tar.gz](${BASE}/Rusty-Backup-linux-riscv64-${VER}.tar.gz) | [rb-cli](${BASE}/rb-cli-linux-riscv64-${VER}.tar.gz) |
           | **MiSTer FPGA** (Cortex-A9, glibc 2.31) | armv7 hardfloat | _(GUI not built for this target)_ | [rb-cli-mini](${BASE}/rb-cli-mini-armv7-linux-${VER}.tar.gz) |
 
-          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **Windows ARM64 / RISC-V 64:** cross-compiled, build-only legs — the Windows ARM64 app is a portable zip and the RISC-V 64 app is a plain dynamically-linked tarball that uses your system GTK3 (not a self-contained AppImage like x64/arm64). · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. GUI/optical features are off; CHD is in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
+          <sub>**Windows:** x86 = 32-bit (Windows 10, the last Windows with 32-bit support). · **macOS:** requires 10.13 High Sierra or later. · **Linux:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; the packages and \`rb-cli\` are built against **glibc 2.39** (Ubuntu 24.04), while the **AppImage** is self-contained and runs on most distributions regardless of glibc. · **Windows ARM64 / RISC-V 64:** cross-compiled, build-only legs — the Windows ARM64 app is a portable zip and the RISC-V 64 app is a plain dynamically-linked tarball that uses your system GTK3 (not a self-contained AppImage like x64/arm64). · **MiSTer FPGA:** \`rb-cli-mini\` is a slim \`rb-cli\` cross-compiled for the MiSTer's armv7 hardfloat Intel Cyclone V SoC against Ubuntu 20.04 glibc 2.31 — same baseline as the MiSTer Buildroot rootfs and the upstream \`libchdman-rs\` armv7 prebuilt. The GUI is off; CHD, optical and the full-screen \`rb-cli tui\` terminal UI are in. Drop it onto the SD at \`/media/fat/Scripts/rb-cli\`. · Every **rb-cli** download contains a single \`rb-cli\` executable (\`rb-cli.exe\` on Windows).</sub>
 
           ### Command-line (\`rb-cli\`) for other CPU architectures
 
-          No desktop GUI on these — they ship the headless **\`rb-cli\` only**, built from the all-pure-Rust slim feature set (no CHD/optical; \`.zst\` / \`.raw\` / \`.vhd\` / \`.img\` and every filesystem still work). Big-endian PowerPC is fully supported — the on-disk parsers use explicit endianness throughout, so a G5 or G4 reads the same images as an x64 box.
+          No desktop GUI on these — they ship the headless **\`rb-cli\` only**, built from the all-pure-Rust slim feature set (no CHD/optical; \`.zst\` / \`.raw\` / \`.vhd\` / \`.img\` and every filesystem still work). The full-screen \`rb-cli tui\` terminal UI is included. Big-endian PowerPC is fully supported — the on-disk parsers use explicit endianness throughout, so a G5 or G4 reads the same images as an x64 box.
 
           | Platform | Architecture | Command line (\`rb-cli\`) |
           |---|---|---|

@@ -93,19 +93,21 @@ so devices with a CD/DVD drive (e.g. the SuperStation One) can rip discs
 on-device.
 
 The desktop release builds use the full feature set; only the MiSTer
-artifact runs `--no-default-features --features chd,pure-zstd,remote,optical`
+artifact runs `--no-default-features --features chd,pure-zstd,remote,optical,tui`
 (CHD via the C prebuilt; zstd via the pure-Rust bit-exact backend, since a
 cross build won't link C libzstd; `remote` for the network daemon — see
 [rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below; `optical`
 for CD/DVD ripping — cd-da-reader links no system libcdio, and
-opticaldiscs reuses the same libchdman-rs 0.288.9 prebuilt as `chd`).
+opticaldiscs reuses the same libchdman-rs 0.288.9 prebuilt as `chd`; `tui`
+for the full-screen `rb-cli tui` — pure-Rust ratatui, so it costs the cross
+build nothing and is what `rb-cli menu` opens).
 
 ```
 # Cross-compile for MiSTer (armv7-unknown-linux-gnueabihf):
 cargo install cross --git https://github.com/cross-rs/cross --locked
 cross build --bin rb-cli --release \
             --target armv7-unknown-linux-gnueabihf \
-            --no-default-features --features chd,pure-zstd,remote,optical
+            --no-default-features --features chd,pure-zstd,remote,optical,tui
 
 # Strip + deploy. The release tarball ships the binary as `rb-cli-mini`;
 # do the local rename here too so the on-MiSTer filename matches the
@@ -603,7 +605,7 @@ inspect-tab Edit Mode.
 | AFFS (OFS / FFS)  | Yes | Yes | Yes (in-place; bm_pages only) | Yes (Amiga Disk Validator) | Amiga `DOS\0`..`DOS\7`. In-place resize relocates root + bitmap pages; refuses on bm_ext-chain volumes or when allocated data would be clobbered. |
 | PFS3 / PDS3 / muFS | Yes | Yes | Yes (in-place + defragmenting clone) | Yes (validate + repair) | Amiga PFS3 family. Shrink refuses to truncate live data; clone path packs the volume for genuinely smaller targets. fsck walks the directory tree + anode chains and reconciles both the data and reserved allocation bitmaps (plus the free-block counters) against the walk, rebuilding them when the structure is intact — the classic "validation needed" after an unclean unmount. PFS3 has no block checksums, so structural damage is surfaced read-only rather than silently rewritten. |
 | SFS (Smart File System) | Yes | Yes (single-leaf btree) | Yes (in-place trim/grow) | Yes (validate + repair) | Amiga `SFS\0` / `SFS\2`. fsck validates every metadata-block checksum, walks the AdminSpaceContainer chain + object tree, and reconciles the single block bitmap against the walk, rebuilding it when the structure is intact. Repair touches only bitmap blocks, so it is safe regardless of btree depth. |
-| SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Symbolic links are read **and written**, so `untar` restores an archive's links instead of dropping them. Aggressive shrink renumbers inodes into low CGs. |
+| SGI EFS        | Yes    | Yes  | Yes (in-place grow + conservative + aggressive shrink) | Yes (check + repair: replica copy, bitmap fixup, lost+found) | IRIX < 6.0. Symbolic links are read **and written**, so `untar` restores an archive's links instead of dropping them. Aggressive shrink renumbers inodes into low CGs. Resizes move in whole cylinder groups (`fs_size == firstcg + ncg * cgfsize`, as `mkfs_efs` lays it out), so a target size rounds down to a group boundary. Files are read **and written** through indirect extents, up to EFS's 2 GiB per-file limit. |
 | SGI XFS (v4 / v5) | Yes | Yes (v4 only; v5 editing pending) | Grow only — disk-layout "Add free space" + in-OS `xfs_growfs`. **Known limitation: no backup compaction or in-place shrink** (XFS backups are written full-size); clone-into-fresh shrink is planned (see [`docs/OPEN-WORK.md`](docs/OPEN-WORK.md) §2.2) | Yes (R1-R8 repair pipeline; v4 oracle-validated) | IRIX 6.x and Linux. `xfs_repair`-clean writes. |
 | Alto BFS / TFS | Yes | Yes | Yes (resize) | Yes | Xerox Alto Basic File System on Diablo 31/44 packs **and the same file system on Trident T-80/T-300 (TFS)** — one codec parameterized by page size (512 vs 2048 B), label shape (8- vs 10-word), and disk-address width (1- vs 2-word). Flat SysDir namespace, leader pages, page-chain files, and **out-of-band sector labels** (the file structure lives in the labels, not the data area). Browse + extract + add/delete + resize; opened from `.pdi` / `.bfs` / `.copydisk` / `.altodisk` / Salto `.dsk` / Trident pack images (edits save as PDI). Diablo validated against every CopyDisk pack in the CHM Xerox PARC archive + the Salto/dorado disks; Trident validated against ContrAlto2's real Spruce print-server T-300 pack (plus synthetic round-trip for the write path). fsck reconciles the DiskDescriptor free-page bitmap + count against the file page-chains (VALIDATE model), flagging overlaps / broken chains read-only and rebuilding the bitmap as the repair; `rb-cli fsck --repair` writes the fix back as a PDI (in place for a `.pdi` input). |
 | Pilot / Cedar | Yes | No (read-only in GUI) | — | — | Xerox D-machine Pilot/Cedar nucleus filesystem (Dolphin/Dorado/Dandelion), structurally unrelated to BFS: physical/logical volume roots (seals `121212`₈ / `131313`₈), a subvolume table, the VAM free bitmap, and extent-based files behind **out-of-band sector labels**. Both file-ID generations (32-bit Cedar nucleus / 80-bit original Pilot) and both label schemes (Cedar-nucleus + classic Pilot 12.3). Browse + extract files in the GUI (enumerated by page-label scan across all subvolumes; the nucleus has no name directory, so real names come from the Cedar **client name directory** — the FS name->FileID B-tree in `rootFile[client]`, decoded when present — then from each file's leader page (XDE volumes name ~90% of files this way, ViewPoint names its boot/system files), and otherwise are synthesized from the file ID); blank-volume creation + add/delete files + **installing a client name directory** (`pilot_probe set-dir`) via `pilot_probe`. Validated against real ViewPoint 2.0 / XDE 5.0 volumes from the Dwarf 6085 emulator (`.zdisk`) as well as round-trip. (ViewPoint *client* files have no on-disk name — no leader name and no Pilot central directory; their names live in the desktop / NS-Filing layer, not on the local disk — so they surface by ID.) See the PARC specs under `docs/`. |

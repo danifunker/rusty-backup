@@ -229,8 +229,27 @@ pub enum Command {
     /// (`cbk pack` / `cbk unpack`). `restore` also reads a `.cbk` directly.
     Cbk(verbs::cbk::CbkArgs),
 
-    /// Interactive backup/restore menu (the appliance UI): pick a disk, then
-    /// Inspect / Backup / Restore. Needs an interactive terminal.
+    /// Open the interactive terminal UI on its Backup screen. Needs an
+    /// interactive terminal.
+    ///
+    // With `tui` (the default), `menu` is an alias for the full app; without
+    // it, `menu` is the standalone appliance screen. Keeping the help text
+    // cfg-split means each build describes what it actually does -- the old
+    // shared wording claimed backup/restore-only on builds that ship all nine
+    // tabs, which reads as "rb-cli is just a backup client".
+    #[cfg_attr(
+        feature = "tui",
+        doc = "This build has the `tui` feature, so `menu` is an alias for `tui` \
+               started on its Backup tab. Every other tab (Restore, Inspect, New \
+               Disk, Optical, Archives, Commander, Bulk, Settings) is a keypress \
+               away; `tui` itself opens on Inspect."
+    )]
+    #[cfg_attr(
+        not(feature = "tui"),
+        doc = "This build has no `tui` feature, so `menu` is the standalone \
+               appliance screen: pick a disk, then Inspect / Backup / Restore. \
+               Builds with `tui` open the full terminal UI here instead."
+    )]
     Menu(verbs::menu::MenuArgs),
 
     /// Stream an image file onto a block device.
