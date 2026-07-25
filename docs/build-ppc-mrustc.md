@@ -122,17 +122,54 @@ gcc-mp-10 *.c -o rb-cli \
 Finalize the exact `-I/-L/-l` flags from the compile command mrustc recorded
 (swap its compiler for `gcc-mp-10`, add legacy-support).
 
+## rb-cli-ppc deviations (mrustc workarounds)
+
+`rb-cli-ppc/Cargo.toml` and `scripts/build-ppc.sh` carry these, each working
+around a specific mrustc gap (all documented at their site):
+
+- **zip** `deflate` -> `deflate-flate2` — drops `zopfli` -> `bumpalo` (mrustc
+  can't infer `Bump::shrink`). Same DEFLATE via flate2.
+- **crc** — `patch_crc_vendor` in build-ppc.sh turbofishes `Digest::<uN,Table<L>>::new`
+  in all 5 width files (mrustc can't infer the const-generic impl params).
+- **env_logger** `0.11` -> `=0.10.2` — drops `jiff` (0.11's timestamp backend;
+  const-generic gap). Same logging via humantime.
+- **YAML** (`serde_yml` -> `libyml`) — an mrustc macro-expansion gap
+  (`TOK_RWORD_AS`); to be dropped via an engine feature-gate.
+
 ## Known blockers (in order)
 
 1. ~~minicargo can't parse the manifest~~ — fixed (the two patches).
 2. ~~no macOS 1.74 override set~~ — fixed (stage `overrides`).
-3. **Host transpile of the engine** — not yet run; `stage_host`. Expect to
-   find a few crates mrustc chokes on and work them one by one.
-4. **`powerpc-apple-darwin` libc** — the real wall. The vendored `libc` crate
-   has no PowerPC-Apple arch definitions (`apple/b32` is x86-only), so a
-   *correct* PPC libstd can't be built. Port that arch file (widths, struct
-   alignment, syscall consts, big-endian-correct) or lift it from
-   [Scottcjn/rust-ppc-tiger](https://github.com/Scottcjn/rust-ppc-tiger).
-   Everything PPC is downstream of this.
-5. **C++ deps** stay off forever (`chd` = libchdman). Already excluded by the
-   vintage feature set.
+3. ~~mrustc const-generic `CallPath` abort~~ (crc) — worked around (turbofish).
+   The general mrustc fix (inferring const-generic impl params from the result
+   type in `visit_call_populate_cache`) is deep and unfinished.
+4. **The engine's diverse long tail** — the whole-engine transpile hits ~6
+   distinct mrustc gaps + target-specific noise (see `native_osx_10_dot_3.md` §
+   "Where this stands"). The scope-down is to transpile the **portable engine**
+   and **exclude `os/`** — which drops `libc`/`nix`/`objc2` (the platform layer,
+   hand-C on PPC anyway) and most of the pain. NOT FAT-only; all filesystems.
+5. **`powerpc-apple-darwin` libc** (for the real target) — no arch file exists
+   (the `libc` crate postdates PPC Macs; rust-ppc-tiger has none — it's a
+   separate hand-C-runtime approach, not liftable). It must be **created**, and
+   the ground truth is on hand: build it from the **MacOSX10.4u SDK** on a real
+   PowerPC Mac (see below).
+6. **C++ deps** stay off forever (`chd` = libchdman). Already excluded.
+
+## Building the `powerpc-apple-darwin` libc arch file
+
+A real PowerPC Mac (Power Mac G5, Leopard 10.5.8) provides everything:
+
+- **`MacOSX10.4u.sdk`** under `/Developer/SDKs/` (universal, includes PPC) — the
+  authoritative C definitions for the Tiger target. Also 10.3.9 / 10.2.8 SDKs
+  and the running system's `/usr/include`.
+- **Native `gcc-4.0.1` / `gcc-4.2.1`** (`powerpc-apple-darwin9`, `arch: ppc`) —
+  enough to compile probe programs (no C11 needed for probes).
+
+Method (don't eyeball the headers — big-endian struct alignment is where you get
+silently-wrong field offsets): compile small C probes on real PPC that emit
+`sizeof` / `offsetof` / `alignof` and constant values for every type the Rust
+`libc` unix layer needs, then generate the `apple`/`powerpc` arch file to match.
+`bindgen` against the 10.4u SDK is a faster first draft but finicky with old
+SDKs + a ppc target, so probe-and-validate on hardware is the trustworthy finish.
+(For compiling mrustc's *emitted* C on this box you still need MacPorts gcc for
+C11 `<stdatomic.h>` — the stock 4.0/4.2 lack it. The probes don't.)

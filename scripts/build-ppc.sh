@@ -48,7 +48,7 @@ PPC_LIBS="$MRUSTC_DIR/output-${RUSTC_VERSION}-${PPC_TARGET}"
 HOST_OUT="$MRUSTC_DIR/output-rb-host"
 HOSTC_OUT="$MRUSTC_DIR/output-rb-hostc"
 PPC_OUT="$MRUSTC_DIR/output-rb-ppc"
-JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 banner() { printf '\n\033[1;36m==== %s ====\033[0m\n' "$*"; }
 note()   { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -80,6 +80,11 @@ stage_mrustc() {
 stage_overrides() {
   banner "2. ensure script-overrides/stable-${RUSTC_VERSION}-macos"
   cd "$MRUSTC_DIR"
+  # mrustc ships stable-<ver>-linux and -windows; only -macos is missing.
+  if [ "$(uname -s)" != "Darwin" ]; then
+    note "non-macOS host: using mrustc's shipped stable-${RUSTC_VERSION}-$(uname -s | tr 'A-Z' 'a-z') override set (no synth needed)."
+    return
+  fi
   local dir="script-overrides/stable-${RUSTC_VERSION}-macos"
   if [ -f "$dir/build_compiler_builtins.txt" ]; then
     note "macos override set already present."
@@ -123,10 +128,27 @@ stage_vendor() {
   note "vendored $(ls vendor | wc -l | tr -d ' ') crates."
 }
 
+# ---- mrustc-workaround patches on the vendored sources ----------------------
+# Re-applied before every transpile because `cargo vendor` regenerates the
+# tree. Each patch works around a specific mrustc gap; idempotent (the pattern
+# stops matching once applied). See docs/build-ppc-mrustc.md.
+patch_crc_vendor() {
+  # crc 3.x: mrustc can't infer the const-generic impl params of
+  # `Digest::<uN, Table<L>>::new` from the return type, so spell them out.
+  local d="$VENDOR_DIR/crc/src" w
+  [ -f "$d/crc128.rs" ] || return 0
+  for w in 8 16 32 64 128; do
+    sed "s/        Digest::new(self, value)/        Digest::<u${w}, Table<L>>::new(self, value)/" \
+      "$d/crc${w}.rs" > "$d/crc${w}.rs.tmp" && mv "$d/crc${w}.rs.tmp" "$d/crc${w}.rs"
+  done
+  note "applied vendored-source workarounds (crc turbofish)."
+}
+
 # ---- stage 5: transpile+compile the engine for the HOST (native proof) ------
 stage_host() {
   banner "5. transpile+build rb-cli for the HOST (native $HOST_ARCH proof)"
   cd "$MRUSTC_DIR"
+  patch_crc_vendor
   mkdir -p "$HOST_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" \
     bin/minicargo "$CRATE_DIR" \
@@ -154,6 +176,7 @@ stage_hostc() {
   cd "$MRUSTC_DIR"
   [ -e "$HOST_LIBS/libstd.rlib" ] || die "run 'hostlibs' first (need $HOST_LIBS)"
   [ -d "$VENDOR_DIR" ] || die "run 'vendor' first"
+  patch_crc_vendor
   mkdir -p "$HOSTC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
@@ -186,6 +209,7 @@ stage_ppc() {
   banner "7. transpile rb-cli to C for $PPC_TARGET (deferred codegen)"
   [ -d "$PPC_LIBS" ] || die "PPC libs missing -- stage 6 must succeed first (blocked on libc)"
   cd "$MRUSTC_DIR"
+  patch_crc_vendor
   mkdir -p "$PPC_OUT"
   MRUSTC_TARGET_VER="$MRUSTC_TARGET_VER" MINICARGO_DEFER_CODEGEN=1 \
     bin/minicargo "$CRATE_DIR" \
