@@ -249,6 +249,86 @@ impl EfsExtent {
     }
 }
 
+/// The blocks an EFS allocator may hand out: the data region of each
+/// cylinder group, and nothing else.
+///
+/// This exists because **a real IRIX volume does not track cylinder-group
+/// inode tables in the free-space bitmap**. `mkfs_efs` leaves those bits
+/// set, which reads as "free" under the set-bit-is-free convention, since
+/// the kernel never allocates data blocks there — inode occupancy lives in
+/// each inode's own `di_mode`, not in a bitmap bit. Measured on the IRIX
+/// 5.3 fixture: counting free bits across the whole bitmap gives
+/// 4,332,204, while the superblock's own `fs_tfree` says 4,140,595. The
+/// 191,609-block gap is exactly the 78 cylinder groups' inode tables.
+///
+/// A first-fit scan that trusts the bitmap alone therefore walks straight
+/// into CG 0's inode table and overwrites live inodes — on that fixture
+/// the very first 8-block run it picks is block 1984, which holds inodes
+/// 616..648. Our own `write_blank_efs` *does* mark inode tables in-use,
+/// which is why synthetic-volume tests never caught it and only real
+/// IRIX-formatted disks corrupted.
+///
+/// So the bitmap is necessary but not sufficient: a block is allocatable
+/// only when the bitmap says free **and** this map says it is a cylinder
+/// group's data block. Both allocation and free-space counting go through
+/// here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EfsDataRegions {
+    firstcg: u32,
+    cgfsize: u32,
+    cgisize: u32,
+    ncg: u32,
+    fs_size: u32,
+}
+
+impl EfsDataRegions {
+    pub(crate) fn from_sb(sb: &EfsSuperblock) -> Self {
+        EfsDataRegions {
+            firstcg: sb.firstcg,
+            cgfsize: sb.cgfsize,
+            cgisize: sb.cgisize as u32,
+            ncg: sb.ncg as u32,
+            fs_size: sb.fs_size,
+        }
+    }
+
+    /// The `[start, end)` data-block range of cylinder group `cg`: the
+    /// group minus its leading inode table, clamped to `fs_size`.
+    /// `None` when the group is degenerate (inode table fills it) or
+    /// falls entirely past the end of the volume.
+    fn cg_data_range(&self, cg: u32) -> Option<(u32, u32)> {
+        if self.cgfsize == 0 || self.cgisize >= self.cgfsize {
+            return None;
+        }
+        let cg_start = self.firstcg.checked_add(cg.checked_mul(self.cgfsize)?)?;
+        let data_start = cg_start.checked_add(self.cgisize)?;
+        let data_end = cg_start.checked_add(self.cgfsize)?.min(self.fs_size);
+        if data_end <= data_start {
+            return None;
+        }
+        Some((data_start, data_end))
+    }
+
+    /// Every cylinder group's data range, low block to high.
+    fn ranges(self) -> impl Iterator<Item = (u32, u32)> {
+        (0..self.ncg).filter_map(move |cg| self.cg_data_range(cg))
+    }
+
+    /// Whether `blk` is a cylinder-group data block — i.e. whether an
+    /// extent is allowed to point at it. Used by the allocator and by
+    /// fsck's "extent points into metadata" check.
+    pub(crate) fn contains(self, blk: u32) -> bool {
+        if blk < self.firstcg || blk >= self.fs_size || self.cgfsize == 0 {
+            return false;
+        }
+        let rel = blk - self.firstcg;
+        if rel / self.cgfsize >= self.ncg {
+            return false;
+        }
+        rel % self.cgfsize >= self.cgisize
+    }
+}
+
 /// Parsed EFS on-disk inode (128 bytes).
 #[derive(Debug, Clone)]
 pub struct EfsInode {
@@ -686,10 +766,17 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     }
 
     /// Allocate a contiguous run of `want_blocks` free disk blocks via
-    /// a first-fit scan over the bitmap. Returns one extent (always
-    /// contiguous on disk by construction) and marks the bits as
-    /// in-use in `bm`. The caller is responsible for writing `bm` back
-    /// via `write_bitmap` once all allocation decisions are made.
+    /// a first-fit scan. Returns one extent (always contiguous on disk
+    /// by construction) and marks the bits as in-use in `bm`. The
+    /// caller is responsible for writing `bm` back via `write_bitmap`
+    /// once all allocation decisions are made.
+    ///
+    /// The scan is confined to `regions` — each cylinder group's data
+    /// area — rather than sweeping the raw bitmap, because on a real
+    /// IRIX volume the bitmap's inode-table bits read as free and
+    /// handing one out overwrites live inodes. See [`EfsDataRegions`]
+    /// for the measurements behind that. Scanning group by group also
+    /// means a run can never straddle the next group's inode table.
     ///
     /// EFS supports up to 12 extents per inode. Callers that need
     /// non-contiguous space across multiple extents should call this
@@ -697,6 +784,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
     /// ceiling themselves.
     pub(crate) fn alloc_contiguous_in_bitmap(
         bm: &mut [u8],
+        regions: &EfsDataRegions,
         want_blocks: u32,
         avoid_below: u32,
     ) -> Result<EfsExtent, FilesystemError> {
@@ -705,31 +793,27 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 "alloc_contiguous_in_bitmap: want_blocks must be > 0".into(),
             ));
         }
-        let total_bits = (bm.len() as u64) * 8;
-        let mut run_start: Option<u32> = None;
-        let mut run_len: u32 = 0;
-        for bit in 0..(total_bits as u32) {
-            if bit < avoid_below {
-                run_start = None;
-                run_len = 0;
+        let total_bits = ((bm.len() as u64) * 8).min(u32::MAX as u64) as u32;
+        for (lo, hi) in regions.ranges() {
+            let lo = lo.max(avoid_below);
+            let hi = hi.min(total_bits);
+            if hi <= lo {
                 continue;
             }
-            let byte = (bit / 8) as usize;
-            let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
-                                             // set bit = FREE on real IRIX EFS, so a free block is bit==1.
-            let free = (bm[byte] >> bit_in_byte) & 1 == 1;
-            if !free {
-                run_start = None;
-                run_len = 0;
-            } else {
-                if run_start.is_none() {
-                    run_start = Some(bit);
-                    run_len = 1;
-                } else {
-                    run_len += 1;
+            let mut run_start: Option<u32> = None;
+            let mut run_len: u32 = 0;
+            for bit in lo..hi {
+                let byte = (bit / 8) as usize;
+                let bit_in_byte = 7 - (bit % 8); // big-endian bit order, MSB first
+                                                 // set bit = FREE on real IRIX EFS, so a free block is bit==1.
+                if (bm[byte] >> bit_in_byte) & 1 == 0 {
+                    run_start = None;
+                    run_len = 0;
+                    continue;
                 }
+                let start = *run_start.get_or_insert(bit);
+                run_len += 1;
                 if run_len >= want_blocks {
-                    let start = run_start.unwrap();
                     // Mark bits [start..start+want_blocks) as in-use (clear).
                     for b in start..start + want_blocks {
                         let by = (b / 8) as usize;
@@ -746,7 +830,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             }
         }
         Err(FilesystemError::DiskFull(format!(
-            "EFS: no contiguous run of {want_blocks} free blocks in bitmap"
+            "EFS: no contiguous run of {want_blocks} free blocks in any cylinder group's data area"
         )))
     }
 
@@ -924,7 +1008,8 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
                 dir_inode.inum, dir_inode.numextents, EFS_DIRECTEXTENTS
             )));
         }
-        let new_ext = Self::alloc_contiguous_in_bitmap(bm, 1, 0)?;
+        let new_ext =
+            Self::alloc_contiguous_in_bitmap(bm, &EfsDataRegions::from_sb(&self.sb), 1, 0)?;
         // Initialize the new block with just our single entry.
         let init =
             serialize_dir_block(&[new_entry]).expect("single entry always fits in 512 bytes");
@@ -1076,6 +1161,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             return Ok(());
         }
         let needed_blocks = data_len.div_ceil(EFS_BLOCKSIZE) as u32;
+        let regions = EfsDataRegions::from_sb(&self.sb);
 
         let mut allocated: Vec<EfsExtent> = Vec::new();
         let mut logical_offset = 0u32;
@@ -1095,7 +1181,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             // until we find something that fits or chunk drops to 1.
             let mut chunk = remaining.min(u8::MAX as u32);
             let ext = loop {
-                match Self::alloc_contiguous_in_bitmap(bm, chunk, 0) {
+                match Self::alloc_contiguous_in_bitmap(bm, &regions, chunk, 0) {
                     Ok(mut e) => {
                         e.offset = logical_offset;
                         break e;
@@ -1171,6 +1257,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         data_extents: &[EfsExtent],
     ) -> Result<(), FilesystemError> {
         let index_blocks = data_extents.len().div_ceil(EFS_EXTENTS_PER_BLOCK) as u32;
+        let regions = EfsDataRegions::from_sb(&self.sb);
 
         // Allocate the index blocks the same way data blocks are
         // allocated — largest run first, halving on failure — but into
@@ -1191,7 +1278,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             }
             let mut chunk = remaining.min(u8::MAX as u32);
             let ext = loop {
-                match Self::alloc_contiguous_in_bitmap(bm, chunk, 0) {
+                match Self::alloc_contiguous_in_bitmap(bm, &regions, chunk, 0) {
                     Ok(mut e) => {
                         e.offset = logical_offset;
                         break e;
@@ -1321,7 +1408,7 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
             // had files written to it still reported itself empty, and a
             // wrong count is exactly what makes IRIX's `fsck -t efs`
             // "fix" the volume on first mount.
-            let free = Self::count_free_blocks_in(&bm, self.sb.fs_size);
+            let free = Self::count_free_blocks_in(&bm, &EfsDataRegions::from_sb(&self.sb));
             if free != self.sb.tfree {
                 self.sb.tfree = free;
                 self.sb_dirty = true;
@@ -1336,18 +1423,22 @@ impl<R: Read + Write + Seek> EfsFilesystem<R> {
         Ok(())
     }
 
-    /// Count the blocks below `fs_size` the bitmap marks free (set bit
-    /// = free). Bits past the bitmap's coverage are not counted.
-    pub(crate) fn count_free_blocks_in(bm: &[u8], fs_size: u32) -> u32 {
+    /// Count the allocatable blocks the bitmap marks free (set bit =
+    /// free). Counts only cylinder-group *data* blocks, matching how
+    /// IRIX derives `fs_tfree` — sweeping the raw bitmap instead would
+    /// count every inode-table bit as free space and overstate the
+    /// total by the whole inode region (191,609 blocks on the IRIX 5.3
+    /// fixture). Bits past the bitmap's coverage are not counted.
+    pub(crate) fn count_free_blocks_in(bm: &[u8], regions: &EfsDataRegions) -> u32 {
+        let total_bits = ((bm.len() as u64) * 8).min(u32::MAX as u64) as u32;
         let mut free = 0u32;
-        for blk in 0..fs_size {
-            let by = (blk / 8) as usize;
-            if by >= bm.len() {
-                break;
-            }
-            let bb = 7 - (blk % 8);
-            if bm[by] & (1u8 << bb) != 0 {
-                free += 1;
+        for (lo, hi) in regions.ranges() {
+            for blk in lo..hi.min(total_bits) {
+                let by = (blk / 8) as usize;
+                let bb = 7 - (blk % 8);
+                if bm[by] & (1u8 << bb) != 0 {
+                    free += 1;
+                }
             }
         }
         free
@@ -1590,7 +1681,12 @@ impl<R: Read + Write + Seek + Send> super::filesystem::EditableFilesystem for Ef
             let inum = self.allocate_inode()?;
             // Allocate one disk block for the new dir's initial
             // dirblock (holding `.` and `..`).
-            let mut ext = Self::alloc_contiguous_in_bitmap(&mut bm, 1, 0)?;
+            let mut ext = Self::alloc_contiguous_in_bitmap(
+                &mut bm,
+                &EfsDataRegions::from_sb(&self.sb),
+                1,
+                0,
+            )?;
             ext.offset = 0;
 
             // Write the initial dirblock with "." and "..".
@@ -3613,8 +3709,10 @@ mod tests {
         let img = build_synthetic_for_bitmap_tests();
         let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
         let mut bm = fs.read_bitmap().unwrap();
-        let ext = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 20)
-            .expect("alloc 4 blocks");
+        let regions = EfsDataRegions::from_sb(&fs.sb);
+        let ext =
+            EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, &regions, 4, 20)
+                .expect("alloc 4 blocks");
         // First-fit with avoid_below=20 in the synthetic gives bn=20
         // (block 19 is in-use; 20..23 are free).
         assert_eq!(ext.bn, 20);
@@ -3627,8 +3725,9 @@ mod tests {
             assert!(bm[by] & (1 << bb) == 0, "block {b} not marked");
         }
         // A second alloc starts past the run we just took.
-        let ext2 = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 2, 20)
-            .expect("alloc 2 more");
+        let ext2 =
+            EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, &regions, 2, 20)
+                .expect("alloc 2 more");
         assert_eq!(ext2.bn, 24);
     }
 
@@ -3640,9 +3739,99 @@ mod tests {
         let mut bm = vec![0u8; 32];
         let b = 50usize;
         bm[b / 8] |= 1 << (7 - (b % 8));
-        let err = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, 4, 0)
-            .expect_err("expected DiskFull");
+        let img = build_synthetic_for_bitmap_tests();
+        let fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open");
+        let regions = EfsDataRegions::from_sb(&fs.sb);
+        let err =
+            EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(&mut bm, &regions, 4, 0)
+                .expect_err("expected DiskFull");
         assert!(matches!(err, FilesystemError::DiskFull(_)), "got {err:?}");
+    }
+
+    /// The bug that corrupted a real IRIX volume: a real `mkfs_efs`
+    /// leaves each cylinder group's inode-table bits SET in the free
+    /// bitmap (IRIX never allocates data there and tracks inode use via
+    /// `di_mode` instead). A first-fit scan over the raw bitmap
+    /// therefore picks block 1984 on this fixture — which holds live
+    /// inodes 616..648 — and writing file data there destroys them.
+    ///
+    /// Our own `write_blank_efs` marks inode tables in-use, so only
+    /// real IRIX-formatted disks ever hit this; that is exactly why it
+    /// has to be tested against the real fixture.
+    #[test]
+    fn allocation_never_lands_in_a_cylinder_group_inode_table() {
+        let img = load_fixture();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open EFS");
+        let sb = fs.sb.clone();
+        let regions = EfsDataRegions::from_sb(&sb);
+        let mut bm = fs.read_bitmap().expect("bitmap");
+
+        // The raw-bitmap scan this replaced would return block 1984.
+        let first_free_bit = (0..sb.fs_size)
+            .find(|blk| {
+                let by = (blk / 8) as usize;
+                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+            })
+            .expect("fixture has free blocks");
+        assert!(
+            !regions.contains(first_free_bit),
+            "fixture no longer reproduces the hazard: its first free bit ({first_free_bit}) \
+             is already a data block"
+        );
+
+        // Take a good number of extents so we sweep well past the head
+        // of the volume, and demand every one be a data block.
+        for _ in 0..64 {
+            let ext = EfsFilesystem::<Cursor<Vec<u8>>>::alloc_contiguous_in_bitmap(
+                &mut bm, &regions, 8, 0,
+            )
+            .expect("alloc");
+            for blk in ext.bn..ext.bn + ext.length as u32 {
+                assert!(
+                    regions.contains(blk),
+                    "allocator handed out block {blk}, which is not a cylinder-group data block"
+                );
+            }
+        }
+    }
+
+    /// IRIX derives `fs_tfree` from data blocks only. Counting the raw
+    /// bitmap instead treats every inode-table bit as free space, which
+    /// overstates the total by the whole inode region and makes IRIX's
+    /// `fsck -t efs` "fix" the volume on the next mount.
+    #[test]
+    fn free_block_count_excludes_inode_tables() {
+        let img = load_fixture();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open EFS");
+        let sb = fs.sb.clone();
+        let bm = fs.read_bitmap().expect("bitmap");
+
+        let counted = EfsFilesystem::<Cursor<Vec<u8>>>::count_free_blocks_in(
+            &bm,
+            &EfsDataRegions::from_sb(&sb),
+        );
+        let raw_bits: u32 = (0..sb.fs_size)
+            .filter(|blk| {
+                let by = (blk / 8) as usize;
+                by < bm.len() && bm[by] & (1 << (7 - (blk % 8))) != 0
+            })
+            .count() as u32;
+
+        // The fixture's own superblock is the oracle. Sweeping the raw
+        // bitmap is off by the ~191k blocks of inode table; the
+        // region-aware count lands within a rounding hair of IRIX.
+        assert!(
+            raw_bits > sb.tfree + 100_000,
+            "expected the naive count to badly overstate free space, got {raw_bits} vs {}",
+            sb.tfree
+        );
+        let drift = counted.abs_diff(sb.tfree);
+        assert!(
+            drift < 1_000,
+            "region-aware free count {counted} drifts {drift} blocks from the volume's own \
+             tfree {}",
+            sb.tfree
+        );
     }
 
     #[test]
@@ -4087,6 +4276,109 @@ mod tests {
             .expect("file present");
         let data = fs2.read_file(entry, usize::MAX).expect("read");
         assert_eq!(data, payload);
+    }
+
+    /// End-to-end reproduction of the report that surfaced this bug:
+    /// adding a few files to a real IRIX volume trashed it, and the
+    /// second or third file was where it showed. Each `create_file`
+    /// used to allocate out of CG 0's inode table, so the payload
+    /// landed on top of live inodes and IRIX then fsck'd the volume.
+    ///
+    /// Guards both halves: the new files must occupy data blocks, and
+    /// the inodes the old allocator would have overwritten must still
+    /// read back exactly as they did before the edits.
+    #[test]
+    fn adding_files_to_a_real_irix_volume_leaves_existing_inodes_intact() {
+        use super::super::filesystem::{CreateFileOptions, EditableFilesystem, Filesystem};
+        let img = load_fixture();
+        let mut fs = EfsFilesystem::open(Cursor::new(img), 0).expect("open EFS");
+        let regions = EfsDataRegions::from_sb(&fs.sb);
+        // The fixture is the first 4 MB of a 3.8 GB volume, so the
+        // volume's own `lastialloc` hint (325229) points at an inode
+        // table past the end of the file. Start the scan low so the
+        // whole exercise stays inside the bytes we have.
+        fs.sb.lastialloc = 2;
+
+        // Snapshot the inodes living in the blocks first-fit used to
+        // hand out (block 1984 onward holds inums 616..).
+        let watched: Vec<u32> = (600..700).collect();
+        let before: Vec<(u32, u16, u32)> = watched
+            .iter()
+            .map(|&i| {
+                let ino = fs.read_inode(i).expect("read inode");
+                (i, ino.mode, ino.size)
+            })
+            .collect();
+
+        // Write into lost+found rather than the root: the root's own
+        // dirblocks run past the end of the truncated fixture, but
+        // lost+found's sit in CG 0 where we still have the bytes.
+        let root = fs.root().expect("root");
+        let parent = fs
+            .list_directory(&root)
+            .expect("list root")
+            .into_iter()
+            .find(|e| e.name == "lost+found")
+            .expect("lost+found present");
+
+        let opts = CreateFileOptions::default();
+        let mut created = Vec::new();
+        for n in 0..4 {
+            let payload = vec![b'A' + n as u8; 4096];
+            let mut cur = Cursor::new(payload.clone());
+            let entry = fs
+                .create_file(
+                    &parent,
+                    &format!("rbtest{n}.txt"),
+                    &mut cur,
+                    payload.len() as u64,
+                    &opts,
+                )
+                .expect("create_file");
+            created.push((entry, payload));
+        }
+        EditableFilesystem::sync_metadata(&mut fs).expect("sync");
+
+        // Every block the new files occupy must be a data block.
+        for (entry, _) in &created {
+            let ino = fs.read_inode(entry.location as u32).expect("inode");
+            for ext in ino.extents.iter().take(ino.numextents as usize) {
+                for blk in ext.bn..ext.bn + ext.length as u32 {
+                    assert!(
+                        regions.contains(blk),
+                        "{} landed on block {blk}, outside any cylinder group's data area",
+                        entry.name
+                    );
+                }
+            }
+        }
+
+        // Nothing in the watched inode range may have shifted, except
+        // the slots we deliberately allocated for the new files.
+        let new_inums: Vec<u32> = created.iter().map(|(e, _)| e.location as u32).collect();
+        for (inum, mode, size) in before {
+            if new_inums.contains(&inum) {
+                continue;
+            }
+            let now = fs.read_inode(inum).expect("re-read inode");
+            assert_eq!(
+                (now.mode, now.size),
+                (mode, size),
+                "inode {inum} was modified by writing unrelated files"
+            );
+        }
+
+        // And the files read back correctly through a fresh open.
+        let bytes = fs.reader.into_inner();
+        let mut fs2 = EfsFilesystem::open(Cursor::new(bytes), 0).expect("reopen");
+        let kids = fs2.list_directory(&parent).expect("list");
+        for (entry, payload) in &created {
+            let found = kids
+                .iter()
+                .find(|e| e.name == entry.name)
+                .unwrap_or_else(|| panic!("{} missing after reopen", entry.name));
+            assert_eq!(&fs2.read_file(found, usize::MAX).expect("read"), payload);
+        }
     }
 
     #[test]
