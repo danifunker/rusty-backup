@@ -98,7 +98,7 @@ artifact runs `--no-default-features --features chd,pure-zstd,remote,optical,tui
 cross build won't link C libzstd; `remote` for the network daemon — see
 [rb-daemon](#run-this-device-as-a-network-daemon-rb-daemon) below; `optical`
 for CD/DVD ripping — cd-da-reader links no system libcdio, and
-opticaldiscs reuses the same libchdman-rs 0.288.9 prebuilt as `chd`; `tui`
+opticaldiscs reuses the same libchdman-rs 0.288.10 prebuilt as `chd`; `tui`
 for the full-screen `rb-cli tui` — pure-Rust ratatui, so it costs the cross
 build nothing and is what `rb-cli menu` opens).
 

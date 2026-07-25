@@ -13,25 +13,27 @@ pub mod source;
 pub use convert::ConvertProgress;
 pub use rip::{run_rip, OpticalTarget, RipConfig, RipFormat, RipProgress};
 
-/// Open `path` as a disc image — the guarded replacement for calling
+/// Open `path` as a disc image — use this rather than calling
 /// [`opticaldiscs::detect::DiscImageInfo::open`] directly.
 ///
-/// **Always use this.** `DiscImageInfo::open` sniffs every container it
-/// knows, and its CHD branch ends in MAME's `cdrom_file(chd_file*)`
-/// constructor, which **throws** when the CHD carries no CD metadata — i.e.
-/// every ordinary hard-disk CHD. A C++ exception cannot unwind through
-/// Rust frames, so the process does not get an error back: it calls
-/// `std::terminate` and aborts. Opening a hard-disk CHD anywhere near an
-/// optical probe therefore killed the app outright.
+/// `DiscImageInfo::open` sniffs every container it knows, and its CHD
+/// branch ends in MAME's `cdrom_file(chd_file*)` constructor, which
+/// **throws** when the CHD carries no CD metadata — i.e. every ordinary
+/// hard-disk CHD. A C++ exception cannot unwind through Rust frames, so the
+/// process did not get an error back: it called `std::terminate` and
+/// aborted. Opening a hard-disk CHD anywhere near an optical probe killed
+/// the app outright.
 ///
-/// The CHD's own info record answers "is this a CD?" without constructing a
-/// `cdrom_file`, so ask that first and refuse anything else with a normal
-/// error. Non-CHD paths are passed straight through.
+/// **libchdman-rs 0.288.10 fixed that at the source** (its shims catch and
+/// return a failure, and it gained a `NotCdMedia` error), so the abort is
+/// no longer reachable through a current dependency tree — see the
+/// `upstream_reports_an_error_...` test, which exercises the raw call. This
+/// wrapper stays because it is still the better answer: the CHD's own info
+/// record says "is this a CD?" without constructing a `cdrom_file` at all,
+/// which is cheaper than a failed construction, gives a message naming the
+/// actual problem, and keeps a dependency downgrade from being fatal.
+/// Non-CHD paths pass straight through.
 ///
-/// The durable fix belongs upstream — the C shim should `catch(...)` and
-/// return null rather than letting an exception reach the FFI boundary —
-/// but this keeps a hard-disk CHD from aborting the process in the
-/// meantime, and remains correct afterwards.
 /// Returns the crate's own error type, so callers keep the distinction
 /// between a hard I/O failure and "this isn't a disc image" — the refusal
 /// arrives as `UnsupportedFormat`, which is what a hard-disk CHD is from
@@ -185,5 +187,47 @@ mod tests {
             version: None,
         };
         assert_eq!(super::format_game_identity(&g), "Sega Dreamcast");
+    }
+
+    /// [`super::open_disc_image`]'s guard exists because a non-CD CHD used
+    /// to abort the whole process inside MAME's `cdrom_file` constructor.
+    /// libchdman-rs 0.288.10 fixed that at the source — its shims catch and
+    /// return a failure — so this asserts the RAW upstream call is safe,
+    /// deliberately bypassing the guard so a dependency downgrade is caught
+    /// here rather than by a user's crash report.
+    ///
+    /// If it regresses, the test binary aborts instead of failing an
+    /// assertion. That is the nature of a foreign exception; it is at least
+    /// unmissable.
+    #[test]
+    #[cfg(feature = "chd")]
+    fn upstream_reports_an_error_for_a_hard_disk_chd_instead_of_aborting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = vec![0x5Au8; 512 * 1024];
+        let base = tmp.path().join("hd");
+        crate::rbformats::chd::compress_chd(
+            &mut std::io::Cursor::new(&data),
+            &base,
+            data.len() as u64,
+            None,
+            None,
+            &mut |_| {},
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("build a hard-disk CHD");
+        let chd = base.with_extension("chd");
+
+        // The call that used to throw across the FFI boundary.
+        let chd_handle =
+            libchdman_rs::Chd::open(chd.to_str().unwrap(), false, None).expect("open CHD");
+        assert!(
+            libchdman_rs::cd::list_tracks(&chd_handle).is_err(),
+            "a hard-disk CHD has no tracks; upstream must say so, not abort"
+        );
+        drop(chd_handle);
+
+        // And the container probe `is_container_path` used to reach through.
+        assert!(opticaldiscs::detect::DiscImageInfo::open(&chd).is_err());
     }
 }

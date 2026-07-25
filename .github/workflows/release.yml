@@ -883,7 +883,7 @@ jobs:
           # no C / no extra crate), so the MiSTer can host its images on the LAN.
           # `optical` = CD/DVD ripping (`optical rip` / `drives` / `convert`).
           # cd-da-reader is cc+libc (an SG_IO shim, no system libcdio); opticaldiscs
-          # (>=0.4.5) reuses the SAME libchdman-rs 0.288.5 prebuilt as `chd` (deduped
+          # (>=0.4.5) reuses the SAME libchdman-rs 0.288.10 prebuilt as `chd` (deduped
           # to one copy), which ships an armv7 build. Lets a device with a CD drive
           # (e.g. SuperStation One) rip discs.
           # `tui` = the full-screen `rb-cli tui` (and the `rb-cli menu` alias,
@@ -1126,7 +1126,7 @@ jobs:
 
   # Full desktop app + `rb-cli` for Windows on ARM64 (aarch64-pc-windows-msvc),
   # cross-compiled on the x64 Windows runner (its Visual Studio carries the ARM64
-  # MSVC libs). First-class GUI build: libchdman-rs 0.288.9 publishes an
+  # MSVC libs). First-class GUI build: libchdman-rs 0.288.10 publishes an
   # aarch64-pc-windows-msvc prebuilt, so the `chd`/`optical` core links and the
   # app ships the same default feature set as the x64/x86 Windows builds.
   # Build-only (continue-on-error): an ARM64 exe can't execute on the x64 runner,
@@ -1209,7 +1209,7 @@ jobs:
   # the default feature set (GUI + CHD + optical) against a riscv64 GTK/GL sysroot
   # pulled in via dpkg multiarch (ubuntu-ports), then ship a plain dynamically-
   # linked tarball — NOT a self-contained AppImage; it uses the user's system
-  # GTK3 at runtime. libchdman-rs 0.288.9 publishes the riscv64gc prebuilt that
+  # GTK3 at runtime. libchdman-rs 0.288.10 publishes the riscv64gc prebuilt that
   # makes the CHD core link. continue-on-error: best-effort, can't block release.
   build-gui-linux-riscv64:
     name: Build Linux RISC-V 64 GUI (rusty-backup)
