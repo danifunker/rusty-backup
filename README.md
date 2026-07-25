@@ -332,7 +332,10 @@ The app has five tabs:
     partition entries on raw disks, image files, and devices. Writers
     cover MBR, GPT, APM, SGI, and RDB-bootable-flag.
   - **Resize Partitions…** for in-place partition data moves with
-    filesystem-side patching.
+    filesystem-side patching. Its **Disk size** field enlarges the image
+    file itself, so a partition can be grown past the end of the current
+    container without dropping to `rb-cli grow` first (a physical device's
+    size is fixed, and a compressed container can't be extended in place).
   - **Add Partition…** as a streamlined entry into the editor when
     trailing free space exists, pre-filled per partition-table type.
   - **Expand Image…** to grow a raw, VHD, or CHD image with trailing

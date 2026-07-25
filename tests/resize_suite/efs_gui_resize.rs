@@ -114,6 +114,45 @@ fn gui_resize(img: Vec<u8>, new_size: u64) -> Vec<u8> {
     cur.into_inner()
 }
 
+/// The GUI's two-dialog grow path: **Expand Image...** enlarges the file,
+/// then **Resize Partitions...** hands the new space to the EFS partition.
+///
+/// This is the flow that did not work. The resize dialog bounded the layout
+/// by the END OF THE LAST PARTITION rather than the container's size, so
+/// growing a partition was impossible even *after* Expand Image had already
+/// added the space — reopening just recomputed the same bound from the same
+/// partition table, and the planner rejected the plan. Feeding it the real
+/// disk size is what connects the two dialogs.
+fn gui_grow_disk_then_partition(mut img: Vec<u8>, new_disk: u64, new_part: u64) -> Vec<u8> {
+    // What "Expand Image..." leaves behind: a longer file, same table.
+    assert!(new_disk > img.len() as u64, "test should be growing");
+    img.resize(new_disk as usize, 0);
+
+    let table = PartitionTable::detect(&mut Cursor::new(&img)).expect("parse table");
+    let partitions = table.partitions();
+    let efs = partitions
+        .iter()
+        .find(|p| p.partition_type_byte == 0xA1)
+        .expect("EFS partition");
+
+    let plans = compute_resize_plan(&partitions, &[(efs.index, new_part)], 0, new_disk)
+        .expect("plan must fit the GROWN disk, not the old partition end");
+
+    let mut cur = Cursor::new(img);
+    apply_resize(
+        &mut cur,
+        &plans,
+        &table,
+        false,
+        false,
+        new_disk,
+        &mut |_, _| {},
+        &mut |_| {},
+    )
+    .expect("apply resize");
+    cur.into_inner()
+}
+
 /// Build the 200 MiB IRIX disk and drop a seed file in its root.
 fn build_seeded_disk() -> Vec<u8> {
     let opts = SgiHddOptions::new(200 * 1024 * 1024, "resize");
@@ -187,6 +226,60 @@ fn gui_resize_shrinks_then_grows_an_efs_root_partition() {
     assert!(
         grown_fs_size as u64 * 512 <= grown_size,
         "EFS claims {grown_fs_size} blocks, past its {grown_size}-byte partition"
+    );
+    assert_healthy(&grown, grown_offset);
+}
+
+/// Growing the disk itself — the case the GUI could not complete.
+///
+/// The scenario: an EFS image with no free space left, wanting a bigger
+/// volume. Expand the image, give the partition the room, and the
+/// filesystem follows. `compute_resize_plan` used to refuse any layout
+/// ending past the last partition, so the second half was unreachable and
+/// the whole job needed three `rb-cli` commands instead.
+#[test]
+fn gui_grows_the_image_itself_then_the_efs_partition() {
+    let img = build_seeded_disk();
+    let (offset, original_part) = efs_slice(&img);
+    let original_disk = img.len() as u64;
+    let original_fs_size = efs_fs_size_blocks(&img, offset);
+
+    // The partition already runs to the end of the image: there is no slack
+    // to grow into, which is exactly why the disk has to get bigger first.
+    assert!(
+        offset + original_part + 512 * 1024 > original_disk,
+        "fixture should have no meaningful free tail (disk {original_disk}, \
+         partition ends {})",
+        offset + original_part
+    );
+
+    // Double the disk and hand the partition all of the new space.
+    let new_disk = original_disk * 2;
+    let new_part = new_disk - offset;
+    let grown = gui_grow_disk_then_partition(img, new_disk, new_part);
+
+    assert_eq!(
+        grown.len() as u64,
+        new_disk,
+        "the image file itself must have grown"
+    );
+    let (grown_offset, grown_part) = efs_slice(&grown);
+    assert_eq!(grown_offset, offset, "the partition should not have moved");
+    assert!(
+        grown_part > original_part,
+        "volume-header entry did not grow: {grown_part} vs {original_part}"
+    );
+
+    // And the filesystem followed the partition up. EFS grows a whole
+    // cylinder group at a time, so it lands at or below the partition.
+    let grown_fs_size = efs_fs_size_blocks(&grown, grown_offset);
+    assert!(
+        grown_fs_size > original_fs_size,
+        "EFS superblock did not grow: {grown_fs_size} vs {original_fs_size}"
+    );
+    assert!(
+        grown_fs_size as u64 * 512 <= grown_part,
+        "EFS claims {grown_fs_size} blocks, past its {grown_part}-byte partition"
     );
     assert_healthy(&grown, grown_offset);
 }
